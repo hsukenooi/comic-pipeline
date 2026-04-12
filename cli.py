@@ -50,15 +50,16 @@ def list():
 
     # Header
     click.echo(
-        f"{'Item ID':<15} {'Max Bid':>8} {'Current':>12} {'Status':<10} {'Title'}"
+        f"{'Item ID':<15} {'Max Bid':>8} {'Current':>12} {'Time Left':<14} {'Status':<10} {'Title'}"
     )
-    click.echo("-" * 80)
+    click.echo("-" * 95)
 
     for s in snipes:
         click.echo(
             f"{s['item_id']:<15} "
             f"{s['max_bid']:>8} "
             f"{s.get('current_bid', ''):>12} "
+            f"{s.get('time_to_end', ''):.<14} "
             f"{s.get('status', ''):.<10} "
             f"{s.get('title', '')[:35]}"
         )
