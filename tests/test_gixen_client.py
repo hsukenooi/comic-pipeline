@@ -1,11 +1,14 @@
-"""Unit tests for gixen_client.py — all network calls are mocked."""
+"""Unit tests for gixen_client.py and cli.py — all network calls are mocked."""
 
+import json
 import pytest
 from decimal import Decimal
 from unittest.mock import patch, MagicMock, PropertyMock
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from click.testing import CliRunner
 
 from gixen_client import (
     GixenClient,
@@ -432,3 +435,182 @@ class TestExceptionHierarchy:
         assert err.code == 299
         assert err.message == "Not found"
         assert "299" in str(err)
+
+
+# ---------------------------------------------------------------------------
+# CLI: add duplicate detection
+# ---------------------------------------------------------------------------
+
+class TestCliAddDuplicate:
+    def test_add_warns_on_existing_snipe(self):
+        from cli import cli
+
+        runner = CliRunner()
+        existing_snipes = [{"item_id": "111222333", "max_bid": "465", "dbidid": "5001"}]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = existing_snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["add", "111222333", "440"])
+
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+        assert "465" in result.output
+        assert "edit" in result.output
+        mock_client.add_snipe.assert_not_called()
+
+    def test_add_succeeds_when_no_duplicate(self):
+        from cli import cli
+
+        runner = CliRunner()
+
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._record_add") as mock_record:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = []
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["add", "444555666", "15.00"])
+
+        assert result.exit_code == 0
+        assert "Added snipe" in result.output
+        mock_client.add_snipe.assert_called_once()
+        mock_record.assert_called_once_with("444555666")
+
+
+# ---------------------------------------------------------------------------
+# CLI: list --json
+# ---------------------------------------------------------------------------
+
+class TestCliListJson:
+    def test_list_json_output(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            {"item_id": "111", "max_bid": "10", "title": "Widget",
+             "current_bid": "5.00 USD", "time_to_end": "1 h", "status": "SCHEDULED"},
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["list", "--json"])
+
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert len(parsed) == 1
+        assert parsed[0]["item_id"] == "111"
+
+    def test_list_json_empty(self):
+        from cli import cli
+
+        runner = CliRunner()
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = []
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["list", "--json"])
+
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert parsed == []
+
+
+# ---------------------------------------------------------------------------
+# CLI: list --added-since
+# ---------------------------------------------------------------------------
+
+class TestCliListAddedSince:
+    def test_filters_by_add_history(self):
+        from cli import cli
+        from datetime import datetime, timezone
+
+        runner = CliRunner()
+        now = datetime.now(timezone.utc).timestamp()
+        history = {"111": now, "222": now - 7200}  # 222 added 2 hours ago
+
+        snipes = [
+            {"item_id": "111", "max_bid": "10", "time_to_end": "1 h"},
+            {"item_id": "222", "max_bid": "20", "time_to_end": "2 h"},
+            {"item_id": "333", "max_bid": "30", "time_to_end": "3 h"},
+        ]
+
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._load_add_history", return_value=history):
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            # Only show items added since 1 hour ago
+            since = datetime.fromtimestamp(now - 3600, tz=timezone.utc)
+            since_str = since.strftime("%Y-%m-%dT%H:%M:%S")
+            result = runner.invoke(cli, ["list", "--json", "--added-since", since_str])
+
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert len(parsed) == 1
+        assert parsed[0]["item_id"] == "111"
+
+    def test_added_since_no_matches_shows_empty(self):
+        from cli import cli
+        from datetime import datetime, timezone
+
+        runner = CliRunner()
+        now = datetime.now(timezone.utc).timestamp()
+        # All adds are old
+        history = {"111": now - 7200}
+
+        snipes = [
+            {"item_id": "111", "max_bid": "10", "time_to_end": "1 h"},
+        ]
+
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._load_add_history", return_value=history):
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            since = datetime.fromtimestamp(now - 3600, tz=timezone.utc)
+            since_str = since.strftime("%Y-%m-%dT%H:%M:%S")
+            result = runner.invoke(cli, ["list", "--added-since", since_str])
+
+        assert result.exit_code == 0
+        assert "No snipes found" in result.output
+
+
+# ---------------------------------------------------------------------------
+# CLI: add history helpers
+# ---------------------------------------------------------------------------
+
+class TestAddHistory:
+    def test_load_missing_file(self, tmp_path):
+        from cli import _load_add_history
+        with patch("cli.HISTORY_FILE", tmp_path / "nonexistent.json"):
+            assert _load_add_history() == {}
+
+    def test_load_corrupt_file(self, tmp_path):
+        from cli import _load_add_history
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("not json{{{")
+        with patch("cli.HISTORY_FILE", bad_file):
+            assert _load_add_history() == {}
+
+    def test_record_and_load_roundtrip(self, tmp_path):
+        from cli import _record_add, _load_add_history
+        hist_file = tmp_path / "history.json"
+        with patch("cli.HISTORY_FILE", hist_file):
+            _record_add("111")
+            _record_add("222")
+            history = _load_add_history()
+
+        assert "111" in history
+        assert "222" in history
+        assert isinstance(history["111"], float)
+        assert history["222"] >= history["111"]

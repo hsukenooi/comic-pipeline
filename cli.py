@@ -1,9 +1,13 @@
 """Gixen CLI — manage eBay snipes from the command line."""
 
+import json
 import os
 import sys
-import click
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+import click
 from dotenv import load_dotenv
 
 from gixen_client import (
@@ -35,7 +39,13 @@ def cli():
 
 
 @cli.command("list")
-def list_snipes():
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+@click.option(
+    "--added-since",
+    type=click.DateTime(formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]),
+    help="Only show snipes added via this CLI since the given time (ISO format)",
+)
+def list_snipes(as_json: bool, added_since: datetime | None):
     """Show all current snipes."""
     client = _make_client()
     try:
@@ -43,6 +53,21 @@ def list_snipes():
     except GixenError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+    # Filter by --added-since using local add history
+    if added_since:
+        history = _load_add_history()
+        since_ts = added_since.replace(tzinfo=timezone.utc).timestamp()
+        added_ids = {
+            item_id
+            for item_id, ts in history.items()
+            if ts >= since_ts
+        }
+        snipes = [s for s in snipes if s["item_id"] in added_ids]
+
+    if as_json:
+        click.echo(json.dumps(snipes, indent=2))
+        return
 
     if not snipes:
         click.echo("No snipes found.")
@@ -130,7 +155,21 @@ def add(item_id: str, max_bid: str, offset: int, group: int):
 
     client = _make_client()
     try:
+        # Check for existing snipe first
+        existing = client.list_snipes()
+        for s in existing:
+            if s["item_id"] == item_id:
+                existing_bid = s.get("max_bid", "?")
+                click.echo(
+                    f"Error: Snipe already exists for {item_id} "
+                    f"with max bid {existing_bid}. "
+                    f"Use `edit {item_id} {max_bid}` to change it.",
+                    err=True,
+                )
+                sys.exit(1)
+
         client.add_snipe(item_id, bid, bid_offset=offset, snipe_group=group)
+        _record_add(item_id)
         click.echo(f"Added snipe for {item_id} with max bid {bid}")
     except GixenError as e:
         click.echo(f"Error: {e}", err=True)
@@ -188,6 +227,26 @@ def purge():
     except GixenError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+HISTORY_FILE = Path(__file__).parent / ".gixen_history.json"
+
+
+def _load_add_history() -> dict[str, float]:
+    """Load {item_id: unix_timestamp} from local history file."""
+    if not HISTORY_FILE.exists():
+        return {}
+    try:
+        return json.loads(HISTORY_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _record_add(item_id: str) -> None:
+    """Record that a snipe was added now."""
+    history = _load_add_history()
+    history[item_id] = datetime.now(timezone.utc).timestamp()
+    HISTORY_FILE.write_text(json.dumps(history))
 
 
 if __name__ == "__main__":
