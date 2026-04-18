@@ -18,6 +18,7 @@ from gixen_client import (
     GixenItemError,
     GixenSnipeNotFoundError,
     GixenParseError,
+    find_sibling_cleanup_targets,
 )
 
 
@@ -614,3 +615,453 @@ class TestAddHistory:
         assert "222" in history
         assert isinstance(history["111"], float)
         assert history["222"] >= history["111"]
+
+
+# ---------------------------------------------------------------------------
+# find_sibling_cleanup_targets
+# ---------------------------------------------------------------------------
+
+def _snipe(item_id, status="SCHEDULED", group="0", title=""):
+    """Build a minimal snipe dict for cleanup-target tests."""
+    return {
+        "item_id": item_id,
+        "status": status,
+        "snipe_group": group,
+        "title": title,
+    }
+
+
+class TestFindSiblingCleanupTargets:
+    def test_empty_input(self):
+        assert find_sibling_cleanup_targets([]) == []
+
+    def test_no_groups_even_with_won(self):
+        # WON snipe in group "0" — group "0" is "no group" and is ignored.
+        snipes = [
+            _snipe("111", status="WON", group="0"),
+            _snipe("222", status="SCHEDULED", group="0"),
+        ]
+        assert find_sibling_cleanup_targets(snipes) == []
+
+    def test_won_with_two_scheduled_siblings(self):
+        snipes = [
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="SCHEDULED", group="1"),
+            _snipe("333", status="SCHEDULED", group="1"),
+        ]
+        result = find_sibling_cleanup_targets(snipes)
+        assert [s["item_id"] for s in result] == ["222", "333"]
+
+    def test_won_with_mixed_non_won_siblings(self):
+        snipes = [
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="LOST", group="1"),
+            _snipe("333", status="SCHEDULED", group="1"),
+        ]
+        result = find_sibling_cleanup_targets(snipes)
+        assert [s["item_id"] for s in result] == ["222", "333"]
+
+    def test_group_without_a_winner_is_left_alone(self):
+        snipes = [
+            _snipe("111", status="SCHEDULED", group="2"),
+            _snipe("222", status="SCHEDULED", group="2"),
+        ]
+        assert find_sibling_cleanup_targets(snipes) == []
+
+    def test_only_winning_groups_siblings_returned(self):
+        snipes = [
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="SCHEDULED", group="1"),
+            _snipe("333", status="SCHEDULED", group="2"),  # group 2 has no win
+            _snipe("444", status="SCHEDULED", group="2"),
+        ]
+        result = find_sibling_cleanup_targets(snipes)
+        assert [s["item_id"] for s in result] == ["222"]
+
+    def test_two_groups_each_with_a_win(self):
+        snipes = [
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="SCHEDULED", group="1"),
+            _snipe("333", status="WON", group="2"),
+            _snipe("444", status="SCHEDULED", group="2"),
+        ]
+        result = find_sibling_cleanup_targets(snipes)
+        # Input order is preserved.
+        assert [s["item_id"] for s in result] == ["222", "444"]
+
+    def test_two_wins_in_same_group_neither_is_a_target(self):
+        snipes = [
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="WON", group="1"),
+            _snipe("333", status="SCHEDULED", group="1"),
+        ]
+        result = find_sibling_cleanup_targets(snipes)
+        assert [s["item_id"] for s in result] == ["333"]
+
+    def test_input_order_is_preserved(self):
+        snipes = [
+            _snipe("999", status="SCHEDULED", group="1"),
+            _snipe("111", status="WON", group="1"),
+            _snipe("555", status="LOST", group="1"),
+        ]
+        result = find_sibling_cleanup_targets(snipes)
+        assert [s["item_id"] for s in result] == ["999", "555"]
+
+
+# ---------------------------------------------------------------------------
+# CLI: purge with sibling cleanup
+# ---------------------------------------------------------------------------
+
+class TestCliPurge:
+    def test_no_siblings_preserves_original_behavior(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            _snipe("111", status="WON", group="0"),
+            _snipe("222", status="SCHEDULED", group="0"),
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["purge"])
+
+        assert result.exit_code == 0
+        assert result.output == "Purged completed snipes\n"
+        mock_client.purge_completed.assert_called_once()
+        mock_client.remove_snipe.assert_not_called()
+
+    def test_siblings_with_no_prompt_aborts(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="SCHEDULED", group="1"),
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            # Answer "n" to the prompt
+            result = runner.invoke(cli, ["purge"], input="n\n")
+
+        assert result.exit_code == 0
+        assert "Aborted" in result.output
+        mock_client.purge_completed.assert_not_called()
+        mock_client.remove_snipe.assert_not_called()
+
+    def test_siblings_with_yes_skips_prompt_and_removes(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="SCHEDULED", group="1"),
+            _snipe("333", status="SCHEDULED", group="1"),
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["purge", "--yes"])
+
+        assert result.exit_code == 0
+        mock_client.purge_completed.assert_called_once()
+        removed_ids = [
+            call.args[0] for call in mock_client.remove_snipe.call_args_list
+        ]
+        assert removed_ids == ["222", "333"]
+        assert "Purged completed snipes" in result.output
+        assert "Removed 2 sibling snipe(s)" in result.output
+
+    def test_dry_run_does_nothing(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            _snipe("111", status="WON", group="1", title="ASM #300 CGC 9.8"),
+            _snipe("222", status="SCHEDULED", group="1", title="ASM #300 raw"),
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["purge", "--dry-run"])
+
+        assert result.exit_code == 0
+        assert "Dry run" in result.output
+        # Sibling is mentioned in the planned-removal listing
+        assert "222" in result.output
+        assert "ASM #300 raw" in result.output
+        mock_client.purge_completed.assert_not_called()
+        mock_client.remove_snipe.assert_not_called()
+
+    def test_dry_run_with_no_siblings(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [_snipe("111", status="WON", group="0")]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["purge", "--dry-run"])
+
+        assert result.exit_code == 0
+        assert "Would purge" in result.output
+        mock_client.purge_completed.assert_not_called()
+        mock_client.remove_snipe.assert_not_called()
+
+    def test_remove_failure_continues_and_exits_nonzero(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="SCHEDULED", group="1"),
+            _snipe("333", status="SCHEDULED", group="1"),
+        ]
+
+        def remove_side_effect(item_id):
+            if item_id == "222":
+                raise GixenError("network blew up")
+            return True
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_client.remove_snipe.side_effect = remove_side_effect
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["purge", "--yes"])
+
+        assert result.exit_code == 1
+        # Both removals were attempted despite the first one failing.
+        attempted_ids = [
+            call.args[0] for call in mock_client.remove_snipe.call_args_list
+        ]
+        assert attempted_ids == ["222", "333"]
+        assert "failed to remove 222" in result.output
+        # The successful one is reported.
+        assert "Removed 1 sibling snipe(s)" in result.output
+
+
+# ---------------------------------------------------------------------------
+# CLI: list shows snipe_group column
+# ---------------------------------------------------------------------------
+
+class TestCliListShowsGroup:
+    def test_format_group_blank_for_zero_or_missing(self):
+        from cli import _format_group
+        assert _format_group("0") == ""
+        assert _format_group("") == ""
+        assert _format_group("1") == "1"
+        assert _format_group("10") == "10"
+
+    def test_active_list_shows_group_column(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            {
+                "item_id": "111",
+                "title": "ASM #300 CGC 9.8",
+                "current_bid": "5.00 USD",
+                "max_bid": "75.00",
+                "snipe_group": "1",
+                "time_to_end": "2 h",
+                "status": "SCHEDULED",
+            },
+            {
+                "item_id": "222",
+                "title": "Random other thing",
+                "current_bid": "1.00 USD",
+                "max_bid": "10.00",
+                "snipe_group": "0",
+                "time_to_end": "5 h",
+                "status": "SCHEDULED",
+            },
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["list"])
+
+        assert result.exit_code == 0
+        assert "Grp" in result.output
+        # Grouped item shows its group; ungrouped item leaves the column blank.
+        lines = result.output.splitlines()
+        line_111 = next(l for l in lines if "111" in l and "ASM" in l)
+        line_222 = next(l for l in lines if "222" in l and "Random" in l)
+        # The "1" appears only in the Grp column for the grouped item.
+        assert " 1 " in line_111
+        # For the ungrouped item, between the max bid and time-left there are
+        # only spaces where the group column lives.
+        assert " 0 " not in line_222
+
+
+# ---------------------------------------------------------------------------
+# CLI: group command
+# ---------------------------------------------------------------------------
+
+class TestCliGroup:
+    def test_assigns_group_preserving_bid_and_offset(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            {
+                "item_id": "111",
+                "max_bid": "75.00",
+                "bid_offset": "4",
+                "snipe_group": "0",
+            },
+            {
+                "item_id": "222",
+                "max_bid": "60.00",
+                "bid_offset": "6",
+                "snipe_group": "0",
+            },
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["group", "1", "111", "222"])
+
+        assert result.exit_code == 0
+        # Two modify_snipe calls, each preserving the original bid + offset
+        # and assigning the new group.
+        calls = mock_client.modify_snipe.call_args_list
+        assert len(calls) == 2
+
+        # Call 1: item 111 keeps max_bid 75 and offset 4
+        args, kwargs = calls[0]
+        assert args[0] == "111"
+        assert args[1] == Decimal("75.00")
+        assert kwargs == {"bid_offset": 4, "snipe_group": 1}
+
+        # Call 2: item 222 keeps max_bid 60 and offset 6
+        args, kwargs = calls[1]
+        assert args[0] == "222"
+        assert args[1] == Decimal("60.00")
+        assert kwargs == {"bid_offset": 6, "snipe_group": 1}
+
+        assert "Updated 2 of 2" in result.output
+
+    def test_ungroup_with_zero(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            {
+                "item_id": "111",
+                "max_bid": "10",
+                "bid_offset": "6",
+                "snipe_group": "1",
+            }
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["group", "0", "111"])
+
+        assert result.exit_code == 0
+        kwargs = mock_client.modify_snipe.call_args.kwargs
+        assert kwargs["snipe_group"] == 0
+
+    def test_rejects_out_of_range_group(self):
+        from cli import cli
+
+        runner = CliRunner()
+
+        with patch("cli._make_client") as mock_make:
+            mock_make.return_value = MagicMock()
+            result = runner.invoke(cli, ["group", "11", "111"])
+
+        assert result.exit_code != 0
+        # Click renders IntRange errors with the range in the message.
+        assert "11" in result.output
+
+    def test_aborts_when_any_item_id_missing(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            {
+                "item_id": "111",
+                "max_bid": "10",
+                "bid_offset": "6",
+                "snipe_group": "0",
+            }
+        ]
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["group", "1", "111", "999"])
+
+        assert result.exit_code == 1
+        assert "999" in result.output
+        # No modifications attempted when validation fails.
+        mock_client.modify_snipe.assert_not_called()
+
+    def test_per_item_failure_continues_and_exits_nonzero(self):
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            {
+                "item_id": "111",
+                "max_bid": "10",
+                "bid_offset": "6",
+                "snipe_group": "0",
+            },
+            {
+                "item_id": "222",
+                "max_bid": "20",
+                "bid_offset": "6",
+                "snipe_group": "0",
+            },
+        ]
+
+        def modify_side_effect(item_id, *_, **__):
+            if item_id == "111":
+                raise GixenError("network blew up")
+            return True
+
+        with patch("cli._make_client") as mock_make:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_client.modify_snipe.side_effect = modify_side_effect
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["group", "1", "111", "222"])
+
+        assert result.exit_code == 1
+        # Both attempted despite the first failing.
+        attempted = [c.args[0] for c in mock_client.modify_snipe.call_args_list]
+        assert attempted == ["111", "222"]
+        assert "Updated 1 of 2" in result.output

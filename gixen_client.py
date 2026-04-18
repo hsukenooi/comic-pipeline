@@ -445,3 +445,31 @@ class GixenClient:
         raise GixenSnipeNotFoundError(
             f"Item {item_id} not found in your Gixen snipe list"
         )
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+def find_sibling_cleanup_targets(
+    snipes: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Return snipes that should be removed because a sibling in their snipe
+    group has already won.
+
+    A "sibling" is any snipe sharing a non-zero ``snipe_group`` value with a
+    snipe whose ``status`` is ``"WON"``. The winning snipe(s) themselves are
+    never returned. Group ``"0"`` (no group) is ignored entirely.
+
+    Pure function — no I/O. Input order is preserved in the result.
+    """
+    won_groups = {
+        s.get("snipe_group", "0")
+        for s in snipes
+        if s.get("status") == "WON" and s.get("snipe_group", "0") != "0"
+    }
+    return [
+        s
+        for s in snipes
+        if s.get("snipe_group", "0") in won_groups and s.get("status") != "WON"
+    ]
