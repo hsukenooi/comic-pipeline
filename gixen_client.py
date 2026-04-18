@@ -139,7 +139,7 @@ class GixenClient:
 
         return html
 
-    def _post_home(self, data: dict, retry_on_expired: bool = True) -> str:
+    def _post_home(self, data: dict, retry_on_expired: bool = True, check_errors: bool = True) -> str:
         """POST to the home page. Auto-re-login on session expiration."""
         resp = self.session.post(
             self._home_url(), data=data, timeout=self.timeout
@@ -152,10 +152,11 @@ class GixenClient:
                 logger.info("Session expired, re-logging in")
                 self.session_id = None
                 self.login()
-                return self._post_home(data, retry_on_expired=False)
+                return self._post_home(data, retry_on_expired=False, check_errors=check_errors)
             raise GixenSessionExpiredError("Session expired and re-login failed")
 
-        self._check_html_error(html)
+        if check_errors:
+            self._check_html_error(html)
         return html
 
     # ------------------------------------------------------------------
@@ -267,7 +268,16 @@ class GixenClient:
             f"delete_{dbidid}": "Delete",
             "username": self.username,
         }
-        self._post_home(data)
+        # Skip global error check — Gixen may show stale red-font errors for
+        # other items on the page even when this delete succeeded.
+        self._post_home(data, check_errors=False)
+
+        # Verify the item is actually gone.
+        remaining = self.list_snipes()
+        still_there = any(s["item_id"] == str(item_id) for s in remaining)
+        if still_there:
+            raise GixenError(f"Delete POST succeeded but item {item_id} is still in snipe list")
+
         logger.info("Removed snipe: item=%s", item_id)
         return True
 

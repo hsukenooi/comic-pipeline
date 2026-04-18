@@ -304,7 +304,8 @@ class TestRemoveSnipe:
 
         snipes = [{"item_id": "111", "dbidid": "5001"}]
 
-        with patch.object(client, "list_snipes", return_value=snipes):
+        # First call returns the snipe list; second call (post-delete verification) returns empty.
+        with patch.object(client, "list_snipes", side_effect=[snipes, []]):
             with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
                 result = client.remove_snipe("111")
 
