@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -152,6 +153,24 @@ def _calc_diff(max_bid: str, winning_bid: str) -> str:
         return ""
 
 
+def _get_ebay_bid_count(item_id: str) -> int | None:
+    """Return current bid count for an eBay listing, or None if unavailable."""
+    try:
+        import requests
+        resp = requests.get(
+            f"https://www.ebay.com/itm/{item_id}",
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        m = re.search(r'x-bid-count.*?<span[^>]*>(\d+)\s*bid', resp.text, re.IGNORECASE | re.DOTALL)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
 @cli.command()
 @click.argument("item_id")
 @click.argument("max_bid")
@@ -183,6 +202,35 @@ def add(item_id: str, max_bid: str, offset: int, group: int):
         client.add_snipe(item_id, bid, bid_offset=offset, snipe_group=group)
         _record_add(item_id)
         click.echo(f"Added snipe for {item_id} with max bid {bid}")
+
+        # Warn if there are no bids — sellers can only end auctions early when
+        # no bids have been placed.
+        bid_count = _get_ebay_bid_count(item_id)
+        if bid_count == 0:
+            click.echo(
+                f"\n0 bids on this listing — place a minimum bid now to prevent "
+                f"the seller from ending early:\n"
+                f"  https://www.ebay.com/itm/{item_id}"
+            )
+        elif bid_count is None:
+            # Scrape failed — fall back to price heuristic
+            snipes = client.list_snipes()
+            for s in snipes:
+                if s["item_id"] == item_id:
+                    current_bid_str = s.get("current_bid", "")
+                    try:
+                        current_val = Decimal(current_bid_str.split()[0])
+                        if current_val < Decimal("2.00") or str(current_val).endswith(".99"):
+                            click.echo(
+                                f"\nCurrent bid is {_format_bid(current_bid_str)} — couldn't verify bid count, "
+                                f"but this looks like it may have no bids yet.\n"
+                                f"Consider placing a minimum bid to prevent early ending:\n"
+                                f"  https://www.ebay.com/itm/{item_id}"
+                            )
+                    except (InvalidOperation, IndexError):
+                        pass
+                    break
+
     except GixenError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
