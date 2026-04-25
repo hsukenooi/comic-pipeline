@@ -11,6 +11,8 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
+import requests
+
 from gixen_client import (
     GixenClient,
     GixenError,
@@ -35,6 +37,36 @@ def _make_client() -> GixenClient:
     return GixenClient(username=username, password=password)
 
 
+def _server_url() -> str | None:
+    return os.getenv("GIXEN_SERVER_URL", "").rstrip("/") or None
+
+
+def _server_request(method: str, path: str, **kwargs) -> dict | list:
+    """Make a request to the gixen server. Raises SystemExit on failure."""
+    url = f"{_server_url()}{path}"
+    try:
+        resp = getattr(requests, method)(url, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.ConnectionError:
+        click.echo("Error: Server unreachable. Is the gixen server running?", err=True)
+        sys.exit(1)
+    except requests.Timeout:
+        click.echo("Error: Server timed out.", err=True)
+        sys.exit(1)
+    except requests.HTTPError as e:
+        status_code = "unknown"
+        detail = ""
+        if e.response is not None:
+            status_code = e.response.status_code
+            try:
+                detail = e.response.json().get("detail", "")
+            except (ValueError, AttributeError):
+                pass
+        click.echo(f"Error: Server returned {status_code}: {detail}", err=True)
+        sys.exit(1)
+
+
 @click.group()
 def cli():
     """Manage Gixen eBay snipes."""
@@ -49,12 +81,15 @@ def cli():
 )
 def list_snipes(as_json: bool, added_since: datetime | None):
     """Show all current snipes."""
-    client = _make_client()
-    try:
-        snipes = client.list_snipes()
-    except GixenError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
+    if _server_url():
+        snipes = _server_request("get", "/api/snipes")
+    else:
+        client = _make_client()
+        try:
+            snipes = client.list_snipes()
+        except GixenError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
 
     # Filter by --added-since using local add history
     if added_since:
@@ -176,7 +211,19 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.argument("max_bid")
 @click.option("--offset", default=6, help="Seconds before end to place bid (1-15)")
 @click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
-def add(item_id: str, max_bid: str, offset: int, group: int):
+@click.option("--comic", default=None, help="Comic title (e.g. 'Amazing Spider-Man')")
+@click.option("--issue", default=None, help="Issue number (e.g. '300')")
+@click.option("--year", default=None, type=int, help="Publication year")
+@click.option("--grade", default=None, type=float, help="CGC grade (e.g. 9.2)")
+@click.option("--fmv-low", default=None, type=float, help="FMV range low end")
+@click.option("--fmv-high", default=None, type=float, help="FMV range high end")
+@click.option("--fmv-comps", default=None, type=int, help="Number of comps used")
+@click.option("--fmv-confidence", default=None, help="FMV confidence: high/medium/low")
+@click.option("--fmv-notes", default=None, help="FMV notes")
+def add(item_id: str, max_bid: str, offset: int, group: int,
+        comic: str | None, issue: str | None, year: int | None, grade: float | None,
+        fmv_low: float | None, fmv_high: float | None,
+        fmv_comps: int | None, fmv_confidence: str | None, fmv_notes: str | None):
     """Add a snipe for an eBay item."""
     try:
         bid = Decimal(max_bid)
@@ -184,9 +231,28 @@ def add(item_id: str, max_bid: str, offset: int, group: int):
         click.echo(f"Error: Invalid bid amount: {max_bid}", err=True)
         sys.exit(1)
 
+    if _server_url():
+        payload = {
+            "item_id": item_id,
+            "max_bid": float(bid),
+            "bid_offset": offset,
+            "snipe_group": group,
+        }
+        if comic:
+            payload.update({
+                "comic": comic, "issue": issue, "year": year,
+                "grade": grade, "fmv_low": fmv_low, "fmv_high": fmv_high,
+                "fmv_comps": fmv_comps, "fmv_confidence": fmv_confidence,
+                "fmv_notes": fmv_notes,
+            })
+        _server_request("post", "/api/bids", json=payload)
+        _record_add(item_id)
+        click.echo(f"Added snipe for {item_id} with max bid {bid}")
+        return
+
+    # Existing direct-Gixen path
     client = _make_client()
     try:
-        # Check for existing snipe first
         existing = client.list_snipes()
         for s in existing:
             if s["item_id"] == item_id:
@@ -198,7 +264,6 @@ def add(item_id: str, max_bid: str, offset: int, group: int):
                     err=True,
                 )
                 sys.exit(1)
-
         client.add_snipe(item_id, bid, bid_offset=offset, snipe_group=group)
         _record_add(item_id)
         click.echo(f"Added snipe for {item_id} with max bid {bid}")
@@ -248,6 +313,12 @@ def edit(item_id: str, max_bid: str, offset: int, group: int):
     except InvalidOperation:
         click.echo(f"Error: Invalid bid amount: {max_bid}", err=True)
         sys.exit(1)
+
+    if _server_url():
+        _server_request("patch", f"/api/bids/{item_id}",
+                        json={"max_bid": float(bid), "bid_offset": offset, "snipe_group": group})
+        click.echo(f"Updated snipe for {item_id} to max bid {bid}")
+        return
 
     client = _make_client()
     try:
@@ -321,6 +392,11 @@ def group_cmd(group_n: int, item_ids: tuple[str, ...]):
 @click.argument("item_id")
 def remove(item_id: str):
     """Remove a snipe."""
+    if _server_url():
+        _server_request("delete", f"/api/bids/{item_id}")
+        click.echo(f"Removed snipe for {item_id}")
+        return
+
     client = _make_client()
     try:
         client.remove_snipe(item_id)
@@ -347,6 +423,17 @@ def remove(item_id: str):
 )
 def purge(dry_run: bool, yes: bool):
     """Remove completed snipes (and sibling snipes from groups with a win)."""
+    if _server_url():
+        if dry_run:
+            click.echo("Would purge completed snipes.")
+            return
+        result = _server_request("post", "/api/purge", json={"sibling_ids": []})
+        click.echo(f"Purged {result['purged_completed']} completed snipe(s)")
+        if result["removed_siblings"]:
+            click.echo(f"Removed {result['removed_siblings']} sibling snipe(s)")
+        return
+
+    # Existing direct-Gixen path (unchanged)
     client = _make_client()
     try:
         snipes = client.list_snipes()
@@ -356,8 +443,6 @@ def purge(dry_run: bool, yes: bool):
 
     siblings = find_sibling_cleanup_targets(snipes)
 
-    # Fast path: no group siblings to clean. Preserve the original
-    # no-prompt, single-line behaviour (including no trailing period).
     if not siblings:
         if dry_run:
             click.echo("Would purge completed snipes")
