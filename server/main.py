@@ -1,4 +1,6 @@
 """Gixen backend server — FastAPI app with SQLite storage and Gixen proxy."""
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -30,6 +32,8 @@ _db: sqlite3.Connection | None = None
 _api_client: GixenClient | None = None
 _sync_client: GixenClient | None = None
 _api_lock: asyncio.Lock | None = None
+_cached_snipes: list = []          # last successful Gixen snipe list
+_cached_snipes_at: float = 0.0     # monotonic timestamp of that fetch
 
 
 def _get_db() -> sqlite3.Connection:
@@ -44,10 +48,12 @@ def _get_db() -> sqlite3.Connection:
 _TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "ENDED"})
 
 SYNC_INTERVAL = int(os.getenv("GIXEN_SYNC_INTERVAL", "600"))
+_SYNC_BACKOFF_MAX = 3600  # cap backoff at 1 hour
 
 
 async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     """Pull current Gixen state and update DB bid statuses. Returns snipes list."""
+    global _cached_snipes, _cached_snipes_at
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
     except GixenError as e:
@@ -81,18 +87,31 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     vanished = [b["item_id"] for b in pending_bids if b["item_id"] not in gixen_item_ids]
     mark_bids_purged(db, vanished)
 
+    _cached_snipes = snipes
+    _cached_snipes_at = datetime.now(timezone.utc).timestamp()
     return snipes
 
 
 async def _sync_loop() -> None:
+    consecutive_failures = 0
     while True:
         try:
             if _sync_client is not None:
                 db = _get_db()
-                await _sync_gixen(db, _sync_client)
+                result = await _sync_gixen(db, _sync_client)
+                if result:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
         except Exception:
             logger.exception("_sync_loop: unexpected error, continuing")
-        await asyncio.sleep(SYNC_INTERVAL)
+            consecutive_failures += 1
+
+        # Exponential backoff: 10min, 20min, 40min, ..., capped at 1 hour
+        delay = min(SYNC_INTERVAL * (2 ** consecutive_failures), _SYNC_BACKOFF_MAX)
+        if consecutive_failures:
+            logger.warning("_sync_loop: %d consecutive failure(s), sleeping %ds", consecutive_failures, delay)
+        await asyncio.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -285,12 +304,22 @@ async def api_add_bid(req: AddBidRequest):
 
 @app.get("/api/snipes")
 async def api_get_snipes():
+    global _cached_snipes, _cached_snipes_at
     db = _get_db()
+
+    # Try a live fetch; fall back to the last successful snapshot if Gixen is down.
     try:
         async with _api_lock:
             gixen_snipes = await asyncio.to_thread(_api_client.list_snipes)
+        _cached_snipes = gixen_snipes
+        _cached_snipes_at = datetime.now(timezone.utc).timestamp()
     except GixenError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        if _cached_snipes:
+            age = int(datetime.now(timezone.utc).timestamp() - _cached_snipes_at)
+            logger.warning("api_get_snipes: Gixen unavailable (%s), returning cached data (%ds old)", e, age)
+            gixen_snipes = _cached_snipes
+        else:
+            raise HTTPException(status_code=503, detail=str(e))
 
     db_rows = db.execute("""
         SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,

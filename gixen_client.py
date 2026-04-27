@@ -7,13 +7,86 @@ same HTML forms a browser would.
 
 import os
 import re
+import subprocess
 import logging
+import time
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Curl-based HTTP session (bypasses LibreSSL 2.8.3 TLS compatibility issues)
+# ---------------------------------------------------------------------------
+
+class _CurlResponse:
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+class _CurlSession:
+    """Drop-in replacement for requests.Session using curl subprocess.
+
+    macOS system Python uses LibreSSL 2.8.3, which has TLS data-transfer
+    bugs with some servers despite completing the handshake. Curl ships with
+    LibreSSL 3.3.6 + SecureTransport and works reliably.
+    """
+
+    def __init__(self):
+        self.headers: Dict[str, str] = {}
+
+    def _run(self, method: str, url: str, data: Optional[Dict] = None,
+             timeout: float = 15.0, allow_redirects: bool = True) -> _CurlResponse:
+        cmd = ["curl", "-s", "-D", "-", "--max-time", str(int(timeout))]
+        if not allow_redirects:
+            cmd += ["--max-redirs", "0"]
+        for k, v in self.headers.items():
+            cmd += ["-H", f"{k}: {v}"]
+        if method == "POST":
+            for k, v in (data or {}).items():
+                cmd += ["--data-urlencode", f"{k}={v}"]
+        cmd += [url]
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout + 10,
+            )
+        except subprocess.TimeoutExpired:
+            raise requests.ReadTimeout(f"curl timed out for {url}")
+
+        raw = result.stdout
+        sep = raw.find("\r\n\r\n")
+        if sep < 0:
+            sep = raw.find("\n\n")
+            body = raw[sep + 2:] if sep >= 0 else raw
+            header_block = raw[:sep] if sep >= 0 else ""
+        else:
+            header_block = raw[:sep]
+            body = raw[sep + 4:]
+
+        status_code = 200
+        m = re.match(r"HTTP/\S+ (\d{3})", header_block)
+        if m:
+            status_code = int(m.group(1))
+
+        return _CurlResponse(status_code, body)
+
+    def get(self, url: str, timeout: float = 15.0, **_) -> _CurlResponse:
+        return self._run("GET", url, timeout=timeout)
+
+    def post(self, url: str, data: Optional[Dict] = None, timeout: float = 15.0,
+             allow_redirects: bool = True, **_) -> _CurlResponse:
+        return self._run("POST", url, data=data, timeout=timeout,
+                         allow_redirects=allow_redirects)
 
 GIXEN_BASE = "https://www.gixen.com/main"
 LOGIN_URL = f"{GIXEN_BASE}/home_1.php"
@@ -57,6 +130,9 @@ class GixenParseError(GixenError):
 # Client
 # ---------------------------------------------------------------------------
 
+_LOGIN_COOLDOWN = 300  # seconds to wait after a failed login before retrying
+
+
 class GixenClient:
     """Web-scraping client for Gixen.com."""
 
@@ -69,8 +145,9 @@ class GixenClient:
         self.username = username or os.getenv("GIXEN_USERNAME", "")
         self.password = password or os.getenv("GIXEN_PASSWORD", "")
         self.timeout = timeout
-        self.session = requests.Session()
+        self.session = _CurlSession()
         self.session_id: Optional[str] = None
+        self._login_failed_at: Optional[float] = None  # monotonic timestamp
 
     # ------------------------------------------------------------------
     # Authentication
@@ -81,26 +158,42 @@ class GixenClient:
 
         Raises:
             GixenLoginError: If credentials are wrong or account is suspended.
+            GixenLoginError: If called within the cooldown window after a failure.
         """
-        resp = self.session.post(
-            LOGIN_URL,
-            data={
-                "username": self.username,
-                "password": self.password,
-                "signin": "signin",
-            },
-            timeout=self.timeout,
-            allow_redirects=False,
-        )
+        if self._login_failed_at is not None:
+            elapsed = time.monotonic() - self._login_failed_at
+            remaining = _LOGIN_COOLDOWN - elapsed
+            if remaining > 0:
+                raise GixenLoginError(
+                    f"Login cooldown active — retry in {int(remaining)}s. "
+                    "Backing off to avoid IP rate-limiting."
+                )
+
+        try:
+            resp = self.session.post(
+                LOGIN_URL,
+                data={
+                    "username": self.username,
+                    "password": self.password,
+                    "signin": "signin",
+                },
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+        except Exception:
+            self._login_failed_at = time.monotonic()
+            raise
 
         # Gixen returns HTML with a meta-refresh containing the sessionid
         match = re.search(r'sessionid=(\d+)', resp.text)
         if not match:
+            self._login_failed_at = time.monotonic()
             raise GixenLoginError(
                 "Login failed — could not extract session ID. "
                 "Check your GIXEN_USERNAME and GIXEN_PASSWORD."
             )
 
+        self._login_failed_at = None
         self.session_id = match.group(1)
         logger.info("Logged in to Gixen (session_id=%s...)", self.session_id[:8])
         return self.session_id
