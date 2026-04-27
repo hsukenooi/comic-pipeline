@@ -34,14 +34,22 @@ CREATE TABLE IF NOT EXISTS bids (
     status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED')),
     winning_bid     REAL,
     seller          TEXT,
-    auction_end_at  TEXT,
-    notes           TEXT,
-    added_at        TEXT DEFAULT (datetime('now')),
-    resolved_at     TEXT
+    auction_end_at      TEXT,
+    local_snipe_at      TEXT,
+    local_snipe_result  TEXT,
+    notes               TEXT,
+    added_at            TEXT DEFAULT (datetime('now')),
+    resolved_at         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
 """
+
+
+_MIGRATIONS = [
+    "ALTER TABLE bids ADD COLUMN local_snipe_at TEXT",
+    "ALTER TABLE bids ADD COLUMN local_snipe_result TEXT",
+]
 
 
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -53,6 +61,12 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     try:
         conn.executescript(_SCHEMA)
         conn.commit()
+        for sql in _MIGRATIONS:
+            try:
+                conn.execute(sql)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
     except Exception:
         conn.close()
         raise
@@ -178,5 +192,40 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     conn.execute(
         f"UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id IN ({placeholders})",
         [now, *item_ids],
+    )
+    conn.commit()
+
+
+def set_auction_end_time(conn: sqlite3.Connection, item_id: str, end_time_iso: str) -> None:
+    conn.execute(
+        "UPDATE bids SET auction_end_at=? WHERE item_id=? AND status='PENDING'",
+        (end_time_iso, item_id),
+    )
+    conn.commit()
+
+
+def get_bids_ready_to_snipe(conn: sqlite3.Connection, now_iso: str) -> list[sqlite3.Row]:
+    """Return PENDING bids whose fire time (auction_end_at - bid_offset) has arrived."""
+    return conn.execute(
+        """
+        SELECT * FROM bids
+        WHERE status = 'PENDING'
+          AND local_snipe_at IS NULL
+          AND auction_end_at IS NOT NULL
+          AND datetime(auction_end_at, '-' || bid_offset || ' seconds') <= datetime(?)
+        """,
+        (now_iso,),
+    ).fetchall()
+
+
+def set_local_snipe_result(
+    conn: sqlite3.Connection,
+    item_id: str,
+    fired_at: str,
+    result: str,
+) -> None:
+    conn.execute(
+        "UPDATE bids SET local_snipe_at=?, local_snipe_result=? WHERE item_id=? AND status='PENDING'",
+        (fired_at, result, item_id),
     )
     conn.commit()

@@ -13,6 +13,8 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
+import asyncio
+
 import requests
 
 from gixen_client import (
@@ -22,6 +24,7 @@ from gixen_client import (
     GixenSnipeNotFoundError,
     find_sibling_cleanup_targets,
 )
+import ebay_bidder
 
 load_dotenv()
 
@@ -137,20 +140,23 @@ def list_snipes(as_json: bool, added_since: datetime | None):
         click.echo(click.style(f"Recently Ended ({len(ended)})", bold=True))
         click.echo(
             f"  {'Item':<17} {'Title':<40} {'Winning':>10} {'Max Bid':>10} "
-            f"{'Grp':>3} {'Diff':>10}"
+            f"{'Grp':>3} {'Status'}"
         )
         click.echo("  " + "-" * 99)
         for s in ended:
             winning = s.get("current_bid", "")
             max_bid = s.get("max_bid", "")
-            diff = _calc_diff(max_bid, winning)
+            mirror = s.get("status_mirror", "")
+            status_display = s.get("status", "")
+            if mirror and mirror not in ("N/A", status_display):
+                status_display += f" / mirror: {mirror}"
             click.echo(
                 f"  {s['item_id']:<17} "
                 f"{s.get('title', '')[:38]:<40} "
                 f"{_format_bid(winning):>10} "
                 f"{_format_bid(max_bid):>10} "
                 f"{_format_group(s.get('snipe_group', '')):>3} "
-                f"{diff:>10}"
+                f"{status_display}"
             )
         click.echo()
 
@@ -528,6 +534,31 @@ def _record_add(item_id: str) -> None:
     history = _load_add_history()
     history[item_id] = datetime.now(timezone.utc).timestamp()
     HISTORY_FILE.write_text(json.dumps(history))
+
+
+@cli.command("ebay-auth")
+def ebay_auth():
+    """Open a browser window to log in to eBay and save the session locally."""
+    click.echo("Opening eBay login — sign in, then press Enter in this terminal.")
+    asyncio.run(ebay_bidder.setup_session())
+
+
+@cli.command("bid")
+@click.argument("item_id")
+@click.argument("max_bid", type=float)
+@click.option("--dry-run", is_flag=True, help="Load bid page but don't click confirm.")
+def bid_now(item_id: str, max_bid: float, dry_run: bool):
+    """Place an eBay bid immediately via local browser automation."""
+    if not item_id.isdigit():
+        click.echo("Error: item_id must be numeric", err=True)
+        sys.exit(1)
+    click.echo(f"Placing bid: item={item_id} max_bid=${max_bid:.2f}{' (dry run)' if dry_run else ''}")
+    result = asyncio.run(ebay_bidder.place_bid(item_id, max_bid, dry_run=dry_run))
+    if result["success"]:
+        click.echo(click.style(f"✓ {result['message']}", fg="green"))
+    else:
+        click.echo(click.style(f"✗ {result['message']}", fg="red"))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

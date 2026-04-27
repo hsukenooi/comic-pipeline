@@ -7,7 +7,7 @@ import os
 import re
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,7 +20,9 @@ from server.db import (
     DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged,
+    set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
 )
+import ebay_bidder
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,7 @@ _db: sqlite3.Connection | None = None
 _api_client: GixenClient | None = None
 _sync_client: GixenClient | None = None
 _api_lock: asyncio.Lock | None = None
+_bidder: ebay_bidder.EbayBidder | None = None
 _cached_snipes: list = []          # last successful Gixen snipe list
 _cached_snipes_at: float = 0.0     # monotonic timestamp of that fetch
 
@@ -60,7 +63,8 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
         logger.warning("_sync_gixen: GixenError (suppressed): %s", e)
         return []  # sync is best-effort; don't crash if Gixen is down
 
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
     gixen_item_ids = {s["item_id"] for s in snipes}
 
     for snipe in snipes:
@@ -80,6 +84,14 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
                 "UPDATE bids SET seller=? WHERE item_id=? AND status='PENDING'",
                 (snipe["seller"], snipe["item_id"]),
             )
+
+        # Refresh auction_end_at from Gixen's relative time on every sync
+        time_to_end = snipe.get("time_to_end", "")
+        if time_to_end and time_to_end.upper() != "ENDED":
+            delta = _parse_time_to_end(time_to_end)
+            if delta is not None:
+                end_time = (now_dt + delta).isoformat()
+                set_auction_end_time(db, snipe["item_id"], end_time)
 
     db.commit()
 
@@ -114,13 +126,53 @@ async def _sync_loop() -> None:
         await asyncio.sleep(delay)
 
 
+def _parse_time_to_end(s: str) -> timedelta | None:
+    """Parse Gixen relative time string like '1 d, 20 h, 59 m' into a timedelta."""
+    total = 0
+    for part in s.split(","):
+        part = part.strip()
+        if m := re.match(r"(\d+)\s*d", part):
+            total += int(m.group(1)) * 86400
+        elif m := re.match(r"(\d+)\s*h", part):
+            total += int(m.group(1)) * 3600
+        elif m := re.match(r"(\d+)\s*m", part):
+            total += int(m.group(1)) * 60
+        elif m := re.match(r"(\d+)\s*s", part):
+            total += int(m.group(1))
+    return timedelta(seconds=total) if total else None
+
+
+SNIPER_INTERVAL = 10  # check every 10 seconds
+
+
+async def _sniper_loop() -> None:
+    while True:
+        try:
+            if _bidder is not None:
+                db = _get_db()
+                now_iso = datetime.now(timezone.utc).isoformat()
+                ready = get_bids_ready_to_snipe(db, now_iso)
+                if ready:
+                    fired_at = datetime.now(timezone.utc).isoformat()
+                    logger.info("_sniper_loop: firing %d bid(s) concurrently", len(ready))
+                    bids = [{"item_id": b["item_id"], "max_bid": b["max_bid"]} for b in ready]
+                    results = await _bidder.place_bids_concurrent(bids)
+                    for bid, result in zip(ready, results):
+                        result_str = ("OK: " if result["success"] else "ERR: ") + result["message"]
+                        set_local_snipe_result(db, bid["item_id"], fired_at, result_str)
+                        logger.info("_sniper_loop: %s — %s", bid["item_id"], result_str)
+        except Exception:
+            logger.exception("_sniper_loop: unexpected error, continuing")
+        await asyncio.sleep(SNIPER_INTERVAL)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _db, _api_client, _sync_client, _api_lock
+    global _db, _api_client, _sync_client, _api_lock, _bidder
     if env_file := os.getenv("ENV_FILE"):
         load_dotenv(env_file)
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
@@ -130,11 +182,20 @@ async def lifespan(app: FastAPI):
     _api_lock = asyncio.Lock()
 
     sync_task = None
+    sniper_task = None
     if os.getenv("GIXEN_SYNC_ENABLED", "true") != "false":
         sync_task = asyncio.create_task(_sync_loop())
+    if os.getenv("LOCAL_SNIPER_ENABLED", "true") != "false":
+        _bidder = ebay_bidder.EbayBidder()
+        await _bidder.start()
+        sniper_task = asyncio.create_task(_sniper_loop())
 
     yield
 
+    if sniper_task:
+        sniper_task.cancel()
+    if _bidder:
+        await _bidder.stop()
     if sync_task:
         sync_task.cancel()
     row = _db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
