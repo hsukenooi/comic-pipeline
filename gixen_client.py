@@ -286,8 +286,8 @@ class GixenClient:
 
         Returns:
             List of dicts with keys: item_id, title, max_bid, current_bid,
-            status, time_to_end, bid_offset, bid_offset_mirror, dbidid,
-            snipe_group, seller.
+            status, status_mirror, time_to_end, bid_offset, bid_offset_mirror,
+            dbidid, snipe_group, seller.
         """
         html = self._get_home_page()
         return self._parse_snipe_table(html)
@@ -512,21 +512,16 @@ class GixenClient:
                 snipe["time_to_end"] = ""
                 snipe["current_bid"] = ""
 
-            # Status
-            m = re.search(
-                rf'name="edit_{re.escape(iid)}".*?</tr>\s*<tr[^>]*>.*?'
-                rf'<td>([\d.]+ \w+[^<]*)</td>\s*<td>(\w+)',
-                html, re.DOTALL,
-            )
-            if m:
-                snipe["status"] = m.group(2).strip()
-            else:
-                # Try simpler pattern
-                m = re.search(
-                    rf'{re.escape(iid)}.*?(SCHEDULED|WON|LOST|FAILED|ENDED)',
-                    html,
-                )
-                snipe["status"] = m.group(1) if m else ""
+            # Status (main) and Status (mirror)
+            # Gixen renders: <td>Status (main): </td><td>SCHEDULED</td>
+            # Find the item's anchor tag, then scan the next ~900 chars for both rows.
+            m_anchor = re.search(rf'<a[^>]*>{re.escape(iid)}</a>', html)
+            anchor_pos = m_anchor.start() if m_anchor else html.find(iid)
+            chunk = html[anchor_pos:anchor_pos + 900] if anchor_pos >= 0 else ""
+            m = re.search(r'Status \(main\):\s*</td><td>([^<]+)', chunk)
+            snipe["status"] = m.group(1).strip() if m else ""
+            m = re.search(r'Status \(mirror\):\s*</td><td>([^<]+)', chunk)
+            snipe["status_mirror"] = m.group(1).strip() if m else ""
 
         # Deduplicate — the mobile table has separate forms too,
         # but we only parsed desktop table inputs (edititemid_<ID> pattern)
