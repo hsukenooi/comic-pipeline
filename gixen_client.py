@@ -237,6 +237,15 @@ class GixenClient:
         resp = self.session.post(
             self._home_url(), data=data, timeout=self.timeout
         )
+
+        # Gixen returns HTTP 500 for requests with a stale/invalid session.
+        # Treat it as session expiry and retry after re-login.
+        if resp.status_code == 500 and retry_on_expired:
+            logger.info("Gixen returned 500 on POST, forcing re-login")
+            self.session_id = None
+            self.login()
+            return self._post_home(data, retry_on_expired=False, check_errors=check_errors)
+
         resp.raise_for_status()
         html = resp.text
 

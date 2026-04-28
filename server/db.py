@@ -93,12 +93,12 @@ def upsert_comic(
                             fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(title, issue, year, grade) DO UPDATE SET
-            fmv_low         = excluded.fmv_low,
-            fmv_high        = excluded.fmv_high,
-            fmv_comps       = excluded.fmv_comps,
-            fmv_confidence  = excluded.fmv_confidence,
-            fmv_notes       = excluded.fmv_notes,
-            fmv_updated_at  = excluded.fmv_updated_at
+            fmv_low         = COALESCE(excluded.fmv_low,        fmv_low),
+            fmv_high        = COALESCE(excluded.fmv_high,       fmv_high),
+            fmv_comps       = COALESCE(excluded.fmv_comps,      fmv_comps),
+            fmv_confidence  = COALESCE(excluded.fmv_confidence, fmv_confidence),
+            fmv_notes       = COALESCE(excluded.fmv_notes,      fmv_notes),
+            fmv_updated_at  = CASE WHEN excluded.fmv_low IS NOT NULL THEN excluded.fmv_updated_at ELSE fmv_updated_at END
         """,
         (title, issue, year, grade, fmv_low, fmv_high,
          fmv_comps, fmv_confidence, fmv_notes, now),

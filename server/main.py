@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
@@ -349,6 +350,8 @@ async def api_add_bid(req: AddBidRequest):
             )
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
 
     bid_id = insert_bid(
         db,
@@ -424,6 +427,8 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen")
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
 
     update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
     row = get_bid_by_item_id(db, item_id)
