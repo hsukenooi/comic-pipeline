@@ -175,6 +175,33 @@ def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     conn.commit()
 
 
+def list_comics(
+    conn: sqlite3.Connection,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+) -> list[sqlite3.Row]:
+    clauses, params = [], []
+    if title is not None:
+        clauses.append("LOWER(title) = LOWER(?)")
+        params.append(title)
+    if issue is not None:
+        clauses.append("issue = ?")
+        params.append(issue)
+    if year is not None:
+        clauses.append("year = ?")
+        params.append(year)
+    if grade is not None:
+        clauses.append("grade = ?")
+        params.append(grade)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return conn.execute(
+        f"SELECT * FROM comics {where} ORDER BY id",
+        params,
+    ).fetchall()
+
+
 def get_all_bids(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM bids ORDER BY added_at DESC").fetchall()
 

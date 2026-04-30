@@ -18,7 +18,7 @@ from pydantic import BaseModel, field_validator
 
 from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
 from server.db import (
-    DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
+    DB_PATH, init_db, upsert_comic, list_comics, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
@@ -299,6 +299,18 @@ class PurgeRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/comics")
+async def api_list_comics(
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+):
+    db = _get_db()
+    rows = list_comics(db, title=title, issue=issue, year=year, grade=grade)
+    return [dict(r) for r in rows]
 
 
 @app.post("/api/comics")
