@@ -157,15 +157,18 @@ def list_snipes(as_json: bool, added_since: datetime | None):
     click.echo(f"{len(snipes)} snipe(s) total")
 
 
-def _format_group(group_str: str) -> str:
+def _format_group(group_str) -> str:
     """Display a snipe_group: blank for '0' / missing, else the number."""
-    if not group_str or group_str == "0":
+    if not group_str or str(group_str) == "0":
         return ""
-    return group_str
+    return str(group_str)
 
 
-def _format_bid(bid_str: str) -> str:
-    """Format a bid string like '41.00 USD' to '$41.00'."""
+def _format_bid(bid_str) -> str:
+    """Format a bid string like '41.00 USD' or float 41.0 to '$41.00'."""
+    if bid_str is None:
+        return ""
+    bid_str = str(bid_str)
     if not bid_str:
         return ""
     parts = bid_str.strip().split()
@@ -176,11 +179,13 @@ def _format_bid(bid_str: str) -> str:
         return bid_str
 
 
-def _calc_diff(max_bid: str, winning_bid: str) -> str:
+def _calc_diff(max_bid, winning_bid) -> str:
     """Calculate difference between max bid and winning bid."""
     try:
-        max_val = Decimal(max_bid.split()[0]) if " " in max_bid else Decimal(max_bid)
-        win_val = Decimal(winning_bid.split()[0]) if " " in winning_bid else Decimal(winning_bid)
+        max_str = str(max_bid)
+        win_str = str(winning_bid) if winning_bid is not None else ""
+        max_val = Decimal(max_str.split()[0]) if " " in max_str else Decimal(max_str)
+        win_val = Decimal(win_str.split()[0]) if " " in win_str else Decimal(win_str)
         diff = max_val - win_val
         if diff >= 0:
             return click.style(f"+${diff:.2f}", fg="green")

@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gixen Snipes</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0f0f0f;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace;
+      font-size: 14px;
+      padding: 20px;
+    }
+
+    h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #fff;
+      margin-bottom: 4px;
+    }
+
+    .meta {
+      color: #666;
+      font-size: 12px;
+      margin-bottom: 24px;
+    }
+
+    .meta a { color: #888; text-decoration: none; }
+    .meta a:hover { color: #ccc; }
+
+    h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #aaa;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+
+    section { margin-bottom: 32px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    thead th {
+      text-align: left;
+      color: #666;
+      font-weight: 500;
+      padding: 4px 8px 8px;
+      border-bottom: 1px solid #222;
+      white-space: nowrap;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid #1a1a1a;
+      transition: background 0.1s;
+    }
+
+    tbody tr:hover { background: #161616; }
+
+    tbody tr.overbid { background: rgba(220, 60, 60, 0.08); }
+    tbody tr.overbid:hover { background: rgba(220, 60, 60, 0.14); }
+
+    td {
+      padding: 7px 8px;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    td.title {
+      white-space: normal;
+      max-width: 340px;
+      line-height: 1.4;
+    }
+
+    .item-link { color: #5b9bd5; text-decoration: none; }
+    .item-link:hover { text-decoration: underline; }
+
+    .right { text-align: right; }
+    .mono { font-family: monospace; }
+
+    .bid-warn { color: #e05252; font-weight: 600; }
+    .time-urgent { color: #e0a052; font-weight: 600; }
+    .time-ended { color: #555; }
+
+    .won { color: #4caf50; }
+    .lost { color: #888; }
+    .error { color: #e05252; }
+
+    .flags {
+      background: rgba(220, 170, 50, 0.1);
+      border: 1px solid rgba(220, 170, 50, 0.3);
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin-bottom: 24px;
+    }
+
+    .flags h3 {
+      font-size: 12px;
+      font-weight: 600;
+      color: #e0a052;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+
+    .flags ul { list-style: none; }
+    .flags li { padding: 3px 0; color: #ccc; font-size: 13px; }
+    .flags li::before { content: "⚠ "; color: #e0a052; }
+
+    .empty { color: #555; font-style: italic; padding: 12px 8px; }
+
+    #status {
+      position: fixed;
+      top: 12px;
+      right: 16px;
+      font-size: 11px;
+      color: #555;
+    }
+
+    #status.loading { color: #5b9bd5; }
+    #status.error { color: #e05252; }
+  </style>
+</head>
+<body>
+
+<div id="status">Loading…</div>
+
+<h1>Gixen Snipes</h1>
+<div class="meta" id="meta">—</div>
+
+<div id="flags-container"></div>
+<div id="active-section"></div>
+<div id="ended-section"></div>
+
+<script>
+const REFRESH_MS = 30000;
+
+function ebayUrl(itemId) {
+  return `https://www.ebay.com/itm/${itemId}`;
+}
+
+function timeLeft(isoStr) {
+  if (!isoStr) return "—";
+  const diff = new Date(isoStr) - Date.now();
+  if (diff <= 0) return "ENDED";
+  const d = Math.floor(diff / 86400000);
+  const h = Math.floor((diff % 86400000) / 3600000);
+  const m = Math.floor((diff % 3600000) / 60000);
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  return parts.length ? parts.join(" ") : "<1m";
+}
+
+function isEnded(row) {
+  if (row.end_date_iso) return new Date(row.end_date_iso) <= Date.now();
+  return (row.time_to_end || "").toUpperCase() === "ENDED";
+}
+
+function parseAmount(str) {
+  if (str == null) return null;
+  const n = parseFloat(String(str).replace(/[^0-9.]/g, ""));
+  return isNaN(n) ? null : n;
+}
+
+function fmtUSD(str) {
+  const n = parseAmount(str);
+  return n != null ? `$${n.toFixed(2)}` : "—";
+}
+
+function mapStatus(row) {
+  const s = (row.status || "").toUpperCase();
+  const sm = (row.status_mirror || "").toUpperCase();
+
+  if (s.includes("WON") || sm.includes("WON")) return '<span class="won">Won ✅</span>';
+  if (s.startsWith("BID UNDER") || s === "OUTBID" || s === "LOST" ||
+      sm.startsWith("BID UNDER") || sm === "OUTBID" || sm === "LOST") {
+    return '<span class="lost">Outbid</span>';
+  }
+  if (s.startsWith("NETWORK ERROR") || sm.startsWith("NETWORK ERROR")) {
+    return '<span class="error">Not Bid ❌</span>';
+  }
+  if (s === "PENDING") return '<span class="lost">Pending</span>';
+  return `<span class="lost">${row.status || "—"}</span>`;
+}
+
+function displayTitle(row) {
+  const t = row.title || row.comic_title || "—";
+  return t.length > 55 ? t.slice(0, 54) + "…" : t;
+}
+
+function buildFlags(snipes) {
+  const lines = [];
+
+  for (const row of snipes) {
+    if (!isEnded(row)) {
+      const cur = parseAmount(row.current_bid);
+      const max = parseAmount(row.max_bid);
+      if (cur != null && max != null && cur >= max) {
+        const t = displayTitle(row);
+        lines.push(`#${row.item_id} "${t}" — current $${cur.toFixed(2)} ≥ max $${max.toFixed(2)}. Raise max or cancel?`);
+      }
+    } else {
+      const s = (row.status || "").toUpperCase();
+      const sm = (row.status_mirror || "").toUpperCase();
+      if (s.startsWith("NETWORK ERROR") && sm.startsWith("NETWORK ERROR")) {
+        const t = displayTitle(row);
+        lines.push(`#${row.item_id} "${t}" — Gixen failed to bid on both main and mirror. Re-snipe if relisted.`);
+      }
+    }
+  }
+
+  return lines;
+}
+
+function renderActive(snipes) {
+  const active = snipes
+    .filter(r => !isEnded(r))
+    .sort((a, b) => {
+      const da = a.end_date_iso ? new Date(a.end_date_iso) : Infinity;
+      const db_ = b.end_date_iso ? new Date(b.end_date_iso) : Infinity;
+      return da - db_;
+    });
+
+  const el = document.getElementById("active-section");
+
+  if (!active.length) {
+    el.innerHTML = `<section><h2>Active (0)</h2><p class="empty">No active snipes.</p></section>`;
+    return;
+  }
+
+  const rows = active.map(row => {
+    const cur = parseAmount(row.current_bid);
+    const max = parseAmount(row.max_bid);
+    const overbid = cur != null && max != null && cur >= max;
+    const tl = row.end_date_iso ? timeLeft(row.end_date_iso) : (row.time_to_end || "—");
+    const isUrgent = row.end_date_iso && (new Date(row.end_date_iso) - Date.now()) < 3600000;
+
+    const timeCell = isUrgent
+      ? `<span class="time-urgent">${tl}</span>`
+      : tl;
+
+    const maxCell = overbid
+      ? `<span class="bid-warn">$${max.toFixed(2)} ⚠️</span>`
+      : fmtUSD(row.max_bid);
+
+    return `<tr class="${overbid ? "overbid" : ""}">
+      <td><a class="item-link" href="${ebayUrl(row.item_id)}" target="_blank">${row.item_id}</a></td>
+      <td class="title">${displayTitle(row)}</td>
+      <td class="right mono">${fmtUSD(row.current_bid)}</td>
+      <td class="right mono">${maxCell}</td>
+      <td class="right">${timeCell}</td>
+      <td>${row.seller || "—"}</td>
+    </tr>`;
+  }).join("");
+
+  el.innerHTML = `<section>
+    <h2>Active (${active.length})</h2>
+    <table>
+      <thead><tr>
+        <th>Item</th><th>Title</th>
+        <th class="right">Current</th><th class="right">Max Bid</th>
+        <th class="right">Time Left</th><th>Seller</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </section>`;
+}
+
+function renderEnded(snipes) {
+  const ended = snipes
+    .filter(r => isEnded(r))
+    .sort((a, b) => {
+      const da = a.end_date_iso ? new Date(a.end_date_iso) : 0;
+      const db_ = b.end_date_iso ? new Date(b.end_date_iso) : 0;
+      return db_ - da;
+    });
+
+  const el = document.getElementById("ended-section");
+
+  if (!ended.length) {
+    el.innerHTML = `<section><h2>Recently Ended (0)</h2><p class="empty">No ended snipes.</p></section>`;
+    return;
+  }
+
+  const rows = ended.map(row => {
+    const winning = row.winning_bid != null
+      ? `$${parseFloat(row.winning_bid).toFixed(2)}`
+      : fmtUSD(row.current_bid);
+
+    return `<tr>
+      <td><a class="item-link" href="${ebayUrl(row.item_id)}" target="_blank">${row.item_id}</a></td>
+      <td class="title">${displayTitle(row)}</td>
+      <td class="right mono">${winning}</td>
+      <td class="right mono">${fmtUSD(row.max_bid)}</td>
+      <td>${mapStatus(row)}</td>
+      <td>${row.seller || "—"}</td>
+    </tr>`;
+  }).join("");
+
+  el.innerHTML = `<section>
+    <h2>Recently Ended (${ended.length})</h2>
+    <table>
+      <thead><tr>
+        <th>Item</th><th>Title</th>
+        <th class="right">Winning</th><th class="right">Max Bid</th>
+        <th>Result</th><th>Seller</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </section>`;
+}
+
+function renderFlags(snipes) {
+  const flags = buildFlags(snipes);
+  const el = document.getElementById("flags-container");
+  if (!flags.length) {
+    el.innerHTML = "";
+    return;
+  }
+  const items = flags.map(f => `<li>${f}</li>`).join("");
+  el.innerHTML = `<div class="flags"><h3>Attention</h3><ul>${items}</ul></div>`;
+}
+
+async function load() {
+  const statusEl = document.getElementById("status");
+  statusEl.textContent = "Refreshing…";
+  statusEl.className = "loading";
+
+  try {
+    const resp = await fetch("/api/snipes");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const snipes = await resp.json();
+
+    renderFlags(snipes);
+    renderActive(snipes);
+    renderEnded(snipes);
+
+    const now = new Date().toLocaleTimeString();
+    document.getElementById("meta").innerHTML =
+      `${snipes.length} snipe(s) &mdash; last updated ${now} &mdash; auto-refresh every 30s`;
+    statusEl.textContent = "Live";
+    statusEl.className = "";
+  } catch (e) {
+    statusEl.textContent = "Error";
+    statusEl.className = "error";
+    document.getElementById("meta").textContent = `Failed to load: ${e.message}`;
+  }
+}
+
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>

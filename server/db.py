@@ -44,6 +44,21 @@ CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
 """
 
 
+_COLUMN_MIGRATIONS = [
+    "ALTER TABLE bids ADD COLUMN ebay_title TEXT",
+    "ALTER TABLE bids ADD COLUMN status_mirror TEXT",
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    for stmt in _COLUMN_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
@@ -56,6 +71,7 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     except Exception:
         conn.close()
         raise
+    _apply_migrations(conn)
     os.chmod(path, 0o600)
     return conn
 
@@ -144,10 +160,25 @@ def update_bid_status(
     status: str,
     winning_bid: float | None = None,
     resolved_at: str | None = None,
+    status_mirror: str | None = None,
 ) -> None:
     conn.execute(
-        "UPDATE bids SET status=?, winning_bid=?, resolved_at=? WHERE item_id=? AND status NOT IN ('PURGED')",
-        (status, winning_bid, resolved_at, item_id),
+        "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, status_mirror=? WHERE item_id=? AND status NOT IN ('PURGED')",
+        (status, winning_bid, resolved_at, status_mirror, item_id),
+    )
+    conn.commit()
+
+
+def cache_ebay_data(
+    conn: sqlite3.Connection,
+    item_id: str,
+    title: str | None,
+    seller: str | None,
+    end_at: str | None,
+) -> None:
+    conn.execute(
+        "UPDATE bids SET ebay_title=?, seller=?, auction_end_at=? WHERE item_id=? AND status NOT IN ('PURGED')",
+        (title, seller, end_at, item_id),
     )
     conn.commit()
 

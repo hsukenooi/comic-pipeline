@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -13,16 +14,34 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
 from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
 from server.db import (
     DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
-    get_pending_bids, mark_bids_purged,
+    get_pending_bids, mark_bids_purged, cache_ebay_data,
 )
 
+# Import eBay helpers from the sibling project
+_EBAY_CLI_DIR = Path.home() / "Projects" / "ebay-cli"
+sys.path.insert(0, str(_EBAY_CLI_DIR))
+try:
+    from ebay_fetch import (  # type: ignore[import]
+        load_config as _ebay_load_config,
+        get_token as _ebay_get_token,
+        fetch_item as _ebay_fetch_item,
+        parse_item as _ebay_parse_item,
+    )
+    _EBAY_AVAILABLE = True
+except ImportError as _ebay_import_err:
+    _EBAY_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+if not _EBAY_AVAILABLE:
+    logger.warning("ebay_fetch not importable from %s — live eBay data disabled", _EBAY_CLI_DIR)
 
 # ---------------------------------------------------------------------------
 # App state
@@ -30,10 +49,7 @@ logger = logging.getLogger(__name__)
 
 _db: sqlite3.Connection | None = None
 _api_client: GixenClient | None = None
-_sync_client: GixenClient | None = None
 _api_lock: asyncio.Lock | None = None
-_cached_snipes: list = []          # last successful Gixen snipe list
-_cached_snipes_at: float = 0.0     # monotonic timestamp of that fetch
 
 
 def _get_db() -> sqlite3.Connection:
@@ -42,23 +58,85 @@ def _get_db() -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# Sync helpers (defined before lifespan so api_purge can reference them)
+# Helpers
 # ---------------------------------------------------------------------------
 
 _TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "ENDED"})
 
-SYNC_INTERVAL = int(os.getenv("GIXEN_SYNC_INTERVAL", "600"))
-_SYNC_BACKOFF_MAX = 3600  # cap backoff at 1 hour
 
+def _fetch_ebay_item_sync(item_id: str) -> dict | None:
+    if not _EBAY_AVAILABLE:
+        return None
+    try:
+        client_id, client_secret, base_url = _ebay_load_config()
+        token = _ebay_get_token(client_id, client_secret, base_url)
+        data = _ebay_fetch_item(item_id, token, base_url)
+        if data:
+            return _ebay_parse_item(data)
+    except SystemExit:
+        logger.warning("_fetch_ebay_item_sync: eBay credentials not configured")
+    except Exception as e:
+        logger.warning("_fetch_ebay_item_sync %s: %s", item_id, e)
+    return None
+
+
+def _auction_ended(end_date_iso: str | None) -> bool:
+    if not end_date_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+        return dt <= datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+
+def _iso_to_relative(end_date_iso: str | None) -> str:
+    if not end_date_iso:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+        diff = dt - datetime.now(timezone.utc)
+        total_seconds = diff.total_seconds()
+        if total_seconds <= 0:
+            return "ENDED"
+        days = int(total_seconds // 86400)
+        hours = int((total_seconds % 86400) // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        return " ".join(parts) if parts else "<1m"
+    except (ValueError, TypeError):
+        return "—"
+
+
+def _ebay_price_to_bid_str(current_price: str | None) -> str | None:
+    """Convert eBay '$12.50' format to '12.50 USD' to match Gixen's format."""
+    if not current_price:
+        return None
+    stripped = current_price.lstrip("$").strip()
+    try:
+        float(stripped)
+        return f"{stripped} USD"
+    except ValueError:
+        return current_price
+
+
+# ---------------------------------------------------------------------------
+# Gixen sync helper (used by api_purge and ended-bid resolution)
+# ---------------------------------------------------------------------------
 
 async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     """Pull current Gixen state and update DB bid statuses. Returns snipes list."""
-    global _cached_snipes, _cached_snipes_at
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
     except GixenError as e:
         logger.warning("_sync_gixen: GixenError (suppressed): %s", e)
-        return []  # sync is best-effort; don't crash if Gixen is down
+        return []
 
     now = datetime.now(timezone.utc).isoformat()
     gixen_item_ids = {s["item_id"] for s in snipes}
@@ -73,12 +151,9 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
                     winning_bid = float(current_bid.split()[0])
                 except (ValueError, IndexError):
                     pass
-            update_bid_status(db, snipe["item_id"], gixen_status, winning_bid, now)
-
-        if snipe.get("seller"):
-            db.execute(
-                "UPDATE bids SET seller=? WHERE item_id=? AND status='PENDING'",
-                (snipe["seller"], snipe["item_id"]),
+            update_bid_status(
+                db, snipe["item_id"], gixen_status, winning_bid, now,
+                snipe.get("status_mirror"),
             )
 
     db.commit()
@@ -87,31 +162,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     vanished = [b["item_id"] for b in pending_bids if b["item_id"] not in gixen_item_ids]
     mark_bids_purged(db, vanished)
 
-    _cached_snipes = snipes
-    _cached_snipes_at = datetime.now(timezone.utc).timestamp()
     return snipes
-
-
-async def _sync_loop() -> None:
-    consecutive_failures = 0
-    while True:
-        try:
-            if _sync_client is not None:
-                db = _get_db()
-                result = await _sync_gixen(db, _sync_client)
-                if result:
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-        except Exception:
-            logger.exception("_sync_loop: unexpected error, continuing")
-            consecutive_failures += 1
-
-        # Exponential backoff: 10min, 20min, 40min, ..., capped at 1 hour
-        delay = min(SYNC_INTERVAL * (2 ** consecutive_failures), _SYNC_BACKOFF_MAX)
-        if consecutive_failures:
-            logger.warning("_sync_loop: %d consecutive failure(s), sleeping %ds", consecutive_failures, delay)
-        await asyncio.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -120,23 +171,16 @@ async def _sync_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _db, _api_client, _sync_client, _api_lock
+    global _db, _api_client, _api_lock
     if env_file := os.getenv("ENV_FILE"):
         load_dotenv(env_file)
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
     _db = init_db(db_path)
     _api_client = GixenClient()
-    _sync_client = GixenClient()
     _api_lock = asyncio.Lock()
-
-    sync_task = None
-    if os.getenv("GIXEN_SYNC_ENABLED", "true") != "false":
-        sync_task = asyncio.create_task(_sync_loop())
 
     yield
 
-    if sync_task:
-        sync_task.cancel()
     row = _db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     if row and row[0]:
         logger.warning("WAL checkpoint incomplete: busy=%s", row[0])
@@ -234,6 +278,11 @@ class PurgeRequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/")
+def root():
+    return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -304,43 +353,109 @@ async def api_add_bid(req: AddBidRequest):
 
 @app.get("/api/snipes")
 async def api_get_snipes():
-    global _cached_snipes, _cached_snipes_at
     db = _get_db()
 
-    # Try a live fetch; fall back to the last successful snapshot if Gixen is down.
-    try:
-        async with _api_lock:
-            gixen_snipes = await asyncio.to_thread(_api_client.list_snipes)
-        _cached_snipes = gixen_snipes
-        _cached_snipes_at = datetime.now(timezone.utc).timestamp()
-    except GixenError as e:
-        if _cached_snipes:
-            age = int(datetime.now(timezone.utc).timestamp() - _cached_snipes_at)
-            logger.warning("api_get_snipes: Gixen unavailable (%s), returning cached data (%ds old)", e, age)
-            gixen_snipes = _cached_snipes
-        else:
-            raise HTTPException(status_code=503, detail=str(e))
-
-    db_rows = db.execute("""
+    rows = db.execute("""
         SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
                c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes
+               c.fmv_low, c.fmv_high, c.fmv_comps, c.fmv_confidence, c.fmv_notes
         FROM bids b
         LEFT JOIN comics c ON b.comic_id = c.id
-        WHERE b.status = 'PENDING'
+        WHERE b.status != 'PURGED'
+        ORDER BY b.added_at DESC
     """).fetchall()
-    db_by_item = {row["item_id"]: dict(row) for row in db_rows}
+
+    items = [dict(r) for r in rows]
+
+    # Fetch live eBay data for all items in parallel
+    ebay_results = await asyncio.gather(
+        *[asyncio.to_thread(_fetch_ebay_item_sync, item["item_id"]) for item in items],
+        return_exceptions=True,
+    )
+
+    needs_resolution = []  # PENDING item_ids whose auctions appear ended
 
     result = []
-    for snipe in gixen_snipes:
-        merged = dict(snipe)
-        db_data = db_by_item.get(snipe["item_id"], {})
-        for key in ("fmv_low", "fmv_high", "fmv_comps", "fmv_confidence",
-                    "fmv_notes", "comic_title", "comic_issue",
-                    "comic_year", "comic_grade", "comic_id"):
-            merged[key] = db_data.get(key)
-        result.append(merged)
+    for item, ebay in zip(items, ebay_results):
+        if isinstance(ebay, BaseException):
+            logger.warning("eBay fetch error for %s: %s", item["item_id"], ebay)
+            ebay = None
+
+        if ebay:
+            cache_ebay_data(db, item["item_id"], ebay["title"],
+                            ebay.get("seller"), ebay.get("end_date_iso"))
+            title = ebay["title"]
+            current_bid = _ebay_price_to_bid_str(ebay.get("current_price"))
+            end_date_iso = ebay.get("end_date_iso")
+            seller = ebay.get("seller")
+        else:
+            title = item.get("ebay_title") or item.get("comic_title") or ""
+            current_bid = None
+            end_date_iso = item.get("auction_end_at")
+            seller = item.get("seller")
+
+        time_to_end = _iso_to_relative(end_date_iso)
+
+        if item["status"] == "PENDING" and _auction_ended(end_date_iso):
+            needs_resolution.append(item["item_id"])
+
+        result.append({
+            "item_id": item["item_id"],
+            "title": title,
+            "current_bid": current_bid,
+            "max_bid": f"{item['max_bid']:.2f}",
+            "bid_offset": item["bid_offset"],
+            "snipe_group": item["snipe_group"],
+            "time_to_end": time_to_end,
+            "end_date_iso": end_date_iso,
+            "status": item["status"],
+            "status_mirror": item.get("status_mirror"),
+            "winning_bid": item.get("winning_bid"),
+            "seller": seller,
+            "comic_title": item.get("comic_title"),
+            "comic_issue": item.get("comic_issue"),
+            "comic_year": item.get("comic_year"),
+            "comic_grade": item.get("comic_grade"),
+            "fmv_low": item.get("fmv_low"),
+            "fmv_high": item.get("fmv_high"),
+            "fmv_comps": item.get("fmv_comps"),
+            "fmv_confidence": item.get("fmv_confidence"),
+            "fmv_notes": item.get("fmv_notes"),
+            "comic_id": item.get("comic_id"),
+        })
+
+    # For PENDING bids whose auctions have ended, resolve status via a single Gixen call
+    if needs_resolution:
+        try:
+            async with _api_lock:
+                gixen_snipes = await asyncio.to_thread(_api_client.list_snipes)
+            now = datetime.now(timezone.utc).isoformat()
+            gixen_by_item = {s["item_id"]: s for s in gixen_snipes}
+
+            for row in result:
+                if row["item_id"] not in needs_resolution:
+                    continue
+                snipe = gixen_by_item.get(row["item_id"])
+                if not snipe:
+                    continue
+                gixen_status = snipe.get("status", "")
+                if gixen_status not in _TERMINAL_GIXEN_STATUSES:
+                    continue
+                current_bid_str = snipe.get("current_bid", "")
+                winning_bid = None
+                if current_bid_str:
+                    try:
+                        winning_bid = float(current_bid_str.split()[0])
+                    except (ValueError, IndexError):
+                        pass
+                status_mirror = snipe.get("status_mirror")
+                update_bid_status(db, row["item_id"], gixen_status, winning_bid, now, status_mirror)
+                row["status"] = gixen_status
+                row["status_mirror"] = status_mirror
+                if winning_bid is not None:
+                    row["winning_bid"] = winning_bid
+        except GixenError as e:
+            logger.warning("api_get_snipes: Gixen unavailable for status resolution: %s", e)
 
     return result
 
