@@ -303,6 +303,153 @@ def test_purge_removes_siblings(api):
     api.mock_gixen.remove_snipe.assert_called_once_with("500000002")
 
 
+def test_add_bid_persists_locg_ids(api):
+    """--locg-id and --locg-variant-id round-trip through add."""
+    r = api.post("/api/bids", json={
+        "item_id": "111111111",
+        "max_bid": 800.0,
+        "comic": "Amazing Spider-Man",
+        "issue": "300",
+        "year": 1988,
+        "grade": 9.2,
+        "locg_id": 6977652,
+        "locg_variant_id": 6977652,
+    })
+    assert r.status_code == 200
+    # Mock Gixen returning the same item so it shows up in /api/snipes
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "111111111",
+        "title": "Amazing Spider-Man #300",
+        "max_bid": "800.00 USD",
+        "current_bid": "0.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "5h 0m",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "abc",
+    }]
+    r = api.get("/api/snipes")
+    assert r.status_code == 200
+    snipes = r.json()
+    assert len(snipes) == 1
+    assert snipes[0]["locg_id"] == 6977652
+    assert snipes[0]["locg_variant_id"] == 6977652
+
+
+def test_add_bid_without_locg_ids_returns_null(api):
+    """Existing call sites without locg_id behave the same — fields are null."""
+    r = api.post("/api/bids", json={
+        "item_id": "222222222",
+        "max_bid": 50.0,
+        "comic": "Hulk",
+        "issue": "181",
+        "year": 1974,
+        "grade": 9.0,
+    })
+    assert r.status_code == 200
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "222222222",
+        "title": "Hulk #181",
+        "max_bid": "50.00 USD",
+        "current_bid": "0.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "5h 0m",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "x",
+    }]
+    r = api.get("/api/snipes")
+    snipes = r.json()
+    assert len(snipes) == 1
+    assert snipes[0]["locg_id"] is None
+    assert snipes[0]["locg_variant_id"] is None
+
+
+def test_edit_bid_preserves_locg_ids(api):
+    """Editing a snipe (without passing locg_id) preserves the comic's locg_id."""
+    api.post("/api/bids", json={
+        "item_id": "333333333",
+        "max_bid": 100.0,
+        "comic": "Daredevil",
+        "issue": "29",
+        "year": 1967,
+        "grade": 7.0,
+        "locg_id": 8823401,
+    })
+    # Edit to bump the max bid; do not pass locg_id
+    r = api.patch("/api/bids/333333333",
+                  json={"max_bid": 150.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 200
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "333333333",
+        "title": "Daredevil #29",
+        "max_bid": "150.00 USD",
+        "current_bid": "20.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "1h 0m",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "yz",
+    }]
+    snipes = api.get("/api/snipes").json()
+    assert snipes[0]["locg_id"] == 8823401
+    assert snipes[0]["max_bid"] == "150.00 USD"
+
+
+def test_edit_bid_can_update_locg_ids(api):
+    """Edit can update locg_id / locg_variant_id on the linked comic."""
+    api.post("/api/bids", json={
+        "item_id": "444444444",
+        "max_bid": 100.0,
+        "comic": "Batman",
+        "issue": "608",
+        "year": 2002,
+        "grade": 9.4,
+        "locg_id": 100,
+    })
+    # Edit, supplying new locg_id and locg_variant_id
+    r = api.patch("/api/bids/444444444", json={
+        "max_bid": 100.0, "bid_offset": 6, "snipe_group": 0,
+        "locg_id": 999, "locg_variant_id": 1001,
+    })
+    assert r.status_code == 200
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "444444444",
+        "title": "Batman #608",
+        "max_bid": "100.00 USD",
+        "current_bid": "10.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "2h",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "n1",
+    }]
+    snipes = api.get("/api/snipes").json()
+    assert snipes[0]["locg_id"] == 999
+    assert snipes[0]["locg_variant_id"] == 1001
+
+
+def test_upsert_comic_persists_locg_ids_via_api(api):
+    """POST /api/comics with locg_id/locg_variant_id stores them."""
+    r = api.post("/api/comics", json={
+        "title": "Invincible", "issue": "1", "year": 2003,
+        "grade": 9.8,
+        "locg_id": 4242, "locg_variant_id": 4242,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["locg_id"] == 4242
+    assert data["locg_variant_id"] == 4242
+
+
 def test_purge_sibling_failure_swallowed(api):
     """GixenError from sibling removal is swallowed; response still 200."""
     from gixen_client import GixenError

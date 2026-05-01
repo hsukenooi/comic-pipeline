@@ -228,10 +228,13 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.option("--fmv-comps", default=None, type=int, help="Number of comps used")
 @click.option("--fmv-confidence", default=None, help="FMV confidence: high/medium/low")
 @click.option("--fmv-notes", default=None, help="FMV notes")
+@click.option("--locg-id", default=None, type=int, help="LOCG canonical comic ID")
+@click.option("--locg-variant-id", default=None, type=int, help="LOCG variant comic ID (if different from --locg-id)")
 def add(item_id: str, max_bid: str, offset: int, group: int,
         comic: str | None, issue: str | None, year: int | None, grade: float | None,
         fmv_low: float | None, fmv_high: float | None,
-        fmv_comps: int | None, fmv_confidence: str | None, fmv_notes: str | None):
+        fmv_comps: int | None, fmv_confidence: str | None, fmv_notes: str | None,
+        locg_id: int | None, locg_variant_id: int | None):
     """Add a snipe for an eBay item."""
     try:
         bid = Decimal(max_bid)
@@ -252,6 +255,7 @@ def add(item_id: str, max_bid: str, offset: int, group: int,
                 "grade": grade, "fmv_low": fmv_low, "fmv_high": fmv_high,
                 "fmv_comps": fmv_comps, "fmv_confidence": fmv_confidence,
                 "fmv_notes": fmv_notes,
+                "locg_id": locg_id, "locg_variant_id": locg_variant_id,
             })
         _server_request("post", "/api/bids", json=payload)
         _record_add(item_id)
@@ -314,7 +318,10 @@ def add(item_id: str, max_bid: str, offset: int, group: int,
 @click.argument("max_bid")
 @click.option("--offset", default=6, help="Seconds before end to place bid (1-15)")
 @click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
-def edit(item_id: str, max_bid: str, offset: int, group: int):
+@click.option("--locg-id", default=None, type=int, help="LOCG canonical comic ID")
+@click.option("--locg-variant-id", default=None, type=int, help="LOCG variant comic ID (if different from --locg-id)")
+def edit(item_id: str, max_bid: str, offset: int, group: int,
+         locg_id: int | None, locg_variant_id: int | None):
     """Change the bid on an existing snipe."""
     try:
         bid = Decimal(max_bid)
@@ -323,8 +330,16 @@ def edit(item_id: str, max_bid: str, offset: int, group: int):
         sys.exit(1)
 
     if _server_url():
-        _server_request("patch", f"/api/bids/{item_id}",
-                        json={"max_bid": float(bid), "bid_offset": offset, "snipe_group": group})
+        payload = {
+            "max_bid": float(bid),
+            "bid_offset": offset,
+            "snipe_group": group,
+        }
+        if locg_id is not None:
+            payload["locg_id"] = locg_id
+        if locg_variant_id is not None:
+            payload["locg_variant_id"] = locg_variant_id
+        _server_request("patch", f"/api/bids/{item_id}", json=payload)
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
         return
 

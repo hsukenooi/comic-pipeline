@@ -163,3 +163,68 @@ def test_update_bid_noop_on_non_pending(db):
     update_bid(db, "300000001", max_bid=999.0, bid_offset=6, snipe_group=0)
     row = get_bid_by_item_id(db, "300000001")
     assert row["max_bid"] == 50.0  # unchanged — update_bid guards on status='PENDING'
+
+
+def test_upsert_comic_persists_locg_ids(db):
+    """locg_id and locg_variant_id round-trip through upsert_comic."""
+    comic_id = upsert_comic(
+        db, title="Amazing Spider-Man", issue="300", year=1988, grade=9.2,
+        fmv_low=800.0, fmv_high=1000.0,
+        fmv_comps=12, fmv_confidence="high", fmv_notes="",
+        locg_id=6977652, locg_variant_id=6977652,
+    )
+    row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
+    assert row["locg_id"] == 6977652
+    assert row["locg_variant_id"] == 6977652
+
+
+def test_upsert_comic_locg_ids_default_to_null(db):
+    """Backwards compat: existing call sites without locg_id keep working."""
+    comic_id = upsert_comic(
+        db, title="Hulk", issue="181", year=1974, grade=9.0,
+        fmv_low=50.0, fmv_high=70.0,
+        fmv_comps=10, fmv_confidence="high", fmv_notes="",
+    )
+    row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
+    assert row["locg_id"] is None
+    assert row["locg_variant_id"] is None
+
+
+def test_upsert_comic_locg_ids_preserved_on_conflict(db):
+    """A second upsert without locg_id must not clobber the existing values."""
+    id1 = upsert_comic(
+        db, title="X-Men", issue="1", year=1963, grade=8.0,
+        fmv_low=500.0, fmv_high=700.0,
+        fmv_comps=5, fmv_confidence="medium", fmv_notes="",
+        locg_id=12345, locg_variant_id=67890,
+    )
+    id2 = upsert_comic(
+        db, title="X-Men", issue="1", year=1963, grade=8.0,
+        fmv_low=550.0, fmv_high=750.0,
+        fmv_comps=8, fmv_confidence="high", fmv_notes="Updated",
+        # No locg_id passed — should preserve prior values
+    )
+    assert id1 == id2
+    row = db.execute("SELECT * FROM comics WHERE id=?", (id1,)).fetchone()
+    assert row["locg_id"] == 12345
+    assert row["locg_variant_id"] == 67890
+
+
+def test_upsert_comic_locg_ids_updated_when_provided(db):
+    """A second upsert with new locg_id values should overwrite the stored ones."""
+    id1 = upsert_comic(
+        db, title="Spawn", issue="1", year=1992, grade=9.8,
+        fmv_low=100.0, fmv_high=150.0,
+        fmv_comps=5, fmv_confidence="high", fmv_notes="",
+        locg_id=100, locg_variant_id=None,
+    )
+    id2 = upsert_comic(
+        db, title="Spawn", issue="1", year=1992, grade=9.8,
+        fmv_low=110.0, fmv_high=160.0,
+        fmv_comps=6, fmv_confidence="high", fmv_notes="",
+        locg_id=200, locg_variant_id=300,
+    )
+    assert id1 == id2
+    row = db.execute("SELECT * FROM comics WHERE id=?", (id1,)).fetchone()
+    assert row["locg_id"] == 200
+    assert row["locg_variant_id"] == 300

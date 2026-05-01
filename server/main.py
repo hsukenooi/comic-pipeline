@@ -221,6 +221,8 @@ class UpsertComicRequest(BaseModel):
     fmv_comps: int | None = None
     fmv_confidence: str | None = None
     fmv_notes: str | None = None
+    locg_id: int | None = None
+    locg_variant_id: int | None = None
 
     @field_validator("fmv_confidence")
     @classmethod
@@ -244,6 +246,8 @@ class AddBidRequest(BaseModel):
     fmv_comps: int | None = None
     fmv_confidence: str | None = None
     fmv_notes: str | None = None
+    locg_id: int | None = None
+    locg_variant_id: int | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -271,6 +275,8 @@ class EditBidRequest(BaseModel):
     max_bid: float
     bid_offset: int = 6
     snipe_group: int = 0
+    locg_id: int | None = None
+    locg_variant_id: int | None = None
 
     @field_validator("max_bid")
     @classmethod
@@ -327,6 +333,8 @@ async def api_upsert_comic(req: UpsertComicRequest):
         fmv_comps=req.fmv_comps,
         fmv_confidence=req.fmv_confidence,
         fmv_notes=req.fmv_notes,
+        locg_id=req.locg_id,
+        locg_variant_id=req.locg_variant_id,
     )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return dict(row)
@@ -349,6 +357,8 @@ async def api_add_bid(req: AddBidRequest):
             fmv_comps=req.fmv_comps,
             fmv_confidence=req.fmv_confidence,
             fmv_notes=req.fmv_notes,
+            locg_id=req.locg_id,
+            locg_variant_id=req.locg_variant_id,
         )
 
     try:
@@ -401,7 +411,8 @@ async def api_get_snipes():
         SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
                c.year AS comic_year, c.grade AS comic_grade,
                c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes
+               c.fmv_confidence, c.fmv_notes,
+               c.locg_id, c.locg_variant_id
         FROM bids b
         LEFT JOIN comics c ON b.comic_id = c.id
         WHERE b.status = 'PENDING'
@@ -414,7 +425,8 @@ async def api_get_snipes():
         db_data = db_by_item.get(snipe["item_id"], {})
         for key in ("fmv_low", "fmv_high", "fmv_comps", "fmv_confidence",
                     "fmv_notes", "comic_title", "comic_issue",
-                    "comic_year", "comic_grade", "comic_id"):
+                    "comic_year", "comic_grade", "comic_id",
+                    "locg_id", "locg_variant_id"):
             merged[key] = db_data.get(key)
         result.append(merged)
 
@@ -443,6 +455,23 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
 
     update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+
+    # If locg_id / locg_variant_id provided, persist on the linked comic row.
+    # COALESCE preserves existing values when only one of the two is supplied.
+    if req.locg_id is not None or req.locg_variant_id is not None:
+        bid_row = get_bid_by_item_id(db, item_id)
+        if bid_row is not None and bid_row["comic_id"] is not None:
+            db.execute(
+                """
+                UPDATE comics
+                SET locg_id = COALESCE(?, locg_id),
+                    locg_variant_id = COALESCE(?, locg_variant_id)
+                WHERE id = ?
+                """,
+                (req.locg_id, req.locg_variant_id, bid_row["comic_id"]),
+            )
+            db.commit()
+
     row = get_bid_by_item_id(db, item_id)
     if row is None:
         return {"item_id": item_id, "max_bid": req.max_bid, "status": "PENDING"}

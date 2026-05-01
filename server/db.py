@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS comics (
     fmv_confidence  TEXT CHECK(fmv_confidence IN ('high', 'medium', 'low') OR fmv_confidence IS NULL),
     fmv_notes       TEXT,
     fmv_updated_at  TEXT,
+    locg_id         INTEGER,
+    locg_variant_id INTEGER,
     created_at      TEXT DEFAULT (datetime('now')),
     UNIQUE(title, issue, year, grade)
 );
@@ -49,6 +51,8 @@ CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
 _MIGRATIONS = [
     "ALTER TABLE bids ADD COLUMN local_snipe_at TEXT",
     "ALTER TABLE bids ADD COLUMN local_snipe_result TEXT",
+    "ALTER TABLE comics ADD COLUMN locg_id INTEGER",
+    "ALTER TABLE comics ADD COLUMN locg_variant_id INTEGER",
 ]
 
 
@@ -85,23 +89,29 @@ def upsert_comic(
     fmv_comps: int | None,
     fmv_confidence: str | None,
     fmv_notes: str | None,
+    locg_id: int | None = None,
+    locg_variant_id: int | None = None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
         INSERT INTO comics (title, issue, year, grade, fmv_low, fmv_high,
-                            fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at,
+                            locg_id, locg_variant_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(title, issue, year, grade) DO UPDATE SET
             fmv_low         = COALESCE(excluded.fmv_low,        fmv_low),
             fmv_high        = COALESCE(excluded.fmv_high,       fmv_high),
             fmv_comps       = COALESCE(excluded.fmv_comps,      fmv_comps),
             fmv_confidence  = COALESCE(excluded.fmv_confidence, fmv_confidence),
             fmv_notes       = COALESCE(excluded.fmv_notes,      fmv_notes),
-            fmv_updated_at  = CASE WHEN excluded.fmv_low IS NOT NULL THEN excluded.fmv_updated_at ELSE fmv_updated_at END
+            fmv_updated_at  = CASE WHEN excluded.fmv_low IS NOT NULL THEN excluded.fmv_updated_at ELSE fmv_updated_at END,
+            locg_id         = COALESCE(excluded.locg_id,         locg_id),
+            locg_variant_id = COALESCE(excluded.locg_variant_id, locg_variant_id)
         """,
         (title, issue, year, grade, fmv_low, fmv_high,
-         fmv_comps, fmv_confidence, fmv_notes, now),
+         fmv_comps, fmv_confidence, fmv_notes, now,
+         locg_id, locg_variant_id),
     )
     conn.commit()
     row = conn.execute(
