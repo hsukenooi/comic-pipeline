@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import logging
+import tempfile
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional
@@ -42,10 +43,12 @@ class _CurlSession:
 
     def __init__(self):
         self.headers: Dict[str, str] = {}
+        self._cookie_jar = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
 
     def _run(self, method: str, url: str, data: Optional[Dict] = None,
              timeout: float = 15.0, allow_redirects: bool = True) -> _CurlResponse:
-        cmd = ["curl", "-s", "-D", "-", "--max-time", str(int(timeout))]
+        cmd = ["curl", "-s", "-D", "-", "--max-time", str(int(timeout)),
+               "-b", self._cookie_jar, "-c", self._cookie_jar]
         if not allow_redirects:
             cmd += ["--max-redirs", "0"]
         for k, v in self.headers.items():
