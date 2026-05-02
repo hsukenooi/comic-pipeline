@@ -417,6 +417,16 @@ def remove(item_id: str):
 
 
 @cli.command()
+def sync():
+    """Sync server DB with live Gixen (picks up snipes added via the web UI)."""
+    if not _server_url():
+        click.echo("Error: GIXEN_SERVER_URL not set — sync only applies to server mode.", err=True)
+        sys.exit(1)
+    result = _server_request("post", "/api/sync")
+    click.echo(f"Synced {result.get('synced', '?')} snipes from Gixen.")
+
+
+@cli.command()
 @click.option(
     "--dry-run",
     is_flag=True,

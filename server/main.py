@@ -162,6 +162,22 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     vanished = [b["item_id"] for b in pending_bids if b["item_id"] not in gixen_item_ids]
     mark_bids_purged(db, vanished)
 
+    # Insert any Gixen snipes not yet in the DB (e.g. added via web UI)
+    existing_ids = {b["item_id"] for b in get_pending_bids(db)}
+    for snipe in snipes:
+        if snipe["item_id"] not in existing_ids and snipe.get("status", "") not in _TERMINAL_GIXEN_STATUSES:
+            try:
+                max_bid = float(snipe.get("max_bid") or 0)
+            except (ValueError, TypeError):
+                max_bid = 0.0
+            insert_bid(
+                db, snipe["item_id"], max_bid, None,
+                int(snipe.get("bid_offset", 6)),
+                int(snipe.get("snipe_group", 0)),
+                snipe.get("seller"),
+            )
+            logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
+
     return snipes
 
 
@@ -501,6 +517,15 @@ async def api_remove_bid(item_id: str):
 
     delete_bid(db, item_id)
     return {"item_id": item_id, "status": "PURGED"}
+
+
+@app.post("/api/sync")
+async def api_sync():
+    """Pull live Gixen state and insert any web-added snipes missing from the DB."""
+    db = _get_db()
+    async with _api_lock:
+        snipes = await _sync_gixen(db, _api_client)
+    return {"synced": len(snipes)}
 
 
 @app.post("/api/purge")
