@@ -259,6 +259,33 @@
   .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .dot.loading { background: var(--yellow); }
   .dot.err { background: var(--red); }
+
+  /* top-of-page refresh bar — visible only while a Gixen pull is in flight */
+  .refresh-bar {
+    position: fixed;
+    top: 28px; /* below topbar */
+    left: 0; right: 0;
+    height: 2px;
+    background: var(--bg-alt);
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 60;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .refresh-bar.is-active { opacity: 1; }
+  .refresh-bar::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, var(--blue), transparent);
+    transform: translateX(-100%);
+    animation: refresh-sweep 1.1s ease-in-out infinite;
+  }
+  @keyframes refresh-sweep {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
 </style>
 </head>
 <body>
@@ -272,6 +299,7 @@
   <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
   <div class="seg clock" id="clock">--:--:--</div>
 </div>
+<div class="refresh-bar" id="refresh-bar"></div>
 
 <div class="wrap">
   <div class="session" id="session">
@@ -576,7 +604,8 @@ setInterval(tickClock, 1000);
 tickClock();
 
 async function load() {
-  setStatus("loading", DEMO ? "loading demo fixture…" : `fetching ${SNIPES_URL}…`);
+  setStatus("loading", DEMO ? "loading demo fixture…" : "syncing from gixen…");
+  document.getElementById("refresh-bar").classList.add("is-active");
   try {
     let snipes;
     if (DEMO) {
@@ -610,6 +639,8 @@ async function load() {
   } catch (e) {
     setStatus("error", e.message);
     document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="err">▸ ${e.message}</span>`;
+  } finally {
+    document.getElementById("refresh-bar").classList.remove("is-active");
   }
 }
 

@@ -21,7 +21,7 @@ from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_
 from server.db import (
     DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
-    get_pending_bids, mark_bids_purged, cache_ebay_data,
+    get_pending_bids, mark_bids_purged, cache_ebay_data, cache_gixen_data,
 )
 from server.title_parser import parse_title
 
@@ -51,6 +51,12 @@ if not _EBAY_AVAILABLE:
 _db: sqlite3.Connection | None = None
 _api_client: GixenClient | None = None
 _api_lock: asyncio.Lock | None = None
+_sync_lock: asyncio.Lock | None = None
+_last_sync_at: float = 0.0
+_SYNC_TTL = 5.0  # concurrent dashboard loads within this window share one Gixen pull
+_ebay_fallback_lock: asyncio.Lock | None = None
+_ebay_cooldown_until: float = 0.0
+_EBAY_COOLDOWN = 300.0  # seconds; suppress eBay fallback after a rate-limit storm
 
 
 def _get_db() -> sqlite3.Connection:
@@ -132,7 +138,15 @@ def _ebay_price_to_bid_str(current_price: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
-    """Pull current Gixen state and update DB bid statuses. Returns snipes list."""
+    """Pull current Gixen state and update DB. Returns the snipes list.
+
+    For every snipe Gixen returns, refresh the cached title/seller/current_bid
+    on the matching DB row (cache_gixen_data) and apply terminal status
+    transitions (WON/LOST/...). Insert new snipes that arrived via Gixen's web
+    UI. Vanished snipes (in DB but missing from Gixen's response) are left
+    alone — the DB is canonical, and whatever status was last captured is the
+    truth.
+    """
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
     except GixenError as e:
@@ -140,21 +154,17 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
         return []
 
     now = datetime.now(timezone.utc).isoformat()
-    gixen_item_ids = {s["item_id"] for s in snipes}
-
-    ended_pending_set = {
-        r["item_id"] for r in db.execute(
-            """
-            SELECT item_id FROM bids
-            WHERE status = 'PENDING'
-              AND auction_end_at IS NOT NULL
-              AND auction_end_at <= ?
-            """,
-            (now,),
-        ).fetchall()
-    }
 
     for snipe in snipes:
+        iid = snipe["item_id"]
+
+        cache_gixen_data(
+            db, iid,
+            snipe.get("title") or None,
+            snipe.get("seller") or None,
+            snipe.get("current_bid") or None,
+        )
+
         gixen_status = snipe.get("status", "")
         if gixen_status in _TERMINAL_GIXEN_STATUSES:
             current_bid = snipe.get("current_bid", "")
@@ -165,20 +175,11 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
                 except (ValueError, IndexError):
                     pass
             update_bid_status(
-                db, snipe["item_id"], gixen_status, winning_bid, now,
+                db, iid, gixen_status, winning_bid, now,
                 snipe.get("status_mirror"),
-            )
-        elif snipe["item_id"] in ended_pending_set:
-            logger.warning(
-                "_sync_gixen: item %s ended in our DB but Gixen reports non-terminal status %r",
-                snipe["item_id"], gixen_status,
             )
 
     db.commit()
-
-    pending_bids = get_pending_bids(db)
-    vanished = [b["item_id"] for b in pending_bids if b["item_id"] not in gixen_item_ids]
-    mark_bids_purged(db, vanished)
 
     # Insert any Gixen snipes not yet in the DB (e.g. added via web UI)
     existing_ids = {b["item_id"] for b in get_pending_bids(db)}
@@ -203,180 +204,126 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
 # Lifespan
 # ---------------------------------------------------------------------------
 
-def _seconds_since_iso(iso: str | None) -> float:
-    if not iso:
-        return float("inf")
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - dt).total_seconds()
-    except (ValueError, TypeError):
-        return float("inf")
+async def _ensure_fresh_sync() -> None:
+    """Pull latest state from Gixen if our last pull was older than _SYNC_TTL.
 
-
-def _seconds_until_iso(iso: str | None) -> float:
-    """Positive if `iso` is in the future, negative if past, +inf if missing."""
-    if not iso:
-        return float("inf")
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return (dt - datetime.now(timezone.utc)).total_seconds()
-    except (ValueError, TypeError):
-        return float("inf")
-
-
-async def _ebay_sync_loop(interval: int, concurrency: int = 1) -> None:
-    """Background task: refresh cached eBay data for active auctions.
-
-    /api/snipes reads only from the cache, so this loop owns all live eBay
-    traffic. Two independent branches per cycle:
-
-    1. Gixen resolution — when any PENDING bid has auction_end_at in the past,
-       call Gixen once to update terminal status (WON/LOST/...).
-    2. eBay refresh — for each PENDING active bid, refresh cached eBay data
-       only if its cache is older than the tier's threshold:
-         - <1h to end:    REFRESH_NEAR (default 60s)
-         - 1-24h to end:  REFRESH_MID  (default 30min)
-         - >24h to end:   REFRESH_FAR  (default 6h)
-       Most cycles are no-ops because most auctions are far from ending —
-       this collapses steady-state eBay call volume by 10-50x at typical scale.
-
-    Each branch is wrapped independently so a failure in one (e.g. eBay
-    rate-limited) doesn't stop the other (e.g. resolving a finished auction).
-
-    Adaptive cooldown: when a fetch cycle is mostly failures (rate-limited),
-    the loop pauses fetches for EBAY_RATE_LIMIT_COOLDOWN seconds. Hammering a
-    depleted token budget doesn't make it refill faster.
+    Called at the top of /api/snipes. Concurrent dashboard loads share one
+    in-flight Gixen scrape via _sync_lock, then return immediately if the
+    just-completed pull is still fresh enough.
     """
-    sem = asyncio.Semaphore(concurrency)
-    inter_call_delay = float(os.getenv("EBAY_SYNC_DELAY", "1.5"))
-    rate_limit_cooldown = int(os.getenv("EBAY_RATE_LIMIT_COOLDOWN", "300"))
-    refresh_near = int(os.getenv("EBAY_REFRESH_NEAR", "60"))
-    refresh_mid = int(os.getenv("EBAY_REFRESH_MID", str(30 * 60)))
-    refresh_far = int(os.getenv("EBAY_REFRESH_FAR", str(6 * 3600)))
+    global _last_sync_at
+    if not _sync_lock or not _api_lock:
+        return
 
-    cooldown_until = 0.0  # epoch seconds
+    async with _sync_lock:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if now_ts - _last_sync_at < _SYNC_TTL:
+            return
 
-    async def _fetch_one(iid: str):
-        async with sem:
-            result = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
-            if inter_call_delay > 0:
-                await asyncio.sleep(inter_call_delay)
-            return result
+        db = _get_db()
+        try:
+            async with _api_lock:
+                await _sync_gixen(db, _api_client)
+        except Exception:
+            logger.exception("_ensure_fresh_sync: gixen pull failed")
+            return
+        _last_sync_at = datetime.now(timezone.utc).timestamp()
 
-    def _is_due(row: sqlite3.Row) -> bool:
-        seconds_to_end = _seconds_until_iso(row["auction_end_at"])
-        if seconds_to_end < 3600:
-            threshold = refresh_near
-        elif seconds_to_end < 86400:
-            threshold = refresh_mid
-        else:
-            threshold = refresh_far
-        return _seconds_since_iso(row["cached_at"]) > threshold
 
-    while True:
+async def _run_ebay_fallback() -> None:
+    """Fire-and-forget: ask eBay for the final selling price of any auction
+    that's ended without a captured winning_bid. One eBay call per such item,
+    ever — once winning_bid is set, the row no longer matches the filter.
+
+    Skipped if a fallback is already running or if we're in rate-limit
+    cooldown from a recent failure storm.
+    """
+    global _ebay_cooldown_until
+    if not _ebay_fallback_lock:
+        return
+    if _ebay_fallback_lock.locked():
+        return
+    if datetime.now(timezone.utc).timestamp() < _ebay_cooldown_until:
+        return
+
+    async with _ebay_fallback_lock:
         try:
             db = _get_db()
             now_iso = datetime.now(timezone.utc).isoformat()
-            now_ts = datetime.now(timezone.utc).timestamp()
+            rows = db.execute(
+                """
+                SELECT item_id, max_bid FROM bids
+                WHERE status = 'PENDING'
+                  AND auction_end_at IS NOT NULL
+                  AND auction_end_at <= ?
+                  AND winning_bid IS NULL
+                """,
+                (now_iso,),
+            ).fetchall()
 
-            ended_pending_count = 0
-            try:
-                ended_pending_count = db.execute(
-                    """
-                    SELECT COUNT(*) AS n FROM bids
-                    WHERE status = 'PENDING'
-                      AND auction_end_at IS NOT NULL
-                      AND auction_end_at <= ?
-                    """,
-                    (now_iso,),
-                ).fetchone()["n"]
-                if ended_pending_count:
-                    async with _api_lock:
-                        await _sync_gixen(db, _api_client)
-            except Exception:
-                logger.exception("_ebay_sync_loop: gixen resolve step failed")
+            if not rows:
+                return
 
-            ok = fail = 0
-            eligible_ids: list[str] = []
-            cooling = now_ts < cooldown_until
-            try:
-                if not cooling:
-                    candidate_rows = db.execute(
-                        """
-                        SELECT item_id, auction_end_at, cached_at FROM bids
-                        WHERE status = 'PENDING'
-                          AND (auction_end_at IS NULL OR auction_end_at > ?)
-                        """,
-                        (now_iso,),
-                    ).fetchall()
-                    eligible_ids = [r["item_id"] for r in candidate_rows if _is_due(r)]
+            failures = 0
+            for row in rows:
+                iid = row["item_id"]
+                ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+                if not ebay:
+                    failures += 1
+                    await asyncio.sleep(1.5)
+                    continue
 
-                    if eligible_ids:
-                        results = await asyncio.gather(
-                            *[_fetch_one(iid) for iid in eligible_ids],
-                            return_exceptions=True,
-                        )
-                        for iid, ebay in zip(eligible_ids, results):
-                            if isinstance(ebay, BaseException) or not ebay:
-                                fail += 1
-                                continue
-                            cache_ebay_data(
-                                db, iid,
-                                ebay.get("title"),
-                                ebay.get("seller"),
-                                ebay.get("end_date_iso"),
-                                _ebay_price_to_bid_str(ebay.get("current_price")),
-                            )
-                            ok += 1
+                final_amount: float | None = None
+                price = ebay.get("current_price")
+                if price:
+                    try:
+                        final_amount = float(str(price).lstrip("$").strip())
+                    except (ValueError, TypeError):
+                        final_amount = None
 
-                        if fail >= max(2, len(eligible_ids) // 2):
-                            cooldown_until = now_ts + rate_limit_cooldown
-                            cooling = True
-                            logger.warning(
-                                "_ebay_sync_loop: %d/%d failed; cooling down %ds",
-                                fail, len(eligible_ids), rate_limit_cooldown,
-                            )
-            except Exception:
-                logger.exception("_ebay_sync_loop: ebay fetch step failed")
+                if final_amount is None:
+                    await asyncio.sleep(1.5)
+                    continue
 
-            cooling_remaining = int(max(0, cooldown_until - now_ts)) if cooling else 0
-            logger.info(
-                "_ebay_sync_loop: ended_pending=%d eligible=%d ok=%d fail=%d cooling=%s",
-                ended_pending_count,
-                len(eligible_ids),
-                ok,
-                fail,
-                f"{cooling_remaining}s" if cooling else "no",
-            )
-        except asyncio.CancelledError:
-            raise
+                # Heuristic: if final price <= our max_bid, our snipe would
+                # have outbid; otherwise we lost. Imperfect but useful.
+                inferred_status = "WON" if final_amount <= float(row["max_bid"]) else "LOST"
+                update_bid_status(
+                    db, iid, inferred_status,
+                    winning_bid=final_amount,
+                    resolved_at=now_iso,
+                )
+                logger.info(
+                    "_run_ebay_fallback: %s -> %s @ $%.2f (max=$%.2f)",
+                    iid, inferred_status, final_amount, row["max_bid"],
+                )
+                await asyncio.sleep(1.5)
+
+            if failures >= max(2, len(rows) // 2):
+                _ebay_cooldown_until = (
+                    datetime.now(timezone.utc).timestamp() + _EBAY_COOLDOWN
+                )
+                logger.warning(
+                    "_run_ebay_fallback: %d/%d failed; cooling %ds",
+                    failures, len(rows), int(_EBAY_COOLDOWN),
+                )
         except Exception:
-            logger.exception("_ebay_sync_loop: outer error")
-
-        await asyncio.sleep(interval)
+            logger.exception("_run_ebay_fallback: error")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _db, _api_client, _api_lock
+    global _db, _api_client, _api_lock, _sync_lock, _ebay_fallback_lock
     if env_file := os.getenv("ENV_FILE"):
         load_dotenv(env_file)
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
     _db = init_db(db_path)
     _api_client = GixenClient()
     _api_lock = asyncio.Lock()
-
-    interval = int(os.getenv("EBAY_SYNC_INTERVAL", "60"))
-    concurrency = int(os.getenv("EBAY_SYNC_CONCURRENCY", "1"))
-    sync_task = asyncio.create_task(_ebay_sync_loop(interval, concurrency))
+    _sync_lock = asyncio.Lock()
+    _ebay_fallback_lock = asyncio.Lock()
 
     yield
-
-    sync_task.cancel()
-    try:
-        await sync_task
-    except asyncio.CancelledError:
-        pass
 
     row = _db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     if row and row[0]:
@@ -593,8 +540,14 @@ async def api_add_bid(req: AddBidRequest):
 
 @app.get("/api/snipes")
 async def api_get_snipes():
-    """Read-only snapshot from the local cache. The background sync loop owns
-    all live eBay/Gixen traffic — this endpoint never makes external calls."""
+    """Pull-on-visit. Synchronously refreshes from Gixen (deduped within
+    _SYNC_TTL across concurrent calls), then returns cached DB rows. eBay is
+    invoked only as a fire-and-forget fallback for ended bids that never got
+    a winning_bid captured — never blocks this response.
+    """
+    await _ensure_fresh_sync()
+    asyncio.create_task(_run_ebay_fallback())
+
     db = _get_db()
 
     rows = db.execute("""

@@ -189,6 +189,29 @@ def cache_ebay_data(
     conn.commit()
 
 
+def cache_gixen_data(
+    conn: sqlite3.Connection,
+    item_id: str,
+    title: str | None,
+    seller: str | None,
+    current_bid: str | None,
+) -> None:
+    """Cache Gixen-sourced fields. Does not touch auction_end_at — that's
+    eBay's domain (Gixen only provides relative time-to-end). COALESCE keeps
+    the existing value when the caller passes None."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE bids SET "
+        "ebay_title=COALESCE(?, ebay_title), "
+        "seller=COALESCE(?, seller), "
+        "cached_current_bid=COALESCE(?, cached_current_bid), "
+        "cached_at=? "
+        "WHERE item_id=? AND status NOT IN ('PURGED')",
+        (title, seller, current_bid, now, item_id),
+    )
+    conn.commit()
+
+
 def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(

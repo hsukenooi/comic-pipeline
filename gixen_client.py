@@ -512,21 +512,17 @@ class GixenClient:
                 snipe["time_to_end"] = ""
                 snipe["current_bid"] = ""
 
-            # Status
+            # Status — whitelist-anchored. The previous primary pattern was a
+            # generic "next-td" capture that grabbed digits from the max_bid
+            # display and returned values like "175" instead of "SCHEDULED".
+            # Anchor on the snipe's edititemid_<id> hidden input and look for
+            # the next known status keyword.
             m = re.search(
-                rf'name="edit_{re.escape(iid)}".*?</tr>\s*<tr[^>]*>.*?'
-                rf'<td>([\d.]+ \w+[^<]*)</td>\s*<td>(\w+)',
+                rf'edititemid_{re.escape(iid)}\b.*?'
+                rf'\b(SCHEDULED|WON|LOST|FAILED|ENDED|OUTBID|BID UNDER MAX|BID UNDER)\b',
                 html, re.DOTALL,
             )
-            if m:
-                snipe["status"] = m.group(2).strip()
-            else:
-                # Try simpler pattern
-                m = re.search(
-                    rf'{re.escape(iid)}.*?(SCHEDULED|WON|LOST|FAILED|ENDED)',
-                    html,
-                )
-                snipe["status"] = m.group(1) if m else ""
+            snipe["status"] = m.group(1) if m else ""
 
         # Deduplicate — the mobile table has separate forms too,
         # but we only parsed desktop table inputs (edititemid_<ID> pattern)
