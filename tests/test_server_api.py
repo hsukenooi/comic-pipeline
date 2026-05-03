@@ -23,7 +23,6 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("GIXEN_USERNAME", "testuser")
     monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
-    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
     mock = _make_mock_gixen()
     with patch("server.main.GixenClient", return_value=mock):
         from server.main import app

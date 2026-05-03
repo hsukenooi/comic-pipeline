@@ -26,6 +26,8 @@ python cli.py purge
 
 # Run the CLI (thin-client mode — set GIXEN_SERVER_URL in .env)
 python cli.py add <item_id> <max_bid> [--comic "Title"] [--issue N] [--year YYYY] [--grade 9.2] [--fmv-low N] [--fmv-high N] [--fmv-comps N] [--fmv-confidence high] [--fmv-notes "notes"]
+python cli.py sync                  # pull latest Gixen state into server DB
+python cli.py extract-comics        # auto-link bids to comics from cached eBay titles
 
 # Run the server (development)
 uvicorn server.main:app --reload
@@ -40,7 +42,8 @@ Three components:
 
 - **`gixen_client.py`** — `GixenClient` class that manages a `requests.Session`, handles login via HTML form POST, extracts session IDs from meta-refresh redirects, and parses the snipe table from raw HTML using regex. All Gixen operations (add/modify/remove/purge) work by POSTing form data to `home_2.php` with the session ID as a query param. Auto-re-logins on session expiration.
 - **`cli.py`** — Click CLI. When `GIXEN_SERVER_URL` is set in `.env`, routes writes (add/edit/remove/purge) to the FastAPI server and reads (`list`) from `GET /api/snipes`. When not set, talks directly to Gixen (existing behavior).
-- **`server/`** — FastAPI app (`main.py`) with SQLite storage (`db.py`) and LaunchAgent installer (`install.sh`). Proxies Gixen operations, stores bid history and comic FMV data, and runs a background sync loop every 10 minutes. Server credentials and DB path are configured via `~/.gixen-server/.env`.
+- **`server/`** — FastAPI app (`main.py`) with SQLite storage (`db.py`) and LaunchAgent installer (`install.sh`). Proxies Gixen operations, stores bid history and comic FMV data, and serves the web dashboard. `/api/snipes` pulls live state from Gixen synchronously on each visit (deduped within `_SYNC_TTL=5s` across concurrent calls) and reads cached rows from SQLite — no background sync loop. eBay's Browse API is invoked only as a fire-and-forget fallback when an auction has ended without a captured `winning_bid`. Server credentials and DB path are configured via `~/.gixen-server/.env`.
+- **`server/title_parser.py`** — regex-based parser that extracts `(series, issue, year, grade)` from cached eBay listing titles. Used by `POST /api/extract-comics` (and `python cli.py extract-comics`) to backfill the `comics` table for snipes added without explicit `--comic` flags.
 
 ## Key Details
 

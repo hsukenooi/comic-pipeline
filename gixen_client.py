@@ -522,7 +522,17 @@ class GixenClient:
                 rf'\b(SCHEDULED|WON|LOST|FAILED|ENDED|OUTBID|BID UNDER MAX|BID UNDER)\b',
                 html, re.DOTALL,
             )
-            snipe["status"] = m.group(1) if m else ""
+            if m:
+                snipe["status"] = m.group(1)
+            else:
+                # Log unknown statuses so we can extend the whitelist before
+                # phantom-PENDING rows accumulate.
+                logger.warning(
+                    "_parse_snipe_table: no known status keyword near edititemid_%s "
+                    "— extend whitelist if Gixen has added a new status",
+                    iid,
+                )
+                snipe["status"] = ""
 
         # Deduplicate — the mobile table has separate forms too,
         # but we only parsed desktop table inputs (edititemid_<ID> pattern)

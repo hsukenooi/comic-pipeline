@@ -21,7 +21,7 @@ from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_
 from server.db import (
     DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
-    get_pending_bids, mark_bids_purged, cache_ebay_data, cache_gixen_data,
+    get_pending_bids, mark_bids_purged, cache_gixen_data,
 )
 from server.title_parser import parse_title
 
@@ -87,16 +87,6 @@ def _fetch_ebay_item_sync(item_id: str) -> dict | None:
     return None
 
 
-def _auction_ended(end_date_iso: str | None) -> bool:
-    if not end_date_iso:
-        return False
-    try:
-        dt = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
-        return dt <= datetime.now(timezone.utc)
-    except (ValueError, TypeError):
-        return False
-
-
 def _iso_to_relative(end_date_iso: str | None) -> str:
     if not end_date_iso:
         return "—"
@@ -119,18 +109,6 @@ def _iso_to_relative(end_date_iso: str | None) -> str:
         return " ".join(parts) if parts else "<1m"
     except (ValueError, TypeError):
         return "—"
-
-
-def _ebay_price_to_bid_str(current_price: str | None) -> str | None:
-    """Convert eBay '$12.50' format to '12.50 USD' to match Gixen's format."""
-    if not current_price:
-        return None
-    stripped = current_price.lstrip("$").strip()
-    try:
-        float(stripped)
-        return f"{stripped} USD"
-    except ValueError:
-        return current_price
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +277,10 @@ async def _run_ebay_fallback() -> None:
                 )
                 await asyncio.sleep(1.5)
 
-            if failures >= max(2, len(rows) // 2):
+            # Threshold is 1 when there's a single ended-unresolved item, else
+            # half the batch. Without the floor, a single persistently-failing
+            # item is retried on every dashboard load forever.
+            if failures >= max(1, len(rows) // 2):
                 _ebay_cooldown_until = (
                     datetime.now(timezone.utc).timestamp() + _EBAY_COOLDOWN
                 )
@@ -569,7 +550,7 @@ async def api_get_snipes():
             "item_id": item["item_id"],
             "title": title,
             "current_bid": item.get("cached_current_bid"),
-            "max_bid": f"{item['max_bid']:.2f}",
+            "max_bid": f"{item['max_bid']:.2f} USD",
             "bid_offset": item["bid_offset"],
             "snipe_group": item["snipe_group"],
             "time_to_end": _iso_to_relative(end_date_iso),

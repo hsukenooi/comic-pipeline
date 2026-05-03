@@ -57,8 +57,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         try:
             conn.execute(stmt)
             conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        except sqlite3.OperationalError as e:
+            # Idempotent column adds: ignore "duplicate column name". Anything
+            # else (disk full, locked DB, syntax error in a future migration)
+            # should not be silently swallowed.
+            if "duplicate column" not in str(e).lower():
+                raise
 
 
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -164,27 +168,13 @@ def update_bid_status(
     resolved_at: str | None = None,
     status_mirror: str | None = None,
 ) -> None:
+    # COALESCE on status_mirror so callers that don't have a fresh mirror value
+    # (e.g. the eBay fallback path) don't clobber the last-known mirror status.
     conn.execute(
-        "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, status_mirror=? WHERE item_id=? AND status NOT IN ('PURGED')",
-        (status, winning_bid, resolved_at, status_mirror, item_id),
-    )
-    conn.commit()
-
-
-def cache_ebay_data(
-    conn: sqlite3.Connection,
-    item_id: str,
-    title: str | None,
-    seller: str | None,
-    end_at: str | None,
-    current_bid: str | None = None,
-) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "UPDATE bids SET ebay_title=?, seller=?, auction_end_at=?, "
-        "cached_current_bid=?, cached_at=? "
+        "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, "
+        "status_mirror=COALESCE(?, status_mirror) "
         "WHERE item_id=? AND status NOT IN ('PURGED')",
-        (title, seller, end_at, current_bid, now, item_id),
+        (status, winning_bid, resolved_at, status_mirror, item_id),
     )
     conn.commit()
 

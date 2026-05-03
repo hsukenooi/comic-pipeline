@@ -17,8 +17,6 @@ if [ ! -f "$SERVER_DIR/.env" ]; then
 GIXEN_USERNAME=your_username_here
 GIXEN_PASSWORD=your_password_here
 DB_PATH=$HOME/.gixen-server/db.sqlite
-GIXEN_SYNC_ENABLED=true
-GIXEN_SYNC_INTERVAL=600
 ENV
   chmod 600 "$SERVER_DIR/.env"
   echo "    Edit $SERVER_DIR/.env before starting the server."

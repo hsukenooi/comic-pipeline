@@ -157,14 +157,14 @@ def list_snipes(as_json: bool, added_since: datetime | None):
     click.echo(f"{len(snipes)} snipe(s) total")
 
 
-def _format_group(group_str) -> str:
+def _format_group(group_str: str | int | None) -> str:
     """Display a snipe_group: blank for '0' / missing, else the number."""
     if not group_str or str(group_str) == "0":
         return ""
     return str(group_str)
 
 
-def _format_bid(bid_str) -> str:
+def _format_bid(bid_str: str | float | None) -> str:
     """Format a bid string like '41.00 USD' or float 41.0 to '$41.00'."""
     if bid_str is None:
         return ""
@@ -179,7 +179,7 @@ def _format_bid(bid_str) -> str:
         return bid_str
 
 
-def _calc_diff(max_bid, winning_bid) -> str:
+def _calc_diff(max_bid: str | float | None, winning_bid: str | float | None) -> str:
     """Calculate difference between max bid and winning bid."""
     try:
         max_str = str(max_bid)
@@ -424,6 +424,27 @@ def sync():
         sys.exit(1)
     result = _server_request("post", "/api/sync")
     click.echo(f"Synced {result.get('synced', '?')} snipes from Gixen.")
+
+
+@cli.command("extract-comics")
+def extract_comics_cmd():
+    """Auto-link bids to comics by parsing cached eBay listing titles."""
+    if not _server_url():
+        click.echo(
+            "Error: GIXEN_SERVER_URL not set — extract-comics only applies to server mode.",
+            err=True,
+        )
+        sys.exit(1)
+    result = _server_request("post", "/api/extract-comics")
+    processed = result.get("processed", 0)
+    linked = result.get("linked", 0)
+    skipped = result.get("skipped", []) or []
+    errors = result.get("errors", []) or []
+    click.echo(f"Processed {processed}, linked {linked}, skipped {len(skipped)}, errors {len(errors)}.")
+    for s in skipped:
+        click.echo(f"  skip {s.get('item_id', '?')}: {s.get('reason', 'unknown')}")
+    for e in errors:
+        click.echo(f"  err  {e}", err=True)
 
 
 @cli.command()

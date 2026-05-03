@@ -148,7 +148,7 @@ def _extract_grade(text: str) -> tuple[float | None, str | None]:
     m = _LETTER_GRADE_PATTERN.search(text)
     if m:
         token = m.group(1)
-        return LETTER_GRADE_MAP.get(token.upper()) or LETTER_GRADE_MAP.get(token), token
+        return LETTER_GRADE_MAP.get(token.upper()), token
     return None, None
 
 

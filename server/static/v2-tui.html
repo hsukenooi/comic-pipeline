@@ -581,6 +581,7 @@ function attrEscape(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
@@ -813,6 +814,12 @@ async function saveMaxBid(cell, newMax) {
   cell.innerHTML = `$${newMax.toFixed(2)}`;
   suppressRefresh = true;
 
+  // Bound the PATCH so a hung Gixen call can't strand suppressRefresh=true
+  // and freeze the in-page repaint tick indefinitely. 30s is generous; the
+  // server's own _api_lock + Gixen scrape comfortably finishes well under.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+
   try {
     const resp = await fetch(`/api/bids/${itemId}`, {
       method: "PATCH",
@@ -822,7 +829,9 @@ async function saveMaxBid(cell, newMax) {
         bid_offset: bidOffset,
         snipe_group: snipeGroup,
       }),
+      signal: ctrl.signal,
     });
+    clearTimeout(timer);
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
       try { const j = await resp.json(); if (j.detail) detail = j.detail; } catch (_) {}
@@ -835,11 +844,13 @@ async function saveMaxBid(cell, newMax) {
     suppressRefresh = false;
     load();
   } catch (e) {
+    clearTimeout(timer);
     cell.classList.remove("saving");
     cell.classList.add("save-error");
     const prev = parseFloat(cell.dataset.currentMax);
     cell.innerHTML = `$${prev.toFixed(2)}`;
-    cell.title = `save failed: ${e.message}`;
+    const msg = e.name === "AbortError" ? "save timed out" : e.message;
+    cell.title = `save failed: ${msg}`;
     setTimeout(() => {
       cell.classList.remove("save-error");
       cell.title = "click to edit";
@@ -899,11 +910,16 @@ document.addEventListener("click", e => {
   if (btn) {
     resetConfirms(btn);
     if (btn.classList.contains("confirming")) {
+      // Guard against rapid double-click: require >=400ms between arming and
+      // the confirming click. A real two-click confirm always exceeds this.
+      const armedAt = btn._armedAt || 0;
+      if (Date.now() - armedAt < 400) return;
       if (btn._confirmTimer) clearTimeout(btn._confirmTimer);
       confirmRemove(btn);
     } else {
       btn.classList.add("confirming");
       btn.textContent = "✕ remove?";
+      btn._armedAt = Date.now();
       btn._confirmTimer = setTimeout(() => {
         btn.classList.remove("confirming");
         btn.textContent = "✕";
