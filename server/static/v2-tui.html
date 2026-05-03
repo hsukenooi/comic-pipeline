@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gixen ▸ snipes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    /* tokyo-night-ish palette */
+    --bg: #16161e;
+    --bg-alt: #1a1b26;
+    --bg-panel: #1f2335;
+    --bg-hover: #232744;
+    --fg: #c0caf5;
+    --fg-dim: #565f89;
+    --fg-mute: #3b4261;
+    --line: #2a2e44;
+    --blue: #7aa2f7;
+    --cyan: #7dcfff;
+    --green: #9ece6a;
+    --yellow: #e0af68;
+    --orange: #ff9e64;
+    --red: #f7768e;
+    --magenta: #bb9af7;
+  }
+
+  html, body { height: 100%; }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "JetBrains Mono", ui-monospace, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 0 0 28px 0;
+  }
+
+  a { color: var(--cyan); text-decoration: none; }
+  a:hover { color: var(--blue); text-decoration: underline; }
+
+  /* tmux-style top bar */
+  .topbar {
+    display: flex;
+    align-items: stretch;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+    height: 28px;
+  }
+
+  .topbar .seg {
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+  }
+
+  .topbar .seg.brand {
+    background: var(--magenta);
+    color: var(--bg);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .topbar .seg.crumb { color: var(--fg-dim); }
+  .topbar .seg.active { color: var(--blue); font-weight: 500; }
+  .topbar a.nav { color: var(--fg-dim); text-decoration: none; }
+  .topbar a.nav:hover { color: var(--fg); background: var(--bg-hover); }
+  .topbar a.nav.active { color: var(--blue); font-weight: 500; }
+
+  .topbar .spacer { flex: 1; }
+
+  .topbar .seg.host { color: var(--fg-dim); }
+  .topbar .seg.clock { color: var(--green); }
+
+  /* wrapper */
+  .wrap {
+    padding: 18px 22px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  /* session line */
+  .session {
+    color: var(--fg-dim);
+    font-size: 12px;
+    margin-bottom: 16px;
+  }
+  .session .prompt { color: var(--green); }
+  .session .cmd { color: var(--fg); }
+  .session .arg { color: var(--yellow); }
+  .session .ok { color: var(--green); }
+  .session .err { color: var(--red); }
+
+  /* panel */
+  .panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    margin-bottom: 18px;
+    overflow: hidden;
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+  }
+
+  .panel-head .label {
+    color: var(--blue);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .panel-head .count {
+    color: var(--fg-dim);
+    font-size: 11px;
+  }
+
+  .panel-head .badge {
+    margin-left: auto;
+    padding: 1px 8px;
+    border-radius: 3px;
+    background: var(--bg-hover);
+    color: var(--fg-dim);
+    font-size: 11px;
+  }
+
+  /* tables */
+  table { width: 100%; border-collapse: collapse; }
+
+  thead th {
+    text-align: left;
+    color: var(--fg-dim);
+    font-weight: 500;
+    padding: 8px 14px;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--line);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+  }
+
+  tbody tr { border-bottom: 1px solid var(--line); }
+  tbody tr:last-child { border-bottom: 0; }
+  tbody tr:hover { background: var(--bg-hover); }
+  tbody tr.overbid { background: rgba(247,118,142,0.08); }
+  tbody tr.overbid:hover { background: rgba(247,118,142,0.16); }
+
+  td {
+    padding: 8px 14px;
+    vertical-align: top;
+    white-space: nowrap;
+  }
+
+  td.title { white-space: normal; max-width: 360px; line-height: 1.4; color: var(--fg); }
+
+  .right { text-align: right; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  .item-id { color: var(--cyan); }
+
+  .seller { color: var(--fg-dim); }
+
+  .pill {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.03em;
+  }
+  .pill.won { background: rgba(158,206,106,0.18); color: var(--green); }
+  .pill.lost { background: rgba(86,95,137,0.25); color: var(--fg-dim); }
+  .pill.err { background: rgba(247,118,142,0.18); color: var(--red); }
+  .pill.pending { background: rgba(224,175,104,0.18); color: var(--yellow); }
+
+  .warn-cell { color: var(--red); font-weight: 700; }
+  .urgent-cell { color: var(--orange); font-weight: 700; }
+
+  /* flags */
+  .flags {
+    background: rgba(224,175,104,0.06);
+    border: 1px solid rgba(224,175,104,0.35);
+    border-left: 3px solid var(--yellow);
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 18px;
+  }
+
+  .flags h3 {
+    color: var(--yellow);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 6px;
+  }
+
+  .flags ul { list-style: none; }
+  .flags li {
+    padding: 3px 0;
+    font-size: 12px;
+    color: var(--fg);
+  }
+  .flags li::before { content: "▲ "; color: var(--yellow); }
+
+  .empty {
+    color: var(--fg-mute);
+    padding: 14px;
+    font-style: italic;
+    font-size: 12px;
+  }
+
+  /* keybinding footer */
+  .keybar {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    background: var(--bg-alt);
+    border-top: 1px solid var(--line);
+    padding: 6px 22px;
+    font-size: 11px;
+    color: var(--fg-dim);
+    z-index: 50;
+  }
+
+  .keybar kbd {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--bg-hover);
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 11px;
+    margin-right: 4px;
+  }
+
+  .keybar .spacer { flex: 1; }
+  .keybar .stat { color: var(--fg-dim); }
+  .keybar .stat.is-loading { color: var(--yellow); }
+  .keybar .stat.is-error { color: var(--red); }
+  .keybar .stat.is-ok { color: var(--green); }
+
+  .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; background: var(--fg-dim); }
+  .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.loading { background: var(--yellow); }
+  .dot.err { background: var(--red); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="seg brand">▎ gixen</div>
+  <a class="seg nav active" href="/v2">▸ snipes</a>
+  <a class="seg nav" href="/v2/comics">comics</a>
+  <a class="seg nav" href="/v2/bids">bids</a>
+  <div class="spacer"></div>
+  <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
+  <div class="seg clock" id="clock">--:--:--</div>
+</div>
+
+<div class="wrap">
+  <div class="session" id="session">
+    <span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--list</span> <span class="arg">--watch=30s</span> <span class="ok">▸ ready</span>
+  </div>
+
+  <div id="flags-container"></div>
+  <div id="active-section"></div>
+  <div id="ended-section"></div>
+</div>
+
+<div class="keybar">
+  <span><kbd>r</kbd>refresh</span>
+  <span><kbd>a</kbd>active</span>
+  <span><kbd>e</kbd>ended</span>
+  <span><kbd>?</kbd>help</span>
+  <span class="spacer"></span>
+  <span class="stat is-loading" id="status"><span class="dot loading"></span><span id="status-text">connecting…</span></span>
+</div>
+
+<script>
+const REFRESH_MS = 30000;
+const params = new URLSearchParams(location.search);
+const DEMO = params.has("demo");
+// Default to the live proxy during preview so V2 sees real Mac Mini data.
+// Pass ?local=1 to hit the local /api/snipes instead.
+const SNIPES_URL = params.has("local") ? "/api/snipes" : "/api/snipes-proxy";
+const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
+
+// ---- demo fixture (used only when ?demo=1) ---------------------------------
+function demoData() {
+  const now = Date.now();
+  const inMin = m => new Date(now + m*60000).toISOString();
+  const ago = m => new Date(now - m*60000).toISOString();
+  return [
+    // urgent — under 5 min, about to overbid
+    { item_id: "364892012345", title: "Amazing Spider-Man #300 CGC 9.4 White Pages — 1st App Venom 1988",
+      current_bid: "1825.00", max_bid: "1850.00", end_date_iso: inMin(3),
+      status: "PENDING", seller: "comicvault77 (4,231)",
+      fmv_low: 1700, fmv_high: 2100, fmv_confidence: "high" },
+
+    // urgent — under 1hr
+    { item_id: "274981023456", title: "Incredible Hulk #181 CGC 6.0 — 1st Full Wolverine 1974",
+      current_bid: "3210.50", max_bid: "3850.00", end_date_iso: inMin(42),
+      status: "PENDING", seller: "silverage_books (1,802)",
+      fmv_low: 3500, fmv_high: 4200, fmv_confidence: "high" },
+
+    // overbid — current >= max (flag)
+    { item_id: "186453789012", title: "X-Men #1 (1991) Jim Lee Variant — Wolverine Cover NM",
+      current_bid: "85.00", max_bid: "80.00", end_date_iso: inMin(190),
+      status: "PENDING", seller: "modernkeyz (542)",
+      fmv_low: 60, fmv_high: 95, fmv_confidence: "medium" },
+
+    // healthy active
+    { item_id: "335667812345", title: "Batman: The Killing Joke 1st Print 1988 NM",
+      current_bid: "42.00", max_bid: "85.00", end_date_iso: inMin(60*8 + 12),
+      status: "PENDING", seller: "gothampress (3,109)",
+      fmv_low: 70, fmv_high: 110, fmv_confidence: "high" },
+
+    { item_id: "204556789013", title: "Daredevil #1 1964 GD/VG — 1st Daredevil",
+      current_bid: "650.00", max_bid: "950.00", end_date_iso: inMin(60*22),
+      status: "PENDING", seller: "atomic_age (8,455)",
+      fmv_low: 800, fmv_high: 1100, fmv_confidence: "high" },
+
+    { item_id: "115778890234", title: "House of Secrets #92 — 1st Swamp Thing FN+ 1971",
+      current_bid: "210.00", max_bid: "320.00", end_date_iso: inMin(60*36),
+      status: "PENDING", seller: "bronzeagebooks (2,290)",
+      fmv_low: 280, fmv_high: 360, fmv_confidence: "medium" },
+
+    { item_id: "445000123456", title: "Saga #1 1st Print 2012 Image NM/M",
+      current_bid: "18.00", max_bid: "45.00", end_date_iso: inMin(60*48 + 30),
+      status: "PENDING", seller: "indie_press (911)",
+      fmv_low: 35, fmv_high: 60, fmv_confidence: "high" },
+
+    { item_id: "556774432211", title: "Walking Dead #1 1st Print 2003 — Image VF",
+      current_bid: "780.00", max_bid: "1200.00", end_date_iso: inMin(60*72),
+      status: "PENDING", seller: "modernkeyz (542)",
+      fmv_low: 950, fmv_high: 1400, fmv_confidence: "high" },
+
+    { item_id: "667123456789", title: "Action Comics #500 1979 — Bicentennial Cover NM",
+      current_bid: "22.00", max_bid: "60.00", end_date_iso: inMin(60*96),
+      status: "PENDING", seller: "dc_collector (4,002)",
+      fmv_low: 45, fmv_high: 75, fmv_confidence: "medium" },
+
+    { item_id: "778234567890", title: "Detective Comics #359 — 1st Batgirl GD/VG 1967",
+      current_bid: "180.00", max_bid: "275.00", end_date_iso: inMin(60*120 + 22),
+      status: "PENDING", seller: "silverage_books (1,802)",
+      fmv_low: 220, fmv_high: 300, fmv_confidence: "high" },
+
+    // ended — won
+    { item_id: "889345678901", title: "New Mutants #98 — 1st Deadpool VF 1991",
+      current_bid: "412.00", max_bid: "475.00", winning_bid: 412.00,
+      end_date_iso: ago(45), status: "WON",
+      seller: "modernkeyz (542)",
+      fmv_low: 380, fmv_high: 520, fmv_confidence: "high" },
+
+    // ended — outbid
+    { item_id: "990456789012", title: "Tales of Suspense #39 — 1st Iron Man Coverless 1963",
+      current_bid: "2150.00", max_bid: "1800.00",
+      end_date_iso: ago(180), status: "BID UNDER MAX",
+      seller: "atomic_age (8,455)",
+      fmv_low: 1700, fmv_high: 2400, fmv_confidence: "high" },
+
+    // ended — net error on both
+    { item_id: "101567890123", title: "Fantastic Four #52 — 1st Black Panther 1966 GD",
+      current_bid: "640.00", max_bid: "780.00",
+      end_date_iso: ago(330), status: "NETWORK ERROR",
+      status_mirror: "NETWORK ERROR",
+      seller: "silverage_books (1,802)",
+      fmv_low: 700, fmv_high: 900, fmv_confidence: "medium" },
+
+    // ended — outbid
+    { item_id: "212678901234", title: "Spawn #1 1st Print 1992 NM/M",
+      current_bid: "32.00", max_bid: "28.00",
+      end_date_iso: ago(1440), status: "OUTBID",
+      seller: "indie_press (911)",
+      fmv_low: 25, fmv_high: 40, fmv_confidence: "medium" },
+
+    // ended — won
+    { item_id: "323789012345", title: "Uncanny X-Men #266 — 1st Gambit FN+ 1990",
+      current_bid: "88.00", max_bid: "130.00", winning_bid: 88.00,
+      end_date_iso: ago(2880), status: "WON",
+      seller: "modernkeyz (542)",
+      fmv_low: 80, fmv_high: 140, fmv_confidence: "high" },
+  ];
+}
+
+function timeLeft(iso) {
+  if (!iso) return "—";
+  const diff = new Date(iso) - Date.now();
+  if (diff <= 0) return "ENDED";
+  const d = Math.floor(diff/86400000);
+  const h = Math.floor((diff%86400000)/3600000);
+  const m = Math.floor((diff%3600000)/60000);
+  if (d >= 1) return `${d}d ${h}h`;
+  if (diff < 3600000) return m > 0 ? `${m}m` : "<1m";
+  return `${h}h`;
+}
+
+function fmtFmv(r) {
+  const lo = r.fmv_low, hi = r.fmv_high;
+  if (lo == null && hi == null) return '<span class="seller">—</span>';
+  if (lo != null && hi != null) {
+    if (Math.round(lo) === Math.round(hi)) return `$${Math.round(lo)}`;
+    return `$${Math.round(lo)}–${Math.round(hi)}`;
+  }
+  return `$${Math.round(lo ?? hi)}`;
+}
+
+const isEnded = r => r.end_date_iso ? new Date(r.end_date_iso) <= Date.now() : (r.time_to_end||"").toUpperCase() === "ENDED";
+const parseAmt = s => { if (s==null) return null; const n = parseFloat(String(s).replace(/[^0-9.]/g,"")); return isNaN(n) ? null : n; };
+const fmtUSD = s => { const n = parseAmt(s); return n != null ? `$${n.toFixed(2)}` : "—"; };
+
+function statusPill(r) {
+  const s = (r.status||"").toUpperCase(), sm = (r.status_mirror||"").toUpperCase();
+  if (s.includes("WON")||sm.includes("WON")) return '<span class="pill won">won</span>';
+  if (s.startsWith("BID UNDER")||s==="OUTBID"||s==="LOST"||sm.startsWith("BID UNDER")||sm==="OUTBID"||sm==="LOST") return '<span class="pill lost">outbid</span>';
+  if (s.startsWith("NETWORK ERROR")||sm.startsWith("NETWORK ERROR")) return '<span class="pill err">net err</span>';
+  if (s==="PENDING") return '<span class="pill pending">pending</span>';
+  return `<span class="pill lost">${(r.status||"—").toLowerCase()}</span>`;
+}
+
+function gradeLabel(g) {
+  if (g == null) return null;
+  const n = parseFloat(g);
+  if (isNaN(n)) return String(g);
+  if (n >= 9.8) return "NM/M";
+  if (n >= 9.4) return "NM+";
+  if (n >= 9.0) return "NM";
+  if (n >= 8.5) return "VF+";
+  if (n >= 8.0) return "VF";
+  if (n >= 7.5) return "VF-";
+  if (n >= 7.0) return "FN/VF";
+  if (n >= 6.5) return "FN+";
+  if (n >= 6.0) return "FN";
+  if (n >= 5.5) return "FN-";
+  if (n >= 5.0) return "VG/FN";
+  if (n >= 4.5) return "VG+";
+  if (n >= 4.0) return "VG";
+  if (n >= 3.5) return "VG-";
+  if (n >= 3.0) return "GD/VG";
+  if (n >= 2.5) return "GD+";
+  if (n >= 2.0) return "GD";
+  if (n >= 1.5) return "FR/GD";
+  if (n >= 1.0) return "FR";
+  return "PR";
+}
+
+function displayTitle(r) {
+  if (r.comic_title && r.comic_issue != null) {
+    return `${r.comic_title} #${r.comic_issue}`;
+  }
+  const t = r.title || r.comic_title || "—";
+  return t.length > 60 ? t.slice(0,59)+"…" : t;
+}
+
+function displayCondition(r) {
+  const g = gradeLabel(r.comic_grade);
+  return g || '<span class="seller">—</span>';
+}
+
+function buildFlags(snipes) {
+  const lines = [];
+  for (const r of snipes) {
+    if (!isEnded(r)) {
+      const cur = parseAmt(r.current_bid), max = parseAmt(r.max_bid);
+      if (cur!=null && max!=null && cur>=max) lines.push(`#${r.item_id} "${displayTitle(r)}" — current $${cur.toFixed(2)} ≥ max $${max.toFixed(2)}. raise or cancel?`);
+    } else {
+      const s = (r.status||"").toUpperCase(), sm = (r.status_mirror||"").toUpperCase();
+      if (s.startsWith("NETWORK ERROR") && sm.startsWith("NETWORK ERROR")) lines.push(`#${r.item_id} "${displayTitle(r)}" — bid failed on main+mirror. re-snipe if relisted.`);
+    }
+  }
+  return lines;
+}
+
+function renderActive(snipes) {
+  const active = snipes.filter(r => !isEnded(r)).sort((a,b)=>(a.end_date_iso?new Date(a.end_date_iso):Infinity)-(b.end_date_iso?new Date(b.end_date_iso):Infinity));
+  const el = document.getElementById("active-section");
+  if (!active.length) {
+    el.innerHTML = `<div class="panel"><div class="panel-head"><span class="label">active</span><span class="count">0 rows</span><span class="badge">live</span></div><div class="empty">// no active snipes</div></div>`;
+    return;
+  }
+  const rows = active.map(r => {
+    const cur = parseAmt(r.current_bid), max = parseAmt(r.max_bid);
+    const overbid = cur!=null && max!=null && cur>=max;
+    const tl = r.end_date_iso ? timeLeft(r.end_date_iso) : (r.time_to_end||"—");
+    const urgent = r.end_date_iso && (new Date(r.end_date_iso)-Date.now()) < 3600000;
+    const timeCell = urgent ? `<span class="urgent-cell">${tl}</span>` : tl;
+    const maxCell = overbid ? `<span class="warn-cell">▲ $${max.toFixed(2)}</span>` : fmtUSD(r.max_bid);
+    return `<tr class="${overbid?"overbid":""}">
+      <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
+      <td class="title">${displayTitle(r)}</td>
+      <td>${displayCondition(r)}</td>
+      <td class="right num">${fmtUSD(r.current_bid)}</td>
+      <td class="right num">${maxCell}</td>
+      <td class="right num">${fmtFmv(r)}</td>
+      <td class="right num">${timeCell}</td>
+      <td class="seller">${r.seller||"—"}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<div class="panel">
+    <div class="panel-head"><span class="label">active</span><span class="count">${active.length} rows</span><span class="badge">live</span></div>
+    <table><thead><tr>
+      <th>item</th><th>title</th><th>cond</th>
+      <th class="right">current</th><th class="right">max</th>
+      <th class="right">fmv</th>
+      <th class="right">t-minus</th><th>seller</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+  </div>`;
+}
+
+function renderEnded(snipes) {
+  const ended = snipes.filter(r => isEnded(r)).sort((a,b)=>(b.end_date_iso?new Date(b.end_date_iso):0)-(a.end_date_iso?new Date(a.end_date_iso):0));
+  const el = document.getElementById("ended-section");
+  if (!ended.length) {
+    el.innerHTML = `<div class="panel"><div class="panel-head"><span class="label">recently ended</span><span class="count">0 rows</span></div><div class="empty">// none</div></div>`;
+    return;
+  }
+  const rows = ended.map(r => {
+    const winning = r.winning_bid != null ? `$${parseFloat(r.winning_bid).toFixed(2)}` : fmtUSD(r.current_bid);
+    return `<tr>
+      <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
+      <td class="title">${displayTitle(r)}</td>
+      <td>${displayCondition(r)}</td>
+      <td class="right num">${winning}</td>
+      <td class="right num">${fmtUSD(r.max_bid)}</td>
+      <td class="right num">${fmtFmv(r)}</td>
+      <td>${statusPill(r)}</td>
+      <td class="seller">${r.seller||"—"}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<div class="panel">
+    <div class="panel-head"><span class="label">recently ended</span><span class="count">${ended.length} rows</span></div>
+    <table><thead><tr>
+      <th>item</th><th>title</th><th>cond</th>
+      <th class="right">winning</th><th class="right">max</th>
+      <th class="right">fmv</th>
+      <th>result</th><th>seller</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+  </div>`;
+}
+
+function renderFlags(snipes) {
+  const flags = buildFlags(snipes);
+  const el = document.getElementById("flags-container");
+  el.innerHTML = flags.length ? `<div class="flags"><h3>attention required</h3><ul>${flags.map(f=>`<li>${f}</li>`).join("")}</ul></div>` : "";
+}
+
+function setStatus(state, text) {
+  const el = document.getElementById("status");
+  const t = document.getElementById("status-text");
+  el.classList.remove("is-loading","is-error","is-ok");
+  el.classList.add("is-"+state);
+  el.querySelector(".dot").className = "dot " + (state === "ok" ? "ok" : state === "error" ? "err" : "loading");
+  t.textContent = text;
+}
+
+function tickClock() {
+  document.getElementById("clock").textContent = new Date().toLocaleTimeString();
+}
+setInterval(tickClock, 1000);
+tickClock();
+
+async function load() {
+  setStatus("loading", DEMO ? "loading demo fixture…" : `fetching ${SNIPES_URL}…`);
+  try {
+    let snipes;
+    if (DEMO) {
+      snipes = demoData();
+    } else {
+      const resp = await fetch(SNIPES_URL);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      snipes = await resp.json();
+    }
+    renderFlags(snipes); renderActive(snipes); renderEnded(snipes);
+    const now = new Date().toLocaleTimeString();
+    const demoTag = DEMO ? ' <span class="arg">[DEMO]</span>' : '';
+    let cacheTag = '';
+    if (!DEMO) {
+      const newest = snipes.reduce((acc, r) => {
+        if (!r.cached_at) return acc;
+        const t = new Date(r.cached_at).getTime();
+        return t > acc ? t : acc;
+      }, 0);
+      if (newest > 0) {
+        const ageS = Math.max(0, Math.floor((Date.now() - newest) / 1000));
+        const ageStr = ageS < 90 ? `${ageS}s ago` : `${Math.floor(ageS/60)}m ago`;
+        cacheTag = ` <span class="arg">· cache ${ageStr}</span>`;
+      } else {
+        cacheTag = ` <span class="err">· cache empty (warming up)</span>`;
+      }
+    }
+    document.getElementById("session").innerHTML =
+      `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--list</span> <span class="arg">--watch=30s</span>${demoTag} <span class="ok">▸ ${snipes.length} rows · synced ${now}</span>${cacheTag}`;
+    setStatus("ok", `${snipes.length} rows · next sync 30s${DEMO ? " · demo" : ""}`);
+  } catch (e) {
+    setStatus("error", e.message);
+    document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="err">▸ ${e.message}</span>`;
+  }
+}
+
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>

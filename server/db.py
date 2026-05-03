@@ -47,6 +47,8 @@ CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
 _COLUMN_MIGRATIONS = [
     "ALTER TABLE bids ADD COLUMN ebay_title TEXT",
     "ALTER TABLE bids ADD COLUMN status_mirror TEXT",
+    "ALTER TABLE bids ADD COLUMN cached_current_bid TEXT",
+    "ALTER TABLE bids ADD COLUMN cached_at TEXT",
 ]
 
 
@@ -175,10 +177,14 @@ def cache_ebay_data(
     title: str | None,
     seller: str | None,
     end_at: str | None,
+    current_bid: str | None = None,
 ) -> None:
+    now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "UPDATE bids SET ebay_title=?, seller=?, auction_end_at=? WHERE item_id=? AND status NOT IN ('PURGED')",
-        (title, seller, end_at, item_id),
+        "UPDATE bids SET ebay_title=?, seller=?, auction_end_at=?, "
+        "cached_current_bid=?, cached_at=? "
+        "WHERE item_id=? AND status NOT IN ('PURGED')",
+        (title, seller, end_at, current_bid, now, item_id),
     )
     conn.commit()
 

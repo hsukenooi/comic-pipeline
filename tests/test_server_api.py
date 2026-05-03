@@ -165,11 +165,14 @@ def test_get_snipes_merges_fmv(api):
     assert snipes[0]["fmv_confidence"] == "high"
 
 
-def test_get_snipes_gixen_error_returns_503(api):
+def test_get_snipes_serves_cached_data_when_gixen_down(api):
+    """The dashboard endpoint reads only from the local cache, so Gixen being
+    down does not affect it. The background sync loop owns all live traffic."""
     from gixen_client import GixenError
     api.mock_gixen.list_snipes.side_effect = GixenError("Gixen down")
     r = api.get("/api/snipes")
-    assert r.status_code == 503
+    assert r.status_code == 200
+    assert isinstance(r.json(), list)
 
 
 def test_edit_bid(api):
