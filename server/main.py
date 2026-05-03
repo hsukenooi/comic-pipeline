@@ -142,6 +142,18 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     now = datetime.now(timezone.utc).isoformat()
     gixen_item_ids = {s["item_id"] for s in snipes}
 
+    ended_pending_set = {
+        r["item_id"] for r in db.execute(
+            """
+            SELECT item_id FROM bids
+            WHERE status = 'PENDING'
+              AND auction_end_at IS NOT NULL
+              AND auction_end_at <= ?
+            """,
+            (now,),
+        ).fetchall()
+    }
+
     for snipe in snipes:
         gixen_status = snipe.get("status", "")
         if gixen_status in _TERMINAL_GIXEN_STATUSES:
@@ -155,6 +167,11 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
             update_bid_status(
                 db, snipe["item_id"], gixen_status, winning_bid, now,
                 snipe.get("status_mirror"),
+            )
+        elif snipe["item_id"] in ended_pending_set:
+            logger.warning(
+                "_sync_gixen: item %s ended in our DB but Gixen reports non-terminal status %r",
+                snipe["item_id"], gixen_status,
             )
 
     db.commit()
@@ -186,19 +203,58 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
 # Lifespan
 # ---------------------------------------------------------------------------
 
+def _seconds_since_iso(iso: str | None) -> float:
+    if not iso:
+        return float("inf")
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+    except (ValueError, TypeError):
+        return float("inf")
+
+
+def _seconds_until_iso(iso: str | None) -> float:
+    """Positive if `iso` is in the future, negative if past, +inf if missing."""
+    if not iso:
+        return float("inf")
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return (dt - datetime.now(timezone.utc)).total_seconds()
+    except (ValueError, TypeError):
+        return float("inf")
+
+
 async def _ebay_sync_loop(interval: int, concurrency: int = 1) -> None:
     """Background task: refresh cached eBay data for active auctions.
 
     /api/snipes reads only from the cache, so this loop owns all live eBay
-    traffic. Skips PURGED/terminal bids and auctions whose end_date has passed.
-    When a PENDING bid's auction has ended, calls Gixen once to resolve status.
+    traffic. Two independent branches per cycle:
 
-    eBay's Browse API rate-limits aggressively per OAuth token. Concurrency
-    defaults to 1 (sequential), with a small inter-call delay (EBAY_SYNC_DELAY,
-    default 1.5s) to stay under the burst threshold.
+    1. Gixen resolution — when any PENDING bid has auction_end_at in the past,
+       call Gixen once to update terminal status (WON/LOST/...).
+    2. eBay refresh — for each PENDING active bid, refresh cached eBay data
+       only if its cache is older than the tier's threshold:
+         - <1h to end:    REFRESH_NEAR (default 60s)
+         - 1-24h to end:  REFRESH_MID  (default 30min)
+         - >24h to end:   REFRESH_FAR  (default 6h)
+       Most cycles are no-ops because most auctions are far from ending —
+       this collapses steady-state eBay call volume by 10-50x at typical scale.
+
+    Each branch is wrapped independently so a failure in one (e.g. eBay
+    rate-limited) doesn't stop the other (e.g. resolving a finished auction).
+
+    Adaptive cooldown: when a fetch cycle is mostly failures (rate-limited),
+    the loop pauses fetches for EBAY_RATE_LIMIT_COOLDOWN seconds. Hammering a
+    depleted token budget doesn't make it refill faster.
     """
     sem = asyncio.Semaphore(concurrency)
     inter_call_delay = float(os.getenv("EBAY_SYNC_DELAY", "1.5"))
+    rate_limit_cooldown = int(os.getenv("EBAY_RATE_LIMIT_COOLDOWN", "300"))
+    refresh_near = int(os.getenv("EBAY_REFRESH_NEAR", "60"))
+    refresh_mid = int(os.getenv("EBAY_REFRESH_MID", str(30 * 60)))
+    refresh_far = int(os.getenv("EBAY_REFRESH_FAR", str(6 * 3600)))
+
+    cooldown_until = 0.0  # epoch seconds
 
     async def _fetch_one(iid: str):
         async with sem:
@@ -207,67 +263,95 @@ async def _ebay_sync_loop(interval: int, concurrency: int = 1) -> None:
                 await asyncio.sleep(inter_call_delay)
             return result
 
+    def _is_due(row: sqlite3.Row) -> bool:
+        seconds_to_end = _seconds_until_iso(row["auction_end_at"])
+        if seconds_to_end < 3600:
+            threshold = refresh_near
+        elif seconds_to_end < 86400:
+            threshold = refresh_mid
+        else:
+            threshold = refresh_far
+        return _seconds_since_iso(row["cached_at"]) > threshold
+
     while True:
         try:
             db = _get_db()
             now_iso = datetime.now(timezone.utc).isoformat()
+            now_ts = datetime.now(timezone.utc).timestamp()
 
-            active_rows = db.execute(
-                """
-                SELECT item_id FROM bids
-                WHERE status = 'PENDING'
-                  AND (auction_end_at IS NULL OR auction_end_at > ?)
-                """,
-                (now_iso,),
-            ).fetchall()
-            active_ids = [r["item_id"] for r in active_rows]
-
-            ok = fail = 0
-            if active_ids:
-                results = await asyncio.gather(
-                    *[_fetch_one(iid) for iid in active_ids],
-                    return_exceptions=True,
-                )
-                for iid, ebay in zip(active_ids, results):
-                    if isinstance(ebay, BaseException):
-                        fail += 1
-                        logger.warning("_ebay_sync_loop: fetch %s failed: %s", iid, ebay)
-                        continue
-                    if not ebay:
-                        fail += 1
-                        continue
-                    cache_ebay_data(
-                        db,
-                        iid,
-                        ebay.get("title"),
-                        ebay.get("seller"),
-                        ebay.get("end_date_iso"),
-                        _ebay_price_to_bid_str(ebay.get("current_price")),
-                    )
-                    ok += 1
-
-            ended_pending = db.execute(
-                """
-                SELECT 1 FROM bids
-                WHERE status = 'PENDING'
-                  AND auction_end_at IS NOT NULL
-                  AND auction_end_at <= ?
-                LIMIT 1
-                """,
-                (now_iso,),
-            ).fetchone()
-            if ended_pending:
-                try:
+            ended_pending_count = 0
+            try:
+                ended_pending_count = db.execute(
+                    """
+                    SELECT COUNT(*) AS n FROM bids
+                    WHERE status = 'PENDING'
+                      AND auction_end_at IS NOT NULL
+                      AND auction_end_at <= ?
+                    """,
+                    (now_iso,),
+                ).fetchone()["n"]
+                if ended_pending_count:
                     async with _api_lock:
                         await _sync_gixen(db, _api_client)
-                except Exception as e:
-                    logger.warning("_ebay_sync_loop: gixen resolve failed: %s", e)
+            except Exception:
+                logger.exception("_ebay_sync_loop: gixen resolve step failed")
 
-            logger.info("_ebay_sync_loop: %d active · %d ok · %d fail", len(active_ids), ok, fail)
+            ok = fail = 0
+            eligible_ids: list[str] = []
+            cooling = now_ts < cooldown_until
+            try:
+                if not cooling:
+                    candidate_rows = db.execute(
+                        """
+                        SELECT item_id, auction_end_at, cached_at FROM bids
+                        WHERE status = 'PENDING'
+                          AND (auction_end_at IS NULL OR auction_end_at > ?)
+                        """,
+                        (now_iso,),
+                    ).fetchall()
+                    eligible_ids = [r["item_id"] for r in candidate_rows if _is_due(r)]
+
+                    if eligible_ids:
+                        results = await asyncio.gather(
+                            *[_fetch_one(iid) for iid in eligible_ids],
+                            return_exceptions=True,
+                        )
+                        for iid, ebay in zip(eligible_ids, results):
+                            if isinstance(ebay, BaseException) or not ebay:
+                                fail += 1
+                                continue
+                            cache_ebay_data(
+                                db, iid,
+                                ebay.get("title"),
+                                ebay.get("seller"),
+                                ebay.get("end_date_iso"),
+                                _ebay_price_to_bid_str(ebay.get("current_price")),
+                            )
+                            ok += 1
+
+                        if fail >= max(2, len(eligible_ids) // 2):
+                            cooldown_until = now_ts + rate_limit_cooldown
+                            cooling = True
+                            logger.warning(
+                                "_ebay_sync_loop: %d/%d failed; cooling down %ds",
+                                fail, len(eligible_ids), rate_limit_cooldown,
+                            )
+            except Exception:
+                logger.exception("_ebay_sync_loop: ebay fetch step failed")
+
+            cooling_remaining = int(max(0, cooldown_until - now_ts)) if cooling else 0
+            logger.info(
+                "_ebay_sync_loop: ended_pending=%d eligible=%d ok=%d fail=%d cooling=%s",
+                ended_pending_count,
+                len(eligible_ids),
+                ok,
+                fail,
+                f"{cooling_remaining}s" if cooling else "no",
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("_ebay_sync_loop: unexpected error")
+            logger.exception("_ebay_sync_loop: outer error")
 
         await asyncio.sleep(interval)
 
