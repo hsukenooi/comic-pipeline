@@ -38,6 +38,48 @@ def test_health(api):
     assert r.json()["status"] == "ok"
 
 
+def test_extract_comics_links_unlinked_bids(api):
+    # Insert a bid with a parseable ebay_title and no comic_id
+    r = api.post("/api/bids", json={"item_id": "999000111", "max_bid": 50.0})
+    assert r.status_code == 200
+    # Backdoor: write ebay_title via the cache helper indirectly through the DB
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("Amazing Spider-Man #300 1988 NM", "999000111"),
+    )
+    db.commit()
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["processed"] >= 1
+    assert body["linked"] >= 1
+
+    # Re-running should be idempotent — bid already linked, processed=0
+    r2 = api.post("/api/extract-comics")
+    body2 = r2.json()
+    assert body2["linked"] == 0
+
+
+def test_extract_comics_skips_unparseable(api):
+    r = api.post("/api/bids", json={"item_id": "999000222", "max_bid": 25.0})
+    assert r.status_code == 200
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("just some text no issue no year", "999000222"),
+    )
+    db.commit()
+
+    r = api.post("/api/extract-comics")
+    body = r.json()
+    # Should have at least one skip with a reason
+    assert any(s["item_id"] == "999000222" for s in body["skipped"])
+
+
 def test_upsert_comic(api):
     r = api.post("/api/comics", json={
         "title": "Amazing Spider-Man",

@@ -23,6 +23,7 @@ from server.db import (
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged, cache_ebay_data,
 )
+from server.title_parser import parse_title
 
 # Import eBay helpers from the sibling project
 _EBAY_CLI_DIR = Path.home() / "Projects" / "ebay-cli"
@@ -192,14 +193,19 @@ async def _ebay_sync_loop(interval: int, concurrency: int = 1) -> None:
     traffic. Skips PURGED/terminal bids and auctions whose end_date has passed.
     When a PENDING bid's auction has ended, calls Gixen once to resolve status.
 
-    eBay's Browse API rate-limits aggressively per OAuth token, so concurrent
-    fetches are bounded by a semaphore.
+    eBay's Browse API rate-limits aggressively per OAuth token. Concurrency
+    defaults to 1 (sequential), with a small inter-call delay (EBAY_SYNC_DELAY,
+    default 1.5s) to stay under the burst threshold.
     """
     sem = asyncio.Semaphore(concurrency)
+    inter_call_delay = float(os.getenv("EBAY_SYNC_DELAY", "1.5"))
 
     async def _fetch_one(iid: str):
         async with sem:
-            return await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+            result = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+            if inter_call_delay > 0:
+                await asyncio.sleep(inter_call_delay)
+            return result
 
     while True:
         try:
@@ -644,3 +650,80 @@ async def api_purge(req: PurgeRequest):
             pass
 
     return {"purged_completed": len(completed_ids), "removed_siblings": removed}
+
+
+@app.post("/api/extract-comics")
+async def api_extract_comics():
+    """Parse cached eBay titles for unlinked bids and link them to comics.
+
+    Idempotent: skips bids that already have comic_id set, and reuses existing
+    comics rows via upsert_comic. Does NOT call eBay (works only from cached
+    ebay_title values). Skips bids without a confidently parseable issue/year.
+    """
+    db = _get_db()
+
+    rows = db.execute(
+        """
+        SELECT id, item_id, ebay_title
+        FROM bids
+        WHERE comic_id IS NULL
+          AND ebay_title IS NOT NULL
+          AND ebay_title != ''
+          AND status != 'PURGED'
+        """
+    ).fetchall()
+
+    processed = 0
+    linked = 0
+    skipped: list[dict] = []
+    errors: list[dict] = []
+
+    for row in rows:
+        processed += 1
+        item_id = row["item_id"]
+        title = row["ebay_title"]
+        try:
+            parsed = parse_title(title)
+        except Exception as e:
+            errors.append({"item_id": item_id, "error": f"parse failed: {e}"})
+            continue
+
+        # Required for upsert_comic: title (series), issue, year. Skip if missing.
+        if not parsed.series:
+            skipped.append({"item_id": item_id, "reason": "no series extracted"})
+            continue
+        if parsed.issue is None:
+            skipped.append({"item_id": item_id, "reason": "no issue extracted"})
+            continue
+        if parsed.year is None:
+            skipped.append({"item_id": item_id, "reason": "no year extracted"})
+            continue
+
+        try:
+            comic_id = upsert_comic(
+                db,
+                title=parsed.series,
+                issue=parsed.issue,
+                year=parsed.year,
+                grade=parsed.grade,
+                fmv_low=None,
+                fmv_high=None,
+                fmv_comps=None,
+                fmv_confidence=None,
+                fmv_notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
+            )
+            db.execute(
+                "UPDATE bids SET comic_id=? WHERE id=? AND comic_id IS NULL",
+                (comic_id, row["id"]),
+            )
+            db.commit()
+            linked += 1
+        except Exception as e:
+            errors.append({"item_id": item_id, "error": f"link failed: {e}"})
+
+    return {
+        "processed": processed,
+        "linked": linked,
+        "skipped": skipped,
+        "errors": errors,
+    }
