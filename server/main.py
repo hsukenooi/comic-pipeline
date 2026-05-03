@@ -59,6 +59,9 @@ _SYNC_TTL = 5.0  # concurrent dashboard loads within this window share one Gixen
 _ebay_fallback_lock: asyncio.Lock | None = None
 _ebay_cooldown_until: float = 0.0
 _EBAY_COOLDOWN = 300.0  # seconds; suppress eBay fallback after a rate-limit storm
+# Tracked so the lifespan teardown can cancel + await any in-flight fallback
+# task before _db.close() runs. Without this the task can hit a closed DB.
+_ebay_fallback_task: asyncio.Task | None = None
 
 
 def _get_db() -> sqlite3.Connection:
@@ -72,9 +75,32 @@ def _get_db() -> sqlite3.Connection:
 
 _TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "ENDED"})
 
+# ebay_fetch.load_config calls sys.exit(1) on missing credentials. Detect that
+# eagerly with explicit env-var checks so a misconfiguration shows up as a
+# clean log line rather than getting laundered into a fake "fetch failed".
+# Once we've logged the problem once we suppress the spam — credentials don't
+# get fixed by this process.
+_EBAY_CREDS_OK: bool | None = None  # tri-state: None=unchecked, True=ok, False=missing
+
+
+def _ebay_creds_available() -> bool:
+    global _EBAY_CREDS_OK
+    if _EBAY_CREDS_OK is not None:
+        return _EBAY_CREDS_OK
+    has_creds = bool(os.getenv("EBAY_CLIENT_ID")) and bool(os.getenv("EBAY_CLIENT_SECRET"))
+    if not has_creds:
+        logger.warning(
+            "_fetch_ebay_item_sync: EBAY_CLIENT_ID and/or EBAY_CLIENT_SECRET not set; "
+            "skipping eBay fallback (silently from here on)"
+        )
+    _EBAY_CREDS_OK = has_creds
+    return has_creds
+
 
 def _fetch_ebay_item_sync(item_id: str) -> dict | None:
     if not _EBAY_AVAILABLE:
+        return None
+    if not _ebay_creds_available():
         return None
     try:
         client_id, client_secret, base_url = _ebay_load_config()
@@ -82,8 +108,6 @@ def _fetch_ebay_item_sync(item_id: str) -> dict | None:
         data = _ebay_fetch_item(item_id, token, base_url)
         if data:
             return _ebay_parse_item(data)
-    except SystemExit:
-        logger.warning("_fetch_ebay_item_sync: eBay credentials not configured")
     except Exception as e:
         logger.warning("_fetch_ebay_item_sync %s: %s", item_id, e)
     return None
@@ -162,8 +186,6 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
                 snipe.get("status_mirror"),
             )
 
-    db.commit()
-
     # Vanished + ended → flip to ENDED. The eBay fallback path then picks
     # them up (ENDED rows with NULL winning_bid) and resolves the final
     # selling price when eBay's rate-limit budget allows.
@@ -185,6 +207,8 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
             "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
             iid,
         )
+
+    db.commit()
 
     # Insert any Gixen snipes not yet in the DB (e.g. added via web UI)
     existing_ids = {b["item_id"] for b in get_pending_bids(db)}
@@ -324,6 +348,8 @@ async def _run_ebay_fallback() -> None:
                 )
                 await asyncio.sleep(1.5)
 
+            db.commit()
+
             # Threshold is 1 when there's a single ended-unresolved item, else
             # half the batch. Without the floor, a single persistently-failing
             # item is retried on every dashboard load forever.
@@ -339,6 +365,17 @@ async def _run_ebay_fallback() -> None:
             logger.exception("_run_ebay_fallback: error")
 
 
+def _spawn_fallback_task() -> None:
+    """Schedule _run_ebay_fallback as a tracked task. The function itself
+    short-circuits if a fallback is already running or the cooldown is
+    active, so it's safe to fire on every dashboard load. Tracking the
+    reference here lets lifespan teardown cancel + await it cleanly."""
+    global _ebay_fallback_task
+    if _ebay_fallback_task is not None and not _ebay_fallback_task.done():
+        return  # one already in flight; let it finish
+    _ebay_fallback_task = asyncio.create_task(_run_ebay_fallback())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _db, _api_client, _api_lock, _sync_lock, _ebay_fallback_lock
@@ -352,6 +389,18 @@ async def lifespan(app: FastAPI):
     _ebay_fallback_lock = asyncio.Lock()
 
     yield
+
+    # Cancel + await any in-flight eBay fallback so its DB writes complete (or
+    # cleanly abort) before we close the connection. Bounded await — if the
+    # task is wedged on a slow eBay call we don't want to block shutdown.
+    if _ebay_fallback_task is not None and not _ebay_fallback_task.done():
+        _ebay_fallback_task.cancel()
+        try:
+            await asyncio.wait_for(_ebay_fallback_task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as e:
+            logger.warning("lifespan: fallback task raised on cancel: %s", e)
 
     row = _db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     if row and row[0]:
@@ -480,6 +529,14 @@ def variant_v3():
     return FileResponse(Path(__file__).parent / "static" / "v3-amber.html")
 
 
+@app.get("/static/v2.css")
+def static_v2_css():
+    return FileResponse(
+        Path(__file__).parent / "static" / "v2.css",
+        media_type="text/css",
+    )
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -556,7 +613,7 @@ async def api_get_snipes():
     a winning_bid captured — never blocks this response.
     """
     await _ensure_fresh_sync()
-    asyncio.create_task(_run_ebay_fallback())
+    _spawn_fallback_task()
 
     db = _get_db()
 
@@ -626,7 +683,21 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
     update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
     row = get_bid_by_item_id(db, item_id)
     if row is None:
-        return {"item_id": item_id, "max_bid": req.max_bid, "status": "PENDING"}
+        # Gixen accepted the modify, so this snipe lives there — but our DB
+        # has no row, meaning the snipe was added via Gixen's web UI and we
+        # haven't ingested it yet. Run one sync (which has the web-added
+        # insert path) so the response shape matches every other PATCH.
+        async with _api_lock:
+            await _sync_gixen(db, _api_client)
+        # _sync_gixen ingests with the snipe's existing max_bid from Gixen,
+        # but we want the user-supplied value to win. Re-apply locally.
+        update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+        row = get_bid_by_item_id(db, item_id)
+        if row is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Item {item_id} not in DB after sync — Gixen state unexpectedly empty",
+            )
     return dict(row)
 
 

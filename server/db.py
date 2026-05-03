@@ -170,13 +170,14 @@ def update_bid_status(
 ) -> None:
     # COALESCE on status_mirror so callers that don't have a fresh mirror value
     # (e.g. the eBay fallback path) don't clobber the last-known mirror status.
+    # Caller must conn.commit() — this helper is hot-path inside loops where
+    # the caller batches the commit at the end of the cycle.
     conn.execute(
         "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, "
         "status_mirror=COALESCE(?, status_mirror) "
         "WHERE item_id=? AND status NOT IN ('PURGED')",
         (status, winning_bid, resolved_at, status_mirror, item_id),
     )
-    conn.commit()
 
 
 def cache_gixen_data(
@@ -188,7 +189,19 @@ def cache_gixen_data(
 ) -> None:
     """Cache Gixen-sourced fields. Does not touch auction_end_at — that's
     eBay's domain (Gixen only provides relative time-to-end). COALESCE keeps
-    the existing value when the caller passes None."""
+    the existing value when the caller passes None.
+
+    cached_at is only refreshed when at least one input field is non-NULL,
+    so all-NULL writes (common for SCHEDULED snipes whose Gixen row hasn't
+    populated current_bid yet) don't make the freshness indicator lie about
+    when we last got real data.
+
+    Caller must conn.commit() — this helper is hot-path inside the
+    _sync_gixen loop where commits are batched at the end of the cycle.
+    """
+    has_data = any(v is not None for v in (title, seller, current_bid))
+    if not has_data:
+        return  # nothing to write, don't bump cached_at
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE bids SET "
@@ -199,7 +212,6 @@ def cache_gixen_data(
         "WHERE item_id=? AND status NOT IN ('PURGED')",
         (title, seller, current_bid, now, item_id),
     )
-    conn.commit()
 
 
 def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:

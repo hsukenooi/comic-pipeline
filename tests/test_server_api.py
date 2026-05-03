@@ -285,13 +285,35 @@ def test_remove_bid_non_numeric_item_id(api):
     assert r.status_code == 422
 
 
-def test_edit_bid_not_in_db_returns_synthetic(api):
-    """PATCH succeeds on Gixen but item has no DB row — returns 3-key synthetic response."""
+def test_edit_bid_not_in_db_self_heals_via_sync(api):
+    """PATCH succeeds on Gixen but item has no DB row → endpoint runs one
+    _sync_gixen so the snipe gets ingested, then returns the full DB row.
+    No more synthetic 3-key response."""
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "999000001",
+        "max_bid": "75.00 USD",
+        "current_bid": "10.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "1d",
+        "seller": "someseller",
+        "snipe_group": "0",
+        "bid_offset": "6",
+    }]
     r = api.patch("/api/bids/999000001", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
     assert r.status_code == 200
     data = r.json()
-    assert data["status"] == "PENDING"
-    assert set(data.keys()) == {"item_id", "max_bid", "status"}
+    # Full DB row shape now — has the bids columns from the schema, not 3 keys.
+    assert "max_bid" in data
+    assert "status" in data
+    assert "added_at" in data  # comes from the bids row, proves it's not synthetic
+
+
+def test_edit_bid_not_in_db_and_not_in_gixen_returns_500(api):
+    """If Gixen accepts modify but list_snipes still doesn't include the item,
+    we genuinely have no row to return — surface 500 rather than fake one."""
+    api.mock_gixen.list_snipes.return_value = []  # default fixture state
+    r = api.patch("/api/bids/999000002", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 500
 
 
 def test_purge_gixen_error_returns_503(api):
@@ -369,3 +391,110 @@ def test_purge_sibling_failure_swallowed(api):
     r = api.post("/api/purge", json={"sibling_ids": []})
     assert r.status_code == 200
     assert r.json()["removed_siblings"] == 0
+
+
+# ----------------------------------------------------------------------------
+# Tests added per ce-review residual #21 — coverage for code paths the initial
+# pass missed.
+# ----------------------------------------------------------------------------
+
+
+def test_ensure_fresh_sync_dedupes_within_ttl(api, monkeypatch):
+    """Two rapid /api/snipes calls should share one Gixen list_snipes call.
+    _last_sync_at is module-global and may carry over from earlier tests in
+    the same process — explicitly reset before measuring."""
+    import server.main as smain
+    monkeypatch.setattr(smain, "_last_sync_at", 0.0, raising=False)
+    api.mock_gixen.list_snipes.return_value = []
+    api.mock_gixen.list_snipes.reset_mock()
+    api.get("/api/snipes")
+    api.get("/api/snipes")
+    api.get("/api/snipes")
+    assert api.mock_gixen.list_snipes.call_count == 1
+
+
+def test_cache_gixen_data_coalesces_none_inputs(tmp_path):
+    """COALESCE preservation: passing None for a field doesn't clobber the
+    existing non-NULL value. cached_at is only bumped when something writes."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from server.db import init_db, insert_bid, cache_gixen_data, get_bid_by_item_id
+
+    db = init_db(tmp_path / "coalesce.db")
+    insert_bid(db, "111111", 50.0, None, 6, 0, "original_seller")
+    cache_gixen_data(db, "111111", "First Title", None, "10.00 USD")
+    db.commit()
+    row = get_bid_by_item_id(db, "111111")
+    assert row["ebay_title"] == "First Title"
+    assert row["seller"] == "original_seller"  # not overwritten by None
+    assert row["cached_current_bid"] == "10.00 USD"
+    first_cached_at = row["cached_at"]
+    assert first_cached_at is not None
+
+    # All-None write: should be a no-op (no commit advancing cached_at).
+    cache_gixen_data(db, "111111", None, None, None)
+    db.commit()
+    row = get_bid_by_item_id(db, "111111")
+    assert row["cached_at"] == first_cached_at  # unchanged
+    assert row["ebay_title"] == "First Title"  # preserved
+
+
+def test_sync_gixen_inserts_web_added_snipe(api):
+    """Snipe present in Gixen but not in DB → inserted as PENDING."""
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "777888999",
+        "max_bid": "30.00 USD",
+        "current_bid": "5.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "2h",
+        "seller": "newseller",
+        "snipe_group": "0",
+        "bid_offset": "6",
+    }]
+    r = api.post("/api/sync")
+    assert r.status_code == 200
+    r = api.get("/api/snipes")
+    assert r.status_code == 200
+    items = r.json()
+    assert any(i["item_id"] == "777888999" for i in items)
+
+
+def test_sync_gixen_does_not_purge_vanished(api):
+    """Vanished-but-future PENDING rows are left alone (not PURGED)."""
+    from datetime import datetime, timedelta, timezone
+    # Create a bid in the DB.
+    api.post("/api/bids", json={"item_id": "888999000", "max_bid": 25.0})
+    # Gixen returns empty — bid is "vanished".
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/sync")
+    # Bid should still be visible (not PURGED) since auction_end_at is NULL
+    # so it's not the vanished+ended case.
+    r = api.get("/api/snipes")
+    assert any(i["item_id"] == "888999000" for i in r.json())
+
+
+def test_sync_gixen_flips_vanished_ended_to_ended(api):
+    """Vanished + auction_end_at in past → status flips PENDING → ENDED."""
+    import os, sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    # Create a bid then back-date its auction_end_at to the past.
+    api.post("/api/bids", json={"item_id": "999111222", "max_bid": 25.0})
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET auction_end_at=? WHERE item_id=?",
+        (past, "999111222"),
+    )
+    raw.commit()
+    raw.close()
+
+    # Gixen returns empty → bid vanished + ended.
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/sync")
+
+    r = api.get("/api/snipes")
+    rows = [i for i in r.json() if i["item_id"] == "999111222"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "ENDED"
