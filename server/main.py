@@ -122,10 +122,12 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
 
     For every snipe Gixen returns, refresh the cached title/seller/current_bid
     on the matching DB row (cache_gixen_data) and apply terminal status
-    transitions (WON/LOST/...). Insert new snipes that arrived via Gixen's web
-    UI. Vanished snipes (in DB but missing from Gixen's response) are left
-    alone — the DB is canonical, and whatever status was last captured is the
-    truth.
+    transitions (WON/LOST/...). Insert new snipes that arrived via Gixen's
+    web UI. For PENDING DB rows that have vanished from Gixen's response and
+    whose auction_end_at is in the past, flip status to ENDED so the eBay
+    fallback can backfill winning_bid. (Vanished-but-still-in-future rows are
+    left as PENDING — that's the "user removed via Gixen web UI before
+    auction end" case, where we have no signal to act on yet.)
     """
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
@@ -134,6 +136,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
         return []
 
     now = datetime.now(timezone.utc).isoformat()
+    gixen_item_ids = {s["item_id"] for s in snipes}
 
     for snipe in snipes:
         iid = snipe["item_id"]
@@ -160,6 +163,28 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
             )
 
     db.commit()
+
+    # Vanished + ended → flip to ENDED. The eBay fallback path then picks
+    # them up (ENDED rows with NULL winning_bid) and resolves the final
+    # selling price when eBay's rate-limit budget allows.
+    vanished_ended = db.execute(
+        """
+        SELECT item_id FROM bids
+        WHERE status = 'PENDING'
+          AND auction_end_at IS NOT NULL
+          AND auction_end_at <= ?
+        """,
+        (now,),
+    ).fetchall()
+    for row in vanished_ended:
+        iid = row["item_id"]
+        if iid in gixen_item_ids:
+            continue  # still on Gixen, will resolve via Gixen path
+        update_bid_status(db, iid, "ENDED", winning_bid=None, resolved_at=now)
+        logger.info(
+            "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
+            iid,
+        )
 
     # Insert any Gixen snipes not yet in the DB (e.g. added via web UI)
     existing_ids = {b["item_id"] for b in get_pending_bids(db)}
@@ -230,10 +255,14 @@ async def _run_ebay_fallback() -> None:
         try:
             db = _get_db()
             now_iso = datetime.now(timezone.utc).isoformat()
+            # Includes both PENDING (auction ended but no terminal status
+            # captured yet) and ENDED (vanished from Gixen, flipped by
+            # _sync_gixen). Excludes PURGED / WON / LOST / FAILED. Once
+            # winning_bid is set the row exits this set.
             rows = db.execute(
                 """
                 SELECT item_id, max_bid FROM bids
-                WHERE status = 'PENDING'
+                WHERE status IN ('PENDING', 'ENDED')
                   AND auction_end_at IS NOT NULL
                   AND auction_end_at <= ?
                   AND winning_bid IS NULL
