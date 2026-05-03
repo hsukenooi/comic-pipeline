@@ -185,7 +185,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
 # Lifespan
 # ---------------------------------------------------------------------------
 
-async def _ebay_sync_loop(interval: int, concurrency: int = 3) -> None:
+async def _ebay_sync_loop(interval: int, concurrency: int = 1) -> None:
     """Background task: refresh cached eBay data for active auctions.
 
     /api/snipes reads only from the cache, so this loop owns all live eBay
@@ -277,7 +277,8 @@ async def lifespan(app: FastAPI):
     _api_lock = asyncio.Lock()
 
     interval = int(os.getenv("EBAY_SYNC_INTERVAL", "60"))
-    sync_task = asyncio.create_task(_ebay_sync_loop(interval))
+    concurrency = int(os.getenv("EBAY_SYNC_CONCURRENCY", "1"))
+    sync_task = asyncio.create_task(_ebay_sync_loop(interval, concurrency))
 
     yield
 
