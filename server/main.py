@@ -185,13 +185,22 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
 # Lifespan
 # ---------------------------------------------------------------------------
 
-async def _ebay_sync_loop(interval: int) -> None:
+async def _ebay_sync_loop(interval: int, concurrency: int = 3) -> None:
     """Background task: refresh cached eBay data for active auctions.
 
     /api/snipes reads only from the cache, so this loop owns all live eBay
     traffic. Skips PURGED/terminal bids and auctions whose end_date has passed.
     When a PENDING bid's auction has ended, calls Gixen once to resolve status.
+
+    eBay's Browse API rate-limits aggressively per OAuth token, so concurrent
+    fetches are bounded by a semaphore.
     """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _fetch_one(iid: str):
+        async with sem:
+            return await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+
     while True:
         try:
             db = _get_db()
@@ -207,16 +216,19 @@ async def _ebay_sync_loop(interval: int) -> None:
             ).fetchall()
             active_ids = [r["item_id"] for r in active_rows]
 
+            ok = fail = 0
             if active_ids:
                 results = await asyncio.gather(
-                    *[asyncio.to_thread(_fetch_ebay_item_sync, iid) for iid in active_ids],
+                    *[_fetch_one(iid) for iid in active_ids],
                     return_exceptions=True,
                 )
                 for iid, ebay in zip(active_ids, results):
                     if isinstance(ebay, BaseException):
+                        fail += 1
                         logger.warning("_ebay_sync_loop: fetch %s failed: %s", iid, ebay)
                         continue
                     if not ebay:
+                        fail += 1
                         continue
                     cache_ebay_data(
                         db,
@@ -226,6 +238,7 @@ async def _ebay_sync_loop(interval: int) -> None:
                         ebay.get("end_date_iso"),
                         _ebay_price_to_bid_str(ebay.get("current_price")),
                     )
+                    ok += 1
 
             ended_pending = db.execute(
                 """
@@ -244,7 +257,7 @@ async def _ebay_sync_loop(interval: int) -> None:
                 except Exception as e:
                     logger.warning("_ebay_sync_loop: gixen resolve failed: %s", e)
 
-            logger.info("_ebay_sync_loop: refreshed %d active items", len(active_ids))
+            logger.info("_ebay_sync_loop: %d active · %d ok · %d fail", len(active_ids), ok, fail)
         except asyncio.CancelledError:
             raise
         except Exception:
