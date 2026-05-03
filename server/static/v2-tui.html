@@ -264,6 +264,17 @@
   }
   tbody tr.removing { opacity: 0.4; transition: opacity 0.25s; }
 
+  /* keybar action: make 'r' clickable as a refresh button */
+  .keybar .key-action {
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    padding: 0;
+  }
+  .keybar .key-action:hover { color: var(--fg); }
+
   /* flags */
   .flags {
     background: rgba(224,175,104,0.06);
@@ -387,9 +398,7 @@
 </div>
 
 <div class="keybar">
-  <span><kbd>r</kbd>refresh</span>
-  <span><kbd>a</kbd>active</span>
-  <span><kbd>e</kbd>ended</span>
+  <button class="key-action" id="refresh-btn" type="button"><kbd>r</kbd>refresh</button>
   <span><kbd>?</kbd>help</span>
   <span class="spacer"></span>
   <span class="stat is-loading" id="status"><span class="dot loading"></span><span id="status-text">connecting…</span></span>
@@ -690,7 +699,45 @@ function tickClock() {
 setInterval(tickClock, 1000);
 tickClock();
 
+// Snipes the table is currently rendering. Repaints (1s tick for time-to-end
+// countdowns, edit/remove optimism) reuse this without re-hitting Gixen.
+let _lastSnipes = null;
+let _lastSyncedAt = null;  // local timestamp of the most recent successful fetch
+
+function renderAll(snipes) {
+  if (!snipes) return;
+  renderFlags(snipes);
+  renderActive(snipes);
+  renderEnded(snipes);
+
+  const demoTag = DEMO ? ' <span class="arg">[DEMO]</span>' : '';
+  let cacheTag = '';
+  if (!DEMO) {
+    const newest = snipes.reduce((acc, r) => {
+      if (!r.cached_at) return acc;
+      const t = new Date(r.cached_at).getTime();
+      return t > acc ? t : acc;
+    }, 0);
+    if (newest > 0) {
+      const ageS = Math.max(0, Math.floor((Date.now() - newest) / 1000));
+      const ageStr = ageS < 90 ? `${ageS}s ago` : `${Math.floor(ageS/60)}m ago`;
+      cacheTag = ` <span class="arg">· cache ${ageStr}</span>`;
+    } else {
+      cacheTag = ` <span class="err">· cache empty (warming up)</span>`;
+    }
+  }
+  const syncedAtStr = _lastSyncedAt
+    ? `synced ${_lastSyncedAt.toLocaleTimeString()}`
+    : 'never synced';
+  document.getElementById("session").innerHTML =
+    `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--list</span>${demoTag} `
+    + `<span class="ok">▸ ${snipes.length} rows · ${syncedAtStr}</span>${cacheTag} `
+    + `<span class="arg">· press r to refresh</span>`;
+}
+
 async function load() {
+  if (_inFlight) return;
+  _inFlight = true;
   setStatus("loading", DEMO ? "loading demo fixture…" : "syncing from gixen…");
   document.getElementById("refresh-bar").classList.add("is-active");
   try {
@@ -702,34 +749,20 @@ async function load() {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       snipes = await resp.json();
     }
-    renderFlags(snipes); renderActive(snipes); renderEnded(snipes);
-    const now = new Date().toLocaleTimeString();
-    const demoTag = DEMO ? ' <span class="arg">[DEMO]</span>' : '';
-    let cacheTag = '';
-    if (!DEMO) {
-      const newest = snipes.reduce((acc, r) => {
-        if (!r.cached_at) return acc;
-        const t = new Date(r.cached_at).getTime();
-        return t > acc ? t : acc;
-      }, 0);
-      if (newest > 0) {
-        const ageS = Math.max(0, Math.floor((Date.now() - newest) / 1000));
-        const ageStr = ageS < 90 ? `${ageS}s ago` : `${Math.floor(ageS/60)}m ago`;
-        cacheTag = ` <span class="arg">· cache ${ageStr}</span>`;
-      } else {
-        cacheTag = ` <span class="err">· cache empty (warming up)</span>`;
-      }
-    }
-    document.getElementById("session").innerHTML =
-      `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--list</span> <span class="arg">--watch=30s</span>${demoTag} <span class="ok">▸ ${snipes.length} rows · synced ${now}</span>${cacheTag}`;
-    setStatus("ok", `${snipes.length} rows · next sync 30s${DEMO ? " · demo" : ""}`);
+    _lastSnipes = snipes;
+    _lastSyncedAt = new Date();
+    renderAll(snipes);
+    setStatus("ok", `${snipes.length} rows${DEMO ? " · demo" : ""}`);
   } catch (e) {
     setStatus("error", e.message);
     document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="err">▸ ${e.message}</span>`;
   } finally {
     document.getElementById("refresh-bar").classList.remove("is-active");
+    _inFlight = false;
   }
 }
+
+let _inFlight = false;
 
 // While a user-initiated edit/remove is in flight, skip the auto-refresh
 // tick so a stale Gixen pull can't clobber the optimistic value.
@@ -883,8 +916,31 @@ document.addEventListener("click", e => {
   resetConfirms(null);
 });
 
+// Manual refresh: 'r' key + the keybar button.
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.key === "r" || e.key === "R") {
+    e.preventDefault();
+    load();
+  }
+});
+document.getElementById("refresh-btn").addEventListener("click", e => {
+  e.preventDefault();
+  load();
+});
+
+// In-page repaint tick — keeps time-to-end countdowns and the "cache Xs ago"
+// indicator current without hitting Gixen. No network calls here.
+function repaint() {
+  if (suppressRefresh) return;          // user is editing/removing — don't clobber
+  if (!_lastSnipes) return;
+  if (document.querySelector(".editable-max.editing, .editable-max.saving")) return;
+  if (document.querySelector(".remove-btn.confirming")) return;
+  renderAll(_lastSnipes);
+}
+
 load();
-setInterval(() => { if (!suppressRefresh) load(); }, REFRESH_MS);
+setInterval(repaint, 1000);
 </script>
 </body>
 </html>
