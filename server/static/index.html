@@ -192,6 +192,15 @@ function mapStatus(row) {
   return `<span class="lost">${row.status || "—"}</span>`;
 }
 
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function displayTitle(row) {
   const t = row.title || row.comic_title || "—";
   return t.length > 55 ? t.slice(0, 54) + "…" : t;
@@ -254,11 +263,11 @@ function renderActive(snipes) {
 
     return `<tr class="${overbid ? "overbid" : ""}">
       <td><a class="item-link" href="${ebayUrl(row.item_id)}" target="_blank">${row.item_id}</a></td>
-      <td class="title">${displayTitle(row)}</td>
+      <td class="title">${escapeHtml(displayTitle(row))}</td>
       <td class="right mono">${fmtUSD(row.current_bid)}</td>
       <td class="right mono">${maxCell}</td>
       <td class="right">${timeCell}</td>
-      <td>${row.seller || "—"}</td>
+      <td>${escapeHtml(row.seller || "—")}</td>
     </tr>`;
   }).join("");
 
@@ -298,11 +307,11 @@ function renderEnded(snipes) {
 
     return `<tr>
       <td><a class="item-link" href="${ebayUrl(row.item_id)}" target="_blank">${row.item_id}</a></td>
-      <td class="title">${displayTitle(row)}</td>
+      <td class="title">${escapeHtml(displayTitle(row))}</td>
       <td class="right mono">${winning}</td>
       <td class="right mono">${fmtUSD(row.max_bid)}</td>
       <td>${mapStatus(row)}</td>
-      <td>${row.seller || "—"}</td>
+      <td>${escapeHtml(row.seller || "—")}</td>
     </tr>`;
   }).join("");
 
@@ -326,7 +335,7 @@ function renderFlags(snipes) {
     el.innerHTML = "";
     return;
   }
-  const items = flags.map(f => `<li>${f}</li>`).join("");
+  const items = flags.map(f => `<li>${escapeHtml(f)}</li>`).join("");
   el.innerHTML = `<div class="flags"><h3>Attention</h3><ul>${items}</ul></div>`;
 }
 

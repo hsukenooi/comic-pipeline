@@ -146,7 +146,7 @@
 <script>
 const REFRESH_MS = 60000;
 const params = new URLSearchParams(location.search);
-const SNIPES_URL = params.has("local") ? "/api/snipes" : "/api/snipes-proxy";
+const SNIPES_URL = "/api/snipes";
 const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
 
 function fmtUSD(s) {
@@ -162,6 +162,15 @@ function statusPill(s) {
   if (u.startsWith("NETWORK ERROR")) return '<span class="pill err">net err</span>';
   if (u === "PENDING") return '<span class="pill pending">pending</span>';
   return `<span class="pill lost">${(s||"—").toLowerCase()}</span>`;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function fmtDate(iso) {
@@ -186,8 +195,8 @@ function renderBids(snipes) {
     return;
   }
   const rows = snipes.map(r => `<tr>
-    <td><a class="id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
-    <td class="wrap">${(r.title || r.comic_title || "—").slice(0,80)}</td>
+    <td><a class="id" href="${ebayUrl(r.item_id)}" target="_blank">${escapeHtml(r.item_id)}</a></td>
+    <td class="wrap">${escapeHtml((r.title || r.comic_title || "—").slice(0,80))}</td>
     <td class="right num">${fmtUSD(r.max_bid)}</td>
     <td class="right num">${r.bid_offset != null ? `${r.bid_offset}s` : '<span class="mute">—</span>'}</td>
     <td class="num dim">${r.snipe_group ?? 0}</td>
@@ -195,7 +204,7 @@ function renderBids(snipes) {
     <td>${r.status_mirror ? statusPill(r.status_mirror) : '<span class="mute">—</span>'}</td>
     <td class="right num">${r.winning_bid != null ? `$${parseFloat(r.winning_bid).toFixed(2)}` : '<span class="mute">—</span>'}</td>
     <td class="num dim">${fmtDate(r.end_date_iso)}</td>
-    <td class="dim">${r.seller || '<span class="mute">—</span>'}</td>
+    <td class="dim">${escapeHtml(r.seller || "—")}</td>
     <td class="num dim">${r.comic_id ?? '<span class="mute">—</span>'}</td>
   </tr>`).join("");
   el.innerHTML = `<div class="panel">

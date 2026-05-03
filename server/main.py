@@ -25,8 +25,10 @@ from server.db import (
 )
 from server.title_parser import parse_title
 
-# Import eBay helpers from the sibling project
-_EBAY_CLI_DIR = Path.home() / "Projects" / "ebay-cli"
+# Import eBay helpers from the sibling project. Path is overridable via
+# EBAY_CLI_PATH so the server isn't pinned to a specific developer's home
+# directory layout.
+_EBAY_CLI_DIR = Path(os.getenv("EBAY_CLI_PATH", str(Path.home() / "Projects" / "ebay-cli")))
 sys.path.insert(0, str(_EBAY_CLI_DIR))
 try:
     from ebay_fetch import (  # type: ignore[import]
@@ -259,12 +261,28 @@ async def _run_ebay_fallback() -> None:
                     except (ValueError, TypeError):
                         final_amount = None
 
-                if final_amount is None:
+                if final_amount is None or final_amount <= 0:
+                    # eBay returns the high-water bid for reserve-not-met or
+                    # unsold listings, which is often 0 or well below our max
+                    # — falsely stamping WON. Treat as ENDED with no winning
+                    # claim instead. We still mark resolved_at so the row
+                    # leaves the fallback queue.
+                    update_bid_status(
+                        db, iid, "ENDED",
+                        winning_bid=None,
+                        resolved_at=now_iso,
+                    )
+                    logger.info(
+                        "_run_ebay_fallback: %s -> ENDED (no final price; max=$%.2f)",
+                        iid, row["max_bid"],
+                    )
                     await asyncio.sleep(1.5)
                     continue
 
-                # Heuristic: if final price <= our max_bid, our snipe would
-                # have outbid; otherwise we lost. Imperfect but useful.
+                # Heuristic: 0 < final_price <= our max_bid → our snipe would
+                # have outbid; > max → we lost. Still imperfect at the boundary
+                # (eBay's reported price excludes our offset bump) but strictly
+                # better than the original "WON if anything <= max" logic.
                 inferred_status = "WON" if final_amount <= float(row["max_bid"]) else "LOST"
                 update_bid_status(
                     db, iid, inferred_status,
@@ -431,24 +449,6 @@ def variant_v2_bids():
 @app.get("/v3")
 def variant_v3():
     return FileResponse(Path(__file__).parent / "static" / "v3-amber.html")
-
-
-@app.get("/api/snipes-proxy")
-async def api_snipes_proxy():
-    """Preview-only: proxy snipes from the production server on the Mac Mini.
-
-    Used by /v2 during local design iteration so the preview UI sees real data
-    without needing to deploy. Set GIXEN_PROXY_URL to override the default.
-    """
-    import requests
-    upstream = os.getenv("GIXEN_PROXY_URL", "http://mac-mini.tail9b7fa5.ts.net:8080/api/snipes")
-    try:
-        data = await asyncio.to_thread(
-            lambda: requests.get(upstream, timeout=45).json()
-        )
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"upstream error: {e}")
 
 
 @app.get("/health")
@@ -714,17 +714,21 @@ async def api_extract_comics():
             skipped.append({"item_id": item_id, "reason": "no issue extracted"})
             continue
 
-        # year is required by the comics schema; use 0 as "unknown year"
-        # sentinel so we can still link by series+issue+grade. Affects only
-        # auto-extracted rows; manual flows still pass real years.
-        year_for_db = parsed.year if parsed.year is not None else 0
+        # year is required by comics.UNIQUE(title, issue, year, grade) — using
+        # a 0 sentinel for "unknown" causes two unrelated listings with no
+        # parseable year to collide and silently overwrite each other's
+        # fmv_notes (the ON CONFLICT path). Skip these rather than corrupt.
+        # Items can still be linked manually via `cli.py add --year`.
+        if parsed.year is None:
+            skipped.append({"item_id": item_id, "reason": "no year extracted"})
+            continue
 
         try:
             comic_id = upsert_comic(
                 db,
                 title=parsed.series,
                 issue=parsed.issue,
-                year=year_for_db,
+                year=parsed.year,
                 grade=parsed.grade,
                 fmv_low=None,
                 fmv_high=None,

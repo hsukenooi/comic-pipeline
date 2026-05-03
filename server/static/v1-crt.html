@@ -230,6 +230,14 @@ function mapStatus(r) {
   return `<span class="dim">[${(r.status||"—").toLowerCase()}]</span>`;
 }
 
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 const displayTitle = r => { const t = r.title||r.comic_title||"—"; return t.length>55 ? t.slice(0,54)+"…" : t; };
 
 function buildFlags(snipes) {
@@ -262,11 +270,11 @@ function renderActive(snipes) {
     const maxCell = overbid ? `<span class="err">$${max.toFixed(2)} !</span>` : fmtUSD(r.max_bid);
     return `<tr class="${overbid?"overbid":""}">
       <td><a href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
-      <td class="title">${displayTitle(r)}</td>
+      <td class="title">${escapeHtml(displayTitle(r))}</td>
       <td class="right">${fmtUSD(r.current_bid)}</td>
       <td class="right">${maxCell}</td>
       <td class="right">${timeCell}</td>
-      <td class="dim">${r.seller||"—"}</td>
+      <td class="dim">${escapeHtml(r.seller||"—")}</td>
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel"><div class="panel-title">active [${active.length}]</div><div class="panel-body">
@@ -289,11 +297,11 @@ function renderEnded(snipes) {
     const winning = r.winning_bid != null ? `$${parseFloat(r.winning_bid).toFixed(2)}` : fmtUSD(r.current_bid);
     return `<tr>
       <td><a href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
-      <td class="title">${displayTitle(r)}</td>
+      <td class="title">${escapeHtml(displayTitle(r))}</td>
       <td class="right">${winning}</td>
       <td class="right">${fmtUSD(r.max_bid)}</td>
       <td>${mapStatus(r)}</td>
-      <td class="dim">${r.seller||"—"}</td>
+      <td class="dim">${escapeHtml(r.seller||"—")}</td>
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel"><div class="panel-title">recent [${ended.length}]</div><div class="panel-body">
@@ -308,7 +316,7 @@ function renderEnded(snipes) {
 function renderFlags(snipes) {
   const flags = buildFlags(snipes);
   const el = document.getElementById("flags-container");
-  el.innerHTML = flags.length ? `<div class="flags"><h3>! attention required</h3><ul>${flags.map(f=>`<li>${f}</li>`).join("")}</ul></div>` : "";
+  el.innerHTML = flags.length ? `<div class="flags"><h3>! attention required</h3><ul>${flags.map(f=>`<li>${escapeHtml(f)}</li>`).join("")}</ul></div>` : "";
 }
 
 async function load() {

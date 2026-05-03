@@ -112,8 +112,19 @@ def list_snipes(as_json: bool, added_since: datetime | None):
         click.echo("No snipes found.")
         return
 
-    active = [s for s in snipes if s.get("time_to_end", "").upper() != "ENDED"]
-    ended = [s for s in snipes if s.get("time_to_end", "").upper() == "ENDED"]
+    # Bucket by status when the server returned a terminal one (server-mode
+    # /api/snipes returns WON/LOST/FAILED/ENDED rows for the dashboard's
+    # "Recently Ended" section). Fall back to time_to_end for rows that lack
+    # a terminal status — matches direct-Gixen-mode where we only get the
+    # relative time string.
+    _TERMINAL = {"WON", "LOST", "FAILED", "ENDED"}
+    def _is_ended(s: dict) -> bool:
+        if (s.get("status") or "").upper() in _TERMINAL:
+            return True
+        return (s.get("time_to_end") or "").upper() == "ENDED"
+
+    active = [s for s in snipes if not _is_ended(s)]
+    ended = [s for s in snipes if _is_ended(s)]
 
     if active:
         click.echo(click.style(f"Active Listings ({len(active)})", bold=True))

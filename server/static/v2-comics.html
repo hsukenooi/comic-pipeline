@@ -145,7 +145,16 @@
 <script>
 const REFRESH_MS = 60000;
 const params = new URLSearchParams(location.search);
-const SNIPES_URL = params.has("local") ? "/api/snipes" : "/api/snipes-proxy";
+const SNIPES_URL = "/api/snipes";
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 function fmtFmv(r) {
   const lo = r.fmv_low, hi = r.fmv_high;
@@ -221,14 +230,14 @@ function renderComics(snipes) {
   }
   const rows = comics.map(c => `<tr>
     <td class="num dim">${c.id}</td>
-    <td>${c.title || '<span class="mute">—</span>'}</td>
-    <td class="num">${c.issue ?? '<span class="mute">—</span>'}</td>
+    <td>${c.title ? escapeHtml(c.title) : '<span class="mute">—</span>'}</td>
+    <td class="num">${c.issue != null ? escapeHtml(c.issue) : '<span class="mute">—</span>'}</td>
     <td class="num dim">${c.year ?? '<span class="mute">—</span>'}</td>
     <td class="num">${c.grade != null ? `${c.grade} ${gradeLabel(c.grade) ? `<span class="dim">(${gradeLabel(c.grade)})</span>` : ''}` : '<span class="mute">—</span>'}</td>
     <td class="right num">${fmtFmv(c)}</td>
     <td class="right num dim">${c.fmv_comps ?? '<span class="mute">—</span>'}</td>
     <td>${confPill(c.fmv_confidence)}</td>
-    <td class="wrap dim">${c.fmv_notes || '<span class="mute">—</span>'}</td>
+    <td class="wrap dim">${c.fmv_notes ? escapeHtml(c.fmv_notes) : '<span class="mute">—</span>'}</td>
   </tr>`).join("");
   el.innerHTML = `<div class="panel">
     <div class="panel-head">

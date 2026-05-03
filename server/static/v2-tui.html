@@ -408,9 +408,7 @@
 const REFRESH_MS = 30000;
 const params = new URLSearchParams(location.search);
 const DEMO = params.has("demo");
-// Default to the live proxy during preview so V2 sees real Mac Mini data.
-// Pass ?local=1 to hit the local /api/snipes instead.
-const SNIPES_URL = params.has("local") ? "/api/snipes" : "/api/snipes-proxy";
+const SNIPES_URL = "/api/snipes";
 const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
 
 // ---- demo fixture (used only when ?demo=1) ---------------------------------
@@ -577,7 +575,11 @@ function displayTitle(r) {
     || (r.comic_title && r.comic_issue != null ? `${r.comic_title} #${r.comic_issue}` : "—");
 }
 
-function attrEscape(s) {
+// Escape arbitrary text for safe inclusion in HTML — element content OR
+// quoted attribute values. Used everywhere we interpolate user-controlled
+// data (eBay titles, sellers, comic notes) into a template literal that
+// gets assigned to innerHTML.
+function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")
@@ -585,6 +587,7 @@ function attrEscape(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+const attrEscape = escapeHtml;  // back-compat alias
 
 function displayCondition(r) {
   const g = gradeLabel(r.comic_grade);
@@ -627,13 +630,13 @@ function renderActive(snipes) {
     const fullTitle = r.title || displayTitle(r);
     return `<tr class="${overbid?"overbid":""}" data-item-id="${r.item_id}">
       <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
-      <td class="title" title="${attrEscape(fullTitle)}">${displayTitle(r)}</td>
+      <td class="title" title="${escapeHtml(fullTitle)}">${escapeHtml(displayTitle(r))}</td>
       <td>${displayCondition(r)}</td>
       <td class="right num">${fmtUSD(r.current_bid)}</td>
       <td class="right num">${maxCell}</td>
       <td class="right num">${fmtFmv(r)}</td>
       <td class="right num">${timeCell}</td>
-      <td class="seller">${r.seller||"—"}<button class="remove-btn" data-item-id="${r.item_id}" aria-label="remove snipe">✕</button></td>
+      <td class="seller">${escapeHtml(r.seller||"—")}<button class="remove-btn" data-item-id="${r.item_id}" aria-label="remove snipe">✕</button></td>
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel">
@@ -659,13 +662,13 @@ function renderEnded(snipes) {
     const fullTitle = r.title || displayTitle(r);
     return `<tr>
       <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
-      <td class="title" title="${attrEscape(fullTitle)}">${displayTitle(r)}</td>
+      <td class="title" title="${escapeHtml(fullTitle)}">${escapeHtml(displayTitle(r))}</td>
       <td>${displayCondition(r)}</td>
       <td class="right num">${winning}</td>
       <td class="right num">${fmtUSD(r.max_bid)}</td>
       <td class="right num">${fmtFmv(r)}</td>
       <td>${statusPill(r)}</td>
-      <td class="seller">${r.seller||"—"}</td>
+      <td class="seller">${escapeHtml(r.seller||"—")}</td>
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel">
@@ -682,7 +685,7 @@ function renderEnded(snipes) {
 function renderFlags(snipes) {
   const flags = buildFlags(snipes);
   const el = document.getElementById("flags-container");
-  el.innerHTML = flags.length ? `<div class="flags"><h3>attention required</h3><ul>${flags.map(f=>`<li>${f}</li>`).join("")}</ul></div>` : "";
+  el.innerHTML = flags.length ? `<div class="flags"><h3>attention required</h3><ul>${flags.map(f=>`<li>${escapeHtml(f)}</li>`).join("")}</ul></div>` : "";
 }
 
 function setStatus(state, text) {
