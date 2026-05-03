@@ -164,7 +164,13 @@
     white-space: nowrap;
   }
 
-  td.title { white-space: normal; max-width: 360px; line-height: 1.4; color: var(--fg); }
+  td.title {
+    max-width: 380px;
+    color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   .right { text-align: right; }
   .num { font-variant-numeric: tabular-nums; }
@@ -489,11 +495,16 @@ function gradeLabel(g) {
 }
 
 function displayTitle(r) {
-  if (r.comic_title && r.comic_issue != null) {
-    return `${r.comic_title} #${r.comic_issue}`;
-  }
-  const t = r.title || r.comic_title || "—";
-  return t.length > 60 ? t.slice(0,59)+"…" : t;
+  return r.title
+    || (r.comic_title && r.comic_issue != null ? `${r.comic_title} #${r.comic_issue}` : "—");
+}
+
+function attrEscape(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function displayCondition(r) {
@@ -529,9 +540,10 @@ function renderActive(snipes) {
     const urgent = r.end_date_iso && (new Date(r.end_date_iso)-Date.now()) < 3600000;
     const timeCell = urgent ? `<span class="urgent-cell">${tl}</span>` : tl;
     const maxCell = overbid ? `<span class="warn-cell">▲ $${max.toFixed(2)}</span>` : fmtUSD(r.max_bid);
+    const fullTitle = r.title || displayTitle(r);
     return `<tr class="${overbid?"overbid":""}">
       <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
-      <td class="title">${displayTitle(r)}</td>
+      <td class="title" title="${attrEscape(fullTitle)}">${displayTitle(r)}</td>
       <td>${displayCondition(r)}</td>
       <td class="right num">${fmtUSD(r.current_bid)}</td>
       <td class="right num">${maxCell}</td>
@@ -560,9 +572,10 @@ function renderEnded(snipes) {
   }
   const rows = ended.map(r => {
     const winning = r.winning_bid != null ? `$${parseFloat(r.winning_bid).toFixed(2)}` : fmtUSD(r.current_bid);
+    const fullTitle = r.title || displayTitle(r);
     return `<tr>
       <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
-      <td class="title">${displayTitle(r)}</td>
+      <td class="title" title="${attrEscape(fullTitle)}">${displayTitle(r)}</td>
       <td>${displayCondition(r)}</td>
       <td class="right num">${winning}</td>
       <td class="right num">${fmtUSD(r.max_bid)}</td>
