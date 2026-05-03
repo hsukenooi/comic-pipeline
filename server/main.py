@@ -695,16 +695,18 @@ async def api_extract_comics():
         if parsed.issue is None:
             skipped.append({"item_id": item_id, "reason": "no issue extracted"})
             continue
-        if parsed.year is None:
-            skipped.append({"item_id": item_id, "reason": "no year extracted"})
-            continue
+
+        # year is required by the comics schema; use 0 as "unknown year"
+        # sentinel so we can still link by series+issue+grade. Affects only
+        # auto-extracted rows; manual flows still pass real years.
+        year_for_db = parsed.year if parsed.year is not None else 0
 
         try:
             comic_id = upsert_comic(
                 db,
                 title=parsed.series,
                 issue=parsed.issue,
-                year=parsed.year,
+                year=year_for_db,
                 grade=parsed.grade,
                 fmv_low=None,
                 fmv_high=None,
