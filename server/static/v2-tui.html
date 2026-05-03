@@ -195,6 +195,75 @@
   .warn-cell { color: var(--red); font-weight: 700; }
   .urgent-cell { color: var(--orange); font-weight: 700; }
 
+  /* inline-edit max_bid */
+  .editable-max {
+    cursor: pointer;
+    border-bottom: 1px dotted transparent;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .editable-max:hover { border-bottom-color: var(--fg-dim); }
+  .editable-max.editing { cursor: text; }
+  .editable-max.saving {
+    color: var(--yellow);
+    animation: pulse-saving 0.9s ease-in-out infinite;
+  }
+  .editable-max.saved {
+    color: var(--green);
+    transition: color 1.2s;
+  }
+  .editable-max.save-error { color: var(--red); }
+  @keyframes pulse-saving {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
+  .max-input {
+    width: 80px;
+    background: var(--bg-alt);
+    color: var(--fg);
+    border: 1px solid var(--blue);
+    border-radius: 3px;
+    padding: 1px 6px;
+    font: inherit;
+    text-align: right;
+    -moz-appearance: textfield;
+  }
+  .max-input::-webkit-outer-spin-button,
+  .max-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .max-input:focus { outline: none; border-color: var(--cyan); }
+
+  /* per-row remove control */
+  .remove-btn {
+    visibility: hidden;
+    margin-left: 8px;
+    padding: 0 6px;
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--fg-dim);
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    line-height: 18px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  tbody tr:hover .remove-btn { visibility: visible; }
+  .remove-btn:hover {
+    color: var(--red);
+    border-color: var(--red);
+    background: rgba(247,118,142,0.1);
+  }
+  .remove-btn.confirming {
+    visibility: visible;
+    color: var(--red);
+    border-color: var(--red);
+    background: rgba(247,118,142,0.18);
+    font-weight: 600;
+  }
+  tbody tr.removing { opacity: 0.4; transition: opacity 0.25s; }
+
   /* flags */
   .flags {
     background: rgba(224,175,104,0.06);
@@ -539,9 +608,14 @@ function renderActive(snipes) {
     const tl = r.end_date_iso ? timeLeft(r.end_date_iso) : (r.time_to_end||"—");
     const urgent = r.end_date_iso && (new Date(r.end_date_iso)-Date.now()) < 3600000;
     const timeCell = urgent ? `<span class="urgent-cell">${tl}</span>` : tl;
-    const maxCell = overbid ? `<span class="warn-cell">▲ $${max.toFixed(2)}</span>` : fmtUSD(r.max_bid);
+    const maxInner = overbid ? `<span class="warn-cell">▲ $${max.toFixed(2)}</span>` : fmtUSD(r.max_bid);
+    const maxCell = `<span class="editable-max" data-item-id="${r.item_id}" `
+      + `data-current-max="${parseFloat(r.max_bid)}" `
+      + `data-bid-offset="${r.bid_offset ?? 6}" `
+      + `data-snipe-group="${r.snipe_group ?? 0}" `
+      + `title="click to edit">${maxInner}</span>`;
     const fullTitle = r.title || displayTitle(r);
-    return `<tr class="${overbid?"overbid":""}">
+    return `<tr class="${overbid?"overbid":""}" data-item-id="${r.item_id}">
       <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
       <td class="title" title="${attrEscape(fullTitle)}">${displayTitle(r)}</td>
       <td>${displayCondition(r)}</td>
@@ -549,7 +623,7 @@ function renderActive(snipes) {
       <td class="right num">${maxCell}</td>
       <td class="right num">${fmtFmv(r)}</td>
       <td class="right num">${timeCell}</td>
-      <td class="seller">${r.seller||"—"}</td>
+      <td class="seller">${r.seller||"—"}<button class="remove-btn" data-item-id="${r.item_id}" aria-label="remove snipe">✕</button></td>
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel">
@@ -657,8 +731,160 @@ async function load() {
   }
 }
 
+// While a user-initiated edit/remove is in flight, skip the auto-refresh
+// tick so a stale Gixen pull can't clobber the optimistic value.
+let suppressRefresh = false;
+
+// ---- inline-edit max_bid -------------------------------------------------
+
+function startMaxEdit(cell) {
+  if (cell.classList.contains("editing") || cell.classList.contains("saving")) return;
+  const current = parseFloat(cell.dataset.currentMax);
+  cell.classList.add("editing");
+  cell.innerHTML = `<input type="number" step="0.01" min="0.01" value="${current.toFixed(2)}" class="max-input" autocomplete="off">`;
+  const input = cell.querySelector("input");
+  input.focus();
+  input.select();
+
+  const restore = () => {
+    cell.classList.remove("editing");
+    const m = parseFloat(cell.dataset.currentMax);
+    cell.innerHTML = `$${m.toFixed(2)}`;
+  };
+
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    if (!commit) { restore(); return; }
+    const val = parseFloat(input.value);
+    const current = parseFloat(cell.dataset.currentMax);
+    if (isNaN(val) || val <= 0 || val === current) { restore(); return; }
+    saveMaxBid(cell, val);
+  };
+
+  input.addEventListener("keydown", ev => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+async function saveMaxBid(cell, newMax) {
+  const itemId = cell.dataset.itemId;
+  const bidOffset = parseInt(cell.dataset.bidOffset, 10) || 6;
+  const snipeGroup = parseInt(cell.dataset.snipeGroup, 10) || 0;
+
+  cell.classList.remove("editing");
+  cell.classList.add("saving");
+  cell.innerHTML = `$${newMax.toFixed(2)}`;
+  suppressRefresh = true;
+
+  try {
+    const resp = await fetch(`/api/bids/${itemId}`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        max_bid: newMax,
+        bid_offset: bidOffset,
+        snipe_group: snipeGroup,
+      }),
+    });
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try { const j = await resp.json(); if (j.detail) detail = j.detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    cell.classList.remove("saving");
+    cell.classList.add("saved");
+    cell.dataset.currentMax = String(newMax);
+    setTimeout(() => cell.classList.remove("saved"), 1200);
+    suppressRefresh = false;
+    load();
+  } catch (e) {
+    cell.classList.remove("saving");
+    cell.classList.add("save-error");
+    const prev = parseFloat(cell.dataset.currentMax);
+    cell.innerHTML = `$${prev.toFixed(2)}`;
+    cell.title = `save failed: ${e.message}`;
+    setTimeout(() => {
+      cell.classList.remove("save-error");
+      cell.title = "click to edit";
+    }, 3500);
+    suppressRefresh = false;
+  }
+}
+
+// ---- per-row remove (two-click confirm) ----------------------------------
+
+function resetConfirms(except) {
+  document.querySelectorAll(".remove-btn.confirming").forEach(b => {
+    if (b === except) return;
+    b.classList.remove("confirming");
+    b.textContent = "✕";
+    if (b._confirmTimer) clearTimeout(b._confirmTimer);
+  });
+}
+
+async function confirmRemove(btn) {
+  const itemId = btn.dataset.itemId;
+  const tr = btn.closest("tr");
+  if (!tr) return;
+  tr.classList.add("removing");
+  suppressRefresh = true;
+  try {
+    const resp = await fetch(`/api/bids/${itemId}`, {method: "DELETE"});
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try { const j = await resp.json(); if (j.detail) detail = j.detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    tr.style.opacity = "0";
+    setTimeout(() => { suppressRefresh = false; load(); }, 250);
+  } catch (e) {
+    tr.classList.remove("removing");
+    btn.classList.remove("confirming");
+    btn.textContent = "✕";
+    btn.title = `remove failed: ${e.message}`;
+    setTimeout(() => { btn.title = "remove snipe"; }, 3500);
+    suppressRefresh = false;
+  }
+}
+
+document.addEventListener("click", e => {
+  // editable max cell
+  const cell = e.target.closest(".editable-max");
+  if (cell) {
+    if (!cell.classList.contains("editing") && !cell.classList.contains("saving")) {
+      startMaxEdit(cell);
+    }
+    return;
+  }
+
+  // remove button
+  const btn = e.target.closest(".remove-btn");
+  if (btn) {
+    resetConfirms(btn);
+    if (btn.classList.contains("confirming")) {
+      if (btn._confirmTimer) clearTimeout(btn._confirmTimer);
+      confirmRemove(btn);
+    } else {
+      btn.classList.add("confirming");
+      btn.textContent = "✕ remove?";
+      btn._confirmTimer = setTimeout(() => {
+        btn.classList.remove("confirming");
+        btn.textContent = "✕";
+      }, 5000);
+    }
+    return;
+  }
+
+  // click anywhere else cancels any pending confirmation
+  resetConfirms(null);
+});
+
 load();
-setInterval(load, REFRESH_MS);
+setInterval(() => { if (!suppressRefresh) load(); }, REFRESH_MS);
 </script>
 </body>
 </html>
