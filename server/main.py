@@ -369,17 +369,23 @@ async def _run_ebay_fallback() -> None:
         try:
             db = _get_db()
             now_iso = datetime.now(timezone.utc).isoformat()
-            # Includes both PENDING (auction ended but no terminal status
-            # captured yet) and ENDED (vanished from Gixen, flipped by
-            # _sync_gixen). Excludes PURGED / WON / LOST / FAILED. Once
-            # winning_bid is set the row exits this set.
+            # Two sets of rows need eBay resolution:
+            # 1. PENDING/ENDED — auction has ended, status not yet terminal.
+            # 2. PURGED — resolved without a winning_bid (e.g. bulk-purged
+            #    before eBay fallback ran). Limited to past 7 days; eBay stops
+            #    serving ended-listing data after a few days anyway.
             rows = db.execute(
                 """
-                SELECT item_id, max_bid FROM bids
+                SELECT item_id, max_bid, 0 AS is_purged FROM bids
                 WHERE status IN ('PENDING', 'ENDED')
                   AND auction_end_at IS NOT NULL
                   AND auction_end_at <= ?
                   AND winning_bid IS NULL
+                UNION ALL
+                SELECT item_id, max_bid, 1 AS is_purged FROM bids
+                WHERE status = 'PURGED'
+                  AND winning_bid IS NULL
+                  AND datetime(COALESCE(auction_end_at, resolved_at)) >= datetime('now', '-7 days')
                 """,
                 (now_iso,),
             ).fetchall()
@@ -390,11 +396,25 @@ async def _run_ebay_fallback() -> None:
             failures = 0
             for row in rows:
                 iid = row["item_id"]
+                is_purged = bool(row["is_purged"])
                 ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
                 if not ebay:
                     failures += 1
                     await asyncio.sleep(1.5)
                     continue
+
+                # Write title and end_date_iso for all rows regardless of
+                # status. update_bid_status / cache_gixen_data both skip
+                # PURGED rows, so use direct SQL here.
+                ebay_title = ebay.get("title") or None
+                ebay_end_iso = ebay.get("end_date_iso") or None
+                db.execute(
+                    "UPDATE bids SET "
+                    "ebay_title = COALESCE(?, ebay_title), "
+                    "auction_end_at = COALESCE(auction_end_at, ?) "
+                    "WHERE item_id = ?",
+                    (ebay_title, ebay_end_iso, iid),
+                )
 
                 final_amount: float | None = None
                 price = ebay.get("current_price")
@@ -403,6 +423,19 @@ async def _run_ebay_fallback() -> None:
                         final_amount = float(str(price).lstrip("$").strip())
                     except (ValueError, TypeError):
                         final_amount = None
+
+                if is_purged:
+                    if final_amount is not None and final_amount > 0:
+                        db.execute(
+                            "UPDATE bids SET winning_bid = ? WHERE item_id = ? AND status = 'PURGED'",
+                            (final_amount, iid),
+                        )
+                        logger.info(
+                            "_run_ebay_fallback: %s (purged) winning_bid=$%.2f",
+                            iid, final_amount,
+                        )
+                    await asyncio.sleep(1.5)
+                    continue
 
                 if final_amount is None or final_amount <= 0:
                     # eBay returns the high-water bid for reserve-not-met or
