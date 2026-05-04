@@ -450,7 +450,8 @@ class TestCliAddDuplicate:
         runner = CliRunner()
         existing_snipes = [{"item_id": "111222333", "max_bid": "465", "dbidid": "5001"}]
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value=None):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = existing_snipes
             mock_make.return_value = mock_client
@@ -469,7 +470,8 @@ class TestCliAddDuplicate:
         runner = CliRunner()
 
         with patch("cli._make_client") as mock_make, \
-             patch("cli._record_add") as mock_record:
+             patch("cli._record_add") as mock_record, \
+             patch("cli._server_url", return_value=None):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = []
             mock_make.return_value = mock_client
@@ -496,7 +498,8 @@ class TestCliListJson:
              "current_bid": "5.00 USD", "time_to_end": "1 h", "status": "SCHEDULED"},
         ]
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_request", return_value=snipes):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_make.return_value = mock_client
@@ -513,7 +516,8 @@ class TestCliListJson:
 
         runner = CliRunner()
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_request", return_value=[]):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = []
             mock_make.return_value = mock_client
@@ -545,7 +549,8 @@ class TestCliListAddedSince:
         ]
 
         with patch("cli._make_client") as mock_make, \
-             patch("cli._load_add_history", return_value=history):
+             patch("cli._load_add_history", return_value=history), \
+             patch("cli._server_request", return_value=snipes):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_make.return_value = mock_client
@@ -723,7 +728,8 @@ class TestCliPurge:
             _snipe("222", status="SCHEDULED", group="0"),
         ]
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value=None):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_make.return_value = mock_client
@@ -744,7 +750,8 @@ class TestCliPurge:
             _snipe("222", status="SCHEDULED", group="1"),
         ]
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value=None):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_make.return_value = mock_client
@@ -767,7 +774,8 @@ class TestCliPurge:
             _snipe("333", status="SCHEDULED", group="1"),
         ]
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value=None):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_make.return_value = mock_client
@@ -792,7 +800,8 @@ class TestCliPurge:
             _snipe("222", status="SCHEDULED", group="1", title="ASM #300 raw"),
         ]
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value=None):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_make.return_value = mock_client
@@ -813,7 +822,8 @@ class TestCliPurge:
         runner = CliRunner()
         snipes = [_snipe("111", status="WON", group="0")]
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value=None):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_make.return_value = mock_client
@@ -840,7 +850,8 @@ class TestCliPurge:
                 raise GixenError("network blew up")
             return True
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value=None):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_client.remove_snipe.side_effect = remove_side_effect
@@ -896,7 +907,8 @@ class TestCliListShowsGroup:
             },
         ]
 
-        with patch("cli._make_client") as mock_make:
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_request", return_value=snipes):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
             mock_make.return_value = mock_client
