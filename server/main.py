@@ -879,6 +879,7 @@ async def api_get_history():
           AND b.resolved_at IS NOT NULL
           AND datetime(b.resolved_at) >= datetime('now', '-7 days')
         )
+          AND (b.status != 'PURGED' OR b.winning_bid IS NOT NULL OR b.status_mirror IS NOT NULL)
         ORDER BY COALESCE(b.auction_end_at, b.resolved_at) DESC
     """).fetchall()
 
