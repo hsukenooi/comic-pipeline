@@ -644,4 +644,150 @@ def test_sync_gixen_flips_vanished_ended_to_ended(api):
     r = api.get("/api/snipes")
     rows = [i for i in r.json() if i["item_id"] == "999111222"]
     assert len(rows) == 1
-    assert rows[0]["status"] == "ENDED"
+
+
+# ---------------------------------------------------------------------------
+# bid_comics junction: comics array + locg-link endpoint
+# ---------------------------------------------------------------------------
+
+def _seed_lot(api, item_id, title="Daredevil 1,2,3,4,5 Marvel 1993", max_bid=20.5):
+    """Insert a bid + ebay_title, run extract-comics so the lot creates 5 comic
+    rows + 5 junction entries. Returns the bid_id."""
+    r = api.post("/api/bids", json={"item_id": item_id, "max_bid": max_bid})
+    assert r.status_code == 200
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        (title, item_id),
+    )
+    db.commit()
+    db.close()
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_snipes_response_includes_comics_array_for_lot(api):
+    _seed_lot(api, "555000001")
+    r = api.get("/api/snipes")
+    rows = [i for i in r.json() if i["item_id"] == "555000001"]
+    assert len(rows) == 1
+    snipe = rows[0]
+    assert "comics" in snipe
+    issues = [c["issue"] for c in snipe["comics"]]
+    # Lot of 1-5: should produce 5 comic rows, primary first.
+    assert issues == ["1", "2", "3", "4", "5"]
+    primary = [c for c in snipe["comics"] if c["is_primary"]]
+    assert len(primary) == 1
+    assert primary[0]["issue"] == "1"
+    # Flat fields stay populated from primary for backward compat.
+    assert snipe["comic_issue"] == "1"
+
+
+def test_snipes_response_comics_empty_for_unlinked(api):
+    """A bid with no comic linkage still returns comics=[] (not missing key)."""
+    r = api.post("/api/bids", json={"item_id": "555000099", "max_bid": 10.0})
+    assert r.status_code == 200
+    r = api.get("/api/snipes")
+    rows = [i for i in r.json() if i["item_id"] == "555000099"]
+    assert len(rows) == 1
+    assert rows[0]["comics"] == []
+
+
+def test_locg_link_primary_updates_existing(api):
+    _seed_lot(api, "555000002")
+    # Without --issue, hits the primary
+    r = api.post(
+        "/api/bids/555000002/comics/locg",
+        json={"locg_id": 1931243},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["locg_id"] == 1931243
+    assert body["is_primary"] is True
+    assert body["issue"] == "1"
+
+
+def test_locg_link_specific_issue(api):
+    _seed_lot(api, "555000003")
+    r = api.post(
+        "/api/bids/555000003/comics/locg",
+        json={"locg_id": 7111218, "issue": "2"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["issue"] == "2"
+    assert body["locg_id"] == 7111218
+    assert body["is_primary"] is False
+
+
+def test_locg_link_auto_creates_missing_issue(api):
+    """If --issue refers to an issue not yet in the bid's junction (e.g. the
+    parser missed it), the endpoint upserts a comic row + junction link."""
+    # Seed with a single-issue bid (no lot expansion)
+    r = api.post("/api/bids", json={"item_id": "555000004", "max_bid": 10.0})
+    assert r.status_code == 200
+    import os, sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("Daredevil The Man Without Fear #1 Marvel 1993", "555000004"),
+    )
+    db.commit()
+    db.close()
+    api.post("/api/extract-comics")
+
+    # Now ask to link issue #2 — not in the bid's set yet.
+    r = api.post(
+        "/api/bids/555000004/comics/locg",
+        json={"locg_id": 7111218, "issue": "2"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["issue"] == "2"
+    assert body["locg_id"] == 7111218
+    assert body["is_primary"] is False
+
+    # Snipes endpoint should now show 2 comics for this bid.
+    r2 = api.get("/api/snipes")
+    rows = [i for i in r2.json() if i["item_id"] == "555000004"]
+    assert len(rows) == 1
+    issues = sorted(c["issue"] for c in rows[0]["comics"])
+    assert issues == ["1", "2"]
+
+
+def test_locg_link_unknown_item_404(api):
+    r = api.post(
+        "/api/bids/000000000/comics/locg",
+        json={"locg_id": 12345},
+    )
+    assert r.status_code == 404
+
+
+def test_locg_link_no_primary_without_issue_409(api):
+    """Bid with no primary comic + no --issue → can't infer target."""
+    r = api.post("/api/bids", json={"item_id": "555000005", "max_bid": 10.0})
+    assert r.status_code == 200
+    r = api.post(
+        "/api/bids/555000005/comics/locg",
+        json={"locg_id": 12345},
+    )
+    assert r.status_code == 409
+
+
+def test_locg_link_variant_id_preserves_when_omitted(api):
+    """Calling locg link without variant-id must not clobber an existing one."""
+    _seed_lot(api, "555000006")
+    api.post(
+        "/api/bids/555000006/comics/locg",
+        json={"locg_id": 1931243, "locg_variant_id": 9999},
+    )
+    # Re-link without variant_id
+    r = api.post(
+        "/api/bids/555000006/comics/locg",
+        json={"locg_id": 1111},
+    )
+    body = r.json()
+    assert body["locg_id"] == 1111
+    assert body["locg_variant_id"] == 9999

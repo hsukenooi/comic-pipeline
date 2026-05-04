@@ -104,3 +104,65 @@ def test_single_issue_with_year_is_high_confidence():
     assert p.issue == "300"
     assert p.year == 1988
     assert p.confidence == "high"
+
+
+# ---------------------------------------------------------------------------
+# Multi-issue list / range support
+# ---------------------------------------------------------------------------
+
+def test_issues_field_populated_for_single():
+    p = parse_title("Amazing Spider-Man #300 1988")
+    assert p.issues == ["300"]
+
+
+def test_comma_run_returns_full_list():
+    t = "Daredevil The Man Without Fear 1,2,3,4,5 Marvel Comics 1993 Limited Series"
+    p = parse_title(t)
+    assert p.issues == ["1", "2", "3", "4", "5"]
+    assert p.issue == "1"
+    assert p.confidence == "low"
+
+
+def test_ampersand_pair_returns_both_issues():
+    t = "Batman The Dark Knight Returns # 1 & 3 First Prints - Miller story & art"
+    p = parse_title(t)
+    assert p.issues == ["1", "3"]
+    assert p.issue == "1"
+
+
+def test_hash_range_expands_full_run():
+    t = "Akira #1-9 Marvel Epic Comics 1988 1st Prints Hardcover"
+    p = parse_title(t)
+    assert p.issues == ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    assert p.year == 1988
+
+
+def test_bare_range_expands():
+    t = "Sandman 1-10 DC Vertigo 1989"
+    p = parse_title(t)
+    # Range should expand to issues 1..10
+    assert p.issues == [str(i) for i in range(1, 11)]
+
+
+def test_year_range_not_treated_as_issue_range():
+    """A '2010-2019' span must not be mistaken for issues 2010-2019.
+
+    The series cleaner happens to also strip these out, so we just need to
+    confirm we don't hallucinate 10 issues with year-shaped numbers.
+    """
+    t = "Walking Dead 2010-2019 complete series Image Comics"
+    p = parse_title(t)
+    # Either no issue extracted or a single sane issue — never a 10-element
+    # year list.
+    if p.issues:
+        for issue in p.issues:
+            assert int(issue) < 1900, f"Issue {issue} looks like a year"
+
+
+def test_huge_range_rejected():
+    """'#1-200' is suspicious — likely a range marker, not the literal 200 issues."""
+    t = "Some Series #1-200 lot"
+    p = parse_title(t)
+    # Range > 50 → reject; either no issues or fall through to a different match.
+    if p.issues:
+        assert len(p.issues) <= 1 or len(p.issues) <= 50

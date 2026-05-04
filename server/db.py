@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS bids (
 );
 
 CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+
+CREATE TABLE IF NOT EXISTS bid_comics (
+    bid_id     INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+    comic_id   INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bid_id, comic_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bid_comics_bid ON bid_comics(bid_id);
 """
 
 
@@ -73,6 +82,16 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             # should not be silently swallowed.
             if "duplicate column" not in str(e).lower():
                 raise
+
+    # Backfill bid_comics from existing bids.comic_id values. INSERT OR IGNORE
+    # makes this idempotent — re-running on an already-migrated DB is a no-op.
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO bid_comics (bid_id, comic_id, is_primary)
+        SELECT id, comic_id, 1 FROM bids WHERE comic_id IS NOT NULL
+        """
+    )
+    conn.commit()
 
 
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -159,6 +178,67 @@ def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | 
     return conn.execute(
         "SELECT * FROM bids WHERE item_id=? ORDER BY id DESC LIMIT 1",
         (item_id,),
+    ).fetchone()
+
+
+def link_comic_to_bid(
+    conn: sqlite3.Connection,
+    bid_id: int,
+    comic_id: int,
+    is_primary: bool = False,
+) -> None:
+    """Add a comic to a bid's set. If is_primary, demote any prior primary,
+    promote this one, and mirror to bids.comic_id (backward-compat pointer).
+    Idempotent: re-running with the same args is a no-op aside from primary
+    bookkeeping."""
+    if is_primary:
+        conn.execute(
+            "UPDATE bid_comics SET is_primary=0 WHERE bid_id=? AND comic_id != ?",
+            (bid_id, comic_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO bid_comics (bid_id, comic_id, is_primary)
+            VALUES (?, ?, 1)
+            ON CONFLICT(bid_id, comic_id) DO UPDATE SET is_primary = 1
+            """,
+            (bid_id, comic_id),
+        )
+        conn.execute("UPDATE bids SET comic_id=? WHERE id=?", (comic_id, bid_id))
+    else:
+        conn.execute(
+            "INSERT OR IGNORE INTO bid_comics (bid_id, comic_id, is_primary) VALUES (?, ?, 0)",
+            (bid_id, comic_id),
+        )
+    conn.commit()
+
+
+def get_comics_for_bid(conn: sqlite3.Connection, bid_id: int) -> list[sqlite3.Row]:
+    """All comics linked to a bid, primary first, then by numeric issue order."""
+    return conn.execute(
+        """
+        SELECT c.*, bc.is_primary
+        FROM bid_comics bc
+        JOIN comics c ON c.id = bc.comic_id
+        WHERE bc.bid_id = ?
+        ORDER BY bc.is_primary DESC,
+                 CAST(c.issue AS INTEGER),
+                 c.issue
+        """,
+        (bid_id,),
+    ).fetchall()
+
+
+def get_primary_comic_for_bid(conn: sqlite3.Connection, bid_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT c.*
+        FROM bid_comics bc
+        JOIN comics c ON c.id = bc.comic_id
+        WHERE bc.bid_id = ? AND bc.is_primary = 1
+        LIMIT 1
+        """,
+        (bid_id,),
     ).fetchone()
 
 

@@ -24,6 +24,7 @@ from server.db import (
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
+    link_comic_to_bid, get_comics_for_bid, get_primary_comic_for_bid,
 )
 from server.title_parser import parse_title
 import ebay_bidder
@@ -608,6 +609,12 @@ class PurgeRequest(BaseModel):
         return v
 
 
+class LocgLinkRequest(BaseModel):
+    locg_id: int
+    locg_variant_id: int | None = None
+    issue: str | None = None  # if set, target a specific issue within a lot
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -760,6 +767,38 @@ async def api_get_snipes():
         ORDER BY b.added_at DESC
     """).fetchall()
 
+    # Second query: every comic linked via bid_comics, keyed by bid_id. This
+    # gives us the full lot-aware view (1 bid → N comics) without disturbing
+    # the flat fields above (still populated from the primary via bids.comic_id).
+    bid_ids = [r["id"] for r in rows]
+    comics_by_bid: dict[int, list[dict]] = {bid_id: [] for bid_id in bid_ids}
+    if bid_ids:
+        placeholders = ",".join("?" * len(bid_ids))
+        comic_rows = db.execute(
+            f"""
+            SELECT bc.bid_id, bc.is_primary, c.id AS comic_id,
+                   c.title, c.issue, c.year, c.grade,
+                   c.locg_id, c.locg_variant_id
+            FROM bid_comics bc
+            JOIN comics c ON c.id = bc.comic_id
+            WHERE bc.bid_id IN ({placeholders})
+            ORDER BY bc.bid_id, bc.is_primary DESC,
+                     CAST(c.issue AS INTEGER), c.issue
+            """,
+            bid_ids,
+        ).fetchall()
+        for cr in comic_rows:
+            comics_by_bid[cr["bid_id"]].append({
+                "comic_id": cr["comic_id"],
+                "title": cr["title"],
+                "issue": cr["issue"],
+                "year": cr["year"],
+                "grade": cr["grade"],
+                "locg_id": cr["locg_id"],
+                "locg_variant_id": cr["locg_variant_id"],
+                "is_primary": bool(cr["is_primary"]),
+            })
+
     result = []
     for row in rows:
         item = dict(row)
@@ -793,6 +832,7 @@ async def api_get_snipes():
             "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
+            "comics": comics_by_bid.get(item["id"], []),
         })
 
     return result
@@ -855,6 +895,97 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                 detail=f"Item {item_id} not in DB after sync — Gixen state unexpectedly empty",
             )
     return dict(row)
+
+
+@app.post("/api/bids/{item_id}/comics/locg")
+async def api_link_locg(item_id: str, req: LocgLinkRequest):
+    """Persist a resolved LOCG ID against a specific comic in a bid's set.
+
+    Without `issue`: target the bid's primary comic (`bids.comic_id`).
+    With `issue`: find a comic in the bid's junction matching that issue;
+    if missing (e.g., the parser only created issue 1 for a 5-issue lot),
+    auto-upsert one using the primary's series/year and link as non-primary.
+    """
+    if not re.match(r"^\d+$", item_id):
+        raise HTTPException(status_code=422, detail="item_id must be numeric")
+    db = _get_db()
+
+    bid_row = get_bid_by_item_id(db, item_id)
+    if bid_row is None:
+        raise HTTPException(status_code=404, detail=f"Item {item_id} not in DB")
+
+    target_comic_id: int | None = None
+
+    if req.issue is not None:
+        # Look for an existing comic at this issue in the bid's junction set.
+        match = db.execute(
+            """
+            SELECT c.id
+            FROM bid_comics bc
+            JOIN comics c ON c.id = bc.comic_id
+            WHERE bc.bid_id = ? AND c.issue = ?
+            LIMIT 1
+            """,
+            (bid_row["id"], req.issue),
+        ).fetchone()
+        if match:
+            target_comic_id = match["id"]
+        else:
+            # Auto-create: copy series/year from primary, leave grade/FMV null
+            # (we don't know per-issue grades for ad-hoc lot expansions).
+            primary = get_primary_comic_for_bid(db, bid_row["id"])
+            if primary is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Bid {item_id} has no primary comic; cannot infer series/year "
+                        "for auto-create. Run extract-comics first or use cli.py add."
+                    ),
+                )
+            target_comic_id = upsert_comic(
+                db,
+                title=primary["title"],
+                issue=req.issue,
+                year=primary["year"],
+                grade=None,
+                fmv_low=None,
+                fmv_high=None,
+                fmv_comps=None,
+                fmv_confidence=None,
+                fmv_notes="auto-linked via locg-link",
+            )
+            link_comic_to_bid(db, bid_row["id"], target_comic_id, is_primary=False)
+    else:
+        if bid_row["comic_id"] is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Bid {item_id} has no primary comic. Pass --issue to target a "
+                    "specific issue or run extract-comics first."
+                ),
+            )
+        target_comic_id = bid_row["comic_id"]
+
+    # Update locg_id (and locg_variant_id if provided). COALESCE on the
+    # variant so callers that omit it don't clobber an existing value.
+    db.execute(
+        """
+        UPDATE comics
+        SET locg_id = ?,
+            locg_variant_id = COALESCE(?, locg_variant_id)
+        WHERE id = ?
+        """,
+        (req.locg_id, req.locg_variant_id, target_comic_id),
+    )
+    db.commit()
+
+    row = db.execute(
+        "SELECT id AS comic_id, title, issue, year, grade, locg_id, locg_variant_id "
+        "FROM comics WHERE id = ?",
+        (target_comic_id,),
+    ).fetchone()
+    is_primary = (target_comic_id == bid_row["comic_id"])
+    return {**dict(row), "is_primary": is_primary}
 
 
 @app.delete("/api/bids/{item_id}")
@@ -966,7 +1097,8 @@ async def api_extract_comics():
         if not parsed.series:
             skipped.append({"item_id": item_id, "reason": "no series extracted"})
             continue
-        if parsed.issue is None:
+        issues = parsed.issues or ([parsed.issue] if parsed.issue else [])
+        if not issues:
             skipped.append({"item_id": item_id, "reason": "no issue extracted"})
             continue
 
@@ -980,23 +1112,22 @@ async def api_extract_comics():
             continue
 
         try:
-            comic_id = upsert_comic(
-                db,
-                title=parsed.series,
-                issue=parsed.issue,
-                year=parsed.year,
-                grade=parsed.grade,
-                fmv_low=None,
-                fmv_high=None,
-                fmv_comps=None,
-                fmv_confidence=None,
-                fmv_notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
-            )
-            db.execute(
-                "UPDATE bids SET comic_id=? WHERE id=? AND comic_id IS NULL",
-                (comic_id, row["id"]),
-            )
-            db.commit()
+            # Upsert one comic row per issue. First issue becomes primary;
+            # mirror to bids.comic_id via link_comic_to_bid(is_primary=True).
+            for idx, issue in enumerate(issues):
+                comic_id = upsert_comic(
+                    db,
+                    title=parsed.series,
+                    issue=issue,
+                    year=parsed.year,
+                    grade=parsed.grade,
+                    fmv_low=None,
+                    fmv_high=None,
+                    fmv_comps=None,
+                    fmv_confidence=None,
+                    fmv_notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
+                )
+                link_comic_to_bid(db, row["id"], comic_id, is_primary=(idx == 0))
             linked += 1
         except Exception as e:
             errors.append({"item_id": item_id, "error": f"link failed: {e}"})

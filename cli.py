@@ -371,6 +371,59 @@ def edit(item_id: str, max_bid: str, offset: int, group: int,
         sys.exit(1)
 
 
+@cli.group("locg")
+def locg_cmd():
+    """Manage LOCG (League of Comic Geeks) ID linking on existing snipes."""
+
+
+@locg_cmd.command("link")
+@click.argument("item_id")
+@click.argument("locg_id", type=int)
+@click.option(
+    "--issue",
+    default=None,
+    help="Specific issue within a lot (e.g. '2' for the 2nd issue of a 5-issue lot). "
+    "Without this flag the bid's primary comic is updated.",
+)
+@click.option(
+    "--variant-id",
+    default=None,
+    type=int,
+    help="LOCG variant comic ID (if different from locg-id)",
+)
+def locg_link(item_id: str, locg_id: int, issue: str | None, variant_id: int | None):
+    """Persist a resolved LOCG ID against a comic in a bid.
+
+    Without --issue: targets the bid's primary comic. With --issue N: targets
+    that issue within the bid; auto-creates the comic row + junction entry if
+    the parser hadn't expanded the lot to that issue yet.
+    """
+    if not _server_url():
+        click.echo(
+            "Error: GIXEN_SERVER_URL must be set — locg link is server-only.",
+            err=True,
+        )
+        sys.exit(1)
+
+    payload: dict = {"locg_id": locg_id}
+    if issue is not None:
+        payload["issue"] = issue
+    if variant_id is not None:
+        payload["locg_variant_id"] = variant_id
+
+    resp = _server_request(
+        "post", f"/api/bids/{item_id}/comics/locg", json=payload
+    )
+    if not isinstance(resp, dict):  # safety: server should return a dict
+        click.echo(f"Unexpected server response: {resp}", err=True)
+        sys.exit(1)
+    issue_str = resp.get("issue") or "?"
+    is_primary = "primary" if resp.get("is_primary") else "secondary"
+    click.echo(
+        f"Linked LOCG {resp['locg_id']} to {item_id} #{issue_str} ({is_primary})"
+    )
+
+
 @cli.command("group")
 @click.argument("group_n", type=click.IntRange(0, 10))
 @click.argument("item_ids", nargs=-1, required=True)
