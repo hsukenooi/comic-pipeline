@@ -319,6 +319,12 @@ function statusPill(r) {
   if (s.startsWith("BID UNDER")||s==="OUTBID"||s==="LOST"||sm.startsWith("BID UNDER")||sm==="OUTBID"||sm==="LOST") return '<span class="pill lost">outbid</span>';
   if (s.startsWith("NETWORK ERROR")||sm.startsWith("NETWORK ERROR")) return '<span class="pill err">net err</span>';
   if (s==="PENDING") return '<span class="pill pending">pending</span>';
+  if (s==="PURGED") {
+    const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
+    const m = parseAmt(r.max_bid);
+    if (w != null && m != null) return w <= m ? '<span class="pill won">won</span>' : '<span class="pill lost">outbid</span>';
+    return '<span class="pill lost">—</span>';
+  }
   return `<span class="pill lost">${(r.status||"—").toLowerCase()}</span>`;
 }
 

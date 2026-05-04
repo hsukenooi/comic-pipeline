@@ -837,10 +837,16 @@ async def api_get_history():
                c.locg_id, c.locg_variant_id
         FROM bids b
         LEFT JOIN comics c ON b.comic_id = c.id
-        WHERE b.auction_end_at IS NOT NULL
-          AND b.auction_end_at <= datetime('now')
-          AND b.auction_end_at >= datetime('now', '-7 days')
-        ORDER BY b.auction_end_at DESC
+        WHERE (
+          b.auction_end_at IS NOT NULL
+          AND datetime(b.auction_end_at) <= datetime('now')
+          AND datetime(b.auction_end_at) >= datetime('now', '-7 days')
+        ) OR (
+          b.auction_end_at IS NULL
+          AND b.resolved_at IS NOT NULL
+          AND datetime(b.resolved_at) >= datetime('now', '-7 days')
+        )
+        ORDER BY COALESCE(b.auction_end_at, b.resolved_at) DESC
     """).fetchall()
 
     result = []
