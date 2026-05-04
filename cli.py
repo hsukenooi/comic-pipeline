@@ -115,15 +115,7 @@ def list_snipes(as_json: bool, added_since: datetime | None):
         click.echo("No snipes found.")
         return
 
-    # Bucket by status when the server returned a terminal one (server-mode
-    # /api/snipes returns WON/LOST/FAILED/ENDED rows for the dashboard's
-    # "Recently Ended" section). Fall back to time_to_end for rows that lack
-    # a terminal status — matches direct-Gixen-mode where we only get the
-    # relative time string.
-    _TERMINAL = {"WON", "LOST", "FAILED", "ENDED"}
     def _is_ended(s: dict) -> bool:
-        if (s.get("status") or "").upper() in _TERMINAL:
-            return True
         return (s.get("time_to_end") or "").upper() == "ENDED"
 
     active = [s for s in snipes if not _is_ended(s)]
@@ -157,17 +149,12 @@ def list_snipes(as_json: bool, added_since: datetime | None):
         for s in ended:
             winning = s.get("current_bid", "")
             max_bid = s.get("max_bid", "")
-            mirror = s.get("status_mirror", "")
-            status_display = s.get("status", "")
-            if mirror and mirror not in ("N/A", status_display):
-                status_display += f" / mirror: {mirror}"
             click.echo(
                 f"  {s['item_id']:<17} "
                 f"{s.get('title', '')[:38]:<40} "
                 f"{_format_bid(winning):>10} "
                 f"{_format_bid(max_bid):>10} "
                 f"{_format_group(s.get('snipe_group', '')):>3} "
-                f"{status_display}"
             )
         click.echo()
 

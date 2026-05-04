@@ -313,20 +313,15 @@ const isEnded = r => r.end_date_iso ? new Date(r.end_date_iso) <= Date.now() : (
 const parseAmt = s => { if (s==null) return null; const n = parseFloat(String(s).replace(/[^0-9.]/g,"")); return isNaN(n) ? null : n; };
 const fmtUSD = s => { const n = parseAmt(s); return n != null ? `$${n.toFixed(2)}` : "—"; };
 
-function statusPill(r) {
-  const s = (r.status||"").toUpperCase(), sm = (r.status_mirror||"").toUpperCase();
-  if (s.includes("WON")||sm.includes("WON")) return '<span class="pill won">won</span>';
-  if (s.startsWith("BID UNDER")||s==="OUTBID"||s==="LOST"||sm.startsWith("BID UNDER")||sm==="OUTBID"||sm==="LOST") return '<span class="pill lost">outbid</span>';
-  if (s.startsWith("NETWORK ERROR")||sm.startsWith("NETWORK ERROR")) return '<span class="pill err">net err</span>';
-  if (s==="PENDING") return '<span class="pill pending">pending</span>';
-  if (s==="PURGED") {
-    const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
-    const m = parseAmt(r.max_bid);
-    if (w != null && m != null) return w <= m ? '<span class="pill won">won</span>' : '<span class="pill lost">outbid</span>';
-    if (r.local_snipe_result) return '<span class="pill err">missed</span>';
-    return '<span class="pill lost">—</span>';
-  }
-  return `<span class="pill lost">${(r.status||"—").toLowerCase()}</span>`;
+function outcome(r) {
+  if (r.status === "PENDING") return '<span class="pill pending">pending</span>';
+  const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
+  const m = parseAmt(r.max_bid);
+  if (w != null && m != null) return w <= m
+    ? '<span class="pill won">won</span>'
+    : '<span class="pill lost">outbid</span>';
+  if (r.local_snipe_result) return '<span class="pill err">missed</span>';
+  return '<span class="mute">—</span>';
 }
 
 function gradeLabel(g) {
@@ -385,9 +380,6 @@ function buildFlags(snipes) {
     if (!isEnded(r)) {
       const cur = parseAmt(r.current_bid), max = parseAmt(r.max_bid);
       if (cur!=null && max!=null && cur>=max) lines.push(`#${r.item_id} "${displayTitle(r)}" — current $${cur.toFixed(2)} ≥ max $${max.toFixed(2)}. raise or cancel?`);
-    } else {
-      const s = (r.status||"").toUpperCase(), sm = (r.status_mirror||"").toUpperCase();
-      if (s.startsWith("NETWORK ERROR") && sm.startsWith("NETWORK ERROR")) lines.push(`#${r.item_id} "${displayTitle(r)}" — bid failed on main+mirror. re-snipe if relisted.`);
     }
   }
   return lines;
@@ -452,7 +444,7 @@ function renderEnded(history) {
       <td class="right num">${winning}</td>
       <td class="right num">${fmtUSD(r.max_bid)}</td>
       <td class="right num">${fmtFmv(r)}</td>
-      <td>${statusPill(r)}</td>
+      <td>${outcome(r)}</td>
       <td class="seller">${escapeHtml(r.seller||"—")}</td>
     </tr>`;
   }).join("");
