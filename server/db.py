@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS comics (
     fmv_confidence  TEXT CHECK(fmv_confidence IN ('high', 'medium', 'low') OR fmv_confidence IS NULL),
     fmv_notes       TEXT,
     fmv_updated_at  TEXT,
+    locg_id         INTEGER,
+    locg_variant_id INTEGER,
     created_at      TEXT DEFAULT (datetime('now')),
     UNIQUE(title, issue, year, grade)
 );
@@ -34,10 +36,12 @@ CREATE TABLE IF NOT EXISTS bids (
     status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED')),
     winning_bid     REAL,
     seller          TEXT,
-    auction_end_at  TEXT,
-    notes           TEXT,
-    added_at        TEXT DEFAULT (datetime('now')),
-    resolved_at     TEXT
+    auction_end_at      TEXT,
+    local_snipe_at      TEXT,
+    local_snipe_result  TEXT,
+    notes               TEXT,
+    added_at            TEXT DEFAULT (datetime('now')),
+    resolved_at         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
@@ -45,10 +49,16 @@ CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
 
 
 _COLUMN_MIGRATIONS = [
+    # bids columns added since the original schema
     "ALTER TABLE bids ADD COLUMN ebay_title TEXT",
     "ALTER TABLE bids ADD COLUMN status_mirror TEXT",
     "ALTER TABLE bids ADD COLUMN cached_current_bid TEXT",
     "ALTER TABLE bids ADD COLUMN cached_at TEXT",
+    "ALTER TABLE bids ADD COLUMN local_snipe_at TEXT",
+    "ALTER TABLE bids ADD COLUMN local_snipe_result TEXT",
+    # comics columns added since the original schema
+    "ALTER TABLE comics ADD COLUMN locg_id INTEGER",
+    "ALTER TABLE comics ADD COLUMN locg_variant_id INTEGER",
 ]
 
 
@@ -93,23 +103,29 @@ def upsert_comic(
     fmv_comps: int | None,
     fmv_confidence: str | None,
     fmv_notes: str | None,
+    locg_id: int | None = None,
+    locg_variant_id: int | None = None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
         INSERT INTO comics (title, issue, year, grade, fmv_low, fmv_high,
-                            fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            fmv_comps, fmv_confidence, fmv_notes, fmv_updated_at,
+                            locg_id, locg_variant_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(title, issue, year, grade) DO UPDATE SET
-            fmv_low         = excluded.fmv_low,
-            fmv_high        = excluded.fmv_high,
-            fmv_comps       = excluded.fmv_comps,
-            fmv_confidence  = excluded.fmv_confidence,
-            fmv_notes       = excluded.fmv_notes,
-            fmv_updated_at  = excluded.fmv_updated_at
+            fmv_low         = COALESCE(excluded.fmv_low,        fmv_low),
+            fmv_high        = COALESCE(excluded.fmv_high,       fmv_high),
+            fmv_comps       = COALESCE(excluded.fmv_comps,      fmv_comps),
+            fmv_confidence  = COALESCE(excluded.fmv_confidence, fmv_confidence),
+            fmv_notes       = COALESCE(excluded.fmv_notes,      fmv_notes),
+            fmv_updated_at  = CASE WHEN excluded.fmv_low IS NOT NULL THEN excluded.fmv_updated_at ELSE fmv_updated_at END,
+            locg_id         = COALESCE(excluded.locg_id,         locg_id),
+            locg_variant_id = COALESCE(excluded.locg_variant_id, locg_variant_id)
         """,
         (title, issue, year, grade, fmv_low, fmv_high,
-         fmv_comps, fmv_confidence, fmv_notes, now),
+         fmv_comps, fmv_confidence, fmv_notes, now,
+         locg_id, locg_variant_id),
     )
     conn.commit()
     row = conn.execute(
@@ -223,6 +239,33 @@ def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     conn.commit()
 
 
+def list_comics(
+    conn: sqlite3.Connection,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+) -> list[sqlite3.Row]:
+    clauses, params = [], []
+    if title is not None:
+        clauses.append("LOWER(title) = LOWER(?)")
+        params.append(title)
+    if issue is not None:
+        clauses.append("issue = ?")
+        params.append(issue)
+    if year is not None:
+        clauses.append("year = ?")
+        params.append(year)
+    if grade is not None:
+        clauses.append("grade = ?")
+        params.append(grade)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return conn.execute(
+        f"SELECT * FROM comics {where} ORDER BY id",
+        params,
+    ).fetchall()
+
+
 def get_all_bids(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM bids ORDER BY added_at DESC").fetchall()
 
@@ -240,5 +283,40 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     conn.execute(
         f"UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id IN ({placeholders})",
         [now, *item_ids],
+    )
+    conn.commit()
+
+
+def set_auction_end_time(conn: sqlite3.Connection, item_id: str, end_time_iso: str) -> None:
+    conn.execute(
+        "UPDATE bids SET auction_end_at=? WHERE item_id=? AND status='PENDING'",
+        (end_time_iso, item_id),
+    )
+    conn.commit()
+
+
+def get_bids_ready_to_snipe(conn: sqlite3.Connection, now_iso: str) -> list[sqlite3.Row]:
+    """Return PENDING bids whose fire time (auction_end_at - bid_offset) has arrived."""
+    return conn.execute(
+        """
+        SELECT * FROM bids
+        WHERE status = 'PENDING'
+          AND local_snipe_at IS NULL
+          AND auction_end_at IS NOT NULL
+          AND datetime(auction_end_at, '-' || bid_offset || ' seconds') <= datetime(?)
+        """,
+        (now_iso,),
+    ).fetchall()
+
+
+def set_local_snipe_result(
+    conn: sqlite3.Connection,
+    item_id: str,
+    fired_at: str,
+    result: str,
+) -> None:
+    conn.execute(
+        "UPDATE bids SET local_snipe_at=?, local_snipe_result=? WHERE item_id=? AND status='PENDING'",
+        (fired_at, result, item_id),
     )
     conn.commit()

@@ -13,6 +13,8 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
+import asyncio
+
 import requests
 
 from gixen_client import (
@@ -22,6 +24,7 @@ from gixen_client import (
     GixenSnipeNotFoundError,
     find_sibling_cleanup_targets,
 )
+import ebay_bidder
 
 load_dotenv()
 
@@ -148,20 +151,23 @@ def list_snipes(as_json: bool, added_since: datetime | None):
         click.echo(click.style(f"Recently Ended ({len(ended)})", bold=True))
         click.echo(
             f"  {'Item':<17} {'Title':<40} {'Winning':>10} {'Max Bid':>10} "
-            f"{'Grp':>3} {'Diff':>10}"
+            f"{'Grp':>3} {'Status'}"
         )
         click.echo("  " + "-" * 99)
         for s in ended:
             winning = s.get("current_bid", "")
             max_bid = s.get("max_bid", "")
-            diff = _calc_diff(max_bid, winning)
+            mirror = s.get("status_mirror", "")
+            status_display = s.get("status", "")
+            if mirror and mirror not in ("N/A", status_display):
+                status_display += f" / mirror: {mirror}"
             click.echo(
                 f"  {s['item_id']:<17} "
                 f"{s.get('title', '')[:38]:<40} "
                 f"{_format_bid(winning):>10} "
                 f"{_format_bid(max_bid):>10} "
                 f"{_format_group(s.get('snipe_group', '')):>3} "
-                f"{diff:>10}"
+                f"{status_display}"
             )
         click.echo()
 
@@ -238,10 +244,13 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.option("--fmv-comps", default=None, type=int, help="Number of comps used")
 @click.option("--fmv-confidence", default=None, help="FMV confidence: high/medium/low")
 @click.option("--fmv-notes", default=None, help="FMV notes")
+@click.option("--locg-id", default=None, type=int, help="LOCG canonical comic ID")
+@click.option("--locg-variant-id", default=None, type=int, help="LOCG variant comic ID (if different from --locg-id)")
 def add(item_id: str, max_bid: str, offset: int, group: int,
         comic: str | None, issue: str | None, year: int | None, grade: float | None,
         fmv_low: float | None, fmv_high: float | None,
-        fmv_comps: int | None, fmv_confidence: str | None, fmv_notes: str | None):
+        fmv_comps: int | None, fmv_confidence: str | None, fmv_notes: str | None,
+        locg_id: int | None, locg_variant_id: int | None):
     """Add a snipe for an eBay item."""
     try:
         bid = Decimal(max_bid)
@@ -262,6 +271,7 @@ def add(item_id: str, max_bid: str, offset: int, group: int,
                 "grade": grade, "fmv_low": fmv_low, "fmv_high": fmv_high,
                 "fmv_comps": fmv_comps, "fmv_confidence": fmv_confidence,
                 "fmv_notes": fmv_notes,
+                "locg_id": locg_id, "locg_variant_id": locg_variant_id,
             })
         _server_request("post", "/api/bids", json=payload)
         _record_add(item_id)
@@ -324,7 +334,10 @@ def add(item_id: str, max_bid: str, offset: int, group: int,
 @click.argument("max_bid")
 @click.option("--offset", default=6, help="Seconds before end to place bid (1-15)")
 @click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
-def edit(item_id: str, max_bid: str, offset: int, group: int):
+@click.option("--locg-id", default=None, type=int, help="LOCG canonical comic ID")
+@click.option("--locg-variant-id", default=None, type=int, help="LOCG variant comic ID (if different from --locg-id)")
+def edit(item_id: str, max_bid: str, offset: int, group: int,
+         locg_id: int | None, locg_variant_id: int | None):
     """Change the bid on an existing snipe."""
     try:
         bid = Decimal(max_bid)
@@ -333,8 +346,16 @@ def edit(item_id: str, max_bid: str, offset: int, group: int):
         sys.exit(1)
 
     if _server_url():
-        _server_request("patch", f"/api/bids/{item_id}",
-                        json={"max_bid": float(bid), "bid_offset": offset, "snipe_group": group})
+        payload = {
+            "max_bid": float(bid),
+            "bid_offset": offset,
+            "snipe_group": group,
+        }
+        if locg_id is not None:
+            payload["locg_id"] = locg_id
+        if locg_variant_id is not None:
+            payload["locg_variant_id"] = locg_variant_id
+        _server_request("patch", f"/api/bids/{item_id}", json=payload)
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
         return
 
@@ -575,6 +596,31 @@ def _record_add(item_id: str) -> None:
     history = _load_add_history()
     history[item_id] = datetime.now(timezone.utc).timestamp()
     HISTORY_FILE.write_text(json.dumps(history))
+
+
+@cli.command("ebay-auth")
+def ebay_auth():
+    """Open a browser window to log in to eBay and save the session locally."""
+    click.echo("Opening eBay login — sign in, then press Enter in this terminal.")
+    asyncio.run(ebay_bidder.setup_session())
+
+
+@cli.command("bid")
+@click.argument("item_id")
+@click.argument("max_bid", type=float)
+@click.option("--dry-run", is_flag=True, help="Load bid page but don't click confirm.")
+def bid_now(item_id: str, max_bid: float, dry_run: bool):
+    """Place an eBay bid immediately via local browser automation."""
+    if not item_id.isdigit():
+        click.echo("Error: item_id must be numeric", err=True)
+        sys.exit(1)
+    click.echo(f"Placing bid: item={item_id} max_bid=${max_bid:.2f}{' (dry run)' if dry_run else ''}")
+    result = asyncio.run(ebay_bidder.place_bid(item_id, max_bid, dry_run=dry_run))
+    if result["success"]:
+        click.echo(click.style(f"✓ {result['message']}", fg="green"))
+    else:
+        click.echo(click.style(f"✗ {result['message']}", fg="red"))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

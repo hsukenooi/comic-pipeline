@@ -8,10 +8,11 @@ import re
 import sqlite3
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -19,11 +20,13 @@ from pydantic import BaseModel, field_validator
 
 from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
 from server.db import (
-    DB_PATH, init_db, upsert_comic, insert_bid, get_bid_by_item_id,
+    DB_PATH, init_db, upsert_comic, list_comics, insert_bid, get_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged, cache_gixen_data,
+    set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
 )
 from server.title_parser import parse_title
+import ebay_bidder
 
 # Import eBay helpers from the sibling project. Path is overridable via
 # EBAY_CLI_PATH so the server isn't pinned to a specific developer's home
@@ -62,6 +65,15 @@ _EBAY_COOLDOWN = 300.0  # seconds; suppress eBay fallback after a rate-limit sto
 # Tracked so the lifespan teardown can cancel + await any in-flight fallback
 # task before _db.close() runs. Without this the task can hit a closed DB.
 _ebay_fallback_task: asyncio.Task | None = None
+# Local-eBay bidder (per-snipe direct-HTTP bid placement). Initialized in
+# lifespan; used by the Gixen-side state machine to fire the timed bid.
+_bidder: "ebay_bidder.EbayBidder | None" = None
+
+# Separate Gixen client for the background sync loop, so its long-running scrapes
+# don't contend on _api_lock with request-handler writes.
+_sync_client: GixenClient | None = None
+SYNC_INTERVAL = int(os.getenv("GIXEN_SYNC_INTERVAL", "600"))  # 10 min default
+_SYNC_BACKOFF_MAX = 3600  # cap exponential backoff at 1 hour
 
 
 def _get_db() -> sqlite3.Connection:
@@ -159,7 +171,8 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
         logger.warning("_sync_gixen: GixenError (suppressed): %s", e)
         return []
 
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
     gixen_item_ids = {s["item_id"] for s in snipes}
 
     for snipe in snipes:
@@ -185,6 +198,18 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
                 db, iid, gixen_status, winning_bid, now,
                 snipe.get("status_mirror"),
             )
+
+        # Refresh auction_end_at from Gixen's relative time string on every
+        # sync. Gixen only gives "21 h, 30 m, 43 s" so we compute the absolute
+        # end timestamp here. (Originally only eBay populated this — bringing
+        # in main's logic so the local-sniper has a current end time without
+        # depending on eBay being reachable.)
+        time_to_end = snipe.get("time_to_end", "")
+        if time_to_end and time_to_end.upper() != "ENDED":
+            delta = _parse_time_to_end(time_to_end)
+            if delta is not None:
+                end_time = (now_dt + delta).isoformat()
+                set_auction_end_time(db, iid, end_time)
 
     # Vanished + ended → flip to ENDED. The eBay fallback path then picks
     # them up (ENDED rows with NULL winning_bid) and resolves the final
@@ -229,6 +254,70 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     return snipes
 
 
+# Background sync loop — primarily for the local sniper, which needs fresh
+# auction_end_at to fire bids at the right time. The dashboard does its own
+# pull-on-visit (_ensure_fresh_sync) and doesn't depend on this loop, but the
+# loop keeps state fresh enough that the sniper can act when nobody's looking.
+async def _sync_loop() -> None:
+    consecutive_failures = 0
+    while True:
+        try:
+            if _sync_client is not None:
+                db = _get_db()
+                result = await _sync_gixen(db, _sync_client)
+                if result:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+        except Exception:
+            logger.exception("_sync_loop: unexpected error, continuing")
+            consecutive_failures += 1
+
+        # Exponential backoff: SYNC_INTERVAL, 2x, 4x, ..., capped at 1 hour
+        delay = min(SYNC_INTERVAL * (2 ** consecutive_failures), _SYNC_BACKOFF_MAX)
+        if consecutive_failures:
+            logger.warning("_sync_loop: %d consecutive failure(s), sleeping %ds", consecutive_failures, delay)
+        await asyncio.sleep(delay)
+
+
+def _parse_time_to_end(s: str) -> timedelta | None:
+    """Parse Gixen relative time string like '1 d, 20 h, 59 m' into a timedelta."""
+    total = 0
+    for part in s.split(","):
+        part = part.strip()
+        if m := re.match(r"(\d+)\s*d", part):
+            total += int(m.group(1)) * 86400
+        elif m := re.match(r"(\d+)\s*h", part):
+            total += int(m.group(1)) * 3600
+        elif m := re.match(r"(\d+)\s*m", part):
+            total += int(m.group(1)) * 60
+        elif m := re.match(r"(\d+)\s*s", part):
+            total += int(m.group(1))
+    return timedelta(seconds=total) if total else None
+
+
+SNIPER_INTERVAL = 10  # check every 10 seconds
+
+
+async def _sniper_loop() -> None:
+    while True:
+        try:
+            if _bidder is not None:
+                db = _get_db()
+                now_iso = datetime.now(timezone.utc).isoformat()
+                ready = get_bids_ready_to_snipe(db, now_iso)
+                if ready:
+                    fired_at = datetime.now(timezone.utc).isoformat()
+                    logger.info("_sniper_loop: firing %d bid(s) concurrently", len(ready))
+                    bids = [{"item_id": b["item_id"], "max_bid": b["max_bid"]} for b in ready]
+                    results = await _bidder.place_bids_concurrent(bids)
+                    for bid, result in zip(ready, results):
+                        result_str = ("OK: " if result["success"] else "ERR: ") + result["message"]
+                        set_local_snipe_result(db, bid["item_id"], fired_at, result_str)
+                        logger.info("_sniper_loop: %s — %s", bid["item_id"], result_str)
+        except Exception:
+            logger.exception("_sniper_loop: unexpected error, continuing")
+        await asyncio.sleep(SNIPER_INTERVAL)
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -378,7 +467,7 @@ def _spawn_fallback_task() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _db, _api_client, _api_lock, _sync_lock, _ebay_fallback_lock
+    global _db, _api_client, _sync_client, _api_lock, _sync_lock, _ebay_fallback_lock, _bidder
     if env_file := os.getenv("ENV_FILE"):
         load_dotenv(env_file)
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
@@ -387,6 +476,17 @@ async def lifespan(app: FastAPI):
     _api_lock = asyncio.Lock()
     _sync_lock = asyncio.Lock()
     _ebay_fallback_lock = asyncio.Lock()
+
+    sync_task = None
+    sniper_task = None
+    if os.getenv("GIXEN_SYNC_ENABLED", "true") != "false":
+        # Separate client so the loop's long scrape doesn't fight _api_lock.
+        _sync_client = GixenClient()
+        sync_task = asyncio.create_task(_sync_loop())
+    if os.getenv("LOCAL_SNIPER_ENABLED", "true") != "false":
+        _bidder = ebay_bidder.EbayBidder()
+        await _bidder.start()
+        sniper_task = asyncio.create_task(_sniper_loop())
 
     yield
 
@@ -401,6 +501,13 @@ async def lifespan(app: FastAPI):
             pass
         except Exception as e:
             logger.warning("lifespan: fallback task raised on cancel: %s", e)
+
+    if sniper_task:
+        sniper_task.cancel()
+    if _bidder:
+        await _bidder.stop()
+    if sync_task:
+        sync_task.cancel()
 
     row = _db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     if row and row[0]:
@@ -424,6 +531,8 @@ class UpsertComicRequest(BaseModel):
     fmv_comps: int | None = None
     fmv_confidence: str | None = None
     fmv_notes: str | None = None
+    locg_id: int | None = None
+    locg_variant_id: int | None = None
 
     @field_validator("fmv_confidence")
     @classmethod
@@ -447,6 +556,8 @@ class AddBidRequest(BaseModel):
     fmv_comps: int | None = None
     fmv_confidence: str | None = None
     fmv_notes: str | None = None
+    locg_id: int | None = None
+    locg_variant_id: int | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -474,6 +585,8 @@ class EditBidRequest(BaseModel):
     max_bid: float
     bid_offset: int = 6
     snipe_group: int = 0
+    locg_id: int | None = None
+    locg_variant_id: int | None = None
 
     @field_validator("max_bid")
     @classmethod
@@ -542,6 +655,18 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/api/comics")
+async def api_list_comics(
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+):
+    db = _get_db()
+    rows = list_comics(db, title=title, issue=issue, year=year, grade=grade)
+    return [dict(r) for r in rows]
+
+
 @app.post("/api/comics")
 async def api_upsert_comic(req: UpsertComicRequest):
     db = _get_db()
@@ -556,6 +681,8 @@ async def api_upsert_comic(req: UpsertComicRequest):
         fmv_comps=req.fmv_comps,
         fmv_confidence=req.fmv_confidence,
         fmv_notes=req.fmv_notes,
+        locg_id=req.locg_id,
+        locg_variant_id=req.locg_variant_id,
     )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return dict(row)
@@ -578,6 +705,8 @@ async def api_add_bid(req: AddBidRequest):
             fmv_comps=req.fmv_comps,
             fmv_confidence=req.fmv_confidence,
             fmv_notes=req.fmv_notes,
+            locg_id=req.locg_id,
+            locg_variant_id=req.locg_variant_id,
         )
 
     try:
@@ -591,6 +720,8 @@ async def api_add_bid(req: AddBidRequest):
             )
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
 
     bid_id = insert_bid(
         db,
@@ -620,7 +751,9 @@ async def api_get_snipes():
     rows = db.execute("""
         SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
                c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps, c.fmv_confidence, c.fmv_notes
+               c.fmv_low, c.fmv_high, c.fmv_comps,
+               c.fmv_confidence, c.fmv_notes,
+               c.locg_id, c.locg_variant_id
         FROM bids b
         LEFT JOIN comics c ON b.comic_id = c.id
         WHERE b.status != 'PURGED'
@@ -656,6 +789,10 @@ async def api_get_snipes():
             "fmv_confidence": item.get("fmv_confidence"),
             "fmv_notes": item.get("fmv_notes"),
             "comic_id": item.get("comic_id"),
+            "locg_id": item.get("locg_id"),
+            "locg_variant_id": item.get("locg_variant_id"),
+            "local_snipe_at": item.get("local_snipe_at"),
+            "local_snipe_result": item.get("local_snipe_result"),
         })
 
     return result
@@ -679,8 +816,27 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen")
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
 
     update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+
+    # If locg_id / locg_variant_id provided, persist on the linked comic row.
+    # COALESCE preserves existing values when only one of the two is supplied.
+    if req.locg_id is not None or req.locg_variant_id is not None:
+        bid_row = get_bid_by_item_id(db, item_id)
+        if bid_row is not None and bid_row["comic_id"] is not None:
+            db.execute(
+                """
+                UPDATE comics
+                SET locg_id = COALESCE(?, locg_id),
+                    locg_variant_id = COALESCE(?, locg_variant_id)
+                WHERE id = ?
+                """,
+                (req.locg_id, req.locg_variant_id, bid_row["comic_id"]),
+            )
+            db.commit()
+
     row = get_bid_by_item_id(db, item_id)
     if row is None:
         # Gixen accepted the modify, so this snipe lives there — but our DB

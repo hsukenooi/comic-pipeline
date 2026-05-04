@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import logging
+import tempfile
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional
@@ -42,10 +43,12 @@ class _CurlSession:
 
     def __init__(self):
         self.headers: Dict[str, str] = {}
+        self._cookie_jar = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
 
     def _run(self, method: str, url: str, data: Optional[Dict] = None,
              timeout: float = 15.0, allow_redirects: bool = True) -> _CurlResponse:
-        cmd = ["curl", "-s", "-D", "-", "--max-time", str(int(timeout))]
+        cmd = ["curl", "-s", "-D", "-", "--max-time", str(int(timeout)),
+               "-b", self._cookie_jar, "-c", self._cookie_jar]
         if not allow_redirects:
             cmd += ["--max-redirs", "0"]
         for k, v in self.headers.items():
@@ -237,6 +240,15 @@ class GixenClient:
         resp = self.session.post(
             self._home_url(), data=data, timeout=self.timeout
         )
+
+        # Gixen returns HTTP 500 for requests with a stale/invalid session.
+        # Treat it as session expiry and retry after re-login.
+        if resp.status_code == 500 and retry_on_expired:
+            logger.info("Gixen returned 500 on POST, forcing re-login")
+            self.session_id = None
+            self.login()
+            return self._post_home(data, retry_on_expired=False, check_errors=check_errors)
+
         resp.raise_for_status()
         html = resp.text
 
@@ -286,8 +298,8 @@ class GixenClient:
 
         Returns:
             List of dicts with keys: item_id, title, max_bid, current_bid,
-            status, time_to_end, bid_offset, bid_offset_mirror, dbidid,
-            snipe_group, seller.
+            status, status_mirror, time_to_end, bid_offset, bid_offset_mirror,
+            dbidid, snipe_group, seller.
         """
         html = self._get_home_page()
         return self._parse_snipe_table(html)
@@ -512,27 +524,27 @@ class GixenClient:
                 snipe["time_to_end"] = ""
                 snipe["current_bid"] = ""
 
-            # Status — whitelist-anchored. The previous primary pattern was a
-            # generic "next-td" capture that grabbed digits from the max_bid
-            # display and returned values like "175" instead of "SCHEDULED".
-            # Anchor on the snipe's edititemid_<id> hidden input and look for
-            # the next known status keyword.
-            m = re.search(
-                rf'edititemid_{re.escape(iid)}\b.*?'
-                rf'\b(SCHEDULED|WON|LOST|FAILED|ENDED|OUTBID|BID UNDER MAX|BID UNDER)\b',
-                html, re.DOTALL,
-            )
-            if m:
-                snipe["status"] = m.group(1)
-            else:
-                # Log unknown statuses so we can extend the whitelist before
-                # phantom-PENDING rows accumulate.
+            # Status (main) and Status (mirror)
+            # Gixen renders: <td>Status (main): </td><td>SCHEDULED</td>
+            # Find the item's anchor tag, then scan the next ~900 chars for
+            # both rows. (Took main's structural extraction over our keyword
+            # whitelist — both fix the original "175" bug, but main's reads
+            # the labelled cell directly which is more durable.)
+            m_anchor = re.search(rf'<a[^>]*>{re.escape(iid)}</a>', html)
+            anchor_pos = m_anchor.start() if m_anchor else html.find(iid)
+            chunk = html[anchor_pos:anchor_pos + 900] if anchor_pos >= 0 else ""
+            m = re.search(r'Status \(main\):\s*</td><td>([^<]+)', chunk)
+            snipe["status"] = m.group(1).strip() if m else ""
+            m = re.search(r'Status \(mirror\):\s*</td><td>([^<]+)', chunk)
+            snipe["status_mirror"] = m.group(1).strip() if m else ""
+            if not snipe["status"]:
+                # Status row absent — Gixen may have changed its desktop-table
+                # layout. Loud signal so we can diagnose before phantom-PENDING
+                # rows accumulate.
                 logger.warning(
-                    "_parse_snipe_table: no known status keyword near edititemid_%s "
-                    "— extend whitelist if Gixen has added a new status",
+                    "_parse_snipe_table: no Status (main) row near edititemid_%s",
                     iid,
                 )
-                snipe["status"] = ""
 
         # Deduplicate — the mobile table has separate forms too,
         # but we only parsed desktop table inputs (edititemid_<ID> pattern)
