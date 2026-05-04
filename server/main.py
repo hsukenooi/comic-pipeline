@@ -624,16 +624,6 @@ def root():
     return FileResponse(Path(__file__).parent / "static" / "index.html")
 
 
-@app.get("/v1")
-def variant_v1():
-    return FileResponse(Path(__file__).parent / "static" / "v1-crt.html")
-
-
-@app.get("/v2")
-def variant_v2():
-    return FileResponse(Path(__file__).parent / "static" / "v2-tui.html")
-
-
 @app.get("/v2/comics")
 def variant_v2_comics():
     return FileResponse(Path(__file__).parent / "static" / "v2-comics.html")
@@ -642,11 +632,6 @@ def variant_v2_comics():
 @app.get("/v2/bids")
 def variant_v2_bids():
     return FileResponse(Path(__file__).parent / "static" / "v2-bids.html")
-
-
-@app.get("/v3")
-def variant_v3():
-    return FileResponse(Path(__file__).parent / "static" / "v3-amber.html")
 
 
 @app.get("/static/v2.css")
@@ -835,6 +820,63 @@ async def api_get_snipes():
             "comics": comics_by_bid.get(item["id"], []),
         })
 
+    return result
+
+
+@app.get("/api/history")
+async def api_get_history():
+    """Recently ended bids from the DB (past 7 days), including PURGED rows.
+    Pure DB read — no Gixen sync.
+    """
+    db = _get_db()
+    rows = db.execute("""
+        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
+               c.year AS comic_year, c.grade AS comic_grade,
+               c.fmv_low, c.fmv_high, c.fmv_comps,
+               c.fmv_confidence, c.fmv_notes,
+               c.locg_id, c.locg_variant_id
+        FROM bids b
+        LEFT JOIN comics c ON b.comic_id = c.id
+        WHERE b.auction_end_at IS NOT NULL
+          AND b.auction_end_at <= datetime('now')
+          AND b.auction_end_at >= datetime('now', '-7 days')
+        ORDER BY b.auction_end_at DESC
+    """).fetchall()
+
+    result = []
+    for row in rows:
+        item = dict(row)
+        end_date_iso = item.get("auction_end_at")
+        title = item.get("ebay_title") or item.get("comic_title") or ""
+        result.append({
+            "item_id": item["item_id"],
+            "title": title,
+            "current_bid": item.get("cached_current_bid"),
+            "max_bid": f"{item['max_bid']:.2f} USD",
+            "bid_offset": item["bid_offset"],
+            "snipe_group": item["snipe_group"],
+            "time_to_end": _iso_to_relative(end_date_iso),
+            "end_date_iso": end_date_iso,
+            "status": item["status"],
+            "status_mirror": item.get("status_mirror"),
+            "winning_bid": item.get("winning_bid"),
+            "seller": item.get("seller"),
+            "cached_at": item.get("cached_at"),
+            "comic_title": item.get("comic_title"),
+            "comic_issue": item.get("comic_issue"),
+            "comic_year": item.get("comic_year"),
+            "comic_grade": item.get("comic_grade"),
+            "fmv_low": item.get("fmv_low"),
+            "fmv_high": item.get("fmv_high"),
+            "fmv_comps": item.get("fmv_comps"),
+            "fmv_confidence": item.get("fmv_confidence"),
+            "fmv_notes": item.get("fmv_notes"),
+            "comic_id": item.get("comic_id"),
+            "locg_id": item.get("locg_id"),
+            "locg_variant_id": item.get("locg_variant_id"),
+            "local_snipe_at": item.get("local_snipe_at"),
+            "local_snipe_result": item.get("local_snipe_result"),
+        })
     return result
 
 
