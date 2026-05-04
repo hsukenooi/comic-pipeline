@@ -919,6 +919,45 @@ async def api_get_history():
     return result
 
 
+@app.get("/api/bids")
+async def api_get_all_bids():
+    """All bids from the DB, newest first. Pure DB read — no Gixen sync."""
+    db = _get_db()
+    rows = db.execute("""
+        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
+               c.year AS comic_year, c.grade AS comic_grade,
+               c.fmv_low, c.fmv_high, c.fmv_comps,
+               c.fmv_confidence, c.fmv_notes,
+               c.locg_id, c.locg_variant_id
+        FROM bids b
+        LEFT JOIN comics c ON b.comic_id = c.id
+        ORDER BY COALESCE(b.auction_end_at, b.added_at) DESC
+    """).fetchall()
+
+    result = []
+    for row in rows:
+        item = dict(row)
+        end_date_iso = item.get("auction_end_at")
+        title = item.get("ebay_title") or item.get("comic_title") or ""
+        result.append({
+            "item_id": item["item_id"],
+            "title": title,
+            "max_bid": item["max_bid"],
+            "bid_offset": item["bid_offset"],
+            "snipe_group": item["snipe_group"],
+            "end_date_iso": end_date_iso,
+            "added_at": item.get("added_at"),
+            "status": item["status"],
+            "status_mirror": item.get("status_mirror"),
+            "winning_bid": item.get("winning_bid"),
+            "seller": item.get("seller"),
+            "comic_id": item.get("comic_id"),
+            "local_snipe_at": item.get("local_snipe_at"),
+            "local_snipe_result": item.get("local_snipe_result"),
+        })
+    return result
+
+
 @app.patch("/api/bids/{item_id}")
 async def api_edit_bid(item_id: str, req: EditBidRequest):
     if not re.match(r"^\d+$", item_id):

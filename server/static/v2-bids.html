@@ -39,23 +39,13 @@
 
 <script>
 const REFRESH_MS = 60000;
-const params = new URLSearchParams(location.search);
-const SNIPES_URL = "/api/snipes";
+const BIDS_URL = "/api/bids";
 const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
 
-function fmtUSD(s) {
-  if (s == null) return "—";
-  const n = parseFloat(String(s).replace(/[^0-9.]/g,""));
+function fmtUSD(v) {
+  if (v == null) return "—";
+  const n = parseFloat(String(v).replace(/[^0-9.]/g,""));
   return isNaN(n) ? "—" : `$${n.toFixed(2)}`;
-}
-
-function statusPill(s) {
-  const u = (s||"").toUpperCase();
-  if (u.includes("WON")) return '<span class="pill won">won</span>';
-  if (u.startsWith("BID UNDER") || u === "OUTBID" || u === "LOST") return '<span class="pill lost">outbid</span>';
-  if (u.startsWith("NETWORK ERROR")) return '<span class="pill err">net err</span>';
-  if (u === "PENDING") return '<span class="pill pending">pending</span>';
-  return `<span class="pill lost">${(s||"—").toLowerCase()}</span>`;
 }
 
 function escapeHtml(s) {
@@ -79,24 +69,35 @@ function fmtDate(iso) {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
 }
 
-function renderBids(snipes) {
+function outcome(r) {
+  if (r.status === "PENDING") return '<span class="pill pending">pending</span>';
+  const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
+  const m = r.max_bid != null ? parseFloat(String(r.max_bid).replace(/[^0-9.]/g,"")) : null;
+  if (w != null && m != null) return w <= m
+    ? '<span class="pill won">won</span>'
+    : '<span class="pill lost">outbid</span>';
+  const mirror = (r.status_mirror || "").toUpperCase();
+  if (mirror.includes("WON")) return '<span class="pill won">won</span>';
+  if (mirror === "LOST" || mirror.includes("OUTBID")) return '<span class="pill lost">outbid</span>';
+  if (r.local_snipe_result) return '<span class="pill err">missed</span>';
+  return '<span class="mute">—</span>';
+}
+
+function renderBids(bids) {
   const el = document.getElementById("bids-section");
-  if (!snipes.length) {
+  if (!bids.length) {
     el.innerHTML = `<div class="panel">
       <div class="panel-head"><span class="label">bids</span><span class="count">0 rows</span></div>
       <div class="empty">// no bids</div>
     </div>`;
     return;
   }
-  const rows = snipes.map(r => `<tr>
+  const rows = bids.map(r => `<tr>
     <td><a class="id" href="${ebayUrl(r.item_id)}" target="_blank">${escapeHtml(r.item_id)}</a></td>
-    <td class="wrap">${escapeHtml((r.title || r.comic_title || "—").slice(0,80))}</td>
+    <td class="wrap">${escapeHtml((r.title || "—").slice(0,80))}</td>
     <td class="right num">${fmtUSD(r.max_bid)}</td>
-    <td class="right num">${r.bid_offset != null ? `${r.bid_offset}s` : '<span class="mute">—</span>'}</td>
-    <td class="num dim">${r.snipe_group ?? 0}</td>
-    <td>${statusPill(r.status)}</td>
-    <td>${r.status_mirror ? statusPill(r.status_mirror) : '<span class="mute">—</span>'}</td>
-    <td class="right num">${r.winning_bid != null ? `$${parseFloat(r.winning_bid).toFixed(2)}` : '<span class="mute">—</span>'}</td>
+    <td class="right num">${r.winning_bid != null ? fmtUSD(r.winning_bid) : '<span class="mute">—</span>'}</td>
+    <td>${outcome(r)}</td>
     <td class="num dim">${fmtDate(r.end_date_iso)}</td>
     <td class="dim">${escapeHtml(r.seller || "—")}</td>
     <td class="num dim">${r.comic_id ?? '<span class="mute">—</span>'}</td>
@@ -104,14 +105,12 @@ function renderBids(snipes) {
   el.innerHTML = `<div class="panel">
     <div class="panel-head">
       <span class="label">bids</span>
-      <span class="count">${snipes.length} rows</span>
-      <span class="badge">live</span>
+      <span class="count">${bids.length} rows</span>
     </div>
     <div class="scroll"><table><thead><tr>
       <th>item_id</th><th>title</th>
-      <th class="right">max_bid</th><th class="right">offset</th>
-      <th>group</th><th>status</th><th>mirror</th>
-      <th class="right">winning</th><th>end_date</th>
+      <th class="right">max_bid</th><th class="right">winning</th>
+      <th>outcome</th><th>end_date</th>
       <th>seller</th><th>comic_id</th>
     </tr></thead><tbody>${rows}</tbody></table></div>
   </div>`;
@@ -130,16 +129,16 @@ function tickClock() { document.getElementById("clock").textContent = new Date()
 setInterval(tickClock, 1000); tickClock();
 
 async function load() {
-  setStatus("loading", `fetching ${SNIPES_URL}…`);
+  setStatus("loading", `fetching ${BIDS_URL}…`);
   try {
-    const resp = await fetch(SNIPES_URL);
+    const resp = await fetch(BIDS_URL);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const snipes = await resp.json();
-    renderBids(snipes);
+    const bids = await resp.json();
+    renderBids(bids);
     const now = new Date().toLocaleTimeString();
     document.getElementById("session").innerHTML =
-      `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">bids</span> <span class="ok">▸ ${snipes.length} rows · synced ${now}</span>`;
-    setStatus("ok", `${snipes.length} rows`);
+      `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">bids</span> <span class="ok">▸ ${bids.length} rows · loaded ${now}</span>`;
+    setStatus("ok", `${bids.length} rows`);
   } catch (e) {
     setStatus("error", e.message);
     document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="err">▸ ${e.message}</span>`;
