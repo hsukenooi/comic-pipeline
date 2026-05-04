@@ -323,6 +323,7 @@ function statusPill(r) {
     const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
     const m = parseAmt(r.max_bid);
     if (w != null && m != null) return w <= m ? '<span class="pill won">won</span>' : '<span class="pill lost">outbid</span>';
+    if (r.local_snipe_result) return '<span class="pill err">missed</span>';
     return '<span class="pill lost">—</span>';
   }
   return `<span class="pill lost">${(r.status||"—").toLowerCase()}</span>`;
