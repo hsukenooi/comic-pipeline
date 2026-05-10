@@ -369,6 +369,42 @@ class TestSessionExpiration:
         assert len(snipes) == 1
         assert client.session_id == "99887766"
 
+    def test_auto_relogin_on_invalidated_session_id(self):
+        # Regression: when Gixen invalidates the session_id server-side, the
+        # response is the homepage with a "Could not log you in. (33)"
+        # wrong-alert div — no <form name="signin">. Without explicit
+        # detection, the parser raises GixenParseError and re-login never
+        # fires, leaving the persistent client wedged. Observed in production:
+        # 145+ consecutive _sync_loop failures and PATCH /api/bids returning
+        # 503.
+        client = _client()
+        client.session_id = "dead_session"
+
+        invalidated_html = (
+            '<html><body>'
+            '<div class="wrong-alert">'
+            'Password is not a match. Could not log you in. (33)'
+            '</div>'
+            '</body></html>'
+        )
+        invalidated_resp = MagicMock()
+        invalidated_resp.text = invalidated_html
+        invalidated_resp.raise_for_status = MagicMock()
+
+        fresh_resp = MagicMock()
+        fresh_resp.text = _wrap_table(_make_snipe_row("222", "5002"))
+        fresh_resp.raise_for_status = MagicMock()
+
+        client.session.get = MagicMock(side_effect=[invalidated_resp, fresh_resp])
+
+        login_resp = MagicMock()
+        login_resp.text = LOGIN_REDIRECT_HTML
+        client.session.post = MagicMock(return_value=login_resp)
+
+        snipes = client.list_snipes()
+        assert len(snipes) == 1
+        assert client.session_id == "99887766"
+
     def test_relogin_fails_raises_error(self):
         client = _client()
         client.session_id = "old_session"

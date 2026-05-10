@@ -213,11 +213,19 @@ class GixenClient:
     def _is_session_expired(self, html: str) -> bool:
         """Detect if the response indicates an expired session."""
         # Expired sessions redirect to login or show the login form
-        return (
+        if (
             'name="signin"' in html
             and 'name="username"' in html
             and 'sessionid=' not in html
-        )
+        ):
+            return True
+        # Server-invalidated session_id: Gixen serves the homepage with a
+        # "Could not log you in. (33)" wrong-alert div instead of the snipe
+        # table. Without this, the parser raises GixenParseError and the
+        # auto-relogin path never fires.
+        if 'wrong-alert' in html and 'Could not log you in' in html:
+            return True
+        return False
 
     def _get_home_page(self, retry_on_expired: bool = True) -> str:
         """Fetch the main snipe page. Auto-re-login on session expiration."""
