@@ -17,6 +17,8 @@ from locg.commands import (
     _validate_grade,
     _validate_price,
     cmd_add,
+    cmd_cache_clear,
+    cmd_cache_stats,
     cmd_check_lists,
     cmd_collection,
     cmd_collection_has,
@@ -176,6 +178,21 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip collection-membership check (no auth needed)",
     )
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass the on-disk ID cache (always hit the API; do not write back)",
+    )
+
+    # cache (with stats / clear / path subcommands)
+    p = sub.add_parser(
+        "cache",
+        parents=[common],
+        help="Inspect or clear the on-disk LOCG ID cache",
+    )
+    cache_sub = p.add_subparsers(dest="cache_command")
+    cache_sub.add_parser("stats", parents=[common], help="Show cache file path, entry count, size")
+    cache_sub.add_parser("clear", parents=[common], help="Delete every cached ID entry")
 
     # login
     p = sub.add_parser(
@@ -332,7 +349,19 @@ def main() -> None:
                 requests = [parse_lookup_spec(s) for s in args.specs]
             except ValueError as e:
                 die(str(e))
-            result = cmd_lookup(client, requests, check_collection=not args.no_collection)
+            result = cmd_lookup(
+                client,
+                requests,
+                check_collection=not args.no_collection,
+                use_cache=not args.no_cache,
+            )
+        elif args.command == "cache":
+            sub_cmd = getattr(args, "cache_command", None)
+            if sub_cmd == "clear":
+                result = cmd_cache_clear()
+            else:
+                # default to stats (also handles explicit "stats")
+                result = cmd_cache_stats()
         elif args.command == "login":
             result = cmd_login(client, username=args.username, password=args.password)
 

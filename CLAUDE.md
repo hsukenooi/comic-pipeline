@@ -49,6 +49,11 @@ It groups by series (one search per unique series), uses a title-filtered
 issue query (avoiding the 140-issue series page limit), and by default
 intersects the result with your collection to populate `in_collection`.
 
+Resolved IDs are cached to `$XDG_CACHE_HOME/locg/ids.json` (default
+`~/.cache/locg/ids.json`) and reused on subsequent runs — repeat lookups
+skip the API entirely (`from_cache: true` in the result). Pass `--no-cache`
+to bypass; use `locg cache stats` and `locg cache clear` to manage.
+
 Note on the 140-issue limit: `locg series <id>` returns at most 140 issues
 per call (date-desc by default). For series with more than 140 issues, the
 oldest ones aren't visible. `locg lookup` works around this by querying

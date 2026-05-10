@@ -73,11 +73,23 @@ Output per row:
 {
   "series_name": "Uncanny X-Men", "issue_number": "185", "variant": null,
   "series_id": 108806, "locg_id": 1081721, "locg_variant_id": null,
-  "issue_name": "Uncanny X-Men #185", "in_collection": false
+  "issue_name": "Uncanny X-Men #185", "in_collection": false,
+  "from_cache": false
 }
 ```
 
+Resolved IDs are cached to disk at `$XDG_CACHE_HOME/locg/ids.json` (default `~/.cache/locg/ids.json`) and reused on subsequent runs — repeat lookups skip the API entirely (`from_cache: true`). Pass `--no-cache` to bypass for both reads and writes. Manage the cache with `locg cache stats` and `locg cache clear`.
+
 Series matching prefers the canonical run (exact name, then preferred publisher, then oldest start year, then highest issue count), so `"Batman"` resolves to the 1940 DC run instead of a recent one-shot. If a series or issue can't be resolved, that row gets an `"error"` field; the rest of the batch still completes.
+
+### cache
+
+Inspect or clear the on-disk LOCG ID cache used by `lookup`. The cache is a single JSON file; entries never auto-expire because LOCG IDs are stable.
+
+```bash
+locg cache stats     # path, entry count, file size
+locg cache clear     # delete every cached ID
+```
 
 ### comic
 

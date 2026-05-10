@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from bs4 import BeautifulSoup
 
+from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
@@ -981,6 +982,8 @@ def cmd_lookup(
     client: LOCGClient,
     requests: list[tuple[str, str, Optional[str]]],
     check_collection: bool = True,
+    use_cache: bool = True,
+    cache: Optional[IDCache] = None,
 ) -> list[dict[str, Any]]:
     """Resolve LOCG IDs for a batch of (series, issue[, variant]) requests.
 
@@ -988,24 +991,66 @@ def cmd_lookup(
     unique series. Each issue is then resolved with one title-filtered query
     against that series_id (small payload, no pagination dance).
 
+    If ``use_cache`` is true (default), the on-disk cache is consulted first;
+    misses fall through to the API and are written back. ``cache`` is
+    primarily for tests — production code uses the default :class:`IDCache`.
+
     If ``check_collection`` is true, fetches the user's collection once and
-    intersects locally to populate ``in_collection`` on each result.
+    intersects locally to populate ``in_collection`` on each result. Cache
+    hits still get a fresh ``in_collection`` value because collection state
+    changes over time even when LOCG IDs don't.
     """
-    # Resolve each unique series exactly once.
+    if use_cache and cache is None:
+        cache = IDCache()
+    elif not use_cache:
+        cache = None
+
+    # Optimistically read all cache entries up front. Anything we can serve
+    # from cache doesn't need a series search OR an issue search.
+    cached_results: dict[int, dict[str, Any]] = {}  # request_index -> result row
+    misses: list[tuple[int, str, str, Optional[str]]] = []
+    for i, (series_name, issue_number, variant) in enumerate(requests):
+        hit = None
+        if cache is not None:
+            hit = cache.get(make_key(series_name, issue_number, variant))
+        if hit:
+            row: dict[str, Any] = {
+                "series_name": series_name,
+                "issue_number": issue_number,
+                "variant": variant,
+                "series_id": hit.get("series_id"),
+                "locg_id": hit.get("locg_id"),
+                "locg_variant_id": hit.get("locg_variant_id"),
+                "issue_name": hit.get("issue_name"),
+                "from_cache": True,
+            }
+            cached_results[i] = row
+        else:
+            misses.append((i, series_name, issue_number, variant))
+
+    # Resolve each unique series among the cache misses, exactly once.
     unique_series: dict[str, Optional[dict[str, Any]]] = {}
-    for series_name, _, _ in requests:
+    for _, series_name, _, _ in misses:
         if series_name not in unique_series:
             results = cmd_search(client, series_name)
             unique_series[series_name] = _pick_best_series(results, series_name)
 
-    # Fetch collection (once) only if needed.
+    # Fetch collection (once) if requested. Done regardless of cache hits
+    # because collection membership is independent of ID resolution.
     collection_ids: Optional[set[int]] = None
     if check_collection:
         collection = _get_user_list(client, "collection")
         collection_ids = {item["id"] for item in collection if item.get("id")}
 
-    out: list[dict[str, Any]] = []
-    for series_name, issue_number, variant in requests:
+    # Build out the result list in original request order.
+    out: list[Optional[dict[str, Any]]] = [None] * len(requests)
+
+    # Slot in cache hits.
+    for i, row in cached_results.items():
+        out[i] = row
+
+    # Resolve and slot in cache misses.
+    for i, series_name, issue_number, variant in misses:
         result: dict[str, Any] = {
             "series_name": series_name,
             "issue_number": issue_number,
@@ -1014,20 +1059,16 @@ def cmd_lookup(
             "locg_id": None,
             "locg_variant_id": None,
             "issue_name": None,
+            "from_cache": False,
         }
-        if check_collection:
-            result["in_collection"] = False
 
         series = unique_series.get(series_name)
         if not series:
             result["error"] = f"Series {series_name!r} not found"
-            out.append(result)
+            out[i] = result
             continue
 
         result["series_id"] = series.get("id")
-        # Use the canonical name LOCG returned for this series, not the user
-        # input — LOCG is consistent in titling ("The Amazing Spider-Man #142")
-        # and the title filter matches that exact prefix.
         canonical_series_name = series.get("name") or series_name
 
         canonical_id, variant_id, issue_name = _find_issue_in_series(
@@ -1041,17 +1082,55 @@ def cmd_lookup(
             result["error"] = (
                 f"Issue #{issue_number} not found in series {canonical_series_name!r}"
             )
-            out.append(result)
+            out[i] = result
             continue
 
         result["locg_id"] = canonical_id
         result["locg_variant_id"] = variant_id
         result["issue_name"] = issue_name
+        out[i] = result
 
-        if check_collection and collection_ids is not None:
-            check_id = variant_id if (variant and variant_id) else canonical_id
-            result["in_collection"] = check_id in collection_ids
+        # Write back to cache (best-effort — never fail a lookup over a
+        # cache write error).
+        if cache is not None:
+            try:
+                cache.set(
+                    make_key(series_name, issue_number, variant),
+                    {
+                        "series_id": result["series_id"],
+                        "locg_id": canonical_id,
+                        "locg_variant_id": variant_id,
+                        "series_name": canonical_series_name,
+                        "issue_name": issue_name,
+                    },
+                )
+            except OSError as e:
+                logger.warning("Failed to write cache entry: %s", e)
 
-        out.append(result)
+    # Compute in_collection for every row (cache hits + fresh) using the
+    # single collection fetch above.
+    for row in out:
+        if row is None:  # defensive — every slot should be filled
+            continue
+        if check_collection and collection_ids is not None and row.get("locg_id"):
+            check_id = (
+                row.get("locg_variant_id")
+                if (row.get("variant") and row.get("locg_variant_id"))
+                else row.get("locg_id")
+            )
+            row["in_collection"] = check_id in collection_ids
+        elif check_collection:
+            row["in_collection"] = False
 
-    return out
+    return [r for r in out if r is not None]
+
+
+def cmd_cache_stats(_client: Optional[LOCGClient] = None) -> dict[str, Any]:
+    """Return file path, entry count, size for the on-disk ID cache."""
+    return IDCache().stats()
+
+
+def cmd_cache_clear(_client: Optional[LOCGClient] = None) -> dict[str, Any]:
+    """Delete every entry from the on-disk ID cache. Returns count removed."""
+    removed = IDCache().clear()
+    return {"cleared": removed}

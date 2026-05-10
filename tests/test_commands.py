@@ -1528,3 +1528,179 @@ def test_cmd_lookup_issue_match_is_exact_not_prefix(mock_client):
     # No exact #15 entry → not found
     assert result[0]["locg_id"] is None
     assert "not found" in result[0].get("error", "")
+
+
+# --- lookup + cache integration ----
+
+
+def test_cmd_lookup_writes_to_cache_on_resolve(tmp_path, mock_client):
+    """A successful resolution should populate the cache."""
+    from locg.cache import IDCache, make_key
+
+    cache = IDCache(path=tmp_path / "ids.json")
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    issue_responses = {
+        ("108806", "Uncanny X-Men #185"): json.dumps({
+            "count": 1, "list": _make_issue_li(1081721, "Uncanny X-Men #185"),
+        }),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    cmd_lookup(
+        mock_client,
+        [("Uncanny X-Men", "185", None)],
+        check_collection=False,
+        cache=cache,
+    )
+
+    entry = cache.get(make_key("Uncanny X-Men", "185"))
+    assert entry is not None
+    assert entry["locg_id"] == 1081721
+    assert entry["series_id"] == 108806
+
+
+def test_cmd_lookup_cache_hit_skips_api_calls(tmp_path, mock_client):
+    """If every request is in the cache, neither search nor issue queries fire."""
+    from locg.cache import IDCache, make_key
+
+    cache = IDCache(path=tmp_path / "ids.json")
+    cache.set(make_key("Uncanny X-Men", "185"), {
+        "series_id": 108806,
+        "locg_id": 1081721,
+        "locg_variant_id": None,
+        "series_name": "Uncanny X-Men",
+        "issue_name": "Uncanny X-Men #185",
+    })
+
+    result = cmd_lookup(
+        mock_client,
+        [("Uncanny X-Men", "185", None)],
+        check_collection=False,
+        cache=cache,
+    )
+
+    assert result[0]["locg_id"] == 1081721
+    assert result[0]["from_cache"] is True
+    # No HTTP calls were made — cache served everything
+    mock_client.get.assert_not_called()
+
+
+def test_cmd_lookup_partial_cache_hit_only_resolves_misses(tmp_path, mock_client):
+    """Cached items skip the API; only misses trigger searches."""
+    from locg.cache import IDCache, make_key
+
+    cache = IDCache(path=tmp_path / "ids.json")
+    # Pre-populate one of two requests
+    cache.set(make_key("Uncanny X-Men", "185"), {
+        "series_id": 108806, "locg_id": 1081721, "locg_variant_id": None,
+        "series_name": "Uncanny X-Men", "issue_name": "Uncanny X-Men #185",
+    })
+
+    # Mock for the OTHER (uncached) request
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    issue_responses = {
+        ("108806", "Uncanny X-Men #188"): json.dumps({
+            "count": 1, "list": _make_issue_li(5907584, "Uncanny X-Men #188"),
+        }),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(
+        mock_client,
+        [("Uncanny X-Men", "185", None), ("Uncanny X-Men", "188", None)],
+        check_collection=False,
+        cache=cache,
+    )
+
+    # Cached row first, fresh row second
+    assert result[0]["locg_id"] == 1081721
+    assert result[0]["from_cache"] is True
+    assert result[1]["locg_id"] == 5907584
+    assert result[1]["from_cache"] is False
+    # Only one series search (for the cache miss), not two
+    series_calls = [
+        c for c in mock_client.get.call_args_list
+        if (c.kwargs.get("params") or {}).get("list_option") == "series"
+    ]
+    assert len(series_calls) == 1
+
+
+def test_cmd_lookup_no_cache_skips_reads_and_writes(tmp_path, mock_client):
+    """use_cache=False bypasses cache regardless of pre-populated entries."""
+    from locg.cache import IDCache, make_key
+
+    cache = IDCache(path=tmp_path / "ids.json")
+    cache.set(make_key("Uncanny X-Men", "185"), {
+        "series_id": 999999,  # Wrong on purpose to verify cache is bypassed
+        "locg_id": 999999,
+        "locg_variant_id": None,
+        "series_name": "Uncanny X-Men",
+        "issue_name": "Uncanny X-Men #185",
+    })
+
+    # API returns the correct ID
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    issue_responses = {
+        ("108806", "Uncanny X-Men #185"): json.dumps({
+            "count": 1, "list": _make_issue_li(1081721, "Uncanny X-Men #185"),
+        }),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(
+        mock_client,
+        [("Uncanny X-Men", "185", None)],
+        check_collection=False,
+        use_cache=False,
+    )
+
+    # Got the API result, not the cached (stale) value
+    assert result[0]["locg_id"] == 1081721
+    assert result[0]["from_cache"] is False
+
+
+def test_cmd_lookup_cache_hit_still_checks_collection(tmp_path, mock_client):
+    """Collection membership is dynamic, so cache hits must still re-check it."""
+    from locg.cache import IDCache, make_key
+
+    cache = IDCache(path=tmp_path / "ids.json")
+    cache.set(make_key("Uncanny X-Men", "185"), {
+        "series_id": 108806, "locg_id": 1081721, "locg_variant_id": None,
+        "series_name": "Uncanny X-Men", "issue_name": "Uncanny X-Men #185",
+    })
+
+    # Collection contains the comic now (even though cache predates this)
+    collection_html = _make_list_response_with_lists(
+        [(1081721, "Uncanny X-Men", [2])], total_count=1,
+    )
+    _setup_lookup_mock(mock_client, "{}", {}, collection_response=collection_html)
+
+    result = cmd_lookup(
+        mock_client,
+        [("Uncanny X-Men", "185", None)],
+        check_collection=True,
+        cache=cache,
+    )
+
+    assert result[0]["from_cache"] is True
+    assert result[0]["in_collection"] is True
+
+
+def test_cmd_lookup_does_not_cache_failed_resolutions(tmp_path, mock_client):
+    """Errors (series-not-found, issue-not-found) must not be cached."""
+    from locg.cache import IDCache, make_key
+
+    cache = IDCache(path=tmp_path / "ids.json")
+    series_response = _make_search_response([], 0)
+    _setup_lookup_mock(mock_client, series_response, {})
+
+    cmd_lookup(
+        mock_client,
+        [("Made Up Series", "1", None)],
+        check_collection=False,
+        cache=cache,
+    )
+    assert cache.get(make_key("Made Up Series", "1")) is None
