@@ -59,3 +59,18 @@ def mock_client():
     client.require_auth = MagicMock()
     client.close = MagicMock()
     return client
+
+
+@pytest.fixture(autouse=True)
+def _isolate_id_cache(tmp_path, monkeypatch):
+    """Redirect the IDCache default path to a per-test tmp dir.
+
+    Without this, tests that exercise `cmd_lookup` (or anything that
+    instantiates :class:`locg.cache.IDCache` without an explicit path)
+    would read and write the developer's real ~/.cache/locg/ids.json.
+    That makes test outcomes depend on local cache state — exactly the
+    kind of cross-run pollution that bit us when the cache integration
+    landed.
+    """
+    import locg.cache as cache_mod
+    monkeypatch.setattr(cache_mod, "cache_path", lambda: tmp_path / "ids.json")
