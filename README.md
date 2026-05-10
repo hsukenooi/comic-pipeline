@@ -57,6 +57,28 @@ locg check 9559460
 locg check 9559460 8823401 --pretty
 ```
 
+### lookup
+
+Resolve LOCG comic IDs in batch from `Series:Issue[:Variant]` specs. Groups requests by series so each unique series is searched only once, then uses a title-filtered query against that series_id to pinpoint each issue (a small response per issue, no pagination dance through 140-issue pages). By default also fetches your collection once and reports `in_collection` per row; pass `--no-collection` to skip the auth + fetch.
+
+```bash
+locg lookup "Uncanny X-Men:185" "Batman:224" "Amazing Spider-Man:142" --pretty
+locg lookup "Uncanny X-Men:179:Newsstand" --no-collection
+locg lookup "Batman: The Long Halloween:9"   # series names with internal ":" are fine
+```
+
+Output per row:
+
+```json
+{
+  "series_name": "Uncanny X-Men", "issue_number": "185", "variant": null,
+  "series_id": 108806, "locg_id": 1081721, "locg_variant_id": null,
+  "issue_name": "Uncanny X-Men #185", "in_collection": false
+}
+```
+
+Series matching prefers the canonical run (exact name, then preferred publisher, then oldest start year, then highest issue count), so `"Batman"` resolves to the 1940 DC run instead of a recent one-shot. If a series or issue can't be resolved, that row gets an `"error"` field; the rest of the batch still completes.
+
 ### comic
 
 Get full details for a specific comic by ID (publisher, price, creators, description, etc.).

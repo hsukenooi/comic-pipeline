@@ -39,6 +39,22 @@ Comic IDs are required for add/remove/check. To find a comic ID:
    out annuals/giant-size; use `find` if you need those)
 3. `locg add collection <comic_id>` — add by issue ID
 
+For batches, prefer `locg lookup`:
+
+```bash
+locg lookup "Uncanny X-Men:185" "Batman:224" "Amazing Spider-Man:142"
+```
+
+It groups by series (one search per unique series), uses a title-filtered
+issue query (avoiding the 140-issue series page limit), and by default
+intersects the result with your collection to populate `in_collection`.
+
+Note on the 140-issue limit: `locg series <id>` returns at most 140 issues
+per call (date-desc by default). For series with more than 140 issues, the
+oldest ones aren't visible. `locg lookup` works around this by querying
+`?series_id=<id>&title=<exact issue name>`, which only returns matches for
+the requested issue.
+
 ### Managing lists (requires login)
 
 ```bash

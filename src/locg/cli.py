@@ -23,6 +23,7 @@ from locg.commands import (
     cmd_comic,
     cmd_find,
     cmd_login,
+    cmd_lookup,
     cmd_pull_list,
     cmd_read_list,
     cmd_releases,
@@ -31,6 +32,7 @@ from locg.commands import (
     cmd_series,
     cmd_update,
     cmd_wish_list,
+    parse_lookup_spec,
 )
 
 
@@ -152,6 +154,28 @@ def create_parser() -> argparse.ArgumentParser:
     # check
     p = sub.add_parser("check", parents=[common], help="Check which lists comics belong to (requires login)")
     p.add_argument("comic_ids", type=int, nargs="+", help="One or more comic IDs")
+
+    # lookup
+    p = sub.add_parser(
+        "lookup",
+        parents=[common],
+        help="Resolve LOCG IDs for a batch of 'Series:Issue[:Variant]' specs",
+        epilog=(
+            "Series names may contain colons; the trailing token is treated as a "
+            "variant only when the second-to-last token looks like an issue number "
+            "(e.g. 'Batman: The Long Halloween:9' is parsed as series + issue)."
+        ),
+    )
+    p.add_argument(
+        "specs",
+        nargs="+",
+        help="One or more 'Series:Issue[:Variant]' specs (e.g. 'Uncanny X-Men:185')",
+    )
+    p.add_argument(
+        "--no-collection",
+        action="store_true",
+        help="Skip collection-membership check (no auth needed)",
+    )
 
     # login
     p = sub.add_parser(
@@ -303,6 +327,12 @@ def main() -> None:
                 sys.exit(1)
         elif args.command == "check":
             result = cmd_check_lists(client, args.comic_ids)
+        elif args.command == "lookup":
+            try:
+                requests = [parse_lookup_spec(s) for s in args.specs]
+            except ValueError as e:
+                die(str(e))
+            result = cmd_lookup(client, requests, check_collection=not args.no_collection)
         elif args.command == "login":
             result = cmd_login(client, username=args.username, password=args.password)
 

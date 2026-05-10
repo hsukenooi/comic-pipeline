@@ -796,3 +796,262 @@ def cmd_login(client: LOCGClient, username: Optional[str] = None, password: Opti
     if success:
         return {"status": "ok", "username": username}
     return {"error": "Login failed. Check your username and password."}
+
+
+# --- lookup ---------------------------------------------------------------
+#
+# `lookup` resolves LOCG comic IDs in batch from "Series:Issue[:Variant]" specs.
+# It groups requests by series, resolves the canonical series_id once per
+# unique series, then uses a title-filtered query to pinpoint each issue.
+# Optionally checks collection membership by fetching the collection once.
+
+# Publishers ranked first when picking the canonical series for a given name.
+_PREFERRED_PUBLISHERS: tuple[str, ...] = (
+    "Marvel Comics",
+    "DC Comics",
+    "Dark Horse Comics",
+    "Image Comics",
+    "IDW Publishing",
+    "BOOM! Studios",
+    "Valiant",
+    "Vertigo",
+)
+
+# Issue numbers are typically integers, optionally with a decimal or short
+# alphabetic suffix (e.g. "1", "1.MU", "1AU"). Used to disambiguate
+# "Series:Issue[:Variant]" specs where the series name may itself contain ":".
+_ISSUE_NUMBER_RE = re.compile(r"^\d+(\.\w+)?[A-Za-z]*$")
+
+
+def _normalize_series_name(name: str) -> str:
+    """Lowercase, strip leading 'The ', collapse internal whitespace."""
+    n = (name or "").lower().strip()
+    if n.startswith("the "):
+        n = n[4:]
+    return re.sub(r"\s+", " ", n)
+
+
+def _looks_like_issue_number(s: str) -> bool:
+    return bool(_ISSUE_NUMBER_RE.match(s.strip()))
+
+
+def parse_lookup_spec(spec: str) -> tuple[str, str, Optional[str]]:
+    """Parse a 'Series:Issue[:Variant]' spec into ``(series, issue, variant)``.
+
+    Series names may contain colons (e.g. "Batman: The Long Halloween:9").
+    To disambiguate, we treat the trailing token as the variant only when
+    the second-to-last token looks like an issue number; otherwise the
+    trailing token IS the issue.
+    """
+    parts = spec.split(":")
+    if len(parts) < 2:
+        raise ValueError(
+            f"Invalid spec {spec!r}: expected 'Series:Issue' or 'Series:Issue:Variant'"
+        )
+
+    last = parts[-1].strip()
+    if len(parts) >= 3 and _looks_like_issue_number(parts[-2].strip()):
+        # Series:Issue:Variant
+        series = ":".join(parts[:-2]).strip()
+        issue = parts[-2].strip()
+        variant: Optional[str] = last
+    else:
+        # Series:Issue (series may contain internal colons)
+        series = ":".join(parts[:-1]).strip()
+        issue = last
+        variant = None
+
+    if not series or not issue:
+        raise ValueError(f"Invalid spec {spec!r}: series and issue are required")
+    return series, issue, variant
+
+
+def _pick_best_series(
+    series_list: list[dict[str, Any]],
+    target: str,
+) -> Optional[dict[str, Any]]:
+    """Pick the canonical series from a search result.
+
+    Heuristic:
+      1. Filter to entries whose normalized name equals the target name
+         (case-insensitive, ignoring leading 'The ').
+      2. If none match exactly, fall back to entries that contain the target
+         as a substring.
+      3. Among candidates, sort by (preferred-publisher rank, oldest start
+         year, highest issue count) and return the best.
+    """
+    target_norm = _normalize_series_name(target)
+
+    exact = [s for s in series_list if _normalize_series_name(s.get("name", "")) == target_norm]
+    candidates = exact or [
+        s for s in series_list if target_norm and target_norm in _normalize_series_name(s.get("name", ""))
+    ]
+    candidates = [s for s in candidates if s.get("id")]
+    if not candidates:
+        return None
+
+    def score(s: dict[str, Any]) -> tuple[int, int, int]:
+        publisher = s.get("publisher") or ""
+        try:
+            pub_rank = _PREFERRED_PUBLISHERS.index(publisher)
+        except ValueError:
+            pub_rank = len(_PREFERRED_PUBLISHERS)
+        start_year = s.get("start_year") or 9999
+        issue_count = s.get("issue_count") or 0
+        return (pub_rank, start_year, -issue_count)
+
+    candidates.sort(key=score)
+    return candidates[0]
+
+
+def _find_issue_in_series(
+    client: LOCGClient,
+    series_id: int,
+    series_name: str,
+    issue_number: str,
+    variant: Optional[str] = None,
+) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """Find canonical and variant comic IDs for an issue within a series.
+
+    Uses a title-filtered query against the series so the result set stays
+    small (a handful of items) regardless of series length, sidestepping
+    the 140-issue page limit on plain ``series`` fetches.
+
+    Returns ``(canonical_id, variant_id, canonical_name)``.
+    """
+    title_query = f"{series_name} #{issue_number}"
+    resp = client.get(
+        "/comic/get_comics",
+        params={
+            "list": "search",
+            "view": "thumbs",
+            "format[]": "1",
+            "series_id": str(series_id),
+            "title": title_query,
+            "order": "date-desc",
+        },
+    )
+    _, soup = parse_list_response(resp.text)
+    items = soup.find_all("li")
+
+    target_series_norm = _normalize_series_name(series_name)
+    issue_token = f"#{issue_number}"
+    variant_norm = (variant or "").lower().strip()
+
+    canonical_id: Optional[int] = None
+    canonical_name: Optional[str] = None
+    variant_id: Optional[int] = None
+
+    for li in items:
+        comic_id_raw = li.get("data-comic")
+        if not comic_id_raw:
+            continue
+        try:
+            comic_id = int(comic_id_raw)
+        except (TypeError, ValueError):
+            continue
+
+        title_div = li.find("div", class_="title")
+        link = title_div.find("a") if title_div else None
+        name = link.get_text(strip=True) if link else ""
+        if not name:
+            continue
+
+        # Issue token must match exactly. Without word-boundary checks
+        # "Spider-Man #15" would falsely match "#150".
+        m = re.search(r"#(\S+)", name)
+        if not m or m.group(1) != issue_number:
+            continue
+
+        # Series part must align with the requested series.
+        if target_series_norm not in _normalize_series_name(name.split("#")[0]):
+            continue
+
+        is_variant_entry = bool(re.search(r"#\S+\s+\S", name))  # has text after "#N "
+        if variant_norm and is_variant_entry and variant_norm in name.lower():
+            variant_id = comic_id
+        elif not is_variant_entry and canonical_id is None:
+            canonical_id = comic_id
+            canonical_name = name
+
+    return canonical_id, variant_id, canonical_name
+
+
+def cmd_lookup(
+    client: LOCGClient,
+    requests: list[tuple[str, str, Optional[str]]],
+    check_collection: bool = True,
+) -> list[dict[str, Any]]:
+    """Resolve LOCG IDs for a batch of (series, issue[, variant]) requests.
+
+    Groups requests by series so we hit the search endpoint at most once per
+    unique series. Each issue is then resolved with one title-filtered query
+    against that series_id (small payload, no pagination dance).
+
+    If ``check_collection`` is true, fetches the user's collection once and
+    intersects locally to populate ``in_collection`` on each result.
+    """
+    # Resolve each unique series exactly once.
+    unique_series: dict[str, Optional[dict[str, Any]]] = {}
+    for series_name, _, _ in requests:
+        if series_name not in unique_series:
+            results = cmd_search(client, series_name)
+            unique_series[series_name] = _pick_best_series(results, series_name)
+
+    # Fetch collection (once) only if needed.
+    collection_ids: Optional[set[int]] = None
+    if check_collection:
+        collection = _get_user_list(client, "collection")
+        collection_ids = {item["id"] for item in collection if item.get("id")}
+
+    out: list[dict[str, Any]] = []
+    for series_name, issue_number, variant in requests:
+        result: dict[str, Any] = {
+            "series_name": series_name,
+            "issue_number": issue_number,
+            "variant": variant,
+            "series_id": None,
+            "locg_id": None,
+            "locg_variant_id": None,
+            "issue_name": None,
+        }
+        if check_collection:
+            result["in_collection"] = False
+
+        series = unique_series.get(series_name)
+        if not series:
+            result["error"] = f"Series {series_name!r} not found"
+            out.append(result)
+            continue
+
+        result["series_id"] = series.get("id")
+        # Use the canonical name LOCG returned for this series, not the user
+        # input — LOCG is consistent in titling ("The Amazing Spider-Man #142")
+        # and the title filter matches that exact prefix.
+        canonical_series_name = series.get("name") or series_name
+
+        canonical_id, variant_id, issue_name = _find_issue_in_series(
+            client,
+            int(result["series_id"]),
+            canonical_series_name,
+            issue_number,
+            variant,
+        )
+        if canonical_id is None:
+            result["error"] = (
+                f"Issue #{issue_number} not found in series {canonical_series_name!r}"
+            )
+            out.append(result)
+            continue
+
+        result["locg_id"] = canonical_id
+        result["locg_variant_id"] = variant_id
+        result["issue_name"] = issue_name
+
+        if check_collection and collection_ids is not None:
+            check_id = variant_id if (variant and variant_id) else canonical_id
+            result["in_collection"] = check_id in collection_ids
+
+        out.append(result)
+
+    return out

@@ -13,11 +13,14 @@ from locg.commands import (
     _filter_by_title,
     _get_user_list,
     _get_week_date,
+    _normalize_series_name,
+    _pick_best_series,
     cmd_add,
     cmd_check_lists,
     cmd_collection,
     cmd_collection_has,
     cmd_find,
+    cmd_lookup,
     cmd_pull_list,
     cmd_read_list,
     cmd_releases,
@@ -25,6 +28,7 @@ from locg.commands import (
     cmd_search,
     cmd_update,
     cmd_wish_list,
+    parse_lookup_spec,
 )
 
 
@@ -1016,7 +1020,6 @@ def test_cmd_update_unexpected_http_error(mock_client):
     mock_client.post.assert_not_called()
 
 
-# --- cmd_find tests ---
 
 
 def _make_find_issue_html(comic_id: int, title: str) -> str:
@@ -1214,3 +1217,314 @@ def test_cmd_remove_retries_on_json_decode_error(mock_client, monkeypatch):
     result = cmd_remove(mock_client, "collection", 12345)
     assert mock_client.post.call_count == 2
     assert result == {"status": "ok"}
+
+# --- lookup ---------------------------------------------------------------
+
+
+def _make_series_li(
+    series_id: int,
+    name: str,
+    publisher: str = "Marvel Comics",
+    start_year: int = 1980,
+    end_year: int = 2011,
+    issue_count: int = 100,
+) -> str:
+    """Build an <li> matching what extract_series() expects."""
+    years = f"{start_year} - {end_year}" if end_year else str(start_year)
+    return (
+        f'<li>'
+        f'<a class="link-collection-series" data-id="{series_id}" '
+        f'href="/comics/series/{series_id}/{name.lower().replace(" ", "-")}">link</a>'
+        f'<div class="title"><a href="/comics/series/{series_id}/{name.lower().replace(" ", "-")}">{name}</a></div>'
+        f'<span class="count-issues">{issue_count}</span>'
+        f'<div class="copy-really-small">'
+        f'<span>{publisher}</span><span>· {years}</span>'
+        f'</div>'
+        f'</li>'
+    )
+
+
+def _make_search_response(series_html_items: list[str], count: int) -> str:
+    return json.dumps({"count": count, "list": "".join(series_html_items)})
+
+
+def _make_issue_li(comic_id: int, name: str) -> str:
+    """Issue HTML matching the search-by-series response format."""
+    return (
+        f'<li data-comic="{comic_id}">'
+        f'<div class="title"><a href="/comic/{comic_id}/x">{name}</a></div>'
+        f'</li>'
+    )
+
+
+# --- parse_lookup_spec ----
+
+
+def test_parse_lookup_spec_simple():
+    assert parse_lookup_spec("Batman:224") == ("Batman", "224", None)
+
+
+def test_parse_lookup_spec_with_variant():
+    assert parse_lookup_spec("Uncanny X-Men:179:Newsstand") == (
+        "Uncanny X-Men",
+        "179",
+        "Newsstand",
+    )
+
+
+def test_parse_lookup_spec_series_with_internal_colon():
+    """A colon inside the series name must not be mistaken for the issue delimiter."""
+    assert parse_lookup_spec("Batman: The Long Halloween:9") == (
+        "Batman: The Long Halloween",
+        "9",
+        None,
+    )
+
+
+def test_parse_lookup_spec_series_with_colon_and_variant():
+    assert parse_lookup_spec(
+        "Batman: Legends of the Dark Knight Halloween Special:1:Newsstand"
+    ) == ("Batman: Legends of the Dark Knight Halloween Special", "1", "Newsstand")
+
+
+def test_parse_lookup_spec_decimal_issue():
+    assert parse_lookup_spec("Saga:1.5") == ("Saga", "1.5", None)
+
+
+def test_parse_lookup_spec_rejects_no_colon():
+    with pytest.raises(ValueError):
+        parse_lookup_spec("Batman")
+
+
+def test_parse_lookup_spec_rejects_empty_parts():
+    with pytest.raises(ValueError):
+        parse_lookup_spec(":224")
+    with pytest.raises(ValueError):
+        parse_lookup_spec("Batman:")
+
+
+# --- normalize / picker ----
+
+
+def test_normalize_strips_the_prefix_and_collapses_whitespace():
+    assert _normalize_series_name("The Amazing  Spider-Man") == "amazing spider-man"
+    assert _normalize_series_name("Uncanny X-Men") == "uncanny x-men"
+
+
+def test_pick_best_series_prefers_exact_name_then_publisher_then_year():
+    series_list = [
+        # Reprint, recent
+        {"id": 1, "name": "Batman", "publisher": "Other", "start_year": 2020, "issue_count": 5},
+        # Canonical 1940 DC run
+        {"id": 2, "name": "Batman", "publisher": "DC Comics", "start_year": 1940, "issue_count": 700},
+        # Loose match (different name)
+        {"id": 3, "name": "Batman: Year One", "publisher": "DC Comics", "start_year": 1987, "issue_count": 4},
+    ]
+    best = _pick_best_series(series_list, "Batman")
+    assert best["id"] == 2
+
+
+def test_pick_best_series_handles_the_prefix():
+    series_list = [
+        {"id": 1, "name": "The Uncanny X-Men", "publisher": "Marvel Comics", "start_year": 1980, "issue_count": 1000},
+        {"id": 2, "name": "Uncanny X-Men", "publisher": "Panini Comics", "start_year": 2013, "issue_count": 5},
+    ]
+    best = _pick_best_series(series_list, "Uncanny X-Men")
+    # Both match exactly after normalization; Marvel/oldest wins.
+    assert best["id"] == 1
+
+
+def test_pick_best_series_returns_none_when_no_match():
+    series_list = [
+        {"id": 1, "name": "Spawn", "publisher": "Image Comics", "start_year": 1992, "issue_count": 350},
+    ]
+    assert _pick_best_series(series_list, "Daredevil") is None
+
+
+def test_pick_best_series_skips_entries_without_id():
+    series_list = [
+        {"id": 0, "name": "Batman", "publisher": "DC Comics", "start_year": 1940, "issue_count": 700},
+        {"id": 5, "name": "Batman", "publisher": "DC Comics", "start_year": 2011, "issue_count": 50},
+    ]
+    best = _pick_best_series(series_list, "Batman")
+    assert best["id"] == 5
+
+
+# --- cmd_lookup integration ----
+
+
+def _setup_lookup_mock(mock_client, series_response, issue_responses, collection_response=None):
+    """Wire mock_client.get to return a sequence of responses based on URL/params."""
+    def side_effect(url, params=None, **kwargs):
+        params = params or {}
+        resp = MagicMock()
+        resp.status_code = 200
+        # Series search (list_option=series)
+        if params.get("list_option") == "series":
+            resp.text = series_response
+            return resp
+        # Title-filtered issue search (has both series_id and title)
+        if params.get("series_id") and params.get("title"):
+            key = (params.get("series_id"), params.get("title"))
+            resp.text = issue_responses.get(key, json.dumps({"count": 0, "list": ""}))
+            return resp
+        # Collection list fetch
+        if params.get("list") == "collection":
+            resp.text = collection_response or _make_list_response([], total_count=0)
+            return resp
+        resp.text = json.dumps({"count": 0, "list": ""})
+        return resp
+
+    mock_client.get.side_effect = side_effect
+
+
+def test_cmd_lookup_resolves_single_request_no_collection(mock_client):
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    issue_responses = {
+        ("108806", "Uncanny X-Men #185"): json.dumps({
+            "count": 1,
+            "list": _make_issue_li(1081721, "Uncanny X-Men #185"),
+        }),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(mock_client, [("Uncanny X-Men", "185", None)], check_collection=False)
+
+    assert len(result) == 1
+    row = result[0]
+    assert row["series_id"] == 108806
+    assert row["locg_id"] == 1081721
+    assert row["locg_variant_id"] is None
+    assert row["issue_name"] == "Uncanny X-Men #185"
+    assert "in_collection" not in row
+    assert "error" not in row
+
+
+def test_cmd_lookup_groups_by_series(mock_client):
+    """Two issues from one series should produce a single search call."""
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    issue_responses = {
+        ("108806", "Uncanny X-Men #185"): json.dumps({
+            "count": 1, "list": _make_issue_li(1081721, "Uncanny X-Men #185"),
+        }),
+        ("108806", "Uncanny X-Men #188"): json.dumps({
+            "count": 1, "list": _make_issue_li(5907584, "Uncanny X-Men #188"),
+        }),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(
+        mock_client,
+        [("Uncanny X-Men", "185", None), ("Uncanny X-Men", "188", None)],
+        check_collection=False,
+    )
+
+    assert [r["locg_id"] for r in result] == [1081721, 5907584]
+    # 1 series search + 2 issue searches = 3 calls
+    series_calls = [
+        c for c in mock_client.get.call_args_list
+        if (c.kwargs.get("params") or {}).get("list_option") == "series"
+    ]
+    assert len(series_calls) == 1
+
+
+def test_cmd_lookup_marks_in_collection(mock_client):
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    issue_responses = {
+        ("108806", "Uncanny X-Men #185"): json.dumps({
+            "count": 1, "list": _make_issue_li(1081721, "Uncanny X-Men #185"),
+        }),
+    }
+    # Collection contains comic 1081721 (with collection-active membership)
+    collection_html = _make_list_response_with_lists(
+        [(1081721, "Uncanny X-Men", [2])],  # 2 = collection
+        total_count=1,
+    )
+    _setup_lookup_mock(mock_client, series_response, issue_responses, collection_response=collection_html)
+
+    result = cmd_lookup(mock_client, [("Uncanny X-Men", "185", None)], check_collection=True)
+
+    assert result[0]["in_collection"] is True
+    assert result[0]["locg_id"] == 1081721
+
+
+def test_cmd_lookup_in_collection_false_when_id_absent(mock_client):
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    issue_responses = {
+        ("108806", "Uncanny X-Men #185"): json.dumps({
+            "count": 1, "list": _make_issue_li(1081721, "Uncanny X-Men #185"),
+        }),
+    }
+    # Collection has a different comic
+    collection_html = _make_list_response_with_lists(
+        [(9999999, "Other", [2])], total_count=1,
+    )
+    _setup_lookup_mock(mock_client, series_response, issue_responses, collection_response=collection_html)
+
+    result = cmd_lookup(mock_client, [("Uncanny X-Men", "185", None)], check_collection=True)
+    assert result[0]["in_collection"] is False
+
+
+def test_cmd_lookup_series_not_found(mock_client):
+    series_response = _make_search_response([], 0)
+    _setup_lookup_mock(mock_client, series_response, {})
+
+    result = cmd_lookup(
+        mock_client, [("Made Up Series", "1", None)], check_collection=False
+    )
+    assert result[0]["error"].startswith("Series ")
+    assert result[0]["locg_id"] is None
+
+
+def test_cmd_lookup_issue_not_found_in_series(mock_client):
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    # Empty issue response
+    issue_responses = {("108806", "Uncanny X-Men #999"): json.dumps({"count": 0, "list": ""})}
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(mock_client, [("Uncanny X-Men", "999", None)], check_collection=False)
+    assert "Issue #999 not found" in result[0]["error"]
+    assert result[0]["series_id"] == 108806
+
+
+def test_cmd_lookup_distinguishes_canonical_from_variant(mock_client):
+    """When a variant is requested, canonical and variant entries get separate IDs."""
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    # Title-filter returns BOTH canonical and newsstand variant
+    list_html = (
+        _make_issue_li(7480697, "Uncanny X-Men #179") +
+        _make_issue_li(8888888, "Uncanny X-Men #179 Newsstand Edition")
+    )
+    issue_responses = {
+        ("108806", "Uncanny X-Men #179"): json.dumps({"count": 2, "list": list_html}),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(
+        mock_client, [("Uncanny X-Men", "179", "Newsstand")], check_collection=False
+    )
+    assert result[0]["locg_id"] == 7480697
+    assert result[0]["locg_variant_id"] == 8888888
+
+
+def test_cmd_lookup_issue_match_is_exact_not_prefix(mock_client):
+    """'#15' should NOT match '#150' or '#155'."""
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    list_html = (
+        _make_issue_li(99001, "Uncanny X-Men #150") +
+        _make_issue_li(99002, "Uncanny X-Men #155")
+    )
+    issue_responses = {("108806", "Uncanny X-Men #15"): json.dumps({"count": 2, "list": list_html})}
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(mock_client, [("Uncanny X-Men", "15", None)], check_collection=False)
+    # No exact #15 entry → not found
+    assert result[0]["locg_id"] is None
+    assert "not found" in result[0].get("error", "")
