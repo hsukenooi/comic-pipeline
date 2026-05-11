@@ -272,10 +272,16 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
 
     db.commit()
 
-    # Insert any Gixen snipes not yet in the DB (e.g. added via web UI)
-    existing_ids = {b["item_id"] for b in get_pending_bids(db)}
+    # Insert any Gixen snipes not yet in the DB (e.g. added via web UI). Use
+    # the full bids table — not just PENDING — so a snipe we already
+    # transitioned to a terminal status earlier in this same sync run isn't
+    # re-inserted as a fresh PENDING duplicate.
+    existing_ids = {b["item_id"] for b in get_all_bids(db)}
     for snipe in snipes:
-        if snipe["item_id"] not in existing_ids and snipe.get("status", "") not in _TERMINAL_GIXEN_STATUSES:
+        snipe_terminal = _map_terminal_status(
+            snipe.get("status", ""), snipe.get("time_to_end", "")
+        )
+        if snipe["item_id"] not in existing_ids and snipe_terminal is None:
             try:
                 max_bid = float(snipe.get("max_bid") or 0)
             except (ValueError, TypeError):

@@ -734,6 +734,35 @@ def test_sync_gixen_time_to_end_ended_with_unknown_status_flips_to_ended(api):
     assert row["status"] == "ENDED"
 
 
+def test_sync_gixen_does_not_duplicate_after_terminal_transition(api):
+    """If a snipe transitions PENDING → terminal in this run, the same run's
+    insert loop must not re-create it as a fresh PENDING. Regression for the
+    bug where existing_ids only counted PENDING rows."""
+    api.post("/api/bids", json={"item_id": "600000005", "max_bid": 25.0})
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "600000005",
+        "title": "Test",
+        "max_bid": "25.00 USD",
+        "current_bid": "30.00 USD",
+        "status": "OUTBID",
+        "status_mirror": "OUTBID: EBAY BID INCREMENT RULE NOT MET",
+        "time_to_end": "ENDED",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "d5",
+    }]
+    api.post("/api/sync")
+    import os, sqlite3
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    count = raw.execute(
+        "SELECT COUNT(*) FROM bids WHERE item_id=?", ("600000005",)
+    ).fetchone()[0]
+    raw.close()
+    assert count == 1, f"expected 1 row for 600000005, got {count}"
+
+
 def test_sync_gixen_scheduled_stays_pending(api):
     """Sanity check: a still-active snipe (SCHEDULED, future end) must remain
     PENDING — the terminal mapper must not over-trigger."""
