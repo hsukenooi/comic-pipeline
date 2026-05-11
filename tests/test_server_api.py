@@ -646,6 +646,118 @@ def test_sync_gixen_flips_vanished_ended_to_ended(api):
     assert len(rows) == 1
 
 
+def _read_db_row(item_id):
+    """Read raw bid row by item_id for assertion."""
+    import os, sqlite3
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.row_factory = sqlite3.Row
+    row = raw.execute(
+        "SELECT status, winning_bid, status_mirror FROM bids WHERE item_id=?",
+        (item_id,),
+    ).fetchone()
+    raw.close()
+    return dict(row) if row else None
+
+
+def test_sync_gixen_maps_outbid_to_lost(api):
+    """Gixen status='OUTBID' (with time_to_end='ENDED') must flip PENDING → LOST
+    and persist status_mirror. Before the fix, OUTBID wasn't in the terminal set
+    and rows stayed PENDING forever."""
+    api.post("/api/bids", json={"item_id": "600000001", "max_bid": 25.0})
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "600000001",
+        "title": "Detective Comics 523",
+        "max_bid": "25.00 USD",
+        "current_bid": "28.50 USD",
+        "status": "OUTBID",
+        "status_mirror": "OUTBID: EBAY BID INCREMENT RULE NOT MET",
+        "time_to_end": "ENDED",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "d1",
+    }]
+    api.post("/api/sync")
+    row = _read_db_row("600000001")
+    assert row["status"] == "LOST"
+    assert row["winning_bid"] == 28.5  # captured from current_bid
+    assert row["status_mirror"] == "OUTBID: EBAY BID INCREMENT RULE NOT MET"
+
+
+def test_sync_gixen_maps_bid_under_asking_price_to_ended(api):
+    """Gixen status='BID UNDER ASKING PRICE' (reserve not met) flips
+    PENDING → ENDED with winning_bid=None — no winner, eBay fallback can
+    refine later if it has data."""
+    api.post("/api/bids", json={"item_id": "600000002", "max_bid": 25.0})
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "600000002",
+        "title": "Detective Comics 575",
+        "max_bid": "25.00 USD",
+        "current_bid": "15.00 USD",
+        "status": "BID UNDER ASKING PRICE",
+        "status_mirror": "N/A",
+        "time_to_end": "ENDED",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "d2",
+    }]
+    api.post("/api/sync")
+    row = _read_db_row("600000002")
+    assert row["status"] == "ENDED"
+    assert row["winning_bid"] is None  # no real winner
+    assert row["status_mirror"] == "N/A"
+
+
+def test_sync_gixen_time_to_end_ended_with_unknown_status_flips_to_ended(api):
+    """If time_to_end='ENDED' but the status string is something we don't
+    recognize, fall back to ENDED rather than leaving the row PENDING."""
+    api.post("/api/bids", json={"item_id": "600000003", "max_bid": 25.0})
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "600000003",
+        "title": "Test",
+        "max_bid": "25.00 USD",
+        "current_bid": "10.00 USD",
+        "status": "SOME_NEW_GIXEN_STATUS",
+        "status_mirror": None,
+        "time_to_end": "ENDED",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "d3",
+    }]
+    api.post("/api/sync")
+    row = _read_db_row("600000003")
+    assert row["status"] == "ENDED"
+
+
+def test_sync_gixen_scheduled_stays_pending(api):
+    """Sanity check: a still-active snipe (SCHEDULED, future end) must remain
+    PENDING — the terminal mapper must not over-trigger."""
+    api.post("/api/bids", json={"item_id": "600000004", "max_bid": 25.0})
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "600000004",
+        "title": "Test",
+        "max_bid": "25.00 USD",
+        "current_bid": "5.00 USD",
+        "status": "SCHEDULED",
+        "status_mirror": None,
+        "time_to_end": "2 d, 4 h",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+        "bid_offset_mirror": "6",
+        "dbidid": "d4",
+    }]
+    api.post("/api/sync")
+    row = _read_db_row("600000004")
+    assert row["status"] == "PENDING"
+    assert row["winning_bid"] is None
+
+
 # ---------------------------------------------------------------------------
 # bid_comics junction: comics array + locg-link endpoint
 # ---------------------------------------------------------------------------

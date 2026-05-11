@@ -88,6 +88,35 @@ def _get_db() -> sqlite3.Connection:
 
 _TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "ENDED"})
 
+# Gixen reports many ended-auction states the original 4-status set misses.
+# Map every Gixen status we've observed in production to our internal terminal
+# set {WON, LOST, FAILED, ENDED}. Keys are normalized (upper-case, stripped).
+_GIXEN_TERMINAL_MAP: dict[str, str] = {
+    "WON": "WON",
+    "LOST": "LOST",
+    "OUTBID": "LOST",
+    "BID UNDER ASKING PRICE": "ENDED",  # reserve not met / no sale
+    "FAILED": "FAILED",
+    "ENDED": "ENDED",
+}
+
+
+def _map_terminal_status(gixen_status: str, time_to_end: str) -> str | None:
+    """Map a Gixen snipe to our internal terminal status when its auction is done.
+
+    `time_to_end == 'ENDED'` is Gixen's authoritative signal that the auction
+    is over. If Gixen reports a recognized terminal status, return its mapped
+    value. If only `time_to_end` says ENDED (status string we don't recognize),
+    fall back to ENDED — the eBay fallback path can later refine it to WON/LOST.
+    Returns None for active snipes (no transition needed).
+    """
+    mapped = _GIXEN_TERMINAL_MAP.get(gixen_status.upper().strip())
+    if mapped:
+        return mapped
+    if time_to_end.upper().strip() == "ENDED":
+        return "ENDED"
+    return None
+
 # ebay_fetch.load_config calls sys.exit(1) on missing credentials. Detect that
 # eagerly with explicit env-var checks so a misconfiguration shows up as a
 # clean log line rather than getting laundered into a fake "fetch failed".
@@ -187,16 +216,23 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
         )
 
         gixen_status = snipe.get("status", "")
-        if gixen_status in _TERMINAL_GIXEN_STATUSES:
-            current_bid = snipe.get("current_bid", "")
+        time_to_end = snipe.get("time_to_end", "")
+        internal_status = _map_terminal_status(gixen_status, time_to_end)
+        if internal_status is not None:
+            # current_bid reflects the final selling price for WON/LOST, but
+            # for BID UNDER ASKING PRICE (reserve not met) or unknown-ENDED
+            # there's no real winner — leave winning_bid None and let the
+            # eBay fallback fill it in if it can.
             winning_bid = None
-            if current_bid:
-                try:
-                    winning_bid = float(current_bid.split()[0])
-                except (ValueError, IndexError):
-                    pass
+            if internal_status in ("WON", "LOST"):
+                current_bid = snipe.get("current_bid", "")
+                if current_bid:
+                    try:
+                        winning_bid = float(current_bid.split()[0])
+                    except (ValueError, IndexError):
+                        pass
             update_bid_status(
-                db, iid, gixen_status, winning_bid, now,
+                db, iid, internal_status, winning_bid, now,
                 snipe.get("status_mirror"),
             )
 
