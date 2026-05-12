@@ -685,16 +685,17 @@ def test_sync_gixen_maps_outbid_to_lost(api):
     assert row["status_mirror"] == "OUTBID: EBAY BID INCREMENT RULE NOT MET"
 
 
-def test_sync_gixen_maps_bid_under_asking_price_to_ended(api):
-    """Gixen status='BID UNDER ASKING PRICE' (reserve not met) flips
-    PENDING → ENDED with winning_bid=None — no winner, eBay fallback can
-    refine later if it has data."""
+def test_sync_gixen_maps_bid_under_asking_price_to_lost(api):
+    """Gixen status='BID UNDER ASKING PRICE' means the current price already
+    exceeded our max at snipe time and Gixen skipped placing the bid — we
+    lost, just at a different stage than OUTBID. Map to LOST and capture
+    current_bid as the price that beat us."""
     api.post("/api/bids", json={"item_id": "600000002", "max_bid": 25.0})
     api.mock_gixen.list_snipes.return_value = [{
         "item_id": "600000002",
         "title": "Detective Comics 575",
         "max_bid": "25.00 USD",
-        "current_bid": "15.00 USD",
+        "current_bid": "37.56 USD",
         "status": "BID UNDER ASKING PRICE",
         "status_mirror": "N/A",
         "time_to_end": "ENDED",
@@ -706,8 +707,8 @@ def test_sync_gixen_maps_bid_under_asking_price_to_ended(api):
     }]
     api.post("/api/sync")
     row = _read_db_row("600000002")
-    assert row["status"] == "ENDED"
-    assert row["winning_bid"] is None  # no real winner
+    assert row["status"] == "LOST"
+    assert row["winning_bid"] == 37.56  # the price that beat us
     assert row["status_mirror"] == "N/A"
 
 

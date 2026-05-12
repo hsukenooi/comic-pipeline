@@ -91,11 +91,17 @@ _TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "
 # Gixen reports many ended-auction states the original 4-status set misses.
 # Map every Gixen status we've observed in production to our internal terminal
 # set {WON, LOST, FAILED, ENDED}. Keys are normalized (upper-case, stripped).
+#
+# OUTBID and BID UNDER ASKING PRICE are both losses: in OUTBID Gixen placed
+# our bid but eBay's proxy revealed a higher standing max; in BID UNDER ASKING
+# PRICE the current price already exceeded our max at snipe time so Gixen
+# skipped the submission. Different mechanics, same outcome — we lost, and
+# current_bid is the price that beat us.
 _GIXEN_TERMINAL_MAP: dict[str, str] = {
     "WON": "WON",
     "LOST": "LOST",
     "OUTBID": "LOST",
-    "BID UNDER ASKING PRICE": "ENDED",  # reserve not met / no sale
+    "BID UNDER ASKING PRICE": "LOST",
     "FAILED": "FAILED",
     "ENDED": "ENDED",
 }
@@ -219,10 +225,10 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
         time_to_end = snipe.get("time_to_end", "")
         internal_status = _map_terminal_status(gixen_status, time_to_end)
         if internal_status is not None:
-            # current_bid reflects the final selling price for WON/LOST, but
-            # for BID UNDER ASKING PRICE (reserve not met) or unknown-ENDED
-            # there's no real winner — leave winning_bid None and let the
-            # eBay fallback fill it in if it can.
+            # For WON/LOST, current_bid is the final price (what we paid or
+            # what beat us). For ENDED/FAILED with unknown status string,
+            # there's no reliable price signal — leave winning_bid None and
+            # let the eBay fallback fill it in if it can.
             winning_bid = None
             if internal_status in ("WON", "LOST"):
                 current_bid = snipe.get("current_bid", "")
