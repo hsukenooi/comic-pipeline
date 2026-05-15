@@ -700,19 +700,35 @@ class LocgLinkRequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+# Force browsers to revalidate static files on every load. Without this, a fix
+# pushed to the dashboard HTML/CSS can sit invisible behind heuristic caching
+# until the user knows to hard-reload. The dashboard is small and fetched
+# rarely; the cost of revalidation is negligible.
+_NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
+
+
 @app.get("/")
 def root():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+    return FileResponse(
+        Path(__file__).parent / "static" / "index.html",
+        headers=_NO_CACHE_HEADERS,
+    )
 
 
 @app.get("/v2/comics")
 def variant_v2_comics():
-    return FileResponse(Path(__file__).parent / "static" / "v2-comics.html")
+    return FileResponse(
+        Path(__file__).parent / "static" / "v2-comics.html",
+        headers=_NO_CACHE_HEADERS,
+    )
 
 
 @app.get("/v2/bids")
 def variant_v2_bids():
-    return FileResponse(Path(__file__).parent / "static" / "v2-bids.html")
+    return FileResponse(
+        Path(__file__).parent / "static" / "v2-bids.html",
+        headers=_NO_CACHE_HEADERS,
+    )
 
 
 @app.get("/static/v2.css")
@@ -720,6 +736,7 @@ def static_v2_css():
     return FileResponse(
         Path(__file__).parent / "static" / "v2.css",
         media_type="text/css",
+        headers=_NO_CACHE_HEADERS,
     )
 
 
