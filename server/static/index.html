@@ -315,6 +315,11 @@ const fmtUSD = s => { const n = parseAmt(s); return n != null ? `$${n.toFixed(2)
 
 function outcome(r) {
   if (r.status === "PENDING") return '<span class="pill pending">pending</span>';
+  // Trust the authoritative backend status before any heuristics. Without this,
+  // an OUTBID-on-tie loss (winning_bid == max_bid because eBay's bid-increment
+  // rule defeats a tied snipe) gets falsely rendered as "won".
+  if (r.status === "WON") return '<span class="pill won">won</span>';
+  if (r.status === "LOST") return '<span class="pill lost">outbid</span>';
   const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
   const m = parseAmt(r.max_bid);
   if (w != null && m != null) return w <= m
