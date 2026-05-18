@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gixen-overlay"
+version = "0.1.0"
+description = "Comic overlay plugin for gixen-cli"
+requires-python = ">=3.11"
+dependencies = [
+    "gixen-cli",
+]
+
+[project.entry-points."gixen.plugins"]
+gixen-overlay = "gixen_overlay.plugin:plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gixen_overlay"]
