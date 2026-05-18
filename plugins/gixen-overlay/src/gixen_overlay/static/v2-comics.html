@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gixen ▸ comics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/v2.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="seg brand">▎ gixen</div>
+  <a class="seg nav" href="/">snipes</a>
+  <a class="seg nav active" href="/v2/comics">▸ comics</a>
+  <a class="seg nav" href="/v2/bids">bids</a>
+  <div class="spacer"></div>
+  <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
+  <div class="seg clock" id="clock">--:--:--</div>
+</div>
+
+<div class="wrap">
+  <div class="session" id="session">
+    <span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">comics</span> <span class="ok">▸ ready</span>
+  </div>
+  <div id="comics-section"></div>
+</div>
+
+<div class="keybar">
+  <span><kbd>r</kbd>refresh</span>
+  <span><kbd>s</kbd>snipes</span>
+  <span><kbd>c</kbd>comics</span>
+  <span><kbd>b</kbd>bids</span>
+  <span class="spacer"></span>
+  <span class="stat is-loading" id="status"><span class="dot loading"></span><span id="status-text">connecting…</span></span>
+</div>
+
+<script>
+const REFRESH_MS = 60000;
+const COMICS_URL = "/api/comics";
+const SNIPES_URL = "/api/snipes";
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function fmtFmv(r) {
+  const lo = r.fmv_low, hi = r.fmv_high;
+  if (lo == null && hi == null) return '<span class="mute">—</span>';
+  if (lo != null && hi != null) {
+    if (Math.round(lo) === Math.round(hi)) return `$${Math.round(lo)}`;
+    return `$${Math.round(lo)}–${Math.round(hi)}`;
+  }
+  return `$${Math.round(lo ?? hi)}`;
+}
+
+function gradeLabel(g) {
+  if (g == null) return null;
+  const n = parseFloat(g);
+  if (isNaN(n)) return String(g);
+  if (n >= 9.8) return "NM/M";
+  if (n >= 9.4) return "NM+";
+  if (n >= 9.0) return "NM";
+  if (n >= 8.5) return "VF+";
+  if (n >= 8.0) return "VF";
+  if (n >= 7.5) return "VF-";
+  if (n >= 7.0) return "FN/VF";
+  if (n >= 6.5) return "FN+";
+  if (n >= 6.0) return "FN";
+  if (n >= 5.5) return "FN-";
+  if (n >= 5.0) return "VG/FN";
+  if (n >= 4.5) return "VG+";
+  if (n >= 4.0) return "VG";
+  if (n >= 3.5) return "VG-";
+  if (n >= 3.0) return "GD/VG";
+  if (n >= 2.5) return "GD+";
+  if (n >= 2.0) return "GD";
+  if (n >= 1.5) return "FR/GD";
+  if (n >= 1.0) return "FR";
+  return "PR";
+}
+
+function confPill(c) {
+  if (!c) return '<span class="mute">—</span>';
+  const cl = String(c).toLowerCase();
+  return `<span class="pill conf-${cl}">${cl}</span>`;
+}
+
+function renderComics(comics) {
+  const el = document.getElementById("comics-section");
+  if (!comics.length) {
+    el.innerHTML = `<div class="panel">
+      <div class="panel-head"><span class="label">comics</span><span class="count">0 rows</span></div>
+      <div class="empty">// no comics yet — add a snipe via cli.py then run extract-comics</div>
+    </div>`;
+    return;
+  }
+  const rows = comics.map(c => `<tr>
+    <td class="num dim">${c.id}</td>
+    <td>${c.title ? escapeHtml(c.title) : '<span class="mute">—</span>'}</td>
+    <td class="num">${c.issue != null ? escapeHtml(c.issue) : '<span class="mute">—</span>'}</td>
+    <td class="num dim">${c.year ?? '<span class="mute">—</span>'}</td>
+    <td class="num">${c.grade != null ? `${c.grade} ${gradeLabel(c.grade) ? `<span class="dim">(${gradeLabel(c.grade)})</span>` : ''}` : '<span class="mute">—</span>'}</td>
+    <td class="right num">${fmtFmv(c)}</td>
+    <td class="right num dim">${c.fmv_comps ?? '<span class="mute">—</span>'}</td>
+    <td>${confPill(c.fmv_confidence)}</td>
+    <td class="wrap dim">${c.fmv_notes ? escapeHtml(c.fmv_notes) : '<span class="mute">—</span>'}</td>
+  </tr>`).join("");
+  el.innerHTML = `<div class="panel">
+    <div class="panel-head">
+      <span class="label">comics</span>
+      <span class="count">${comics.length} rows</span>
+    </div>
+    <div class="scroll"><table><thead><tr>
+      <th>id</th><th>title</th><th>issue</th><th>year</th>
+      <th>grade</th><th class="right">fmv</th><th class="right">comps</th>
+      <th>conf</th><th>notes</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>
+  </div>`;
+}
+
+function setStatus(state, text) {
+  const el = document.getElementById("status");
+  const t = document.getElementById("status-text");
+  el.classList.remove("is-loading","is-error","is-ok");
+  el.classList.add("is-"+state);
+  el.querySelector(".dot").className = "dot " + (state === "ok" ? "ok" : state === "error" ? "err" : "loading");
+  t.textContent = text;
+}
+
+function tickClock() { document.getElementById("clock").textContent = new Date().toLocaleTimeString(); }
+setInterval(tickClock, 1000); tickClock();
+
+async function load() {
+  setStatus("loading", `fetching ${COMICS_URL}…`);
+  try {
+    const [comicsResp] = await Promise.all([fetch(COMICS_URL)]);
+    if (!comicsResp.ok) throw new Error(`HTTP ${comicsResp.status}`);
+    const comics = await comicsResp.json();
+    const sorted = [...comics].sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+    renderComics(sorted);
+    const now = new Date().toLocaleTimeString();
+    document.getElementById("session").innerHTML =
+      `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">comics</span> <span class="ok">▸ ${comics.length} rows · synced ${now}</span>`;
+    setStatus("ok", `${comics.length} rows`);
+  } catch (e) {
+    setStatus("error", e.message);
+    document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="err">▸ ${e.message}</span>`;
+  }
+}
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.key === "r") load();
+  if (e.key === "s") location.href = "/";
+  if (e.key === "c") location.href = "/v2/comics";
+  if (e.key === "b") location.href = "/v2/bids";
+});
+
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>
