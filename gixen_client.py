@@ -129,6 +129,17 @@ class GixenParseError(GixenError):
     """HTML response didn't match expected structure."""
 
 
+class GixenAddNotConfirmedError(GixenError):
+    """add_snipe POST returned no error but the item never appeared in the list."""
+
+    def __init__(self, item_id: str):
+        self.item_id = str(item_id)
+        super().__init__(
+            f"Gixen accepted add for item {item_id} but it never appeared in the "
+            f"snipe list — likely silently rate-limited or dropped."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -138,6 +149,18 @@ _LOGIN_COOLDOWN = 300  # seconds to wait after a failed login before retrying
 
 class GixenClient:
     """Web-scraping client for Gixen.com."""
+
+    # Minimum seconds between Gixen write POSTs — prevents silent drops during bursts.
+    _min_post_gap: float = 1.5
+    # Backoff before retrying an add_snipe that wasn't confirmed by list_snipes.
+    _add_retry_backoff: float = 5.0
+    # Account-keyed monotonic timestamp of the last _post_home call. Class-
+    # level so two GixenClient instances sharing the same username (e.g.
+    # _api_client + _sync_client in the server) actually serialize against
+    # Gixen-side rate limits. Without this, the two clients each carry their
+    # own _last_post_at and the throttle is per-instance, defeating the
+    # bursts-protection intent.
+    _last_post_at_by_user: dict[str, float] = {}
 
     def __init__(
         self,
@@ -151,6 +174,17 @@ class GixenClient:
         self.session = _CurlSession()
         self.session_id: Optional[str] = None
         self._login_failed_at: Optional[float] = None  # monotonic timestamp
+
+    @property
+    def _last_post_at(self) -> Optional[float]:
+        return type(self)._last_post_at_by_user.get(self.username)
+
+    @_last_post_at.setter
+    def _last_post_at(self, value: Optional[float]) -> None:
+        if value is None:
+            type(self)._last_post_at_by_user.pop(self.username, None)
+        else:
+            type(self)._last_post_at_by_user[self.username] = value
 
     # ------------------------------------------------------------------
     # Authentication
@@ -198,6 +232,11 @@ class GixenClient:
 
         self._login_failed_at = None
         self.session_id = match.group(1)
+        # Clear the post-throttle: re-login already takes seconds and has
+        # effectively spaced the requests. Without this, the recursion path
+        # in _post_home (500 → relogin → retry) stacks throttle on top of
+        # login latency.
+        self._last_post_at = None
         logger.info("Logged in to Gixen (session_id=%s...)", self.session_id[:8])
         return self.session_id
 
@@ -245,9 +284,16 @@ class GixenClient:
 
     def _post_home(self, data: dict, retry_on_expired: bool = True, check_errors: bool = True) -> str:
         """POST to the home page. Auto-re-login on session expiration."""
+        if self._min_post_gap and self._last_post_at is not None:
+            elapsed = time.monotonic() - self._last_post_at
+            remaining = self._min_post_gap - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
         resp = self.session.post(
             self._home_url(), data=data, timeout=self.timeout
         )
+        self._last_post_at = time.monotonic()
 
         # Gixen returns HTTP 500 for requests with a stale/invalid session.
         # Treat it as session expiry and retry after re-login.
@@ -325,6 +371,11 @@ class GixenClient:
 
         Raises:
             GixenItemError: If the item can't be added (not found, duplicate, etc.)
+            GixenAddNotConfirmedError: If the POST returned no error but the snipe
+                never appeared in the snipe list (Gixen silently dropped it),
+                even after one retry. Also raised when the verify list_snipes
+                itself fails (parse error, HTTP error) — in that case we cannot
+                tell whether the POST landed, so we refuse to double-POST.
         """
         data = {
             "newitemid": str(item_id),
@@ -334,9 +385,70 @@ class GixenClient:
             "newsnipegroup": str(snipe_group),
             "username": self.username,
         }
+        target = str(item_id)
+
         self._post_home(data)
-        logger.info("Added snipe: item=%s, max_bid=%s", item_id, max_bid)
-        return True
+
+        # Verify the POST landed. If list_snipes itself fails (parser drift,
+        # network blip), we can't know whether the POST succeeded — and
+        # double-POSTing in that uncertain state risks duplicate snipes. Bail
+        # with AddNotConfirmedError so the caller can investigate.
+        try:
+            snipes = self.list_snipes()
+        except (GixenParseError, requests.HTTPError, GixenSessionExpiredError) as e:
+            logger.warning(
+                "add_snipe for item=%s: verify list_snipes failed (%s); "
+                "refusing to double-POST",
+                item_id, e,
+            )
+            raise GixenAddNotConfirmedError(item_id) from e
+
+        if any(s["item_id"] == target for s in snipes):
+            logger.info("Added snipe: item=%s, max_bid=%s", item_id, max_bid)
+            return True
+
+        # Silent drop: Gixen returned 200 with no error banner, but the snipe
+        # never landed. Back off and retry once before giving up.
+        logger.warning(
+            "add_snipe for item=%s not confirmed in list; retrying after %.1fs",
+            item_id, self._add_retry_backoff,
+        )
+        if self._add_retry_backoff:
+            time.sleep(self._add_retry_backoff)
+
+        # Retry POST. Catch the eventual-consistency race: Gixen accepted the
+        # original POST but the verify GET was served from a stale view; the
+        # retry POST then trips ITEM ALREADY PRESENT (code 202). Treat 202 +
+        # subsequent verify-shows-item as success (the first POST really
+        # landed). Any other GixenItemError bubbles up.
+        try:
+            self._post_home(data)
+        except GixenItemError as e:
+            if e.code == 202:
+                try:
+                    snipes = self.list_snipes()
+                except (GixenParseError, requests.HTTPError, GixenSessionExpiredError):
+                    raise GixenAddNotConfirmedError(item_id) from e
+                if any(s["item_id"] == target for s in snipes):
+                    logger.info(
+                        "add_snipe for item=%s: first POST landed, retry hit "
+                        "202; treating as success", item_id,
+                    )
+                    return True
+                # 202 but verify still doesn't see it → genuinely confused.
+                raise GixenAddNotConfirmedError(item_id) from e
+            raise
+
+        try:
+            snipes = self.list_snipes()
+        except (GixenParseError, requests.HTTPError, GixenSessionExpiredError) as e:
+            raise GixenAddNotConfirmedError(item_id) from e
+
+        if any(s["item_id"] == target for s in snipes):
+            logger.info("Added snipe on retry: item=%s, max_bid=%s", item_id, max_bid)
+            return True
+
+        raise GixenAddNotConfirmedError(item_id)
 
     def modify_snipe(
         self,
