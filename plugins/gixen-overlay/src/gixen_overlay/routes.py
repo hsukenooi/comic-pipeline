@@ -9,9 +9,10 @@ from fastapi.responses import FileResponse
 
 from gixen_overlay.db import (
     upsert_comic,
+    upsert_fmv,
+    link_fmv_to_bid,
+    get_primary_fmv_for_bid,
     list_comics,
-    get_primary_comic_for_bid,
-    link_comic_to_bid,
 )
 from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest
 from gixen_overlay.title_parser import parse_title
@@ -52,15 +53,20 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
         title=req.title,
         issue=req.issue,
         year=req.year,
-        grade=req.grade,
-        fmv_low=req.fmv_low,
-        fmv_high=req.fmv_high,
-        fmv_comps=req.fmv_comps,
-        fmv_confidence=req.fmv_confidence,
-        fmv_notes=req.fmv_notes,
         locg_id=req.locg_id,
         locg_variant_id=req.locg_variant_id,
     )
+    if req.grade is not None:
+        upsert_fmv(
+            db,
+            comic_id=comic_id,
+            grade=req.grade,
+            low=req.fmv_low,
+            high=req.fmv_high,
+            comps=req.fmv_comps,
+            confidence=req.fmv_confidence,
+            notes=req.fmv_notes,
+        )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return dict(row)
 
@@ -69,8 +75,8 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
 async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
     """Persist a resolved LOCG ID against a specific comic in a bid's set.
 
-    Without `issue`: target the bid's primary comic (`bids.comic_id`).
-    With `issue`: find a comic in the bid's junction matching that issue;
+    Without `issue`: target the bid's primary fmv's comic (`bid.fmv_id → fmv.comic_id`).
+    With `issue`: find an fmv in the bid's junction matching that issue;
     if missing, auto-upsert one using the primary's series/year.
     """
     if not re.match(r"^\d+$", item_id):
@@ -81,28 +87,32 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
     if bid_row is None:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in DB")
 
+    target_fmv_id: int | None = None
     target_comic_id: int | None = None
 
     if req.issue is not None:
+        # Find an fmv whose comic has the requested issue, linked to this bid
         match = db.execute(
             """
-            SELECT c.id
-            FROM bid_comics bc
-            JOIN comics c ON c.id = bc.comic_id
-            WHERE bc.bid_id = ? AND c.issue = ?
+            SELECT bf.fmv_id, c.id AS comic_id
+            FROM bid_fmvs bf
+            JOIN fmv f ON f.id = bf.fmv_id
+            JOIN comics c ON c.id = f.comic_id
+            WHERE bf.bid_id = ? AND c.issue = ?
             LIMIT 1
             """,
             (bid_row["id"], req.issue),
         ).fetchone()
         if match:
-            target_comic_id = match["id"]
+            target_fmv_id = match["fmv_id"]
+            target_comic_id = match["comic_id"]
         else:
-            primary = get_primary_comic_for_bid(db, bid_row["id"])
+            primary = get_primary_fmv_for_bid(db, bid_row["id"])
             if primary is None:
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        f"Bid {item_id} has no primary comic; cannot infer series/year "
+                        f"Bid {item_id} has no primary fmv; cannot infer series/year "
                         "for auto-create. Run extract-comics first or use cli.py add."
                     ),
                 )
@@ -111,24 +121,29 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
                 title=primary["title"],
                 issue=req.issue,
                 year=primary["year"],
-                grade=None,
-                fmv_low=None,
-                fmv_high=None,
-                fmv_comps=None,
-                fmv_confidence=None,
-                fmv_notes="auto-linked via locg-link",
             )
-            link_comic_to_bid(db, bid_row["id"], target_comic_id, is_primary=False)
+            # Create an fmv stub at the primary's grade for the lot issue
+            new_fmv_id = upsert_fmv(db, target_comic_id, primary["grade"])
+            link_fmv_to_bid(db, bid_row["id"], new_fmv_id, is_primary=False)
+            target_fmv_id = new_fmv_id
     else:
-        if bid_row["comic_id"] is None:
+        primary_fmv_id = bid_row["fmv_id"]
+        if primary_fmv_id is None:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Bid {item_id} has no primary comic. Pass --issue to target a "
+                    f"Bid {item_id} has no primary fmv. Pass --issue to target a "
                     "specific issue or run extract-comics first."
                 ),
             )
-        target_comic_id = bid_row["comic_id"]
+        target_fmv_id = primary_fmv_id
+        fmv_row = db.execute(
+            "SELECT comic_id FROM fmv WHERE id=?", (primary_fmv_id,)
+        ).fetchone()
+        target_comic_id = fmv_row["comic_id"] if fmv_row else None
+
+    if target_comic_id is None:
+        raise HTTPException(status_code=500, detail="Could not resolve target comic")
 
     db.execute(
         """
@@ -142,19 +157,20 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
     db.commit()
 
     row = db.execute(
-        "SELECT id AS comic_id, title, issue, year, grade, locg_id, locg_variant_id "
+        "SELECT id AS comic_id, title, issue, year, locg_id, locg_variant_id "
         "FROM comics WHERE id = ?",
         (target_comic_id,),
     ).fetchone()
-    is_primary = (target_comic_id == bid_row["comic_id"])
+    # is_primary: target fmv matches the bid's primary fmv_id
+    is_primary = (target_fmv_id == bid_row["fmv_id"])
     return {**dict(row), "is_primary": is_primary}
 
 
 @router.post("/api/extract-comics")
 async def api_extract_comics(request: Request):
-    """Parse cached eBay titles for unlinked bids and link them to comics.
+    """Parse cached eBay titles for unlinked bids and link them via fmv_id.
 
-    Idempotent: skips bids that already have comic_id set.
+    Idempotent: skips bids that already have fmv_id set.
     """
     db = request.app.state.db
 
@@ -162,7 +178,7 @@ async def api_extract_comics(request: Request):
         """
         SELECT id, item_id, ebay_title
         FROM bids
-        WHERE comic_id IS NULL
+        WHERE fmv_id IS NULL
           AND ebay_title IS NOT NULL
           AND ebay_title != ''
           AND status != 'PURGED'
@@ -202,14 +218,16 @@ async def api_extract_comics(request: Request):
                     title=parsed.series,
                     issue=issue,
                     year=parsed.year,
-                    grade=parsed.grade,
-                    fmv_low=None,
-                    fmv_high=None,
-                    fmv_comps=None,
-                    fmv_confidence=None,
-                    fmv_notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
                 )
-                link_comic_to_bid(db, row["id"], comic_id, is_primary=(idx == 0))
+                if parsed.grade is not None:
+                    fmv_id = upsert_fmv(
+                        db,
+                        comic_id=comic_id,
+                        grade=parsed.grade,
+                        notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
+                    )
+                    link_fmv_to_bid(db, row["id"], fmv_id, is_primary=(idx == 0))
+                # Bids with no parseable grade cannot get an fmv link (fmv.grade NOT NULL)
             linked += 1
         except Exception as e:
             errors.append({"item_id": item_id, "error": f"link failed: {e}"})
