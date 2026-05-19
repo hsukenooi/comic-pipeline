@@ -9,18 +9,18 @@ from locg.client import AuthRequired, LOCGClient
 
 
 def _make_client_with_session(ci_session: str | None = "abc123") -> LOCGClient:
-    """Build an LOCGClient without touching the filesystem."""
-    with patch.object(LOCGClient, "_load_cookies"):
+    """Build an LOCGClient without touching the filesystem or launching Chrome."""
+    cookies = [{"name": "ci_session", "value": ci_session}] if ci_session else []
+
+    mock_context = MagicMock()
+    mock_context.cookies.return_value = cookies
+    mock_context.new_page.return_value = MagicMock()
+
+    with patch("locg.client.sync_playwright") as mock_sync_pw, \
+         patch("locg.client.playwright_profile_dir", return_value="/tmp/fake-profile"):
+        mock_sync_pw.return_value.start.return_value.chromium.launch_persistent_context.return_value = mock_context
         client = LOCGClient()
-    # Install a fake cookie jar
-    jar = []
-    if ci_session:
-        cookie = MagicMock()
-        cookie.name = "ci_session"
-        cookie.value = ci_session
-        jar.append(cookie)
-    client._session = MagicMock()
-    client._session.cookies.jar = jar
+
     return client
 
 
@@ -187,20 +187,18 @@ def test_require_auth_partial_env_does_not_login(monkeypatch):
 def test_login_success_primes_verified_cache():
     """On successful login, _server_auth_verified should be True so
     the next require_auth call doesn't re-verify."""
-    client = _make_client_with_session(ci_session=None)  # start empty
+    client = _make_client_with_session(ci_session=None)  # start with no cookie
 
-    # Fake login that sets the cookie then returns success
+    # After a successful POST /login the server sets ci_session;
+    # simulate this by having post() return a 200 and then updating
+    # the mock context to report the cookie as present.
     def fake_post(path, data=None):
-        cookie = MagicMock()
-        cookie.name = "ci_session"
-        cookie.value = "xyz"
-        client._session.cookies.jar.append(cookie)
+        client._context.cookies.return_value = [{"name": "ci_session", "value": "xyz"}]
         resp = MagicMock()
         resp.status_code = 200
         return resp
 
     client.post = MagicMock(side_effect=fake_post)
-    client._save_cookies = MagicMock()
     client.verify_session = MagicMock(return_value=True)
 
     assert client.login("user", "pass") is True
@@ -209,3 +207,48 @@ def test_login_success_primes_verified_cache():
     # Now require_auth should NOT call verify_session again
     client.require_auth()
     assert client.verify_session.call_count == 1  # only the one from login()
+
+
+def test_close_tears_down_playwright():
+    """close() must shut down the context and the Playwright driver."""
+    client = _make_client_with_session()
+    client.close()
+
+    client._context.close.assert_called_once()
+    client._playwright_instance.stop.assert_called_once()
+
+
+def test_wrap_response_maps_fields():
+    """_wrap_playwright_response maps APIResponse fields to _PlaywrightResponse."""
+    from locg.client import _PlaywrightResponse, _wrap_response
+
+    api_resp = MagicMock()
+    api_resp.status = 200
+    api_resp.text.return_value = "hello"
+    api_resp.body.return_value = b"hello"
+    api_resp.headers = {"content-type": "text/html", "retry-after": "30"}
+
+    result = _wrap_response(api_resp)
+
+    assert isinstance(result, _PlaywrightResponse)
+    assert result.status_code == 200
+    assert result.text == "hello"
+    assert result.content == b"hello"
+    assert result.headers["retry-after"] == "30"
+    api_resp.dispose.assert_called_once()
+
+
+def test_wrap_response_empty_body():
+    """Empty body produces content=b'' and text='', not None."""
+    from locg.client import _wrap_response
+
+    api_resp = MagicMock()
+    api_resp.status = 204
+    api_resp.text.return_value = ""
+    api_resp.body.return_value = b""
+    api_resp.headers = {}
+
+    result = _wrap_response(api_resp)
+
+    assert result.content == b""
+    assert result.text == ""

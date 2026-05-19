@@ -1,16 +1,17 @@
-"""HTTP client for League of Comic Geeks with Cloudflare bypass."""
+"""HTTP client for League of Comic Geeks using Playwright with real Chrome."""
 from __future__ import annotations
 
 import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlencode
 
-from curl_cffi import requests as cffi_requests
+from playwright.sync_api import APIResponse, sync_playwright
 
-from locg.config import cookie_path, ensure_config_dir
+from locg.config import cookie_path, playwright_profile_dir
 
 BASE_URL = "https://leagueofcomicgeeks.com"
 
@@ -22,41 +23,65 @@ class AuthRequired(Exception):
     pass
 
 
+@dataclass
+class _PlaywrightResponse:
+    status_code: int
+    text: str
+    content: bytes
+    headers: dict[str, str]
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+def _wrap_response(api_response: APIResponse) -> _PlaywrightResponse:
+    try:
+        raw = api_response.body()
+        return _PlaywrightResponse(
+            status_code=api_response.status,
+            text=raw.decode("utf-8", errors="replace"),
+            content=raw,
+            headers=dict(api_response.headers),
+        )
+    finally:
+        api_response.dispose()
+
+
 class LOCGClient:
-    """HTTP client that impersonates Chrome to bypass Cloudflare."""
+    """HTTP client that uses real Chrome via Playwright to bypass Cloudflare."""
 
     def __init__(self) -> None:
-        self._session = cffi_requests.Session(impersonate="chrome")
-        self._cookies_loaded = False
+        self._playwright_instance = sync_playwright().start()
+        try:
+            profile_dir = str(playwright_profile_dir())
+            self._context = self._playwright_instance.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                channel="chrome",
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            )
+            self._page = self._context.new_page()
+        except Exception:
+            self._playwright_instance.stop()
+            raise
         self._server_auth_verified: Optional[bool] = None
-        self._load_cookies()
-
-    def _load_cookies(self) -> None:
+        # Remove stale cookies.json left by the previous curl_cffi implementation.
         p = cookie_path()
         if p.exists():
-            with open(p) as f:
-                cookies = json.load(f)
-            for name, value in cookies.items():
-                self._session.cookies.set(name, value, domain="leagueofcomicgeeks.com")
-            self._cookies_loaded = True
-            logger.debug(f"Loaded {len(cookies)} cookies from {p}")
-
-    def _save_cookies(self) -> None:
-        ensure_config_dir()
-        p = cookie_path()
-        cookies = {}
-        for cookie in self._session.cookies.jar:
-            cookies[cookie.name] = cookie.value
-        with open(p, "w") as f:
-            json.dump(cookies, f, indent=2)
-        logger.debug(f"Saved {len(cookies)} cookies to {p}")
+            try:
+                p.unlink()
+                logger.debug("Removed legacy cookies.json (cookies now in Playwright profile)")
+            except OSError:
+                pass
 
     @property
     def is_authenticated(self) -> bool:
-        for cookie in self._session.cookies.jar:
-            if cookie.name == "ci_session":
-                return True
-        return False
+        cookies = self._context.cookies([BASE_URL])
+        return any(c["name"] == "ci_session" for c in cookies)
 
     def require_auth(self) -> None:
         if not self.is_authenticated:
@@ -105,29 +130,30 @@ class LOCGClient:
             )
         return ok
 
-    def get(self, path: str, params: Optional[dict[str, Any]] = None) -> cffi_requests.Response:
+    def get(self, path: str, params: Optional[dict[str, Any]] = None) -> _PlaywrightResponse:
         url = f"{BASE_URL}{path}"
         if params:
             url = f"{url}?{urlencode(params, doseq=True)}"
         logger.debug(f"GET {url}")
         start = time.monotonic()
-        resp = self._session.get(url, timeout=30)
+        api_resp = self._page.request.get(url, timeout=30000)
+        resp = _wrap_response(api_resp)
         elapsed = time.monotonic() - start
         logger.debug(f"  -> {resp.status_code} ({elapsed:.2f}s, {len(resp.content)} bytes)")
         if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After", "60")
+            retry_after = resp.headers.get("retry-after", "60")
             logger.warning(f"Rate limited on GET {url}, retry after {retry_after}s")
             raise Exception(f"Rate limited. Retry after {retry_after}s")
         return resp
 
-    def post(self, path: str, data: Optional[dict[str, Any]] = None) -> cffi_requests.Response:
+    def post(self, path: str, data: Optional[dict[str, Any]] = None) -> _PlaywrightResponse:
         url = f"{BASE_URL}{path}"
         logger.debug(f"POST {url}")
         start = time.monotonic()
-        resp = self._session.post(url, data=data, timeout=30)
+        api_resp = self._page.request.post(url, form=data or {}, timeout=30000)
+        resp = _wrap_response(api_resp)
         elapsed = time.monotonic() - start
         logger.debug(f"  -> {resp.status_code} ({elapsed:.2f}s)")
-        self._save_cookies()
         return resp
 
     def verify_session(self) -> bool:
@@ -156,8 +182,6 @@ class LOCGClient:
             logger.debug(f"Login failed: no ci_session cookie (status {resp.status_code})")
             return False
 
-        self._save_cookies()
-
         # Verify the session is actually valid server-side
         if not self.verify_session():
             logger.debug("Login appeared to succeed but session is not valid server-side")
@@ -168,4 +192,7 @@ class LOCGClient:
         return True
 
     def close(self) -> None:
-        self._session.close()
+        try:
+            self._context.close()
+        finally:
+            self._playwright_instance.stop()

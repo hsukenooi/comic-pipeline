@@ -5,7 +5,7 @@ import argparse
 import json
 import logging
 import sys
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 
@@ -260,9 +260,10 @@ def main() -> None:
     )
 
     logger = logging.getLogger("locg")
-    client = LOCGClient()
+    client: Optional[LOCGClient] = None
 
     try:
+        client = LOCGClient()
         result: Any = None
         logger.info(f"Running command: {args.command}")
 
@@ -375,4 +376,5 @@ def main() -> None:
     except Exception as e:
         die(str(e), code=4)
     finally:
-        client.close()
+        if client is not None:
+            client.close()

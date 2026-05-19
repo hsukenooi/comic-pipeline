@@ -124,18 +124,20 @@ src/locg/
 ├── __init__.py      # Package version
 ├── __main__.py      # `python -m locg` entry point
 ├── cli.py           # Argparse definitions, main() entry, JSON output
-├── client.py        # HTTP client using curl_cffi (Cloudflare bypass), cookie persistence
+├── client.py        # HTTP client using Playwright + real Chrome (Cloudflare bypass), persistent profile
 ├── commands.py      # Command implementations (search, releases, comic, series, lists, add/remove, login)
 ├── config.py        # XDG config dir management, cookie/config file paths
 ├── models.py        # HTML → dict extraction (extract_issue, extract_series, extract_comic_detail)
 ├── parser.py        # Low-level HTML/JSON parsing helpers (BeautifulSoup wrappers, price/date extraction)
 ```
 
-- **client.py** handles all HTTP. Uses `curl_cffi` with Chrome impersonation to bypass Cloudflare. Session cookies are persisted to `~/.config/locg/cookies.json`.
+- **client.py** handles all HTTP. Uses Playwright (`channel="chrome"`, real system Chrome) to bypass Cloudflare TLS fingerprint checks. Session and `cf_clearance` cookies persist in `~/.config/locg/playwright-profile/`.
 - **commands.py** orchestrates client calls and parser/model extraction. Each `cmd_*` function returns a dict or list of dicts.
 - **models.py** extracts structured data from BeautifulSoup tags. `extract_issue` handles list items, `extract_series` handles search results, `extract_comic_detail` handles full comic pages.
 - **parser.py** provides shared parsing utilities (JSON list response parsing, text cleaning, price/date extraction).
 - **cli.py** wires argparse to commands and handles JSON serialization, error formatting, and exit codes.
+
+`docs/solutions/` — documented solutions to past problems (bugs, best practices), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when debugging integration or HTTP client issues.
 
 ## Conventions
 
@@ -152,7 +154,9 @@ PYTHONPATH=src python3 -m pytest tests/ -v
 
 ## Dependencies
 
-- `curl-cffi` — HTTP client with browser impersonation (Cloudflare bypass)
+- `playwright` — HTTP client via real Chrome (`channel="chrome"`); cookies persist in `~/.config/locg/playwright-profile/`. System Chrome must be installed. No `playwright install` needed.
 - `beautifulsoup4` — HTML parsing
 - `python-dotenv` — load `~/.config/locg/.env` at startup for auto-login
 - `pytest` (test only)
+
+**Note:** Existing `~/.config/locg/cookies.json` is no longer read. Run `locg login` once after upgrading to populate the new Playwright profile.

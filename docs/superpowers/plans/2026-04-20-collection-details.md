@@ -6,7 +6,7 @@
 
 **Architecture:** Three surgical additions to the existing `client` / `commands` / `cli` / `models` layers. No new modules. `post_my_details` is a form POST — its quirk is that omitted fields get wiped, so `update` does a fetch-merge-POST while `add` can safely send a minimum payload (comic is brand new). Session validation piggybacks on the existing `verify_session()` method with a cached boolean to keep cost at one GET per CLI invocation.
 
-**Tech Stack:** Python 3.9+, argparse, `curl_cffi` (already in use), BeautifulSoup, `pytest` + `unittest.mock` (already in use).
+**Tech Stack:** Python 3.9+, argparse, `playwright` (real Chrome via persistent context; replaced `curl_cffi` in PER-38), BeautifulSoup, `pytest` + `unittest.mock` (already in use).
 
 **Spec:** `docs/superpowers/specs/2026-04-20-collection-details-design.md`
 
