@@ -31,6 +31,10 @@ def cookie_path() -> Path:
     return _config_dir() / "cookies.json"
 
 
+def playwright_profile_dir() -> Path:
+    return _config_dir() / "playwright-profile"
+
+
 def env_path() -> Path:
     return _config_dir() / ".env"
 
