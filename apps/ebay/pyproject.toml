@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ebay-fetch"
+version = "0.1.0"
+description = "Fetch structured listing data from the eBay Browse API"
+requires-python = ">=3.11"
+dependencies = [
+    "requests",
+]
+
+[project.scripts]
+ebay-fetch = "ebay_fetch:main"
+
+[tool.hatch.build.targets.wheel]
+include = ["src/ebay_fetch.py"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
