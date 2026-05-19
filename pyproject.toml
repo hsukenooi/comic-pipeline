@@ -1,12 +1,27 @@
 [build-system]
 requires = ["setuptools>=70"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "gixen-cli"
 version = "1.0.0"
 description = "CLI and server for managing eBay snipes via Gixen"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Hsu Ken Ooi", email = "hsukenooi@googlemail.com" }]
+keywords = ["ebay", "sniper", "gixen", "cli", "auctions"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
 dependencies = [
     "requests",
     "click",
@@ -16,6 +31,12 @@ dependencies = [
     "httpx",
     "pluggy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hsukenooi/gixen-cli"
+Repository = "https://github.com/hsukenooi/gixen-cli"
+Issues = "https://github.com/hsukenooi/gixen-cli/issues"
+Changelog = "https://github.com/hsukenooi/gixen-cli/blob/main/CHANGELOG.md"
 
 [project.scripts]
 gixen = "cli:cli"
@@ -29,3 +50,9 @@ gixen = "cli:cli"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gixen*", "server*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests requiring real Gixen credentials (deselect with -m 'not integration')",
+]
