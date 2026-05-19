@@ -104,21 +104,16 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
     """).fetchall()
 
     survivor_ids = [r["id"] for r in survivors]
-    # Build mapping from legacy comic_id to survivor_id for the same (title, issue, year)
-    id_to_survivor = {}
-    for s in survivors:
-        id_to_survivor[s["id"]] = s["id"]
+    # Build O(n) mapping from legacy comic_id to survivor_id for the same (title, issue, year)
+    survivor_key_map = {(s["title"], s["issue"], s["year"]): s["id"] for s in survivors}
+    id_to_survivor: dict[int, int] = {s["id"]: s["id"] for s in survivors}
 
-    # For non-survivor comics, map them to their group's survivor
     all_comics = conn.execute(
         "SELECT id, title, issue, year FROM comics"
     ).fetchall()
     for c in all_comics:
         if c["id"] not in id_to_survivor:
-            for s in survivors:
-                if s["title"] == c["title"] and s["issue"] == c["issue"] and s["year"] == c["year"]:
-                    id_to_survivor[c["id"]] = s["id"]
-                    break
+            id_to_survivor[c["id"]] = survivor_key_map[(c["title"], c["issue"], c["year"])]
 
     # Step 2: Manufacture fmv rows for each legacy (survivor_id, grade) pair.
     legacy_rows = conn.execute(
@@ -218,16 +213,20 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
             if fmv_id is None:
                 junction_skipped += 1
                 continue
-            conn.execute(
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, ?)",
                 (bc["bid_id"], fmv_id, bc["is_primary"]),
             )
-            junction_inserted += 1
+            junction_inserted += cur.rowcount
 
         # Step 5: Drop bid_comics (removes FK blocking non-survivor delete).
         conn.execute("DROP TABLE bid_comics")
 
     # Step 6: Delete non-survivor comics rows.
+    if any(sid is None for sid in survivor_ids):
+        raise RuntimeError(
+            "survivor_ids contains None — sqlite3.Row row_factory misconfiguration"
+        )
     if survivor_ids:
         placeholders = ",".join("?" * len(survivor_ids))
         conn.execute(
@@ -269,7 +268,7 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
 
     # Recreate fmv and bid_fmvs with full FK constraints.
     conn.execute("""
-        CREATE TABLE fmv (
+        CREATE TABLE IF NOT EXISTS fmv (
             id          INTEGER PRIMARY KEY,
             comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
             grade       REAL NOT NULL,
@@ -283,7 +282,7 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.execute("""
-        CREATE TABLE bid_fmvs (
+        CREATE TABLE IF NOT EXISTS bid_fmvs (
             bid_id      INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
             fmv_id      INTEGER NOT NULL REFERENCES fmv(id) ON DELETE CASCADE,
             is_primary  INTEGER NOT NULL DEFAULT 0,
@@ -359,7 +358,7 @@ def upsert_comic(
 def upsert_fmv(
     conn: sqlite3.Connection,
     comic_id: int,
-    grade: float,
+    grade: float | None,
     low: float | None = None,
     high: float | None = None,
     comps: int | None = None,

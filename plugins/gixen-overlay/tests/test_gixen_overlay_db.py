@@ -436,6 +436,8 @@ def test_migration_is_idempotent():
     create_tables(conn)
     comics = conn.execute("SELECT * FROM comics").fetchall()
     assert len(comics) == 1
+    fmv_rows = conn.execute("SELECT * FROM fmv").fetchall()
+    assert len(fmv_rows) == 1
 
 
 def test_migration_crash_recovery_raises_runtime_error():

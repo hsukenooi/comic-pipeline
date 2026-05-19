@@ -155,8 +155,8 @@ def test_extract_comics_links_unlinked_bid(api):
     r = api.post("/api/extract-comics")
     assert r.status_code == 200
     body = r.json()
-    assert body["processed"] >= 1
-    assert body["linked"] >= 1
+    assert body["processed"] == 1
+    assert body["linked"] == 1
 
 
 def test_extract_comics_idempotent(api):
