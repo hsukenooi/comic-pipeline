@@ -90,7 +90,14 @@ def test_upsert_comic_creates_comic(api):
     data = r.json()
     assert data["id"] > 0
     assert data["title"] == "Amazing Spider-Man"
-    assert data["fmv_confidence"] == "high"
+    # POST returns the comics (identity) row; fmv data lives in the fmv table
+    assert "fmv_confidence" not in data
+    # Verify fmv was stored via GET /api/comics
+    gr = api.get("/api/comics", params={"grade": 9.2})
+    assert gr.status_code == 200
+    rows = gr.json()
+    assert len(rows) == 1
+    assert rows[0]["fmv_confidence"] == "high"
 
 
 def test_upsert_comic_twice_upserts(api):
@@ -101,7 +108,20 @@ def test_upsert_comic_twice_upserts(api):
     payload["fmv_low"] = 550.0
     r2 = api.post("/api/comics", json=payload)
     assert r1.json()["id"] == r2.json()["id"]
-    assert r2.json()["fmv_low"] == 550.0
+    # fmv_low is updated in the fmv table; verify via GET
+    gr = api.get("/api/comics", params={"grade": 8.0})
+    assert gr.status_code == 200
+    assert gr.json()[0]["fmv_low"] == 550.0
+
+
+def test_upsert_comic_without_grade_creates_no_fmv(api):
+    r = api.post("/api/comics", json={"title": "X-Men", "issue": "1", "year": 1963})
+    assert r.status_code == 200
+    gr = api.get("/api/comics")
+    assert gr.status_code == 200
+    rows = gr.json()
+    assert len(rows) == 1
+    assert rows[0]["grade"] is None
 
 
 def test_upsert_comic_missing_year_returns_422(api):
@@ -163,8 +183,9 @@ def test_locg_link_sets_locg_id(api):
     api.post("/api/bids", json={"item_id": "555000010", "max_bid": 30.0})
     db_path = os.environ["DB_PATH"]
     raw = sqlite3.connect(db_path)
+    # Title must include a grade so extract-comics creates an fmv row and sets fmv_id
     raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
-                ("Daredevil #1 Marvel 1993", "555000010"))
+                ("Daredevil #1 1993 VF", "555000010"))
     raw.commit()
     raw.close()
     api.post("/api/extract-comics")
