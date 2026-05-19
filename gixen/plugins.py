@@ -24,7 +24,15 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from importlib.metadata import entry_points
+from importlib.metadata import entry_points as _stdlib_entry_points
+
+
+def entry_points(group: str):
+    # entry_points(group=...) requires Python 3.12+; fall back to dict API on 3.9-3.11
+    try:
+        return _stdlib_entry_points(group=group)
+    except TypeError:
+        return _stdlib_entry_points().get(group, [])
 from typing import TYPE_CHECKING
 
 import pluggy
@@ -140,7 +148,7 @@ def load_plugins() -> pluggy.PluginManager:
     """
     pm = make_plugin_manager()
     registered: list[str] = []
-    for ep in sorted(entry_points(group=_GROUP), key=lambda e: e.name):
+    for ep in sorted(entry_points(_GROUP), key=lambda e: e.name):
         try:
             plugin = ep.load()
         except Exception:

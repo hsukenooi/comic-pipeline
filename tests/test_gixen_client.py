@@ -846,6 +846,7 @@ class TestCliListAddedSince:
         ]
 
         with patch("cli._make_client") as mock_make, \
+             patch("cli._server_request", return_value=snipes), \
              patch("cli._load_add_history", return_value=history):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
