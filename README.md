@@ -6,7 +6,7 @@ Comic overlay plugin for [gixen-cli](https://github.com/hsukenooi/gixen-cli), pl
 
 - `plugins/gixen-overlay/` — FastAPI routes, SQLite tables, and dashboard tab for comic sniping workflow
 - `apps/` — standalone apps (PER-31: ebay, PER-32: ezship)
-- `skills/` — Claude Code skills for the comic workflow (PER-33)
+- `.claude/skills/` — Claude Code skills for the comic workflow (`/comic:buy`, `/comic:grade`, etc.)
 
 ## Status
 
