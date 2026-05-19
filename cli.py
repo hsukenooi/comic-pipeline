@@ -222,22 +222,7 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.argument("max_bid")
 @click.option("--offset", default=6, help="Seconds before end to place bid (1-15)")
 @click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
-@click.option("--comic", default=None, help="Comic title (e.g. 'Amazing Spider-Man')")
-@click.option("--issue", default=None, help="Issue number (e.g. '300')")
-@click.option("--year", default=None, type=int, help="Publication year")
-@click.option("--grade", default=None, type=float, help="CGC grade (e.g. 9.2)")
-@click.option("--fmv-low", default=None, type=float, help="FMV range low end")
-@click.option("--fmv-high", default=None, type=float, help="FMV range high end")
-@click.option("--fmv-comps", default=None, type=int, help="Number of comps used")
-@click.option("--fmv-confidence", default=None, help="FMV confidence: high/medium/low")
-@click.option("--fmv-notes", default=None, help="FMV notes")
-@click.option("--locg-id", default=None, type=int, help="LOCG canonical comic ID")
-@click.option("--locg-variant-id", default=None, type=int, help="LOCG variant comic ID (if different from --locg-id)")
-def add(item_id: str, max_bid: str, offset: int, group: int,
-        comic: str | None, issue: str | None, year: int | None, grade: float | None,
-        fmv_low: float | None, fmv_high: float | None,
-        fmv_comps: int | None, fmv_confidence: str | None, fmv_notes: str | None,
-        locg_id: int | None, locg_variant_id: int | None):
+def add(item_id: str, max_bid: str, offset: int, group: int):
     """Add a snipe for an eBay item."""
     try:
         bid = Decimal(max_bid)
@@ -252,14 +237,6 @@ def add(item_id: str, max_bid: str, offset: int, group: int,
             "bid_offset": offset,
             "snipe_group": group,
         }
-        if comic:
-            payload.update({
-                "comic": comic, "issue": issue, "year": year,
-                "grade": grade, "fmv_low": fmv_low, "fmv_high": fmv_high,
-                "fmv_comps": fmv_comps, "fmv_confidence": fmv_confidence,
-                "fmv_notes": fmv_notes,
-                "locg_id": locg_id, "locg_variant_id": locg_variant_id,
-            })
         _server_request("post", "/api/bids", json=payload)
         _record_add(item_id)
         click.echo(f"Added snipe for {item_id} with max bid {bid}")
@@ -321,10 +298,7 @@ def add(item_id: str, max_bid: str, offset: int, group: int,
 @click.argument("max_bid")
 @click.option("--offset", default=6, help="Seconds before end to place bid (1-15)")
 @click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
-@click.option("--locg-id", default=None, type=int, help="LOCG canonical comic ID")
-@click.option("--locg-variant-id", default=None, type=int, help="LOCG variant comic ID (if different from --locg-id)")
-def edit(item_id: str, max_bid: str, offset: int, group: int,
-         locg_id: int | None, locg_variant_id: int | None):
+def edit(item_id: str, max_bid: str, offset: int, group: int):
     """Change the bid on an existing snipe."""
     try:
         bid = Decimal(max_bid)
@@ -338,10 +312,6 @@ def edit(item_id: str, max_bid: str, offset: int, group: int,
             "bid_offset": offset,
             "snipe_group": group,
         }
-        if locg_id is not None:
-            payload["locg_id"] = locg_id
-        if locg_variant_id is not None:
-            payload["locg_variant_id"] = locg_variant_id
         _server_request("patch", f"/api/bids/{item_id}", json=payload)
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
         return
@@ -356,59 +326,6 @@ def edit(item_id: str, max_bid: str, offset: int, group: int,
     except GixenError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
-
-
-@cli.group("locg")
-def locg_cmd():
-    """Manage LOCG (League of Comic Geeks) ID linking on existing snipes."""
-
-
-@locg_cmd.command("link")
-@click.argument("item_id")
-@click.argument("locg_id", type=int)
-@click.option(
-    "--issue",
-    default=None,
-    help="Specific issue within a lot (e.g. '2' for the 2nd issue of a 5-issue lot). "
-    "Without this flag the bid's primary comic is updated.",
-)
-@click.option(
-    "--variant-id",
-    default=None,
-    type=int,
-    help="LOCG variant comic ID (if different from locg-id)",
-)
-def locg_link(item_id: str, locg_id: int, issue: str | None, variant_id: int | None):
-    """Persist a resolved LOCG ID against a comic in a bid.
-
-    Without --issue: targets the bid's primary comic. With --issue N: targets
-    that issue within the bid; auto-creates the comic row + junction entry if
-    the parser hadn't expanded the lot to that issue yet.
-    """
-    if not _server_url():
-        click.echo(
-            "Error: GIXEN_SERVER_URL must be set — locg link is server-only.",
-            err=True,
-        )
-        sys.exit(1)
-
-    payload: dict = {"locg_id": locg_id}
-    if issue is not None:
-        payload["issue"] = issue
-    if variant_id is not None:
-        payload["locg_variant_id"] = variant_id
-
-    resp = _server_request(
-        "post", f"/api/bids/{item_id}/comics/locg", json=payload
-    )
-    if not isinstance(resp, dict):  # safety: server should return a dict
-        click.echo(f"Unexpected server response: {resp}", err=True)
-        sys.exit(1)
-    issue_str = resp.get("issue") or "?"
-    is_primary = "primary" if resp.get("is_primary") else "secondary"
-    click.echo(
-        f"Linked LOCG {resp['locg_id']} to {item_id} #{issue_str} ({is_primary})"
-    )
 
 
 @cli.command("group")
@@ -496,27 +413,6 @@ def sync():
         sys.exit(1)
     result = _server_request("post", "/api/sync")
     click.echo(f"Synced {result.get('synced', '?')} snipes from Gixen.")
-
-
-@cli.command("extract-comics")
-def extract_comics_cmd():
-    """Auto-link bids to comics by parsing cached eBay listing titles."""
-    if not _server_url():
-        click.echo(
-            "Error: GIXEN_SERVER_URL not set — extract-comics only applies to server mode.",
-            err=True,
-        )
-        sys.exit(1)
-    result = _server_request("post", "/api/extract-comics")
-    processed = result.get("processed", 0)
-    linked = result.get("linked", 0)
-    skipped = result.get("skipped", []) or []
-    errors = result.get("errors", []) or []
-    click.echo(f"Processed {processed}, linked {linked}, skipped {len(skipped)}, errors {len(errors)}.")
-    for s in skipped:
-        click.echo(f"  skip {s.get('item_id', '?')}: {s.get('reason', 'unknown')}")
-    for e in errors:
-        click.echo(f"  err  {e}", err=True)
 
 
 @cli.command()
