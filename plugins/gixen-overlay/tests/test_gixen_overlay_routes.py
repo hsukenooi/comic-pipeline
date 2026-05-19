@@ -219,3 +219,306 @@ def test_dashboard_tabs_returns_comics_tab(api):
     assert isinstance(tabs, list)
     assert len(tabs) == 1
     assert tabs[0] == {"label": "comics", "path": "/comics"}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/comics/snipes  +  GET /api/comics/history
+# ---------------------------------------------------------------------------
+
+
+def _set_bid_fields(db_path, item_id, **fields):
+    """Patch arbitrary bids columns by item_id."""
+    raw = sqlite3.connect(db_path)
+    try:
+        sets = ", ".join(f"{k}=?" for k in fields)
+        raw.execute(f"UPDATE bids SET {sets} WHERE item_id=?",
+                    (*fields.values(), item_id))
+        raw.commit()
+    finally:
+        raw.close()
+
+
+def _link_comic(db_path, item_id, *, title, issue, year, grade,
+                fmv_low=None, fmv_high=None, is_primary=True):
+    """Create a comic + fmv row and link it to a bid via bid_fmvs."""
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    try:
+        raw.execute(
+            "INSERT OR IGNORE INTO comics (title, issue, year) VALUES (?, ?, ?)",
+            (title, issue, year),
+        )
+        cid = raw.execute(
+            "SELECT id FROM comics WHERE title=? AND issue=? AND year=?",
+            (title, issue, year),
+        ).fetchone()["id"]
+        raw.execute(
+            "INSERT OR REPLACE INTO fmv (comic_id, grade, low, high) VALUES (?, ?, ?, ?)",
+            (cid, grade, fmv_low, fmv_high),
+        )
+        fid = raw.execute(
+            "SELECT id FROM fmv WHERE comic_id=? AND grade=?", (cid, grade)
+        ).fetchone()["id"]
+        bid = raw.execute(
+            "SELECT id FROM bids WHERE item_id=?", (item_id,)
+        ).fetchone()
+        if is_primary:
+            raw.execute("UPDATE bid_fmvs SET is_primary=0 WHERE bid_id=?", (bid["id"],))
+            raw.execute("UPDATE bids SET fmv_id=? WHERE id=?", (fid, bid["id"]))
+        raw.execute(
+            "INSERT OR REPLACE INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, ?)",
+            (bid["id"], fid, 1 if is_primary else 0),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+
+# --- /api/comics/snipes ---
+
+
+def test_comics_snipes_empty_on_fresh_db(api):
+    r = api.get("/api/comics/snipes")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_comics_snipes_single_linked_comic_returns_full_enrichment(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "100000001", "max_bid": 125.0})
+    _set_bid_fields(db_path, "100000001",
+                    cached_current_bid="120.00 USD",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+    _link_comic(db_path, "100000001",
+                title="Amazing Spider-Man", issue="300", year=1988,
+                grade=9.4, fmv_low=100.0, fmv_high=200.0)
+
+    r = api.get("/api/comics/snipes")
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["item_id"] == "100000001"
+    assert row["cond_grade"] == 9.4
+    assert row["cond_extra_count"] == 0
+    assert row["fmv_low"] == 100.0
+    assert row["fmv_high"] == 200.0
+    assert row["lot_count"] == 1
+    assert row["needs_linking"] is False
+    assert row["max_bid_numeric"] == 125.0
+    assert row["current_bid_numeric"] == 120.0
+    # 120 / midpoint(150) * 100 = 80.0
+    assert row["value_pct"] == pytest.approx(80.0)
+
+
+def test_comics_snipes_lot_aggregates_fmv_and_blanks_value(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "100000002", "max_bid": 300.0})
+    _set_bid_fields(db_path, "100000002",
+                    cached_current_bid="200.00 USD",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+    _link_comic(db_path, "100000002",
+                title="Lot Comic A", issue="1", year=1990,
+                grade=9.4, fmv_low=50.0, fmv_high=100.0, is_primary=True)
+    _link_comic(db_path, "100000002",
+                title="Lot Comic B", issue="2", year=1990,
+                grade=8.0, fmv_low=40.0, fmv_high=100.0, is_primary=False)
+    _link_comic(db_path, "100000002",
+                title="Lot Comic C", issue="3", year=1990,
+                grade=7.0, fmv_low=60.0, fmv_high=100.0, is_primary=False)
+
+    row = api.get("/api/comics/snipes").json()[0]
+    assert row["cond_grade"] == 9.4
+    assert row["cond_extra_count"] == 2
+    assert row["fmv_low"] == 150.0  # sum of 50+40+60
+    assert row["fmv_high"] == 300.0
+    assert row["lot_count"] == 3
+    # Lots never get a value % per R17 even when all components are priced.
+    assert row["value_pct"] is None
+
+
+def test_comics_snipes_needs_linking_when_no_bid_fmvs(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "100000003", "max_bid": 30.0})
+    _set_bid_fields(db_path, "100000003",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+
+    row = api.get("/api/comics/snipes").json()[0]
+    assert row["needs_linking"] is True
+    assert row["lot_count"] == 0
+    # cond_extra_count is clamped — must not be -1 when lot_count is 0.
+    assert row["cond_extra_count"] == 0
+    assert row["cond_grade"] is None
+    assert row["fmv_low"] is None
+    assert row["fmv_high"] is None
+    assert row["value_pct"] is None
+
+
+def test_comics_snipes_partial_null_single_comic_nulls_value(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "100000004", "max_bid": 150.0})
+    _set_bid_fields(db_path, "100000004",
+                    cached_current_bid="100.00 USD",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+    # fmv_high is NULL — single-comic partial-null rule: keep the available
+    # bound, but null value_pct because the midpoint isn't computable.
+    _link_comic(db_path, "100000004",
+                title="Partial Comic", issue="1", year=1990,
+                grade=9.0, fmv_low=100.0, fmv_high=None)
+
+    row = api.get("/api/comics/snipes").json()[0]
+    assert row["fmv_low"] == 100.0   # available bound is preserved
+    assert row["fmv_high"] is None
+    assert row["value_pct"] is None  # but no value signal without a midpoint
+
+
+def test_comics_snipes_lot_partial_null_nulls_aggregate(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "100000005", "max_bid": 300.0})
+    _set_bid_fields(db_path, "100000005",
+                    cached_current_bid="200.00 USD",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+    # Two priced, one unpriced — SUM would silently drop the third.
+    _link_comic(db_path, "100000005",
+                title="Lot A", issue="1", year=1990,
+                grade=9.4, fmv_low=100.0, fmv_high=200.0, is_primary=True)
+    _link_comic(db_path, "100000005",
+                title="Lot B", issue="2", year=1990,
+                grade=8.0, fmv_low=50.0, fmv_high=150.0, is_primary=False)
+    _link_comic(db_path, "100000005",
+                title="Lot C (unpriced)", issue="3", year=1990,
+                grade=7.0, fmv_low=None, fmv_high=None, is_primary=False)
+
+    row = api.get("/api/comics/snipes").json()[0]
+    assert row["lot_count"] == 3
+    assert row["fmv_low"] is None  # nulled because one component is unpriced
+    assert row["fmv_high"] is None
+    assert row["value_pct"] is None
+
+
+def test_comics_snipes_excludes_purged(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "100000006", "max_bid": 50.0})
+    _set_bid_fields(db_path, "100000006",
+                    status="PURGED",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+
+    r = api.get("/api/comics/snipes")
+    assert r.status_code == 200
+    assert all(row["item_id"] != "100000006" for row in r.json())
+
+
+def test_comics_snipes_includes_ended_but_pending_bid(api):
+    """Mirror /api/snipes: do NOT filter by end date server-side.
+
+    A snipe whose auction has ended but whose status hasn't transitioned yet
+    should still appear in /api/comics/snipes — the JS will partition it via
+    isEnded() and move it to the ended table.
+    """
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "100000007", "max_bid": 50.0})
+    _set_bid_fields(db_path, "100000007",
+                    auction_end_at="2000-01-01T00:00:00+00:00")  # past
+
+    r = api.get("/api/comics/snipes")
+    assert any(row["item_id"] == "100000007" for row in r.json())
+
+
+# --- /api/comics/history ---
+
+
+def test_comics_history_empty_on_fresh_db(api):
+    r = api.get("/api/comics/history")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_comics_history_returns_recently_ended_snipes(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "200000001", "max_bid": 475.0})
+    _set_bid_fields(db_path, "200000001",
+                    auction_end_at="2025-01-01T00:00:00+00:00",  # within last 7 days from "now"? no — adjust
+                    status="WON",
+                    winning_bid=412.0)
+    # Re-set auction_end_at to 1 day ago in SQLite's "now"
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET auction_end_at = datetime('now', '-1 day') WHERE item_id=?",
+        ("200000001",),
+    )
+    raw.commit()
+    raw.close()
+    _link_comic(db_path, "200000001",
+                title="Spider-Man", issue="300", year=1988,
+                grade=9.4, fmv_low=300.0, fmv_high=500.0)
+
+    rows = api.get("/api/comics/history").json()
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == "200000001"
+    assert rows[0]["status"] == "WON"
+    assert rows[0]["winning_bid"] == 412.0
+    assert rows[0]["max_bid_numeric"] == 475.0
+    assert rows[0]["cond_grade"] == 9.4
+
+
+def test_comics_history_dedups_by_max_id_per_item(api):
+    """Two rows for the same item_id (re-snipe after purge) → one in history."""
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at) "
+        "VALUES (?, ?, 'PURGED', datetime('now', '-2 days'))",
+        ("200000002", 100.0),
+    )
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at) "
+        "VALUES (?, ?, 'LOST', datetime('now', '-1 day'))",
+        ("200000002", 120.0),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/history").json()
+    matching = [r for r in rows if r["item_id"] == "200000002"]
+    assert len(matching) == 1
+    # Latest row should be the LOST one (higher id).
+    assert matching[0]["status"] == "LOST"
+
+
+def test_comics_history_includes_resolved_at_fallback_for_null_auction_end(api):
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, resolved_at) "
+        "VALUES (?, ?, 'LOST', NULL, datetime('now', '-2 days'))",
+        ("200000003", 50.0),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/history").json()
+    assert any(r["item_id"] == "200000003" for r in rows)
+
+
+def test_comics_history_excludes_active_snipes(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "200000004", "max_bid": 50.0})
+    _set_bid_fields(db_path, "200000004",
+                    auction_end_at="2099-01-01T00:00:00+00:00")  # far future
+
+    rows = api.get("/api/comics/history").json()
+    assert all(r["item_id"] != "200000004" for r in rows)
+
+
+def test_comics_snipes_triggers_fresh_sync(api):
+    """/api/comics/snipes calls _ensure_fresh_sync just like /api/snipes does.
+
+    Patches at the import site (gixen_overlay.routes) because the route binds
+    the symbol at module load.
+    """
+    with patch("gixen_overlay.routes._ensure_fresh_sync") as mock_sync, \
+         patch("gixen_overlay.routes._spawn_fallback_task") as mock_spawn:
+        r = api.get("/api/comics/snipes")
+        assert r.status_code == 200
+        assert mock_sync.called
+        assert mock_spawn.called
