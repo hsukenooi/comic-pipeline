@@ -818,17 +818,22 @@ async def api_get_history():
     """
     db = _get_db()
     rows = db.execute("""
-        SELECT * FROM bids
-        WHERE (
-          auction_end_at IS NOT NULL
-          AND datetime(auction_end_at) <= datetime('now')
-          AND datetime(auction_end_at) >= datetime('now', '-7 days')
-        ) OR (
-          auction_end_at IS NULL
-          AND resolved_at IS NOT NULL
-          AND datetime(resolved_at) >= datetime('now', '-7 days')
-        )
-        ORDER BY COALESCE(auction_end_at, resolved_at) DESC
+        SELECT b.* FROM bids b
+        INNER JOIN (
+            SELECT item_id, MAX(id) AS max_id
+            FROM bids
+            WHERE (
+              auction_end_at IS NOT NULL
+              AND datetime(auction_end_at) <= datetime('now')
+              AND datetime(auction_end_at) >= datetime('now', '-7 days')
+            ) OR (
+              auction_end_at IS NULL
+              AND resolved_at IS NOT NULL
+              AND datetime(resolved_at) >= datetime('now', '-7 days')
+            )
+            GROUP BY item_id
+        ) latest ON b.id = latest.max_id
+        ORDER BY COALESCE(b.auction_end_at, b.resolved_at) DESC
     """).fetchall()
 
     result = []

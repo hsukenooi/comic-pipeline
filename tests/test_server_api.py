@@ -568,3 +568,33 @@ def test_api_dashboard_tabs_empty_without_plugins(tmp_path, monkeypatch):
             r = client.get("/api/dashboard-tabs")
     assert r.status_code == 200
     assert r.json() == []
+
+
+def test_history_deduplicates_by_item_id(api):
+    """GET /api/history returns one row per item_id even when the bids table has
+    multiple rows for the same item (e.g. after a purge-and-re-add cycle)."""
+    import os
+    import sqlite3 as _sqlite3
+
+    db_path = os.getenv("DB_PATH")
+    yesterday = "2026-05-18T10:00:00"
+    # Open a separate connection to seed duplicate rows directly.
+    conn = _sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, status, auction_end_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        ("900000001", 10.0, 6, 0, "PURGED", yesterday),
+    )
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, status, auction_end_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        ("900000001", 20.0, 6, 0, "LOST", yesterday),
+    )
+    conn.commit()
+    conn.close()
+
+    r = api.get("/api/history")
+    assert r.status_code == 200
+    items = r.json()
+    ids = [item["item_id"] for item in items]
+    assert ids.count("900000001") == 1
