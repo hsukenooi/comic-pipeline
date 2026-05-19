@@ -1,0 +1,340 @@
+---
+name: comic:fmv
+description: Calculate fair market value for a raw (ungraded) comic from eBay sold listings. Use when the user wants to price a comic, set a bid cap, or validate an auction's current price.
+---
+
+# Comic FMV
+
+Compute fair market value from real eBay sold transactions. No multiplier math — just recent comps in the target condition.
+
+## How to run
+
+**Default path: delegate to `gixen-cli fmv`.** It handles fetch (via `ebay-fetch sold-comps`), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
+
+```bash
+cd ~/Projects/gixen-cli && .venv/bin/python cli.py fmv --batch <working_list.json> --out <results.json>
+```
+
+`--batch` JSON shape: `[{item_id, title, issue, year, grade, locg_id?, locg_variant_id?, notes?}, ...]`
+
+Flags:
+- `--max-age-days N` (default 7): reuse FMVs already in the Gixen DB if `fmv_updated_at` is within N days
+- `--force`: bypass both the SerpApi cache and the DB cache and recompute everything
+
+The CLI prints a human-readable table to stdout and writes the full structured result to `--out`. Present the table to the user and carry the JSON forward to Step 4 of `/comic:buy`.
+
+**The rest of this file is the spec for the math the CLI implements** — read only when debugging the CLI, building a new consumer, or doing manual fallback computation.
+
+---
+
+## Manual fallback (only if the CLI is broken)
+
+If `gixen-cli fmv` is unavailable, you can run the steps below by hand. SerpApi access requires `SERPAPI_KEY`; canonical location is `~/.config/ebay-fetch/config.json`.
+
+## Server Health Check
+
+Before doing any research, verify the server is configured and up.
+
+**1. Check that `GIXEN_SERVER_URL` is set:**
+
+```bash
+echo "${GIXEN_SERVER_URL:-UNSET}"
+```
+
+If it is not set, **stop immediately** with: "`GIXEN_SERVER_URL` is not set. FMV data cannot be saved. Set the variable and confirm the server is running before continuing." Do not proceed with any queries.
+
+**2. Verify the server is responding:**
+
+```bash
+curl -sf "$GIXEN_SERVER_URL/health"
+```
+
+If this fails or returns non-200, **stop immediately** with: "The Gixen server at `$GIXEN_SERVER_URL` is not responding. FMV data cannot be saved. Confirm the server is running before continuing." Do not proceed with any queries.
+
+## Input
+
+One or more comics, each with:
+- Title + issue + year (e.g., "X-Men #31 1967")
+- Target condition (e.g., "VF+ 8.5", "NM 9.2", "FN- 5.5")
+
+## Query eBay Sold Listings
+
+**Default query pattern (use this first):**
+
+```bash
+curl -s "https://serpapi.com/search.json?engine=ebay&_nkw=%22{title}+{issue}%22+{year}+-cgc+-cbcs+-graded+-slab&show_only=Sold&api_key=$SERPAPI_KEY"
+```
+
+**Quote the series title + issue number** (`"Spawn 98"`, `"Amazing Spider-Man 300"`). This is the primary noise-reduction technique — eBay's index otherwise matches "Spawn" and "98" independently, pulling in Curse of Spawn, Spawn trading cards, and unrelated issues. URL-encode the quotes as `%22`.
+
+> ⚠️ **SerpApi gotcha — only `show_only=Sold` triggers the sold filter.**
+> Despite eBay's URL syntax, SerpApi's eBay engine **silently drops** the `LH_Sold=1` and `LH_Complete=1` params if you pass them directly. The only param that gets translated through to the eBay search is `show_only=Sold` (which sets `LH_Sold=1` server-side). After your first query, **verify** that `data["search_metadata"]["ebay_url"]` contains `LH_Sold=1` — if it doesn't, you're looking at active listings, not sold ones, and the FMV will be wrong (typically far too low).
+
+**Sanity check:** if the median price for a non-junk book in the target grade comes back implausibly low (e.g. <$5 for a Bronze-Age VF), suspect that the sold filter didn't apply. Re-verify the eBay URL before trusting the number.
+
+- Always exclude graded copies with `-cgc -cbcs -graded -slab` — they sell at very different prices
+- **Do not include "raw" as a keyword** — most sellers don't use it and it drops comps to near zero
+- **For non-Marvel/DC publishers (Image, Dark Horse, Valiant, etc.), add the publisher name to the query.** Titles like "Invincible", "Spawn", "Saga" match sports cards, trucks, and trading card sets. Adding `image+comics` or `dark+horse` scopes results to actual comics and prevents FMV contamination.
+
+**Tiered query strategy** (the CLI does this automatically; replicate it manually if falling back):
+
+1. **Base** — always run: `"{title} {issue}" {year} {publisher_if_indie} -cgc -cbcs -graded -slab` + `show_only=Sold`. Dedupe by `product_id`.
+2. **Auto-broaden** — only if base returns <5 total results: re-run without the year (`"{title} {issue}"` only). Common for thin-trade modern keys and oddball one-shots.
+3. **Grade-targeted** — only if base returns <10 grade-tagged comps after parsing: add a grade-label query (`"{title} {issue}" VG` or `FN` etc.). For Silver/Bronze keys this surfaces extra comps; for Copper-and-newer it almost always overlaps the base query and is wasted spend.
+
+Skip tiers 2 and 3 by default — they're conditional, not always-on.
+
+**Self-exclusion:** if an active auction is being priced, drop any comp whose `item_id` matches the listing being valued. Re-listed auctions appear in `LH_Complete` results and self-bias the FMV.
+
+**Parse results:**
+
+```bash
+curl -s "..." | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for r in data.get('organic_results',[]):
+    p=r.get('price',{})
+    print(f\"  {p.get('raw','?'):>10}  {r.get('sold_date',''):>15}  {r.get('title','')[:75]}\")
+"
+```
+
+## Filter Results
+
+Not every result is a valid comp. Three tiers:
+
+### Hard exclude (drop entirely)
+
+- **Coverless / damaged structurally** — "coverless", "no cover", "cover torn", "cvr off", "detached"
+- **Missing content** — "missing pin-up", "missing wrap", "missing pages", "non story page missing"
+- **Lots / multi-issue bundles** — "lot", `#48-50`, `#15 & #16`, `& strange tales`, etc.
+- **Reprints / facsimile editions** — "reprint", "2024 reprint", "facsimile", "marvel tales", "retold"
+- **Foreign editions** — "rare uk", "rare brazil", "rare mexico", "norway", "australia", "italian", "spain", "ebal", "pence", "9d variant"
+- **Wrong volume** — "vol 2/3/4/5/6/7", later-run issues with same number (e.g., for ASM #5 1963 exclude `#75 vol 5`, `#288`)
+- **Other graders** — "psa", "pgx" (alongside the existing `-cgc -cbcs -graded -slab`)
+- **McFarlane Toys / figures** — "1:6 scale", "collectible figure", "action figure"
+- **Trading cards** — "Upper Deck", "trading card", "Johnny Lightning", "Keepsake", "Signagraph", "Donruss", "Impel", "Fleer", "PSA" (sports card grader)
+- **Premium-distorting** — "signed by", "stan lee" (autograph), "Signature Series"
+- **WW Live Sale results** — titles starting with "WW LIVE SALE" swing erratically
+- **Junk listings** — "space filler", "single panel", "production acetate"
+- **Restored copies / waterstain** unless target is also in that state
+
+### Suspect (flag, manual review — do NOT auto-include in FMV)
+
+Comps that pass IQR filter but are clearly inconsistent with the grade curve. Examples:
+- A `VG 4.0` selling for $2500 in a market where 4.0 typically sells for $800
+- A `GD 2.0` selling for $1300 in a market where 2.0 typically sells for $400
+- A `FN+ 6.5` raw selling for $242 when graded 6.5 copies sell for $3000
+
+These are usually heated bidding, mis-listed grades, or graded copies whose slab keywords are missing from the title. Flag them in output but exclude from the FMV computation. If the user disagrees, they can override.
+
+### Keep
+
+Single-issue, unrestored, US first-print, raw comps in the target condition neighborhood.
+
+## Compute FMV Range
+
+### 1. Parse grades from titles
+
+Order matters — match most-specific first:
+
+```
+Numeric: \b([0-9]\.[02-9])\b   (e.g., "4.5", "(5.0)", "VG 4.0", "9.2", "9.4", "9.6", "9.8", "9.9")
+Letter (specific → general):
+  vg/fn+ → 5.5    fn/vf → 7.0    vf/nm → 9.0
+  vg/fn  → 5.0    fn-   → 5.5    vf-   → 7.5
+  vg+    → 4.5    fn+   → 6.5    vf+   → 8.5
+  vg-    → 3.5    fn    → 6.0    vf    → 8.0
+  vg     → 4.0    nm-   → 9.2    nm/m  → 9.6
+  gd/vg  → 3.0    nm    → 9.4    nm+   → 9.6
+  gd+    → 2.5
+  gd     → 2.0
+  fr/gd  → 1.5
+  fr     → 1.0
+  poor   → 0.5
+```
+
+Treat seller-grade `F` (loose "Fine") as suspect — sellers often misuse it for both Fair and Fine.
+
+### 2. Bucket comps by parsed grade
+
+Build a grade → [prices] map. Compute median per bucket.
+
+### 3. Build the comp pool
+
+Try ±0.5 grades from target first. If <5 comps, widen to ±1.0.
+
+### 4. IQR outlier removal
+
+On the chosen pool, drop values outside `Q1 − 1.5×IQR` to `Q3 + 1.5×IQR`. Don't eyeball — use the math.
+
+**Quartile method:** use `statistics.quantiles(data, n=4, method='inclusive')` for both IQR trim and the FMV range step below. The default Python method (`'exclusive'`) places quartiles between data points and over-dilates IQR on small samples (n=5 IQR can be ~10× the data spread), which lets clear outliers survive trimming. Inclusive method matches Excel's `QUARTILE.INC` and behaves predictably for the small comp pools (5–15 points) we typically see.
+
+### 5. Sanity-check the grade curve
+
+Bucket medians should rise monotonically with grade. If 4.0 median > 4.5 median, something's wrong — re-examine the data (likely a damaged 4.0 or graded 4.5 leaked through).
+
+### 6. Compute FMV range
+
+- **Median** = median of trimmed pool
+- **FMV range** = Q25 to Q75 of trimmed pool (same `method='inclusive'` as the IQR step), rounded to clean numbers (`$25` step above $200, `$10` step from $50–$200, `$5` step below)
+- **Max bid** = 80% × FMV high (round to clean number)
+
+### 7. Grade-curve interpolation when direct comps are sparse
+
+If target grade has <3 direct comps, interpolate linearly between bracketing grade-bucket medians:
+
+```
+target_price = median_below + (target_grade − grade_below) / (grade_above − grade_below) × (median_above − median_below)
+```
+
+State explicitly that interpolation was used and confidence is reduced.
+
+### 7a. CGC Proxy Fallback (high-value keys with sparse raw comps)
+
+**Trigger — both conditions must be true:**
+1. Raw eBay comps in the target grade window: n < 3 after filtering
+2. Estimated book value: > $200
+
+Below $200 the two markets diverge too much (certification cost is proportionally too large, raw buyers discount heavily). Above $200 the cost of CGC submission (~$50–150) is small relative to value, so rational buyers pay near-CGC prices for clean raw copies — making CGC realized prices a reliable anchor.
+
+**Why this beats grade-curve interpolation for keys:**
+Raw eBay comps for keys are sparse and noisy (sellers misgrade, titles lack condition info). CGC Heritage/GoCollect sales are grade-certain and drawn from the same buyer pool. For high-value keys, CGC data is more representative of true demand than a handful of raw eBay listings.
+
+**Step 1 — Find CGC realized prices**
+
+Run Google SerpApi queries targeting Heritage Auctions and Key Collector:
+
+```bash
+# Heritage Auctions realized prices
+curl -s "https://serpapi.com/search.json?engine=google&q={title}+{issue}+{year}+CGC+{grade}+realized+heritage+auctions&api_key=$SERPAPI_KEY"
+
+# Key Collector Comics Hot 10 or averages
+curl -s "https://serpapi.com/search.json?engine=google&q={title}+{issue}+{year}+CGC+average+price+key+collector+comics&api_key=$SERPAPI_KEY"
+
+# GoCollect
+curl -s "https://serpapi.com/search.json?engine=google&q={title}+{issue}+{year}+CGC+{grade}+raw+value+gocollect&api_key=$SERPAPI_KEY"
+```
+
+Extract realized prices from snippets. Target the grade nearest your raw target (within ±0.5) and bracket grades above and below for interpolation if needed.
+
+**Step 2 — Apply raw discount**
+
+| Estimated value | Raw discount |
+|---|---|
+| > $500 | 10–15% below CGC equivalent |
+| $200–$500 | 15–25% below CGC equivalent |
+| < $200 | Do not use this method |
+
+Use the midpoint of the range by default. Adjust toward the tighter end (10% / 15%) if the book is a major key with active raw demand; toward the wider end (15% / 25%) if seller grading is unreliable for this title or condition is uncertain.
+
+**Step 3 — State the result clearly**
+
+- Label the FMV as "CGC proxy" in the Notes column
+- State the CGC source price, the grade, and the discount applied
+- Cap confidence at MEDIUM-LOW regardless of how many CGC comps you found — the discount estimate itself introduces irreducible uncertainty
+
+### 8. Confidence rubric
+
+| n (trimmed pool) | CV | Confidence |
+|---|---|---|
+| ≥8 | <25% | HIGH |
+| ≥6 | <30% | HIGH |
+| ≥5 | <35% | MEDIUM-HIGH |
+| ≥4 | <45% | MEDIUM |
+| ≥3 | any | MEDIUM-LOW |
+| <3 | — | LOW |
+
+Where `CV = stdev / median`. State which window (±0.5 vs ±1.0) was used.
+
+### 9. Within-grade adjustments
+
+Note these in `fmv_notes` but don't bake into the number unless the target page-quality / variant is known:
+
+- **Page quality**: "OW pages" (off-white) sells materially higher than "tan/cream" at same grade
+- **Newsstand vs direct**: distinct sub-markets — match target variant, don't blend
+- **Eye appeal**: a "nice" 4.0 with bright cover commonly outsells a dull 4.5
+
+### 10. Real-time signal: current bid
+
+For an active auction with 30+ bids that has already crossed your computed Q75, treat that as evidence the market disagrees with the comps (key is hot, comps stale, or target grade undershot). Surface it — don't quietly bid above your discipline.
+
+## Caching layers
+
+Two caches insulate this skill from SerpApi's 250/month free tier and from re-running compute we already did. The CLI handles both automatically; the manual fallback should respect them.
+
+1. **SerpApi response cache (`ebay-fetch sold-comps`)** — cache key `sha256(canonical_query_url)`, stored at `~/.cache/ebay-sold-comps/<sha>.json`, TTL 7 days. eBay sold prices for older books move slowly; one fresh fetch per book per week is plenty. Bypass with `--force`.
+2. **DB FMV cache (Gixen `comics` table)** — before any SerpApi call, look up the existing row by `(locg_id, grade)` and reuse if `fmv_updated_at` is within `--max-age-days N` (default 7). Bypass with `--force`. The `POST /api/comics` endpoint always touches `fmv_updated_at` on FMV-field updates, so the freshness check is reliable.
+
+Manual fallback: skip these unless you're explicitly recomputing — re-running by hand spends API calls that the CLI would have served from cache.
+
+## Output
+
+```
+| # | Comic | Grade | FMV Range | Median | n | Window | CV | Confidence | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | X-Men #31 (1967) | VF+ 8.5 | $100-175 | $135 | 9 | ±0.5 | 22% | HIGH | — |
+| 2 | ASM #5 (1963) | VG+ 4.5 | $1100-1300 | $1240 | 1 + curve | ±0.5 | n/a | LOW | Single direct 4.0 OW comp; interpolated |
+| 3 | MS #5 (1972) | VG 4.0 | $575-650 | $610 | CGC proxy | n/a | n/a | MEDIUM-LOW | CGC proxy: Heritage 4.0 avg $658; 10% raw discount |
+```
+
+Always include:
+- The window used (±0.5 or ±1.0)
+- N and CV
+- Whether grade-curve interpolation was applied
+- Suspect comps flagged (with reason)
+- Hot-market signal if current bid > Q75
+
+## Save to DB
+
+Upsert each comic into the `comics` table immediately after computing FMV. This is the authoritative step for comic metadata — `/comic:snipe-add` links bids to these records, not the other way around.
+
+```bash
+curl -s -X POST $GIXEN_SERVER_URL/api/comics \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "X-Men",
+    "issue": "31",
+    "year": 1967,
+    "grade": 8.5,
+    "fmv_low": 100,
+    "fmv_high": 175,
+    "fmv_comps": 9,
+    "fmv_confidence": "high",
+    "fmv_notes": "OW pages copies excluded",
+    "locg_id": 1234567
+  }'
+```
+
+- `title` — series name only, no issue number (e.g. `"Amazing Spider-Man"`, not `"ASM #15"`)
+- `issue` — issue number as string; use a range for lots (e.g. `"337-339"`)
+- `grade` — numeric only (e.g. `8.5`); omit or `null` if unknown
+- `fmv_confidence` — must be `"high"`, `"medium"`, or `"low"`
+- `locg_id` — from the LOCG ID resolved in `/comic:collection-check`; omit entirely if unresolved (don't pass null)
+- `locg_variant_id` — include only if a separate variant entry was found on LOCG
+
+Confirm the `id` returned — that's the `comic_id` that will be linked to the bid.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---|---|
+| Passing `LH_Sold=1` / `LH_Complete=1` to SerpApi | SerpApi's eBay engine drops them silently — use `show_only=Sold`. Verify by grepping the returned `search_metadata.ebay_url` for `LH_Sold=1` |
+| Trusting low medians without checking the eBay URL | An impossibly low median (e.g. <$5 for a Bronze-Age VF) usually means the sold filter didn't apply — re-verify the URL |
+| Always firing 3 queries (base + broader + grade-targeted) | Run base only by default; auto-broaden if <5 results; add grade-targeted only if <10 grade-tagged comps. Always-on tier 3 is wasted spend on Copper-and-newer books |
+| Letting the active auction comp itself | Drop the listing's own `product_id` from the result set (note: SerpApi field is `product_id`, not `item_id`) |
+| Mixing quartile methods between IQR and FMV range | Use `statistics.quantiles(method='inclusive')` for both. The default `'exclusive'` over-dilates IQR on small samples and lets outliers survive |
+| Numeric grade regex `\b([0-9]\.[058])\b` (old) | Use `\b([0-9]\.[02-9])\b` — the old form silently dropped 9.2/9.4/9.6/9.9 comps |
+| Eyeballing outliers | Use IQR × 1.5 — and add a "suspect" tier for grade-curve violators |
+| Treating loose "F" as Fine | Seller-grade `F` is suspect — often used for Fair too |
+| Blending newsstand and direct | They're distinct sub-markets at the same grade |
+| Foreign editions in the comp pool | UK Pence, Brazilian, Mexican, Italian, Spanish editions price differently — exclude unless target is foreign |
+| Page-quality blind spot | "OW pages" copies sell higher than "tan" at same grade — note in adjustments |
+| Treating "FN+ 6.5" raw at $242 as a real 6.5 | Likely incomplete or mis-listed — flag as suspect, don't include |
+| Stating "Medium" confidence by feel | Use the rubric: n + CV decide it |
+| Including "raw" as a search keyword | Most sellers don't use it — returns near-zero comps |
+| Not quoting the title + issue | `spawn 98` matches "Curse of Spawn #12" and trading cards; `"Spawn 98"` requires the exact phrase — primary noise-reduction technique |
+| Forgetting to exclude graded copies | Always add `-cgc -cbcs -graded -slab` to the query, plus `-psa -pgx` |
+| Quiet bidding above discipline because "the market disagrees" | Surface the conflict to the user instead of silently overriding |
+| Applying CGC proxy to books under $200 | Raw and CGC markets diverge too much below $200 — stick to raw eBay comps only |
+| Using CGC proxy as the primary method when raw comps exist | CGC proxy is a fallback — n < 3 raw comps AND value > $200 are both required to trigger it |
+| Forgetting to cap confidence when using CGC proxy | The discount estimate introduces irreducible uncertainty — max MEDIUM-LOW regardless of CGC data quality |
