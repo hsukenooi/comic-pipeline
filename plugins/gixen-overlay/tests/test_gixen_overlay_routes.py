@@ -64,6 +64,20 @@ def test_comics_returns_html(api):
     assert "text/html" in r.headers["content-type"]
 
 
+def test_comics_page_references_new_endpoints_and_dynamic_tabs(api):
+    body = api.get("/comics").text
+    assert "/api/comics/snipes" in body
+    assert "/api/comics/history" in body
+    assert "/api/dashboard-tabs" in body
+
+
+def test_comics_page_has_no_stale_v2_comics_urls(api):
+    body = api.get("/comics").text
+    # Route was renamed from /v2/comics to /comics; nothing inside the page
+    # should still point at the old URL.
+    assert "/v2/comics" not in body
+
+
 # ---------------------------------------------------------------------------
 # GET /api/comics
 # ---------------------------------------------------------------------------
