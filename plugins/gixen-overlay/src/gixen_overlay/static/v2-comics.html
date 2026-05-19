@@ -45,20 +45,9 @@
     margin-left: 6px;
     vertical-align: middle;
   }
-  .cond-extra {
-    color: var(--fg-dim);
-    font-size: 11px;
-    margin-left: 4px;
-  }
-
-  /* value % color bands (v1 thresholds: <80 green, 80-100 neutral, >100 red) */
-  .value-green   { color: var(--green); font-weight: 500; }
-  .value-neutral { color: var(--fg-dim); }
-  .value-red     { color: var(--red); font-weight: 500; }
-
-  /* spread (ended section): hardcoded sign prefix from JS */
-  .spread-over   { color: var(--red); font-weight: 700; }
-  .spread-under  { color: var(--fg-dim); }
+  /* Green max-bid coloring when current bid is comfortably under FMV
+     (value_pct < 80). Red overbid uses the existing .warn-cell. */
+  .value-green { color: var(--green); font-weight: 500; }
 
   /* inline-edit max_bid */
   .editable-max {
@@ -137,27 +126,6 @@
   }
   .keybar .key-action:hover { color: var(--fg); }
 
-  /* attention flags */
-  .flags {
-    background: rgba(224,175,104,0.06);
-    border: 1px solid rgba(224,175,104,0.35);
-    border-left: 3px solid var(--yellow);
-    border-radius: 6px;
-    padding: 12px 16px;
-    margin-bottom: 18px;
-  }
-  .flags h3 {
-    color: var(--yellow);
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin-bottom: 6px;
-  }
-  .flags ul { list-style: none; }
-  .flags li { padding: 3px 0; font-size: 12px; color: var(--fg); }
-  .flags li::before { content: "▲ "; color: var(--yellow); }
-
   /* top-of-page refresh sweep — visible only while a fetch is in flight */
   .refresh-bar {
     position: fixed;
@@ -203,7 +171,6 @@
     <span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--comics</span> <span class="ok">▸ ready</span>
   </div>
 
-  <div id="flags-container"></div>
   <div id="active-section"></div>
   <div id="ended-section"></div>
 </div>
@@ -299,13 +266,13 @@ function displayTitle(r) {
 
 function fmtCond(r) {
   if (r.cond_grade == null) return '<span class="seller">—</span>';
-  const g = parseFloat(r.cond_grade);
-  const label = gradeLabel(g);
-  const base = label ? `${g} <span class="dim">${label}</span>` : String(g);
-  if (r.cond_extra_count > 0) {
-    return `${base}<span class="cond-extra">(+${r.cond_extra_count} more)</span>`;
-  }
-  return base;
+  return gradeLabel(parseFloat(r.cond_grade)) || String(r.cond_grade);
+}
+
+// Strip the eBay feedback count from seller strings: "modernkeyz (542)" -> "modernkeyz"
+function fmtSeller(r) {
+  const s = r.seller || "—";
+  return escapeHtml(String(s).replace(/\s*\(\d[\d,]*\)\s*$/, ""));
 }
 
 function fmtFmv(r) {
@@ -318,14 +285,12 @@ function fmtFmv(r) {
   return `$${Math.round(lo ?? hi).toLocaleString()}`;
 }
 
-// Value % cell with v1 threshold coloring.
-function fmtValuePct(r) {
-  if (r.value_pct == null) return '<span class="seller">—</span>';
-  const pct = Math.round(r.value_pct);
-  const cls = pct < 80 ? "value-green"
-            : pct <= 100 ? "value-neutral"
-            : "value-red";
-  return `<span class="${cls}">${pct}% of FMV</span>`;
+// Pick the color class for the active-table max cell. Red is already used by
+// the overbid warn-cell branch; green flags a deal worth holding (current bid
+// is well under FMV midpoint). Falls back to neutral.
+function maxDealClass(r) {
+  if (r.value_pct == null) return "";
+  return r.value_pct < 80 ? "value-green" : "";
 }
 
 // Title-cell content: ebay_title + needs-link icon + lot badge.
@@ -356,40 +321,6 @@ function outcome(r) {
   return '<span class="mute">—</span>';
 }
 
-// Spread cell for the ended table — always referenced to the user's max.
-function fmtSpread(r) {
-  const max = numericMax(r);
-  const win = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
-  if (win == null || max == null) return '<span class="mute">—</span>';
-  if (r.status === "WON" || win <= max) {
-    return `<span class="spread-under">−$${Math.abs(max - win).toFixed(2)} under</span>`;
-  }
-  return `<span class="spread-over">+$${(win - max).toFixed(2)} over</span>`;
-}
-
-// ---- Attention flags --------------------------------------------------------
-
-function buildFlags(snipes) {
-  const lines = [];
-  for (const r of snipes) {
-    if (isEnded(r)) continue;
-    const cur = numericCurrent(r);
-    const max = numericMax(r);
-    if (cur != null && max != null && cur >= max) {
-      lines.push(`#${r.item_id} "${displayTitle(r)}" — current $${cur.toFixed(2)} ≥ max $${max.toFixed(2)}. raise or cancel?`);
-    }
-  }
-  return lines;
-}
-
-function renderFlags(snipes) {
-  const flags = buildFlags(snipes);
-  const el = document.getElementById("flags-container");
-  el.innerHTML = flags.length
-    ? `<div class="flags"><h3>attention required</h3><ul>${flags.map(f=>`<li>${escapeHtml(f)}</li>`).join("")}</ul></div>`
-    : "";
-}
-
 // ---- Tables -----------------------------------------------------------------
 
 function renderActive(snipes) {
@@ -411,9 +342,16 @@ function renderActive(snipes) {
     const tl = r.end_date_iso ? timeLeft(r.end_date_iso) : (r.time_to_end || "—");
     const urgent = r.end_date_iso && (new Date(r.end_date_iso) - Date.now()) < 3600000;
     const timeCell = urgent ? `<span class="urgent-cell">${tl}</span>` : tl;
-    const maxInner = overbid
-      ? `<span class="warn-cell">▲ $${max.toFixed(2)}</span>`
-      : fmtUSD(r.max_bid);
+    // Max cell coloring: red on overbid (existing warn-cell), green when the
+    // current bid is comfortably under FMV (deal worth defending), neutral
+    // otherwise. Value % is computed by the endpoint and used only for color.
+    let maxInner;
+    if (overbid) {
+      maxInner = `<span class="warn-cell">▲ $${max.toFixed(2)}</span>`;
+    } else {
+      const dealCls = maxDealClass(r);
+      maxInner = dealCls ? `<span class="${dealCls}">${fmtUSD(r.max_bid)}</span>` : fmtUSD(r.max_bid);
+    }
     const maxCell = `<span class="editable-max" data-item-id="${r.item_id}" `
       + `data-current-max="${max != null ? max : ''}" `
       + `data-bid-offset="${r.bid_offset ?? 6}" `
@@ -429,9 +367,8 @@ function renderActive(snipes) {
       <td class="right num">${fmtUSD(r.current_bid)}</td>
       <td class="right num">${maxCell}</td>
       <td class="right num">${fmtFmv(r)}</td>
-      <td>${fmtValuePct(r)}</td>
       <td class="right num">${timeCell}</td>
-      <td class="seller">${escapeHtml(r.seller || "—")}<button class="remove-btn" data-item-id="${r.item_id}" aria-label="remove snipe">✕</button></td>
+      <td class="seller">${fmtSeller(r)}<button class="remove-btn" data-item-id="${r.item_id}" aria-label="remove snipe">✕</button></td>
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel">
@@ -440,7 +377,6 @@ function renderActive(snipes) {
       <th>item</th><th>title</th><th>cond</th>
       <th class="right">current</th><th class="right">max</th>
       <th class="right">fmv</th>
-      <th>value</th>
       <th class="right">t-minus</th><th>seller</th>
     </tr></thead><tbody>${rows}</tbody></table></div>
   </div>`;
@@ -469,9 +405,8 @@ function renderEnded(history) {
       <td class="right num">${winning}</td>
       <td class="right num">${fmtUSD(r.max_bid)}</td>
       <td class="right num">${fmtFmv(r)}</td>
-      <td class="right num">${fmtSpread(r)}</td>
       <td>${outcome(r)}</td>
-      <td class="seller">${escapeHtml(r.seller || "—")}</td>
+      <td class="seller">${fmtSeller(r)}</td>
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel">
@@ -480,7 +415,6 @@ function renderEnded(history) {
       <th>item</th><th>title</th><th>cond</th>
       <th class="right">winning</th><th class="right">max</th>
       <th class="right">fmv</th>
-      <th class="right">spread</th>
       <th>result</th><th>seller</th>
     </tr></thead><tbody>${rows}</tbody></table></div>
   </div>`;
@@ -529,7 +463,6 @@ let suppressRefresh = false;
 
 function renderAll(snipes, history) {
   if (!snipes) return;
-  renderFlags(snipes);
   renderActive(snipes);
   renderEnded(history || []);
 
