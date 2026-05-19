@@ -16,3 +16,6 @@ gixen-overlay = "gixen_overlay.plugin:plugin"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gixen_overlay"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "/Users/hsukenooi/Projects/gixen-cli"]
