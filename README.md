@@ -26,7 +26,7 @@ Some commands (collection, pull-list, wish-list, read-list, add, remove, update)
 locg login
 ```
 
-This stores your session cookie in `~/.config/locg/cookies.json`.
+This persists your session in `~/.config/locg/playwright-profile/`.
 
 ## Commands
 
