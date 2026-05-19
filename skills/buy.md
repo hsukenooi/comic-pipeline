@@ -1,6 +1,6 @@
 ---
 name: comic:buy
-description: End-to-end comic bidding workflow. Takes eBay URLs, identifies comics, checks your collection, calculates FMV, and adds snipes to Gixen. Orchestrates /comic:identify, /comic:collection-check, /comic:fmv, and /comic:snipe-add sequentially.
+description: "End-to-end comic bidding workflow. Takes eBay URLs, identifies comics, checks your collection, calculates FMV, and adds snipes to Gixen. Orchestrates /comic:identify, /comic:collection-check, /comic:fmv, and /comic:snipe-add sequentially."
 ---
 
 # Comic Buy
@@ -41,7 +41,7 @@ Read `~/Projects/comic-pipeline/skills/collection-check.md` and follow it.
 
 Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate).
 
-Remove skipped comics from the working list before Step 2.5.
+Remove skipped comics from the working list before Step 2.5.5.
 
 ---
 
@@ -107,7 +107,7 @@ Flags worth knowing:
 - CV >100% → suspect a wild outlier survived; check the comp pool in the JSON output
 - "CGC proxy" in Notes → confidence is capped at MEDIUM-LOW regardless of comp count
 
-If the CLI fails, fall back to the manual procedure in `comic/fmv.md`. Otherwise present the table directly.
+If the CLI fails, fall back to the manual procedure in `~/Projects/comic-pipeline/skills/fmv.md`. Otherwise present the table directly.
 
 ---
 

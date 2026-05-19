@@ -19,11 +19,11 @@ Use the eBay Browse API via `~/Projects/comic-pipeline/apps/ebay/src/ebay_fetch.
 #!/usr/bin/env python3
 import base64, json, os, urllib.request, requests
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv(Path("~/.config/ebay-fetch/config.json").expanduser())
-APP_ID = os.getenv("EBAY_CLIENT_ID")
-CERT_ID = os.getenv("EBAY_CLIENT_SECRET")
+with open(Path("~/.config/ebay-fetch/config.json").expanduser()) as _f:
+    _cfg = json.load(_f)
+APP_ID = os.environ.get("EBAY_CLIENT_ID") or _cfg.get("client_id")
+CERT_ID = os.environ.get("EBAY_CLIENT_SECRET") or _cfg.get("client_secret")
 BASE_URL = "https://api.ebay.com"
 
 def get_token():
