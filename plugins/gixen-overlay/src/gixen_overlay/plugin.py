@@ -23,7 +23,7 @@ class GixenOverlayPlugin:
 
     @hookimpl
     def register_dashboard_tabs(self) -> list[dict]:
-        return [{"label": "comics", "path": "/v2/comics"}]
+        return [{"label": "comics", "path": "/comics"}]
 
 
 plugin = GixenOverlayPlugin()

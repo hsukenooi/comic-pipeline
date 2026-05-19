@@ -24,7 +24,7 @@ _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 router = APIRouter()
 
 
-@router.get("/v2/comics")
+@router.get("/comics")
 def variant_v2_comics():
     return FileResponse(
         Path(__file__).parent / "static" / "v2-comics.html",

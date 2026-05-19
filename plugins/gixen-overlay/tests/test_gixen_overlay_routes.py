@@ -58,8 +58,8 @@ def api(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_v2_comics_returns_html(api):
-    r = api.get("/v2/comics")
+def test_comics_returns_html(api):
+    r = api.get("/comics")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
 
@@ -218,4 +218,4 @@ def test_dashboard_tabs_returns_comics_tab(api):
     tabs = r.json()
     assert isinstance(tabs, list)
     assert len(tabs) == 1
-    assert tabs[0] == {"label": "comics", "path": "/v2/comics"}
+    assert tabs[0] == {"label": "comics", "path": "/comics"}
