@@ -705,11 +705,17 @@ _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 
 
 @app.get("/")
-def root():
-    return FileResponse(
-        Path(__file__).parent / "static" / "index.html",
-        headers=_NO_CACHE_HEADERS,
-    )
+def root(request: Request):
+    html = (Path(__file__).parent / "static" / "index.html").read_text()
+    tabs = getattr(request.app.state, "dashboard_tabs", [])
+    if tabs:
+        tab_links = "".join(
+            f'  <a class="seg nav" href="{t["path"]}">{t["label"]}</a>\n'
+            for t in tabs
+        )
+        html = html.replace('  <div class="spacer"></div>', f'{tab_links}  <div class="spacer"></div>', 1)
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=html, headers=dict(_NO_CACHE_HEADERS))
 
 
 @app.get("/v2/bids")
