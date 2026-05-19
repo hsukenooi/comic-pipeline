@@ -15,23 +15,11 @@ jobs:
         run: |
           # Grep for comic-specific terms that should not appear in the generic
           # gixen-cli source tree. These terms belong in the comic-pipeline plugin.
-          #
-          # LEGACY EXCLUSIONS (remove each line as the corresponding PER-30 cleanup lands):
-          #   server/comic_routes.py  — remove after PER-30 deletes this file
-          #   server/title_parser.py  — remove after PER-30 deletes this file
-          #   server/db.py            — remove after PER-30 strips comics/bid_comics tables
-          #   server/main.py          — remove after PER-30 strips inline comic routes
-          #   cli.py                  — remove after PER-30 strips comic CLI flags
           MATCHES=$(find . -name "*.py" \
             -not -path "./tests/*" \
             -not -path "./docs/*" \
             -not -path "./.git/*" \
             -not -path "./.claude/*" \
-            -not -name "comic_routes.py" \
-            -not -name "title_parser.py" \
-            -not -path "./server/db.py" \
-            -not -path "./server/main.py" \
-            -not -path "./cli.py" \
             | xargs grep -lEi "\bcomic\b|\blocg\b|\bcgc\b|\bfmv\b" 2>/dev/null || true)
 
           if [ -n "$MATCHES" ]; then

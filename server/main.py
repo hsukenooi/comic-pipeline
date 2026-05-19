@@ -14,19 +14,23 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
 from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
-from server.db import (
-    DB_PATH, init_db, upsert_comic, list_comics, insert_bid, get_bid_by_item_id,
-    update_bid, update_bid_status, delete_bid, get_all_bids,
-    get_pending_bids, mark_bids_purged, cache_gixen_data,
-    set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
-    link_comic_to_bid, get_comics_for_bid, get_primary_comic_for_bid,
+from gixen.plugins import (
+    load_plugins,
+    _invoke_db_tables_isolated,
+    _invoke_register_routes,
+    _collect_dashboard_tabs,
 )
-from server.title_parser import parse_title
+from server.db import (
+    DB_PATH, init_db, insert_bid, get_bid_by_item_id,
+    update_bid, update_bid_status, delete_bid, get_all_bids,
+    mark_bids_purged, cache_gixen_data,
+    set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
+)
 import ebay_bidder
 
 # Import eBay helpers from the sibling project. Path is overridable via
@@ -46,6 +50,22 @@ except ImportError as _ebay_import_err:
     _EBAY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# The host configures the plugin subsystem's logger explicitly so the audit
+# trail emitted by load_plugins() (plugin discovery, registration, validation
+# errors) is visible at INFO. Uvicorn does not configure the root logger by
+# default, so propagation alone wouldn't show these messages — attach a
+# stream handler with a uvicorn-style prefix so the lines blend into the
+# normal startup log.
+_plugin_logger = logging.getLogger("gixen.plugins")
+_plugin_logger.setLevel(logging.INFO)
+if not _plugin_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(levelname)s:     gixen.plugins: %(message)s"))
+    _plugin_logger.addHandler(_h)
+# Note: propagate stays True so pytest's caplog (which attaches to root) can
+# capture these records in tests. Uvicorn's default config attaches no root
+# handler, so propagation does not cause double-logging in production.
 
 if not _EBAY_AVAILABLE:
     logger.warning("ebay_fetch not importable from %s — live eBay data disabled", _EBAY_CLI_DIR)
@@ -293,7 +313,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
             except (ValueError, TypeError):
                 max_bid = 0.0
             insert_bid(
-                db, snipe["item_id"], max_bid, None,
+                db, snipe["item_id"], max_bid,
                 int(snipe.get("bid_offset", 6)),
                 int(snipe.get("snipe_group", 0)),
                 snipe.get("seller"),
@@ -367,6 +387,7 @@ async def _sniper_loop() -> None:
         except Exception:
             logger.exception("_sniper_loop: unexpected error, continuing")
         await asyncio.sleep(SNIPER_INTERVAL)
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -554,10 +575,21 @@ async def lifespan(app: FastAPI):
         load_dotenv(env_file)
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
     _db = init_db(db_path)
+    app.state.db = _db
     _api_client = GixenClient()
     _api_lock = asyncio.Lock()
     _sync_lock = asyncio.Lock()
     _ebay_fallback_lock = asyncio.Lock()
+
+    # Plugin loading: discover entry-point plugins, then fire startup hooks.
+    # Helpers live in gixen/plugins.py (PER-26 M-01); they accept an injected
+    # logger so log records appear under the "server.main" logger name that
+    # PER-25 regression tests assert on.
+    pm = load_plugins()
+    app.state.plugin_manager = pm
+    _invoke_db_tables_isolated(pm, _db, logger=logger)
+    _invoke_register_routes(pm, app, logger=logger)
+    app.state.dashboard_tabs = _collect_dashboard_tabs(pm, logger=logger)
 
     sync_task = None
     sniper_task = None
@@ -595,6 +627,7 @@ async def lifespan(app: FastAPI):
     if row and row[0]:
         logger.warning("WAL checkpoint incomplete: busy=%s", row[0])
     _db.close()
+    app.state.db = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -603,43 +636,18 @@ app = FastAPI(lifespan=lifespan)
 # Pydantic models
 # ---------------------------------------------------------------------------
 
-class UpsertComicRequest(BaseModel):
-    title: str
-    issue: str
-    year: int
-    grade: float | None = None
-    fmv_low: float | None = None
-    fmv_high: float | None = None
-    fmv_comps: int | None = None
-    fmv_confidence: str | None = None
-    fmv_notes: str | None = None
-    locg_id: int | None = None
-    locg_variant_id: int | None = None
-
-    @field_validator("fmv_confidence")
-    @classmethod
-    def validate_confidence(cls, v: str | None) -> str | None:
-        if v is not None and v not in ("high", "medium", "low"):
-            raise ValueError("fmv_confidence must be high, medium, or low")
-        return v
+class TabSpec(BaseModel):
+    label: str
+    path: str
 
 
 class AddBidRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+
     item_id: str
     max_bid: float
     bid_offset: int = 6
     snipe_group: int = 0
-    comic: str | None = None
-    issue: str | None = None
-    year: int | None = None
-    grade: float | None = None
-    fmv_low: float | None = None
-    fmv_high: float | None = None
-    fmv_comps: int | None = None
-    fmv_confidence: str | None = None
-    fmv_notes: str | None = None
-    locg_id: int | None = None
-    locg_variant_id: int | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -655,20 +663,13 @@ class AddBidRequest(BaseModel):
             raise ValueError("max_bid must be positive")
         return v
 
-    @field_validator("fmv_confidence")
-    @classmethod
-    def validate_confidence(cls, v: str | None) -> str | None:
-        if v is not None and v not in ("high", "medium", "low"):
-            raise ValueError("fmv_confidence must be high, medium, or low")
-        return v
-
 
 class EditBidRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+
     max_bid: float
     bid_offset: int = 6
     snipe_group: int = 0
-    locg_id: int | None = None
-    locg_variant_id: int | None = None
 
     @field_validator("max_bid")
     @classmethod
@@ -679,6 +680,8 @@ class EditBidRequest(BaseModel):
 
 
 class PurgeRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+
     sibling_ids: list[str] = []
 
     @field_validator("sibling_ids")
@@ -688,12 +691,6 @@ class PurgeRequest(BaseModel):
             if not re.match(r"^\d+$", item_id):
                 raise ValueError(f"sibling_ids contains non-numeric value: {item_id}")
         return v
-
-
-class LocgLinkRequest(BaseModel):
-    locg_id: int
-    locg_variant_id: int | None = None
-    issue: str | None = None  # if set, target a specific issue within a lot
 
 
 # ---------------------------------------------------------------------------
@@ -711,14 +708,6 @@ _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 def root():
     return FileResponse(
         Path(__file__).parent / "static" / "index.html",
-        headers=_NO_CACHE_HEADERS,
-    )
-
-
-@app.get("/v2/comics")
-def variant_v2_comics():
-    return FileResponse(
-        Path(__file__).parent / "static" / "v2-comics.html",
         headers=_NO_CACHE_HEADERS,
     )
 
@@ -745,60 +734,14 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/api/comics")
-async def api_list_comics(
-    title: str | None = None,
-    issue: str | None = None,
-    year: int | None = None,
-    grade: float | None = None,
-):
-    db = _get_db()
-    rows = list_comics(db, title=title, issue=issue, year=year, grade=grade)
-    return [dict(r) for r in rows]
-
-
-@app.post("/api/comics")
-async def api_upsert_comic(req: UpsertComicRequest):
-    db = _get_db()
-    comic_id = upsert_comic(
-        db,
-        title=req.title,
-        issue=req.issue,
-        year=req.year,
-        grade=req.grade,
-        fmv_low=req.fmv_low,
-        fmv_high=req.fmv_high,
-        fmv_comps=req.fmv_comps,
-        fmv_confidence=req.fmv_confidence,
-        fmv_notes=req.fmv_notes,
-        locg_id=req.locg_id,
-        locg_variant_id=req.locg_variant_id,
-    )
-    row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
-    return dict(row)
+@app.get("/api/dashboard-tabs", response_model=list[TabSpec])
+def api_dashboard_tabs(request: Request) -> list[dict]:
+    return getattr(request.app.state, "dashboard_tabs", [])
 
 
 @app.post("/api/bids")
 async def api_add_bid(req: AddBidRequest):
     db = _get_db()
-
-    comic_id = None
-    if req.comic and req.issue and req.year is not None:
-        comic_id = upsert_comic(
-            db,
-            title=req.comic,
-            issue=req.issue,
-            year=req.year,
-            grade=req.grade,
-            fmv_low=req.fmv_low,
-            fmv_high=req.fmv_high,
-            fmv_comps=req.fmv_comps,
-            fmv_confidence=req.fmv_confidence,
-            fmv_notes=req.fmv_notes,
-            locg_id=req.locg_id,
-            locg_variant_id=req.locg_variant_id,
-        )
-
     try:
         async with _api_lock:
             await asyncio.to_thread(
@@ -817,7 +760,6 @@ async def api_add_bid(req: AddBidRequest):
         db,
         item_id=req.item_id,
         max_bid=req.max_bid,
-        comic_id=comic_id,
         bid_offset=req.bid_offset,
         snipe_group=req.snipe_group,
         seller=None,
@@ -839,57 +781,18 @@ async def api_get_snipes():
     db = _get_db()
 
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
-               c.locg_id, c.locg_variant_id
-        FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
-        WHERE b.status != 'PURGED'
-        ORDER BY b.added_at DESC
+        SELECT * FROM bids
+        WHERE status != 'PURGED'
+        ORDER BY added_at DESC
     """).fetchall()
-
-    # Second query: every comic linked via bid_comics, keyed by bid_id. This
-    # gives us the full lot-aware view (1 bid → N comics) without disturbing
-    # the flat fields above (still populated from the primary via bids.comic_id).
-    bid_ids = [r["id"] for r in rows]
-    comics_by_bid: dict[int, list[dict]] = {bid_id: [] for bid_id in bid_ids}
-    if bid_ids:
-        placeholders = ",".join("?" * len(bid_ids))
-        comic_rows = db.execute(
-            f"""
-            SELECT bc.bid_id, bc.is_primary, c.id AS comic_id,
-                   c.title, c.issue, c.year, c.grade,
-                   c.locg_id, c.locg_variant_id
-            FROM bid_comics bc
-            JOIN comics c ON c.id = bc.comic_id
-            WHERE bc.bid_id IN ({placeholders})
-            ORDER BY bc.bid_id, bc.is_primary DESC,
-                     CAST(c.issue AS INTEGER), c.issue
-            """,
-            bid_ids,
-        ).fetchall()
-        for cr in comic_rows:
-            comics_by_bid[cr["bid_id"]].append({
-                "comic_id": cr["comic_id"],
-                "title": cr["title"],
-                "issue": cr["issue"],
-                "year": cr["year"],
-                "grade": cr["grade"],
-                "locg_id": cr["locg_id"],
-                "locg_variant_id": cr["locg_variant_id"],
-                "is_primary": bool(cr["is_primary"]),
-            })
 
     result = []
     for row in rows:
         item = dict(row)
         end_date_iso = item.get("auction_end_at")
-        title = item.get("ebay_title") or item.get("comic_title") or ""
         result.append({
             "item_id": item["item_id"],
-            "title": title,
+            "title": item.get("ebay_title") or None,
             "current_bid": item.get("cached_current_bid"),
             "max_bid": f"{item['max_bid']:.2f} USD",
             "bid_offset": item["bid_offset"],
@@ -901,21 +804,8 @@ async def api_get_snipes():
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
             "cached_at": item.get("cached_at"),
-            "comic_title": item.get("comic_title"),
-            "comic_issue": item.get("comic_issue"),
-            "comic_year": item.get("comic_year"),
-            "comic_grade": item.get("comic_grade"),
-            "fmv_low": item.get("fmv_low"),
-            "fmv_high": item.get("fmv_high"),
-            "fmv_comps": item.get("fmv_comps"),
-            "fmv_confidence": item.get("fmv_confidence"),
-            "fmv_notes": item.get("fmv_notes"),
-            "comic_id": item.get("comic_id"),
-            "locg_id": item.get("locg_id"),
-            "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
-            "comics": comics_by_bid.get(item["id"], []),
         })
 
     return result
@@ -928,33 +818,26 @@ async def api_get_history():
     """
     db = _get_db()
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
-               c.locg_id, c.locg_variant_id
-        FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
+        SELECT * FROM bids
         WHERE (
-          b.auction_end_at IS NOT NULL
-          AND datetime(b.auction_end_at) <= datetime('now')
-          AND datetime(b.auction_end_at) >= datetime('now', '-7 days')
+          auction_end_at IS NOT NULL
+          AND datetime(auction_end_at) <= datetime('now')
+          AND datetime(auction_end_at) >= datetime('now', '-7 days')
         ) OR (
-          b.auction_end_at IS NULL
-          AND b.resolved_at IS NOT NULL
-          AND datetime(b.resolved_at) >= datetime('now', '-7 days')
+          auction_end_at IS NULL
+          AND resolved_at IS NOT NULL
+          AND datetime(resolved_at) >= datetime('now', '-7 days')
         )
-        ORDER BY COALESCE(b.auction_end_at, b.resolved_at) DESC
+        ORDER BY COALESCE(auction_end_at, resolved_at) DESC
     """).fetchall()
 
     result = []
     for row in rows:
         item = dict(row)
         end_date_iso = item.get("auction_end_at")
-        title = item.get("ebay_title") or item.get("comic_title") or ""
         result.append({
             "item_id": item["item_id"],
-            "title": title,
+            "title": item.get("ebay_title") or None,
             "current_bid": item.get("cached_current_bid"),
             "max_bid": f"{item['max_bid']:.2f} USD",
             "bid_offset": item["bid_offset"],
@@ -966,18 +849,6 @@ async def api_get_history():
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
             "cached_at": item.get("cached_at"),
-            "comic_title": item.get("comic_title"),
-            "comic_issue": item.get("comic_issue"),
-            "comic_year": item.get("comic_year"),
-            "comic_grade": item.get("comic_grade"),
-            "fmv_low": item.get("fmv_low"),
-            "fmv_high": item.get("fmv_high"),
-            "fmv_comps": item.get("fmv_comps"),
-            "fmv_confidence": item.get("fmv_confidence"),
-            "fmv_notes": item.get("fmv_notes"),
-            "comic_id": item.get("comic_id"),
-            "locg_id": item.get("locg_id"),
-            "locg_variant_id": item.get("locg_variant_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
         })
@@ -989,34 +860,25 @@ async def api_get_all_bids():
     """All bids from the DB, newest first. Pure DB read — no Gixen sync."""
     db = _get_db()
     rows = db.execute("""
-        SELECT b.*, c.title AS comic_title, c.issue AS comic_issue,
-               c.year AS comic_year, c.grade AS comic_grade,
-               c.fmv_low, c.fmv_high, c.fmv_comps,
-               c.fmv_confidence, c.fmv_notes,
-               c.locg_id, c.locg_variant_id
-        FROM bids b
-        LEFT JOIN comics c ON b.comic_id = c.id
-        ORDER BY COALESCE(b.auction_end_at, b.added_at) DESC
+        SELECT * FROM bids
+        ORDER BY COALESCE(auction_end_at, added_at) DESC
     """).fetchall()
 
     result = []
     for row in rows:
         item = dict(row)
-        end_date_iso = item.get("auction_end_at")
-        title = item.get("ebay_title") or item.get("comic_title") or ""
         result.append({
             "item_id": item["item_id"],
-            "title": title,
+            "title": item.get("ebay_title") or None,
             "max_bid": item["max_bid"],
             "bid_offset": item["bid_offset"],
             "snipe_group": item["snipe_group"],
-            "end_date_iso": end_date_iso,
+            "end_date_iso": item.get("auction_end_at"),
             "added_at": item.get("added_at"),
             "status": item["status"],
             "status_mirror": item.get("status_mirror"),
             "winning_bid": item.get("winning_bid"),
             "seller": item.get("seller"),
-            "comic_id": item.get("comic_id"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
         })
@@ -1046,22 +908,6 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
 
     update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
 
-    # If locg_id / locg_variant_id provided, persist on the linked comic row.
-    # COALESCE preserves existing values when only one of the two is supplied.
-    if req.locg_id is not None or req.locg_variant_id is not None:
-        bid_row = get_bid_by_item_id(db, item_id)
-        if bid_row is not None and bid_row["comic_id"] is not None:
-            db.execute(
-                """
-                UPDATE comics
-                SET locg_id = COALESCE(?, locg_id),
-                    locg_variant_id = COALESCE(?, locg_variant_id)
-                WHERE id = ?
-                """,
-                (req.locg_id, req.locg_variant_id, bid_row["comic_id"]),
-            )
-            db.commit()
-
     row = get_bid_by_item_id(db, item_id)
     if row is None:
         # Gixen accepted the modify, so this snipe lives there — but our DB
@@ -1080,97 +926,6 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                 detail=f"Item {item_id} not in DB after sync — Gixen state unexpectedly empty",
             )
     return dict(row)
-
-
-@app.post("/api/bids/{item_id}/comics/locg")
-async def api_link_locg(item_id: str, req: LocgLinkRequest):
-    """Persist a resolved LOCG ID against a specific comic in a bid's set.
-
-    Without `issue`: target the bid's primary comic (`bids.comic_id`).
-    With `issue`: find a comic in the bid's junction matching that issue;
-    if missing (e.g., the parser only created issue 1 for a 5-issue lot),
-    auto-upsert one using the primary's series/year and link as non-primary.
-    """
-    if not re.match(r"^\d+$", item_id):
-        raise HTTPException(status_code=422, detail="item_id must be numeric")
-    db = _get_db()
-
-    bid_row = get_bid_by_item_id(db, item_id)
-    if bid_row is None:
-        raise HTTPException(status_code=404, detail=f"Item {item_id} not in DB")
-
-    target_comic_id: int | None = None
-
-    if req.issue is not None:
-        # Look for an existing comic at this issue in the bid's junction set.
-        match = db.execute(
-            """
-            SELECT c.id
-            FROM bid_comics bc
-            JOIN comics c ON c.id = bc.comic_id
-            WHERE bc.bid_id = ? AND c.issue = ?
-            LIMIT 1
-            """,
-            (bid_row["id"], req.issue),
-        ).fetchone()
-        if match:
-            target_comic_id = match["id"]
-        else:
-            # Auto-create: copy series/year from primary, leave grade/FMV null
-            # (we don't know per-issue grades for ad-hoc lot expansions).
-            primary = get_primary_comic_for_bid(db, bid_row["id"])
-            if primary is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Bid {item_id} has no primary comic; cannot infer series/year "
-                        "for auto-create. Run extract-comics first or use cli.py add."
-                    ),
-                )
-            target_comic_id = upsert_comic(
-                db,
-                title=primary["title"],
-                issue=req.issue,
-                year=primary["year"],
-                grade=None,
-                fmv_low=None,
-                fmv_high=None,
-                fmv_comps=None,
-                fmv_confidence=None,
-                fmv_notes="auto-linked via locg-link",
-            )
-            link_comic_to_bid(db, bid_row["id"], target_comic_id, is_primary=False)
-    else:
-        if bid_row["comic_id"] is None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Bid {item_id} has no primary comic. Pass --issue to target a "
-                    "specific issue or run extract-comics first."
-                ),
-            )
-        target_comic_id = bid_row["comic_id"]
-
-    # Update locg_id (and locg_variant_id if provided). COALESCE on the
-    # variant so callers that omit it don't clobber an existing value.
-    db.execute(
-        """
-        UPDATE comics
-        SET locg_id = ?,
-            locg_variant_id = COALESCE(?, locg_variant_id)
-        WHERE id = ?
-        """,
-        (req.locg_id, req.locg_variant_id, target_comic_id),
-    )
-    db.commit()
-
-    row = db.execute(
-        "SELECT id AS comic_id, title, issue, year, grade, locg_id, locg_variant_id "
-        "FROM comics WHERE id = ?",
-        (target_comic_id,),
-    ).fetchone()
-    is_primary = (target_comic_id == bid_row["comic_id"])
-    return {**dict(row), "is_primary": is_primary}
 
 
 @app.delete("/api/bids/{item_id}")
@@ -1240,86 +995,3 @@ async def api_purge(req: PurgeRequest):
             pass
 
     return {"purged_completed": len(completed_ids), "removed_siblings": removed}
-
-
-@app.post("/api/extract-comics")
-async def api_extract_comics():
-    """Parse cached eBay titles for unlinked bids and link them to comics.
-
-    Idempotent: skips bids that already have comic_id set, and reuses existing
-    comics rows via upsert_comic. Does NOT call eBay (works only from cached
-    ebay_title values). Skips bids without a confidently parseable issue/year.
-    """
-    db = _get_db()
-
-    rows = db.execute(
-        """
-        SELECT id, item_id, ebay_title
-        FROM bids
-        WHERE comic_id IS NULL
-          AND ebay_title IS NOT NULL
-          AND ebay_title != ''
-          AND status != 'PURGED'
-        """
-    ).fetchall()
-
-    processed = 0
-    linked = 0
-    skipped: list[dict] = []
-    errors: list[dict] = []
-
-    for row in rows:
-        processed += 1
-        item_id = row["item_id"]
-        title = row["ebay_title"]
-        try:
-            parsed = parse_title(title)
-        except Exception as e:
-            errors.append({"item_id": item_id, "error": f"parse failed: {e}"})
-            continue
-
-        # Required for upsert_comic: title (series), issue, year. Skip if missing.
-        if not parsed.series:
-            skipped.append({"item_id": item_id, "reason": "no series extracted"})
-            continue
-        issues = parsed.issues or ([parsed.issue] if parsed.issue else [])
-        if not issues:
-            skipped.append({"item_id": item_id, "reason": "no issue extracted"})
-            continue
-
-        # year is required by comics.UNIQUE(title, issue, year, grade) — using
-        # a 0 sentinel for "unknown" causes two unrelated listings with no
-        # parseable year to collide and silently overwrite each other's
-        # fmv_notes (the ON CONFLICT path). Skip these rather than corrupt.
-        # Items can still be linked manually via `cli.py add --year`.
-        if parsed.year is None:
-            skipped.append({"item_id": item_id, "reason": "no year extracted"})
-            continue
-
-        try:
-            # Upsert one comic row per issue. First issue becomes primary;
-            # mirror to bids.comic_id via link_comic_to_bid(is_primary=True).
-            for idx, issue in enumerate(issues):
-                comic_id = upsert_comic(
-                    db,
-                    title=parsed.series,
-                    issue=issue,
-                    year=parsed.year,
-                    grade=parsed.grade,
-                    fmv_low=None,
-                    fmv_high=None,
-                    fmv_comps=None,
-                    fmv_confidence=None,
-                    fmv_notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
-                )
-                link_comic_to_bid(db, row["id"], comic_id, is_primary=(idx == 0))
-            linked += 1
-        except Exception as e:
-            errors.append({"item_id": item_id, "error": f"link failed: {e}"})
-
-    return {
-        "processed": processed,
-        "linked": linked,
-        "skipped": skipped,
-        "errors": errors,
-    }
