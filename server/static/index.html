@@ -194,95 +194,79 @@ function demoData() {
   const inMin = m => new Date(now + m*60000).toISOString();
   const ago = m => new Date(now - m*60000).toISOString();
   return [
-    // urgent — under 5 min, about to overbid
-    { item_id: "364892012345", title: "Amazing Spider-Man #300 CGC 9.4 White Pages — 1st App Venom 1988",
+    // urgent — under 5 min, current near max
+    { item_id: "364892012345", title: "Omega Speedmaster Professional Mark II 1969 — Box & Papers",
       current_bid: "1825.00", max_bid: "1850.00", end_date_iso: inMin(3),
-      status: "PENDING", seller: "comicvault77 (4,231)",
-      fmv_low: 1700, fmv_high: 2100, fmv_confidence: "high" },
+      status: "PENDING", seller: "vintage_dial_co" },
 
     // urgent — under 1hr
-    { item_id: "274981023456", title: "Incredible Hulk #181 CGC 6.0 — 1st Full Wolverine 1974",
+    { item_id: "274981023456", title: "Leica M6 Classic 35mm Rangefinder Body — Black, Tested",
       current_bid: "3210.50", max_bid: "3850.00", end_date_iso: inMin(42),
-      status: "PENDING", seller: "silverage_books (1,802)",
-      fmv_low: 3500, fmv_high: 4200, fmv_confidence: "high" },
+      status: "PENDING", seller: "film_corner" },
 
     // overbid — current >= max (flag)
-    { item_id: "186453789012", title: "X-Men #1 (1991) Jim Lee Variant — Wolverine Cover NM",
-      current_bid: "85.00", max_bid: "80.00", end_date_iso: inMin(190),
-      status: "PENDING", seller: "modernkeyz (542)",
-      fmv_low: 60, fmv_high: 95, fmv_confidence: "medium" },
+    { item_id: "186453789012", title: "Topre Realforce R3 87U Mechanical Keyboard — JIS Layout",
+      current_bid: "285.00", max_bid: "275.00", end_date_iso: inMin(190),
+      status: "PENDING", seller: "kbd_lab" },
 
     // healthy active
-    { item_id: "335667812345", title: "Batman: The Killing Joke 1st Print 1988 NM",
-      current_bid: "42.00", max_bid: "85.00", end_date_iso: inMin(60*8 + 12),
-      status: "PENDING", seller: "gothampress (3,109)",
-      fmv_low: 70, fmv_high: 110, fmv_confidence: "high" },
+    { item_id: "335667812345", title: "Nike Air Jordan 1 Retro High OG 'Chicago' 2015 — Size 10",
+      current_bid: "642.00", max_bid: "950.00", end_date_iso: inMin(60*8 + 12),
+      status: "PENDING", seller: "kicks_archive" },
 
-    { item_id: "204556789013", title: "Daredevil #1 1964 GD/VG — 1st Daredevil",
-      current_bid: "650.00", max_bid: "950.00", end_date_iso: inMin(60*22),
-      status: "PENDING", seller: "atomic_age (8,455)",
-      fmv_low: 800, fmv_high: 1100, fmv_confidence: "high" },
+    { item_id: "204556789013", title: "Pink Floyd — The Dark Side of the Moon UK 1973 First Press LP",
+      current_bid: "210.00", max_bid: "325.00", end_date_iso: inMin(60*22),
+      status: "PENDING", seller: "analog_grooves" },
 
-    { item_id: "115778890234", title: "House of Secrets #92 — 1st Swamp Thing FN+ 1971",
-      current_bid: "210.00", max_bid: "320.00", end_date_iso: inMin(60*36),
-      status: "PENDING", seller: "bronzeagebooks (2,290)",
-      fmv_low: 280, fmv_high: 360, fmv_confidence: "medium" },
+    { item_id: "115778890234", title: "Festool Domino DF 500 Q-Set Joiner — Systainer + Cutters",
+      current_bid: "380.00", max_bid: "560.00", end_date_iso: inMin(60*36),
+      status: "PENDING", seller: "second_pass_tools" },
 
-    { item_id: "445000123456", title: "Saga #1 1st Print 2012 Image NM/M",
-      current_bid: "18.00", max_bid: "45.00", end_date_iso: inMin(60*48 + 30),
-      status: "PENDING", seller: "indie_press (911)",
-      fmv_low: 35, fmv_high: 60, fmv_confidence: "high" },
+    { item_id: "445000123456", title: "Pokémon TCG 1999 Base Set Booster Pack — Sealed",
+      current_bid: "118.00", max_bid: "180.00", end_date_iso: inMin(60*48 + 30),
+      status: "PENDING", seller: "sealed_packs_only" },
 
-    { item_id: "556774432211", title: "Walking Dead #1 1st Print 2003 — Image VF",
-      current_bid: "780.00", max_bid: "1200.00", end_date_iso: inMin(60*72),
-      status: "PENDING", seller: "modernkeyz (542)",
-      fmv_low: 950, fmv_high: 1400, fmv_confidence: "high" },
+    { item_id: "556774432211", title: "Sennheiser HD 650 Open-Back Headphones — Like New, Boxed",
+      current_bid: "180.00", max_bid: "260.00", end_date_iso: inMin(60*72),
+      status: "PENDING", seller: "audio_garage" },
 
-    { item_id: "667123456789", title: "Action Comics #500 1979 — Bicentennial Cover NM",
-      current_bid: "22.00", max_bid: "60.00", end_date_iso: inMin(60*96),
-      status: "PENDING", seller: "dc_collector (4,002)",
-      fmv_low: 45, fmv_high: 75, fmv_confidence: "medium" },
+    { item_id: "667123456789", title: "Polaroid SX-70 Land Camera Alpha 1 — Folding, Tested Working",
+      current_bid: "120.00", max_bid: "210.00", end_date_iso: inMin(60*96),
+      status: "PENDING", seller: "film_corner" },
 
-    { item_id: "778234567890", title: "Detective Comics #359 — 1st Batgirl GD/VG 1967",
-      current_bid: "180.00", max_bid: "275.00", end_date_iso: inMin(60*120 + 22),
-      status: "PENDING", seller: "silverage_books (1,802)",
-      fmv_low: 220, fmv_high: 300, fmv_confidence: "high" },
+    { item_id: "778234567890", title: "Le Creuset Signature 7.25qt Round Dutch Oven — Cerise",
+      current_bid: "165.00", max_bid: "240.00", end_date_iso: inMin(60*120 + 22),
+      status: "PENDING", seller: "kitchen_kit" },
 
     // ended — won
-    { item_id: "889345678901", title: "New Mutants #98 — 1st Deadpool VF 1991",
+    { item_id: "889345678901", title: "Rolex Submariner 16610 Bezel Insert — OEM Service Part",
       current_bid: "412.00", max_bid: "475.00", winning_bid: 412.00,
       end_date_iso: ago(45), status: "WON",
-      seller: "modernkeyz (542)",
-      fmv_low: 380, fmv_high: 520, fmv_confidence: "high" },
+      seller: "vintage_dial_co" },
 
     // ended — outbid
-    { item_id: "990456789012", title: "Tales of Suspense #39 — 1st Iron Man Coverless 1963",
-      current_bid: "2150.00", max_bid: "1800.00",
+    { item_id: "990456789012", title: "GMK Olivia++ Base Keycap Set — Cherry Profile, Sealed",
+      current_bid: "315.00", max_bid: "280.00",
       end_date_iso: ago(180), status: "BID UNDER MAX",
-      seller: "atomic_age (8,455)",
-      fmv_low: 1700, fmv_high: 2400, fmv_confidence: "high" },
+      seller: "kbd_lab" },
 
-    // ended — net error on both
-    { item_id: "101567890123", title: "Fantastic Four #52 — 1st Black Panther 1966 GD",
+    // ended — net error
+    { item_id: "101567890123", title: "Sony Walkman WM-D6C Professional Cassette Recorder — Serviced",
       current_bid: "640.00", max_bid: "780.00",
       end_date_iso: ago(330), status: "NETWORK ERROR",
-      status_mirror: "NETWORK ERROR",
-      seller: "silverage_books (1,802)",
-      fmv_low: 700, fmv_high: 900, fmv_confidence: "medium" },
+      seller: "audio_garage" },
 
     // ended — outbid
-    { item_id: "212678901234", title: "Spawn #1 1st Print 1992 NM/M",
-      current_bid: "32.00", max_bid: "28.00",
+    { item_id: "212678901234", title: "Hasselblad 500C/M Body + 80mm Planar T* Lens — Working Set",
+      current_bid: "1820.00", max_bid: "1700.00",
       end_date_iso: ago(1440), status: "OUTBID",
-      seller: "indie_press (911)",
-      fmv_low: 25, fmv_high: 40, fmv_confidence: "medium" },
+      seller: "film_corner" },
 
     // ended — won
-    { item_id: "323789012345", title: "Uncanny X-Men #266 — 1st Gambit FN+ 1990",
+    { item_id: "323789012345", title: "Casio F-91W 1990s NOS — Sealed Box, Made in Japan",
       current_bid: "88.00", max_bid: "130.00", winning_bid: 88.00,
       end_date_iso: ago(2880), status: "WON",
-      seller: "modernkeyz (542)",
-      fmv_low: 80, fmv_high: 140, fmv_confidence: "high" },
+      seller: "vintage_dial_co" },
   ];
 }
 
@@ -296,16 +280,6 @@ function timeLeft(iso) {
   if (d >= 1) return `${d}d ${h}h`;
   if (diff < 3600000) return m > 0 ? `${m}m` : "<1m";
   return `${h}h`;
-}
-
-function fmtFmv(r) {
-  const lo = r.fmv_low, hi = r.fmv_high;
-  if (lo == null && hi == null) return '<span class="seller">—</span>';
-  if (lo != null && hi != null) {
-    if (Math.round(lo) === Math.round(hi)) return `$${Math.round(lo)}`;
-    return `$${Math.round(lo)}–${Math.round(hi)}`;
-  }
-  return `$${Math.round(lo ?? hi)}`;
 }
 
 const isEnded = r => r.end_date_iso ? new Date(r.end_date_iso) <= Date.now() : (r.time_to_end||"").toUpperCase() === "ENDED";
@@ -328,41 +302,14 @@ function outcome(r) {
   return '<span class="mute">—</span>';
 }
 
-function gradeLabel(g) {
-  if (g == null) return null;
-  const n = parseFloat(g);
-  if (isNaN(n)) return String(g);
-  if (n >= 9.8) return "NM/M";
-  if (n >= 9.4) return "NM+";
-  if (n >= 9.0) return "NM";
-  if (n >= 8.5) return "VF+";
-  if (n >= 8.0) return "VF";
-  if (n >= 7.5) return "VF-";
-  if (n >= 7.0) return "FN/VF";
-  if (n >= 6.5) return "FN+";
-  if (n >= 6.0) return "FN";
-  if (n >= 5.5) return "FN-";
-  if (n >= 5.0) return "VG/FN";
-  if (n >= 4.5) return "VG+";
-  if (n >= 4.0) return "VG";
-  if (n >= 3.5) return "VG-";
-  if (n >= 3.0) return "GD/VG";
-  if (n >= 2.5) return "GD+";
-  if (n >= 2.0) return "GD";
-  if (n >= 1.5) return "FR/GD";
-  if (n >= 1.0) return "FR";
-  return "PR";
-}
-
 function displayTitle(r) {
-  return r.title
-    || (r.comic_title && r.comic_issue != null ? `${r.comic_title} #${r.comic_issue}` : "—");
+  return r.title || "—";
 }
 
 // Escape arbitrary text for safe inclusion in HTML — element content OR
 // quoted attribute values. Used everywhere we interpolate user-controlled
-// data (eBay titles, sellers, comic notes) into a template literal that
-// gets assigned to innerHTML.
+// data (eBay titles, sellers) into a template literal that gets assigned
+// to innerHTML.
 function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -372,11 +319,6 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;");
 }
 const attrEscape = escapeHtml;  // back-compat alias
-
-function displayCondition(r) {
-  const g = gradeLabel(r.comic_grade);
-  return g || '<span class="seller">—</span>';
-}
 
 function buildFlags(snipes) {
   const lines = [];
@@ -412,10 +354,8 @@ function renderActive(snipes) {
     return `<tr class="${overbid?"overbid":""}" data-item-id="${r.item_id}">
       <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
       <td class="title" title="${escapeHtml(fullTitle)}">${escapeHtml(displayTitle(r))}</td>
-      <td>${displayCondition(r)}</td>
       <td class="right num">${fmtUSD(r.current_bid)}</td>
       <td class="right num">${maxCell}</td>
-      <td class="right num">${fmtFmv(r)}</td>
       <td class="right num">${timeCell}</td>
       <td class="seller">${escapeHtml(r.seller||"—")}<button class="remove-btn" data-item-id="${r.item_id}" aria-label="remove snipe">✕</button></td>
     </tr>`;
@@ -423,9 +363,8 @@ function renderActive(snipes) {
   el.innerHTML = `<div class="panel">
     <div class="panel-head"><span class="label">active</span><span class="count">${active.length} rows</span><span class="badge">live</span></div>
     <table><thead><tr>
-      <th>item</th><th>title</th><th>cond</th>
+      <th>item</th><th>title</th>
       <th class="right">current</th><th class="right">max</th>
-      <th class="right">fmv</th>
       <th class="right">t-minus</th><th>seller</th>
     </tr></thead><tbody>${rows}</tbody></table>
   </div>`;
@@ -444,10 +383,8 @@ function renderEnded(history) {
     return `<tr>
       <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
       <td class="title" title="${escapeHtml(fullTitle)}">${escapeHtml(displayTitle(r))}</td>
-      <td>${displayCondition(r)}</td>
       <td class="right num">${winning}</td>
       <td class="right num">${fmtUSD(r.max_bid)}</td>
-      <td class="right num">${fmtFmv(r)}</td>
       <td>${outcome(r)}</td>
       <td class="seller">${escapeHtml(r.seller||"—")}</td>
     </tr>`;
@@ -455,9 +392,8 @@ function renderEnded(history) {
   el.innerHTML = `<div class="panel">
     <div class="panel-head"><span class="label">recently ended</span><span class="count">${ended.length} rows</span></div>
     <table><thead><tr>
-      <th>item</th><th>title</th><th>cond</th>
+      <th>item</th><th>title</th>
       <th class="right">winning</th><th class="right">max</th>
-      <th class="right">fmv</th>
       <th>result</th><th>seller</th>
     </tr></thead><tbody>${rows}</tbody></table>
   </div>`;
