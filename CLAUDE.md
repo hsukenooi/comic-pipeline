@@ -152,7 +152,9 @@ PYTHONPATH=src python3 -m pytest tests/ -v
 
 ## Dependencies
 
-- `curl-cffi` — HTTP client with browser impersonation (Cloudflare bypass)
+- `playwright` — HTTP client via real Chrome (`channel="chrome"`); cookies persist in `~/.config/locg/playwright-profile/`. System Chrome must be installed. No `playwright install` needed.
 - `beautifulsoup4` — HTML parsing
 - `python-dotenv` — load `~/.config/locg/.env` at startup for auto-login
 - `pytest` (test only)
+
+**Note:** Existing `~/.config/locg/cookies.json` is no longer read. Run `locg login` once after upgrading to populate the new Playwright profile.
