@@ -207,3 +207,25 @@ def test_fk_removal_migration_is_idempotent(tmp_path):
     conn2 = init_db(db_path)
     assert len(conn2.execute("PRAGMA foreign_key_list(bids)").fetchall()) == 0
     conn2.close()
+
+
+# ---------------------------------------------------------------------------
+# fmv_id column migration
+# ---------------------------------------------------------------------------
+
+
+def test_bids_fmv_id_column_present_on_fresh_db(tmp_path):
+    conn = init_db(tmp_path / "fresh.db")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "fmv_id" in cols
+    conn.close()
+
+
+def test_bids_fmv_id_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem.db"
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "fmv_id" in cols
+    conn2.close()
