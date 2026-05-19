@@ -38,6 +38,9 @@ _COLUMN_MIGRATIONS = [
     "ALTER TABLE bids ADD COLUMN cached_at TEXT",
     "ALTER TABLE bids ADD COLUMN local_snipe_at TEXT",
     "ALTER TABLE bids ADD COLUMN local_snipe_result TEXT",
+    # Plain INTEGER (no FK) so gixen-cli starts cleanly without the plugin.
+    # The plugin reads/writes this column when present.
+    "ALTER TABLE bids ADD COLUMN fmv_id INTEGER",
 ]
 
 
