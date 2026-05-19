@@ -168,15 +168,18 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
     return {**dict(row), "is_primary": is_primary}
 
 
-def _parse_current_bid(s):
+def _parse_current_bid(value: str | None) -> float | None:
     """Extract a numeric value from a cached_current_bid string ('10.00 USD' -> 10.0).
 
     Mirrors the JS `parseAmt` in server/static/index.html so server-side
-    value_pct math sees the same numbers the client does.
+    value_pct math sees the same numbers the client does. Non-negative
+    inputs only — the regex strips minus signs along with everything else,
+    so this would silently sign-flip negative values. eBay current bids are
+    always non-negative; do not reuse this for refund/credit fields.
     """
-    if s is None:
+    if value is None:
         return None
-    cleaned = _NUMERIC_RE.sub("", str(s))
+    cleaned = _NUMERIC_RE.sub("", str(value))
     if not cleaned or cleaned == ".":
         return None
     try:
