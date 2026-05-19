@@ -3,7 +3,7 @@ import { mapWarehouse } from "./types.js";
 import { getHeaders } from "./auth.js";
 
 const SESSION_EXPIRED_MSG =
-  "Session expired. Run: npx tsx src/cli.ts set-cookie \"<paste from DevTools>\"";
+  "Session expired. Run: ezship set-cookie \"<paste from DevTools>\"";
 
 export async function callRpc(
   config: Config,
@@ -32,6 +32,7 @@ export async function callRpc(
     if (location.includes("/Account/Login")) {
       throw new Error(SESSION_EXPIRED_MSG);
     }
+    throw new Error(`Unexpected redirect to: ${location || "(empty Location header)"}`);
   }
 
   if (!response.ok && response.status !== 302 && response.status !== 303) {

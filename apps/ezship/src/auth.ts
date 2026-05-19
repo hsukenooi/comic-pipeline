@@ -57,8 +57,22 @@ export function getHeaders(config: Config): Record<string, string> {
 
 export function saveCookie(cookie: string, path?: string): void {
   const configPath = path ?? CONFIG_PATH;
-  const raw = readFileSync(configPath, "utf-8");
-  const config = JSON.parse(raw) as Record<string, unknown>;
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, "utf-8");
+  } catch {
+    throw new Error(
+      `Config file not found at ${configPath}\n` +
+        "Create it first with your ezbuy credentials:\n" +
+        '  { "cookie": "...", "userAgent": "...", "apiBaseUrl": "..." }'
+    );
+  }
+  let config: Record<string, unknown>;
+  try {
+    config = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Config file at ${configPath} is not valid JSON`);
+  }
   config.cookie = cookie;
   writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
 }
