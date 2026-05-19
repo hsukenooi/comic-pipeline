@@ -8,58 +8,220 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/v2.css">
+<style>
+  /* v2-tui (comics dashboard) — page-specific styles. Shared chrome in v2.css.
+     Patterns copied from server/static/index.html (gixen-cli) per the plan's
+     "drop parity criterion" decision: both dashboards drift independently. */
+
+  tbody tr.overbid { background: rgba(247,118,142,0.08); }
+  tbody tr.overbid:hover { background: rgba(247,118,142,0.16); }
+
+  tbody tr.needs-linking td { opacity: 0.55; }
+  .needs-link-icon {
+    display: inline-block;
+    color: var(--yellow);
+    margin-right: 4px;
+    font-size: 11px;
+  }
+
+  td.title {
+    max-width: 380px;
+    color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .warn-cell { color: var(--red); font-weight: 700; }
+  .urgent-cell { color: var(--orange); font-weight: 700; }
+
+  .lot-badge {
+    display: inline-block;
+    font-size: 10px;
+    color: var(--fg-dim);
+    border: 1px solid var(--line);
+    padding: 0 4px;
+    border-radius: 3px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  /* Green max-bid coloring when current bid is comfortably under FMV
+     (value_pct < 80). Red overbid uses the existing .warn-cell. */
+  .value-green { color: var(--green); font-weight: 500; }
+
+  /* inline-edit max_bid */
+  .editable-max {
+    cursor: pointer;
+    border-bottom: 1px dotted transparent;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .editable-max:hover { border-bottom-color: var(--fg-dim); }
+  .editable-max.editing { cursor: text; }
+  .editable-max.saving {
+    color: var(--yellow);
+    animation: pulse-saving 0.9s ease-in-out infinite;
+  }
+  .editable-max.saved { color: var(--green); transition: color 1.2s; }
+  .editable-max.save-error { color: var(--red); }
+  @keyframes pulse-saving {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
+  .max-input {
+    width: 80px;
+    background: var(--bg-alt);
+    color: var(--fg);
+    border: 1px solid var(--blue);
+    border-radius: 3px;
+    padding: 1px 6px;
+    font: inherit;
+    text-align: right;
+    -moz-appearance: textfield;
+  }
+  .max-input::-webkit-outer-spin-button,
+  .max-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .max-input:focus { outline: none; border-color: var(--cyan); }
+
+  /* per-row remove control */
+  .remove-btn {
+    visibility: hidden;
+    margin-left: 8px;
+    padding: 0 6px;
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--fg-dim);
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    line-height: 18px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  tbody tr:hover .remove-btn { visibility: visible; }
+  .remove-btn:hover {
+    color: var(--red);
+    border-color: var(--red);
+    background: rgba(247,118,142,0.1);
+  }
+  .remove-btn.confirming {
+    visibility: visible;
+    color: var(--red);
+    border-color: var(--red);
+    background: rgba(247,118,142,0.18);
+    font-weight: 600;
+  }
+  tbody tr.removing { opacity: 0.4; transition: opacity 0.25s; }
+
+  /* keybar 'r' refresh button */
+  .keybar .key-action {
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    padding: 0;
+  }
+  .keybar .key-action:hover { color: var(--fg); }
+
+  /* top-of-page refresh sweep — visible only while a fetch is in flight */
+  .refresh-bar {
+    position: fixed;
+    top: 28px;
+    left: 0; right: 0;
+    height: 2px;
+    background: var(--bg-alt);
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 60;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .refresh-bar.is-active { opacity: 1; }
+  .refresh-bar::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, var(--blue), transparent);
+    transform: translateX(-100%);
+    animation: refresh-sweep 1.1s ease-in-out infinite;
+  }
+  @keyframes refresh-sweep {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+</style>
 </head>
 <body>
 
 <div class="topbar">
   <div class="seg brand">▎ gixen</div>
   <a class="seg nav" href="/">snipes</a>
-  <a class="seg nav active" href="/v2/comics">▸ comics</a>
-  <a class="seg nav" href="/v2/bids">bids</a>
+  <div id="nav-tabs"></div>
   <div class="spacer"></div>
   <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
   <div class="seg clock" id="clock">--:--:--</div>
 </div>
+<div class="refresh-bar" id="refresh-bar"></div>
 
 <div class="wrap">
   <div class="session" id="session">
-    <span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">comics</span> <span class="ok">▸ ready</span>
+    <span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--comics</span> <span class="ok">▸ ready</span>
   </div>
-  <div id="comics-section"></div>
+
+  <div id="active-section"></div>
+  <div id="ended-section"></div>
 </div>
 
 <div class="keybar">
-  <span><kbd>r</kbd>refresh</span>
+  <button class="key-action" id="refresh-btn" type="button"><kbd>r</kbd>refresh</button>
   <span><kbd>s</kbd>snipes</span>
-  <span><kbd>c</kbd>comics</span>
   <span><kbd>b</kbd>bids</span>
   <span class="spacer"></span>
   <span class="stat is-loading" id="status"><span class="dot loading"></span><span id="status-text">connecting…</span></span>
 </div>
 
 <script>
-const REFRESH_MS = 60000;
-const COMICS_URL = "/api/comics";
-const SNIPES_URL = "/api/snipes";
+const REFRESH_MS = 30000;
+const SNIPES_URL = "/api/comics/snipes";
+const HISTORY_URL = "/api/comics/history";
+const TABS_URL = "/api/dashboard-tabs";
+const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
 
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+// ---- Helpers (mirrors gixen-cli's index.html; copied not shared) ------------
+
+function timeLeft(iso) {
+  if (!iso) return "—";
+  const diff = new Date(iso) - Date.now();
+  if (diff <= 0) return "ENDED";
+  const d = Math.floor(diff/86400000);
+  const h = Math.floor((diff%86400000)/3600000);
+  const m = Math.floor((diff%3600000)/60000);
+  if (d >= 1) return `${d}d ${h}h`;
+  if (diff < 3600000) return m > 0 ? `${m}m` : "<1m";
+  return `${h}h`;
 }
 
-function fmtFmv(r) {
-  const lo = r.fmv_low, hi = r.fmv_high;
-  if (lo == null && hi == null) return '<span class="mute">—</span>';
-  if (lo != null && hi != null) {
-    if (Math.round(lo) === Math.round(hi)) return `$${Math.round(lo)}`;
-    return `$${Math.round(lo)}–${Math.round(hi)}`;
-  }
-  return `$${Math.round(lo ?? hi)}`;
-}
+const isEnded = r => r.end_date_iso
+  ? new Date(r.end_date_iso) <= Date.now()
+  : (r.time_to_end||"").toUpperCase() === "ENDED";
+
+const parseAmt = s => {
+  if (s == null) return null;
+  const n = parseFloat(String(s).replace(/[^0-9.]/g,""));
+  return isNaN(n) ? null : n;
+};
+const fmtUSD = s => {
+  const n = parseAmt(s);
+  return n != null ? `$${n.toFixed(2)}` : "—";
+};
+
+// Numeric extraction prefers the server-emitted *_numeric fields; falls back
+// to parseAmt() on the formatted string for safety.
+const numericMax = r => r.max_bid_numeric != null ? r.max_bid_numeric : parseAmt(r.max_bid);
+const numericCurrent = r => r.current_bid_numeric != null ? r.current_bid_numeric : parseAmt(r.current_bid);
 
 function gradeLabel(g) {
   if (g == null) return null;
@@ -87,44 +249,197 @@ function gradeLabel(g) {
   return "PR";
 }
 
-function confPill(c) {
-  if (!c) return '<span class="mute">—</span>';
-  const cl = String(c).toLowerCase();
-  return `<span class="pill conf-${cl}">${cl}</span>`;
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
-function renderComics(comics) {
-  const el = document.getElementById("comics-section");
-  if (!comics.length) {
+function displayTitle(r) {
+  return r.title || "—";
+}
+
+// ---- Comic-enrichment cell renderers ----------------------------------------
+
+function fmtCond(r) {
+  if (r.cond_grade == null) return '<span class="seller">—</span>';
+  return gradeLabel(parseFloat(r.cond_grade)) || String(r.cond_grade);
+}
+
+// Strip the eBay feedback count from seller strings: "modernkeyz (542)" -> "modernkeyz"
+function fmtSeller(r) {
+  const s = r.seller || "—";
+  return escapeHtml(String(s).replace(/\s*\(\d[\d,]*\)\s*$/, ""));
+}
+
+function fmtFmv(r) {
+  const lo = r.fmv_low, hi = r.fmv_high;
+  if (lo == null && hi == null) return '<span class="seller">—</span>';
+  if (lo != null && hi != null) {
+    if (Math.round(lo) === Math.round(hi)) return `$${Math.round(lo).toLocaleString()}`;
+    return `$${Math.round(lo).toLocaleString()}–$${Math.round(hi).toLocaleString()}`;
+  }
+  return `$${Math.round(lo ?? hi).toLocaleString()}`;
+}
+
+// Pick the color class for the active-table max cell. Red is already used by
+// the overbid warn-cell branch; green flags a deal worth holding (current bid
+// is well under FMV midpoint). Falls back to neutral.
+function maxDealClass(r) {
+  if (r.value_pct == null) return "";
+  return r.value_pct < 80 ? "value-green" : "";
+}
+
+// Title-cell content: ebay_title + needs-link icon + lot badge.
+function fmtTitle(r) {
+  const title = escapeHtml(displayTitle(r));
+  const icon = r.needs_linking
+    ? '<span class="needs-link-icon" title="needs linking — run extract-comics or hand-link">⛓</span>'
+    : '';
+  const lot = r.lot_count > 1
+    ? `<span class="lot-badge">lot of ${r.lot_count}</span>`
+    : '';
+  return `${icon}${title}${lot}`;
+}
+
+// Outcome pill (ended rows). Trust backend status before any heuristics:
+// an OUTBID-on-tie loss (winning_bid == max_bid because eBay's bid-increment
+// rule defeats a tied snipe) should still render as "outbid".
+function outcome(r) {
+  if (r.status === "PENDING") return '<span class="pill pending">pending</span>';
+  if (r.status === "WON") return '<span class="pill won">won</span>';
+  if (r.status === "LOST") return '<span class="pill lost">outbid</span>';
+  const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
+  const m = numericMax(r);
+  if (w != null && m != null) return w <= m
+    ? '<span class="pill won">won</span>'
+    : '<span class="pill lost">outbid</span>';
+  if (r.local_snipe_result) return '<span class="pill err">missed</span>';
+  return '<span class="mute">—</span>';
+}
+
+// ---- Tables -----------------------------------------------------------------
+
+function renderActive(snipes) {
+  const active = snipes.filter(r => !isEnded(r)).sort((a,b) =>
+    (a.end_date_iso ? new Date(a.end_date_iso) : Infinity) -
+    (b.end_date_iso ? new Date(b.end_date_iso) : Infinity));
+  const el = document.getElementById("active-section");
+  if (!active.length) {
     el.innerHTML = `<div class="panel">
-      <div class="panel-head"><span class="label">comics</span><span class="count">0 rows</span></div>
-      <div class="empty">// no comics yet — add a snipe via cli.py then run extract-comics</div>
+      <div class="panel-head"><span class="label">active</span><span class="count">0 rows</span><span class="badge">live</span></div>
+      <div class="empty">// no active snipes</div>
     </div>`;
     return;
   }
-  const rows = comics.map(c => `<tr>
-    <td class="num dim">${c.id}</td>
-    <td>${c.title ? escapeHtml(c.title) : '<span class="mute">—</span>'}</td>
-    <td class="num">${c.issue != null ? escapeHtml(c.issue) : '<span class="mute">—</span>'}</td>
-    <td class="num dim">${c.year ?? '<span class="mute">—</span>'}</td>
-    <td class="num">${c.grade != null ? `${c.grade} ${gradeLabel(c.grade) ? `<span class="dim">(${gradeLabel(c.grade)})</span>` : ''}` : '<span class="mute">—</span>'}</td>
-    <td class="right num">${fmtFmv(c)}</td>
-    <td class="right num dim">${c.fmv_comps ?? '<span class="mute">—</span>'}</td>
-    <td>${confPill(c.fmv_confidence)}</td>
-    <td class="wrap dim">${c.fmv_notes ? escapeHtml(c.fmv_notes) : '<span class="mute">—</span>'}</td>
-  </tr>`).join("");
+  const rows = active.map(r => {
+    const cur = numericCurrent(r);
+    const max = numericMax(r);
+    const overbid = cur != null && max != null && cur >= max;
+    const tl = r.end_date_iso ? timeLeft(r.end_date_iso) : (r.time_to_end || "—");
+    const urgent = r.end_date_iso && (new Date(r.end_date_iso) - Date.now()) < 3600000;
+    const timeCell = urgent ? `<span class="urgent-cell">${tl}</span>` : tl;
+    // Max cell coloring: red on overbid (existing warn-cell), green when the
+    // current bid is comfortably under FMV (deal worth defending), neutral
+    // otherwise. Value % is computed by the endpoint and used only for color.
+    let maxInner;
+    if (overbid) {
+      maxInner = `<span class="warn-cell">▲ $${max.toFixed(2)}</span>`;
+    } else {
+      const dealCls = maxDealClass(r);
+      maxInner = dealCls ? `<span class="${dealCls}">${fmtUSD(r.max_bid)}</span>` : fmtUSD(r.max_bid);
+    }
+    const maxCell = `<span class="editable-max" data-item-id="${r.item_id}" `
+      + `data-current-max="${max != null ? max : ''}" `
+      + `data-bid-offset="${r.bid_offset ?? 6}" `
+      + `data-snipe-group="${r.snipe_group ?? 0}" `
+      + `title="click to edit">${maxInner}</span>`;
+    const fullTitle = displayTitle(r);
+    const rowClass = [overbid ? "overbid" : "", r.needs_linking ? "needs-linking" : ""]
+      .filter(Boolean).join(" ");
+    return `<tr class="${rowClass}" data-item-id="${r.item_id}">
+      <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
+      <td class="title" title="${escapeHtml(fullTitle)}">${fmtTitle(r)}</td>
+      <td>${fmtCond(r)}</td>
+      <td class="right num">${fmtUSD(r.current_bid)}</td>
+      <td class="right num">${maxCell}</td>
+      <td class="right num">${fmtFmv(r)}</td>
+      <td class="right num">${timeCell}</td>
+      <td class="seller">${fmtSeller(r)}<button class="remove-btn" data-item-id="${r.item_id}" aria-label="remove snipe">✕</button></td>
+    </tr>`;
+  }).join("");
   el.innerHTML = `<div class="panel">
-    <div class="panel-head">
-      <span class="label">comics</span>
-      <span class="count">${comics.length} rows</span>
-    </div>
+    <div class="panel-head"><span class="label">active</span><span class="count">${active.length} rows</span><span class="badge">live</span></div>
     <div class="scroll"><table><thead><tr>
-      <th>id</th><th>title</th><th>issue</th><th>year</th>
-      <th>grade</th><th class="right">fmv</th><th class="right">comps</th>
-      <th>conf</th><th>notes</th>
+      <th>item</th><th>title</th><th>cond</th>
+      <th class="right">current</th><th class="right">max</th>
+      <th class="right">fmv</th>
+      <th class="right">t-minus</th><th>seller</th>
     </tr></thead><tbody>${rows}</tbody></table></div>
   </div>`;
 }
+
+function renderEnded(history) {
+  const ended = [...history].sort((a,b) =>
+    (b.end_date_iso ? new Date(b.end_date_iso) : 0) -
+    (a.end_date_iso ? new Date(a.end_date_iso) : 0));
+  const el = document.getElementById("ended-section");
+  if (!ended.length) {
+    el.innerHTML = `<div class="panel">
+      <div class="panel-head"><span class="label">recently ended</span><span class="count">0 rows</span></div>
+      <div class="empty">// none</div>
+    </div>`;
+    return;
+  }
+  const rows = ended.map(r => {
+    const winning = r.winning_bid != null ? `$${parseFloat(r.winning_bid).toFixed(2)}` : fmtUSD(r.current_bid);
+    const fullTitle = displayTitle(r);
+    const rowClass = r.needs_linking ? "needs-linking" : "";
+    return `<tr class="${rowClass}">
+      <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
+      <td class="title" title="${escapeHtml(fullTitle)}">${fmtTitle(r)}</td>
+      <td>${fmtCond(r)}</td>
+      <td class="right num">${winning}</td>
+      <td class="right num">${fmtUSD(r.max_bid)}</td>
+      <td class="right num">${fmtFmv(r)}</td>
+      <td>${outcome(r)}</td>
+      <td class="seller">${fmtSeller(r)}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<div class="panel">
+    <div class="panel-head"><span class="label">recently ended</span><span class="count">${ended.length} rows</span></div>
+    <div class="scroll"><table><thead><tr>
+      <th>item</th><th>title</th><th>cond</th>
+      <th class="right">winning</th><th class="right">max</th>
+      <th class="right">fmv</th>
+      <th>result</th><th>seller</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>
+  </div>`;
+}
+
+// ---- Dynamic nav (filter current page by pathname, not literal string) ------
+
+async function renderNavTabs() {
+  try {
+    const resp = await fetch(TABS_URL);
+    if (!resp.ok) return;
+    const tabs = await resp.json();
+    const el = document.getElementById("nav-tabs");
+    const here = window.location.pathname;
+    const html = tabs.map(t => t.path === here
+      ? `<a class="seg nav active" href="${t.path}">▸ ${escapeHtml(t.label)}</a>`
+      : `<a class="seg nav" href="${t.path}">${escapeHtml(t.label)}</a>`
+    ).join("");
+    el.innerHTML = html;
+  } catch (_) {
+    // Nav is best-effort; failures don't block the dashboard.
+  }
+}
+
+// ---- Status pill + clock ----------------------------------------------------
 
 function setStatus(state, text) {
   const el = document.getElementById("status");
@@ -138,34 +453,257 @@ function setStatus(state, text) {
 function tickClock() { document.getElementById("clock").textContent = new Date().toLocaleTimeString(); }
 setInterval(tickClock, 1000); tickClock();
 
+// ---- Fetch + repaint loop ---------------------------------------------------
+
+let _lastSnipes = null;
+let _lastHistory = null;
+let _lastSyncedAt = null;
+let _inFlight = false;
+let suppressRefresh = false;
+
+function renderAll(snipes, history) {
+  if (!snipes) return;
+  renderActive(snipes);
+  renderEnded(history || []);
+
+  let cacheTag = '';
+  const newest = snipes.reduce((acc, r) => {
+    if (!r.cached_at) return acc;
+    const t = new Date(r.cached_at).getTime();
+    return t > acc ? t : acc;
+  }, 0);
+  if (newest > 0) {
+    const ageS = Math.max(0, Math.floor((Date.now() - newest) / 1000));
+    const ageStr = ageS < 90 ? `${ageS}s ago` : `${Math.floor(ageS/60)}m ago`;
+    cacheTag = ` <span class="arg">· cache ${ageStr}</span>`;
+  } else if (snipes.length > 0) {
+    cacheTag = ` <span class="err">· cache empty (warming up)</span>`;
+  }
+  const syncedAtStr = _lastSyncedAt
+    ? `synced ${_lastSyncedAt.toLocaleTimeString()}`
+    : 'never synced';
+  document.getElementById("session").innerHTML =
+    `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--comics</span> `
+    + `<span class="ok">▸ ${snipes.length} rows · ${syncedAtStr}</span>${cacheTag} `
+    + `<span class="arg">· press r to refresh</span>`;
+}
+
 async function load() {
-  setStatus("loading", `fetching ${COMICS_URL}…`);
+  if (_inFlight) return;
+  _inFlight = true;
+  setStatus("loading", "syncing…");
+  document.getElementById("refresh-bar").classList.add("is-active");
   try {
-    const [comicsResp] = await Promise.all([fetch(COMICS_URL)]);
-    if (!comicsResp.ok) throw new Error(`HTTP ${comicsResp.status}`);
-    const comics = await comicsResp.json();
-    const sorted = [...comics].sort((a, b) => (a.title || "").localeCompare(b.title || ""));
-    renderComics(sorted);
-    const now = new Date().toLocaleTimeString();
-    document.getElementById("session").innerHTML =
-      `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">comics</span> <span class="ok">▸ ${comics.length} rows · synced ${now}</span>`;
-    setStatus("ok", `${comics.length} rows`);
+    const [snipes, history] = await Promise.all([
+      fetch(SNIPES_URL).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+      fetch(HISTORY_URL).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+    ]);
+    _lastSnipes = snipes;
+    _lastHistory = history;
+    _lastSyncedAt = new Date();
+    renderAll(snipes, history);
+    setStatus("ok", `${snipes.length} rows`);
   } catch (e) {
     setStatus("error", e.message);
-    document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="err">▸ ${e.message}</span>`;
+    document.getElementById("session").innerHTML =
+      `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="err">▸ ${escapeHtml(e.message)}</span>`;
+  } finally {
+    document.getElementById("refresh-bar").classList.remove("is-active");
+    _inFlight = false;
   }
 }
 
-document.addEventListener("keydown", e => {
-  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-  if (e.key === "r") load();
-  if (e.key === "s") location.href = "/";
-  if (e.key === "c") location.href = "/v2/comics";
-  if (e.key === "b") location.href = "/v2/bids";
+// ---- Inline-edit max_bid ----------------------------------------------------
+
+function startMaxEdit(cell) {
+  if (cell.classList.contains("editing") || cell.classList.contains("saving")) return;
+  const current = parseFloat(cell.dataset.currentMax);
+  if (isNaN(current)) return;
+  cell.classList.add("editing");
+  cell.innerHTML = `<input type="number" step="0.01" min="0.01" value="${current.toFixed(2)}" class="max-input" autocomplete="off">`;
+  const input = cell.querySelector("input");
+  input.focus();
+  input.select();
+
+  const restore = () => {
+    cell.classList.remove("editing");
+    const m = parseFloat(cell.dataset.currentMax);
+    cell.innerHTML = `$${m.toFixed(2)}`;
+  };
+
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    if (!commit) { restore(); return; }
+    const val = parseFloat(input.value);
+    const cur = parseFloat(cell.dataset.currentMax);
+    if (isNaN(val) || val <= 0 || val === cur) { restore(); return; }
+    saveMaxBid(cell, val);
+  };
+
+  input.addEventListener("keydown", ev => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+async function saveMaxBid(cell, newMax) {
+  const itemId = cell.dataset.itemId;
+  const bidOffset = parseInt(cell.dataset.bidOffset, 10) || 6;
+  const snipeGroup = parseInt(cell.dataset.snipeGroup, 10) || 0;
+
+  cell.classList.remove("editing");
+  cell.classList.add("saving");
+  cell.innerHTML = `$${newMax.toFixed(2)}`;
+  suppressRefresh = true;
+
+  // Bound the PATCH so a hung call can't strand suppressRefresh=true.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+
+  try {
+    const resp = await fetch(`/api/bids/${itemId}`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        max_bid: newMax,
+        bid_offset: bidOffset,
+        snipe_group: snipeGroup,
+      }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try { const j = await resp.json(); if (j.detail) detail = j.detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    cell.classList.remove("saving");
+    cell.classList.add("saved");
+    cell.dataset.currentMax = String(newMax);
+    setTimeout(() => cell.classList.remove("saved"), 1200);
+    suppressRefresh = false;
+    load();
+  } catch (e) {
+    clearTimeout(timer);
+    cell.classList.remove("saving");
+    cell.classList.add("save-error");
+    const prev = parseFloat(cell.dataset.currentMax);
+    cell.innerHTML = `$${prev.toFixed(2)}`;
+    const msg = e.name === "AbortError" ? "save timed out" : e.message;
+    cell.title = `save failed: ${msg}`;
+    setTimeout(() => {
+      cell.classList.remove("save-error");
+      cell.title = "click to edit";
+    }, 3500);
+    suppressRefresh = false;
+  }
+}
+
+// ---- Per-row remove (two-click confirm) -------------------------------------
+
+function resetConfirms(except) {
+  document.querySelectorAll(".remove-btn.confirming").forEach(b => {
+    if (b === except) return;
+    b.classList.remove("confirming");
+    b.textContent = "✕";
+    if (b._confirmTimer) clearTimeout(b._confirmTimer);
+  });
+}
+
+async function confirmRemove(btn) {
+  const itemId = btn.dataset.itemId;
+  const tr = btn.closest("tr");
+  if (!tr) return;
+  tr.classList.add("removing");
+  suppressRefresh = true;
+  // Clear the row from our cached snapshot so the next 1s repaint doesn't
+  // revive it before load() returns.
+  if (_lastSnipes) {
+    _lastSnipes = _lastSnipes.filter(r => r.item_id !== itemId);
+  }
+  try {
+    const resp = await fetch(`/api/bids/${itemId}`, {method: "DELETE"});
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try { const j = await resp.json(); if (j.detail) detail = j.detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    tr.style.opacity = "0";
+    setTimeout(() => { suppressRefresh = false; load(); }, 250);
+  } catch (e) {
+    tr.classList.remove("removing");
+    btn.classList.remove("confirming");
+    btn.textContent = "✕";
+    btn.title = `remove failed: ${e.message}`;
+    setTimeout(() => { btn.title = "remove snipe"; }, 3500);
+    suppressRefresh = false;
+  }
+}
+
+document.addEventListener("click", e => {
+  const cell = e.target.closest(".editable-max");
+  if (cell) {
+    if (!cell.classList.contains("editing") && !cell.classList.contains("saving")) {
+      startMaxEdit(cell);
+    }
+    return;
+  }
+
+  const btn = e.target.closest(".remove-btn");
+  if (btn) {
+    resetConfirms(btn);
+    if (btn.classList.contains("confirming")) {
+      const armedAt = btn._armedAt || 0;
+      if (Date.now() - armedAt < 400) return;
+      if (btn._confirmTimer) clearTimeout(btn._confirmTimer);
+      confirmRemove(btn);
+    } else {
+      btn.classList.add("confirming");
+      btn.textContent = "✕ remove?";
+      btn._armedAt = Date.now();
+      btn._confirmTimer = setTimeout(() => {
+        btn.classList.remove("confirming");
+        btn.textContent = "✕";
+      }, 5000);
+    }
+    return;
+  }
+
+  resetConfirms(null);
 });
 
+// ---- Keyboard + refresh button ----------------------------------------------
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.key === "r" || e.key === "R") { e.preventDefault(); load(); }
+  if (e.key === "s") location.href = "/";
+  if (e.key === "c") location.href = "/comics";
+  if (e.key === "b") location.href = "/v2/bids";
+});
+document.getElementById("refresh-btn").addEventListener("click", e => {
+  e.preventDefault();
+  load();
+});
+
+// ---- 1s repaint tick — countdowns + cache-age, no network ------------------
+
+function repaint() {
+  if (suppressRefresh) return;
+  if (!_lastSnipes) return;
+  if (document.querySelector(".editable-max.editing, .editable-max.saving")) return;
+  if (document.querySelector(".remove-btn.confirming")) return;
+  if (document.querySelector("tr.removing")) return;
+  renderAll(_lastSnipes, _lastHistory);
+}
+
+renderNavTabs();
 load();
 setInterval(load, REFRESH_MS);
+setInterval(repaint, 1000);
 </script>
 </body>
 </html>
