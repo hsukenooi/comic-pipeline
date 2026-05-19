@@ -43,6 +43,7 @@ GRADE_BARE_PATTERN = re.compile(
 )
 
 VARIANT_SPECIFICS_KEYS = {"Variant", "Edition", "Printing"}
+VARIANT_SPECIFICS_KEYS_LOWER = frozenset(k.lower() for k in VARIANT_SPECIFICS_KEYS)
 VARIANT_TITLE_KEYWORDS = [
     "Newsstand", "Direct", "Whitman", "Price Variant",
     "Type 1A", "Type 1B", "Collectors Edition",
@@ -50,6 +51,8 @@ VARIANT_TITLE_KEYWORDS = [
 
 GRADE_SPECIFICS_KEYS = {"Grade", "CGC Grade", "CBCS Grade", "Condition"}
 GRADE_SPECIFICS_KEYS_LOWER = frozenset(k.lower() for k in GRADE_SPECIFICS_KEYS)
+
+_GENERIC_EBAY_CONDITIONS = frozenset({"Brand New", "Like New", "New", "Very Good", "Good", "Acceptable"})
 
 
 def load_config():
@@ -165,9 +168,10 @@ def fetch_item(item_id, token, base_url, retries=3):
             print(f"Error: Item {item_id} not found (404).", file=sys.stderr)
             return None
         elif resp.status_code == 429:
-            wait = 2 ** attempt
-            print(f"Rate limited, retrying in {wait}s...", file=sys.stderr)
-            time.sleep(wait)
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"Rate limited, retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
         else:
             print(
                 f"Error fetching item {item_id}: HTTP {resp.status_code}: {resp.text[:200]}",
@@ -223,7 +227,7 @@ def extract_variant(item_specifics, title):
     """Extract variant from item specifics or title."""
     # Check item specifics
     for spec in item_specifics:
-        if spec.get("name", "").strip().lower() in {k.lower() for k in VARIANT_SPECIFICS_KEYS}:
+        if spec.get("name", "").strip().lower() in VARIANT_SPECIFICS_KEYS_LOWER:
             val = spec.get("value")
             if val:
                 return val
@@ -304,7 +308,6 @@ def parse_item(data):
     # misleading for collectibles like comics where actual grading applies.
     # Suppress them when a real grade is available or when the generic label
     # clearly doesn't match a vintage/used item.
-    _GENERIC_EBAY_CONDITIONS = {"Brand New", "Like New", "New", "Very Good", "Good", "Acceptable"}
     condition_note = None
     if condition in _GENERIC_EBAY_CONDITIONS:
         condition_note = "eBay category label, not comic grade"
