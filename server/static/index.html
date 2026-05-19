@@ -743,6 +743,20 @@ function repaint() {
   renderAll(_lastSnipes, _lastHistory);
 }
 
+fetch("/api/dashboard-tabs")
+  .then(r => r.ok ? r.json() : [])
+  .then(tabs => {
+    const spacer = document.querySelector(".topbar .spacer");
+    tabs.forEach(({label, path}) => {
+      const a = document.createElement("a");
+      a.className = "seg nav";
+      a.href = path;
+      a.textContent = label;
+      spacer.before(a);
+    });
+  })
+  .catch(() => {});
+
 load();
 setInterval(repaint, 1000);
 </script>
