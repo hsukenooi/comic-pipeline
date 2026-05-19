@@ -1,6 +1,7 @@
 """HTTP client for League of Comic Geeks using Playwright with real Chrome."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -8,12 +9,11 @@ from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlencode
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import APIResponse, sync_playwright
 
-from locg.config import playwright_profile_dir
+from locg.config import cookie_path, playwright_profile_dir
 
 BASE_URL = "https://leagueofcomicgeeks.com"
-_LOCG_ORIGIN = "https://leagueofcomicgeeks.com"
 
 logger = logging.getLogger("locg")
 
@@ -28,18 +28,23 @@ class _PlaywrightResponse:
     status_code: int
     text: str
     content: bytes
-    headers: dict
+    headers: dict[str, str]
+
+    def json(self) -> Any:
+        return json.loads(self.text)
 
 
-def _wrap_response(api_response) -> _PlaywrightResponse:
-    resp = _PlaywrightResponse(
-        status_code=api_response.status,
-        text=api_response.text(),
-        content=api_response.body(),
-        headers=dict(api_response.headers),
-    )
-    api_response.dispose()
-    return resp
+def _wrap_response(api_response: APIResponse) -> _PlaywrightResponse:
+    try:
+        raw = api_response.body()
+        return _PlaywrightResponse(
+            status_code=api_response.status,
+            text=raw.decode("utf-8", errors="replace"),
+            content=raw,
+            headers=dict(api_response.headers),
+        )
+    finally:
+        api_response.dispose()
 
 
 class LOCGClient:
@@ -47,23 +52,35 @@ class LOCGClient:
 
     def __init__(self) -> None:
         self._playwright_instance = sync_playwright().start()
-        profile_dir = str(playwright_profile_dir())
-        self._context = self._playwright_instance.chromium.launch_persistent_context(
-            user_data_dir=profile_dir,
-            channel="chrome",
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        )
-        self._page = self._context.new_page()
+        try:
+            profile_dir = str(playwright_profile_dir())
+            self._context = self._playwright_instance.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                channel="chrome",
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            )
+            self._page = self._context.new_page()
+        except Exception:
+            self._playwright_instance.stop()
+            raise
         self._server_auth_verified: Optional[bool] = None
+        # Remove stale cookies.json left by the previous curl_cffi implementation.
+        p = cookie_path()
+        if p.exists():
+            try:
+                p.unlink()
+                logger.debug("Removed legacy cookies.json (cookies now in Playwright profile)")
+            except OSError:
+                pass
 
     @property
     def is_authenticated(self) -> bool:
-        cookies = self._context.cookies([_LOCG_ORIGIN])
+        cookies = self._context.cookies([BASE_URL])
         return any(c["name"] == "ci_session" for c in cookies)
 
     def require_auth(self) -> None:
@@ -175,5 +192,7 @@ class LOCGClient:
         return True
 
     def close(self) -> None:
-        self._context.close()
-        self._playwright_instance.stop()
+        try:
+            self._context.close()
+        finally:
+            self._playwright_instance.stop()
