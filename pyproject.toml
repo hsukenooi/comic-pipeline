@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "gixen-cli"
+version = "1.0.0"
+description = "CLI and server for managing eBay snipes via Gixen"
+requires-python = ">=3.11"
+dependencies = [
+    "requests",
+    "click",
+    "python-dotenv",
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "pluggy",
+]
+
+[project.scripts]
+gixen = "cli:cli"
+
+[project.entry-points."gixen.plugins"]
+# External plugin packages declare their entry-points here.
+# Example (in the plugin's own pyproject.toml):
+#   [project.entry-points."gixen.plugins"]
+#   my-plugin = "my_plugin:GixenPlugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gixen*", "server*"]

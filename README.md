@@ -1,13 +1,19 @@
 # Gixen CLI
 
-A command-line tool for managing your [Gixen](https://www.gixen.com) eBay snipes.
+A command-line tool and local server for managing your [Gixen](https://www.gixen.com) eBay snipes.
 
 Gixen's official API is disabled for some accounts. This CLI works by automating the Gixen web interface directly, submitting the same forms your browser would.
+
+## Plugin Architecture
+
+gixen-cli is a generic sniping tool. Domain-specific features (comic grading, FMV lookup, LOCG integration) live in separate plugin packages that extend gixen-cli via the `gixen.plugins` entry-point group.
+
+**Comic overlay users:** install the `comic-pipeline` package from `~/Projects/comic-pipeline` to restore comic-specific routes and dashboard tabs.
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
 
 Create a `.env` file (or export the variables):
@@ -46,7 +52,7 @@ python cli.py purge
 
 ```bash
 # Unit tests (no credentials needed)
-pytest tests/test_gixen_client.py
+pytest tests/ --ignore=tests/test_integration.py
 
 # Integration tests (requires credentials)
 pytest -m integration
