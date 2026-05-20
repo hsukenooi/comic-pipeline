@@ -14,6 +14,7 @@ from gixen_overlay.db import (
     get_primary_fmv_for_bid,
     list_comics,
 )
+from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
@@ -371,9 +372,19 @@ async def api_extract_comics(request: Request):
         if not issues:
             skipped.append({"item_id": item_id, "reason": "no issue extracted"})
             continue
-        if parsed.year is None:
-            skipped.append({"item_id": item_id, "reason": "no year extracted"})
-            continue
+        year = parsed.year
+        # Year is only resolved for the primary issue. Multi-issue runs (rare
+        # for the year-less case in practice) all get the same year.
+        primary_resolution = None
+        if year is None:
+            primary_resolution = resolve_year_and_locg(parsed.series, issues[0])
+            if primary_resolution is None:
+                skipped.append({
+                    "item_id": item_id,
+                    "reason": "no year extracted (locg fallback failed)",
+                })
+                continue
+            year = primary_resolution.year
 
         try:
             for idx, issue in enumerate(issues):
@@ -381,7 +392,9 @@ async def api_extract_comics(request: Request):
                     db,
                     title=parsed.series,
                     issue=issue,
-                    year=parsed.year,
+                    year=year,
+                    locg_id=primary_resolution.locg_id if (primary_resolution and idx == 0) else None,
+                    locg_variant_id=primary_resolution.locg_variant_id if (primary_resolution and idx == 0) else None,
                 )
                 if parsed.grade is not None:
                     fmv_id = upsert_fmv(
