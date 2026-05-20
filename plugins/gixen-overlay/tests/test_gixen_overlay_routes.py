@@ -159,6 +159,91 @@ def test_extract_comics_links_unlinked_bid(api):
     assert body["linked"] == 1
 
 
+def test_extract_comics_year_falls_back_to_locg(api, monkeypatch):
+    """Title without a year resolves via the LOCG fallback and links cleanly."""
+    from gixen_overlay import locg_lookup, routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    api.post("/api/bids", json={"item_id": "999000113", "max_bid": 50.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Uncanny X-Men #211 (NM+) MARAUDERS WOLVERINE", "999000113"))
+    raw.commit()
+    raw.close()
+
+    calls = []
+
+    def fake_resolve(series, issue):
+        calls.append((series, issue))
+        return LocgResolution(year=1986, locg_id=12345, locg_variant_id=None)
+
+    monkeypatch.setattr(routes, "resolve_year_and_locg", fake_resolve)
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linked"] == 1
+    assert body["skipped"] == []
+    # Fallback was the path that resolved the year
+    assert calls and calls[0][1] == "211"
+
+    # Comic row carries the resolved year and locg_id
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    rows = raw.execute(
+        "SELECT title, issue, year, locg_id FROM comics WHERE issue=?", ("211",)
+    ).fetchall()
+    raw.close()
+    assert len(rows) == 1
+    assert rows[0]["year"] == 1986
+    assert rows[0]["locg_id"] == 12345
+
+
+def test_extract_comics_year_fallback_failure_keeps_skip(api, monkeypatch):
+    """When LOCG can't resolve, the bid stays skipped with an informative reason."""
+    from gixen_overlay import routes
+
+    api.post("/api/bids", json={"item_id": "999000114", "max_bid": 50.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Giant-Size Fantastic Four # 6 Fine Cond", "999000114"))
+    raw.commit()
+    raw.close()
+
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linked"] == 0
+    assert len(body["skipped"]) == 1
+    assert "locg fallback failed" in body["skipped"][0]["reason"]
+
+
+def test_extract_comics_does_not_call_locg_when_year_present(api, monkeypatch):
+    """The LOCG fallback is only invoked when the title parser misses the year."""
+    from gixen_overlay import routes
+
+    api.post("/api/bids", json={"item_id": "999000115", "max_bid": 50.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Amazing Spider-Man #300 1988 NM", "999000115"))
+    raw.commit()
+    raw.close()
+
+    def boom(*_a, **_kw):
+        raise AssertionError("resolve_year_and_locg should not be called when year is parsed from title")
+
+    monkeypatch.setattr(routes, "resolve_year_and_locg", boom)
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    assert r.json()["linked"] == 1
+
+
 def test_extract_comics_idempotent(api):
     r = api.post("/api/bids", json={"item_id": "999000112", "max_bid": 50.0})
     assert r.status_code == 200
