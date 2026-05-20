@@ -209,6 +209,42 @@ def test_login_success_primes_verified_cache():
     assert client.verify_session.call_count == 1  # only the one from login()
 
 
+def _make_list_response_text(data_user: str = "12345") -> str:
+    """Build a minimal /comic/get_comics JSON payload like the real server returns.
+
+    The HTML fragment is the bit that carry ``data-user``.  When *data_user*
+    is ``"0"`` the session is anonymous; any other value means logged-in.
+    """
+    import json
+    html = f'<ul data-user="{data_user}" class="comic-list-thumbs"></ul>'
+    return json.dumps({"count": 0, "list": html})
+
+
+def test_verify_session_valid_when_cookie_present():
+    """verify_session returns True when a ci_session cookie is present."""
+    client = _make_client_with_session()
+    client.get = MagicMock(side_effect=AssertionError("verify_session must not make HTTP calls"))
+
+    assert client.verify_session() is True
+
+
+def test_verify_session_false_when_no_cookie():
+    """verify_session returns False when no ci_session cookie is present."""
+    client = _make_client_with_session(ci_session=None)
+    client.get = MagicMock(side_effect=AssertionError("verify_session must not make HTTP calls"))
+
+    assert client.verify_session() is False
+
+
+def test_verify_session_makes_no_http_calls():
+    """verify_session must be HTTP-free — server-side detection happens downstream."""
+    client = _make_client_with_session()
+    client.get = MagicMock(side_effect=AssertionError("verify_session must not make HTTP calls"))
+    client.post = MagicMock(side_effect=AssertionError("verify_session must not make HTTP calls"))
+
+    client.verify_session()  # should not raise
+
+
 def test_close_tears_down_playwright():
     """close() must shut down the context and the Playwright driver."""
     client = _make_client_with_session()

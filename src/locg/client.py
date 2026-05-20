@@ -182,20 +182,19 @@ class LOCGClient:
         return resp
 
     def verify_session(self) -> bool:
-        """Check if the current session is valid by making a lightweight request.
+        """Confirm session validity from local cookie state. No HTTP call.
 
-        Returns True if the server recognizes us as a logged-in user.
+        The previous implementation fetched the entire user collection
+        (~545 KB) on every authenticated command just to read ``data-user``.
+        A second attempt used a small probe URL, but Cloudflare flags
+        unusual probe titles, making any explicit GET unreliable.
+
+        Server-side staleness (cookie present but invalidated) surfaces
+        downstream: list commands trip ``_check_session_valid``, and any
+        command's response that contains ``data-user="0"`` raises
+        AuthRequired with the standard "Session expired" message.
         """
-        from locg.parser import parse_list_response
-        resp = self.get("/comic/get_comics", params={
-            "list": "collection",
-            "view": "thumbs",
-        })
-        _count, soup = parse_list_response(resp.text)
-        tag = soup.find(attrs={"data-user": "0"})
-        is_valid = tag is None
-        logger.debug(f"Session verification: {'valid' if is_valid else 'invalid (data-user=0)'}")
-        return is_valid
+        return self.is_authenticated
 
     def login(self, username: str, password: str) -> bool:
         """Log in and persist the session cookie. Returns True on success."""
