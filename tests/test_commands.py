@@ -1249,11 +1249,69 @@ def _make_search_response(series_html_items: list[str], count: int) -> str:
 
 
 def _make_issue_li(comic_id: int, name: str) -> str:
-    """Issue HTML matching the search-by-series response format."""
+    """Issue HTML matching the search-by-series response format (no list membership)."""
     return (
         f'<li data-comic="{comic_id}">'
         f'<div class="title"><a href="/comic/{comic_id}/x">{name}</a></div>'
         f'</li>'
+    )
+
+
+def _make_issue_li_with_lists(
+    comic_id: int,
+    name: str,
+    active_lists: list[int] | None = None,
+) -> str:
+    """Issue HTML for lookup search responses that includes comic-controller spans.
+
+    *active_lists* is a list of LOCG list IDs (1=pull, 2=collection, 3=wish, 5=read)
+    that should be marked as active.  When non-empty the authenticated response
+    shape is produced so extract_issue returns a non-None lists dict.
+    """
+    if active_lists is None:
+        active_lists = []
+    all_lists = [1, 2, 3, 5]
+    controllers = ""
+    for lid in all_lists:
+        active = " active" if lid in active_lists else ""
+        controllers += (
+            f'<span class="comic-controller{active}" '
+            f'data-comic="{comic_id}" data-list="{lid}"></span>'
+        )
+    return (
+        f'<li data-comic="{comic_id}">'
+        f'{controllers}'
+        f'<div class="title"><a href="/comic/{comic_id}/x">{name}</a></div>'
+        f'</li>'
+    )
+
+
+def _make_comic_detail_page(
+    comic_id: int,
+    name: str,
+    active_lists: list[int] | None = None,
+) -> str:
+    """Minimal HTML page matching what extract_comic_lists() expects.
+
+    Used to mock the per-comic GET (/comic/<id>/x) for cache-hit collection checks.
+    """
+    if active_lists is None:
+        active_lists = []
+    all_lists = [1, 2, 3, 5]
+    controllers = ""
+    for lid in all_lists:
+        active = " active" if lid in active_lists else ""
+        controllers += (
+            f'<span class="comic-controller{active}" '
+            f'data-comic="{comic_id}" data-list="{lid}"></span>'
+        )
+    return (
+        f'<html><head>'
+        f'<link rel="canonical" href="https://leagueofcomicgeeks.com/comic/{comic_id}/x"/>'
+        f'</head><body>'
+        f'<h1>{name}</h1>'
+        f'{controllers}'
+        f'</body></html>'
     )
 
 
@@ -1353,8 +1411,15 @@ def test_pick_best_series_skips_entries_without_id():
 # --- cmd_lookup integration ----
 
 
-def _setup_lookup_mock(mock_client, series_response, issue_responses, collection_response=None):
-    """Wire mock_client.get to return a sequence of responses based on URL/params."""
+def _setup_lookup_mock(mock_client, series_response, issue_responses, detail_pages=None):
+    """Wire mock_client.get to return a sequence of responses based on URL/params.
+
+    *detail_pages* maps comic_id (int) to HTML page text, used for per-comic
+    GET requests (/comic/<id>/x) issued for cache-hit collection checks.
+    """
+    if detail_pages is None:
+        detail_pages = {}
+
     def side_effect(url, params=None, **kwargs):
         params = params or {}
         resp = MagicMock()
@@ -1368,9 +1433,14 @@ def _setup_lookup_mock(mock_client, series_response, issue_responses, collection
             key = (params.get("series_id"), params.get("title"))
             resp.text = issue_responses.get(key, json.dumps({"count": 0, "list": ""}))
             return resp
-        # Collection list fetch
-        if params.get("list") == "collection":
-            resp.text = collection_response or _make_list_response([], total_count=0)
+        # Per-comic detail page (/comic/<id>/x) for cache-hit collection checks
+        import re as _re
+        m = _re.match(r"^/comic/(\d+)/x$", url)
+        if m:
+            comic_id = int(m.group(1))
+            resp.text = detail_pages.get(
+                comic_id, _make_comic_detail_page(comic_id, "Unknown", [])
+            )
             return resp
         resp.text = json.dumps({"count": 0, "list": ""})
         return resp
@@ -1431,39 +1501,59 @@ def test_cmd_lookup_groups_by_series(mock_client):
 
 
 def test_cmd_lookup_marks_in_collection(mock_client):
+    """Fresh lookup: in_collection comes from the issue search response (no collection fetch)."""
     series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
     series_response = _make_search_response([series_html], 1)
+    # Issue search response includes list membership (collection=active)
     issue_responses = {
         ("108806", "Uncanny X-Men #185"): json.dumps({
-            "count": 1, "list": _make_issue_li(1081721, "Uncanny X-Men #185"),
+            "count": 1,
+            "list": _make_issue_li_with_lists(1081721, "Uncanny X-Men #185", [2]),
         }),
     }
-    # Collection contains comic 1081721 (with collection-active membership)
-    collection_html = _make_list_response_with_lists(
-        [(1081721, "Uncanny X-Men", [2])],  # 2 = collection
-        total_count=1,
-    )
-    _setup_lookup_mock(mock_client, series_response, issue_responses, collection_response=collection_html)
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
 
     result = cmd_lookup(mock_client, [("Uncanny X-Men", "185", None)], check_collection=True)
 
     assert result[0]["in_collection"] is True
     assert result[0]["locg_id"] == 1081721
+    # No /comic/get_comics?list=collection call was made — membership came from
+    # the issue search response directly.
+    collection_calls = [
+        c for c in mock_client.get.call_args_list
+        if (c.kwargs.get("params") or {}).get("list") == "collection"
+    ]
+    assert len(collection_calls) == 0
+
+
+def test_cmd_lookup_in_collection_false_when_not_in_search_response(mock_client):
+    """Fresh lookup: in_collection is False when search response shows comic not in collection."""
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    # Issue search response: comic is NOT in the collection (no active list)
+    issue_responses = {
+        ("108806", "Uncanny X-Men #185"): json.dumps({
+            "count": 1,
+            "list": _make_issue_li_with_lists(1081721, "Uncanny X-Men #185", []),
+        }),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(mock_client, [("Uncanny X-Men", "185", None)], check_collection=True)
+    assert result[0]["in_collection"] is False
 
 
 def test_cmd_lookup_in_collection_false_when_id_absent(mock_client):
+    """Unauthenticated response (no comic-controller spans): in_collection defaults to False."""
     series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
     series_response = _make_search_response([series_html], 1)
+    # Plain issue HTML without list membership spans (unauthenticated / legacy)
     issue_responses = {
         ("108806", "Uncanny X-Men #185"): json.dumps({
             "count": 1, "list": _make_issue_li(1081721, "Uncanny X-Men #185"),
         }),
     }
-    # Collection has a different comic
-    collection_html = _make_list_response_with_lists(
-        [(9999999, "Other", [2])], total_count=1,
-    )
-    _setup_lookup_mock(mock_client, series_response, issue_responses, collection_response=collection_html)
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
 
     result = cmd_lookup(mock_client, [("Uncanny X-Men", "185", None)], check_collection=True)
     assert result[0]["in_collection"] is False
@@ -1663,7 +1753,7 @@ def test_cmd_lookup_no_cache_skips_reads_and_writes(tmp_path, mock_client):
 
 
 def test_cmd_lookup_cache_hit_still_checks_collection(tmp_path, mock_client):
-    """Collection membership is dynamic, so cache hits must still re-check it."""
+    """Cache hits re-check collection via per-comic GET, not a full collection fetch."""
     from locg.cache import IDCache, make_key
 
     cache = IDCache(path=tmp_path / "ids.json")
@@ -1672,11 +1762,11 @@ def test_cmd_lookup_cache_hit_still_checks_collection(tmp_path, mock_client):
         "series_name": "Uncanny X-Men", "issue_name": "Uncanny X-Men #185",
     })
 
-    # Collection contains the comic now (even though cache predates this)
-    collection_html = _make_list_response_with_lists(
-        [(1081721, "Uncanny X-Men", [2])], total_count=1,
-    )
-    _setup_lookup_mock(mock_client, "{}", {}, collection_response=collection_html)
+    # Per-comic detail page for ID 1081721 — comic IS in collection.
+    detail_pages = {
+        1081721: _make_comic_detail_page(1081721, "Uncanny X-Men #185", [2]),
+    }
+    _setup_lookup_mock(mock_client, "{}", {}, detail_pages=detail_pages)
 
     result = cmd_lookup(
         mock_client,
@@ -1687,6 +1777,10 @@ def test_cmd_lookup_cache_hit_still_checks_collection(tmp_path, mock_client):
 
     assert result[0]["from_cache"] is True
     assert result[0]["in_collection"] is True
+    # Exactly one GET was made — the per-comic detail page (no collection list fetch).
+    assert mock_client.get.call_count == 1
+    called_url = mock_client.get.call_args_list[0][0][0]
+    assert called_url == "/comic/1081721/x"
 
 
 def test_cmd_lookup_does_not_cache_failed_resolutions(tmp_path, mock_client):
@@ -1704,3 +1798,78 @@ def test_cmd_lookup_does_not_cache_failed_resolutions(tmp_path, mock_client):
         cache=cache,
     )
     assert cache.get(make_key("Made Up Series", "1")) is None
+
+
+def test_cmd_lookup_no_collection_suppresses_in_collection(mock_client):
+    """check_collection=False must not produce in_collection on any row."""
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    # Even with membership data in the response, in_collection must be absent.
+    issue_responses = {
+        ("108806", "Uncanny X-Men #185"): json.dumps({
+            "count": 1,
+            "list": _make_issue_li_with_lists(1081721, "Uncanny X-Men #185", [2]),
+        }),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(mock_client, [("Uncanny X-Men", "185", None)], check_collection=False)
+
+    assert "in_collection" not in result[0]
+    # No per-comic detail page fetched either.
+    detail_calls = [
+        c for c in mock_client.get.call_args_list
+        if c[0] and "/comic/" in c[0][0] and "/x" in c[0][0]
+    ]
+    assert len(detail_calls) == 0
+
+
+def test_cmd_lookup_variant_reads_membership_from_variant_item(mock_client):
+    """When a variant is matched, in_collection reflects the variant item's membership."""
+    series_html = _make_series_li(108806, "Uncanny X-Men", "Marvel Comics", 1980, 2011, 1247)
+    series_response = _make_search_response([series_html], 1)
+    # Canonical item NOT in collection; variant IS in collection.
+    list_html = (
+        _make_issue_li_with_lists(7480697, "Uncanny X-Men #179", [])  # canonical, not collected
+        + _make_issue_li_with_lists(8888888, "Uncanny X-Men #179 Newsstand Edition", [2])  # variant, collected
+    )
+    issue_responses = {
+        ("108806", "Uncanny X-Men #179"): json.dumps({"count": 2, "list": list_html}),
+    }
+    _setup_lookup_mock(mock_client, series_response, issue_responses)
+
+    result = cmd_lookup(
+        mock_client, [("Uncanny X-Men", "179", "Newsstand")], check_collection=True
+    )
+
+    assert result[0]["locg_id"] == 7480697
+    assert result[0]["locg_variant_id"] == 8888888
+    # Membership should come from the VARIANT item (in collection), not the canonical.
+    assert result[0]["in_collection"] is True
+
+
+def test_cmd_lookup_cache_hit_not_in_collection(tmp_path, mock_client):
+    """Cache hit where the per-comic check shows the comic is NOT in collection."""
+    from locg.cache import IDCache, make_key
+
+    cache = IDCache(path=tmp_path / "ids.json")
+    cache.set(make_key("Uncanny X-Men", "185"), {
+        "series_id": 108806, "locg_id": 1081721, "locg_variant_id": None,
+        "series_name": "Uncanny X-Men", "issue_name": "Uncanny X-Men #185",
+    })
+
+    # Per-comic detail page: comic is NOT in collection.
+    detail_pages = {
+        1081721: _make_comic_detail_page(1081721, "Uncanny X-Men #185", []),
+    }
+    _setup_lookup_mock(mock_client, "{}", {}, detail_pages=detail_pages)
+
+    result = cmd_lookup(
+        mock_client,
+        [("Uncanny X-Men", "185", None)],
+        check_collection=True,
+        cache=cache,
+    )
+
+    assert result[0]["from_cache"] is True
+    assert result[0]["in_collection"] is False

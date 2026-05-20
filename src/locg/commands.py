@@ -911,14 +911,17 @@ def _find_issue_in_series(
     series_name: str,
     issue_number: str,
     variant: Optional[str] = None,
-) -> tuple[Optional[int], Optional[int], Optional[str]]:
+) -> tuple[Optional[int], Optional[int], Optional[str], Optional[dict], Optional[dict]]:
     """Find canonical and variant comic IDs for an issue within a series.
 
     Uses a title-filtered query against the series so the result set stays
     small (a handful of items) regardless of series length, sidestepping
     the 140-issue page limit on plain ``series`` fetches.
 
-    Returns ``(canonical_id, variant_id, canonical_name)``.
+    Returns ``(canonical_id, variant_id, canonical_name, canonical_lists,
+    variant_lists)`` where ``canonical_lists`` and ``variant_lists`` are the
+    ``lists`` membership dicts parsed from the search response (``None`` when
+    unauthenticated or when the respective item was not found).
     """
     title_query = f"{series_name} #{issue_number}"
     resp = client.get(
@@ -936,12 +939,13 @@ def _find_issue_in_series(
     items = soup.find_all("li")
 
     target_series_norm = _normalize_series_name(series_name)
-    issue_token = f"#{issue_number}"
     variant_norm = (variant or "").lower().strip()
 
     canonical_id: Optional[int] = None
     canonical_name: Optional[str] = None
+    canonical_lists: Optional[dict] = None
     variant_id: Optional[int] = None
+    variant_lists: Optional[dict] = None
 
     for li in items:
         comic_id_raw = li.get("data-comic")
@@ -968,14 +972,17 @@ def _find_issue_in_series(
         if target_series_norm not in _normalize_series_name(name.split("#")[0]):
             continue
 
+        issue_data = extract_issue(li)
         is_variant_entry = bool(re.search(r"#\S+\s+\S", name))  # has text after "#N "
         if variant_norm and is_variant_entry and variant_norm in name.lower():
             variant_id = comic_id
+            variant_lists = issue_data.get("lists")
         elif not is_variant_entry and canonical_id is None:
             canonical_id = comic_id
             canonical_name = name
+            canonical_lists = issue_data.get("lists")
 
-    return canonical_id, variant_id, canonical_name
+    return canonical_id, variant_id, canonical_name, canonical_lists, variant_lists
 
 
 def cmd_lookup(
@@ -995,10 +1002,11 @@ def cmd_lookup(
     misses fall through to the API and are written back. ``cache`` is
     primarily for tests — production code uses the default :class:`IDCache`.
 
-    If ``check_collection`` is true, fetches the user's collection once and
-    intersects locally to populate ``in_collection`` on each result. Cache
-    hits still get a fresh ``in_collection`` value because collection state
-    changes over time even when LOCG IDs don't.
+    If ``check_collection`` is true, populates ``in_collection`` on each
+    result row.  For fresh lookups the membership data comes directly from
+    the title-filtered issue search response (no extra request).  For cache
+    hits a single per-comic GET (``/comic/<id>/x``) is issued so membership
+    stays current even when IDs are served from cache.
     """
     if use_cache and cache is None:
         cache = IDCache()
@@ -1035,13 +1043,6 @@ def cmd_lookup(
             results = cmd_search(client, series_name)
             unique_series[series_name] = _pick_best_series(results, series_name)
 
-    # Fetch collection (once) if requested. Done regardless of cache hits
-    # because collection membership is independent of ID resolution.
-    collection_ids: Optional[set[int]] = None
-    if check_collection:
-        collection = _get_user_list(client, "collection")
-        collection_ids = {item["id"] for item in collection if item.get("id")}
-
     # Build out the result list in original request order.
     out: list[Optional[dict[str, Any]]] = [None] * len(requests)
 
@@ -1071,12 +1072,14 @@ def cmd_lookup(
         result["series_id"] = series.get("id")
         canonical_series_name = series.get("name") or series_name
 
-        canonical_id, variant_id, issue_name = _find_issue_in_series(
-            client,
-            int(result["series_id"]),
-            canonical_series_name,
-            issue_number,
-            variant,
+        canonical_id, variant_id, issue_name, canonical_lists, variant_lists = (
+            _find_issue_in_series(
+                client,
+                int(result["series_id"]),
+                canonical_series_name,
+                issue_number,
+                variant,
+            )
         )
         if canonical_id is None:
             result["error"] = (
@@ -1088,6 +1091,10 @@ def cmd_lookup(
         result["locg_id"] = canonical_id
         result["locg_variant_id"] = variant_id
         result["issue_name"] = issue_name
+        # Stash list membership for use in the in_collection pass below.
+        # These keys are internal and removed before returning.
+        result["_canonical_lists"] = canonical_lists
+        result["_variant_lists"] = variant_lists
         out[i] = result
 
         # Write back to cache (best-effort — never fail a lookup over a
@@ -1107,20 +1114,55 @@ def cmd_lookup(
             except OSError as e:
                 logger.warning("Failed to write cache entry: %s", e)
 
-    # Compute in_collection for every row (cache hits + fresh) using the
-    # single collection fetch above.
+    # Populate in_collection for every row.
+    #
+    # Fresh results: membership comes directly from the title-filtered issue
+    # search response (no extra request needed — the data was already parsed
+    # by extract_issue inside _find_issue_in_series).
+    #
+    # Cache hits: issue data is not re-fetched, so we do a lightweight
+    # per-comic GET (/comic/<id>/x) to get current membership.  Cost is
+    # 1 GET per cache hit, which is acceptable.
     for row in out:
         if row is None:  # defensive — every slot should be filled
             continue
-        if check_collection and collection_ids is not None and row.get("locg_id"):
-            check_id = (
-                row.get("locg_variant_id")
+
+        # Remove internal stash keys regardless of check_collection.
+        canonical_lists = row.pop("_canonical_lists", None)
+        variant_lists = row.pop("_variant_lists", None)
+
+        if not check_collection or not row.get("locg_id"):
+            if check_collection:
+                row["in_collection"] = False
+            continue
+
+        check_id = (
+            row.get("locg_variant_id")
+            if (row.get("variant") and row.get("locg_variant_id"))
+            else row.get("locg_id")
+        )
+
+        if row.get("from_cache"):
+            # Cache hit: fetch current membership via a lightweight comic page.
+            try:
+                detail_resp = client.get(f"/comic/{check_id}/x")
+                detail_soup = parse_page(detail_resp.text)
+                entry = extract_comic_lists(detail_soup)
+                lists = entry.get("lists") or {}
+                row["in_collection"] = bool(lists.get("collection", False))
+            except Exception:
+                row["in_collection"] = False
+        else:
+            # Fresh result: membership already parsed from search response.
+            lists_for_id = (
+                variant_lists
                 if (row.get("variant") and row.get("locg_variant_id"))
-                else row.get("locg_id")
+                else canonical_lists
             )
-            row["in_collection"] = check_id in collection_ids
-        elif check_collection:
-            row["in_collection"] = False
+            if lists_for_id is not None:
+                row["in_collection"] = bool(lists_for_id.get("collection", False))
+            else:
+                row["in_collection"] = False
 
     return [r for r in out if r is not None]
 
