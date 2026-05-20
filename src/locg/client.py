@@ -69,6 +69,7 @@ class LOCGClient:
             self._playwright_instance.stop()
             raise
         self._server_auth_verified: Optional[bool] = None
+        self._cf_warmed_up = False
         # Remove stale cookies.json left by the previous curl_cffi implementation.
         p = cookie_path()
         if p.exists():
@@ -77,6 +78,15 @@ class LOCGClient:
                 logger.debug("Removed legacy cookies.json (cookies now in Playwright profile)")
             except OSError:
                 pass
+
+    def _warm_up_cloudflare(self) -> None:
+        """Navigate to homepage so Cloudflare's Turnstile challenge can run and set cf_clearance."""
+        if self._cf_warmed_up:
+            return
+        logger.debug("Warming up Cloudflare clearance via homepage navigation")
+        self._page.goto(BASE_URL, wait_until="networkidle", timeout=30000)
+        self._cf_warmed_up = True
+        logger.debug("Cloudflare warm-up complete")
 
     @property
     def is_authenticated(self) -> bool:
@@ -140,6 +150,19 @@ class LOCGClient:
         resp = _wrap_response(api_resp)
         elapsed = time.monotonic() - start
         logger.debug(f"  -> {resp.status_code} ({elapsed:.2f}s, {len(resp.content)} bytes)")
+        if resp.status_code == 403:
+            # Cloudflare clearance either not yet obtained or has expired mid-session.
+            # Reset the warm-up flag so _warm_up_cloudflare re-navigates to the homepage,
+            # then retry once.  This handles both the first-time case and the case where
+            # cf_clearance expires after a long batch of sequential requests.
+            self._cf_warmed_up = False
+            self._warm_up_cloudflare()
+            logger.debug(f"Retrying GET {url} after Cloudflare warm-up")
+            start = time.monotonic()
+            api_resp = self._page.request.get(url, timeout=30000)
+            resp = _wrap_response(api_resp)
+            elapsed = time.monotonic() - start
+            logger.debug(f"  -> {resp.status_code} ({elapsed:.2f}s, {len(resp.content)} bytes)")
         if resp.status_code == 429:
             retry_after = resp.headers.get("retry-after", "60")
             logger.warning(f"Rate limited on GET {url}, retry after {retry_after}s")
@@ -149,6 +172,8 @@ class LOCGClient:
     def post(self, path: str, data: Optional[dict[str, Any]] = None) -> _PlaywrightResponse:
         url = f"{BASE_URL}{path}"
         logger.debug(f"POST {url}")
+        if not self._cf_warmed_up:
+            self._warm_up_cloudflare()
         start = time.monotonic()
         api_resp = self._page.request.post(url, form=data or {}, timeout=30000)
         resp = _wrap_response(api_resp)
