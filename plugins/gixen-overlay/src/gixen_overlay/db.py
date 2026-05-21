@@ -14,17 +14,22 @@ logger = logging.getLogger(__name__)
 
 
 def create_tables(conn: sqlite3.Connection) -> None:
-    """Create comics, fmv, and bid_fmvs tables. Idempotent (IF NOT EXISTS)."""
+    """Create comics, fmv, and bid_fmvs tables. Idempotent (IF NOT EXISTS).
+
+    `comics.year` is nullable. Uniqueness is enforced by two partial indexes
+    so a comic exists at most once per (title, issue): either yeared or
+    yearless, never both at the same time after reconciliation in
+    upsert_comic.
+    """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS comics (
             id              INTEGER PRIMARY KEY,
             title           TEXT NOT NULL,
             issue           TEXT NOT NULL,
-            year            INTEGER NOT NULL,
+            year            INTEGER,
             locg_id         INTEGER,
             locg_variant_id INTEGER,
-            created_at      TEXT DEFAULT (datetime('now')),
-            UNIQUE(title, issue, year)
+            created_at      TEXT DEFAULT (datetime('now'))
         )
     """)
     conn.execute("""
@@ -52,6 +57,18 @@ def create_tables(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
     _migrate_fmv_split(conn)
+    _migrate_year_nullable(conn)
+    # Partial unique indexes go AFTER migrations so the legacy duplicate-row
+    # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
+    # one comic) has run before we try to enforce uniqueness on the cleaned set.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_tiy "
+        "ON comics(title, issue, year) WHERE year IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_ti_nullyear "
+        "ON comics(title, issue) WHERE year IS NULL"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +336,122 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# One-time migration: drop comics.year NOT NULL (PER-98)
+# ---------------------------------------------------------------------------
+
+
+def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
+    """Make comics.year nullable + swap the UNIQUE(title, issue, year) constraint
+    for two partial unique indexes (see create_tables).
+
+    Gate: if comics.year is already nullable, return immediately. Detected via
+    PRAGMA table_info — when notnull=0 on the year column.
+
+    IMPORTANT: Uses raw conn.execute() SQL only. Never calls CRUD helpers
+    (upsert_fmv, upsert_comic, link_fmv_to_bid) — those call conn.commit()
+    which would destroy the host's SAVEPOINT and make rollback impossible.
+
+    Pattern: Python-memory rebuild (per docs/solutions/database-issues/
+    sqlite-fk-rename-savepoint-pragma-2026-05-19.md). SQLite 3.26+ rewrites
+    FK references on RENAME, so fmv rows would block DROP TABLE comics_old.
+    Save FK children to Python memory first, drop them, rebuild, restore.
+    """
+    year_col = next(
+        (row for row in conn.execute("PRAGMA table_info(comics)") if row[1] == "year"),
+        None,
+    )
+    if year_col is None:
+        # No comics table yet — create_tables made it from scratch with the
+        # nullable schema. Nothing to migrate.
+        return
+    if year_col[3] == 0:
+        # year is already nullable. Migration done (or fresh install). Bail.
+        return
+
+    logger.info("year-nullable migration: starting")
+
+    saved_fmv = conn.execute(
+        "SELECT id, comic_id, grade, low, high, comps, confidence, notes, updated_at FROM fmv"
+    ).fetchall()
+    saved_bid_fmvs = conn.execute(
+        "SELECT bid_id, fmv_id, is_primary FROM bid_fmvs"
+    ).fetchall()
+
+    conn.execute("DROP TABLE bid_fmvs")
+    conn.execute("DROP TABLE fmv")
+    conn.execute("ALTER TABLE comics RENAME TO comics_old")
+    conn.execute("""
+        CREATE TABLE comics (
+            id              INTEGER PRIMARY KEY,
+            title           TEXT NOT NULL,
+            issue           TEXT NOT NULL,
+            year            INTEGER,
+            locg_id         INTEGER,
+            locg_variant_id INTEGER,
+            created_at      TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        INSERT INTO comics (id, title, issue, year, locg_id, locg_variant_id, created_at)
+        SELECT id, title, issue, year, locg_id, locg_variant_id, created_at
+        FROM comics_old
+    """)
+    conn.execute("DROP TABLE comics_old")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_tiy "
+        "ON comics(title, issue, year) WHERE year IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_ti_nullyear "
+        "ON comics(title, issue) WHERE year IS NULL"
+    )
+
+    # Recreate FK children with full constraints, restore from memory.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fmv (
+            id          INTEGER PRIMARY KEY,
+            comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+            grade       REAL NOT NULL,
+            low         REAL,
+            high        REAL,
+            comps       INTEGER,
+            confidence  TEXT CHECK(confidence IN ('high', 'medium', 'low') OR confidence IS NULL),
+            notes       TEXT,
+            updated_at  TEXT,
+            UNIQUE(comic_id, grade)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bid_fmvs (
+            bid_id      INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+            fmv_id      INTEGER NOT NULL REFERENCES fmv(id) ON DELETE CASCADE,
+            is_primary  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (bid_id, fmv_id)
+        )
+    """)
+    for f in saved_fmv:
+        conn.execute(
+            """
+            INSERT INTO fmv (id, comic_id, grade, low, high, comps, confidence, notes, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (f["id"], f["comic_id"], f["grade"], f["low"], f["high"],
+             f["comps"], f["confidence"], f["notes"], f["updated_at"]),
+        )
+    for bf in saved_bid_fmvs:
+        conn.execute(
+            "INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, ?)",
+            (bf["bid_id"], bf["fmv_id"], bf["is_primary"]),
+        )
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
+
+    logger.info("year-nullable migration complete: %d fmv, %d bid_fmvs restored",
+                len(saved_fmv), len(saved_bid_fmvs))
+
+
+# ---------------------------------------------------------------------------
 # Comic CRUD (identity-only)
 # ---------------------------------------------------------------------------
 
@@ -327,27 +460,99 @@ def upsert_comic(
     conn: sqlite3.Connection,
     title: str,
     issue: str,
-    year: int,
+    year: int | None = None,
     locg_id: int | None = None,
     locg_variant_id: int | None = None,
 ) -> int:
-    """Upsert a comic identity row. Returns the comic id."""
-    conn.execute(
-        """
-        INSERT INTO comics (title, issue, year, locg_id, locg_variant_id)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(title, issue, year) DO UPDATE SET
-            locg_id         = COALESCE(excluded.locg_id,         locg_id),
-            locg_variant_id = COALESCE(excluded.locg_variant_id, locg_variant_id)
-        """,
-        (title, issue, year, locg_id, locg_variant_id),
+    """Upsert a comic identity row. Returns the comic id.
+
+    Year is optional. Reconciliation rules keep at most one row per
+    (title, issue) logical comic:
+
+    - Yeared insert finds an existing yeared row at the same year → updates
+      locg metadata, returns it.
+    - Yeared insert finds an existing yearless row for the same (title, issue)
+      → promotes it (UPDATE comics SET year=?), returns it. Avoids creating a
+      duplicate alongside the yearless placeholder.
+    - Yearless insert finds an existing yeared row for the same (title, issue)
+      → prefers the yeared one (returns its id without creating a yearless
+      duplicate). Locg metadata still gets merged in.
+    - Yearless insert finds an existing yearless row → updates locg, returns.
+
+    When multiple yeared rows exist for the same (title, issue) — pre-PER-98
+    historical data — the one with locg_id set wins; ties broken by lowest id.
+    """
+    if year is not None:
+        # Yeared insert.
+        existing_yeared = conn.execute(
+            "SELECT id FROM comics WHERE title=? AND issue=? AND year=?",
+            (title, issue, year),
+        ).fetchone()
+        if existing_yeared is not None:
+            conn.execute(
+                "UPDATE comics SET locg_id=COALESCE(?, locg_id), "
+                "locg_variant_id=COALESCE(?, locg_variant_id) WHERE id=?",
+                (locg_id, locg_variant_id, existing_yeared["id"]),
+            )
+            conn.commit()
+            return existing_yeared["id"]
+        # Look for a yearless placeholder to promote.
+        existing_yearless = conn.execute(
+            "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NULL",
+            (title, issue),
+        ).fetchone()
+        if existing_yearless is not None:
+            conn.execute(
+                "UPDATE comics SET year=?, "
+                "locg_id=COALESCE(?, locg_id), "
+                "locg_variant_id=COALESCE(?, locg_variant_id) WHERE id=?",
+                (year, locg_id, locg_variant_id, existing_yearless["id"]),
+            )
+            conn.commit()
+            return existing_yearless["id"]
+        # No existing row — insert fresh.
+        cur = conn.execute(
+            "INSERT INTO comics (title, issue, year, locg_id, locg_variant_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (title, issue, year, locg_id, locg_variant_id),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    # Yearless insert. Prefer an existing yeared row if one exists — never
+    # create a yearless duplicate next to a yeared canonical row.
+    canonical_yeared = conn.execute(
+        "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NOT NULL "
+        "ORDER BY (locg_id IS NULL), id LIMIT 1",
+        (title, issue),
+    ).fetchone()
+    if canonical_yeared is not None:
+        conn.execute(
+            "UPDATE comics SET locg_id=COALESCE(?, locg_id), "
+            "locg_variant_id=COALESCE(?, locg_variant_id) WHERE id=?",
+            (locg_id, locg_variant_id, canonical_yeared["id"]),
+        )
+        conn.commit()
+        return canonical_yeared["id"]
+    existing_yearless = conn.execute(
+        "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NULL",
+        (title, issue),
+    ).fetchone()
+    if existing_yearless is not None:
+        conn.execute(
+            "UPDATE comics SET locg_id=COALESCE(?, locg_id), "
+            "locg_variant_id=COALESCE(?, locg_variant_id) WHERE id=?",
+            (locg_id, locg_variant_id, existing_yearless["id"]),
+        )
+        conn.commit()
+        return existing_yearless["id"]
+    cur = conn.execute(
+        "INSERT INTO comics (title, issue, year, locg_id, locg_variant_id) "
+        "VALUES (?, ?, NULL, ?, ?)",
+        (title, issue, locg_id, locg_variant_id),
     )
     conn.commit()
-    row = conn.execute(
-        "SELECT id FROM comics WHERE title=? AND issue=? AND year=?",
-        (title, issue, year),
-    ).fetchone()
-    return row["id"]
+    return cur.lastrowid
 
 
 # ---------------------------------------------------------------------------

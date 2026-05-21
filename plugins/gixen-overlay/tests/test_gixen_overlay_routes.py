@@ -138,9 +138,11 @@ def test_upsert_comic_without_grade_creates_no_fmv(api):
     assert rows[0]["grade"] is None
 
 
-def test_upsert_comic_missing_year_returns_422(api):
+def test_upsert_comic_without_year_creates_yearless_row(api):
+    """PER-98: year is optional — yearless inserts create a NULL-year row."""
     r = api.post("/api/comics", json={"title": "X-Men", "issue": "1"})
-    assert r.status_code == 422
+    assert r.status_code == 200
+    assert r.json()["year"] is None
 
 
 def test_upsert_comic_invalid_confidence_returns_422(api):
@@ -214,15 +216,15 @@ def test_extract_comics_year_falls_back_to_locg(api, monkeypatch):
     assert rows[0]["locg_id"] == 12345
 
 
-def test_extract_comics_year_fallback_failure_keeps_skip(api, monkeypatch):
-    """When LOCG can't resolve, the bid stays skipped with an informative reason."""
+def test_extract_comics_year_fallback_failure_creates_yearless_row(api, monkeypatch):
+    """PER-98: when LOCG can't resolve year, the bid still links — yearless."""
     from gixen_overlay import routes
 
     api.post("/api/bids", json={"item_id": "999000114", "max_bid": 50.0})
     db_path = os.environ["DB_PATH"]
     raw = sqlite3.connect(db_path)
     raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
-                ("Giant-Size Fantastic Four # 6 Fine Cond", "999000114"))
+                ("Amazing Spider-Man #300 NM", "999000114"))
     raw.commit()
     raw.close()
 
@@ -231,9 +233,18 @@ def test_extract_comics_year_fallback_failure_keeps_skip(api, monkeypatch):
     r = api.post("/api/extract-comics")
     assert r.status_code == 200
     body = r.json()
-    assert body["linked"] == 0
-    assert len(body["skipped"]) == 1
-    assert "locg fallback failed" in body["skipped"][0]["reason"]
+    # No longer skipped — comic + fmv + bid_fmvs all created with year=NULL
+    assert body["linked"] == 1
+    assert body["skipped"] == []
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    rows = raw.execute(
+        "SELECT title, issue, year FROM comics WHERE issue=?", ("300",)
+    ).fetchall()
+    raw.close()
+    assert len(rows) == 1
+    assert rows[0]["year"] is None
 
 
 def test_extract_comics_does_not_call_locg_when_year_present(api, monkeypatch):

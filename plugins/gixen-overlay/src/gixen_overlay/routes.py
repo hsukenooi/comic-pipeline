@@ -373,18 +373,15 @@ async def api_extract_comics(request: Request):
             skipped.append({"item_id": item_id, "reason": "no issue extracted"})
             continue
         year = parsed.year
-        # Year is only resolved for the primary issue. Multi-issue runs (rare
-        # for the year-less case in practice) all get the same year.
+        # PER-98: year is optional. Try LOCG only as a best-effort enrichment
+        # for the locg_id (and a real year if available). When it fails, fall
+        # through with year=None — upsert_comic handles yearless rows and
+        # promotes them to yeared rows later if LOCG becomes reachable.
         primary_resolution = None
         if year is None:
             primary_resolution = resolve_year_and_locg(parsed.series, issues[0])
-            if primary_resolution is None:
-                skipped.append({
-                    "item_id": item_id,
-                    "reason": "no year extracted (locg fallback failed)",
-                })
-                continue
-            year = primary_resolution.year
+            if primary_resolution is not None:
+                year = primary_resolution.year
 
         try:
             for idx, issue in enumerate(issues):
