@@ -370,11 +370,24 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
 
     logger.info("year-nullable migration: starting")
 
+    # Only carry rows that survive a JOIN against the live parents. CASCADE
+    # deletes can be bypassed by sqlite3 CLI sessions that didn't opt into
+    # PRAGMA foreign_keys=ON (default OFF), leaving orphan junction rows that
+    # would fail FK enforcement when re-inserted.
     saved_fmv = conn.execute(
-        "SELECT id, comic_id, grade, low, high, comps, confidence, notes, updated_at FROM fmv"
+        """
+        SELECT f.id, f.comic_id, f.grade, f.low, f.high, f.comps, f.confidence, f.notes, f.updated_at
+        FROM fmv f
+        JOIN comics c ON c.id = f.comic_id
+        """
     ).fetchall()
     saved_bid_fmvs = conn.execute(
-        "SELECT bid_id, fmv_id, is_primary FROM bid_fmvs"
+        """
+        SELECT bf.bid_id, bf.fmv_id, bf.is_primary
+        FROM bid_fmvs bf
+        JOIN fmv f ON f.id = bf.fmv_id
+        JOIN bids b ON b.id = bf.bid_id
+        """
     ).fetchall()
 
     conn.execute("DROP TABLE bid_fmvs")
