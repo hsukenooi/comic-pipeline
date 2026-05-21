@@ -110,6 +110,31 @@ def test_partial_unique_indexes_prevent_dupes():
         conn.execute("INSERT INTO comics (title, issue, year) VALUES ('Y', '1', NULL)")
 
 
+def test_migration_preserves_bids_fmv_id():
+    """bids.fmv_id REFERENCES fmv(id) ON DELETE SET NULL, so dropping the fmv
+    table during the rebuild fires that cascade and wipes every bid's primary
+    fmv link. The migration must save and restore those values."""
+    # Use the post-PER-98 schema so bids.fmv_id has the live FK.
+    conn = _legacy_db_with_year_not_null()
+    conn.execute("DROP TABLE bids")
+    conn.execute(
+        "CREATE TABLE bids ("
+        "id INTEGER PRIMARY KEY, item_id TEXT NOT NULL, max_bid REAL NOT NULL, "
+        "fmv_id INTEGER REFERENCES fmv(id) ON DELETE SET NULL)"
+    )
+    conn.execute("INSERT INTO bids (id, item_id, max_bid) VALUES (1, 'a', 10.0)")
+    conn.execute("INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)")
+    conn.execute("INSERT INTO fmv (id, comic_id, grade, low, high) VALUES (10, 1, 9.0, 50, 60)")
+    conn.execute("UPDATE bids SET fmv_id = 10 WHERE id = 1")
+    conn.execute("INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (1, 10, 1)")
+    conn.commit()
+
+    create_tables(conn)
+
+    row = conn.execute("SELECT fmv_id FROM bids WHERE id=1").fetchone()
+    assert row["fmv_id"] == 10, "bids.fmv_id must survive the migration"
+
+
 def test_migration_drops_orphan_junction_rows_defensively():
     """sqlite3 CLI defaults to PRAGMA foreign_keys=OFF, which can leave
     orphan bid_fmvs / fmv rows when deletes bypass CASCADE. The migration
