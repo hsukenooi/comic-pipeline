@@ -485,6 +485,59 @@ def _merge_locg_fields(
     )
 
 
+def check_reconciliation_conflict(
+    conn: sqlite3.Connection,
+    title: str,
+    issue: str,
+    year: int | None,
+) -> str | None:
+    """Read-only predicate: returns the conflict message that upsert_comic
+    would raise for these args, or None if no conflict.
+
+    Used by api_extract_comics to pre-check every issue in a multi-issue lot
+    before any writes — so a mid-loop conflict on idx=1 doesn't leave the
+    idx=0 writes committed as orphan rows. See PER-98 todo 004.
+    """
+    if year is None:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM comics WHERE title=? AND issue=? AND year IS NOT NULL",
+            (title, issue),
+        ).fetchone()[0]
+        if n >= 2:
+            years = sorted(
+                r["year"] for r in conn.execute(
+                    "SELECT year FROM comics WHERE title=? AND issue=? AND year IS NOT NULL",
+                    (title, issue),
+                )
+            )
+            return (
+                f"year=None inbound for ({title!r}, {issue!r}) but multiple yeared "
+                f"reboot siblings exist (years: {years}) — manual disambiguation required."
+            )
+        return None
+
+    existing_null = conn.execute(
+        "SELECT 1 FROM comics WHERE title=? AND issue=? AND year IS NULL LIMIT 1",
+        (title, issue),
+    ).fetchone()
+    existing_yeared = conn.execute(
+        "SELECT 1 FROM comics WHERE title=? AND issue=? AND year=? LIMIT 1",
+        (title, issue, year),
+    ).fetchone()
+    other_yeared = conn.execute(
+        "SELECT year FROM comics "
+        "WHERE title=? AND issue=? AND year IS NOT NULL AND year != ? LIMIT 1",
+        (title, issue, year),
+    ).fetchone()
+    if other_yeared is not None and existing_null is not None and existing_yeared is None:
+        return (
+            f"NULL-year row exists alongside yeared row for ({title!r}, {issue!r}) "
+            f"at year {other_yeared['year']}; inbound year {year} would create a "
+            f"second yeared identity — manual disambiguation required."
+        )
+    return None
+
+
 def upsert_comic(
     conn: sqlite3.Connection,
     title: str,
@@ -521,16 +574,26 @@ def _upsert_comic_null_year(
 ) -> int:
     """Handle cases 1-2: year=None branch of upsert_comic.
 
-    Case 1: a yeared row exists for (title, issue) -> return its id, merge locg fields.
+    Case 1a (R10, year=None side): 2+ yeared reboot siblings exist for
+        (title, issue) -> raise ReconciliationConflictError. Without a year
+        hint, the caller cannot pick the right run (X-Men 1963 vs X-Men 1991).
+    Case 1b: exactly one yeared row exists -> return its id, merge locg fields.
     Case 2: no yeared row -> INSERT or update the NULL-row via partial unique index.
 
-    Always commits on return.
+    Always commits on return (unless raising).
     """
-    existing_yeared = conn.execute(
-        "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NOT NULL LIMIT 1",
+    yeared_rows = conn.execute(
+        "SELECT id, year FROM comics WHERE title=? AND issue=? AND year IS NOT NULL",
         (title, issue),
-    ).fetchone()
-    if existing_yeared is not None:
+    ).fetchall()
+    if len(yeared_rows) >= 2:
+        years = sorted(r["year"] for r in yeared_rows)
+        raise ReconciliationConflictError(
+            f"year=None inbound for ({title!r}, {issue!r}) but multiple yeared "
+            f"reboot siblings exist (years: {years}) — manual disambiguation required."
+        )
+    if yeared_rows:
+        existing_yeared = yeared_rows[0]
         _merge_locg_fields(conn, existing_yeared["id"], locg_id, locg_variant_id)
         conn.commit()
         return existing_yeared["id"]

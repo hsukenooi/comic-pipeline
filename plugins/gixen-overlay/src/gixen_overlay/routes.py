@@ -14,6 +14,7 @@ from gixen_overlay.db import (
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
+    check_reconciliation_conflict,
     ReconciliationConflictError,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
@@ -398,6 +399,21 @@ async def api_extract_comics(request: Request):
             if primary_resolution is not None:
                 year = primary_resolution.year
 
+        # Pre-check every issue in the lot before any writes — upsert_comic
+        # commits per-call, so a mid-loop conflict on idx=1 would leave idx=0's
+        # writes durably committed as orphan rows. See PER-98 todo 004.
+        conflict_reason: str | None = None
+        for issue in issues:
+            conflict_reason = check_reconciliation_conflict(db, parsed.series, issue, year)
+            if conflict_reason is not None:
+                break
+        if conflict_reason is not None:
+            skipped.append({
+                "item_id": item_id,
+                "reason": f"reboot conflict (manual disambiguation required): {conflict_reason}",
+            })
+            continue
+
         try:
             for idx, issue in enumerate(issues):
                 comic_id = upsert_comic(
@@ -418,11 +434,6 @@ async def api_extract_comics(request: Request):
                     link_fmv_to_bid(db, row["id"], fmv_id, is_primary=(idx == 0))
                 # Bids with no parseable grade cannot get an fmv link (fmv.grade NOT NULL)
             linked += 1
-        except ReconciliationConflictError as e:
-            skipped.append({
-                "item_id": item_id,
-                "reason": f"reboot conflict (manual disambiguation required): {e}",
-            })
         except Exception as e:
             errors.append({"item_id": item_id, "error": f"link failed: {e}"})
 

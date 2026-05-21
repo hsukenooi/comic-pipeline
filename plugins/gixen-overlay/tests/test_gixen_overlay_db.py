@@ -13,6 +13,7 @@ from gixen_overlay.db import (
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
+    check_reconciliation_conflict,
     ReconciliationConflictError,
 )
 
@@ -969,6 +970,90 @@ def test_upsert_comic_bid_fmvs_survive_promotion(db):
         "SELECT bid_id, fmv_id FROM bid_fmvs WHERE bid_id=?", (bid_id,)
     ).fetchone()
     assert bf is not None and bf["fmv_id"] == fmv_id
+
+
+def test_upsert_comic_year_none_with_two_reboot_siblings_raises(db):
+    """Todo 003: year=None + 2+ yeared rows for (title, issue) -> raise."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', 1963)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', 1991)")
+    db.commit()
+    with pytest.raises(ReconciliationConflictError, match="multiple yeared reboot siblings"):
+        upsert_comic(db, "X-Men", "1", year=None)
+    # No NULL row should have been created
+    n = db.execute(
+        "SELECT COUNT(*) FROM comics WHERE title='X-Men' AND issue='1' AND year IS NULL"
+    ).fetchone()[0]
+    assert n == 0
+
+
+def test_upsert_comic_year_none_with_one_yeared_sibling_short_circuits(db):
+    """Todo 003: year=None + exactly 1 yeared row -> short-circuit (regression guard)."""
+    yeared_id = upsert_comic(db, "X-Men", "1", year=1963)
+    returned = upsert_comic(db, "X-Men", "1", year=None)
+    assert returned == yeared_id
+
+
+def test_upsert_comic_year_none_three_siblings_lists_all_years(db):
+    """Todo 003: error message names every conflicting year, sorted."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', 1991)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', 1963)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', 2019)")
+    db.commit()
+    with pytest.raises(ReconciliationConflictError, match=r"\[1963, 1991, 2019\]"):
+        upsert_comic(db, "X-Men", "1", year=None)
+
+
+# ---------------------------------------------------------------------------
+# PER-98 todo 004: check_reconciliation_conflict (read-only pre-check)
+# ---------------------------------------------------------------------------
+
+
+def test_check_reconciliation_conflict_clean_state_returns_none(db):
+    assert check_reconciliation_conflict(db, "ASM", "300", year=1988) is None
+    assert check_reconciliation_conflict(db, "ASM", "300", year=None) is None
+
+
+def test_check_reconciliation_conflict_reports_reboot_for_year_set(db):
+    """Same shape as Case 3: NULL row + other-year row, no exact match."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1987)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', NULL)")
+    db.commit()
+    msg = check_reconciliation_conflict(db, "ASM", "300", year=1988)
+    assert msg is not None
+    assert "manual disambiguation" in msg
+    assert "1987" in msg
+
+
+def test_check_reconciliation_conflict_reports_reboot_for_year_none(db):
+    """Same shape as Case 1a (Todo 003): 2+ yeared siblings, year=None inbound."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', 1963)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', 1991)")
+    db.commit()
+    msg = check_reconciliation_conflict(db, "X-Men", "1", year=None)
+    assert msg is not None
+    assert "multiple yeared reboot siblings" in msg
+
+
+def test_check_reconciliation_conflict_does_not_write(db):
+    """Pre-check must be read-only."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1987)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', NULL)")
+    db.commit()
+    before = db.execute("SELECT COUNT(*) FROM comics").fetchone()[0]
+    check_reconciliation_conflict(db, "ASM", "300", year=1988)
+    check_reconciliation_conflict(db, "ASM", "300", year=None)
+    after = db.execute("SELECT COUNT(*) FROM comics").fetchone()[0]
+    assert before == after
+
+
+def test_check_reconciliation_conflict_matches_match_with_other_year_is_fine(db):
+    """year=Y where the exact-year row exists falls to Case 5 (merge), not conflict."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1987)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', NULL)")
+    db.commit()
+    # Inbound year matches 1988 — merge path, no conflict.
+    assert check_reconciliation_conflict(db, "ASM", "300", year=1988) is None
 
 
 def test_upsert_comic_merge_cascades_bid_fmvs_on_discarded_fmv(db):

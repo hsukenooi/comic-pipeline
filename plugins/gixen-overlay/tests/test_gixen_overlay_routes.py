@@ -335,6 +335,66 @@ def test_extract_comics_reboot_conflict_skips_with_reason(api, monkeypatch):
     assert "reboot conflict" in body["skipped"][0]["reason"]
 
 
+def test_extract_comics_multi_issue_lot_conflict_writes_no_orphans(api, monkeypatch):
+    """Todo 004: a multi-issue lot where idx=1 conflicts must not leave idx=0 orphans.
+
+    Seed a reboot conflict for issue '212' specifically. The bid title is a lot
+    spanning issues 211 + 212. Without the pre-check (todo 004 fix), upsert_comic
+    would commit idx=0 (issue 211) and then raise on idx=1 (issue 212), leaving
+    an orphan comics+fmv+bid_fmvs trio for 211.
+    """
+    from gixen_overlay import routes
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+
+    db_path = os.environ["DB_PATH"]
+    # Build the conflict state for issue 212 only. The title parser yields
+    # series='Uncanny X-Men' for the hash-separated lot title below.
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO comics (title, issue, year) VALUES ('Uncanny X-Men', '212', 1985)"
+    )
+    raw.execute(
+        "INSERT INTO comics (title, issue, year) VALUES ('Uncanny X-Men', '212', NULL)"
+    )
+    raw.commit()
+    raw.close()
+
+    api.post("/api/bids", json={"item_id": "999000130", "max_bid": 50.0})
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("Uncanny X-Men #211-213 VF 1986", "999000130"),
+    )
+    raw.commit()
+    raw.close()
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
+    # Bid lands in skipped, NOT linked, NOT errored.
+    assert body["linked"] == 0
+    assert body["errors"] == []
+    assert len(body["skipped"]) == 1
+    assert "reboot conflict" in body["skipped"][0]["reason"]
+
+    # Critical: no comics row for issue 211 or 213 was created (would be orphan).
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    rows_orphan = raw.execute(
+        "SELECT issue FROM comics WHERE title='Uncanny X-Men' AND issue IN ('211', '213')"
+    ).fetchall()
+    assert len(rows_orphan) == 0
+    # No bid_fmvs were created for this bid either.
+    bid_id = raw.execute(
+        "SELECT id FROM bids WHERE item_id='999000130'"
+    ).fetchone()["id"]
+    bf = raw.execute(
+        "SELECT COUNT(*) AS c FROM bid_fmvs WHERE bid_id=?", (bid_id,)
+    ).fetchone()
+    raw.close()
+    assert bf["c"] == 0
+
+
 def test_extract_comics_does_not_call_locg_when_year_present(api, monkeypatch):
     """The LOCG fallback is only invoked when the title parser misses the year."""
     from gixen_overlay import routes
