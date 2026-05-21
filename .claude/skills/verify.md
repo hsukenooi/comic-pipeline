@@ -1,0 +1,99 @@
+---
+name: comic:verify
+description: Verify a working list of comics is fully linked end-to-end in the gixen DB (bids → bid_fmvs → fmv → comics). Use after /comic:buy or /comic:snipe-add to confirm the pipeline didn't silently drop a write.
+---
+
+# Comic Verify
+
+Walks the bid → bid_fmvs → fmv → comics chain for each comic in a working list and reports per-row gaps. Born from the PER-70 / PER-90 / PER-98 cascade where `/comic:buy` ran to apparent completion but left rows partially populated (missing comic, wrong year, FMV stub, junction never inserted, `bids.fmv_id` null).
+
+This is a **warn-only** verification — it doesn't fix anything, just surfaces gaps so you (or future-you next session) can act.
+
+## Pre-flight
+
+Verify `GIXEN_SERVER_URL` is set and the server is up:
+
+```bash
+echo "${GIXEN_SERVER_URL:-UNSET}" && curl -sf "$GIXEN_SERVER_URL/health"
+```
+
+If either fails, stop with: "Cannot verify — the Gixen server isn't reachable. Skipping verification step."
+
+## Input
+
+A working list. Each entry needs `item_id` (eBay ID) and ideally `grade`. `locg_id` is optional but tightens matching when present.
+
+```json
+{
+  "items": [
+    {"item_id": "123456789", "grade": 9.2, "locg_id": 6977652},
+    {"item_id": "987654321", "grade": 9.4}
+  ]
+}
+```
+
+## Call
+
+```bash
+curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/verify" \
+  -H 'content-type: application/json' \
+  -d @working_list.verify.json
+```
+
+## Output
+
+The endpoint returns:
+
+```json
+{
+  "summary": {"total": 3, "fully_linked": 2, "issues": 1},
+  "results": [
+    {"item_id": "...", "verdict": "fully_linked", "missing": [], ...},
+    {"item_id": "...", "verdict": "fmv_stub", "missing": ["fmv.low", "fmv.high"], ...}
+  ]
+}
+```
+
+Verdicts (ladder — first failure wins):
+
+| Verdict | Meaning |
+|---|---|
+| `fully_linked` | All five checks pass — comic, fmv (with low+high), junction, bids.fmv_id |
+| `fmv_stub` | Comic + fmv at grade exist but `fmv.low`/`fmv.high` are NULL — `/comic:fmv` never computed FMV |
+| `partial` | fmv populated but `bids.fmv_id` is null or mismatches the matched fmv |
+| `no_fmv_at_grade` | Comic linked, but no `fmv` row at the bid's grade |
+| `no_comic` | No comic linked to the bid (and no match via `locg_id` if given) |
+| `no_bid` | The `bids` row itself is missing — snipe never landed |
+
+## Presentation
+
+Surface a table for the user. Use the verdict column to scan for issues:
+
+```
+| # | Item ID | Comic | Grade | Verdict | Missing |
+|---|---|---|---|---|---|
+| 1 | 123456789 | Amazing Spider-Man #300 | 9.2 | ✅ fully_linked | — |
+| 2 | 987654321 | Spawn #9 | 9.4 | ⚠️ fmv_stub | fmv.low, fmv.high |
+| 3 | 555555555 | Hulk #181 | 9.8 | ⚠️ no_fmv_at_grade | fmv row at grade 9.8 |
+| 4 | 666666666 | (unknown) | 9.0 | ❌ no_bid | bids row |
+```
+
+If `summary.issues > 0`, after the table give the user one-line guidance per verdict:
+
+- `fmv_stub` → "Run `/comic:fmv` for this comic at the missing grade(s)."
+- `no_fmv_at_grade` → "The bid's grade doesn't have an FMV row yet. Run `/comic:fmv` at this grade."
+- `no_comic` → "No comic linked. Run `POST /api/extract-comics` or re-run `/comic:snipe-add` with `--locg-id` set."
+- `partial` → "Junction or `bids.fmv_id` is out of sync. Surface to user for manual reconciliation."
+- `no_bid` → "Snipe never landed in the DB. Confirm `GIXEN_SERVER_URL` was set during `/comic:snipe-add` and the snipe is on Gixen."
+
+## When to invoke
+
+- **End of `/comic:buy`** — final wrap step (Step 6) after `snipe-add`. Confirms the full pipeline took.
+- **After ad-hoc backfills** — when reconciling history (PER-70-style cleanup), pass the patched item_ids in to confirm.
+- **Sanity-check before `/comic:collection-add`** — if the FMV side is broken, the LOCG collection write is going to be confused too.
+
+## Notes
+
+- This skill does not write — it's read-only against the gixen DB. Safe to run repeatedly.
+- Lots (item_ids linked to multiple comics): pass one row per `(item_id, grade)` you want to confirm. The endpoint walks all `bid_fmvs` for the bid and matches by grade (and `locg_id` if given).
+- `bids.fmv_id` mismatch with the matched fmv shows up as `partial` — this is the PER-90 footgun (denormalized pointer drifted from the canonical primary row).

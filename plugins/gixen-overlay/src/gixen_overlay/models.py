@@ -29,3 +29,15 @@ class LocgLinkRequest(BaseModel):
     locg_id: int
     locg_variant_id: int | None = None
     issue: str | None = None  # if set, target a specific issue within a lot
+
+
+class VerifyItem(BaseModel):
+    """One entry of a working list, as fed to POST /api/comics/verify."""
+
+    item_id: str
+    grade: float | None = None
+    locg_id: int | None = None
+
+
+class VerifyRequest(BaseModel):
+    items: list[VerifyItem]

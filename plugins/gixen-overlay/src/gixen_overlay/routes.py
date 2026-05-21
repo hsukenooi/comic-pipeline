@@ -16,7 +16,7 @@ from gixen_overlay.db import (
     sweep_orphan_yearless_comics,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
-from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest
+from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest, VerifyRequest
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
 from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task
@@ -185,6 +185,148 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
     # is_primary: target fmv matches the bid's primary fmv_id
     is_primary = (target_fmv_id == bid_row["fmv_id"])
     return {**dict(row), "is_primary": is_primary}
+
+
+@router.post("/api/comics/verify")
+async def api_verify(req: VerifyRequest, request: Request):
+    """Verify each working-list item's bid → fmv → comic linkage is complete.
+
+    PER-99: `/comic:buy` and `/comic:snipe-add` write across `bids`, `comics`,
+    `fmv`, and `bid_fmvs` but no single step asserts every link landed. This
+    endpoint walks the chain for each input item_id + grade (+ optional locg_id)
+    and assigns a verdict so the caller can surface gaps in the run summary.
+
+    Verdicts (ladder — first failure wins):
+      - `no_bid`         — no bids row for item_id
+      - `no_comic`       — no comic linked via bid_fmvs (or via locg_id if given)
+      - `no_fmv_at_grade`— comic exists but no fmv row at the requested grade
+      - `fmv_stub`       — fmv row exists but low/high are NULL (`/comic:fmv` never ran)
+      - `partial`        — fmv populated but bid_fmvs junction or bids.fmv_id is missing
+      - `fully_linked`   — all five checks pass
+
+    `missing` lists the specific failed checks so callers don't have to map
+    verdict → user-visible message themselves.
+    """
+    db = request.app.state.db
+    results = []
+
+    for item in req.items:
+        result = _verify_one(db, item.item_id, item.grade, item.locg_id)
+        results.append(result)
+
+    summary = {
+        "total": len(results),
+        "fully_linked": sum(1 for r in results if r["verdict"] == "fully_linked"),
+        "issues": sum(1 for r in results if r["verdict"] != "fully_linked"),
+    }
+    return {"summary": summary, "results": results}
+
+
+def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> dict:
+    """Walk bid → bid_fmvs → fmv → comics for one working-list item.
+
+    The grade-matched fmv is the canonical pivot: we look for a row whose
+    grade exactly matches the requested grade (when given). `bids.fmv_id` is
+    a denormalized pointer that should agree with the primary `bid_fmvs` row
+    — we check both because past incidents (PER-90) showed they can drift.
+    """
+    base = {
+        "item_id": item_id,
+        "grade": grade,
+        "locg_id": locg_id,
+        "missing": [],
+    }
+
+    bid = db.execute(
+        "SELECT id, fmv_id FROM bids WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    if bid is None:
+        return {**base, "verdict": "no_bid", "missing": ["bids row"]}
+
+    # All comics linked to this bid via the junction, plus optional grade filter.
+    fmv_query = (
+        "SELECT bf.fmv_id, bf.is_primary, "
+        "       f.grade, f.low, f.high, "
+        "       c.id AS comic_id, c.title, c.issue, c.year, c.locg_id "
+        "FROM bid_fmvs bf "
+        "JOIN fmv f ON f.id = bf.fmv_id "
+        "JOIN comics c ON c.id = f.comic_id "
+        "WHERE bf.bid_id = ?"
+    )
+    fmv_rows = db.execute(fmv_query, (bid["id"],)).fetchall()
+
+    # Match strategy: prefer locg_id (canonical), fall back to grade.
+    match = None
+    if locg_id is not None:
+        match = next((r for r in fmv_rows if r["locg_id"] == locg_id
+                      and (grade is None or r["grade"] == grade)), None)
+    if match is None and grade is not None:
+        match = next((r for r in fmv_rows if r["grade"] == grade), None)
+    if match is None and fmv_rows:
+        # Last resort: take the primary, so we can still report partial states.
+        match = next((r for r in fmv_rows if r["is_primary"]), fmv_rows[0])
+
+    if match is None:
+        # No comic linked at all. If locg_id was given, check whether the
+        # comic exists in the table — useful to distinguish "linkage missing"
+        # from "we don't know this comic".
+        missing = ["bid_fmvs junction"]
+        if locg_id is not None:
+            comic_exists = db.execute(
+                "SELECT 1 FROM comics WHERE locg_id = ?", (locg_id,)
+            ).fetchone()
+            if comic_exists is None:
+                missing = ["comics row", "fmv row", "bid_fmvs junction"]
+        return {**base, "verdict": "no_comic", "missing": missing,
+                "bid_fmv_id": bid["fmv_id"]}
+
+    # We have a candidate comic. Did we match on grade?
+    if grade is not None and match["grade"] != grade:
+        return {**base, "verdict": "no_fmv_at_grade",
+                "missing": [f"fmv row at grade {grade}"],
+                "comic_id": match["comic_id"],
+                "bid_fmv_id": bid["fmv_id"]}
+
+    # fmv exists at the right grade. Is it stubbed?
+    if match["low"] is None or match["high"] is None:
+        missing = []
+        if match["low"] is None:
+            missing.append("fmv.low")
+        if match["high"] is None:
+            missing.append("fmv.high")
+        return {**base, "verdict": "fmv_stub",
+                "missing": missing,
+                "comic_id": match["comic_id"],
+                "fmv_id": match["fmv_id"],
+                "bid_fmv_id": bid["fmv_id"]}
+
+    # fmv populated. Check bids.fmv_id agrees with the matched fmv. The
+    # junction row is implicit (the match came from bid_fmvs), but
+    # bids.fmv_id can still be NULL or point at a different fmv.
+    partial_missing = []
+    if bid["fmv_id"] is None:
+        partial_missing.append("bids.fmv_id")
+    elif bid["fmv_id"] != match["fmv_id"]:
+        partial_missing.append(
+            f"bids.fmv_id={bid['fmv_id']} mismatches matched fmv_id={match['fmv_id']}"
+        )
+    # Locg sanity check, only when caller passed locg_id.
+    if locg_id is not None and match["locg_id"] != locg_id:
+        partial_missing.append(
+            f"comic.locg_id={match['locg_id']} mismatches expected {locg_id}"
+        )
+
+    if partial_missing:
+        return {**base, "verdict": "partial",
+                "missing": partial_missing,
+                "comic_id": match["comic_id"],
+                "fmv_id": match["fmv_id"],
+                "bid_fmv_id": bid["fmv_id"]}
+
+    return {**base, "verdict": "fully_linked",
+            "comic_id": match["comic_id"],
+            "fmv_id": match["fmv_id"],
+            "bid_fmv_id": bid["fmv_id"]}
 
 
 def _parse_current_bid(value: str | None) -> float | None:
