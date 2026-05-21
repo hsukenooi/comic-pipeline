@@ -389,6 +389,13 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
         JOIN bids b ON b.id = bf.bid_id
         """
     ).fetchall()
+    # bids.fmv_id is declared REFERENCES fmv(id) ON DELETE SET NULL. Dropping
+    # the fmv table fires that cascade and nulls every bid's primary fmv link.
+    # Save current values so we can restore the column after the rebuild.
+    saved_bid_fmv_id = conn.execute(
+        "SELECT b.id, b.fmv_id FROM bids b "
+        "JOIN fmv f ON f.id = b.fmv_id WHERE b.fmv_id IS NOT NULL"
+    ).fetchall()
 
     conn.execute("DROP TABLE bid_fmvs")
     conn.execute("DROP TABLE fmv")
@@ -456,12 +463,17 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, ?)",
             (bf["bid_id"], bf["fmv_id"], bf["is_primary"]),
         )
+    # Restore bids.fmv_id values that the SET NULL cascade wiped when fmv dropped.
+    for b in saved_bid_fmv_id:
+        conn.execute("UPDATE bids SET fmv_id = ? WHERE id = ?", (b["fmv_id"], b["id"]))
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
 
-    logger.info("year-nullable migration complete: %d fmv, %d bid_fmvs restored",
-                len(saved_fmv), len(saved_bid_fmvs))
+    logger.info(
+        "year-nullable migration complete: %d fmv, %d bid_fmvs, %d bids.fmv_id restored",
+        len(saved_fmv), len(saved_bid_fmvs), len(saved_bid_fmv_id),
+    )
 
 
 # ---------------------------------------------------------------------------
