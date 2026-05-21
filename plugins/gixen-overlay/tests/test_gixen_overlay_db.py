@@ -558,6 +558,76 @@ def test_migration_crash_recovery_raises_runtime_error():
         create_tables(conn)
 
 
+def test_migration_fmv_split_crash_after_drop_old_raises_runtime_error():
+    """A crash after DROP TABLE comics_old in fmv_split leaves the schema looking
+    already-migrated. The marker guard must raise RuntimeError on next startup."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE bids (id INTEGER PRIMARY KEY, item_id TEXT, fmv_id INTEGER, max_bid REAL)")
+    # Post-drop schema: no grade col, no comics_old — gate would return early without marker.
+    conn.execute("""
+        CREATE TABLE comics (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, issue TEXT NOT NULL,
+            year INTEGER NOT NULL, locg_id INTEGER, locg_variant_id INTEGER,
+            created_at TEXT, UNIQUE(title, issue, year)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE fmv (
+            id INTEGER PRIMARY KEY,
+            comic_id INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+            grade REAL NOT NULL, low REAL, high REAL, comps INTEGER,
+            confidence TEXT, notes TEXT, updated_at TEXT, UNIQUE(comic_id, grade)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE bid_fmvs (
+            bid_id INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+            fmv_id INTEGER NOT NULL REFERENCES fmv(id) ON DELETE CASCADE,
+            is_primary INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (bid_id, fmv_id)
+        )
+    """)
+    conn.execute("CREATE TABLE migration_state (migration TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO migration_state (migration) VALUES ('fmv_split')")
+    conn.commit()
+    with pytest.raises(RuntimeError, match="fmv_split"):
+        create_tables(conn)
+
+
+def test_migration_year_nullable_crash_after_drop_old_raises_runtime_error():
+    """A crash after DROP TABLE comics_old in year_nullable leaves year already
+    nullable. The marker guard must raise RuntimeError on next startup."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE bids (id INTEGER PRIMARY KEY, item_id TEXT, fmv_id INTEGER, max_bid REAL)")
+    # Post-drop schema: year is nullable — gate would return early without marker.
+    conn.execute("""
+        CREATE TABLE comics (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, issue TEXT NOT NULL,
+            year INTEGER, locg_id INTEGER, locg_variant_id INTEGER, created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE fmv (
+            id INTEGER PRIMARY KEY,
+            comic_id INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+            grade REAL NOT NULL, low REAL, UNIQUE(comic_id, grade)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE bid_fmvs (
+            bid_id INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+            fmv_id INTEGER NOT NULL REFERENCES fmv(id) ON DELETE CASCADE,
+            is_primary INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (bid_id, fmv_id)
+        )
+    """)
+    conn.execute("CREATE TABLE migration_state (migration TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO migration_state (migration) VALUES ('year_nullable')")
+    conn.commit()
+    with pytest.raises(RuntimeError, match="year_nullable"):
+        create_tables(conn)
+
+
 def test_migration_fresh_db_no_legacy_data_is_noop():
     """Fresh DB (no comics rows, no bid_comics) migration gate returns immediately."""
     conn = _make_db()

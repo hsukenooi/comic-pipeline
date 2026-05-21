@@ -56,6 +56,11 @@ def create_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS migration_state (
+            migration TEXT PRIMARY KEY
+        )
+    """)
     _migrate_fmv_split(conn)
     _migrate_year_nullable(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
@@ -69,6 +74,38 @@ def create_tables(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_ti_nullyear "
         "ON comics(title, issue) WHERE year IS NULL"
     )
+
+
+# ---------------------------------------------------------------------------
+# Migration crash-guard helpers
+# ---------------------------------------------------------------------------
+
+
+def _assert_no_migration_marker(conn: sqlite3.Connection, name: str) -> None:
+    """Raise RuntimeError if a crash marker for `name` is present in migration_state.
+
+    Called before each migration's gate so a crash in the post-DROP window
+    (where the schema looks already-migrated and the gate would return early)
+    still surfaces instead of silently leaving fmv/bid_fmvs empty.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state WHERE migration=?", (name,)
+    ).fetchone()
+    if row is not None:
+        raise RuntimeError(
+            f"DB in crashed mid-migration state: '{name}' marker present — "
+            "restore from pre-migration snapshot before restarting"
+        )
+
+
+def _set_migration_marker(conn: sqlite3.Connection, name: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO migration_state (migration) VALUES (?)", (name,)
+    )
+
+
+def _clear_migration_marker(conn: sqlite3.Connection, name: str) -> None:
+    conn.execute("DELETE FROM migration_state WHERE migration=?", (name,))
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +124,11 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
     (upsert_fmv, upsert_comic, link_fmv_to_bid) — those call conn.commit()
     which would destroy the host's SAVEPOINT and make rollback impossible.
     """
+    # Check marker before the gate: a crash after DROP TABLE comics_old leaves
+    # the schema looking already-migrated (no grade col, no comics_old), so the
+    # gate would return early and hide the incomplete fmv/bid_fmvs restore.
+    _assert_no_migration_marker(conn, "fmv_split")
+
     cols = {row[1] for row in conn.execute("PRAGMA table_info(comics)")}
     if "grade" not in cols:
         tables = {r[0] for r in conn.execute(
@@ -254,6 +296,9 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
     # SQLite 3.26+ updates FK references on RENAME, so DROP TABLE comics_old
     # would fail if fmv rows exist (FK follows the rename). Solution: save
     # fmv and bid_fmvs to Python memory, drop them, rebuild comics, restore.
+    # Write crash marker before first DROP so a crash mid-restore is detectable
+    # on next startup (the gate would otherwise return early on the clean schema).
+    _set_migration_marker(conn, "fmv_split")
     saved_fmv = conn.execute(
         "SELECT id, comic_id, grade, low, high, comps, confidence, notes, updated_at FROM fmv"
     ).fetchall()
@@ -328,6 +373,8 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
 
+    _clear_migration_marker(conn, "fmv_split")
+
     logger.info(
         "fmv-split migration complete: survivors=%d fmv_inserted=%d "
         "bids_linked=%d junction_inserted=%d junction_skipped=%d",
@@ -356,6 +403,11 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
     FK references on RENAME, so fmv rows would block DROP TABLE comics_old.
     Save FK children to Python memory first, drop them, rebuild, restore.
     """
+    # Check marker before the gate: a crash after DROP TABLE comics_old leaves
+    # year already nullable, so the gate would return early and hide the
+    # incomplete fmv/bid_fmvs restore.
+    _assert_no_migration_marker(conn, "year_nullable")
+
     year_col = next(
         (row for row in conn.execute("PRAGMA table_info(comics)") if row[1] == "year"),
         None,
@@ -396,6 +448,10 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
         "SELECT b.id, b.fmv_id FROM bids b "
         "JOIN fmv f ON f.id = b.fmv_id WHERE b.fmv_id IS NOT NULL"
     ).fetchall()
+
+    # Write crash marker before first DROP so a crash mid-restore is detectable
+    # on next startup (the gate would otherwise return early on the nullable schema).
+    _set_migration_marker(conn, "year_nullable")
 
     conn.execute("DROP TABLE bid_fmvs")
     conn.execute("DROP TABLE fmv")
@@ -469,6 +525,8 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
+
+    _clear_migration_marker(conn, "year_nullable")
 
     logger.info(
         "year-nullable migration complete: %d fmv, %d bid_fmvs, %d bids.fmv_id restored",
