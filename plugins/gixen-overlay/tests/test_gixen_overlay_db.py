@@ -13,6 +13,7 @@ from gixen_overlay.db import (
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
+    ReconciliationConflictError,
 )
 
 
@@ -512,3 +513,456 @@ def test_register_db_tables_creates_tables_via_sqlite_master():
     assert "bid_fmvs" in tables
     assert "bid_comics" not in tables
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# PER-98 year-nullable migration (_migrate_year_nullable)
+# ---------------------------------------------------------------------------
+
+
+def _make_post_fmv_split_db_with_notnull_year() -> sqlite3.Connection:
+    """Build a DB in the post-fmv-split, pre-year-nullable shape:
+    comics has UNIQUE(title, issue, year) and year NOT NULL; fmv + bid_fmvs exist.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("""
+        CREATE TABLE bids (
+            id INTEGER PRIMARY KEY, item_id TEXT NOT NULL,
+            fmv_id INTEGER, max_bid REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE comics (
+            id              INTEGER PRIMARY KEY,
+            title           TEXT NOT NULL,
+            issue           TEXT NOT NULL,
+            year            INTEGER NOT NULL,
+            locg_id         INTEGER,
+            locg_variant_id INTEGER,
+            created_at      TEXT DEFAULT (datetime('now')),
+            UNIQUE(title, issue, year)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE fmv (
+            id INTEGER PRIMARY KEY,
+            comic_id INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+            grade REAL NOT NULL, low REAL, high REAL, comps INTEGER,
+            confidence TEXT, notes TEXT, updated_at TEXT,
+            UNIQUE(comic_id, grade)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE bid_fmvs (
+            bid_id INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+            fmv_id INTEGER NOT NULL REFERENCES fmv(id) ON DELETE CASCADE,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (bid_id, fmv_id)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def test_year_nullable_migration_relaxes_year_notnull():
+    conn = _make_post_fmv_split_db_with_notnull_year()
+    conn.execute("INSERT INTO comics (id, title, issue, year) VALUES (1, 'ASM', '300', 1988)")
+    conn.commit()
+    create_tables(conn)
+    info = {r[1]: r for r in conn.execute("PRAGMA table_info(comics)")}
+    assert info["year"][3] == 0, "year column should be nullable (notnull=0)"
+    rows = conn.execute("SELECT id, title, issue, year FROM comics").fetchall()
+    assert len(rows) == 1 and rows[0]["id"] == 1 and rows[0]["year"] == 1988
+
+
+def test_year_nullable_migration_preserves_fmv_and_bid_fmvs():
+    conn = _make_post_fmv_split_db_with_notnull_year()
+    conn.execute("INSERT INTO bids (id, item_id, max_bid) VALUES (1, 'item1', 50.0)")
+    conn.execute("INSERT INTO comics (id, title, issue, year) VALUES (1, 'ASM', '300', 1988)")
+    conn.execute(
+        "INSERT INTO fmv (id, comic_id, grade, low, high, comps, confidence, notes, updated_at) "
+        "VALUES (1, 1, 9.2, 800.0, 1000.0, 12, 'high', 'Key', '2026-05-01T00:00:00Z')"
+    )
+    conn.execute("INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (1, 1, 1)")
+    conn.commit()
+    create_tables(conn)
+    fmv = conn.execute("SELECT * FROM fmv WHERE id=1").fetchone()
+    assert fmv["comic_id"] == 1 and fmv["low"] == 800.0 and fmv["high"] == 1000.0
+    assert fmv["notes"] == "Key"
+    bf = conn.execute("SELECT * FROM bid_fmvs WHERE bid_id=1").fetchone()
+    assert bf["fmv_id"] == 1 and bf["is_primary"] == 1
+
+
+def test_year_nullable_migration_installs_partial_unique_indexes():
+    conn = _make_post_fmv_split_db_with_notnull_year()
+    create_tables(conn)
+    indexes = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='comics'"
+    )}
+    assert "idx_comics_tiy_yes" in indexes
+    assert "idx_comics_ti_null" in indexes
+
+
+def test_year_nullable_migration_partial_indexes_enforce_uniqueness():
+    conn = _make_post_fmv_split_db_with_notnull_year()
+    create_tables(conn)
+    # Two NULL-year rows for same (title, issue) → conflict on idx_comics_ti_null
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', NULL)")
+    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', NULL)")
+        conn.commit()
+    conn.rollback()
+    # Two yeared rows for same (title, issue, year) → conflict on idx_comics_tiy_yes
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '400', 1995)")
+    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '400', 1995)")
+        conn.commit()
+    conn.rollback()
+    # Mixed: (ASM, '500', NULL) and (ASM, '500', 1988) coexist
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '500', NULL)")
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '500', 1988)")
+    conn.commit()
+    rows = conn.execute(
+        "SELECT year FROM comics WHERE title='ASM' AND issue='500' ORDER BY year"
+    ).fetchall()
+    assert [r["year"] for r in rows] == [1988, None] or [r["year"] for r in rows] == [None, 1988]
+
+
+def test_year_nullable_migration_idempotent():
+    conn = _make_post_fmv_split_db_with_notnull_year()
+    conn.execute("INSERT INTO comics (id, title, issue, year) VALUES (1, 'ASM', '300', 1988)")
+    conn.commit()
+    create_tables(conn)
+    create_tables(conn)
+    rows = conn.execute("SELECT id, year FROM comics").fetchall()
+    assert len(rows) == 1 and rows[0]["id"] == 1 and rows[0]["year"] == 1988
+
+
+def test_year_nullable_migration_empty_fmv_succeeds():
+    conn = _make_post_fmv_split_db_with_notnull_year()
+    conn.execute("INSERT INTO comics (id, title, issue, year) VALUES (1, 'ASM', '300', 1988)")
+    conn.commit()
+    create_tables(conn)
+    fmv_count = conn.execute("SELECT COUNT(*) FROM fmv").fetchone()[0]
+    bf_count = conn.execute("SELECT COUNT(*) FROM bid_fmvs").fetchone()[0]
+    assert fmv_count == 0 and bf_count == 0
+    # Tables still exist
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"comics", "fmv", "bid_fmvs"}.issubset(tables)
+
+
+def test_year_nullable_migration_crash_recovery_raises():
+    """If year is already nullable but comics_old_ynull exists, raise."""
+    conn = _make_db()
+    create_tables(conn)
+    # Simulate mid-rebuild crash
+    conn.execute("""
+        CREATE TABLE comics_old_ynull (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, issue TEXT NOT NULL,
+            year INTEGER NOT NULL, locg_id INTEGER, locg_variant_id INTEGER, created_at TEXT,
+            UNIQUE(title, issue, year)
+        )
+    """)
+    conn.commit()
+    with pytest.raises(RuntimeError, match="crashed mid-migration state"):
+        create_tables(conn)
+
+
+def test_year_nullable_migration_does_not_trip_on_fmv_split_intermediate():
+    """A leftover comics_old (fmv-split's name) must NOT trigger this gate."""
+    conn = _make_db()
+    create_tables(conn)
+    # year is already nullable here. Create a comics_old table — belongs to the
+    # other migration, must not raise from _migrate_year_nullable's gate.
+    conn.execute("CREATE TABLE comics_old (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.commit()
+    # Should not raise — comics_old_ynull is absent
+    from gixen_overlay.db import _migrate_year_nullable
+    _migrate_year_nullable(conn)
+
+
+# ---------------------------------------------------------------------------
+# PER-98 upsert_comic reconciliation (year=None, promote, merge, reboot guard)
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_comic_year_none_inserts_null_row(db):
+    cid = upsert_comic(db, "ASM", "300", year=None)
+    row = db.execute("SELECT year FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["year"] is None
+
+
+def test_upsert_comic_year_none_idempotent(db):
+    cid1 = upsert_comic(db, "ASM", "300", year=None)
+    cid2 = upsert_comic(db, "ASM", "300", year=None)
+    assert cid1 == cid2
+    n = db.execute(
+        "SELECT COUNT(*) FROM comics WHERE title='ASM' AND issue='300'"
+    ).fetchone()[0]
+    assert n == 1
+
+
+def test_upsert_comic_year_none_short_circuits_to_yeared_row(db):
+    """R5: year=None on (title, issue) where a yeared row exists returns the yeared row."""
+    yeared_id = upsert_comic(db, "ASM", "300", year=1988)
+    null_call_id = upsert_comic(db, "ASM", "300", year=None)
+    assert null_call_id == yeared_id
+    rows = db.execute(
+        "SELECT id, year FROM comics WHERE title='ASM' AND issue='300'"
+    ).fetchall()
+    assert len(rows) == 1 and rows[0]["year"] == 1988
+
+
+def test_upsert_comic_year_none_merges_locg_on_short_circuit(db):
+    yeared_id = upsert_comic(db, "ASM", "300", year=1988)
+    upsert_comic(db, "ASM", "300", year=None, locg_id=42, locg_variant_id=7)
+    row = db.execute(
+        "SELECT year, locg_id, locg_variant_id FROM comics WHERE id=?",
+        (yeared_id,),
+    ).fetchone()
+    assert row["year"] == 1988
+    assert row["locg_id"] == 42
+    assert row["locg_variant_id"] == 7
+
+
+def test_upsert_comic_promotes_null_row_in_place(db):
+    """R4 promotion: year=None then year=Y returns the same id; row gains year."""
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    yeared_id = upsert_comic(db, "ASM", "300", year=1988)
+    assert null_id == yeared_id
+    rows = db.execute(
+        "SELECT id, year FROM comics WHERE title='ASM' AND issue='300'"
+    ).fetchall()
+    assert len(rows) == 1 and rows[0]["year"] == 1988
+
+
+def test_upsert_comic_promote_preserves_fmv_children(db):
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    upsert_fmv(db, null_id, grade=9.2, low=800.0)
+    promoted_id = upsert_comic(db, "ASM", "300", year=1988)
+    assert promoted_id == null_id
+    fmv = db.execute(
+        "SELECT grade, low FROM fmv WHERE comic_id=?", (promoted_id,)
+    ).fetchone()
+    assert fmv["grade"] == 9.2 and fmv["low"] == 800.0
+
+
+def test_upsert_comic_merge_no_fmv_collision(db):
+    """R4 merge with non-overlapping grades: fmv children reparent, NULL row gone."""
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    upsert_fmv(db, null_id, grade=9.2, low=800.0)
+    # Force the yeared row to be a separate id by inserting via raw SQL.
+    db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)"
+    )
+    db.commit()
+    yeared_id = db.execute(
+        "SELECT id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()["id"]
+    upsert_fmv(db, yeared_id, grade=8.5, low=500.0)
+    # Trigger merge.
+    returned = upsert_comic(db, "ASM", "300", year=1988)
+    assert returned == yeared_id
+    rows = db.execute(
+        "SELECT id, year FROM comics WHERE title='ASM' AND issue='300'"
+    ).fetchall()
+    assert len(rows) == 1 and rows[0]["id"] == yeared_id
+    fmv_rows = db.execute(
+        "SELECT grade, low FROM fmv WHERE comic_id=? ORDER BY grade",
+        (yeared_id,),
+    ).fetchall()
+    assert [(r["grade"], r["low"]) for r in fmv_rows] == [(8.5, 500.0), (9.2, 800.0)]
+
+
+def test_upsert_comic_merge_fmv_collision_yeared_has_prices(db):
+    """R9: collision where yeared row already has prices -> yeared wins; null fmv discarded."""
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    upsert_fmv(db, null_id, grade=9.2, low=800.0)
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)")
+    db.commit()
+    yeared_id = db.execute(
+        "SELECT id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()["id"]
+    upsert_fmv(db, yeared_id, grade=9.2, low=900.0)
+    upsert_comic(db, "ASM", "300", year=1988)
+    fmv_rows = db.execute(
+        "SELECT grade, low FROM fmv WHERE comic_id=?", (yeared_id,)
+    ).fetchall()
+    assert len(fmv_rows) == 1
+    assert fmv_rows[0]["low"] == 900.0
+    # NULL row gone
+    assert db.execute(
+        "SELECT COUNT(*) FROM comics WHERE id=?", (null_id,)
+    ).fetchone()[0] == 0
+
+
+def test_upsert_comic_merge_fmv_collision_null_has_prices_yeared_stub(db, caplog):
+    """R9: yeared stub gets prices transplanted from null row; null fmv deleted; WARN."""
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    upsert_fmv(db, null_id, grade=9.2, low=800.0, high=1000.0, comps=10,
+               confidence="high", notes="from null")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)")
+    db.commit()
+    yeared_id = db.execute(
+        "SELECT id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()["id"]
+    # Stub fmv: grade set, no prices (mirrors api_link_locg auto-stub behavior).
+    upsert_fmv(db, yeared_id, grade=9.2)
+    import logging
+    with caplog.at_level(logging.WARNING, logger="gixen_overlay.db"):
+        upsert_comic(db, "ASM", "300", year=1988)
+    fmv = db.execute(
+        "SELECT low, high, comps, confidence, notes FROM fmv WHERE comic_id=?",
+        (yeared_id,),
+    ).fetchone()
+    assert fmv["low"] == 800.0
+    assert fmv["high"] == 1000.0
+    assert fmv["comps"] == 10
+    assert fmv["confidence"] == "high"
+    assert fmv["notes"] == "from null"
+    # Verify a WARNING about transplant was emitted
+    assert any("transplanted" in rec.message for rec in caplog.records)
+    # Null fmv is gone and null comic row was deleted
+    assert db.execute(
+        "SELECT COUNT(*) FROM fmv WHERE comic_id=?", (null_id,)
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM comics WHERE id=?", (null_id,)
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM fmv WHERE comic_id=?", (yeared_id,)
+    ).fetchone()[0] == 1
+
+
+def test_upsert_comic_merge_collision_discard_warning(db, caplog):
+    """R9: when yeared already has prices and null also has prices, log warns of discard."""
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    upsert_fmv(db, null_id, grade=9.2, low=800.0)
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)")
+    db.commit()
+    yeared_id = db.execute(
+        "SELECT id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()["id"]
+    upsert_fmv(db, yeared_id, grade=9.2, low=750.0)
+    import logging
+    with caplog.at_level(logging.WARNING, logger="gixen_overlay.db"):
+        upsert_comic(db, "ASM", "300", year=1988)
+    assert any("discarded" in rec.message for rec in caplog.records)
+    # Yeared row kept its prices, null row's fmv is gone, null comic row deleted
+    fmv = db.execute(
+        "SELECT low FROM fmv WHERE comic_id=? AND grade=9.2", (yeared_id,)
+    ).fetchone()
+    assert fmv["low"] == 750.0
+    assert db.execute(
+        "SELECT COUNT(*) FROM fmv WHERE comic_id=?", (null_id,)
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM comics WHERE id=?", (null_id,)
+    ).fetchone()[0] == 0
+
+
+def test_upsert_comic_merge_multi_grade_mixed_collision_and_reparent(db, caplog):
+    """T3: null row has two fmv rows — one collides with yeared, one doesn't.
+
+    The colliding one should be discarded (yeared has prices); the non-colliding
+    one should reparent. Survivor ends up with exactly two fmv rows.
+    """
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    upsert_fmv(db, null_id, grade=9.2, low=800.0)  # will collide
+    upsert_fmv(db, null_id, grade=8.5, low=400.0)  # no collision
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)")
+    db.commit()
+    yeared_id = db.execute(
+        "SELECT id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()["id"]
+    upsert_fmv(db, yeared_id, grade=9.2, low=900.0)  # yeared wins the collision
+    upsert_comic(db, "ASM", "300", year=1988)
+    rows = db.execute(
+        "SELECT grade, low FROM fmv WHERE comic_id=? ORDER BY grade",
+        (yeared_id,),
+    ).fetchall()
+    assert [(r["grade"], r["low"]) for r in rows] == [(8.5, 400.0), (9.2, 900.0)]
+    assert db.execute(
+        "SELECT COUNT(*) FROM comics WHERE id=?", (null_id,)
+    ).fetchone()[0] == 0
+    # No orphan fmv rows
+    assert db.execute(
+        "SELECT COUNT(*) FROM fmv WHERE comic_id=?", (null_id,)
+    ).fetchone()[0] == 0
+
+
+def test_upsert_comic_reboot_guard_raises(db):
+    """R10: NULL row + other-year row + inbound different year -> raise."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1987)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', NULL)")
+    db.commit()
+    with pytest.raises(ReconciliationConflictError, match="manual disambiguation"):
+        upsert_comic(db, "ASM", "300", year=1988)
+    # Both rows still present
+    n = db.execute(
+        "SELECT COUNT(*) FROM comics WHERE title='ASM' AND issue='300'"
+    ).fetchone()[0]
+    assert n == 2
+
+
+def test_upsert_comic_reboot_guard_same_year_merges(db):
+    """R10: NULL row + matching-year row -> merge proceeds (no reboot)."""
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)")
+    db.commit()
+    yeared_id = db.execute(
+        "SELECT id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()["id"]
+    returned = upsert_comic(db, "ASM", "300", year=1988)
+    assert returned == yeared_id
+    assert db.execute("SELECT COUNT(*) FROM comics WHERE id=?", (null_id,)).fetchone()[0] == 0
+
+
+def test_upsert_comic_reboot_no_null_row_creates_sibling(db):
+    """R10: no NULL row + other-year row -> sibling reboot row is fine."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1987)")
+    db.commit()
+    new_id = upsert_comic(db, "ASM", "300", year=1988)
+    rows = db.execute(
+        "SELECT year FROM comics WHERE title='ASM' AND issue='300' ORDER BY year"
+    ).fetchall()
+    assert [r["year"] for r in rows] == [1987, 1988]
+    assert db.execute("SELECT year FROM comics WHERE id=?", (new_id,)).fetchone()["year"] == 1988
+
+
+def test_upsert_comic_bid_fmvs_survive_promotion(db):
+    """Promoted NULL row keeps bid_fmvs links because comic_id and fmv_id are preserved."""
+    bid_id = _insert_bid(db)
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    fmv_id = upsert_fmv(db, null_id, grade=9.2, low=800.0)
+    link_fmv_to_bid(db, bid_id, fmv_id, is_primary=True)
+    upsert_comic(db, "ASM", "300", year=1988)
+    bf = db.execute(
+        "SELECT bid_id, fmv_id FROM bid_fmvs WHERE bid_id=?", (bid_id,)
+    ).fetchone()
+    assert bf is not None and bf["fmv_id"] == fmv_id
+
+
+def test_upsert_comic_merge_cascades_bid_fmvs_on_discarded_fmv(db):
+    """When a null-row fmv is deleted during merge, its bid_fmvs cascade-delete."""
+    bid_id = _insert_bid(db)
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    null_fmv = upsert_fmv(db, null_id, grade=9.2, low=800.0)
+    link_fmv_to_bid(db, bid_id, null_fmv, is_primary=True)
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)")
+    db.commit()
+    yeared_id = db.execute(
+        "SELECT id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()["id"]
+    upsert_fmv(db, yeared_id, grade=9.2, low=900.0)
+    upsert_comic(db, "ASM", "300", year=1988)
+    # bid_fmvs row that pointed at null_fmv is gone (cascade)
+    bf_count = db.execute(
+        "SELECT COUNT(*) FROM bid_fmvs WHERE bid_id=? AND fmv_id=?",
+        (bid_id, null_fmv),
+    ).fetchone()[0]
+    assert bf_count == 0

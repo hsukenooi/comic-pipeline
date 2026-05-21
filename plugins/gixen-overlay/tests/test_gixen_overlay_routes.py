@@ -138,9 +138,30 @@ def test_upsert_comic_without_grade_creates_no_fmv(api):
     assert rows[0]["grade"] is None
 
 
-def test_upsert_comic_missing_year_returns_422(api):
+def test_upsert_comic_missing_year_creates_null_year_row(api):
+    """PER-98: year is optional; absence creates a NULL-year row."""
     r = api.post("/api/comics", json={"title": "X-Men", "issue": "1"})
-    assert r.status_code == 422
+    assert r.status_code == 200
+    body = r.json()
+    assert body["title"] == "X-Men"
+    assert body["issue"] == "1"
+    assert body["year"] is None
+
+
+def test_upsert_comic_reboot_conflict_returns_409(api):
+    """R10: POST /api/comics surfaces ReconciliationConflictError as 409."""
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1987)")
+    raw.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', NULL)")
+    raw.commit()
+    raw.close()
+    r = api.post(
+        "/api/comics",
+        json={"title": "ASM", "issue": "300", "year": 1988},
+    )
+    assert r.status_code == 409
+    assert "manual disambiguation" in r.json()["detail"]
 
 
 def test_upsert_comic_invalid_confidence_returns_422(api):
@@ -214,8 +235,8 @@ def test_extract_comics_year_falls_back_to_locg(api, monkeypatch):
     assert rows[0]["locg_id"] == 12345
 
 
-def test_extract_comics_year_fallback_failure_keeps_skip(api, monkeypatch):
-    """When LOCG can't resolve, the bid stays skipped with an informative reason."""
+def test_extract_comics_year_fallback_failure_links_with_null_year(api, monkeypatch):
+    """PER-98: when LOCG can't resolve, the bid still links with year=NULL."""
     from gixen_overlay import routes
 
     api.post("/api/bids", json={"item_id": "999000114", "max_bid": 50.0})
@@ -231,9 +252,87 @@ def test_extract_comics_year_fallback_failure_keeps_skip(api, monkeypatch):
     r = api.post("/api/extract-comics")
     assert r.status_code == 200
     body = r.json()
+    assert body["linked"] == 1
+    assert body["skipped"] == []
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    rows = raw.execute(
+        "SELECT title, issue, year FROM comics WHERE issue=?", ("6",)
+    ).fetchall()
+    raw.close()
+    assert len(rows) == 1
+    assert rows[0]["year"] is None
+
+
+def test_extract_comics_null_year_dedups_across_bids(api, monkeypatch):
+    """Two bids with the same (series, issue) and no year link to one NULL-year row."""
+    from gixen_overlay import routes
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "999000120", "max_bid": 50.0})
+    api.post("/api/bids", json={"item_id": "999000121", "max_bid": 60.0})
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Giant-Size Fantastic Four # 6 VG", "999000120"))
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Giant-Size Fantastic Four # 6 GD", "999000121"))
+    raw.commit()
+    raw.close()
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    assert r.json()["linked"] == 2
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    rows = raw.execute(
+        "SELECT id, year FROM comics WHERE issue=?", ("6",)
+    ).fetchall()
+    raw.close()
+    assert len(rows) == 1 and rows[0]["year"] is None
+
+
+def test_extract_comics_reboot_conflict_skips_with_reason(api, monkeypatch):
+    """R10: when reconciliation refuses, the bid is added to skipped, not errored."""
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    db_path = os.environ["DB_PATH"]
+    # The parser's series output is what matters for the partial-index match.
+    parsed_series = "Uncanny X-Men MARAUDERS"
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, '211', 1987)",
+        (parsed_series,),
+    )
+    raw.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, '211', NULL)",
+        (parsed_series,),
+    )
+    raw.commit()
+    raw.close()
+
+    api.post("/api/bids", json={"item_id": "999000125", "max_bid": 50.0})
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Uncanny X-Men #211 (NM+) MARAUDERS", "999000125"))
+    raw.commit()
+    raw.close()
+
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg",
+        lambda *_: LocgResolution(year=1986, locg_id=12345, locg_variant_id=None),
+    )
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
     assert body["linked"] == 0
+    assert body["errors"] == []
     assert len(body["skipped"]) == 1
-    assert "locg fallback failed" in body["skipped"][0]["reason"]
+    assert "reboot conflict" in body["skipped"][0]["reason"]
 
 
 def test_extract_comics_does_not_call_locg_when_year_present(api, monkeypatch):
@@ -304,6 +403,63 @@ def test_locg_link_no_primary_returns_409(api):
     api.post("/api/bids", json={"item_id": "555000011", "max_bid": 10.0})
     r = api.post("/api/bids/555000011/comics/locg", json={"locg_id": 12345})
     assert r.status_code == 409
+
+
+def test_locg_link_null_year_primary_lot_issue_succeeds(api, monkeypatch):
+    """PER-98: lot-issue auto-upsert works when the primary comic has year=NULL."""
+    from gixen_overlay import routes
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+
+    api.post("/api/bids", json={"item_id": "555000020", "max_bid": 30.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Amazing Spider-Man # 300 VF", "555000020"))
+    raw.commit()
+    raw.close()
+    api.post("/api/extract-comics")
+
+    # Add a lot-issue link for issue "302" — primary is NULL-year, so the
+    # auto-upsert will create a NULL-year comic row for ASM 302.
+    r = api.post("/api/bids/555000020/comics/locg",
+                 json={"locg_id": 999, "issue": "302"})
+    assert r.status_code == 200, r.json()
+    body = r.json()
+    assert body["issue"] == "302"
+    assert body["year"] is None
+    assert body["locg_id"] == 999
+
+
+def test_locg_link_reboot_conflict_returns_409(api, monkeypatch):
+    """R10: lot-issue auto-upsert hitting a reboot conflict returns 409."""
+    from gixen_overlay import routes
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+
+    api.post("/api/bids", json={"item_id": "555000021", "max_bid": 30.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Uncanny X-Men # 211 VF 1987", "555000021"))
+    raw.commit()
+    raw.close()
+    api.post("/api/extract-comics")
+    # Now seed both a NULL-year row and a different-year row for issue "212".
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO comics (title, issue, year) VALUES ('Uncanny X-Men', '212', 1985)"
+    )
+    raw.execute(
+        "INSERT INTO comics (title, issue, year) VALUES ('Uncanny X-Men', '212', NULL)"
+    )
+    raw.commit()
+    raw.close()
+
+    # api_link_locg primary points at the 1987 row. Lot-issue 212 auto-upsert
+    # uses primary["year"]=1987 → trips reboot guard vs the seeded 1985 row.
+    r = api.post("/api/bids/555000021/comics/locg",
+                 json={"locg_id": 999, "issue": "212"})
+    assert r.status_code == 409
+    assert "manual disambiguation" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +607,65 @@ def test_comics_snipes_needs_linking_when_no_bid_fmvs(api):
     assert row["fmv_low"] is None
     assert row["fmv_high"] is None
     assert row["value_pct"] is None
+
+
+def test_comics_snipes_null_year_comic_has_same_shape_as_yeared(api):
+    """PER-98 Unit 6: dashboard rows are identical in shape whether year is set or NULL."""
+    db_path = os.environ["DB_PATH"]
+    # Yeared comic + bid
+    api.post("/api/bids", json={"item_id": "100000099", "max_bid": 100.0})
+    _set_bid_fields(db_path, "100000099",
+                    auction_end_at="2099-01-01T00:00:00+00:00",
+                    cached_current_bid="80.00 USD")
+    _link_comic(db_path, "100000099",
+                title="Yeared Comic", issue="1", year=1985,
+                grade=9.0, fmv_low=50.0, fmv_high=70.0)
+
+    # NULL-year comic + bid — built inline since _link_comic uses year=?
+    api.post("/api/bids", json={"item_id": "100000098", "max_bid": 100.0})
+    _set_bid_fields(db_path, "100000098",
+                    auction_end_at="2099-01-01T00:00:00+00:00",
+                    cached_current_bid="80.00 USD")
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    raw.execute(
+        "INSERT INTO comics (title, issue, year) VALUES ('No-Year Comic', '1', NULL)"
+    )
+    cid = raw.execute(
+        "SELECT id FROM comics WHERE title='No-Year Comic' AND issue='1' AND year IS NULL"
+    ).fetchone()["id"]
+    raw.execute(
+        "INSERT INTO fmv (comic_id, grade, low, high) VALUES (?, 9.0, 50.0, 70.0)",
+        (cid,),
+    )
+    fid = raw.execute(
+        "SELECT id FROM fmv WHERE comic_id=? AND grade=9.0", (cid,)
+    ).fetchone()["id"]
+    bid_id = raw.execute(
+        "SELECT id FROM bids WHERE item_id='100000098'"
+    ).fetchone()["id"]
+    raw.execute(
+        "INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, 1)",
+        (bid_id, fid),
+    )
+    raw.execute("UPDATE bids SET fmv_id=? WHERE id=?", (fid, bid_id))
+    raw.commit()
+    raw.close()
+
+    rows = {r["item_id"]: r for r in api.get("/api/comics/snipes").json()}
+    assert set(rows) == {"100000099", "100000098"}
+    yeared = rows["100000099"]
+    null_yr = rows["100000098"]
+    # Shape parity: both rows have the same set of keys, and no `year` key leaks out.
+    assert set(yeared.keys()) == set(null_yr.keys())
+    assert "year" not in yeared
+    # Both rows are fully linked with cond + fmv.
+    for r in (yeared, null_yr):
+        assert r["cond_grade"] == 9.0
+        assert r["fmv_low"] == 50.0
+        assert r["fmv_high"] == 70.0
+        assert r["lot_count"] == 1
+        assert r["needs_linking"] is False
 
 
 def test_comics_snipes_partial_null_single_comic_nulls_value(api):

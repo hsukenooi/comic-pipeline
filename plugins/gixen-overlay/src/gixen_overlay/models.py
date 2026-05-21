@@ -7,7 +7,7 @@ from pydantic import BaseModel, field_validator
 class UpsertComicRequest(BaseModel):
     title: str
     issue: str
-    year: int
+    year: int | None = None
     grade: float | None = None
     fmv_low: float | None = None
     fmv_high: float | None = None

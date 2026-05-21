@@ -1,6 +1,7 @@
 """Comic FastAPI routes for the gixen-overlay plugin."""
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from gixen_overlay.db import (
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
+    ReconciliationConflictError,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest
@@ -23,6 +25,8 @@ from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_ta
 
 _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 _NUMERIC_RE = re.compile(r"[^0-9.]")
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -51,14 +55,17 @@ async def api_list_comics(
 @router.post("/api/comics")
 async def api_upsert_comic(req: UpsertComicRequest, request: Request):
     db = request.app.state.db
-    comic_id = upsert_comic(
-        db,
-        title=req.title,
-        issue=req.issue,
-        year=req.year,
-        locg_id=req.locg_id,
-        locg_variant_id=req.locg_variant_id,
-    )
+    try:
+        comic_id = upsert_comic(
+            db,
+            title=req.title,
+            issue=req.issue,
+            year=req.year,
+            locg_id=req.locg_id,
+            locg_variant_id=req.locg_variant_id,
+        )
+    except ReconciliationConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if req.grade is not None:
         upsert_fmv(
             db,
@@ -119,12 +126,15 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
                         "for auto-create. Run extract-comics first or use cli.py add."
                     ),
                 )
-            target_comic_id = upsert_comic(
-                db,
-                title=primary["title"],
-                issue=req.issue,
-                year=primary["year"],
-            )
+            try:
+                target_comic_id = upsert_comic(
+                    db,
+                    title=primary["title"],
+                    issue=req.issue,
+                    year=primary["year"],
+                )
+            except ReconciliationConflictError as e:
+                raise HTTPException(status_code=409, detail=str(e))
             # Create an fmv stub at the primary's grade for the lot issue
             new_fmv_id = upsert_fmv(db, target_comic_id, primary["grade"])
             link_fmv_to_bid(db, bid_row["id"], new_fmv_id, is_primary=False)
@@ -373,18 +383,20 @@ async def api_extract_comics(request: Request):
             skipped.append({"item_id": item_id, "reason": "no issue extracted"})
             continue
         year = parsed.year
-        # Year is only resolved for the primary issue. Multi-issue runs (rare
-        # for the year-less case in practice) all get the same year.
+        # Year is opportunistic post-PER-98. LOCG fallback enriches when it works;
+        # absence no longer blocks linking. Multi-issue lots: resolved year (if any)
+        # applies to all issues — same-era run is the most likely identity. Any
+        # LOCG exception (network, Cloudflare, Playwright crash) is swallowed: the
+        # bid continues to link with year=None rather than 500-ing the whole batch.
         primary_resolution = None
         if year is None:
-            primary_resolution = resolve_year_and_locg(parsed.series, issues[0])
-            if primary_resolution is None:
-                skipped.append({
-                    "item_id": item_id,
-                    "reason": "no year extracted (locg fallback failed)",
-                })
-                continue
-            year = primary_resolution.year
+            try:
+                primary_resolution = resolve_year_and_locg(parsed.series, issues[0])
+            except Exception as e:
+                logger.warning("resolve_year_and_locg raised for item %s: %s", item_id, e)
+                primary_resolution = None
+            if primary_resolution is not None:
+                year = primary_resolution.year
 
         try:
             for idx, issue in enumerate(issues):
@@ -406,6 +418,11 @@ async def api_extract_comics(request: Request):
                     link_fmv_to_bid(db, row["id"], fmv_id, is_primary=(idx == 0))
                 # Bids with no parseable grade cannot get an fmv link (fmv.grade NOT NULL)
             linked += 1
+        except ReconciliationConflictError as e:
+            skipped.append({
+                "item_id": item_id,
+                "reason": f"reboot conflict (manual disambiguation required): {e}",
+            })
         except Exception as e:
             errors.append({"item_id": item_id, "error": f"link failed: {e}"})
 
