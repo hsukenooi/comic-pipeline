@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -666,8 +666,17 @@ def list_comics(
     issue: str | None = None,
     year: int | None = None,
     grade: float | None = None,
+    locg_id: int | None = None,
+    max_age_days: float | None = None,
 ) -> list[sqlite3.Row]:
-    """Return comics enriched with FMV data. One row per (comic, fmv) pair."""
+    """Return comics enriched with FMV data. One row per (comic, fmv) pair.
+
+    locg_id: filter to one canonical issue (used by comic-fmv to look up a
+        fresh FMV by LOCG ID + grade without juggling title spellings).
+    max_age_days: if set, only return rows where the joined fmv.updated_at
+        is within the last N days. Stale rows are excluded so callers can't
+        accidentally reuse outdated FMVs.
+    """
     clauses, params = [], []
     if title is not None:
         clauses.append("LOWER(c.title) = LOWER(?)")
@@ -681,6 +690,14 @@ def list_comics(
     if grade is not None:
         clauses.append("f.grade = ?")
         params.append(grade)
+    if locg_id is not None:
+        clauses.append("c.locg_id = ?")
+        params.append(locg_id)
+    if max_age_days is not None:
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=max_age_days)).isoformat()
+        clauses.append("f.updated_at IS NOT NULL AND f.updated_at >= ?")
+        params.append(cutoff)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     return conn.execute(
         f"""

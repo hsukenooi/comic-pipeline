@@ -154,6 +154,65 @@ def test_upsert_comic_invalid_confidence_returns_422(api):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/comics — locg_id and max_age_days filters (comic-fmv cache lookup)
+# ---------------------------------------------------------------------------
+
+
+def test_list_comics_by_locg_id(api):
+    """GET /api/comics?locg_id=N returns rows with that LOCG ID."""
+    api.post("/api/comics", json={
+        "title": "Amazing Spider-Man", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800, "fmv_high": 1000, "fmv_comps": 12,
+        "fmv_confidence": "high", "fmv_notes": "key",
+        "locg_id": 6977652,
+    })
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0, "fmv_low": 50, "fmv_high": 70, "fmv_comps": 10,
+        "fmv_confidence": "high", "fmv_notes": "",
+        "locg_id": 12345,
+    })
+    rows = api.get("/api/comics", params={"locg_id": 6977652}).json()
+    assert len(rows) == 1
+    assert rows[0]["title"] == "Amazing Spider-Man"
+
+
+def test_list_comics_max_age_days_excludes_stale(api):
+    """GET /api/comics?max_age_days=N excludes rows past the cutoff."""
+    from datetime import datetime, timedelta, timezone
+    import sqlite3
+
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0, "fmv_low": 50, "fmv_high": 70, "fmv_comps": 10,
+        "fmv_confidence": "high", "fmv_notes": "",
+    })
+    conn = sqlite3.connect(os.environ["DB_PATH"])
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    conn.execute("UPDATE fmv SET updated_at = ?", (old,))
+    conn.commit()
+    conn.close()
+
+    assert api.get("/api/comics", params={"max_age_days": 7}).json() == []
+    assert len(api.get("/api/comics", params={"max_age_days": 60}).json()) == 1
+
+
+def test_list_comics_locg_id_plus_max_age(api):
+    """The fmv-cache lookup pattern from comic-fmv: locg_id + grade + max_age_days."""
+    api.post("/api/comics", json={
+        "title": "ASM", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800, "fmv_high": 1000, "fmv_comps": 12,
+        "fmv_confidence": "high", "fmv_notes": "",
+        "locg_id": 6977652,
+    })
+    rows = api.get("/api/comics", params={
+        "locg_id": 6977652, "grade": 9.2, "max_age_days": 7,
+    }).json()
+    assert len(rows) == 1
+    assert rows[0]["fmv_low"] == 800
+
+
+# ---------------------------------------------------------------------------
 # POST /api/extract-comics
 # ---------------------------------------------------------------------------
 

@@ -42,9 +42,26 @@ async def api_list_comics(
     issue: str | None = None,
     year: int | None = None,
     grade: float | None = None,
+    locg_id: int | None = None,
+    max_age_days: float | None = None,
 ):
+    """List comics enriched with FMV data.
+
+    `locg_id` + `grade` is the canonical lookup for FMV cache reuse — see
+    `comic-fmv` (apps/fmv) and `/comic:fmv`. `max_age_days` excludes rows
+    whose `fmv_updated_at` is older than the cutoff so callers can't reuse
+    stale FMVs by accident.
+    """
     db = request.app.state.db
-    rows = list_comics(db, title=title, issue=issue, year=year, grade=grade)
+    rows = list_comics(
+        db,
+        title=title,
+        issue=issue,
+        year=year,
+        grade=grade,
+        locg_id=locg_id,
+        max_age_days=max_age_days,
+    )
     return [dict(r) for r in rows]
 
 
