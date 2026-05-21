@@ -20,6 +20,7 @@ include = [
     "src/ebay_fetch.py",
     "src/sold_comps.py",
 ]
+sources = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
