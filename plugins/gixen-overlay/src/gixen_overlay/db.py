@@ -498,7 +498,9 @@ def upsert_comic(
       locg metadata, returns it.
     - Yeared insert finds an existing yearless row for the same (title, issue)
       → promotes it (UPDATE comics SET year=?), returns it. Avoids creating a
-      duplicate alongside the yearless placeholder.
+      duplicate alongside the yearless placeholder. Exception: if a yeared row
+      at a *different* year already exists, promotion is skipped (warning logged,
+      yearless row returned unchanged) to prevent two yeared siblings (PER-104).
     - Yearless insert finds an existing yeared row for the same (title, issue)
       → prefers the yeared one (returns its id without creating a yearless
       duplicate). Locg metadata still gets merged in.
@@ -527,6 +529,23 @@ def upsert_comic(
             (title, issue),
         ).fetchone()
         if existing_yearless is not None:
+            # Guard (PER-104): if a yeared row at a *different* year already
+            # exists, promoting would create two yeared siblings. Skip and warn.
+            conflicting_yeared = conn.execute(
+                "SELECT id FROM comics "
+                "WHERE title=? AND issue=? AND year IS NOT NULL AND year!=?",
+                (title, issue, year),
+            ).fetchone()
+            if conflicting_yeared is not None:
+                logger.warning(
+                    "upsert_comic: skipping yearless promotion — yeared sibling "
+                    "conflict (title=%r issue=%r incoming_year=%r); keeping "
+                    "yearless row",
+                    title,
+                    issue,
+                    year,
+                )
+                return existing_yearless["id"]
             conn.execute(
                 "UPDATE comics SET year=?, "
                 "locg_id=COALESCE(?, locg_id), "
@@ -552,6 +571,15 @@ def upsert_comic(
         (title, issue),
     ).fetchone()
     if canonical_yeared is not None:
+        # PER-103: clean up any pre-existing yearless orphan alongside the
+        # canonical yeared row before returning.
+        orphan = conn.execute(
+            "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NULL",
+            (title, issue),
+        ).fetchone()
+        if orphan is not None:
+            _merge_yearless_into_yeared(conn, orphan["id"], canonical_yeared["id"])
+            conn.execute("DELETE FROM comics WHERE id=?", (orphan["id"],))
         conn.execute(
             "UPDATE comics SET locg_id=COALESCE(?, locg_id), "
             "locg_variant_id=COALESCE(?, locg_variant_id) WHERE id=?",
@@ -578,6 +606,129 @@ def upsert_comic(
     )
     conn.commit()
     return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# Orphan yearless cleanup (PER-103)
+# ---------------------------------------------------------------------------
+
+
+def _merge_yearless_into_yeared(
+    conn: sqlite3.Connection, yearless_id: int, yeared_id: int
+) -> None:
+    """Reparent all fmv children from a yearless orphan onto a yeared row.
+
+    For each fmv grade on yearless_id:
+    - No conflict (yeared has no fmv at that grade): reassign comic_id in-place.
+    - Conflict (yeared already has fmv at that grade): COALESCE non-null fields
+      into the yeared fmv, reparent bid_fmvs and bids.fmv_id, then delete the
+      duplicate yearless fmv row.
+
+    Does NOT delete the yearless comics row — caller's responsibility.
+    """
+    yearless_fmvs = conn.execute(
+        "SELECT id, grade, low, high, comps, confidence, notes, updated_at "
+        "FROM fmv WHERE comic_id=?",
+        (yearless_id,),
+    ).fetchall()
+
+    for yfmv in yearless_fmvs:
+        yeared_fmv = conn.execute(
+            "SELECT id FROM fmv WHERE comic_id=? AND grade=?",
+            (yeared_id, yfmv["grade"]),
+        ).fetchone()
+
+        if yeared_fmv is None:
+            conn.execute("UPDATE fmv SET comic_id=? WHERE id=?", (yeared_id, yfmv["id"]))
+        else:
+            # Merge non-null fields from yearless into yeared (COALESCE keeps
+            # existing non-null values; yearless fills gaps only).
+            conn.execute(
+                """
+                UPDATE fmv SET
+                    low        = COALESCE(low,        ?),
+                    high       = COALESCE(high,       ?),
+                    comps      = COALESCE(comps,      ?),
+                    confidence = COALESCE(confidence, ?),
+                    notes      = COALESCE(notes,      ?),
+                    updated_at = COALESCE(updated_at, ?)
+                WHERE id=?
+                """,
+                (
+                    yfmv["low"], yfmv["high"], yfmv["comps"],
+                    yfmv["confidence"], yfmv["notes"], yfmv["updated_at"],
+                    yeared_fmv["id"],
+                ),
+            )
+            # Reparent bid_fmvs; preserve the higher is_primary if both exist.
+            for bf in conn.execute(
+                "SELECT bid_id, is_primary FROM bid_fmvs WHERE fmv_id=?",
+                (yfmv["id"],),
+            ).fetchall():
+                conn.execute(
+                    """
+                    INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, ?)
+                    ON CONFLICT(bid_id, fmv_id) DO UPDATE
+                        SET is_primary = MAX(is_primary, excluded.is_primary)
+                    """,
+                    (bf["bid_id"], yeared_fmv["id"], bf["is_primary"]),
+                )
+            # Reparent bids.fmv_id.
+            conn.execute(
+                "UPDATE bids SET fmv_id=? WHERE fmv_id=?",
+                (yeared_fmv["id"], yfmv["id"]),
+            )
+            # Delete the now-redundant yearless fmv (cascade cleans its bid_fmvs).
+            conn.execute("DELETE FROM fmv WHERE id=?", (yfmv["id"],))
+
+
+def sweep_orphan_yearless_comics(
+    conn: sqlite3.Connection, dry_run: bool = False
+) -> dict:
+    """Find yearless rows that have a yeared sibling and merge them in.
+
+    When dry_run=True reports what would change without touching the DB.
+    Returns a summary dict with 'merged' (or 'would_merge') count and details.
+    """
+    orphans = conn.execute(
+        """
+        SELECT
+            c.id   AS yearless_id,
+            c.title,
+            c.issue,
+            (SELECT id FROM comics
+             WHERE title=c.title AND issue=c.issue AND year IS NOT NULL
+             ORDER BY (locg_id IS NULL), id LIMIT 1) AS yeared_id
+        FROM comics c
+        WHERE c.year IS NULL
+          AND EXISTS (
+              SELECT 1 FROM comics
+              WHERE title=c.title AND issue=c.issue AND year IS NOT NULL
+          )
+        """
+    ).fetchall()
+
+    details = [
+        {
+            "title": row["title"],
+            "issue": row["issue"],
+            "yearless_id": row["yearless_id"],
+            "yeared_id": row["yeared_id"],
+        }
+        for row in orphans
+    ]
+
+    if dry_run:
+        return {"dry_run": True, "would_merge": len(details), "details": details}
+
+    for row in orphans:
+        _merge_yearless_into_yeared(conn, row["yearless_id"], row["yeared_id"])
+        conn.execute("DELETE FROM comics WHERE id=?", (row["yearless_id"],))
+    if orphans:
+        conn.commit()
+
+    logger.info("sweep_orphan_yearless_comics: merged %d orphan(s)", len(orphans))
+    return {"dry_run": False, "merged": len(details), "details": details}
 
 
 # ---------------------------------------------------------------------------
