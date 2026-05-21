@@ -865,6 +865,30 @@ def test_upsert_comic_merge_collision_discard_warning(db, caplog):
     ).fetchone()[0] == 0
 
 
+def test_upsert_comic_merge_transplant_preserves_yeared_partial_columns(db, caplog):
+    """Todo 002: transplant must not overwrite a non-null yeared column with null.
+
+    Yeared fmv has low=None but high=1200 (e.g., set by a prior targeted
+    upsert_fmv). Null-row fmv has low=800 but high=None. After merge, the
+    yeared fmv should have low=800 (transplanted) AND high=1200 (preserved).
+    """
+    null_id = upsert_comic(db, "ASM", "300", year=None)
+    upsert_fmv(db, null_id, grade=9.2, low=800.0)  # high left NULL
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('ASM', '300', 1988)")
+    db.commit()
+    yeared_id = db.execute(
+        "SELECT id FROM comics WHERE title='ASM' AND issue='300' AND year=1988"
+    ).fetchone()["id"]
+    # Yeared fmv: low NULL, but high already set
+    upsert_fmv(db, yeared_id, grade=9.2, high=1200.0)
+    upsert_comic(db, "ASM", "300", year=1988)
+    fmv = db.execute(
+        "SELECT low, high FROM fmv WHERE comic_id=? AND grade=9.2", (yeared_id,)
+    ).fetchone()
+    assert fmv["low"] == 800.0   # transplanted from null
+    assert fmv["high"] == 1200.0  # preserved from yeared
+
+
 def test_upsert_comic_merge_multi_grade_mixed_collision_and_reparent(db, caplog):
     """T3: null row has two fmv rows — one collides with yeared, one doesn't.
 

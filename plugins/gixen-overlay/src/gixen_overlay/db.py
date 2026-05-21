@@ -686,10 +686,19 @@ def _merge_null_row_into_yeared(
             )
             continue
         if sf["low"] is None and nf["low"] is not None:
+            # Per-column COALESCE so a non-null survivor column (e.g., high or
+            # comps set by an earlier targeted upsert_fmv) is never overwritten
+            # by a null on the inbound row. The `low IS NULL` discriminator
+            # selects the branch; the actual transplant is per-column.
             conn.execute(
                 """
                 UPDATE fmv SET
-                    low=?, high=?, comps=?, confidence=?, notes=?, updated_at=?
+                    low        = COALESCE(low,        ?),
+                    high       = COALESCE(high,       ?),
+                    comps      = COALESCE(comps,      ?),
+                    confidence = COALESCE(confidence, ?),
+                    notes      = COALESCE(notes,      ?),
+                    updated_at = COALESCE(updated_at, ?)
                 WHERE id=?
                 """,
                 (nf["low"], nf["high"], nf["comps"], nf["confidence"],
