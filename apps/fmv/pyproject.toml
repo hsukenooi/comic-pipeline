@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "comic-fmv"
+version = "0.1.0"
+description = "Compute fair market value for comics from eBay sold comps"
+requires-python = ">=3.11"
+dependencies = [
+    "click",
+    "requests",
+]
+
+[project.scripts]
+comic-fmv = "fmv_cli:main"
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "src/fmv_cli.py",
+    "src/fmv_math.py",
+    "src/fmv_runner.py",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
