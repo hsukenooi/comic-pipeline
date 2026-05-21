@@ -71,6 +71,11 @@ _ISSUE_BARE_RANGE = re.compile(r"\b(\d{1,3})\s*-\s*(\d{1,3})\b")
 _ISSUE_BARE_RUN = re.compile(r"\b(\d+(?:\s*[,&]\s*\d+){2,})\b")  # bare run like "1,2,3,4,5"
 _ISSUE_HASH_SINGLE = re.compile(r"#\s*(\d{1,4})\b")
 _ISSUE_NO_KEYWORD = re.compile(r"\b(?:Issue|No|Number)\.?\s*#?\s*(\d{1,4})\b", re.IGNORECASE)
+# Last-resort fallback for titles that omit "#" entirely, e.g.
+# "UNCANNY X-MEN   211 - (NM+)". Conservative: requires whitespace before, must
+# not look like a decimal (rejects the "9" in "9.8"). Year filtering happens at
+# the call site so we can pick the *next* candidate when the first is a year.
+_ISSUE_BARE_SINGLE = re.compile(r"(?<=\s)(\d{1,4})(?!\.\d)\b")
 
 # Tokens to scrub from series text.
 _PUBLISHER_WORDS = {
@@ -226,6 +231,15 @@ def _extract_issue(text: str) -> tuple[list[str], bool]:
         if expanded:
             return expanded, True
 
+    # 6. Bare single number — last-resort fallback for hashless titles like
+    # "X-MEN 211 - (NM+)". Walks matches in order and returns the first that
+    # isn't a year, so "Spider-Man 300 1988 NM" returns "300" rather than 1988.
+    for m in _ISSUE_BARE_SINGLE.finditer(text):
+        n = int(m.group(1))
+        if 1930 <= n <= 2099:
+            continue
+        return [m.group(1)], False
+
     return [], False
 
 
@@ -243,11 +257,23 @@ def _clean_series(text: str) -> str:
     t = _ISSUE_NO_KEYWORD.sub(" ", t)
     t = _ISSUE_BARE_RUN.sub(" ", t)
 
-    # Remove edition tags / condition tokens
+    # Remove edition tags / condition tokens. Then strip orphaned parens left
+    # behind by scrubbing tokens like "(NM+)" → "(  )".
     t = _EDITION_RE.sub(" ", t)
+    t = re.sub(r"\(\s*[^A-Za-z0-9]*\s*\)", " ", t)
+    # Truncate at the first stray ")" that has no matching "(" — listings often
+    # have "Series Issue - (Grade) -extra noise" and scrubbing the grade leaves
+    # "Series Issue - ) -extra noise" with the trailing junk we don't want in
+    # the dedup key.
+    t = re.sub(r"\s+[^A-Za-z0-9\s]*\).*", "", t)
 
     # Remove year
     t = _YEAR_PATTERN.sub(" ", t)
+
+    # Strip any remaining bare 1-4 digit numbers. Years and prices are gone by
+    # this point, so leftover digits are issue-context (matches what
+    # _ISSUE_BARE_SINGLE picks up). Keeps the series clean for dedup.
+    t = re.sub(r"(?<=\s)\d{1,4}\b", " ", t)
 
     # Token-level publisher scrub
     tokens = re.split(r"\s+", t)
@@ -266,6 +292,15 @@ def _clean_series(text: str) -> str:
             continue
         cleaned.append(tok)
     t = " ".join(cleaned)
+
+    # Seller format is typically "Series Issue - (Grade) - Description". After
+    # the issue/grade/year scrubs above, a standalone " - " (with spaces on
+    # both sides — hyphenated "X-Men" doesn't match) is the boundary between
+    # series and listing-specific description. Truncate there. Runs before the
+    # single-letter token filter, which would otherwise eat the bare "-".
+    m = re.search(r"\s+-\s+", t)
+    if m and m.start() > 2:
+        t = t[: m.start()]
 
     # Truncate at common descriptor markers (creator names, app/key markers, etc.)
     cut_markers = [
