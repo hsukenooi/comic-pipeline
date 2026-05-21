@@ -110,6 +110,32 @@ def test_partial_unique_indexes_prevent_dupes():
         conn.execute("INSERT INTO comics (title, issue, year) VALUES ('Y', '1', NULL)")
 
 
+def test_migration_drops_orphan_junction_rows_defensively():
+    """sqlite3 CLI defaults to PRAGMA foreign_keys=OFF, which can leave
+    orphan bid_fmvs / fmv rows when deletes bypass CASCADE. The migration
+    must filter them out instead of crashing on FK enforcement."""
+    conn = _legacy_db_with_year_not_null()
+    conn.execute("INSERT INTO bids (id, item_id, max_bid) VALUES (1, 'a', 10.0)")
+    conn.execute("INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)")
+    conn.execute("INSERT INTO fmv (id, comic_id, grade) VALUES (1, 1, 9.0)")
+    conn.commit()
+    # PRAGMA foreign_keys is per-connection and ignored inside an active txn,
+    # so flip it off only outside one — same trick the sqlite3 CLI uses
+    # implicitly. Plants the orphan, then turn FKs back on.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (1, 999, 1)")
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    create_tables(conn)  # must not raise
+
+    # Orphan junction is dropped; valid rows survive.
+    surviving = conn.execute("SELECT bid_id, fmv_id FROM bid_fmvs ORDER BY fmv_id").fetchall()
+    assert [(r["bid_id"], r["fmv_id"]) for r in surviving] == []
+    real_fmv = conn.execute("SELECT id FROM fmv").fetchall()
+    assert [r["id"] for r in real_fmv] == [1]
+
+
 def test_partial_indexes_allow_yeared_and_yearless_same_title_issue():
     """The partial-index design allows (T,I,Y) and (T,I,NULL) to coexist at
     the DB layer — application code (upsert_comic) is responsible for not
