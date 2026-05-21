@@ -13,6 +13,7 @@ from gixen_overlay.db import (
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
+    sweep_orphan_yearless_comics,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest
@@ -429,3 +430,15 @@ async def api_extract_comics(request: Request):
         "skipped": skipped,
         "errors": errors,
     }
+
+
+@router.post("/api/sweep-orphans")
+async def api_sweep_orphans(request: Request, dry_run: bool = True):
+    """Merge yearless comics rows that have a yeared sibling.
+
+    Safe to call repeatedly — idempotent. Defaults to dry_run=True so a
+    plain POST returns a preview without touching data. Pass ?dry_run=false
+    to perform the actual merge.
+    """
+    db = request.app.state.db
+    return sweep_orphan_yearless_comics(db, dry_run=dry_run)

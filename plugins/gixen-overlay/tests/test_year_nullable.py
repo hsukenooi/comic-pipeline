@@ -5,7 +5,12 @@ import sqlite3
 
 import pytest
 
-from gixen_overlay.db import create_tables, upsert_comic, upsert_fmv
+from gixen_overlay.db import (
+    create_tables,
+    upsert_comic,
+    upsert_fmv,
+    sweep_orphan_yearless_comics,
+)
 
 
 def _fresh_db() -> sqlite3.Connection:
@@ -227,6 +232,34 @@ def test_upsert_locg_metadata_merged_via_coalesce():
     assert row["locg_id"] == 999
 
 
+def test_upsert_yeared_with_conflicting_sibling_skips_promotion():
+    """PER-104: yearless row must not be promoted when a yeared row at a
+    different year already exists — that would create two yeared siblings."""
+    conn = _fresh_db()
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', 1987)")
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+    yearless_id = conn.execute(
+        "SELECT id FROM comics WHERE title='X' AND issue='1' AND year IS NULL"
+    ).fetchone()[0]
+
+    result = upsert_comic(conn, title="X", issue="1", year=1988)
+
+    # Returns the yearless row unchanged.
+    assert result == yearless_id
+    row = conn.execute("SELECT year FROM comics WHERE id=?", (yearless_id,)).fetchone()
+    assert row["year"] is None
+    # No row at year=1988 was created.
+    count_1988 = conn.execute(
+        "SELECT count(*) FROM comics WHERE title='X' AND issue='1' AND year=1988"
+    ).fetchone()[0]
+    assert count_1988 == 0
+    # Still exactly two rows (yeared 1987 + yearless).
+    count = conn.execute(
+        "SELECT count(*) FROM comics WHERE title='X' AND issue='1'"
+    ).fetchone()[0]
+    assert count == 2
+
+
 def test_yearless_insert_with_multiple_yeared_prefers_locg():
     """When historical data has multiple yeared rows for one (title, issue) —
     the PER-98 backfill mistake — prefer the one with locg_id."""
@@ -237,3 +270,176 @@ def test_yearless_insert_with_multiple_yeared_prefers_locg():
     expected = conn.execute("SELECT id FROM comics WHERE locg_id=12345").fetchone()[0]
     actual = upsert_comic(conn, title="X", issue="1")
     assert actual == expected
+
+
+# ---------------------------------------------------------------------------
+# PER-103: orphan yearless cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_yearless_insert_cleans_orphan_yearless_no_fmv():
+    """PER-103: yearless insert finding canonical_yeared also deletes a
+    pre-existing yearless orphan that has no fmv children."""
+    conn = _fresh_db()
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', 1963)")
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+
+    result = upsert_comic(conn, title="X", issue="1")
+
+    yeared_id = conn.execute(
+        "SELECT id FROM comics WHERE title='X' AND issue='1' AND year=1963"
+    ).fetchone()[0]
+    assert result == yeared_id
+    # Orphan gone.
+    assert conn.execute(
+        "SELECT count(*) FROM comics WHERE title='X' AND issue='1' AND year IS NULL"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT count(*) FROM comics WHERE title='X' AND issue='1'"
+    ).fetchone()[0] == 1
+
+
+def test_yearless_insert_cleans_orphan_and_migrates_fmv_no_conflict():
+    """PER-103: orphan yearless fmv (no grade conflict on yeared) is
+    reassigned to the yeared row — no data loss."""
+    conn = _fresh_db()
+    yeared_id = upsert_comic(conn, title="X", issue="1", year=1963)
+    # Manually seed orphan yearless with an fmv at a grade the yeared row lacks.
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+    yearless_id = conn.execute(
+        "SELECT id FROM comics WHERE title='X' AND issue='1' AND year IS NULL"
+    ).fetchone()[0]
+    upsert_fmv(conn, comic_id=yearless_id, grade=9.2, low=800, high=1200)
+
+    upsert_comic(conn, title="X", issue="1")
+
+    # Orphan gone.
+    assert conn.execute(
+        "SELECT count(*) FROM comics WHERE year IS NULL AND title='X'"
+    ).fetchone()[0] == 0
+    # fmv migrated to yeared row.
+    fmv = conn.execute(
+        "SELECT * FROM fmv WHERE comic_id=? AND grade=9.2", (yeared_id,)
+    ).fetchone()
+    assert fmv is not None
+    assert fmv["low"] == 800
+    assert fmv["high"] == 1200
+
+
+def test_yearless_insert_cleans_orphan_fmv_conflict_coalesces():
+    """PER-103: when both yeared and yearless have fmv at the same grade, the
+    yearless values fill in gaps (COALESCE) — yeared non-null fields win."""
+    conn = _fresh_db()
+    yeared_id = upsert_comic(conn, title="X", issue="1", year=1963)
+    upsert_fmv(conn, comic_id=yeared_id, grade=9.2, low=900)
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+    yearless_id = conn.execute(
+        "SELECT id FROM comics WHERE year IS NULL AND title='X'"
+    ).fetchone()[0]
+    # Yearless has low=800 (different) and high=1200 (yeared lacks it).
+    upsert_fmv(conn, comic_id=yearless_id, grade=9.2, low=800, high=1200)
+
+    upsert_comic(conn, title="X", issue="1")
+
+    fmv = conn.execute(
+        "SELECT * FROM fmv WHERE comic_id=? AND grade=9.2", (yeared_id,)
+    ).fetchone()
+    # Yeared low=900 wins (non-null), yearless high=1200 fills the gap.
+    assert fmv["low"] == 900
+    assert fmv["high"] == 1200
+    # Only one fmv row at that grade.
+    assert conn.execute(
+        "SELECT count(*) FROM fmv WHERE grade=9.2"
+    ).fetchone()[0] == 1
+
+
+def test_yearless_insert_reparents_bid_fmvs_on_conflict():
+    """PER-103: bid_fmvs pointing to a yearless fmv are reparented to the
+    surviving yeared fmv when grade conflicts on merge."""
+    conn = _fresh_db()
+    conn.execute(
+        "INSERT INTO bids (id, item_id, max_bid) VALUES (1, 'eb1', 50.0)"
+    )
+    yeared_id = upsert_comic(conn, title="X", issue="1", year=1963)
+    yeared_fmv_id = upsert_fmv(conn, comic_id=yeared_id, grade=9.2, low=900)
+    # Orphan yearless + its fmv linked to bid 1.
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+    yearless_id = conn.execute(
+        "SELECT id FROM comics WHERE year IS NULL AND title='X'"
+    ).fetchone()[0]
+    yearless_fmv_id = upsert_fmv(conn, comic_id=yearless_id, grade=9.2, low=800)
+    conn.execute(
+        "INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (1, ?, 1)",
+        (yearless_fmv_id,),
+    )
+
+    upsert_comic(conn, title="X", issue="1")
+
+    # bid_fmvs now points to yeared fmv.
+    row = conn.execute(
+        "SELECT fmv_id FROM bid_fmvs WHERE bid_id=1"
+    ).fetchone()
+    assert row["fmv_id"] == yeared_fmv_id
+    # Yearless fmv gone.
+    assert conn.execute(
+        "SELECT count(*) FROM fmv WHERE id=?", (yearless_fmv_id,)
+    ).fetchone()[0] == 0
+
+
+def test_sweep_dry_run_reports_without_mutating():
+    """sweep_orphan_yearless_comics dry_run=True returns details but makes no changes."""
+    conn = _fresh_db()
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', 1963)")
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+    upsert_fmv(
+        conn,
+        comic_id=conn.execute(
+            "SELECT id FROM comics WHERE year IS NULL"
+        ).fetchone()[0],
+        grade=9.2,
+        low=800,
+    )
+
+    result = sweep_orphan_yearless_comics(conn, dry_run=True)
+
+    assert result["dry_run"] is True
+    assert result["would_merge"] == 1
+    assert result["details"][0]["title"] == "X"
+    # Nothing mutated.
+    assert conn.execute(
+        "SELECT count(*) FROM comics WHERE year IS NULL"
+    ).fetchone()[0] == 1
+
+
+def test_sweep_merges_orphan_and_removes_yearless():
+    """sweep_orphan_yearless_comics dry_run=False merges fmv and removes yearless row."""
+    conn = _fresh_db()
+    yeared_id = upsert_comic(conn, title="X", issue="1", year=1963)
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+    yearless_id = conn.execute(
+        "SELECT id FROM comics WHERE year IS NULL AND title='X'"
+    ).fetchone()[0]
+    upsert_fmv(conn, comic_id=yearless_id, grade=9.2, low=800)
+
+    result = sweep_orphan_yearless_comics(conn, dry_run=False)
+
+    assert result["dry_run"] is False
+    assert result["merged"] == 1
+    assert conn.execute(
+        "SELECT count(*) FROM comics WHERE year IS NULL"
+    ).fetchone()[0] == 0
+    fmv = conn.execute(
+        "SELECT * FROM fmv WHERE comic_id=? AND grade=9.2", (yeared_id,)
+    ).fetchone()
+    assert fmv["low"] == 800
+
+
+def test_sweep_no_orphans_returns_zero():
+    """sweep_orphan_yearless_comics on a clean DB returns merged=0."""
+    conn = _fresh_db()
+    upsert_comic(conn, title="X", issue="1", year=1963)
+
+    result = sweep_orphan_yearless_comics(conn, dry_run=False)
+
+    assert result["merged"] == 0
+    assert result["details"] == []
