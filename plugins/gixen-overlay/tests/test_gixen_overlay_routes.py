@@ -691,3 +691,190 @@ def test_comics_snipes_triggers_fresh_sync(api):
         assert r.status_code == 200
         assert mock_sync.called
         assert mock_spawn.called
+
+
+# ---------------------------------------------------------------------------
+# POST /api/comics/verify  (PER-99)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_fully_linked(api):
+    """A bid with comic + fmv (populated low/high) + junction + bids.fmv_id."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000001", "max_bid": 100.0})
+    _link_comic(db_path, "300000001",
+                title="Amazing Spider-Man", issue="300", year=1988,
+                grade=9.2, fmv_low=800.0, fmv_high=1000.0)
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000001", "grade": 9.2}],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["summary"] == {"total": 1, "fully_linked": 1, "issues": 0}
+    row = body["results"][0]
+    assert row["verdict"] == "fully_linked"
+    assert row["missing"] == []
+    assert row["comic_id"] > 0
+    assert row["fmv_id"] > 0
+    assert row["bid_fmv_id"] == row["fmv_id"]
+
+
+def test_verify_no_bid(api):
+    """item_id that never made it into the bids table."""
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "999999999", "grade": 9.2}],
+    })
+    assert r.status_code == 200
+    row = r.json()["results"][0]
+    assert row["verdict"] == "no_bid"
+    assert row["missing"] == ["bids row"]
+
+
+def test_verify_no_comic_when_bid_has_no_links(api):
+    """Bid exists but no bid_fmvs junction — `/comic:fmv` step never ran."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000002", "max_bid": 50.0})
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000002", "grade": 9.2}],
+    })
+    row = r.json()["results"][0]
+    assert row["verdict"] == "no_comic"
+    assert "bid_fmvs junction" in row["missing"]
+
+
+def test_verify_no_comic_when_locg_id_unknown(api):
+    """locg_id passed but no comic row matches — every link is missing."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000003", "max_bid": 50.0})
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000003", "grade": 9.2, "locg_id": 999999}],
+    })
+    row = r.json()["results"][0]
+    assert row["verdict"] == "no_comic"
+    assert "comics row" in row["missing"]
+
+
+def test_verify_fmv_stub(api):
+    """Comic + fmv at grade exist, but fmv.low/high are NULL (`/comic:fmv` never ran)."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000004", "max_bid": 50.0})
+    _link_comic(db_path, "300000004",
+                title="Spawn", issue="9", year=1993,
+                grade=9.4, fmv_low=None, fmv_high=None)
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000004", "grade": 9.4}],
+    })
+    row = r.json()["results"][0]
+    assert row["verdict"] == "fmv_stub"
+    assert "fmv.low" in row["missing"]
+    assert "fmv.high" in row["missing"]
+
+
+def test_verify_no_fmv_at_grade(api):
+    """Comic exists with fmv at a different grade — caller asked for 9.8."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000005", "max_bid": 50.0})
+    _link_comic(db_path, "300000005",
+                title="Hulk", issue="181", year=1974,
+                grade=9.0, fmv_low=300.0, fmv_high=500.0)
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000005", "grade": 9.8}],
+    })
+    row = r.json()["results"][0]
+    assert row["verdict"] == "no_fmv_at_grade"
+    assert row["missing"] == ["fmv row at grade 9.8"]
+
+
+def test_verify_partial_when_bids_fmv_id_missing(api):
+    """Junction exists with populated fmv, but bids.fmv_id is NULL."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000006", "max_bid": 50.0})
+    _link_comic(db_path, "300000006",
+                title="X-Men", issue="266", year=1990,
+                grade=9.6, fmv_low=40.0, fmv_high=60.0)
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET fmv_id = NULL WHERE item_id = ?", ("300000006",))
+    raw.commit()
+    raw.close()
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000006", "grade": 9.6}],
+    })
+    row = r.json()["results"][0]
+    assert row["verdict"] == "partial"
+    assert "bids.fmv_id" in row["missing"]
+
+
+def test_verify_partial_when_bids_fmv_id_mismatches(api):
+    """bids.fmv_id points at a different fmv than the one matched by grade."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000007", "max_bid": 50.0})
+    # Primary fmv at grade 8.0
+    _link_comic(db_path, "300000007",
+                title="ASM", issue="252", year=1984,
+                grade=8.0, fmv_low=100.0, fmv_high=150.0, is_primary=True)
+    # Second fmv at grade 9.2 — but not flagged as primary
+    _link_comic(db_path, "300000007",
+                title="ASM", issue="252", year=1984,
+                grade=9.2, fmv_low=400.0, fmv_high=500.0, is_primary=False)
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000007", "grade": 9.2}],
+    })
+    row = r.json()["results"][0]
+    assert row["verdict"] == "partial"
+    assert any("bids.fmv_id" in m for m in row["missing"])
+
+
+def test_verify_locg_id_mismatch_is_partial(api):
+    """locg_id passed differs from what's on the comic row — surfaces in `missing`."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000008", "max_bid": 50.0})
+    _link_comic(db_path, "300000008",
+                title="ASM", issue="300", year=1988,
+                grade=9.2, fmv_low=800.0, fmv_high=1000.0)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE comics SET locg_id = ? WHERE title = ? AND issue = ?",
+        (11111, "ASM", "300"),
+    )
+    raw.commit()
+    raw.close()
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000008", "grade": 9.2, "locg_id": 22222}],
+    })
+    row = r.json()["results"][0]
+    assert row["verdict"] == "partial"
+    assert any("locg_id" in m for m in row["missing"])
+
+
+def test_verify_summary_counts(api):
+    """Mixed batch: summary reports total/fully_linked/issues correctly."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000010", "max_bid": 50.0})
+    _link_comic(db_path, "300000010",
+                title="Good", issue="1", year=1990,
+                grade=9.0, fmv_low=10.0, fmv_high=20.0)
+    api.post("/api/bids", json={"item_id": "300000011", "max_bid": 50.0})
+    _link_comic(db_path, "300000011",
+                title="Stub", issue="1", year=1990,
+                grade=9.0, fmv_low=None, fmv_high=None)
+
+    r = api.post("/api/comics/verify", json={
+        "items": [
+            {"item_id": "300000010", "grade": 9.0},
+            {"item_id": "300000011", "grade": 9.0},
+            {"item_id": "999000000", "grade": 9.0},
+        ],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["summary"] == {"total": 3, "fully_linked": 1, "issues": 2}
+    verdicts = [r["verdict"] for r in body["results"]]
+    assert verdicts == ["fully_linked", "fmv_stub", "no_bid"]

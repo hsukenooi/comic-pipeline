@@ -143,6 +143,20 @@ Skip Buy It Now listings. Run sequentially (not in parallel) — Gixen session i
 
 ---
 
+## Step 6: Verify
+
+Read `~/Projects/comic-pipeline/skills/verify.md` and follow it.
+
+**Input:** Working list of `{item_id, grade, locg_id?}` for every comic that was sniped in Step 5. Skip Buy It Now listings (they have no bid to verify).
+
+**Output:** Verification table with a verdict per row.
+
+Warn-only — don't block. If `summary.issues > 0`, surface the table and the per-verdict guidance from `verify.md`. The pipeline is done; the goal is to tell the user *now* about gaps so they don't discover them when the auction ends and `/comic:collection-add` chokes (PER-70 cascade).
+
+Born from PER-99 — `/comic:buy` ran to apparent success in past incidents while leaving rows partially populated (missing comic row, FMV stub, `bids.fmv_id` null).
+
+---
+
 ## Subagent Strategy (30+ books)
 
 `gixen-cli fmv` already does async fan-out internally and serves cache hits without API calls, so the previous "split FMV across subagents at 30 books" rule mostly doesn't apply anymore — one CLI invocation handles 50+ books in a few seconds. Reach for subagents only when:
