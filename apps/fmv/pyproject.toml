@@ -21,6 +21,7 @@ include = [
     "src/fmv_math.py",
     "src/fmv_runner.py",
 ]
+sources = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
