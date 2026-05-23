@@ -10,3 +10,4 @@ build/
 .eggs/
 *.egg
 .mypy_cache/
+.firecrawl/
