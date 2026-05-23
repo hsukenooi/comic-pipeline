@@ -182,6 +182,7 @@ def test_sweep_orphan_yearless_comics_merges_allcaps_stubs(db):
 
     result = sweep_orphan_yearless_comics(db)
 
+    assert result["dry_run"] is False
     assert result["merged"] == 1
     assert result["details"][0]["yearless_id"] == stub_id
     assert result["details"][0]["yeared_id"] == yeared_id

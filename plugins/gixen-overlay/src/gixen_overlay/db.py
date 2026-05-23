@@ -541,11 +541,15 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_sweep_allcaps_orphans(conn: sqlite3.Connection) -> None:
-    """Run sweep_orphan_yearless_comics() exactly once to clean up ALL-CAPS
-    yearless stubs created before PER-123 added case-insensitive title matching.
+    """Merge ALL-CAPS yearless orphan comics into their yeared siblings exactly once.
 
+    Cleans up stubs created before PER-123 added case-insensitive title matching.
     Gate: migration_state row 'sweep_allcaps_orphans' present → already ran.
-    No crash guard needed — sweep_orphan_yearless_comics is atomic (single commit).
+
+    IMPORTANT: Uses raw conn.execute() only — no conn.commit(). Called from
+    create_tables() which runs inside the host's per-plugin SAVEPOINT; calling
+    conn.commit() here would destroy it (same constraint as _migrate_fmv_split
+    and _migrate_year_nullable).
     """
     row = conn.execute(
         "SELECT 1 FROM migration_state WHERE migration='sweep_allcaps_orphans'"
@@ -553,17 +557,35 @@ def _migrate_sweep_allcaps_orphans(conn: sqlite3.Connection) -> None:
     if row is not None:
         return
 
-    result = sweep_orphan_yearless_comics(conn)
-    if result["merged"] > 0:
+    orphans = conn.execute(
+        """
+        SELECT
+            c.id   AS yearless_id,
+            c.title,
+            c.issue,
+            (SELECT id FROM comics
+             WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
+             ORDER BY (locg_id IS NULL), id LIMIT 1) AS yeared_id
+        FROM comics c
+        WHERE c.year IS NULL
+          AND EXISTS (
+              SELECT 1 FROM comics
+              WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
+          )
+        """
+    ).fetchall()
+
+    for orphan in orphans:
+        _merge_yearless_into_yeared(conn, orphan["yearless_id"], orphan["yeared_id"])
+        conn.execute("DELETE FROM comics WHERE id=?", (orphan["yearless_id"],))
+
+    if orphans:
         logger.info(
             "_migrate_sweep_allcaps_orphans: merged %d orphan(s): %s",
-            result["merged"],
-            [(d["title"], d["issue"]) for d in result["details"]],
+            len(orphans),
+            [(r["title"], r["issue"]) for r in orphans],
         )
-    conn.execute(
-        "INSERT OR IGNORE INTO migration_state (migration) VALUES ('sweep_allcaps_orphans')"
-    )
-    conn.commit()
+    _set_migration_marker(conn, "sweep_allcaps_orphans")
 
 
 # ---------------------------------------------------------------------------
