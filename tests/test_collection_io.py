@@ -494,3 +494,284 @@ def test_import_bad_header_raises_before_merge(tmp_path):
 
     # Cache should be untouched — no file created
     assert not (tmp_path / "collection.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Unit 3: generate_csv
+# ---------------------------------------------------------------------------
+
+RECIPE_CSV = FIXTURES / "locg_import_test_recipe.csv"
+
+
+def _make_ready_row(
+    publisher: str = "Marvel Comics",
+    series: str = "The Amazing Spider-Man (Vol. 1) (1962 - 1998)",
+    full_title: str = "The Amazing Spider-Man #84",
+    release_date: str = "1970-05-01",
+    price_paid: Any = 27.86,
+    date_purchased: Any = "2026-05-22",
+) -> dict[str, Any]:
+    """Build a minimal agent_win row suitable for CSV export."""
+    return {
+        "publisher_name": publisher,
+        "series_name": series,
+        "full_title": full_title,
+        "release_date": release_date,
+        "in_collection": 1,
+        "in_wish_list": 0,
+        "marked_read": 0,
+        "my_rating": None,
+        "media_format": "Print",
+        "price_paid": price_paid,
+        "date_purchased": date_purchased,
+        "condition": None,
+        "notes": None,
+        "tags": None,
+        "storage_box": None,
+        "owner": None,
+        "purchase_store": "eBay",
+        "signature": 0,
+        "slabbing": 0,
+        "grading": None,
+        "grading_company": None,
+        "local_added_at": "2026-05-22T10:00:00.000000Z",
+        "local_added_seq": 1,
+        "pushed_to_locg_at": None,
+        "last_seen_in_export_at": None,
+        "source": "agent_win",
+        "needs_manual_variant": False,
+        "needs_manual_series_canonical": False,
+        "metron_id": None,
+        "gixen_item_id": "12345",
+        "previous_full_title": None,
+    }
+
+
+def test_generate_csv_row_count(tmp_path):
+    """10 ready rows produce a 10-row CSV (plus header)."""
+    import csv
+    from locg.collection_io import generate_csv
+    rows = [_make_ready_row(full_title=f"ASM #{i}") for i in range(10)]
+    out = tmp_path / "out.csv"
+    generate_csv(rows, out)
+    with open(out, newline="") as f:
+        reader = list(csv.reader(f))
+    assert len(reader) == 11  # 1 header + 10 data rows
+
+
+def test_generate_csv_header_order(tmp_path):
+    """CSV header matches the canonical 21-column LOCG order."""
+    import csv
+    from locg.collection_io import LOCG_XLSX_HEADERS, generate_csv
+    generate_csv([_make_ready_row()], tmp_path / "out.csv")
+    with open(tmp_path / "out.csv", newline="") as f:
+        header = next(csv.reader(f))
+    assert tuple(header) == LOCG_XLSX_HEADERS
+
+
+def test_generate_csv_my_rating_blank_in_body(tmp_path):
+    """My Rating column is present in header AND body as an empty string (R27)."""
+    from locg.collection_io import generate_csv
+    generate_csv([_make_ready_row()], tmp_path / "out.csv")
+    raw = (tmp_path / "out.csv").read_text()
+    lines = raw.splitlines()
+    # Header must contain My Rating
+    assert "My Rating" in lines[0]
+    # Body row: the My Rating field position must be empty
+    import csv, io
+    reader = list(csv.reader(io.StringIO(raw)))
+    header = reader[0]
+    my_rating_idx = header.index("My Rating")
+    body_row = reader[1]
+    assert body_row[my_rating_idx] == ""
+
+
+def test_generate_csv_empty_queue_header_only(tmp_path):
+    """Zero ready rows produces a CSV with only the header line."""
+    import csv
+    from locg.collection_io import generate_csv
+    generate_csv([], tmp_path / "out.csv")
+    with open(tmp_path / "out.csv", newline="") as f:
+        rows = list(csv.reader(f))
+    assert len(rows) == 1  # header only
+
+
+def test_generate_csv_price_format(tmp_path):
+    """Price Paid is formatted as NN.NN with no currency suffix."""
+    import csv
+    from locg.collection_io import generate_csv
+    generate_csv([_make_ready_row(price_paid=27.8600001)], tmp_path / "out.csv")
+    with open(tmp_path / "out.csv", newline="") as f:
+        rows = list(csv.reader(f))
+    header = rows[0]
+    price_idx = header.index("Price Paid")
+    assert rows[1][price_idx] == "27.86"
+
+
+def test_generate_csv_negative_price_defaults_to_zero(tmp_path):
+    """Negative price_paid defaults to 0.00 (R29)."""
+    import csv
+    from locg.collection_io import generate_csv
+    generate_csv([_make_ready_row(price_paid=-5.0)], tmp_path / "out.csv")
+    with open(tmp_path / "out.csv", newline="") as f:
+        rows = list(csv.reader(f))
+    price_idx = rows[0].index("Price Paid")
+    assert rows[1][price_idx] == "0.00"
+
+
+def test_generate_csv_missing_price_defaults_to_zero(tmp_path):
+    """None price_paid defaults to 0.00."""
+    import csv
+    from locg.collection_io import generate_csv
+    generate_csv([_make_ready_row(price_paid=None)], tmp_path / "out.csv")
+    with open(tmp_path / "out.csv", newline="") as f:
+        rows = list(csv.reader(f))
+    price_idx = rows[0].index("Price Paid")
+    assert rows[1][price_idx] == "0.00"
+
+
+def test_generate_csv_date_iso_format(tmp_path):
+    """Date Purchased is output as ISO date (YYYY-MM-DD) (R30)."""
+    import csv
+    from locg.collection_io import generate_csv
+    generate_csv([_make_ready_row(date_purchased="2026-05-22")], tmp_path / "out.csv")
+    with open(tmp_path / "out.csv", newline="") as f:
+        rows = list(csv.reader(f))
+    date_idx = rows[0].index("Date Purchased")
+    assert rows[1][date_idx] == "2026-05-22"
+
+
+def test_generate_csv_fixed_fields(tmp_path):
+    """In Collection=1, In Wish List=0, Marked Read=0, Media Format=Print, Purchase Store=eBay."""
+    import csv
+    from locg.collection_io import generate_csv
+    generate_csv([_make_ready_row()], tmp_path / "out.csv")
+    with open(tmp_path / "out.csv", newline="") as f:
+        rows = list(csv.reader(f))
+    h, d = rows[0], rows[1]
+    assert d[h.index("In Collection")] == "1"
+    assert d[h.index("In Wish List")] == "0"
+    assert d[h.index("Marked Read")] == "0"
+    assert d[h.index("Media Format")] == "Print"
+    assert d[h.index("Purchase Store")] == "eBay"
+    assert d[h.index("Signature")] == "0"
+    assert d[h.index("Slabbing")] == "0"
+
+
+def test_generate_csv_bitforbit_recipe(tmp_path):
+    """CSV output for the validated golden fixture rows matches the recipe bit-for-bit."""
+    import csv as _csv
+    from locg.collection_io import generate_csv
+
+    # Build the same rows as in locg_import_test_recipe.csv
+    with open(RECIPE_CSV, newline="") as f:
+        reader = _csv.DictReader(f)
+        recipe_rows = list(reader)
+
+    # Reconstruct cache rows from the recipe CSV
+    cache_rows = []
+    for r in recipe_rows:
+        cache_rows.append({
+            "publisher_name": r["Publisher Name"],
+            "series_name": r["Series Name"],
+            "full_title": r["Full Title"],
+            "release_date": r["Release Date"],
+            "price_paid": float(r["Price Paid"]) if r["Price Paid"] else None,
+            "date_purchased": r["Date Purchased"] or None,
+            "needs_manual_variant": False,
+            "needs_manual_series_canonical": False,
+            # All other fields not needed for CSV output
+        })
+
+    out = tmp_path / "test_out.csv"
+    generate_csv(cache_rows, out)
+
+    generated = out.read_text()
+    expected = RECIPE_CSV.read_text()
+    assert generated == expected
+
+
+# ---------------------------------------------------------------------------
+# Unit 3: generate_notes_md
+# ---------------------------------------------------------------------------
+
+def test_notes_md_ready_count(tmp_path):
+    """notes.md correctly counts ready rows."""
+    from locg.collection_io import generate_notes_md
+    ready = [_make_ready_row() for _ in range(5)]
+    out = tmp_path / "out.notes.md"
+    generate_notes_md(ready, [], [], out)
+    text = out.read_text()
+    assert "Ready to upload (5 rows)" in text
+
+
+def test_notes_md_empty_queue(tmp_path):
+    """Zero pending rows produces notes.md noting empty queue."""
+    from locg.collection_io import generate_notes_md
+    out = tmp_path / "out.notes.md"
+    generate_notes_md([], [], [], out)
+    text = out.read_text()
+    assert "Ready to upload (0 rows)" in text
+
+
+def test_notes_md_manual_variant_section(tmp_path):
+    """Variant rows appear in the variants section, not ready section."""
+    from locg.collection_io import generate_notes_md
+    variant_row = _make_ready_row(full_title="ASM #300 Newsstand")
+    variant_row["needs_manual_variant"] = True
+    out = tmp_path / "out.notes.md"
+    generate_notes_md([], [variant_row], [], out)
+    text = out.read_text()
+    assert "Needs manual handling — variants (1 rows)" in text
+    assert "ASM #300 Newsstand" in text
+
+
+def test_notes_md_manual_series_section(tmp_path):
+    """Series-canonical rows appear in the series canonical section."""
+    from locg.collection_io import generate_notes_md
+    series_row = _make_ready_row(series="Unknown Series")
+    series_row["needs_manual_series_canonical"] = True
+    out = tmp_path / "out.notes.md"
+    generate_notes_md([], [], [series_row], out)
+    text = out.read_text()
+    assert "Needs manual handling — series canonical (1 rows)" in text
+    assert "Unknown Series" in text
+
+
+# ---------------------------------------------------------------------------
+# Unit 3: _pending_push_rows
+# ---------------------------------------------------------------------------
+
+def test_pending_push_rows_partitions(tmp_path):
+    """_pending_push_rows correctly partitions ready / manual_variant / manual_series."""
+    from locg.collection_io import _pending_push_rows
+
+    r = _make_ready_row()
+    v = _make_ready_row(full_title="ASM #300 Newsstand")
+    v["needs_manual_variant"] = True
+    s = _make_ready_row(series="Unknown")
+    s["needs_manual_series_canonical"] = True
+    already_pushed = _make_ready_row(full_title="Pushed #1")
+    already_pushed["pushed_to_locg_at"] = "2030-01-01T00:00:00Z"  # future; not pending
+    already_pushed["local_added_at"] = "2026-01-01T00:00:00Z"
+
+    payload = {"comics": [r, v, s, already_pushed]}
+    ready, mv, ms = _pending_push_rows(payload)
+    assert len(ready) == 1
+    assert len(mv) == 1
+    assert len(ms) == 1
+    assert ready[0]["full_title"] == _make_ready_row()["full_title"]
+
+
+def test_pending_push_already_pushed_excluded(tmp_path):
+    """Rows where local_added_at <= pushed_to_locg_at are not pending."""
+    from locg.collection_io import _pending_push_rows
+
+    row = _make_ready_row()
+    row["pushed_to_locg_at"] = "2030-01-01T00:00:00Z"  # pushed far in the future
+    row["local_added_at"] = "2026-01-01T00:00:00Z"  # added before push timestamp
+
+    ready, mv, ms = _pending_push_rows({"comics": [row]})
+    assert len(ready) == 0
+    assert len(mv) == 0
+    assert len(ms) == 0

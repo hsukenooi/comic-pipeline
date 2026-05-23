@@ -21,7 +21,12 @@ from locg.commands import (
     cmd_cache_stats,
     cmd_check_lists,
     cmd_collection,
+    cmd_collection_check,
+    cmd_collection_doctor,
+    cmd_collection_export,
     cmd_collection_has,
+    cmd_collection_import,
+    cmd_collection_status,
     cmd_comic,
     cmd_find,
     cmd_login,
@@ -115,12 +120,35 @@ def create_parser() -> argparse.ArgumentParser:
         help="Only return titles ending in #<issue> with no variant suffix",
     )
 
-    # collection (with 'has' subcommand)
-    p = sub.add_parser("collection", parents=[common], help="View your collection (requires login)")
-    p.add_argument("--title", help="Filter results by title (case-insensitive substring match)")
+    # collection — LOCG view (default) + cache-based subcommands
+    p = sub.add_parser("collection", parents=[common], help="View your collection or manage the local cache")
+    p.add_argument("--title", help="Filter results by title (case-insensitive substring match, LOCG fetch only)")
     coll_sub = p.add_subparsers(dest="collection_command")
-    p_has = coll_sub.add_parser("has", parents=[common], help="Check if a title is in your collection (fast, avoids full fetch)")
+
+    # collection has — live LOCG check
+    p_has = coll_sub.add_parser("has", parents=[common], help="Check if a title is in your collection via LOCG (requires login)")
     p_has.add_argument("title_query", help="Title to search for (case-insensitive substring match)")
+
+    # collection import — local cache
+    p_import = coll_sub.add_parser("import", parents=[common], help="Import a LOCG Excel export into the local collection cache")
+    p_import.add_argument("path", help="Path to a LOCG Excel export (.xlsx)")
+
+    # collection export — local cache
+    p_export = coll_sub.add_parser("export", parents=[common], help="Export pending-push rows to a LOCG-compatible CSV")
+    p_export.add_argument("--out", dest="out_path", help="Output CSV path (default: ~/Downloads/locg-bulk-import-<timestamp>.csv)")
+
+    # collection status — local cache (--verbose inherited from common parent)
+    coll_sub.add_parser("status", parents=[common], help="Show local collection cache status (use --verbose for extended metrics)")
+
+    # collection check — local cache
+    p_check = coll_sub.add_parser("check", parents=[common], help="Check if a specific comic is in the local collection cache")
+    p_check.add_argument("--series", required=True, help="Series name (normalized match)")
+    p_check.add_argument("--issue", required=True, help="Issue number (e.g. 300)")
+    p_check.add_argument("--variant", help="Optional variant text to match in title")
+    p_check.add_argument("--year", help="Optional publication year filter (e.g. 1988)")
+
+    # collection doctor — local cache
+    coll_sub.add_parser("doctor", parents=[common], help="Print first-run setup walkthrough and cache status")
 
     # pull-list
     p = sub.add_parser("pull-list", parents=[common], help="View your pull list (requires login)")
@@ -260,10 +288,24 @@ def main() -> None:
     )
 
     logger = logging.getLogger("locg")
+
+    # Collection cache subcommands are purely local — skip Playwright browser launch.
+    _LOCAL_COLLECTION_SUBCMDS = {"import", "export", "status", "check", "doctor"}
+    _collection_sub = (
+        getattr(args, "collection_command", None)
+        if args.command == "collection"
+        else None
+    )
+    _needs_client = not (
+        args.command == "cache"
+        or (_collection_sub in _LOCAL_COLLECTION_SUBCMDS)
+    )
+
     client: Optional[LOCGClient] = None
 
     try:
-        client = LOCGClient()
+        if _needs_client:
+            client = LOCGClient()
         result: Any = None
         logger.info(f"Running command: {args.command}")
 
@@ -284,8 +326,24 @@ def main() -> None:
                 exact=getattr(args, "exact", False),
             )
         elif args.command == "collection":
-            if getattr(args, "collection_command", None) == "has":
+            sub_cmd = getattr(args, "collection_command", None)
+            if sub_cmd == "has":
                 result = cmd_collection_has(client, args.title_query)
+            elif sub_cmd == "import":
+                result = cmd_collection_import(args.path)
+            elif sub_cmd == "export":
+                result = cmd_collection_export(getattr(args, "out_path", None))
+            elif sub_cmd == "status":
+                result = cmd_collection_status(verbose=args.verbose)
+            elif sub_cmd == "check":
+                result = cmd_collection_check(
+                    series=args.series,
+                    issue=args.issue,
+                    variant=getattr(args, "variant", None),
+                    year=getattr(args, "year", None),
+                )
+            elif sub_cmd == "doctor":
+                result = cmd_collection_doctor()
             else:
                 result = cmd_collection(client, title=args.title)
         elif args.command == "pull-list":

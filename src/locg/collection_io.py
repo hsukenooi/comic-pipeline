@@ -485,3 +485,169 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
 
     cache.apply(do_merge, command="import")
     return summary
+
+
+# ---------------------------------------------------------------------------
+# CSV export (Unit 3)
+# ---------------------------------------------------------------------------
+
+def _pending_push_rows(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition pending-push rows into (ready, manual_variant, manual_series_canonical).
+
+    Pending: pushed_to_locg_at IS NULL OR local_added_at > pushed_to_locg_at.
+    Ready: pending AND not flagged.
+    Manual: pending AND flagged (excluded from CSV).
+    """
+    ready: list[dict[str, Any]] = []
+    manual_variant: list[dict[str, Any]] = []
+    manual_series: list[dict[str, Any]] = []
+
+    for row in payload.get("comics", []):
+        pushed = row.get("pushed_to_locg_at")
+        added = row.get("local_added_at") or ""
+        is_pending = pushed is None or (added and added > pushed)
+        if not is_pending:
+            continue
+
+        if row.get("needs_manual_variant"):
+            manual_variant.append(row)
+        elif row.get("needs_manual_series_canonical"):
+            manual_series.append(row)
+        else:
+            ready.append(row)
+
+    return ready, manual_variant, manual_series
+
+
+def _format_price(value: Any) -> str:
+    """Format a price as 'NN.NN'. Returns '0.00' for missing/invalid/negative."""
+    try:
+        f = float(value)
+        return "0.00" if f < 0 else f"{f:.2f}"
+    except (TypeError, ValueError):
+        return "0.00"
+
+
+def _format_date(value: Any) -> str:
+    """Return value as an ISO date string (first 10 chars). Falls back to today."""
+    from datetime import date
+    if value is None:
+        return date.today().isoformat()
+    s = str(value)
+    return s[:10] if len(s) >= 10 else date.today().isoformat()
+
+
+def _row_to_csv_dict(row: dict[str, Any]) -> dict[str, str | int]:
+    """Map a cache row to the 21-column LOCG CSV recipe (R21–R31)."""
+    return {
+        "Publisher Name": row.get("publisher_name") or "",
+        "Series Name": row.get("series_name") or "",
+        "Full Title": row.get("full_title") or "",
+        "Release Date": row.get("release_date") or "",
+        "In Collection": 1,
+        "In Wish List": 0,
+        "Marked Read": 0,
+        "My Rating": "",  # Present-but-blank (R27 — critical; controls Marked Read default)
+        "Media Format": "Print",
+        "Price Paid": _format_price(row.get("price_paid")),
+        "Date Purchased": _format_date(row.get("date_purchased")),
+        "Condition": "",
+        "Notes": "",
+        "Tags": "",
+        "Storage Box": "",
+        "Owner": "",
+        "Purchase Store": "eBay",
+        "Signature": 0,
+        "Slabbing": 0,
+        "Grading": "",
+        "Grading Company": "",
+    }
+
+
+def generate_csv(ready_rows: list[dict[str, Any]], out_path: Path) -> None:
+    """Write ready-to-upload rows to a LOCG-compatible 21-column CSV.
+
+    Uses csv.QUOTE_MINIMAL. My Rating column always present with blank body (R27).
+    """
+    import csv as _csv
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    headers = list(LOCG_XLSX_HEADERS)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = _csv.DictWriter(f, fieldnames=headers, quoting=_csv.QUOTE_MINIMAL)
+        writer.writeheader()
+        for row in ready_rows:
+            writer.writerow(_row_to_csv_dict(row))
+
+
+def generate_notes_md(
+    ready_rows: list[dict[str, Any]],
+    manual_variant_rows: list[dict[str, Any]],
+    manual_series_rows: list[dict[str, Any]],
+    out_path: Path,
+) -> None:
+    """Write the .notes.md companion report (R18).
+
+    Three sections: Ready to upload, Needs manual handling — variants,
+    Needs manual handling — series canonical.
+    """
+    def _manual_table(rows: list[dict[str, Any]]) -> list[str]:
+        lines = [
+            "| Series | Full Title | eBay Item ID | Price |",
+            "|--------|------------|--------------|-------|",
+        ]
+        for row in rows:
+            series = (row.get("series_name") or "").replace("|", "\\|")
+            title = (row.get("full_title") or "").replace("|", "\\|")
+            item_id = row.get("gixen_item_id") or ""
+            price = _format_price(row.get("price_paid"))
+            lines.append(f"| {series} | {title} | {item_id} | ${price} |")
+        return lines
+
+    sections: list[str] = [
+        "# locg collection export — manual handling notes",
+        "",
+        f"## Ready to upload ({len(ready_rows)} rows)",
+        "",
+        "These rows are included in the CSV and ready to upload via LOCG Bulk Import."
+        if ready_rows else "No rows ready to upload.",
+        "",
+    ]
+
+    if manual_variant_rows:
+        sections += [
+            f"## Needs manual handling — variants ({len(manual_variant_rows)} rows)",
+            "",
+            "These rows have unresolved variant text and were excluded from the CSV.",
+            "Add them manually via the LOCG web UI.",
+            "",
+        ] + _manual_table(manual_variant_rows) + [""]
+    else:
+        sections += [
+            "## Needs manual handling — variants (0 rows)",
+            "",
+            "No rows with unresolved variant text.",
+            "",
+        ]
+
+    if manual_series_rows:
+        sections += [
+            f"## Needs manual handling — series canonical ({len(manual_series_rows)} rows)",
+            "",
+            "These rows have unresolved canonical series names and were excluded from the CSV.",
+            "Add them manually via the LOCG web UI.",
+            "",
+        ] + _manual_table(manual_series_rows) + [""]
+    else:
+        sections += [
+            "## Needs manual handling — series canonical (0 rows)",
+            "",
+            "No rows with unresolved series names.",
+            "",
+        ]
+
+    Path(out_path).write_text("\n".join(sections), encoding="utf-8")

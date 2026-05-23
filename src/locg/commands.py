@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 
 from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
+from locg.collection_cache import CollectionCache, _normalize_series_key
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
 
@@ -1176,3 +1177,298 @@ def cmd_cache_clear(_client: Optional[LOCGClient] = None) -> dict[str, Any]:
     """Delete every entry from the on-disk ID cache. Returns count removed."""
     removed = IDCache().clear()
     return {"cleared": removed}
+
+
+# ---------------------------------------------------------------------------
+# Collection cache commands (Unit 4)
+# ---------------------------------------------------------------------------
+
+def cmd_collection_import(path_str: str) -> dict[str, Any]:
+    """Import a LOCG Excel export into the local collection cache."""
+    from pathlib import Path as _Path
+    from locg.collection_io import import_xlsx
+
+    path = _Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    cache = CollectionCache()
+    # Pre-flight load triggers crash detection (migration_in_progress guard)
+    # before we start parsing the xlsx. Raises RuntimeError on corrupt state.
+    cache.load()
+    return import_xlsx(path, cache)
+
+
+def _cache_age_days(last_full_import: Optional[str]) -> Optional[int]:
+    """Return days since last_full_import, or None if never imported."""
+    if not last_full_import:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(last_full_import.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).days
+    except ValueError:
+        return None
+
+
+def _oldest_pending_days(rows: list[dict[str, Any]]) -> Optional[int]:
+    """Return age in days of the oldest pending row, or None if no pending rows."""
+    if not rows:
+        return None
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    oldest = None
+    for row in rows:
+        added = row.get("local_added_at") or ""
+        if added:
+            try:
+                dt = datetime.fromisoformat(added.replace("Z", "+00:00"))
+                if oldest is None or dt < oldest:
+                    oldest = dt
+            except ValueError:
+                pass
+    return (now - oldest).days if oldest is not None else None
+
+
+def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
+    """Export pending-push rows to a LOCG-compatible CSV + .notes.md companion.
+
+    Returns {csv_path, notes_md_path, ready_count, manual_variant_count,
+    manual_series_count, oldest_pending_days}.
+    """
+    from datetime import datetime
+    from pathlib import Path as _Path
+    from locg.collection_io import _pending_push_rows, generate_csv, generate_notes_md
+
+    cache = CollectionCache()
+    payload = cache.load()
+    ready, manual_variant, manual_series = _pending_push_rows(payload)
+
+    if out_path is None:
+        ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        dest = _Path.home() / "Downloads" / f"locg-bulk-import-{ts}.csv"
+    else:
+        dest = _Path(out_path)
+
+    notes_dest = dest.with_suffix(".notes.md")
+
+    generate_csv(ready, dest)
+    generate_notes_md(ready, manual_variant, manual_series, notes_dest)
+
+    all_pending = ready + manual_variant + manual_series
+    return {
+        "csv_path": str(dest),
+        "notes_md_path": str(notes_dest),
+        "ready_count": len(ready),
+        "manual_variant_count": len(manual_variant),
+        "manual_series_count": len(manual_series),
+        "oldest_pending_days": _oldest_pending_days(all_pending),
+    }
+
+
+def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
+    """Return cache status metrics.
+
+    With verbose=True also returns agent_win/locg_export counts, median win age,
+    reconciliation success rate, and behavioral drift event count.
+    """
+    from locg import __version__
+    from locg.collection_io import _pending_push_rows
+
+    cache = CollectionCache()
+    payload = cache.load()
+
+    comics = payload.get("comics", [])
+    ready, manual_variant, manual_series = _pending_push_rows(payload)
+    all_pending = ready + manual_variant + manual_series
+
+    last_full_import = payload.get("last_full_import")
+
+    result: dict[str, Any] = {
+        "last_full_import": last_full_import,
+        "last_import_source": payload.get("last_import_source"),
+        "row_count": len(comics),
+        "cache_age_days": _cache_age_days(last_full_import),
+        "pending_push_count": len(all_pending),
+        "oldest_pending_days": _oldest_pending_days(all_pending),
+        "locg_cli_version": __version__,
+        "schema_version": payload.get("schema_version"),
+    }
+
+    if not verbose:
+        return result
+
+    # Verbose metrics (F9 observability)
+    from datetime import datetime, timezone
+
+    agent_wins = [r for r in comics if r.get("source") == "agent_win"]
+    locg_exports = [r for r in comics if r.get("source") == "locg_export"]
+
+    median_win_age: Optional[int] = None
+    if agent_wins:
+        now = datetime.now(timezone.utc)
+        ages = []
+        for row in agent_wins:
+            added = row.get("local_added_at") or ""
+            if added:
+                try:
+                    dt = datetime.fromisoformat(added.replace("Z", "+00:00"))
+                    ages.append((now - dt).days)
+                except ValueError:
+                    pass
+        if ages:
+            ages.sort()
+            mid = len(ages) // 2
+            median_win_age = ages[mid] if len(ages) % 2 else (ages[mid - 1] + ages[mid]) // 2
+
+    recon_success_rate: Optional[float] = None
+    drift_events: Optional[int] = None
+    if cache.audit_path.exists():
+        try:
+            lines = cache.audit_path.read_text().strip().splitlines()
+            types = []
+            for line in lines:
+                try:
+                    types.append(json.loads(line).get("type", ""))
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+            recon = sum(1 for t in types if t == "reconciliation")
+            ambiguous = sum(1 for t in types if t == "ambiguous_reconciliation")
+            total = recon + ambiguous
+            if total > 0:
+                recon_success_rate = round(recon / total, 2)
+            drift_events = sum(1 for t in types if t == "behavioral_drift")
+        except OSError:
+            pass
+
+    result.update({
+        "agent_win_count": len(agent_wins),
+        "locg_export_count": len(locg_exports),
+        "needs_manual_variant_count": len(manual_variant),
+        "needs_manual_series_canonical_count": len(manual_series),
+        "median_agent_win_age_days": median_win_age,
+        "reconciliation_success_rate_last_5_imports": recon_success_rate,
+        "behavioral_drift_events_last_5_imports": drift_events,
+    })
+    return result
+
+
+def cmd_collection_check(
+    series: str,
+    issue: str,
+    variant: Optional[str] = None,
+    year: Optional[str] = None,
+) -> dict[str, Any]:
+    """Check whether a comic is in the local collection cache.
+
+    Returns {match_status, full_title_matched, cache_age_days}.
+    match_status: "in_collection" | "not_in_cache".
+    """
+    import re
+
+    cache = CollectionCache()
+    payload = cache.load()
+    cache_age = _cache_age_days(payload.get("last_full_import"))
+
+    series_key = _normalize_series_key(series)
+    # Strip leading zeros for the issue token comparison
+    issue_stripped = str(issue).strip().lstrip("0") or str(issue).strip()
+
+    for row in payload.get("comics", []):
+        row_series_key = _normalize_series_key(row.get("series_name") or "")
+        if row_series_key != series_key:
+            continue
+
+        full_title = row.get("full_title") or ""
+
+        # Match #<number> token (ignoring leading zeros)
+        m = re.search(r"#\s*(\d+[A-Za-z]?)\b", full_title)
+        if m:
+            title_issue = m.group(1).lstrip("0") or m.group(1)
+            if title_issue.lower() != issue_stripped.lower():
+                # Also try the raw issue string (e.g. "Annual 1")
+                if issue.strip().lower() not in full_title.lower():
+                    continue
+        else:
+            # No '#N' token — try substring match (TPBs, annuals, specials)
+            if issue.strip().lower() not in full_title.lower():
+                continue
+
+        if variant and variant.lower() not in full_title.lower():
+            continue
+
+        if year and not (row.get("release_date") or "").startswith(str(year)):
+            continue
+
+        return {
+            "match_status": "in_collection",
+            "full_title_matched": full_title,
+            "cache_age_days": cache_age,
+        }
+
+    return {
+        "match_status": "not_in_cache",
+        "full_title_matched": None,
+        "cache_age_days": cache_age,
+    }
+
+
+def cmd_collection_doctor() -> dict[str, Any]:
+    """Return first-run walkthrough and current cache status.
+
+    Runs the same checks as status and explains the next remediation (F2).
+    """
+    status = cmd_collection_status(verbose=False)
+
+    steps = [
+        {
+            "step": 1,
+            "title": "Export your collection from LOCG",
+            "instruction": (
+                "Go to https://leagueofcomicgeeks.com/profile (logged in) "
+                "and click 'Export My Comics'. An Excel file will download to ~/Downloads."
+            ),
+        },
+        {
+            "step": 2,
+            "title": "Import the Excel file",
+            "instruction": (
+                "Run: locg collection import ~/Downloads/<ComicGeeks-YYYY-MM-DD-HH-MM-SS>.xlsx"
+            ),
+        },
+        {
+            "step": 3,
+            "title": "Verify the import",
+            "instruction": "Run: locg collection status --pretty",
+        },
+        {
+            "step": 4,
+            "title": "(Optional) Set up Metron credentials for series name resolution",
+            "instruction": (
+                "Add METRON_USERNAME and METRON_PASSWORD to ~/.config/locg/.env "
+                "to enable automatic canonical series name lookup via Metron API."
+            ),
+        },
+    ]
+
+    if status["last_full_import"] is None:
+        next_action = (
+            "Cache is empty. Start with Step 1: export your collection from LOCG."
+        )
+        ready = False
+    elif (status["cache_age_days"] or 0) > 14:
+        next_action = (
+            f"Cache is {status['cache_age_days']} days old — consider re-exporting "
+            "from LOCG and re-importing."
+        )
+        ready = True
+    else:
+        next_action = "Cache is up to date."
+        ready = True
+
+    return {
+        "status": status,
+        "ready": ready,
+        "next_action": next_action,
+        "setup_steps": steps,
+    }
