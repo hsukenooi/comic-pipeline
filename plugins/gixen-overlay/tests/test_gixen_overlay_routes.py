@@ -343,6 +343,102 @@ def test_extract_comics_idempotent(api):
     assert r2.json()["linked"] == 0
 
 
+def test_extract_comics_caps_title_reuses_existing_valued_fmv(api):
+    """ALL-CAPS eBay title must reuse existing valued FMV row, not create a stub."""
+    # Pre-populate a properly-cased comic + valued FMV via POST /api/comics
+    r = api.post("/api/comics", json={
+        "title": "Batman", "issue": "375", "year": 1984,
+        "grade": 8.0, "fmv_low": 50.0, "fmv_high": 70.0, "fmv_confidence": "high",
+    })
+    assert r.status_code == 200
+
+    # Add a bid with an ALL-CAPS eBay title for the same comic
+    api.post("/api/bids", json={"item_id": "999000120", "max_bid": 60.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("BATMAN #375 1984 VF", "999000120"))
+    raw.commit()
+    raw.close()
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linked"] == 1
+
+    # Only one comic row must exist — no stub duplicate
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    comics = raw.execute("SELECT id FROM comics WHERE issue='375'").fetchall()
+    assert len(comics) == 1
+
+    # The bid_fmvs junction must point at the valued FMV, not a stub
+    fmvs = raw.execute(
+        "SELECT f.low FROM bid_fmvs bf JOIN fmv f ON f.id=bf.fmv_id "
+        "JOIN bids b ON b.id=bf.bid_id WHERE b.item_id='999000120'"
+    ).fetchall()
+    raw.close()
+    assert len(fmvs) == 1
+    assert fmvs[0]["low"] == 50.0
+
+
+def test_extract_comics_no_grade_links_to_existing_valued_fmv(api):
+    """Grade-null bid links to any existing valued FMV for the comic."""
+    api.post("/api/comics", json={
+        "title": "Batman", "issue": "375", "year": 1984,
+        "grade": 8.0, "fmv_low": 50.0, "fmv_high": 70.0, "fmv_confidence": "high",
+    })
+    api.post("/api/bids", json={"item_id": "999000121", "max_bid": 60.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Batman #375 1984", "999000121"))
+    raw.commit()
+    raw.close()
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linked"] == 1
+    assert body["skipped"] == []
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    fmvs = raw.execute(
+        "SELECT f.low FROM bid_fmvs bf JOIN fmv f ON f.id=bf.fmv_id "
+        "JOIN bids b ON b.id=bf.bid_id WHERE b.item_id='999000121'"
+    ).fetchall()
+    raw.close()
+    assert len(fmvs) == 1
+    assert fmvs[0]["low"] == 50.0
+
+
+def test_extract_comics_no_grade_no_fmv_goes_to_skipped(api):
+    """Grade-null bid with no existing FMV is skipped, not falsely reported as linked."""
+    api.post("/api/bids", json={"item_id": "999000122", "max_bid": 60.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Batman #375 1984", "999000122"))
+    raw.commit()
+    raw.close()
+
+    r = api.post("/api/extract-comics")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linked"] == 0
+    assert any(s["item_id"] == "999000122" for s in body["skipped"])
+
+    # Confirm no bid_fmvs junction was written
+    raw = sqlite3.connect(db_path)
+    count = raw.execute(
+        "SELECT COUNT(*) FROM bid_fmvs bf JOIN bids b ON b.id=bf.bid_id "
+        "WHERE b.item_id='999000122'"
+    ).fetchone()[0]
+    raw.close()
+    assert count == 0
+
+
 # ---------------------------------------------------------------------------
 # POST /api/bids/{item_id}/comics/locg
 # ---------------------------------------------------------------------------

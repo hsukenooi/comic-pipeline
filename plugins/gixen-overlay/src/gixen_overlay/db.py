@@ -570,7 +570,7 @@ def upsert_comic(
     if year is not None:
         # Yeared insert.
         existing_yeared = conn.execute(
-            "SELECT id FROM comics WHERE title=? AND issue=? AND year=?",
+            "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year=?",
             (title, issue, year),
         ).fetchone()
         if existing_yeared is not None:
@@ -583,7 +583,7 @@ def upsert_comic(
             return existing_yeared["id"]
         # Look for a yearless placeholder to promote.
         existing_yearless = conn.execute(
-            "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NULL",
+            "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL",
             (title, issue),
         ).fetchone()
         if existing_yearless is not None:
@@ -591,7 +591,7 @@ def upsert_comic(
             # exists, promoting would create two yeared siblings. Skip and warn.
             conflicting_yeared = conn.execute(
                 "SELECT id FROM comics "
-                "WHERE title=? AND issue=? AND year IS NOT NULL AND year!=?",
+                "WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NOT NULL AND year!=?",
                 (title, issue, year),
             ).fetchone()
             if conflicting_yeared is not None:
@@ -624,7 +624,7 @@ def upsert_comic(
     # Yearless insert. Prefer an existing yeared row if one exists — never
     # create a yearless duplicate next to a yeared canonical row.
     canonical_yeared = conn.execute(
-        "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NOT NULL "
+        "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NOT NULL "
         "ORDER BY (locg_id IS NULL), id LIMIT 1",
         (title, issue),
     ).fetchone()
@@ -632,7 +632,7 @@ def upsert_comic(
         # PER-103: clean up any pre-existing yearless orphan alongside the
         # canonical yeared row before returning.
         orphan = conn.execute(
-            "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NULL",
+            "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL",
             (title, issue),
         ).fetchone()
         if orphan is not None:
@@ -646,7 +646,7 @@ def upsert_comic(
         conn.commit()
         return canonical_yeared["id"]
     existing_yearless = conn.execute(
-        "SELECT id FROM comics WHERE title=? AND issue=? AND year IS NULL",
+        "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL",
         (title, issue),
     ).fetchone()
     if existing_yearless is not None:
@@ -755,13 +755,13 @@ def sweep_orphan_yearless_comics(
             c.title,
             c.issue,
             (SELECT id FROM comics
-             WHERE title=c.title AND issue=c.issue AND year IS NOT NULL
+             WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
              ORDER BY (locg_id IS NULL), id LIMIT 1) AS yeared_id
         FROM comics c
         WHERE c.year IS NULL
           AND EXISTS (
               SELECT 1 FROM comics
-              WHERE title=c.title AND issue=c.issue AND year IS NOT NULL
+              WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
           )
         """
     ).fetchall()

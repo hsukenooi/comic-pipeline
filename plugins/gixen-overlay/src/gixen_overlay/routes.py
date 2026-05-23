@@ -579,6 +579,7 @@ async def api_extract_comics(request: Request):
                 year = primary_resolution.year
 
         try:
+            wrote_junction = False
             for idx, issue in enumerate(issues):
                 comic_id = upsert_comic(
                     db,
@@ -605,8 +606,20 @@ async def api_extract_comics(request: Request):
                             notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
                         )
                     link_fmv_to_bid(db, row["id"], fmv_id, is_primary=(idx == 0))
-                # Bids with no parseable grade cannot get an fmv link (fmv.grade NOT NULL)
-            linked += 1
+                    wrote_junction = True
+                else:
+                    # No parseable grade — link to any existing valued FMV for this comic.
+                    any_valued = db.execute(
+                        "SELECT f.id FROM fmv f WHERE f.comic_id=? AND f.low IS NOT NULL LIMIT 1",
+                        (comic_id,),
+                    ).fetchone()
+                    if any_valued:
+                        link_fmv_to_bid(db, row["id"], any_valued["id"], is_primary=(idx == 0))
+                        wrote_junction = True
+            if wrote_junction:
+                linked += 1
+            else:
+                skipped.append({"item_id": item_id, "reason": "no grade parsed"})
         except Exception as e:
             errors.append({"item_id": item_id, "error": f"link failed: {e}"})
 
