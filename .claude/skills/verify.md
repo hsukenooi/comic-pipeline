@@ -97,3 +97,4 @@ If `summary.issues > 0`, after the table give the user one-line guidance per ver
 - This skill does not write — it's read-only against the gixen DB. Safe to run repeatedly.
 - Lots (item_ids linked to multiple comics): pass one row per `(item_id, grade)` you want to confirm. The endpoint walks all `bid_fmvs` for the bid and matches by grade (and `locg_id` if given).
 - `bids.fmv_id` mismatch with the matched fmv shows up as `partial` — this is the PER-90 footgun (denormalized pointer drifted from the canonical primary row).
+- **LOCG collection verification** (did the comic land in LOCG with the right state?) is handled by step 7 of `/comic:collection-add` — it runs inline in the same Playwright session and checks `in_collection`, `wish_removed`, and `db_linked`. This skill covers the bid→fmv→comic DB chain only.

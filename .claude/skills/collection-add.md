@@ -190,7 +190,80 @@ api_post(context, '/comic/my_list_move', {
 })
 ```
 
-## 7. Final Report
+## 7. Verification (Playwright + DB)
+
+Run inside the same Playwright block, after step 6, before closing the browser. Verifies that each successfully added comic landed correctly in LOCG and the local DB.
+
+For each comic that was added in step 5 (i.e. not skipped as duplicate):
+
+```python
+import json, os, urllib.request
+
+verify_rows = []
+for entry in added_entries:  # built up during steps 4–6
+    comic_id   = entry['comic_id']    # LOCG numeric ID
+    title      = entry['title']
+    was_in_wish = entry.get('was_in_wish', False)
+    checks = {}
+
+    # LOCG page check — reuse the already-open Playwright session
+    try:
+        page.goto(f"{BASE}/comic/{comic_id}/x", wait_until='domcontentloaded')
+        html = page.content()
+        in_collection, in_wish = check_page_lists(html)
+        checks['in_collection'] = in_collection
+        checks['wish_removed']  = (not in_wish) if was_in_wish else None  # None = not applicable
+    except Exception as e:
+        checks['in_collection'] = None  # unreachable
+        checks['wish_removed']  = None
+        checks['locg_error']    = str(e)
+
+    # DB check — confirm comics.locg_id was written back (step 5b)
+    gixen_url = os.environ.get('GIXEN_SERVER_URL', '')
+    if gixen_url and comic_id:
+        try:
+            resp = urllib.request.urlopen(f"{gixen_url}/api/comics?locg_id={comic_id}", timeout=5)
+            rows = json.loads(resp.read())
+            checks['db_linked'] = len(rows) > 0
+        except Exception as e:
+            checks['db_linked'] = None  # server unreachable
+            checks['db_error']  = str(e)
+    else:
+        checks['db_linked'] = None  # GIXEN_SERVER_URL unset — skip
+
+    verify_rows.append({'title': title, 'comic_id': comic_id, 'was_in_wish': was_in_wish, **checks})
+```
+
+### Verdict per comic
+
+- `ok` — all applicable checks pass (`in_collection=True`, `wish_removed=True` if applicable, `db_linked=True` if server reachable)
+- `not_in_collection` — page shows comic is not in collection after the add
+- `still_in_wishlist` — comic was in wishlist and `in_wish` is still `True` after step 6
+- `db_not_linked` — `GET /api/comics?locg_id=<id>` returned zero rows (`comics.locg_id` write-back from step 5b failed)
+- `locg_unreachable` — page navigation threw an exception; LOCG checks skipped, DB check still runs
+
+### Presentation
+
+Print a verification table after the add table from step 8:
+
+```
+**Verification:**
+
+| Comic | LOCG ID | In Collection | Wish Removed | DB Linked | Verdict |
+|---|---|---|---|---|---|
+| Amazing Spider-Man #300 | 9559460 | ✅ | ✅ | ✅ | ok |
+| Daredevil #29 | 8823401 | ✅ | — | ✅ | ok |
+| Spawn #9 | 7712340 | ❌ | — | ✅ | not_in_collection |
+```
+
+- Use `—` for Wish Removed when the comic was not in the wishlist originally.
+- Use `—` for DB Linked when `GIXEN_SERVER_URL` is unset.
+- Use `⚠️` (and add a note below the table) when a check returned `None` due to an unreachable service.
+- If any comics have a non-`ok` verdict, list remediation steps below the table — same pattern as `/comic:verify`.
+
+**Failure mode:** verification is warn-only. Never abort or retry the add because verification failed. The add state is the ground truth; verification only surfaces gaps.
+
+## 8. Final Report
 
 Print a markdown table of what was added, plus a Total row:
 
@@ -204,9 +277,13 @@ Print a markdown table of what was added, plus a Total row:
 | **Total** | | | **$456.28** |
 ```
 
-Use `—` for missing grade. Below the table, list:
+Use `—` for missing grade. Follow with the verification table from step 7. Below both tables, list:
 
 - **Skipped (already in collection):** IDs and titles, if any.
 - **Wish-list cleaned:** IDs removed from wish, if any.
 - **Failed:** IDs and error messages, if any (after retry).
 - **Needs manual lookup:** Comics where LOCG ID could not be resolved and user did not provide a URL.
+- **Verification issues:** Per-comic remediation for any non-`ok` verdicts from step 7:
+  - `not_in_collection` → "Page shows not in collection. Re-run add step for this comic."
+  - `still_in_wishlist` → "Wishlist removal may have failed. Run wish-list cleanup manually."
+  - `db_not_linked` → "DB write-back failed (step 5b). Re-run: `gixen-cli locg link <item_id> <locg_id>`."
