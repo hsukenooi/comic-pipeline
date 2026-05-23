@@ -14,11 +14,13 @@ dependencies = [
 [project.scripts]
 ebay-fetch = "ebay_fetch:main"
 ebay-sold-comps = "sold_comps:main"
+seller-scan = "seller_scan:main"
 
 [tool.hatch.build.targets.wheel]
 include = [
     "src/ebay_fetch.py",
     "src/sold_comps.py",
+    "src/seller_scan.py",
 ]
 sources = ["src"]
 
