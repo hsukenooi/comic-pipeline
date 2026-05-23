@@ -113,6 +113,26 @@ def test_upsert_comic_no_grade_or_fmv_columns(db):
     assert "fmv_low" not in cols
 
 
+def test_upsert_comic_case_insensitive_yeared(db):
+    id1 = upsert_comic(db, "The Mighty Thor", "154", 1968)
+    id2 = upsert_comic(db, "THE MIGHTY THOR", "154", 1968)
+    assert id1 == id2
+    assert db.execute("SELECT COUNT(*) FROM comics WHERE issue='154'").fetchone()[0] == 1
+
+
+def test_upsert_comic_case_insensitive_yearless(db):
+    id1 = upsert_comic(db, "Batman", "375")
+    id2 = upsert_comic(db, "BATMAN", "375")
+    assert id1 == id2
+    assert db.execute("SELECT COUNT(*) FROM comics WHERE issue='375'").fetchone()[0] == 1
+
+
+def test_upsert_comic_caps_insert_finds_canonical_yeared(db):
+    id1 = upsert_comic(db, "Batman", "375", 1984)
+    id2 = upsert_comic(db, "BATMAN", "375", 1984)
+    assert id1 == id2
+
+
 # ---------------------------------------------------------------------------
 # upsert_fmv
 # ---------------------------------------------------------------------------
