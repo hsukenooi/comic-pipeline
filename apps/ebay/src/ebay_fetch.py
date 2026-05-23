@@ -341,6 +341,116 @@ def parse_item(data):
     }
 
 
+def _extract_seller_username(arg):
+    """Normalize an eBay store/user URL or raw username to a plain username."""
+    # https://www.ebay.com/usr/beatlebluecat or /str/beatlebluecat
+    m = re.search(r"/(?:usr|str)/([^/?&]+)", arg)
+    if m:
+        return m.group(1)
+    return arg.strip()
+
+
+def parse_item_summary(item):
+    """Parse a Browse API itemSummary into structured output.
+
+    itemSummary (from search results) differs from a full item detail:
+    no localizedAspects, price/currentBidPrice are top-level dicts.
+    """
+    item_id_raw = item.get("itemId", "")
+    m = re.search(r"\|(\d+)\|", item_id_raw)
+    item_id = m.group(1) if m else item_id_raw
+
+    title = item.get("title", "")
+    buying_options = item.get("buyingOptions", [])
+
+    if "AUCTION" in buying_options:
+        listing_type = "Auction"
+        price_data = item.get("currentBidPrice") or item.get("price", {})
+    elif "FIXED_PRICE" in buying_options:
+        listing_type = "BIN"
+        price_data = item.get("price", {})
+    else:
+        listing_type = ", ".join(buying_options) if buying_options else "Unknown"
+        price_data = item.get("price", {})
+
+    price_val = price_data.get("value", "0") if isinstance(price_data, dict) else "0"
+    currency = price_data.get("currency", "USD") if isinstance(price_data, dict) else "USD"
+    currency_symbol = "$" if currency == "USD" else currency + " "
+    try:
+        current_price = f"{currency_symbol}{float(price_val):.2f}"
+    except (ValueError, TypeError):
+        current_price = f"{currency_symbol}{price_val}"
+
+    end_date = format_end_date(item.get("itemEndDate"))
+    end_date_iso = item.get("itemEndDate")
+
+    seller_data = item.get("seller", {})
+    seller = seller_data.get("username") if isinstance(seller_data, dict) else None
+
+    return {
+        "item_id": item_id,
+        "title": title,
+        "listing_type": listing_type,
+        "current_price": current_price,
+        "end_date": end_date,
+        "end_date_iso": end_date_iso,
+        "listing_url": item.get("itemWebUrl", f"https://www.ebay.com/itm/{item_id}"),
+        "seller": seller,
+    }
+
+
+def search_seller_listings(seller, token, base_url, *, max_results=500, retries=3):
+    """Fetch active listings from a seller via Browse API item_summary/search.
+
+    Paginates automatically. Returns a list of raw itemSummary dicts.
+    seller may be a username or eBay store/user URL.
+    """
+    username = _extract_seller_username(seller)
+    url = f"{base_url}/buy/browse/v1/item_summary/search"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    }
+
+    all_items = []
+    offset = 0
+    page_size = 200
+
+    while True:
+        params = {
+            "q": "comics",
+            "filter": f"sellers:{{{username}}}",
+            "limit": page_size,
+            "offset": offset,
+        }
+
+        for attempt in range(retries):
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                break
+            if resp.status_code == 429 and attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"Rate limited, retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                print(
+                    f"Error fetching seller listings: HTTP {resp.status_code}: {resp.text[:200]}",
+                    file=sys.stderr,
+                )
+                return all_items
+
+        data = resp.json()
+        page_items = data.get("itemSummaries", [])
+        all_items.extend(page_items)
+        offset += len(page_items)
+        total = data.get("total", 0)
+
+        if not page_items or offset >= total or offset >= max_results:
+            break
+
+    return all_items
+
+
 def truncate(text, width):
     """Truncate text to width with ellipsis."""
     if not text:
