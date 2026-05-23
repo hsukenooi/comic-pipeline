@@ -169,6 +169,31 @@ def test_upsert_comic_allcaps_yearless_hits_existing_yearless(db):
     assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
 
 
+def test_upsert_comic_allcaps_skips_yearless_promotion_on_yeared_sibling_conflict(db):
+    # Set up: yearless row + yeared row at 1968 (bypassing upsert_comic to avoid
+    # auto-promotion — simulates pre-existing split state in the DB).
+    cur = db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("The Mighty Thor", "154"),
+    )
+    db.commit()
+    id_yearless = cur.lastrowid
+    db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)",
+        ("The Mighty Thor", "154", 1968),
+    )
+    db.commit()
+
+    # ALL-CAPS yeared insert at year=1999 — LOWER() finds 1968 as a conflicting
+    # yeared sibling, so PER-104 guard fires and returns the yearless row unchanged.
+    id_returned = upsert_comic(db, "THE MIGHTY THOR", "154", 1999)
+
+    assert id_returned == id_yearless
+    row = db.execute("SELECT year FROM comics WHERE id=?", (id_yearless,)).fetchone()
+    assert row["year"] is None
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 2
+
+
 def test_sweep_orphan_yearless_comics_merges_allcaps_stubs(db):
     yeared_id = upsert_comic(db, "The Mighty Thor", "154", 1968)
     # Manually insert an ALL-CAPS yearless stub (bypassing upsert_comic which
@@ -778,6 +803,42 @@ def test_migrate_sweep_allcaps_orphans_is_idempotent():
     assert conn.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM migration_state WHERE migration='sweep_allcaps_orphans'"
+    ).fetchone()[0] == 1
+
+
+def test_migrate_lowercase_title_indexes_creates_lower_expression_indexes(db):
+    idx = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_comics_tiy'"
+    ).fetchone()
+    assert idx is not None
+    assert "lower(" in idx["sql"].lower()
+
+
+def test_migrate_lowercase_title_indexes_blocks_case_variant_yeared_duplicate(db):
+    db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)",
+        ("The Mighty Thor", "154", 1968),
+    )
+    db.commit()
+    with pytest.raises(Exception):
+        db.execute(
+            "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)",
+            ("THE MIGHTY THOR", "154", 1968),
+        )
+        db.commit()
+
+
+def test_migrate_lowercase_title_indexes_is_idempotent():
+    conn = _make_db()
+    create_tables(conn)
+    create_tables(conn)
+    idx = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_comics_tiy'"
+    ).fetchone()
+    assert idx is not None
+    assert "lower(" in idx["sql"].lower()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_state WHERE migration='lowercase_title_indexes'"
     ).fetchone()[0] == 1
 
 
