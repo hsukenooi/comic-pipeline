@@ -445,13 +445,13 @@ async def _run_ebay_fallback() -> None:
             #    serving ended-listing data after a few days anyway.
             rows = db.execute(
                 """
-                SELECT item_id, max_bid, 0 AS is_purged FROM bids
+                SELECT item_id, max_bid, local_snipe_result, 0 AS is_purged FROM bids
                 WHERE status IN ('PENDING', 'ENDED')
                   AND auction_end_at IS NOT NULL
                   AND auction_end_at <= ?
                   AND winning_bid IS NULL
                 UNION ALL
-                SELECT item_id, max_bid, 1 AS is_purged FROM bids
+                SELECT item_id, max_bid, local_snipe_result, 1 AS is_purged FROM bids
                 WHERE status = 'PURGED'
                   AND winning_bid IS NULL
                   AND datetime(COALESCE(auction_end_at, resolved_at)) >= datetime('now', '-7 days')
@@ -524,11 +524,18 @@ async def _run_ebay_fallback() -> None:
                     await asyncio.sleep(1.5)
                     continue
 
-                # Heuristic: 0 < final_price <= our max_bid → our snipe would
-                # have outbid; > max → we lost. Still imperfect at the boundary
-                # (eBay's reported price excludes our offset bump) but strictly
-                # better than the original "WON if anything <= max" logic.
-                inferred_status = "WON" if final_amount <= float(row["max_bid"]) else "LOST"
+                # Heuristic: 0 < final_price < our max_bid suggests we outbid
+                # everyone; final_price >= max_bid means someone matched or beat
+                # us. Two additional guards against false positives:
+                #   1. Tie at final_price == max_bid → eBay's first-bidder rule
+                #      means we likely lost (strict < instead of <=).
+                #   2. local_snipe_result starts with "ERR:" → our bid never
+                #      landed; mark LOST regardless of price.
+                local_result = row["local_snipe_result"] or ""
+                if local_result.startswith("ERR:") or final_amount >= float(row["max_bid"]):
+                    inferred_status = "LOST"
+                else:
+                    inferred_status = "WON"
                 update_bid_status(
                     db, iid, inferred_status,
                     winning_bid=final_amount,

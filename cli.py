@@ -224,7 +224,7 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
 @click.option("--catalog-id", type=int, default=None, help="External catalog ID for post-bid linking")
 @click.option("--grade", type=float, default=None, help="Numeric condition grade for post-bid linking")
-def add(item_id: str, max_bid: str, offset: int, group: int, catalog_id: int, grade: float):
+def add(item_id: str, max_bid: str, offset: int, group: int, catalog_id: int | None, grade: float | None):
     """Add a snipe for an eBay item."""
     try:
         bid = Decimal(max_bid)
@@ -241,13 +241,21 @@ def add(item_id: str, max_bid: str, offset: int, group: int, catalog_id: int, gr
         }
         _server_request("post", "/api/bids", json=payload)
         _record_add(item_id)
-        click.echo(f"Added snipe for {item_id} with max bid {bid}")
+        link_ok = True
         if catalog_id is not None and grade is not None:
             try:
-                _server_request("post", f"/api/bids/{item_id}/link",
+                _server_request("post", f"/api/bids/{item_id}/link-fmv",
                                 json={"locg_id": catalog_id, "grade": grade})
             except SystemExit:
-                click.echo("Warning: snipe added but post-bid link failed", err=True)
+                link_ok = False
+                click.echo(f"⚠️  Snipe added but FMV link failed for {item_id} "
+                           f"(locg_id={catalog_id}, grade={grade})", err=True)
+        if catalog_id is not None and grade is not None and link_ok:
+            click.echo(f"✅ Added + linked: {item_id} (max bid {bid})")
+        elif not link_ok:
+            click.echo(f"⚠️  Added (FMV link failed): {item_id} (max bid {bid})")
+        else:
+            click.echo(f"Added snipe for {item_id} with max bid {bid}")
         return
 
     # Existing direct-Gixen path

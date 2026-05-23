@@ -188,9 +188,10 @@ def update_bid_status(
     # the caller batches the commit at the end of the cycle.
     conn.execute(
         "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, "
+        "auction_end_at=COALESCE(auction_end_at, ?), "
         "status_mirror=COALESCE(?, status_mirror) "
         "WHERE item_id=? AND status NOT IN ('PURGED')",
-        (status, winning_bid, resolved_at, status_mirror, item_id),
+        (status, winning_bid, resolved_at, resolved_at, status_mirror, item_id),
     )
 
 
