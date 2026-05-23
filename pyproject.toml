@@ -25,11 +25,6 @@ classifiers = [
     "Topic :: Utilities",
 ]
 
-[project.urls]
-Homepage = "https://github.com/hsukenooi/locg-cli"
-Source = "https://github.com/hsukenooi/locg-cli"
-"Issue Tracker" = "https://github.com/hsukenooi/locg-cli/issues"
-
 dependencies = [
     "playwright>=1.40.0",
     "beautifulsoup4>=4.12.0",
@@ -37,6 +32,11 @@ dependencies = [
     "openpyxl>=3.1",
     "mokkari>=3.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hsukenooi/locg-cli"
+Source = "https://github.com/hsukenooi/locg-cli"
+"Issue Tracker" = "https://github.com/hsukenooi/locg-cli/issues"
 
 [project.optional-dependencies]
 test = ["pytest"]
