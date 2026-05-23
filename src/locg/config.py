@@ -39,6 +39,20 @@ def env_path() -> Path:
     return _config_dir() / ".env"
 
 
+def _cache_dir() -> Path:
+    """Return the cache directory, respecting XDG_CACHE_HOME."""
+    base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    return Path(base) / "locg"
+
+
+def collection_cache_path() -> Path:
+    return _cache_dir() / "collection.json"
+
+
+def import_history_path() -> Path:
+    return _cache_dir() / "import-history.jsonl"
+
+
 def load_config() -> dict[str, Any]:
     p = config_path()
     if p.exists():

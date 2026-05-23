@@ -74,3 +74,15 @@ def _isolate_id_cache(tmp_path, monkeypatch):
     """
     import locg.cache as cache_mod
     monkeypatch.setattr(cache_mod, "cache_path", lambda: tmp_path / "ids.json")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_collection_cache(tmp_path, monkeypatch):
+    """Redirect the collection cache and audit log paths to a per-test tmp dir.
+
+    Mirrors _isolate_id_cache.  Prevents tests from reading or writing the
+    developer's real ~/.cache/locg/collection.json and import-history.jsonl.
+    """
+    import locg.collection_cache as cc_mod
+    monkeypatch.setattr(cc_mod, "collection_cache_path", lambda: tmp_path / "collection.json")
+    monkeypatch.setattr(cc_mod, "import_history_path", lambda: tmp_path / "import-history.jsonl")

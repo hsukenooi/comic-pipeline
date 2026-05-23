@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 
 from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
+from locg.collection_cache import CollectionCache, _normalize_series_key
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
 
@@ -1176,3 +1177,510 @@ def cmd_cache_clear(_client: Optional[LOCGClient] = None) -> dict[str, Any]:
     """Delete every entry from the on-disk ID cache. Returns count removed."""
     removed = IDCache().clear()
     return {"cleared": removed}
+
+
+# ---------------------------------------------------------------------------
+# Collection cache commands (Unit 4)
+# ---------------------------------------------------------------------------
+
+def cmd_collection_import(path_str: str) -> dict[str, Any]:
+    """Import a LOCG Excel export into the local collection cache."""
+    from pathlib import Path as _Path
+    from locg.collection_io import import_xlsx
+
+    path = _Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    cache = CollectionCache()
+    # Pre-flight load triggers crash detection (migration_in_progress guard)
+    # before we start parsing the xlsx. Raises RuntimeError on corrupt state.
+    cache.load()
+    return import_xlsx(path, cache)
+
+
+def _cache_age_days(last_full_import: Optional[str]) -> Optional[int]:
+    """Return days since last_full_import, or None if never imported."""
+    if not last_full_import:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(last_full_import.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).days
+    except ValueError:
+        return None
+
+
+def _oldest_pending_days(rows: list[dict[str, Any]]) -> Optional[int]:
+    """Return age in days of the oldest pending row, or None if no pending rows."""
+    if not rows:
+        return None
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    oldest = None
+    for row in rows:
+        added = row.get("local_added_at") or ""
+        if added:
+            try:
+                dt = datetime.fromisoformat(added.replace("Z", "+00:00"))
+                if oldest is None or dt < oldest:
+                    oldest = dt
+            except ValueError:
+                pass
+    return (now - oldest).days if oldest is not None else None
+
+
+def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
+    """Export pending-push rows to a LOCG-compatible CSV + .notes.md companion.
+
+    Returns {csv_path, notes_md_path, ready_count, manual_variant_count,
+    manual_series_count, oldest_pending_days}.
+    """
+    from datetime import datetime
+    from pathlib import Path as _Path
+    from locg.collection_io import _pending_push_rows, generate_csv, generate_notes_md
+
+    cache = CollectionCache()
+    payload = cache.load()
+    ready, manual_variant, manual_series = _pending_push_rows(payload)
+
+    if out_path is None:
+        ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        dest = _Path.home() / "Downloads" / f"locg-bulk-import-{ts}.csv"
+    else:
+        dest = _Path(out_path)
+
+    notes_dest = dest.with_suffix(".notes.md")
+
+    generate_csv(ready, dest)
+    generate_notes_md(ready, manual_variant, manual_series, notes_dest)
+
+    all_pending = ready + manual_variant + manual_series
+    return {
+        "csv_path": str(dest),
+        "notes_md_path": str(notes_dest),
+        "ready_count": len(ready),
+        "manual_variant_count": len(manual_variant),
+        "manual_series_count": len(manual_series),
+        "oldest_pending_days": _oldest_pending_days(all_pending),
+    }
+
+
+def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
+    """Return cache status metrics.
+
+    With verbose=True also returns agent_win/locg_export counts, median win age,
+    reconciliation success rate, and behavioral drift event count.
+    """
+    from locg import __version__
+    from locg.collection_io import _pending_push_rows
+
+    cache = CollectionCache()
+    payload = cache.load()
+
+    comics = payload.get("comics", [])
+    ready, manual_variant, manual_series = _pending_push_rows(payload)
+    all_pending = ready + manual_variant + manual_series
+
+    last_full_import = payload.get("last_full_import")
+
+    result: dict[str, Any] = {
+        "last_full_import": last_full_import,
+        "last_import_source": payload.get("last_import_source"),
+        "row_count": len(comics),
+        "cache_age_days": _cache_age_days(last_full_import),
+        "pending_push_count": len(all_pending),
+        "oldest_pending_days": _oldest_pending_days(all_pending),
+        "locg_cli_version": __version__,
+        "schema_version": payload.get("schema_version"),
+    }
+
+    if not verbose:
+        return result
+
+    # Verbose metrics (F9 observability)
+    from datetime import datetime, timezone
+
+    agent_wins = [r for r in comics if r.get("source") == "agent_win"]
+    locg_exports = [r for r in comics if r.get("source") == "locg_export"]
+
+    median_win_age: Optional[int] = None
+    if agent_wins:
+        now = datetime.now(timezone.utc)
+        ages = []
+        for row in agent_wins:
+            added = row.get("local_added_at") or ""
+            if added:
+                try:
+                    dt = datetime.fromisoformat(added.replace("Z", "+00:00"))
+                    ages.append((now - dt).days)
+                except ValueError:
+                    pass
+        if ages:
+            ages.sort()
+            mid = len(ages) // 2
+            median_win_age = ages[mid] if len(ages) % 2 else (ages[mid - 1] + ages[mid]) // 2
+
+    recon_success_rate: Optional[float] = None
+    drift_events: Optional[int] = None
+    if cache.audit_path.exists():
+        try:
+            lines = cache.audit_path.read_text().strip().splitlines()
+            types = []
+            for line in lines:
+                try:
+                    types.append(json.loads(line).get("type", ""))
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+            recon = sum(1 for t in types if t == "reconciliation")
+            ambiguous = sum(1 for t in types if t == "ambiguous_reconciliation")
+            total = recon + ambiguous
+            if total > 0:
+                recon_success_rate = round(recon / total, 2)
+            drift_events = sum(1 for t in types if t == "behavioral_drift")
+        except OSError:
+            pass
+
+    result.update({
+        "agent_win_count": len(agent_wins),
+        "locg_export_count": len(locg_exports),
+        "needs_manual_variant_count": len(manual_variant),
+        "needs_manual_series_canonical_count": len(manual_series),
+        "median_agent_win_age_days": median_win_age,
+        "reconciliation_success_rate_last_5_imports": recon_success_rate,
+        "behavioral_drift_events_last_5_imports": drift_events,
+    })
+    return result
+
+
+def cmd_collection_check(
+    series: str,
+    issue: str,
+    variant: Optional[str] = None,
+    year: Optional[str] = None,
+) -> dict[str, Any]:
+    """Check whether a comic is in the local collection cache.
+
+    Returns {match_status, full_title_matched, cache_age_days}.
+    match_status: "in_collection" | "not_in_cache".
+    """
+    import re
+
+    cache = CollectionCache()
+    payload = cache.load()
+    cache_age = _cache_age_days(payload.get("last_full_import"))
+
+    series_key = _normalize_series_key(series)
+    # Strip leading zeros for the issue token comparison
+    issue_stripped = str(issue).strip().lstrip("0") or str(issue).strip()
+
+    for row in payload.get("comics", []):
+        row_series_key = _normalize_series_key(row.get("series_name") or "")
+        if row_series_key != series_key:
+            continue
+
+        full_title = row.get("full_title") or ""
+
+        # Match #<number> token (ignoring leading zeros)
+        m = re.search(r"#\s*(\d+[A-Za-z]?)\b", full_title)
+        if m:
+            title_issue = m.group(1).lstrip("0") or m.group(1)
+            if title_issue.lower() != issue_stripped.lower():
+                # Also try the raw issue string (e.g. "Annual 1")
+                if issue.strip().lower() not in full_title.lower():
+                    continue
+        else:
+            # No '#N' token — try substring match (TPBs, annuals, specials)
+            if issue.strip().lower() not in full_title.lower():
+                continue
+
+        if variant and variant.lower() not in full_title.lower():
+            continue
+
+        if year and not (row.get("release_date") or "").startswith(str(year)):
+            continue
+
+        return {
+            "match_status": "in_collection",
+            "full_title_matched": full_title,
+            "cache_age_days": cache_age,
+        }
+
+    return {
+        "match_status": "not_in_cache",
+        "full_title_matched": None,
+        "cache_age_days": cache_age,
+    }
+
+
+VARIANT_SUFFIX_MAP: dict[str, str] = {
+    "newsstand": "Newsstand Edition",
+    "newsstand edition": "Newsstand Edition",
+    "direct": "Direct Edition",
+    "direct edition": "Direct Edition",
+    "2nd print": "2nd Printing",
+    "second print": "2nd Printing",
+    "2nd printing": "2nd Printing",
+    "facsimile": "Facsimile Edition",
+    "facsimile edition": "Facsimile Edition",
+}
+
+RECORD_WIN_CHUNK_SIZE = 25
+
+
+def _resolve_price(raw: Any) -> Optional[float]:
+    """Parse price from a float or a '12.50 USD' string."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).split()[0]
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def cmd_collection_record_win(
+    wins: list[dict[str, Any]],
+    cache: Optional[Any] = None,
+    metron: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Record a batch of Gixen auction wins into the local collection cache.
+
+    Accepts a list of dicts with keys:
+      item_id, current_bid, end_date_iso,
+      identify_data: {series, issue, year?, variant_text?}
+
+    Resolves canonical Series Name via the R36 chain:
+      1. series_name_index (high confidence, no Metron call)
+      2. Metron lookup → format_series_name (medium confidence)
+      3. Bare series name, needs_manual_series_canonical=True (fallback)
+
+    Commits in chunks of 25 rows (RECORD_WIN_CHUNK_SIZE) so a crash only
+    rolls back the in-flight chunk.  Returns summary metrics.
+    """
+    from datetime import datetime, timezone
+    from locg.collection_cache import (
+        CollectionCache,
+        _normalize_series_key,
+        _next_seq,
+        _utcnow_iso,
+    )
+    from locg.metron import MetronClient, MetronCredentialError
+
+    if cache is None:
+        cache = CollectionCache()
+    if metron is None:
+        metron = MetronClient()
+
+    payload = cache.load()
+    series_name_index: dict[str, str] = payload.get("series_name_index", {})
+    existing_titles: set[str] = {
+        row.get("full_title", "") for row in payload.get("comics", [])
+    }
+
+    rows_written = 0
+    chunks_committed = 0
+    manual_variant_count = 0
+    manual_series_count = 0
+    metron_lookups_attempted = 0
+    metron_lookups_succeeded = 0
+    partial_failure = False
+    metron_disabled = False
+
+    chunks = [
+        wins[i : i + RECORD_WIN_CHUNK_SIZE]
+        for i in range(0, len(wins), RECORD_WIN_CHUNK_SIZE)
+    ]
+
+    for chunk in chunks:
+        built_rows: list[dict[str, Any]] = []
+        chunk_manual_variant = 0
+        chunk_manual_series = 0
+        chunk_metron_attempted = 0
+        chunk_metron_succeeded = 0
+
+        for win in chunk:
+            identify = win.get("identify_data") or {}
+            series_raw = str(identify.get("series") or "").strip()
+            issue_num = str(identify.get("issue") or "").strip()
+            variant_text = str(identify.get("variant_text") or "").strip().lower()
+            end_date = str(win.get("end_date_iso") or "").strip()
+            item_id = str(win.get("item_id") or "").strip()
+            price = _resolve_price(win.get("current_bid"))
+
+            # date_purchased: date portion of end_date_iso
+            date_purchased: Optional[str] = None
+            if end_date:
+                try:
+                    dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    date_purchased = dt.date().isoformat()
+                except ValueError:
+                    date_purchased = end_date[:10] if len(end_date) >= 10 else end_date
+
+            # R36: series resolution
+            norm_key = _normalize_series_key(series_raw)
+            canonical_series: Optional[str] = None
+            needs_manual_series = False
+            metron_data: Optional[dict[str, Any]] = None
+
+            if norm_key in series_name_index:
+                canonical_series = series_name_index[norm_key]
+            elif not metron_disabled:
+                try:
+                    chunk_metron_attempted += 1
+                    metron_data = metron.lookup_issue(series_raw, issue_num)
+                    if metron_data:
+                        chunk_metron_succeeded += 1
+                        canonical_series = metron.format_series_name(metron_data)
+                except MetronCredentialError:
+                    metron_disabled = True
+                    logger.warning("Metron credentials not configured; falling back to manual series resolution.")
+
+            if canonical_series is None:
+                canonical_series = series_raw
+                needs_manual_series = True
+                chunk_manual_series += 1
+
+            # R32: variant handling
+            needs_manual_variant = False
+            base_full_title = f"{canonical_series} #{issue_num}" if issue_num else canonical_series
+            if variant_text:
+                suffix = VARIANT_SUFFIX_MAP.get(variant_text)
+                if suffix:
+                    candidate = f"{base_full_title} {suffix}"
+                    full_title = candidate
+                else:
+                    # Unknown variant — check exact cache hit
+                    if base_full_title in existing_titles:
+                        full_title = base_full_title
+                    else:
+                        full_title = base_full_title
+                        needs_manual_variant = True
+                        chunk_manual_variant += 1
+            else:
+                full_title = base_full_title
+
+            # release_date: prefer store_date, fall back to cover_date
+            release_date: Optional[str] = None
+            if metron_data:
+                release_date = metron_data.get("store_date") or metron_data.get("cover_date")
+
+            row: dict[str, Any] = {
+                "publisher_name": None,
+                "series_name": canonical_series,
+                "full_title": full_title,
+                "release_date": release_date,
+                "in_collection": 1,
+                "in_wish_list": 0,
+                "marked_read": 0,
+                "my_rating": None,
+                "media_format": None,
+                "price_paid": price,
+                "date_purchased": date_purchased,
+                "condition": None,
+                "notes": None,
+                "tags": None,
+                "storage_box": None,
+                "owner": None,
+                "purchase_store": "eBay",
+                "signature": 0,
+                "slabbing": 0,
+                "grading": None,
+                "grading_company": None,
+                "local_added_at": _utcnow_iso(),
+                "local_added_seq": _next_seq(),
+                "pushed_to_locg_at": None,
+                "last_seen_in_export_at": None,
+                "source": "agent_win",
+                "needs_manual_variant": needs_manual_variant,
+                "needs_manual_series_canonical": needs_manual_series,
+                "metron_id": metron_data.get("metron_id") if metron_data else None,
+                "gixen_item_id": item_id or None,
+                "previous_full_title": None,
+            }
+            built_rows.append(row)
+
+        try:
+            cache.write_wins(built_rows, command="record-win")
+            rows_written += len(built_rows)
+            chunks_committed += 1
+            manual_variant_count += chunk_manual_variant
+            manual_series_count += chunk_manual_series
+            metron_lookups_attempted += chunk_metron_attempted
+            metron_lookups_succeeded += chunk_metron_succeeded
+        except Exception as exc:
+            logger.error("Chunk commit failed: %s", exc)
+            partial_failure = True
+
+    return {
+        "rows_written": rows_written,
+        "chunks_committed": chunks_committed,
+        "manual_variant_count": manual_variant_count,
+        "manual_series_count": manual_series_count,
+        "metron_lookups_attempted": metron_lookups_attempted,
+        "metron_lookups_succeeded": metron_lookups_succeeded,
+        "partial_failure": partial_failure,
+    }
+
+
+def cmd_collection_doctor() -> dict[str, Any]:
+    """Return first-run walkthrough and current cache status.
+
+    Runs the same checks as status and explains the next remediation (F2).
+    """
+    status = cmd_collection_status(verbose=False)
+
+    steps = [
+        {
+            "step": 1,
+            "title": "Export your collection from LOCG",
+            "instruction": (
+                "Go to https://leagueofcomicgeeks.com/profile (logged in) "
+                "and click 'Export My Comics'. An Excel file will download to ~/Downloads."
+            ),
+        },
+        {
+            "step": 2,
+            "title": "Import the Excel file",
+            "instruction": (
+                "Run: locg collection import ~/Downloads/<ComicGeeks-YYYY-MM-DD-HH-MM-SS>.xlsx"
+            ),
+        },
+        {
+            "step": 3,
+            "title": "Verify the import",
+            "instruction": "Run: locg collection status --pretty",
+        },
+        {
+            "step": 4,
+            "title": "(Optional) Set up Metron credentials for series name resolution",
+            "instruction": (
+                "Add METRON_USERNAME and METRON_PASSWORD to ~/.config/locg/.env "
+                "to enable automatic canonical series name lookup via Metron API."
+            ),
+        },
+    ]
+
+    if status["last_full_import"] is None:
+        next_action = (
+            "Cache is empty. Start with Step 1: export your collection from LOCG."
+        )
+        ready = False
+    elif (status["cache_age_days"] or 0) > 14:
+        next_action = (
+            f"Cache is {status['cache_age_days']} days old — consider re-exporting "
+            "from LOCG and re-importing."
+        )
+        ready = True
+    else:
+        next_action = "Cache is up to date."
+        ready = True
+
+    return {
+        "status": status,
+        "ready": ready,
+        "next_action": next_action,
+        "setup_steps": steps,
+    }
