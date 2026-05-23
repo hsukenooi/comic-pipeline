@@ -63,6 +63,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
     """)
     _migrate_fmv_split(conn)
     _migrate_year_nullable(conn)
+    _migrate_sweep_allcaps_orphans(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
     # one comic) has run before we try to enforce uniqueness on the cleaned set.
@@ -532,6 +533,37 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
         "year-nullable migration complete: %d fmv, %d bid_fmvs, %d bids.fmv_id restored",
         len(saved_fmv), len(saved_bid_fmvs), len(saved_bid_fmv_id),
     )
+
+
+# ---------------------------------------------------------------------------
+# One-time data migration: sweep ALL-CAPS yearless orphans created pre-PER-123
+# ---------------------------------------------------------------------------
+
+
+def _migrate_sweep_allcaps_orphans(conn: sqlite3.Connection) -> None:
+    """Run sweep_orphan_yearless_comics() exactly once to clean up ALL-CAPS
+    yearless stubs created before PER-123 added case-insensitive title matching.
+
+    Gate: migration_state row 'sweep_allcaps_orphans' present → already ran.
+    No crash guard needed — sweep_orphan_yearless_comics is atomic (single commit).
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state WHERE migration='sweep_allcaps_orphans'"
+    ).fetchone()
+    if row is not None:
+        return
+
+    result = sweep_orphan_yearless_comics(conn)
+    if result["merged"] > 0:
+        logger.info(
+            "_migrate_sweep_allcaps_orphans: merged %d orphan(s): %s",
+            result["merged"],
+            [(d["title"], d["issue"]) for d in result["details"]],
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO migration_state (migration) VALUES ('sweep_allcaps_orphans')"
+    )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------

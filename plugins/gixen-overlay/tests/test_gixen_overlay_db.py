@@ -729,6 +729,57 @@ def test_migration_fresh_db_no_legacy_data_is_noop():
     assert "bid_fmvs" in tables
 
 
+def test_migrate_sweep_allcaps_orphans_merges_on_startup():
+    """create_tables() sweeps ALL-CAPS yearless stubs into their yeared siblings."""
+    conn = _make_db()
+    create_tables(conn)
+    # Manually insert a yeared canonical row and an ALL-CAPS yearless stub
+    # (bypasses upsert_comic which now deduplicates — simulates pre-PER-123 data).
+    yeared_id = upsert_comic(conn, "The Mighty Thor", "154", 1968)
+    cur = conn.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("THE MIGHTY THOR", "154"),
+    )
+    conn.commit()
+    stub_id = cur.lastrowid
+    # Clear the migration marker so the sweep runs again on next create_tables call.
+    conn.execute("DELETE FROM migration_state WHERE migration='sweep_allcaps_orphans'")
+    conn.commit()
+
+    create_tables(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+    row = conn.execute("SELECT id FROM comics WHERE year=1968").fetchone()
+    assert row["id"] == yeared_id
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_state WHERE migration='sweep_allcaps_orphans'"
+    ).fetchone()[0] == 1
+
+
+def test_migrate_sweep_allcaps_orphans_is_idempotent():
+    """create_tables() called twice does not double-count or re-run the sweep."""
+    conn = _make_db()
+    create_tables(conn)
+    upsert_comic(conn, "X-Men", "1", 1963)
+    cur = conn.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("X-MEN", "1"),
+    )
+    conn.commit()
+    conn.execute("DELETE FROM migration_state WHERE migration='sweep_allcaps_orphans'")
+    conn.commit()
+
+    create_tables(conn)
+    assert conn.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+    # Second call — stub is gone; no new merges.
+    create_tables(conn)
+    assert conn.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_state WHERE migration='sweep_allcaps_orphans'"
+    ).fetchone()[0] == 1
+
+
 def test_migration_regression_second_grade_revision_upserts_fmv_not_new_comic():
     """After migration, a grade revision updates the existing fmv row, not inserts a new comic."""
     conn = _make_legacy_db()
