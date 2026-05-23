@@ -377,6 +377,49 @@ def test_locg_link_no_primary_returns_409(api):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/bids/{item_id}/link-fmv
+# ---------------------------------------------------------------------------
+
+
+def test_link_fmv_creates_junction_and_returns_linked(api):
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "600000001", "max_bid": 50.0})
+    # Create comic + fmv with a known locg_id
+    api.post("/api/comics", json={
+        "title": "Amazing Spider-Man", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800.0, "fmv_high": 1000.0, "locg_id": 77777,
+    })
+
+    r = api.post("/api/bids/600000001/link-fmv",
+                 json={"locg_id": 77777, "grade": 9.2})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["item_id"] == "600000001"
+    assert body["linked"] is True
+    assert isinstance(body["fmv_id"], int)
+
+    # Confirm /api/comics/snipes now shows enrichment for this bid
+    snipes = api.get("/api/comics/snipes").json()
+    row = next(s for s in snipes if s["item_id"] == "600000001")
+    assert row["cond_grade"] == 9.2
+    assert row["fmv_low"] == 800.0
+    assert row["fmv_high"] == 1000.0
+
+
+def test_link_fmv_unknown_item_returns_404(api):
+    r = api.post("/api/bids/999999999/link-fmv",
+                 json={"locg_id": 77777, "grade": 9.2})
+    assert r.status_code == 404
+
+
+def test_link_fmv_unknown_fmv_returns_404(api):
+    api.post("/api/bids", json={"item_id": "600000002", "max_bid": 50.0})
+    r = api.post("/api/bids/600000002/link-fmv",
+                 json={"locg_id": 99999, "grade": 9.8})
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # GET /api/dashboard-tabs
 # ---------------------------------------------------------------------------
 

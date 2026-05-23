@@ -16,7 +16,7 @@ from gixen_overlay.db import (
     sweep_orphan_yearless_comics,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
-from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest, VerifyRequest
+from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest, LinkFmvRequest, VerifyRequest
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
 from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task
@@ -90,6 +90,41 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
         )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return dict(row)
+
+
+@router.post("/api/bids/{item_id}/link-fmv")
+async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
+    """Link a bid to its FMV row by locg_id + grade.
+
+    Populates the bid_fmvs junction table and sets bids.fmv_id so the
+    /api/comics/snipes dashboard can show cond_grade and fmv_low/fmv_high.
+    """
+    if not re.match(r"^\d+$", item_id):
+        raise HTTPException(status_code=422, detail="item_id must be numeric")
+    db = request.app.state.db
+
+    bid = get_bid_by_item_id(db, item_id)
+    if bid is None:
+        raise HTTPException(status_code=404, detail=f"Item {item_id} not in DB")
+
+    fmv_row = db.execute(
+        """
+        SELECT f.id AS fmv_id
+        FROM fmv f
+        JOIN comics c ON c.id = f.comic_id
+        WHERE c.locg_id = ? AND f.grade = ?
+        LIMIT 1
+        """,
+        (req.locg_id, req.grade),
+    ).fetchone()
+    if fmv_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No FMV found for locg_id={req.locg_id} grade={req.grade}",
+        )
+
+    link_fmv_to_bid(db, bid["id"], fmv_row["fmv_id"], is_primary=True)
+    return {"item_id": item_id, "fmv_id": fmv_row["fmv_id"], "linked": True}
 
 
 @router.post("/api/bids/{item_id}/comics/locg")
