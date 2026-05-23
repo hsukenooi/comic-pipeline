@@ -81,15 +81,15 @@ Compare each auction's current bid against the proposed max bid. If current bid 
 
 **Run sequentially** — Gixen sessions are stateful and parallel adds will fail.
 
-If `GIXEN_SERVER_URL` is set in the environment, pass `--locg-id` and `--grade` so the server automatically calls `POST /api/bids/{item_id}/link-fmv` and creates the `bid_fmvs` junction row that links the bid to its FMV data:
+If `GIXEN_SERVER_URL` is set in the environment, pass `--catalog-id` and `--grade` so the server automatically calls `POST /api/bids/{item_id}/link-fmv` and creates the `bid_fmvs` junction row that links the bid to its FMV data:
 
 ```bash
-gixen-cli add {item_id} {max_bid} --locg-id {locg_id} --grade {grade_numeric}
+gixen-cli add {item_id} {max_bid} --catalog-id {locg_id} --grade {grade_numeric}
 ```
 
-Include `--locg-variant-id` only if a separate variant ID was resolved. Omit `--locg-id` and `--grade` only if LOCG resolution failed entirely — the bid will still register; `/comic:collection-add` will fall back to lookup at win time.
+Omit `--catalog-id` and `--grade` only if LOCG resolution failed entirely — the bid will still register; `/comic:collection-add` will fall back to lookup at win time.
 
-Passing `--locg-id` + `--grade` is what triggers the server-side FMV link. Without them, the dashboard will show `—` for Cond and FMV on every active snipe.
+Passing `--catalog-id` + `--grade` is what triggers the server-side FMV link. Without them, the dashboard will show `—` for Cond and FMV on every active snipe.
 
 If `GIXEN_SERVER_URL` is not set (direct Gixen mode):
 
@@ -100,7 +100,7 @@ cd ~/Projects/gixen-cli && .venv/bin/python cli.py add {item_id} {max_bid}
 
 Use the grade numeric value only (e.g. `9.2`, not `"NM 9.2"`). If the grade is unknown, omit `--grade`.
 
-Omit `--locg-id` if the LOCG ID was not resolved for this comic. Include `--locg-variant-id {locg_variant_id}` only if a separate variant ID was found.
+Omit `--catalog-id` if the LOCG ID was not resolved for this comic.
 
 After all adds, verify:
 
@@ -138,4 +138,4 @@ Useful when FMV analysis shows an existing bid is too low.
 | Attempting to snipe a BIN listing | Skip — Gixen is for auctions only |
 | Max bid = FMV top | Use 80% × top — leaves margin for bidder competition |
 | Odd number bids ($137.43) | Round to clean numbers — doesn't materially change outcomes |
-| Passing --locg-id 0 or null | Omit the flag entirely if the ID was not resolved |
+| Passing --catalog-id 0 or null | Omit the flag entirely if the ID was not resolved |
