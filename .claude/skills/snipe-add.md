@@ -81,17 +81,15 @@ Compare each auction's current bid against the proposed max bid. If current bid 
 
 **Run sequentially** — Gixen sessions are stateful and parallel adds will fail.
 
-If `GIXEN_SERVER_URL` is set in the environment, pass the comic identifier so the bid links to the existing `comics` row written by `/comic:fmv`. Include `--locg-id` (and `--locg-variant-id` if a variant applies) so the won snipe carries its LOCG ID without a second lookup at `/comic:collection-add` time:
+If `GIXEN_SERVER_URL` is set in the environment, pass `--locg-id` and `--grade` so the server automatically calls `POST /api/bids/{item_id}/link-fmv` and creates the `bid_fmvs` junction row that links the bid to its FMV data:
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py add {item_id} {max_bid} \
-  --comic "{title}" --issue "{issue}" --year {year} --grade {grade_numeric} \
-  --locg-id {locg_id} [--locg-variant-id {locg_variant_id}]
+gixen-cli add {item_id} {max_bid} --locg-id {locg_id} --grade {grade_numeric}
 ```
 
-Do not re-pass FMV fields (`--fmv-low`, `--fmv-high`, etc.) — those are already in the `comics` table from the FMV step and the upsert will preserve them.
+Include `--locg-variant-id` only if a separate variant ID was resolved. Omit `--locg-id` and `--grade` only if LOCG resolution failed entirely — the bid will still register; `/comic:collection-add` will fall back to lookup at win time.
 
-Omit `--locg-id` only if LOCG resolution failed entirely (covered above). The bid will still register; `/comic:collection-add` will fall back to lookup at win time.
+Passing `--locg-id` + `--grade` is what triggers the server-side FMV link. Without them, the dashboard will show `—` for Cond and FMV on every active snipe.
 
 If `GIXEN_SERVER_URL` is not set (direct Gixen mode):
 
