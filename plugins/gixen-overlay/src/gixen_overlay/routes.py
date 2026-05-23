@@ -426,7 +426,7 @@ def _build_comics_row(row):
         if midpoint > 0:
             value_pct = current_bid_numeric / midpoint * 100
 
-    end_date_iso = item.get("auction_end_at")
+    end_date_iso = item.get("auction_end_at") or item.get("resolved_at")
     return {
         # Base /api/snipes shape — preserved so JS can share render helpers.
         "item_id": item["item_id"],
