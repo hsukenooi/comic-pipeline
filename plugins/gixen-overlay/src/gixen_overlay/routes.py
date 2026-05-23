@@ -589,12 +589,21 @@ async def api_extract_comics(request: Request):
                     locg_variant_id=primary_resolution.locg_variant_id if (primary_resolution and idx == 0) else None,
                 )
                 if parsed.grade is not None:
-                    fmv_id = upsert_fmv(
-                        db,
-                        comic_id=comic_id,
-                        grade=parsed.grade,
-                        notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
-                    )
+                    existing_valued = db.execute(
+                        "SELECT f.id FROM fmv f JOIN comics c ON c.id = f.comic_id "
+                        "WHERE LOWER(c.title)=LOWER(?) AND c.issue=? AND f.grade=? AND f.low IS NOT NULL "
+                        "LIMIT 1",
+                        (parsed.series, issue, parsed.grade),
+                    ).fetchone()
+                    if existing_valued:
+                        fmv_id = existing_valued["id"]
+                    else:
+                        fmv_id = upsert_fmv(
+                            db,
+                            comic_id=comic_id,
+                            grade=parsed.grade,
+                            notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
+                        )
                     link_fmv_to_bid(db, row["id"], fmv_id, is_primary=(idx == 0))
                 # Bids with no parseable grade cannot get an fmv link (fmv.grade NOT NULL)
             linked += 1

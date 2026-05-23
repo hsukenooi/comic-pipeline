@@ -113,12 +113,23 @@ cd ~/Projects/gixen-cli && .venv/bin/python cli.py list
 ```
 | # | Comic | Item ID | Max Bid | LOCG ID | Status |
 |---|---|---|---|---|---|
-| 1 | Amazing Spider-Man #300 | 123456789 | $800 | 6977652 | ✅ Added |
-| 2 | Invincible #1 | 987654321 | $256 | 4242 | ✅ Added |
+| 1 | Amazing Spider-Man #300 | 123456789 | $800 | 6977652 | ✅ Added + linked |
+| 2 | Invincible #1 | 987654321 | $256 | 4242 | ⚠️ Added (FMV link failed) |
 | 3 | Batman #608 | 555555555 | — | — | ⏭️ Skipped (BIN) |
 ```
 
-Show `—` in the LOCG ID column if resolution failed; show the variant ID after a slash (e.g. `6977652 / 6977699`) if `locg_variant_id` differs from `locg_id`.
+Status values:
+- **✅ Added + linked** — snipe registered AND bid_fmvs junction created
+- **⚠️ Added (FMV link failed)** — snipe registered but link-fmv returned non-2xx
+- **❌ Failed** — snipe not registered
+- **⏭️ Skipped** — not added (BIN listing, duplicate, etc.)
+
+Show `—` in the LOCG ID column if resolution failed; show the variant ID after a slash (e.g. `6977652 / 6977699`) if `locg_variant_id` differs from `locg_id`. When ⚠️ appears, always show the LOCG ID that was passed so the user can diagnose the failure.
+
+**Resolving ⚠️ rows before the session ends:**
+- If the FMV row doesn't exist yet (no prior `/comic:fmv` run): re-run `/comic:fmv` for the comic, then call `POST /api/bids/{item_id}/link-fmv` with the correct `locg_id` and `grade`.
+- If the FMV row exists but the `comics` row has a null `locg_id` (title case mismatch or missing LOCG resolution): fix the comics row first (`UPDATE comics SET locg_id=? WHERE id=?`), then call `POST /api/bids/{item_id}/link-fmv`.
+- All ⚠️ rows must be resolved before the session ends — leaving them unlinked means the dashboard shows Cond but no FMV.
 
 ## Editing Existing Snipes
 
