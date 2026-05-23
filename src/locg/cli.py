@@ -26,6 +26,7 @@ from locg.commands import (
     cmd_collection_export,
     cmd_collection_has,
     cmd_collection_import,
+    cmd_collection_record_win,
     cmd_collection_status,
     cmd_comic,
     cmd_find,
@@ -149,6 +150,23 @@ def create_parser() -> argparse.ArgumentParser:
 
     # collection doctor — local cache
     coll_sub.add_parser("doctor", parents=[common], help="Print first-run setup walkthrough and cache status")
+
+    # collection record-win — agent win recording
+    p_rw = coll_sub.add_parser(
+        "record-win",
+        parents=[common],
+        help=(
+            "Record Gixen auction wins into the local collection cache. "
+            "Reads a JSON list from stdin or --from-gixen-json. "
+            "Commits in batches of 25; large batches scale with Metron rate limit."
+        ),
+    )
+    p_rw.add_argument(
+        "--from-gixen-json",
+        dest="gixen_json_path",
+        metavar="PATH",
+        help="Path to a JSON file containing wins (use '-' to read from stdin)",
+    )
 
     # pull-list
     p = sub.add_parser("pull-list", parents=[common], help="View your pull list (requires login)")
@@ -290,7 +308,7 @@ def main() -> None:
     logger = logging.getLogger("locg")
 
     # Collection cache subcommands are purely local — skip Playwright browser launch.
-    _LOCAL_COLLECTION_SUBCMDS = {"import", "export", "status", "check", "doctor"}
+    _LOCAL_COLLECTION_SUBCMDS = {"import", "export", "status", "check", "doctor", "record-win"}
     _collection_sub = (
         getattr(args, "collection_command", None)
         if args.command == "collection"
@@ -344,6 +362,22 @@ def main() -> None:
                 )
             elif sub_cmd == "doctor":
                 result = cmd_collection_doctor()
+            elif sub_cmd == "record-win":
+                import json as _json
+                import sys as _sys
+                path = getattr(args, "gixen_json_path", None)
+                if path is None or path == "-":
+                    raw = _sys.stdin.read()
+                else:
+                    import pathlib as _pathlib
+                    raw = _pathlib.Path(path).read_text()
+                try:
+                    wins = _json.loads(raw)
+                except _json.JSONDecodeError as exc:
+                    die(f"Failed to parse JSON input: {exc}", code=2)
+                if not isinstance(wins, list):
+                    die("JSON input must be a list of win objects", code=2)
+                result = cmd_collection_record_win(wins)
             else:
                 result = cmd_collection(client, title=args.title)
         elif args.command == "pull-list":

@@ -1413,6 +1413,218 @@ def cmd_collection_check(
     }
 
 
+VARIANT_SUFFIX_MAP: dict[str, str] = {
+    "newsstand": "Newsstand Edition",
+    "newsstand edition": "Newsstand Edition",
+    "direct": "Direct Edition",
+    "direct edition": "Direct Edition",
+    "2nd print": "2nd Printing",
+    "second print": "2nd Printing",
+    "2nd printing": "2nd Printing",
+    "facsimile": "Facsimile Edition",
+    "facsimile edition": "Facsimile Edition",
+}
+
+RECORD_WIN_CHUNK_SIZE = 25
+
+
+def _resolve_price(raw: Any) -> Optional[float]:
+    """Parse price from a float or a '12.50 USD' string."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).split()[0]
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def cmd_collection_record_win(
+    wins: list[dict[str, Any]],
+    cache: Optional[Any] = None,
+    metron: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Record a batch of Gixen auction wins into the local collection cache.
+
+    Accepts a list of dicts with keys:
+      item_id, current_bid, end_date_iso,
+      identify_data: {series, issue, year?, variant_text?}
+
+    Resolves canonical Series Name via the R36 chain:
+      1. series_name_index (high confidence, no Metron call)
+      2. Metron lookup → format_series_name (medium confidence)
+      3. Bare series name, needs_manual_series_canonical=True (fallback)
+
+    Commits in chunks of 25 rows (RECORD_WIN_CHUNK_SIZE) so a crash only
+    rolls back the in-flight chunk.  Returns summary metrics.
+    """
+    from datetime import datetime, timezone
+    from locg.collection_cache import (
+        CollectionCache,
+        _normalize_series_key,
+        _next_seq,
+        _utcnow_iso,
+    )
+    from locg.metron import MetronClient, MetronCredentialError
+
+    if cache is None:
+        cache = CollectionCache()
+    if metron is None:
+        metron = MetronClient()
+
+    payload = cache.load()
+    series_name_index: dict[str, str] = payload.get("series_name_index", {})
+    existing_titles: set[str] = {
+        row.get("full_title", "") for row in payload.get("comics", [])
+    }
+
+    rows_written = 0
+    chunks_committed = 0
+    manual_variant_count = 0
+    manual_series_count = 0
+    metron_lookups_attempted = 0
+    metron_lookups_succeeded = 0
+    partial_failure = False
+    metron_disabled = False
+
+    chunks = [
+        wins[i : i + RECORD_WIN_CHUNK_SIZE]
+        for i in range(0, len(wins), RECORD_WIN_CHUNK_SIZE)
+    ]
+
+    for chunk in chunks:
+        built_rows: list[dict[str, Any]] = []
+        chunk_manual_variant = 0
+        chunk_manual_series = 0
+        chunk_metron_attempted = 0
+        chunk_metron_succeeded = 0
+
+        for win in chunk:
+            identify = win.get("identify_data") or {}
+            series_raw = str(identify.get("series") or "").strip()
+            issue_num = str(identify.get("issue") or "").strip()
+            variant_text = str(identify.get("variant_text") or "").strip().lower()
+            end_date = str(win.get("end_date_iso") or "").strip()
+            item_id = str(win.get("item_id") or "").strip()
+            price = _resolve_price(win.get("current_bid"))
+
+            # date_purchased: date portion of end_date_iso
+            date_purchased: Optional[str] = None
+            if end_date:
+                try:
+                    dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    date_purchased = dt.date().isoformat()
+                except ValueError:
+                    date_purchased = end_date[:10] if len(end_date) >= 10 else end_date
+
+            # R36: series resolution
+            norm_key = _normalize_series_key(series_raw)
+            canonical_series: Optional[str] = None
+            needs_manual_series = False
+            metron_data: Optional[dict[str, Any]] = None
+
+            if norm_key in series_name_index:
+                canonical_series = series_name_index[norm_key]
+            elif not metron_disabled:
+                try:
+                    chunk_metron_attempted += 1
+                    metron_data = metron.lookup_issue(series_raw, issue_num)
+                    if metron_data:
+                        chunk_metron_succeeded += 1
+                        canonical_series = metron.format_series_name(metron_data)
+                except MetronCredentialError:
+                    metron_disabled = True
+                    logger.warning("Metron credentials not configured; falling back to manual series resolution.")
+
+            if canonical_series is None:
+                canonical_series = series_raw
+                needs_manual_series = True
+                chunk_manual_series += 1
+
+            # R32: variant handling
+            needs_manual_variant = False
+            base_full_title = f"{canonical_series} #{issue_num}" if issue_num else canonical_series
+            if variant_text:
+                suffix = VARIANT_SUFFIX_MAP.get(variant_text)
+                if suffix:
+                    candidate = f"{base_full_title} {suffix}"
+                    full_title = candidate
+                else:
+                    # Unknown variant — check exact cache hit
+                    if base_full_title in existing_titles:
+                        full_title = base_full_title
+                    else:
+                        full_title = base_full_title
+                        needs_manual_variant = True
+                        chunk_manual_variant += 1
+            else:
+                full_title = base_full_title
+
+            # release_date: prefer store_date, fall back to cover_date
+            release_date: Optional[str] = None
+            if metron_data:
+                release_date = metron_data.get("store_date") or metron_data.get("cover_date")
+
+            row: dict[str, Any] = {
+                "publisher_name": None,
+                "series_name": canonical_series,
+                "full_title": full_title,
+                "release_date": release_date,
+                "in_collection": 1,
+                "in_wish_list": 0,
+                "marked_read": 0,
+                "my_rating": None,
+                "media_format": None,
+                "price_paid": price,
+                "date_purchased": date_purchased,
+                "condition": None,
+                "notes": None,
+                "tags": None,
+                "storage_box": None,
+                "owner": None,
+                "purchase_store": "eBay",
+                "signature": 0,
+                "slabbing": 0,
+                "grading": None,
+                "grading_company": None,
+                "local_added_at": _utcnow_iso(),
+                "local_added_seq": _next_seq(),
+                "pushed_to_locg_at": None,
+                "last_seen_in_export_at": None,
+                "source": "agent_win",
+                "needs_manual_variant": needs_manual_variant,
+                "needs_manual_series_canonical": needs_manual_series,
+                "metron_id": metron_data.get("metron_id") if metron_data else None,
+                "gixen_item_id": item_id or None,
+                "previous_full_title": None,
+            }
+            built_rows.append(row)
+
+        try:
+            cache.write_wins(built_rows, command="record-win")
+            rows_written += len(built_rows)
+            chunks_committed += 1
+            manual_variant_count += chunk_manual_variant
+            manual_series_count += chunk_manual_series
+            metron_lookups_attempted += chunk_metron_attempted
+            metron_lookups_succeeded += chunk_metron_succeeded
+        except Exception as exc:
+            logger.error("Chunk commit failed: %s", exc)
+            partial_failure = True
+
+    return {
+        "rows_written": rows_written,
+        "chunks_committed": chunks_committed,
+        "manual_variant_count": manual_variant_count,
+        "manual_series_count": manual_series_count,
+        "metron_lookups_attempted": metron_lookups_attempted,
+        "metron_lookups_succeeded": metron_lookups_succeeded,
+        "partial_failure": partial_failure,
+    }
+
+
 def cmd_collection_doctor() -> dict[str, Any]:
     """Return first-run walkthrough and current cache status.
 

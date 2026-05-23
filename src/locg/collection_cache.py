@@ -362,6 +362,28 @@ class CollectionCache:
         finally:
             lock_file.close()
 
+    def write_wins(self, rows: list[dict[str, Any]], command: str = "record-win") -> None:
+        """Insert or update a batch of agent_win rows under exclusive lock.
+
+        Duplicate detection is by gixen_item_id: an existing row with the
+        same ID is overwritten; rows without a gixen_item_id are always
+        appended.  Callers are responsible for chunking large batches.
+        """
+        def mutate(payload: dict[str, Any]) -> None:
+            idx_by_gixen: dict[str, int] = {
+                row["gixen_item_id"]: i
+                for i, row in enumerate(payload["comics"])
+                if row.get("gixen_item_id")
+            }
+            for row in rows:
+                gixen_id = row.get("gixen_item_id")
+                if gixen_id and gixen_id in idx_by_gixen:
+                    payload["comics"][idx_by_gixen[gixen_id]] = row
+                else:
+                    payload["comics"].append(row)
+
+        self.apply(mutate, command=command)
+
     def append_audit(self, record: dict[str, Any]) -> None:
         """Append a JSON audit record to import-history.jsonl.
 

@@ -336,3 +336,33 @@ def test_cli_update_server_error_exits_1(monkeypatch, capsys):
     assert exc.value.code == 1
     captured = capsys.readouterr()
     assert "error" in captured.out  # still printed to stdout (machine-readable)
+
+
+# --- collection record-win ---
+
+def test_cli_record_win_malformed_json_exits_2(monkeypatch, capsys, tmp_path):
+    """Malformed JSON passed via --from-gixen-json exits 2 with a parse error."""
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{not valid json")
+
+    monkeypatch.setattr(sys, "argv", [
+        "locg", "collection", "record-win", "--from-gixen-json", str(bad_json),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "parse" in captured.err.lower() or "json" in captured.err.lower()
+
+
+def test_cli_record_win_non_list_json_exits_2(monkeypatch, capsys, tmp_path):
+    """JSON that isn't a list exits 2."""
+    bad_json = tmp_path / "obj.json"
+    bad_json.write_text('{"item_id": "1"}')
+
+    monkeypatch.setattr(sys, "argv", [
+        "locg", "collection", "record-win", "--from-gixen-json", str(bad_json),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
