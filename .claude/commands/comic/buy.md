@@ -74,10 +74,10 @@ Gate: user confirms the assessed grades (or overrides any) before FMV.
 
 ## Step 3: FMV
 
-Run `gixen-cli fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetch (via `ebay-fetch sold-comps`), cache, dedup, IQR, quartiles, confidence rubric, self-exclusion, and DB upsert.
+Run `comic-fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetch (via `ebay-fetch sold-comps`), cache, dedup, IQR, quartiles, confidence rubric, self-exclusion, and DB upsert.
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py fmv --batch <working_list.json> --out <results.json>
+comic-fmv --batch <working_list.json> --out <results.json>
 ```
 
 **Input:** Working list JSON: `[{item_id, title, issue, year, grade, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable).
@@ -158,7 +158,7 @@ Born from PER-99 — `/comic:buy` ran to apparent success in past incidents whil
 
 ## Subagent Strategy (30+ books)
 
-`gixen-cli fmv` already does async fan-out internally and serves cache hits without API calls, so the previous "split FMV across subagents at 30 books" rule mostly doesn't apply anymore — one CLI invocation handles 50+ books in a few seconds. Reach for subagents only when:
+`comic-fmv` already does async fan-out internally and serves cache hits without API calls, so the previous "split FMV across subagents at 30 books" rule mostly doesn't apply anymore — one CLI invocation handles 50+ books in a few seconds. Reach for subagents only when:
 
 - The eBay identification step is bottlenecked (Browse API rate limit or large batch)
 - You're processing 50+ unique books and want to keep the orchestrator's context tight

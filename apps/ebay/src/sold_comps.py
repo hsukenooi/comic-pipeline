@@ -218,7 +218,7 @@ _LETTER_PATTERNS = [
     # Tier 1 — slash combos (longest first)
     (re.compile(r'\bnm[/\\]m\b', re.I), 9.6),
     (re.compile(r'\bvf[/\\]nm\b', re.I), 9.0),
-    (re.compile(r'\bfn[/\\]vf\b|\bfine[/\\]vf\b', re.I), 7.0),
+    (re.compile(r'\bfn[/\\]vf\b|\bfine[/\\]vf\b|\bfvf\b', re.I), 7.0),
     (re.compile(r'\bvg[/\\]fn\+(?!\w)', re.I), 5.5),
     (re.compile(r'\bvg[/\\]fn\b', re.I), 5.0),
     (re.compile(r'\bgd[/\\]vg\b', re.I), 3.0),
@@ -358,6 +358,8 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
 
     # Tier 3 — grade-targeted if too few grade-tagged comps in pool so far
     target_grade = book.get("grade")
+    if isinstance(target_grade, str):
+        target_grade = parse_grade(target_grade)
     grade_tagged = sum(1 for c in comps if c["grade"] is not None)
     if target_grade is not None and grade_tagged < GRADE_TAGGED_THRESHOLD:
         label = _grade_label_for_query(target_grade)

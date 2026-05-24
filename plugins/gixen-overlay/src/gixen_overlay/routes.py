@@ -16,7 +16,7 @@ from gixen_overlay.db import (
     sweep_orphan_yearless_comics,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
-from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest, VerifyRequest
+from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest, LinkFmvRequest, VerifyRequest
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
 from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task
@@ -90,6 +90,41 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
         )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return dict(row)
+
+
+@router.post("/api/bids/{item_id}/link-fmv")
+async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
+    """Link a bid to its FMV row by locg_id + grade.
+
+    Populates the bid_fmvs junction table and sets bids.fmv_id so the
+    /api/comics/snipes dashboard can show cond_grade and fmv_low/fmv_high.
+    """
+    if not re.match(r"^\d+$", item_id):
+        raise HTTPException(status_code=422, detail="item_id must be numeric")
+    db = request.app.state.db
+
+    bid = get_bid_by_item_id(db, item_id)
+    if bid is None:
+        raise HTTPException(status_code=404, detail=f"Item {item_id} not in DB")
+
+    fmv_row = db.execute(
+        """
+        SELECT f.id AS fmv_id
+        FROM fmv f
+        JOIN comics c ON c.id = f.comic_id
+        WHERE c.locg_id = ? AND f.grade = ?
+        LIMIT 1
+        """,
+        (req.locg_id, req.grade),
+    ).fetchone()
+    if fmv_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No FMV found for locg_id={req.locg_id} grade={req.grade}",
+        )
+
+    link_fmv_to_bid(db, bid["id"], fmv_row["fmv_id"], is_primary=True)
+    return {"item_id": item_id, "fmv_id": fmv_row["fmv_id"], "linked": True}
 
 
 @router.post("/api/bids/{item_id}/comics/locg")
@@ -391,7 +426,7 @@ def _build_comics_row(row):
         if midpoint > 0:
             value_pct = current_bid_numeric / midpoint * 100
 
-    end_date_iso = item.get("auction_end_at")
+    end_date_iso = item.get("auction_end_at") or item.get("resolved_at")
     return {
         # Base /api/snipes shape — preserved so JS can share render helpers.
         "item_id": item["item_id"],
@@ -544,6 +579,7 @@ async def api_extract_comics(request: Request):
                 year = primary_resolution.year
 
         try:
+            wrote_junction = False
             for idx, issue in enumerate(issues):
                 comic_id = upsert_comic(
                     db,
@@ -554,15 +590,36 @@ async def api_extract_comics(request: Request):
                     locg_variant_id=primary_resolution.locg_variant_id if (primary_resolution and idx == 0) else None,
                 )
                 if parsed.grade is not None:
-                    fmv_id = upsert_fmv(
-                        db,
-                        comic_id=comic_id,
-                        grade=parsed.grade,
-                        notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
-                    )
+                    existing_valued = db.execute(
+                        "SELECT f.id FROM fmv f JOIN comics c ON c.id = f.comic_id "
+                        "WHERE LOWER(c.title)=LOWER(?) AND c.issue=? AND f.grade=? AND f.low IS NOT NULL "
+                        "LIMIT 1",
+                        (parsed.series, issue, parsed.grade),
+                    ).fetchone()
+                    if existing_valued:
+                        fmv_id = existing_valued["id"]
+                    else:
+                        fmv_id = upsert_fmv(
+                            db,
+                            comic_id=comic_id,
+                            grade=parsed.grade,
+                            notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
+                        )
                     link_fmv_to_bid(db, row["id"], fmv_id, is_primary=(idx == 0))
-                # Bids with no parseable grade cannot get an fmv link (fmv.grade NOT NULL)
-            linked += 1
+                    wrote_junction = True
+                else:
+                    # No parseable grade — link to any existing valued FMV for this comic.
+                    any_valued = db.execute(
+                        "SELECT f.id FROM fmv f WHERE f.comic_id=? AND f.low IS NOT NULL LIMIT 1",
+                        (comic_id,),
+                    ).fetchone()
+                    if any_valued:
+                        link_fmv_to_bid(db, row["id"], any_valued["id"], is_primary=(idx == 0))
+                        wrote_junction = True
+            if wrote_junction:
+                linked += 1
+            else:
+                skipped.append({"item_id": item_id, "reason": "no grade parsed"})
         except Exception as e:
             errors.append({"item_id": item_id, "error": f"link failed: {e}"})
 
