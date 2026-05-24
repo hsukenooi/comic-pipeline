@@ -71,3 +71,22 @@ def test_hyphenated_series_name_preserved():
     r = parse_title("Giant-Size X-Men 2")
     assert r.series == "Giant-Size X-Men"
     assert r.issue == "2"
+
+
+# Real eBay titles from a Batman lot listed by a seller who uses
+# "(DC Comics Month Year) Grade condition" format. All 7 broke before the
+# publisher-paren-removal and condition/1st-content-note fixes.
+@pytest.mark.parametrize("title,expected_issue", [
+    ("Batman  363 (DC Comics September 1983) VF/NM condition",                         "363"),
+    ("Batman  368 (DC Comics February 1984) 1st Jason Todd as Robin VF/NM condition",  "368"),
+    ("Batman  376 (DC Comics October 1984) VF+ condition",                             "376"),
+    ("Batman  426 (DC Comics December 1988) VF- condition",                            "426"),
+    ("Batman  427 (DC Comics Winter 1988) VF/NM condition",                            "427"),
+    ("Batman  428 VF/NM condition Huge auction going on now!",                         "428"),
+    ("Batman  429 (DC Comics January 1989) FN- condition",                             "429"),
+])
+def test_publisher_paren_and_condition_noise_stripped(title, expected_issue):
+    """Series must be 'Batman', not 'Batman (DC September condition' or similar."""
+    r = parse_title(title)
+    assert r.series == "Batman", f"got {r.series!r} from {title!r}"
+    assert r.issue == expected_issue
