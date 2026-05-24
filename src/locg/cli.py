@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from locg import __version__
 from locg.client import AuthRequired, LOCGClient
-from locg.config import env_path
+from locg.config import env_path, wish_list_cache_path
 from locg.commands import (
     VALID_LISTS,
     _validate_grade,
@@ -40,6 +40,7 @@ from locg.commands import (
     cmd_series,
     cmd_update,
     cmd_wish_list,
+    cmd_wish_list_from_cache,
     parse_lookup_spec,
 )
 
@@ -314,9 +315,13 @@ def main() -> None:
         if args.command == "collection"
         else None
     )
+    # wish-list skips Playwright when the local cache exists; it still needs a
+    # client when no cache is present (live fallback, R5).
+    _wish_list_cached = args.command == "wish-list" and wish_list_cache_path().exists()
     _needs_client = not (
         args.command == "cache"
         or (_collection_sub in _LOCAL_COLLECTION_SUBCMDS)
+        or _wish_list_cached
     )
 
     client: Optional[LOCGClient] = None
@@ -383,7 +388,15 @@ def main() -> None:
         elif args.command == "pull-list":
             result = cmd_pull_list(client, title=args.title)
         elif args.command == "wish-list":
-            result = cmd_wish_list(client, title=args.title)
+            if _wish_list_cached:
+                try:
+                    result = cmd_wish_list_from_cache(title=args.title)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    # Cache disappeared or is corrupt between the exists() check
+                    # and the read — fall through to live fetch.
+                    result = cmd_wish_list(client, title=args.title)
+            else:
+                result = cmd_wish_list(client, title=args.title)
         elif args.command == "read-list":
             result = cmd_read_list(client, title=args.title)
         elif args.command == "add":

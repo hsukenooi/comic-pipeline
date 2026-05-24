@@ -4,9 +4,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import stat
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from locg.config import wish_list_cache_path
 
 from locg.collection_cache import (
     LOCG_COLUMNS,
@@ -208,6 +214,52 @@ def _partial_identity(row: dict[str, Any]) -> tuple[str, str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Wish-list cache write
+# ---------------------------------------------------------------------------
+
+def _write_wish_list_cache(wish_rows: list[dict[str, Any]]) -> None:
+    """Atomically write wish-list.json from merged collection rows.
+
+    Follows the IDCache._save() pattern: tempfile + os.replace + chmod 600.
+    No fsync needed — this is a best-effort read-only cache.
+    """
+    path = wish_list_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    items = [
+        {
+            "name": row.get("full_title") or "",
+            "id": None,
+            "series_name": row.get("series_name"),
+            "publisher_name": row.get("publisher_name"),
+            "release_date": row.get("release_date"),
+            "media_format": row.get("media_format"),
+        }
+        for row in wish_rows
+    ]
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }
+
+    fd, tmp = tempfile.mkstemp(
+        prefix=".wish-list-", suffix=".json.tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Main import orchestration
 # ---------------------------------------------------------------------------
 
@@ -242,8 +294,12 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
     # Collect audit records to append after each merge step.
     # append_audit is called inside the mutate_fn (safe: uses a different file).
     audit_records: list[dict[str, Any]] = []
+    # Wish-list rows are captured inside do_merge and written after apply() succeeds,
+    # so both caches only update when the full import completes successfully.
+    wish_rows: list[dict[str, Any]] = []
 
     def do_merge(payload: dict[str, Any]) -> None:
+        nonlocal wish_rows
         comics = payload["comics"]
 
         # Full identity index: (publisher, series, full_title, release_date) → idx
@@ -475,6 +531,11 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         payload["last_full_import"] = now
         payload["last_import_source"] = str(path)
 
+        # Capture wish-list rows for writing after apply() completes.
+        wish_rows = [
+            r for r in payload["comics"] if r.get("in_wish_list") == 1
+        ]
+
         # Flush audit records while still inside apply (append_audit uses a
         # separate file so it does not need the cache lock)
         for record in audit_records:
@@ -484,6 +545,7 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 logger.warning("Failed to write audit record: %s", exc)
 
     cache.apply(do_merge, command="import")
+    _write_wish_list_cache(wish_rows)
     return summary
 
 

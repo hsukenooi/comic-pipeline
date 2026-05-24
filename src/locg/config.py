@@ -49,6 +49,10 @@ def collection_cache_path() -> Path:
     return _cache_dir() / "collection.json"
 
 
+def wish_list_cache_path() -> Path:
+    return _cache_dir() / "wish-list.json"
+
+
 def import_history_path() -> Path:
     return _cache_dir() / "import-history.jsonl"
 

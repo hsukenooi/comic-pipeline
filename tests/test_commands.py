@@ -1873,3 +1873,62 @@ def test_cmd_lookup_cache_hit_not_in_collection(tmp_path, mock_client):
 
     assert result[0]["from_cache"] is True
     assert result[0]["in_collection"] is False
+
+
+# ---------------------------------------------------------------------------
+# cmd_wish_list_from_cache
+# ---------------------------------------------------------------------------
+
+def _make_wish_list_cache(tmp_path, items=None):
+    """Write a wish-list.json fixture to the tmp_path-isolated cache location."""
+    from datetime import datetime, timezone
+    from locg.commands import wish_list_cache_path
+    if items is None:
+        items = [
+            {"name": "Amazing Spider-Man #300", "id": None, "series_name": "Amazing Spider-Man"},
+            {"name": "X-Men #1", "id": None, "series_name": "X-Men"},
+            {"name": "Batman #500", "id": None, "series_name": "Batman"},
+        ]
+    import json
+    cache_path = wish_list_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps({
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }))
+    return items
+
+
+def test_cmd_wish_list_from_cache_returns_all_items(tmp_path):
+    """cmd_wish_list_from_cache returns the full items list from cache."""
+    from locg.commands import cmd_wish_list_from_cache
+    items = _make_wish_list_cache(tmp_path)
+    result = cmd_wish_list_from_cache()
+    assert len(result) == len(items)
+    assert result[0]["name"] == "Amazing Spider-Man #300"
+    assert result[0]["id"] is None
+
+
+def test_cmd_wish_list_from_cache_title_filter_case_insensitive(tmp_path):
+    """Title filter is case-insensitive substring match on name."""
+    from locg.commands import cmd_wish_list_from_cache
+    _make_wish_list_cache(tmp_path)
+    result = cmd_wish_list_from_cache(title="spider-man")
+    assert len(result) == 1
+    assert result[0]["name"] == "Amazing Spider-Man #300"
+
+
+def test_cmd_wish_list_from_cache_empty_cache(tmp_path):
+    """An empty items list returns [] without error."""
+    from locg.commands import cmd_wish_list_from_cache
+    _make_wish_list_cache(tmp_path, items=[])
+    result = cmd_wish_list_from_cache()
+    assert result == []
+
+
+def test_cmd_wish_list_from_cache_missing_file(tmp_path):
+    """Raises FileNotFoundError when cache does not exist."""
+    from locg.commands import cmd_wish_list_from_cache
+    import pytest
+    with pytest.raises(FileNotFoundError):
+        cmd_wish_list_from_cache()

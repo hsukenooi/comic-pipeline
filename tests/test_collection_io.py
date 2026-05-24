@@ -775,3 +775,95 @@ def test_pending_push_already_pushed_excluded(tmp_path):
     assert len(ready) == 0
     assert len(mv) == 0
     assert len(ms) == 0
+
+
+# ---------------------------------------------------------------------------
+# import_xlsx — wish-list cache
+# ---------------------------------------------------------------------------
+
+def test_import_xlsx_writes_wish_list_cache(tmp_path, monkeypatch):
+    """import_xlsx writes wish-list.json alongside collection.json."""
+    from locg.collection_io import import_xlsx, wish_list_cache_path
+    cache = make_cache(tmp_path)
+    import_xlsx(SAMPLE_XLSX, cache)
+    wl_path = wish_list_cache_path()
+    assert wl_path.exists()
+    data = json.loads(wl_path.read_text())
+    assert "updated_at" in data
+    assert "items" in data
+
+
+def test_wish_list_cache_item_count(tmp_path):
+    """wish-list.json contains exactly the rows where in_wish_list == 1."""
+    from locg.collection_io import import_xlsx, wish_list_cache_path
+    cache = make_cache(tmp_path)
+    import_xlsx(SAMPLE_XLSX, cache)
+    payload = cache.load()
+    expected = sum(1 for r in payload["comics"] if r.get("in_wish_list") == 1)
+    data = json.loads(wish_list_cache_path().read_text())
+    assert len(data["items"]) == expected
+    assert expected > 0  # fixture has wish-list rows
+
+
+def test_wish_list_cache_item_shape(tmp_path):
+    """Each wish-list cache entry has name (from full_title) and id: null."""
+    from locg.collection_io import import_xlsx, wish_list_cache_path
+    cache = make_cache(tmp_path)
+    import_xlsx(SAMPLE_XLSX, cache)
+    payload = cache.load()
+    xl_wish = {r["full_title"] for r in payload["comics"] if r.get("in_wish_list") == 1}
+    data = json.loads(wish_list_cache_path().read_text())
+    for item in data["items"]:
+        assert item["name"] in xl_wish
+        assert item["id"] is None
+
+
+def test_wish_list_cache_updated_at_is_iso_timestamp(tmp_path):
+    """wish-list.json envelope contains a valid ISO 8601 UTC timestamp."""
+    from datetime import datetime, timezone
+    from locg.collection_io import import_xlsx, wish_list_cache_path
+    cache = make_cache(tmp_path)
+    import_xlsx(SAMPLE_XLSX, cache)
+    data = json.loads(wish_list_cache_path().read_text())
+    ts = data["updated_at"]
+    # Should parse without error and be timezone-aware
+    parsed = datetime.fromisoformat(ts)
+    assert parsed.tzinfo is not None
+
+
+def test_wish_list_cache_overwritten_on_reimport(tmp_path):
+    """Re-importing overwrites wish-list.json rather than appending."""
+    from locg.collection_io import import_xlsx, wish_list_cache_path
+    cache = make_cache(tmp_path)
+    import_xlsx(SAMPLE_XLSX, cache)
+    first_mtime = wish_list_cache_path().stat().st_mtime_ns
+    import_xlsx(SAMPLE_XLSX, cache)
+    second_mtime = wish_list_cache_path().stat().st_mtime_ns
+    # Second import must have produced a fresh file
+    assert second_mtime >= first_mtime
+    data = json.loads(wish_list_cache_path().read_text())
+    assert isinstance(data["items"], list)
+
+
+def test_wish_list_cache_empty_when_no_wish_list_rows(tmp_path, monkeypatch):
+    """An XLSX with zero wish-list rows writes items: [] without error."""
+    import openpyxl
+    from locg.collection_io import import_xlsx, wish_list_cache_path, LOCG_XLSX_HEADERS
+
+    # Build a minimal XLSX with one collection-only row (in_wish_list=0)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(list(LOCG_XLSX_HEADERS))
+    ws.append([
+        "Marvel", "X-Men", "X-Men #1", "1963-09-01",
+        1, 0, 0, None, "Print", None, None, None, None,
+        None, None, None, None, None, None, None, None,
+    ])
+    xlsx_path = tmp_path / "no_wish.xlsx"
+    wb.save(xlsx_path)
+
+    cache = make_cache(tmp_path)
+    import_xlsx(xlsx_path, cache)
+    data = json.loads(wish_list_cache_path().read_text())
+    assert data["items"] == []
+    assert "updated_at" in data

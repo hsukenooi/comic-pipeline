@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
 from locg.collection_cache import CollectionCache, _normalize_series_key
+from locg.config import wish_list_cache_path
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
 
@@ -589,6 +590,23 @@ def cmd_pull_list(client: LOCGClient, title: Optional[str] = None) -> list[dict[
 def cmd_wish_list(client: LOCGClient, title: Optional[str] = None) -> list[dict[str, Any]]:
     """Get the user's wish list."""
     return _get_user_list(client, "wish", title=title)
+
+
+def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]]:
+    """Serve the wish list from the local cache populated by collection import.
+
+    Raises FileNotFoundError if the cache does not exist.
+    """
+    path = wish_list_cache_path()
+    if not path.exists():
+        raise FileNotFoundError(f"Wish-list cache not found: {path}. Run: locg collection import")
+    with open(path) as f:
+        data = json.load(f)
+    items: list[dict[str, Any]] = data.get("items", [])
+    if title:
+        needle = title.lower()
+        items = [it for it in items if needle in (it.get("name") or "").lower()]
+    return items
 
 
 def cmd_read_list(client: LOCGClient, title: Optional[str] = None) -> list[dict[str, Any]]:

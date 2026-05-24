@@ -366,3 +366,69 @@ def test_cli_record_win_non_list_json_exits_2(monkeypatch, capsys, tmp_path):
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2
+
+
+# --- wish-list cache routing ---
+
+
+def test_cli_wish_list_uses_cache_skips_client(monkeypatch, tmp_path, capsys):
+    """When wish-list cache exists, LOCGClient must not be constructed."""
+    import locg.cli
+
+    cache_file = tmp_path / "wish-list.json"
+    cache_file.write_text(json.dumps({
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "items": [{"name": "Batman #1", "id": None}],
+    }))
+
+    client_constructed = []
+
+    class FakeClient:
+        def __init__(self):
+            client_constructed.append(True)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "cmd_wish_list_from_cache", lambda title=None: [{"name": "Batman #1"}])
+    monkeypatch.setattr(sys, "argv", ["locg", "wish-list"])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert not client_constructed, "LOCGClient must not be constructed when wish-list cache is present"
+
+
+def test_cli_wish_list_falls_back_to_live_when_no_cache(monkeypatch, tmp_path, capsys):
+    """When wish-list cache is absent, cmd_wish_list (live) is called."""
+    import locg.cli
+
+    # Cache file is absent — _isolate_wish_list_cache fixture returns a path that doesn't exist yet
+
+    live_called = []
+
+    def fake_cmd_wish_list(client, title=None):
+        live_called.append(True)
+        return [{"name": "Batman #1"}]
+
+    class FakeClient:
+        def __init__(self):
+            pass
+        def require_auth(self):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "load_dotenv", lambda *a, **kw: None)
+    monkeypatch.setattr(locg.cli, "cmd_wish_list", fake_cmd_wish_list)
+    monkeypatch.setattr(sys, "argv", ["locg", "wish-list"])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert live_called, "cmd_wish_list (live) must be called when wish-list cache is absent"

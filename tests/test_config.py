@@ -9,6 +9,7 @@ from locg.config import (
     ensure_config_dir,
     load_config,
     save_config,
+    wish_list_cache_path,
 )
 
 
@@ -42,3 +43,17 @@ def test_cookie_path_resolves(tmp_path, monkeypatch):
     p = cookie_path()
     assert p == tmp_path / "locg" / "cookies.json"
     assert p.name == "cookies.json"
+
+
+def test_wish_list_cache_path_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    p = wish_list_cache_path()
+    assert p == tmp_path / "locg" / "wish-list.json"
+    assert p.name == "wish-list.json"
+
+
+def test_wish_list_cache_path_respects_xdg_cache_home(tmp_path, monkeypatch):
+    custom_cache = tmp_path / "custom-cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(custom_cache))
+    p = wish_list_cache_path()
+    assert p == custom_cache / "locg" / "wish-list.json"
