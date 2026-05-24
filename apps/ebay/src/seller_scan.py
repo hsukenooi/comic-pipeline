@@ -6,6 +6,9 @@ import json
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+import anthropic
 
 from ebay_fetch import load_config, get_token, parse_item_summary, search_seller_listings
 
@@ -107,6 +110,71 @@ def match_listing(title, wish_items):
     return None, 0.0
 
 
+# ─── Claude verification ──────────────────────────────────────────────────────
+
+def _load_dotenv(path):
+    """Load key=value pairs from a .env file into os.environ (if not already set)."""
+    import os
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                if key and key not in os.environ:
+                    os.environ[key] = val.strip()
+    except FileNotFoundError:
+        pass
+
+
+def verify_with_claude(matches):
+    """Filter candidates to genuine matches using a single Claude API call."""
+    if not matches:
+        return []
+
+    _load_dotenv(Path(__file__).parent.parent / ".env")
+    client = anthropic.Anthropic()
+    pairs = "\n".join(
+        f'{i+1}. Listing: "{m["title"]}"\n   Wish item: "{m["wish_name"]}"'
+        for i, m in enumerate(matches)
+    )
+    prompt = f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
+
+Reject if:
+- Different series sharing words (Spider-Man Noir vs Amazing Spider-Man, X-Factor vs X-Men, Superior/Ultimate Spider-Man vs Amazing Spider-Man)
+- Annual, Giant-Size, or special edition matching a regular series issue (and vice versa)
+- Lot listing where the issue number appears in the lot size
+- Promotional reprint (Trick or Read, LCSD, Amazon promo, Undeluxe)
+- Modern renumbered issue matching an original issue number (e.g. #10 (811))
+- Series name only in a subtitle or story description, not the actual series
+
+Respond with only a JSON array, one object per pair in order:
+{{"id": 1, "genuine": true}}
+or
+{{"id": 1, "genuine": false, "reason": "brief reason"}}
+
+Pairs:
+{pairs}"""
+
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text = response.content[0].text
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if not m:
+        print("Warning: could not parse Claude response, returning all candidates", file=sys.stderr)
+        return matches
+
+    verdicts = json.loads(m.group())
+    verdict_map = {v["id"]: v.get("genuine", False) for v in verdicts}
+    return [m for i, m in enumerate(matches, 1) if verdict_map.get(i, False)]
+
+
 # ─── Output ───────────────────────────────────────────────────────────────────
 
 def _trunc(text, width):
@@ -193,21 +261,27 @@ def main(argv=None):
     print(f"  {len(raw_listings)} listings fetched", file=sys.stderr)
 
     # Match
-    matches = []
+    seen_ids = set()
+    candidates = []
     for raw in raw_listings:
         listing = parse_item_summary(raw)
         if "cgc" in listing["title"].lower():
             continue
+        if listing["item_id"] in seen_ids:
+            continue
+        seen_ids.add(listing["item_id"])
         wish, score = match_listing(listing["title"], wish_items)
         if wish:
-            matches.append({
+            candidates.append({
                 **listing,
                 "wish_id": wish["id"],
                 "wish_name": wish["name"],
                 "match_score": round(score, 2),
             })
 
-    print(f"  {len(matches)} match(es) found", file=sys.stderr)
+    print(f"  {len(candidates)} candidate(s) — verifying with Claude...", file=sys.stderr)
+    matches = verify_with_claude(candidates)
+    print(f"  {len(matches)} genuine match(es) found", file=sys.stderr)
 
     if args.json_output:
         print(json.dumps(matches, indent=2))
