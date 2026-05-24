@@ -22,6 +22,7 @@ EXPECTED_SKILLS = [
     "identify.md",
     "snipe-add.md",
     "snipe-show.md",
+    "verify.md",
 ]
 
 STALE_PATH_PATTERNS = [
