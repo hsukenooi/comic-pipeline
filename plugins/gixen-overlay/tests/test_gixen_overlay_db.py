@@ -13,6 +13,7 @@ from gixen_overlay.db import (
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
+    sweep_orphan_yearless_comics,
 )
 
 
@@ -131,6 +132,101 @@ def test_upsert_comic_caps_insert_finds_canonical_yeared(db):
     id1 = upsert_comic(db, "Batman", "375", 1984)
     id2 = upsert_comic(db, "BATMAN", "375", 1984)
     assert id1 == id2
+
+
+# ---------------------------------------------------------------------------
+# upsert_comic — case-insensitive title matching (PER-123)
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_comic_allcaps_yeared_hits_existing_yeared_row(db):
+    id1 = upsert_comic(db, "The Mighty Thor", "154", 1968)
+    id2 = upsert_comic(db, "THE MIGHTY THOR", "154", 1968)
+    assert id1 == id2
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+
+def test_upsert_comic_allcaps_yeared_promotes_existing_yearless(db):
+    id_yearless = upsert_comic(db, "THE MIGHTY THOR", "154")
+    id_yeared = upsert_comic(db, "The Mighty Thor", "154", 1968)
+    assert id_yearless == id_yeared
+    row = db.execute("SELECT year FROM comics WHERE id=?", (id_yeared,)).fetchone()
+    assert row["year"] == 1968
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+
+def test_upsert_comic_allcaps_yearless_defers_to_existing_yeared(db):
+    id_yeared = upsert_comic(db, "The Mighty Thor", "154", 1968)
+    id_yearless = upsert_comic(db, "THE MIGHTY THOR", "154")
+    assert id_yearless == id_yeared
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+
+def test_upsert_comic_allcaps_yearless_hits_existing_yearless(db):
+    id1 = upsert_comic(db, "The Mighty Thor", "154")
+    id2 = upsert_comic(db, "THE MIGHTY THOR", "154")
+    assert id1 == id2
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+
+def test_upsert_comic_allcaps_skips_yearless_promotion_on_yeared_sibling_conflict(db):
+    # Set up: yearless row + yeared row at 1968 (bypassing upsert_comic to avoid
+    # auto-promotion — simulates pre-existing split state in the DB).
+    cur = db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("The Mighty Thor", "154"),
+    )
+    db.commit()
+    id_yearless = cur.lastrowid
+    db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)",
+        ("The Mighty Thor", "154", 1968),
+    )
+    db.commit()
+
+    # ALL-CAPS yeared insert at year=1999 — LOWER() finds 1968 as a conflicting
+    # yeared sibling, so PER-104 guard fires and returns the yearless row unchanged.
+    id_returned = upsert_comic(db, "THE MIGHTY THOR", "154", 1999)
+
+    assert id_returned == id_yearless
+    row = db.execute("SELECT year FROM comics WHERE id=?", (id_yearless,)).fetchone()
+    assert row["year"] is None
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 2
+
+
+def test_sweep_orphan_yearless_comics_merges_allcaps_stubs(db):
+    yeared_id = upsert_comic(db, "The Mighty Thor", "154", 1968)
+    # Manually insert an ALL-CAPS yearless stub (bypassing upsert_comic which
+    # now deduplicates — this simulates pre-PER-123 data in the DB).
+    cur = db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("THE MIGHTY THOR", "154"),
+    )
+    db.commit()
+    stub_id = cur.lastrowid
+
+    result = sweep_orphan_yearless_comics(db)
+
+    assert result["dry_run"] is False
+    assert result["merged"] == 1
+    assert result["details"][0]["yearless_id"] == stub_id
+    assert result["details"][0]["yeared_id"] == yeared_id
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+
+def test_sweep_orphan_yearless_comics_dry_run_does_not_delete(db):
+    upsert_comic(db, "The Mighty Thor", "154", 1968)
+    db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("THE MIGHTY THOR", "154"),
+    )
+    db.commit()
+
+    result = sweep_orphan_yearless_comics(db, dry_run=True)
+
+    assert result["dry_run"] is True
+    assert result["would_merge"] == 1
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +753,93 @@ def test_migration_fresh_db_no_legacy_data_is_noop():
     assert "bid_comics" not in tables
     assert "fmv" in tables
     assert "bid_fmvs" in tables
+
+
+def test_migrate_sweep_allcaps_orphans_merges_on_startup():
+    """create_tables() sweeps ALL-CAPS yearless stubs into their yeared siblings."""
+    conn = _make_db()
+    create_tables(conn)
+    # Manually insert a yeared canonical row and an ALL-CAPS yearless stub
+    # (bypasses upsert_comic which now deduplicates — simulates pre-PER-123 data).
+    yeared_id = upsert_comic(conn, "The Mighty Thor", "154", 1968)
+    cur = conn.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("THE MIGHTY THOR", "154"),
+    )
+    conn.commit()
+    stub_id = cur.lastrowid
+    # Clear the migration marker so the sweep runs again on next create_tables call.
+    conn.execute("DELETE FROM migration_state WHERE migration='sweep_allcaps_orphans'")
+    conn.commit()
+
+    create_tables(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+    row = conn.execute("SELECT id FROM comics WHERE year=1968").fetchone()
+    assert row["id"] == yeared_id
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_state WHERE migration='sweep_allcaps_orphans'"
+    ).fetchone()[0] == 1
+
+
+def test_migrate_sweep_allcaps_orphans_is_idempotent():
+    """create_tables() called twice does not double-count or re-run the sweep."""
+    conn = _make_db()
+    create_tables(conn)
+    upsert_comic(conn, "X-Men", "1", 1963)
+    cur = conn.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("X-MEN", "1"),
+    )
+    conn.commit()
+    conn.execute("DELETE FROM migration_state WHERE migration='sweep_allcaps_orphans'")
+    conn.commit()
+
+    create_tables(conn)
+    assert conn.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+    # Second call — stub is gone; no new merges.
+    create_tables(conn)
+    assert conn.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_state WHERE migration='sweep_allcaps_orphans'"
+    ).fetchone()[0] == 1
+
+
+def test_migrate_lowercase_title_indexes_creates_lower_expression_indexes(db):
+    idx = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_comics_tiy'"
+    ).fetchone()
+    assert idx is not None
+    assert "lower(" in idx["sql"].lower()
+
+
+def test_migrate_lowercase_title_indexes_blocks_case_variant_yeared_duplicate(db):
+    db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)",
+        ("The Mighty Thor", "154", 1968),
+    )
+    db.commit()
+    with pytest.raises(Exception):
+        db.execute(
+            "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)",
+            ("THE MIGHTY THOR", "154", 1968),
+        )
+        db.commit()
+
+
+def test_migrate_lowercase_title_indexes_is_idempotent():
+    conn = _make_db()
+    create_tables(conn)
+    create_tables(conn)
+    idx = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_comics_tiy'"
+    ).fetchone()
+    assert idx is not None
+    assert "lower(" in idx["sql"].lower()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_state WHERE migration='lowercase_title_indexes'"
+    ).fetchone()[0] == 1
 
 
 def test_migration_regression_second_grade_revision_upserts_fmv_not_new_comic():

@@ -63,16 +63,20 @@ def create_tables(conn: sqlite3.Connection) -> None:
     """)
     _migrate_fmv_split(conn)
     _migrate_year_nullable(conn)
+    _migrate_sweep_allcaps_orphans(conn)
+    _migrate_lowercase_title_indexes(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
     # one comic) has run before we try to enforce uniqueness on the cleaned set.
+    # LOWER(title) expression indexes enforce uniqueness case-insensitively so
+    # direct SQL writes also can't create case-variant duplicates.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_tiy "
-        "ON comics(title, issue, year) WHERE year IS NOT NULL"
+        "ON comics(LOWER(title), issue, year) WHERE year IS NOT NULL"
     )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_ti_nullyear "
-        "ON comics(title, issue) WHERE year IS NULL"
+        "ON comics(LOWER(title), issue) WHERE year IS NULL"
     )
 
 
@@ -532,6 +536,94 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
         "year-nullable migration complete: %d fmv, %d bid_fmvs, %d bids.fmv_id restored",
         len(saved_fmv), len(saved_bid_fmvs), len(saved_bid_fmv_id),
     )
+
+
+# ---------------------------------------------------------------------------
+# One-time data migration: sweep ALL-CAPS yearless orphans created pre-PER-123
+# ---------------------------------------------------------------------------
+
+
+def _migrate_sweep_allcaps_orphans(conn: sqlite3.Connection) -> None:
+    """Merge ALL-CAPS yearless orphan comics into their yeared siblings exactly once.
+
+    Cleans up stubs created before PER-123 added case-insensitive title matching.
+    Gate: migration_state row 'sweep_allcaps_orphans' present → already ran.
+
+    IMPORTANT: Uses raw conn.execute() only — no conn.commit(). Called from
+    create_tables() which runs inside the host's per-plugin SAVEPOINT; calling
+    conn.commit() here would destroy it (same constraint as _migrate_fmv_split
+    and _migrate_year_nullable).
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state WHERE migration='sweep_allcaps_orphans'"
+    ).fetchone()
+    if row is not None:
+        return
+
+    orphans = conn.execute(
+        """
+        SELECT
+            c.id   AS yearless_id,
+            c.title,
+            c.issue,
+            (SELECT id FROM comics
+             WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
+             ORDER BY (locg_id IS NULL), id LIMIT 1) AS yeared_id
+        FROM comics c
+        WHERE c.year IS NULL
+          AND EXISTS (
+              SELECT 1 FROM comics
+              WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
+          )
+        """
+    ).fetchall()
+
+    for orphan in orphans:
+        _merge_yearless_into_yeared(conn, orphan["yearless_id"], orphan["yeared_id"])
+        conn.execute("DELETE FROM comics WHERE id=?", (orphan["yearless_id"],))
+
+    if orphans:
+        logger.info(
+            "_migrate_sweep_allcaps_orphans: merged %d orphan(s): %s",
+            len(orphans),
+            [(r["title"], r["issue"]) for r in orphans],
+        )
+    _set_migration_marker(conn, "sweep_allcaps_orphans")
+
+
+# ---------------------------------------------------------------------------
+# One-time schema migration: LOWER(title) expression unique indexes (PER-120)
+# ---------------------------------------------------------------------------
+
+
+def _migrate_lowercase_title_indexes(conn: sqlite3.Connection) -> None:
+    """Replace case-sensitive partial unique indexes with LOWER(title) variants.
+
+    Old: ON comics(title, issue, year) / ON comics(title, issue)
+    New: ON comics(LOWER(title), issue, year) / ON comics(LOWER(title), issue)
+
+    Gate: migration_state row 'lowercase_title_indexes' present → already ran.
+
+    IMPORTANT: Uses raw conn.execute() only — no conn.commit(). Called from
+    create_tables() which runs inside the host's per-plugin SAVEPOINT.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state WHERE migration='lowercase_title_indexes'"
+    ).fetchone()
+    if row is not None:
+        return
+
+    conn.execute("DROP INDEX IF EXISTS idx_comics_tiy")
+    conn.execute("DROP INDEX IF EXISTS idx_comics_ti_nullyear")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_comics_tiy "
+        "ON comics(LOWER(title), issue, year) WHERE year IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_comics_ti_nullyear "
+        "ON comics(LOWER(title), issue) WHERE year IS NULL"
+    )
+    _set_migration_marker(conn, "lowercase_title_indexes")
 
 
 # ---------------------------------------------------------------------------
