@@ -9,13 +9,11 @@ Compute fair market value from real eBay sold transactions. No multiplier math �
 
 ## How to run
 
-**Default path: delegate to `comic-fmv` (apps/fmv).** It handles fetch (via `ebay-sold-comps` from apps/ebay), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
+**Default path: delegate to `gixen-cli fmv`.** It handles fetch (via `ebay-fetch sold-comps`), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
 
 ```bash
-comic-fmv --batch <working_list.json> --out <results.json>
+cd ~/Projects/gixen-cli && .venv/bin/python cli.py fmv --batch <working_list.json> --out <results.json>
 ```
-
-Install once with `pip install -e apps/ebay -e apps/fmv` from the repo root; both `ebay-sold-comps` and `comic-fmv` then live on `$PATH`.
 
 `--batch` JSON shape: `[{item_id, title, issue, year, grade, locg_id?, locg_variant_id?, notes?}, ...]`
 
@@ -31,7 +29,7 @@ The CLI prints a human-readable table to stdout and writes the full structured r
 
 ## Manual fallback (only if the CLI is broken)
 
-If `comic-fmv` is unavailable, you can run the steps below by hand. SerpApi access requires `SERPAPI_KEY`; canonical location is `apps/ebay/.env` (or set the env var directly).
+If `gixen-cli fmv` is unavailable, you can run the steps below by hand. SerpApi access requires `SERPAPI_KEY`; canonical location is `~/.config/ebay-fetch/config.json`.
 
 ## Server Health Check
 
@@ -264,7 +262,7 @@ For an active auction with 30+ bids that has already crossed your computed Q75, 
 
 Two caches insulate this skill from SerpApi's 250/month free tier and from re-running compute we already did. The CLI handles both automatically; the manual fallback should respect them.
 
-1. **SerpApi response cache (`ebay-sold-comps`)** — cache key `sha256(canonical_query_url)`, stored at `~/.cache/ebay-sold-comps/<sha>.json`, TTL 7 days. eBay sold prices for older books move slowly; one fresh fetch per book per week is plenty. Bypass with `--force`.
+1. **SerpApi response cache (`ebay-fetch sold-comps`)** — cache key `sha256(canonical_query_url)`, stored at `~/.cache/ebay-sold-comps/<sha>.json`, TTL 7 days. eBay sold prices for older books move slowly; one fresh fetch per book per week is plenty. Bypass with `--force`.
 2. **DB FMV cache (Gixen `comics` table)** — before any SerpApi call, look up the existing row by `(locg_id, grade)` and reuse if `fmv_updated_at` is within `--max-age-days N` (default 7). Bypass with `--force`. The `POST /api/comics` endpoint always touches `fmv_updated_at` on FMV-field updates, so the freshness check is reliable.
 
 Manual fallback: skip these unless you're explicitly recomputing — re-running by hand spends API calls that the CLI would have served from cache.

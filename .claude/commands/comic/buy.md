@@ -21,7 +21,7 @@ At each step, present results to the user and wait for approval before proceedin
 
 ## Step 1: Identify
 
-Read `~/Projects/comic-pipeline/skills/identify.md` and follow it.
+Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow it.
 
 **Input:** eBay URLs from the user.
 **Output:** Identification table (comic, issue, grade, variant, auction vs BIN).
@@ -32,16 +32,14 @@ Gate: user confirms identifications are correct. Flag Buy It Now listings — th
 
 ## Step 2: Collection Check
 
-Read `~/Projects/comic-pipeline/skills/collection-check.md` and follow it.
+Read `~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md` and follow it.
 
 **Input:** Comic identification table from Step 1.
-**Output:** Table with `in_collection` flag per comic, and a resolved `locg_id` (and `locg_variant_id` if applicable) for each comic where one was found.
+**Output:** Table showing collection membership from the local cache. Cache may lag LOCG by up to N days (shown as "Cache age" in the results).
 
-`/comic:collection-check` performs LOCG lookups to test for duplicates anyway — capture the resolved IDs from that pass and carry them on the working list for Step 5. This avoids a second lookup.
+Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate). For any `⚠️ Not in cache (cache stale)` results, surface them separately so the user can decide whether to bid before verifying manually.
 
-Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate).
-
-Remove skipped comics from the working list before Step 2.5.5.
+Remove skipped comics from the working list before Step 2.5.
 
 ---
 
@@ -53,7 +51,7 @@ Inspect the surviving working list for comics where `grade_source` is `"missing"
 
 **If any such comics remain:**
 
-Read `~/Projects/comic-pipeline/skills/grade.md` and follow it for those listings only.
+Read `~/Projects/comic-pipeline/.claude/commands/comic/grade.md` and follow it for those listings only.
 
 - Pass only the ungraded item IDs — already-graded comics skip this step
 - The skill downloads photos via the eBay Browse API and dispatches 3 independent grader agents per comic
@@ -107,7 +105,7 @@ Flags worth knowing:
 - CV >100% → suspect a wild outlier survived; check the comp pool in the JSON output
 - "CGC proxy" in Notes → confidence is capped at MEDIUM-LOW regardless of comp count
 
-If the CLI fails, fall back to the manual procedure in `~/Projects/comic-pipeline/skills/fmv.md`. Otherwise present the table directly.
+If the CLI fails, fall back to the manual procedure in `~/Projects/comic-pipeline/.claude/commands/comic/fmv.md`. Otherwise present the table directly.
 
 ---
 
@@ -131,21 +129,22 @@ Gate: user approves or overrides each max bid.
 
 ## Step 5: Snipe Add
 
-Read `~/Projects/comic-pipeline/skills/snipe-add.md` and follow it.
+Read `~/Projects/comic-pipeline/.claude/commands/comic/snipe-add.md` and follow it.
 
-**Input:** Approved auctions with max bids and the resolved `locg_id` (and `locg_variant_id` if applicable) carried forward from Step 2.
-
-If a comic was added since Step 2 (e.g. user override) and has no `locg_id` yet, follow the "Resolve LOCG ID" section in `snipe-add.md` to fill it in before running `gixen-cli add`. Pass `--locg-id` (and `--locg-variant-id` if applicable) on every `add` call so the won snipe is self-contained for `/comic:collection-add`.
+**Input:** Approved auctions with max bids.
 
 **Output:** Gixen confirmation table.
 
 Skip Buy It Now listings. Run sequentially (not in parallel) — Gixen session is stateful.
 
+When snipes are added, remind the user:
+> Run `/comic:collection-add` after auctions close to record wins. Check `locg collection status` for pending push count before uploading.
+
 ---
 
 ## Step 6: Verify
 
-Read `~/Projects/comic-pipeline/skills/verify.md` and follow it.
+Read `~/Projects/comic-pipeline/.claude/commands/comic/verify.md` and follow it.
 
 **Input:** Working list of `{item_id, grade, locg_id?}` for every comic that was sniped in Step 5. Skip Buy It Now listings (they have no bid to verify).
 
