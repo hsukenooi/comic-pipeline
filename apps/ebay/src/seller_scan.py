@@ -33,7 +33,7 @@ def fetch_wish_list():
 
 # ─── Matching ─────────────────────────────────────────────────────────────────
 
-_STOPWORDS = frozenset({"the", "a", "an", "of", "and", "in", "vol"})
+_STOPWORDS = frozenset({"the", "a", "an", "of", "and", "in", "vol", "comics"})
 
 
 def _normalize(text):
@@ -43,7 +43,7 @@ def _normalize(text):
 
 def _series_tokens(series):
     """Return significant tokens from a series name."""
-    return [t for t in _normalize(series).split() if t and t not in _STOPWORDS]
+    return [t for t in _normalize(series).split() if len(t) >= 2 and t not in _STOPWORDS]
 
 
 def _parse_wish_name(name):
@@ -94,14 +94,15 @@ def match_listing(title, wish_items):
             continue
 
         tokens = wish["_tokens"]
-        matched = sum(1 for t in tokens if t in title_norm)
+        title_words = set(title_norm.split())
+        matched = sum(1 for t in tokens if t in title_words)
         score = matched / len(tokens)
 
         if score > best_score:
             best_score = score
             best = wish
 
-    if best_score >= 0.5:
+    if best_score >= 0.65:
         return best, best_score
     return None, 0.0
 
@@ -160,8 +161,8 @@ def main(argv=None):
     parser.add_argument(
         "--max-results",
         type=int,
-        default=500,
-        help="Maximum listings to fetch from seller (default: 500)",
+        default=1000,
+        help="Maximum listings to fetch from seller (default: 1000)",
     )
     parser.add_argument(
         "--env",
@@ -195,6 +196,8 @@ def main(argv=None):
     matches = []
     for raw in raw_listings:
         listing = parse_item_summary(raw)
+        if "cgc" in listing["title"].lower():
+            continue
         wish, score = match_listing(listing["title"], wish_items)
         if wish:
             matches.append({

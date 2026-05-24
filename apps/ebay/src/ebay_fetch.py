@@ -399,7 +399,7 @@ def parse_item_summary(item):
     }
 
 
-def search_seller_listings(seller, token, base_url, *, max_results=500, retries=3):
+def search_seller_listings(seller, token, base_url, *, max_results=1000, retries=3):
     """Fetch active listings from a seller via Browse API item_summary/search.
 
     Paginates automatically. Returns a list of raw itemSummary dicts.
@@ -418,8 +418,8 @@ def search_seller_listings(seller, token, base_url, *, max_results=500, retries=
 
     while True:
         params = {
-            "q": "comics",
-            "filter": f"sellers:{{{username}}}",
+            "q": "comic",
+            "filter": f"sellers:{{{username}}},buyingOptions:{{AUCTION}}",
             "limit": page_size,
             "offset": offset,
         }
