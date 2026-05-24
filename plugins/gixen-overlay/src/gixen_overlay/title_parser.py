@@ -105,6 +105,7 @@ _EDITION_TAGS = [
     r"key(?:\s+issue)?",
     r"low\s+print\s+run",
     r"high\s+grades?",
+    r"\bcondition\b",
     r"homage(?:\s+(?:cover|variant))?",
     r"beauty",
     r"gem",
@@ -257,6 +258,14 @@ def _clean_series(text: str) -> str:
     t = _ISSUE_NO_KEYWORD.sub(" ", t)
     t = _ISSUE_BARE_RUN.sub(" ", t)
 
+    # Remove publisher context parens like "(DC Comics September 1983)".
+    # Must run before edition-tag removal so the year inside is still present
+    # to anchor the match (avoids partial matches on grade-only parens).
+    t = re.sub(
+        r"\([^)]*\b(?:marvel|dc|image|dark\s+horse|idw|valiant|boom|vertigo|comics|comic)\b[^)]*\)",
+        " ", t, flags=re.IGNORECASE,
+    )
+
     # Remove edition tags / condition tokens. Then strip orphaned parens left
     # behind by scrubbing tokens like "(NM+)" → "(  )".
     t = _EDITION_RE.sub(" ", t)
@@ -283,7 +292,7 @@ def _clean_series(text: str) -> str:
         if skip_next:
             skip_next = False
             continue
-        low = tok.lower().strip(".,!?;:")
+        low = tok.lower().strip(".,!?;:()")
         # "Dark Horse" 2-token publisher
         if low == "dark" and i + 1 < len(tokens) and tokens[i + 1].lower().strip(".,!?;:") == "horse":
             skip_next = True
@@ -306,6 +315,12 @@ def _clean_series(text: str) -> str:
     cut_markers = [
         r"\b1st\s+app\w*",
         r"\bfirst\s+app\w*",
+        # "1st Jason Todd as Robin", "1st Dick Grayson", etc. — content notes,
+        # not edition tags. Exclude "class/series/issue/edition/vol" so
+        # series like "Spider-Man 1st Class" are not truncated.
+        r"\b1st\s+(?!print|class|series|issue|edition|vol)[A-Za-z]",
+        r"\bauction\b",
+        r"\bhuge\b",
         r"\bfull\s+run\b",
         r"\bkey\b",
         r"\bmcfarlane\b",
