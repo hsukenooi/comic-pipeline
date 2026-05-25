@@ -58,18 +58,40 @@ Compare each auction's current bid against the proposed max bid. If current bid 
 
 **Run sequentially** — Gixen sessions are stateful and parallel adds will fail.
 
+### Available `add` flags (canonical)
+
+These are the flags that exist in `gixen-cli/cli.py` today. Anything else (no `--comic`, `--issue`, or `--year`) is fictional — do not invent flags.
+
+| Flag | Type | Purpose |
+|---|---|---|
+| `--offset N` | int | Seconds before end to place bid (1–15, default 6) |
+| `--group N` | int | Snipe group (0=none, 1–10, default 0) |
+| `--grade X.Y` | float | Numeric condition grade for post-bid FMV linking (e.g. `9.2`, not `"NM 9.2"`) |
+| `--comic-id N` | int | Internal `comics.id` from gixen-overlay — preferred, used by `/comic:buy` after FMV |
+| `--catalog-id N` | int | External LOCG catalog id (`locg_id`) — only when you have the LOCG id, not the internal id |
+
+`--comic-id` and `--catalog-id` are mutually preferential: if both are given, the CLI uses `--comic-id` and warns that `--catalog-id` was ignored. Either flag triggers a `POST /api/bids/{item_id}/link-fmv` call **only when `--grade` is also present**.
+
+### Canonical post-FMV invocation
+
+After `/comic:fmv` (or `/comic:buy`) has produced a row with `comic_id` and a numeric `grade`:
+
 ```bash
 cd ~/Projects/gixen-cli && .venv/bin/python cli.py add {item_id} {max_bid} \
-  --comic "{title}" --issue "{issue}" --year {year} --grade {grade_numeric}
+  --comic-id {comic_id} --grade {grade_numeric}
 ```
 
-Use the grade numeric value only (e.g. `9.2`, not `"NM 9.2"`). If the grade is unknown, omit `--grade`.
+This is the path that populates `bids.comic_id` / `bids.fmv_id` via the `bid_fmvs` junction (see PER-140). Do **not** pass the internal `comic_id` into `--catalog-id` — that flag is for LOCG ids and the server will look it up as `locg_id`, silently fail, and leave the bid unlinked.
 
-If `GIXEN_SERVER_URL` is not set (direct Gixen mode):
+### Fallback invocations
+
+If the grade is unknown, omit `--grade` (and `--comic-id` — link-fmv only fires when both are present):
 
 ```bash
 cd ~/Projects/gixen-cli && .venv/bin/python cli.py add {item_id} {max_bid}
 ```
+
+If `GIXEN_SERVER_URL` is not set (direct Gixen mode, no overlay DB), the same minimal form applies — linking is a no-op without the server.
 
 After all adds, verify:
 
