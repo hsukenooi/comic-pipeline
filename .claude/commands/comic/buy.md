@@ -82,7 +82,23 @@ comic-fmv --batch <working_list.json> --out <results.json>
 
 **Input:** Working list JSON: `[{item_id, title, issue, year, grade, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable).
 
-**Output:** Human FMV table to stdout + structured JSON at `--out`. Carry the JSON forward to Step 4.
+**Output:** Human FMV table to stdout + structured JSON at `--out`. Carry the JSON forward to Step 4 **and Step 5**.
+
+Each row in the output JSON includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen-cli add`. A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid.
+
+### The ID chain (why we capture `comic_id`)
+
+This is the chain that fixes the recurring "bids.comic_id and bids.fmv_id are NULL" bug (PER-140):
+
+```
+fmv_runner.py → result["comic_id"]
+              → /comic:buy carries it forward
+              → gixen-cli add --comic-id <id> --grade <float>
+              → POST /api/bids/{item_id}/link-fmv {comic_id, grade}
+              → bids.comic_id + bids.fmv_id populated via bid_fmvs junction
+```
+
+If the `comic_id` is dropped at any step the snipe still records, but the dashboard loses condition and FMV data for that bid. Step 5 is where most past sessions broke the chain.
 
 Flags worth knowing:
 - `--max-age-days N` (default 7) — reuses FMVs already in the Gixen DB if `fmv_updated_at` is recent
@@ -131,7 +147,16 @@ Gate: user approves or overrides each max bid.
 
 Read `~/Projects/comic-pipeline/.claude/commands/comic/snipe-add.md` and follow it.
 
-**Input:** Approved auctions with max bids.
+**Input:** Approved auctions with max bids **plus the `comic_id` and numeric grade for each row from the Step 3 FMV JSON**. Without `comic_id`, the bid will be added but `bids.comic_id` / `bids.fmv_id` will stay NULL — see PER-140.
+
+For each approved auction call:
+
+```bash
+cd ~/Projects/gixen-cli && .venv/bin/python cli.py add {item_id} {max_bid} \
+  --comic-id {comic_id} --grade {grade_numeric}
+```
+
+If `comic_id` is null for a row (FMV upsert was skipped, e.g. `n=0`), omit `--comic-id` and surface that this bid will not have FMV linkage in the dashboard. Do **not** pass the internal `comic_id` to `--catalog-id` — that flag expects an LOCG id and silently fails to link.
 
 **Output:** Gixen confirmation table.
 
