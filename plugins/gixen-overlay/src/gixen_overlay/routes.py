@@ -94,7 +94,19 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
 
 @router.post("/api/bids/{item_id}/link-fmv")
 async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
-    """Link a bid to its FMV row by locg_id + grade.
+    """Link a bid to its FMV row.
+
+    Tries three resolution strategies in order, narrowed by grade:
+
+    1. `comic_id` — direct lookup against `fmv(comic_id, grade)`. Use this
+       when the caller already knows the internal DB id (e.g. `fmv_runner`
+       threading the id back from `POST /api/comics`).
+    2. `locg_id` — JOIN comics on locg_id. The canonical path historically,
+       but `comics.locg_id` is NULL after most FMV runs (LOCG cache returns
+       null ids; live `locg lookup` is Cloudflare-blocked).
+    3. `(series, issue, [year])` — case-insensitive title + issue match,
+       optionally narrowed by year. The fallback that keeps link-fmv working
+       when locg_id never got populated (PER-140 Gap 2).
 
     Populates the bid_fmvs junction table and sets bids.fmv_id so the
     /api/comics/snipes dashboard can show cond_grade and fmv_low/fmv_high.
@@ -107,24 +119,88 @@ async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
     if bid is None:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in DB")
 
-    fmv_row = db.execute(
-        """
-        SELECT f.id AS fmv_id
-        FROM fmv f
-        JOIN comics c ON c.id = f.comic_id
-        WHERE c.locg_id = ? AND f.grade = ?
-        LIMIT 1
-        """,
-        (req.locg_id, req.grade),
-    ).fetchone()
+    fmv_row, strategy = _resolve_fmv_for_link(db, req)
     if fmv_row is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No FMV found for locg_id={req.locg_id} grade={req.grade}",
+            detail=f"No FMV found (strategies attempted: {', '.join(strategy)})",
         )
 
     link_fmv_to_bid(db, bid["id"], fmv_row["fmv_id"], is_primary=True)
     return {"item_id": item_id, "fmv_id": fmv_row["fmv_id"], "linked": True}
+
+
+def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[object | None, list[str]]:
+    """Resolve fmv_id for link-fmv. Returns (row, list-of-strategies-attempted).
+
+    Strategies are tried in order and short-circuit on first hit. The
+    attempted list is reported back in the 404 detail so callers can tell
+    which inputs were too sparse.
+    """
+    attempted: list[str] = []
+
+    if req.comic_id is not None:
+        attempted.append(f"comic_id={req.comic_id}+grade={req.grade}")
+        row = db.execute(
+            "SELECT id AS fmv_id FROM fmv WHERE comic_id=? AND grade=? LIMIT 1",
+            (req.comic_id, req.grade),
+        ).fetchone()
+        if row is not None:
+            return row, attempted
+
+    if req.locg_id is not None:
+        attempted.append(f"locg_id={req.locg_id}+grade={req.grade}")
+        row = db.execute(
+            """
+            SELECT f.id AS fmv_id
+            FROM fmv f
+            JOIN comics c ON c.id = f.comic_id
+            WHERE c.locg_id = ? AND f.grade = ?
+            LIMIT 1
+            """,
+            (req.locg_id, req.grade),
+        ).fetchone()
+        if row is not None:
+            return row, attempted
+
+    if req.series and req.issue:
+        if req.year is not None:
+            attempted.append(
+                f"series={req.series!r}+issue={req.issue!r}+year={req.year}+grade={req.grade}"
+            )
+            row = db.execute(
+                """
+                SELECT f.id AS fmv_id
+                FROM fmv f
+                JOIN comics c ON c.id = f.comic_id
+                WHERE LOWER(c.title) = LOWER(?) AND c.issue = ?
+                  AND c.year = ? AND f.grade = ?
+                LIMIT 1
+                """,
+                (req.series, req.issue, req.year, req.grade),
+            ).fetchone()
+            if row is not None:
+                return row, attempted
+        attempted.append(
+            f"series={req.series!r}+issue={req.issue!r}+grade={req.grade}"
+        )
+        row = db.execute(
+            """
+            SELECT f.id AS fmv_id
+            FROM fmv f
+            JOIN comics c ON c.id = f.comic_id
+            WHERE LOWER(c.title) = LOWER(?) AND c.issue = ?
+              AND f.grade = ?
+            LIMIT 1
+            """,
+            (req.series, req.issue, req.grade),
+        ).fetchone()
+        if row is not None:
+            return row, attempted
+
+    if not attempted:
+        attempted.append("none — provide comic_id, locg_id, or series+issue")
+    return None, attempted
 
 
 @router.post("/api/bids/{item_id}/comics/locg")
