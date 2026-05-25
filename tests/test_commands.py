@@ -1996,3 +1996,84 @@ def test_cmd_wish_list_add_rejects_empty_title(tmp_path):
     result = cmd_wish_list_add("   ")
     assert "error" in result
     assert not wish_list_cache_path().exists()
+
+
+# ---------------------------------------------------------------------------
+# cmd_wish_list_remove
+# ---------------------------------------------------------------------------
+
+def test_cmd_wish_list_remove_removes_matching_entry(tmp_path):
+    """Remove returns ok and the entry is gone from the cache."""
+    import json as _json
+    from locg.commands import cmd_wish_list_remove, wish_list_cache_path
+
+    _make_wish_list_cache(tmp_path)
+    result = cmd_wish_list_remove("X-Men #1")
+
+    assert result["status"] == "ok"
+    assert result["removed"]["name"] == "X-Men #1"
+    assert result["items"] == 2
+
+    payload = _json.loads(wish_list_cache_path().read_text())
+    names = [it["name"] for it in payload["items"]]
+    assert "X-Men #1" not in names
+    assert "Amazing Spider-Man #300" in names
+    assert "Batman #500" in names
+
+
+def test_cmd_wish_list_remove_removes_first_match_only(tmp_path):
+    """When a title appears twice, only the first occurrence is removed."""
+    import json as _json
+    from locg.commands import cmd_wish_list_remove, wish_list_cache_path
+
+    _make_wish_list_cache(tmp_path, items=[
+        {"name": "Batman #1", "id": None},
+        {"name": "Batman #1", "id": 99},
+    ])
+    result = cmd_wish_list_remove("Batman #1")
+
+    assert result["status"] == "ok"
+    assert result["items"] == 1
+
+    payload = _json.loads(wish_list_cache_path().read_text())
+    assert payload["items"] == [{"name": "Batman #1", "id": 99}]
+
+
+def test_cmd_wish_list_remove_not_found_returns_error(tmp_path):
+    """Removing a title that doesn't exist returns an error dict."""
+    from locg.commands import cmd_wish_list_remove
+
+    _make_wish_list_cache(tmp_path)
+    result = cmd_wish_list_remove("Daredevil #181")
+
+    assert "error" in result
+    assert "not found" in result["error"]
+
+
+def test_cmd_wish_list_remove_missing_cache_returns_error(tmp_path):
+    """Removing when no cache exists returns an error dict (no crash)."""
+    from locg.commands import cmd_wish_list_remove
+
+    result = cmd_wish_list_remove("Amazing Spider-Man #300")
+
+    assert "error" in result
+    assert "not found" in result["error"].lower()
+
+
+def test_cmd_wish_list_remove_rejects_empty_title(tmp_path):
+    """Empty or whitespace-only titles are refused."""
+    from locg.commands import cmd_wish_list_remove
+
+    result = cmd_wish_list_remove("   ")
+    assert "error" in result
+
+
+def test_cmd_wish_list_remove_file_mode_is_600(tmp_path):
+    """Atomic remove write leaves the cache file mode set to 600."""
+    import stat as _stat
+    from locg.commands import cmd_wish_list_remove, wish_list_cache_path
+
+    _make_wish_list_cache(tmp_path)
+    cmd_wish_list_remove("X-Men #1")
+    mode = _stat.S_IMODE(wish_list_cache_path().stat().st_mode)
+    assert mode == _stat.S_IRUSR | _stat.S_IWUSR

@@ -667,6 +667,64 @@ def cmd_wish_list_add(title: str) -> dict[str, Any]:
     }
 
 
+def cmd_wish_list_remove(title: str) -> dict[str, Any]:
+    """Remove the first matching entry from the local wish-list cache.
+
+    Matches on exact ``name`` field.  Uses the same atomic write pattern as
+    :func:`cmd_wish_list_add` (tempfile + os.replace + chmod 600).
+    """
+    title = (title or "").strip()
+    if not title:
+        return {"error": "wish-list remove: title must be non-empty"}
+
+    path = wish_list_cache_path()
+    if not path.exists():
+        return {"error": f"Wish-list cache not found: {path}. Run: locg collection import"}
+
+    with open(path) as f:
+        payload = json.load(f)
+    items: list[dict[str, Any]] = payload.get("items") or []
+
+    removed: Optional[dict[str, Any]] = None
+    new_items: list[dict[str, Any]] = []
+    for item in items:
+        if removed is None and item.get("name") == title:
+            removed = item
+        else:
+            new_items.append(item)
+
+    if removed is None:
+        return {"error": f"wish-list remove: '{title}' not found in cache"}
+
+    new_payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "items": new_items,
+    }
+
+    fd, tmp = tempfile.mkstemp(
+        prefix=".wish-list-", suffix=".json.tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(new_payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
+
+    return {
+        "status": "ok",
+        "removed": removed,
+        "items": len(new_items),
+        "path": str(path),
+    }
+
+
 def cmd_read_list(client: LOCGClient, title: Optional[str] = None) -> list[dict[str, Any]]:
     """Get the user's read list."""
     return _get_user_list(client, "read", title=title)

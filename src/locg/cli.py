@@ -42,6 +42,7 @@ from locg.commands import (
     cmd_wish_list,
     cmd_wish_list_add,
     cmd_wish_list_from_cache,
+    cmd_wish_list_remove,
     parse_lookup_spec,
 )
 
@@ -190,6 +191,12 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     p_wish_add.add_argument("title", help="Title to record (e.g. 'Amazing Spider-Man #300')")
+    p_wish_remove = wish_sub.add_parser(
+        "remove",
+        parents=[common],
+        help="Remove a title from the local wish-list cache",
+    )
+    p_wish_remove.add_argument("title", help="Exact title to remove (e.g. 'Amazing Spider-Man #300')")
 
     # read-list
     p = sub.add_parser("read-list", parents=[common], help="View your read list (requires login)")
@@ -332,10 +339,10 @@ def main() -> None:
     # wish-list skips Playwright when the local cache exists; it still needs a
     # client when no cache is present (live fallback, R5).
     _wish_list_cached = args.command == "wish-list" and wish_list_cache_path().exists()
-    # wish-list add is a pure local-cache write — never needs a client.
+    # wish-list add/remove are pure local-cache writes — never need a client.
     _wish_list_add = (
         args.command == "wish-list"
-        and getattr(args, "wish_list_command", None) == "add"
+        and getattr(args, "wish_list_command", None) in ("add", "remove")
     )
     _needs_client = not (
         args.command == "cache"
@@ -412,6 +419,8 @@ def main() -> None:
                 # The subparser positional `title` shadows the parent's
                 # --title flag, so args.title is the value to append.
                 result = cmd_wish_list_add(args.title)
+            elif getattr(args, "wish_list_command", None) == "remove":
+                result = cmd_wish_list_remove(args.title)
             elif _wish_list_cached:
                 try:
                     result = cmd_wish_list_from_cache(title=args.title)
