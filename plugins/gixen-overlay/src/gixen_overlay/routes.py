@@ -68,6 +68,13 @@ async def api_list_comics(
 
 @router.post("/api/comics")
 async def api_upsert_comic(req: UpsertComicRequest, request: Request):
+    """Upsert a comic (and optional FMV at grade) and return both ids.
+
+    Response includes `comic_id` (alias of `id` — the comics row PK) and
+    `fmv_id` (the upserted fmv row, or null when no grade was provided).
+    PER-144: callers like `fmv_runner` need both ids in one round-trip so
+    they can thread them straight into `gixen-cli add` for link-fmv.
+    """
     db = request.app.state.db
     comic_id = upsert_comic(
         db,
@@ -77,8 +84,9 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
         locg_id=req.locg_id,
         locg_variant_id=req.locg_variant_id,
     )
+    fmv_id: int | None = None
     if req.grade is not None:
-        upsert_fmv(
+        fmv_id = upsert_fmv(
             db,
             comic_id=comic_id,
             grade=req.grade,
@@ -89,7 +97,7 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
             notes=req.fmv_notes,
         )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
-    return dict(row)
+    return {**dict(row), "comic_id": comic_id, "fmv_id": fmv_id}
 
 
 @router.post("/api/bids/{item_id}/link-fmv")

@@ -145,6 +145,31 @@ def test_upsert_comic_without_year_creates_yearless_row(api):
     assert r.json()["year"] is None
 
 
+def test_upsert_comic_response_includes_comic_id_and_fmv_id(api):
+    """PER-144: response includes both comic_id and fmv_id when FMV is provided."""
+    r = api.post("/api/comics", json={
+        "title": "Daredevil", "issue": "1", "year": 1964,
+        "grade": 7.0, "fmv_low": 1200.0, "fmv_high": 1500.0,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["comic_id"] == data["id"]
+    assert data["comic_id"] > 0
+    assert isinstance(data["fmv_id"], int)
+    assert data["fmv_id"] > 0
+
+
+def test_upsert_comic_response_fmv_id_null_without_grade(api):
+    """PER-144: fmv_id is null when no grade is supplied."""
+    r = api.post("/api/comics", json={
+        "title": "Daredevil", "issue": "1", "year": 1964,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["comic_id"] == data["id"]
+    assert data["fmv_id"] is None
+
+
 def test_upsert_comic_invalid_confidence_returns_422(api):
     r = api.post("/api/comics", json={
         "title": "X-Men", "issue": "1", "year": 1963,
