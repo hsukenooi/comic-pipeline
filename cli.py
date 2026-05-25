@@ -222,15 +222,44 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.argument("max_bid")
 @click.option("--offset", default=6, help="Seconds before end to place bid (1-15)")
 @click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
-@click.option("--catalog-id", type=int, default=None, help="External catalog ID for post-bid linking")
-@click.option("--grade", type=float, default=None, help="Numeric condition grade for post-bid linking")
-def add(item_id: str, max_bid: str, offset: int, group: int, catalog_id: int | None, grade: float | None):
+@click.option(
+    "--catalog-id",
+    type=int,
+    default=None,
+    help="External LOCG catalog id (locg_id) for post-bid FMV linking. "
+         "Use --comic-id if you have the internal comics.id from gixen-overlay.",
+)
+@click.option(
+    "--comic-id",
+    type=int,
+    default=None,
+    help="Internal gixen-overlay comics.id for post-bid FMV linking. "
+         "Takes precedence over --catalog-id if both are given.",
+)
+@click.option("--grade", type=float, default=None, help="Numeric condition grade for post-bid FMV linking")
+def add(
+    item_id: str,
+    max_bid: str,
+    offset: int,
+    group: int,
+    catalog_id: int | None,
+    comic_id: int | None,
+    grade: float | None,
+):
     """Add a snipe for an eBay item."""
     try:
         bid = Decimal(max_bid)
     except InvalidOperation:
         click.echo(f"Error: Invalid bid amount: {max_bid}", err=True)
         sys.exit(1)
+
+    if comic_id is not None and catalog_id is not None:
+        click.echo(
+            f"⚠️  Both --comic-id and --catalog-id provided; using --comic-id "
+            f"({comic_id}) and ignoring --catalog-id ({catalog_id}).",
+            err=True,
+        )
+        catalog_id = None
 
     if _server_url():
         payload = {
@@ -241,18 +270,32 @@ def add(item_id: str, max_bid: str, offset: int, group: int, catalog_id: int | N
         }
         _server_request("post", "/api/bids", json=payload)
         _record_add(item_id)
+
+        link_attempted = grade is not None and (comic_id is not None or catalog_id is not None)
         link_ok = True
-        if catalog_id is not None and grade is not None:
+        if link_attempted:
+            if comic_id is not None:
+                link_body = {"comic_id": comic_id, "grade": grade}
+                link_desc = f"comic_id={comic_id}, grade={grade}"
+            else:
+                link_body = {"locg_id": catalog_id, "grade": grade}
+                link_desc = f"locg_id={catalog_id}, grade={grade}"
             try:
-                _server_request("post", f"/api/bids/{item_id}/link-fmv",
-                                json={"locg_id": catalog_id, "grade": grade})
+                _server_request(
+                    "post",
+                    f"/api/bids/{item_id}/link-fmv",
+                    json=link_body,
+                )
             except SystemExit:
                 link_ok = False
-                click.echo(f"⚠️  Snipe added but FMV link failed for {item_id} "
-                           f"(locg_id={catalog_id}, grade={grade})", err=True)
-        if catalog_id is not None and grade is not None and link_ok:
+                click.echo(
+                    f"⚠️  Snipe added but FMV link failed for {item_id} ({link_desc})",
+                    err=True,
+                )
+
+        if link_attempted and link_ok:
             click.echo(f"✅ Added + linked: {item_id} (max bid {bid})")
-        elif not link_ok:
+        elif link_attempted and not link_ok:
             click.echo(f"⚠️  Added (FMV link failed): {item_id} (max bid {bid})")
         else:
             click.echo(f"Added snipe for {item_id} with max bid {bid}")

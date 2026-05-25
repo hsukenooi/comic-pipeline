@@ -752,6 +752,121 @@ class TestCliAddDuplicate:
 
 
 # ---------------------------------------------------------------------------
+# CLI: add --comic-id / --catalog-id link-fmv routing (server mode)
+# ---------------------------------------------------------------------------
+
+class TestCliAddLinkFmv:
+    def test_comic_id_sends_comic_id_in_link_body(self):
+        from cli import cli
+
+        runner = CliRunner()
+        calls = []
+
+        def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs.get("json")))
+            return {}
+
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("cli._server_request", side_effect=fake_request), \
+             patch("cli._record_add"):
+            result = runner.invoke(
+                cli, ["add", "444", "10.00", "--comic-id", "187", "--grade", "5.0"]
+            )
+
+        assert result.exit_code == 0, result.output
+        link_calls = [c for c in calls if c[1].endswith("/link-fmv")]
+        assert len(link_calls) == 1
+        assert link_calls[0] == ("post", "/api/bids/444/link-fmv",
+                                 {"comic_id": 187, "grade": 5.0})
+        assert "✅ Added + linked" in result.output
+
+    def test_catalog_id_still_sends_locg_id(self):
+        from cli import cli
+
+        runner = CliRunner()
+        calls = []
+
+        def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs.get("json")))
+            return {}
+
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("cli._server_request", side_effect=fake_request), \
+             patch("cli._record_add"):
+            result = runner.invoke(
+                cli, ["add", "444", "10.00", "--catalog-id", "9001", "--grade", "8.5"]
+            )
+
+        assert result.exit_code == 0, result.output
+        link_calls = [c for c in calls if c[1].endswith("/link-fmv")]
+        assert len(link_calls) == 1
+        assert link_calls[0] == ("post", "/api/bids/444/link-fmv",
+                                 {"locg_id": 9001, "grade": 8.5})
+        assert "✅ Added + linked" in result.output
+
+    def test_comic_id_takes_precedence_over_catalog_id(self):
+        from cli import cli
+
+        runner = CliRunner()
+        calls = []
+
+        def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs.get("json")))
+            return {}
+
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("cli._server_request", side_effect=fake_request), \
+             patch("cli._record_add"):
+            result = runner.invoke(cli, [
+                "add", "444", "10.00",
+                "--comic-id", "187",
+                "--catalog-id", "9001",
+                "--grade", "5.0",
+            ])
+
+        assert result.exit_code == 0, result.output
+        link_calls = [c for c in calls if c[1].endswith("/link-fmv")]
+        assert len(link_calls) == 1
+        assert link_calls[0] == ("post", "/api/bids/444/link-fmv",
+                                 {"comic_id": 187, "grade": 5.0})
+        assert "ignoring --catalog-id" in result.output
+        assert "9001" in result.output
+
+    def test_no_link_call_when_grade_missing(self):
+        from cli import cli
+
+        runner = CliRunner()
+        calls = []
+
+        def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs.get("json")))
+            return {}
+
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("cli._server_request", side_effect=fake_request), \
+             patch("cli._record_add"):
+            result = runner.invoke(
+                cli, ["add", "444", "10.00", "--comic-id", "187"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert not any(c[1].endswith("/link-fmv") for c in calls)
+        assert "Added snipe" in result.output
+
+    def test_help_disambiguates_flags(self):
+        from cli import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["add", "--help"])
+
+        assert result.exit_code == 0
+        assert "--comic-id" in result.output
+        assert "--catalog-id" in result.output
+        assert "locg_id" in result.output
+        assert "comics.id" in result.output
+
+
+# ---------------------------------------------------------------------------
 # CLI: list --json
 # ---------------------------------------------------------------------------
 
