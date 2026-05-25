@@ -1310,15 +1310,16 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
     """Export pending-push rows to a LOCG-compatible CSV + .notes.md companion.
 
     Returns {csv_path, notes_md_path, ready_count, manual_variant_count,
-    manual_series_count, oldest_pending_days}.
+    manual_series_count, wish_list_count, oldest_pending_days}.
     """
     from datetime import datetime
     from pathlib import Path as _Path
-    from locg.collection_io import _pending_push_rows, generate_csv, generate_notes_md
+    from locg.collection_io import _load_wish_list_items, _pending_push_rows, generate_csv, generate_notes_md
 
     cache = CollectionCache()
     payload = cache.load()
     ready, manual_variant, manual_series = _pending_push_rows(payload)
+    wish_rows = _load_wish_list_items()
 
     if out_path is None:
         ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
@@ -1328,7 +1329,7 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
 
     notes_dest = dest.with_suffix(".notes.md")
 
-    generate_csv(ready, dest)
+    generate_csv(ready, dest, wish_rows=wish_rows)
     generate_notes_md(ready, manual_variant, manual_series, notes_dest)
 
     all_pending = ready + manual_variant + manual_series
@@ -1338,6 +1339,7 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
         "ready_count": len(ready),
         "manual_variant_count": len(manual_variant),
         "manual_series_count": len(manual_series),
+        "wish_list_count": len(wish_rows),
         "oldest_pending_days": _oldest_pending_days(all_pending),
     }
 

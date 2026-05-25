@@ -601,15 +601,38 @@ def _format_date(value: Any) -> str:
     return s[:10] if len(s) >= 10 else date.today().isoformat()
 
 
-def _row_to_csv_dict(row: dict[str, Any]) -> dict[str, str | int]:
+def _load_wish_list_items() -> list[dict[str, Any]]:
+    """Load wish-list cache items as normalized dicts for CSV export."""
+    path = wish_list_cache_path()
+    if not path.exists():
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    return [
+        {
+            "publisher_name": item.get("publisher_name") or "",
+            "series_name": item.get("series_name") or "",
+            "full_title": item.get("name") or "",
+            "release_date": item.get("release_date") or "",
+            "price_paid": None,
+            "date_purchased": None,
+        }
+        for item in data.get("items", [])
+    ]
+
+
+def _row_to_csv_dict(row: dict[str, Any], in_wish_list: bool = False) -> dict[str, str | int]:
     """Map a cache row to the 21-column LOCG CSV recipe (R21–R31)."""
     return {
         "Publisher Name": row.get("publisher_name") or "",
         "Series Name": row.get("series_name") or "",
         "Full Title": row.get("full_title") or "",
         "Release Date": row.get("release_date") or "",
-        "In Collection": 1,
-        "In Wish List": 0,
+        "In Collection": 0 if in_wish_list else 1,
+        "In Wish List": 1 if in_wish_list else 0,
         "Marked Read": 0,
         "My Rating": "",  # Present-but-blank (R27 — critical; controls Marked Read default)
         "Media Format": "Print",
@@ -628,10 +651,15 @@ def _row_to_csv_dict(row: dict[str, Any]) -> dict[str, str | int]:
     }
 
 
-def generate_csv(ready_rows: list[dict[str, Any]], out_path: Path) -> None:
+def generate_csv(
+    ready_rows: list[dict[str, Any]],
+    out_path: Path,
+    wish_rows: list[dict[str, Any]] | None = None,
+) -> None:
     """Write ready-to-upload rows to a LOCG-compatible 21-column CSV.
 
     Uses csv.QUOTE_MINIMAL. My Rating column always present with blank body (R27).
+    Wish-list rows are appended with In Collection=0, In Wish List=1.
     """
     import csv as _csv
 
@@ -644,6 +672,8 @@ def generate_csv(ready_rows: list[dict[str, Any]], out_path: Path) -> None:
         writer.writeheader()
         for row in ready_rows:
             writer.writerow(_row_to_csv_dict(row))
+        for row in (wish_rows or []):
+            writer.writerow(_row_to_csv_dict(row, in_wish_list=True))
 
 
 def generate_notes_md(

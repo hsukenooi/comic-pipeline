@@ -185,6 +185,80 @@ def test_export_manual_rows_excluded_from_csv(tmp_path, monkeypatch):
     assert "ASM #300 Newsstand" in notes_text
 
 
+def test_export_includes_wish_list_items(tmp_path, monkeypatch):
+    """Wish-list cache items appear in the CSV with In Collection=0, In Wish List=1."""
+    import csv
+    import locg.collection_io as cio
+    import locg.commands as cmds
+
+    wish_path = cio.wish_list_cache_path()
+    wish_path.parent.mkdir(parents=True, exist_ok=True)
+    wish_path.write_text(json.dumps({
+        "updated_at": "2026-05-22T00:00:00+00:00",
+        "items": [
+            {
+                "name": "Batman #1",
+                "id": None,
+                "series_name": "Batman (1940 - 2011)",
+                "publisher_name": "DC Comics",
+                "release_date": "1940-04-25",
+                "media_format": "Print",
+            }
+        ],
+    }))
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    out_csv = tmp_path / "out.csv"
+    result = cmds.cmd_collection_export(str(out_csv))
+
+    assert result["wish_list_count"] == 1
+    assert result["ready_count"] == 0
+
+    with open(out_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 1
+    assert rows[0]["Full Title"] == "Batman #1"
+    assert rows[0]["In Collection"] == "0"
+    assert rows[0]["In Wish List"] == "1"
+
+
+def test_export_collection_and_wish_list_combined(tmp_path, monkeypatch):
+    """Collection rows and wish-list rows both appear in the same CSV."""
+    import csv
+    import locg.collection_io as cio
+    import locg.commands as cmds
+
+    wish_path = cio.wish_list_cache_path()
+    wish_path.parent.mkdir(parents=True, exist_ok=True)
+    wish_path.write_text(json.dumps({
+        "updated_at": "2026-05-22T00:00:00+00:00",
+        "items": [{"name": "Batman #1", "id": None}],
+    }))
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(full_title="Amazing Spider-Man #300")])
+
+    out_csv = tmp_path / "out.csv"
+    result = cmds.cmd_collection_export(str(out_csv))
+
+    assert result["ready_count"] == 1
+    assert result["wish_list_count"] == 1
+
+    with open(out_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 2
+    by_title = {r["Full Title"]: r for r in rows}
+    assert by_title["Amazing Spider-Man #300"]["In Collection"] == "1"
+    assert by_title["Amazing Spider-Man #300"]["In Wish List"] == "0"
+    assert by_title["Batman #1"]["In Collection"] == "0"
+    assert by_title["Batman #1"]["In Wish List"] == "1"
+
+
 # ---------------------------------------------------------------------------
 # cmd_collection_status
 # ---------------------------------------------------------------------------
