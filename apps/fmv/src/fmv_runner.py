@@ -230,7 +230,8 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
         return {
             "input": inp, "fmv": None, "comp_count_total": len(comps),
             "queries_used": result.get("queries_used", []),
-            "db_row": None, "source": "error",
+            "db_row": None, "comic_id": None, "fmv_id": None,
+            "source": "error",
             "error": "no target grade in input",
         }
     if isinstance(target_grade, str):
@@ -244,7 +245,8 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
             return {
                 "input": inp, "fmv": None, "comp_count_total": len(comps),
                 "queries_used": result.get("queries_used", []),
-                "db_row": None, "source": "error",
+                "db_row": None, "comic_id": None, "fmv_id": None,
+                "source": "error",
                 "error": f"unrecognized grade string: {target_grade!r}",
             }
         target_grade = coerced
@@ -252,12 +254,25 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
 
     fmv = fmv_math.compute_fmv(comps, target_grade=target_grade)
     upserted = _upsert_fmv(server_url, inp, fmv) if fmv["fmv_low"] is not None else None
+    comic_id, fmv_id = _extract_ids(upserted)
 
     return {
         "input": inp, "fmv": fmv, "comp_count_total": len(comps),
         "queries_used": result.get("queries_used", []),
-        "db_row": upserted, "source": "fresh",
+        "db_row": upserted, "comic_id": comic_id, "fmv_id": fmv_id,
+        "source": "fresh",
     }
+
+
+def _extract_ids(row: dict | None) -> tuple[int | None, int | None]:
+    """Pull comic_id and fmv_id from a /api/comics response.
+
+    Old server versions return only the comics row (no fmv_id) — surface None
+    rather than fail, so the orchestrator can still proceed without IDs.
+    """
+    if not row:
+        return None, None
+    return row.get("comic_id"), row.get("fmv_id")
 
 
 def _upsert_fmv(server_url: str, inp: dict, fmv: dict) -> dict | None:

@@ -189,6 +189,37 @@ class TestComputeOne:
         assert out["input"]["grade"] == 8.0
         assert out["fmv"]["n"] == 5
 
+    def test_returns_comic_id_and_fmv_id_when_present(self, server_url):
+        """PER-146: surface comic_id and fmv_id from the upsert response so
+        the /comic:buy orchestrator can thread them into snipe-add."""
+        comps = [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 42, "fmv_id": 99}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        assert out["comic_id"] == 42
+        assert out["fmv_id"] == 99
+
+    def test_ids_are_none_when_server_omits_them(self, server_url):
+        """Graceful with old server versions that only return the comics row
+        (no comic_id / fmv_id keys yet)."""
+        comps = [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1, "title": "X"}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        assert out["comic_id"] is None
+        assert out["fmv_id"] is None
+
     def test_unrecognized_grade_string_errors(self, server_url):
         """If the grade string can't be coerced, log and return an error
         row rather than silently passing it to fmv_math."""
