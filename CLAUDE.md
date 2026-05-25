@@ -78,6 +78,11 @@ locg collection has "Amazing Spider-Man #300"
 # Limit output fields (works on any command)
 locg collection --fields name,id
 
+# Append a title to the local wish-list cache (no LOCG round-trip).
+# A subsequent `locg collection import` overwrites the cache from the XLSX
+# export, so manually-added entries are NOT preserved across imports.
+locg wish-list add "Amazing Spider-Man #300"
+
 # Add/remove a comic to/from a list (pull, collection, wish, read)
 locg add collection <comic_id>
 locg remove wish <comic_id>

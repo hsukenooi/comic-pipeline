@@ -40,6 +40,7 @@ from locg.commands import (
     cmd_series,
     cmd_update,
     cmd_wish_list,
+    cmd_wish_list_add,
     cmd_wish_list_from_cache,
     parse_lookup_spec,
 )
@@ -176,6 +177,19 @@ def create_parser() -> argparse.ArgumentParser:
     # wish-list
     p = sub.add_parser("wish-list", parents=[common], help="View your wish list (requires login)")
     p.add_argument("--title", help="Filter results by title (case-insensitive substring match)")
+    wish_sub = p.add_subparsers(dest="wish_list_command")
+    p_wish_add = wish_sub.add_parser(
+        "add",
+        parents=[common],
+        help="Append a manual entry to the local wish-list cache",
+        epilog=(
+            "Writes {name: <title>, id: null} to ~/.cache/locg/wish-list.json. "
+            "A subsequent `locg collection import` overwrites the cache from "
+            "the LOCG XLSX export, so manually-added entries are not preserved "
+            "across imports."
+        ),
+    )
+    p_wish_add.add_argument("title", help="Title to record (e.g. 'Amazing Spider-Man #300')")
 
     # read-list
     p = sub.add_parser("read-list", parents=[common], help="View your read list (requires login)")
@@ -318,10 +332,16 @@ def main() -> None:
     # wish-list skips Playwright when the local cache exists; it still needs a
     # client when no cache is present (live fallback, R5).
     _wish_list_cached = args.command == "wish-list" and wish_list_cache_path().exists()
+    # wish-list add is a pure local-cache write — never needs a client.
+    _wish_list_add = (
+        args.command == "wish-list"
+        and getattr(args, "wish_list_command", None) == "add"
+    )
     _needs_client = not (
         args.command == "cache"
         or (_collection_sub in _LOCAL_COLLECTION_SUBCMDS)
         or _wish_list_cached
+        or _wish_list_add
     )
 
     client: Optional[LOCGClient] = None
@@ -388,7 +408,11 @@ def main() -> None:
         elif args.command == "pull-list":
             result = cmd_pull_list(client, title=args.title)
         elif args.command == "wish-list":
-            if _wish_list_cached:
+            if getattr(args, "wish_list_command", None) == "add":
+                # The subparser positional `title` shadows the parent's
+                # --title flag, so args.title is the value to append.
+                result = cmd_wish_list_add(args.title)
+            elif _wish_list_cached:
                 try:
                     result = cmd_wish_list_from_cache(title=args.title)
                 except (FileNotFoundError, json.JSONDecodeError):

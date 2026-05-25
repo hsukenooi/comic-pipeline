@@ -5,9 +5,12 @@ import getpass
 import json
 import logging
 import math
+import os
 import re
+import stat
+import tempfile
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from bs4 import BeautifulSoup
@@ -607,6 +610,61 @@ def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]
         needle = title.lower()
         items = [it for it in items if needle in (it.get("name") or "").lower()]
     return items
+
+
+def cmd_wish_list_add(title: str) -> dict[str, Any]:
+    """Append a manual entry to the local wish-list cache.
+
+    Writes ``{"name": title, "id": None}`` to ``~/.cache/locg/wish-list.json``
+    using the same atomic write pattern as :func:`collection_io._write_wish_list_cache`
+    (tempfile + os.replace + chmod 600).  A subsequent ``locg collection import``
+    overwrites the cache with fresh XLSX data, so manually-added entries are
+    not preserved across imports.
+    """
+    title = (title or "").strip()
+    if not title:
+        return {"error": "wish-list add: title must be non-empty"}
+
+    path = wish_list_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        with open(path) as f:
+            payload = json.load(f)
+        items: list[dict[str, Any]] = payload.get("items") or []
+    else:
+        items = []
+
+    entry = {"name": title, "id": None}
+    items.append(entry)
+
+    new_payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }
+
+    fd, tmp = tempfile.mkstemp(
+        prefix=".wish-list-", suffix=".json.tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(new_payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
+
+    return {
+        "status": "ok",
+        "added": entry,
+        "items": len(items),
+        "path": str(path),
+    }
 
 
 def cmd_read_list(client: LOCGClient, title: Optional[str] = None) -> list[dict[str, Any]]:

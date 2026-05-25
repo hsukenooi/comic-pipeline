@@ -432,3 +432,38 @@ def test_cli_wish_list_falls_back_to_live_when_no_cache(monkeypatch, tmp_path, c
         assert e.code in (None, 0)
 
     assert live_called, "cmd_wish_list (live) must be called when wish-list cache is absent"
+
+
+def test_cli_wish_list_add_skips_client_and_writes_cache(monkeypatch, tmp_path, capsys):
+    """`locg wish-list add <title>` must not construct LOCGClient and writes the cache."""
+    import locg.cli
+
+    client_constructed = []
+
+    class FakeClient:
+        def __init__(self):
+            client_constructed.append(True)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "load_dotenv", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        sys, "argv", ["locg", "wish-list", "add", "Amazing Spider-Man #300"],
+    )
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert not client_constructed, "LOCGClient must not be constructed for `wish-list add`"
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "ok"
+    assert out["added"] == {"name": "Amazing Spider-Man #300", "id": None}
+
+    # Cache file should now exist with the added item.  Use the (test-isolated)
+    # path patched by the autouse `_isolate_wish_list_cache` fixture in conftest.
+    payload = json.loads(locg.cli.wish_list_cache_path().read_text())
+    assert payload["items"][-1] == {"name": "Amazing Spider-Man #300", "id": None}

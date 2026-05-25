@@ -1932,3 +1932,67 @@ def test_cmd_wish_list_from_cache_missing_file(tmp_path):
     import pytest
     with pytest.raises(FileNotFoundError):
         cmd_wish_list_from_cache()
+
+
+# ---------------------------------------------------------------------------
+# cmd_wish_list_add
+# ---------------------------------------------------------------------------
+
+def test_cmd_wish_list_add_creates_cache_when_missing(tmp_path):
+    """Adding to an absent cache creates the file with one entry."""
+    import json as _json
+    from locg.commands import cmd_wish_list_add, wish_list_cache_path
+
+    assert not wish_list_cache_path().exists()
+
+    result = cmd_wish_list_add("Amazing Spider-Man #300")
+
+    assert result["status"] == "ok"
+    assert result["added"] == {"name": "Amazing Spider-Man #300", "id": None}
+    assert result["items"] == 1
+
+    payload = _json.loads(wish_list_cache_path().read_text())
+    assert payload["items"] == [{"name": "Amazing Spider-Man #300", "id": None}]
+    assert "updated_at" in payload
+
+
+def test_cmd_wish_list_add_appends_to_existing_cache(tmp_path):
+    """Adding to an existing cache preserves prior entries."""
+    import json as _json
+    from locg.commands import cmd_wish_list_add, wish_list_cache_path
+
+    seeded = _make_wish_list_cache(tmp_path)
+    cmd_wish_list_add("Batman #224")
+
+    payload = _json.loads(wish_list_cache_path().read_text())
+    names = [item["name"] for item in payload["items"]]
+    assert names == [item["name"] for item in seeded] + ["Batman #224"]
+    assert payload["items"][-1] == {"name": "Batman #224", "id": None}
+
+
+def test_cmd_wish_list_add_then_read_returns_new_entry(tmp_path):
+    """A subsequent wish-list read surfaces the manually-added entry."""
+    from locg.commands import cmd_wish_list_add, cmd_wish_list_from_cache
+
+    cmd_wish_list_add("Uncanny X-Men #185")
+    items = cmd_wish_list_from_cache()
+    assert any(it["name"] == "Uncanny X-Men #185" and it["id"] is None for it in items)
+
+
+def test_cmd_wish_list_add_file_mode_is_600(tmp_path):
+    """Atomic write leaves the cache file mode set to 600."""
+    import stat as _stat
+    from locg.commands import cmd_wish_list_add, wish_list_cache_path
+
+    cmd_wish_list_add("Daredevil #181")
+    mode = _stat.S_IMODE(wish_list_cache_path().stat().st_mode)
+    assert mode == _stat.S_IRUSR | _stat.S_IWUSR
+
+
+def test_cmd_wish_list_add_rejects_empty_title(tmp_path):
+    """Empty or whitespace-only titles are refused without writing the cache."""
+    from locg.commands import cmd_wish_list_add, wish_list_cache_path
+
+    result = cmd_wish_list_add("   ")
+    assert "error" in result
+    assert not wish_list_cache_path().exists()
