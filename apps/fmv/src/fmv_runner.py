@@ -31,6 +31,34 @@ import fmv_math
 EBAY_SOLD_COMPS_BIN = "ebay-sold-comps"
 
 
+# Wish-list caches sometimes carry letter grades (e.g. "VF+") while sold_comps
+# resolves a numeric grade. fmv_math.build_pool() does `abs(c["grade"] - target)`
+# and silently returns n=0 if `target` is a string, so we coerce here.
+_LETTER_GRADE_MAP: dict[str, float] = {
+    "NM/M": 9.8, "NM+": 9.6, "NM": 9.4, "NM-": 9.2,
+    "VF/NM": 9.0, "VFNM": 9.0,
+    "VF+": 8.5, "VF": 8.0, "VF-": 7.5,
+    "FN/VF": 7.0, "FN+": 6.5, "FN": 6.0, "FN-": 5.5,
+    "VG/FN": 5.0, "VG+": 4.5, "VG": 4.0, "VG-": 3.5,
+    "GD/VG": 3.0, "GD+": 2.5, "GD": 2.0,
+    "FR": 1.0, "PR": 0.5,
+}
+
+
+def _coerce_grade(value) -> float | None:
+    """Return a numeric grade, or None if the value can't be interpreted."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return _LETTER_GRADE_MAP.get(s.upper())
+
+
 # ─── Public entry point ──────────────────────────────────────────────────────
 
 def run(*, batch_path: str | None, out_path: str | None,
@@ -188,11 +216,16 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
                             server_url: str) -> dict:
     """Run FMV math + DB upsert for a single book. Returns the assembled result."""
     inp = result.get("input") or {}
-    inp = {**inp, **{k: v for k, v in original_book.items()
-                     if k not in ("_idx",) and v is not None}}
-    target_grade = inp.get("grade")
+    overrides = {k: v for k, v in original_book.items()
+                 if k not in ("_idx",) and v is not None}
+    # Don't let a wish-list string grade clobber a numeric grade resolved by
+    # sold_comps; fmv_math.build_pool() silently returns n=0 on string grades.
+    if isinstance(inp.get("grade"), (int, float)) and isinstance(overrides.get("grade"), str):
+        overrides.pop("grade", None)
+    inp = {**inp, **overrides}
     comps = result.get("comps", [])
 
+    target_grade = inp.get("grade")
     if target_grade is None:
         return {
             "input": inp, "fmv": None, "comp_count_total": len(comps),
@@ -200,6 +233,22 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
             "db_row": None, "source": "error",
             "error": "no target grade in input",
         }
+    if isinstance(target_grade, str):
+        coerced = _coerce_grade(target_grade)
+        if coerced is None:
+            click.echo(
+                f"Warning: could not coerce grade {target_grade!r} to numeric "
+                f"for {inp.get('title')} #{inp.get('issue')}; skipping.",
+                err=True,
+            )
+            return {
+                "input": inp, "fmv": None, "comp_count_total": len(comps),
+                "queries_used": result.get("queries_used", []),
+                "db_row": None, "source": "error",
+                "error": f"unrecognized grade string: {target_grade!r}",
+            }
+        target_grade = coerced
+        inp["grade"] = coerced
 
     fmv = fmv_math.compute_fmv(comps, target_grade=target_grade)
     upserted = _upsert_fmv(server_url, inp, fmv) if fmv["fmv_low"] is not None else None
