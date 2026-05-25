@@ -157,6 +157,82 @@ class TestComputeOne:
         body = upsert_mock.call_args.args[1]
         assert body.get("locg_id") == 100
 
+    def test_coerces_letter_grade_string(self, server_url):
+        """Wish-list caches sometimes carry letter grades. The runner must
+        coerce them to numeric so fmv_math doesn't silently return n=0."""
+        comps = [_make_comp(p, 8.5) for p in [20, 22, 24, 26, 28]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": "VF+"},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": "VF+"},
+                server_url=server_url)
+        assert out["source"] == "fresh"
+        assert out["fmv"]["n"] == 5  # not silently 0
+        assert out["input"]["grade"] == 8.5  # coerced
+
+    def test_string_grade_does_not_clobber_numeric(self, server_url):
+        """If sold_comps resolved a numeric grade, an original-book string
+        grade must not overwrite it during the merge."""
+        comps = [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": "VF"},
+                server_url=server_url)
+        assert out["source"] == "fresh"
+        assert out["input"]["grade"] == 8.0
+        assert out["fmv"]["n"] == 5
+
+    def test_returns_comic_id_and_fmv_id_when_present(self, server_url):
+        """PER-146: surface comic_id and fmv_id from the upsert response so
+        the /comic:buy orchestrator can thread them into snipe-add."""
+        comps = [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 42, "fmv_id": 99}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        assert out["comic_id"] == 42
+        assert out["fmv_id"] == 99
+
+    def test_ids_are_none_when_server_omits_them(self, server_url):
+        """Graceful with old server versions that only return the comics row
+        (no comic_id / fmv_id keys yet)."""
+        comps = [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1, "title": "X"}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        assert out["comic_id"] is None
+        assert out["fmv_id"] is None
+
+    def test_unrecognized_grade_string_errors(self, server_url):
+        """If the grade string can't be coerced, log and return an error
+        row rather than silently passing it to fmv_math."""
+        result = {
+            "input": {"title": "X", "issue": "1", "grade": "ZZ?"},
+            "comps": [_make_comp(10, 9.0)],
+        }
+        out = fmv_runner._compute_and_upsert_one(
+            result, {"title": "X", "issue": "1", "grade": "ZZ?"},
+            server_url=server_url)
+        assert out["source"] == "error"
+        assert "ZZ?" in out["error"]
+
     def test_no_upsert_when_no_pool(self, server_url):
         # All comps without grade → empty pool → no upsert call
         comps = [_make_comp(10, None)]
