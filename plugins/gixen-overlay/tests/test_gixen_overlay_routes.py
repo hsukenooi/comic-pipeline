@@ -145,6 +145,31 @@ def test_upsert_comic_without_year_creates_yearless_row(api):
     assert r.json()["year"] is None
 
 
+def test_upsert_comic_response_includes_comic_id_and_fmv_id(api):
+    """PER-144: response includes both comic_id and fmv_id when FMV is provided."""
+    r = api.post("/api/comics", json={
+        "title": "Daredevil", "issue": "1", "year": 1964,
+        "grade": 7.0, "fmv_low": 1200.0, "fmv_high": 1500.0,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["comic_id"] == data["id"]
+    assert data["comic_id"] > 0
+    assert isinstance(data["fmv_id"], int)
+    assert data["fmv_id"] > 0
+
+
+def test_upsert_comic_response_fmv_id_null_without_grade(api):
+    """PER-144: fmv_id is null when no grade is supplied."""
+    r = api.post("/api/comics", json={
+        "title": "Daredevil", "issue": "1", "year": 1964,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["comic_id"] == data["id"]
+    assert data["fmv_id"] is None
+
+
 def test_upsert_comic_invalid_confidence_returns_422(api):
     r = api.post("/api/comics", json={
         "title": "X-Men", "issue": "1", "year": 1963,
@@ -513,6 +538,111 @@ def test_link_fmv_unknown_fmv_returns_404(api):
     r = api.post("/api/bids/600000002/link-fmv",
                  json={"locg_id": 99999, "grade": 9.8})
     assert r.status_code == 404
+
+
+def test_link_fmv_by_comic_id_skips_locg_lookup(api):
+    """PER-143 strategy 1: comic_id+grade resolves without touching locg_id."""
+    api.post("/api/bids", json={"item_id": "600000010", "max_bid": 50.0})
+    # No locg_id set on the comic at all
+    r = api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.0, "fmv_low": 300.0, "fmv_high": 500.0,
+    })
+    comic_id = r.json()["id"]
+
+    r = api.post(
+        "/api/bids/600000010/link-fmv",
+        json={"comic_id": comic_id, "grade": 9.0},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linked"] is True
+    assert isinstance(body["fmv_id"], int)
+
+    # Sanity: dashboard now shows enrichment for this bid
+    row = next(s for s in api.get("/api/comics/snipes").json()
+               if s["item_id"] == "600000010")
+    assert row["cond_grade"] == 9.0
+    assert row["fmv_low"] == 300.0
+
+
+def test_link_fmv_by_series_issue_grade_when_locg_id_null(api):
+    """PER-143 strategy 3: series+issue+grade resolves when locg_id is NULL."""
+    api.post("/api/bids", json={"item_id": "600000011", "max_bid": 50.0})
+    # locg_id deliberately omitted — mirrors the post-fmv_runner reality
+    api.post("/api/comics", json={
+        "title": "Avengers", "issue": "10", "year": 1964,
+        "grade": 5.0, "fmv_low": 200.0, "fmv_high": 300.0,
+    })
+
+    r = api.post(
+        "/api/bids/600000011/link-fmv",
+        json={"series": "Avengers", "issue": "10", "grade": 5.0},
+    )
+    assert r.status_code == 200
+    assert r.json()["linked"] is True
+
+    row = next(s for s in api.get("/api/comics/snipes").json()
+               if s["item_id"] == "600000011")
+    assert row["cond_grade"] == 5.0
+    assert row["fmv_low"] == 200.0
+
+
+def test_link_fmv_by_series_issue_grade_case_insensitive(api):
+    """series matches case-insensitively — ALL-CAPS eBay titles should still link."""
+    api.post("/api/bids", json={"item_id": "600000012", "max_bid": 50.0})
+    api.post("/api/comics", json={
+        "title": "Amazing Spider-Man", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800.0, "fmv_high": 1000.0,
+    })
+
+    r = api.post(
+        "/api/bids/600000012/link-fmv",
+        json={"series": "AMAZING SPIDER-MAN", "issue": "300", "grade": 9.2},
+    )
+    assert r.status_code == 200
+    assert r.json()["linked"] is True
+
+
+def test_link_fmv_by_series_issue_year_grade_disambiguates(api):
+    """When year is supplied, only the (series, issue, year, grade) row matches."""
+    api.post("/api/bids", json={"item_id": "600000013", "max_bid": 50.0})
+    # Two volumes of the same series at the same grade
+    api.post("/api/comics", json={
+        "title": "X-Men", "issue": "1", "year": 1963,
+        "grade": 8.0, "fmv_low": 5000.0, "fmv_high": 8000.0,
+    })
+    api.post("/api/comics", json={
+        "title": "X-Men", "issue": "1", "year": 1991,
+        "grade": 8.0, "fmv_low": 10.0, "fmv_high": 20.0,
+    })
+
+    r = api.post(
+        "/api/bids/600000013/link-fmv",
+        json={"series": "X-Men", "issue": "1", "year": 1991, "grade": 8.0},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linked"] is True
+
+    row = next(s for s in api.get("/api/comics/snipes").json()
+               if s["item_id"] == "600000013")
+    assert row["fmv_low"] == 10.0  # the 1991 volume, not 1963
+
+
+def test_link_fmv_404_lists_attempted_strategies(api):
+    """404 detail names every strategy actually attempted."""
+    api.post("/api/bids", json={"item_id": "600000014", "max_bid": 50.0})
+    r = api.post(
+        "/api/bids/600000014/link-fmv",
+        json={"comic_id": 99999, "locg_id": 88888,
+              "series": "Nope", "issue": "1", "grade": 1.0},
+    )
+    assert r.status_code == 404
+    detail = r.json()["detail"]
+    assert "comic_id=99999" in detail
+    assert "locg_id=88888" in detail
+    assert "series='Nope'" in detail
 
 
 # ---------------------------------------------------------------------------

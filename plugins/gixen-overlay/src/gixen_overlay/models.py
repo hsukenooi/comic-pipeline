@@ -32,8 +32,20 @@ class LocgLinkRequest(BaseModel):
 
 
 class LinkFmvRequest(BaseModel):
-    locg_id: int
+    """Inputs for POST /api/bids/{item_id}/link-fmv.
+
+    Three resolution strategies, tried in order: `comic_id` (internal DB id),
+    `locg_id`, then `(series, issue, [year])`. `grade` is always required —
+    each strategy narrows by grade. At least one of comic_id/locg_id/series
+    must be provided.
+    """
+
     grade: float
+    comic_id: int | None = None
+    locg_id: int | None = None
+    series: str | None = None
+    issue: str | None = None
+    year: int | None = None
 
 
 class VerifyItem(BaseModel):
