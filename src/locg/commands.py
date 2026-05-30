@@ -1489,6 +1489,26 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
     return result
 
 
+_ISSUE_TOKEN_RE = re.compile(r"#\s*(\d+[A-Za-z]?)\b")
+
+
+def _split_full_title(full_title: str) -> tuple[str, Optional[str]]:
+    """Split a cached ``full_title`` into ``(series_portion, issue_token)``.
+
+    ``"Thor #154"``                -> ``("Thor", "154")``
+    ``"Fantastic Four Annual #6"`` -> ``("Fantastic Four Annual", "6")``
+    ``"Watchmen"`` (no ``#N``)     -> ``("Watchmen", None)``
+
+    The series portion is everything before the ``#N`` token, so qualifier words
+    like ``Annual`` / ``King-Size Annual`` stay attached to the series identity
+    instead of being silently collapsed into the base series (BUI-26).
+    """
+    m = _ISSUE_TOKEN_RE.search(full_title)
+    if m:
+        return full_title[: m.start()].strip(), m.group(1)
+    return full_title.strip(), None
+
+
 def cmd_collection_check(
     series: str,
     issue: str,
@@ -1500,8 +1520,6 @@ def cmd_collection_check(
     Returns {match_status, full_title_matched, cache_age_days}.
     match_status: "in_collection" | "not_in_cache".
     """
-    import re
-
     cache = CollectionCache()
     payload = cache.load()
     cache_age = _cache_age_days(payload.get("last_full_import"))
@@ -1511,22 +1529,28 @@ def cmd_collection_check(
     issue_stripped = str(issue).strip().lstrip("0") or str(issue).strip()
 
     for row in payload.get("comics", []):
-        row_series_key = _normalize_series_key(row.get("series_name") or "")
-        if row_series_key != series_key:
+        # in_collection is a copies-owned count (0 = wish-list / pull / read but
+        # not owned). Only owned rows count as "in collection" (BUI-26 bug D).
+        if not row.get("in_collection"):
             continue
 
         full_title = row.get("full_title") or ""
+        title_series, title_issue = _split_full_title(full_title)
 
-        # Match #<number> token (ignoring leading zeros)
-        m = re.search(r"#\s*(\d+[A-Za-z]?)\b", full_title)
-        if m:
-            title_issue = m.group(1).lstrip("0") or m.group(1)
-            if title_issue.lower() != issue_stripped.lower():
-                # Also try the raw issue string (e.g. "Annual 1")
-                if issue.strip().lower() not in full_title.lower():
-                    continue
+        # Series identity comes from the title prefix, so "Fantastic Four Annual"
+        # does not satisfy a plain "Fantastic Four" query (BUI-26 bug C).
+        if _normalize_series_key(title_series) != series_key:
+            continue
+
+        if title_issue is not None:
+            # Exact issue-token equality (leading zeros ignored). No substring
+            # fallback, so issue "2" no longer matches "#32" (BUI-26 bug B).
+            norm_title_issue = title_issue.lstrip("0") or title_issue
+            if norm_title_issue.lower() != issue_stripped.lower():
+                continue
         else:
-            # No '#N' token — try substring match (TPBs, annuals, specials)
+            # Title carries no "#N" (TPB / OGN / special): require the issue
+            # token to appear verbatim.
             if issue.strip().lower() not in full_title.lower():
                 continue
 
@@ -1560,6 +1584,46 @@ VARIANT_SUFFIX_MAP: dict[str, str] = {
     "facsimile": "Facsimile Edition",
     "facsimile edition": "Facsimile Edition",
 }
+
+# Generic variant words that, on their own, are too weak to anchor a match.
+_VARIANT_STOPWORDS = frozenset({"variant", "cover", "edition", "the", "a", "an"})
+_VARIANT_MATCH_THRESHOLD = 0.5
+
+
+def _variant_tokens(text: str) -> set[str]:
+    """Normalize a variant label to a set of alphanumeric tokens."""
+    return {t for t in re.sub(r"[^a-z0-9]+", " ", text.lower()).split() if t}
+
+
+def _fuzzy_variant_match(variant_text: str, names: list[str]) -> Optional[str]:
+    """Best fuzzy match of ``variant_text`` against Metron variant ``names``.
+
+    Metron and the auction text rarely match verbatim ("Capullo Variant" vs
+    "capullo variant", "ASM 299 Homage Cover" vs "Amazing Spider-Man #299 Homage
+    Cover"), so compare by token-set Jaccard similarity. Requires the overlap to
+    include at least one non-generic token (not just "variant"/"cover") and a
+    similarity >= the threshold. Returns the best-matching name or ``None``.
+    """
+    want = _variant_tokens(variant_text)
+    if not want:
+        return None
+
+    best_name: Optional[str] = None
+    best_score = 0.0
+    for name in names:
+        have = _variant_tokens(name)
+        if not have:
+            continue
+        shared = want & have
+        if not (shared - _VARIANT_STOPWORDS):
+            continue  # only generic words in common — too weak
+        score = len(shared) / len(want | have)
+        if score > best_score:
+            best_score = score
+            best_name = name
+
+    return best_name if best_score >= _VARIANT_MATCH_THRESHOLD else None
+
 
 RECORD_WIN_CHUNK_SIZE = 25
 
@@ -1616,12 +1680,32 @@ def cmd_collection_record_win(
         row.get("full_title", "") for row in payload.get("comics", [])
     }
 
+    # BUI-34: index of (normalized series, issue token) already owned in the
+    # cache, so wins for back-issues won before the last import aren't written as
+    # duplicate pending rows. Uses the full_title prefix for series identity so
+    # an Annual doesn't shadow the base issue (consistent with collection-check).
+    def _issue_key(token: str) -> str:
+        return (token.strip().lstrip("0") or token.strip()).lower()
+
+    owned_index: set[tuple[str, str]] = set()
+    for r in payload.get("comics", []):
+        if not r.get("in_collection"):
+            continue
+        prefix, token = _split_full_title(r.get("full_title") or "")
+        if token is None:
+            continue
+        owned_index.add((_normalize_series_key(prefix), _issue_key(token)))
+
     rows_written = 0
     chunks_committed = 0
+    skipped_already_owned = 0
+    skipped_already_owned_titles: list[str] = []
     manual_variant_count = 0
     manual_series_count = 0
     metron_lookups_attempted = 0
     metron_lookups_succeeded = 0
+    metron_variant_lookups_attempted = 0
+    metron_variant_matches = 0
     partial_failure = False
     metron_disabled = False
 
@@ -1636,11 +1720,14 @@ def cmd_collection_record_win(
         chunk_manual_series = 0
         chunk_metron_attempted = 0
         chunk_metron_succeeded = 0
+        chunk_variant_detail_attempted = 0
+        chunk_variant_matches = 0
 
         for win in chunk:
             identify = win.get("identify_data") or {}
             series_raw = str(identify.get("series") or "").strip()
             issue_num = str(identify.get("issue") or "").strip()
+            year_raw = identify.get("year")
             variant_text = str(identify.get("variant_text") or "").strip().lower()
             end_date = str(win.get("end_date_iso") or "").strip()
             item_id = str(win.get("item_id") or "").strip()
@@ -1666,7 +1753,7 @@ def cmd_collection_record_win(
             elif not metron_disabled:
                 try:
                     chunk_metron_attempted += 1
-                    metron_data = metron.lookup_issue(series_raw, issue_num)
+                    metron_data = metron.lookup_issue(series_raw, issue_num, year_raw)
                     if metron_data:
                         chunk_metron_succeeded += 1
                         canonical_series = metron.format_series_name(metron_data)
@@ -1679,17 +1766,52 @@ def cmd_collection_record_win(
                 needs_manual_series = True
                 chunk_manual_series += 1
 
+            # BUI-34: skip wins already owned in the cache (series + issue),
+            # before any variant lookup or row construction. Dedup is by issue
+            # identity and ignores variant, matching the reported duplicates
+            # (variant Spawn back-issues already owned).
+            if issue_num and (
+                _normalize_series_key(canonical_series),
+                _issue_key(issue_num),
+            ) in owned_index:
+                skipped_already_owned += 1
+                skipped_already_owned_titles.append(f"{canonical_series} #{issue_num}")
+                continue
+
             # R32: variant handling
             needs_manual_variant = False
             base_full_title = f"{canonical_series} #{issue_num}" if issue_num else canonical_series
             if variant_text:
                 suffix = VARIANT_SUFFIX_MAP.get(variant_text)
                 if suffix:
-                    candidate = f"{base_full_title} {suffix}"
-                    full_title = candidate
+                    full_title = f"{base_full_title} {suffix}"
                 else:
-                    # Unknown variant — check exact cache hit
-                    if base_full_title in existing_titles:
+                    # BUI-33: Metron variant resolution. The lightweight
+                    # lookup_issue has no variants, so fetch issue detail and
+                    # fuzzy-match the auction variant text against Metron's
+                    # variant cover names. (LOCG title-search fallback is dead
+                    # per the local-first pivot, ADR 0001 / BUI-25.)
+                    matched_variant: Optional[str] = None
+                    metron_id = metron_data.get("metron_id") if metron_data else None
+                    if metron_id is not None and not metron_disabled:
+                        try:
+                            chunk_variant_detail_attempted += 1
+                            detail = metron.lookup_issue_detail(metron_id)
+                            if detail:
+                                matched_variant = _fuzzy_variant_match(
+                                    variant_text, detail.get("variants") or []
+                                )
+                        except MetronCredentialError:
+                            metron_disabled = True
+                            logger.warning(
+                                "Metron credentials not configured; skipping variant resolution."
+                            )
+
+                    if matched_variant:
+                        full_title = f"{base_full_title} {matched_variant}"
+                        chunk_variant_matches += 1
+                    elif base_full_title in existing_titles:
+                        # Base issue already owned — attach to the canonical entry.
                         full_title = base_full_title
                     else:
                         full_title = base_full_title
@@ -1746,6 +1868,8 @@ def cmd_collection_record_win(
             manual_series_count += chunk_manual_series
             metron_lookups_attempted += chunk_metron_attempted
             metron_lookups_succeeded += chunk_metron_succeeded
+            metron_variant_lookups_attempted += chunk_variant_detail_attempted
+            metron_variant_matches += chunk_variant_matches
         except Exception as exc:
             logger.error("Chunk commit failed: %s", exc)
             partial_failure = True
@@ -1753,10 +1877,14 @@ def cmd_collection_record_win(
     return {
         "rows_written": rows_written,
         "chunks_committed": chunks_committed,
+        "skipped_already_owned": skipped_already_owned,
+        "skipped_already_owned_titles": skipped_already_owned_titles,
         "manual_variant_count": manual_variant_count,
         "manual_series_count": manual_series_count,
         "metron_lookups_attempted": metron_lookups_attempted,
         "metron_lookups_succeeded": metron_lookups_succeeded,
+        "metron_variant_lookups_attempted": metron_variant_lookups_attempted,
+        "metron_variant_matches": metron_variant_matches,
         "partial_failure": partial_failure,
     }
 

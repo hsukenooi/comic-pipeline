@@ -121,6 +121,77 @@ def test_lookup_issue_no_cover_date():
 
 
 # ---------------------------------------------------------------------------
+# lookup_issue — series disambiguation by publication year (BUI-32)
+# ---------------------------------------------------------------------------
+
+def test_lookup_issue_disambiguates_multiple_series_by_year():
+    """Multiple series match the name; year picks the one whose range covers it."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="The Amazing Spider-Man", year_began=1963, year_end=1998),
+            _mock_series(id=2, display_name="The Amazing Spider-Man", year_began=1999, year_end=2012),
+            _mock_series(id=3, display_name="The Amazing Spider-Man", year_began=2018, year_end=None),
+        ],
+        issues_list=[_mock_issue(id=151, cover_date="1975-12-01")],
+    )
+    result = client.lookup_issue("Amazing Spider-Man", "151", year=1975)
+
+    assert result is not None
+    assert result["series_id"] == 1  # the 1963–1998 volume
+    # The issue lookup must target the disambiguated series, not series_list[0]
+    session.issues_list.assert_called_once_with({"series": 1, "number": "151"})
+
+
+def test_lookup_issue_disambiguates_into_ongoing_series():
+    """year_end=None (ongoing) series is matched when year >= year_began."""
+    client, _ = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Daredevil", year_began=1964, year_end=1998),
+            _mock_series(id=2, display_name="Daredevil", year_began=2019, year_end=None),
+        ],
+        issues_list=[_mock_issue(id=5)],
+    )
+    result = client.lookup_issue("Daredevil", "5", year=2023)
+    assert result is not None
+    assert result["series_id"] == 2
+
+
+def test_lookup_issue_ambiguous_without_year_returns_none():
+    """Multiple series + no year → cannot disambiguate → None (manual fallback)."""
+    client, _ = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, year_began=1963, year_end=1998),
+            _mock_series(id=2, year_began=1999, year_end=2012),
+        ],
+        issues_list=[_mock_issue()],
+    )
+    assert client.lookup_issue("Amazing Spider-Man", "151") is None
+
+
+def test_lookup_issue_ambiguous_year_in_two_ranges_returns_none():
+    """Year falls in two overlapping ranges → still ambiguous → None."""
+    client, _ = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, year_began=1980, year_end=2011),
+            _mock_series(id=2, year_began=2000, year_end=None),
+        ],
+        issues_list=[_mock_issue()],
+    )
+    assert client.lookup_issue("Uncanny X-Men", "200", year=2005) is None
+
+
+def test_lookup_issue_single_series_ignores_year_mismatch():
+    """A sole series match is trusted even if year is outside its range."""
+    client, _ = _make_client_with_session(
+        series_list=[_mock_series(id=7, year_began=1961, year_end=1996)],
+        issues_list=[_mock_issue(id=100)],
+    )
+    result = client.lookup_issue("Fantastic Four", "1", year=2050)
+    assert result is not None
+    assert result["series_id"] == 7
+
+
+# ---------------------------------------------------------------------------
 # lookup_issue — no-match cases return None
 # ---------------------------------------------------------------------------
 
@@ -163,6 +234,55 @@ def test_lookup_issue_swallows_api_error():
     client, session = _make_client_with_session()
     session.series_list.side_effect = ApiError("404 not found")
     assert client.lookup_issue("Nonexistent", "1") is None
+
+
+# ---------------------------------------------------------------------------
+# lookup_issue_detail — variant cover names (BUI-33)
+# ---------------------------------------------------------------------------
+
+def _mock_variant(name: str) -> MagicMock:
+    v = MagicMock()
+    v.name = name
+    return v
+
+
+def test_lookup_issue_detail_returns_variant_names():
+    client = MetronClient()
+    session = MagicMock()
+    issue = MagicMock()
+    issue.variants = [_mock_variant("Capullo Variant"), _mock_variant("Todd McFarlane Cover")]
+    session.issue.return_value = issue
+    client._session = session
+
+    result = client.lookup_issue_detail(5)
+    assert result == {"variants": ["Capullo Variant", "Todd McFarlane Cover"]}
+    session.issue.assert_called_once_with(5)
+
+
+def test_lookup_issue_detail_no_variants():
+    client = MetronClient()
+    session = MagicMock()
+    issue = MagicMock()
+    issue.variants = []
+    session.issue.return_value = issue
+    client._session = session
+    assert client.lookup_issue_detail(5) == {"variants": []}
+
+
+def test_lookup_issue_detail_swallows_exception():
+    client = MetronClient()
+    session = MagicMock()
+    session.issue.side_effect = ConnectionError("down")
+    client._session = session
+    assert client.lookup_issue_detail(5) is None
+
+
+def test_lookup_issue_detail_raises_credential_error(monkeypatch):
+    monkeypatch.delenv("METRON_USERNAME", raising=False)
+    monkeypatch.delenv("METRON_PASSWORD", raising=False)
+    client = MetronClient()
+    with pytest.raises(MetronCredentialError):
+        client.lookup_issue_detail(5)
 
 
 # ---------------------------------------------------------------------------

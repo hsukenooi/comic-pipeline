@@ -384,6 +384,127 @@ def test_check_includes_cache_age_days(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# cmd_collection_check — BUI-26 matcher regressions
+# ---------------------------------------------------------------------------
+
+def test_check_rejects_substring_issue_match(tmp_path, monkeypatch):
+    """Issue '2' must not match '#32'/'#12'/'#222' (BUI-26 bug B).
+
+    The old fallback did `issue in full_title`, so a check for #2 matched any
+    title containing a '2' and reported owned books the user did not own.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Fantastic Four (Vol. 1) (1961 - 1996)",
+        full_title="Fantastic Four #32",
+    )])
+
+    result = cmds.cmd_collection_check(series="Fantastic Four", issue="2")
+    assert result["match_status"] == "not_in_cache"
+    assert result["full_title_matched"] is None
+
+
+def test_check_rejects_annual_for_base_series_query(tmp_path, monkeypatch):
+    """A plain 'Fantastic Four #6' query must not match 'Fantastic Four Annual #6'.
+
+    Annuals are filed under the base series_name with the qualifier in the
+    full_title; the matcher must keep them distinct (BUI-26 bug C / GSFF).
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Fantastic Four (Vol. 1) (1961 - 1996)",
+        full_title="Fantastic Four Annual #6",
+    )])
+
+    result = cmds.cmd_collection_check(series="Fantastic Four", issue="6")
+    assert result["match_status"] == "not_in_cache"
+
+
+def test_check_matches_annual_by_qualified_name(tmp_path, monkeypatch):
+    """The annual is still findable when queried by its qualified name."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Fantastic Four (Vol. 1) (1961 - 1996)",
+        full_title="Fantastic Four Annual #6",
+    )])
+
+    result = cmds.cmd_collection_check(series="Fantastic Four Annual", issue="6")
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Fantastic Four Annual #6"
+
+
+def test_check_giant_size_not_confused_with_annual(tmp_path, monkeypatch):
+    """Giant-Size Fantastic Four must not match a Fantastic Four Annual row.
+
+    Folds in the GSFF false-positive: collection-check wrongly reported
+    Giant-Size Fantastic Four as owned by conflating it with FF Annual.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Fantastic Four (Vol. 1) (1961 - 1996)",
+        full_title="Fantastic Four Annual #2",
+    )])
+
+    result = cmds.cmd_collection_check(series="Giant-Size Fantastic Four", issue="2")
+    assert result["match_status"] == "not_in_cache"
+
+
+def test_check_ignores_unowned_rows(tmp_path, monkeypatch):
+    """in_collection is a copies-owned count; 0 means not owned (BUI-26 bug D).
+
+    A wish-list/pull row (in_collection=0) must not report as in_collection,
+    while a multi-copy row (in_collection=2) still counts as owned.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    unowned = _agent_win_row(series="Batman (Vol. 1)", full_title="Batman #100")
+    unowned["in_collection"] = 0
+    multi = _agent_win_row(series="Detective Comics (Vol. 1)", full_title="Detective Comics #27")
+    multi["in_collection"] = 2
+    _seed_cache(cache, [unowned, multi])
+
+    assert cmds.cmd_collection_check(series="Batman", issue="100")["match_status"] == "not_in_cache"
+    assert cmds.cmd_collection_check(series="Detective Comics", issue="27")["match_status"] == "in_collection"
+
+
+@pytest.mark.skip(reason="BUI-46: masthead/cover-title series alias (Mighty Thor vs Thor) "
+                         "false negative — needs a series-alias strategy, tracked separately")
+def test_check_mighty_thor_masthead_alias_known_gap(tmp_path, monkeypatch):
+    """Thor #154 is owned as 'Thor (Vol. 1)' but identify reports 'The Mighty Thor'.
+
+    This is the original BUI-26 false negative (the comic that got sniped while
+    owned). Un-skip when BUI-46 lands a series-alias fix.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 1) (1966 - 1996)",
+        full_title="Thor #154",
+    )])
+
+    # The catalog name already works:
+    assert cmds.cmd_collection_check(series="Thor", issue="154")["match_status"] == "in_collection"
+    # The cover/masthead name should also resolve (currently does not):
+    assert cmds.cmd_collection_check(series="The Mighty Thor", issue="154")["match_status"] == "in_collection"
+
+
+# ---------------------------------------------------------------------------
 # cmd_collection_doctor
 # ---------------------------------------------------------------------------
 
@@ -656,6 +777,205 @@ def test_record_win_no_variant_no_flag(tmp_path):
     assert row["needs_manual_variant"] is False
 
 
+# --- BUI-33: Metron variant resolution ---
+
+def test_fuzzy_variant_match_exact_ish():
+    from locg.commands import _fuzzy_variant_match
+    names = ["Capullo Variant", "Todd McFarlane Cover"]
+    assert _fuzzy_variant_match("capullo variant", names) == "Capullo Variant"
+
+
+def test_fuzzy_variant_match_across_abbreviation():
+    from locg.commands import _fuzzy_variant_match
+    # auction text uses "ASM 299"; Metron spells out the series
+    names = ["Amazing Spider-Man #299 Homage Virgin Variant", "Direct Edition"]
+    assert _fuzzy_variant_match(
+        "asm 299 homage virgin variant", names
+    ) == "Amazing Spider-Man #299 Homage Virgin Variant"
+
+
+def test_fuzzy_variant_match_rejects_generic_only_overlap():
+    from locg.commands import _fuzzy_variant_match
+    # only the generic word "variant"/"cover" overlaps — must not match
+    assert _fuzzy_variant_match("capullo variant", ["Skan Cover Variant"]) is None
+
+
+def test_fuzzy_variant_match_no_names():
+    from locg.commands import _fuzzy_variant_match
+    assert _fuzzy_variant_match("capullo variant", []) is None
+
+
+def _metron_with_variants(series_name: str, variants: list[str]):
+    """Metron stub: series lookup hits, and issue-detail returns variant names."""
+    from unittest.mock import MagicMock
+    m = MagicMock()
+    m.lookup_issue.return_value = {
+        "metron_id": 777,
+        "cover_date": "1992-05-01",
+        "store_date": None,
+        "series_year_began": 1992,
+        "series_year_end": None,
+        "series_name": series_name.split(" (")[0],
+        "series_id": 5,
+    }
+    m.format_series_name.return_value = series_name
+    m.lookup_issue_detail.return_value = {"variants": variants}
+    return m
+
+
+def test_record_win_metron_variant_match(tmp_path):
+    """Unknown variant text resolves via Metron issue-detail fuzzy match."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_with_variants("Spawn (1992 - Present)", ["Capullo Variant", "Direct Edition"])
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["metron_variant_lookups_attempted"] == 1
+    assert result["metron_variant_matches"] == 1
+    assert result["manual_variant_count"] == 0
+
+    row = cache.load()["comics"][-1]
+    assert row["full_title"] == "Spawn (1992 - Present) #313 Capullo Variant"
+    assert row["needs_manual_variant"] is False
+
+
+def test_record_win_metron_variant_no_match_flags(tmp_path):
+    """Metron has the issue but no matching variant → still flagged manual."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_with_variants("Spawn (1992 - Present)", ["Some Unrelated Cover"])
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["metron_variant_lookups_attempted"] == 1
+    assert result["metron_variant_matches"] == 0
+    assert result["manual_variant_count"] == 1
+    assert cache.load()["comics"][-1]["needs_manual_variant"] is True
+
+
+def test_record_win_no_variant_skips_detail_lookup(tmp_path):
+    """A known-suffix variant must not trigger a Metron issue-detail call."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_with_variants("Spawn (1992 - Present)", ["Capullo Variant"])
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="313", variant_text="newsstand")],
+        cache=cache,
+        metron=metron,
+    )
+    assert result["metron_variant_lookups_attempted"] == 0
+    metron.lookup_issue_detail.assert_not_called()
+    assert cache.load()["comics"][-1]["full_title"].endswith("Newsstand Edition")
+
+
+# --- BUI-34: dedup already-owned wins ---
+
+def _seed_owned_spawn(cache, full_title="Spawn #98", in_collection=1):
+    from locg.collection_cache import rebuild_series_name_index
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Spawn (1992 - Present)", full_title=full_title),
+        "in_collection": in_collection,
+        "source": "locg_export",
+    }])
+    cache.apply(
+        lambda p: p.__setitem__("series_name_index", rebuild_series_name_index(p)),
+        command="test-rebuild",
+    )
+
+
+def test_record_win_skips_already_owned(tmp_path):
+    """A win for an issue already owned in the cache is skipped, not duplicated."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_spawn(cache, "Spawn #98")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="98")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    assert result["rows_written"] == 0
+    assert result["skipped_already_owned_titles"] == ["Spawn (1992 - Present) #98"]
+    # No new agent_win row written
+    assert [r for r in cache.load()["comics"] if r["source"] == "agent_win"] == []
+
+
+def test_record_win_writes_genuinely_new_issue(tmp_path):
+    """A win for a different issue of an owned series is still written."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_spawn(cache, "Spawn #98")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="99")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
+def test_record_win_unowned_row_not_skipped(tmp_path):
+    """A cache row with in_collection=0 (wish-list/not owned) does not block a win."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_spawn(cache, "Spawn #98", in_collection=0)
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="98")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
+def test_record_win_dedup_ignores_variant(tmp_path):
+    """A variant win for an already-owned issue is still deduped (series+issue)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_spawn(cache, "Spawn #313")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    assert result["rows_written"] == 0
+
+
+def test_record_win_dedup_does_not_conflate_annual(tmp_path):
+    """Owning 'Spawn Annual #1' must not skip a plain 'Spawn #1' win."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_spawn(cache, "Spawn Annual #1")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="1")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
 # --- Tracking fields ---
 
 def test_record_win_tracking_fields(tmp_path):
@@ -899,7 +1219,7 @@ def test_record_win_integration_mix(tmp_path):
 
     # Metron returns hit for Spawn, None for unknown
     metron = MagicMock()
-    def metron_lookup(series_query, issue_number):
+    def metron_lookup(series_query, issue_number, year=None):
         if "Spawn" in series_query:
             return {
                 "metron_id": 5,

@@ -34,14 +34,50 @@ class MetronClient:
         self._session = mokkari.api(username, password, user_agent="locg-cli/1.0")
         return self._session
 
+    @staticmethod
+    def _disambiguate_series(series_list: list[Any], year: Any) -> Optional[Any]:
+        """Pick the series whose publication range includes ``year`` (BUI-32).
+
+        - exactly one candidate            -> use it (trust the sole match)
+        - multiple + ``year`` falls in exactly one ``[year_began, year_end]``
+          range (year_end ``None`` means ongoing) -> that one
+        - otherwise (no year, or still ambiguous) -> ``None`` so the caller
+          falls back to ``needs_manual_series_canonical``
+        """
+        if len(series_list) == 1:
+            return series_list[0]
+
+        try:
+            y = int(year) if year is not None else None
+        except (TypeError, ValueError):
+            y = None
+        if y is None:
+            return None
+
+        matches = []
+        for s in series_list:
+            began = getattr(s, "year_began", None)
+            if began is None:
+                continue
+            end = getattr(s, "year_end", None)
+            if began <= y and (end is None or y <= end):
+                matches.append(s)
+        return matches[0] if len(matches) == 1 else None
+
     def lookup_issue(
-        self, series_query: str, issue_number: str | int
+        self, series_query: str, issue_number: str | int, year: Any = None
     ) -> Optional[dict[str, Any]]:
         """Look up an issue by series name and number via the Metron API.
 
+        When the series name matches multiple series, ``year`` (the issue's
+        publication year from identify_data) disambiguates by publication range
+        (BUI-32). If it can't, the lookup returns None so the row is flagged for
+        manual series resolution rather than guessed.
+
         Returns a dict with metron_id, cover_date, store_date,
         series_year_began, series_year_end, series_name, series_id — or None
-        on any failure (no match, rate limit, network error, missing creds).
+        on any failure (no match, ambiguous series, rate limit, network error,
+        missing creds).
 
         MetronCredentialError is re-raised so callers can disable Metron for
         the rest of a batch rather than retrying on every win.
@@ -52,7 +88,14 @@ class MetronClient:
             if not series_list:
                 return None
 
-            best_series = series_list[0]
+            best_series = self._disambiguate_series(series_list, year)
+            if best_series is None:
+                logger.debug(
+                    "Metron series ambiguous for %r (year=%r): %d candidates",
+                    series_query, year, len(series_list),
+                )
+                return None
+
             issues = session.issues_list(
                 {"series": best_series.id, "number": str(issue_number)}
             )
@@ -75,6 +118,31 @@ class MetronClient:
             raise
         except Exception as exc:
             logger.debug("Metron lookup failed for %r #%s: %s", series_query, issue_number, exc)
+            return None
+
+    def lookup_issue_detail(self, metron_id: int) -> Optional[dict[str, Any]]:
+        """Fetch full issue detail (incl. variant cover names) for a Metron id.
+
+        ``issues_list`` (used by :meth:`lookup_issue`) returns lightweight
+        ``BaseIssue`` records with no variants, so variant resolution needs the
+        detail endpoint ``session.issue(metron_id)`` (BUI-33).
+
+        Returns ``{"variants": [name, ...]}`` — the names of every variant cover
+        Metron has for the issue — or ``None`` on any failure. MetronCredentialError
+        is re-raised so a batch can disable Metron rather than retry per win.
+        """
+        try:
+            session = self._get_session()
+            issue = session.issue(metron_id)
+            variants = [
+                v.name for v in (getattr(issue, "variants", None) or [])
+                if getattr(v, "name", None)
+            ]
+            return {"variants": variants}
+        except MetronCredentialError:
+            raise
+        except Exception as exc:
+            logger.debug("Metron issue-detail lookup failed for id %s: %s", metron_id, exc)
             return None
 
     def format_series_name(self, series_data: dict[str, Any]) -> str:
