@@ -1509,26 +1509,31 @@ def _split_full_title(full_title: str) -> tuple[str, Optional[str]]:
     return full_title.strip(), None
 
 
-def cmd_collection_check(
-    series: str,
+# Cover/masthead title (normalized) -> LOCG catalog base series (normalized),
+# for series whose catalog name drops a masthead adjective. Used as a year-gated
+# fallback in cmd_collection_check (BUI-46): "The Mighty Thor #154" (1968) should
+# resolve to the owned "Thor #154" without colliding with the distinct
+# "The Mighty Thor (Vol. 3)" 2015 series. Verified against the real catalog; extend
+# conservatively (only when the LOCG series name genuinely drops the adjective).
+_SERIES_ALIASES: dict[str, str] = {
+    "mighty thor": "thor",
+    "invincible iron man": "iron man",
+}
+
+
+def _match_owned_issue(
+    comics: list[dict[str, Any]],
+    series_key: str,
+    issue_stripped: str,
     issue: str,
-    variant: Optional[str] = None,
-    year: Optional[str] = None,
-) -> dict[str, Any]:
-    """Check whether a comic is in the local collection cache.
-
-    Returns {match_status, full_title_matched, cache_age_days}.
-    match_status: "in_collection" | "not_in_cache".
+    variant: Optional[str],
+    year: Optional[str],
+) -> Optional[str]:
+    """Return the full_title of an owned cache row matching the series key +
+    issue (+ optional variant/year), or None. Shared by the direct and the
+    alias-fallback passes of cmd_collection_check.
     """
-    cache = CollectionCache()
-    payload = cache.load()
-    cache_age = _cache_age_days(payload.get("last_full_import"))
-
-    series_key = _normalize_series_key(series)
-    # Strip leading zeros for the issue token comparison
-    issue_stripped = str(issue).strip().lstrip("0") or str(issue).strip()
-
-    for row in payload.get("comics", []):
+    for row in comics:
         # in_collection is a copies-owned count (0 = wish-list / pull / read but
         # not owned). Only owned rows count as "in collection" (BUI-26 bug D).
         if not row.get("in_collection"):
@@ -1560,9 +1565,49 @@ def cmd_collection_check(
         if year and not (row.get("release_date") or "").startswith(str(year)):
             continue
 
+        return full_title
+
+    return None
+
+
+def cmd_collection_check(
+    series: str,
+    issue: str,
+    variant: Optional[str] = None,
+    year: Optional[str] = None,
+) -> dict[str, Any]:
+    """Check whether a comic is in the local collection cache.
+
+    Returns {match_status, full_title_matched, cache_age_days}.
+    match_status: "in_collection" | "not_in_cache".
+    """
+    cache = CollectionCache()
+    payload = cache.load()
+    cache_age = _cache_age_days(payload.get("last_full_import"))
+    comics = payload.get("comics", [])
+
+    series_key = _normalize_series_key(series)
+    # Strip leading zeros for the issue token comparison
+    issue_stripped = str(issue).strip().lstrip("0") or str(issue).strip()
+
+    matched = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
+
+    # BUI-46: masthead/cover-title fallback. If the cover title ("The Mighty
+    # Thor") missed, retry against the LOCG catalog base ("Thor"). Year-gated:
+    # only attempt with a year, and the year filter in _match_owned_issue then
+    # ensures the era matches, so it can't collide with a distinct same-masthead
+    # series (e.g. The Mighty Thor (Vol. 3), 2015).
+    if matched is None and year:
+        alias_key = _SERIES_ALIASES.get(series_key)
+        if alias_key is not None:
+            matched = _match_owned_issue(
+                comics, alias_key, issue_stripped, issue, variant, year
+            )
+
+    if matched is not None:
         return {
             "match_status": "in_collection",
-            "full_title_matched": full_title,
+            "full_title_matched": matched,
             "cache_age_days": cache_age,
         }
 

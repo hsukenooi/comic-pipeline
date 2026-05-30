@@ -481,13 +481,12 @@ def test_check_ignores_unowned_rows(tmp_path, monkeypatch):
     assert cmds.cmd_collection_check(series="Detective Comics", issue="27")["match_status"] == "in_collection"
 
 
-@pytest.mark.skip(reason="BUI-46: masthead/cover-title series alias (Mighty Thor vs Thor) "
-                         "false negative — needs a series-alias strategy, tracked separately")
-def test_check_mighty_thor_masthead_alias_known_gap(tmp_path, monkeypatch):
-    """Thor #154 is owned as 'Thor (Vol. 1)' but identify reports 'The Mighty Thor'.
+def test_check_mighty_thor_masthead_alias(tmp_path, monkeypatch):
+    """'The Mighty Thor #154' (cover title, 1968) resolves to the owned
+    'Thor #154' via the year-gated masthead alias (BUI-46).
 
-    This is the original BUI-26 false negative (the comic that got sniped while
-    owned). Un-skip when BUI-46 lands a series-alias fix.
+    This was the original BUI-26 false negative — the comic that got sniped
+    while owned because identify reports the cover masthead, not the catalog name.
     """
     import locg.commands as cmds
 
@@ -496,12 +495,40 @@ def test_check_mighty_thor_masthead_alias_known_gap(tmp_path, monkeypatch):
     _seed_cache(cache, [_agent_win_row(
         series="Thor (Vol. 1) (1966 - 1996)",
         full_title="Thor #154",
+        release_date="1968-05-02",
     )])
 
-    # The catalog name already works:
+    # The catalog name works directly:
     assert cmds.cmd_collection_check(series="Thor", issue="154")["match_status"] == "in_collection"
-    # The cover/masthead name should also resolve (currently does not):
-    assert cmds.cmd_collection_check(series="The Mighty Thor", issue="154")["match_status"] == "in_collection"
+    # The cover/masthead name resolves via the year-gated alias:
+    r = cmds.cmd_collection_check(series="The Mighty Thor", issue="154", year="1968")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Thor #154"
+    # Without a year the alias does NOT fire — offline safety, since the masthead
+    # is shared with the distinct 'The Mighty Thor (Vol. 3)' 2015 series:
+    assert cmds.cmd_collection_check(
+        series="The Mighty Thor", issue="154"
+    )["match_status"] == "not_in_cache"
+
+
+def test_check_masthead_alias_year_gate_prevents_collision(tmp_path, monkeypatch):
+    """The year gate stops a wrong-era masthead query from matching the owned
+    Vol-1 issue, protecting the distinct Vol-3 series (BUI-46)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 1) (1966 - 1996)",
+        full_title="Thor #5",
+        release_date="1966-01-02",
+    )])
+
+    # Owns Thor (Vol. 1) #5 (1966); a "The Mighty Thor #5" query for the 2016
+    # (Vol. 3) era must NOT report it as owned.
+    assert cmds.cmd_collection_check(
+        series="The Mighty Thor", issue="5", year="2016"
+    )["match_status"] == "not_in_cache"
 
 
 # ---------------------------------------------------------------------------
