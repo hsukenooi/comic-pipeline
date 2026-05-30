@@ -30,11 +30,18 @@ Save `cache_age_days`, `pending_push_count`, and `oldest_pending_days` from the 
 
 ## Step 1: Check each comic against the cache
 
-For each comic in the input list, run one `locg collection check` call:
+For each comic in the input list, run one `locg collection check` call. **Always
+pass `--year`** when the identification has one — it disambiguates volumes and
+enables the masthead-alias fallback (BUI-46): e.g. a listing identified as "The
+Mighty Thor #154" (1968) only resolves to the owned catalog entry "Thor #154"
+when the year is supplied. Without a year that fallback is suppressed (to avoid
+colliding with same-masthead reboots like *The Mighty Thor* Vol. 3), so an owned
+comic can slip through.
 
 ```bash
-locg collection check --series "Amazing Spider-Man" --issue 300 --pretty
-locg collection check --series "Uncanny X-Men" --issue 179 --variant Newsstand --pretty
+locg collection check --series "Amazing Spider-Man" --issue 300 --year 1988 --pretty
+locg collection check --series "The Mighty Thor" --issue 154 --year 1968 --pretty
+locg collection check --series "Uncanny X-Men" --issue 179 --year 1984 --variant Newsstand --pretty
 ```
 
 Each call returns:
@@ -90,6 +97,7 @@ Remove skipped comics from the working list before passing to `/comic:fmv`.
 
 | Mistake | Fix |
 |---|---|
+| Omitting `--year` | Always pass the identified year — it disambiguates volumes and enables the masthead-alias fallback (BUI-46); without it an owned comic listed by its cover title can slip through |
 | Running `locg lookup` to check collection status | Use `locg collection check` — fully offline, no LOCG network hit |
 | Treating a stale-cache `not_in_cache` as confident "not in collection" | Apply the stale-cache downgrade when `cache_age_days > 14` |
 | Fetching the full LOCG collection list to check 5 titles | Use `locg collection check` per comic — one call each, no login needed |
