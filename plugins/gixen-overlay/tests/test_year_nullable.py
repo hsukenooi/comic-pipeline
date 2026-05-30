@@ -105,6 +105,11 @@ def test_migration_is_idempotent():
 
 def test_partial_unique_indexes_prevent_dupes():
     conn = _fresh_db()
+    # create_tables returns mid-transaction (a migration marker INSERT opens one;
+    # under Python 3.12+ sqlite3 it isn't auto-committed). Commit so the partial
+    # unique indexes are durable — otherwise the rollback below discards them and
+    # the second duplicate insert wouldn't be rejected (BUI-48).
+    conn.commit()
     conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', 1963)")
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', 1963)")
