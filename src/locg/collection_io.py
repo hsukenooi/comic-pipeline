@@ -217,8 +217,33 @@ def _partial_identity(row: dict[str, Any]) -> tuple[str, str, str]:
 # Wish-list cache write
 # ---------------------------------------------------------------------------
 
+def _local_only_wish_items(path: Path) -> list[dict[str, Any]]:
+    """Existing wish-list entries that were added locally (BUI-47).
+
+    Entries created by ``locg wish-list add`` carry only ``name``/``id``;
+    export-derived entries always carry a ``series_name``. Anything without a
+    ``series_name`` is therefore a local-only add that hasn't round-tripped
+    through a LOCG export yet.
+    """
+    if not path.exists():
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    return [it for it in data.get("items", []) if not it.get("series_name")]
+
+
 def _write_wish_list_cache(wish_rows: list[dict[str, Any]]) -> None:
-    """Atomically write wish-list.json from merged collection rows.
+    """Atomically (re)write wish-list.json from imported collection rows.
+
+    Preserves local-only ``wish-list add`` entries (BUI-47): the export-derived
+    set is rebuilt from the incoming rows, then any local-only entry (no
+    ``series_name``) whose name isn't already covered is re-appended, so manual
+    adds survive imports instead of being silently dropped. Once an add
+    round-trips through a LOCG export it appears in ``wish_rows`` and the
+    local copy is deduped out by name.
 
     Follows the IDCache._save() pattern: tempfile + os.replace + chmod 600.
     No fsync needed — this is a best-effort read-only cache.
@@ -237,6 +262,13 @@ def _write_wish_list_cache(wish_rows: list[dict[str, Any]]) -> None:
         }
         for row in wish_rows
     ]
+    covered = {it["name"] for it in items}
+    for local in _local_only_wish_items(path):
+        name = local.get("name") or ""
+        if name and name not in covered:
+            items.append(local)
+            covered.add(name)
+
     payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "items": items,

@@ -845,6 +845,52 @@ def test_wish_list_cache_overwritten_on_reimport(tmp_path):
     assert isinstance(data["items"], list)
 
 
+def test_import_preserves_local_wish_list_add(tmp_path):
+    """A local `wish-list add` survives a subsequent import (BUI-47).
+
+    Regression: import used to overwrite wish-list.json from the export's
+    in_wish_list rows, silently dropping local-only adds.
+    """
+    from locg.collection_io import import_xlsx, wish_list_cache_path
+    import locg.commands as cmds
+
+    cmds.cmd_wish_list_add("Saga #1")  # local-only add, not in the fixture export
+    cache = make_cache(tmp_path)
+    import_xlsx(SAMPLE_XLSX, cache)
+
+    items = json.loads(wish_list_cache_path().read_text())["items"]
+    saga = [i for i in items if i["name"] == "Saga #1"]
+    assert len(saga) == 1, "local wish-list add must survive the import"
+    assert saga[0].get("series_name") is None  # still a local-only entry
+    assert any(i.get("series_name") for i in items)  # export rows present too
+
+
+def test_write_wish_list_cache_dedups_local_when_in_export(tmp_path):
+    """A local add that now appears in the export is not duplicated (BUI-47)."""
+    from locg.collection_io import _write_wish_list_cache, wish_list_cache_path
+
+    p = wish_list_cache_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({
+        "updated_at": "2026-05-30T00:00:00+00:00",
+        "items": [{"name": "Batman #1", "id": None}],  # local-only add
+    }))
+
+    # The same title now arrives from the LOCG export (carries a series_name).
+    _write_wish_list_cache([{
+        "full_title": "Batman #1",
+        "series_name": "Batman (1940 - 2011)",
+        "publisher_name": "DC Comics",
+        "release_date": "1940-04-25",
+        "media_format": "Print",
+    }])
+
+    items = json.loads(p.read_text())["items"]
+    batman = [i for i in items if i["name"] == "Batman #1"]
+    assert len(batman) == 1, "must dedupe, not duplicate"
+    assert batman[0]["series_name"] == "Batman (1940 - 2011)"  # export version wins
+
+
 def test_wish_list_cache_empty_when_no_wish_list_rows(tmp_path, monkeypatch):
     """An XLSX with zero wish-list rows writes items: [] without error."""
     import openpyxl
