@@ -326,6 +326,27 @@ def test_check_hit_returns_in_collection(tmp_path, monkeypatch):
     assert result["full_title_matched"] == "Amazing Spider-Man #300"
 
 
+def test_check_matches_across_leading_article(tmp_path, monkeypatch):
+    """A 'The Incredible Hulk' cache row is found by an 'Incredible Hulk' query.
+
+    Regression for BUI-45: identify drops the leading article, so the McFarlane
+    run the user already owned slipped past collection-check and got sniped.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Incredible Hulk (Vol. 2) (1968 - 1999)",
+        full_title="The Incredible Hulk #341",
+        release_date="1987-11-17",
+    )])
+
+    result = cmds.cmd_collection_check(series="Incredible Hulk", issue="341")
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "The Incredible Hulk #341"
+
+
 def test_check_miss_returns_not_in_cache(tmp_path, monkeypatch):
     import locg.commands as cmds
 

@@ -592,6 +592,21 @@ def test_series_name_index_normalizes_keys(tmp_path):
     assert _normalize_series_key("1963 (1993)") == "1963"
 
 
+def test_normalize_series_key_strips_leading_article():
+    """Leading articles are dropped so 'The X' and 'X' share a key (BUI-45)."""
+    from locg.collection_cache import _normalize_series_key
+    # The cache stores the McFarlane run with the article; identify drops it.
+    assert (
+        _normalize_series_key("The Incredible Hulk (Vol. 2) (1968 - 1999)")
+        == _normalize_series_key("Incredible Hulk")
+        == "incredible hulk"
+    )
+    assert _normalize_series_key("A Distant Soil") == "distant soil"
+    assert _normalize_series_key("An Unkindness of Ravens") == "unkindness of ravens"
+    # Only a true leading article is stripped, not an embedded one.
+    assert _normalize_series_key("Theater of War") == "theater of war"
+
+
 # ---------------------------------------------------------------------------
 # Integration: last_writer populated after apply
 # ---------------------------------------------------------------------------

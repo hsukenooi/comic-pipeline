@@ -118,18 +118,23 @@ _YEAR_RANGE_RE = re.compile(r"\s*\(\d{4}\s*-\s*(\d{4}|Present)\)", re.IGNORECASE
 _VOL_RE = re.compile(r"\s*\(Vol\.\s*\d+\)", re.IGNORECASE)
 # Also strip bare 4-digit year in parens: (1993)
 _BARE_YEAR_RE = re.compile(r"\s*\(\d{4}\)")
+# Strip a leading article so "The Incredible Hulk" and "Incredible Hulk" share
+# a key. The article is load-bearing in display names but not for identity, and
+# /comic:identify is inconsistent about emitting it (BUI-45).
+_LEADING_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
 
 
 def _normalize_series_key(series_name: str) -> str:
     """Normalize a series name for series_name_index lookup.
 
     Strips (Vol. N), (YYYY - YYYY), (YYYY - Present), and bare (YYYY) suffixes,
-    then lowercases.
+    a leading article (The/A/An), then lowercases.
     """
     s = series_name.strip()
     s = _YEAR_RANGE_RE.sub("", s)
     s = _VOL_RE.sub("", s)
     s = _BARE_YEAR_RE.sub("", s)
+    s = _LEADING_ARTICLE_RE.sub("", s.strip())
     return s.strip().lower()
 
 
