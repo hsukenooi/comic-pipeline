@@ -292,6 +292,10 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict) -> dict | None:
         body["locg_id"] = inp["locg_id"]
     if inp.get("locg_variant_id"):
         body["locg_variant_id"] = inp["locg_variant_id"]
+    if inp.get("variant"):
+        # BUI-28: variant is part of the comic identity, so base vs Newsstand
+        # (etc.) get distinct comic_ids instead of being conflated.
+        body["variant"] = inp["variant"]
 
     try:
         resp = requests.post(f"{server_url}/api/comics", json=body, timeout=15)

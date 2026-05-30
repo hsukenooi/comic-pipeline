@@ -83,6 +83,7 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
         year=req.year,
         locg_id=req.locg_id,
         locg_variant_id=req.locg_variant_id,
+        variant=req.variant,
     )
     fmv_id: int | None = None
     if req.grade is not None:

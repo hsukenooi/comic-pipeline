@@ -99,6 +99,51 @@ def test_upsert_comic_returns_same_id_on_conflict(db):
     assert id1 == id2
 
 
+# --- BUI-28: variant is part of comic identity ---
+
+def test_upsert_comic_variant_gets_distinct_id(db):
+    """Base cover and Newsstand variant of the same (title, issue, year) split."""
+    base = upsert_comic(db, "Hulk", "332", 1986)
+    news = upsert_comic(db, "Hulk", "332", 1986, variant="Newsstand")
+    assert base != news
+    rows = db.execute(
+        "SELECT variant FROM comics WHERE LOWER(title)='hulk' AND issue='332' ORDER BY id"
+    ).fetchall()
+    assert [r["variant"] for r in rows] == [None, "Newsstand"]
+
+
+def test_upsert_comic_same_variant_is_stable(db):
+    a = upsert_comic(db, "Hulk", "332", 1986, variant="Newsstand")
+    b = upsert_comic(db, "Hulk", "332", 1986, variant="Newsstand")
+    assert a == b
+
+
+def test_upsert_comic_blank_variant_is_base(db):
+    """Empty/whitespace variant normalizes to NULL (the base edition)."""
+    base = upsert_comic(db, "Hulk", "332", 1986)
+    blank = upsert_comic(db, "Hulk", "332", 1986, variant="   ")
+    assert base == blank
+    assert db.execute(
+        "SELECT variant FROM comics WHERE id=?", (base,)
+    ).fetchone()["variant"] is None
+
+
+def test_upsert_comic_variant_distinct_for_yearless(db):
+    base = upsert_comic(db, "Spawn", "300")
+    direct = upsert_comic(db, "Spawn", "300", variant="Direct")
+    assert base != direct
+
+
+def test_upsert_comic_variant_promotes_within_variant_only(db):
+    """A yearless variant placeholder is promoted by a yeared insert of the same
+    variant — and does not absorb a different variant."""
+    yearless_news = upsert_comic(db, "Hulk", "332", variant="Newsstand")
+    yeared_news = upsert_comic(db, "Hulk", "332", 1986, variant="Newsstand")
+    assert yearless_news == yeared_news  # promoted in place
+    base = upsert_comic(db, "Hulk", "332", 1986)  # base must be its own row
+    assert base != yeared_news
+
+
 def test_upsert_comic_updates_locg_id_via_coalesce(db):
     id1 = upsert_comic(db, "X-Men", "1", 1963, locg_id=12345)
     id2 = upsert_comic(db, "X-Men", "1", 1963, locg_id=None)
@@ -808,10 +853,12 @@ def test_migrate_sweep_allcaps_orphans_is_idempotent():
 
 def test_migrate_lowercase_title_indexes_creates_lower_expression_indexes(db):
     idx = db.execute(
-        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_comics_tiy'"
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_comics_tiyv'"
     ).fetchone()
     assert idx is not None
     assert "lower(" in idx["sql"].lower()
+    # BUI-28: variant is part of the unique key.
+    assert "variant" in idx["sql"].lower()
 
 
 def test_migrate_lowercase_title_indexes_blocks_case_variant_yeared_duplicate(db):
@@ -833,7 +880,7 @@ def test_migrate_lowercase_title_indexes_is_idempotent():
     create_tables(conn)
     create_tables(conn)
     idx = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_comics_tiy'"
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_comics_tiyv'"
     ).fetchone()
     assert idx is not None
     assert "lower(" in idx["sql"].lower()

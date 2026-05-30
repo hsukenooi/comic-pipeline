@@ -27,6 +27,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             title           TEXT NOT NULL,
             issue           TEXT NOT NULL,
             year            INTEGER,
+            variant         TEXT,
             locg_id         INTEGER,
             locg_variant_id INTEGER,
             created_at      TEXT DEFAULT (datetime('now'))
@@ -64,20 +65,28 @@ def create_tables(conn: sqlite3.Connection) -> None:
     _migrate_fmv_split(conn)
     _migrate_year_nullable(conn)
     _migrate_sweep_allcaps_orphans(conn)
+    # variant column must exist before the unique-index migration references it.
+    _migrate_add_variant_column(conn)
     _migrate_lowercase_title_indexes(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
     # one comic) has run before we try to enforce uniqueness on the cleaned set.
     # LOWER(title) expression indexes enforce uniqueness case-insensitively so
     # direct SQL writes also can't create case-variant duplicates.
+    # BUI-28: variant is part of the identity, so a base cover and its Newsstand
+    # (etc.) variant are distinct rows. COALESCE(variant,'') folds NULL→'' so two
+    # base rows still collide (SQLite treats bare NULLs as distinct in indexes).
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_tiy "
-        "ON comics(LOWER(title), issue, year) WHERE year IS NOT NULL"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_tiyv "
+        "ON comics(LOWER(title), issue, year, COALESCE(variant,'')) WHERE year IS NOT NULL"
     )
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_ti_nullyear "
-        "ON comics(LOWER(title), issue) WHERE year IS NULL"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_tiv_nullyear "
+        "ON comics(LOWER(title), issue, COALESCE(variant,'')) WHERE year IS NULL"
     )
+    # Drop the pre-variant indexes (they'd wrongly reject a second variant row).
+    conn.execute("DROP INDEX IF EXISTS idx_comics_tiy")
+    conn.execute("DROP INDEX IF EXISTS idx_comics_ti_nullyear")
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +119,18 @@ def _set_migration_marker(conn: sqlite3.Connection, name: str) -> None:
 
 def _clear_migration_marker(conn: sqlite3.Connection, name: str) -> None:
     conn.execute("DELETE FROM migration_state WHERE migration=?", (name,))
+
+
+def _migrate_add_variant_column(conn: sqlite3.Connection) -> None:
+    """Add the nullable `variant` column to comics if absent (BUI-28).
+
+    Additive and idempotent. Existing rows keep variant=NULL (treated as the
+    base edition); variants split off only on the next encounter — no bulk
+    backfill of historically conflated rows.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(comics)")}
+    if "variant" not in cols:
+        conn.execute("ALTER TABLE comics ADD COLUMN variant TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -597,15 +618,21 @@ def _migrate_sweep_allcaps_orphans(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_lowercase_title_indexes(conn: sqlite3.Connection) -> None:
-    """Replace case-sensitive partial unique indexes with LOWER(title) variants.
+    """Replace case-sensitive partial unique indexes with LOWER(title), variant-aware ones.
 
     Old: ON comics(title, issue, year) / ON comics(title, issue)
-    New: ON comics(LOWER(title), issue, year) / ON comics(LOWER(title), issue)
+    New: ON comics(LOWER(title), issue, year, COALESCE(variant,'')) /
+         ON comics(LOWER(title), issue, COALESCE(variant,''))   (BUI-28)
 
     Gate: migration_state row 'lowercase_title_indexes' present → already ran.
+    (DBs that ran the pre-variant version of this migration are upgraded to the
+    variant-aware indexes by the unconditional create/drop in create_tables.)
 
     IMPORTANT: Uses raw conn.execute() only — no conn.commit(). Called from
-    create_tables() which runs inside the host's per-plugin SAVEPOINT.
+    create_tables() which runs inside the host's per-plugin SAVEPOINT. The index
+    creation here happens in create_tables' autocommit window (before any
+    migration marker INSERT opens a transaction) so the indexes survive a caller
+    rollback.
     """
     row = conn.execute(
         "SELECT 1 FROM migration_state WHERE migration='lowercase_title_indexes'"
@@ -616,12 +643,12 @@ def _migrate_lowercase_title_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("DROP INDEX IF EXISTS idx_comics_tiy")
     conn.execute("DROP INDEX IF EXISTS idx_comics_ti_nullyear")
     conn.execute(
-        "CREATE UNIQUE INDEX idx_comics_tiy "
-        "ON comics(LOWER(title), issue, year) WHERE year IS NOT NULL"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_tiyv "
+        "ON comics(LOWER(title), issue, year, COALESCE(variant,'')) WHERE year IS NOT NULL"
     )
     conn.execute(
-        "CREATE UNIQUE INDEX idx_comics_ti_nullyear "
-        "ON comics(LOWER(title), issue) WHERE year IS NULL"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comics_tiv_nullyear "
+        "ON comics(LOWER(title), issue, COALESCE(variant,'')) WHERE year IS NULL"
     )
     _set_migration_marker(conn, "lowercase_title_indexes")
 
@@ -638,11 +665,17 @@ def upsert_comic(
     year: int | None = None,
     locg_id: int | None = None,
     locg_variant_id: int | None = None,
+    variant: str | None = None,
 ) -> int:
     """Upsert a comic identity row. Returns the comic id.
 
+    `variant` (BUI-28) is part of the row identity: a base cover and its
+    Newsstand/Direct/etc. variant of the same (title, issue, year) get distinct
+    comic ids. An empty/blank variant normalizes to NULL (the base edition). All
+    the reconciliation below is scoped to a single variant.
+
     Year is optional. Reconciliation rules keep at most one row per
-    (title, issue) logical comic:
+    (title, issue, variant) logical comic:
 
     - Yeared insert finds an existing yeared row at the same year → updates
       locg metadata, returns it.
@@ -659,11 +692,17 @@ def upsert_comic(
     When multiple yeared rows exist for the same (title, issue) — pre-PER-98
     historical data — the one with locg_id set wins; ties broken by lowest id.
     """
+    # BUI-28: normalize blank variant to NULL (base edition) and scope every
+    # identity query to this variant so reconciliation never crosses variants.
+    variant = (variant or "").strip() or None
+    v_sql = "variant=?" if variant is not None else "variant IS NULL"
+    v_param: tuple = (variant,) if variant is not None else ()
+
     if year is not None:
         # Yeared insert.
         existing_yeared = conn.execute(
-            "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year=?",
-            (title, issue, year),
+            f"SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year=? AND {v_sql}",
+            (title, issue, year, *v_param),
         ).fetchone()
         if existing_yeared is not None:
             conn.execute(
@@ -675,25 +714,26 @@ def upsert_comic(
             return existing_yeared["id"]
         # Look for a yearless placeholder to promote.
         existing_yearless = conn.execute(
-            "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL",
-            (title, issue),
+            f"SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL AND {v_sql}",
+            (title, issue, *v_param),
         ).fetchone()
         if existing_yearless is not None:
             # Guard (PER-104): if a yeared row at a *different* year already
             # exists, promoting would create two yeared siblings. Skip and warn.
             conflicting_yeared = conn.execute(
                 "SELECT id FROM comics "
-                "WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NOT NULL AND year!=?",
-                (title, issue, year),
+                f"WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NOT NULL AND year!=? AND {v_sql}",
+                (title, issue, year, *v_param),
             ).fetchone()
             if conflicting_yeared is not None:
                 logger.warning(
                     "upsert_comic: skipping yearless promotion — yeared sibling "
-                    "conflict (title=%r issue=%r incoming_year=%r); keeping "
+                    "conflict (title=%r issue=%r incoming_year=%r variant=%r); keeping "
                     "yearless row",
                     title,
                     issue,
                     year,
+                    variant,
                 )
                 return existing_yearless["id"]
             conn.execute(
@@ -706,9 +746,9 @@ def upsert_comic(
             return existing_yearless["id"]
         # No existing row — insert fresh.
         cur = conn.execute(
-            "INSERT INTO comics (title, issue, year, locg_id, locg_variant_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (title, issue, year, locg_id, locg_variant_id),
+            "INSERT INTO comics (title, issue, year, variant, locg_id, locg_variant_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (title, issue, year, variant, locg_id, locg_variant_id),
         )
         conn.commit()
         return cur.lastrowid
@@ -716,16 +756,16 @@ def upsert_comic(
     # Yearless insert. Prefer an existing yeared row if one exists — never
     # create a yearless duplicate next to a yeared canonical row.
     canonical_yeared = conn.execute(
-        "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NOT NULL "
+        f"SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NOT NULL AND {v_sql} "
         "ORDER BY (locg_id IS NULL), id LIMIT 1",
-        (title, issue),
+        (title, issue, *v_param),
     ).fetchone()
     if canonical_yeared is not None:
         # PER-103: clean up any pre-existing yearless orphan alongside the
         # canonical yeared row before returning.
         orphan = conn.execute(
-            "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL",
-            (title, issue),
+            f"SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL AND {v_sql}",
+            (title, issue, *v_param),
         ).fetchone()
         if orphan is not None:
             _merge_yearless_into_yeared(conn, orphan["id"], canonical_yeared["id"])
@@ -738,8 +778,8 @@ def upsert_comic(
         conn.commit()
         return canonical_yeared["id"]
     existing_yearless = conn.execute(
-        "SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL",
-        (title, issue),
+        f"SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL AND {v_sql}",
+        (title, issue, *v_param),
     ).fetchone()
     if existing_yearless is not None:
         conn.execute(
@@ -750,9 +790,9 @@ def upsert_comic(
         conn.commit()
         return existing_yearless["id"]
     cur = conn.execute(
-        "INSERT INTO comics (title, issue, year, locg_id, locg_variant_id) "
-        "VALUES (?, ?, NULL, ?, ?)",
-        (title, issue, locg_id, locg_variant_id),
+        "INSERT INTO comics (title, issue, year, variant, locg_id, locg_variant_id) "
+        "VALUES (?, ?, NULL, ?, ?, ?)",
+        (title, issue, variant, locg_id, locg_variant_id),
     )
     conn.commit()
     return cur.lastrowid

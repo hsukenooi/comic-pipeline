@@ -8,6 +8,7 @@ class UpsertComicRequest(BaseModel):
     title: str
     issue: str
     year: int | None = None
+    variant: str | None = None
     grade: float | None = None
     fmv_low: float | None = None
     fmv_high: float | None = None
