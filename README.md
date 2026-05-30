@@ -8,6 +8,26 @@ Comic overlay plugin for [gixen-cli](https://github.com/hsukenooi/gixen-cli), pl
 - `apps/` — standalone apps (PER-31: ebay, PER-32: ezship)
 - `.claude/skills/` — Claude Code skills for the comic workflow (`/comic:buy`, `/comic:grade`, etc.)
 
+## Installing the Python CLIs
+
+The `apps/ebay` and `apps/fmv` apps provide console scripts (`ebay-fetch`,
+`ebay-sold-comps`, `seller-scan`, `comic-fmv`). Install them with [uv](https://docs.astral.sh/uv/):
+
+```sh
+./scripts/install.sh
+```
+
+This runs `uv tool install --reinstall` for both apps (into `~/.local/bin`) and
+removes any stale wrappers. After it finishes, the CLIs work from any directory:
+
+```sh
+comic-fmv --help
+ebay-sold-comps --help
+```
+
+`comic-fmv` shells out to `ebay-sold-comps` at runtime, so install both. No
+`PYTHONPATH` workaround is needed.
+
 ## Plugin: gixen-overlay
 
 Provides the `/comics` dashboard tab and comic-specific endpoints:

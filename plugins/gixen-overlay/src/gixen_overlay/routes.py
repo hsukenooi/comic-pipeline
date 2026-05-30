@@ -83,6 +83,7 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
         year=req.year,
         locg_id=req.locg_id,
         locg_variant_id=req.locg_variant_id,
+        variant=req.variant,
     )
     fmv_id: int | None = None
     if req.grade is not None:
@@ -214,6 +215,14 @@ def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[object | None, list[
 @router.post("/api/bids/{item_id}/comics/locg")
 async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
     """Persist a resolved LOCG ID against a specific comic in a bid's set.
+
+    DEPRECATED (BUI-24, BUI-25): LOCG IDs are no longer resolved live — the LOCG
+    API 403s everything and the tool pivoted to a local-first model. The canonical
+    flow is now `locg collection record-win` -> `locg collection export` -> manual
+    LOCG Bulk Import -> `locg collection import` (see
+    docs/solutions/integration-issues/locg-bulk-import-recipe-2026-05-22.md). This
+    route stays functional for legacy snipes — it preserves existing values (R47)
+    — but should not be used by new flows; v2 may remove it.
 
     Without `issue`: target the bid's primary fmv's comic (`bid.fmv_id → fmv.comic_id`).
     With `issue`: find an fmv in the bid's junction matching that issue;
