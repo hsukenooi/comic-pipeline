@@ -151,8 +151,8 @@ def test_sync_captures_won_status(api):
     }]
 
     # Trigger sync via purge (which calls _sync_gixen internally).
-    # _sync_gixen sets the bid to WON; purge then marks it PURGED and
-    # returns purged_completed >= 1.
+    # _sync_gixen sets the bid to WON; purge then marks it REMOVED (the
+    # tombstone) and returns purged_completed >= 1.
     r = api.post("/api/purge", json={"sibling_ids": []})
     assert r.json()["purged_completed"] >= 1
 
@@ -334,14 +334,14 @@ def test_sync_gixen_inserts_web_added_snipe(api):
 
 
 def test_sync_gixen_does_not_purge_vanished(api):
-    """Vanished-but-future PENDING rows are left alone (not PURGED)."""
+    """Vanished-but-future PENDING rows are left alone (not removed)."""
     from datetime import datetime, timedelta, timezone
     # Create a bid in the DB.
     api.post("/api/bids", json={"item_id": "888999000", "max_bid": 25.0})
     # Gixen returns empty — bid is "vanished".
     api.mock_gixen.list_snipes.return_value = []
     api.post("/api/sync")
-    # Bid should still be visible (not PURGED) since auction_end_at is NULL
+    # Bid should still be visible (not removed) since auction_end_at is NULL
     # so it's not the vanished+ended case.
     r = api.get("/api/snipes")
     assert any(i["item_id"] == "888999000" for i in r.json())
@@ -575,10 +575,16 @@ def test_history_deduplicates_by_item_id(api):
     multiple rows for the same item (e.g. after a purge-and-re-add cycle)."""
     import os
     import sqlite3 as _sqlite3
+    from datetime import datetime, timedelta, timezone
 
     db_path = os.getenv("DB_PATH")
-    yesterday = "2026-05-18T10:00:00"
+    # Must fall inside /api/history's 7-day window. Computed relative to now so
+    # it can't age out — a previously hardcoded literal date silently rotted
+    # past the window and turned this into a time-bomb failure.
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     # Open a separate connection to seed duplicate rows directly.
+    # Intentionally seeds the legacy 'PURGED' tombstone (not 'REMOVED') to
+    # verify gixen-cli's /api/history still tolerates pre-BUI-49 values.
     conn = _sqlite3.connect(db_path)
     conn.execute(
         "INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, status, auction_end_at)"

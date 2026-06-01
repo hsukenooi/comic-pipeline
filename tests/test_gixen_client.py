@@ -1541,7 +1541,7 @@ def test_cli_remove_deletes_server(monkeypatch):
     with patch("cli.requests") as mock_req:
         mock_resp = MagicMock()
         mock_resp.raise_for_status.return_value = None
-        mock_resp.json.return_value = {"item_id": "123456789", "status": "PURGED"}
+        mock_resp.json.return_value = {"item_id": "123456789", "status": "REMOVED"}
         mock_req.delete.return_value = mock_resp
 
         result = runner.invoke(cli_app, ["remove", "123456789"])

@@ -440,9 +440,10 @@ async def _run_ebay_fallback() -> None:
             now_iso = datetime.now(timezone.utc).isoformat()
             # Two sets of rows need eBay resolution:
             # 1. PENDING/ENDED — auction has ended, status not yet terminal.
-            # 2. PURGED — resolved without a winning_bid (e.g. bulk-purged
-            #    before eBay fallback ran). Limited to past 7 days; eBay stops
-            #    serving ended-listing data after a few days anyway.
+            # 2. The soft-delete tombstone (REMOVED, or legacy PURGED) —
+            #    resolved without a winning_bid (e.g. bulk-removed before eBay
+            #    fallback ran). Limited to past 7 days; eBay stops serving
+            #    ended-listing data after a few days anyway.
             rows = db.execute(
                 """
                 SELECT item_id, max_bid, local_snipe_result, 0 AS is_purged FROM bids
@@ -452,7 +453,7 @@ async def _run_ebay_fallback() -> None:
                   AND winning_bid IS NULL
                 UNION ALL
                 SELECT item_id, max_bid, local_snipe_result, 1 AS is_purged FROM bids
-                WHERE status = 'PURGED'
+                WHERE status IN ('PURGED', 'REMOVED')
                   AND winning_bid IS NULL
                   AND datetime(COALESCE(auction_end_at, resolved_at)) >= datetime('now', '-7 days')
                 """,
@@ -473,8 +474,8 @@ async def _run_ebay_fallback() -> None:
                     continue
 
                 # Write title and end_date_iso for all rows regardless of
-                # status. update_bid_status / cache_gixen_data both skip
-                # PURGED rows, so use direct SQL here.
+                # status. update_bid_status / cache_gixen_data both skip the
+                # tombstone (PURGED/REMOVED) rows, so use direct SQL here.
                 ebay_title = ebay.get("title") or None
                 ebay_end_iso = ebay.get("end_date_iso") or None
                 db.execute(
@@ -496,7 +497,7 @@ async def _run_ebay_fallback() -> None:
                 if is_purged:
                     if final_amount is not None and final_amount > 0:
                         db.execute(
-                            "UPDATE bids SET winning_bid = ? WHERE item_id = ? AND status = 'PURGED'",
+                            "UPDATE bids SET winning_bid = ? WHERE item_id = ? AND status IN ('PURGED', 'REMOVED')",
                             (final_amount, iid),
                         )
                         logger.info(
@@ -795,7 +796,7 @@ async def api_get_snipes():
 
     rows = db.execute("""
         SELECT * FROM bids
-        WHERE status != 'PURGED'
+        WHERE status NOT IN ('PURGED', 'REMOVED')
         ORDER BY added_at DESC
     """).fetchall()
 
@@ -826,8 +827,8 @@ async def api_get_snipes():
 
 @app.get("/api/history")
 async def api_get_history():
-    """Recently ended bids from the DB (past 7 days), including PURGED rows.
-    Pure DB read — no Gixen sync.
+    """Recently ended bids from the DB (past 7 days), including removed
+    (REMOVED/PURGED) rows. Pure DB read — no Gixen sync.
     """
     db = _get_db()
     rows = db.execute("""
@@ -960,7 +961,9 @@ async def api_remove_bid(item_id: str):
         raise HTTPException(status_code=503, detail=str(e))
 
     delete_bid(db, item_id)
-    return {"item_id": item_id, "status": "PURGED"}
+    # Response status mirrors the soft-delete tombstone, renamed PURGED ->
+    # REMOVED in BUI-49. No in-repo consumer string-matches the old value.
+    return {"item_id": item_id, "status": "REMOVED"}
 
 
 @app.post("/api/sync")
@@ -998,7 +1001,7 @@ async def api_purge(req: PurgeRequest):
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    # 5. Mark completed bids as PURGED in DB
+    # 5. Mark completed bids with the soft-delete tombstone (REMOVED) in DB
     mark_bids_purged(db, completed_ids)
 
     # 6. Remove sibling snipes (best-effort)

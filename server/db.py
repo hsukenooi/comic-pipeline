@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS bids (
     max_bid         REAL NOT NULL,
     bid_offset      INTEGER DEFAULT 6,
     snipe_group     INTEGER DEFAULT 0,
-    status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED')),
+    status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED','REMOVED')),
     winning_bid     REAL,
     seller          TEXT,
     auction_end_at      TEXT,
@@ -75,7 +75,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                     max_bid         REAL NOT NULL,
                     bid_offset      INTEGER DEFAULT 6,
                     snipe_group     INTEGER DEFAULT 0,
-                    status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED')),
+                    status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED','REMOVED')),
                     winning_bid     REAL,
                     seller          TEXT,
                     auction_end_at      TEXT,
@@ -115,6 +115,72 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             raise
         finally:
             conn.execute("PRAGMA foreign_keys=ON")
+
+    # Rename the soft-delete tombstone status PURGED -> REMOVED (BUI-49). Two
+    # parts: (1) widen the CHECK to *allow* REMOVED, and (2) remap existing data.
+    #
+    # (1) SQLite can't ALTER a CHECK constraint, so widening the allowed-status
+    # set requires a table rebuild (same pattern as the FK removal above).
+    # Idempotency is by feature detection: only rebuild while the live CHECK
+    # still lacks REMOVED. The INSERT copies EVERY column (introspected from the
+    # live table) verbatim, so no column is silently dropped — the FK-rebuild
+    # above hardcodes a column list that omits fmv_id, and this must not repeat
+    # that trap (BUI-49 plan KTD-3). bid_fmvs has an FK to bids(id), so FK
+    # enforcement is disabled for the rebuild, like the FK removal above.
+    table_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bids'"
+    ).fetchone()
+    if table_sql_row and "REMOVED" not in (table_sql_row["sql"] or ""):
+        cols = ", ".join(row[1] for row in conn.execute("PRAGMA table_info(bids)"))
+        conn.execute("DROP TABLE IF EXISTS bids_status_rename_old")
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("SAVEPOINT status_rename")
+        try:
+            conn.execute("ALTER TABLE bids RENAME TO bids_status_rename_old")
+            conn.execute("""
+                CREATE TABLE bids (
+                    id              INTEGER PRIMARY KEY,
+                    item_id         TEXT NOT NULL,
+                    comic_id        INTEGER,
+                    max_bid         REAL NOT NULL,
+                    bid_offset      INTEGER DEFAULT 6,
+                    snipe_group     INTEGER DEFAULT 0,
+                    status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED','REMOVED')),
+                    winning_bid     REAL,
+                    seller          TEXT,
+                    auction_end_at      TEXT,
+                    local_snipe_at      TEXT,
+                    local_snipe_result  TEXT,
+                    notes               TEXT,
+                    added_at            TEXT DEFAULT (datetime('now')),
+                    resolved_at         TEXT,
+                    ebay_title          TEXT,
+                    status_mirror       TEXT,
+                    cached_current_bid  TEXT,
+                    cached_at           TEXT,
+                    fmv_id              INTEGER
+                )
+            """)
+            conn.execute(
+                f"INSERT INTO bids ({cols}) SELECT {cols} FROM bids_status_rename_old"
+            )
+            conn.execute("DROP TABLE bids_status_rename_old")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id)")
+            conn.execute("RELEASE status_rename")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK TO status_rename")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
+
+    # (2) Remap the tombstone value. Runs in all cases — whether the CHECK was
+    # just widened above, or already allowed REMOVED on a fresh / FK-rebuilt DB
+    # that still held legacy PURGED rows. Idempotent: matches 0 rows once done.
+    conn.execute("UPDATE bids SET status='REMOVED' WHERE status='PURGED'")
+    conn.commit()
 
 
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -190,7 +256,7 @@ def update_bid_status(
         "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, "
         "auction_end_at=COALESCE(auction_end_at, ?), "
         "status_mirror=COALESCE(?, status_mirror) "
-        "WHERE item_id=? AND status NOT IN ('PURGED')",
+        "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
         (status, winning_bid, resolved_at, resolved_at, status_mirror, item_id),
     )
 
@@ -224,15 +290,17 @@ def cache_gixen_data(
         "seller=COALESCE(?, seller), "
         "cached_current_bid=COALESCE(?, cached_current_bid), "
         "cached_at=? "
-        "WHERE item_id=? AND status NOT IN ('PURGED')",
+        "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
         (title, seller, current_bid, now, item_id),
     )
 
 
 def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
+    # Soft-delete tombstone. Renamed PURGED -> REMOVED in BUI-49; skip rows that
+    # already carry either tombstone value so we don't re-stamp resolved_at.
     conn.execute(
-        "UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id=? AND status NOT IN ('PURGED')",
+        "UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
         (now, item_id),
     )
     conn.commit()
@@ -252,8 +320,9 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     # placeholders contains only '?' chars — no user data is interpolated
     placeholders = ",".join("?" * len(item_ids))
+    # Tombstone completed bids. Renamed PURGED -> REMOVED in BUI-49.
     conn.execute(
-        f"UPDATE bids SET status='PURGED', resolved_at=? WHERE item_id IN ({placeholders})",
+        f"UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id IN ({placeholders})",
         [now, *item_ids],
     )
     conn.commit()
