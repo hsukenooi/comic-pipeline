@@ -3,12 +3,17 @@
 # Install the comic-pipeline Python CLIs into uv-managed tool environments so
 # they work from any directory with no PYTHONPATH workaround.
 #
-# Installs:
+# Installs (uv-managed console scripts into ~/.local/bin — runtime model (a),
+# BUI-55: the apps AND the gixen/locg package CLIs live on PATH; the uv workspace
+# env is for development/server/tests only, not these user-facing commands):
 #   - ebay-tools  -> ebay-fetch, ebay-sold-comps, seller-scan   (apps/ebay)
 #   - comic-fmv   -> comic-fmv                                   (apps/fmv)
+#   - gixen-cli   -> gixen                                       (packages/gixen-cli, editable)
+#   - locg        -> locg                                        (packages/locg-cli, editable)
 #
 # comic-fmv shells out to the `ebay-sold-comps` console script at runtime, so
-# both apps must be installed for the FMV pipeline to work end to end.
+# both apps must be installed for the FMV pipeline to work end to end. The
+# /comic:* skills invoke `gixen` and `locg` as bare commands (U6/BUI-57).
 #
 # Background (BUI-27): hand-rolled wrappers were previously dropped into
 # /opt/homebrew/bin with a shebang pinned to /opt/homebrew/opt/python@3.14 — an
@@ -31,10 +36,21 @@ uv tool install --reinstall "$REPO_ROOT/apps/ebay"
 echo "Installing comic-fmv..."
 uv tool install --reinstall "$REPO_ROOT/apps/fmv"
 
+# gixen + locg are uv-workspace packages, but the /comic:* skills invoke them as
+# bare console scripts on PATH. Installed --editable so the entry-point module
+# resolves from the source tree: gixen's cli.py uses a file-relative load_dotenv(),
+# so an editable install finds packages/gixen-cli/.env regardless of caller cwd.
+echo "Installing gixen (packages/gixen-cli)..."
+uv tool install --reinstall --editable "$REPO_ROOT/packages/gixen-cli"
+
+echo "Installing locg (packages/locg-cli)..."
+uv tool install --reinstall --editable "$REPO_ROOT/packages/locg-cli"
+
 # Remove stale hand-rolled wrappers pinned to python@3.14. Only delete files we
 # positively identify as the broken wrappers, never anything else on PATH.
+# (The pre-merge locg install was exactly this python@3.14 wrapper.)
 echo "Cleaning up stale wrappers..."
-for name in comic-fmv ebay-fetch ebay-sold-comps seller-scan; do
+for name in comic-fmv ebay-fetch ebay-sold-comps seller-scan gixen locg; do
   stale="/opt/homebrew/bin/$name"
   if [ -f "$stale" ] && grep -q "python@3.14" "$stale" 2>/dev/null; then
     echo "  removing stale $stale"
@@ -45,6 +61,6 @@ done
 bin_dir="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
 echo
 echo "Done. CLIs installed via uv into $bin_dir:"
-for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan; do
+for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan gixen locg; do
   printf '  %-16s -> %s\n' "$name" "$(command -v "$name" 2>/dev/null || echo 'NOT ON PATH — add '"$bin_dir"' to PATH')"
 done

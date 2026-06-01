@@ -6,16 +6,32 @@ on:
   pull_request:
 
 jobs:
-  lint:
+  # U8a/BUI-59: keep CI green on the monorepo layout and exercise the uv
+  # workspace install (incl. the gixen-cli py-modules fix, KTD2) in a clean env.
+  # The full per-package test matrix (Playwright provisioning, etc.) is the
+  # deferred U8b follow-up — this job only proves the merge didn't make CI lie.
+  workspace:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync workspace (packages/* + plugins/*)
+        run: uv sync --all-packages
+
+      - name: Smoke — workspace imports + gixen console script (KTD2 py-modules fix)
+        run: |
+          uv run python -c "import server.main; import gixen.plugins; print('workspace imports OK')"
+          uv run gixen --help > /dev/null && echo "gixen console script OK"
+
+      - name: Smoke — overlay resolves gixen-cli via the workspace (no path hack)
+        run: |
+          uv run python -c "import gixen_overlay.routes; from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task; from server.db import get_bid_by_item_id; print('overlay -> gixen-cli coupling OK')"
+
       - name: Check plugin structure
         run: |
-          python -c "import ast, sys
-          tree = ast.parse(open('plugins/gixen-overlay/src/gixen_overlay/plugin.py').read())
-          print('plugin.py parses OK')
-          "
+          uv run python -c "import ast; ast.parse(open('plugins/gixen-overlay/src/gixen_overlay/plugin.py').read()); print('plugin.py parses OK')"

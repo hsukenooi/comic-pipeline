@@ -9,10 +9,10 @@ Compute fair market value from real eBay sold transactions. No multiplier math â
 
 ## How to run
 
-**Default path: delegate to `gixen-cli fmv`.** It handles fetch (via `ebay-fetch sold-comps`), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
+**Default path: delegate to `gixen fmv`.** It handles fetch (via `ebay-fetch sold-comps`), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py fmv --batch <working_list.json> --out <results.json>
+gixen fmv --batch <working_list.json> --out <results.json>
 ```
 
 `--batch` JSON shape: `[{item_id, title, issue, year, grade, locg_id?, locg_variant_id?, notes?}, ...]`
@@ -29,7 +29,7 @@ The CLI prints a human-readable table to stdout and writes the full structured r
 
 ## Manual fallback (only if the CLI is broken)
 
-If `gixen-cli fmv` is unavailable, you can run the steps below by hand. SerpApi access requires `SERPAPI_KEY`; canonical location is `~/.config/ebay-fetch/config.json`.
+If `gixen fmv` is unavailable, you can run the steps below by hand. SerpApi access requires `SERPAPI_KEY`; canonical location is `~/.config/ebay-fetch/config.json`.
 
 ## Server Health Check
 

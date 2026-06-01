@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.context/
+.gixen_history.json
+.claude/
+.firecrawl/
+.gstack/
+.DS_Store
+server/gixen.db
+uv.lock

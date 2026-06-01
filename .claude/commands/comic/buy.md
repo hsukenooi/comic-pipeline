@@ -84,7 +84,7 @@ comic-fmv --batch <working_list.json> --out <results.json>
 
 **Output:** Human FMV table to stdout + structured JSON at `--out`. Carry the JSON forward to Step 4 **and Step 5**.
 
-Each row in the output JSON includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen-cli add`. A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid.
+Each row in the output JSON includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen add`. A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid.
 
 ### The ID chain (why we capture `comic_id`)
 
@@ -93,7 +93,7 @@ This is the chain that fixes the recurring "bids.comic_id and bids.fmv_id are NU
 ```
 fmv_runner.py → result["comic_id"]
               → /comic:buy carries it forward
-              → gixen-cli add --comic-id <id> --grade <float>
+              → gixen add --comic-id <id> --grade <float>
               → POST /api/bids/{item_id}/link-fmv {comic_id, grade}
               → bids.comic_id + bids.fmv_id populated via bid_fmvs junction
 ```
@@ -152,7 +152,7 @@ Read `~/Projects/comic-pipeline/.claude/commands/comic/snipe-add.md` and follow 
 For each approved auction call:
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py add {item_id} {max_bid} \
+gixen add {item_id} {max_bid} \
   --comic-id {comic_id} --grade {grade_numeric}
 ```
 

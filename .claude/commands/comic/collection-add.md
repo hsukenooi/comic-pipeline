@@ -8,7 +8,7 @@ requires_locg_cli: ">=0.2.0"
 
 Record won Gixen auctions into the local collection cache in one batch, then export a CSV for LOCG upload. No Playwright, no live LOCG session required.
 
-**Gixen CLI:** `cd ~/Projects/gixen-cli && .venv/bin/python cli.py`
+**Gixen CLI:** `gixen` (a uv-installed console script on PATH; run `./scripts/install.sh` if not found).
 
 ## Step 0: Bootstrap guard
 
@@ -22,12 +22,12 @@ locg collection status --pretty
 > Cache empty — run `locg collection doctor` for setup instructions.
 
 **If `locg_cli_version` is older than `0.2.0`:** Stop immediately with:
-> locg-cli version >=0.2.0 required (installed: X.Y.Z). Upgrade via `cd ~/Projects/locg-cli && pip install -e .` and retry.
+> locg-cli version >=0.2.0 required (installed: X.Y.Z). Upgrade via `./scripts/install.sh` (reinstalls the in-repo `locg`) and retry.
 
 ## Step 1: Pull won auctions
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py list --json 2>/dev/null
+gixen list --json 2>/dev/null
 ```
 
 Filter to wins:

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gixen ▸ bids</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/v2.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="seg brand">▎ gixen</div>
+  <a class="seg nav" href="/">snipes</a>
+  <a class="seg nav active" href="/v2/bids">▸ bids</a>
+  <div class="spacer"></div>
+  <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
+  <div class="seg clock" id="clock">--:--:--</div>
+</div>
+
+<div class="wrap">
+  <div class="session" id="session">
+    <span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">bids</span> <span class="ok">▸ ready</span>
+  </div>
+  <div id="bids-section"></div>
+</div>
+
+<div class="keybar">
+  <span><kbd>r</kbd>refresh</span>
+  <span><kbd>s</kbd>snipes</span>
+  <span><kbd>c</kbd>comics</span>
+  <span><kbd>b</kbd>bids</span>
+  <span class="spacer"></span>
+  <span class="stat is-loading" id="status"><span class="dot loading"></span><span id="status-text">connecting…</span></span>
+</div>
+
+<script>
+const REFRESH_MS = 60000;
+const BIDS_URL = "/api/bids";
+const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
+
+function fmtUSD(v) {
+  if (v == null) return "—";
+  const n = parseFloat(String(v).replace(/[^0-9.]/g,""));
+  return isNaN(n) ? "—" : `$${n.toFixed(2)}`;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function fmtDate(iso) {
+  if (!iso) return '<span class="mute">—</span>';
+  const d = new Date(iso);
+  if (isNaN(d)) return '<span class="mute">—</span>';
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth()+1).padStart(2,"0");
+  const dd = String(d.getDate()).padStart(2,"0");
+  const hh = String(d.getHours()).padStart(2,"0");
+  const mi = String(d.getMinutes()).padStart(2,"0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+}
+
+function outcome(r) {
+  if (r.status === "PENDING") return '<span class="pill pending">pending</span>';
+  // Trust the authoritative backend status before any heuristics. Without this,
+  // an OUTBID-on-tie loss (winning_bid == max_bid because eBay's bid-increment
+  // rule defeats a tied snipe) gets falsely rendered as "won".
+  if (r.status === "WON") return '<span class="pill won">won</span>';
+  if (r.status === "LOST") return '<span class="pill lost">outbid</span>';
+  const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
+  const m = r.max_bid != null ? parseFloat(String(r.max_bid).replace(/[^0-9.]/g,"")) : null;
+  if (w != null && m != null) return w <= m
+    ? '<span class="pill won">won</span>'
+    : '<span class="pill lost">outbid</span>';
+  const mirror = (r.status_mirror || "").toUpperCase();
+  if (mirror.includes("WON")) return '<span class="pill won">won</span>';
+  if (mirror === "LOST" || mirror.includes("OUTBID")) return '<span class="pill lost">outbid</span>';
+  if (r.local_snipe_result) return '<span class="pill err">missed</span>';
+  return '<span class="mute">—</span>';
+}
+
+function renderBids(bids) {
+  const el = document.getElementById("bids-section");
+  if (!bids.length) {
+    el.innerHTML = `<div class="panel">
+      <div class="panel-head"><span class="label">bids</span><span class="count">0 rows</span></div>
+      <div class="empty">// no bids</div>
+    </div>`;
+    return;
+  }
+  const rows = bids.map(r => `<tr>
+    <td><a class="id" href="${ebayUrl(r.item_id)}" target="_blank">${escapeHtml(r.item_id)}</a></td>
+    <td class="wrap">${escapeHtml((r.title || "—").slice(0,80))}</td>
+    <td class="right num">${fmtUSD(r.max_bid)}</td>
+    <td class="right num">${r.winning_bid != null ? fmtUSD(r.winning_bid) : '<span class="mute">—</span>'}</td>
+    <td>${outcome(r)}</td>
+    <td class="num dim">${fmtDate(r.end_date_iso)}</td>
+    <td class="dim">${escapeHtml(r.seller || "—")}</td>
+    <td class="num dim">${r.comic_id ?? '<span class="mute">—</span>'}</td>
+  </tr>`).join("");
+  el.innerHTML = `<div class="panel">
+    <div class="panel-head">
+      <span class="label">bids</span>
+      <span class="count">${bids.length} rows</span>
+    </div>
+    <div class="scroll"><table><thead><tr>
+      <th>item_id</th><th>title</th>
+      <th class="right">max_bid</th><th class="right">winning</th>
+      <th>outcome</th><th>end_date</th>
+      <th>seller</th><th>comic_id</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>
+  </div>`;
+}
+
+function setStatus(state, text) {
+  const el = document.getElementById("status");
+  const t = document.getElementById("status-text");
+  el.classList.remove("is-loading","is-error","is-ok");
+  el.classList.add("is-"+state);
+  el.querySelector(".dot").className = "dot " + (state === "ok" ? "ok" : state === "error" ? "err" : "loading");
+  t.textContent = text;
+}
+
+function tickClock() { document.getElementById("clock").textContent = new Date().toLocaleTimeString(); }
+setInterval(tickClock, 1000); tickClock();
+
+async function load() {
+  setStatus("loading", `fetching ${BIDS_URL}…`);
+  try {
+    const resp = await fetch(BIDS_URL);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const bids = await resp.json();
+    renderBids(bids);
+    const now = new Date().toLocaleTimeString();
+    document.getElementById("session").innerHTML =
+      `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">bids</span> <span class="ok">▸ ${bids.length} rows · loaded ${now}</span>`;
+    setStatus("ok", `${bids.length} rows`);
+  } catch (e) {
+    setStatus("error", e.message);
+    document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="err">▸ ${e.message}</span>`;
+  }
+}
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.key === "r") load();
+  if (e.key === "s") location.href = "/";
+  if (e.key === "b") location.href = "/v2/bids";
+});
+
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>

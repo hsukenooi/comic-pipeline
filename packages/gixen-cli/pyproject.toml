@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gixen-cli"
+version = "1.0.0"
+description = "CLI and server for managing eBay snipes via Gixen"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Hsu Ken Ooi", email = "hsukenooi@googlemail.com" }]
+keywords = ["ebay", "sniper", "gixen", "cli", "auctions"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "requests",
+    "click",
+    "python-dotenv",
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "pluggy",
+    "playwright",
+]
+
+[project.urls]
+Homepage = "https://github.com/hsukenooi/gixen-cli"
+Repository = "https://github.com/hsukenooi/gixen-cli"
+Issues = "https://github.com/hsukenooi/gixen-cli/issues"
+Changelog = "https://github.com/hsukenooi/gixen-cli/blob/main/CHANGELOG.md"
+
+[project.scripts]
+gixen = "cli:cli"
+
+[project.entry-points."gixen.plugins"]
+# External plugin packages declare their entry-points here.
+# Example (in the plugin's own pyproject.toml):
+#   [project.entry-points."gixen.plugins"]
+#   my-plugin = "my_plugin:GixenPlugin"
+
+# KTD2 (U4 / BUI-55): the flat top-level modules are NOT matched by the
+# packages.find glob below, but server/main.py does `from gixen_client import ...`
+# and `import ebay_bidder`, and the `gixen` console script is `cli:cli`. Without
+# packaging these as py-modules, the workspace editable install raises
+# ModuleNotFoundError for gixen_client/ebay_bidder/cli. This is what lets the
+# overlay drop its hardcoded pythonpath in U5.
+[tool.setuptools]
+py-modules = ["cli", "gixen_client", "ebay_bidder"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gixen*", "server*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests requiring real Gixen credentials (deselect with -m 'not integration')",
+]

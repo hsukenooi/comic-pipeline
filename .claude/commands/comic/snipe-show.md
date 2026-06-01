@@ -7,12 +7,12 @@ description: Show active and recently ended Gixen snipes in formatted tables wit
 
 Display active and recently ended Gixen snipes as formatted tables with eBay links and seller info.
 
-**Gixen CLI:** `cd ~/Projects/gixen-cli && .venv/bin/python cli.py`
+**Gixen CLI:** `gixen` (a uv-installed console script on PATH; run `./scripts/install.sh` if not found).
 
 ## Fetch Data
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py list --json 2>/dev/null
+gixen list --json 2>/dev/null
 ```
 
 ## Build Tables
