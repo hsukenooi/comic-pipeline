@@ -82,6 +82,10 @@ PLIST
 echo "==> Loading LaunchAgent"
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load -w "$PLIST"
+# `load -w` registers the job but on modern macOS does not reliably (re)start the
+# process when reloading in-place — RunAtLoad can be skipped, leaving the job
+# "loaded but not running". Force a fresh start so the deploy actually serves.
+launchctl kickstart -k "gui/$(id -u)/com.gixen.server" 2>/dev/null || true
 
 echo ""
 echo "Done. Server starting on port 8080 from the monorepo workspace venv."
