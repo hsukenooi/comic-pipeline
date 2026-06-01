@@ -600,14 +600,23 @@ async def api_comics_history(request: Request):
         INNER JOIN (
             SELECT item_id, MAX(id) AS max_id
             FROM bids
-            WHERE (
-              auction_end_at IS NOT NULL
-              AND datetime(auction_end_at) <= datetime('now')
-              AND datetime(auction_end_at) >= datetime('now', '-7 days')
-            ) OR (
-              auction_end_at IS NULL
-              AND resolved_at IS NOT NULL
-              AND datetime(resolved_at) >= datetime('now', '-7 days')
+            -- Exclude PURGED (soft-delete tombstone) so removed snipes never
+            -- leak into "recently ended" (BUI-50). Filtering inside the dedup
+            -- subquery — not just the outer query — means MAX(id) picks the
+            -- latest *non-purged* row, so a legit LOST/WON row still shows even
+            -- if a later same-item snipe was added then removed (higher id,
+            -- PURGED). Mirrors api_comics_snipes' status filter.
+            WHERE status != 'PURGED'
+            AND (
+              (
+                auction_end_at IS NOT NULL
+                AND datetime(auction_end_at) <= datetime('now')
+                AND datetime(auction_end_at) >= datetime('now', '-7 days')
+              ) OR (
+                auction_end_at IS NULL
+                AND resolved_at IS NOT NULL
+                AND datetime(resolved_at) >= datetime('now', '-7 days')
+              )
             )
             GROUP BY item_id
         ) latest ON b.id = latest.max_id

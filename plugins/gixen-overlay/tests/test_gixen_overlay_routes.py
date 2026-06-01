@@ -5,13 +5,60 @@ loaded via the entry-point discovery path.
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import sqlite3
+import subprocess
 from importlib.metadata import EntryPoint
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+_STATIC_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "src", "gixen_overlay", "static"
+)
+
+
+def _extract_js_function(source: str, name: str) -> str:
+    """Slice a top-level `function <name>(...) { ... }` out of JS source by
+    brace-matching, so we can execute it in node without a JS test runner."""
+    start = source.index(f"function {name}(")
+    depth = 0
+    i = source.index("{", start)
+    while i < len(source):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : i + 1]
+        i += 1
+    raise AssertionError(f"unterminated function {name} in source")  # pragma: no cover
+
+
+def _run_outcome(row: dict) -> str:
+    """Execute v2-comics.html's outcome() in node against a single row and
+    return the rendered HTML string. Skips if node is unavailable."""
+    node = shutil.which("node")
+    if node is None:  # pragma: no cover
+        pytest.skip("node not installed")
+    with open(os.path.join(_STATIC_DIR, "v2-comics.html")) as fh:
+        html = fh.read()
+    outcome_src = _extract_js_function(html, "outcome")
+    script = (
+        "function numericMax(r){return r.max_bid_numeric!=null?"
+        "parseFloat(r.max_bid_numeric):null;}\n"
+        f"{outcome_src}\n"
+        "const row=JSON.parse(process.argv[1]);\n"
+        "process.stdout.write(outcome(row));\n"
+    )
+    out = subprocess.run(
+        [node, "-e", script, json.dumps(row)],
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout
 
 
 def _install_real_plugin(monkeypatch):
@@ -946,6 +993,82 @@ def test_comics_history_excludes_active_snipes(api):
 
     rows = api.get("/api/comics/history").json()
     assert all(r["item_id"] != "200000004" for r in rows)
+
+
+def test_comics_history_excludes_purged_within_window(api):
+    """BUI-50: a removed (PURGED) snipe whose auction ended within the 7-day
+    window must not appear in recently-ended (it would render a false 'won')."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "200000005", "max_bid": 50.0})
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='PURGED', winning_bid=12.0, "
+        "auction_end_at=datetime('now', '-1 day') WHERE item_id=?",
+        ("200000005",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/history").json()
+    assert all(r["item_id"] != "200000005" for r in rows)
+
+
+def test_comics_history_purged_does_not_shadow_legit_loss(api):
+    """BUI-50: filtering PURGED inside the MAX(id) dedup subquery (not just the
+    outer query) means a later add-then-remove (PURGED, higher id) for the same
+    item does not hide the earlier legitimate LOST row."""
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    # Lower id: a real loss. Higher id: re-added then removed (PURGED).
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at) "
+        "VALUES (?, ?, 'LOST', datetime('now', '-2 days'))",
+        ("200000006", 120.0),
+    )
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, winning_bid, auction_end_at) "
+        "VALUES (?, ?, 'PURGED', ?, datetime('now', '-1 day'))",
+        ("200000006", 120.0, 10.0),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/history").json()
+    matching = [r for r in rows if r["item_id"] == "200000006"]
+    assert len(matching) == 1
+    assert matching[0]["status"] == "LOST"
+
+
+# --- JS outcome() (v2-comics.html) -------------------------------------------
+
+
+def test_outcome_purged_never_renders_won():
+    """BUI-50 defense-in-depth: a leaked PURGED row must never be painted 'won'
+    by the winning_bid<=max_bid heuristic, even when the stale snapshot is low."""
+    html = _run_outcome({
+        "status": "PURGED",
+        "winning_bid": 10.0,   # stale pre-removal snapshot, well below max
+        "max_bid_numeric": 120.0,
+    })
+    assert 'pill won' not in html  # never the green "won" pill
+    assert "removed" in html
+
+
+def test_outcome_won_still_renders_won():
+    """Guard: the new PURGED branch doesn't disturb a genuine WON row."""
+    html = _run_outcome({
+        "status": "WON", "winning_bid": 100.0, "max_bid_numeric": 120.0,
+    })
+    assert 'pill won' in html
+
+
+def test_outcome_lost_still_renders_outbid():
+    """Guard: a genuine LOST row still renders 'outbid'."""
+    html = _run_outcome({
+        "status": "LOST", "winning_bid": 130.0, "max_bid_numeric": 120.0,
+    })
+    assert 'pill lost' in html
+    assert "outbid" in html
 
 
 def test_comics_snipes_triggers_fresh_sync(api):

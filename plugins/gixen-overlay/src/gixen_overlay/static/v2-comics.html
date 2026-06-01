@@ -312,6 +312,11 @@ function outcome(r) {
   if (r.status === "PENDING") return '<span class="pill pending">pending</span>';
   if (r.status === "WON") return '<span class="pill won">won</span>';
   if (r.status === "LOST") return '<span class="pill lost">outbid</span>';
+  // PURGED is a soft-delete tombstone (removed snipe), not an auction outcome.
+  // Render it explicitly before the winning_bid<=max_bid heuristic below —
+  // a PURGED row's winning_bid is a stale pre-removal current-bid snapshot that
+  // sits below max_bid and would otherwise be painted a false "won" (BUI-50).
+  if (r.status === "PURGED") return '<span class="mute">removed</span>';
   const w = r.winning_bid != null ? parseFloat(r.winning_bid) : null;
   const m = numericMax(r);
   if (w != null && m != null) return w <= m
