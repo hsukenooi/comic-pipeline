@@ -223,26 +223,36 @@ Mirror the host's filter exactly so the JS partitioning continues to work:
 WHERE b.status != 'PURGED'
 ```
 
-And for history, mirror the host's `MAX(id) per item_id` dedup so a re-added snipe appears once:
+And for history, mirror the host's `MAX(id) per item_id` dedup so a re-added snipe appears once. **Apply the `status != 'PURGED'` filter here too** — see the caution below:
 
 ```python
 INNER JOIN (
     SELECT item_id, MAX(id) AS max_id
     FROM bids
-    WHERE (
-      auction_end_at IS NOT NULL
-      AND datetime(auction_end_at) <= datetime('now')
-      AND datetime(auction_end_at) >= datetime('now', '-7 days')
-    ) OR (
-      auction_end_at IS NULL
-      AND resolved_at IS NOT NULL
-      AND datetime(resolved_at) >= datetime('now', '-7 days')
-    )
+    WHERE status != 'PURGED'
+      AND (
+        (
+          auction_end_at IS NOT NULL
+          AND datetime(auction_end_at) <= datetime('now')
+          AND datetime(auction_end_at) >= datetime('now', '-7 days')
+        ) OR (
+          auction_end_at IS NULL
+          AND resolved_at IS NOT NULL
+          AND datetime(resolved_at) >= datetime('now', '-7 days')
+        )
+      )
     GROUP BY item_id
 ) latest ON b.id = latest.max_id
 ```
 
 Rule of thumb: when mirroring a host endpoint, copy the host's `WHERE`/dedup verbatim. Bucketing belongs on the client because the client is what sees time tick past T=0.
+
+> **Caution (added 2026-06-01, BUI-50):** earlier revisions of this doc showed the
+> history dedup subquery *without* `WHERE status != 'PURGED'`. That omission is the
+> exact bug behind BUI-50 — soft-deleted (removed) snipes leaked into "recently
+> ended" and the client painted them "won". PURGED is a soft-delete tombstone, not a
+> terminal auction outcome; it must be filtered on **both** the active and history
+> endpoints. See `../ui-bugs/purged-snipes-shown-as-won-2026-06-01.md`.
 
 ### g. Clamp `lot_count - 1` to non-negative
 
