@@ -8,3 +8,5 @@ venv/
 .env
 *.sqlite
 .DS_Store
+.firecrawl/
+.claude/scheduled_tasks.lock
