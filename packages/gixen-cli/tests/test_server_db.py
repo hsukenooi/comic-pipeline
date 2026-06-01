@@ -456,3 +456,193 @@ def test_removed_status_accepted_after_migration(tmp_path):
         ).fetchone()["status"] == "REMOVED"
     finally:
         conn.close()
+
+
+# --- BUI-67: collapse duplicate PENDING snipes + partial unique index ---------
+#
+# Seed via a raw schema that lacks the partial unique index (it's the migration
+# being tested), so duplicate PENDING rows can be inserted before init_db runs
+# the collapse. Reuses _OLD_SCHEMA_SQL (no unique index, CHECK widened to REMOVED
+# by the status-rename migration before the dedup runs).
+
+def _seed_dup_db(path, inserts):
+    raw = sqlite3.connect(str(path))
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript(_OLD_SCHEMA_SQL)
+    for sql in inserts:
+        raw.execute(sql)
+    raw.commit()
+    raw.close()
+
+
+def test_dedup_collapses_duplicate_pending(tmp_path):
+    db_path = tmp_path / "dup.db"
+    _seed_dup_db(db_path, [
+        "INSERT INTO bids (id, item_id, max_bid, status, cached_at) "
+        "VALUES (10, '236831609134', 20.0, 'PENDING', '2026-06-01T00:00:00+00:00')",
+        "INSERT INTO bids (id, item_id, max_bid, status, cached_at) "
+        "VALUES (11, '236831609134', 20.0, 'PENDING', '2026-06-01T00:01:00+00:00')",
+    ])
+    conn = init_db(db_path)
+    try:
+        pend = conn.execute(
+            "SELECT id FROM bids WHERE item_id='236831609134' AND status='PENDING'"
+        ).fetchall()
+        assert len(pend) == 1
+        assert pend[0]["id"] == 11  # MAX(id) survives
+        removed = conn.execute(
+            "SELECT * FROM bids WHERE item_id='236831609134' AND status='REMOVED'"
+        ).fetchone()
+        assert removed["notes"] == "deduped BUI-67"
+        assert removed["resolved_at"] is not None
+        assert "+00:00" in removed["resolved_at"]  # ISO form, matches delete_bid
+    finally:
+        conn.close()
+
+
+def test_dedup_forward_fills_survivor(tmp_path):
+    """Survivor (MAX id) inherits the older row's auction_end_at/fmv_id and the
+    higher max_bid — the data-loss guard."""
+    db_path = tmp_path / "dup.db"
+    _seed_dup_db(db_path, [
+        "INSERT INTO bids (id, item_id, max_bid, status, auction_end_at, fmv_id, cached_at) "
+        "VALUES (10, 'itemA', 20.0, 'PENDING', '2026-06-05T12:00:00+00:00', 42, '2026-06-01T00:05:00+00:00')",
+        "INSERT INTO bids (id, item_id, max_bid, status, auction_end_at, fmv_id, cached_at) "
+        "VALUES (11, 'itemA', 15.0, 'PENDING', NULL, NULL, NULL)",
+    ])
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM bids WHERE item_id='itemA' AND status='PENDING'"
+        ).fetchone()
+        assert row["id"] == 11
+        assert row["auction_end_at"] == "2026-06-05T12:00:00+00:00"
+        assert row["fmv_id"] == 42
+        assert row["max_bid"] == 20.0
+    finally:
+        conn.close()
+
+
+def test_dedup_divergent_end_times_pick_freshest(tmp_path):
+    """When both rows carry an auction_end_at, the freshest cached_at wins — even
+    if that's the lower-id row, not the survivor's own (stale) value."""
+    db_path = tmp_path / "dup.db"
+    _seed_dup_db(db_path, [
+        # lower id, FRESHER cached_at
+        "INSERT INTO bids (id, item_id, max_bid, status, auction_end_at, cached_at) "
+        "VALUES (10, 'itemB', 20.0, 'PENDING', '2026-06-05T12:00:30+00:00', '2026-06-01T00:09:00+00:00')",
+        # higher id (survivor), STALER cached_at
+        "INSERT INTO bids (id, item_id, max_bid, status, auction_end_at, cached_at) "
+        "VALUES (11, 'itemB', 20.0, 'PENDING', '2026-06-05T12:00:00+00:00', '2026-06-01T00:01:00+00:00')",
+    ])
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM bids WHERE item_id='itemB' AND status='PENDING'"
+        ).fetchone()
+        assert row["id"] == 11  # survivor is still MAX(id)
+        assert row["auction_end_at"] == "2026-06-05T12:00:30+00:00"  # but the fresher end time
+    finally:
+        conn.close()
+
+
+def test_dedup_preserves_relisting(tmp_path):
+    """An ENDED + a PENDING row for the same item are both left intact — only
+    PENDING duplicates collapse."""
+    db_path = tmp_path / "dup.db"
+    _seed_dup_db(db_path, [
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (10, 'itemD', 20.0, 'ENDED')",
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (11, 'itemD', 25.0, 'PENDING')",
+    ])
+    conn = init_db(db_path)
+    try:
+        statuses = sorted(
+            r["status"] for r in conn.execute("SELECT status FROM bids WHERE item_id='itemD'")
+        )
+        assert statuses == ["ENDED", "PENDING"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM bids WHERE item_id='itemD' AND notes='deduped BUI-67'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_dedup_three_way_collapse(tmp_path):
+    db_path = tmp_path / "dup.db"
+    _seed_dup_db(db_path, [
+        "INSERT INTO bids (id, item_id, max_bid, status, fmv_id, cached_at) "
+        "VALUES (10, 'itemE', 20.0, 'PENDING', 7, '2026-06-01T00:01:00+00:00')",
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (11, 'itemE', 22.0, 'PENDING')",
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (12, 'itemE', 21.0, 'PENDING')",
+    ])
+    conn = init_db(db_path)
+    try:
+        pend = conn.execute(
+            "SELECT * FROM bids WHERE item_id='itemE' AND status='PENDING'"
+        ).fetchall()
+        assert len(pend) == 1
+        assert pend[0]["id"] == 12
+        assert pend[0]["fmv_id"] == 7  # union of live fields across the group
+        assert pend[0]["max_bid"] == 22.0  # MAX across the group
+        assert conn.execute(
+            "SELECT COUNT(*) FROM bids WHERE item_id='itemE' AND status='REMOVED'"
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_pending_unique_index_enforced_after_migration(tmp_path):
+    db_path = tmp_path / "dup.db"
+    _seed_dup_db(db_path, [
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (10, 'itemF', 20.0, 'PENDING')",
+    ])
+    conn = init_db(db_path)
+    try:
+        idx = {r["name"] for r in conn.execute("PRAGMA index_list(bids)")}
+        assert "idx_bids_pending_item_id" in idx
+        # Second live snipe for the same item is rejected at the DB.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO bids (item_id, max_bid, status) VALUES ('itemF', 30.0, 'PENDING')")
+        conn.rollback()
+        # A PENDING for a new item is fine; a non-PENDING for the same item is fine.
+        conn.execute("INSERT INTO bids (item_id, max_bid, status) VALUES ('itemG', 30.0, 'PENDING')")
+        conn.execute("INSERT INTO bids (item_id, max_bid, status) VALUES ('itemF', 30.0, 'ENDED')")
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM bids WHERE item_id='itemF'").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_dedup_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "dup.db"
+    _seed_dup_db(db_path, [
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (10, 'itemH', 20.0, 'PENDING')",
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (11, 'itemH', 20.0, 'PENDING')",
+    ])
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)  # re-run must be a clean no-op
+    try:
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM bids WHERE item_id='itemH' AND status='PENDING'"
+        ).fetchone()[0] == 1
+        idx = {r["name"] for r in conn2.execute("PRAGMA index_list(bids)")}
+        assert "idx_bids_pending_item_id" in idx
+    finally:
+        conn2.close()
+
+
+def test_dedup_creates_index_when_no_duplicates(tmp_path):
+    """Crash re-entrancy proxy: a DB with no PENDING dups (collapse already done,
+    index not yet created) still gets the index on the next init_db."""
+    db_path = tmp_path / "dup.db"
+    _seed_dup_db(db_path, [
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (10, 'itemI', 20.0, 'PENDING')",
+        "INSERT INTO bids (id, item_id, max_bid, status) VALUES (11, 'itemJ', 20.0, 'WON')",
+    ])
+    conn = init_db(db_path)
+    try:
+        idx = {r["name"] for r in conn.execute("PRAGMA index_list(bids)")}
+        assert "idx_bids_pending_item_id" in idx
+    finally:
+        conn.close()
