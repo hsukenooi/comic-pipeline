@@ -31,7 +31,7 @@ from gixen.plugins import (
 from server.db import (
     DB_PATH, init_db, insert_bid, get_bid_by_item_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
-    mark_bids_purged, cache_gixen_data,
+    mark_bids_purged, cache_gixen_data, DEDUP_TOMBSTONE_NOTE,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
 )
 import ebay_bidder
@@ -440,8 +440,8 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
     2. The soft-delete tombstone (REMOVED, or legacy PURGED) resolved without a
        winning_bid (e.g. bulk-removed before the fallback ran), within 7 days.
 
-    Excludes BUI-67 dedup losers (REMOVED with notes='deduped BUI-67'): they are
-    not real ended auctions, and the 7-day window matches on their freshly-set
+    Excludes BUI-67 dedup losers (REMOVED with notes=DEDUP_TOMBSTONE_NOTE): they
+    are not real ended auctions, and the 7-day window matches on their freshly-set
     resolved_at, so without this guard they'd burn an eBay call and could get a
     phantom winning_bid/WON stamp. The 'IS NOT' comparison keeps NULL-notes rows.
     """
@@ -456,10 +456,10 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
         SELECT item_id, max_bid, local_snipe_result, 1 AS is_purged FROM bids
         WHERE status IN ('PURGED', 'REMOVED')
           AND winning_bid IS NULL
-          AND notes IS NOT 'deduped BUI-67'
+          AND notes IS NOT ?
           AND datetime(COALESCE(auction_end_at, resolved_at)) >= datetime('now', '-7 days')
         """,
-        (now_iso,),
+        (now_iso, DEDUP_TOMBSTONE_NOTE),
     ).fetchall()
 
 
