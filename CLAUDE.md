@@ -50,10 +50,10 @@ CI (`.github/workflows/ci.yml`) only AST-parses `plugin.py` as a smoke check —
 
 **Cross-repo coupling is load-bearing and fragile:** `routes.py` imports private helpers from gixen-cli's `server.main` (`_ensure_fresh_sync`, `_spawn_fallback_task`, `_iso_to_relative`) and `server.db` (`get_bid_by_item_id`). If those are renamed upstream the plugin fails at import time. The comic tables (`comics`, `fmv`, `bid_fmvs`) live in the plugin's `db.py` but JOIN against gixen-cli's `bids` table — one shared SQLite DB.
 
-**Endpoint parity matters:** `/api/comics/snipes` and `/api/comics/history` both read the shared `bids` table and must apply the same status filters (notably `status != 'PURGED'`). A drift here caused the BUI-50 false-"won" bug — see `docs/solutions/ui-bugs/purged-snipes-shown-as-won-2026-06-01.md`.
+**Endpoint parity matters:** `/api/comics/snipes` and `/api/comics/history` both read the shared `bids` table and must apply the same status filters (notably excluding the tombstone via `status NOT IN ('PURGED', 'REMOVED')`). A drift here caused the BUI-50 false-"won" bug — see `docs/solutions/ui-bugs/purged-snipes-shown-as-won-2026-06-01.md`.
 
 ### `bids.status` lifecycle (owned by gixen-cli)
-Statuses: `PENDING → WON/LOST/ENDED/FAILED`, plus `PURGED`. **`PURGED` is a soft-delete tombstone**, written either when a live snipe is removed (`delete_bid`) or when completed bids are swept (`mark_bids_purged`) — it is *not* a terminal auction outcome. Filter it out of any user-facing "results" view. (Conflation of those two meanings is tracked in BUI-49.)
+Statuses: `PENDING → WON/LOST/ENDED/FAILED`, plus the soft-delete tombstone. **The tombstone is `REMOVED`** (renamed from `PURGED` in BUI-49); it is written either when a live snipe is removed (`delete_bid`) or when completed bids are swept (`mark_bids_purged`) — it is *not* a terminal auction outcome. Filter it out of any user-facing "results" view. The overlay tolerates **both** `'PURGED'` and `'REMOVED'` so it stays correct whether or not the gixen-cli rename migration has run (package version skew). BUI-49 chose a pure rename (Option A), not splitting live-cancel vs completed-sweep into distinct statuses.
 
 ### The `/comic:*` skill workflow
 `/comic:buy` is the orchestrator; it reads and runs the leaf skills in sequence with a user gate at each step: **identify → collection-check → (conditional) grade → fmv → snipe-add**. Leaf skills are also usable standalone. The skills shell out to:
