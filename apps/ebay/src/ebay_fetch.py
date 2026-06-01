@@ -450,7 +450,7 @@ def search_seller_listings(seller, token, base_url, *, app_id=None, max_results=
         response = data.get("findItemsIneBayStoresResponse", [{}])[0]
         ack = response.get("ack", [""])[0]
         if ack not in ("Success", "Warning"):
-            err = (data.get("errorMessage", [{}])[0]
+            err = (response.get("errorMessage", [{}])[0]
                       .get("error", [{}])[0]
                       .get("message", ["unknown"])[0])
             print(f"Finding API error: {err}", file=sys.stderr)
@@ -487,7 +487,11 @@ def _finding_item_to_browse(item, seller_username):
     price_val = price_data.get("__value__", "0")
     currency = price_data.get("@currencyId", "USD")
 
-    buying_options = ["AUCTION"] if listing_type in ("Chinese", "Auction") else ["FIXED_PRICE"]
+    # Finding API returns "Chinese" for a plain auction and "AuctionWithBIN" for an
+    # auction that still has a live Buy It Now (it flips to "Chinese" once a bid lands).
+    # "Auction" is the request-side itemFilter value; keep it for defensiveness.
+    auction_types = ("Chinese", "AuctionWithBIN", "Auction")
+    buying_options = ["AUCTION"] if listing_type in auction_types else ["FIXED_PRICE"]
 
     price_dict = {"value": price_val, "currency": currency}
     return {
