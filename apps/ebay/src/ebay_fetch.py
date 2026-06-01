@@ -399,33 +399,40 @@ def parse_item_summary(item):
     }
 
 
-def search_seller_listings(seller, token, base_url, *, max_results=1000, retries=3):
-    """Fetch active listings from a seller via Browse API item_summary/search.
+def search_seller_listings(seller, token, base_url, *, app_id=None, max_results=1000, retries=3):
+    """Fetch active auction listings from a seller via the eBay Finding API.
 
-    Paginates automatically. Returns a list of raw itemSummary dicts.
-    seller may be a username or eBay store/user URL.
+    Uses findItemsIneBayStores so the seller arg can be a store name or username.
+    The Browse API sellers filter requires an exact username and is unreliable;
+    findItemsIneBayStores accepts the store name directly.
+    Returns a list of Browse-API-shaped dicts compatible with parse_item_summary.
     """
-    username = _extract_seller_username(seller)
-    url = f"{base_url}/buy/browse/v1/item_summary/search"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
-    }
+    store_name = _extract_seller_username(seller)
+
+    if "sandbox" in base_url:
+        find_url = "https://svcs.sandbox.ebay.com/services/search/FindingService/v1"
+    else:
+        find_url = "https://svcs.ebay.com/services/search/FindingService/v1"
 
     all_items = []
-    offset = 0
-    page_size = 200
+    page = 1
+    page_size = min(100, max_results)
 
     while True:
         params = {
-            "q": "comic",
-            "filter": f"sellers:{{{username}}},buyingOptions:{{AUCTION}}",
-            "limit": page_size,
-            "offset": offset,
+            "OPERATION-NAME": "findItemsIneBayStores",
+            "SERVICE-VERSION": "1.0.0",
+            "SECURITY-APPNAME": app_id,
+            "RESPONSE-DATA-FORMAT": "JSON",
+            "storeName": store_name,
+            "itemFilter(0).name": "ListingType",
+            "itemFilter(0).value": "Auction",
+            "paginationInput.entriesPerPage": page_size,
+            "paginationInput.pageNumber": page,
         }
 
         for attempt in range(retries):
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            resp = requests.get(find_url, params=params, timeout=15)
             if resp.status_code == 200:
                 break
             if resp.status_code == 429 and attempt < retries - 1:
@@ -440,15 +447,59 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
                 return all_items
 
         data = resp.json()
-        page_items = data.get("itemSummaries", [])
-        all_items.extend(page_items)
-        offset += len(page_items)
-        total = data.get("total", 0)
+        response = data.get("findItemsIneBayStoresResponse", [{}])[0]
+        ack = response.get("ack", [""])[0]
+        if ack not in ("Success", "Warning"):
+            err = (data.get("errorMessage", [{}])[0]
+                      .get("error", [{}])[0]
+                      .get("message", ["unknown"])[0])
+            print(f"Finding API error: {err}", file=sys.stderr)
+            return all_items
 
-        if not page_items or offset >= total or offset >= max_results:
+        search_result = response.get("searchResult", [{}])[0]
+        raw_items = search_result.get("item", [])
+
+        for item in raw_items:
+            all_items.append(_finding_item_to_browse(item, store_name))
+
+        pagination = response.get("paginationOutput", [{}])[0]
+        total_pages = int(pagination.get("totalPages", ["1"])[0])
+
+        if page >= total_pages or len(all_items) >= max_results or not raw_items:
             break
+        page += 1
 
-    return all_items
+    return all_items[:max_results]
+
+
+def _finding_item_to_browse(item, seller_username):
+    """Reshape a Finding API item dict into a Browse API itemSummary-shaped dict."""
+    item_id = item.get("itemId", [""])[0]
+    title = item.get("title", [""])[0]
+    url = item.get("viewItemURL", [f"https://www.ebay.com/itm/{item_id}"])[0]
+
+    listing_info = item.get("listingInfo", [{}])[0]
+    listing_type = listing_info.get("listingType", ["Unknown"])[0]
+    end_time = listing_info.get("endTime", [None])[0]
+
+    selling = item.get("sellingStatus", [{}])[0]
+    price_data = selling.get("currentPrice", [{}])[0]
+    price_val = price_data.get("__value__", "0")
+    currency = price_data.get("@currencyId", "USD")
+
+    buying_options = ["AUCTION"] if listing_type in ("Chinese", "Auction") else ["FIXED_PRICE"]
+
+    price_dict = {"value": price_val, "currency": currency}
+    return {
+        "itemId": item_id,
+        "title": title,
+        "buyingOptions": buying_options,
+        "currentBidPrice": price_dict if "AUCTION" in buying_options else None,
+        "price": price_dict,
+        "itemEndDate": end_time,
+        "itemWebUrl": url,
+        "seller": {"username": seller_username},
+    }
 
 
 def truncate(text, width):

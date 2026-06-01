@@ -18,9 +18,7 @@ from ebay_fetch import load_config, get_token, parse_item_summary, search_seller
 def fetch_wish_list():
     """Fetch LOCG wish list via locg CLI. Returns list of dicts with id and name."""
     result = subprocess.run(
-        ["python3", "-m", "locg", "wish-list"],
-        cwd="/Users/hsukenooi/Projects/locg-cli",
-        env={**__import__("os").environ, "PYTHONPATH": "src"},
+        ["locg", "wish-list"],
         capture_output=True,
         text=True,
     )
@@ -256,7 +254,7 @@ def main(argv=None):
     # Fetch seller listings
     print(f"Fetching listings for seller '{args.seller}'...", file=sys.stderr)
     raw_listings = search_seller_listings(
-        args.seller, token, base_url, max_results=args.max_results
+        args.seller, token, base_url, app_id=client_id, max_results=args.max_results
     )
     print(f"  {len(raw_listings)} listings fetched", file=sys.stderr)
 
