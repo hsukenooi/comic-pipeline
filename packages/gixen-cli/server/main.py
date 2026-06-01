@@ -330,6 +330,12 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
                 # client, no _api_lock), so the partial unique index is what
                 # actually prevents the duplicate — catch its violation and skip
                 # rather than aborting the whole sync run (BUI-67 U4/KTD6).
+                #
+                # rollback() scope: the only uncommitted statement here is this
+                # failed INSERT — the terminal/cache writes from the earlier loop
+                # were committed at the db.commit() above, and each insert_bid
+                # self-commits. So this discards just the failed insert, not any
+                # batched sibling work.
                 db.rollback()
                 logger.debug(
                     "_sync_gixen: %s already present (concurrent add); skipping insert",
@@ -778,7 +784,10 @@ def api_dashboard_tabs(request: Request) -> list[dict]:
     return getattr(request.app.state, "dashboard_tabs", [])
 
 
-async def _modify_and_update_bid(db, item_id, max_bid, bid_offset, snipe_group):
+async def _modify_and_update_bid(
+    db: sqlite3.Connection, item_id: str, max_bid: float,
+    bid_offset: int, snipe_group: int,
+) -> sqlite3.Row:
     """Gixen modify_snipe (off-thread) + local update_bid. Re-raises
     GixenSnipeNotFoundError so the caller owns the not-found *policy* (add falls
     back; edit 404s). Caller must already hold _api_lock — this does NOT acquire
@@ -793,7 +802,10 @@ async def _modify_and_update_bid(db, item_id, max_bid, bid_offset, snipe_group):
     return get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
 
 
-async def _add_bid_row(db, item_id, max_bid, bid_offset, snipe_group):
+async def _add_bid_row(
+    db: sqlite3.Connection, item_id: str, max_bid: float,
+    bid_offset: int, snipe_group: int,
+) -> tuple[sqlite3.Row, bool]:
     """Gixen add_snipe (off-thread) + insert_bid; returns (row, created=True).
 
     On a partial-unique-index collision — a racing unlocked _sync_loop insert for
