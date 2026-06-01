@@ -785,6 +785,46 @@ class TestCliServerAddCreatedFlag:
         # A re-add (in-place update) must NOT reset the add-history timestamp.
         mock_record.assert_not_called()
 
+    def test_updated_and_linked_on_in_place_update(self):
+        from cli import cli
+
+        runner = CliRunner()
+
+        def fake_request(method, path, **kwargs):
+            if path == "/api/bids":
+                return {"item_id": "444", "max_bid": 10.0, "created": False}
+            return {}  # link-fmv ok
+
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("cli._server_request", side_effect=fake_request), \
+             patch("cli._record_add") as mock_record:
+            result = runner.invoke(
+                cli, ["add", "444", "10.00", "--comic-id", "187", "--grade", "5.0"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Updated existing snipe + linked" in result.output  # not "Added + linked"
+        mock_record.assert_not_called()
+
+    def test_updated_but_link_failed_warns(self):
+        from cli import cli
+
+        runner = CliRunner()
+
+        def fake_request(method, path, **kwargs):
+            if path == "/api/bids":
+                return {"item_id": "444", "max_bid": 10.0, "created": False}
+            raise SystemExit(1)  # link-fmv fails
+
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("cli._server_request", side_effect=fake_request), \
+             patch("cli._record_add"):
+            result = runner.invoke(
+                cli, ["add", "444", "10.00", "--comic-id", "187", "--grade", "5.0"]
+            )
+
+        assert "Snipe updated but FMV link failed" in result.output
+
 
 # ---------------------------------------------------------------------------
 # CLI: add --comic-id / --catalog-id link-fmv routing (server mode)

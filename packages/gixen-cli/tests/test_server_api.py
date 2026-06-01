@@ -172,6 +172,19 @@ def test_add_gixen_state_skew_falls_back_to_add(api):
     assert row["max_bid"] == 65.0
 
 
+def test_add_not_confirmed_on_new_item_returns_503(api):
+    """A brand-new add where Gixen can't confirm the snipe surfaces as 503 and
+    inserts no row (the next sync's web-add path reconciles if Gixen has it)."""
+    from gixen_client import GixenAddNotConfirmedError
+    api.mock_gixen.add_snipe.side_effect = GixenAddNotConfirmedError("411000008")
+    r = api.post("/api/bids", json={"item_id": "411000008", "max_bid": 50.0})
+    assert r.status_code == 503
+    conn = _dbconn()
+    n = conn.execute("SELECT COUNT(*) FROM bids WHERE item_id='411000008'").fetchone()[0]
+    conn.close()
+    assert n == 0
+
+
 def test_add_not_confirmed_on_fallback_returns_existing(api):
     from gixen_client import GixenSnipeNotFoundError, GixenAddNotConfirmedError
     api.post("/api/bids", json={"item_id": "411000006", "max_bid": 50.0})
