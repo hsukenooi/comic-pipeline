@@ -24,7 +24,7 @@ locg collection status --pretty
 > Cache empty — run `locg collection doctor` for setup instructions.
 
 **If `locg_cli_version` is older than `0.2.0`:** Stop immediately with:
-> locg-cli version >=0.2.0 required (installed: X.Y.Z). Upgrade via `cd ~/Projects/locg-cli && pip install -e .` and retry.
+> locg-cli version >=0.2.0 required (installed: X.Y.Z). Upgrade via `./scripts/install.sh` (reinstalls the in-repo `locg`) and retry.
 
 Save `cache_age_days`, `pending_push_count`, and `oldest_pending_days` from the response — you need them for output banners.
 

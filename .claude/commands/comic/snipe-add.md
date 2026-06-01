@@ -7,11 +7,11 @@ description: Add approved comic snipes to Gixen with a computed max bid. Use whe
 
 Add snipes to Gixen. Typically the final step after `/comic:fmv` has produced FMV ranges and the user has approved max bids.
 
-**Gixen CLI:** `cd ~/Projects/gixen-cli && .venv/bin/python cli.py`
+**Gixen CLI:** `gixen` (a uv-installed console script on PATH).
 
-If the venv doesn't exist yet:
+If `gixen` isn't found, install the monorepo CLIs:
 ```bash
-cd ~/Projects/gixen-cli && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q
+./scripts/install.sh
 ```
 
 ## Input
@@ -60,7 +60,7 @@ Compare each auction's current bid against the proposed max bid. If current bid 
 
 ### Available `add` flags (canonical)
 
-These are the flags that exist in `gixen-cli/cli.py` today. Anything else (no `--comic`, `--issue`, or `--year`) is fictional — do not invent flags.
+These are the flags that exist in `packages/gixen-cli/cli.py` today. Anything else (no `--comic`, `--issue`, or `--year`) is fictional — do not invent flags.
 
 | Flag | Type | Purpose |
 |---|---|---|
@@ -77,7 +77,7 @@ These are the flags that exist in `gixen-cli/cli.py` today. Anything else (no `-
 After `/comic:fmv` (or `/comic:buy`) has produced a row with `comic_id` and a numeric `grade`:
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py add {item_id} {max_bid} \
+gixen add {item_id} {max_bid} \
   --comic-id {comic_id} --grade {grade_numeric}
 ```
 
@@ -88,7 +88,7 @@ This is the path that populates `bids.comic_id` / `bids.fmv_id` via the `bid_fmv
 If the grade is unknown, omit `--grade` (and `--comic-id` — link-fmv only fires when both are present):
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py add {item_id} {max_bid}
+gixen add {item_id} {max_bid}
 ```
 
 If `GIXEN_SERVER_URL` is not set (direct Gixen mode, no overlay DB), the same minimal form applies — linking is a no-op without the server.
@@ -96,7 +96,7 @@ If `GIXEN_SERVER_URL` is not set (direct Gixen mode, no overlay DB), the same mi
 After all adds, verify:
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py list
+gixen list
 ```
 
 ## Output
@@ -114,7 +114,7 @@ cd ~/Projects/gixen-cli && .venv/bin/python cli.py list
 Same CLI, different subcommand:
 
 ```bash
-cd ~/Projects/gixen-cli && .venv/bin/python cli.py edit {item_id} {new_max_bid}
+gixen edit {item_id} {new_max_bid}
 ```
 
 Useful when FMV analysis shows an existing bid is too low.

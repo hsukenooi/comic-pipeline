@@ -101,7 +101,7 @@ title that already succeeded). Stop and report if any call returns an `error`.
 the next `locg collection import`** (import rebuilds the wish-list from the LOCG
 export's wish-list rows). To keep these: `locg collection export` and upload the
 CSV to LOCG **before** running another `collection import`. See
-`~/Projects/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
+`packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
 ## Common Mistakes
 
