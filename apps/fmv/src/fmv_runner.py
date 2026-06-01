@@ -159,8 +159,12 @@ def _db_lookup(server_url: str, *, locg_id: int, grade: float,
                    err=True)
         return None
     rows = resp.json()
+    # A stub fmv row (null fmv_low, written by BUI-44 when n=0 comps) links the
+    # comic but has no pricing to reuse — don't count it as a cache hit, so the
+    # book falls through to a fresh fetch+compute instead of reusing the stub.
     rows = [r for r in rows
-            if r.get("locg_id") == locg_id and r.get("grade") == grade]
+            if r.get("locg_id") == locg_id and r.get("grade") == grade
+            and r.get("fmv_low") is not None]
     if not rows:
         return None
     rows.sort(key=lambda r: r.get("fmv_updated_at") or "", reverse=True)
@@ -253,7 +257,11 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
         inp["grade"] = coerced
 
     fmv = fmv_math.compute_fmv(comps, target_grade=target_grade)
-    upserted = _upsert_fmv(server_url, inp, fmv) if fmv["fmv_low"] is not None else None
+    # BUI-44: upsert unconditionally — even with n=0 comps (fmv_low/high None),
+    # so the comics row + a stub fmv row are written and comic_id is returned.
+    # This lets snipe-add thread --comic-id and verify report no_fmv_at_grade
+    # (linked comic, missing pricing) instead of the more severe no_comic.
+    upserted = _upsert_fmv(server_url, inp, fmv)
     comic_id, fmv_id = _extract_ids(upserted)
 
     return {
