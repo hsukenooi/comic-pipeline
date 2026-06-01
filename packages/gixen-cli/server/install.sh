@@ -1,11 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# U11/BUI-60: deploy the gixen server from the comic-pipeline MONOREPO workspace.
+#
+# server/ now lives at packages/gixen-cli/server/, so the workspace root is three
+# levels up. The deploy uses `uv sync --all-packages` rather than a per-package
+# `pip install -r requirements.txt`, so the shared .venv includes gixen-cli AND
+# the gixen-overlay plugin AND locg. This closes the pre-merge gap: plugin
+# discovery is via importlib.metadata entry-points (the `gixen.plugins` group),
+# which reads INSTALLED dist metadata — so the overlay must be *installed*
+# (dist-info present), not merely importable. A bare gixen-cli venv would boot
+# the server without the /comics tab.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
-VENV="$REPO_DIR/.venv"
+PKG_DIR="$(dirname "$SCRIPT_DIR")"               # packages/gixen-cli
+MONOREPO_ROOT="$(cd "$PKG_DIR/../.." && pwd)"    # monorepo root (uv workspace)
+VENV="$MONOREPO_ROOT/.venv"                      # shared workspace venv
 SERVER_DIR="$HOME/.gixen-server"
 PLIST="$HOME/Library/LaunchAgents/com.gixen.server.plist"
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "error: uv is not installed. See https://docs.astral.sh/uv/ to install it." >&2
+  exit 1
+fi
 
 echo "==> Creating $SERVER_DIR"
 mkdir -p "$SERVER_DIR"
@@ -22,9 +39,8 @@ ENV
   echo "    Edit $SERVER_DIR/.env before starting the server."
 fi
 
-echo "==> Creating Python venv"
-python3 -m venv "$VENV"
-"$VENV/bin/pip" install -q -r "$REPO_DIR/requirements.txt"
+echo "==> Syncing uv workspace (gixen-cli + gixen-overlay + locg) at $MONOREPO_ROOT"
+( cd "$MONOREPO_ROOT" && uv sync --all-packages )
 
 echo "==> Writing LaunchAgent plist to $PLIST"
 cat > "$PLIST" <<PLIST
@@ -45,7 +61,7 @@ cat > "$PLIST" <<PLIST
         <string>8080</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>$REPO_DIR</string>
+    <string>$PKG_DIR</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>ENV_FILE</key>
@@ -68,8 +84,11 @@ launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load -w "$PLIST"
 
 echo ""
-echo "Done. Server starting on port 8080."
+echo "Done. Server starting on port 8080 from the monorepo workspace venv."
+echo "  venv:    $VENV"
+echo "  cwd:     $PKG_DIR"
+echo "  env:     $SERVER_DIR/.env"
 echo "Logs: $SERVER_DIR/server.log"
 echo "      $SERVER_DIR/server.error.log"
 echo ""
-echo "Test: curl http://localhost:8080/health"
+echo "Test: curl http://localhost:8080/health && curl -s http://localhost:8080/comics | head"
