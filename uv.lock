@@ -231,6 +231,12 @@ requires-dist = [
 name = "gixen-overlay"
 version = "0.1.0"
 source = { editable = "plugins/gixen-overlay" }
+dependencies = [
+    { name = "gixen-cli" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "gixen-cli", editable = "packages/gixen-cli" }]
 
 [[package]]
 name = "greenlet"

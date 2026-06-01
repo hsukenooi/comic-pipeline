@@ -7,7 +7,14 @@ name = "gixen-overlay"
 version = "0.1.0"
 description = "Comic overlay plugin for gixen-cli"
 requires-python = ">=3.9"
-dependencies = []
+# U5/BUI-56: the overlay reaches into gixen-cli's server.* (incl. private
+# helpers in routes.py). Declared as an explicit workspace dependency so the
+# coupling is recorded and CI-guarded — a gixen-cli rename + its overlay caller
+# now land in one commit. Resolved from the in-repo member via [tool.uv.sources].
+dependencies = ["gixen-cli"]
+
+[tool.uv.sources]
+gixen-cli = { workspace = true }
 
 [project.entry-points."gixen.plugins"]
 gixen-overlay = "gixen_overlay.plugin:plugin"
@@ -16,4 +23,7 @@ gixen-overlay = "gixen_overlay.plugin:plugin"
 packages = ["src/gixen_overlay"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "/Users/hsukenooi/Projects/gixen-cli"]
+# U5/BUI-56: the hardcoded absolute gixen-cli repo path was removed here —
+# server.* now resolves via the workspace install, not a machine-specific
+# sys.path injection. Only "src" (this package's own sources) remains.
+pythonpath = ["src"]
