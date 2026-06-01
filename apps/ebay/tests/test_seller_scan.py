@@ -103,56 +103,175 @@ class TestParseItemSummary:
         assert "BEST_OFFER" in parsed["listing_type"]
 
 
+def _finding_item(item_id, title="Comic", listing_type="Chinese", price="10.00"):
+    """Build a Finding API item dict (single-element arrays per field)."""
+    return {
+        "itemId": [item_id],
+        "title": [title],
+        "viewItemURL": [f"https://www.ebay.com/itm/{item_id}"],
+        "listingInfo": [{
+            "listingType": [listing_type],
+            "endTime": ["2026-06-15T18:30:00.000Z"],
+        }],
+        "sellingStatus": [{
+            "currentPrice": [{"@currencyId": "USD", "__value__": price}],
+        }],
+    }
+
+
 class TestSearchSellerListings:
-    def _mock_page(self, items, total):
+    def _mock_page(self, items, total_pages=1, ack="Success", error=None):
+        """Build a Finding API findItemsIneBayStores JSON response."""
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = {"itemSummaries": items, "total": total}
+        response = {"ack": [ack]}
+        if error is not None:
+            response["errorMessage"] = [{"error": [{"message": [error]}]}]
+        else:
+            response["searchResult"] = [{"item": items}]
+            response["paginationOutput"] = [{"totalPages": [str(total_pages)]}]
+        resp.json.return_value = {"findItemsIneBayStoresResponse": [response]}
         return resp
 
     @patch("ebay_fetch.requests.get")
     def test_single_page(self, mock_get):
-        items = [{"itemId": "v1|1|0", "title": "Comic #1"}]
-        mock_get.return_value = self._mock_page(items, 1)
-        result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
+        items = [_finding_item("1", title="Comic #1")]
+        mock_get.return_value = self._mock_page(items, total_pages=1)
+        result = ebay_fetch.search_seller_listings(
+            "seller", "tok", "https://api.ebay.com", app_id="APP"
+        )
         assert len(result) == 1
+        # Returned dicts are Browse-API-shaped (reshaped from the Finding API).
         assert result[0]["title"] == "Comic #1"
+        assert result[0]["itemId"] == "1"
+        assert result[0]["buyingOptions"] == ["AUCTION"]
 
     @patch("ebay_fetch.requests.get")
     def test_paginates(self, mock_get):
-        page1 = [{"itemId": f"v1|{i}|0"} for i in range(200)]
-        page2 = [{"itemId": "v1|200|0"}]
+        page1 = [_finding_item(str(i)) for i in range(100)]
+        page2 = [_finding_item("100")]
         mock_get.side_effect = [
-            self._mock_page(page1, 201),
-            self._mock_page(page2, 201),
+            self._mock_page(page1, total_pages=2),
+            self._mock_page(page2, total_pages=2),
         ]
-        result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
-        assert len(result) == 201
+        result = ebay_fetch.search_seller_listings(
+            "seller", "tok", "https://api.ebay.com", app_id="APP"
+        )
+        assert len(result) == 101
+        assert mock_get.call_count == 2
+        # Second request asks for page 2.
+        second_params = mock_get.call_args_list[1][1]["params"]
+        assert second_params["paginationInput.pageNumber"] == 2
 
     @patch("ebay_fetch.requests.get")
     def test_stops_at_max_results(self, mock_get):
-        page1 = [{"itemId": f"v1|{i}|0"} for i in range(200)]
-        mock_get.return_value = self._mock_page(page1, 500)
+        page1 = [_finding_item(str(i)) for i in range(100)]
+        mock_get.return_value = self._mock_page(page1, total_pages=5)
         result = ebay_fetch.search_seller_listings(
-            "seller", "tok", "https://api.ebay.com", max_results=200
+            "seller", "tok", "https://api.ebay.com", app_id="APP", max_results=50
         )
-        assert len(result) == 200
+        assert len(result) == 50
         assert mock_get.call_count == 1
 
     @patch("ebay_fetch.requests.get")
-    def test_empty_seller(self, mock_get):
-        mock_get.return_value = self._mock_page([], 0)
-        result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
+    def test_empty_store(self, mock_get):
+        mock_get.return_value = self._mock_page([], total_pages=1)
+        result = ebay_fetch.search_seller_listings(
+            "seller", "tok", "https://api.ebay.com", app_id="APP"
+        )
         assert result == []
 
     @patch("ebay_fetch.requests.get")
-    def test_username_extracted_from_url(self, mock_get):
-        mock_get.return_value = self._mock_page([], 0)
+    def test_store_name_from_url_passed_as_storeName(self, mock_get):
+        mock_get.return_value = self._mock_page([], total_pages=1)
         ebay_fetch.search_seller_listings(
-            "https://www.ebay.com/usr/beatlebluecat", "tok", "https://api.ebay.com"
+            "https://www.ebay.com/str/tunerscomics",
+            "tok",
+            "https://api.ebay.com",
+            app_id="APP",
         )
-        call_params = mock_get.call_args[1]["params"]
-        assert "beatlebluecat" in call_params["filter"]
+        params = mock_get.call_args[1]["params"]
+        assert params["storeName"] == "tunerscomics"
+        assert params["OPERATION-NAME"] == "findItemsIneBayStores"
+        assert params["SECURITY-APPNAME"] == "APP"
+
+    @patch("ebay_fetch.requests.get")
+    def test_error_ack_returns_partial_and_logs(self, mock_get, capsys):
+        mock_get.return_value = self._mock_page(
+            [], ack="Failure", error="Invalid app ID"
+        )
+        result = ebay_fetch.search_seller_listings(
+            "seller", "tok", "https://api.ebay.com", app_id="APP"
+        )
+        assert result == []
+        assert "Invalid app ID" in capsys.readouterr().err
+
+
+class TestFindingItemToBrowse:
+    def _item(self, **overrides):
+        base = _finding_item("298217294954", title="Amazing Spider-Man #300 NM Marvel 1988")
+        # Allow overriding nested listingInfo via a listing_type shortcut.
+        listing_type = overrides.pop("listing_type", None)
+        if listing_type is not None:
+            base["listingInfo"] = [{
+                "listingType": [listing_type],
+                "endTime": ["2026-05-28T12:00:00.000Z"],
+            }]
+        base.update(overrides)
+        return base
+
+    def test_auction_chinese(self):
+        d = ebay_fetch._finding_item_to_browse(self._item(), "tunerscomics")
+        assert d["buyingOptions"] == ["AUCTION"]
+        assert d["currentBidPrice"] == {"value": "10.00", "currency": "USD"}
+        assert d["itemId"] == "298217294954"
+        assert d["seller"] == {"username": "tunerscomics"}
+
+    def test_fixed_price(self):
+        d = ebay_fetch._finding_item_to_browse(
+            self._item(listing_type="FixedPrice"), "tunerscomics"
+        )
+        assert d["buyingOptions"] == ["FIXED_PRICE"]
+        assert d["currentBidPrice"] is None
+        assert d["price"] == {"value": "10.00", "currency": "USD"}
+
+    def test_auction_with_bin_classified_as_auction(self):
+        # Regression: an auction with a live Buy It Now reports "AuctionWithBIN".
+        d = ebay_fetch._finding_item_to_browse(
+            self._item(listing_type="AuctionWithBIN"), "tunerscomics"
+        )
+        assert d["buyingOptions"] == ["AUCTION"]
+        assert d["currentBidPrice"] == {"value": "10.00", "currency": "USD"}
+
+    def test_store_inventory_classified_as_fixed_price(self):
+        d = ebay_fetch._finding_item_to_browse(
+            self._item(listing_type="StoreInventory"), "tunerscomics"
+        )
+        assert d["buyingOptions"] == ["FIXED_PRICE"]
+
+    def test_plain_item_id_survives_parse(self):
+        d = ebay_fetch._finding_item_to_browse(self._item(), "tunerscomics")
+        parsed = ebay_fetch.parse_item_summary(d)
+        assert parsed["item_id"] == "298217294954"
+        assert parsed["listing_type"] == "Auction"
+        assert parsed["current_price"] == "$10.00"
+
+    def test_missing_view_item_url_fallback(self):
+        item = self._item()
+        del item["viewItemURL"]
+        d = ebay_fetch._finding_item_to_browse(item, "tunerscomics")
+        assert "298217294954" in d["itemWebUrl"]
+
+    def test_end_time_round_trips_through_parse(self):
+        d = ebay_fetch._finding_item_to_browse(self._item(), "tunerscomics")
+        parsed = ebay_fetch.parse_item_summary(d)
+        assert parsed["end_date_iso"] == "2026-06-15T18:30:00.000Z"
+        assert parsed["end_date"] is not None
+
+    def test_seller_round_trips_through_parse(self):
+        d = ebay_fetch._finding_item_to_browse(self._item(), "tunerscomics")
+        parsed = ebay_fetch.parse_item_summary(d)
+        assert parsed["seller"] == "tunerscomics"
 
 
 # ─── seller_scan matching ─────────────────────────────────────────────────────
