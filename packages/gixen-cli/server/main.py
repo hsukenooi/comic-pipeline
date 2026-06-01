@@ -18,7 +18,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
-from gixen_client import GixenClient, GixenError, GixenSnipeNotFoundError, find_sibling_cleanup_targets
+from gixen_client import (
+    GixenClient, GixenError, GixenSnipeNotFoundError,
+    GixenAddNotConfirmedError, find_sibling_cleanup_targets,
+)
 from gixen.plugins import (
     load_plugins,
     _invoke_db_tables_isolated,
@@ -26,7 +29,7 @@ from gixen.plugins import (
     _collect_dashboard_tabs,
 )
 from server.db import (
-    DB_PATH, init_db, insert_bid, get_bid_by_item_id,
+    DB_PATH, init_db, insert_bid, get_bid_by_item_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
@@ -753,33 +756,85 @@ def api_dashboard_tabs(request: Request) -> list[dict]:
     return getattr(request.app.state, "dashboard_tabs", [])
 
 
+async def _modify_and_update_bid(db, item_id, max_bid, bid_offset, snipe_group):
+    """Gixen modify_snipe (off-thread) + local update_bid. Re-raises
+    GixenSnipeNotFoundError so the caller owns the not-found *policy* (add falls
+    back; edit 404s). Caller must already hold _api_lock — this does NOT acquire
+    it, so the lookup→Gixen→DB-write sequence stays atomic (BUI-67 KTD6/KTD7).
+    """
+    await asyncio.to_thread(
+        _api_client.modify_snipe,
+        item_id, Decimal(str(max_bid)),
+        bid_offset=bid_offset, snipe_group=snipe_group,
+    )
+    update_bid(db, item_id, max_bid, bid_offset, snipe_group)
+    return get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
+
+
+async def _add_bid_row(db, item_id, max_bid, bid_offset, snipe_group):
+    """Gixen add_snipe (off-thread) + insert_bid; returns (row, created=True).
+
+    On a partial-unique-index collision — a racing unlocked _sync_loop insert for
+    the same item landed first (BUI-67 KTD6) — recover by updating the existing
+    live row and return (row, created=False) instead of 500. Caller holds
+    _api_lock.
+    """
+    await asyncio.to_thread(
+        _api_client.add_snipe,
+        item_id, Decimal(str(max_bid)),
+        bid_offset=bid_offset, snipe_group=snipe_group,
+    )
+    try:
+        bid_id = insert_bid(
+            db, item_id=item_id, max_bid=max_bid,
+            bid_offset=bid_offset, snipe_group=snipe_group, seller=None,
+        )
+        return db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone(), True
+    except sqlite3.IntegrityError:
+        db.rollback()
+        update_bid(db, item_id, max_bid, bid_offset, snipe_group)
+        row = get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
+        return row, False
+
+
 @app.post("/api/bids")
 async def api_add_bid(req: AddBidRequest):
     db = _get_db()
     try:
+        # Lookup + Gixen call + DB write all under _api_lock so the add/modify
+        # decision is atomic against other request handlers (BUI-67 KTD6). The
+        # unlocked background _sync_loop is the remaining concurrent writer; the
+        # partial unique index (+ _add_bid_row's recovery) guards that race.
         async with _api_lock:
-            await asyncio.to_thread(
-                _api_client.add_snipe,
-                req.item_id,
-                Decimal(str(req.max_bid)),
-                bid_offset=req.bid_offset,
-                snipe_group=req.snipe_group,
+            existing = get_pending_bid_by_item_id(db, req.item_id)
+            if existing is not None:
+                # A live snipe exists → update in place. Gixen rejects a re-add of
+                # an already-sniped item (code 202), so modify, not add.
+                try:
+                    row = await _modify_and_update_bid(
+                        db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group
+                    )
+                    return {**dict(row), "created": False}
+                except GixenSnipeNotFoundError:
+                    # DB has a live row but Gixen lost it (state skew). Intent is
+                    # "add" → fall back. If Gixen can't confirm the add, keep the
+                    # existing row visible rather than a bare 503 that hides it.
+                    try:
+                        row, created = await _add_bid_row(
+                            db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group
+                        )
+                        return {**dict(row), "created": created}
+                    except GixenAddNotConfirmedError:
+                        return {**dict(existing), "created": False, "applied": False}
+
+            row, created = await _add_bid_row(
+                db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group
             )
+            return {**dict(row), "created": created}
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except requests.HTTPError as e:
         raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
-
-    bid_id = insert_bid(
-        db,
-        item_id=req.item_id,
-        max_bid=req.max_bid,
-        bid_offset=req.bid_offset,
-        snipe_group=req.snipe_group,
-        seller=None,
-    )
-    row = db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
-    return dict(row)
 
 
 @app.get("/api/snipes")

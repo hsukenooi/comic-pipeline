@@ -752,6 +752,41 @@ class TestCliAddDuplicate:
 
 
 # ---------------------------------------------------------------------------
+# CLI: server-mode add created-vs-updated signal (BUI-67)
+# ---------------------------------------------------------------------------
+
+class TestCliServerAddCreatedFlag:
+    def test_records_add_and_says_added_on_create(self):
+        from cli import cli
+
+        runner = CliRunner()
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("cli._server_request",
+                   return_value={"item_id": "444", "max_bid": 20.0, "created": True}), \
+             patch("cli._record_add") as mock_record:
+            result = runner.invoke(cli, ["add", "444", "20.00"])
+
+        assert result.exit_code == 0, result.output
+        assert "Added snipe" in result.output
+        mock_record.assert_called_once_with("444")
+
+    def test_skips_record_and_says_updated_on_in_place_update(self):
+        from cli import cli
+
+        runner = CliRunner()
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("cli._server_request",
+                   return_value={"item_id": "444", "max_bid": 20.0, "created": False}), \
+             patch("cli._record_add") as mock_record:
+            result = runner.invoke(cli, ["add", "444", "20.00"])
+
+        assert result.exit_code == 0, result.output
+        assert "updated existing snipe" in result.output.lower()
+        # A re-add (in-place update) must NOT reset the add-history timestamp.
+        mock_record.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # CLI: add --comic-id / --catalog-id link-fmv routing (server mode)
 # ---------------------------------------------------------------------------
 

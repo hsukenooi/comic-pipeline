@@ -268,8 +268,15 @@ def add(
             "bid_offset": offset,
             "snipe_group": group,
         }
-        _server_request("post", "/api/bids", json=payload)
-        _record_add(item_id)
+        resp = _server_request("post", "/api/bids", json=payload)
+        # BUI-67: the server upserts. created=False means an existing live snipe
+        # was updated in place — don't reset the add-history timestamp (that drives
+        # the --added-since window), and tell the user it was an update so an
+        # accidental re-add (e.g. a lowered max bid) is visible.
+        created = resp.get("created", True) if isinstance(resp, dict) else True
+        if created:
+            _record_add(item_id)
+        verb = "Added" if created else "Updated existing snipe"
 
         link_attempted = grade is not None and (comic_id is not None or catalog_id is not None)
         link_ok = True
@@ -289,16 +296,19 @@ def add(
             except SystemExit:
                 link_ok = False
                 click.echo(
-                    f"⚠️  Snipe added but FMV link failed for {item_id} ({link_desc})",
+                    f"⚠️  Snipe {'added' if created else 'updated'} but FMV link failed "
+                    f"for {item_id} ({link_desc})",
                     err=True,
                 )
 
         if link_attempted and link_ok:
-            click.echo(f"✅ Added + linked: {item_id} (max bid {bid})")
+            click.echo(f"✅ {verb} + linked: {item_id} (max bid {bid})")
         elif link_attempted and not link_ok:
-            click.echo(f"⚠️  Added (FMV link failed): {item_id} (max bid {bid})")
-        else:
+            click.echo(f"⚠️  {verb} (FMV link failed): {item_id} (max bid {bid})")
+        elif created:
             click.echo(f"Added snipe for {item_id} with max bid {bid}")
+        else:
+            click.echo(f"Updated existing snipe for {item_id} with max bid {bid}")
         return
 
     # Existing direct-Gixen path

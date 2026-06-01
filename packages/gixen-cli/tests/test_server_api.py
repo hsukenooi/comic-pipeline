@@ -1,6 +1,7 @@
 """HTTP endpoint tests — GixenClient is mocked, DB uses tmp_path."""
 import sys
 import os
+import sqlite3
 import types
 import pytest
 from importlib.metadata import EntryPoint
@@ -46,6 +47,15 @@ def api(tmp_path, monkeypatch):
             yield client
 
 
+def _dbconn():
+    """Fresh connection to the server's DB file. The app's own connection is
+    thread-bound (created in the TestClient's thread), so tests read/seed via a
+    separate connection — WAL makes committed writes visible across connections."""
+    conn = sqlite3.connect(os.environ["DB_PATH"])
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def test_health(api):
     r = api.get("/health")
     assert r.status_code == 200
@@ -79,6 +89,134 @@ def test_add_bid_gixen_error_returns_503(api):
     api.mock_gixen.add_snipe.side_effect = GixenError("Gixen down")
     r = api.post("/api/bids", json={"item_id": "111222333", "max_bid": 50.0})
     assert r.status_code == 503
+
+
+# --- BUI-67: add-endpoint upsert ----------------------------------------------
+
+def test_add_bid_new_item_created_true(api):
+    r = api.post("/api/bids", json={"item_id": "411000001", "max_bid": 50.0})
+    assert r.status_code == 200
+    assert r.json()["created"] is True
+    api.mock_gixen.add_snipe.assert_called_once()
+    api.mock_gixen.modify_snipe.assert_not_called()
+
+
+def test_readd_updates_in_place(api):
+    r1 = api.post("/api/bids", json={"item_id": "411000002", "max_bid": 50.0})
+    first_id = r1.json()["id"]
+    api.mock_gixen.add_snipe.reset_mock()
+
+    r2 = api.post("/api/bids", json={"item_id": "411000002", "max_bid": 75.0})
+    assert r2.status_code == 200
+    data = r2.json()
+    assert data["id"] == first_id          # same row
+    assert data["max_bid"] == 75.0         # updated
+    assert data["created"] is False
+    # Gixen modify, not a second add.
+    api.mock_gixen.modify_snipe.assert_called_once()
+    api.mock_gixen.add_snipe.assert_not_called()
+    # exactly one non-tombstone row for the item
+    conn = _dbconn()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM bids WHERE item_id='411000002' AND status NOT IN ('REMOVED','PURGED')"
+    ).fetchone()[0]
+    conn.close()
+    assert n == 1
+
+
+def test_readd_lower_max_bid_is_visible_as_update(api):
+    api.post("/api/bids", json={"item_id": "411000003", "max_bid": 80.0})
+    r = api.post("/api/bids", json={"item_id": "411000003", "max_bid": 40.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["created"] is False   # the foot-gun guard: caller can see it's not a new snipe
+    assert data["max_bid"] == 40.0
+
+
+def test_relisting_allowed_after_terminal(api):
+    api.post("/api/bids", json={"item_id": "411000004", "max_bid": 50.0})
+    conn = _dbconn()
+    conn.execute("UPDATE bids SET status='ENDED' WHERE item_id='411000004'")
+    conn.commit()
+    api.mock_gixen.add_snipe.reset_mock()
+
+    r = api.post("/api/bids", json={"item_id": "411000004", "max_bid": 60.0})
+    assert r.status_code == 200
+    assert r.json()["created"] is True
+    api.mock_gixen.add_snipe.assert_called_once()
+    # one ENDED + one new PENDING
+    rows = sorted(x["status"] for x in conn.execute(
+        "SELECT status FROM bids WHERE item_id='411000004'"
+    ))
+    conn.close()
+    assert rows == ["ENDED", "PENDING"]
+
+
+def test_add_gixen_state_skew_falls_back_to_add(api):
+    from gixen_client import GixenSnipeNotFoundError
+    api.post("/api/bids", json={"item_id": "411000005", "max_bid": 50.0})
+    # Gixen lost the snipe: modify says not-found.
+    api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("gone")
+    api.mock_gixen.add_snipe.reset_mock()
+
+    r = api.post("/api/bids", json={"item_id": "411000005", "max_bid": 65.0})
+    assert r.status_code == 200          # not 404/500
+    api.mock_gixen.add_snipe.assert_called_once()  # fell back to add
+    # still exactly one PENDING row, updated
+    conn = _dbconn()
+    row = conn.execute(
+        "SELECT * FROM bids WHERE item_id='411000005' AND status='PENDING'"
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["max_bid"] == 65.0
+
+
+def test_add_not_confirmed_on_fallback_returns_existing(api):
+    from gixen_client import GixenSnipeNotFoundError, GixenAddNotConfirmedError
+    api.post("/api/bids", json={"item_id": "411000006", "max_bid": 50.0})
+    api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("gone")
+    api.mock_gixen.add_snipe.side_effect = GixenAddNotConfirmedError("411000006")
+
+    r = api.post("/api/bids", json={"item_id": "411000006", "max_bid": 65.0})
+    assert r.status_code == 200          # not a bare 503 that hides the stale row
+    data = r.json()
+    assert data["created"] is False
+    assert data["applied"] is False      # signals the new bid was NOT applied
+
+
+def test_add_defensive_integrity_recovery(api, monkeypatch):
+    """If insert collides with the unique index (a racing unlocked-sync insert
+    landed first), the endpoint recovers by updating the existing live row."""
+    import server.main as m
+    seed = _dbconn()
+    seed.execute("INSERT INTO bids (item_id, max_bid, status) VALUES ('411000007', 10.0, 'PENDING')")
+    seed.commit()
+    seed.close()
+    # Force the endpoint's initial lookup to miss (simulate the stale read that
+    # lets execution reach the add branch), so insert_bid hits the index.
+    real = m.get_pending_bid_by_item_id
+    state = {"first": True}
+
+    def stale_then_real(c, iid):
+        if state["first"]:
+            state["first"] = False
+            return None
+        return real(c, iid)
+
+    monkeypatch.setattr("server.main.get_pending_bid_by_item_id", stale_then_real)
+
+    r = api.post("/api/bids", json={"item_id": "411000007", "max_bid": 22.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["created"] is False
+    assert data["max_bid"] == 22.0
+    conn = _dbconn()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM bids WHERE item_id='411000007' AND status='PENDING'"
+    ).fetchone()[0]
+    conn.close()
+    assert n == 1
 
 
 def test_get_snipes_empty(api):
