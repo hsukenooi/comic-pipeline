@@ -315,13 +315,26 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
                 max_bid = float(snipe.get("max_bid") or 0)
             except (ValueError, TypeError):
                 max_bid = 0.0
-            insert_bid(
-                db, snipe["item_id"], max_bid,
-                int(snipe.get("bid_offset", 6)),
-                int(snipe.get("snipe_group", 0)),
-                snipe.get("seller"),
-            )
-            logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
+            try:
+                insert_bid(
+                    db, snipe["item_id"], max_bid,
+                    int(snipe.get("bid_offset", 6)),
+                    int(snipe.get("snipe_group", 0)),
+                    snipe.get("seller"),
+                )
+                logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
+            except sqlite3.IntegrityError:
+                # existing_ids was snapshotted before the list_snipes await; a
+                # concurrent api_add_bid can insert this PENDING row in that
+                # window. This loop runs unlocked (_sync_loop uses a separate
+                # client, no _api_lock), so the partial unique index is what
+                # actually prevents the duplicate — catch its violation and skip
+                # rather than aborting the whole sync run (BUI-67 U4/KTD6).
+                db.rollback()
+                logger.debug(
+                    "_sync_gixen: %s already present (concurrent add); skipping insert",
+                    snipe["item_id"],
+                )
 
     return snipes
 
@@ -421,6 +434,35 @@ async def _ensure_fresh_sync() -> None:
         _last_sync_at = datetime.now(timezone.utc).timestamp()
 
 
+def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
+    """Rows needing eBay price resolution. Two sets:
+    1. PENDING/ENDED — auction ended, status not yet terminal.
+    2. The soft-delete tombstone (REMOVED, or legacy PURGED) resolved without a
+       winning_bid (e.g. bulk-removed before the fallback ran), within 7 days.
+
+    Excludes BUI-67 dedup losers (REMOVED with notes='deduped BUI-67'): they are
+    not real ended auctions, and the 7-day window matches on their freshly-set
+    resolved_at, so without this guard they'd burn an eBay call and could get a
+    phantom winning_bid/WON stamp. The 'IS NOT' comparison keeps NULL-notes rows.
+    """
+    return db.execute(
+        """
+        SELECT item_id, max_bid, local_snipe_result, 0 AS is_purged FROM bids
+        WHERE status IN ('PENDING', 'ENDED')
+          AND auction_end_at IS NOT NULL
+          AND auction_end_at <= ?
+          AND winning_bid IS NULL
+        UNION ALL
+        SELECT item_id, max_bid, local_snipe_result, 1 AS is_purged FROM bids
+        WHERE status IN ('PURGED', 'REMOVED')
+          AND winning_bid IS NULL
+          AND notes IS NOT 'deduped BUI-67'
+          AND datetime(COALESCE(auction_end_at, resolved_at)) >= datetime('now', '-7 days')
+        """,
+        (now_iso,),
+    ).fetchall()
+
+
 async def _run_ebay_fallback() -> None:
     """Fire-and-forget: ask eBay for the final selling price of any auction
     that's ended without a captured winning_bid. One eBay call per such item,
@@ -441,27 +483,7 @@ async def _run_ebay_fallback() -> None:
         try:
             db = _get_db()
             now_iso = datetime.now(timezone.utc).isoformat()
-            # Two sets of rows need eBay resolution:
-            # 1. PENDING/ENDED — auction has ended, status not yet terminal.
-            # 2. The soft-delete tombstone (REMOVED, or legacy PURGED) —
-            #    resolved without a winning_bid (e.g. bulk-removed before eBay
-            #    fallback ran). Limited to past 7 days; eBay stops serving
-            #    ended-listing data after a few days anyway.
-            rows = db.execute(
-                """
-                SELECT item_id, max_bid, local_snipe_result, 0 AS is_purged FROM bids
-                WHERE status IN ('PENDING', 'ENDED')
-                  AND auction_end_at IS NOT NULL
-                  AND auction_end_at <= ?
-                  AND winning_bid IS NULL
-                UNION ALL
-                SELECT item_id, max_bid, local_snipe_result, 1 AS is_purged FROM bids
-                WHERE status IN ('PURGED', 'REMOVED')
-                  AND winning_bid IS NULL
-                  AND datetime(COALESCE(auction_end_at, resolved_at)) >= datetime('now', '-7 days')
-                """,
-                (now_iso,),
-            ).fetchall()
+            rows = _ebay_fallback_rows(db, now_iso)
 
             if not rows:
                 return

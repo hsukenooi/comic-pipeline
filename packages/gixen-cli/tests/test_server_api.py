@@ -742,3 +742,59 @@ def test_history_deduplicates_by_item_id(api):
     items = r.json()
     ids = [item["item_id"] for item in items]
     assert ids.count("900000001") == 1
+
+
+# --- BUI-67 U4: hardening against the partial unique index --------------------
+
+def test_sync_survives_racing_duplicate(api, monkeypatch):
+    """A concurrent api_add_bid can insert a PENDING row after _sync_gixen's
+    existing_ids snapshot; the unique index then makes the web-add insert raise
+    IntegrityError. The sync must skip it and keep ingesting other snipes."""
+    # Seed a PENDING row the stale snapshot will NOT include.
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute("INSERT INTO bids (item_id, max_bid, status) VALUES ('551000001', 10.0, 'PENDING')")
+    raw.commit()
+    raw.close()
+    # Stale snapshot: existing_ids omits the racing row.
+    monkeypatch.setattr("server.main.get_all_bids", lambda db: [])
+    api.mock_gixen.list_snipes.return_value = [
+        {"item_id": "551000001", "max_bid": "10.00", "status": "SCHEDULED",
+         "time_to_end": "2h", "seller": "s", "snipe_group": "0", "bid_offset": "6"},
+        {"item_id": "551000002", "max_bid": "20.00", "status": "SCHEDULED",
+         "time_to_end": "2h", "seller": "s", "snipe_group": "0", "bid_offset": "6"},
+    ]
+    r = api.post("/api/sync")
+    assert r.status_code == 200  # sync did not abort on the IntegrityError
+
+    chk = _dbconn()
+    assert chk.execute(
+        "SELECT COUNT(*) FROM bids WHERE item_id='551000001' AND status='PENDING'"
+    ).fetchone()[0] == 1                                  # racing row intact, no dup
+    assert chk.execute(
+        "SELECT COUNT(*) FROM bids WHERE item_id='551000002'"
+    ).fetchone()[0] == 1                                  # genuinely-new snipe still ingested
+    chk.close()
+
+
+def test_ebay_fallback_excludes_dedup_losers(tmp_path):
+    """A dedup loser (REMOVED, notes='deduped BUI-67') must not enter the eBay
+    fallback queue; a genuinely-removed row still does."""
+    from datetime import datetime, timezone
+    from server.db import init_db
+    from server.main import _ebay_fallback_rows
+
+    conn = init_db(tmp_path / "fb.db")
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, resolved_at, notes) "
+        "VALUES ('loser1', 10.0, 'REMOVED', ?, 'deduped BUI-67')", (now,)
+    )
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, resolved_at) "
+        "VALUES ('real1', 10.0, 'REMOVED', ?)", (now,)
+    )
+    conn.commit()
+    items = {r["item_id"] for r in _ebay_fallback_rows(conn, now)}
+    conn.close()
+    assert "loser1" not in items
+    assert "real1" in items
