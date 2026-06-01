@@ -179,6 +179,103 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE bids SET status='REMOVED' WHERE status='PURGED'")
     conn.commit()
 
+    # Enforce at most one live (PENDING) snipe per item_id (BUI-67). Runs last,
+    # after the PURGED->REMOVED remap so the CHECK already permits the REMOVED
+    # tombstone this writes on dedup losers.
+    _dedup_pending_and_index(conn)
+
+
+# Fields carried forward from a collapsed duplicate onto its survivor, so no
+# auction-tracking data or cached state is lost (BUI-67 KTD4). max_bid is merged
+# separately (MAX, not freshest) so a stale clone can never lower the ceiling.
+_DEDUP_FILL_FIELDS = (
+    "auction_end_at", "fmv_id", "local_snipe_at", "local_snipe_result",
+    "seller", "cached_current_bid", "cached_at",
+)
+
+
+def _dedup_pending_and_index(conn: sqlite3.Connection) -> None:
+    """Collapse pre-existing same-item PENDING duplicates, then add the partial
+    unique index that prevents new ones (BUI-67).
+
+    Collapse keeps the MAX(id) row as survivor (the row consumers treat as
+    "live": get_bid_by_item_id, the overlay history MAX(id) dedup, link-fmv),
+    forward-filling each live-snipe field from the freshest (highest cached_at)
+    contributing row — auction_end_at can diverge across rows by sync drift, so
+    a blind keep-survivor could fire the sniper at the wrong second. Losers are
+    tombstoned REMOVED with a 'deduped BUI-67' marker distinguishing them from
+    user-cancel / completed-sweep tombstones.
+
+    Raw conn.execute only — no CRUD helpers (they commit() and would collapse the
+    savepoint). Collapse strictly precedes CREATE UNIQUE INDEX: building it over
+    un-collapsed dups fails, and DDL may implicitly commit the collapse first, so
+    the order is load-bearing (KTD5). Idempotent: collapse matches 0 groups once
+    deduped; the index is IF NOT EXISTS.
+    """
+    dup_item_ids = [
+        r["item_id"] for r in conn.execute(
+            "SELECT item_id FROM bids WHERE status='PENDING' "
+            "GROUP BY item_id HAVING COUNT(*) > 1"
+        )
+    ]
+
+    conn.execute("SAVEPOINT bui67_dedup")
+    try:
+        if dup_item_ids:
+            now = datetime.now(timezone.utc).isoformat()
+            for item_id in dup_item_ids:
+                rows = conn.execute(
+                    "SELECT * FROM bids WHERE item_id=? AND status='PENDING'",
+                    (item_id,),
+                ).fetchall()
+                survivor_id = max(r["id"] for r in rows)
+                # Freshest first: non-NULL cached_at outranks NULL, then later
+                # cached_at (ISO strings sort chronologically) outranks earlier.
+                ordered = sorted(
+                    rows,
+                    key=lambda r: (r["cached_at"] is not None, r["cached_at"] or ""),
+                    reverse=True,
+                )
+                merged = {}
+                for field in _DEDUP_FILL_FIELDS:
+                    merged[field] = next(
+                        (r[field] for r in ordered if r[field] is not None), None
+                    )
+                merged_max_bid = max(r["max_bid"] for r in rows)
+                set_clause = ", ".join(f"{f}=?" for f in _DEDUP_FILL_FIELDS)
+                conn.execute(
+                    f"UPDATE bids SET {set_clause}, max_bid=? WHERE id=?",
+                    [merged[f] for f in _DEDUP_FILL_FIELDS] + [merged_max_bid, survivor_id],
+                )
+                conn.execute(
+                    "UPDATE bids SET status='REMOVED', resolved_at=?, notes='deduped BUI-67' "
+                    "WHERE item_id=? AND status='PENDING' AND id<>?",
+                    (now, item_id, survivor_id),
+                )
+
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM ("
+                "SELECT 1 FROM bids WHERE status='PENDING' "
+                "GROUP BY item_id HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+            if remaining:
+                raise RuntimeError(
+                    f"BUI-67 dedup left {remaining} duplicate PENDING item_id(s)"
+                )
+
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bids_pending_item_id "
+            "ON bids(item_id) WHERE status='PENDING'"
+        )
+        conn.execute("RELEASE bui67_dedup")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK TO bui67_dedup")
+        except Exception:
+            pass
+        raise
+    conn.commit()
+
 
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
