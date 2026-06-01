@@ -193,6 +193,12 @@ _DEDUP_FILL_FIELDS = (
     "seller", "cached_current_bid", "cached_at",
 )
 
+# Marker on a dedup-loser tombstone, distinguishing it from user-cancel /
+# completed-sweep tombstones (BUI-67). Written here and read by the server's
+# eBay-fallback exclusion — one constant so the writer and filter can't drift.
+DEDUP_TOMBSTONE_NOTE = "deduped BUI-67"
+_PENDING_UNIQUE_INDEX = "idx_bids_pending_item_id"
+
 
 def _dedup_pending_and_index(conn: sqlite3.Connection) -> None:
     """Collapse pre-existing same-item PENDING duplicates, then add the partial
@@ -203,15 +209,22 @@ def _dedup_pending_and_index(conn: sqlite3.Connection) -> None:
     forward-filling each live-snipe field from the freshest (highest cached_at)
     contributing row — auction_end_at can diverge across rows by sync drift, so
     a blind keep-survivor could fire the sniper at the wrong second. Losers are
-    tombstoned REMOVED with a 'deduped BUI-67' marker distinguishing them from
-    user-cancel / completed-sweep tombstones.
+    tombstoned REMOVED with the DEDUP_TOMBSTONE_NOTE marker.
 
     Raw conn.execute only — no CRUD helpers (they commit() and would collapse the
     savepoint). Collapse strictly precedes CREATE UNIQUE INDEX: building it over
     un-collapsed dups fails, and DDL may implicitly commit the collapse first, so
-    the order is load-bearing (KTD5). Idempotent: collapse matches 0 groups once
-    deduped; the index is IF NOT EXISTS.
+    the order is load-bearing (KTD5).
     """
+    # Once the index exists the migration is provably complete — it makes new
+    # PENDING duplicates impossible, so there is nothing left to collapse. Skip
+    # the table scan + write transaction on every subsequent server start.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+        (_PENDING_UNIQUE_INDEX,),
+    ).fetchone():
+        return
+
     dup_item_ids = [
         r["item_id"] for r in conn.execute(
             "SELECT item_id FROM bids WHERE status='PENDING' "
@@ -219,6 +232,7 @@ def _dedup_pending_and_index(conn: sqlite3.Connection) -> None:
         )
     ]
 
+    set_clause = ", ".join(f"{f}=?" for f in _DEDUP_FILL_FIELDS)
     conn.execute("SAVEPOINT bui67_dedup")
     try:
         if dup_item_ids:
@@ -236,21 +250,21 @@ def _dedup_pending_and_index(conn: sqlite3.Connection) -> None:
                     key=lambda r: (r["cached_at"] is not None, r["cached_at"] or ""),
                     reverse=True,
                 )
-                merged = {}
-                for field in _DEDUP_FILL_FIELDS:
-                    merged[field] = next(
+                merged = {
+                    field: next(
                         (r[field] for r in ordered if r[field] is not None), None
                     )
+                    for field in _DEDUP_FILL_FIELDS
+                }
                 merged_max_bid = max(r["max_bid"] for r in rows)
-                set_clause = ", ".join(f"{f}=?" for f in _DEDUP_FILL_FIELDS)
                 conn.execute(
                     f"UPDATE bids SET {set_clause}, max_bid=? WHERE id=?",
                     [merged[f] for f in _DEDUP_FILL_FIELDS] + [merged_max_bid, survivor_id],
                 )
                 conn.execute(
-                    "UPDATE bids SET status='REMOVED', resolved_at=?, notes='deduped BUI-67' "
+                    "UPDATE bids SET status='REMOVED', resolved_at=?, notes=? "
                     "WHERE item_id=? AND status='PENDING' AND id<>?",
-                    (now, item_id, survivor_id),
+                    (now, DEDUP_TOMBSTONE_NOTE, item_id, survivor_id),
                 )
 
             remaining = conn.execute(
@@ -264,7 +278,7 @@ def _dedup_pending_and_index(conn: sqlite3.Connection) -> None:
                 )
 
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bids_pending_item_id "
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {_PENDING_UNIQUE_INDEX} "
             "ON bids(item_id) WHERE status='PENDING'"
         )
         conn.execute("RELEASE bui67_dedup")
