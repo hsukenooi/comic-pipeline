@@ -81,9 +81,9 @@ class TestDbLookup:
     def test_returns_freshest_row(self, server_url):
         rows = [
             {"id": 1, "fmv_updated_at": "2026-05-01T00:00:00", "title": "old",
-             "locg_id": 1, "grade": 9.0},
+             "locg_id": 1, "grade": 9.0, "fmv_low": 40},
             {"id": 2, "fmv_updated_at": "2026-05-09T00:00:00", "title": "new",
-             "locg_id": 1, "grade": 9.0},
+             "locg_id": 1, "grade": 9.0, "fmv_low": 50},
         ]
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
@@ -92,6 +92,22 @@ class TestDbLookup:
             row = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
                                         max_age_days=7)
         assert row["title"] == "new"
+
+    def test_skips_stub_rows(self, server_url):
+        """BUI-44: a stub fmv row (null fmv_low, written when n=0 comps) links
+        the comic but has no pricing to reuse — it must NOT count as a cache
+        hit, so the book falls through to a fresh recompute."""
+        rows = [
+            {"id": 1, "title": "stub", "locg_id": 1, "grade": 9.0,
+             "fmv_updated_at": "2026-05-31T00:00:00", "fmv_low": None},
+        ]
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = rows
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            row = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                        max_age_days=7)
+        assert row is None  # stub is not a reusable cache hit
 
     def test_filters_out_mismatched_locg_id(self, server_url):
         """Defensive: even if the server returns extra rows (because it's
@@ -220,6 +236,43 @@ class TestComputeOne:
         assert out["comic_id"] is None
         assert out["fmv_id"] is None
 
+    def test_upserts_stub_comic_when_no_comps(self, server_url):
+        """BUI-44: with n=0 comps, still upsert the comics row + a stub fmv
+        (null low/high, comps=0, confidence low) and surface comic_id, so the
+        bid links to a comic and verify shows no_fmv_at_grade, not no_comic.
+
+        Exercises the real _upsert_fmv (mocking only requests.post) so the
+        stub POST body is asserted end to end."""
+        result = {
+            "input": {"title": "Godzilla: The Half-Century War",
+                      "issue": "1", "year": 2012, "grade": 9.8},
+            "comps": [],  # no sold comps found -> n=0
+        }
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"comic_id": 7, "fmv_id": 3, "id": 7}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result,
+                {"title": "Godzilla: The Half-Century War", "issue": "1",
+                 "grade": 9.8},
+                server_url=server_url)
+
+        # The upsert must happen even with zero comps.
+        post_mock.assert_called_once()
+        body = post_mock.call_args.kwargs["json"]
+        assert body["grade"] == 9.8
+        assert body["fmv_low"] is None
+        assert body["fmv_high"] is None
+        assert body["fmv_comps"] == 0
+        assert body["fmv_confidence"] == "low"
+
+        assert out["source"] == "fresh"
+        assert out["fmv"]["n"] == 0
+        assert out["fmv"]["fmv_low"] is None
+        assert out["comic_id"] == 7
+        assert out["fmv_id"] == 3
+
     def test_unrecognized_grade_string_errors(self, server_url):
         """If the grade string can't be coerced, log and return an error
         row rather than silently passing it to fmv_math."""
@@ -233,19 +286,24 @@ class TestComputeOne:
         assert out["source"] == "error"
         assert "ZZ?" in out["error"]
 
-    def test_no_upsert_when_no_pool(self, server_url):
-        # All comps without grade → empty pool → no upsert call
-        comps = [_make_comp(10, None)]
+    def test_upserts_stub_when_pool_empty(self, server_url):
+        """BUI-44: ungraded comps yield an empty pool (n=0), but we still upsert
+        the comics row + stub fmv so the bid links to a comic (no_fmv_at_grade,
+        not no_comic). Previously this path skipped the upsert."""
+        comps = [_make_comp(10, None)]  # ungraded → excluded → empty pool
         result = {
             "input": {"title": "X", "issue": "1", "grade": 9.0},
             "comps": comps,
         }
-        with patch("fmv_runner._upsert_fmv") as upsert_mock:
+        with patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 5, "fmv_id": 2}) as upsert_mock:
             out = fmv_runner._compute_and_upsert_one(
                 result, {"title": "X", "issue": "1", "grade": 9.0},
                 server_url=server_url)
-            upsert_mock.assert_not_called()
+            upsert_mock.assert_called_once()
         assert out["fmv"]["fmv_low"] is None
+        assert out["fmv"]["n"] == 0
+        assert out["comic_id"] == 5
 
 
 # ─── _upsert_fmv ──────────────────────────────────────────────────────────────
