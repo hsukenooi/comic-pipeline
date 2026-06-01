@@ -893,6 +893,19 @@ def test_comics_snipes_excludes_purged(api):
     assert all(row["item_id"] != "100000006" for row in r.json())
 
 
+def test_comics_snipes_excludes_removed(api):
+    """BUI-49: 'REMOVED' is the renamed tombstone — also excluded from snipes."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "100000016", "max_bid": 50.0})
+    _set_bid_fields(db_path, "100000016",
+                    status="REMOVED",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+
+    r = api.get("/api/comics/snipes")
+    assert r.status_code == 200
+    assert all(row["item_id"] != "100000016" for row in r.json())
+
+
 def test_comics_snipes_includes_ended_but_pending_bid(api):
     """Mirror /api/snipes: do NOT filter by end date server-side.
 
@@ -1039,6 +1052,48 @@ def test_comics_history_purged_does_not_shadow_legit_loss(api):
     assert matching[0]["status"] == "LOST"
 
 
+def test_comics_history_excludes_removed_within_window(api):
+    """BUI-49: a 'REMOVED' (renamed tombstone) bid within the 7-day window must
+    not appear in recently-ended, same as the legacy 'PURGED' value."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "200000015", "max_bid": 50.0})
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='REMOVED', winning_bid=12.0, "
+        "auction_end_at=datetime('now', '-1 day') WHERE item_id=?",
+        ("200000015",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/history").json()
+    assert all(r["item_id"] != "200000015" for r in rows)
+
+
+def test_comics_history_removed_does_not_shadow_legit_loss(api):
+    """BUI-49: the dedup-subquery tombstone filter covers 'REMOVED' too — a
+    later add-then-remove (REMOVED, higher id) does not hide the earlier LOST."""
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at) "
+        "VALUES (?, ?, 'LOST', datetime('now', '-2 days'))",
+        ("200000016", 120.0),
+    )
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, winning_bid, auction_end_at) "
+        "VALUES (?, ?, 'REMOVED', ?, datetime('now', '-1 day'))",
+        ("200000016", 120.0, 10.0),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/history").json()
+    matching = [r for r in rows if r["item_id"] == "200000016"]
+    assert len(matching) == 1
+    assert matching[0]["status"] == "LOST"
+
+
 # --- JS outcome() (v2-comics.html) -------------------------------------------
 
 
@@ -1051,6 +1106,18 @@ def test_outcome_purged_never_renders_won():
         "max_bid_numeric": 120.0,
     })
     assert 'pill won' not in html  # never the green "won" pill
+    assert "removed" in html
+
+
+def test_outcome_removed_never_renders_won():
+    """BUI-49: the renamed tombstone 'REMOVED' is handled exactly like 'PURGED'
+    — never the 'won' pill, even when the stale snapshot is below max_bid."""
+    html = _run_outcome({
+        "status": "REMOVED",
+        "winning_bid": 10.0,
+        "max_bid_numeric": 120.0,
+    })
+    assert 'pill won' not in html
     assert "removed" in html
 
 

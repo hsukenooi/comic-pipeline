@@ -578,7 +578,10 @@ async def api_comics_snipes(request: Request):
         FROM bids b
         LEFT JOIN bid_fmvs bf ON bf.bid_id = b.id
         LEFT JOIN fmv f ON f.id = bf.fmv_id
-        WHERE b.status != 'PURGED'
+        -- 'PURGED' (legacy) and 'REMOVED' (BUI-49 rename) are the same
+        -- soft-delete tombstone. Filter both so removed snipes are excluded
+        -- regardless of whether the gixen-cli rename migration has run yet.
+        WHERE b.status NOT IN ('PURGED', 'REMOVED')
         GROUP BY b.id
         ORDER BY b.added_at DESC
     """).fetchall()
@@ -600,13 +603,14 @@ async def api_comics_history(request: Request):
         INNER JOIN (
             SELECT item_id, MAX(id) AS max_id
             FROM bids
-            -- Exclude PURGED (soft-delete tombstone) so removed snipes never
-            -- leak into "recently ended" (BUI-50). Filtering inside the dedup
-            -- subquery — not just the outer query — means MAX(id) picks the
-            -- latest *non-purged* row, so a legit LOST/WON row still shows even
-            -- if a later same-item snipe was added then removed (higher id,
-            -- PURGED). Mirrors api_comics_snipes' status filter.
-            WHERE status != 'PURGED'
+            -- Exclude the soft-delete tombstone ('PURGED' legacy + 'REMOVED'
+            -- BUI-49 rename) so removed snipes never leak into "recently ended"
+            -- (BUI-50). Filtering inside the dedup subquery — not just the outer
+            -- query — means MAX(id) picks the latest *non-tombstone* row, so a
+            -- legit LOST/WON row still shows even if a later same-item snipe was
+            -- added then removed (higher id, tombstone). Mirrors
+            -- api_comics_snipes' status filter.
+            WHERE status NOT IN ('PURGED', 'REMOVED')
             AND (
               (
                 auction_end_at IS NOT NULL
@@ -643,7 +647,7 @@ async def api_extract_comics(request: Request):
         WHERE fmv_id IS NULL
           AND ebay_title IS NOT NULL
           AND ebay_title != ''
-          AND status != 'PURGED'
+          AND status NOT IN ('PURGED', 'REMOVED')
         """
     ).fetchall()
 
