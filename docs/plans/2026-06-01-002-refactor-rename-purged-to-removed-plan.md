@@ -1,6 +1,6 @@
 ---
 title: "refactor: Rename PURGED Bid Status to REMOVED (BUI-49)"
-status: active
+status: completed
 date: 2026-06-01
 type: refactor
 issue: BUI-49
