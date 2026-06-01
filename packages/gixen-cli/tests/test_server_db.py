@@ -8,7 +8,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from server.db import (
-    init_db, insert_bid, get_bid_by_item_id,
+    init_db, insert_bid, get_bid_by_item_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged,
 )
@@ -60,6 +60,43 @@ def test_get_bid_by_item_id(db):
 
 def test_get_bid_by_item_id_missing(db):
     assert get_bid_by_item_id(db, "999999999") is None
+
+
+def test_get_pending_bid_by_item_id_returns_pending(db):
+    insert_bid(db, "555000111", 40.0, 6, 0, "s")
+    row = get_pending_bid_by_item_id(db, "555000111")
+    assert row is not None
+    assert row["item_id"] == "555000111"
+    assert row["status"] == "PENDING"
+
+
+def test_get_pending_bid_by_item_id_none_when_only_terminal(db):
+    insert_bid(db, "555000222", 40.0, 6, 0, "s")
+    update_bid_status(db, "555000222", "ENDED", resolved_at="2026-06-01T00:00:00+00:00")
+    db.commit()
+    assert get_pending_bid_by_item_id(db, "555000222") is None
+
+
+def test_get_pending_bid_by_item_id_none_when_unknown(db):
+    assert get_pending_bid_by_item_id(db, "999999999") is None
+
+
+def test_get_pending_bid_by_item_id_ignores_newer_tombstone(db):
+    """A newer REMOVED row must not shadow the live PENDING row — the exact
+    case get_bid_by_item_id (latest-of-any-status) gets wrong."""
+    pending_id = insert_bid(db, "555000333", 40.0, 6, 0, "s")
+    # A later, higher-id tombstone for the same item (e.g. a removed re-add).
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status) VALUES ('555000333', 99.0, 'REMOVED')"
+    )
+    db.commit()
+    # get_bid_by_item_id would return the newer REMOVED row...
+    assert get_bid_by_item_id(db, "555000333")["status"] == "REMOVED"
+    # ...but the PENDING-specific lookup returns the live row.
+    row = get_pending_bid_by_item_id(db, "555000333")
+    assert row is not None
+    assert row["id"] == pending_id
+    assert row["status"] == "PENDING"
 
 
 def test_update_bid(db):

@@ -223,6 +223,22 @@ def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | 
     ).fetchone()
 
 
+def get_pending_bid_by_item_id(
+    conn: sqlite3.Connection, item_id: str
+) -> sqlite3.Row | None:
+    """Return the live (PENDING) snipe for an item_id, or None.
+
+    Unlike get_bid_by_item_id, this filters to status='PENDING' so a newer
+    terminal/tombstone row can't shadow the live snipe. This is the lookup the
+    add-upsert path keys on — deciding insert-vs-update by the *live* row, not
+    the latest row of any status (BUI-67).
+    """
+    return conn.execute(
+        "SELECT * FROM bids WHERE item_id=? AND status='PENDING' ORDER BY id DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
+
+
 def update_bid(
     conn: sqlite3.Connection,
     item_id: str,
