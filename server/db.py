@@ -87,23 +87,20 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                     ebay_title          TEXT,
                     status_mirror       TEXT,
                     cached_current_bid  TEXT,
-                    cached_at           TEXT
+                    cached_at           TEXT,
+                    fmv_id              INTEGER
                 )
             """)
-            conn.execute("""
-                INSERT INTO bids (
-                    id, item_id, comic_id, max_bid, bid_offset, snipe_group,
-                    status, winning_bid, seller, auction_end_at, local_snipe_at,
-                    local_snipe_result, notes, added_at, resolved_at,
-                    ebay_title, status_mirror, cached_current_bid, cached_at
-                )
-                SELECT
-                    id, item_id, comic_id, max_bid, bid_offset, snipe_group,
-                    status, winning_bid, seller, auction_end_at, local_snipe_at,
-                    local_snipe_result, notes, added_at, resolved_at,
-                    ebay_title, status_mirror, cached_current_bid, cached_at
-                FROM bids_old
-            """)
+            # Copy every column present on the old table (introspected) so none
+            # is dropped. A hardcoded list previously omitted fmv_id, silently
+            # destroying it on legacy-FK databases (BUI-64); introspection also
+            # makes this immune to future _COLUMN_MIGRATIONS additions.
+            cols = ", ".join(
+                row[1] for row in conn.execute("PRAGMA table_info(bids_old)")
+            )
+            conn.execute(
+                f"INSERT INTO bids ({cols}) SELECT {cols} FROM bids_old"
+            )
             conn.execute("DROP TABLE bids_old")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id)")
             conn.execute("RELEASE fk_rebuild")

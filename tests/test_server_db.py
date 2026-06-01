@@ -209,6 +209,70 @@ def test_fk_removal_migration_is_idempotent(tmp_path):
     conn2.close()
 
 
+def test_fk_removal_migration_preserves_fmv_id_and_later_columns(tmp_path):
+    """BUI-64: a legacy DB that has BOTH the comics FK and a populated fmv_id
+    must keep fmv_id (and every other column) through the FK-removal rebuild.
+    The rebuild previously hardcoded a column list that dropped fmv_id."""
+    legacy_db_path = tmp_path / "legacy_fmv.db"
+    raw = sqlite3.connect(str(legacy_db_path))
+    raw.execute("PRAGMA journal_mode=WAL")
+    # Old bids schema WITH the comics FK and the full later column set,
+    # including fmv_id populated with real data.
+    raw.executescript("""
+        CREATE TABLE comics (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, issue TEXT NOT NULL,
+            year INTEGER NOT NULL, grade REAL
+        );
+        CREATE TABLE bids (
+            id INTEGER PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            comic_id INTEGER REFERENCES comics(id),
+            max_bid REAL NOT NULL,
+            bid_offset INTEGER DEFAULT 6,
+            snipe_group INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'PENDING',
+            winning_bid REAL,
+            seller TEXT,
+            auction_end_at TEXT,
+            local_snipe_at TEXT,
+            local_snipe_result TEXT,
+            notes TEXT,
+            added_at TEXT DEFAULT (datetime('now')),
+            resolved_at TEXT,
+            ebay_title TEXT,
+            status_mirror TEXT,
+            cached_current_bid TEXT,
+            cached_at TEXT,
+            fmv_id INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+    """)
+    raw.execute("INSERT INTO comics (title, issue, year) VALUES ('Hulk', '181', 1974)")
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, comic_id, fmv_id, ebay_title) "
+        "VALUES ('legacy_fmv001', 50.0, 1, 42, 'Hulk #181')"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = init_db(legacy_db_path)
+    try:
+        # FK is gone...
+        fk_after = conn.execute("PRAGMA foreign_key_list(bids)").fetchall()
+        assert not any(row["table"] == "comics" for row in fk_after)
+        # ...and the fmv_id column + its data survived the rebuild.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+        assert "fmv_id" in cols
+        row = conn.execute(
+            "SELECT comic_id, fmv_id, ebay_title FROM bids WHERE item_id='legacy_fmv001'"
+        ).fetchone()
+        assert row["fmv_id"] == 42
+        assert row["comic_id"] == 1
+        assert row["ebay_title"] == "Hulk #181"
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # fmv_id column migration
 # ---------------------------------------------------------------------------
