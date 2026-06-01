@@ -30,6 +30,7 @@ dependencies = [
     "uvicorn[standard]",
     "httpx",
     "pluggy",
+    "playwright",
 ]
 
 [project.urls]
@@ -46,6 +47,15 @@ gixen = "cli:cli"
 # Example (in the plugin's own pyproject.toml):
 #   [project.entry-points."gixen.plugins"]
 #   my-plugin = "my_plugin:GixenPlugin"
+
+# KTD2 (U4 / BUI-55): the flat top-level modules are NOT matched by the
+# packages.find glob below, but server/main.py does `from gixen_client import ...`
+# and `import ebay_bidder`, and the `gixen` console script is `cli:cli`. Without
+# packaging these as py-modules, the workspace editable install raises
+# ModuleNotFoundError for gixen_client/ebay_bidder/cli. This is what lets the
+# overlay drop its hardcoded pythonpath in U5.
+[tool.setuptools]
+py-modules = ["cli", "gixen_client", "ebay_bidder"]
 
 [tool.setuptools.packages.find]
 where = ["."]

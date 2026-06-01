@@ -1,0 +1,16 @@
+# Root of the comic-pipeline monorepo uv workspace.
+#
+# Runtime model (U4 / BUI-55, decision (a)): the workspace covers the packages
+# that actually share imports — packages/* (gixen-cli, locg-cli) and
+# plugins/* (gixen-overlay). The standalone CLIs under apps/* (ebay, fmv) are
+# intentionally EXCLUDED: they are installed via `uv tool install` into
+# ~/.local/bin (see scripts/install.sh) and reach each other by shelling out on
+# PATH, not by importing. Folding them into the workspace would change that
+# working behavior for no benefit (they have no cross-import problem), so they
+# keep their isolated tool envs.
+[tool.uv.workspace]
+members = ["packages/*", "plugins/*"]
+
+# pytest is available across every workspace member for `uv run pytest`.
+[dependency-groups]
+dev = ["pytest"]
