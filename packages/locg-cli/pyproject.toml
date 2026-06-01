@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "locg"
+version = "0.2.0"
+description = "CLI for League of Comic Geeks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Hsu Ken Ooi", email = "hsukenooi@googlemail.com" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "playwright>=1.40.0",
+    "beautifulsoup4>=4.12.0",
+    "python-dotenv>=1.0.0",
+    "openpyxl>=3.1",
+    "mokkari>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/hsukenooi/locg-cli"
+Source = "https://github.com/hsukenooi/locg-cli"
+"Issue Tracker" = "https://github.com/hsukenooi/locg-cli/issues"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+locg = "locg.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/locg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
