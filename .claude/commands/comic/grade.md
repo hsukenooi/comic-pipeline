@@ -139,7 +139,7 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 
 ### Grader Prompt Template
 
-Adapt per comic (fill in `{COMIC}`, `{YEAR}`, `{FOLDER}`, `{N}`):
+Adapt per comic (fill in `{COMIC}`, `{YEAR}`, `{FOLDER}`, `{N}`, `{SELLER_GRADE}`). `{SELLER_GRADE}` is the seller's stated grade from the listing title/description if present, else "none stated":
 
 ```
 You are an expert vintage comic book grader. Grade the physical condition of a raw (ungraded) comic from the seller's eBay photos.
@@ -147,6 +147,7 @@ You are an expert vintage comic book grader. Grade the physical condition of a r
 COMIC: {COMIC} ({YEAR})
 IMAGE FOLDER: {FOLDER}
 IMAGES: img-01.jpg through img-{N:02d}.jpg ({N} photos of the seller's copy)
+SELLER-STATED GRADE: {SELLER_GRADE}
 
 GRADING SCALE (Heritage/Overstreet — use these numeric values):
 9.8 NM/MT | 9.6 NM+ | 9.4 NM | 9.2 NM- | 9.0 VF/NM | 8.5 VF+ | 8.0 VF | 7.5 VF- | 7.0 FN/VF | 6.5 FN+ | 6.0 FN | 5.5 FN- | 5.0 VG/FN | 4.5 VG+ | 4.0 VG | 3.5 VG- | 3.0 GD/VG | 2.5 GD+ | 2.0 GD | 1.8 GD- | 1.5 FR/GD | 1.0 FR | 0.5 PR
@@ -286,29 +287,39 @@ HARD CEILING: with 2 or fewer usable cover views and no spine-raking / interior 
 
 GRADE RANGE: when confidence is MEDIUM-LOW or LOW, report a grade RANGE spanning the plausible outcomes given what you cannot see (e.g. "5.0–6.0 VG/FN–FN"), with the single GRADE as your best point estimate inside that range. At HIGH confidence the range may collapse to the point grade.
 
+SELLER-STATED GRADE — USE AS A PRIOR YOU MUST ARGUE AWAY FROM, NOT A FOLLOWER:
+If SELLER-STATED GRADE above is a grade (not "none stated"), treat it as a prior the photos must overturn — sellers grade optimistically, so it is an anchor to test, not to trust. Grade independently from the photos FIRST, then compare (measure the gap in **numeric scale points**, e.g. 8.0→6.0 is 2.0 points — not in named-grade steps):
+- If your grade lands within ~1.5 points of the seller's → no special action; report both.
+- If your grade is ≥2.0 points BELOW the seller's → you must justify the gap with a NAMED defect (e.g. "spine split ~1/2"", "color-breaking corner crease") observed in a specific photo. "Looks worse" is not enough. If you cannot name a defect that accounts for a ≥2.0-point gap, re-examine the photos — you may be over-grading-down on coverage anxiety; widen the range rather than forcing a low point grade.
+- If your grade is ≥2.0 points ABOVE the seller's → re-check for a disclosed defect you missed; sellers rarely under-grade.
+Never simply adopt the seller's number. The seller grade calibrates your scrutiny; the photos set the grade.
+
 PROCEDURE:
-1. Read listing.html from {FOLDER} and scan the seller's description for any disclosed defects, restoration, or condition notes. Note these before viewing photos — they may reveal things photos don't show.
+1. Note the SELLER-STATED GRADE (from the listing title/description; there is no listing.html file). Treat it per the SELLER-STATED GRADE rule above. If "none stated", grade purely from photos.
 2. Use the Read tool on every img-XX.jpg in the folder (read all {N}).
 3. Before grading, map each photo to its content type: front cover / spine view / back cover / interior pages / detail shot / other. Note the mapping explicitly (e.g., "img-01: front cover, img-02: spine, img-03: back cover").
 4. Assess PHOTO COVERAGE: list which views from the table above are present, and set your CONFIDENCE ceiling from coverage before you finalize the grade.
-5. Note each defect with its location, referencing the photo where you saw it.
-6. Identify any grade-capping defects and state the ceiling explicitly.
-7. Apply the CGC scale; anchor on physical defects first, use reflectivity to confirm.
-8. Be rigorous — do NOT inflate. Grade only what you can see, and let coverage cap your confidence.
+5. STRUCTURED DEFECT ENUMERATION (do this BEFORE naming a number): walk the zones in order — front cover, spine, corners, edges, staples, back cover, interior/pages — and for each, list every defect you can see with its location and photo reference. For any ink mark, text, or signature-like element, classify it explicitly as **print-layer / post-print / uncertain** using the PRINT-LAYER RULE test, and state that tag inline. A zone with nothing visible is "clean (or un-assessed — no view)". Only after this enumeration do you map the defects to a grade.
+6. Identify any grade-capping defects from the enumeration and state the ceiling explicitly.
+7. Apply the CGC scale; anchor on the enumerated physical defects first, use reflectivity only to confirm.
+8. Reconcile against the SELLER-STATED GRADE per the rule above; if a ≥2-grade gap remains, confirm a named defect justifies it.
+9. Be rigorous — do NOT inflate. Grade only what you can see, and let coverage cap your confidence.
 
 OUTPUT FORMAT (exactly this, no preamble):
 PHOTO MAP: img-01: [content type], img-02: [content type], ... (one line per image)
 COVERAGE: [views present vs. missing, e.g. "front + back cover only; no spine-raking, no interior, no page-edge"]
-SELLER DESCRIPTION NOTES: [any disclosed defects or condition notes from listing.html; "none stated" if clean]
+SELLER DESCRIPTION NOTES: [any disclosed defects/condition notes from the listing title/description; "none stated" if clean — there is no listing.html file]
 GRADE: X.X (label) — best point estimate
 GRADE RANGE: [plausible span given coverage, e.g. "5.0–6.0 VG/FN–FN"; may equal the point grade at HIGH confidence]
 CONFIDENCE: HIGH | MEDIUM | MEDIUM-LOW | LOW — driven by coverage (state the one-line reason, e.g. "MEDIUM-LOW: 2 cover photos, no spine/interior/edge")
+SELLER-GRADE CHECK: [seller-stated grade vs. your grade and the gap, e.g. "seller VF- (7.5) vs. mine 6.5 — within 1.5, no named defect required"; if ≥2-grade gap, name the defect justifying it; "none stated" if the seller gave no grade]
 GRADE CAP: [defect that sets the ceiling, e.g. "spine split ~1/4" caps at 6.0 FN" — or "none" if no single cap applies]
 SIGNATURE/CREDIT CHECK: [if any signature-like or credit text is visible, classify per the PRINT-LAYER RULE: "printed/facsimile — no effect", "authentic post-print autograph — writing defect", or "uncertain → treated as print-layer, not capped". State "none visible" if none.]
-KEY DEFECTS OBSERVED:
+KEY DEFECTS OBSERVED (per-zone enumeration; tag any mark print-layer/post-print/uncertain):
 - [front cover: ...]
 - [spine: ...]
 - [corners: ...]
+- [edges: ...]
 - [back cover: ...]
 - [pages/interior: ...]
 - [staples: ...]
