@@ -959,6 +959,24 @@ def test_comics_snipes_includes_ended_but_pending_bid(api):
     assert any(row["item_id"] == "100000007" for row in r.json())
 
 
+def test_comics_snipes_excludes_terminal_statuses(api):
+    """BUI-83: terminal outcomes (WON/LOST/ENDED/FAILED) belong to history, not
+    Active. The server is authoritative — a resolved snipe must not leak into
+    /api/comics/snipes even if it has no auction_end_at for the client's
+    isEnded() heuristic to key on.
+    """
+    db_path = os.environ["DB_PATH"]
+    for i, status in enumerate(("WON", "LOST", "ENDED", "FAILED")):
+        item_id = f"10000010{i}"
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": 50.0})
+        # No auction_end_at — the exact case the client heuristic can't detect.
+        _set_bid_fields(db_path, item_id, status=status)
+
+    returned = {row["item_id"] for row in api.get("/api/comics/snipes").json()}
+    for i in range(4):
+        assert f"10000010{i}" not in returned
+
+
 # --- /api/comics/history ---
 
 
