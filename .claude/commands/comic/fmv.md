@@ -9,10 +9,18 @@ Compute fair market value from real eBay sold transactions. No multiplier math �
 
 ## How to run
 
-**Default path: delegate to `gixen fmv`.** It handles fetch (via `ebay-fetch sold-comps`), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
+**Default path: `comic-fmv`.** It handles fetch (via `ebay-sold-comps`), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
+
+Before running, ensure `SERPAPI_KEY` and `GIXEN_SERVER_URL` are set. If either is missing, source the canonical env file first:
 
 ```bash
-gixen fmv --batch <working_list.json> --out <results.json>
+set -a && source ~/Projects/comic-pipeline/apps/ebay/.env && set +a
+```
+
+`SERPAPI_KEY` lives in `~/Projects/comic-pipeline/apps/ebay/.env`. `GIXEN_SERVER_URL` is machine-dependent — see the Server Health Check section below.
+
+```bash
+comic-fmv --batch <working_list.json> --out <results.json>
 ```
 
 `--batch` JSON shape: `[{item_id, title, issue, year, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]`
@@ -37,13 +45,20 @@ If `gixen fmv` is unavailable, you can run the steps below by hand. SerpApi acce
 
 Before doing any research, verify the server is configured and up.
 
-**1. Check that `GIXEN_SERVER_URL` is set:**
+**1. Resolve `GIXEN_SERVER_URL`:**
+
+The Gixen server runs on the Mac Mini. The MacBook connects to it via Tailscale; the Mac Mini uses localhost.
 
 ```bash
 echo "${GIXEN_SERVER_URL:-UNSET}"
+hostname
 ```
 
-If it is not set, **stop immediately** with: "`GIXEN_SERVER_URL` is not set. FMV data cannot be saved. Set the variable and confirm the server is running before continuing." Do not proceed with any queries.
+If `GIXEN_SERVER_URL` is unset, infer it from the hostname:
+- `Hsus-MacBook-Air.local` → `http://mac-mini.tail9b7fa5.ts.net:8080`
+- `mac-mini` (or any Mac Mini hostname) → `http://localhost:8080`
+
+Set it for the current invocation and continue. If the hostname matches neither known machine, **stop** with: "`GIXEN_SERVER_URL` is not set and the machine is unrecognised. Set the variable manually and confirm the server is running."
 
 **2. Verify the server is responding:**
 

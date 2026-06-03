@@ -52,12 +52,15 @@ Flag items where `grade_source` is `"missing"` — but check the title first. If
 Present to user for confirmation:
 
 ```
-| # | Item ID | Comic | Issue | Grade | Variant | Type | Seller | Notes |
+| # | Comic | Issue | Grade | Variant | Type | Seller | Ends | Notes |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 298217294954 | Amazing Spider-Man | #300 | NM- | — | Auction | beatlebluecat | — |
-| 2 | 318141695576 | Amazing Spider-Man | #300 | — | Newsstand | Auction | comicsRus | ⚠️ Grade not stated |
-| 3 | 555555555 | Batman | #608 | VF | — | BIN | someseller | ⚠️ Buy It Now |
+| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | NM- | — | Auction | beatlebluecat | 2d | — |
+| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | Newsstand | Auction | comicsRus | 47m | ⚠️ Grade not stated |
+| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | VF | — | BIN | someseller | — | ⚠️ Buy It Now |
 ```
+
+- The `#` column links directly to the eBay listing (`https://www.ebay.com/itm/{item_id}`). No separate Item ID column.
+- **Ends** shows time remaining, not the end date: `<60 min → "47m"`, `<24h → "18h"`, `≥1 day → "2d"`. Compute from current UTC time vs `end_date_iso`. Mark with ⚠️ in the Ends cell if under 24h.
 
 - Flag any listing where `grade_source` is `"missing"`
 - Flag Buy It Now listings — they're skipped at the Gixen step
