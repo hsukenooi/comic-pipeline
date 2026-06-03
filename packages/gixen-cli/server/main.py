@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
 from gixen_client import (
-    GixenClient, GixenError, GixenSnipeNotFoundError,
+    GixenClient, GixenError, GixenConnectionError, GixenSnipeNotFoundError,
     GixenAddNotConfirmedError, find_sibling_cleanup_targets,
 )
 from gixen.plugins import (
@@ -227,6 +227,11 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     """
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
+    except GixenConnectionError as e:
+        # Gixen unreachable at the network layer (BUI-77) — distinct, honest
+        # signal so the operator isn't sent chasing credentials.
+        logger.warning("_sync_gixen: Gixen unreachable (connectivity, not creds): %s", e)
+        return []
     except GixenError as e:
         logger.warning("_sync_gixen: GixenError (suppressed): %s", e)
         return []

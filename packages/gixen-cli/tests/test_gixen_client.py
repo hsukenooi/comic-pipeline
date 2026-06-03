@@ -10,10 +10,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from click.testing import CliRunner
 
+import requests
+
 from gixen_client import (
     GixenClient,
     GixenError,
     GixenLoginError,
+    GixenConnectionError,
     GixenSessionExpiredError,
     GixenItemError,
     GixenSnipeNotFoundError,
@@ -146,6 +149,51 @@ class TestLogin:
 
         with pytest.raises(GixenLoginError, match="Login failed"):
             client.login()
+
+    def test_login_unreachable_host_raises_connection_error(self):
+        """A transport-level failure (black-holed host, BUI-77) classifies as
+        connectivity, not credentials."""
+        session = MagicMock()
+        session.post.side_effect = requests.ConnectTimeout("connect timed out")
+
+        client = GixenClient(username="user", password="pass")
+        client.session = session
+
+        with pytest.raises(GixenConnectionError, match="connectivity problem"):
+            client.login()
+        # Not misattributed to credentials.
+        assert client._login_failed_at is not None
+
+    def test_login_empty_response_is_connectivity_not_credentials(self):
+        """An empty body with no sessionid means a truncated/flapping host,
+        not an auth rejection (which returns the login HTML)."""
+        session = MagicMock()
+        resp = MagicMock()
+        resp.text = ""
+        session.post.return_value = resp
+
+        client = GixenClient(username="user", password="pass")
+        client.session = session
+
+        with pytest.raises(GixenConnectionError, match="empty response"):
+            client.login()
+
+    def test_curl_session_raises_on_transport_failure(self):
+        """_CurlSession surfaces a non-zero curl exit as a connection error
+        instead of fabricating a 200 with an empty body (the root of the
+        BUI-77 misleading 'check your credentials')."""
+        from gixen_client import _CurlSession
+
+        sess = _CurlSession()
+        completed = MagicMock(returncode=28, stdout="", stderr="curl: (28) timed out")
+        with patch("gixen_client.subprocess.run", return_value=completed):
+            with pytest.raises(requests.ConnectTimeout):
+                sess.get("https://www.gixen.com/main/home_1.php")
+
+        completed_conn = MagicMock(returncode=7, stdout="", stderr="curl: (7) failed to connect")
+        with patch("gixen_client.subprocess.run", return_value=completed_conn):
+            with pytest.raises(requests.ConnectionError):
+                sess.get("https://www.gixen.com/main/home_1.php")
 
 
 # ---------------------------------------------------------------------------
