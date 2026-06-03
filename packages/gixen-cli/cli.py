@@ -326,6 +326,12 @@ def add(
         return
 
     # Existing direct-Gixen path
+    if seller is not None or seller_grade is not None or photo_grade is not None:
+        click.echo(
+            "⚠️  --seller/--seller-grade/--photo-grade require GIXEN_SERVER_URL "
+            "(server mode); ignored in direct-Gixen mode.",
+            err=True,
+        )
     client = _make_client()
     try:
         existing = client.list_snipes()

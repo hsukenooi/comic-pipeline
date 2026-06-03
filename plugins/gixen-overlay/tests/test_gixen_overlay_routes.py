@@ -1405,3 +1405,41 @@ def test_seller_reliability_case_insensitive(api):
     body = r.json()
     assert body["sample_size"] == 1
     assert body["avg_deviation"] == pytest.approx(2.0)
+
+
+def test_seller_reliability_matches_mixedcase_stored_seller(api):
+    """Legacy/sync rows may store a mixed-case seller; the lowercased query must
+    still match them (WHERE LOWER(seller) = ?)."""
+    api.post("/api/bids", json={"item_id": "800000030", "max_bid": 50.0})
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET seller='MixedCaseSeller', seller_grade=9.0, photo_grade=8.0 WHERE item_id=?",
+        ("800000030",),
+    )
+    raw.commit()
+    raw.close()
+    r = api.get("/api/seller-reliability", params={"seller": "mixedcaseseller"})
+    assert r.status_code == 200
+    assert r.json()["sample_size"] == 1
+
+
+def test_readd_over_sync_seller_normalizes_key(api):
+    """Web-added (sync) row carries a mixed-case store name; a buy-flow re-add
+    with grades must normalize the seller to the username so the advisory finds it."""
+    api.post("/api/bids", json={"item_id": "800000031", "max_bid": 50.0})
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET seller='Beatle Blue Cat Collectibles' WHERE item_id=?",
+        ("800000031",),
+    )
+    raw.commit()
+    raw.close()
+    # Buy-flow re-add (existing PENDING -> modify path) supplies the username + grades.
+    r = api.post("/api/bids", json={
+        "item_id": "800000031", "max_bid": 60.0,
+        "seller": "beatlebluecat", "seller_grade": 9.0, "photo_grade": 7.0,
+    })
+    assert r.status_code == 200
+    adv = api.get("/api/seller-reliability", params={"seller": "beatlebluecat"})
+    assert adv.json()["sample_size"] == 1
+    assert adv.json()["avg_deviation"] == pytest.approx(2.0)

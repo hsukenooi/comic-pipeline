@@ -121,6 +121,26 @@ def test_readd_fills_null_grades(api):
     assert row["photo_grade"] == 6.0
 
 
+def test_add_bid_rejects_overlong_seller(api):
+    """Write path mirrors the read endpoint's 1-128 char seller validation."""
+    r = api.post("/api/bids", json={
+        "item_id": "412000004", "max_bid": 50.0, "seller": "x" * 129,
+    })
+    assert r.status_code == 422
+
+
+def test_add_bid_empty_seller_stored_as_null(api):
+    """An empty/whitespace seller normalizes to NULL rather than an empty-string key."""
+    r = api.post("/api/bids", json={
+        "item_id": "412000005", "max_bid": 50.0, "seller": "   ",
+    })
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT seller FROM bids WHERE item_id='412000005'"
+    ).fetchone()
+    assert row["seller"] is None
+
+
 def test_add_bid_invalid_item_id(api):
     r = api.post("/api/bids", json={"item_id": "abc", "max_bid": 50.0})
     assert r.status_code == 422

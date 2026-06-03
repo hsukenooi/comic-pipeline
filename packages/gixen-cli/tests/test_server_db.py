@@ -451,6 +451,22 @@ def test_update_bid_grades_fills_only_nulls(db):
     assert row["photo_grade"] == 6.5
 
 
+def test_update_bid_grades_seller_is_authoritative(db):
+    """The buy-flow username is the canonical key, so update_bid_grades overwrites
+    a prior (e.g. sync-set store-name) seller — while grades stay fill-NULL only."""
+    from server.db import update_bid_grades
+    insert_bid(db, "700000006", 50.0, 6, 0, "Beatle Blue Cat Collectibles")  # sync-style store name
+    update_bid_grades(db, "700000006", seller="beatlebluecat", seller_grade=9.0, photo_grade=7.0)
+    row = get_bid_by_item_id(db, "700000006")
+    assert row["seller"] == "beatlebluecat"   # buy-flow username wins
+    assert row["seller_grade"] == 9.0
+    # A grade already set is NOT overwritten on a later call (fill-NULL).
+    update_bid_grades(db, "700000006", seller="beatlebluecat", seller_grade=1.0, photo_grade=1.0)
+    row = get_bid_by_item_id(db, "700000006")
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 7.0
+
+
 def test_cache_gixen_data_does_not_overwrite_existing_seller(db):
     """BUI-78 (A1): a sync must not overwrite an INSERT-time seller username
     with Gixen's scraped store display name."""

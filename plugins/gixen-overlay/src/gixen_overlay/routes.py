@@ -656,7 +656,7 @@ async def api_seller_reliability(request: Request, seller: str):
         """
         SELECT AVG(seller_grade - photo_grade) AS avg_dev, COUNT(*) AS n
         FROM bids
-        WHERE seller = ?
+        WHERE LOWER(seller) = ?
           AND seller_grade IS NOT NULL
           AND photo_grade IS NOT NULL
           AND status NOT IN ('PURGED', 'REMOVED')

@@ -420,15 +420,22 @@ def update_bid_grades(
     seller_grade: float | None = None,
     photo_grade: float | None = None,
 ) -> None:
-    """Fill NULL seller/grade columns on the live (PENDING) row without
-    overwriting already-set values (BUI-78 C2). COALESCE(<col>, ?) keeps the
-    existing value when non-NULL, so a re-add completes an incomplete insert
-    rather than editing grades. No-op when all inputs are None."""
+    """Update the live (PENDING) row's seller + grades from a buy-flow re-add.
+
+    - `seller` is the canonical key, so the supplied (lowercased username) value
+      is **authoritative** and overwrites whatever was there — e.g. a mixed-case
+      store name a prior sync wrote — `COALESCE(?, seller)` (supplied wins, else
+      keep existing). This keeps one canonical key per seller (BUI-78 A1).
+    - Grades are observations, so they are **fill-NULL only** —
+      `COALESCE(<col>, ?)` — completing an incomplete insert without editing an
+      already-set grade (BUI-78 C2; re-grading is a deferred follow-up).
+
+    No-op when all inputs are None."""
     if seller is None and seller_grade is None and photo_grade is None:
         return
     conn.execute(
         "UPDATE bids SET "
-        "seller=COALESCE(seller, ?), "
+        "seller=COALESCE(?, seller), "
         "seller_grade=COALESCE(seller_grade, ?), "
         "photo_grade=COALESCE(photo_grade, ?) "
         "WHERE item_id=? AND status='PENDING'",

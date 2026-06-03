@@ -707,6 +707,21 @@ class AddBidRequest(BaseModel):
             raise ValueError("max_bid must be positive")
         return v
 
+    @field_validator("seller")
+    @classmethod
+    def normalize_seller(cls, v: str | None) -> str | None:
+        # BUI-78: canonical key = lowercased eBay username. Normalize once here so
+        # the write key matches the read endpoint (which lowercases too) and the
+        # 1-128 char bound is enforced on both sides. Empty/whitespace -> NULL.
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > 128:
+            raise ValueError("seller must be 1-128 characters")
+        return v.lower()
+
 
 class EditBidRequest(BaseModel):
     model_config = {"extra": "ignore"}
@@ -851,9 +866,9 @@ async def _add_bid_row(
 @app.post("/api/bids")
 async def api_add_bid(req: AddBidRequest):
     db = _get_db()
-    # BUI-78 A1: store the canonical lowercased eBay username so the write key
-    # matches the advisory lookup key (which also lowercases).
-    seller = req.seller.lower() if req.seller else None
+    # BUI-78: req.seller is already normalized (lowercased, validated) by
+    # AddBidRequest.normalize_seller.
+    seller = req.seller
     try:
         # Lookup + Gixen call + DB write all under _api_lock so the add/modify
         # decision is atomic against other request handlers (BUI-67 KTD6). The
