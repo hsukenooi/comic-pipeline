@@ -147,7 +147,7 @@ lays the data foundation for future automatic calibration (BUI-81).
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add `seller_grade` / `photo_grade` columns to `bids`**
+- [x] **Unit 1: Add `seller_grade` / `photo_grade` columns to `bids`**
 
 **Goal:** Two nullable REAL columns on `bids`, migration-safe and rebuild-safe.
 
@@ -178,7 +178,7 @@ and its presence in `_BIDS_TABLE_SQL`.
 
 ---
 
-- [ ] **Unit 2: Persist grades + canonical seller at bid creation**
+- [x] **Unit 2: Persist grades + canonical seller at bid creation**
 
 **Goal:** Write both grades and the lowercased username on INSERT; fill NULL grades on
 re-run; stop sync from overwriting the seller.
@@ -227,7 +227,7 @@ NULLs without clobbering; sync never rewrites a set seller.
 
 ---
 
-- [ ] **Unit 3: `GET /api/seller-reliability` endpoint**
+- [x] **Unit 3: `GET /api/seller-reliability` endpoint**
 
 **Goal:** Return a seller's average grade deviation and sample size.
 
@@ -264,7 +264,7 @@ and validates input.
 
 ---
 
-- [ ] **Unit 4: Wire `/comic:buy` (capture grades + Step 1 advisory)**
+- [x] **Unit 4: Wire `/comic:buy` (capture grades + Step 1 advisory)**
 
 **Goal:** Capture both grades through the buy flow and surface the seller advisory.
 
