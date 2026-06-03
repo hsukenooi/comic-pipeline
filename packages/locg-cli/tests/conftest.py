@@ -62,43 +62,19 @@ def mock_client():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_id_cache(tmp_path, monkeypatch):
-    """Redirect the IDCache default path to a per-test tmp dir.
+def _isolate_cache_dir(tmp_path, monkeypatch):
+    """Redirect the entire LOCG cache dir to a per-test tmp dir.
 
-    Without this, tests that exercise `cmd_lookup` (or anything that
-    instantiates :class:`locg.cache.IDCache` without an explicit path)
-    would read and write the developer's real ~/.cache/locg/ids.json.
-    That makes test outcomes depend on local cache state — exactly the
-    kind of cross-run pollution that bit us when the cache integration
-    landed.
+    BUI-84 moved the cache into the repo at ``data/locg/`` (tracked files), so
+    an un-isolated test would now read and *write the real tracked repo files*
+    — far worse than the old ~/.cache pollution. We isolate at the resolver
+    (``config._cache_dir``) rather than per-public-function: setting
+    ``LOCG_DATA_DIR`` makes ``cache_path()``, ``collection_cache_path()``,
+    ``wish_list_cache_path()``, ``import_history_path()`` AND the directly-called
+    ``ensure_cache_dir()`` / ``_cache_dir()`` all resolve under tmp, so no caller
+    — patched or not — can touch the repo's tracked cache.
+
+    Tests that exercise the resolver itself (``test_cache_paths.py``) set or
+    ``delenv`` ``LOCG_DATA_DIR`` in their own bodies, which overrides this.
     """
-    import locg.cache as cache_mod
-    monkeypatch.setattr(cache_mod, "cache_path", lambda: tmp_path / "ids.json")
-
-
-@pytest.fixture(autouse=True)
-def _isolate_collection_cache(tmp_path, monkeypatch):
-    """Redirect the collection cache and audit log paths to a per-test tmp dir.
-
-    Mirrors _isolate_id_cache.  Prevents tests from reading or writing the
-    developer's real ~/.cache/locg/collection.json and import-history.jsonl.
-    """
-    import locg.collection_cache as cc_mod
-    monkeypatch.setattr(cc_mod, "collection_cache_path", lambda: tmp_path / "collection.json")
-    monkeypatch.setattr(cc_mod, "import_history_path", lambda: tmp_path / "import-history.jsonl")
-
-
-@pytest.fixture(autouse=True)
-def _isolate_wish_list_cache(tmp_path, monkeypatch):
-    """Redirect wish_list_cache_path to a per-test tmp dir.
-
-    Patches every module that imports wish_list_cache_path at module level so
-    that tests never touch the real ~/.cache/locg/wish-list.json.
-    """
-    wish_path = tmp_path / "wish-list.json"
-    import locg.collection_io as cio_mod
-    import locg.commands as cmd_mod
-    import locg.cli as cli_mod
-    monkeypatch.setattr(cio_mod, "wish_list_cache_path", lambda: wish_path)
-    monkeypatch.setattr(cmd_mod, "wish_list_cache_path", lambda: wish_path)
-    monkeypatch.setattr(cli_mod, "wish_list_cache_path", lambda: wish_path)
+    monkeypatch.setenv("LOCG_DATA_DIR", str(tmp_path))

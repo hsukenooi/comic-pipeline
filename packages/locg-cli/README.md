@@ -78,7 +78,13 @@ Output per row:
 }
 ```
 
-Resolved IDs are cached to disk at `$XDG_CACHE_HOME/locg/ids.json` (default `~/.cache/locg/ids.json`) and reused on subsequent runs — repeat lookups skip the API entirely (`from_cache: true`). Pass `--no-cache` to bypass for both reads and writes. Manage the cache with `locg cache stats` and `locg cache clear`.
+Resolved IDs are cached to disk at `<repo>/data/locg/ids.json` and reused on subsequent runs — repeat lookups skip the API entirely (`from_cache: true`). Pass `--no-cache` to bypass for both reads and writes. Manage the cache with `locg cache stats` and `locg cache clear`.
+
+The cache directory (which also holds `collection.json`, `wish-list.json`, and `import-history.jsonl`) is resolved with this precedence:
+
+1. **`LOCG_DATA_DIR`** — if set, used verbatim. Point a specific checkout or worktree at its own cache here.
+2. **`<repo>/data/locg`** — the default. The repo root is found by walking up from the installed package source, which works because `locg` is installed `--editable` (see `scripts/install.sh`). These files are versioned, so the collection and wish-list travel with the repo across machines (BUI-84).
+3. **`~/.cache/locg`** — fallback only when no repo root is found (a non-editable / wheel install).
 
 Series matching prefers the canonical run (exact name, then preferred publisher, then oldest start year, then highest issue count), so `"Batman"` resolves to the 1940 DC run instead of a recent one-shot. If a series or issue can't be resolved, that row gets an `"error"` field; the rest of the batch still completes.
 

@@ -136,7 +136,7 @@ def test_cache_atomic_write_no_orphan_tmpfile_on_success(tmp_path):
     assert files == [tmp_path / "ids.json"]
 
 
-def test_cache_path_default_uses_xdg_cache_home(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def test_cache_path_respects_data_dir_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCG_DATA_DIR", str(tmp_path))
     p = cache_path()
-    assert p == tmp_path / "locg" / "ids.json"
+    assert p == tmp_path / "ids.json"

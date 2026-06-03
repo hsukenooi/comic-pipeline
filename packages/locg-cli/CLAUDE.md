@@ -49,10 +49,13 @@ It groups by series (one search per unique series), uses a title-filtered
 issue query (avoiding the 140-issue series page limit), and by default
 intersects the result with your collection to populate `in_collection`.
 
-Resolved IDs are cached to `$XDG_CACHE_HOME/locg/ids.json` (default
-`~/.cache/locg/ids.json`) and reused on subsequent runs — repeat lookups
-skip the API entirely (`from_cache: true` in the result). Pass `--no-cache`
-to bypass; use `locg cache stats` and `locg cache clear` to manage.
+Resolved IDs are cached to `<repo>/data/locg/ids.json` and reused on
+subsequent runs — repeat lookups skip the API entirely (`from_cache: true`
+in the result). Pass `--no-cache` to bypass; use `locg cache stats` and
+`locg cache clear` to manage. The cache dir is resolved by `config._cache_dir`
+with precedence `LOCG_DATA_DIR` env → `<repo>/data/locg` → `~/.cache/locg`
+fallback (BUI-84); it also holds `collection.json` and `wish-list.json`, which
+are versioned so the collection travels with the repo.
 
 Note on the 140-issue limit: `locg series <id>` returns at most 140 issues
 per call (date-desc by default). For series with more than 140 issues, the
@@ -131,7 +134,7 @@ src/locg/
 ├── cli.py           # Argparse definitions, main() entry, JSON output
 ├── client.py        # HTTP client using Playwright + real Chrome (Cloudflare bypass), persistent profile
 ├── commands.py      # Command implementations (search, releases, comic, series, lists, add/remove, login)
-├── config.py        # XDG config dir management, cookie/config file paths
+├── config.py        # XDG config dir + cache dir resolver (_cache_dir, _find_repo_root)
 ├── models.py        # HTML → dict extraction (extract_issue, extract_series, extract_comic_detail)
 ├── parser.py        # Low-level HTML/JSON parsing helpers (BeautifulSoup wrappers, price/date extraction)
 ```

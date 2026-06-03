@@ -184,7 +184,7 @@ def create_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="Append a manual entry to the local wish-list cache",
         epilog=(
-            "Writes {name: <title>, id: null} to ~/.cache/locg/wish-list.json. "
+            "Writes {name: <title>, id: null} to data/locg/wish-list.json. "
             "A subsequent `locg collection import` overwrites the cache from "
             "the LOCG XLSX export, so manually-added entries are not preserved "
             "across imports."

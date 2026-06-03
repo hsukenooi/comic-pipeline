@@ -615,7 +615,7 @@ def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]
 def cmd_wish_list_add(title: str) -> dict[str, Any]:
     """Append a manual entry to the local wish-list cache.
 
-    Writes ``{"name": title, "id": None}`` to ``~/.cache/locg/wish-list.json``
+    Writes ``{"name": title, "id": None}`` to ``data/locg/wish-list.json``
     using the same atomic write pattern as :func:`collection_io._write_wish_list_cache`
     (tempfile + os.replace + chmod 600).  A subsequent ``locg collection import``
     overwrites the cache with fresh XLSX data, so manually-added entries are

@@ -8,8 +8,8 @@ requires_locg_cli: ">=0.2.0"
 
 Add every issue of a series (or a sub-range) to the local wish-list cache. The
 issue count comes from **Metron** (metron.cloud); **no LOCG network access is
-required** — adds go straight to `~/.cache/locg/wish-list.json` via
-`locg wish-list add`.
+required** — adds go straight to the repo-versioned `data/locg/wish-list.json`
+via `locg wish-list add`.
 
 ## Input
 
@@ -94,7 +94,7 @@ title that already succeeded). Stop and report if any call returns an `error`.
 
 ```
 **Wish-listed 4 issues of Children of the Vault (2023):**
-  #1, #2, #3, #4  →  ~/.cache/locg/wish-list.json (N items total)
+  #1, #2, #3, #4  →  data/locg/wish-list.json (N items total)
 ```
 
 ⚠️ **Sync caveat (BUI-47):** local `wish-list add` entries are **overwritten on
