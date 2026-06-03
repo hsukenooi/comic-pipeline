@@ -71,8 +71,13 @@ These are the flags that exist in `packages/gixen-cli/cli.py` today. Anything el
 | `--grade X.Y` | float | Numeric condition grade for post-bid FMV linking (e.g. `9.2`, not `"NM 9.2"`) |
 | `--comic-id N` | int | Internal `comics.id` from gixen-overlay — preferred, used by `/comic:buy` after FMV |
 | `--catalog-id N` | int | External LOCG catalog id (`locg_id`) — only when you have the LOCG id, not the internal id |
+| `--seller NAME` | str | eBay seller username (from `/comic:identify`). Stored lowercased on the snipe; the key for the seller-reliability advisory (BUI-78) |
+| `--seller-grade X.Y` | float | Seller's *stated* grade as a CGC float (convert "VF/NM" → `9.0`). Stored for deviation analytics (BUI-78) |
+| `--photo-grade X.Y` | float | Photo-assessed *consensus* grade as a CGC float — the **raw** Step 2.5 assessment, not any user override (BUI-78) |
 
 `--comic-id` and `--catalog-id` are mutually preferential: if both are given, the CLI uses `--comic-id` and warns that `--catalog-id` was ignored. Either flag triggers a `POST /api/bids/{item_id}/link-fmv` call **only when `--grade` is also present**.
+
+`--seller` / `--seller-grade` / `--photo-grade` are independent of FMV linking — they're written straight to the `bids` row at add time (omit any that are absent). They feed `/comic:buy`'s seller-reliability advisory; they do not affect the bid or FMV.
 
 ### Canonical post-FMV invocation
 
@@ -80,8 +85,13 @@ After `/comic:fmv` (or `/comic:buy`) has produced a row with `comic_id` and a nu
 
 ```bash
 gixen add {item_id} {max_bid} \
-  --comic-id {comic_id} --grade {grade_numeric}
+  --comic-id {comic_id} --grade {grade_numeric} \
+  --seller {seller_username} --seller-grade {seller_grade} --photo-grade {photo_grade}
 ```
+
+(Omit `--seller-grade`/`--photo-grade` when not available — e.g. `--photo-grade`
+only when Step 2.5 photo-graded the book. `--photo-grade` is the raw consensus,
+not a value the user overrode at the gate.)
 
 This is the path that populates `bids.comic_id` / `bids.fmv_id` via the `bid_fmvs` junction (see PER-140). Do **not** pass the internal `comic_id` into `--catalog-id` — that flag is for LOCG ids and the server will look it up as `locg_id`, silently fail, and leave the bid unlinked.
 

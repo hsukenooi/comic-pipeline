@@ -237,6 +237,9 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
          "Takes precedence over --catalog-id if both are given.",
 )
 @click.option("--grade", type=float, default=None, help="Numeric condition grade for post-bid FMV linking")
+@click.option("--seller", default=None, help="eBay seller username (BUI-78 seller-reliability)")
+@click.option("--seller-grade", type=float, default=None, help="Seller's stated grade (CGC float, BUI-78)")
+@click.option("--photo-grade", type=float, default=None, help="Photo-assessed consensus grade (CGC float, BUI-78)")
 def add(
     item_id: str,
     max_bid: str,
@@ -245,6 +248,9 @@ def add(
     catalog_id: int | None,
     comic_id: int | None,
     grade: float | None,
+    seller: str | None,
+    seller_grade: float | None,
+    photo_grade: float | None,
 ):
     """Add a snipe for an eBay item."""
     try:
@@ -268,6 +274,14 @@ def add(
             "bid_offset": offset,
             "snipe_group": group,
         }
+        # BUI-78: pass seller + grades when supplied (server stores + lowercases
+        # seller). Omit unset keys so the payload stays minimal.
+        if seller is not None:
+            payload["seller"] = seller
+        if seller_grade is not None:
+            payload["seller_grade"] = seller_grade
+        if photo_grade is not None:
+            payload["photo_grade"] = photo_grade
         resp = _server_request("post", "/api/bids", json=payload)
         # BUI-67: the server upserts. created=False means an existing live snipe
         # was updated in place — don't reset the add-history timestamp (that drives
@@ -312,6 +326,12 @@ def add(
         return
 
     # Existing direct-Gixen path
+    if seller is not None or seller_grade is not None or photo_grade is not None:
+        click.echo(
+            "⚠️  --seller/--seller-grade/--photo-grade require GIXEN_SERVER_URL "
+            "(server mode); ignored in direct-Gixen mode.",
+            err=True,
+        )
     client = _make_client()
     try:
         existing = client.list_snipes()

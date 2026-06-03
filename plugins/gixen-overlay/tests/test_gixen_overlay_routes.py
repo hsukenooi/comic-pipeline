@@ -1374,3 +1374,109 @@ def test_verify_summary_counts(api):
     assert body["summary"] == {"total": 3, "fully_linked": 1, "issues": 2}
     verdicts = [r["verdict"] for r in body["results"]]
     assert verdicts == ["fully_linked", "fmv_stub", "no_bid"]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/seller-reliability (BUI-78)
+# ---------------------------------------------------------------------------
+
+
+def _seed_graded_bid(api, item_id, seller, seller_grade, photo_grade, status="PENDING"):
+    """Create a bid then set its seller + grades + status directly."""
+    api.post("/api/bids", json={"item_id": item_id, "max_bid": 50.0})
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET seller=?, seller_grade=?, photo_grade=?, status=? WHERE item_id=?",
+        (seller, seller_grade, photo_grade, status, item_id),
+    )
+    raw.commit()
+    raw.close()
+
+
+def test_seller_reliability_avg_and_sample(api):
+    # sellera: +1.0, +2.0, +1.5 -> avg 1.5 over n=3
+    _seed_graded_bid(api, "800000001", "sellera", 9.0, 8.0)
+    _seed_graded_bid(api, "800000002", "sellera", 9.2, 7.2)
+    _seed_graded_bid(api, "800000003", "sellera", 9.0, 7.5)
+    r = api.get("/api/seller-reliability", params={"seller": "sellera"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["seller"] == "sellera"
+    assert body["sample_size"] == 3
+    assert body["avg_deviation"] == pytest.approx(1.5)
+
+
+def test_seller_reliability_excludes_missing_grade_and_tombstones(api):
+    _seed_graded_bid(api, "800000010", "sellerb", 9.0, 8.0)              # +1.0, counts
+    _seed_graded_bid(api, "800000011", "sellerb", 9.0, None)            # missing photo grade
+    _seed_graded_bid(api, "800000012", "sellerb", 5.0, 1.0, status="REMOVED")  # tombstone
+    r = api.get("/api/seller-reliability", params={"seller": "sellerb"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sample_size"] == 1
+    assert body["avg_deviation"] == pytest.approx(1.0)
+
+
+def test_seller_reliability_unknown_seller_zero_sample(api):
+    r = api.get("/api/seller-reliability", params={"seller": "nobody-here"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["seller"] == "nobody-here"
+    assert body["sample_size"] == 0
+    assert body["avg_deviation"] is None
+
+
+def test_seller_reliability_missing_param_422(api):
+    assert api.get("/api/seller-reliability").status_code == 422
+
+
+def test_seller_reliability_overlong_param_422(api):
+    r = api.get("/api/seller-reliability", params={"seller": "x" * 129})
+    assert r.status_code == 422
+
+
+def test_seller_reliability_case_insensitive(api):
+    _seed_graded_bid(api, "800000020", "beatlebluecat", 9.0, 7.0)  # +2.0
+    r = api.get("/api/seller-reliability", params={"seller": "BeatleBlueCat"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sample_size"] == 1
+    assert body["avg_deviation"] == pytest.approx(2.0)
+
+
+def test_seller_reliability_matches_mixedcase_stored_seller(api):
+    """Legacy/sync rows may store a mixed-case seller; the lowercased query must
+    still match them (WHERE LOWER(seller) = ?)."""
+    api.post("/api/bids", json={"item_id": "800000030", "max_bid": 50.0})
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET seller='MixedCaseSeller', seller_grade=9.0, photo_grade=8.0 WHERE item_id=?",
+        ("800000030",),
+    )
+    raw.commit()
+    raw.close()
+    r = api.get("/api/seller-reliability", params={"seller": "mixedcaseseller"})
+    assert r.status_code == 200
+    assert r.json()["sample_size"] == 1
+
+
+def test_readd_over_sync_seller_normalizes_key(api):
+    """Web-added (sync) row carries a mixed-case store name; a buy-flow re-add
+    with grades must normalize the seller to the username so the advisory finds it."""
+    api.post("/api/bids", json={"item_id": "800000031", "max_bid": 50.0})
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET seller='Beatle Blue Cat Collectibles' WHERE item_id=?",
+        ("800000031",),
+    )
+    raw.commit()
+    raw.close()
+    # Buy-flow re-add (existing PENDING -> modify path) supplies the username + grades.
+    r = api.post("/api/bids", json={
+        "item_id": "800000031", "max_bid": 60.0,
+        "seller": "beatlebluecat", "seller_grade": 9.0, "photo_grade": 7.0,
+    })
+    assert r.status_code == 200
+    adv = api.get("/api/seller-reliability", params={"seller": "beatlebluecat"})
+    assert adv.json()["sample_size"] == 1
+    assert adv.json()["avg_deviation"] == pytest.approx(2.0)

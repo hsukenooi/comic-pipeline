@@ -74,6 +74,73 @@ def test_add_bid_minimal(api):
     api.mock_gixen.add_snipe.assert_called_once()
 
 
+def test_add_bid_persists_seller_and_grades(api):
+    """BUI-78: seller (lowercased) + both grades sent on POST land in the DB.
+    Guards the AddBidRequest extra='ignore' silent-drop — asserts the DB row,
+    not just a 200."""
+    r = api.post("/api/bids", json={
+        "item_id": "412000001", "max_bid": 50.0,
+        "seller": "BeatleBlueCat", "seller_grade": 9.0, "photo_grade": 7.0,
+    })
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT seller, seller_grade, photo_grade FROM bids WHERE item_id='412000001'"
+    ).fetchone()
+    assert row["seller"] == "beatlebluecat"   # lowercased canonical key
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 7.0
+
+
+def test_add_bid_without_grades_stores_null(api):
+    """Backward-compat: a minimal add stores NULL grades, no error."""
+    r = api.post("/api/bids", json={"item_id": "412000002", "max_bid": 50.0})
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT seller_grade, photo_grade FROM bids WHERE item_id='412000002'"
+    ).fetchone()
+    assert row["seller_grade"] is None
+    assert row["photo_grade"] is None
+
+
+def test_readd_fills_null_grades(api):
+    """BUI-78 (C2): a snipe added without grades, then re-added with grades,
+    gets its NULL grade columns filled via the update-in-place path."""
+    api.post("/api/bids", json={"item_id": "412000003", "max_bid": 50.0})
+    r = api.post("/api/bids", json={
+        "item_id": "412000003", "max_bid": 60.0,
+        "seller": "seller3", "seller_grade": 8.0, "photo_grade": 6.0,
+    })
+    assert r.status_code == 200
+    assert r.json()["created"] is False  # update-in-place path
+    row = _dbconn().execute(
+        "SELECT seller, seller_grade, photo_grade FROM bids "
+        "WHERE item_id='412000003' AND status='PENDING'"
+    ).fetchone()
+    assert row["seller"] == "seller3"
+    assert row["seller_grade"] == 8.0
+    assert row["photo_grade"] == 6.0
+
+
+def test_add_bid_rejects_overlong_seller(api):
+    """Write path mirrors the read endpoint's 1-128 char seller validation."""
+    r = api.post("/api/bids", json={
+        "item_id": "412000004", "max_bid": 50.0, "seller": "x" * 129,
+    })
+    assert r.status_code == 422
+
+
+def test_add_bid_empty_seller_stored_as_null(api):
+    """An empty/whitespace seller normalizes to NULL rather than an empty-string key."""
+    r = api.post("/api/bids", json={
+        "item_id": "412000005", "max_bid": 50.0, "seller": "   ",
+    })
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT seller FROM bids WHERE item_id='412000005'"
+    ).fetchone()
+    assert row["seller"] is None
+
+
 def test_add_bid_invalid_item_id(api):
     r = api.post("/api/bids", json={"item_id": "abc", "max_bid": 50.0})
     assert r.status_code == 422

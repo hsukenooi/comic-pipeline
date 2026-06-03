@@ -333,6 +333,162 @@ def test_bids_fmv_id_migration_is_idempotent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# seller_grade / photo_grade column migration (BUI-78)
+# ---------------------------------------------------------------------------
+
+
+def test_bids_grade_columns_present_on_fresh_db(tmp_path):
+    conn = init_db(tmp_path / "fresh.db")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "seller_grade" in cols
+    assert "photo_grade" in cols
+    conn.close()
+
+
+def test_bids_grade_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem_grades.db"
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "seller_grade" in cols
+    assert "photo_grade" in cols
+    conn2.close()
+
+
+def test_grade_columns_survive_bids_rebuild(tmp_path):
+    """BUI-78: seller_grade/photo_grade must be in _BIDS_TABLE_SQL so the
+    FK-removal rebuild preserves them (and their data). A legacy DB carrying the
+    comics FK forces the rebuild; the columns already exist with data, so the
+    rebuild's `INSERT INTO bids (...cols...)` raises 'no such column' unless the
+    rebuilt schema declares them."""
+    legacy_db_path = tmp_path / "legacy_grades.db"
+    raw = sqlite3.connect(str(legacy_db_path))
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript("""
+        CREATE TABLE comics (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, issue TEXT NOT NULL,
+            year INTEGER NOT NULL, grade REAL
+        );
+        CREATE TABLE bids (
+            id INTEGER PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            comic_id INTEGER REFERENCES comics(id),
+            max_bid REAL NOT NULL,
+            bid_offset INTEGER DEFAULT 6,
+            snipe_group INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'PENDING',
+            winning_bid REAL,
+            seller TEXT,
+            auction_end_at TEXT,
+            local_snipe_at TEXT,
+            local_snipe_result TEXT,
+            notes TEXT,
+            added_at TEXT DEFAULT (datetime('now')),
+            resolved_at TEXT,
+            ebay_title TEXT,
+            status_mirror TEXT,
+            cached_current_bid TEXT,
+            cached_at TEXT,
+            fmv_id INTEGER,
+            seller_grade REAL,
+            photo_grade REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+    """)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, comic_id, seller_grade, photo_grade) "
+        "VALUES ('legacy_grade001', 50.0, NULL, 9.0, 7.0)"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = init_db(legacy_db_path)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+        assert "seller_grade" in cols
+        assert "photo_grade" in cols
+        row = conn.execute(
+            "SELECT seller_grade, photo_grade FROM bids WHERE item_id='legacy_grade001'"
+        ).fetchone()
+        assert row["seller_grade"] == 9.0
+        assert row["photo_grade"] == 7.0
+    finally:
+        conn.close()
+
+
+def test_insert_bid_persists_grades(db):
+    """BUI-78: insert_bid stores seller_grade/photo_grade when supplied."""
+    insert_bid(db, "700000001", 50.0, 6, 0, "someseller",
+               seller_grade=9.0, photo_grade=7.5)
+    row = get_bid_by_item_id(db, "700000001")
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 7.5
+
+
+def test_insert_bid_grades_default_null(db):
+    """Backward-compat: the existing positional call (no grades) stores NULL."""
+    insert_bid(db, "700000002", 50.0, 6, 0, "someseller")
+    row = get_bid_by_item_id(db, "700000002")
+    assert row["seller_grade"] is None
+    assert row["photo_grade"] is None
+
+
+def test_update_bid_grades_fills_only_nulls(db):
+    """BUI-78 (C2): update_bid_grades fills NULL grade/seller columns but never
+    overwrites already-set values — completing an incomplete insert, not editing."""
+    from server.db import update_bid_grades
+    # Row added without grades (seller present).
+    insert_bid(db, "700000003", 50.0, 6, 0, "buyer")
+    update_bid_grades(db, "700000003", seller=None, seller_grade=9.0, photo_grade=6.5)
+    row = get_bid_by_item_id(db, "700000003")
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 6.5
+    # A second call with different values must NOT overwrite the set grades.
+    update_bid_grades(db, "700000003", seller=None, seller_grade=2.0, photo_grade=1.0)
+    row = get_bid_by_item_id(db, "700000003")
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 6.5
+
+
+def test_update_bid_grades_seller_is_authoritative(db):
+    """The buy-flow username is the canonical key, so update_bid_grades overwrites
+    a prior (e.g. sync-set store-name) seller — while grades stay fill-NULL only."""
+    from server.db import update_bid_grades
+    insert_bid(db, "700000006", 50.0, 6, 0, "Beatle Blue Cat Collectibles")  # sync-style store name
+    update_bid_grades(db, "700000006", seller="beatlebluecat", seller_grade=9.0, photo_grade=7.0)
+    row = get_bid_by_item_id(db, "700000006")
+    assert row["seller"] == "beatlebluecat"   # buy-flow username wins
+    assert row["seller_grade"] == 9.0
+    # A grade already set is NOT overwritten on a later call (fill-NULL).
+    update_bid_grades(db, "700000006", seller="beatlebluecat", seller_grade=1.0, photo_grade=1.0)
+    row = get_bid_by_item_id(db, "700000006")
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 7.0
+
+
+def test_cache_gixen_data_does_not_overwrite_existing_seller(db):
+    """BUI-78 (A1): a sync must not overwrite an INSERT-time seller username
+    with Gixen's scraped store display name."""
+    from server.db import cache_gixen_data
+    insert_bid(db, "700000004", 50.0, 6, 0, "beatlebluecat")
+    cache_gixen_data(db, "700000004", "Some Title", "Beatle Blue Cat Collectibles", "10.00 USD")
+    db.commit()
+    row = get_bid_by_item_id(db, "700000004")
+    assert row["seller"] == "beatlebluecat"  # INSERT value wins
+
+
+def test_cache_gixen_data_fills_null_seller(db):
+    """A1 must still let sync populate seller when it started NULL (web-added)."""
+    from server.db import cache_gixen_data
+    insert_bid(db, "700000005", 50.0, 6, 0, None)
+    cache_gixen_data(db, "700000005", "T", "scraped_seller", "1.00 USD")
+    db.commit()
+    row = get_bid_by_item_id(db, "700000005")
+    assert row["seller"] == "scraped_seller"
+
+
+# ---------------------------------------------------------------------------
 # PURGED -> REMOVED status rename migration (BUI-49)
 # ---------------------------------------------------------------------------
 

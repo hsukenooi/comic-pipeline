@@ -42,6 +42,10 @@ _COLUMN_MIGRATIONS = [
     # Plain INTEGER (no FK) so gixen-cli starts cleanly without the plugin.
     # The plugin reads/writes this column when present.
     "ALTER TABLE bids ADD COLUMN fmv_id INTEGER",
+    # BUI-78: seller-stated and photo-assessed grades per snipe, for seller
+    # reliability analytics. Both nullable CGC floats; written by the buy flow.
+    "ALTER TABLE bids ADD COLUMN seller_grade REAL",
+    "ALTER TABLE bids ADD COLUMN photo_grade REAL",
 ]
 
 
@@ -69,7 +73,9 @@ _BIDS_TABLE_SQL = """
         status_mirror       TEXT,
         cached_current_bid  TEXT,
         cached_at           TEXT,
-        fmv_id              INTEGER
+        fmv_id              INTEGER,
+        seller_grade        REAL,
+        photo_grade         REAL
     )
 """
 
@@ -390,16 +396,52 @@ def insert_bid(
     bid_offset: int,
     snipe_group: int,
     seller: str | None,
+    seller_grade: float | None = None,
+    photo_grade: float | None = None,
 ) -> int:
+    # seller_grade/photo_grade are trailing defaults (BUI-78) so existing
+    # positional callers (e.g. _sync_gixen) keep working unchanged.
     cur = conn.execute(
         """
-        INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller,
+                          seller_grade, photo_grade)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (item_id, max_bid, bid_offset, snipe_group, seller),
+        (item_id, max_bid, bid_offset, snipe_group, seller, seller_grade, photo_grade),
     )
     conn.commit()
     return cur.lastrowid
+
+
+def update_bid_grades(
+    conn: sqlite3.Connection,
+    item_id: str,
+    seller: str | None = None,
+    seller_grade: float | None = None,
+    photo_grade: float | None = None,
+) -> None:
+    """Update the live (PENDING) row's seller + grades from a buy-flow re-add.
+
+    - `seller` is the canonical key, so the supplied (lowercased username) value
+      is **authoritative** and overwrites whatever was there — e.g. a mixed-case
+      store name a prior sync wrote — `COALESCE(?, seller)` (supplied wins, else
+      keep existing). This keeps one canonical key per seller (BUI-78 A1).
+    - Grades are observations, so they are **fill-NULL only** —
+      `COALESCE(<col>, ?)` — completing an incomplete insert without editing an
+      already-set grade (BUI-78 C2; re-grading is a deferred follow-up).
+
+    No-op when all inputs are None."""
+    if seller is None and seller_grade is None and photo_grade is None:
+        return
+    conn.execute(
+        "UPDATE bids SET "
+        "seller=COALESCE(?, seller), "
+        "seller_grade=COALESCE(seller_grade, ?), "
+        "photo_grade=COALESCE(photo_grade, ?) "
+        "WHERE item_id=? AND status='PENDING'",
+        (seller, seller_grade, photo_grade, item_id),
+    )
+    conn.commit()
 
 
 def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
@@ -483,10 +525,16 @@ def cache_gixen_data(
     if not has_data:
         return  # nothing to write, don't bump cached_at
     now = datetime.now(timezone.utc).isoformat()
+    # BUI-78 A1: seller uses COALESCE(seller, ?) — keep an already-set seller
+    # rather than overwriting it. The buy flow writes the canonical lowercased
+    # eBay username at INSERT; Gixen's scrape returns the store display name, so
+    # without this guard the sync would clobber the username and split a seller's
+    # grade history. Seller-per-item is immutable, so never overwriting is safe;
+    # a row that started NULL (web-added snipe) still gets filled.
     conn.execute(
         "UPDATE bids SET "
         "ebay_title=COALESCE(?, ebay_title), "
-        "seller=COALESCE(?, seller), "
+        "seller=COALESCE(seller, ?), "
         "cached_current_bid=COALESCE(?, cached_current_bid), "
         "cached_at=? "
         "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",

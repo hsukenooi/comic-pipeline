@@ -24,9 +24,28 @@ At each step, present results to the user and wait for approval before proceedin
 Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow it.
 
 **Input:** eBay URLs from the user.
-**Output:** Identification table (comic, issue, grade, variant, auction vs BIN).
+**Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **seller**).
 
 Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step.
+
+### Seller reliability advisory (BUI-78)
+
+For each distinct seller in the table, query the seller's grading track record
+(cheap local GET; best-effort — on any error treat as no history and proceed):
+
+```bash
+curl -s "$GIXEN_SERVER_URL/api/seller-reliability?seller=<seller_username>"
+```
+
+When `sample_size >= 1`, surface a line before the user decides whether to grade
+(Step 2.5) or how aggressively to bid:
+
+> ⚠️ Seller `beatlebluecat` has over-stated condition by ~**+1.5** grade points (n=4 prior assessments). Consider photo-grading this listing to verify condition before bidding.
+
+- `avg_deviation` is `seller_grade − photo_grade`; **positive = over-grades**. Render with an explicit sign.
+- For `sample_size` of 1–2, prefix **"early signal —"** and soften the wording (one or two data points, not an established pattern).
+- `sample_size == 0` (or any error / no server): show nothing.
+- Advisory only — it never changes the grade, FMV, or max bid automatically.
 
 ---
 
@@ -68,7 +87,9 @@ Present the photo-assessed grades to the user before proceeding:
 
 Gate: user confirms the assessed grades (or overrides any) before FMV. Map the grade skill's confidence to `grade_confidence` for Step 3, preserving all four levels: HIGH → `high`, MEDIUM → `medium`, MEDIUM-LOW → `medium-low`, LOW → `low` (MEDIUM-LOW and LOW haircut differently — 0.70 vs 0.60 — so don't collapse them).
 
-**If all comics already have a stated grade:** skip this step entirely.
+**Preserve the raw photo consensus.** Keep the grader's consensus point estimate as its own working-list field (`photo_grade`), distinct from the grade the user confirms/overrides for FMV (`grade`). Step 5 stores `photo_grade` for seller-deviation analytics — it must be the *raw* assessment, never the override.
+
+**If all comics already have a stated grade:** skip grading by default. **Optionally offer to "grade anyway"** for a stated-grade listing — recommended when the Step 1 advisory flagged the seller as an over-grader, or for a high-value book — since photo-grading a stated-grade listing is the only way the seller-deviation signal (BUI-78) accumulates for over-graders (who almost always state a grade). Keep it user-gated, not automatic.
 
 ---
 
@@ -147,14 +168,20 @@ Gate: user approves or overrides each max bid.
 
 Read `~/Projects/comic-pipeline/.claude/commands/comic/snipe-add.md` and follow it.
 
-**Input:** Approved auctions with max bids **plus the `comic_id` and numeric grade for each row from the Step 3 FMV JSON**. Without `comic_id`, the bid will be added but `bids.comic_id` / `bids.fmv_id` will stay NULL — see PER-140.
+**Input:** Approved auctions with max bids **plus the `comic_id` and numeric grade for each row from the Step 3 FMV JSON**, and the `seller` username + grades captured earlier. Without `comic_id`, the bid will be added but `bids.comic_id` / `bids.fmv_id` will stay NULL — see PER-140.
 
 For each approved auction call:
 
 ```bash
 gixen add {item_id} {max_bid} \
-  --comic-id {comic_id} --grade {grade_numeric}
+  --comic-id {comic_id} --grade {grade_numeric} \
+  --seller {seller_username} --seller-grade {seller_grade} --photo-grade {photo_grade}
 ```
+
+- `--seller` is the username from Step 1 (stored lowercased; the seller-reliability key).
+- `--seller-grade` is the seller's stated grade as a CGC float (convert "VF/NM" → `9.0`); omit if the seller stated no grade or it's unmappable.
+- `--photo-grade` is the **raw** Step 2.5 consensus (BUI-78) — omit unless the book was photo-graded; never pass a user-overridden value here.
+- These three are independent of FMV linkage — they populate `bids.seller`/`seller_grade`/`photo_grade` for the seller-reliability advisory and don't affect the bid.
 
 If `comic_id` is null for a row (FMV upsert was skipped, e.g. `n=0`), omit `--comic-id` and surface that this bid will not have FMV linkage in the dashboard. Do **not** pass the internal `comic_id` to `--catalog-id` — that flag expects an LOCG id and silently fails to link.
 
