@@ -20,7 +20,10 @@ CONFIG_DIR = Path.home() / ".config" / "ebay-fetch"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 # Maps eBay *store names* (what a human types) to the seller's login *username*
 # (what the Browse API filter actually needs). See BUI-68.
-SELLER_ALIASES_FILE = CONFIG_DIR / "seller_aliases.json"
+# Committed to the repo (next to the modules, so it resolves in both the dev
+# checkout and the installed wheel where `sources=["src"]` flattens the layout)
+# so the seller list travels with the code — no per-machine setup.
+SELLER_ALIASES_FILE = Path(__file__).resolve().parent / "seller_aliases.json"
 
 PRODUCTION_BASE = "https://api.ebay.com"
 SANDBOX_BASE = "https://api.sandbox.ebay.com"
@@ -397,7 +400,7 @@ def save_seller_alias(store, username):
         except (json.JSONDecodeError, OSError):
             aliases = {}
     aliases[store.strip().lower()] = username.strip()
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SELLER_ALIASES_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SELLER_ALIASES_FILE, "w") as f:
         json.dump(aliases, f, indent=2, sort_keys=True)
     return aliases

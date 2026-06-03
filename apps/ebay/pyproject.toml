@@ -22,6 +22,7 @@ include = [
     "src/ebay_fetch.py",
     "src/sold_comps.py",
     "src/seller_scan.py",
+    "src/seller_aliases.json",
 ]
 sources = ["src"]
 

@@ -88,9 +88,8 @@ class TestSellerAliases:
         assert ebay_fetch.load_seller_aliases() == {"tunerscomics": "tuners_comics_2011"}
 
     def test_save_then_load_roundtrip(self, tmp_path, monkeypatch):
-        f = tmp_path / "aliases.json"
+        f = tmp_path / "sub" / "aliases.json"  # parent created by save
         monkeypatch.setattr(ebay_fetch, "SELLER_ALIASES_FILE", f)
-        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
         ebay_fetch.save_seller_alias("TunersComics", "tuners_comics_2011")
         assert ebay_fetch.load_seller_aliases() == {"tunerscomics": "tuners_comics_2011"}
 
@@ -99,6 +98,11 @@ class TestSellerAliases:
         f.write_text("{not json")
         monkeypatch.setattr(ebay_fetch, "SELLER_ALIASES_FILE", f)
         assert ebay_fetch.load_seller_aliases() == {}
+
+    def test_committed_seed_file_present(self):
+        # The alias map ships in the repo so it needs no per-machine setup.
+        aliases = ebay_fetch.load_seller_aliases()
+        assert aliases.get("tunerscomics") == "tuners36"
 
 
 class TestParseItemSummary:

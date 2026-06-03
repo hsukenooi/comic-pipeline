@@ -11,8 +11,10 @@ Fetch all active listings from an eBay seller and fuzzy-match them against your 
 
 A store name, a username URL, or a raw login username. **An eBay store name is
 not the same as the seller's login username** — the Browse API only filters by
-login username, so store names are resolved through an alias map at
-`~/.config/ebay-fetch/seller_aliases.json` (BUI-68).
+login username, so store names are resolved through an alias map committed in
+the repo at `apps/ebay/src/seller_aliases.json` (BUI-68). It ships with the
+code, so there's nothing to set up per machine; `--add-alias` edits this
+tracked file, so commit it after adding a new seller.
 
 - `beatlebluecat` — bare name; resolved via the alias map (seeded names map to themselves)
 - `https://www.ebay.com/usr/<username>` — trusted login username
