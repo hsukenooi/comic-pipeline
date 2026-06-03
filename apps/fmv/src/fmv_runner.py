@@ -256,7 +256,13 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
         target_grade = coerced
         inp["grade"] = coerced
 
-    fmv = fmv_math.compute_fmv(comps, target_grade=target_grade)
+    # BUI-51: grade_confidence (photo-coverage confidence from /comic:grade)
+    # rides the batch envelope and haircuts the bid cap when low. Absent → no
+    # haircut (back-compat for manual / already-graded books).
+    fmv = fmv_math.compute_fmv(
+        comps, target_grade=target_grade,
+        grade_confidence=inp.get("grade_confidence"),
+    )
     # BUI-44: upsert unconditionally — even with n=0 comps (fmv_low/high None),
     # so the comics row + a stub fmv row are written and comic_id is returned.
     # This lets snipe-add thread --comic-id and verify report no_fmv_at_grade
@@ -328,6 +334,12 @@ def _confidence_to_db_label(label: str) -> str:
 def _build_notes(fmv: dict) -> str:
     parts = [f"window=±{fmv['window']}", f"cv={fmv['cv_pct']}",
              f"label={fmv['confidence']}"]
+    # BUI-51: surface the bid haircut so the lowered max bid is explained.
+    factor = fmv.get("bid_factor")
+    if factor is not None and factor < fmv_math.BASE_BID_FACTOR:
+        parts.append(
+            f"bid_haircut={factor:.2f} (grade_conf={fmv.get('grade_confidence')})"
+        )
     return " | ".join(parts)
 
 
@@ -342,7 +354,7 @@ def _stitch(books: list[dict], cached: dict[int, dict],
             row = cached[i]
             out.append({
                 "input": _input_summary(book),
-                "fmv": _fmv_from_db_row(row),
+                "fmv": _fmv_from_db_row(row, book.get("grade_confidence")),
                 "comp_count_total": row.get("fmv_comps") or 0,
                 "queries_used": [],
                 "db_row": row,
@@ -366,23 +378,34 @@ def _stitch(books: list[dict], cached: dict[int, dict],
 def _input_summary(book: dict) -> dict:
     return {k: book.get(k) for k in
             ("item_id", "title", "issue", "year", "publisher", "grade",
-             "locg_id", "locg_variant_id", "notes")
+             "grade_confidence", "locg_id", "locg_variant_id", "notes")
             if book.get(k) is not None}
 
 
-def _fmv_from_db_row(row: dict) -> dict:
-    """Project a gixen-overlay `comics` row back into the fmv dict shape."""
+def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
+    """Project a gixen-overlay `comics` row back into the fmv dict shape.
+
+    BUI-51: grade_confidence is not *persisted* (KTD6 — no DB column), but a
+    cache hit on a freshly photo-graded comic still gets the haircut: we combine
+    the request's grade_confidence with the row's stored fmv_confidence at read
+    time. Without this, reusing a recent FMV would silently bid a low-confidence
+    grade at full 80% — the exact case the haircut exists to prevent.
+    """
     fmv_high = row.get("fmv_high")
+    fmv_conf = (row.get("fmv_confidence") or "low").upper()
+    factor = fmv_math.bid_factor(fmv_conf, grade_confidence)
     return {
         "n": row.get("fmv_comps") or 0,
         "window": None,
         "fmv_low": row.get("fmv_low"),
         "fmv_high": fmv_high,
         "median": None,
-        "max_bid": fmv_math.clean_round(fmv_high * 0.80) if fmv_high else None,
+        "max_bid": fmv_math.clean_round(fmv_high * factor) if fmv_high else None,
         "cv": None,
         "cv_pct": "n/a",
-        "confidence": (row.get("fmv_confidence") or "low").upper(),
+        "confidence": fmv_conf,
+        "grade_confidence": grade_confidence,
+        "bid_factor": factor,
         "trimmed_pool": [],
     }
 
