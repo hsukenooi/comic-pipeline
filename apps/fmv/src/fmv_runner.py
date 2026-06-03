@@ -63,8 +63,13 @@ def _coerce_grade(value) -> float | None:
 
 def run(*, batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool,
-        quiet: bool, server_url: str | None) -> None:
-    """Driver for `comic-fmv`. Exits with sys.exit on hard failures."""
+        quiet: bool, server_url: str | None,
+        grade_window: float | None = None) -> None:
+    """Driver for `comic-fmv`. Exits with sys.exit on hard failures.
+
+    `grade_window` (BUI-86) caps how far the comp pool may widen; None uses
+    fmv_math's default ceiling. It does not bypass the priceability guards.
+    """
     if not server_url:
         click.echo("Error: GIXEN_SERVER_URL must be set. The fmv command "
                    "needs the server for cache reuse and DB upsert.", err=True)
@@ -97,7 +102,7 @@ def run(*, batch_path: str | None, out_path: str | None,
             break
         idx = needs_indices[ordinal]
         fresh_fmvs[idx] = _compute_and_upsert_one(
-            result, books[idx], server_url=server_url,
+            result, books[idx], server_url=server_url, grade_window=grade_window,
         )
 
     # 4. Stitch cached + fresh in input order
@@ -217,7 +222,8 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
 # ─── Step 3 — Math + DB upsert ────────────────────────────────────────────────
 
 def _compute_and_upsert_one(result: dict, original_book: dict, *,
-                            server_url: str) -> dict:
+                            server_url: str,
+                            grade_window: float | None = None) -> dict:
     """Run FMV math + DB upsert for a single book. Returns the assembled result."""
     inp = result.get("input") or {}
     overrides = {k: v for k, v in original_book.items()
@@ -259,9 +265,12 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # BUI-51: grade_confidence (photo-coverage confidence from /comic:grade)
     # rides the batch envelope and haircuts the bid cap when low. Absent → no
     # haircut (back-compat for manual / already-graded books).
+    # grade_window is None when --grade-window is omitted; compute_fmv treats
+    # None as "use the default ceiling", so it threads straight through.
     fmv = fmv_math.compute_fmv(
         comps, target_grade=target_grade,
         grade_confidence=inp.get("grade_confidence"),
+        max_window=grade_window,
     )
     # BUI-44: upsert unconditionally — even with n=0 comps (fmv_low/high None),
     # so the comics row + a stub fmv row are written and comic_id is returned.
@@ -334,9 +343,19 @@ def _confidence_to_db_label(label: str) -> str:
 def _build_notes(fmv: dict) -> str:
     parts = [f"window=±{fmv['window']}", f"cv={fmv['cv_pct']}",
              f"label={fmv['confidence']}"]
-    # BUI-51: surface the bid haircut so the lowered max bid is explained.
+    # BUI-86: surface grade-span and the manual-pricing flag so a needs_manual
+    # stub is legible (distinct from a never-filled n=0 stub) on inspection.
+    span = fmv.get("grade_span")
+    if span is not None:
+        parts.append(f"span={span:g}")
+    flag = fmv.get("flag_reason")
+    if flag:
+        parts.append(f"manual_review={flag}")
+    # BUI-51: surface the bid haircut so the lowered max bid is explained. Skip
+    # it for a flagged book — it has no max bid, so a haircut token would be
+    # misleading (its LOW label is forced by the flag, not a real haircut).
     factor = fmv.get("bid_factor")
-    if factor is not None and factor < fmv_math.BASE_BID_FACTOR:
+    if not flag and factor is not None and factor < fmv_math.BASE_BID_FACTOR:
         parts.append(
             f"bid_haircut={factor:.2f} (grade_conf={fmv.get('grade_confidence')})"
         )
@@ -397,6 +416,12 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     return {
         "n": row.get("fmv_comps") or 0,
         "window": None,
+        # BUI-86: shape parity with compute_fmv output. Flagged books are never
+        # cache hits (_db_lookup filters null fmv_low), so a cached row is always
+        # a priced book — flag_reason stays None — but the keys must exist for
+        # downstream readers that iterate the fmv dict uniformly.
+        "flag_reason": None,
+        "grade_span": None,
         "fmv_low": row.get("fmv_low"),
         "fmv_high": fmv_high,
         "median": None,
@@ -438,7 +463,12 @@ def _print_table(rows: list[dict]) -> None:
         label = f"{inp.get('title','?')} #{inp.get('issue','?')}"
         grade = inp.get("grade")
         fmv = r.get("fmv") or {}
-        if fmv.get("fmv_low") is not None:
+        if fmv.get("flag_reason"):
+            # BUI-86: needs manual pricing — distinct from a genuine no-comps row.
+            fmv_str = f"manual:{fmv['flag_reason']}"
+            med_str = "—"
+            mb_str = "manual"
+        elif fmv.get("fmv_low") is not None:
             fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']}"
             med_str = f"${fmv.get('median') or '?'}"
             mb_str = f"${fmv.get('max_bid') or '?'}"
