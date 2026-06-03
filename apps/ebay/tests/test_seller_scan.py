@@ -34,6 +34,76 @@ class TestExtractSellerUsername:
     def test_strips_whitespace(self):
         assert ebay_fetch._extract_seller_username("  beatlebluecat  ") == "beatlebluecat"
 
+    def test_ssn_search_url(self):
+        assert ebay_fetch._extract_seller_username(
+            "https://www.ebay.com/sch/i.html?_ssn=tuners_comics_2011&_sop=1"
+        ) == "tuners_comics_2011"
+
+
+class TestResolveSellerUsername:
+    def test_username_override_wins(self):
+        assert ebay_fetch.resolve_seller_username(
+            "tunerscomics", {}, username_override="tuners_comics_2011"
+        ) == "tuners_comics_2011"
+
+    def test_usr_url_is_trusted_username(self):
+        assert ebay_fetch.resolve_seller_username(
+            "https://www.ebay.com/usr/beatlebluecat", {}
+        ) == "beatlebluecat"
+
+    def test_ssn_url_is_trusted_username(self):
+        assert ebay_fetch.resolve_seller_username(
+            "https://www.ebay.com/sch/i.html?_ssn=tuners_comics_2011", {}
+        ) == "tuners_comics_2011"
+
+    def test_store_name_resolved_via_alias(self):
+        aliases = {"tunerscomics": "tuners_comics_2011"}
+        assert ebay_fetch.resolve_seller_username("tunerscomics", aliases) == "tuners_comics_2011"
+
+    def test_alias_lookup_case_insensitive(self):
+        aliases = {"tunerscomics": "tuners_comics_2011"}
+        assert ebay_fetch.resolve_seller_username("TunersComics", aliases) == "tuners_comics_2011"
+
+    def test_str_url_needs_alias(self):
+        aliases = {"tunerscomics": "tuners_comics_2011"}
+        assert ebay_fetch.resolve_seller_username(
+            "https://www.ebay.com/str/tunerscomics", aliases
+        ) == "tuners_comics_2011"
+
+    def test_unknown_store_raises(self):
+        with pytest.raises(ebay_fetch.UnknownSellerError) as exc:
+            ebay_fetch.resolve_seller_username("mysteryshop", {})
+        assert exc.value.store == "mysteryshop"
+
+
+class TestSellerAliases:
+    def test_load_missing_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ebay_fetch, "SELLER_ALIASES_FILE", tmp_path / "nope.json")
+        assert ebay_fetch.load_seller_aliases() == {}
+
+    def test_load_lowercases_keys(self, tmp_path, monkeypatch):
+        f = tmp_path / "aliases.json"
+        f.write_text(json.dumps({"TunersComics": "tuners_comics_2011"}))
+        monkeypatch.setattr(ebay_fetch, "SELLER_ALIASES_FILE", f)
+        assert ebay_fetch.load_seller_aliases() == {"tunerscomics": "tuners_comics_2011"}
+
+    def test_save_then_load_roundtrip(self, tmp_path, monkeypatch):
+        f = tmp_path / "sub" / "aliases.json"  # parent created by save
+        monkeypatch.setattr(ebay_fetch, "SELLER_ALIASES_FILE", f)
+        ebay_fetch.save_seller_alias("TunersComics", "tuners_comics_2011")
+        assert ebay_fetch.load_seller_aliases() == {"tunerscomics": "tuners_comics_2011"}
+
+    def test_corrupt_file_returns_empty(self, tmp_path, monkeypatch):
+        f = tmp_path / "aliases.json"
+        f.write_text("{not json")
+        monkeypatch.setattr(ebay_fetch, "SELLER_ALIASES_FILE", f)
+        assert ebay_fetch.load_seller_aliases() == {}
+
+    def test_committed_seed_file_present(self):
+        # The alias map ships in the repo so it needs no per-machine setup.
+        aliases = ebay_fetch.load_seller_aliases()
+        assert aliases.get("tunerscomics") == "tuners36"
+
 
 class TestParseItemSummary:
     def _make_auction(self, **overrides):
@@ -104,24 +174,33 @@ class TestParseItemSummary:
 
 
 class TestSearchSellerListings:
-    def _mock_page(self, items, total):
+    def _item(self, i, seller="seller"):
+        return {
+            "itemId": f"v1|{i}|0",
+            "title": f"Comic #{i}",
+            "seller": {"username": seller},
+        }
+
+    def _mock_page(self, items, total, warnings=None):
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = {"itemSummaries": items, "total": total}
+        body = {"itemSummaries": items, "total": total}
+        if warnings:
+            body["warnings"] = warnings
+        resp.json.return_value = body
         return resp
 
     @patch("ebay_fetch.requests.get")
     def test_single_page(self, mock_get):
-        items = [{"itemId": "v1|1|0", "title": "Comic #1"}]
-        mock_get.return_value = self._mock_page(items, 1)
+        mock_get.return_value = self._mock_page([self._item(1)], 1)
         result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
         assert len(result) == 1
         assert result[0]["title"] == "Comic #1"
 
     @patch("ebay_fetch.requests.get")
     def test_paginates(self, mock_get):
-        page1 = [{"itemId": f"v1|{i}|0"} for i in range(200)]
-        page2 = [{"itemId": "v1|200|0"}]
+        page1 = [self._item(i) for i in range(200)]
+        page2 = [self._item(200)]
         mock_get.side_effect = [
             self._mock_page(page1, 201),
             self._mock_page(page2, 201),
@@ -131,7 +210,7 @@ class TestSearchSellerListings:
 
     @patch("ebay_fetch.requests.get")
     def test_stops_at_max_results(self, mock_get):
-        page1 = [{"itemId": f"v1|{i}|0"} for i in range(200)]
+        page1 = [self._item(i) for i in range(200)]
         mock_get.return_value = self._mock_page(page1, 500)
         result = ebay_fetch.search_seller_listings(
             "seller", "tok", "https://api.ebay.com", max_results=200
@@ -146,13 +225,36 @@ class TestSearchSellerListings:
         assert result == []
 
     @patch("ebay_fetch.requests.get")
-    def test_username_extracted_from_url(self, mock_get):
+    def test_filter_braces_survive_in_query(self, mock_get):
+        # Braces must reach eBay literally, not percent-encoded (BUI-68).
         mock_get.return_value = self._mock_page([], 0)
         ebay_fetch.search_seller_listings(
             "https://www.ebay.com/usr/beatlebluecat", "tok", "https://api.ebay.com"
         )
-        call_params = mock_get.call_args[1]["params"]
-        assert "beatlebluecat" in call_params["filter"]
+        query = mock_get.call_args[1]["params"]
+        assert isinstance(query, str)
+        assert "sellers:{beatlebluecat}" in query
+        assert "%7B" not in query
+
+    @patch("ebay_fetch.requests.get")
+    def test_other_sellers_filtered_out(self, mock_get):
+        # Even if eBay returns foreign sellers, we never surface them.
+        items = [self._item(1, seller="seller"), self._item(2, seller="someoneelse")]
+        mock_get.return_value = self._mock_page(items, 2)
+        result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
+        assert len(result) == 1
+        assert result[0]["seller"]["username"] == "seller"
+
+    @patch("ebay_fetch.requests.get")
+    def test_invalid_seller_warning_aborts(self, mock_get):
+        items = [self._item(i, seller="randomseller") for i in range(200)]
+        mock_get.return_value = self._mock_page(
+            items, 260000,
+            warnings=[{"message": "A seller 'username' provided in the request filters is invalid."}],
+        )
+        result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
+        assert result == []
+        assert mock_get.call_count == 1
 
 
 # ─── seller_scan matching ─────────────────────────────────────────────────────
