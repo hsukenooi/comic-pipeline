@@ -21,12 +21,17 @@ import fmv_runner
 @click.option("--force", is_flag=True,
               help="Bypass both the SerpApi response cache and the DB FMV cache; "
                    "recompute everything.")
+@click.option("--grade-window", "grade_window", type=float, default=None,
+              help="Max grade-window the comp pool may widen to (e.g. 2.5). "
+                   "Default 2.0. Only changes how far widening reaches — it does "
+                   "NOT bypass the one-sided/spread guards (a guarded book stays "
+                   "flagged for manual pricing).")
 @click.option("--quiet", is_flag=True, help="Suppress the human table on stdout.")
 @click.option("--server-url", envvar="GIXEN_SERVER_URL", default=None,
               help="Gixen server URL (also reads GIXEN_SERVER_URL).")
 def cli(batch_path: str | None, out_path: str | None,
-        max_age_days: float, force: bool, quiet: bool,
-        server_url: str | None) -> None:
+        max_age_days: float, force: bool, grade_window: float | None,
+        quiet: bool, server_url: str | None) -> None:
     """Compute fair market value for a batch of comics.
 
     Pipeline per book:
@@ -51,6 +56,7 @@ def cli(batch_path: str | None, out_path: str | None,
         out_path=out_path,
         max_age_days=max_age_days,
         force=force,
+        grade_window=grade_window,
         quiet=quiet,
         server_url=server_url,
     )

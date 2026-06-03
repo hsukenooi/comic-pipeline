@@ -63,8 +63,13 @@ def _coerce_grade(value) -> float | None:
 
 def run(*, batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool,
-        quiet: bool, server_url: str | None) -> None:
-    """Driver for `comic-fmv`. Exits with sys.exit on hard failures."""
+        quiet: bool, server_url: str | None,
+        grade_window: float | None = None) -> None:
+    """Driver for `comic-fmv`. Exits with sys.exit on hard failures.
+
+    `grade_window` (BUI-86) caps how far the comp pool may widen; None uses
+    fmv_math's default ceiling. It does not bypass the priceability guards.
+    """
     if not server_url:
         click.echo("Error: GIXEN_SERVER_URL must be set. The fmv command "
                    "needs the server for cache reuse and DB upsert.", err=True)
@@ -97,7 +102,7 @@ def run(*, batch_path: str | None, out_path: str | None,
             break
         idx = needs_indices[ordinal]
         fresh_fmvs[idx] = _compute_and_upsert_one(
-            result, books[idx], server_url=server_url,
+            result, books[idx], server_url=server_url, grade_window=grade_window,
         )
 
     # 4. Stitch cached + fresh in input order
@@ -217,7 +222,8 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
 # ─── Step 3 — Math + DB upsert ────────────────────────────────────────────────
 
 def _compute_and_upsert_one(result: dict, original_book: dict, *,
-                            server_url: str) -> dict:
+                            server_url: str,
+                            grade_window: float | None = None) -> dict:
     """Run FMV math + DB upsert for a single book. Returns the assembled result."""
     inp = result.get("input") or {}
     overrides = {k: v for k, v in original_book.items()
@@ -259,10 +265,10 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # BUI-51: grade_confidence (photo-coverage confidence from /comic:grade)
     # rides the batch envelope and haircuts the bid cap when low. Absent → no
     # haircut (back-compat for manual / already-graded books).
-    fmv = fmv_math.compute_fmv(
-        comps, target_grade=target_grade,
-        grade_confidence=inp.get("grade_confidence"),
-    )
+    compute_kwargs = {"grade_confidence": inp.get("grade_confidence")}
+    if grade_window is not None:
+        compute_kwargs["max_window"] = grade_window
+    fmv = fmv_math.compute_fmv(comps, target_grade=target_grade, **compute_kwargs)
     # BUI-44: upsert unconditionally — even with n=0 comps (fmv_low/high None),
     # so the comics row + a stub fmv row are written and comic_id is returned.
     # This lets snipe-add thread --comic-id and verify report no_fmv_at_grade

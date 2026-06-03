@@ -173,6 +173,36 @@ class TestComputeOne:
         body = upsert_mock.call_args.args[1]
         assert body.get("locg_id") == 100
 
+    def test_grade_window_threads_through_without_bypassing_guard(self, server_url):
+        """BUI-86 AE4: --grade-window raises the ceiling but a one-sided book
+        stays flagged — the flag is never manufactured into a price."""
+        comps = [_make_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        result = {
+            "input": {"title": "FF", "issue": "63", "year": 1967, "grade": 9.6},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "FF", "issue": "63", "grade": 9.6},
+                server_url=server_url, grade_window=2.5)
+        assert out["fmv"]["flag_reason"] == "one_sided"
+        assert out["fmv"]["max_bid"] is None
+
+    def test_lower_grade_window_caps_reach(self, server_url):
+        """A tightened ceiling can't widen far enough → flags too_sparse for a
+        book that would otherwise have widened to gather a pool."""
+        comps = [_make_comp(100, 7.0), _make_comp(110, 8.0), _make_comp(120, 8.0)]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 7.0},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 7.0},
+                server_url=server_url, grade_window=0.5)
+        assert out["fmv"]["window"] == 0.5
+        assert out["fmv"]["flag_reason"] == "too_sparse"
+
     def test_grade_confidence_threads_into_haircut(self, server_url):
         """BUI-51: grade_confidence on the batch envelope must reach compute_fmv
         and haircut the bid, and the upsert notes must surface it."""
