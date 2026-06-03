@@ -333,6 +333,91 @@ def test_bids_fmv_id_migration_is_idempotent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# seller_grade / photo_grade column migration (BUI-78)
+# ---------------------------------------------------------------------------
+
+
+def test_bids_grade_columns_present_on_fresh_db(tmp_path):
+    conn = init_db(tmp_path / "fresh.db")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "seller_grade" in cols
+    assert "photo_grade" in cols
+    conn.close()
+
+
+def test_bids_grade_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem_grades.db"
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "seller_grade" in cols
+    assert "photo_grade" in cols
+    conn2.close()
+
+
+def test_grade_columns_survive_bids_rebuild(tmp_path):
+    """BUI-78: seller_grade/photo_grade must be in _BIDS_TABLE_SQL so the
+    FK-removal rebuild preserves them (and their data). A legacy DB carrying the
+    comics FK forces the rebuild; the columns already exist with data, so the
+    rebuild's `INSERT INTO bids (...cols...)` raises 'no such column' unless the
+    rebuilt schema declares them."""
+    legacy_db_path = tmp_path / "legacy_grades.db"
+    raw = sqlite3.connect(str(legacy_db_path))
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript("""
+        CREATE TABLE comics (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, issue TEXT NOT NULL,
+            year INTEGER NOT NULL, grade REAL
+        );
+        CREATE TABLE bids (
+            id INTEGER PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            comic_id INTEGER REFERENCES comics(id),
+            max_bid REAL NOT NULL,
+            bid_offset INTEGER DEFAULT 6,
+            snipe_group INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'PENDING',
+            winning_bid REAL,
+            seller TEXT,
+            auction_end_at TEXT,
+            local_snipe_at TEXT,
+            local_snipe_result TEXT,
+            notes TEXT,
+            added_at TEXT DEFAULT (datetime('now')),
+            resolved_at TEXT,
+            ebay_title TEXT,
+            status_mirror TEXT,
+            cached_current_bid TEXT,
+            cached_at TEXT,
+            fmv_id INTEGER,
+            seller_grade REAL,
+            photo_grade REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+    """)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, comic_id, seller_grade, photo_grade) "
+        "VALUES ('legacy_grade001', 50.0, NULL, 9.0, 7.0)"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = init_db(legacy_db_path)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+        assert "seller_grade" in cols
+        assert "photo_grade" in cols
+        row = conn.execute(
+            "SELECT seller_grade, photo_grade FROM bids WHERE item_id='legacy_grade001'"
+        ).fetchone()
+        assert row["seller_grade"] == 9.0
+        assert row["photo_grade"] == 7.0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # PURGED -> REMOVED status rename migration (BUI-49)
 # ---------------------------------------------------------------------------
 

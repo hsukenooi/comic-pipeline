@@ -42,6 +42,10 @@ _COLUMN_MIGRATIONS = [
     # Plain INTEGER (no FK) so gixen-cli starts cleanly without the plugin.
     # The plugin reads/writes this column when present.
     "ALTER TABLE bids ADD COLUMN fmv_id INTEGER",
+    # BUI-78: seller-stated and photo-assessed grades per snipe, for seller
+    # reliability analytics. Both nullable CGC floats; written by the buy flow.
+    "ALTER TABLE bids ADD COLUMN seller_grade REAL",
+    "ALTER TABLE bids ADD COLUMN photo_grade REAL",
 ]
 
 
@@ -69,7 +73,9 @@ _BIDS_TABLE_SQL = """
         status_mirror       TEXT,
         cached_current_bid  TEXT,
         cached_at           TEXT,
-        fmv_id              INTEGER
+        fmv_id              INTEGER,
+        seller_grade        REAL,
+        photo_grade         REAL
     )
 """
 
