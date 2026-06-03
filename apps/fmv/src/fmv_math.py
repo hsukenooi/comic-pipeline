@@ -27,11 +27,6 @@ MIN_NARROW_POOL = 5          # widen-stop target: keep widening until this many 
 MIN_PRICEABLE_POOL = 2       # sparse-flag floor: fewer trimmed comps → flag too_sparse
 MAX_GRADE_SPAN = 2.0         # too-wide guard: pool grade-span above this → flag
 
-# Flag reasons for the needs_manual state (BUI-86). None == priceable / no-comps.
-FLAG_ONE_SIDED = "one_sided"
-FLAG_TOO_WIDE = "too_wide"
-FLAG_TOO_SPARSE = "too_sparse"
-
 
 def build_pool(comps: Iterable[dict], target_grade: float,
                max_window: float = MAX_GRADE_WINDOW) -> tuple[list[dict], float]:
@@ -63,6 +58,7 @@ def _classify_pool(pool: list[dict], target_grade: float,
                    trimmed_n: int) -> tuple[str | None, float | None]:
     """Return (flag_reason, grade_span) for a widened pool (BUI-86).
 
+    flag_reason is one of "one_sided" / "too_wide" / "too_sparse" or None.
     one_sided / too_wide are evaluated on the untrimmed grade-bearing pool (grade
     coverage is a property of the comps we found, not of price-outlier trimming);
     too_sparse is evaluated on the post-IQR-trim count. Precedence when more than
@@ -72,15 +68,14 @@ def _classify_pool(pool: list[dict], target_grade: float,
     grades = [c["grade"] for c in pool if c.get("grade") is not None]
     if not grades:
         return None, None
-    grade_span = max(grades) - min(grades)
+    lo, hi = min(grades), max(grades)
+    grade_span = hi - lo
     if 0 < trimmed_n < MIN_PRICEABLE_POOL:
-        return FLAG_TOO_SPARSE, grade_span
-    bracketed = any(g <= target_grade for g in grades) and \
-        any(g >= target_grade for g in grades)
-    if not bracketed:
-        return FLAG_ONE_SIDED, grade_span
+        return "too_sparse", grade_span
+    if not (lo <= target_grade <= hi):       # not bracketed → one-sided
+        return "one_sided", grade_span
     if grade_span > MAX_GRADE_SPAN:
-        return FLAG_TOO_WIDE, grade_span
+        return "too_wide", grade_span
     return None, grade_span
 
 
@@ -211,7 +206,7 @@ def clean_round(value: float) -> int:
 
 def compute_fmv(comps: list[dict], target_grade: float,
                 grade_confidence: str | None = None,
-                max_window: float = MAX_GRADE_WINDOW) -> dict:
+                max_window: float | None = None) -> dict:
     """Take a deduped, hard-excluded comp list and return the FMV summary.
 
     `grade_confidence` (BUI-51) is the photo-coverage confidence from
@@ -246,6 +241,8 @@ def compute_fmv(comps: list[dict], target_grade: float,
     fmv_confidence stays `low`. Priceability is derived downstream from
     `flag_reason is not None` — there is no separate `priceable` field.
     """
+    if max_window is None:
+        max_window = MAX_GRADE_WINDOW
     pool, window = build_pool(comps, target_grade, max_window=max_window)
     trimmed = iqr_trim([c["price"] for c in pool])
     n = len(trimmed)
@@ -255,7 +252,7 @@ def compute_fmv(comps: list[dict], target_grade: float,
     label = confidence_label(n, cv_val)
     if flag_reason is not None:
         label = "LOW"  # a needs_manual book never claims priceable confidence
-    elif window > WIDE_GRADE_WINDOW and _CONF_RANK.get(label, 2) > _CONF_RANK["MEDIUM"]:
+    elif window > WIDE_GRADE_WINDOW and _rank(label) > _CONF_RANK["MEDIUM"]:
         label = "MEDIUM"  # wide-window pools can't claim HIGH/MEDIUM-HIGH (BUI-86 R7)
     factor = bid_factor(label, grade_confidence)
 

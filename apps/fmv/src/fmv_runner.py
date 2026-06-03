@@ -265,10 +265,13 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # BUI-51: grade_confidence (photo-coverage confidence from /comic:grade)
     # rides the batch envelope and haircuts the bid cap when low. Absent → no
     # haircut (back-compat for manual / already-graded books).
-    compute_kwargs = {"grade_confidence": inp.get("grade_confidence")}
-    if grade_window is not None:
-        compute_kwargs["max_window"] = grade_window
-    fmv = fmv_math.compute_fmv(comps, target_grade=target_grade, **compute_kwargs)
+    # grade_window is None when --grade-window is omitted; compute_fmv treats
+    # None as "use the default ceiling", so it threads straight through.
+    fmv = fmv_math.compute_fmv(
+        comps, target_grade=target_grade,
+        grade_confidence=inp.get("grade_confidence"),
+        max_window=grade_window,
+    )
     # BUI-44: upsert unconditionally — even with n=0 comps (fmv_low/high None),
     # so the comics row + a stub fmv row are written and comic_id is returned.
     # This lets snipe-add thread --comic-id and verify report no_fmv_at_grade
