@@ -396,16 +396,45 @@ def insert_bid(
     bid_offset: int,
     snipe_group: int,
     seller: str | None,
+    seller_grade: float | None = None,
+    photo_grade: float | None = None,
 ) -> int:
+    # seller_grade/photo_grade are trailing defaults (BUI-78) so existing
+    # positional callers (e.g. _sync_gixen) keep working unchanged.
     cur = conn.execute(
         """
-        INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller,
+                          seller_grade, photo_grade)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (item_id, max_bid, bid_offset, snipe_group, seller),
+        (item_id, max_bid, bid_offset, snipe_group, seller, seller_grade, photo_grade),
     )
     conn.commit()
     return cur.lastrowid
+
+
+def update_bid_grades(
+    conn: sqlite3.Connection,
+    item_id: str,
+    seller: str | None = None,
+    seller_grade: float | None = None,
+    photo_grade: float | None = None,
+) -> None:
+    """Fill NULL seller/grade columns on the live (PENDING) row without
+    overwriting already-set values (BUI-78 C2). COALESCE(<col>, ?) keeps the
+    existing value when non-NULL, so a re-add completes an incomplete insert
+    rather than editing grades. No-op when all inputs are None."""
+    if seller is None and seller_grade is None and photo_grade is None:
+        return
+    conn.execute(
+        "UPDATE bids SET "
+        "seller=COALESCE(seller, ?), "
+        "seller_grade=COALESCE(seller_grade, ?), "
+        "photo_grade=COALESCE(photo_grade, ?) "
+        "WHERE item_id=? AND status='PENDING'",
+        (seller, seller_grade, photo_grade, item_id),
+    )
+    conn.commit()
 
 
 def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
@@ -489,10 +518,16 @@ def cache_gixen_data(
     if not has_data:
         return  # nothing to write, don't bump cached_at
     now = datetime.now(timezone.utc).isoformat()
+    # BUI-78 A1: seller uses COALESCE(seller, ?) — keep an already-set seller
+    # rather than overwriting it. The buy flow writes the canonical lowercased
+    # eBay username at INSERT; Gixen's scrape returns the store display name, so
+    # without this guard the sync would clobber the username and split a seller's
+    # grade history. Seller-per-item is immutable, so never overwriting is safe;
+    # a row that started NULL (web-added snipe) still gets filled.
     conn.execute(
         "UPDATE bids SET "
         "ebay_title=COALESCE(?, ebay_title), "
-        "seller=COALESCE(?, seller), "
+        "seller=COALESCE(seller, ?), "
         "cached_current_bid=COALESCE(?, cached_current_bid), "
         "cached_at=? "
         "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",

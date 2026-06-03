@@ -417,6 +417,61 @@ def test_grade_columns_survive_bids_rebuild(tmp_path):
         conn.close()
 
 
+def test_insert_bid_persists_grades(db):
+    """BUI-78: insert_bid stores seller_grade/photo_grade when supplied."""
+    insert_bid(db, "700000001", 50.0, 6, 0, "someseller",
+               seller_grade=9.0, photo_grade=7.5)
+    row = get_bid_by_item_id(db, "700000001")
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 7.5
+
+
+def test_insert_bid_grades_default_null(db):
+    """Backward-compat: the existing positional call (no grades) stores NULL."""
+    insert_bid(db, "700000002", 50.0, 6, 0, "someseller")
+    row = get_bid_by_item_id(db, "700000002")
+    assert row["seller_grade"] is None
+    assert row["photo_grade"] is None
+
+
+def test_update_bid_grades_fills_only_nulls(db):
+    """BUI-78 (C2): update_bid_grades fills NULL grade/seller columns but never
+    overwrites already-set values — completing an incomplete insert, not editing."""
+    from server.db import update_bid_grades
+    # Row added without grades (seller present).
+    insert_bid(db, "700000003", 50.0, 6, 0, "buyer")
+    update_bid_grades(db, "700000003", seller=None, seller_grade=9.0, photo_grade=6.5)
+    row = get_bid_by_item_id(db, "700000003")
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 6.5
+    # A second call with different values must NOT overwrite the set grades.
+    update_bid_grades(db, "700000003", seller=None, seller_grade=2.0, photo_grade=1.0)
+    row = get_bid_by_item_id(db, "700000003")
+    assert row["seller_grade"] == 9.0
+    assert row["photo_grade"] == 6.5
+
+
+def test_cache_gixen_data_does_not_overwrite_existing_seller(db):
+    """BUI-78 (A1): a sync must not overwrite an INSERT-time seller username
+    with Gixen's scraped store display name."""
+    from server.db import cache_gixen_data
+    insert_bid(db, "700000004", 50.0, 6, 0, "beatlebluecat")
+    cache_gixen_data(db, "700000004", "Some Title", "Beatle Blue Cat Collectibles", "10.00 USD")
+    db.commit()
+    row = get_bid_by_item_id(db, "700000004")
+    assert row["seller"] == "beatlebluecat"  # INSERT value wins
+
+
+def test_cache_gixen_data_fills_null_seller(db):
+    """A1 must still let sync populate seller when it started NULL (web-added)."""
+    from server.db import cache_gixen_data
+    insert_bid(db, "700000005", 50.0, 6, 0, None)
+    cache_gixen_data(db, "700000005", "T", "scraped_seller", "1.00 USD")
+    db.commit()
+    row = get_bid_by_item_id(db, "700000005")
+    assert row["seller"] == "scraped_seller"
+
+
 # ---------------------------------------------------------------------------
 # PURGED -> REMOVED status rename migration (BUI-49)
 # ---------------------------------------------------------------------------

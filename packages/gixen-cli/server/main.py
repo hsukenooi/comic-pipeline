@@ -29,7 +29,8 @@ from gixen.plugins import (
     _collect_dashboard_tabs,
 )
 from server.db import (
-    DB_PATH, init_db, insert_bid, get_bid_by_item_id, get_pending_bid_by_item_id,
+    DB_PATH, init_db, insert_bid, update_bid_grades, get_bid_by_item_id,
+    get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     mark_bids_purged, cache_gixen_data, DEDUP_TOMBSTONE_NOTE,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
@@ -687,6 +688,10 @@ class AddBidRequest(BaseModel):
     max_bid: float
     bid_offset: int = 6
     snipe_group: int = 0
+    # BUI-78: optional seller + grades captured by the buy flow at add time.
+    seller: str | None = None
+    seller_grade: float | None = None
+    photo_grade: float | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -787,6 +792,8 @@ def api_dashboard_tabs(request: Request) -> list[dict]:
 async def _modify_and_update_bid(
     db: sqlite3.Connection, item_id: str, max_bid: float,
     bid_offset: int, snipe_group: int,
+    seller: str | None = None, seller_grade: float | None = None,
+    photo_grade: float | None = None,
 ) -> sqlite3.Row:
     """Gixen modify_snipe (off-thread) + local update_bid. Re-raises
     GixenSnipeNotFoundError so the caller owns the not-found *policy* (add falls
@@ -799,12 +806,18 @@ async def _modify_and_update_bid(
         bid_offset=bid_offset, snipe_group=snipe_group,
     )
     update_bid(db, item_id, max_bid, bid_offset, snipe_group)
+    # BUI-78 C2: fill any NULL seller/grade columns from this request without
+    # overwriting values a prior add already set.
+    update_bid_grades(db, item_id, seller=seller, seller_grade=seller_grade,
+                      photo_grade=photo_grade)
     return get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
 
 
 async def _add_bid_row(
     db: sqlite3.Connection, item_id: str, max_bid: float,
     bid_offset: int, snipe_group: int,
+    seller: str | None = None, seller_grade: float | None = None,
+    photo_grade: float | None = None,
 ) -> tuple[sqlite3.Row, bool]:
     """Gixen add_snipe (off-thread) + insert_bid; returns (row, created=True).
 
@@ -821,12 +834,16 @@ async def _add_bid_row(
     try:
         bid_id = insert_bid(
             db, item_id=item_id, max_bid=max_bid,
-            bid_offset=bid_offset, snipe_group=snipe_group, seller=None,
+            bid_offset=bid_offset, snipe_group=snipe_group, seller=seller,
+            seller_grade=seller_grade, photo_grade=photo_grade,
         )
         return db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone(), True
     except sqlite3.IntegrityError:
         db.rollback()
         update_bid(db, item_id, max_bid, bid_offset, snipe_group)
+        # BUI-78 C2: a racing sync insert won the row; still fill its NULL grades.
+        update_bid_grades(db, item_id, seller=seller, seller_grade=seller_grade,
+                          photo_grade=photo_grade)
         row = get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
         return row, False
 
@@ -834,6 +851,9 @@ async def _add_bid_row(
 @app.post("/api/bids")
 async def api_add_bid(req: AddBidRequest):
     db = _get_db()
+    # BUI-78 A1: store the canonical lowercased eBay username so the write key
+    # matches the advisory lookup key (which also lowercases).
+    seller = req.seller.lower() if req.seller else None
     try:
         # Lookup + Gixen call + DB write all under _api_lock so the add/modify
         # decision is atomic against other request handlers (BUI-67 KTD6). The
@@ -846,7 +866,9 @@ async def api_add_bid(req: AddBidRequest):
                 # an already-sniped item (code 202), so modify, not add.
                 try:
                     row = await _modify_and_update_bid(
-                        db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group
+                        db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                        seller=seller, seller_grade=req.seller_grade,
+                        photo_grade=req.photo_grade,
                     )
                     return {**dict(row), "created": False}
                 except GixenSnipeNotFoundError:
@@ -855,14 +877,18 @@ async def api_add_bid(req: AddBidRequest):
                     # existing row visible rather than a bare 503 that hides it.
                     try:
                         row, created = await _add_bid_row(
-                            db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group
+                            db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                            seller=seller, seller_grade=req.seller_grade,
+                            photo_grade=req.photo_grade,
                         )
                         return {**dict(row), "created": created}
                     except GixenAddNotConfirmedError:
                         return {**dict(existing), "created": False, "applied": False}
 
             row, created = await _add_bid_row(
-                db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group
+                db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                seller=seller, seller_grade=req.seller_grade,
+                photo_grade=req.photo_grade,
             )
             return {**dict(row), "created": created}
     except GixenError as e:
