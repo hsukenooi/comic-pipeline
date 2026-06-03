@@ -97,17 +97,17 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 
 **Escalate the single-grader result to a full 3-grader panel when ANY of these hold:**
 1. **Value:** `current_price ≥ VALUE_THRESHOLD` (or the listing is a known key regardless of current bid).
-2. **Boundary-ambiguous grade:** the grade is within `CAP_BAND` of a grade-capping threshold, OR the grader flagged the grade as uncertain / gave a wide GRADE RANGE (≥1.5 pts), OR a possible-restoration flag fired.
+2. **Boundary-ambiguous grade:** the grader identified a grade-capping defect (`GRADE CAP` ≠ none) and the grade sits within `CAP_BAND` of that ceiling — or is unsure whether a capping defect is present — OR a possible-restoration flag fired, OR the grader gave a wide GRADE RANGE (≥1.5 pts) **at MEDIUM confidence or higher**. (Proximity to a round grade with `GRADE CAP: none` is **not** a near-cap trigger — the cap must be an observed/suspected *defect*, not a number.) A wide range only escalates when it signals disagreement over *visible* evidence that more graders can resolve. A wide range at MEDIUM-LOW/LOW confidence is **coverage-driven** — the photos can't show the deciding surfaces (spine stress, interior, page edge), so adding graders cannot narrow it; it does **not** escalate on its own. (Near-cap and restoration still escalate regardless of coverage, since a second look can confirm a *visible* capping defect.)
 3. **Decision-relevant:** a half-grade swing would plausibly cross the buy/no-buy line the user cares about (if known at grade time).
 
-**Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, the grade is unambiguous, and no cap/restoration flag fired. Unknown `current_price` counts as below-threshold.
+**Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, no cap/restoration flag fired, and any wide range is coverage-driven (MEDIUM-LOW/LOW confidence). Unknown `current_price` counts as below-threshold. Note the common case: a cheap 2-cover-photo lot draws a wide range *because* coverage is thin — that is the expected MEDIUM-LOW output, not an escalation signal. Escalating it would burn 3 graders on photos that structurally can't resolve the spread (the failure mode that negates the value gate on a typical thin-photo seller scan).
 
 **Dispatch mechanics:**
 - Run the **first** grader for every comic in one parallel batch (N comics = N parallel calls).
 - Then, for the comics that tripped a gate, dispatch the **remaining 2** graders — again all in one parallel batch. (Two batches total, not one-at-a-time.)
 - The grader prompt and criteria are identical across batches so the 3 panel grades stay independent and comparable.
 
-**Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. The user must be able to see where rigor was and wasn't spent.
+**Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, range wide but coverage-driven at MEDIUM-LOW)` or `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. The user must be able to see where rigor was and wasn't spent.
 
 ### Grader Prompt Template
 
@@ -375,6 +375,7 @@ Always note these. Do not claim CGC accuracy.
 | Giving all 3 agents the same agent name | Use distinct names (e.g., `grader-c1-a`, `grader-c1-b`) so results are traceable |
 | Running graders sequentially | Within a batch, dispatch in a single message for independence — batch 1 = one first-grader per comic; batch 2 = the extra 2 graders for comics that tripped the value gate |
 | Fanning out 3 graders for every comic | Value-gate it (Step 2): 1 grader first, escalate to 3 only on value ≥ threshold or an ambiguous/near-cap grade. State the grader count + reason per comic |
+| Escalating every 2-photo lot because its range is wide | A wide range at MEDIUM-LOW/LOW confidence is coverage-driven — more graders can't see the missing views, so it does NOT escalate (Step 2 trigger 2). Only escalate on a wide range at MEDIUM+ confidence, a near-cap grade, restoration, or value |
 | Including related-listing images | Extract carousel IDs from the `ux-image-carousel-container` section only |
 | Inflating grade because it's a key issue | Grade physical condition only — key issue premium belongs in FMV, not grade |
 | Capping the grade over a printed credit/signature | Printed credits, facsimile signatures, barcodes, and price boxes are in the print layer — never defects (PRINT-LAYER RULE). Only a post-print autograph caps. When unsure, do NOT cap |
