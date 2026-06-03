@@ -516,6 +516,16 @@ class TestFlaggedPresentation:
         notes = fmv_runner._build_notes(fmv)
         assert "manual_review" not in notes
 
+    def test_build_notes_no_bid_haircut_on_flagged_book(self):
+        # A flagged book's forced-LOW label yields factor 0.60, but it has no
+        # max bid — the bid_haircut token would be misleading, so it's suppressed.
+        fmv = {"window": 2.0, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": "too_wide", "grade_span": 4.0, "bid_factor": 0.60,
+               "grade_confidence": None}
+        notes = fmv_runner._build_notes(fmv)
+        assert "manual_review=too_wide" in notes
+        assert "bid_haircut" not in notes
+
     def test_print_table_distinguishes_three_states(self, capsys):
         rows = [
             {"input": {"title": "Priced", "issue": "1", "grade": 8.0},

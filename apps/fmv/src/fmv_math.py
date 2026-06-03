@@ -46,10 +46,12 @@ def build_pool(comps: Iterable[dict], target_grade: float,
                 if c.get("grade") is not None
                 and abs(c["grade"] - target_grade) <= window]
 
-    window = DEFAULT_GRADE_WINDOW
+    # Honor max_window exactly: start no wider than the ceiling, and never step
+    # past it (a non-0.5-aligned ceiling like 1.3 must cap at ±1.3, not ±1.5).
+    window = min(DEFAULT_GRADE_WINDOW, max_window)
     pool = within(window)
     while len(pool) < MIN_NARROW_POOL and window < max_window:
-        window = round(window + GRADE_WINDOW_STEP, 4)
+        window = round(min(window + GRADE_WINDOW_STEP, max_window), 4)
         pool = within(window)
     return pool, window
 

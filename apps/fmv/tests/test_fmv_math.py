@@ -51,6 +51,20 @@ class TestBuildPool:
         _, window = fm.build_pool(comps, target_grade=7.0, max_window=0.5)
         assert window == 0.5
 
+    def test_non_step_aligned_ceiling_not_overshot(self):
+        # max_window=1.3 must cap at ±1.3, never step to ±1.5 and pull in a 1.4-away comp
+        comps = [_comp(10, 7.0)] + [_comp(20 + i, 5.6) for i in range(6)]  # 5.6 is 1.4 away
+        pool, window = fm.build_pool(comps, target_grade=7.0, max_window=1.3)
+        assert window == 1.3
+        assert all(c["grade"] != 5.6 for c in pool)  # 1.4-away comp excluded
+
+    def test_sub_default_ceiling_respected(self):
+        # max_window below ±0.5 must not silently widen to ±0.5
+        comps = [_comp(10, 7.0), _comp(11, 7.4)]  # 7.4 is 0.4 away
+        pool, window = fm.build_pool(comps, target_grade=7.0, max_window=0.3)
+        assert window == 0.3
+        assert all(c["grade"] != 7.4 for c in pool)
+
     def test_returns_comp_dicts(self):
         comps = [_comp(10, 9.2)]
         pool, _ = fm.build_pool(comps, target_grade=9.2)

@@ -351,9 +351,11 @@ def _build_notes(fmv: dict) -> str:
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")
-    # BUI-51: surface the bid haircut so the lowered max bid is explained.
+    # BUI-51: surface the bid haircut so the lowered max bid is explained. Skip
+    # it for a flagged book — it has no max bid, so a haircut token would be
+    # misleading (its LOW label is forced by the flag, not a real haircut).
     factor = fmv.get("bid_factor")
-    if factor is not None and factor < fmv_math.BASE_BID_FACTOR:
+    if not flag and factor is not None and factor < fmv_math.BASE_BID_FACTOR:
         parts.append(
             f"bid_haircut={factor:.2f} (grade_conf={fmv.get('grade_confidence')})"
         )
