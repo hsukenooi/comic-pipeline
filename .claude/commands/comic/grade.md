@@ -87,6 +87,30 @@ Output directory layout:
 
 No `listing.html` is produced. In the grader prompt, note "no seller description available" unless the seller's grade is known from the listing title (retrieved by `ebay_fetch.py`).
 
+## Step 1.5: Triage Pre-Pass (optional — for raw scans)
+
+Before fanning out any grader, kill the no-hopers. Grading is the expensive step; spending it on a book that is un-gradeable, mis-listed, or an obvious beater the user would never buy is pure waste. **Use this step when grading a raw, uncurated seller scan** (many listings, unknown quality). **Skip it** for a short, already-curated list (user-supplied URLs, confirmed wish-list matches) — the pre-pass costs more than it saves there.
+
+Run **one** cheap agent over the whole candidate list (title + first image + photo count per listing — not a full grade) that sorts each into **KEEP / DROP / FLAG**:
+
+- **DROP** (no grading) — only the *unambiguous* no-hopers:
+  - **Un-gradeable photos:** 0–1 usable images, or all images blurry / obstructed / not the comic.
+  - **Confirmed non-match:** the listing is plainly not the wish-listed book (wrong series/issue/title) — i.e. it should not have been in the scan.
+- **FLAG** (grade only if the user confirms) — a **suspected obvious beater** (visible heavy damage — large missing piece, detached/ split cover, water damage). There is **no FMV floor at grade time**, so do NOT auto-kill on condition; surface it and let the user decide.
+- **KEEP** — everything else proceeds to Step 2.
+
+**Conservative default:** when unsure which bucket a listing belongs in, **KEEP it** — the failure to avoid is silently dropping a book the user wanted (mirrors the no-cap-when-ambiguous principle elsewhere in this skill).
+
+**No silent drops:** output a triage table — every candidate with its bucket and a one-line reason — so the user sees exactly what was skipped and why before any grading runs.
+
+```
+| Item ID | Title | Photos | Triage | Reason |
+|---------|-------|--------|--------|--------|
+| 1780... | FF #48 (1966) | 2 | KEEP | gradeable, on wish list |
+| 1781... | (blurry) | 1 | DROP | single blurry photo — un-gradeable |
+| 1782... | Hulk #1 (beater) | 4 | FLAG | large back-cover chunk missing — confirm before grading |
+```
+
 ## Step 2: Dispatch Grader Agents (value-gated)
 
 Don't fan out 3 graders for every comic — most listings in a seller scan are cheap, and 3-per-comic burns agents where 1 will do. **Run 1 grader first, then escalate to a 3-grader panel only when the comic earns it.** Use the `general-purpose` subagent type; the grader prompt template below is identical whether you run 1 or 3.
@@ -381,6 +405,7 @@ Always note these. Do not claim CGC accuracy.
 | Batching a near-cap or escalation-bound book with the cheap group | Grade it on its own — a book heading for a 3-grader panel needs an independent grader A, not a shared batched context |
 | Fanning out 3 graders for every comic | Value-gate it (Step 2): 1 grader first, escalate to 3 only on value ≥ threshold or an ambiguous/near-cap grade. State the grader count + reason per comic |
 | Escalating every 2-photo lot because its range is wide | A wide range at MEDIUM-LOW/LOW confidence is coverage-driven — more graders can't see the missing views, so it does NOT escalate (Step 2 trigger 2). Only escalate on a wide range at MEDIUM+ confidence, a near-cap grade, restoration, or value |
+| Auto-dropping a book in triage because it looks like a beater | Condition is not a triage kill — there's no FMV floor at grade time. FLAG suspected beaters for the user; only DROP un-gradeable photos or confirmed non-matches (Step 1.5). When unsure, KEEP |
 | Including related-listing images | Extract carousel IDs from the `ux-image-carousel-container` section only |
 | Inflating grade because it's a key issue | Grade physical condition only — key issue premium belongs in FMV, not grade |
 | Capping the grade over a printed credit/signature | Printed credits, facsimile signatures, barcodes, and price boxes are in the print layer — never defects (PRINT-LAYER RULE). Only a post-print autograph caps. When unsure, do NOT cap |
