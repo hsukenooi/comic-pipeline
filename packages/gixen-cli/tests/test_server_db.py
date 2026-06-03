@@ -646,3 +646,170 @@ def test_dedup_creates_index_when_no_duplicates(tmp_path):
         assert "idx_bids_pending_item_id" in idx
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# BUI-79: bid_fmvs FK survives / is repaired across the bids rename
+# ---------------------------------------------------------------------------
+
+# Current bids schema (REMOVED already in the CHECK) so the broken state can be
+# reproduced faithfully without tripping the status-rename rebuild.
+_CURRENT_BIDS_SQL = """
+    CREATE TABLE bids (
+        id              INTEGER PRIMARY KEY,
+        item_id         TEXT NOT NULL,
+        comic_id        INTEGER,
+        max_bid         REAL NOT NULL,
+        bid_offset      INTEGER DEFAULT 6,
+        snipe_group     INTEGER DEFAULT 0,
+        status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED','REMOVED')),
+        winning_bid     REAL,
+        seller          TEXT,
+        auction_end_at      TEXT,
+        local_snipe_at      TEXT,
+        local_snipe_result  TEXT,
+        notes               TEXT,
+        added_at            TEXT DEFAULT (datetime('now')),
+        resolved_at         TEXT,
+        ebay_title          TEXT,
+        status_mirror       TEXT,
+        cached_current_bid  TEXT,
+        cached_at           TEXT,
+        fmv_id              INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+"""
+
+# Overlay-owned tables (gixen-overlay/db.py) sharing the DB. bid_fmvs.bid_id
+# REFERENCES bids(id) is the FK BUI-79 is about.
+_OVERLAY_TABLES_SQL = """
+    CREATE TABLE comics (
+        id INTEGER PRIMARY KEY, title TEXT NOT NULL, issue TEXT NOT NULL, year INTEGER
+    );
+    CREATE TABLE fmv (
+        id INTEGER PRIMARY KEY,
+        comic_id INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+        grade REAL NOT NULL
+    );
+    CREATE TABLE bid_fmvs (
+        bid_id      INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+        fmv_id      INTEGER NOT NULL REFERENCES fmv(id) ON DELETE CASCADE,
+        is_primary  INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bid_id, fmv_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id);
+"""
+
+
+def _seed_overlay_rows(raw):
+    raw.execute("INSERT INTO bids (id, item_id, max_bid, status) VALUES (1, 'b1', 50.0, 'PENDING')")
+    raw.execute("INSERT INTO comics (id, title, issue, year) VALUES (1, 'Hulk', '181', 1974)")
+    raw.execute("INSERT INTO fmv (id, comic_id, grade) VALUES (1, 1, 6.0)")
+    raw.execute("INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (1, 1, 1)")
+
+
+def _seed_broken_bid_fmvs_db(path):
+    """A DB already broken by a pre-fix bids rename: bid_fmvs.bid_id REFERENCES a
+    dropped temp table (the exact BUI-49 -> BUI-79 breakage)."""
+    raw = sqlite3.connect(str(path))
+    raw.row_factory = sqlite3.Row
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript(_CURRENT_BIDS_SQL)     # REMOVED present -> no rebuild fires
+    raw.executescript(_OVERLAY_TABLES_SQL)
+    _seed_overlay_rows(raw)
+    raw.commit()
+    # SQLite 3.26+ rewrites bid_fmvs.bid_id -> REFERENCES bids_status_rename_old
+    # on the rename; dropping that temp table leaves the FK dangling.
+    raw.execute("PRAGMA foreign_keys=OFF")
+    raw.execute("ALTER TABLE bids RENAME TO bids_status_rename_old")
+    raw.executescript(_CURRENT_BIDS_SQL)
+    raw.execute("INSERT INTO bids SELECT * FROM bids_status_rename_old")
+    raw.execute("DROP TABLE bids_status_rename_old")
+    raw.commit()
+    targets = {fk["table"] for fk in raw.execute("PRAGMA foreign_key_list(bid_fmvs)")}
+    assert "bids_status_rename_old" in targets  # sanity: the FK really is broken
+    raw.close()
+
+
+def _bid_fmvs_fk_targets(conn):
+    return {fk["table"] for fk in conn.execute("PRAGMA foreign_key_list(bid_fmvs)")}
+
+
+def _assert_can_link_fmv(conn):
+    """The acceptance check: INSERT INTO bid_fmvs must succeed under enforced FKs
+    (the bug raised 'no such table: bids_status_rename_old' here)."""
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("INSERT INTO bids (id, item_id, max_bid, status) VALUES (2, 'b2', 9.0, 'PENDING')")
+    conn.execute("INSERT INTO fmv (id, comic_id, grade) VALUES (2, 1, 8.0)")
+    conn.execute("INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (2, 2, 1)")
+    conn.commit()
+
+
+def test_status_rename_preserves_bid_fmvs_fk(tmp_path):
+    """Preventive (BUI-79): the PURGED->REMOVED rebuild leaves bid_fmvs.bid_id
+    referencing bids(id), not the dropped temp table."""
+    db_path = tmp_path / "overlay_old.db"
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript(_OLD_SCHEMA_SQL)       # pre-BUI-49 bids: CHECK lacks REMOVED
+    raw.executescript(_OVERLAY_TABLES_SQL)
+    _seed_overlay_rows(raw)
+    raw.commit()
+    raw.close()
+
+    conn = init_db(db_path)
+    try:
+        assert "bids" in _bid_fmvs_fk_targets(conn)
+        assert "bids_status_rename_old" not in _bid_fmvs_fk_targets(conn)
+        assert conn.execute("SELECT COUNT(*) FROM bid_fmvs").fetchone()[0] == 1
+        _assert_can_link_fmv(conn)
+    finally:
+        conn.close()
+
+
+def test_repair_heals_dangling_bid_fmvs_fk(tmp_path):
+    """Repair (BUI-79): an already-broken DB is healed on the next init_db, with
+    bid_fmvs rows preserved."""
+    db_path = tmp_path / "broken.db"
+    _seed_broken_bid_fmvs_db(db_path)
+
+    conn = init_db(db_path)
+    try:
+        assert "bids" in _bid_fmvs_fk_targets(conn)
+        assert "bids_status_rename_old" not in _bid_fmvs_fk_targets(conn)
+        assert conn.execute("SELECT COUNT(*) FROM bid_fmvs").fetchone()[0] == 1
+        _assert_can_link_fmv(conn)
+    finally:
+        conn.close()
+
+
+def test_repair_is_idempotent(tmp_path):
+    """Re-running init_db on an already-healed DB leaves bid_fmvs untouched."""
+    db_path = tmp_path / "broken.db"
+    _seed_broken_bid_fmvs_db(db_path)
+    init_db(db_path).close()
+
+    conn2 = init_db(db_path)
+    try:
+        assert "bids" in _bid_fmvs_fk_targets(conn2)
+        assert conn2.execute("SELECT COUNT(*) FROM bid_fmvs").fetchone()[0] == 1
+    finally:
+        conn2.close()
+
+
+def test_repair_noop_without_overlay(tmp_path):
+    """gixen-cli standalone (no bid_fmvs table): the repair is a clean no-op and
+    the status rename still runs."""
+    db_path = tmp_path / "standalone.db"
+    _seed_old_db(db_path)  # pre-BUI-49 bids, no overlay tables
+
+    conn = init_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='bid_fmvs'"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT status FROM bids WHERE item_id='purged001'"
+        ).fetchone()["status"] == "REMOVED"
+    finally:
+        conn.close()

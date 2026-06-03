@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,172 @@ _COLUMN_MIGRATIONS = [
 ]
 
 
+# The full current bids schema. Both table rebuilds in _apply_migrations (FK
+# removal and the PURGED->REMOVED CHECK widen) converge on this exact shape, so
+# it lives in one place rather than being duplicated per rebuild.
+_BIDS_TABLE_SQL = """
+    CREATE TABLE bids (
+        id              INTEGER PRIMARY KEY,
+        item_id         TEXT NOT NULL,
+        comic_id        INTEGER,
+        max_bid         REAL NOT NULL,
+        bid_offset      INTEGER DEFAULT 6,
+        snipe_group     INTEGER DEFAULT 0,
+        status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED','REMOVED')),
+        winning_bid     REAL,
+        seller          TEXT,
+        auction_end_at      TEXT,
+        local_snipe_at      TEXT,
+        local_snipe_result  TEXT,
+        notes               TEXT,
+        added_at            TEXT DEFAULT (datetime('now')),
+        resolved_at         TEXT,
+        ebay_title          TEXT,
+        status_mirror       TEXT,
+        cached_current_bid  TEXT,
+        cached_at           TEXT,
+        fmv_id              INTEGER
+    )
+"""
+
+
+def _rebuild_bids_table(
+    conn: sqlite3.Connection, temp_name: str, savepoint_name: str
+) -> None:
+    """Rebuild the bids table (RENAME -> CREATE -> copy rows -> DROP) while
+    preserving the overlay's bid_fmvs FK child across the rename.
+
+    SQLite 3.26+ rewrites FK references on RENAME, so bid_fmvs.bid_id REFERENCES
+    bids(id) would silently become REFERENCES <temp_name>(id) and then dangle
+    once the temp table is dropped — every later INSERT INTO bid_fmvs then fails
+    with "no such table" (BUI-79). The fix mirrors the overlay's
+    _migrate_year_nullable: save bid_fmvs (its CREATE SQL + rows) to Python
+    memory and drop it *before* the rename, so there is no FK for SQLite to
+    rewrite, then recreate it from the saved SQL (which still references bids)
+    and restore the rows.
+
+    bid_fmvs is owned by the gixen-overlay plugin, so it is absent when
+    gixen-cli runs standalone — preserved only when present. The bids INSERT
+    copies EVERY column (introspected from the renamed table) verbatim, so no
+    column is silently dropped (the BUI-64 fmv_id-drop trap). Raw conn.execute
+    only — no CRUD helpers (they commit() and would collapse the savepoint).
+    PRAGMA foreign_keys must change outside any transaction, so it brackets the
+    SAVEPOINT.
+    """
+    conn.execute(f"DROP TABLE IF EXISTS {temp_name}")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(f"SAVEPOINT {savepoint_name}")
+    try:
+        bid_fmvs_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='bid_fmvs'"
+        ).fetchone()
+        saved_bid_fmvs = None
+        if bid_fmvs_sql_row:
+            saved_bid_fmvs = conn.execute(
+                "SELECT bid_id, fmv_id, is_primary FROM bid_fmvs"
+            ).fetchall()
+            conn.execute("DROP TABLE bid_fmvs")
+
+        conn.execute(f"ALTER TABLE bids RENAME TO {temp_name}")
+        conn.execute(_BIDS_TABLE_SQL)
+        cols = ", ".join(
+            row[1] for row in conn.execute(f"PRAGMA table_info({temp_name})")
+        )
+        conn.execute(f"INSERT INTO bids ({cols}) SELECT {cols} FROM {temp_name}")
+        conn.execute(f"DROP TABLE {temp_name}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id)")
+
+        if bid_fmvs_sql_row:
+            conn.execute(bid_fmvs_sql_row["sql"])
+            for bf in saved_bid_fmvs:
+                conn.execute(
+                    "INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary) "
+                    "VALUES (?, ?, ?)",
+                    (bf["bid_id"], bf["fmv_id"], bf["is_primary"]),
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)"
+            )
+        conn.execute(f"RELEASE {savepoint_name}")
+    except Exception:
+        try:
+            conn.execute(f"ROLLBACK TO {savepoint_name}")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _repair_bid_fmvs_fk(conn: sqlite3.Connection) -> None:
+    """Heal a bid_fmvs table whose bids FK was left dangling by a pre-fix bids
+    rename (BUI-79).
+
+    The BUI-49 PURGED->REMOVED rebuild renamed bids without preserving bid_fmvs,
+    so SQLite 3.26+ rewrote bid_fmvs.bid_id to REFERENCES the temp table; when
+    that temp table was dropped the FK pointed at a missing table and every
+    INSERT INTO bid_fmvs failed with "no such table". This rebuilds bid_fmvs
+    from its own CREATE SQL with the dangling table name rewritten back to bids,
+    preserving all rows.
+
+    No-op when bid_fmvs is absent (gixen-cli standalone) or all its FK targets
+    resolve (healthy DB), so it is safe to run on every startup. Raw
+    conn.execute only; PRAGMA foreign_keys brackets the SAVEPOINT.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bid_fmvs'"
+    ).fetchone()
+    if row is None:
+        return
+    existing = {
+        r["name"]
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    dangling = [
+        fk["table"]
+        for fk in conn.execute("PRAGMA foreign_key_list(bid_fmvs)")
+        if fk["table"] not in existing
+    ]
+    if not dangling:
+        return
+
+    fixed_sql = row["sql"]
+    for bad in dangling:
+        # Rewrite the dangling reference (SQLite quotes the rewritten name, e.g.
+        # REFERENCES "bids_status_rename_old"(id)) back to bids. Match the
+        # optionally double-quoted whole identifier so a column merely prefixed
+        # with the bad name is never touched.
+        fixed_sql = re.sub(rf'"?{re.escape(bad)}"?', "bids", fixed_sql)
+
+    saved = conn.execute(
+        "SELECT bid_id, fmv_id, is_primary FROM bid_fmvs"
+    ).fetchall()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("SAVEPOINT bui79_repair")
+    try:
+        conn.execute("DROP TABLE bid_fmvs")
+        conn.execute(fixed_sql)
+        for bf in saved:
+            conn.execute(
+                "INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary) "
+                "VALUES (?, ?, ?)",
+                (bf["bid_id"], bf["fmv_id"], bf["is_primary"]),
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)"
+        )
+        conn.execute("RELEASE bui79_repair")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK TO bui79_repair")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+    conn.commit()
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     for stmt in _COLUMN_MIGRATIONS:
         try:
@@ -56,122 +223,30 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             if "duplicate column" not in str(e).lower():
                 raise
 
+    # Heal any bid_fmvs whose bids FK was left dangling by a pre-fix bids rename
+    # (BUI-79). Must run before the rename rebuilds below, which preserve
+    # bid_fmvs by saving its CREATE SQL verbatim — repairing first ensures that
+    # saved SQL references bids, not a dropped temp table.
+    _repair_bid_fmvs_fk(conn)
+
     # Remove the FK on bids.comic_id for existing databases that were created
     # before this refactor. SQLite has no ALTER TABLE DROP CONSTRAINT, so we
     # must rebuild the table. PRAGMA foreign_keys cannot be changed inside an
     # active transaction — it must precede any BEGIN/SAVEPOINT.
     fk_rows = conn.execute("PRAGMA foreign_key_list(bids)").fetchall()
     if any(row["table"] == "comics" for row in fk_rows):
-        conn.execute("DROP TABLE IF EXISTS bids_old")
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("SAVEPOINT fk_rebuild")
-        try:
-            conn.execute("ALTER TABLE bids RENAME TO bids_old")
-            conn.execute("""
-                CREATE TABLE bids (
-                    id              INTEGER PRIMARY KEY,
-                    item_id         TEXT NOT NULL,
-                    comic_id        INTEGER,
-                    max_bid         REAL NOT NULL,
-                    bid_offset      INTEGER DEFAULT 6,
-                    snipe_group     INTEGER DEFAULT 0,
-                    status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED','REMOVED')),
-                    winning_bid     REAL,
-                    seller          TEXT,
-                    auction_end_at      TEXT,
-                    local_snipe_at      TEXT,
-                    local_snipe_result  TEXT,
-                    notes               TEXT,
-                    added_at            TEXT DEFAULT (datetime('now')),
-                    resolved_at         TEXT,
-                    ebay_title          TEXT,
-                    status_mirror       TEXT,
-                    cached_current_bid  TEXT,
-                    cached_at           TEXT,
-                    fmv_id              INTEGER
-                )
-            """)
-            # Copy every column present on the old table (introspected) so none
-            # is dropped. A hardcoded list previously omitted fmv_id, silently
-            # destroying it on legacy-FK databases (BUI-64); introspection also
-            # makes this immune to future _COLUMN_MIGRATIONS additions.
-            cols = ", ".join(
-                row[1] for row in conn.execute("PRAGMA table_info(bids_old)")
-            )
-            conn.execute(
-                f"INSERT INTO bids ({cols}) SELECT {cols} FROM bids_old"
-            )
-            conn.execute("DROP TABLE bids_old")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id)")
-            conn.execute("RELEASE fk_rebuild")
-        except Exception:
-            try:
-                conn.execute("ROLLBACK TO fk_rebuild")
-            except Exception:
-                pass
-            raise
-        finally:
-            conn.execute("PRAGMA foreign_keys=ON")
+        _rebuild_bids_table(conn, "bids_old", "fk_rebuild")
 
-    # Rename the soft-delete tombstone status PURGED -> REMOVED (BUI-49). Two
-    # parts: (1) widen the CHECK to *allow* REMOVED, and (2) remap existing data.
-    #
-    # (1) SQLite can't ALTER a CHECK constraint, so widening the allowed-status
-    # set requires a table rebuild (same pattern as the FK removal above).
-    # Idempotency is by feature detection: only rebuild while the live CHECK
-    # still lacks REMOVED. The INSERT copies EVERY column (introspected from the
-    # live table) verbatim, so no column is silently dropped — the FK-rebuild
-    # above hardcodes a column list that omits fmv_id, and this must not repeat
-    # that trap (BUI-49 plan KTD-3). bid_fmvs has an FK to bids(id), so FK
-    # enforcement is disabled for the rebuild, like the FK removal above.
+    # Rename the soft-delete tombstone status PURGED -> REMOVED (BUI-49): widen
+    # the CHECK to *allow* REMOVED, then (below) remap existing data. SQLite
+    # can't ALTER a CHECK constraint, so widening the allowed-status set requires
+    # a table rebuild (same pattern as the FK removal above). Idempotency is by
+    # feature detection: only rebuild while the live CHECK still lacks REMOVED.
     table_sql_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='bids'"
     ).fetchone()
     if table_sql_row and "REMOVED" not in (table_sql_row["sql"] or ""):
-        cols = ", ".join(row[1] for row in conn.execute("PRAGMA table_info(bids)"))
-        conn.execute("DROP TABLE IF EXISTS bids_status_rename_old")
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("SAVEPOINT status_rename")
-        try:
-            conn.execute("ALTER TABLE bids RENAME TO bids_status_rename_old")
-            conn.execute("""
-                CREATE TABLE bids (
-                    id              INTEGER PRIMARY KEY,
-                    item_id         TEXT NOT NULL,
-                    comic_id        INTEGER,
-                    max_bid         REAL NOT NULL,
-                    bid_offset      INTEGER DEFAULT 6,
-                    snipe_group     INTEGER DEFAULT 0,
-                    status          TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING','WON','LOST','FAILED','ENDED','PURGED','REMOVED')),
-                    winning_bid     REAL,
-                    seller          TEXT,
-                    auction_end_at      TEXT,
-                    local_snipe_at      TEXT,
-                    local_snipe_result  TEXT,
-                    notes               TEXT,
-                    added_at            TEXT DEFAULT (datetime('now')),
-                    resolved_at         TEXT,
-                    ebay_title          TEXT,
-                    status_mirror       TEXT,
-                    cached_current_bid  TEXT,
-                    cached_at           TEXT,
-                    fmv_id              INTEGER
-                )
-            """)
-            conn.execute(
-                f"INSERT INTO bids ({cols}) SELECT {cols} FROM bids_status_rename_old"
-            )
-            conn.execute("DROP TABLE bids_status_rename_old")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id)")
-            conn.execute("RELEASE status_rename")
-        except Exception:
-            try:
-                conn.execute("ROLLBACK TO status_rename")
-            except Exception:
-                pass
-            raise
-        finally:
-            conn.execute("PRAGMA foreign_keys=ON")
+        _rebuild_bids_table(conn, "bids_status_rename_old", "status_rename")
 
     # (2) Remap the tombstone value. Runs in all cases — whether the CHECK was
     # just widened above, or already allowed REMOVED on a fresh / FK-rebuilt DB
