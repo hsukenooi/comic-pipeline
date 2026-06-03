@@ -87,6 +87,30 @@ Output directory layout:
 
 No `listing.html` is produced. In the grader prompt, note "no seller description available" unless the seller's grade is known from the listing title (retrieved by `ebay_fetch.py`).
 
+## Step 1.5: Triage Pre-Pass (optional — for raw scans)
+
+Before fanning out any grader, kill the no-hopers. Grading is the expensive step; spending it on a book that is un-gradeable, mis-listed, or an obvious beater the user would never buy is pure waste. **Use this step when grading a raw, uncurated seller scan** (many listings, unknown quality). **Skip it** for a short, already-curated list (user-supplied URLs, confirmed wish-list matches) — the pre-pass costs more than it saves there.
+
+Run **one** cheap agent over the whole candidate list (title + first image + photo count per listing — not a full grade) that sorts each into **KEEP / DROP / FLAG**:
+
+- **DROP** (no grading) — only the *unambiguous* no-hopers:
+  - **Un-gradeable photos:** 0–1 usable images, or all images blurry / obstructed / not the comic.
+  - **Confirmed non-match:** the listing is plainly not the wish-listed book (wrong series/issue/title) — i.e. it should not have been in the scan.
+- **FLAG** (grade only if the user confirms) — a **suspected obvious beater** (visible heavy damage — large missing piece, detached/ split cover, water damage). There is **no FMV floor at grade time**, so do NOT auto-kill on condition; surface it and let the user decide.
+- **KEEP** — everything else proceeds to Step 2.
+
+**Conservative default:** when unsure which bucket a listing belongs in, **KEEP it** — the failure to avoid is silently dropping a book the user wanted (mirrors the no-cap-when-ambiguous principle elsewhere in this skill).
+
+**No silent drops:** output a triage table — every candidate with its bucket and a one-line reason — so the user sees exactly what was skipped and why before any grading runs.
+
+```
+| Item ID | Title | Photos | Triage | Reason |
+|---------|-------|--------|--------|--------|
+| 1780... | FF #48 (1966) | 2 | KEEP | gradeable, on wish list |
+| 1781... | (blurry) | 1 | DROP | single blurry photo — un-gradeable |
+| 1782... | Hulk #1 (beater) | 4 | FLAG | large back-cover chunk missing — confirm before grading |
+```
+
 ## Step 2: Dispatch Grader Agents (value-gated)
 
 Don't fan out 3 graders for every comic — most listings in a seller scan are cheap, and 3-per-comic burns agents where 1 will do. **Run 1 grader first, then escalate to a 3-grader panel only when the comic earns it.** Use the `general-purpose` subagent type; the grader prompt template below is identical whether you run 1 or 3.
@@ -94,24 +118,31 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 **Tunable gate constants** (stated here so they're easy to adjust):
 - `VALUE_THRESHOLD = $25` — `current_price` (from Step 1) at or above this always gets the full 3-grader panel; an expensive book justifies the rigor.
 - `CAP_BAND = 0.5` — if the single grader's grade sits within this many points of a grade-capping threshold (the spine-split / missing-piece / detached-cover ceilings), treat it as boundary-ambiguous.
+- `BATCH_MAX = 5` — how many sub-threshold (cheap) books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
+- `CAP_DECISION_TOLERANCE = 10%` — in the decision-sensitivity gate (below), two bid caps computed at the ends of a grade range count as "the same decision" if they're within this much of each other (and the buy/no-buy call doesn't flip).
 
 **Escalate the single-grader result to a full 3-grader panel when ANY of these hold:**
 1. **Value:** `current_price ≥ VALUE_THRESHOLD` (or the listing is a known key regardless of current bid).
-2. **Boundary-ambiguous grade:** the grade is within `CAP_BAND` of a grade-capping threshold, OR the grader flagged the grade as uncertain / gave a wide GRADE RANGE (≥1.5 pts), OR a possible-restoration flag fired.
+2. **Boundary-ambiguous grade:** the grader identified a grade-capping defect (`GRADE CAP` ≠ none) and the grade sits within `CAP_BAND` of that ceiling — or is unsure whether a capping defect is present — OR a possible-restoration flag fired, OR the grader gave a wide GRADE RANGE (≥1.5 pts) **at MEDIUM confidence or higher**. (Proximity to a round grade with `GRADE CAP: none` is **not** a near-cap trigger — the cap must be an observed/suspected *defect*, not a number.) A wide range only escalates when it signals disagreement over *visible* evidence that more graders can resolve. A wide range at MEDIUM-LOW/LOW confidence is **coverage-driven** — the photos can't show the deciding surfaces (spine stress, interior, page edge), so adding graders cannot narrow it; it does **not** escalate on its own. (Near-cap and restoration still escalate regardless of coverage, since a second look can confirm a *visible* capping defect.)
 3. **Decision-relevant:** a half-grade swing would plausibly cross the buy/no-buy line the user cares about (if known at grade time).
 
-**Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, the grade is unambiguous, and no cap/restoration flag fired. Unknown `current_price` counts as below-threshold.
+**Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, no cap/restoration flag fired, and any wide range is coverage-driven (MEDIUM-LOW/LOW confidence). Unknown `current_price` counts as below-threshold. Note the common case: a cheap 2-cover-photo lot draws a wide range *because* coverage is thin — that is the expected MEDIUM-LOW output, not an escalation signal. Escalating it would burn 3 graders on photos that structurally can't resolve the spread (the failure mode that negates the value gate on a typical thin-photo seller scan).
+
+**Decision-sensitivity gate (optional — suppresses escalation when the grade can't change the buy).** When grading inside a flow that knows the auction's current price and can compute FMV (e.g. `/comic:buy`), a book that tripped an escalation trigger above can still **stay at 1 grader** if a tighter grade wouldn't change the decision. Before escalating, probe FMV at the **endpoints of the grade RANGE** (low and high) and compute the bid cap at each (same `grade_confidence` haircut at both). If **both** endpoints give the **same buy/no-buy call** against the current price **and** bid caps within `CAP_DECISION_TOLERANCE` of each other, the extra grader precision cannot move the outcome → do **not** escalate; report e.g. `1 grader (decision-insensitive: bid cap $34–$37 across 6.0–7.5, same buy call)`. Escalate only when the range straddles a decision boundary — the buy/no-buy call flips, or the bid-cap swing exceeds the tolerance. This is the highest-leverage skip on a value-gated scan: it stops a 3-grader panel from pinning a grade whose imprecision doesn't reach the bid. (The value trigger still escalates a high-value book whose decision *is* sensitive; the gate only suppresses escalation that provably can't matter.)
 
 **Dispatch mechanics:**
-- Run the **first** grader for every comic in one parallel batch (N comics = N parallel calls).
-- Then, for the comics that tripped a gate, dispatch the **remaining 2** graders — again all in one parallel batch. (Two batches total, not one-at-a-time.)
-- The grader prompt and criteria are identical across batches so the 3 panel grades stay independent and comparable.
+- Split the candidates into **cheap** (`current_price < VALUE_THRESHOLD`, or unknown price) and **not-cheap** (≥ `VALUE_THRESHOLD`, or a known key).
+- **Cheap books → batch them (U9).** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
+- **Not-cheap books → 1 grader each, first pass**, run in parallel (separate agents).
+- **Escalation (both kinds).** After the first pass, any book that tripped a gate (Step 2 triggers) gets the **remaining 2** graders as separate, independent agents — dispatched together in one parallel batch. A batched cheap book's first grade counts as grader A; pull it out and add B + C. (The grader prompt and criteria are identical across passes so the panel grades stay independent and comparable.)
+- **Batching guardrails:** keep each book's images and OUTPUT FORMAT block fully separate in the batched prompt; never let one book's defects bleed into another's grade; if a batch would exceed `BATCH_MAX`, open another agent. When in doubt about a specific cheap book (e.g. it looks near a cap), grade it on its own rather than in the batch.
+- **Anti-anchoring (batched grades must not drift):** grade every book against the **absolute** CGC/Overstreet scale, exactly as if it were the only book in front of you. Do **not** let the overall quality of the batch raise or lower any single grade — a clean book in a batch of beaters is not a 9.6, and a rough book among clean ones is not a 2.0. A measured drift toward higher point grades on clean books was seen when batching vs. one-agent-each (BUI-81 U9 validation); counter it by re-anchoring each book on its own visible defects before naming a number.
 
-**Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. The user must be able to see where rigor was and wasn't spent.
+**Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, range wide but coverage-driven at MEDIUM-LOW)` or `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. The user must be able to see where rigor was and wasn't spent.
 
 ### Grader Prompt Template
 
-Adapt per comic (fill in `{COMIC}`, `{YEAR}`, `{FOLDER}`, `{N}`):
+Adapt per comic (fill in `{COMIC}`, `{YEAR}`, `{FOLDER}`, `{N}`, `{SELLER_GRADE}`). `{SELLER_GRADE}` is the seller's stated grade from the listing title/description if present, else "none stated":
 
 ```
 You are an expert vintage comic book grader. Grade the physical condition of a raw (ungraded) comic from the seller's eBay photos.
@@ -119,6 +150,7 @@ You are an expert vintage comic book grader. Grade the physical condition of a r
 COMIC: {COMIC} ({YEAR})
 IMAGE FOLDER: {FOLDER}
 IMAGES: img-01.jpg through img-{N:02d}.jpg ({N} photos of the seller's copy)
+SELLER-STATED GRADE: {SELLER_GRADE}
 
 GRADING SCALE (Heritage/Overstreet — use these numeric values):
 9.8 NM/MT | 9.6 NM+ | 9.4 NM | 9.2 NM- | 9.0 VF/NM | 8.5 VF+ | 8.0 VF | 7.5 VF- | 7.0 FN/VF | 6.5 FN+ | 6.0 FN | 5.5 FN- | 5.0 VG/FN | 4.5 VG+ | 4.0 VG | 3.5 VG- | 3.0 GD/VG | 2.5 GD+ | 2.0 GD | 1.8 GD- | 1.5 FR/GD | 1.0 FR | 0.5 PR
@@ -258,29 +290,39 @@ HARD CEILING: with 2 or fewer usable cover views and no spine-raking / interior 
 
 GRADE RANGE: when confidence is MEDIUM-LOW or LOW, report a grade RANGE spanning the plausible outcomes given what you cannot see (e.g. "5.0–6.0 VG/FN–FN"), with the single GRADE as your best point estimate inside that range. At HIGH confidence the range may collapse to the point grade.
 
+SELLER-STATED GRADE — USE AS A PRIOR YOU MUST ARGUE AWAY FROM, NOT A FOLLOWER:
+If SELLER-STATED GRADE above is a grade (not "none stated"), treat it as a prior the photos must overturn — sellers grade optimistically, so it is an anchor to test, not to trust. Grade independently from the photos FIRST, then compare (measure the gap in **numeric scale points**, e.g. 8.0→6.0 is 2.0 points — not in named-grade steps):
+- If your grade lands within ~1.5 points of the seller's → no special action; report both.
+- If your grade is ≥2.0 points BELOW the seller's → you must justify the gap with a NAMED defect (e.g. "spine split ~1/2"", "color-breaking corner crease") observed in a specific photo. "Looks worse" is not enough. If you cannot name a defect that accounts for a ≥2.0-point gap, re-examine the photos — you may be over-grading-down on coverage anxiety; widen the range rather than forcing a low point grade.
+- If your grade is ≥2.0 points ABOVE the seller's → re-check for a disclosed defect you missed; sellers rarely under-grade.
+Never simply adopt the seller's number. The seller grade calibrates your scrutiny; the photos set the grade.
+
 PROCEDURE:
-1. Read listing.html from {FOLDER} and scan the seller's description for any disclosed defects, restoration, or condition notes. Note these before viewing photos — they may reveal things photos don't show.
+1. Note the SELLER-STATED GRADE (from the listing title/description; there is no listing.html file). Treat it per the SELLER-STATED GRADE rule above. If "none stated", grade purely from photos.
 2. Use the Read tool on every img-XX.jpg in the folder (read all {N}).
 3. Before grading, map each photo to its content type: front cover / spine view / back cover / interior pages / detail shot / other. Note the mapping explicitly (e.g., "img-01: front cover, img-02: spine, img-03: back cover").
 4. Assess PHOTO COVERAGE: list which views from the table above are present, and set your CONFIDENCE ceiling from coverage before you finalize the grade.
-5. Note each defect with its location, referencing the photo where you saw it.
-6. Identify any grade-capping defects and state the ceiling explicitly.
-7. Apply the CGC scale; anchor on physical defects first, use reflectivity to confirm.
-8. Be rigorous — do NOT inflate. Grade only what you can see, and let coverage cap your confidence.
+5. STRUCTURED DEFECT ENUMERATION (do this BEFORE naming a number): walk the zones in order — front cover, spine, corners, edges, staples, back cover, interior/pages — and for each, list every defect you can see with its location and photo reference. For any ink mark, text, or signature-like element, classify it explicitly as **print-layer / post-print / uncertain** using the PRINT-LAYER RULE test, and state that tag inline. A zone with nothing visible is "clean (or un-assessed — no view)". Only after this enumeration do you map the defects to a grade.
+6. Identify any grade-capping defects from the enumeration and state the ceiling explicitly.
+7. Apply the CGC scale; anchor on the enumerated physical defects first, use reflectivity only to confirm.
+8. Reconcile against the SELLER-STATED GRADE per the rule above; if a ≥2-grade gap remains, confirm a named defect justifies it.
+9. Be rigorous — do NOT inflate. Grade only what you can see, and let coverage cap your confidence.
 
 OUTPUT FORMAT (exactly this, no preamble):
 PHOTO MAP: img-01: [content type], img-02: [content type], ... (one line per image)
 COVERAGE: [views present vs. missing, e.g. "front + back cover only; no spine-raking, no interior, no page-edge"]
-SELLER DESCRIPTION NOTES: [any disclosed defects or condition notes from listing.html; "none stated" if clean]
+SELLER DESCRIPTION NOTES: [any disclosed defects/condition notes from the listing title/description; "none stated" if clean — there is no listing.html file]
 GRADE: X.X (label) — best point estimate
 GRADE RANGE: [plausible span given coverage, e.g. "5.0–6.0 VG/FN–FN"; may equal the point grade at HIGH confidence]
 CONFIDENCE: HIGH | MEDIUM | MEDIUM-LOW | LOW — driven by coverage (state the one-line reason, e.g. "MEDIUM-LOW: 2 cover photos, no spine/interior/edge")
+SELLER-GRADE CHECK: [seller-stated grade vs. your grade and the gap, e.g. "seller VF- (7.5) vs. mine 6.5 — within 1.5, no named defect required"; if ≥2-grade gap, name the defect justifying it; "none stated" if the seller gave no grade]
 GRADE CAP: [defect that sets the ceiling, e.g. "spine split ~1/4" caps at 6.0 FN" — or "none" if no single cap applies]
 SIGNATURE/CREDIT CHECK: [if any signature-like or credit text is visible, classify per the PRINT-LAYER RULE: "printed/facsimile — no effect", "authentic post-print autograph — writing defect", or "uncertain → treated as print-layer, not capped". State "none visible" if none.]
-KEY DEFECTS OBSERVED:
+KEY DEFECTS OBSERVED (per-zone enumeration; tag any mark print-layer/post-print/uncertain):
 - [front cover: ...]
 - [spine: ...]
 - [corners: ...]
+- [edges: ...]
 - [back cover: ...]
 - [pages/interior: ...]
 - [staples: ...]
@@ -373,8 +415,11 @@ Always note these. Do not claim CGC accuracy.
 | Using firecrawl/WebFetch for eBay images | Both are blocked by eBay bot detection — use Browse API only |
 | Grading from WebFetch text output | WebFetch returns markdown text, not images — useless for visual grading |
 | Giving all 3 agents the same agent name | Use distinct names (e.g., `grader-c1-a`, `grader-c1-b`) so results are traceable |
-| Running graders sequentially | Within a batch, dispatch in a single message for independence — batch 1 = one first-grader per comic; batch 2 = the extra 2 graders for comics that tripped the value gate |
+| Running graders sequentially | Dispatch in a single message. First pass: cheap books batched (≤`BATCH_MAX` per agent, U9), not-cheap books one grader each; escalation pass: the extra 2 panel graders for any book that tripped a gate, as separate independent agents |
+| Batching a near-cap or escalation-bound book with the cheap group | Grade it on its own — a book heading for a 3-grader panel needs an independent grader A, not a shared batched context |
 | Fanning out 3 graders for every comic | Value-gate it (Step 2): 1 grader first, escalate to 3 only on value ≥ threshold or an ambiguous/near-cap grade. State the grader count + reason per comic |
+| Escalating every 2-photo lot because its range is wide | A wide range at MEDIUM-LOW/LOW confidence is coverage-driven — more graders can't see the missing views, so it does NOT escalate (Step 2 trigger 2). Only escalate on a wide range at MEDIUM+ confidence, a near-cap grade, restoration, or value |
+| Auto-dropping a book in triage because it looks like a beater | Condition is not a triage kill — there's no FMV floor at grade time. FLAG suspected beaters for the user; only DROP un-gradeable photos or confirmed non-matches (Step 1.5). When unsure, KEEP |
 | Including related-listing images | Extract carousel IDs from the `ux-image-carousel-container` section only |
 | Inflating grade because it's a key issue | Grade physical condition only — key issue premium belongs in FMV, not grade |
 | Capping the grade over a printed credit/signature | Printed credits, facsimile signatures, barcodes, and price boxes are in the print layer — never defects (PRINT-LAYER RULE). Only a post-print autograph caps. When unsure, do NOT cap |
