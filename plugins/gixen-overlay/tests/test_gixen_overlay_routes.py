@@ -574,6 +574,43 @@ def test_link_fmv_creates_junction_and_returns_linked(api):
     assert row["fmv_high"] == 1000.0
 
 
+def test_extract_then_relink_valued_keeps_single_junction_and_fmv(api):
+    """BUI-82 regression: extract-comics grade-only link, then a valued
+    re-link of the same comic, must leave one junction with a non-null FMV.
+
+    Before the fix the demoted grade-only junction lingered, so lot_count==2
+    and the unpriced-lot guard blanked the dashboard FMV of a priced comic.
+    """
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "600000099", "max_bid": 50.0})
+    # eBay title carries a seller grade (VF -> 8.0): extract-comics makes a
+    # grade-only stub fmv (low IS NULL) and links it primary.
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Amazing Spider-Man #300 1988 VF", "600000099"))
+    raw.commit()
+    raw.close()
+    assert api.post("/api/extract-comics").status_code == 200
+
+    # /comic:fmv prices the same comic at a different (photo) grade -> a new
+    # valued fmv row -> the re-link that historically left a duplicate.
+    r = api.post("/api/comics", json={
+        "title": "Amazing Spider-Man", "issue": "300", "year": 1988,
+        "grade": 9.2, "fmv_low": 800.0, "fmv_high": 1000.0,
+    })
+    comic_id = r.json()["id"]
+    r = api.post("/api/bids/600000099/link-fmv",
+                 json={"comic_id": comic_id, "grade": 9.2})
+    assert r.status_code == 200
+
+    row = next(s for s in api.get("/api/comics/snipes").json()
+               if s["item_id"] == "600000099")
+    assert row["lot_count"] == 1
+    assert row["fmv_low"] == 800.0
+    assert row["fmv_high"] == 1000.0
+    assert row["cond_grade"] == 9.2
+
+
 def test_link_fmv_unknown_item_returns_404(api):
     r = api.post("/api/bids/999999999/link-fmv",
                  json={"locg_id": 77777, "grade": 9.2})

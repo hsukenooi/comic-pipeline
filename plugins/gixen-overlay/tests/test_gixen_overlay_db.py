@@ -329,7 +329,9 @@ def test_upsert_fmv_subsequent_call_with_low_sets_updated_at(db):
 # ---------------------------------------------------------------------------
 
 
-def test_link_fmv_to_bid_non_primary(db):
+def test_link_fmv_to_bid_sole_junction_is_promoted_to_primary(db):
+    """BUI-82: a sole junction is always primary so the grade/FMV aggregates
+    (which key off is_primary=1) don't blank, even when linked non-primary."""
     bid_id = _insert_bid(db)
     cid = _insert_comic(db)
     fid = upsert_fmv(db, cid, 9.2, low=800.0)
@@ -337,7 +339,27 @@ def test_link_fmv_to_bid_non_primary(db):
     rows = db.execute("SELECT * FROM bid_fmvs WHERE bid_id=?", (bid_id,)).fetchall()
     assert len(rows) == 1
     assert rows[0]["fmv_id"] == fid
-    assert rows[0]["is_primary"] == 0
+    assert rows[0]["is_primary"] == 1
+    assert db.execute(
+        "SELECT fmv_id FROM bids WHERE id=?", (bid_id,)
+    ).fetchone()["fmv_id"] == fid
+
+
+def test_link_fmv_to_bid_nonprimary_lot_member_stays_nonprimary(db):
+    """Once a primary exists, a non-primary link to a *different* comic stays
+    a non-primary lot member — genuine lots are preserved."""
+    bid_id = _insert_bid(db)
+    cid1 = _insert_comic(db, issue="1")
+    cid2 = _insert_comic(db, issue="2")
+    primary = upsert_fmv(db, cid1, 9.2, low=800.0)
+    member = upsert_fmv(db, cid2, 9.0, low=400.0)
+    link_fmv_to_bid(db, bid_id, primary, is_primary=True)
+    link_fmv_to_bid(db, bid_id, member, is_primary=False)
+    rows = {r["fmv_id"]: r["is_primary"]
+            for r in db.execute(
+                "SELECT fmv_id, is_primary FROM bid_fmvs WHERE bid_id=?", (bid_id,))}
+    assert rows[primary] == 1
+    assert rows[member] == 0
 
 
 def test_link_fmv_to_bid_primary_mirrors_to_bids_fmv_id(db):
@@ -349,17 +371,44 @@ def test_link_fmv_to_bid_primary_mirrors_to_bids_fmv_id(db):
     assert row["fmv_id"] == fid
 
 
-def test_link_fmv_to_bid_primary_demotes_prior(db):
+def test_link_fmv_to_bid_primary_demotes_prior_different_comic(db):
+    """A primary re-link to a *different* comic demotes (but keeps) the prior
+    junction — multi-comic lots are preserved."""
     bid_id = _insert_bid(db)
-    cid = _insert_comic(db)
-    fid1 = upsert_fmv(db, cid, 9.0, low=700.0)
-    fid2 = upsert_fmv(db, cid, 9.2, low=800.0)
+    cid1 = _insert_comic(db, issue="1")
+    cid2 = _insert_comic(db, issue="2")
+    fid1 = upsert_fmv(db, cid1, 9.0, low=700.0)
+    fid2 = upsert_fmv(db, cid2, 9.2, low=800.0)
     link_fmv_to_bid(db, bid_id, fid1, is_primary=True)
     link_fmv_to_bid(db, bid_id, fid2, is_primary=True)
     rows = {r["fmv_id"]: r["is_primary"]
             for r in db.execute("SELECT fmv_id, is_primary FROM bid_fmvs WHERE bid_id=?", (bid_id,))}
     assert rows[fid1] == 0
     assert rows[fid2] == 1
+
+
+def test_link_fmv_to_bid_primary_replaces_same_comic_grade_only_stub(db):
+    """BUI-82: re-linking the *same comic* to a valued FMV must replace the
+    prior grade-only junction, not leave a demoted null-valued duplicate.
+
+    The duplicate inflates the dashboard's lot_count to 2 and trips the
+    "unpriced lot member" guard, blanking the FMV of a single priced comic.
+    """
+    bid_id = _insert_bid(db)
+    cid = _insert_comic(db)
+    stub = upsert_fmv(db, cid, 8.0)  # grade-only stub, low IS NULL
+    link_fmv_to_bid(db, bid_id, stub, is_primary=True)
+    valued = upsert_fmv(db, cid, 9.2, low=800.0, high=1000.0)  # same comic, real FMV
+    link_fmv_to_bid(db, bid_id, valued, is_primary=True)
+    rows = db.execute(
+        "SELECT fmv_id, is_primary FROM bid_fmvs WHERE bid_id=?", (bid_id,)
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["fmv_id"] == valued
+    assert rows[0]["is_primary"] == 1
+    assert db.execute(
+        "SELECT fmv_id FROM bids WHERE id=?", (bid_id,)
+    ).fetchone()["fmv_id"] == valued
 
 
 def test_link_fmv_to_bid_idempotent(db):

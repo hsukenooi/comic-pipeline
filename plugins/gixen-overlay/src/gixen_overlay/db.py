@@ -983,8 +983,31 @@ def link_fmv_to_bid(
     fmv_id: int,
     is_primary: bool = False,
 ) -> None:
-    """Insert into bid_fmvs. If primary, demote prior entries and mirror to bids.fmv_id."""
+    """Insert into bid_fmvs and keep one junction per comic per bid.
+
+    Primary links replace any prior junction pointing at the *same comic*
+    (so a grade-only stub re-linked to a valued FMV collapses to one row
+    rather than leaving a demoted null-valued duplicate — BUI-82) and demote
+    other-comic junctions to lot members. A sole junction is always primary
+    so the dashboard's grade/FMV aggregates (which key off is_primary=1)
+    never blank.
+    """
     if is_primary:
+        # Drop prior junctions for the same comic as the new FMV; genuine
+        # other-comic lot members survive and are demoted just below.
+        conn.execute(
+            """
+            DELETE FROM bid_fmvs
+            WHERE bid_id = ?
+              AND fmv_id != ?
+              AND fmv_id IN (
+                  SELECT other.id FROM fmv other
+                  JOIN fmv target ON target.comic_id = other.comic_id
+                  WHERE target.id = ?
+              )
+            """,
+            (bid_id, fmv_id, fmv_id),
+        )
         conn.execute(
             "UPDATE bid_fmvs SET is_primary=0 WHERE bid_id=? AND fmv_id != ?",
             (bid_id, fmv_id),
@@ -1003,6 +1026,16 @@ def link_fmv_to_bid(
             "INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, 0)",
             (bid_id, fmv_id),
         )
+        # A sole junction must be primary, else cond_grade/fmv blank out.
+        sole = conn.execute(
+            "SELECT COUNT(*) FROM bid_fmvs WHERE bid_id=?", (bid_id,)
+        ).fetchone()[0] == 1
+        if sole:
+            conn.execute(
+                "UPDATE bid_fmvs SET is_primary=1 WHERE bid_id=? AND fmv_id=?",
+                (bid_id, fmv_id),
+            )
+            conn.execute("UPDATE bids SET fmv_id=? WHERE id=?", (fmv_id, bid_id))
     conn.commit()
 
 
