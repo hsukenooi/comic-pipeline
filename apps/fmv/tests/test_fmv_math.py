@@ -11,12 +11,17 @@ def _comp(price, grade=None):
 
 # ─── build_pool ────────────────────────────────────────────────────────────────
 
+def _prices(pool):
+    """build_pool now returns comp dicts; pull prices for assertions."""
+    return sorted(c["price"] for c in pool)
+
+
 class TestBuildPool:
     def test_narrow_window_when_dense(self):
         comps = [_comp(p, 9.2) for p in [10, 12, 11, 13, 14, 15]]  # all at 9.2
         pool, window = fm.build_pool(comps, target_grade=9.2)
         assert window == 0.5
-        assert sorted(pool) == [10, 11, 12, 13, 14, 15]
+        assert _prices(pool) == [10, 11, 12, 13, 14, 15]
 
     def test_widens_when_sparse(self):
         # Only 2 comps at ±0.5 — should widen to ±1.0
@@ -26,10 +31,35 @@ class TestBuildPool:
         assert window == 1.0
         assert len(pool) == 5
 
+    def test_progressive_widen_past_one(self):
+        # 4 comps reachable only at ±1.5 — must keep widening past ±1.0
+        comps = [_comp(10, 7.0), _comp(11, 6.0), _comp(12, 8.0),
+                 _comp(13, 5.5), _comp(14, 8.5)]
+        pool, window = fm.build_pool(comps, target_grade=7.0)
+        assert window == 1.5
+        assert len(pool) == 5
+
+    def test_stops_at_ceiling(self):
+        # Never enough comps — widening stops at MAX_GRADE_WINDOW
+        comps = [_comp(10, 7.0), _comp(11, 9.0)]
+        pool, window = fm.build_pool(comps, target_grade=7.0)
+        assert window == fm.MAX_GRADE_WINDOW
+
+    def test_max_window_override(self):
+        # A lower ceiling caps reach
+        comps = [_comp(10, 7.0), _comp(11, 8.0)]
+        _, window = fm.build_pool(comps, target_grade=7.0, max_window=0.5)
+        assert window == 0.5
+
+    def test_returns_comp_dicts(self):
+        comps = [_comp(10, 9.2)]
+        pool, _ = fm.build_pool(comps, target_grade=9.2)
+        assert pool and isinstance(pool[0], dict) and pool[0]["grade"] == 9.2
+
     def test_drops_no_grade(self):
         comps = [_comp(10, 9.2), _comp(99, None)]  # 99 has no grade
         pool, _ = fm.build_pool(comps, target_grade=9.2)
-        assert 99 not in pool
+        assert 99 not in _prices(pool)
 
 
 # ─── iqr_trim ──────────────────────────────────────────────────────────────────
@@ -151,6 +181,8 @@ class TestComputeFmv:
         assert out["n"] == 0
         assert out["fmv_low"] is None
         assert out["confidence"] == "LOW"
+        assert out["flag_reason"] is None  # n=0 is no-comps, not a manual flag
+        assert out["grade_span"] is None
 
     def test_widens_window_when_sparse(self):
         # 2 comps at exact target, 4 within ±1.0
@@ -168,6 +200,77 @@ class TestComputeFmv:
         assert out["max_bid"] is not None
         assert out["fmv_high"] is not None
         assert abs(out["max_bid"] - 0.8 * out["fmv_high"]) <= 10
+
+
+# ─── Priceability guards (BUI-86) ─────────────────────────────────────────────
+
+class TestPriceabilityGuards:
+    def test_one_sided_flags(self):
+        # FF #63 shape: target 9.6, all comps at/below 9.0 even at ceiling
+        comps = [_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        out = fm.compute_fmv(comps, target_grade=9.6)
+        assert out["flag_reason"] == "one_sided"
+        assert out["fmv_low"] is None and out["fmv_high"] is None
+        assert out["max_bid"] is None
+
+    def test_too_wide_flags(self):
+        # Iron Man #124 shape: target 7.0, pool brackets but spans 4 grade points
+        comps = [_comp(50, 5.0), _comp(300, 9.0), _comp(320, 9.0)]
+        out = fm.compute_fmv(comps, target_grade=7.0)
+        assert out["flag_reason"] == "too_wide"
+        assert out["grade_span"] == 4.0
+        assert out["fmv_low"] is None
+
+    def test_too_sparse_flags_single_comp(self):
+        # A lone comp no longer emits a point estimate — it flags
+        comps = [_comp(100, 7.0)]
+        out = fm.compute_fmv(comps, target_grade=7.0)
+        assert out["flag_reason"] == "too_sparse"
+        assert out["fmv_low"] is None and out["max_bid"] is None
+
+    def test_guard_precedence_sparse_before_one_sided(self):
+        # A single comp that is also one-sided → sparse wins (documented order)
+        comps = [_comp(100, 8.0)]
+        out = fm.compute_fmv(comps, target_grade=9.6)
+        assert out["flag_reason"] == "too_sparse"
+
+    def test_bracketed_bounded_prices(self):
+        # Bracketed, span within threshold, enough comps → priced
+        comps = [_comp(p, g) for p, g in
+                 [(100, 6.5), (110, 7.0), (120, 7.0), (130, 7.5), (140, 7.0)]]
+        out = fm.compute_fmv(comps, target_grade=7.0)
+        assert out["flag_reason"] is None
+        assert out["fmv_low"] is not None and out["fmv_high"] is not None
+
+    def test_wide_window_caps_confidence_at_medium(self):
+        # A dense pool that would score HIGH, but built at ±1.5 → capped MEDIUM
+        comps = ([_comp(p, 7.0) for p in [100, 105, 110, 115]] +
+                 [_comp(p, 8.5) for p in [120, 125, 130, 135, 140]])
+        out = fm.compute_fmv(comps, target_grade=7.0)
+        assert out["window"] == 1.5
+        assert out["flag_reason"] is None
+        assert out["confidence"] == "MEDIUM"
+
+    def test_narrow_window_keeps_high_confidence(self):
+        # Same shape of dense pool but all at target → ±0.5, HIGH allowed
+        comps = [_comp(p, 7.0) for p in
+                 [100, 105, 110, 115, 120, 125, 130, 135, 140]]
+        out = fm.compute_fmv(comps, target_grade=7.0)
+        assert out["window"] == 0.5
+        assert out["confidence"] == "HIGH"
+
+    def test_flagged_dense_pool_forces_low_confidence(self):
+        # One-sided but dense+tight: must NOT persist HIGH — forced to LOW
+        comps = [_comp(p, 9.0) for p in [40, 41, 42, 43, 44, 45]]
+        out = fm.compute_fmv(comps, target_grade=9.6)
+        assert out["flag_reason"] == "one_sided"
+        assert out["confidence"] == "LOW"
+
+    def test_grade_window_override_does_not_bypass_guard(self):
+        # AE4: a higher ceiling reaches further but a one-sided book stays flagged
+        comps = [_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        out = fm.compute_fmv(comps, target_grade=9.6, max_window=2.5)
+        assert out["flag_reason"] == "one_sided"
 
 
 # ─── bid_factor (BUI-51 confidence haircut) ───────────────────────────────────
