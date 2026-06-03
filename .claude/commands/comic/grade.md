@@ -119,6 +119,7 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 - `VALUE_THRESHOLD = $25` — `current_price` (from Step 1) at or above this always gets the full 3-grader panel; an expensive book justifies the rigor.
 - `CAP_BAND = 0.5` — if the single grader's grade sits within this many points of a grade-capping threshold (the spine-split / missing-piece / detached-cover ceilings), treat it as boundary-ambiguous.
 - `BATCH_MAX = 5` — how many sub-threshold (cheap) books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
+- `CAP_DECISION_TOLERANCE = 10%` — in the decision-sensitivity gate (below), two bid caps computed at the ends of a grade range count as "the same decision" if they're within this much of each other (and the buy/no-buy call doesn't flip).
 
 **Escalate the single-grader result to a full 3-grader panel when ANY of these hold:**
 1. **Value:** `current_price ≥ VALUE_THRESHOLD` (or the listing is a known key regardless of current bid).
@@ -126,6 +127,8 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 3. **Decision-relevant:** a half-grade swing would plausibly cross the buy/no-buy line the user cares about (if known at grade time).
 
 **Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, no cap/restoration flag fired, and any wide range is coverage-driven (MEDIUM-LOW/LOW confidence). Unknown `current_price` counts as below-threshold. Note the common case: a cheap 2-cover-photo lot draws a wide range *because* coverage is thin — that is the expected MEDIUM-LOW output, not an escalation signal. Escalating it would burn 3 graders on photos that structurally can't resolve the spread (the failure mode that negates the value gate on a typical thin-photo seller scan).
+
+**Decision-sensitivity gate (optional — suppresses escalation when the grade can't change the buy).** When grading inside a flow that knows the auction's current price and can compute FMV (e.g. `/comic:buy`), a book that tripped an escalation trigger above can still **stay at 1 grader** if a tighter grade wouldn't change the decision. Before escalating, probe FMV at the **endpoints of the grade RANGE** (low and high) and compute the bid cap at each (same `grade_confidence` haircut at both). If **both** endpoints give the **same buy/no-buy call** against the current price **and** bid caps within `CAP_DECISION_TOLERANCE` of each other, the extra grader precision cannot move the outcome → do **not** escalate; report e.g. `1 grader (decision-insensitive: bid cap $34–$37 across 6.0–7.5, same buy call)`. Escalate only when the range straddles a decision boundary — the buy/no-buy call flips, or the bid-cap swing exceeds the tolerance. This is the highest-leverage skip on a value-gated scan: it stops a 3-grader panel from pinning a grade whose imprecision doesn't reach the bid. (The value trigger still escalates a high-value book whose decision *is* sensitive; the gate only suppresses escalation that provably can't matter.)
 
 **Dispatch mechanics:**
 - Split the candidates into **cheap** (`current_price < VALUE_THRESHOLD`, or unknown price) and **not-cheap** (≥ `VALUE_THRESHOLD`, or a known key).
