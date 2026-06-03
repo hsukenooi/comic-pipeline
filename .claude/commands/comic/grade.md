@@ -94,6 +94,7 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 **Tunable gate constants** (stated here so they're easy to adjust):
 - `VALUE_THRESHOLD = $25` — `current_price` (from Step 1) at or above this always gets the full 3-grader panel; an expensive book justifies the rigor.
 - `CAP_BAND = 0.5` — if the single grader's grade sits within this many points of a grade-capping threshold (the spine-split / missing-piece / detached-cover ceilings), treat it as boundary-ambiguous.
+- `BATCH_MAX = 5` — how many sub-threshold (cheap) books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
 
 **Escalate the single-grader result to a full 3-grader panel when ANY of these hold:**
 1. **Value:** `current_price ≥ VALUE_THRESHOLD` (or the listing is a known key regardless of current bid).
@@ -103,9 +104,12 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 **Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, no cap/restoration flag fired, and any wide range is coverage-driven (MEDIUM-LOW/LOW confidence). Unknown `current_price` counts as below-threshold. Note the common case: a cheap 2-cover-photo lot draws a wide range *because* coverage is thin — that is the expected MEDIUM-LOW output, not an escalation signal. Escalating it would burn 3 graders on photos that structurally can't resolve the spread (the failure mode that negates the value gate on a typical thin-photo seller scan).
 
 **Dispatch mechanics:**
-- Run the **first** grader for every comic in one parallel batch (N comics = N parallel calls).
-- Then, for the comics that tripped a gate, dispatch the **remaining 2** graders — again all in one parallel batch. (Two batches total, not one-at-a-time.)
-- The grader prompt and criteria are identical across batches so the 3 panel grades stay independent and comparable.
+- Split the candidates into **cheap** (`current_price < VALUE_THRESHOLD`, or unknown price) and **not-cheap** (≥ `VALUE_THRESHOLD`, or a known key).
+- **Cheap books → batch them (U9).** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
+- **Not-cheap books → 1 grader each, first pass**, run in parallel (separate agents).
+- **Escalation (both kinds).** After the first pass, any book that tripped a gate (Step 2 triggers) gets the **remaining 2** graders as separate, independent agents — dispatched together in one parallel batch. A batched cheap book's first grade counts as grader A; pull it out and add B + C. (The grader prompt and criteria are identical across passes so the panel grades stay independent and comparable.)
+- **Batching guardrails:** keep each book's images and OUTPUT FORMAT block fully separate in the batched prompt; never let one book's defects bleed into another's grade; if a batch would exceed `BATCH_MAX`, open another agent. When in doubt about a specific cheap book (e.g. it looks near a cap), grade it on its own rather than in the batch.
+- **Anti-anchoring (batched grades must not drift):** grade every book against the **absolute** CGC/Overstreet scale, exactly as if it were the only book in front of you. Do **not** let the overall quality of the batch raise or lower any single grade — a clean book in a batch of beaters is not a 9.6, and a rough book among clean ones is not a 2.0. A measured drift toward higher point grades on clean books was seen when batching vs. one-agent-each (BUI-81 U9 validation); counter it by re-anchoring each book on its own visible defects before naming a number.
 
 **Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, range wide but coverage-driven at MEDIUM-LOW)` or `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. The user must be able to see where rigor was and wasn't spent.
 
@@ -373,7 +377,8 @@ Always note these. Do not claim CGC accuracy.
 | Using firecrawl/WebFetch for eBay images | Both are blocked by eBay bot detection — use Browse API only |
 | Grading from WebFetch text output | WebFetch returns markdown text, not images — useless for visual grading |
 | Giving all 3 agents the same agent name | Use distinct names (e.g., `grader-c1-a`, `grader-c1-b`) so results are traceable |
-| Running graders sequentially | Within a batch, dispatch in a single message for independence — batch 1 = one first-grader per comic; batch 2 = the extra 2 graders for comics that tripped the value gate |
+| Running graders sequentially | Dispatch in a single message. First pass: cheap books batched (≤`BATCH_MAX` per agent, U9), not-cheap books one grader each; escalation pass: the extra 2 panel graders for any book that tripped a gate, as separate independent agents |
+| Batching a near-cap or escalation-bound book with the cheap group | Grade it on its own — a book heading for a 3-grader panel needs an independent grader A, not a shared batched context |
 | Fanning out 3 graders for every comic | Value-gate it (Step 2): 1 grader first, escalate to 3 only on value ≥ threshold or an ambiguous/near-cap grade. State the grader count + reason per comic |
 | Escalating every 2-photo lot because its range is wide | A wide range at MEDIUM-LOW/LOW confidence is coverage-driven — more graders can't see the missing views, so it does NOT escalate (Step 2 trigger 2). Only escalate on a wide range at MEDIUM+ confidence, a near-cap grade, restoration, or value |
 | Including related-listing images | Extract carousel IDs from the `ux-image-carousel-container` section only |
