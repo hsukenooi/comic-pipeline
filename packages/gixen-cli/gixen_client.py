@@ -66,6 +66,18 @@ class _CurlSession:
         except subprocess.TimeoutExpired:
             raise requests.ReadTimeout(f"curl timed out for {url}")
 
+        # A non-zero curl exit is a transport-level failure (DNS, connect, TLS,
+        # timeout) — stdout is typically empty. Parsing it would yield a
+        # misleading "200 + empty body", which login() then misattributes to
+        # bad credentials (BUI-77). Surface it as a requests-style connection
+        # error instead so callers can classify it as connectivity. Curl exit
+        # 28 == operation timeout; everything else maps to a connection error.
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip() or f"curl exit {result.returncode}"
+            if result.returncode == 28:
+                raise requests.ConnectTimeout(f"{url}: {detail}")
+            raise requests.ConnectionError(f"{url}: {detail}")
+
         raw = result.stdout
         sep = raw.find("\r\n\r\n")
         if sep < 0:
@@ -106,6 +118,16 @@ class GixenError(Exception):
 
 class GixenLoginError(GixenError):
     """Bad credentials or account suspended."""
+
+
+class GixenConnectionError(GixenError):
+    """Could not reach Gixen at the network layer (DNS, connect, TLS, timeout).
+
+    Distinct from GixenLoginError: this means we never got a usable response
+    from the host, so it is a connectivity problem, not a credentials problem.
+    A black-holed/unreachable host (BUI-77) lands here instead of being
+    misattributed to bad credentials.
+    """
 
 
 class GixenSessionExpiredError(GixenError):
@@ -190,10 +212,21 @@ class GixenClient:
     # Authentication
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _connection_error(url: str, exc: Exception) -> "GixenConnectionError":
+        """Wrap a transport-level failure in a GixenError-class connectivity error."""
+        return GixenConnectionError(
+            f"Could not reach Gixen at {url}: {exc}. The host may be down or "
+            "unreachable from this network — a connectivity problem, not a "
+            "credentials problem."
+        )
+
     def login(self) -> str:
         """Log in to Gixen and return the session ID.
 
         Raises:
+            GixenConnectionError: If Gixen is unreachable (DNS/connect/TLS/timeout)
+                or returns an empty response.
             GixenLoginError: If credentials are wrong or account is suspended.
             GixenLoginError: If called within the cooldown window after a failure.
         """
@@ -217,6 +250,11 @@ class GixenClient:
                 timeout=self.timeout,
                 allow_redirects=False,
             )
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # Host unreachable / black-holed / timed out — never got a response.
+            # Classify as connectivity, not credentials (BUI-77).
+            self._login_failed_at = time.monotonic()
+            raise self._connection_error(LOGIN_URL, e) from e
         except Exception:
             self._login_failed_at = time.monotonic()
             raise
@@ -225,9 +263,20 @@ class GixenClient:
         match = re.search(r'sessionid=(\d+)', resp.text)
         if not match:
             self._login_failed_at = time.monotonic()
+            # An empty/blank body with no sessionid is the signature of a
+            # truncated connection or a flapping host, not an auth rejection —
+            # a real rejection returns the login HTML (form + error). Only the
+            # latter is a credentials problem (BUI-77).
+            if not (resp.text or "").strip():
+                raise GixenConnectionError(
+                    f"Gixen returned an empty response from {LOGIN_URL} — the "
+                    "host is likely unreachable or flapping. This is a "
+                    "connectivity problem, not a credentials problem."
+                )
             raise GixenLoginError(
-                "Login failed — could not extract session ID. "
-                "Check your GIXEN_USERNAME and GIXEN_PASSWORD."
+                "Login failed — Gixen returned a page with no session ID. "
+                "If credentials are correct, Gixen's login page may have "
+                "changed. Check your GIXEN_USERNAME and GIXEN_PASSWORD."
             )
 
         self._login_failed_at = None
@@ -268,7 +317,11 @@ class GixenClient:
 
     def _get_home_page(self, retry_on_expired: bool = True) -> str:
         """Fetch the main snipe page. Auto-re-login on session expiration."""
-        resp = self.session.get(self._home_url(), timeout=self.timeout)
+        url = self._home_url()
+        try:
+            resp = self.session.get(url, timeout=self.timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise self._connection_error(url, e) from e
         resp.raise_for_status()
         html = resp.text
 
@@ -290,9 +343,11 @@ class GixenClient:
             if remaining > 0:
                 time.sleep(remaining)
 
-        resp = self.session.post(
-            self._home_url(), data=data, timeout=self.timeout
-        )
+        url = self._home_url()
+        try:
+            resp = self.session.post(url, data=data, timeout=self.timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise self._connection_error(url, e) from e
         self._last_post_at = time.monotonic()
 
         # Gixen returns HTTP 500 for requests with a stale/invalid session.
