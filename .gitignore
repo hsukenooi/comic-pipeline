@@ -10,3 +10,7 @@ venv/
 .DS_Store
 .firecrawl/
 .claude/scheduled_tasks.lock
+
+# LOCG cache: track the JSON/JSONL artifacts (BUI-84), ignore transient state.
+data/locg/collection.lock
+data/locg/collection.json.bak.*

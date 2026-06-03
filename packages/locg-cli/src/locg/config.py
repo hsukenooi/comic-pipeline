@@ -39,10 +39,40 @@ def env_path() -> Path:
     return _config_dir() / ".env"
 
 
+def _find_repo_root() -> Path | None:
+    """Walk up from this file to the comic-pipeline repo root.
+
+    `locg` is installed ``--editable`` (see ``scripts/install.sh``), so this
+    module's source stays in the repo tree and ``__file__`` resolves inside the
+    checkout regardless of the caller's cwd. The root is the first ancestor that
+    has both a ``.git`` entry (a directory in a normal clone, a *file* in a
+    Conductor worktree — ``exists()`` covers both) and a top-level
+    ``pyproject.toml``. Requiring both avoids stopping at a nested package
+    ``pyproject.toml`` (e.g. ``packages/locg-cli/``). Returns ``None`` for a
+    non-editable / wheel install whose source lives outside any repo.
+    """
+    for parent in Path(__file__).resolve().parents:
+        if (parent / ".git").exists() and (parent / "pyproject.toml").exists():
+            return parent
+    return None
+
+
 def _cache_dir() -> Path:
-    """Return the cache directory, respecting XDG_CACHE_HOME."""
-    base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-    return Path(base) / "locg"
+    """Return the LOCG cache directory.
+
+    Precedence:
+      1. ``LOCG_DATA_DIR`` env override — used verbatim (whitespace-stripped;
+         blank/whitespace-only is ignored, not treated as ``.``).
+      2. ``<repo_root>/data/locg`` when running from an editable repo checkout.
+      3. ``~/.cache/locg`` fallback for non-editable / wheel installs.
+    """
+    override = os.environ.get("LOCG_DATA_DIR", "").strip()
+    if override:
+        return Path(override)
+    root = _find_repo_root()
+    if root is not None:
+        return root / "data" / "locg"
+    return Path(os.path.expanduser("~/.cache")) / "locg"
 
 
 def collection_cache_path() -> Path:

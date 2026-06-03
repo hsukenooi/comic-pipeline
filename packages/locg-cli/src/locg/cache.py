@@ -1,10 +1,11 @@
 """Persistent on-disk cache for resolved LOCG comic IDs.
 
-The cache is a single JSON file at ``$XDG_CACHE_HOME/locg/ids.json`` (or
-``~/.cache/locg/ids.json`` if XDG_CACHE_HOME is unset). It maps a
-normalized ``series:issue[:variant]`` key to a small entry containing the
-resolved ``locg_id``, ``locg_variant_id``, ``series_id``, and
-canonical names.
+The cache is a single JSON file at ``<repo>/data/locg/ids.json`` when running
+from an editable repo checkout (``~/.cache/locg/ids.json`` as a fallback, or
+``$LOCG_DATA_DIR/ids.json`` when that override is set — see
+``config._cache_dir``). It maps a normalized ``series:issue[:variant]`` key to a
+small entry containing the resolved ``locg_id``, ``locg_variant_id``,
+``series_id``, and canonical names.
 
 LOCG comic IDs are stable, so entries never auto-expire — call
 ``cache clear`` if a stale mapping ever needs to go.
@@ -21,15 +22,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .config import _cache_dir
+
 logger = logging.getLogger("locg")
 
 CACHE_VERSION = 1
-
-
-def _cache_dir() -> Path:
-    """Return the cache directory, respecting XDG_CACHE_HOME."""
-    base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-    return Path(base) / "locg"
 
 
 def cache_path() -> Path:

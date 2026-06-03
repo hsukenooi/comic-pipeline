@@ -45,15 +45,8 @@ def test_cookie_path_resolves(tmp_path, monkeypatch):
     assert p.name == "cookies.json"
 
 
-def test_wish_list_cache_path_default(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def test_wish_list_cache_path_respects_data_dir_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCG_DATA_DIR", str(tmp_path))
     p = wish_list_cache_path()
-    assert p == tmp_path / "locg" / "wish-list.json"
+    assert p == tmp_path / "wish-list.json"
     assert p.name == "wish-list.json"
-
-
-def test_wish_list_cache_path_respects_xdg_cache_home(tmp_path, monkeypatch):
-    custom_cache = tmp_path / "custom-cache"
-    monkeypatch.setenv("XDG_CACHE_HOME", str(custom_cache))
-    p = wish_list_cache_path()
-    assert p == custom_cache / "locg" / "wish-list.json"

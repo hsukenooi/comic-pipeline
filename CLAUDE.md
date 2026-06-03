@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `comic-pipeline` is a **monorepo** for the comic-collecting use case. It bundles two CLIs that used to live in separate repos (grafted under `packages/` with full history preserved) plus the comic-specific glue:
 
 - `packages/gixen-cli/` — eBay auction sniping: the FastAPI server + `bids` SQLite table + dashboard. Exposes the `gixen` console script.
-- `packages/locg-cli/` — League of Comic Geeks collection/wish-list cache. Exposes the `locg` console script (`locg collection ...`).
+- `packages/locg-cli/` — League of Comic Geeks collection/wish-list cache. Exposes the `locg` console script (`locg collection ...`). The cache is repo-versioned under `data/locg/` (resolved by `config._cache_dir`: `LOCG_DATA_DIR` env → `<repo>/data/locg` → `~/.cache/locg` fallback; BUI-84), so the collection/wish-list travel with the repo.
 - `plugins/gixen-overlay/` — a gixen-cli **plugin** (Python) that adds the `/comics` dashboard tab, comic-specific tables, and `/api/comics/*` endpoints.
 - `apps/` — standalone CLIs: `ebay` + `fmv` (Python), `ezship` (TypeScript).
 - `.claude/commands/comic/` — the `/comic:*` Claude Code skills that orchestrate the whole buying workflow by shelling out to the console scripts (`gixen`, `locg`, `ebay-*`, `comic-fmv`) and endpoints.

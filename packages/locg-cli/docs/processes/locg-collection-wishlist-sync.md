@@ -1,7 +1,8 @@
 # Safe LOCG Collection & Wish-List Sync Process
 
-How to keep the local cache (`~/.cache/locg/collection.json`,
-`~/.cache/locg/wish-list.json`) and your League of Comic Geeks (LOCG) account in
+How to keep the local cache (`data/locg/collection.json`,
+`data/locg/wish-list.json` — repo-versioned since BUI-84) and your League of
+Comic Geeks (LOCG) account in
 sync without losing data, given that edits happen in **two places**: locally (via
 `record-win`, `collection import`, `wish-list add/remove`) and directly in the
 LOCG web UI.
@@ -78,7 +79,7 @@ pending; do not upload the same CSV twice.
 
 ## Wish-list model
 
-- Stored locally in `~/.cache/locg/wish-list.json` (`{name, id, ...}` items).
+- Stored locally in `data/locg/wish-list.json` (`{name, id, ...}` items).
 - `locg collection import` **rebuilds** `wish-list.json` from the imported
   collection rows where `in_wish_list == 1`. So wish-list items added **directly
   in LOCG** do appear locally after an import.
