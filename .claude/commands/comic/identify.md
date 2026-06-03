@@ -43,6 +43,7 @@ The response is a JSON array. Each object contains:
 | `grade_source` | `"item_specifics"`, `"title"`, or `"missing"` |
 | `variant` | Newsstand, Direct, Whitman, etc. Null if not found |
 | `item_specifics` | Full key-value pairs from the listing |
+| `seller` | eBay seller **username** (not the store display name). Carry it forward — it's the key for `/comic:buy`'s seller-reliability advisory and is stored on the snipe. |
 
 Flag items where `grade_source` is `"missing"` — but check the title first. If the grade appears explicitly in the title (e.g. "NM", "VF+", "FVF", "Fine+"), use it as the stated grade with a light note. Reserve a strong ⚠️ for listings with no grade signal anywhere in the title or description.
 
@@ -51,15 +52,18 @@ Flag items where `grade_source` is `"missing"` — but check the title first. If
 Present to user for confirmation:
 
 ```
-| # | Item ID | Comic | Issue | Grade | Variant | Type | Notes |
-|---|---|---|---|---|---|---|---|
-| 1 | 298217294954 | Amazing Spider-Man | #300 | NM- | — | Auction | — |
-| 2 | 318141695576 | Amazing Spider-Man | #300 | — | Newsstand | Auction | ⚠️ Grade not stated |
-| 3 | 555555555 | Batman | #608 | VF | — | BIN | ⚠️ Buy It Now |
+| # | Item ID | Comic | Issue | Grade | Variant | Type | Seller | Notes |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 298217294954 | Amazing Spider-Man | #300 | NM- | — | Auction | beatlebluecat | — |
+| 2 | 318141695576 | Amazing Spider-Man | #300 | — | Newsstand | Auction | comicsRus | ⚠️ Grade not stated |
+| 3 | 555555555 | Batman | #608 | VF | — | BIN | someseller | ⚠️ Buy It Now |
 ```
 
 - Flag any listing where `grade_source` is `"missing"`
 - Flag Buy It Now listings — they're skipped at the Gixen step
+- Carry the `seller` username and the stated `grade` forward — `/comic:buy` uses
+  the seller for its reliability advisory (Step 1) and stores both the seller
+  grade and (if graded) the photo grade on the snipe.
 - Ask user to confirm identifications are correct
 
 Series and issue are not returned directly by the API — derive them from the `title` field.
