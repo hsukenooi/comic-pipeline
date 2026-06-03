@@ -61,6 +61,29 @@ def _run_outcome(row: dict) -> str:
     return out.stdout
 
 
+def _run_is_ended(row: dict) -> bool:
+    """Execute v2-comics.html's isEnded() (a const arrow + its TERMINAL_STATUSES
+    table) in node against a single row. Skips if node is unavailable."""
+    node = shutil.which("node")
+    if node is None:  # pragma: no cover
+        pytest.skip("node not installed")
+    with open(os.path.join(_STATIC_DIR, "v2-comics.html")) as fh:
+        html = fh.read()
+    start = html.index("const TERMINAL_STATUSES")
+    end = html.index('=== "ENDED";', start) + len('=== "ENDED";')
+    snippet = html[start:end]
+    script = (
+        f"{snippet}\n"
+        "const row=JSON.parse(process.argv[1]);\n"
+        "process.stdout.write(isEnded(row) ? '1' : '0');\n"
+    )
+    out = subprocess.run(
+        [node, "-e", script, json.dumps(row)],
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout == "1"
+
+
 def _install_real_plugin(monkeypatch):
     """Wire the actual gixen-overlay plugin into gixen.plugins.entry_points."""
     ep = EntryPoint(
@@ -959,6 +982,24 @@ def test_comics_snipes_includes_ended_but_pending_bid(api):
     assert any(row["item_id"] == "100000007" for row in r.json())
 
 
+def test_comics_snipes_excludes_terminal_statuses(api):
+    """BUI-83: terminal outcomes (WON/LOST/ENDED/FAILED) belong to history, not
+    Active. The server is authoritative — a resolved snipe must not leak into
+    /api/comics/snipes even if it has no auction_end_at for the client's
+    isEnded() heuristic to key on.
+    """
+    db_path = os.environ["DB_PATH"]
+    for i, status in enumerate(("WON", "LOST", "ENDED", "FAILED")):
+        item_id = f"10000010{i}"
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": 50.0})
+        # No auction_end_at — the exact case the client heuristic can't detect.
+        _set_bid_fields(db_path, item_id, status=status)
+
+    returned = {row["item_id"] for row in api.get("/api/comics/snipes").json()}
+    for i in range(4):
+        assert f"10000010{i}" not in returned
+
+
 # --- /api/comics/history ---
 
 
@@ -1173,6 +1214,40 @@ def test_outcome_lost_still_renders_outbid():
     })
     assert 'pill lost' in html
     assert "outbid" in html
+
+
+def test_is_ended_terminal_status_without_end_date():
+    """BUI-83: a terminal status with no end_date_iso (auction_end_at never
+    captured) and a non-'ENDED' relative time still counts as ended — the case
+    the old heuristic missed, leaving the row pinned in Active."""
+    for status in ("WON", "LOST", "ENDED", "FAILED"):
+        assert _run_is_ended(
+            {"status": status, "end_date_iso": None, "time_to_end": "—"}
+        ), status
+
+
+def test_is_ended_pending_future_is_active():
+    assert not _run_is_ended(
+        {"status": "PENDING", "end_date_iso": "2099-01-01T00:00:00+00:00"}
+    )
+
+
+def test_is_ended_pending_past_end_date_is_ended():
+    assert _run_is_ended(
+        {"status": "PENDING", "end_date_iso": "2000-01-01T00:00:00+00:00"}
+    )
+
+
+def test_is_ended_pending_relative_ended_is_ended():
+    assert _run_is_ended(
+        {"status": "PENDING", "end_date_iso": None, "time_to_end": "ENDED"}
+    )
+
+
+def test_is_ended_pending_relative_time_remaining_is_active():
+    assert not _run_is_ended(
+        {"status": "PENDING", "end_date_iso": None, "time_to_end": "2h"}
+    )
 
 
 def test_comics_snipes_triggers_fresh_sync(api):

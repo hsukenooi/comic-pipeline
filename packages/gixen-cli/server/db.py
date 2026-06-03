@@ -260,6 +260,23 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE bids SET status='REMOVED' WHERE status='PURGED'")
     conn.commit()
 
+    # BUI-83: backfill auction_end_at from resolved_at for legacy resolved rows.
+    # update_bid_status now does `auction_end_at=COALESCE(auction_end_at, ?)` at
+    # resolution time (the 2b7484a fix), but rows that resolved *before* that
+    # landed kept auction_end_at NULL. With no end date they fall out of both
+    # /api/comics/snipes (filtered as terminal) and the 7-day history window once
+    # resolved_at ages past the fallback branch — rendering in neither table. A
+    # resolved auction's end time is its resolved_at, so backfill it. Excludes the
+    # soft-delete tombstone (PURGED/REMOVED): its resolved_at is the removal time,
+    # not an auction end. Idempotent: matches 0 rows once every resolved row has
+    # an end date.
+    conn.execute(
+        "UPDATE bids SET auction_end_at = resolved_at "
+        "WHERE auction_end_at IS NULL AND resolved_at IS NOT NULL "
+        "AND status NOT IN ('PURGED', 'REMOVED')"
+    )
+    conn.commit()
+
     # Enforce at most one live (PENDING) snipe per item_id (BUI-67). Runs last,
     # after the PURGED->REMOVED remap so the CHECK already permits the REMOVED
     # tombstone this writes on dedup losers.

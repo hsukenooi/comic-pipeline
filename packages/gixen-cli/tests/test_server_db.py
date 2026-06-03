@@ -599,6 +599,59 @@ def test_status_rename_migration_is_idempotent(tmp_path):
         conn2.close()
 
 
+def test_auction_end_at_backfill_from_resolved_at(tmp_path):
+    """BUI-83: a resolved (terminal) row whose auction_end_at was never captured
+    gets it backfilled from resolved_at, so it isn't lost from both the active
+    and history views."""
+    db_path = tmp_path / "bf.db"
+    conn = init_db(db_path)
+    insert_bid(conn, "143000001", 25.0, 6, 0, "s")
+    # Simulate a legacy row that resolved before the resolve-time COALESCE
+    # backfill landed: terminal status + resolved_at set, auction_end_at NULL.
+    conn.execute(
+        "UPDATE bids SET status='LOST', resolved_at='2026-05-23T22:33:19+00:00', "
+        "auction_end_at=NULL WHERE item_id='143000001'"
+    )
+    conn.commit()
+    conn.close()
+
+    conn2 = init_db(db_path)  # re-run migrations → backfill
+    try:
+        row = conn2.execute(
+            "SELECT auction_end_at FROM bids WHERE item_id='143000001'"
+        ).fetchone()
+        assert row["auction_end_at"] == "2026-05-23T22:33:19+00:00"
+    finally:
+        conn2.close()
+
+
+def test_auction_end_at_backfill_skips_tombstone_and_unresolved(tmp_path):
+    """The backfill must not touch the soft-delete tombstone (its resolved_at is
+    a removal time, not an auction end) nor a live PENDING row with no
+    resolved_at."""
+    db_path = tmp_path / "bf2.db"
+    conn = init_db(db_path)
+    insert_bid(conn, "rem000001", 25.0, 6, 0, "s")
+    insert_bid(conn, "pend00001", 25.0, 6, 0, "s")
+    conn.execute(
+        "UPDATE bids SET status='REMOVED', resolved_at='2026-05-23T00:00:00+00:00', "
+        "auction_end_at=NULL WHERE item_id='rem000001'"
+    )
+    conn.commit()
+    conn.close()
+
+    conn2 = init_db(db_path)
+    try:
+        assert conn2.execute(
+            "SELECT auction_end_at FROM bids WHERE item_id='rem000001'"
+        ).fetchone()["auction_end_at"] is None
+        assert conn2.execute(
+            "SELECT auction_end_at FROM bids WHERE item_id='pend00001'"
+        ).fetchone()["auction_end_at"] is None
+    finally:
+        conn2.close()
+
+
 def test_removed_status_accepted_after_migration(tmp_path):
     """Post-migration, the CHECK accepts an explicit REMOVED insert."""
     db_path = tmp_path / "old.db"

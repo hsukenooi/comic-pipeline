@@ -204,9 +204,16 @@ function timeLeft(iso) {
   return `${h}h`;
 }
 
-const isEnded = r => r.end_date_iso
-  ? new Date(r.end_date_iso) <= Date.now()
-  : (r.time_to_end||"").toUpperCase() === "ENDED";
+// A terminal backend status is end-of-auction by definition — trust it before
+// any date/relative-time heuristic so a resolved snipe with no end_date_iso
+// (auction_end_at never captured) can't stay pinned in Active even if the
+// server still serves it (e.g. version skew where it lacks the BUI-83 filter).
+const TERMINAL_STATUSES = ["WON", "LOST", "ENDED", "FAILED"];
+const isEnded = r => TERMINAL_STATUSES.includes((r.status||"").toUpperCase())
+  ? true
+  : r.end_date_iso
+    ? new Date(r.end_date_iso) <= Date.now()
+    : (r.time_to_end||"").toUpperCase() === "ENDED";
 
 const parseAmt = s => {
   if (s == null) return null;
