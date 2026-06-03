@@ -354,7 +354,7 @@ def _stitch(books: list[dict], cached: dict[int, dict],
             row = cached[i]
             out.append({
                 "input": _input_summary(book),
-                "fmv": _fmv_from_db_row(row),
+                "fmv": _fmv_from_db_row(row, book.get("grade_confidence")),
                 "comp_count_total": row.get("fmv_comps") or 0,
                 "queries_used": [],
                 "db_row": row,
@@ -382,25 +382,30 @@ def _input_summary(book: dict) -> dict:
             if book.get(k) is not None}
 
 
-def _fmv_from_db_row(row: dict) -> dict:
-    """Project a gixen-overlay `comics` row back into the fmv dict shape."""
+def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
+    """Project a gixen-overlay `comics` row back into the fmv dict shape.
+
+    BUI-51: grade_confidence is not *persisted* (KTD6 — no DB column), but a
+    cache hit on a freshly photo-graded comic still gets the haircut: we combine
+    the request's grade_confidence with the row's stored fmv_confidence at read
+    time. Without this, reusing a recent FMV would silently bid a low-confidence
+    grade at full 80% — the exact case the haircut exists to prevent.
+    """
     fmv_high = row.get("fmv_high")
-    # BUI-51: grade_confidence is not persisted (KTD6), so a cached reuse can't
-    # reapply the grade haircut — cached rows keep the standard BASE_BID_FACTOR.
-    # Fresh computes (the path that runs right after a photo grade) carry the
-    # haircut via compute_fmv.
+    fmv_conf = (row.get("fmv_confidence") or "low").upper()
+    factor = fmv_math.bid_factor(fmv_conf, grade_confidence)
     return {
         "n": row.get("fmv_comps") or 0,
         "window": None,
         "fmv_low": row.get("fmv_low"),
         "fmv_high": fmv_high,
         "median": None,
-        "max_bid": fmv_math.clean_round(fmv_high * fmv_math.BASE_BID_FACTOR) if fmv_high else None,
+        "max_bid": fmv_math.clean_round(fmv_high * factor) if fmv_high else None,
         "cv": None,
         "cv_pct": "n/a",
-        "confidence": (row.get("fmv_confidence") or "low").upper(),
-        "grade_confidence": None,
-        "bid_factor": fmv_math.BASE_BID_FACTOR,
+        "confidence": fmv_conf,
+        "grade_confidence": grade_confidence,
+        "bid_factor": factor,
         "trimmed_pool": [],
     }
 

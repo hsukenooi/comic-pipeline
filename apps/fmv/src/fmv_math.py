@@ -104,8 +104,8 @@ BASE_BID_FACTOR = 0.80  # standard: max_bid = 80% × fmv_high
 _CONF_RANK = {
     "HIGH": 4, "MEDIUM-HIGH": 3, "MEDIUM": 2, "MEDIUM-LOW": 1, "LOW": 0,
 }
-# /comic:grade emits grade_confidence as high|medium|low (it collapses its
-# MEDIUM-LOW onto "low"); tolerate the finer label too.
+# /comic:grade emits grade_confidence as high|medium|medium-low|low (all four
+# levels preserved through the handoff so MEDIUM-LOW haircuts at 0.70, not 0.60).
 _GRADE_CONF_NORMALIZE = {
     "high": "HIGH", "medium": "MEDIUM", "medium-low": "MEDIUM-LOW", "low": "LOW",
 }
@@ -124,15 +124,27 @@ def bid_factor(fmv_confidence: str | None, grade_confidence: str | None) -> floa
     reflects photo coverage from /comic:grade. When grade_confidence is present
     we take the MORE CONSERVATIVE of the two and haircut a low combined level.
 
-    Back-compat (BUI-51): when grade_confidence is None — a manual run or an
-    already-graded comic that never went through the photo grader — the haircut
-    does NOT engage and the bid stays at BASE_BID_FACTOR, exactly as before. The
-    presence of grade_confidence is the opt-in switch for the haircut behavior.
+    Back-compat (BUI-51): when grade_confidence is None or blank — a manual run
+    or an already-graded comic that never went through the photo grader — the
+    haircut does NOT engage and the bid stays at BASE_BID_FACTOR, exactly as
+    before. The presence of a real grade_confidence is the opt-in switch.
+
+    The grade_confidence value is authored by the /comic:grade LLM and reaches
+    here via a JSON envelope, so it is untrusted: a non-string or a typo'd label
+    must neither crash nor silently skip the haircut. A present-but-unrecognized
+    value is treated as LOW — the conservative direction for a bid cap (bid less
+    when we're unsure), not MEDIUM (which would fail open).
     """
     if grade_confidence is None:
         return BASE_BID_FACTOR
-    g = _GRADE_CONF_NORMALIZE.get(grade_confidence.strip().lower(), grade_confidence)
-    combined = min(_rank(fmv_confidence), _rank(g))
+    if isinstance(grade_confidence, str):
+        gc = grade_confidence.strip().lower()
+        if gc == "":
+            return BASE_BID_FACTOR              # blank == absent
+        g = _GRADE_CONF_NORMALIZE.get(gc, "LOW")
+    else:
+        g = "LOW"                               # non-string envelope value → conservative
+    combined = min(_rank(fmv_confidence), _CONF_RANK[g])
     if combined <= _CONF_RANK["LOW"]:          # LOW
         return 0.60
     if combined == _CONF_RANK["MEDIUM-LOW"]:   # MEDIUM-LOW

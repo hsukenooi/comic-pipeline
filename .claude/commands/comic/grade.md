@@ -344,7 +344,7 @@ Then a summary table at the end:
 | 2 | ASM #300 (1988) | 123456789 | 8.5 VF+ | 8.5 | HIGH |
 ```
 
-The summary table is the input for `/comic:fmv`. **Carry the Confidence column forward** — `comic-fmv` consumes it (as `grade_confidence`) to haircut the bid cap when grade confidence is low (LOW/MEDIUM-LOW → `low`; MEDIUM → `medium`; HIGH → `high`).
+The summary table is the input for `/comic:fmv`. **Carry the Confidence column forward** — `comic-fmv` consumes it (as `grade_confidence`) to haircut the bid cap when grade confidence is low. Map the label to lowercase, preserving all four levels: `HIGH → high`, `MEDIUM → medium`, `MEDIUM-LOW → medium-low`, `LOW → low`. (Don't collapse MEDIUM-LOW into `low` — they haircut differently: MEDIUM-LOW → 0.70, LOW → 0.60.)
 
 ## Integration with /comic:buy
 

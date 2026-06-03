@@ -66,7 +66,7 @@ Present the photo-assessed grades to the user before proceeding:
 | 2 | Fantastic Four #48 | ⚠️ not stated | 5.0 VG/FN | MEDIUM-LOW | photo assessed |
 ```
 
-Gate: user confirms the assessed grades (or overrides any) before FMV. Map the grade skill's confidence to `grade_confidence` for Step 3: LOW/MEDIUM-LOW → `low`, MEDIUM → `medium`, HIGH → `high`.
+Gate: user confirms the assessed grades (or overrides any) before FMV. Map the grade skill's confidence to `grade_confidence` for Step 3, preserving all four levels: HIGH → `high`, MEDIUM → `medium`, MEDIUM-LOW → `medium-low`, LOW → `low` (MEDIUM-LOW and LOW haircut differently — 0.70 vs 0.60 — so don't collapse them).
 
 **If all comics already have a stated grade:** skip this step entirely.
 

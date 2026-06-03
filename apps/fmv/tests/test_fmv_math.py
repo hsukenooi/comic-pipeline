@@ -189,18 +189,44 @@ class TestBidFactor:
         assert fm.bid_factor("LOW", "high") == 0.60
 
     def test_takes_more_conservative_axis(self):
-        assert fm.bid_factor("HIGH", "low") == fm.bid_factor("LOW", "high")
+        # Symmetric AND pinned to the actual conservative value (MIN → LOW → 0.60),
+        # so a MAX/OR regression that kept symmetry would still fail.
+        assert fm.bid_factor("HIGH", "low") == 0.60
+        assert fm.bid_factor("LOW", "high") == 0.60
 
     def test_medium_low_combined(self):
         assert fm.bid_factor("MEDIUM-LOW", "high") == 0.70
         assert fm.bid_factor("HIGH", "medium-low") == 0.70
 
+    def test_medium_grade_with_high_fmv_no_haircut(self):
+        # A MEDIUM grade paired with a HIGHER axis must NOT haircut — guards the
+        # MIN boundary (combined == MEDIUM-LOW, not <= MEDIUM).
+        assert fm.bid_factor("HIGH", "medium") == fm.BASE_BID_FACTOR
+        assert fm.bid_factor("MEDIUM", "high") == fm.BASE_BID_FACTOR
+
     def test_medium_no_haircut(self):
         assert fm.bid_factor("MEDIUM", "medium") == fm.BASE_BID_FACTOR
 
-    def test_unknown_label_treated_as_medium(self):
-        # Defensive: an unrecognized fmv label shouldn't crash or over-haircut
+    def test_unknown_fmv_label_no_overhaircut(self):
+        # An unrecognized *fmv* label (code-generated, should always be valid)
+        # degrades to neutral MEDIUM — no crash, no over-haircut.
         assert fm.bid_factor("WEIRD", "high") == fm.BASE_BID_FACTOR
+
+    def test_unknown_grade_label_fails_conservative(self):
+        # An unrecognized *grade* label (LLM-authored, untrusted) leans LOW —
+        # bid less when unsure, not the fail-open MEDIUM.
+        assert fm.bid_factor("HIGH", "lo") == 0.60
+        assert fm.bid_factor("HIGH", "unknown") == 0.60
+
+    def test_non_string_grade_confidence_no_crash(self):
+        # A malformed envelope value (number/bool) must not crash; treat as LOW.
+        assert fm.bid_factor("HIGH", 1) == 0.60
+        assert fm.bid_factor("HIGH", True) == 0.60
+
+    def test_blank_grade_confidence_is_absent(self):
+        # Empty/whitespace string is an "absent" encoding → no haircut, like None.
+        assert fm.bid_factor("LOW", "") == fm.BASE_BID_FACTOR
+        assert fm.bid_factor("LOW", "   ") == fm.BASE_BID_FACTOR
 
 
 # ─── compute_fmv grade-confidence haircut (BUI-51) ────────────────────────────
@@ -247,8 +273,9 @@ class TestComputeFmvGradeConfidence:
         out = fm.compute_fmv(self._dense_high_fmv(), 8.0, grade_confidence="medium")
         assert out["grade_confidence"] == "medium"
 
-    def test_haircut_result_is_clean_rounded(self):
-        out = fm.compute_fmv(self._dense_high_fmv(), 8.0, grade_confidence="low")
-        # clean_round step is $5 below $50 / $10 below $200 / $25 above
-        mb = out["max_bid"]
-        assert mb % 5 == 0 or mb % 10 == 0 or mb % 25 == 0
+    def test_medium_low_grade_haircuts_to_070(self):
+        # MEDIUM-LOW now survives the handoff (not collapsed to low) → 0.70 tier.
+        out = fm.compute_fmv(self._dense_high_fmv(), 8.0,
+                             grade_confidence="medium-low")
+        assert out["bid_factor"] == 0.70
+        assert out["max_bid"] == fm.clean_round(out["fmv_high"] * 0.70)

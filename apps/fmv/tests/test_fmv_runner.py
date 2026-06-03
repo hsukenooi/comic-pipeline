@@ -420,6 +420,29 @@ class TestStitch:
         assert out[0]["source"] == "error"
         assert "no comps fetched" in out[0]["error"]
 
+    def test_cached_path_applies_grade_haircut(self):
+        """BUI-51: a cache hit on a freshly low-confidence grade must still be
+        haircut — reusing a recent FMV at full 80% is the gap this closes."""
+        book = _make_book("a", "A", "1", 1990, 9.0)
+        book["grade_confidence"] = "low"
+        cached = {0: {"fmv_low": 50, "fmv_high": 100, "fmv_comps": 8,
+                      "fmv_confidence": "high",
+                      "title": "A", "issue": "1", "year": 1990, "grade": 9.0}}
+        out = fmv_runner._stitch([book], cached, {})
+        assert out[0]["source"] == "cached"
+        # high comp confidence + low grade confidence → conservative LOW → 0.60
+        assert out[0]["fmv"]["bid_factor"] == 0.60
+        assert out[0]["fmv"]["max_bid"] == fmv_runner.fmv_math.clean_round(100 * 0.60)
+
+    def test_cached_path_no_grade_confidence_unchanged(self):
+        book = _make_book("a", "A", "1", 1990, 9.0)  # no grade_confidence
+        cached = {0: {"fmv_low": 50, "fmv_high": 100, "fmv_comps": 8,
+                      "fmv_confidence": "high",
+                      "title": "A", "issue": "1", "year": 1990, "grade": 9.0}}
+        out = fmv_runner._stitch([book], cached, {})
+        assert out[0]["fmv"]["bid_factor"] == fmv_runner.fmv_math.BASE_BID_FACTOR
+        assert out[0]["fmv"]["max_bid"] == fmv_runner.fmv_math.clean_round(100 * 0.80)
+
 
 # ─── End-to-end (with mocks) ──────────────────────────────────────────────────
 
