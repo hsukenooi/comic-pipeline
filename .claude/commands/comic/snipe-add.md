@@ -28,6 +28,8 @@ If the user hasn't set max bids, default to:
 
 Round to a clean number (e.g., $136 → $135). User can override per comic.
 
+**Note:** when the bid comes from `comic-fmv` (the `/comic:buy` path), the CLI may have already applied a **confidence haircut** below 80% — `0.70` or `0.60` × FMV high — when the photo `grade_confidence` or comp confidence was low (look for `bid_haircut=…` in the row's Notes). That lowered number is intentional; don't "correct" it back up to 80% without a reason. The 80% formula above is the fallback for manually-set bids.
+
 ## Pre-flight Check
 
 **1. Server health**

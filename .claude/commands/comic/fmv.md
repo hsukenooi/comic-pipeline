@@ -15,7 +15,9 @@ Compute fair market value from real eBay sold transactions. No multiplier math �
 gixen fmv --batch <working_list.json> --out <results.json>
 ```
 
-`--batch` JSON shape: `[{item_id, title, issue, year, grade, locg_id?, locg_variant_id?, notes?}, ...]`
+`--batch` JSON shape: `[{item_id, title, issue, year, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]`
+
+`grade_confidence` (optional, `high`|`medium`|`low`) is the photo-coverage confidence from `/comic:grade`. When present and low, it haircuts the max bid (see Step 6). Absent → standard 80% bid, no haircut (back-compat for seller-stated grades and manual runs).
 
 Flags:
 - `--max-age-days N` (default 7): reuse FMVs already in the Gixen DB if `fmv_updated_at` is within N days
@@ -177,7 +179,7 @@ Bucket medians should rise monotonically with grade. If 4.0 median > 4.5 median,
 
 - **Median** = median of trimmed pool
 - **FMV range** = Q25 to Q75 of trimmed pool (same `method='inclusive'` as the IQR step), rounded to clean numbers (`$25` step above $200, `$10` step from $50–$200, `$5` step below)
-- **Max bid** = 80% × FMV high (round to clean number)
+- **Max bid** = `bid_factor` × FMV high (round to clean number). `bid_factor` is `0.80` by default. When `grade_confidence` is supplied (photo grade), the haircut takes the **more conservative** of the grade confidence and the comp confidence and lowers the factor: MEDIUM-LOW combined → `0.70`, LOW combined → `0.60`. This is why a thinly-photographed comic bids below 80% of FMV — the bid reflects how sure we are of the grade, not just the price.
 
 ### 7. Grade-curve interpolation when direct comps are sparse
 

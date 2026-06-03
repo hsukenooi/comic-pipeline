@@ -96,6 +96,50 @@ def confidence_label(n: int, cv_value: float | None) -> str:
     return "LOW"
 
 
+# ─── Bid-cap factor (confidence haircut) ──────────────────────────────────────
+
+BASE_BID_FACTOR = 0.80  # standard: max_bid = 80% × fmv_high
+
+# Ordinal ranking of confidence labels, lowest = least confident.
+_CONF_RANK = {
+    "HIGH": 4, "MEDIUM-HIGH": 3, "MEDIUM": 2, "MEDIUM-LOW": 1, "LOW": 0,
+}
+# /comic:grade emits grade_confidence as high|medium|low (it collapses its
+# MEDIUM-LOW onto "low"); tolerate the finer label too.
+_GRADE_CONF_NORMALIZE = {
+    "high": "HIGH", "medium": "MEDIUM", "medium-low": "MEDIUM-LOW", "low": "LOW",
+}
+
+
+def _rank(label: str | None) -> int:
+    """Rank a confidence label; unknown/blank → MEDIUM (neutral, no haircut)."""
+    return _CONF_RANK.get((label or "").strip().upper(), _CONF_RANK["MEDIUM"])
+
+
+def bid_factor(fmv_confidence: str | None, grade_confidence: str | None) -> float:
+    """Multiplier applied to fmv_high to get the max bid.
+
+    Defaults to BASE_BID_FACTOR (0.80). The two confidence axes are orthogonal
+    (BUI-51 KTD2): `fmv_confidence` reflects comp-pool quality, `grade_confidence`
+    reflects photo coverage from /comic:grade. When grade_confidence is present
+    we take the MORE CONSERVATIVE of the two and haircut a low combined level.
+
+    Back-compat (BUI-51): when grade_confidence is None — a manual run or an
+    already-graded comic that never went through the photo grader — the haircut
+    does NOT engage and the bid stays at BASE_BID_FACTOR, exactly as before. The
+    presence of grade_confidence is the opt-in switch for the haircut behavior.
+    """
+    if grade_confidence is None:
+        return BASE_BID_FACTOR
+    g = _GRADE_CONF_NORMALIZE.get(grade_confidence.strip().lower(), grade_confidence)
+    combined = min(_rank(fmv_confidence), _rank(g))
+    if combined <= _CONF_RANK["LOW"]:          # LOW
+        return 0.60
+    if combined == _CONF_RANK["MEDIUM-LOW"]:   # MEDIUM-LOW
+        return 0.70
+    return BASE_BID_FACTOR                      # MEDIUM and above
+
+
 # ─── Clean rounding ───────────────────────────────────────────────────────────
 
 def clean_round(value: float) -> int:
@@ -111,8 +155,15 @@ def clean_round(value: float) -> int:
 
 # ─── End-to-end: comps → FMV summary ─────────────────────────────────────────
 
-def compute_fmv(comps: list[dict], target_grade: float) -> dict:
+def compute_fmv(comps: list[dict], target_grade: float,
+                grade_confidence: str | None = None) -> dict:
     """Take a deduped, hard-excluded comp list and return the FMV summary.
+
+    `grade_confidence` (BUI-51) is the photo-coverage confidence from
+    /comic:grade (high|medium|low). When present, the max bid is haircut by
+    the more conservative of it and the comp-pool confidence (see bid_factor).
+    When None, the bid stays at BASE_BID_FACTOR — back-compat for manual or
+    already-graded books.
 
     Output shape:
     {
@@ -121,10 +172,12 @@ def compute_fmv(comps: list[dict], target_grade: float) -> dict:
       "fmv_low": int | None,           # Q25, clean-rounded
       "fmv_high": int | None,          # Q75, clean-rounded
       "median": int | None,            # median, clean-rounded
-      "max_bid": int | None,           # 80% × fmv_high, clean-rounded
+      "max_bid": int | None,           # bid_factor × fmv_high, clean-rounded
       "cv": float | None,              # raw CV (not %)
       "cv_pct": str,                   # human "27%" or "n/a"
       "confidence": str,               # HIGH | MEDIUM-HIGH | MEDIUM | MEDIUM-LOW | LOW
+      "grade_confidence": str | None,  # echoed back for traceability
+      "bid_factor": float,             # the multiplier actually applied
       "trimmed_pool": list[float],     # for debugging / display
     }
     """
@@ -133,16 +186,17 @@ def compute_fmv(comps: list[dict], target_grade: float) -> dict:
     n = len(trimmed)
     cv_val = cv(trimmed)
     label = confidence_label(n, cv_val)
+    factor = bid_factor(label, grade_confidence)
 
     if n >= 2:
         fmv_low = clean_round(quartile(trimmed, 0.25))
         fmv_high = clean_round(quartile(trimmed, 0.75))
         med = clean_round(statistics.median(trimmed))
-        max_bid = clean_round(fmv_high * 0.80)
+        max_bid = clean_round(fmv_high * factor)
     elif n == 1:
         v = clean_round(trimmed[0])
         fmv_low = fmv_high = med = v
-        max_bid = clean_round(trimmed[0] * 0.80)
+        max_bid = clean_round(trimmed[0] * factor)
     else:
         fmv_low = fmv_high = med = max_bid = None
 
@@ -156,5 +210,7 @@ def compute_fmv(comps: list[dict], target_grade: float) -> dict:
         "cv": cv_val,
         "cv_pct": f"{cv_val * 100:.0f}%" if cv_val is not None else "n/a",
         "confidence": label,
+        "grade_confidence": grade_confidence,
+        "bid_factor": factor,
         "trimmed_pool": sorted(trimmed),
     }

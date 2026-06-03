@@ -54,19 +54,19 @@ Inspect the surviving working list for comics where `grade_source` is `"missing"
 Read `~/Projects/comic-pipeline/.claude/commands/comic/grade.md` and follow it for those listings only.
 
 - Pass only the ungraded item IDs — already-graded comics skip this step
-- The skill downloads photos via the eBay Browse API and dispatches 3 independent grader agents per comic
-- Use the consensus grade output as the grade for Step 3
+- The skill downloads photos via the eBay Browse API and dispatches graders per comic (value-gated: 1 grader for cheap/unambiguous lots, a 3-grader panel for high-value or boundary-ambiguous ones)
+- Use the consensus grade output as the grade for Step 3 — and carry the **Confidence** column forward as `grade_confidence` (FMV uses it to haircut the bid cap when grade confidence is low)
 
 Present the photo-assessed grades to the user before proceeding:
 
 ```
-| # | Comic | Seller Grade | Photo Grade | Source |
-|---|---|---|---|---|
-| 1 | Amazing Spider-Man #300 | NM- | — | seller stated |
-| 2 | Fantastic Four #48 | ⚠️ not stated | 5.0 VG/FN | photo assessed |
+| # | Comic | Seller Grade | Photo Grade | Confidence | Source |
+|---|---|---|---|---|---|
+| 1 | Amazing Spider-Man #300 | NM- | — | — | seller stated |
+| 2 | Fantastic Four #48 | ⚠️ not stated | 5.0 VG/FN | MEDIUM-LOW | photo assessed |
 ```
 
-Gate: user confirms the assessed grades (or overrides any) before FMV.
+Gate: user confirms the assessed grades (or overrides any) before FMV. Map the grade skill's confidence to `grade_confidence` for Step 3: LOW/MEDIUM-LOW → `low`, MEDIUM → `medium`, HIGH → `high`.
 
 **If all comics already have a stated grade:** skip this step entirely.
 
@@ -80,7 +80,7 @@ Run `comic-fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetc
 comic-fmv --batch <working_list.json> --out <results.json>
 ```
 
-**Input:** Working list JSON: `[{item_id, title, issue, year, grade, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable).
+**Input:** Working list JSON: `[{item_id, title, issue, year, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Include `grade_confidence` (`high`|`medium`|`low`) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
 
 **Output:** Human FMV table to stdout + structured JSON at `--out`. Carry the JSON forward to Step 4 **and Step 5**.
 
@@ -127,13 +127,13 @@ If the CLI fails, fall back to the manual procedure in `~/Projects/comic-pipelin
 
 ## Step 4: Compute Max Bids
 
-The CLI returns `max_bid = round_clean(0.80 × fmv_high)` per row. Present the proposed bids:
+The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is the standard `0.80` **unless** a low `grade_confidence` (from a photo grade) or low comp confidence triggers a haircut (`0.70` at MEDIUM-LOW, `0.60` at LOW combined) — see Step 2.5. When a haircut applied, the row's Notes carry `bid_haircut=…`. Present the proposed bids:
 
 ```
-| # | Comic | Grade | FMV Range | Max Bid (80%) | Notes |
+| # | Comic | Grade | FMV Range | Max Bid | Notes |
 |---|---|---|---|---|---|
 | 1 | Amazing Spider-Man #300 | NM | $800–1000 | $800 | |
-| 2 | Invincible #1 | NM (assumed) | $270–320 | $256 | LOW conf, n=2 |
+| 2 | Invincible #1 | NM (assumed) | $270–320 | $192 | LOW conf, n=2, bid_haircut=0.60 |
 | 3 | Batman #609 | NM | $40–50 | $40 | ⚠️ ends 2026-05-11 |
 ```
 

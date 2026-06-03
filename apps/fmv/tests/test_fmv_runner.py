@@ -173,6 +173,46 @@ class TestComputeOne:
         body = upsert_mock.call_args.args[1]
         assert body.get("locg_id") == 100
 
+    def test_grade_confidence_threads_into_haircut(self, server_url):
+        """BUI-51: grade_confidence on the batch envelope must reach compute_fmv
+        and haircut the bid, and the upsert notes must surface it."""
+        comps = [_make_comp(p, 8.0) for p in
+                 [100, 110, 120, 130, 140, 150, 160, 170, 180]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": comps,
+        }
+        captured = {}
+        def _capture(server, inp, fmv):
+            captured["fmv"] = fmv
+            return {"id": 1}
+        with patch("fmv_runner._upsert_fmv", side_effect=_capture):
+            out = fmv_runner._compute_and_upsert_one(
+                result,
+                {"title": "X", "issue": "1", "grade": 8.0,
+                 "grade_confidence": "low"},
+                server_url=server_url)
+        assert out["fmv"]["bid_factor"] == 0.60          # haircut applied
+        assert out["fmv"]["grade_confidence"] == "low"
+        assert out["input"]["grade_confidence"] == "low"  # echoed in input summary
+        # Notes (persisted to fmv_notes) explain the lowered bid
+        notes = fmv_runner._build_notes(captured["fmv"])
+        assert "bid_haircut=0.60" in notes
+
+    def test_absent_grade_confidence_no_haircut_in_runner(self, server_url):
+        comps = [_make_comp(p, 8.0) for p in
+                 [100, 110, 120, 130, 140, 150, 160, 170, 180]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        assert out["fmv"]["bid_factor"] == fmv_runner.fmv_math.BASE_BID_FACTOR
+        assert "bid_haircut" not in fmv_runner._build_notes(out["fmv"])
+
     def test_coerces_letter_grade_string(self, server_url):
         """Wish-list caches sometimes carry letter grades. The runner must
         coerce them to numeric so fmv_math doesn't silently return n=0."""
