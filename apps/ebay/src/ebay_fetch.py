@@ -12,11 +12,15 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
+from urllib.parse import quote
 
 # --- Configuration ---
 
 CONFIG_DIR = Path.home() / ".config" / "ebay-fetch"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+# Maps eBay *store names* (what a human types) to the seller's login *username*
+# (what the Browse API filter actually needs). See BUI-68.
+SELLER_ALIASES_FILE = CONFIG_DIR / "seller_aliases.json"
 
 PRODUCTION_BASE = "https://api.ebay.com"
 SANDBOX_BASE = "https://api.sandbox.ebay.com"
@@ -342,12 +346,101 @@ def parse_item(data):
 
 
 def _extract_seller_username(arg):
-    """Normalize an eBay store/user URL or raw username to a plain username."""
+    """Normalize an eBay store/user URL or raw username to a plain token.
+
+    Low-level: just pulls a token out of a URL. It does NOT distinguish a real
+    login username from a store slug — that judgement lives in
+    resolve_seller_username(). Used by search_seller_listings to know which
+    seller to filter/verify against once a clean value has been chosen.
+    """
+    # A seller-search URL carries the real login username in _ssn=
+    m = re.search(r"[?&]_ssn=([^&]+)", arg)
+    if m:
+        return m.group(1)
     # https://www.ebay.com/usr/beatlebluecat or /str/beatlebluecat
     m = re.search(r"/(?:usr|str)/([^/?&]+)", arg)
     if m:
         return m.group(1)
     return arg.strip()
+
+
+class UnknownSellerError(Exception):
+    """Raised when a store name can't be resolved to an eBay login username."""
+
+    def __init__(self, store):
+        self.store = store
+        super().__init__(store)
+
+
+def load_seller_aliases():
+    """Load the store-name → username map. Returns {} if the file is absent.
+
+    Keys are lowercased so lookups are case-insensitive.
+    """
+    if not SELLER_ALIASES_FILE.exists():
+        return {}
+    try:
+        with open(SELLER_ALIASES_FILE) as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return {str(k).strip().lower(): str(v).strip() for k, v in raw.items() if v}
+
+
+def save_seller_alias(store, username):
+    """Add/update one store-name → username mapping and persist it."""
+    aliases = {}
+    if SELLER_ALIASES_FILE.exists():
+        try:
+            with open(SELLER_ALIASES_FILE) as f:
+                aliases = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            aliases = {}
+    aliases[store.strip().lower()] = username.strip()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SELLER_ALIASES_FILE, "w") as f:
+        json.dump(aliases, f, indent=2, sort_keys=True)
+    return aliases
+
+
+def _classify_seller_input(raw):
+    """Return (value, kind): kind is 'username' (a trustworthy login name) or
+    'store' (a store name/slug that must be resolved via the alias map).
+
+    An eBay *store name* is NOT a seller username — the Browse API silently
+    rejects it and returns every seller's listings (BUI-68). Only values we
+    know to be real usernames (/usr/ paths, _ssn= query params) are trusted.
+    """
+    s = raw.strip()
+    if re.search(r"[?&]_ssn=([^&]+)", s):
+        return re.search(r"[?&]_ssn=([^&]+)", s).group(1), "username"
+    m = re.search(r"/usr/([^/?&]+)", s)
+    if m:
+        return m.group(1), "username"
+    m = re.search(r"/str/([^/?&]+)", s)
+    if m:
+        return m.group(1), "store"
+    return s, "store"
+
+
+def resolve_seller_username(seller, aliases, *, username_override=None):
+    """Resolve a user-supplied seller arg to an eBay login username.
+
+    - username_override (from --username) is trusted verbatim.
+    - /usr/ and _ssn= URLs carry a real username and are trusted.
+    - Everything else is treated as a store name and looked up in `aliases`;
+      an unknown store raises UnknownSellerError rather than silently scanning
+      every seller.
+    """
+    if username_override:
+        return username_override.strip()
+    value, kind = _classify_seller_input(seller)
+    if kind == "username":
+        return value
+    key = value.lower()
+    if key in aliases:
+        return aliases[key]
+    raise UnknownSellerError(value)
 
 
 def parse_item_summary(item):
@@ -399,11 +492,43 @@ def parse_item_summary(item):
     }
 
 
-def search_seller_listings(seller, token, base_url, *, max_results=1000, retries=3):
-    """Fetch active listings from a seller via Browse API item_summary/search.
+def _seller_filter_rejected(data):
+    """True if eBay's response warns that the sellers filter was invalid.
 
-    Paginates automatically. Returns a list of raw itemSummary dicts.
-    seller may be a username or eBay store/user URL.
+    When the filter is rejected, eBay falls back to returning *all* sellers'
+    listings — the BUI-68 bug. We detect that and abort instead.
+    """
+    for w in data.get("warnings", []):
+        msg = f"{w.get('message', '')} {w.get('longMessage', '')}".lower()
+        if "seller" in msg and "invalid" in msg:
+            return True
+    return False
+
+
+def _filter_by_seller(items, expected_username):
+    """Keep only itemSummaries whose seller matches expected_username.
+
+    Belt-and-suspenders against a silently-dropped sellers filter: even if the
+    Browse API ever falls back to all sellers, we never surface someone else's
+    listing (which could lead to a bad snipe).
+    """
+    expected = expected_username.lower()
+    out = []
+    for it in items:
+        s = it.get("seller") or {}
+        uname = s.get("username") if isinstance(s, dict) else None
+        if uname and uname.lower() == expected:
+            out.append(it)
+    return out
+
+
+def search_seller_listings(seller, token, base_url, *, max_results=1000, retries=3):
+    """Fetch a seller's active auction listings via Browse API item_summary/search.
+
+    Paginates automatically. Returns raw itemSummary dicts, filtered to the
+    target seller. `seller` should be a resolved login username (or a /usr/ or
+    _ssn= URL); a bare store name will not match eBay's seller filter — resolve
+    it via resolve_seller_username() first.
     """
     username = _extract_seller_username(seller)
     url = f"{base_url}/buy/browse/v1/item_summary/search"
@@ -415,17 +540,17 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
     all_items = []
     offset = 0
     page_size = 200
+    # Braces in the filter must reach eBay literally. requests percent-encodes
+    # dict params ({ -> %7B), which eBay silently rejects, dropping the filter
+    # (BUI-68). Build the query string by hand, encoding only the username.
+    safe_user = quote(username, safe="")
 
     while True:
-        params = {
-            "q": "comic",
-            "filter": f"sellers:{{{username}}},buyingOptions:{{AUCTION}}",
-            "limit": page_size,
-            "offset": offset,
-        }
+        filter_val = f"sellers:{{{safe_user}}},buyingOptions:{{AUCTION}}"
+        query = f"q=comic&filter={filter_val}&limit={page_size}&offset={offset}"
 
         for attempt in range(retries):
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            resp = requests.get(url, headers=headers, params=query, timeout=15)
             if resp.status_code == 200:
                 break
             if resp.status_code == 429 and attempt < retries - 1:
@@ -437,9 +562,20 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
                     f"Error fetching seller listings: HTTP {resp.status_code}: {resp.text[:200]}",
                     file=sys.stderr,
                 )
-                return all_items
+                return _filter_by_seller(all_items, username)
 
         data = resp.json()
+        if _seller_filter_rejected(data):
+            print(
+                f"Error: eBay rejected the seller filter for '{username}' "
+                "(not a valid eBay login username). Aborting to avoid returning "
+                "other sellers' listings. Find the username via the seller's "
+                "'See other items' URL (_ssn= value) and pass --username, or "
+                "register it with --add-alias.",
+                file=sys.stderr,
+            )
+            return []
+
         page_items = data.get("itemSummaries", [])
         all_items.extend(page_items)
         offset += len(page_items)
@@ -448,7 +584,15 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
         if not page_items or offset >= total or offset >= max_results:
             break
 
-    return all_items
+    kept = _filter_by_seller(all_items, username)
+    dropped = len(all_items) - len(kept)
+    if dropped:
+        print(
+            f"  ⚠️  Dropped {dropped} listing(s) from other sellers "
+            "(seller filter mismatch)",
+            file=sys.stderr,
+        )
+    return kept
 
 
 def truncate(text, width):

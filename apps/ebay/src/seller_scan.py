@@ -10,7 +10,16 @@ from pathlib import Path
 
 import anthropic
 
-from ebay_fetch import load_config, get_token, parse_item_summary, search_seller_listings
+from ebay_fetch import (
+    UnknownSellerError,
+    get_token,
+    load_config,
+    load_seller_aliases,
+    parse_item_summary,
+    resolve_seller_username,
+    save_seller_alias,
+    search_seller_listings,
+)
 
 
 # ─── Wish list fetching ───────────────────────────────────────────────────────
@@ -18,9 +27,7 @@ from ebay_fetch import load_config, get_token, parse_item_summary, search_seller
 def fetch_wish_list():
     """Fetch LOCG wish list via locg CLI. Returns list of dicts with id and name."""
     result = subprocess.run(
-        ["python3", "-m", "locg", "wish-list"],
-        cwd="/Users/hsukenooi/Projects/locg-cli",
-        env={**__import__("os").environ, "PYTHONPATH": "src"},
+        ["locg", "wish-list"],
         capture_output=True,
         text=True,
     )
@@ -218,7 +225,21 @@ def main(argv=None):
     )
     parser.add_argument(
         "seller",
-        help="eBay seller username or store URL",
+        help="eBay store name (resolved via your alias map), a /usr/ or _ssn= URL, "
+             "or use --username for a raw login username",
+    )
+    parser.add_argument(
+        "--username",
+        default=None,
+        help="eBay login username to scan directly, bypassing the alias map "
+             "(for a one-off seller not yet in your aliases)",
+    )
+    parser.add_argument(
+        "--add-alias",
+        default=None,
+        metavar="USERNAME",
+        help="Register the given login USERNAME for the store name in the "
+             "positional arg, persist it, then scan",
     )
     parser.add_argument(
         "--json",
@@ -240,6 +261,32 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    # Resolve the store name to an eBay login username before anything else —
+    # a store name is NOT a username and would silently scan every seller (BUI-68).
+    if args.add_alias:
+        save_seller_alias(args.seller, args.add_alias)
+        print(
+            f"Registered alias '{args.seller.strip().lower()}' → '{args.add_alias.strip()}'",
+            file=sys.stderr,
+        )
+    aliases = load_seller_aliases()
+    try:
+        username = resolve_seller_username(
+            args.seller, aliases, username_override=args.username
+        )
+    except UnknownSellerError as e:
+        print(
+            f"Error: unknown seller '{e.store}'. A store name is not an eBay "
+            "login username, so the scan can't run safely.\n"
+            "  Find the username: open one of the seller's listings, click "
+            "'See other items', and copy the _ssn= value from the URL.\n"
+            f"  Then either:\n"
+            f"    seller-scan {e.store} --add-alias <username>   (saves it for next time)\n"
+            f"    seller-scan {e.store} --username <username>     (one-off)",
+            file=sys.stderr,
+        )
+        return 2
+
     # Auth
     client_id, client_secret, base_url = load_config()
     if args.env:
@@ -254,9 +301,9 @@ def main(argv=None):
     print(f"  {len(wish_items)} matchable wish list items", file=sys.stderr)
 
     # Fetch seller listings
-    print(f"Fetching listings for seller '{args.seller}'...", file=sys.stderr)
+    print(f"Fetching listings for seller '{username}'...", file=sys.stderr)
     raw_listings = search_seller_listings(
-        args.seller, token, base_url, max_results=args.max_results
+        username, token, base_url, max_results=args.max_results
     )
     print(f"  {len(raw_listings)} listings fetched", file=sys.stderr)
 
