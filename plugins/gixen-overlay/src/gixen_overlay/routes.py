@@ -632,6 +632,45 @@ async def api_comics_history(request: Request):
     return [_build_comics_row(r) for r in rows]
 
 
+@router.get("/api/seller-reliability")
+async def api_seller_reliability(request: Request, seller: str):
+    """Average grade deviation for one seller (BUI-78).
+
+    `avg_deviation = AVG(seller_grade - photo_grade)` over the seller's bids that
+    have BOTH grades and are not tombstoned (status NOT IN PURGED/REMOVED — the
+    BUI-50 parity rule). Positive = the seller over-states condition. The key is
+    the lowercased eBay username (matching what the buy flow writes at INSERT);
+    auction outcome is irrelevant to grading accuracy, so all live/terminal
+    statuses count. No min-sample cutoff — the caller (/comic:buy) decides.
+
+    Deliberately does NOT trigger `_ensure_fresh_sync`: it reads locally written
+    historical grades, not live Gixen state, so a sync would add latency for no
+    freshness gain.
+    """
+    seller = seller.strip()
+    if not seller or len(seller) > 128:
+        raise HTTPException(status_code=422, detail="seller must be 1-128 characters")
+    key = seller.lower()
+    db = request.app.state.db
+    row = db.execute(
+        """
+        SELECT AVG(seller_grade - photo_grade) AS avg_dev, COUNT(*) AS n
+        FROM bids
+        WHERE seller = ?
+          AND seller_grade IS NOT NULL
+          AND photo_grade IS NOT NULL
+          AND status NOT IN ('PURGED', 'REMOVED')
+        """,
+        (key,),
+    ).fetchone()
+    n = row["n"] or 0
+    return {
+        "seller": key,
+        "avg_deviation": round(row["avg_dev"], 4) if n else None,
+        "sample_size": n,
+    }
+
+
 @router.post("/api/extract-comics")
 async def api_extract_comics(request: Request):
     """Parse cached eBay titles for unlinked bids and link them via fmv_id.
