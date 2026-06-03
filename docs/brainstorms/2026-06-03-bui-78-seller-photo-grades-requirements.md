@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-03
 **Linear:** BUI-78
-**Status:** In review — pass-2 factual corrections applied; 4 open decisions (A–D) pending
+**Status:** Approved — reviewed (2 passes); decisions A1/B1/C2/D2 resolved; ready for implementation plan
 
 ## Problem
 
@@ -17,7 +17,7 @@ snipe lets us measure each seller's grade deviation over time.
 Build the **data-collection foundation plus a first-pass advisory** for seller
 reliability:
 
-1. Persist `seller_grade`, `photo_grade`, and `photo_grade_confidence` per bid.
+1. Persist `seller_grade` and `photo_grade` per bid.
 2. Expose a read endpoint returning a seller's average grade deviation.
 3. Surface that signal advisorily inside `/comic:buy` (no automatic FMV/bid
    change — see Non-goals).
@@ -43,30 +43,23 @@ user a human-readable signal in the meantime. The goal is stated this way (not
 
 ## Data model (gixen-cli)
 
-Three nullable columns on `bids` (`packages/gixen-cli/server/db.py`):
+Two nullable columns on `bids` (`packages/gixen-cli/server/db.py`):
 
 ```sql
-ALTER TABLE bids ADD COLUMN seller_grade            REAL  -- seller's stated grade, CGC float
-ALTER TABLE bids ADD COLUMN photo_grade             REAL  -- photo-assessment consensus point estimate, CGC float
--- photo_grade_confidence: provisional — see Open Decision E (keep vs defer)
-ALTER TABLE bids ADD COLUMN photo_grade_confidence  TEXT  -- 'high'|'medium'|'low'; NULL if not graded
+ALTER TABLE bids ADD COLUMN seller_grade  REAL  -- seller's stated grade, CGC float
+ALTER TABLE bids ADD COLUMN photo_grade   REAL  -- photo-assessment consensus point estimate, CGC float
 ```
-
-> **Confidence levels:** the grader emits **four** bands (HIGH / MEDIUM /
-> MEDIUM-LOW / LOW). If this column is kept (Open Decision E), define the collapse
-> to the stored set (e.g. MEDIUM-LOW → `medium`), lowercase before writing, and
-> add `CHECK(photo_grade_confidence IN ('high','medium','low'))` so a casing/level
-> mismatch fails loudly instead of silently storing an off-enum string.
 
 - `seller_grade` and `photo_grade` are CGC-scale floats, matching the existing
   `--grade` representation.
-- `photo_grade` stores the grader's **consensus point estimate** (BUI-51 emits a
-  range + confidence; we keep the point estimate and capture the confidence band
-  separately — see below). It is the *raw* photo assessment, independent of any
-  user override at the Step 2.5 gate.
-- `photo_grade_confidence` is captured **because it is unrecoverable later** — the
-  grader's range/confidence is ephemeral. Confidence-*weighting* of the deviation
-  is a documented follow-up; storing it now avoids permanently losing the signal.
+- `photo_grade` stores the grader's **consensus point estimate**. It is the *raw*
+  photo assessment, independent of any user override at the Step 2.5 gate.
+- **Decision B1:** `photo_grade_confidence` is **deferred** to the
+  confidence-weighting follow-up. The grader's confidence is already carried in
+  session state (`grade_confidence`), so it is not unrecoverable; adding the column
+  now (with no consumer) would mirror the very YAGNI we cut `max_deviation` for.
+  When the follow-up needs it, it adds the column then (with the 4→3 level collapse
+  + a `CHECK` constraint).
 - Added to the `_COLUMN_MIGRATIONS` list (same mechanism that added `fmv_id`),
   appended **after** the existing entries.
 - **Also** added to `_BIDS_TABLE_SQL` — required, not optional. `_rebuild_bids_table`
@@ -76,7 +69,7 @@ ALTER TABLE bids ADD COLUMN photo_grade_confidence  TEXT  -- 'high'|'medium'|'lo
   rebuild before/without the `_BIDS_TABLE_SQL` change would silently drop the
   columns. Both edits land together, and a test must assert they survive a rebuild.
 
-## Seller identity (write + read must use the same key) — ⚠️ see Open Decision A
+## Seller identity (write + read use the same key)
 
 The deviation analytics group by `bids.seller`, so the write key and the advisory
 lookup key must match. Verified code facts:
@@ -92,13 +85,21 @@ lookup key must match. Verified code facts:
   returns `seller.username`), so `/comic:buy` can pass the same username to both
   the write payload and the advisory GET.
 
-**The unresolved problem (Open Decision A):** `cache_gixen_data` updates with
-`seller = COALESCE(?, seller)` (server/db.py ~489), so the next background sync
-**overwrites** the INSERT-time username with whatever Gixen scrapes — which is the
-**store display name**, not the username (the BUI-68 alias map exists precisely
-because these differ). Writing the username at INSERT is therefore clobbered on
-the first sync, and an advisory keyed on the username finds zero rows. This must
-be resolved before the feature works — see Open Decision A.
+**Sync-overwrite fix (Decision A1).** `cache_gixen_data` currently updates with
+`seller = COALESCE(?, seller)` (server/db.py ~489), so the next sync **overwrites**
+the INSERT-time username with Gixen's scraped **store display name** (the BUI-68
+alias map exists because these differ). Fix: change it to `COALESCE(seller, ?)`
+(or guard: only write the scraped seller when `seller IS NULL`). Seller-per-item is
+immutable, so never overwriting a non-NULL `seller` is safe. Effect: buy-flow rows
+keep the username; web-added snipes (no INSERT username) still get their store name
+on first sync — and they carry no grades, so they never enter the deviation query.
+
+**Case-normalize.** eBay usernames are case-insensitive, so lowercase the username
+on both write and the advisory query to avoid `BeatleBluecat` vs `beatlebluecat`
+splitting one seller's history.
+
+**To verify in planning:** confirm the COALESCE flip doesn't regress the dashboard
+seller column for web-added snipes (it shouldn't — those start NULL and still fill).
 
 ## Population — write at bid creation (INSERT only)
 
@@ -109,36 +110,41 @@ never updated in place (see Non-goals).
 
 **CLI layer**
 1. `cli.py add` gains optional options: `--seller-grade` (float), `--photo-grade`
-   (float), `--photo-grade-confidence` (`high|medium|low`). Existing `--grade` is
-   unchanged — it remains the grade used for FMV linking.
+   (float). Existing `--grade` is unchanged — it remains the grade used for FMV
+   linking.
 
 **HTTP transport**
-2. The grades, confidence, and resolved `seller` are added to the `POST /api/bids`
-   JSON payload.
+2. The two grades and the resolved (lowercased) `seller` are added to the
+   `POST /api/bids` JSON payload.
 
 **Server model + DB write**
 3. `AddBidRequest` (server/main.py) gains `seller_grade: float | None`,
-   `photo_grade: float | None`, `photo_grade_confidence: str | None`, and
-   `seller: str | None`. Note `AddBidRequest` is configured `extra="ignore"`, so
-   a field missing from the model is silently dropped — a test must assert the
-   values actually land in the DB, not just that `POST` returns 200.
+   `photo_grade: float | None`, and `seller: str | None`. Note `AddBidRequest` is
+   configured `extra="ignore"`, so a field missing from the model is silently
+   dropped — a test must assert the values actually land in the DB, not just that
+   `POST` returns 200.
 4. Threaded through `_add_bid_row` → `insert_bid` to write on INSERT.
-   - `insert_bid` already has a `seller` param; it gains **three** new ones
-     (`seller_grade`, `photo_grade`, `photo_grade_confidence`) plus the three new
-     columns in its INSERT list. Add the new params **keyword-only with `None`
-     defaults** so the two existing call sites don't break.
+   - `insert_bid` already has a `seller` param; it gains **two** new ones
+     (`seller_grade`, `photo_grade`) plus the two new columns in its INSERT list.
+     Add the new params **keyword-only with `None` defaults** so the two existing
+     call sites don't break.
    - `_add_bid_row` gains the new params (incl. `seller`) and forwards them;
      `api_add_bid` passes `req.seller` + the grades into it (today it forwards
      neither).
    - `_sync_gixen` already passes `snipe.get("seller")`; for the new grade params
      it relies on the `None` defaults — no change needed.
-   - **Known gap:** `_add_bid_row`'s `IntegrityError` recovery branch calls
-     `update_bid` (which writes none of these columns), so a snipe added during a
-     concurrent-sync collision is recorded without grades/seller. Acceptable for
-     v1 (rare race); documented rather than handled. See also Open Decision D
-     (re-run).
    - The direct-Gixen `cli.py add` path (no server URL) never hits `POST /api/bids`,
      so grades aren't captured there — acceptable; the buy flow always runs the server.
+
+**Re-run / upsert (Decision C2 — fill-NULL only).** When `POST /api/bids` finds an
+existing PENDING snipe it goes through `_modify_and_update_bid` → `update_bid`,
+which writes no grades. Add a small `update_bid_grades` (or extend the update path)
+that writes `seller_grade`/`photo_grade`/`seller` **only into columns that are
+currently NULL** — i.e. completing an incomplete earlier insert (e.g. added without
+grading, then re-run with grading). It never overwrites a non-NULL grade, so it is
+not user-facing grade editing (still a non-goal). The `IntegrityError` recovery
+branch in `_add_bid_row` (a rare concurrent-sync collision) uses the same fill-NULL
+update so grades are not silently lost on that path either.
 
 **Grade value normalization**
 5. `seller_grade` is a CGC float, but identify returns a label/range ("VF/NM",
@@ -149,9 +155,9 @@ never updated in place (see Non-goals).
    helper to shell out to. An ambiguous/unmappable label stores `NULL` (never a
    guess). `photo_grade` is the grader's consensus point estimate.
 
-Null-safety: every new column is optional. A bid added without grading stores
-`photo_grade = NULL` / `photo_grade_confidence = NULL` and is excluded from
-deviation averages. An unmappable seller grade stores `seller_grade = NULL`.
+Null-safety: both new columns are optional. A bid added without grading stores
+`photo_grade = NULL` and is excluded from deviation averages. An unmappable seller
+grade stores `seller_grade = NULL`.
 
 ## Read endpoint (overlay)
 
@@ -190,8 +196,8 @@ Semantics:
   `{"seller": <name>, "avg_deviation": null, "sample_size": 0}` (HTTP 200, not
   404), so `/comic:buy` branches on `sample_size`.
 
-(`photo_grade_confidence` is stored but not yet used to weight the average —
-confidence-weighted deviation is the documented follow-up.)
+(Confidence-weighted deviation is a documented follow-up; this endpoint weights
+every dual-graded row equally.)
 
 ## `/comic:buy` integration — advisory only
 
@@ -199,17 +205,19 @@ confidence-weighted deviation is the documented follow-up.)
   the listing's seller username is resolved, call
   `/api/seller-reliability?seller=<username>`. Surfacing the signal *before* Step
   2.5 lets the user decide whether photo-grading is worth running. The lookup is a
-  cheap local GET. Surface only when `sample_size >= 3` (below that it is anecdote,
-  not pattern):
+  cheap local GET. **Decision D2:** surface whenever `sample_size >= 1`, but label
+  thin samples honestly so a single observation isn't read as an established
+  pattern:
 
   > ⚠️ Seller `beatlebluecat` has over-stated condition by ~**+1.5** grade points
-  > on average (n=4 prior assessments). Consider photo-grading this listing to
-  > verify condition before bidding.
+  > (n=4 prior assessments). Consider photo-grading this listing to verify
+  > condition before bidding.
 
-  (Recommending photo-grading the *current* listing is **not** circular — the
-  deviation was computed from *prior* listings; grading this one is how you verify
-  it. Render `avg_deviation` with an explicit sign.) When `sample_size` is below
-  the floor (Open Decision F), show nothing.
+  For `sample_size` of 1–2, prefix **"early signal —"** and soften the wording
+  (e.g. *"early signal — `seller` over-stated by ~+2.0 on 1 prior assessment"*).
+  Render `avg_deviation` with an explicit sign. Recommending photo-grading the
+  *current* listing is **not** circular — the deviation came from *prior* listings;
+  grading this one is how you verify it. `sample_size == 0` → show nothing.
 
 - **Bootstrapping the signal (addresses the near-empty-population problem).** Photo
   grading (Step 2.5) only runs for listings with *no* stated grade, but
@@ -220,21 +228,25 @@ confidence-weighted deviation is the documented follow-up.)
   flagged (`avg_deviation` high) or the book is high-value. Grading stays optional
   and user-gated — not forced on every stated-grade book.
 
-- **Step 5 (snipe-add):** pass `--seller-grade`, `--photo-grade`,
-  `--photo-grade-confidence` (omit any that are absent), and the resolved
-  `seller`, alongside the existing `--comic-id`/`--grade`. `photo_grade` is the
-  raw Step 2.5 consensus — **not** any value the user overrode at the gate (the
-  override flows to `--grade`/FMV; the deviation must compare against the raw
-  assessment).
+- **Step 5 (snipe-add):** pass `--seller-grade`, `--photo-grade` (omit either if
+  absent), and the resolved lowercased `seller`, alongside the existing
+  `--comic-id`/`--grade`. `photo_grade` is the raw Step 2.5 consensus — **not** any
+  value the user overrode at the gate (the override flows to `--grade`/FMV; the
+  deviation must compare against the raw assessment). buy.md must keep the raw
+  consensus as its own working-list field so an override doesn't clobber it.
 
 ## Testing
 
 **gixen-cli (`packages/gixen-cli/tests`):**
-- Migration adds the three columns; present after `connect()`/`_apply_migrations`.
-- Columns survive a `bids` rebuild (the BUI-79 path) — explicit assertion.
-- `insert_bid` / `POST /api/bids` persist all three grade fields + `seller` when supplied.
+- Migration adds `seller_grade`/`photo_grade`; present after `connect()`/`_apply_migrations`.
+- Both columns survive a `bids` rebuild (the BUI-79 path) — explicit assertion.
+- `insert_bid` / `POST /api/bids` persist both grades + `seller` when supplied.
 - Null-safe: add without grades stores `NULL`, no error.
-- `_sync_gixen` insert path still works (passes `None` for the new fields).
+- `_sync_gixen` insert path still works (relies on `None` defaults for new params).
+- **Sync no longer overwrites a non-NULL `seller`** (Decision A1): a sync cycle
+  after a seller-bearing INSERT leaves `seller` unchanged.
+- **Fill-NULL upsert** (Decision C2): add without grades → re-add with grades fills
+  the NULL grade columns; a re-add never overwrites an already-set grade.
 
 **overlay (`plugins/gixen-overlay/tests`):**
 - `/api/seller-reliability?seller=X` returns correct `avg_deviation` (sign + value)
@@ -246,59 +258,42 @@ confidence-weighted deviation is the documented follow-up.)
 
 ## Affected files (anticipated)
 
-- `packages/gixen-cli/server/db.py` — migration + `_BIDS_TABLE_SQL` + `insert_bid`
-  (3 new keyword params; `seller` already exists). Decision A touches
-  `cache_gixen_data`'s COALESCE; Decision C may add a fill-NULL `update_bid_grades`.
+- `packages/gixen-cli/server/db.py` — migration (2 cols) + `_BIDS_TABLE_SQL` +
+  `insert_bid` (2 new keyword params; `seller` already exists) + a fill-NULL
+  `update_bid_grades` (C2) + flip `cache_gixen_data` to `COALESCE(seller, ?)` (A1).
 - `packages/gixen-cli/server/main.py` — `AddBidRequest` (+`seller`/grades),
-  `_add_bid_row` (stop hardcoding `seller=None`; forward new params), `api_add_bid`
-  (forward `req.seller`). No user-facing update-in-place of grades.
+  `_add_bid_row` (stop hardcoding `seller=None`; forward new params; use fill-NULL
+  update on the recovery branch), `api_add_bid` (forward `req.seller`; fill-NULL on
+  the existing-snipe path). No user-facing update-in-place of grades.
 - `apps/ebay/...` / `.claude/commands/comic/identify.md` — `parse_item` already
-  returns `seller.username`; surface it in identify's output table (no column today).
-- `packages/gixen-cli/cli.py` — `--seller-grade` / `--photo-grade` /
-  `--photo-grade-confidence` options + `seller` in payload.
+  returns `seller.username`; surface it (lowercased) in identify's output (no
+  column today).
+- `packages/gixen-cli/cli.py` — `--seller-grade` / `--photo-grade` options +
+  lowercased `seller` in payload.
 - `plugins/gixen-overlay/src/gixen_overlay/routes.py` — `GET /api/seller-reliability`.
 - `.claude/commands/comic/grade.md` / `buy.md` Step 2.5 — opt-in "grade anyway"
-  affordance for stated-grade listings; emit the consensus point estimate +
-  confidence.
+  affordance for stated-grade listings; emit + preserve the raw consensus point
+  estimate (separate from any user override).
 - `.claude/commands/comic/snipe-add.md` — add the new flags to its canonical
   "available flags" table (a standalone session reads that table as ground truth).
 - `.claude/commands/comic/buy.md` — Step 1 advisory read; pass grades/seller at Step 5.
 - Tests in both packages.
 
-## Open decisions (raised in review pass 2 — resolve before planning)
+## Decisions resolved in review (pass 2)
 
-**A. Seller key: stop sync from overwriting the INSERT username.** `cache_gixen_data`
-does `seller = COALESCE(?, seller)`, so a sync overwrites the INSERT username with
-Gixen's scraped store display name. Options: (A1) flip to `COALESCE(seller, ?)` /
-guard so a non-NULL existing `seller` is never overwritten (INSERT username wins);
-(A2) accept Gixen's store-name as the stored key and normalize via the BUI-68 alias
-map on the *read* side. **Recommended: A1** (simplest, keeps one canonical key) —
-needs a test asserting a sync cycle doesn't change a seller-bearing row.
-
-**B. `photo_grade_confidence`: keep now or defer?** scope-guardian notes it has no
-consumer in this ticket (weighting is deferred) and that `grade_confidence` is
-already in session state, so the "unrecoverable" rationale is weak — inconsistent
-with cutting `max_deviation`/all-sellers on the same YAGNI logic. Options: (B1)
-**defer** the column to the confidence-weighting follow-up (ship 2 columns now);
-(B2) keep it, with the 4→3 collapse + CHECK above. **Recommended: B1** (defer).
-
-**C. Re-run / upsert grades.** A re-run of buy for an existing PENDING snipe goes
-through `update_bid`, which writes no grades, leaving stale/NULL grade columns.
-Options: (C1) document "first write wins" as a known limitation; (C2) add a
-fill-NULL-only partial update (write grade columns only when the existing row's are
-NULL — completing an incomplete insert, not user-editing). **Recommended: C2.**
-
-**D. Advisory floor / scope.** The `n≥3` floor + opt-in bootstrap may rarely fire
-for a solo user's infrequent sellers; product-lens questions whether the advisory
-delivers value within this ticket. Options: (D1) keep `n≥3`; (D2) lower to `n≥1`
-with an explicit "early signal — single observation" label; (D3) drop the advisory
-from BUI-78 and ship the data-collection foundation only, with the advisory as the
-follow-up. **Recommended: D2** (useful from day one, honestly labelled).
+- **A1** — Stop sync overwriting the INSERT username: flip `cache_gixen_data` to
+  `COALESCE(seller, ?)`; store the lowercased eBay username as the canonical key.
+- **B1** — Defer `photo_grade_confidence` to the confidence-weighting follow-up;
+  ship two columns now.
+- **C2** — Fill-NULL-only upsert: a re-run completes an incomplete insert without
+  overwriting set grades (not user-facing grade editing).
+- **D2** — Advisory fires at `sample_size >= 1` with an explicit "early signal"
+  label for n of 1–2.
 
 ## Open follow-ups (not this ticket)
 
-- Confidence-weighted deviation (use `photo_grade_confidence` to down-weight or
-  exclude low-confidence assessments).
+- Confidence-weighted deviation: add the `photo_grade_confidence` column (deferred
+  here, Decision B1) and use it to down-weight/exclude low-confidence assessments.
 - Automatic FMV/grade calibration from accumulated deviation (couples with BUI-81).
 - Re-grading an existing live snipe (a dedicated update path, if ever needed).
 - Optional backfill of historical bids if seller-grade is recoverable from cached
