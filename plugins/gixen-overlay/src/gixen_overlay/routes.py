@@ -1,7 +1,9 @@
 """Comic FastAPI routes for the gixen-overlay plugin."""
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -21,11 +23,45 @@ from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
 from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task
 
+# BUI-91/92: the overlay wraps locg-cli's existing collection + wish-list logic
+# (the accumulated matcher with its four documented bugfixes, plus the three
+# write paths) behind /api/comics/* instead of porting any of it to SQL. These
+# imports prove the locg workspace dependency resolves (exercised by the
+# workspace-imports canary).
+from locg.commands import (
+    cmd_collection_check,
+    cmd_collection_export,
+    cmd_collection_status,
+    cmd_wish_list_from_cache,
+)
+
 
 _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 _NUMERIC_RE = re.compile(r"[^0-9.]")
 
 router = APIRouter()
+
+
+def _ensure_collection_store() -> None:
+    """Point locg-cli's cache resolver at a server-owned, provider-neutral store.
+
+    ``locg.config._cache_dir()`` resolves ``LOCG_DATA_DIR`` env →
+    ``<repo>/data/locg`` → ``~/.cache/locg``. On the Mac Mini's editable checkout
+    the default would be the repo's ``data/locg/`` — the very location BUI-93
+    retires as the source of truth. So when ``LOCG_DATA_DIR`` is unset we point
+    it at a server-owned directory beside the gixen DB
+    (``<dir(DB_PATH)>/collection-store``, default
+    ``~/.gixen-server/collection-store``). The directory is named neutrally, not
+    "locg" (R1: "the path is not named for LOCG"). An explicitly-set
+    ``LOCG_DATA_DIR`` always wins, so the Mac Mini launch env and the tests
+    (which point it at a tmp dir) both override this default.
+    """
+    if os.environ.get("LOCG_DATA_DIR", "").strip():
+        return
+    db_path = Path(os.environ.get("DB_PATH") or (Path.home() / ".gixen-server" / "db.sqlite"))
+    store = db_path.parent / "collection-store"
+    store.mkdir(parents=True, exist_ok=True)
+    os.environ["LOCG_DATA_DIR"] = str(store)
 
 
 @router.get("/comics")
@@ -790,3 +826,81 @@ async def api_sweep_orphans(request: Request, dry_run: bool = True):
     """
     db = request.app.state.db
     return sweep_orphan_yearless_comics(db, dry_run=dry_run)
+
+
+# ---------------------------------------------------------------------------
+# BUI-91: server-authoritative collection + wish-list READ endpoints.
+#
+# These wrap the existing locg-cli functions against the server-owned canonical
+# store (see _ensure_collection_store). Provider-neutral names — the served data
+# is a *collection* and a *wish-list*, not "the locg collection" (LOCG is one
+# import source, not the data's identity). None of these touch the SQLite DB, so
+# they take no `request` / `app.state.db`.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/comics/collection/check")
+async def api_collection_check(
+    series: str,
+    issue: str,
+    year: str | None = None,
+    variant: str | None = None,
+):
+    """Collection-ownership check (R2). Returns the exact verdict shape the
+    `locg collection check` CLI returns today:
+    ``{match_status, full_title_matched, cache_age_days}``.
+
+    A corrupt/crashed store raises RuntimeError from CollectionCache.load(); we
+    surface it as HTTP 500 rather than letting it 500 unhandled. The consumer
+    MUST treat any non-200 (or an unreachable server) as a hard error and never
+    render "not owned" from it (R11) — a silent miss buys a duplicate.
+    """
+    _ensure_collection_store()
+    try:
+        return cmd_collection_check(series=series, issue=issue, variant=variant, year=year)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+
+
+@router.get("/api/comics/collection/status")
+async def api_collection_status():
+    """Collection cache status metrics (last_full_import, row_count,
+    cache_age_days, pending_push_count, locg_cli_version, ...). Used by the
+    collection-check bootstrap guard."""
+    _ensure_collection_store()
+    try:
+        return cmd_collection_status()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+
+
+@router.get("/api/comics/wish-list")
+async def api_wish_list(title: str | None = None):
+    """Wish-list read (R3) for seller-scan to match against. Returns
+    ``[{name, id, ...}]``. A never-imported wish-list (FileNotFoundError) yields
+    an empty list: an empty wish-list is a correct, non-dangerous answer (a miss
+    only fails to surface a wanted book; it cannot buy a dupe)."""
+    _ensure_collection_store()
+    try:
+        return cmd_wish_list_from_cache(title)
+    except FileNotFoundError:
+        return []
+
+
+@router.get("/api/comics/collection/export")
+async def api_collection_export():
+    """Export pending-push rows to a LOCG-bulk-import CSV (+ .notes.md), read
+    from the server store, for the collection-add round-trip. Returns the file
+    *contents* (``csv``, ``notes_md``) plus the counts so the caller can save
+    them locally and upload to LOCG."""
+    _ensure_collection_store()
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = Path(tmp) / "locg-bulk-import.csv"
+        try:
+            result = cmd_collection_export(out_path=str(csv_path))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+        csv_text = Path(result["csv_path"]).read_text()
+        notes_path = Path(result["notes_md_path"])
+        notes_text = notes_path.read_text() if notes_path.exists() else ""
+    return {**result, "csv": csv_text, "notes_md": notes_text}
