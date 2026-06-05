@@ -286,3 +286,39 @@ def test_import_applies_xlsx_and_is_readable(client):
 
     chk = client.get("/api/comics/collection/check", params={"series": "X-Men", "issue": "1", "year": "1963"})
     assert chk.json()["match_status"] == "in_collection"
+
+
+# ===========================================================================
+# Review hardening: R11 endpoint guard + import error-class distinction
+# ===========================================================================
+
+def test_check_refuses_when_store_never_imported(client):
+    """R11 defense-in-depth: an un-imported store must NOT answer 'not owned'
+    for everything — the endpoint returns 409, not 200 not_in_cache, so a
+    caller that skips the bootstrap guard can't be tricked into a dupe buy."""
+    (client.store / "collection.json").unlink()  # never-imported store
+    r = client.get("/api/comics/collection/check", params={"series": "Batman", "issue": "1", "year": "1940"})
+    assert r.status_code == 409
+
+
+def test_check_not_in_cache_still_200_when_imported(client):
+    """A genuinely-not-owned comic against an *imported* store is still a normal
+    200 not_in_cache (the guard only fires on a never-imported store)."""
+    r = client.get("/api/comics/collection/check", params={"series": "Batman", "issue": "1", "year": "1940"})
+    assert r.status_code == 200
+    assert r.json()["match_status"] == "not_in_cache"
+
+
+def test_import_server_fault_is_not_masked_as_422(client):
+    """An unexpected server-side fault during import (e.g. OSError) must NOT be
+    caught by the narrow 'bad upload' clause and mislabeled a 422 client error.
+    It propagates as a server fault (a 500 in production; the TestClient, with
+    raise_server_exceptions=True, re-raises it here) — the point is it is never
+    returned as a 422."""
+    from unittest.mock import patch
+    with patch("gixen_overlay.routes.cmd_collection_import", side_effect=OSError("disk full")):
+        with pytest.raises(OSError):
+            client.post(
+                "/api/comics/collection/import",
+                files={"file": ("import.xlsx", b"anything", "application/octet-stream")},
+            )

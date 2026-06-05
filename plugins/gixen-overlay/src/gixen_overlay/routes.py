@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
@@ -44,6 +45,7 @@ from locg.commands import (
     cmd_wish_list_add,
     cmd_wish_list_from_cache,
 )
+from openpyxl.utils.exceptions import InvalidFileException
 
 
 _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
@@ -867,9 +869,22 @@ async def api_collection_check(
     """
     _ensure_collection_store()
     try:
-        return cmd_collection_check(series=series, issue=issue, variant=variant, year=year)
+        result = cmd_collection_check(series=series, issue=issue, variant=variant, year=year)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+    # R11 defense-in-depth at the endpoint, not just in the skill: a store that
+    # was never imported answers `not_in_cache` for EVERY comic. Returning that
+    # as a 200 lets any caller that skips the bootstrap status guard read it as
+    # "not owned → safe to buy" and buy duplicates. cache_age_days is None iff
+    # last_full_import is null (never imported), so refuse with 409 instead of
+    # emitting a "not owned" verdict we cannot actually stand behind.
+    if result["match_status"] == "not_in_cache" and result["cache_age_days"] is None:
+        raise HTTPException(
+            status_code=409,
+            detail="collection store has no import yet — cannot determine ownership "
+            "(refusing to report 'not owned', R11)",
+        )
+    return result
 
 
 @router.get("/api/comics/collection/status")
@@ -939,17 +954,25 @@ async def api_collection_import(file: UploadFile = File(...)):
     """
     _ensure_collection_store()
     suffix = Path(file.filename or "import.xlsx").suffix or ".xlsx"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    tmp_path: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name  # set before write so a read failure still cleans up
+            tmp.write(await file.read())
         return cmd_collection_import(tmp_path)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
-    except Exception as exc:  # bad/corrupt upload -> client error, not a 500
-        raise HTTPException(status_code=422, detail=f"import failed: {exc}")
+    except (InvalidFileException, zipfile.BadZipFile, ValueError, KeyError) as exc:
+        # Bad/corrupt/wrong-shape upload -> client error. Anything else (OSError,
+        # an internal merge bug) is NOT caught here, so it surfaces as a 500
+        # rather than being mislabeled a client error.
+        raise HTTPException(status_code=422, detail=f"import failed: bad upload ({exc})")
     finally:
-        os.unlink(tmp_path)
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 @router.post("/api/comics/collection/record-win")
