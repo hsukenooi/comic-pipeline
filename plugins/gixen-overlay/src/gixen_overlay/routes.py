@@ -6,7 +6,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from gixen_overlay.db import (
@@ -18,7 +18,14 @@ from gixen_overlay.db import (
     sweep_orphan_yearless_comics,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
-from gixen_overlay.models import UpsertComicRequest, LocgLinkRequest, LinkFmvRequest, VerifyRequest
+from gixen_overlay.models import (
+    UpsertComicRequest,
+    LocgLinkRequest,
+    LinkFmvRequest,
+    VerifyRequest,
+    WishListAddRequest,
+    RecordWinRequest,
+)
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
 from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task
@@ -31,7 +38,10 @@ from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_ta
 from locg.commands import (
     cmd_collection_check,
     cmd_collection_export,
+    cmd_collection_import,
+    cmd_collection_record_win,
     cmd_collection_status,
+    cmd_wish_list_add,
     cmd_wish_list_from_cache,
 )
 
@@ -904,3 +914,68 @@ async def api_collection_export():
         notes_path = Path(result["notes_md_path"])
         notes_text = notes_path.read_text() if notes_path.exists() else ""
     return {**result, "csv": csv_text, "notes_md": notes_text}
+
+
+# ---------------------------------------------------------------------------
+# BUI-92: server-authoritative collection + wish-list WRITE endpoints.
+#
+# The three write paths apply to the server-owned canonical store using the
+# EXISTING locg-cli write functions, serialized server-side (CollectionCache
+# already does flock + atomic tempfile-rename). After any write lands, both
+# machines see it on their next API read — no git commit/push/pull (R8).
+# ---------------------------------------------------------------------------
+
+
+@router.post("/api/comics/collection/import")
+async def api_collection_import(file: UploadFile = File(...)):
+    """Apply a full LOCG XLSX import to the server store (R5).
+
+    The interactive Playwright login + XLSX download stay local; the client
+    POSTs the .xlsx *file* here and the server runs the existing merge
+    (`cmd_collection_import` → agent_win reconciliation, identity-tuple upsert,
+    rename detection, wish-list rebuild). Uploading the file the server already
+    knows how to import reuses that battle-tested path wholesale rather than
+    re-deriving it from structured rows.
+    """
+    _ensure_collection_store()
+    suffix = Path(file.filename or "import.xlsx").suffix or ".xlsx"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+    try:
+        return cmd_collection_import(tmp_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+    except Exception as exc:  # bad/corrupt upload -> client error, not a 500
+        raise HTTPException(status_code=422, detail=f"import failed: {exc}")
+    finally:
+        os.unlink(tmp_path)
+
+
+@router.post("/api/comics/collection/record-win")
+async def api_record_win(req: RecordWinRequest):
+    """Append won auctions to the collection on the server (R6).
+
+    Mirrors `locg collection record-win`; the Metron series resolution and
+    BUI-34 already-owned dedup are unchanged (owned by locg-cli). Returns the
+    same summary metrics the CLI does.
+    """
+    _ensure_collection_store()
+    try:
+        return cmd_collection_record_win(req.wins)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+
+
+@router.post("/api/comics/wish-list")
+async def api_wish_list_add(req: WishListAddRequest):
+    """Append an issue to the wish-list on the server (R7).
+
+    BUI-47 semantics carry over: a server-side wish-list append is still
+    overwritten by the next full import unless exported to LOCG first.
+    """
+    _ensure_collection_store()
+    result = cmd_wish_list_add(req.title)
+    if "error" in result:
+        raise HTTPException(status_code=422, detail=result["error"])
+    return result

@@ -59,3 +59,29 @@ class VerifyItem(BaseModel):
 
 class VerifyRequest(BaseModel):
     items: list[VerifyItem]
+
+
+class WishListAddRequest(BaseModel):
+    """POST /api/comics/wish-list — append one issue to the wish-list (BUI-92)."""
+
+    title: str
+
+    @field_validator("title")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("title must be non-empty")
+        return v
+
+
+class RecordWinRequest(BaseModel):
+    """POST /api/comics/collection/record-win — append won auctions (BUI-92).
+
+    Each win mirrors the shape /comic:collection-add builds:
+    ``{item_id, current_bid, end_date_iso,
+       identify_data: {series, issue, year?, variant_text?}}``.
+    The list is passed straight to locg-cli's cmd_collection_record_win, which
+    owns the Metron series resolution + BUI-34 already-owned dedup.
+    """
+
+    wins: list[dict]

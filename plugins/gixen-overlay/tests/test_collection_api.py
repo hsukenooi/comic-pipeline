@@ -182,3 +182,107 @@ def test_collection_export_returns_csv(client):
     assert isinstance(body["csv"], str) and body["csv"].strip()  # non-empty CSV (header at least)
     assert "notes_md" in body
     assert isinstance(body["ready_count"], int)
+
+
+# ===========================================================================
+# BUI-92: write endpoints
+# ===========================================================================
+
+def _reseed_with_index(store, index):
+    """Re-seed collection.json with a series_name_index so record-win resolves
+    canonical series without a Metron call."""
+    payload = json.loads((store / "collection.json").read_text())
+    payload["series_name_index"] = index
+    (store / "collection.json").write_text(json.dumps(payload))
+
+
+_ASM_INDEX = {"amazing spider-man": "The Amazing Spider-Man"}
+
+
+def test_record_win_appends_and_is_readable(client):
+    _reseed_with_index(client.store, _ASM_INDEX)
+    win = {
+        "item_id": "115500000001",
+        "current_bid": "42.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "301", "year": "1988"},
+    }
+    r = client.post("/api/comics/collection/record-win", json={"wins": [win]})
+    assert r.status_code == 200, r.text
+    assert r.json()["rows_written"] == 1
+
+    # R8: the append is immediately visible on the next read from the same store.
+    # No `year` filter here: a record-win row resolved via series_name_index has
+    # no Metron data, so release_date is None — a year-gated check would miss it
+    # (pre-existing locg-cli behavior, faithfully wrapped by the endpoint).
+    chk = client.get("/api/comics/collection/check", params={"series": "Amazing Spider-Man", "issue": "301"})
+    assert chk.json()["match_status"] == "in_collection"
+
+
+def test_record_win_skips_already_owned(client):
+    _reseed_with_index(client.store, _ASM_INDEX)
+    win = {
+        "item_id": "115500000002",
+        "current_bid": "999.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "300", "year": "1988"},
+    }
+    r = client.post("/api/comics/collection/record-win", json={"wins": [win]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rows_written"] == 0
+    assert body["skipped_already_owned"] >= 1
+
+
+def test_wish_list_add_appends(client):
+    r = client.post("/api/comics/wish-list", json={"title": "Daredevil #1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok"
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Daredevil #1" in names
+
+
+def test_wish_list_add_rejects_empty_title(client):
+    assert client.post("/api/comics/wish-list", json={"title": "   "}).status_code == 422
+    assert client.post("/api/comics/wish-list", json={}).status_code == 422
+
+
+def test_import_requires_a_file(client):
+    assert client.post("/api/comics/collection/import").status_code == 422
+
+
+def test_import_rejects_bad_upload(client):
+    r = client.post(
+        "/api/comics/collection/import",
+        files={"file": ("junk.xlsx", b"not a real xlsx", "application/octet-stream")},
+    )
+    assert r.status_code == 422
+
+
+def test_import_applies_xlsx_and_is_readable(client):
+    import io
+    import openpyxl
+    from locg.collection_io import LOCG_XLSX_HEADERS
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(list(LOCG_XLSX_HEADERS))
+    ws.append([
+        "Marvel", "X-Men", "X-Men #1", "1963-09-01",
+        1, 0, 0, None, "Print", None, None, None, None,
+        None, None, None, None, None, None, None, None,
+    ])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    r = client.post(
+        "/api/comics/collection/import",
+        files={"file": ("import.xlsx", buf.getvalue(),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert r.status_code == 200, r.text
+    # import_xlsx merges; the new row is added.
+    assert r.json().get("added", 0) >= 1
+
+    chk = client.get("/api/comics/collection/check", params={"series": "X-Men", "issue": "1", "year": "1963"})
+    assert chk.json()["match_status"] == "in_collection"
