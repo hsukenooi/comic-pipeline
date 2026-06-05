@@ -1,7 +1,7 @@
 ---
 title: "feat: Serve collection + wish-list from the server API (BUI-87 project)"
 type: feat
-status: in_progress
+status: completed
 date: 2026-06-05
 issue: BUI-91, BUI-92, BUI-88, BUI-89, BUI-93
 brainstorm: docs/brainstorms/2026-06-03-bui-87-collection-server-api-requirements.md
