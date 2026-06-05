@@ -355,3 +355,33 @@ class TestMatchListing:
         items = self._items(["X-Men #1"])
         wish, _ = seller_scan.match_listing("X MEN 1 NM 1963 MARVEL", items)
         assert wish is not None
+
+
+# ─── BUI-88: wish-list fetched over HTTP from the gixen server API ────────────
+
+
+class TestFetchWishList:
+    def test_returns_parsed_items(self, monkeypatch):
+        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = [{"id": 1, "name": "Daredevil #1"}]
+        with patch("seller_scan.requests.get", return_value=resp) as get:
+            assert seller_scan.fetch_wish_list() == [{"id": 1, "name": "Daredevil #1"}]
+        # trailing slash is trimmed; endpoint is the provider-neutral path
+        get.assert_called_once()
+        assert get.call_args[0][0] == "http://mac-mini.example:8080/api/comics/wish-list"
+
+    def test_hard_fails_when_server_url_unset(self, monkeypatch):
+        monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
+        with pytest.raises(SystemExit):
+            seller_scan.fetch_wish_list()
+
+    def test_hard_fails_when_server_unreachable(self, monkeypatch):
+        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        with patch(
+            "seller_scan.requests.get",
+            side_effect=seller_scan.requests.exceptions.ConnectionError("down"),
+        ):
+            with pytest.raises(SystemExit):
+                seller_scan.fetch_wish_list()

@@ -82,5 +82,6 @@ Copy the eBay URLs from the URL column and pass them to `/comic:buy`. The buy wo
 | `Dropped N listing(s) from other sellers` | Safety net fired: eBay returned foreign sellers and they were filtered out. Usually means the alias points at the wrong/stale username |
 | 0 listings fetched | Seller may have no active auction listings; check their eBay page |
 | False positives (wrong comic) | Check match_score — scores near 0.5 with short series names can be ambiguous |
-| Wish list empty | Run `locg wish-list` to verify authentication and list contents |
+| Wish list empty | seller-scan now fetches the wish-list from the gixen server (`GET /api/comics/wish-list`), not a local `locg` call. Check `curl -sf "$GIXEN_SERVER_URL/api/comics/wish-list"` returns items; if empty, run the LOCG import flow. |
+| `GIXEN_SERVER_URL is not set` | seller-scan fetches the wish-list over HTTP (apps/ebay can't import locg). Set `GIXEN_SERVER_URL` (MacBook → `http://mac-mini.tail9b7fa5.ts.net:8080`) and re-run. |
 | Rate limit error | Re-run after a few seconds; the Browse API allows retries |

@@ -43,3 +43,32 @@ def test_plugin_hook_entrypoint_importable():
     from gixen_overlay.plugin import plugin
 
     assert plugin is not None
+
+
+def test_locg_command_surface_resolves():
+    """BUI-91/92: the overlay wraps locg-cli's collection + wish-list functions
+    behind /api/comics/*. These resolve via the `locg` workspace dependency. If
+    any is renamed in packages/locg-cli, this canary fails loudly (same role as
+    the gixen-cli helper canary above)."""
+    from locg.commands import (
+        cmd_collection_check,
+        cmd_collection_export,
+        cmd_collection_import,
+        cmd_collection_record_win,
+        cmd_collection_status,
+        cmd_wish_list_add,
+        cmd_wish_list_from_cache,
+    )
+
+    assert all(
+        callable(fn)
+        for fn in (
+            cmd_collection_check,
+            cmd_collection_export,
+            cmd_collection_import,
+            cmd_collection_record_win,
+            cmd_collection_status,
+            cmd_wish_list_add,
+            cmd_wish_list_from_cache,
+        )
+    )

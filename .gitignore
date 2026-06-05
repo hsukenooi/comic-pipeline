@@ -12,6 +12,8 @@ venv/
 .claude/scheduled_tasks.lock
 .worktrees
 
-# LOCG cache: track the JSON/JSONL artifacts (BUI-84), ignore transient state.
-data/locg/collection.lock
-data/locg/collection.json.bak.*
+# LOCG cache: retired as the source of truth (BUI-93). The collection +
+# wish-list are now served from the gixen server's collection-store (BUI-87);
+# data/locg/ is at most a local, non-authoritative working cache, so the whole
+# directory is ignored — no more 1.8 MB collection.json churn in git.
+data/locg/

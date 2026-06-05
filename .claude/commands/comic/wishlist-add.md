@@ -1,15 +1,14 @@
 ---
 name: comic:wishlist-add
-description: Look up a series on Metron and add each of its issues to the local LOCG wish-list cache. Fully offline w.r.t. LOCG — only Metron is queried. Use to wish-list a whole run at once.
-requires_locg_cli: ">=0.2.0"
+description: Look up a series on Metron and add each of its issues to the wish-list on the gixen server. Only Metron is queried for the lookup; LOCG is not. Use to wish-list a whole run at once.
 ---
 
 # Comic Wishlist Add
 
-Add every issue of a series (or a sub-range) to the local wish-list cache. The
-issue count comes from **Metron** (metron.cloud); **no LOCG network access is
-required** — adds go straight to the repo-versioned `data/locg/wish-list.json`
-via `locg wish-list add`.
+Add every issue of a series (or a sub-range) to the wish-list on the gixen server
+(BUI-87). The issue count comes from **Metron** (metron.cloud); **no LOCG network
+access is required** — adds go to the server's canonical wish-list via
+`POST /api/comics/wish-list`, so they're visible on both machines immediately.
 
 ## Input
 
@@ -30,6 +29,16 @@ set -a; . ~/.config/locg/.env 2>/dev/null; set +a
 **If `MISSING`:** Stop with:
 > Metron credentials not found. Add `METRON_USERNAME` and `METRON_PASSWORD` to
 > `~/.config/locg/.env` and retry.
+
+Also resolve the gixen server (the wish-list now lives there) and health-gate it
+— same `GIXEN_SERVER_URL` env + hostname fallback as `/comic:fmv`:
+
+```bash
+echo "${GIXEN_SERVER_URL:-UNSET}"; hostname   # unset → MacBook: http://mac-mini.tail9b7fa5.ts.net:8080
+curl -sf "$GIXEN_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
+```
+
+**If the health gate fails:** Stop — adds can't be written to an unreachable server.
 
 ## Step 1: Look up the series on Metron
 
@@ -78,29 +87,32 @@ LOCG-searchable form). Mention that the Metron canonical name is
 
 ## Step 4: Add each issue
 
-On confirmation, add one issue per call:
+On confirmation, add one issue per call (`curl -sf` so a non-200 fails loudly):
 
 ```bash
-locg wish-list add "Children of the Vault #1" --pretty
-locg wish-list add "Children of the Vault #2" --pretty
+curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/wish-list" \
+  -H 'content-type: application/json' -d '{"title": "Children of the Vault #1"}'
+curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/wish-list" \
+  -H 'content-type: application/json' -d '{"title": "Children of the Vault #2"}'
 # …
 ```
 
-Each call appends `{name: "<title>", id: null}` to the wish-list cache and is
-idempotent-safe to re-run (it will create a duplicate entry, so don't re-run a
-title that already succeeded). Stop and report if any call returns an `error`.
+Each call appends `{name: "<title>", id: null}` to the server wish-list and
+returns `{"status": "ok", ...}`. It is not deduped, so don't re-run a title that
+already succeeded (it would create a duplicate). Stop and report if any call
+returns a non-200.
 
 ## Step 5: Report
 
 ```
 **Wish-listed 4 issues of Children of the Vault (2023):**
-  #1, #2, #3, #4  →  data/locg/wish-list.json (N items total)
+  #1, #2, #3, #4  →  server wish-list (N items total)
 ```
 
-⚠️ **Sync caveat (BUI-47):** local `wish-list add` entries are **overwritten on
-the next `locg collection import`** (import rebuilds the wish-list from the LOCG
-export's wish-list rows). To keep these: `locg collection export` and upload the
-CSV to LOCG **before** running another `collection import`. See
+⚠️ **Sync caveat (BUI-47):** wish-list adds are **overwritten on the next full
+LOCG import** (import rebuilds the wish-list from the LOCG export's wish-list
+rows). To keep these: export (`GET /api/comics/collection/export`) and upload the
+CSV to LOCG **before** running another import. See
 `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
 ## Common Mistakes
@@ -110,4 +122,5 @@ CSV to LOCG **before** running another `collection import`. See
 | Hitting LOCG to get the issue count | Use the Metron series API — `issue_count` is in the series result; LOCG is not needed |
 | Guessing the issue count | Always read `issue_count` from Metron; don't assume a run length |
 | Adding issues without a preview | Always show the title list and confirm first (Step 3) — that's the dry run |
-| Re-running the whole range after a partial failure | Re-add only the issues that didn't succeed; `wish-list add` does not dedupe |
+| Re-running the whole range after a partial failure | Re-add only the issues that didn't succeed; the wish-list endpoint does not dedupe |
+| Writing to `data/locg/wish-list.json` directly | Adds go to the server via `POST /api/comics/wish-list` — the repo file is no longer the source of truth (BUI-93) |

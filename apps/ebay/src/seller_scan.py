@@ -3,12 +3,13 @@
 
 import argparse
 import json
+import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 import anthropic
+import requests
 
 from ebay_fetch import (
     UnknownSellerError,
@@ -25,19 +26,35 @@ from ebay_fetch import (
 # ─── Wish list fetching ───────────────────────────────────────────────────────
 
 def fetch_wish_list():
-    """Fetch LOCG wish list via locg CLI. Returns list of dicts with id and name."""
-    result = subprocess.run(
-        ["locg", "wish-list"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"Error fetching wish list: {result.stderr.strip()}", file=sys.stderr)
+    """Fetch the wish list from the gixen server API. Returns a list of
+    {id, name} dicts.
+
+    BUI-88 (R10): seller-scan lives in apps/ebay, which is NOT a uv workspace
+    member and cannot import locg-cli — so it fetches the wish-list over HTTP
+    from the server's /api/comics/wish-list endpoint instead of shelling out to
+    the `locg` CLI. Fails loudly on any unreachable-server / non-200 / bad-JSON
+    condition (never returns a partial or empty list silently) so a scan can't
+    run against a stale or empty wish list because the server was down.
+    """
+    base = os.environ.get("GIXEN_SERVER_URL", "").rstrip("/")
+    if not base:
+        print(
+            "Error: GIXEN_SERVER_URL is not set — cannot reach the wish-list API.\n"
+            "Set it in ~/.zshrc (MacBook → http://mac-mini.tail9b7fa5.ts.net:8080; "
+            "Mac Mini → http://localhost:8080).",
+            file=sys.stderr,
+        )
         sys.exit(1)
+    url = f"{base}/api/comics/wish-list"
     try:
-        return json.loads(result.stdout)
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching wish list from {url}: {e}", file=sys.stderr)
+        sys.exit(1)
     except json.JSONDecodeError as e:
-        print(f"Error parsing wish list JSON: {e}", file=sys.stderr)
+        print(f"Error parsing wish list JSON from {url}: {e}", file=sys.stderr)
         sys.exit(1)
 
 

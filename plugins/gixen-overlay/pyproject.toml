@@ -11,10 +11,14 @@ requires-python = ">=3.9"
 # helpers in routes.py). Declared as an explicit workspace dependency so the
 # coupling is recorded and CI-guarded — a gixen-cli rename + its overlay caller
 # now land in one commit. Resolved from the in-repo member via [tool.uv.sources].
-dependencies = ["gixen-cli"]
+dependencies = ["gixen-cli", "locg", "python-multipart"]
 
 [tool.uv.sources]
 gixen-cli = { workspace = true }
+# BUI-91: the overlay wraps locg-cli's collection/wish-list matching + write
+# functions behind /api/comics/* endpoints. Declared as a workspace dependency
+# (same pattern as gixen-cli) so the coupling is recorded and CI-guarded.
+locg = { workspace = true }
 
 [project.entry-points."gixen.plugins"]
 gixen-overlay = "gixen_overlay.plugin:plugin"

@@ -1,47 +1,80 @@
 ---
 name: comic:collection-check
-description: Check if identified comics are already in your local collection cache. Fully offline — no LOCG network access required. Use when deciding whether to buy a comic to avoid duplicates.
-requires_locg_cli: ">=0.2.0"
+description: Check if identified comics are already in your collection via the gixen server API. Use when deciding whether to buy a comic to avoid duplicates.
 ---
 
 # Comic Collection Check
 
-Check whether identified comics are in the local collection cache. Fully offline — no LOCG login or network access required.
+Check whether identified comics are already in your collection by querying the
+gixen server's collection API (`/api/comics/collection/*`). The server is the
+single source of truth across machines (BUI-87), so both the MacBook and the Mac
+Mini see the same answer.
+
+> **Hard-fail rule (R11):** if the server is unreachable or any check call fails,
+> **STOP** and tell the user — never render "Not in collection" from a failed
+> call. A silent miss buys a duplicate. This is the whole point of the check.
 
 ## Input
 
-A list of identified comics (series + issue, optionally variant and year). Either from the `/comic:identify` output table or provided directly by the user.
+A list of identified comics (series + issue, optionally variant and year). Either
+from the `/comic:identify` output table or provided directly by the user.
 
-## Step 0: Bootstrap guard
+## Step 0: Resolve the server + bootstrap guard
 
-Before any other work, verify the cache is populated and `locg-cli` is current.
+Resolve `GIXEN_SERVER_URL` (env var, with a hostname fallback) and confirm the
+server is up before any checks — same pattern as `/comic:fmv` and
+`/comic:snipe-add`:
 
 ```bash
-locg collection status --pretty
+echo "${GIXEN_SERVER_URL:-UNSET}"; hostname
 ```
 
-**If `last_full_import` is null:** Stop immediately with:
-> Cache empty — run `locg collection doctor` for setup instructions.
+If `GIXEN_SERVER_URL` is unset, infer it:
+- `Hsus-MacBook-Air.local` → `http://mac-mini.tail9b7fa5.ts.net:8080`
+- a Mac Mini hostname → `http://localhost:8080`
+- neither → **stop** ("machine is unrecognised — set GIXEN_SERVER_URL").
 
-**If `locg_cli_version` is older than `0.2.0`:** Stop immediately with:
-> locg-cli version >=0.2.0 required (installed: X.Y.Z). Upgrade via `./scripts/install.sh` (reinstalls the in-repo `locg`) and retry.
-
-Save `cache_age_days`, `pending_push_count`, and `oldest_pending_days` from the response — you need them for output banners.
-
-## Step 1: Check each comic against the cache
-
-For each comic in the input list, run one `locg collection check` call. **Always
-pass `--year`** when the identification has one — it disambiguates volumes and
-enables the masthead-alias fallback (BUI-46): e.g. a listing identified as "The
-Mighty Thor #154" (1968) only resolves to the owned catalog entry "Thor #154"
-when the year is supplied. Without a year that fallback is suppressed (to avoid
-colliding with same-masthead reboots like *The Mighty Thor* Vol. 3), so an owned
-comic can slip through.
+Health gate, then read collection status:
 
 ```bash
-locg collection check --series "Amazing Spider-Man" --issue 300 --year 1988 --pretty
-locg collection check --series "The Mighty Thor" --issue 154 --year 1968 --pretty
-locg collection check --series "Uncanny X-Men" --issue 179 --year 1984 --variant Newsstand --pretty
+curl -sf "$GIXEN_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
+curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
+```
+
+**If the health gate or status call fails:** STOP immediately — the collection
+cannot be checked, so do not proceed to bidding. Do not report any comic as "not
+in collection".
+
+**If `last_full_import` is null:** Stop with:
+> Collection empty on the server — run a full LOCG import (`/comic:collection-add`
+> import flow) before checking.
+
+Save `cache_age_days`, `pending_push_count`, and `oldest_pending_days` from the
+response — you need them for output banners.
+
+## Step 1: Check each comic against the server
+
+For each comic, call the check endpoint. **Always pass `year`** when the
+identification has one — it disambiguates volumes and enables the masthead-alias
+fallback (BUI-46): e.g. a listing identified as "The Mighty Thor #154" (1968)
+only resolves to the owned catalog entry "Thor #154" when the year is supplied.
+Without a year that fallback is suppressed (to avoid colliding with same-masthead
+reboots like *The Mighty Thor* Vol. 3), so an owned comic can slip through.
+
+Use `curl -sf -G --data-urlencode` so series names with spaces are encoded and a
+non-200 makes curl exit non-zero:
+
+```bash
+curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
+  --data-urlencode "series=Amazing Spider-Man" \
+  --data-urlencode "issue=300" \
+  --data-urlencode "year=1988"
+
+curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
+  --data-urlencode "series=Uncanny X-Men" \
+  --data-urlencode "issue=179" \
+  --data-urlencode "year=1984" \
+  --data-urlencode "variant=Newsstand"
 ```
 
 Each call returns:
@@ -53,19 +86,28 @@ Each call returns:
 }
 ```
 
-**Variant flag-through (R42):** If the listing has a variant (e.g., "Newsstand") but `locg collection check --variant Newsstand` returns `not_in_cache`, re-run without `--variant` to check whether the canonical entry is in the cache. If the canonical matches, record the verdict as `✅ In collection (canonical)` and add the note `⚠️ canonical match — listing variant not disambiguated`.
+> **If any check call fails (curl non-zero / connection error / non-200): STOP
+> the entire check.** Report the server error to the user and render NO verdicts
+> — not even for the comics that already succeeded. A partial run invites a
+> "not in collection" misread on the comics that never got checked (R11).
+
+**Variant flag-through (R42):** If the listing has a variant (e.g. "Newsstand")
+but the check with `variant=` returns `not_in_cache`, re-run without `variant` to
+check the canonical entry. If the canonical matches, record the verdict as
+`✅ In collection (canonical)` and add the note `⚠️ canonical match — listing
+variant not disambiguated`.
 
 ## Step 2: Apply stale-cache verdict downgrade
 
-**When `cache_age_days > 14` AND `match_status == "not_in_cache"`:** downgrade the verdict from confident "Not in collection" to:
+**When `cache_age_days > 14` AND `match_status == "not_in_cache"`:** downgrade the
+verdict from confident "Not in collection" to:
 
 > ⚠️ Not in cache (cache N days stale — manual LOCG check recommended before bidding)
 
-A stale cache may be missing recently added comics. This prevents a snipe going through on a comic you already own.
+A stale import may be missing recently added comics. This prevents a snipe going
+through on a comic you already own.
 
 ## Step 3: Output table
-
-Present results to the user:
 
 ```
 | # | Comic | In Cache? | Full Title Matched | Cache Age | Notes |
@@ -76,11 +118,12 @@ Present results to the user:
 | 4 | Batman #608 | ⚠️ Not in cache | — | 16 days | cache stale — manual LOCG check recommended |
 ```
 
-Cache age is the same value for every row (it's a property of the import date, not the comic).
+Cache age is the same value for every row (it's a property of the import date,
+not the comic).
 
 **Status banners** (below the table):
 
-- If `cache_age_days > 14`: `⚠️ Cache is N days old — consider re-exporting from LOCG (leagueofcomicgeeks.com → My Comics → Export).`
+- If `cache_age_days > 14`: `⚠️ Cache is N days old — consider re-importing from LOCG (leagueofcomicgeeks.com → My Comics → Export).`
 - Pending push: `N rows pending push to LOCG; oldest pending = X days.` Escalate tone when `oldest_pending_days > 21` or `pending_push_count > 25`.
 
 ## Step 4: Decision gate
@@ -97,7 +140,7 @@ Remove skipped comics from the working list before passing to `/comic:fmv`.
 
 | Mistake | Fix |
 |---|---|
-| Omitting `--year` | Always pass the identified year — it disambiguates volumes and enables the masthead-alias fallback (BUI-46); without it an owned comic listed by its cover title can slip through |
-| Running `locg lookup` to check collection status | Use `locg collection check` — fully offline, no LOCG network hit |
+| Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11). A silent miss buys a duplicate. |
+| Omitting `year` | Always pass the identified year — it disambiguates volumes and enables the masthead-alias fallback (BUI-46); without it an owned comic listed by its cover title can slip through |
+| Running checks before the `/health` gate passes | Health-gate first; a check against a down server is worthless and dangerous |
 | Treating a stale-cache `not_in_cache` as confident "not in collection" | Apply the stale-cache downgrade when `cache_age_days > 14` |
-| Fetching the full LOCG collection list to check 5 titles | Use `locg collection check` per comic — one call each, no login needed |
