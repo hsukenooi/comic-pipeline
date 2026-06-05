@@ -1,28 +1,35 @@
 ---
 name: comic:collection-add
-description: Record won Gixen auctions into the local collection cache, then export a CSV ready to upload to LOCG. No Playwright, no LOCG network access required.
-requires_locg_cli: ">=0.2.0"
+description: Record won Gixen auctions into the collection on the gixen server, then export a CSV ready to upload to LOCG. No Playwright, no LOCG network access required.
 ---
 
 # Comic Collection Add
 
-Record won Gixen auctions into the local collection cache in one batch, then export a CSV for LOCG upload. No Playwright, no live LOCG session required.
+Record won Gixen auctions into the collection on the gixen server (BUI-87) in one
+batch, then export a CSV for LOCG upload. The server is the single source of
+truth across machines, so a win recorded here is visible on the other machine
+immediately — no git round-trip (R8). No Playwright, no live LOCG session needed.
 
 **Gixen CLI:** `gixen` (a uv-installed console script on PATH; run `./scripts/install.sh` if not found).
 
-## Step 0: Bootstrap guard
+## Step 0: Resolve the server + bootstrap guard
 
-Before any other work, verify the cache is populated and `locg-cli` is current.
+Resolve `GIXEN_SERVER_URL` (env var, with a hostname fallback — same as
+`/comic:fmv`) and confirm the server is up before writing:
 
 ```bash
-locg collection status --pretty
+echo "${GIXEN_SERVER_URL:-UNSET}"; hostname
+# unset → MacBook (Hsus-MacBook-Air.local): http://mac-mini.tail9b7fa5.ts.net:8080
+#         Mac Mini: http://localhost:8080 ; neither → stop
+curl -sf "$GIXEN_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
+curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
 ```
 
-**If `last_full_import` is null:** Stop immediately with:
-> Cache empty — run `locg collection doctor` for setup instructions.
+**If the health gate fails:** STOP — do not record wins against an unreachable
+server.
 
-**If `locg_cli_version` is older than `0.2.0`:** Stop immediately with:
-> locg-cli version >=0.2.0 required (installed: X.Y.Z). Upgrade via `./scripts/install.sh` (reinstalls the in-repo `locg`) and retry.
+**If `last_full_import` is null:** Stop immediately with:
+> Collection empty on the server — run a full LOCG import before recording wins.
 
 ## Step 1: Pull won auctions
 
@@ -69,38 +76,46 @@ Do not leave `series` or `issue` blank — if you cannot determine them, ask the
 
 ## Step 3: Record wins
 
-Write the JSON to a temp file and pipe to `locg collection record-win`:
+Wrap the entries array as `{"wins": [...]}`, write it to a temp file, and POST it
+to the server's record-win endpoint (`curl -sf` so a non-200 fails loudly):
 
 ```bash
-locg collection record-win --from-gixen-json /tmp/wins.json --pretty
+# /tmp/wins.json contains: {"wins": [ {entry}, {entry}, ... ]}
+curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/collection/record-win" \
+  -H 'content-type: application/json' \
+  -d @/tmp/wins.json
 ```
 
-Or pipe directly from stdin:
-
-```bash
-echo '<json array>' | locg collection record-win --from-gixen-json - --pretty
-```
-
-The command commits in batches of 25. On success it returns:
+The server commits in batches of 25 using the same locg-cli logic (Metron series
+resolution + BUI-34 already-owned dedup). On success it returns:
 
 ```json
 {
   "rows_written": 3,
   "manual_variant_count": 0,
   "manual_series_count": 1,
-  "metron_lookups_succeeded": 2
+  "metron_lookups_succeeded": 2,
+  "skipped_already_owned": 0
 }
 ```
 
-`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up.
+`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails, STOP** — do not report success.
 
 ## Step 4: Export to CSV
 
+The export reads the *server* collection and returns the file contents; save them
+locally for the LOCG upload:
+
 ```bash
-locg collection export --pretty
+curl -sf "$GIXEN_SERVER_URL/api/comics/collection/export" -o /tmp/export.json
+ts=$(date +%Y-%m-%dT%H%M%S)
+python3 -c "import json,sys,os; d=json.load(open('/tmp/export.json')); \
+  base=os.path.expanduser(f'~/Downloads/locg-bulk-import-$ts'); \
+  open(base+'.csv','w').write(d['csv']); open(base+'.notes.md','w').write(d['notes_md']); \
+  print('csv:', base+'.csv', '| ready:', d['ready_count'])"
 ```
 
-This generates a CSV at `~/Downloads/locg-bulk-import-<timestamp>.csv` plus a `.notes.md` sidecar listing any rows that need manual attention (unknown variant, unknown series canonical).
+This writes a CSV at `~/Downloads/locg-bulk-import-<timestamp>.csv` plus a `.notes.md` sidecar listing any rows that need manual attention (unknown variant, unknown series canonical).
 
 ## Step 5: Report
 
@@ -126,6 +141,8 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 
 | Mistake | Fix |
 |---|---|
-| Using Playwright to add comics directly to LOCG | Use `locg collection record-win` + `locg collection export` — no Playwright needed |
-| Passing LOCG IDs as part of record-win input | `record-win` does not take LOCG IDs; it resolves series via Metron and the local cache |
+| Using Playwright to add comics directly to LOCG | POST to `/api/comics/collection/record-win` then GET `/api/comics/collection/export` — no Playwright needed |
+| POSTing the bare entries array | The endpoint expects `{"wins": [ ... ]}`, not a top-level array |
+| Recording wins against an unreachable server | Health-gate first; if the POST fails, STOP and report — don't claim success |
+| Passing LOCG IDs as part of record-win input | `record-win` does not take LOCG IDs; it resolves series via Metron and the server collection |
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
