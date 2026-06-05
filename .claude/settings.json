@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "files=$(git ls-files --others --exclude-standard -- docs 2>/dev/null | grep '\\.md$' | paste -sd ',' - | sed 's/,/, /g'); [ -z \"$files\" ] && exit 0; jq -n --arg f \"$files\" '{systemMessage: (\"⚠️  Untracked planning doc(s) not committed (lost on workspace cleanup): \" + $f + \" — commit before ending the session.\")}'"
+          }
+        ]
+      }
+    ]
+  }
+}
