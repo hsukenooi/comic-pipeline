@@ -1562,7 +1562,12 @@ def _match_owned_issue(
         if variant and variant.lower() not in full_title.lower():
             continue
 
-        if year and not (row.get("release_date") or "").startswith(str(year)):
+        # BUI-105: only reject on a year mismatch when the row actually carries a
+        # release_date. A dateless owned row (e.g. an index-resolved record-win
+        # written before its date was stamped) must not be silently excluded by
+        # the year gate — treat absent dates as a year match, not a miss.
+        release_date = row.get("release_date") or ""
+        if year and release_date and not release_date.startswith(str(year)):
             continue
 
         return full_title
@@ -1869,6 +1874,19 @@ def cmd_collection_record_win(
             release_date: Optional[str] = None
             if metron_data:
                 release_date = metron_data.get("store_date") or metron_data.get("cover_date")
+
+            # BUI-105: when no Metron data backs this win (the series_name_index
+            # path, or the bare-series manual fallback), there is no Metron date,
+            # so the row would be written dateless and miss a year-gated
+            # collection-check. Stamp a best-effort release_date from the identify
+            # year (Jan 1 — year precision is all the year.startswith() gate in
+            # _match_owned_issue needs) so a just-won book reads as in-collection.
+            # A Metron hit that simply lacks dates stays blank (R66) — the relaxed
+            # year gate already lets that row match.
+            if release_date is None and metron_data is None and year_raw is not None:
+                year_str = str(year_raw).strip()
+                if re.fullmatch(r"\d{4}", year_str):
+                    release_date = f"{year_str}-01-01"
 
             row: dict[str, Any] = {
                 "publisher_name": None,
