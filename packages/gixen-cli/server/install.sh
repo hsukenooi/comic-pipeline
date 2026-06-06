@@ -66,6 +66,13 @@ cat > "$PLIST" <<PLIST
     <dict>
         <key>ENV_FILE</key>
         <string>$SERVER_DIR/.env</string>
+        <!-- launchd starts jobs with a minimal PATH that omits ~/.local/bin,
+             where uv installs the ebay-fetch console script the server shells
+             out to for the ENDED-auction winning-bid fallback (BUI-66). Put it
+             on PATH so a bare ebay-fetch resolves without an EBAY_FETCH_BIN
+             override. -->
+        <key>PATH</key>
+        <string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>KeepAlive</key>
     <true/>

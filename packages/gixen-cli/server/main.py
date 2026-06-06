@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
-import sys
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -37,21 +39,27 @@ from server.db import (
 )
 import ebay_bidder
 
-# Import eBay helpers from the sibling project. Path is overridable via
-# EBAY_CLI_PATH so the server isn't pinned to a specific developer's home
-# directory layout.
-_EBAY_CLI_DIR = Path(os.getenv("EBAY_CLI_PATH", str(Path.home() / "Projects" / "ebay-cli")))
-sys.path.insert(0, str(_EBAY_CLI_DIR))
-try:
-    from ebay_fetch import (  # type: ignore[import]
-        load_config as _ebay_load_config,
-        get_token as _ebay_get_token,
-        fetch_item as _ebay_fetch_item,
-        parse_item as _ebay_parse_item,
-    )
-    _EBAY_AVAILABLE = True
-except ImportError as _ebay_import_err:
-    _EBAY_AVAILABLE = False
+# The eBay Browse-API fallback (winning-bid capture for ENDED auctions) shells
+# out to the `ebay-fetch` console script from apps/ebay rather than importing
+# ebay_fetch as a module (BUI-66). apps/* are NOT uv workspace members, so the
+# module's transitive deps aren't in the server venv — a subprocess against the
+# installed console script sidesteps that, and inherits the server's eBay
+# credentials from the environment.
+def _ebay_fetch_bin() -> str | None:
+    """Resolve the `ebay-fetch` console script to an invocable path, or None.
+
+    Resolved at CALL time, never at import time: EBAY_FETCH_BIN comes from the
+    server .env (loaded in the lifespan, *after* this module is imported), and
+    the LaunchAgent's PATH may not include ~/.local/bin where uv installs the
+    script — so an import-time shutil.which would spuriously report it missing.
+    A value containing a path separator is used verbatim if executable; a bare
+    name is looked up on PATH.
+    """
+    name = os.getenv("EBAY_FETCH_BIN", "ebay-fetch")
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return name if os.access(name, os.X_OK) else None
+    return shutil.which(name)
+
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +79,6 @@ if not _plugin_logger.handlers:
 # capture these records in tests. Uvicorn's default config attaches no root
 # handler, so propagation does not cause double-logging in production.
 
-if not _EBAY_AVAILABLE:
-    logger.warning("ebay_fetch not importable from %s — live eBay data disabled", _EBAY_CLI_DIR)
-
 # ---------------------------------------------------------------------------
 # App state
 # ---------------------------------------------------------------------------
@@ -87,6 +92,9 @@ _SYNC_TTL = 5.0  # concurrent dashboard loads within this window share one Gixen
 _ebay_fallback_lock: asyncio.Lock | None = None
 _ebay_cooldown_until: float = 0.0
 _EBAY_COOLDOWN = 300.0  # seconds; suppress eBay fallback after a rate-limit storm
+# BUI-85: cap eBay lookups for vanished PENDING rows with no captured end time,
+# so a backlog of them can't flood the rate-limited eBay budget in one sync.
+_VANISHED_NULL_END_MAX_PER_SYNC = 5
 # Tracked so the lifespan teardown can cancel + await any in-flight fallback
 # task before _db.close() runs. Without this the task can hit a closed DB.
 _ebay_fallback_task: asyncio.Task | None = None
@@ -170,19 +178,41 @@ def _ebay_creds_available() -> bool:
 
 
 def _fetch_ebay_item_sync(item_id: str) -> dict | None:
-    if not _EBAY_AVAILABLE:
+    bin_path = _ebay_fetch_bin()
+    if bin_path is None:
         return None
     if not _ebay_creds_available():
         return None
     try:
-        client_id, client_secret, base_url = _ebay_load_config()
-        token = _ebay_get_token(client_id, client_secret, base_url)
-        data = _ebay_fetch_item(item_id, token, base_url)
-        if data:
-            return _ebay_parse_item(data)
-    except Exception as e:
+        proc = subprocess.run(
+            [bin_path, item_id, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "_fetch_ebay_item_sync %s: ebay-fetch exited %d: %s",
+                item_id, proc.returncode, (proc.stderr or "").strip()[:200],
+            )
+            return None
+        results = json.loads(proc.stdout)
+        if results:
+            return results[0]
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
         logger.warning("_fetch_ebay_item_sync %s: %s", item_id, e)
     return None
+
+
+def _parse_end_iso(end_iso: str | None) -> datetime | None:
+    """Parse an eBay itemEndDate ('2025-05-01T12:34:56.000Z') into an aware
+    datetime, or None if unparseable."""
+    if not end_iso:
+        return None
+    try:
+        return datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
 
 
 def _iso_to_relative(end_date_iso: str | None) -> str:
@@ -304,6 +334,53 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
             "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
             iid,
         )
+
+    # BUI-85: PENDING rows that vanished from Gixen but never had an end time
+    # captured (auction_end_at IS NULL) escape the vanished_ended query above —
+    # it requires a non-NULL end. These rows are ambiguous on their own ("the
+    # auction ended and Gixen dropped it" vs "the user removed the snipe via
+    # Gixen's web UI before any sync ran"), so they can't be blindly marked
+    # ENDED. eBay's listing end time is the external signal that disambiguates:
+    #   - end in the past  → the auction genuinely ended → ENDED (the eBay
+    #     fallback then fills winning_bid). Glitch-safe: a still-live snipe has
+    #     a future end, so it can never wrongly land here.
+    #   - end in the future → the auction is still live but the snipe is gone →
+    #     the user removed it → tombstone REMOVED (never ENDED/WON/LOST). Only
+    #     when Gixen returned a non-empty list this sync, so an empty-list
+    #     scrape glitch can't mass-cancel live snipes.
+    #   - no eBay data      → leave PENDING and retry a later sync.
+    # Gated by the eBay cooldown and capped per sync to bound rate-limited I/O.
+    if _ebay_fetch_bin() is not None and now_dt.timestamp() >= _ebay_cooldown_until:
+        vanished_null_end = db.execute(
+            "SELECT item_id FROM bids "
+            "WHERE status = 'PENDING' AND auction_end_at IS NULL"
+        ).fetchall()
+        checked = 0
+        for row in vanished_null_end:
+            iid = row["item_id"]
+            if iid in gixen_item_ids:
+                continue  # still live on Gixen; the time_to_end path sets end
+            if checked >= _VANISHED_NULL_END_MAX_PER_SYNC:
+                break
+            checked += 1
+            ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+            end_iso = (ebay or {}).get("end_date_iso")
+            end_dt = _parse_end_iso(end_iso)
+            if end_dt is None:
+                continue  # can't disambiguate yet — leave PENDING, retry later
+            set_auction_end_time(db, iid, end_iso)
+            if end_dt <= now_dt:
+                update_bid_status(db, iid, "ENDED", winning_bid=None, resolved_at=now)
+                logger.info(
+                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s is past → ENDED",
+                    iid, end_iso,
+                )
+            elif snipes:
+                update_bid_status(db, iid, "REMOVED", winning_bid=None, resolved_at=now)
+                logger.info(
+                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s still future "
+                    "→ removed from Gixen, tombstoned REMOVED", iid, end_iso,
+                )
 
     db.commit()
 
@@ -618,6 +695,16 @@ async def lifespan(app: FastAPI):
     global _db, _api_client, _sync_client, _api_lock, _sync_lock, _ebay_fallback_lock, _bidder
     if env_file := os.getenv("ENV_FILE"):
         load_dotenv(env_file)
+    # Resolve the eBay fallback binary now that the .env (EBAY_FETCH_BIN, PATH)
+    # is loaded — a missing script silently disables ENDED-auction winning-bid
+    # capture, so log it loudly once at startup (BUI-66).
+    if _ebay_fetch_bin() is None:
+        logger.warning(
+            "ebay-fetch console script not found (EBAY_FETCH_BIN=%r, PATH lookup failed) "
+            "— live eBay fallback disabled. Install apps/ebay via scripts/install.sh, "
+            "or set EBAY_FETCH_BIN to its absolute path in the server .env.",
+            os.getenv("EBAY_FETCH_BIN", "ebay-fetch"),
+        )
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
     _db = init_db(db_path)
     app.state.db = _db
