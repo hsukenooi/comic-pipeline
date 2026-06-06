@@ -44,10 +44,22 @@ import ebay_bidder
 # ebay_fetch as a module (BUI-66). apps/* are NOT uv workspace members, so the
 # module's transitive deps aren't in the server venv — a subprocess against the
 # installed console script sidesteps that, and inherits the server's eBay
-# credentials from the environment. The binary name is overridable via
-# EBAY_FETCH_BIN for non-standard install layouts.
-_EBAY_FETCH_BIN = os.getenv("EBAY_FETCH_BIN", "ebay-fetch")
-_EBAY_AVAILABLE = shutil.which(_EBAY_FETCH_BIN) is not None
+# credentials from the environment.
+def _ebay_fetch_bin() -> str | None:
+    """Resolve the `ebay-fetch` console script to an invocable path, or None.
+
+    Resolved at CALL time, never at import time: EBAY_FETCH_BIN comes from the
+    server .env (loaded in the lifespan, *after* this module is imported), and
+    the LaunchAgent's PATH may not include ~/.local/bin where uv installs the
+    script — so an import-time shutil.which would spuriously report it missing.
+    A value containing a path separator is used verbatim if executable; a bare
+    name is looked up on PATH.
+    """
+    name = os.getenv("EBAY_FETCH_BIN", "ebay-fetch")
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return name if os.access(name, os.X_OK) else None
+    return shutil.which(name)
+
 
 logger = logging.getLogger(__name__)
 
@@ -66,13 +78,6 @@ if not _plugin_logger.handlers:
 # Note: propagate stays True so pytest's caplog (which attaches to root) can
 # capture these records in tests. Uvicorn's default config attaches no root
 # handler, so propagation does not cause double-logging in production.
-
-if not _EBAY_AVAILABLE:
-    logger.warning(
-        "ebay-fetch console script %r not found on PATH — live eBay data disabled "
-        "(install apps/ebay via scripts/install.sh, or set EBAY_FETCH_BIN)",
-        _EBAY_FETCH_BIN,
-    )
 
 # ---------------------------------------------------------------------------
 # App state
@@ -173,13 +178,14 @@ def _ebay_creds_available() -> bool:
 
 
 def _fetch_ebay_item_sync(item_id: str) -> dict | None:
-    if not _EBAY_AVAILABLE:
+    bin_path = _ebay_fetch_bin()
+    if bin_path is None:
         return None
     if not _ebay_creds_available():
         return None
     try:
         proc = subprocess.run(
-            [_EBAY_FETCH_BIN, item_id, "--json"],
+            [bin_path, item_id, "--json"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -344,7 +350,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     #     scrape glitch can't mass-cancel live snipes.
     #   - no eBay data      → leave PENDING and retry a later sync.
     # Gated by the eBay cooldown and capped per sync to bound rate-limited I/O.
-    if _EBAY_AVAILABLE and now_dt.timestamp() >= _ebay_cooldown_until:
+    if _ebay_fetch_bin() is not None and now_dt.timestamp() >= _ebay_cooldown_until:
         vanished_null_end = db.execute(
             "SELECT item_id FROM bids "
             "WHERE status = 'PENDING' AND auction_end_at IS NULL"
@@ -689,6 +695,16 @@ async def lifespan(app: FastAPI):
     global _db, _api_client, _sync_client, _api_lock, _sync_lock, _ebay_fallback_lock, _bidder
     if env_file := os.getenv("ENV_FILE"):
         load_dotenv(env_file)
+    # Resolve the eBay fallback binary now that the .env (EBAY_FETCH_BIN, PATH)
+    # is loaded — a missing script silently disables ENDED-auction winning-bid
+    # capture, so log it loudly once at startup (BUI-66).
+    if _ebay_fetch_bin() is None:
+        logger.warning(
+            "ebay-fetch console script not found (EBAY_FETCH_BIN=%r, PATH lookup failed) "
+            "— live eBay fallback disabled. Install apps/ebay via scripts/install.sh, "
+            "or set EBAY_FETCH_BIN to its absolute path in the server .env.",
+            os.getenv("EBAY_FETCH_BIN", "ebay-fetch"),
+        )
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
     _db = init_db(db_path)
     app.state.db = _db

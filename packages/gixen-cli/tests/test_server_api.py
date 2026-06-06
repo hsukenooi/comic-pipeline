@@ -893,7 +893,7 @@ def _seed_pending_null_end(api, item_id, max_bid=25.0):
 def _arm_ebay(monkeypatch, end_iso):
     """Make _sync_gixen's eBay path active and return a fixed listing end time."""
     import server.main as m
-    monkeypatch.setattr(m, "_EBAY_AVAILABLE", True)
+    monkeypatch.setattr(m, "_ebay_fetch_bin", lambda: "ebay-fetch")
     monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
     monkeypatch.setattr(
         m, "_fetch_ebay_item_sync",

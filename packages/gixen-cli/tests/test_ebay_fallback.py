@@ -25,8 +25,8 @@ def _completed(stdout="", returncode=0, stderr=""):
 
 @pytest.fixture
 def ebay_ready(monkeypatch):
-    """Pretend the binary is on PATH and credentials are present."""
-    monkeypatch.setattr(m, "_EBAY_AVAILABLE", True)
+    """Pretend the binary is resolvable and credentials are present."""
+    monkeypatch.setattr(m, "_ebay_fetch_bin", lambda: "ebay-fetch")
     monkeypatch.setattr(m, "_ebay_creds_available", lambda: True)
 
 
@@ -38,18 +38,18 @@ def test_fetch_returns_first_item(ebay_ready):
     assert result == item
     # invoked the console script with --json for that item id
     args = run.call_args[0][0]
-    assert args[0] == m._EBAY_FETCH_BIN and "123" in args and "--json" in args
+    assert args[0] == "ebay-fetch" and "123" in args and "--json" in args
 
 
 def test_fetch_unavailable_returns_none(monkeypatch):
-    monkeypatch.setattr(m, "_EBAY_AVAILABLE", False)
+    monkeypatch.setattr(m, "_ebay_fetch_bin", lambda: None)
     with patch.object(m.subprocess, "run") as run:
         assert m._fetch_ebay_item_sync("123") is None
     run.assert_not_called()  # no subprocess spawned when binary missing
 
 
 def test_fetch_no_creds_returns_none(monkeypatch):
-    monkeypatch.setattr(m, "_EBAY_AVAILABLE", True)
+    monkeypatch.setattr(m, "_ebay_fetch_bin", lambda: "ebay-fetch")
     monkeypatch.setattr(m, "_ebay_creds_available", lambda: False)
     with patch.object(m.subprocess, "run") as run:
         assert m._fetch_ebay_item_sync("123") is None
