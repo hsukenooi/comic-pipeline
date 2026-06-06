@@ -87,6 +87,9 @@ _SYNC_TTL = 5.0  # concurrent dashboard loads within this window share one Gixen
 _ebay_fallback_lock: asyncio.Lock | None = None
 _ebay_cooldown_until: float = 0.0
 _EBAY_COOLDOWN = 300.0  # seconds; suppress eBay fallback after a rate-limit storm
+# BUI-85: cap eBay lookups for vanished PENDING rows with no captured end time,
+# so a backlog of them can't flood the rate-limited eBay budget in one sync.
+_VANISHED_NULL_END_MAX_PER_SYNC = 5
 # Tracked so the lifespan teardown can cancel + await any in-flight fallback
 # task before _db.close() runs. Without this the task can hit a closed DB.
 _ebay_fallback_task: asyncio.Task | None = None
@@ -193,6 +196,17 @@ def _fetch_ebay_item_sync(item_id: str) -> dict | None:
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
         logger.warning("_fetch_ebay_item_sync %s: %s", item_id, e)
     return None
+
+
+def _parse_end_iso(end_iso: str | None) -> datetime | None:
+    """Parse an eBay itemEndDate ('2025-05-01T12:34:56.000Z') into an aware
+    datetime, or None if unparseable."""
+    if not end_iso:
+        return None
+    try:
+        return datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
 
 
 def _iso_to_relative(end_date_iso: str | None) -> str:
@@ -314,6 +328,53 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
             "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
             iid,
         )
+
+    # BUI-85: PENDING rows that vanished from Gixen but never had an end time
+    # captured (auction_end_at IS NULL) escape the vanished_ended query above —
+    # it requires a non-NULL end. These rows are ambiguous on their own ("the
+    # auction ended and Gixen dropped it" vs "the user removed the snipe via
+    # Gixen's web UI before any sync ran"), so they can't be blindly marked
+    # ENDED. eBay's listing end time is the external signal that disambiguates:
+    #   - end in the past  → the auction genuinely ended → ENDED (the eBay
+    #     fallback then fills winning_bid). Glitch-safe: a still-live snipe has
+    #     a future end, so it can never wrongly land here.
+    #   - end in the future → the auction is still live but the snipe is gone →
+    #     the user removed it → tombstone REMOVED (never ENDED/WON/LOST). Only
+    #     when Gixen returned a non-empty list this sync, so an empty-list
+    #     scrape glitch can't mass-cancel live snipes.
+    #   - no eBay data      → leave PENDING and retry a later sync.
+    # Gated by the eBay cooldown and capped per sync to bound rate-limited I/O.
+    if _EBAY_AVAILABLE and now_dt.timestamp() >= _ebay_cooldown_until:
+        vanished_null_end = db.execute(
+            "SELECT item_id FROM bids "
+            "WHERE status = 'PENDING' AND auction_end_at IS NULL"
+        ).fetchall()
+        checked = 0
+        for row in vanished_null_end:
+            iid = row["item_id"]
+            if iid in gixen_item_ids:
+                continue  # still live on Gixen; the time_to_end path sets end
+            if checked >= _VANISHED_NULL_END_MAX_PER_SYNC:
+                break
+            checked += 1
+            ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+            end_iso = (ebay or {}).get("end_date_iso")
+            end_dt = _parse_end_iso(end_iso)
+            if end_dt is None:
+                continue  # can't disambiguate yet — leave PENDING, retry later
+            set_auction_end_time(db, iid, end_iso)
+            if end_dt <= now_dt:
+                update_bid_status(db, iid, "ENDED", winning_bid=None, resolved_at=now)
+                logger.info(
+                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s is past → ENDED",
+                    iid, end_iso,
+                )
+            elif snipes:
+                update_bid_status(db, iid, "REMOVED", winning_bid=None, resolved_at=now)
+                logger.info(
+                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s still future "
+                    "→ removed from Gixen, tombstoned REMOVED", iid, end_iso,
+                )
 
     db.commit()
 

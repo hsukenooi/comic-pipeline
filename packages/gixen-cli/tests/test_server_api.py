@@ -878,3 +878,96 @@ def test_ebay_fallback_excludes_dedup_losers(tmp_path):
     conn.close()
     assert "loser1" not in items
     assert "real1" in items
+
+
+# --- BUI-85: vanished PENDING with no captured auction_end_at ---
+
+def _seed_pending_null_end(api, item_id, max_bid=25.0):
+    """Add a PENDING bid (auction_end_at stays NULL — no sync captured an end)."""
+    r = api.post("/api/bids", json={"item_id": item_id, "max_bid": max_bid})
+    assert r.status_code == 200
+    row = _read_db_row(item_id)
+    assert row["status"] == "PENDING"
+
+
+def _arm_ebay(monkeypatch, end_iso):
+    """Make _sync_gixen's eBay path active and return a fixed listing end time."""
+    import server.main as m
+    monkeypatch.setattr(m, "_EBAY_AVAILABLE", True)
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+    monkeypatch.setattr(
+        m, "_fetch_ebay_item_sync",
+        lambda iid: {"end_date_iso": end_iso} if end_iso is not None else None,
+    )
+
+
+def test_vanished_null_end_past_ebay_end_flips_to_ended(api, monkeypatch):
+    """Vanished PENDING + NULL end + eBay says the auction already ended → ENDED."""
+    from datetime import datetime, timedelta, timezone
+    _seed_pending_null_end(api, "850000001")
+    api.mock_gixen.list_snipes.return_value = []  # vanished
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    _arm_ebay(monkeypatch, past)
+
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("850000001")["status"] == "ENDED"
+
+
+def test_vanished_null_end_future_ebay_end_tombstones_removed(api, monkeypatch):
+    """Vanished PENDING + NULL end + eBay says the auction is still live (Gixen
+    healthy this sync) → user removed it → REMOVED, never WON/LOST/ENDED."""
+    from datetime import datetime, timedelta, timezone
+    _seed_pending_null_end(api, "850000002")
+    # Gixen returns a *different* live snipe → non-empty list (not a scrape glitch).
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "850099999", "max_bid": "10.00 USD", "current_bid": "1.00 USD",
+        "status": "SCHEDULED", "time_to_end": "3h", "seller": "s",
+        "snipe_group": "0", "bid_offset": "6",
+    }]
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+    _arm_ebay(monkeypatch, future)
+
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("850000002")["status"] == "REMOVED"
+
+
+def test_vanished_null_end_future_ebay_end_empty_list_left_pending(api, monkeypatch):
+    """Same future-end case but Gixen returned an EMPTY list (possible scrape
+    glitch) → do NOT mass-tombstone live snipes; leave PENDING."""
+    from datetime import datetime, timedelta, timezone
+    _seed_pending_null_end(api, "850000003")
+    api.mock_gixen.list_snipes.return_value = []  # empty → glitch guard trips
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+    _arm_ebay(monkeypatch, future)
+
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("850000003")["status"] == "PENDING"
+
+
+def test_vanished_null_end_no_ebay_data_left_pending(api, monkeypatch):
+    """eBay returns nothing → can't disambiguate → leave PENDING, retry later."""
+    _seed_pending_null_end(api, "850000004")
+    api.mock_gixen.list_snipes.return_value = []
+    _arm_ebay(monkeypatch, None)  # _fetch_ebay_item_sync → None
+
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("850000004")["status"] == "PENDING"
+
+
+def test_vanished_null_end_still_on_gixen_not_touched(api, monkeypatch):
+    """A NULL-end PENDING row still present in Gixen's list is not eBay-resolved
+    — the normal time_to_end path owns it."""
+    from datetime import datetime, timedelta, timezone
+    _seed_pending_null_end(api, "850000005")
+    # Still on Gixen with a live time_to_end → handled by the normal path.
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "850000005", "max_bid": "25.00 USD", "current_bid": "1.00 USD",
+        "status": "SCHEDULED", "time_to_end": "4h", "seller": "s",
+        "snipe_group": "0", "bid_offset": "6",
+    }]
+    # If eBay were (wrongly) consulted it would say "ended"; assert it isn't.
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    _arm_ebay(monkeypatch, past)
+
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("850000005")["status"] == "PENDING"
