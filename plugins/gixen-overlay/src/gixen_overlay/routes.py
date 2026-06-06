@@ -36,6 +36,7 @@ from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_ta
 # write paths) behind /api/comics/* instead of porting any of it to SQL. These
 # imports prove the locg workspace dependency resolves (exercised by the
 # workspace-imports canary).
+from locg.collection_io import MAX_XLSX_BYTES
 from locg.commands import (
     cmd_collection_check,
     cmd_collection_export,
@@ -50,6 +51,11 @@ from openpyxl.utils.exceptions import InvalidFileException
 
 _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 _NUMERIC_RE = re.compile(r"[^0-9.]")
+
+# BUI-106: stream uploads to the tempfile in bounded chunks so an over-cap POST
+# is rejected before its whole body is buffered into memory/disk. 1 MB keeps
+# peak memory to one chunk while staying well under the MAX_XLSX_BYTES cap.
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 router = APIRouter()
 
@@ -956,9 +962,27 @@ async def api_collection_import(file: UploadFile = File(...)):
     suffix = Path(file.filename or "import.xlsx").suffix or ".xlsx"
     tmp_path: str | None = None
     try:
+        # BUI-106: stream to disk in bounded chunks and abort the moment the
+        # running total exceeds MAX_XLSX_BYTES, so a multi-GB POST can't exhaust
+        # memory/disk before locg-cli's stat()-based 10 MB guard fires on the
+        # already-buffered file. At most one chunk past the cap is read/written.
+        total = 0
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = tmp.name  # set before write so a read failure still cleans up
-            tmp.write(await file.read())
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_XLSX_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Upload exceeds the "
+                            f"{MAX_XLSX_BYTES // (1024 * 1024)} MB limit."
+                        ),
+                    )
+                tmp.write(chunk)
         return cmd_collection_import(tmp_path)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")

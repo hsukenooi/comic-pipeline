@@ -259,6 +259,24 @@ def test_import_rejects_bad_upload(client):
     assert r.status_code == 422
 
 
+def test_import_rejects_over_cap_upload_without_parsing(client):
+    """BUI-106: an over-cap upload is rejected with 413 during streaming, before
+    the whole body is buffered and handed to the parser. We assert the parser
+    (cmd_collection_import) is never reached — proof the abort happens early, not
+    after locg-cli's stat()-based 10 MB guard fires on an already-buffered file."""
+    from unittest.mock import patch
+    from locg.collection_io import MAX_XLSX_BYTES
+
+    oversize = b"\0" * (MAX_XLSX_BYTES + 1)
+    with patch("gixen_overlay.routes.cmd_collection_import") as parse:
+        r = client.post(
+            "/api/comics/collection/import",
+            files={"file": ("huge.xlsx", oversize, "application/octet-stream")},
+        )
+    assert r.status_code == 413
+    parse.assert_not_called()
+
+
 def test_import_applies_xlsx_and_is_readable(client):
     import io
     import openpyxl
