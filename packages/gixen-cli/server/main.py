@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
-import sys
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -37,21 +39,15 @@ from server.db import (
 )
 import ebay_bidder
 
-# Import eBay helpers from the sibling project. Path is overridable via
-# EBAY_CLI_PATH so the server isn't pinned to a specific developer's home
-# directory layout.
-_EBAY_CLI_DIR = Path(os.getenv("EBAY_CLI_PATH", str(Path.home() / "Projects" / "ebay-cli")))
-sys.path.insert(0, str(_EBAY_CLI_DIR))
-try:
-    from ebay_fetch import (  # type: ignore[import]
-        load_config as _ebay_load_config,
-        get_token as _ebay_get_token,
-        fetch_item as _ebay_fetch_item,
-        parse_item as _ebay_parse_item,
-    )
-    _EBAY_AVAILABLE = True
-except ImportError as _ebay_import_err:
-    _EBAY_AVAILABLE = False
+# The eBay Browse-API fallback (winning-bid capture for ENDED auctions) shells
+# out to the `ebay-fetch` console script from apps/ebay rather than importing
+# ebay_fetch as a module (BUI-66). apps/* are NOT uv workspace members, so the
+# module's transitive deps aren't in the server venv — a subprocess against the
+# installed console script sidesteps that, and inherits the server's eBay
+# credentials from the environment. The binary name is overridable via
+# EBAY_FETCH_BIN for non-standard install layouts.
+_EBAY_FETCH_BIN = os.getenv("EBAY_FETCH_BIN", "ebay-fetch")
+_EBAY_AVAILABLE = shutil.which(_EBAY_FETCH_BIN) is not None
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +68,11 @@ if not _plugin_logger.handlers:
 # handler, so propagation does not cause double-logging in production.
 
 if not _EBAY_AVAILABLE:
-    logger.warning("ebay_fetch not importable from %s — live eBay data disabled", _EBAY_CLI_DIR)
+    logger.warning(
+        "ebay-fetch console script %r not found on PATH — live eBay data disabled "
+        "(install apps/ebay via scripts/install.sh, or set EBAY_FETCH_BIN)",
+        _EBAY_FETCH_BIN,
+    )
 
 # ---------------------------------------------------------------------------
 # App state
@@ -175,12 +175,22 @@ def _fetch_ebay_item_sync(item_id: str) -> dict | None:
     if not _ebay_creds_available():
         return None
     try:
-        client_id, client_secret, base_url = _ebay_load_config()
-        token = _ebay_get_token(client_id, client_secret, base_url)
-        data = _ebay_fetch_item(item_id, token, base_url)
-        if data:
-            return _ebay_parse_item(data)
-    except Exception as e:
+        proc = subprocess.run(
+            [_EBAY_FETCH_BIN, item_id, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "_fetch_ebay_item_sync %s: ebay-fetch exited %d: %s",
+                item_id, proc.returncode, (proc.stderr or "").strip()[:200],
+            )
+            return None
+        results = json.loads(proc.stdout)
+        if results:
+            return results[0]
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
         logger.warning("_fetch_ebay_item_sync %s: %s", item_id, e)
     return None
 
