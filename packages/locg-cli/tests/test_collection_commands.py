@@ -531,6 +531,54 @@ def test_check_masthead_alias_year_gate_prevents_collision(tmp_path, monkeypatch
     )["match_status"] == "not_in_cache"
 
 
+# --- BUI-105: dateless owned rows must survive the year gate ---
+
+def test_check_year_gate_matches_dateless_owned_row(tmp_path, monkeypatch):
+    """A year-gated check finds an owned row that has no release_date.
+
+    Regression for BUI-105: an index-resolved record-win written before its
+    date was stamped has release_date=None. collection-check always passes
+    --year, and the old year filter excluded any row whose release_date did
+    not start with that year — so a just-won book read as 'not in collection'
+    and risked a duplicate snipe. A dateless row must now pass the year gate.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #300",
+        release_date=None,
+    )])
+
+    result = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="300", year="1988"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Amazing Spider-Man #300"
+
+
+def test_check_year_gate_still_rejects_wrong_dated_row(tmp_path, monkeypatch):
+    """The relaxed year gate only spares *dateless* rows — a row with a
+    release_date that disagrees with the queried year is still rejected, so
+    BUI-105 doesn't reopen the volume-disambiguation the year gate provides."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #1",
+        release_date="1963-03-01",
+    )])
+
+    # Owns the 1963 Amazing Spider-Man #1; a 2018-era query must still miss.
+    assert cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="1", year="2018"
+    )["match_status"] == "not_in_cache"
+
+
 # ---------------------------------------------------------------------------
 # cmd_collection_doctor
 # ---------------------------------------------------------------------------
@@ -702,6 +750,71 @@ def test_record_win_series_from_index(tmp_path):
     row = payload["comics"][-1]
     assert row["series_name"] == "Amazing Spider-Man (1963 - 1998)"
     assert row["source"] == "agent_win"
+    # BUI-105: no Metron date on the index path, so stamp a best-effort
+    # release_date from the identify year (Jan 1) instead of leaving it None.
+    assert row["release_date"] == "1988-01-01"
+
+
+def test_record_win_index_path_found_by_year_gated_check(tmp_path, monkeypatch):
+    """Acceptance (BUI-105): a record-win resolved via series_name_index is
+    reported in_collection by a subsequent year-gated collection-check."""
+    import locg.commands as cmds
+    from locg.collection_cache import rebuild_series_name_index
+
+    cache = make_cache(tmp_path)
+    # Seed a locg_export row so the series_name_index resolves the series
+    # without any Metron call (the no-Metron path that drops the date).
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Amazing Spider-Man (1963 - 1998)", full_title="Amazing Spider-Man #1"),
+        "source": "locg_export",
+    }])
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    cmds.cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man (1963 - 1998)", issue="300", year=1988)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    # The win's title carries the canonical series name (with its date range),
+    # as record-win builds it from the index value; the matcher strips the
+    # parenthetical via _normalize_series_key, so the bare-series query matches.
+    assert cache.load()["comics"][-1]["full_title"] == "Amazing Spider-Man (1963 - 1998) #300"
+
+    # collection-check always passes --year; the just-won book must be found.
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    result = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="300", year="1988"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Amazing Spider-Man (1963 - 1998) #300"
+
+
+def test_record_win_index_path_dateless_when_no_year(tmp_path):
+    """When the win carries no identify year, the index path leaves the row
+    dateless — the relaxed year gate (BUI-105) still lets a later check match."""
+    import locg.commands as cmds
+    from locg.collection_cache import rebuild_series_name_index
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Amazing Spider-Man (1963 - 1998)", full_title="Amazing Spider-Man #1"),
+        "source": "locg_export",
+    }])
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    cmds.cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man (1963 - 1998)", issue="300", year=None)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] is None
 
 
 def test_record_win_series_from_metron(tmp_path):
