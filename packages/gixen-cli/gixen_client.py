@@ -220,6 +220,11 @@ class GixenClient:
     _min_post_gap: float = 1.5
     # Backoff before retrying an add_snipe that wasn't confirmed by list_snipes.
     _add_retry_backoff: float = 5.0
+    # BUI-117: within this window, a second+ login() reuses the last good session
+    # instead of re-authenticating. Sized to span one edit's lifetime (which
+    # includes the 5s _add_retry_backoff + 1.5s post gaps) so an edit's burst of
+    # recovery re-logins collapses to a single real login.
+    _login_throttle: float = 12.0
     # Account-keyed monotonic timestamp of the last _post_home call. Class-
     # level so two GixenClient instances sharing the same username (e.g.
     # _api_client + _sync_client in the server) actually serialize against
@@ -240,6 +245,15 @@ class GixenClient:
         self.session = _CurlSession()
         self.session_id: Optional[str] = None
         self._login_failed_at: Optional[float] = None  # monotonic timestamp
+        # BUI-117: instance-level successful-login throttle. A single edit's
+        # recovery path can clear session_id and call login() up to ~6 times
+        # during a Gixen flap (3 list_snipes × GET-500 + table-missing re-logins).
+        # These collapse to one real login if a successful login is recent enough.
+        # Instance-level (not class-level) on purpose: each client has its own
+        # _CurlSession/cookie jar, so a session id is not portable across the
+        # _api_client/_sync_client pair even though they share a username.
+        self._last_login_at: Optional[float] = None  # monotonic, set on success
+        self._last_session_id: Optional[str] = None  # last good session id
 
     @property
     def _last_post_at(self) -> Optional[float]:
@@ -283,6 +297,23 @@ class GixenClient:
                     "Backing off to avoid IP rate-limiting."
                 )
 
+        # BUI-117: collapse a burst of recovery re-logins within one edit to a
+        # single real login. This only fires on the 2nd+ login() inside the
+        # window — the first one always authenticates for real, so a legitimate
+        # single stale-session recovery still does its one login and heals (the
+        # recovery callers null session_id first, so we restore the last good id
+        # here). During a *persistent* flap the reused session is already dead;
+        # the bounded retry then 500s and surfaces 503 — the edit fails after one
+        # login instead of six, which is the intended bound, not a regression.
+        if (
+            self._last_login_at is not None
+            and self._last_session_id is not None
+            and time.monotonic() - self._last_login_at < self._login_throttle
+        ):
+            logger.info("Login throttle active — reusing recent session")
+            self.session_id = self._last_session_id
+            return self.session_id
+
         try:
             resp = self.session.post(
                 LOGIN_URL,
@@ -325,6 +356,10 @@ class GixenClient:
 
         self._login_failed_at = None
         self.session_id = match.group(1)
+        # BUI-117: remember this good login so a same-edit burst of recovery
+        # re-logins within _login_throttle reuses it instead of re-authenticating.
+        self._last_login_at = time.monotonic()
+        self._last_session_id = self.session_id
         # Clear the post-throttle: re-login already takes seconds and has
         # effectively spaced the requests. Without this, the recursion path
         # in _post_home (500 → relogin → retry) stacks throttle on top of
