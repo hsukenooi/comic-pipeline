@@ -91,7 +91,7 @@ Copy the eBay URLs from the URL column and pass them to `/comic:buy`. The buy wo
 
 ## Matching algorithm
 
-- Fetches up to 500 seller listings (override with `--max-results N`)
+- Fetches up to 1000 seller listings (override with `--max-results N`)
 - Parses each wish list item `name` (e.g., "Amazing Spider-Man #300") into series + issue number
 - Matches when: issue number appears in the listing title AND ≥50% of series name tokens match
 - Reports match score — scores close to 1.0 are exact series matches; 0.5 means partial series overlap (verify manually)
