@@ -569,13 +569,15 @@ async function saveMaxBid(cell, newMax) {
 
   try {
     let resp = await attempt();
-    // BUI-115: a 503 is the transient stale-session/Gixen blip the server now
-    // mostly self-heals. Retry once before surfacing failure so the user isn't
-    // forced to re-type the bid for a momentary hiccup.
-    if (resp.status === 503) {
-      await new Promise(r => setTimeout(r, 800));
-      resp = await attempt();
-    }
+    // BUI-117: no client-side 503 retry. The server already exhausts recovery
+    // for an edit — _modify_with_cache_fallback runs up to two full modify_snipe
+    // attempts (cached dbidid → list lookup), each POSTing twice via the internal
+    // _add_retry_backoff retry. A blind client retry on top doubled the POST load
+    // during the exact degraded state the recovery absorbs, and under the BUI-117
+    // login throttle an 800ms retry can't escape the throttle window anyway (it
+    // reuses the same session or hits the login cooldown). A 503 here is now a
+    // real failure — surface it so the user can re-edit rather than silently
+    // re-hammering Gixen.
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
       try { const j = await resp.json(); if (j.detail) detail = j.detail; } catch (_) {}

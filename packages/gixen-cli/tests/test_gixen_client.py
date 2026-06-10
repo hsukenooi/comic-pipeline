@@ -1969,7 +1969,11 @@ class TestGetPathRecovery:
 
     def test_500_then_non_table_then_table_stays_bounded(self):
         """U1 + U2 compose: a 500, then a non-table 200, then a valid table.
-        Bound is one re-login per recovery layer (2 logins, 3 GETs max)."""
+        GETs stay bounded at 3 (one re-fetch per recovery layer). BUI-117: the
+        two recovery layers' re-logins now collapse to a single real login —
+        the U2 table-missing re-login lands inside the throttle window opened by
+        the U1 GET-500 re-login, so it reuses that session instead of
+        re-authenticating."""
         client = _client()
         client.session_id = "stale"
 
@@ -1985,7 +1989,85 @@ class TestGetPathRecovery:
         snipes = client.list_snipes()
         assert len(snipes) == 1
         assert client.session.get.call_count == 3
-        assert client.session.post.call_count == 2  # U1 relogin + U2 relogin
+        assert client.session.post.call_count == 1  # BUI-117: re-logins collapse
+
+
+# ---------------------------------------------------------------------------
+# BUI-117: successful-login throttle bounds the per-edit re-login cascade
+# ---------------------------------------------------------------------------
+
+class TestLoginThrottle:
+    def _login_resp(self):
+        r = MagicMock()
+        r.text = LOGIN_REDIRECT_HTML  # yields session_id 99887766
+        return r
+
+    def test_second_login_within_window_reuses_session(self):
+        """A successful login within _login_throttle reuses the session instead
+        of re-authenticating (AC: assert the login POST count)."""
+        client = _client()
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        sid1 = client.login()
+        sid2 = client.login()  # immediate → inside the throttle window
+
+        assert sid1 == sid2 == "99887766"
+        assert client.session.post.call_count == 1  # only the first authenticates
+
+    def test_throttle_restores_session_id_nulled_by_recovery_caller(self):
+        """The GET-500 / table-missing recovery paths set session_id = None
+        before calling login(). When the throttle skips the real login it must
+        restore the last good session id, or the next request has no session."""
+        client = _client()
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        client.login()             # real login, caches the session
+        client.session_id = None   # simulate a recovery caller nulling it
+        sid = client.login()       # throttled
+
+        assert sid == "99887766"
+        assert client.session_id == "99887766"  # restored, not left None
+        assert client.session.post.call_count == 1
+
+    def test_login_outside_window_reauthenticates(self):
+        """Past the throttle window a real login fires again — the throttle only
+        collapses within-edit bursts, it does not pin a session forever."""
+        client = _client()
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        clock = {"t": 100.0}
+        with patch("gixen_client.time.monotonic", side_effect=lambda: clock["t"]):
+            client.login()                       # records t=100
+            clock["t"] = 100.0 + client._login_throttle + 1.0
+            client.login()                       # past window → real login
+
+        assert client.session.post.call_count == 2
+
+    def test_repeated_list_relogins_collapse_to_one_login(self):
+        """AC #1 mechanism: during a persistent flap every list_snipes GET 500s
+        and would force its own re-login. Across three list_snipes attempts (the
+        most a single modify_snipe issues) only the first authenticates for real;
+        the rest reuse the recent session. The edit still fails (the session is
+        genuinely dead) but the login load is bounded to one."""
+        client = _client()
+        client.session_id = "stale"
+
+        def make_500(*_a, **_k):
+            r = MagicMock()
+            r.status_code = 500
+            r.text = "<html>500</html>"
+            r.raise_for_status = MagicMock(side_effect=requests.HTTPError("HTTP 500"))
+            return r
+
+        client.session.get = MagicMock(side_effect=make_500)
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        for _ in range(3):
+            with pytest.raises(requests.HTTPError):
+                client.list_snipes()
+
+        # Without the throttle this would be three logins (one per list_snipes).
+        assert client.session.post.call_count == 1
 
 
 # ---------------------------------------------------------------------------
