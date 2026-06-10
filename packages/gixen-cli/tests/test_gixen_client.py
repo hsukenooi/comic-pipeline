@@ -1986,3 +1986,60 @@ class TestGetPathRecovery:
         assert len(snipes) == 1
         assert client.session.get.call_count == 3
         assert client.session.post.call_count == 2  # U1 relogin + U2 relogin
+
+
+# ---------------------------------------------------------------------------
+# BUI-116: cached-dbidid fast path on modify/remove
+# ---------------------------------------------------------------------------
+
+class TestCachedDbidid:
+    def test_modify_with_dbidid_skips_pre_post_lookup(self):
+        client = _client()
+        client.session_id = "99887766"
+        # Only the post-POST verify should call list_snipes (1 call), not the
+        # pre-POST lookup (which would make it 2).
+        verify = [{"item_id": "111", "dbidid": "5001", "max_bid": "20.00"}]
+        with patch.object(client, "list_snipes", side_effect=[verify]) as mock_list:
+            with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+                assert client.modify_snipe("111", Decimal("20.00"), dbidid="5001") is True
+        assert mock_list.call_count == 1                 # verify only
+        assert mock_post.call_args[0][0]["dbidid"] == "5001"
+
+    def test_modify_without_dbidid_still_lists_first(self):
+        client = _client()
+        client.session_id = "99887766"
+        old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        new = [{"item_id": "111", "dbidid": "5001", "max_bid": "20.00"}]
+        with patch.object(client, "list_snipes", side_effect=[old, new]) as mock_list:
+            with patch.object(client, "_post_home", return_value="<html>OK</html>"):
+                assert client.modify_snipe("111", Decimal("20.00")) is True
+        assert mock_list.call_count == 2                 # pre-POST lookup + verify
+
+    def test_modify_with_stale_dbidid_raises_not_confirmed(self):
+        client = _client()
+        client.session_id = "99887766"
+        still_old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        with patch("gixen_client.time.sleep"):
+            with patch.object(client, "list_snipes", side_effect=[still_old, still_old]):
+                with patch.object(client, "_post_home", return_value="<html>OK</html>"):
+                    with pytest.raises(GixenModifyNotConfirmedError):
+                        client.modify_snipe("111", Decimal("20.00"), dbidid="stale")
+
+    def test_remove_with_dbidid_skips_pre_post_lookup(self):
+        client = _client()
+        client.session_id = "99887766"
+        # Post-delete verify list shows the item gone -> success. Only 1 list call.
+        with patch.object(client, "list_snipes", side_effect=[[]]) as mock_list:
+            with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+                assert client.remove_snipe("111", dbidid="5001") is True
+        assert mock_list.call_count == 1
+        assert "delete_5001" in mock_post.call_args[0][0]
+
+    def test_remove_with_stale_dbidid_still_present_raises(self):
+        client = _client()
+        client.session_id = "99887766"
+        still_there = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        with patch.object(client, "list_snipes", side_effect=[still_there]):
+            with patch.object(client, "_post_home", return_value="<html>OK</html>"):
+                with pytest.raises(GixenError):
+                    client.remove_snipe("111", dbidid="stale")

@@ -1022,3 +1022,52 @@ def test_repair_noop_without_overlay(tmp_path):
         ).fetchone()["status"] == "REMOVED"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# BUI-116: dbidid cache column
+# ---------------------------------------------------------------------------
+
+def test_dbidid_column_present_on_fresh_db(db):
+    cols = [r[1] for r in db.execute("PRAGMA table_info(bids)")]
+    assert "dbidid" in cols
+
+
+def test_init_db_idempotent_with_dbidid(tmp_path):
+    """Running init_db twice doesn't error on the dbidid migration (duplicate
+    column is tolerated) and the column persists."""
+    path = tmp_path / "twice.db"
+    init_db(path).close()
+    conn = init_db(path)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bids)")]
+    assert "dbidid" in cols
+
+
+def test_cache_gixen_data_writes_dbidid(db):
+    from server.db import cache_gixen_data
+    insert_bid(db, "700000010", 50.0, 6, 0, "seller")
+    cache_gixen_data(db, "700000010", "Title", None, "10.00 USD", dbidid="abc123")
+    db.commit()
+    row = get_bid_by_item_id(db, "700000010")
+    assert row["dbidid"] == "abc123"
+
+
+def test_cache_gixen_data_writes_dbidid_even_with_no_other_data(db):
+    """A SCHEDULED snipe with no title/seller/current_bid still gets its dbidid
+    cached — the has_data early-return must not skip the dbidid write."""
+    from server.db import cache_gixen_data
+    insert_bid(db, "700000011", 50.0, 6, 0, "seller")
+    cache_gixen_data(db, "700000011", None, None, None, dbidid="xyz789")
+    db.commit()
+    row = get_bid_by_item_id(db, "700000011")
+    assert row["dbidid"] == "xyz789"
+
+
+def test_cache_gixen_data_skips_dbidid_on_removed_row(db):
+    from server.db import cache_gixen_data, delete_bid
+    insert_bid(db, "700000012", 50.0, 6, 0, "seller")
+    delete_bid(db, "700000012")  # -> REMOVED tombstone
+    cache_gixen_data(db, "700000012", None, None, None, dbidid="should-not-write")
+    db.commit()
+    row = get_bid_by_item_id(db, "700000012")
+    assert row["dbidid"] is None

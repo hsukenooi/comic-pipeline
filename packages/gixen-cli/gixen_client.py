@@ -615,6 +615,7 @@ class GixenClient:
         max_bid: Decimal,
         bid_offset: int = 6,
         snipe_group: int = 0,
+        dbidid: Optional[str] = None,
     ) -> bool:
         """Modify an existing snipe's bid.
 
@@ -623,14 +624,21 @@ class GixenClient:
         modify is retried once, then raised as GixenModifyNotConfirmedError rather
         than reported as success (which would leave the DB lying about the bid).
 
+        BUI-116: when ``dbidid`` (Gixen's internal row id) is supplied, the
+        pre-POST list_snipes() lookup is skipped — this is the edit fast-path.
+        A stale cached dbidid is caught by the post-POST verify below; the caller
+        (the server, which owns the cache) handles re-resolving and retrying.
+
         Raises:
-            GixenSnipeNotFoundError: If item_id is not in the snipe list.
+            GixenSnipeNotFoundError: If item_id is not in the snipe list (only
+                when dbidid is not supplied — the lookup path).
             GixenModifyNotConfirmedError: If the modify POST returned no error but
                 the new max_bid never appeared in the list, even after one retry.
         """
         target = str(item_id)
-        snipes = self.list_snipes()
-        snipe = self._find_snipe(snipes, target)
+        if dbidid is None:
+            snipe = self._find_snipe(self.list_snipes(), target)
+            dbidid = snipe["dbidid"]
 
         data = {
             "newitemid": str(item_id),
@@ -639,7 +647,7 @@ class GixenClient:
             "newbidoffsetmirror": str(bid_offset),
             "newsnipegroup": str(snipe_group),
             "username": self.username,
-            "dbidid": snipe["dbidid"],
+            "dbidid": dbidid,
             "ismodified": "1",
         }
 
@@ -671,15 +679,21 @@ class GixenClient:
 
         raise GixenModifyNotConfirmedError(item_id, max_bid)
 
-    def remove_snipe(self, item_id: str) -> bool:
+    def remove_snipe(self, item_id: str, dbidid: Optional[str] = None) -> bool:
         """Remove a snipe.
 
+        BUI-116: when ``dbidid`` is supplied, the pre-POST list_snipes() lookup
+        is skipped. The post-delete verify below still confirms the item is gone,
+        so a stale cached dbidid (delete hits a wrong/absent row) surfaces as the
+        "still in list" error, which the server turns into a list-based retry.
+
         Raises:
-            GixenSnipeNotFoundError: If item_id is not in the snipe list.
+            GixenSnipeNotFoundError: If item_id is not in the snipe list (only
+                when dbidid is not supplied — the lookup path).
         """
-        snipes = self.list_snipes()
-        snipe = self._find_snipe(snipes, str(item_id))
-        dbidid = snipe["dbidid"]
+        if dbidid is None:
+            snipe = self._find_snipe(self.list_snipes(), str(item_id))
+            dbidid = snipe["dbidid"]
 
         data = {
             f"delete_{dbidid}": "Delete",
