@@ -17,6 +17,8 @@ from gixen_overlay.db import (
     get_primary_fmv_for_bid,
     list_comics,
     sweep_orphan_yearless_comics,
+    get_seen_item_ids,
+    mark_items_seen,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import (
@@ -26,6 +28,7 @@ from gixen_overlay.models import (
     VerifyRequest,
     WishListAddRequest,
     RecordWinRequest,
+    SellerScanSeenRequest,
 )
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
@@ -1026,3 +1029,32 @@ async def api_wish_list_add(req: WishListAddRequest):
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
     return result
+
+
+# ---------------------------------------------------------------------------
+# BUI-113: seller-scan seen-tracking. Lets seller_scan.py default to surfacing
+# only wish-list matches it hasn't shown before. Provider-neutral, server-owned
+# so the MacBook and Mac Mini share one memory (a JSON cache would diverge —
+# the exact failure that motivated the ticket). Best-effort on the client: a
+# failed call only costs a duplicate, never a hidden match.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/comics/seller-scan/seen")
+async def api_seller_scan_seen(request: Request, seller: str | None = None):
+    """Return item_ids already surfaced by a seller scan as ``{"item_ids": [...]}``.
+
+    ``seller`` is an optional filter; omitted returns every seen id (item_ids
+    are globally unique on eBay, so a default scan filters across all sellers).
+    """
+    db = request.app.state.db
+    return {"item_ids": sorted(get_seen_item_ids(db, seller))}
+
+
+@router.post("/api/comics/seller-scan/seen")
+async def api_seller_scan_seen_add(request: Request, req: SellerScanSeenRequest):
+    """Mark item_ids as surfaced. Idempotent — re-marking keeps the first
+    first_seen_at. Returns ``{"marked": <newly-inserted count>}``."""
+    db = request.app.state.db
+    inserted = mark_items_seen(db, req.item_ids, req.seller)
+    return {"marked": inserted}
