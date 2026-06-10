@@ -438,6 +438,23 @@ def test_edit_bid_gixen_error_returns_503(api):
     assert r.status_code == 503
 
 
+def test_edit_bid_unconfirmed_modify_returns_503_and_leaves_db_unchanged(api):
+    """BUI-115: when Gixen accepts the modify POST but the new bid never goes
+    live, modify_snipe raises GixenModifyNotConfirmedError → 503, and the local
+    DB must NOT be updated (no false 'new bid' while Gixen keeps the old)."""
+    from gixen_client import GixenModifyNotConfirmedError
+    api.post("/api/bids", json={"item_id": "800000077", "max_bid": 50.0})
+
+    api.mock_gixen.modify_snipe.side_effect = GixenModifyNotConfirmedError("800000077", 75.0)
+    r = api.patch("/api/bids/800000077", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 503
+
+    # DB still shows the original bid — the write was skipped.
+    rows = api.get("/api/bids").json()
+    row = next(b for b in rows if b["item_id"] == "800000077")
+    assert row["max_bid"] == 50.0
+
+
 def test_purge_removes_siblings(api):
     """Sibling loop executes when a group has a WON snipe."""
     api.post("/api/bids", json={"item_id": "500000001", "max_bid": 50.0})

@@ -22,6 +22,7 @@ from gixen_client import (
     GixenSnipeNotFoundError,
     GixenParseError,
     GixenAddNotConfirmedError,
+    GixenModifyNotConfirmedError,
     find_sibling_cleanup_targets,
 )
 
@@ -255,9 +256,13 @@ class TestListSnipes:
 
         html = "<html><body>Maintenance in progress</body></html>"
 
+        # BUI-115: a missing table now triggers one re-login + retry. Mock the
+        # re-login so it succeeds but the retried fetch still has no table — the
+        # bounded retry is exhausted and the parse error surfaces.
         with patch.object(client, "_get_home_page", return_value=html):
-            with pytest.raises(GixenParseError, match="Could not find snipe table"):
-                client.list_snipes()
+            with patch.object(client, "login", return_value="99887766"):
+                with pytest.raises(GixenParseError, match="Could not find snipe table"):
+                    client.list_snipes()
 
     def test_parse_error_non_numeric_bid(self):
         client = _client()
@@ -549,9 +554,12 @@ class TestModifySnipe:
         client = _client()
         client.session_id = "99887766"
 
-        snipes = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        # BUI-115: modify re-lists AFTER the POST to confirm the change landed.
+        # First list (dbidid lookup) shows the old bid; second (verify) shows new.
+        old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        new = [{"item_id": "111", "dbidid": "5001", "max_bid": "20.00"}]
 
-        with patch.object(client, "list_snipes", return_value=snipes):
+        with patch.object(client, "list_snipes", side_effect=[old, new]):
             with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
                 result = client.modify_snipe("111", Decimal("20.00"))
 
@@ -569,6 +577,77 @@ class TestModifySnipe:
         with patch.object(client, "list_snipes", return_value=[]):
             with pytest.raises(GixenSnipeNotFoundError, match="111"):
                 client.modify_snipe("111", Decimal("20"))
+
+    def test_modify_format_tolerant_confirmation(self):
+        """Gixen may echo 40 as 40.00 (or vice versa) — confirmation compares
+        as Decimal, so a formatting difference is not a false silent-drop."""
+        client = _client()
+        client.session_id = "99887766"
+        old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        verify = [{"item_id": "111", "dbidid": "5001", "max_bid": "40"}]  # no decimals
+
+        with patch.object(client, "list_snipes", side_effect=[old, verify]):
+            with patch.object(client, "_post_home", return_value="<html>OK</html>"):
+                assert client.modify_snipe("111", Decimal("40.00")) is True
+
+    def test_max_bid_matches_tolerates_formatting(self):
+        # currency suffix, trailing zeros, whitespace all compare equal
+        assert GixenClient._max_bid_matches("40.00 USD", Decimal("40.00")) is True
+        assert GixenClient._max_bid_matches("40", Decimal("40.00")) is True
+        assert GixenClient._max_bid_matches(" 40.00 ", Decimal("40")) is True
+        # genuine mismatches and junk compare unequal (never a false-positive)
+        assert GixenClient._max_bid_matches("41.00", Decimal("40.00")) is False
+        assert GixenClient._max_bid_matches("", Decimal("40")) is False
+        assert GixenClient._max_bid_matches(None, Decimal("40")) is False
+
+    def test_modify_confirm_with_usd_suffix(self):
+        """Gixen echoing the bid with a ' USD' suffix still confirms (no false
+        silent-drop that would 503 a modify that actually landed)."""
+        client = _client()
+        client.session_id = "99887766"
+        old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        verify = [{"item_id": "111", "dbidid": "5001", "max_bid": "40.00 USD"}]
+        with patch.object(client, "list_snipes", side_effect=[old, verify]):
+            with patch.object(client, "_post_home", return_value="<html>OK</html>"):
+                assert client.modify_snipe("111", Decimal("40.00")) is True
+
+    def test_modify_silent_drop_retries_then_succeeds(self):
+        client = _client()
+        client.session_id = "99887766"
+        old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        still_old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        new = [{"item_id": "111", "dbidid": "5001", "max_bid": "20.00"}]
+
+        with patch("gixen_client.time.sleep"):
+            with patch.object(client, "list_snipes", side_effect=[old, still_old, new]):
+                with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+                    assert client.modify_snipe("111", Decimal("20.00")) is True
+        # POST issued twice: original + one retry after the unconfirmed first attempt
+        assert mock_post.call_count == 2
+
+    def test_modify_never_confirms_raises(self):
+        client = _client()
+        client.session_id = "99887766"
+        old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+
+        with patch("gixen_client.time.sleep"):
+            # dbidid lookup, then verify x2 both still showing the old value
+            with patch.object(client, "list_snipes", side_effect=[old, old, old]):
+                with patch.object(client, "_post_home", return_value="<html>OK</html>"):
+                    with pytest.raises(GixenModifyNotConfirmedError):
+                        client.modify_snipe("111", Decimal("20.00"))
+
+    def test_modify_snipe_vanishes_after_post_raises(self):
+        client = _client()
+        client.session_id = "99887766"
+        old = [{"item_id": "111", "dbidid": "5001", "max_bid": "10"}]
+        gone = []  # snipe absent from the post-POST list
+
+        with patch("gixen_client.time.sleep"):
+            with patch.object(client, "list_snipes", side_effect=[old, gone, gone]):
+                with patch.object(client, "_post_home", return_value="<html>OK</html>"):
+                    with pytest.raises(GixenModifyNotConfirmedError):
+                        client.modify_snipe("111", Decimal("20.00"))
 
 
 # ---------------------------------------------------------------------------
@@ -1763,3 +1842,147 @@ def test_parse_snipe_table_logs_body_snippet_when_table_missing(caplog):
     # secrets are redacted in the captured snippet
     assert "999888777" not in msg
     assert "hsukenooi" not in msg
+
+
+# ---------------------------------------------------------------------------
+# BUI-115: GET-path session recovery (U1) + parse-failure recovery (U2)
+# ---------------------------------------------------------------------------
+
+class TestGetPathRecovery:
+    def _login_resp(self):
+        r = MagicMock()
+        r.text = LOGIN_REDIRECT_HTML  # yields session_id 99887766
+        return r
+
+    # ---- U1: HTTP 500 on the GET path -> re-login + retry ----
+
+    def test_get_500_triggers_relogin_and_retry(self):
+        client = _client()
+        client.session_id = "stale"
+
+        resp500 = MagicMock()
+        resp500.status_code = 500
+        resp500.text = "<html>500 Internal Server Error</html>"
+
+        table_resp = MagicMock()
+        table_resp.status_code = 200
+        table_resp.text = _wrap_table(_make_snipe_row("111", "5001"))
+        table_resp.raise_for_status = MagicMock()
+
+        client.session.get = MagicMock(side_effect=[resp500, table_resp])
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        snipes = client.list_snipes()
+        assert len(snipes) == 1
+        assert client.session_id == "99887766"     # session refreshed
+        assert client.session.get.call_count == 2   # original + retry
+        assert client.session.post.call_count == 1   # exactly one re-login
+
+    def test_get_500_twice_propagates(self):
+        client = _client()
+        client.session_id = "stale"
+
+        def make_500():
+            r = MagicMock()
+            r.status_code = 500
+            r.text = "<html>500</html>"
+            r.raise_for_status = MagicMock(side_effect=requests.HTTPError("HTTP 500"))
+            return r
+
+        client.session.get = MagicMock(side_effect=[make_500(), make_500()])
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        with pytest.raises(requests.HTTPError):
+            client.list_snipes()
+        # original + exactly one retry, then it gives up (no infinite loop)
+        assert client.session.get.call_count == 2
+
+    def test_get_500_no_retry_when_flag_false(self):
+        client = _client()
+        client.session_id = "stale"
+
+        resp500 = MagicMock()
+        resp500.status_code = 500
+        resp500.text = "<html>500</html>"
+        resp500.raise_for_status = MagicMock(side_effect=requests.HTTPError("HTTP 500"))
+
+        client.session.get = MagicMock(return_value=resp500)
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        with pytest.raises(requests.HTTPError):
+            client._get_home_page(retry_on_expired=False)
+        client.session.post.assert_not_called()  # no re-login attempted
+
+    # ---- U2: 200 non-table body -> re-login + re-fetch once ----
+
+    def _non_table_resp(self):
+        # A 200 body that is neither the snipe table nor matched by
+        # _is_session_expired (no login form, no wrong-alert).
+        r = MagicMock()
+        r.status_code = 200
+        r.text = "<html><body>Service temporarily unavailable, please retry.</body></html>"
+        r.raise_for_status = MagicMock()
+        return r
+
+    def _table_resp(self, item_id="222", dbidid="5002"):
+        r = MagicMock()
+        r.status_code = 200
+        r.text = _wrap_table(_make_snipe_row(item_id, dbidid))
+        r.raise_for_status = MagicMock()
+        return r
+
+    def test_non_table_body_triggers_relogin_and_retry(self):
+        client = _client()
+        client.session_id = "stale"
+
+        client.session.get = MagicMock(side_effect=[self._non_table_resp(), self._table_resp()])
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        snipes = client.list_snipes()
+        assert len(snipes) == 1
+        assert client.session_id == "99887766"
+        assert client.session.get.call_count == 2
+        assert client.session.post.call_count == 1
+
+    def test_non_table_body_twice_raises_parse_error(self):
+        client = _client()
+        client.session_id = "stale"
+
+        client.session.get = MagicMock(side_effect=[self._non_table_resp(), self._non_table_resp()])
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        with pytest.raises(GixenParseError):
+            client.list_snipes()
+        assert client.session.get.call_count == 2  # bounded, no loop
+
+    def test_valid_table_first_try_no_relogin(self):
+        client = _client()
+        client.session_id = "good"
+
+        client.session.get = MagicMock(side_effect=[self._table_resp()])
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        snipes = client.list_snipes()
+        assert len(snipes) == 1
+        assert client.session.get.call_count == 1   # single fetch on success path
+        client.session.post.assert_not_called()
+
+    def test_500_then_non_table_then_table_stays_bounded(self):
+        """U1 + U2 compose: a 500, then a non-table 200, then a valid table.
+        Bound is one re-login per recovery layer (2 logins, 3 GETs max)."""
+        client = _client()
+        client.session_id = "stale"
+
+        resp500 = MagicMock()
+        resp500.status_code = 500
+        resp500.text = "<html>500</html>"
+
+        client.session.get = MagicMock(
+            side_effect=[resp500, self._non_table_resp(), self._table_resp()]
+        )
+        client.session.post = MagicMock(return_value=self._login_resp())
+
+        snipes = client.list_snipes()
+        assert len(snipes) == 1
+        assert client.session.get.call_count == 3
+        assert client.session.post.call_count == 2  # U1 relogin + U2 relogin
