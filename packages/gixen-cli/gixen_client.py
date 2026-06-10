@@ -19,6 +19,22 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def _response_snippet(text: str, username: Optional[str] = None, limit: int = 200) -> str:
+    """Truncated, secret-redacted slice of a Gixen response body, for logging.
+
+    BUI-114: when Gixen returns an unexpected body (HTTP 5xx, or a 200 page that
+    isn't the snipe table), we log the first ``limit`` chars so the failure mode
+    is diagnosable instead of opaque. Redacts the session id and username so a
+    captured snippet never leaks credentials into the log file, and collapses
+    whitespace so the snippet stays on a single log line.
+    """
+    snippet = (text or "")[:limit]
+    snippet = re.sub(r"sessionid=\d+", "sessionid=REDACTED", snippet)
+    if username:
+        snippet = snippet.replace(username, "REDACTED_USER")
+    return re.sub(r"\s+", " ", snippet).strip()
+
+
 # ---------------------------------------------------------------------------
 # Curl-based HTTP session (bypasses LibreSSL 2.8.3 TLS compatibility issues)
 # ---------------------------------------------------------------------------
@@ -322,6 +338,14 @@ class GixenClient:
             resp = self.session.get(url, timeout=self.timeout)
         except (requests.ConnectionError, requests.Timeout) as e:
             raise self._connection_error(url, e) from e
+        if resp.status_code >= 400:
+            # BUI-114: Gixen serves HTTP 500 for a stale session (among other
+            # causes). Capture what it returned before raising so the failure is
+            # diagnosable — BUI-115 uses this to broaden session-expiry detection.
+            logger.warning(
+                "GET home page returned HTTP %s; body snippet: %s",
+                resp.status_code, _response_snippet(resp.text, self.username),
+            )
         resp.raise_for_status()
         html = resp.text
 
@@ -358,6 +382,13 @@ class GixenClient:
             self.login()
             return self._post_home(data, retry_on_expired=False, check_errors=check_errors)
 
+        if resp.status_code >= 400:
+            # BUI-114: capture the body for any non-500 HTTP error reaching here
+            # (the 500-on-stale-session case is handled by the re-login above).
+            logger.warning(
+                "POST home page returned HTTP %s; body snippet: %s",
+                resp.status_code, _response_snippet(resp.text, self.username),
+            )
         resp.raise_for_status()
         html = resp.text
 
@@ -579,6 +610,13 @@ class GixenClient:
         """Parse the desktop snipe table from the home page HTML."""
         # Check that the expected form exists
         if '<form name="bids"' not in html and '<form name="addsnipe"' not in html:
+            # BUI-114: log what Gixen actually returned instead of the snipe
+            # table — this is the single most common failure mode (anti-bot
+            # interstitial, login page, error body) and was previously opaque.
+            logger.warning(
+                "snipe table not found in response; body snippet: %s",
+                _response_snippet(html, getattr(self, "username", None)),
+            )
             raise GixenParseError(
                 "Could not find snipe table in response. "
                 "Gixen may be down or the page structure has changed."
