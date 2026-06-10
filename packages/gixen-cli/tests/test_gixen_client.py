@@ -628,11 +628,13 @@ class TestSessionExpiration:
         client.session_id = "old_session"
 
         expired_resp = MagicMock()
+        expired_resp.status_code = 200  # 200 OK with a login-page body
         expired_resp.text = LOGIN_FAILED_HTML  # looks like login form
         expired_resp.raise_for_status = MagicMock()
 
         fresh_html = _wrap_table(_make_snipe_row("111", "5001"))
         fresh_resp = MagicMock()
+        fresh_resp.status_code = 200
         fresh_resp.text = fresh_html
         fresh_resp.raise_for_status = MagicMock()
 
@@ -666,10 +668,12 @@ class TestSessionExpiration:
             '</body></html>'
         )
         invalidated_resp = MagicMock()
+        invalidated_resp.status_code = 200  # 200 OK with a "could not log you in" body
         invalidated_resp.text = invalidated_html
         invalidated_resp.raise_for_status = MagicMock()
 
         fresh_resp = MagicMock()
+        fresh_resp.status_code = 200
         fresh_resp.text = _wrap_table(_make_snipe_row("222", "5002"))
         fresh_resp.raise_for_status = MagicMock()
 
@@ -688,6 +692,7 @@ class TestSessionExpiration:
         client.session_id = "old_session"
 
         expired_resp = MagicMock()
+        expired_resp.status_code = 200
         expired_resp.text = LOGIN_FAILED_HTML
         expired_resp.raise_for_status = MagicMock()
 
@@ -1702,3 +1707,59 @@ def test_cli_purge_dry_run_server_mode(monkeypatch):
         assert result.exit_code == 0
         assert "would purge" in result.output.lower()
         mock_req.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# BUI-114: failing-response capture
+# ---------------------------------------------------------------------------
+
+from gixen_client import _response_snippet
+
+
+def test_response_snippet_truncates_to_limit():
+    body = "x" * 500
+    assert len(_response_snippet(body, limit=200)) == 200
+
+
+def test_response_snippet_redacts_sessionid():
+    body = 'redirect url=home_2.php?sessionid=127104536873641522 next'
+    out = _response_snippet(body)
+    assert "127104536873641522" not in out
+    assert "sessionid=REDACTED" in out
+
+
+def test_response_snippet_redacts_username():
+    body = "Welcome back hsukenooi, your snipes are below"
+    out = _response_snippet(body, username="hsukenooi")
+    assert "hsukenooi" not in out
+    assert "REDACTED_USER" in out
+
+
+def test_response_snippet_collapses_whitespace_to_one_line():
+    body = "line one\n\n   line two\ttabbed"
+    out = _response_snippet(body)
+    assert "\n" not in out
+    assert out == "line one line two tabbed"
+
+
+def test_response_snippet_handles_empty_and_none():
+    assert _response_snippet("") == ""
+    assert _response_snippet(None) == ""
+
+
+def test_parse_snipe_table_logs_body_snippet_when_table_missing(caplog):
+    """When Gixen returns a page without the snipe form, the parser logs a
+    redacted snippet of the body before raising GixenParseError (BUI-114)."""
+    client = GixenClient(username="hsukenooi", password="pw")
+    bad_body = (
+        "<html><body>Could not log you in. "
+        "sessionid=999888777 please retry hsukenooi</body></html>"
+    )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(GixenParseError):
+            client._parse_snipe_table(bad_body)
+    msg = caplog.text
+    assert "snipe table not found" in msg
+    # secrets are redacted in the captured snippet
+    assert "999888777" not in msg
+    assert "hsukenooi" not in msg

@@ -59,6 +59,18 @@ cat > "$PLIST" <<PLIST
         <string>0.0.0.0</string>
         <string>--port</string>
         <string>8080</string>
+        <!-- BUI-114: timestamp every access + app log line and stamp the
+             gixen_client/server loggers. Path is relative to WorkingDirectory
+             ($PKG_DIR = packages/gixen-cli) so it resolves to the repo-tracked
+             server/log_config.json. The config uses stdout/stderr handlers, so
+             server.log (StandardOut) and server.error.log (StandardError) keep
+             their existing semantics — now timestamped.
+             Log rotation is intentionally NOT configured here: the file bloat
+             came from the bid-edit traceback flood, which BUI-115 fixes at the
+             source. Revisit rotation (RotatingFileHandler or newsyslog) only if
+             the logs keep growing after BUI-115 ships. -->
+        <string>--log-config</string>
+        <string>server/log_config.json</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$PKG_DIR</string>
