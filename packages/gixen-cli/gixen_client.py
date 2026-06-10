@@ -167,6 +167,17 @@ class GixenParseError(GixenError):
     """HTML response didn't match expected structure."""
 
 
+class GixenSnipeTableMissingError(GixenParseError):
+    """The snipe table/form was absent from the response entirely.
+
+    BUI-115: this specific shape is, in practice, almost always a stale-session
+    response (login page, "could not log you in" wrong-alert, anti-bot page) that
+    _is_session_expired didn't match — so list_snipes recovers from it with one
+    re-login + retry. Distinct from a generic GixenParseError (e.g. a malformed
+    field inside an otherwise-valid table), where re-login would not help.
+    """
+
+
 class GixenAddNotConfirmedError(GixenError):
     """add_snipe POST returned no error but the item never appeared in the list."""
 
@@ -175,6 +186,23 @@ class GixenAddNotConfirmedError(GixenError):
         super().__init__(
             f"Gixen accepted add for item {item_id} but it never appeared in the "
             f"snipe list — likely silently rate-limited or dropped."
+        )
+
+
+class GixenModifyNotConfirmedError(GixenError):
+    """modify_snipe POST returned no error but the new max_bid never went live.
+
+    BUI-115 parity with GixenAddNotConfirmedError: a silently-dropped modify
+    must not be reported as success, or the local DB would show the new bid
+    while Gixen kept the old one.
+    """
+
+    def __init__(self, item_id: str, max_bid):
+        self.item_id = str(item_id)
+        self.max_bid = max_bid
+        super().__init__(
+            f"Gixen accepted modify for item {item_id} (new max_bid {max_bid}) but "
+            f"the change never appeared in the snipe list — likely silently dropped."
         )
 
 
@@ -346,6 +374,17 @@ class GixenClient:
                 "GET home page returned HTTP %s; body snippet: %s",
                 resp.status_code, _response_snippet(resp.text, self.username),
             )
+        # BUI-115: Gixen returns HTTP 500 for a stale/invalid session. The POST
+        # path (_post_home) already recovers from this; the GET path did not,
+        # which is why modify/remove (which list_snipes first) failed ~17% of
+        # the time while add (POST-only) self-healed. Mirror the POST recovery:
+        # re-login once and retry. A second 500 falls through to raise_for_status
+        # so a genuinely-down Gixen still fails loudly.
+        if resp.status_code == 500 and retry_on_expired:
+            logger.info("Gixen returned 500 on GET, forcing re-login")
+            self.session_id = None
+            self.login()
+            return self._get_home_page(retry_on_expired=False)
         resp.raise_for_status()
         html = resp.text
 
@@ -442,7 +481,22 @@ class GixenClient:
             dbidid, snipe_group, seller.
         """
         html = self._get_home_page()
-        return self._parse_snipe_table(html)
+        try:
+            return self._parse_snipe_table(html)
+        except GixenSnipeTableMissingError:
+            # BUI-115: a 200 body that isn't the snipe table is, in practice,
+            # almost always a stale-session response that _is_session_expired
+            # didn't match (login page, "could not log you in" wrong-alert,
+            # anti-bot interstitial). Production saw 743 of these surface as 503
+            # with the auto-relogin never firing. Rather than hard-code a brittle
+            # body signature, recover structurally: force one re-login + re-fetch
+            # and parse again. A second parse failure is a real drift/outage and
+            # propagates. Bounded to one extra login per call.
+            logger.info("snipe table missing, forcing re-login and retrying once")
+            self.session_id = None
+            self.login()
+            html = self._get_home_page(retry_on_expired=False)
+            return self._parse_snipe_table(html)
 
     def add_snipe(
         self,
@@ -536,6 +590,25 @@ class GixenClient:
 
         raise GixenAddNotConfirmedError(item_id)
 
+    @staticmethod
+    def _max_bid_matches(actual: str, expected: Decimal) -> bool:
+        """Compare a snipe-list max_bid against the requested value as Decimals.
+
+        Tolerates Gixen formatting drift: strips anything that isn't part of a
+        decimal number (a currency suffix like " USD", stray whitespace, thousands
+        separators) before comparing, so 40, 40.00, and "40.00 USD" all match
+        40.00. A false mismatch here would raise GixenModifyNotConfirmedError for
+        a modify that actually landed (503 + the DB left showing the old bid), so
+        the comparison errs toward recognizing equivalent values.
+        """
+        try:
+            cleaned = re.sub(r"[^0-9.\-]", "", str(actual))
+            if cleaned in ("", ".", "-"):
+                return False
+            return Decimal(cleaned) == Decimal(str(expected))
+        except (InvalidOperation, TypeError):
+            return False
+
     def modify_snipe(
         self,
         item_id: str,
@@ -545,11 +618,19 @@ class GixenClient:
     ) -> bool:
         """Modify an existing snipe's bid.
 
+        BUI-115: verifies the new max_bid actually went live in Gixen before
+        returning success, mirroring add_snipe's confirmation. A silently-dropped
+        modify is retried once, then raised as GixenModifyNotConfirmedError rather
+        than reported as success (which would leave the DB lying about the bid).
+
         Raises:
             GixenSnipeNotFoundError: If item_id is not in the snipe list.
+            GixenModifyNotConfirmedError: If the modify POST returned no error but
+                the new max_bid never appeared in the list, even after one retry.
         """
+        target = str(item_id)
         snipes = self.list_snipes()
-        snipe = self._find_snipe(snipes, str(item_id))
+        snipe = self._find_snipe(snipes, target)
 
         data = {
             "newitemid": str(item_id),
@@ -561,9 +642,34 @@ class GixenClient:
             "dbidid": snipe["dbidid"],
             "ismodified": "1",
         }
+
+        def _confirmed() -> bool:
+            # Re-read AFTER the POST and confirm the new max_bid is live. A list
+            # failure here propagates (GixenError -> 503) rather than confirming.
+            for s in self.list_snipes():
+                if s["item_id"] == target:
+                    return self._max_bid_matches(s.get("max_bid", ""), max_bid)
+            return False
+
         self._post_home(data)
-        logger.info("Modified snipe: item=%s, new_max_bid=%s", item_id, max_bid)
-        return True
+        if _confirmed():
+            logger.info("Modified snipe: item=%s, new_max_bid=%s", item_id, max_bid)
+            return True
+
+        # Silent drop: Gixen returned 200 with no error banner but the new bid
+        # never went live. Back off and retry the POST once before giving up.
+        logger.warning(
+            "modify_snipe for item=%s not confirmed; retrying after %.1fs",
+            item_id, self._add_retry_backoff,
+        )
+        if self._add_retry_backoff:
+            time.sleep(self._add_retry_backoff)
+        self._post_home(data)
+        if _confirmed():
+            logger.info("Modified snipe on retry: item=%s, new_max_bid=%s", item_id, max_bid)
+            return True
+
+        raise GixenModifyNotConfirmedError(item_id, max_bid)
 
     def remove_snipe(self, item_id: str) -> bool:
         """Remove a snipe.
@@ -617,7 +723,7 @@ class GixenClient:
                 "snipe table not found in response; body snippet: %s",
                 _response_snippet(html, getattr(self, "username", None)),
             )
-            raise GixenParseError(
+            raise GixenSnipeTableMissingError(
                 "Could not find snipe table in response. "
                 "Gixen may be down or the page structure has changed."
             )
