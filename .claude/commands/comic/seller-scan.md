@@ -48,6 +48,29 @@ cd ~/Projects/comic-pipeline/apps/ebay && \
   .venv/bin/python src/seller_scan.py <seller> --json
 ```
 
+## Only-new-matches by default (BUI-113)
+
+By default the scan **hides wish-list matches it has already surfaced in a prior
+run**, so a repeat scan shows only listings you haven't seen before. The seen
+set is owned by the gixen server (`/api/comics/seller-scan/seen`), so the
+MacBook and Mac Mini share one memory — scanning the same seller from either
+machine won't re-surface the same matches.
+
+- Only the genuine **matches** are recorded as seen (a handful of item_ids per
+  run, not every listing).
+- `--all` shows every match again, including already-seen ones. It still records
+  newly-surfaced matches — `--all` means "show me everything," not "forget."
+
+```bash
+.venv/bin/python src/seller_scan.py <seller>          # only new matches
+.venv/bin/python src/seller_scan.py <seller> --all    # every match
+```
+
+Seen-tracking is **best-effort**: if the server is unreachable, the scan warns
+and shows all matches rather than aborting (a duplicate is harmless; silently
+hiding a real match is not). This is deliberately *not* the wish-list's
+hard-fail behavior.
+
 ## Output
 
 ```
@@ -82,6 +105,8 @@ Copy the eBay URLs from the URL column and pass them to `/comic:buy`. The buy wo
 | `Dropped N listing(s) from other sellers` | Safety net fired: eBay returned foreign sellers and they were filtered out. Usually means the alias points at the wrong/stale username |
 | 0 listings fetched | Seller may have no active auction listings; check their eBay page |
 | False positives (wrong comic) | Check match_score — scores near 0.5 with short series names can be ambiguous |
+| Expected a match but got nothing new | It was already surfaced in a prior scan and hidden by default. Re-run with `--all` to see every match. |
+| `could not fetch/record seen item IDs` warning | Best-effort seen-tracking couldn't reach the server, so the scan showed all matches (safe fallback). Check `$GIXEN_SERVER_URL` is reachable if you want only-new filtering back. |
 | Wish list empty | seller-scan now fetches the wish-list from the gixen server (`GET /api/comics/wish-list`), not a local `locg` call. Check `curl -sf "$GIXEN_SERVER_URL/api/comics/wish-list"` returns items; if empty, run the LOCG import flow. |
 | `GIXEN_SERVER_URL is not set` | seller-scan fetches the wish-list over HTTP (apps/ebay can't import locg). Set `GIXEN_SERVER_URL` (MacBook → `http://mac-mini.tail9b7fa5.ts.net:8080`) and re-run. |
 | Rate limit error | Re-run after a few seconds; the Browse API allows retries |

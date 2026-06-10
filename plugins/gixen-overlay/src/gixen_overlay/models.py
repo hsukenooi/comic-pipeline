@@ -74,6 +74,13 @@ class WishListAddRequest(BaseModel):
         return v
 
 
+class SellerScanSeenRequest(BaseModel):
+    """POST /api/comics/seller-scan/seen — mark item_ids as already surfaced (BUI-113)."""
+
+    item_ids: list[str]
+    seller: str | None = None
+
+
 class RecordWinRequest(BaseModel):
     """POST /api/comics/collection/record-win — append won auctions (BUI-92).
 

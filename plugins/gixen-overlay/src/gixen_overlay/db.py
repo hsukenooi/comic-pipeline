@@ -57,6 +57,19 @@ def create_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
+    # BUI-113: remember which seller-scan wish-list matches have already been
+    # surfaced, so repeat scans default to showing only new ones. Standalone —
+    # no FK or JOIN to comics/bids — so it's a plain additive table that needs
+    # none of the Python-memory rebuild machinery the comic tables require.
+    # Only matches get recorded (a handful of item_ids per scan, not every
+    # listing), so the table stays small and means exactly "matches I've shown".
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS seller_scan_seen (
+            item_id       TEXT PRIMARY KEY,
+            seller        TEXT,
+            first_seen_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS migration_state (
             migration TEXT PRIMARY KEY
@@ -1112,3 +1125,45 @@ def list_comics(
         """,
         params,
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Seller-scan seen-tracking (BUI-113)
+# ---------------------------------------------------------------------------
+
+
+def get_seen_item_ids(
+    conn: sqlite3.Connection, seller: str | None = None
+) -> set[str]:
+    """Return the set of seller-scan item_ids already surfaced.
+
+    `seller` is an optional filter; omitted (the default) returns every seen
+    item_id, which is what seller_scan.py wants — item_ids are globally unique
+    on eBay, so a match surfaced under any seller shouldn't re-appear.
+    """
+    if seller is not None:
+        rows = conn.execute(
+            "SELECT item_id FROM seller_scan_seen WHERE seller=?", (seller,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT item_id FROM seller_scan_seen").fetchall()
+    return {r["item_id"] for r in rows}
+
+
+def mark_items_seen(
+    conn: sqlite3.Connection, item_ids: list[str], seller: str | None = None
+) -> int:
+    """Record item_ids as surfaced. Returns the number of newly-inserted rows.
+
+    INSERT OR IGNORE preserves the original first_seen_at (and seller) on a
+    re-mark, so the timestamp reflects when a match was *first* shown.
+    """
+    inserted = 0
+    for item_id in item_ids:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO seller_scan_seen (item_id, seller) VALUES (?, ?)",
+            (item_id, seller),
+        )
+        inserted += cur.rowcount
+    conn.commit()
+    return inserted

@@ -14,6 +14,8 @@ from gixen_overlay.db import (
     get_primary_fmv_for_bid,
     list_comics,
     sweep_orphan_yearless_comics,
+    get_seen_item_ids,
+    mark_items_seen,
 )
 
 
@@ -965,5 +967,53 @@ def test_register_db_tables_creates_tables_via_sqlite_master():
     assert "comics" in tables
     assert "fmv" in tables
     assert "bid_fmvs" in tables
+    assert "seller_scan_seen" in tables
     assert "bid_comics" not in tables
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# BUI-113: seller-scan seen-tracking helpers
+# ---------------------------------------------------------------------------
+
+
+def test_seller_scan_seen_table_is_idempotent():
+    # create_tables runs on every server start; calling it twice must not error.
+    conn = _make_db()
+    create_tables(conn)
+    create_tables(conn)
+    assert get_seen_item_ids(conn) == set()
+    conn.close()
+
+
+def test_mark_and_get_seen_item_ids(db):
+    assert mark_items_seen(db, ["111", "222"], "tuners36") == 2
+    assert get_seen_item_ids(db) == {"111", "222"}
+
+
+def test_mark_items_seen_is_idempotent(db):
+    mark_items_seen(db, ["111"], "tuners36")
+    # Re-marking inserts nothing new and preserves the original row.
+    assert mark_items_seen(db, ["111", "333"], "tuners36") == 1
+    assert get_seen_item_ids(db) == {"111", "333"}
+
+
+def test_get_seen_item_ids_filters_by_seller(db):
+    mark_items_seen(db, ["111"], "tuners36")
+    mark_items_seen(db, ["222"], "beatlebluecat")
+    assert get_seen_item_ids(db) == {"111", "222"}
+    assert get_seen_item_ids(db, "tuners36") == {"111"}
+
+
+def test_mark_items_seen_preserves_first_seen_at(db):
+    mark_items_seen(db, ["111"], "tuners36")
+    first = db.execute(
+        "SELECT first_seen_at FROM seller_scan_seen WHERE item_id='111'"
+    ).fetchone()["first_seen_at"]
+    mark_items_seen(db, ["111"], "someoneelse")
+    row = db.execute(
+        "SELECT first_seen_at, seller FROM seller_scan_seen WHERE item_id='111'"
+    ).fetchone()
+    # INSERT OR IGNORE keeps the original timestamp and seller.
+    assert row["first_seen_at"] == first
+    assert row["seller"] == "tuners36"

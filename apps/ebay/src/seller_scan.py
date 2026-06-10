@@ -58,6 +58,52 @@ def fetch_wish_list():
         sys.exit(1)
 
 
+# ─── Seen-tracking (BUI-113) ──────────────────────────────────────────────────
+
+def fetch_seen_item_ids(seller):
+    """Best-effort: return the set of item_ids already surfaced in a prior scan.
+
+    BUI-113: unlike fetch_wish_list (which hard-fails — an empty wish-list would
+    cause a wrong "no match"), seen-tracking is non-fatal. A failed read only
+    risks re-showing a listing you've seen (mildly annoying, always safe);
+    hiding everything because the server is down could silently suppress a real
+    buy. So any failure → empty set + a warning, and the scan continues showing
+    all matches.
+    """
+    base = os.environ.get("GIXEN_SERVER_URL", "").rstrip("/")
+    if not base:
+        return set()
+    url = f"{base}/api/comics/seller-scan/seen"
+    try:
+        resp = requests.get(url, params={"seller": seller}, timeout=10)
+        resp.raise_for_status()
+        return set(resp.json().get("item_ids", []))
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(
+            f"Warning: could not fetch seen item IDs ({e}); showing all matches",
+            file=sys.stderr,
+        )
+        return set()
+
+
+def record_items_seen(item_ids, seller):
+    """Best-effort: mark surfaced item_ids as seen so future scans skip them.
+
+    Warns on failure but never aborts (see fetch_seen_item_ids for the rationale).
+    """
+    base = os.environ.get("GIXEN_SERVER_URL", "").rstrip("/")
+    if not base or not item_ids:
+        return
+    url = f"{base}/api/comics/seller-scan/seen"
+    try:
+        resp = requests.post(
+            url, json={"item_ids": item_ids, "seller": seller}, timeout=10
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: could not record seen item IDs ({e})", file=sys.stderr)
+
+
 # ─── Matching ─────────────────────────────────────────────────────────────────
 
 _STOPWORDS = frozenset({"the", "a", "an", "of", "and", "in", "vol", "comics"})
@@ -265,6 +311,14 @@ def main(argv=None):
         help="Output matches as JSON array",
     )
     parser.add_argument(
+        "--all",
+        action="store_true",
+        dest="show_all",
+        help="Show every wish-list match, including ones surfaced in a prior "
+             "scan. By default (BUI-113) already-seen matches are hidden. "
+             "Newly-surfaced matches are recorded as seen either way.",
+    )
+    parser.add_argument(
         "--max-results",
         type=int,
         default=1000,
@@ -343,14 +397,36 @@ def main(argv=None):
                 "match_score": round(score, 2),
             })
 
-    print(f"  {len(candidates)} candidate(s) — verifying with Claude...", file=sys.stderr)
-    matches = verify_with_claude(candidates)
+    # BUI-113: drop matches already surfaced in a prior scan (default). --all
+    # skips the filter (and its server fetch); the short-circuit on an empty
+    # candidate list skips the fetch/Claude/record entirely.
+    if candidates and not args.show_all:
+        seen = fetch_seen_item_ids(username)
+        before = len(candidates)
+        candidates = [c for c in candidates if c["item_id"] not in seen]
+        hidden = before - len(candidates)
+        if hidden:
+            print(
+                f"  {hidden} already-seen match(es) hidden (use --all to show)",
+                file=sys.stderr,
+            )
+
+    if candidates:
+        print(f"  {len(candidates)} candidate(s) — verifying with Claude...", file=sys.stderr)
+        matches = verify_with_claude(candidates)
+    else:
+        matches = []
     print(f"  {len(matches)} genuine match(es) found", file=sys.stderr)
 
     if args.json_output:
         print(json.dumps(matches, indent=2))
     else:
         print_matches(matches)
+
+    # BUI-113: record surfaced matches (best-effort) so future scans skip them.
+    # Runs under --all too — --all means "show me everything again", not "forget".
+    if matches:
+        record_items_seen([m["item_id"] for m in matches], username)
 
     return 0
 

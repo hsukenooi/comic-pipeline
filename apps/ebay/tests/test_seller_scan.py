@@ -385,3 +385,74 @@ class TestFetchWishList:
         ):
             with pytest.raises(SystemExit):
                 seller_scan.fetch_wish_list()
+
+
+# ─── BUI-113: seen-tracking (best-effort, never fatal) ────────────────────────
+
+
+class TestFetchSeenItemIds:
+    def test_returns_set_on_success(self, monkeypatch):
+        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080/")
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"item_ids": ["111", "222"]}
+        with patch("seller_scan.requests.get", return_value=resp) as get:
+            assert seller_scan.fetch_seen_item_ids("tuners36") == {"111", "222"}
+        # trailing slash trimmed; seller passed as a query param
+        assert get.call_args[0][0] == (
+            "http://mac-mini.example:8080/api/comics/seller-scan/seen"
+        )
+        assert get.call_args[1]["params"] == {"seller": "tuners36"}
+
+    def test_empty_set_when_server_url_unset(self, monkeypatch):
+        monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
+        with patch("seller_scan.requests.get") as get:
+            assert seller_scan.fetch_seen_item_ids("tuners36") == set()
+        get.assert_not_called()
+
+    def test_soft_fails_to_empty_set_when_unreachable(self, monkeypatch):
+        # Unlike the wish-list, a failed seen-read must NOT abort — it falls back
+        # to showing all matches (a duplicate is safe; a hidden match is not).
+        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        with patch(
+            "seller_scan.requests.get",
+            side_effect=seller_scan.requests.exceptions.ConnectionError("down"),
+        ):
+            assert seller_scan.fetch_seen_item_ids("tuners36") == set()
+
+
+class TestRecordItemsSeen:
+    def test_posts_item_ids(self, monkeypatch):
+        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080/")
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        with patch("seller_scan.requests.post", return_value=resp) as post:
+            seller_scan.record_items_seen(["111", "222"], "tuners36")
+        assert post.call_args[0][0] == (
+            "http://mac-mini.example:8080/api/comics/seller-scan/seen"
+        )
+        assert post.call_args[1]["json"] == {
+            "item_ids": ["111", "222"],
+            "seller": "tuners36",
+        }
+
+    def test_noop_on_empty_item_ids(self, monkeypatch):
+        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        with patch("seller_scan.requests.post") as post:
+            seller_scan.record_items_seen([], "tuners36")
+        post.assert_not_called()
+
+    def test_noop_when_server_url_unset(self, monkeypatch):
+        monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
+        with patch("seller_scan.requests.post") as post:
+            seller_scan.record_items_seen(["111"], "tuners36")
+        post.assert_not_called()
+
+    def test_swallows_post_failure(self, monkeypatch):
+        # Best-effort: a failed record must not raise.
+        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        with patch(
+            "seller_scan.requests.post",
+            side_effect=seller_scan.requests.exceptions.ConnectionError("down"),
+        ):
+            seller_scan.record_items_seen(["111"], "tuners36")  # no exception

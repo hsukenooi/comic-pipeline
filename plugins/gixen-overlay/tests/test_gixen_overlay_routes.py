@@ -160,6 +160,60 @@ def test_list_comics_empty_on_fresh_db(api):
 
 
 # ---------------------------------------------------------------------------
+# BUI-113: seller-scan seen-tracking endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_seller_scan_seen_empty_on_fresh_db(api):
+    r = api.get("/api/comics/seller-scan/seen")
+    assert r.status_code == 200
+    assert r.json() == {"item_ids": []}
+
+
+def test_seller_scan_seen_post_then_get_roundtrips(api):
+    r = api.post(
+        "/api/comics/seller-scan/seen",
+        json={"item_ids": ["111", "222"], "seller": "tuners36"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"marked": 2}
+    assert api.get("/api/comics/seller-scan/seen").json() == {
+        "item_ids": ["111", "222"]
+    }
+
+
+def test_seller_scan_seen_post_is_idempotent(api):
+    api.post("/api/comics/seller-scan/seen", json={"item_ids": ["111"]})
+    # Re-marking an existing id inserts nothing new.
+    r = api.post(
+        "/api/comics/seller-scan/seen",
+        json={"item_ids": ["111", "333"]},
+    )
+    assert r.json() == {"marked": 1}
+    assert api.get("/api/comics/seller-scan/seen").json() == {
+        "item_ids": ["111", "333"]
+    }
+
+
+def test_seller_scan_seen_filters_by_seller(api):
+    api.post(
+        "/api/comics/seller-scan/seen",
+        json={"item_ids": ["111"], "seller": "tuners36"},
+    )
+    api.post(
+        "/api/comics/seller-scan/seen",
+        json={"item_ids": ["222"], "seller": "beatlebluecat"},
+    )
+    # No filter → every id; seller filter → just that seller's.
+    assert api.get("/api/comics/seller-scan/seen").json() == {
+        "item_ids": ["111", "222"]
+    }
+    assert api.get(
+        "/api/comics/seller-scan/seen", params={"seller": "tuners36"}
+    ).json() == {"item_ids": ["111"]}
+
+
+# ---------------------------------------------------------------------------
 # POST /api/comics
 # ---------------------------------------------------------------------------
 
