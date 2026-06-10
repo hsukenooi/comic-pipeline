@@ -46,6 +46,11 @@ _COLUMN_MIGRATIONS = [
     # reliability analytics. Both nullable CGC floats; written by the buy flow.
     "ALTER TABLE bids ADD COLUMN seller_grade REAL",
     "ALTER TABLE bids ADD COLUMN photo_grade REAL",
+    # BUI-116: Gixen's internal row id for the snipe. Cached during sync so
+    # modify/remove can POST directly without a list_snipes() lookup. Nullable —
+    # existing/web-added rows start NULL (cache miss -> list fallback) until the
+    # next sync fills them.
+    "ALTER TABLE bids ADD COLUMN dbidid TEXT",
 ]
 
 
@@ -75,7 +80,8 @@ _BIDS_TABLE_SQL = """
         cached_at           TEXT,
         fmv_id              INTEGER,
         seller_grade        REAL,
-        photo_grade         REAL
+        photo_grade         REAL,
+        dbidid              TEXT
     )
 """
 
@@ -525,6 +531,7 @@ def cache_gixen_data(
     title: str | None,
     seller: str | None,
     current_bid: str | None,
+    dbidid: str | None = None,
 ) -> None:
     """Cache Gixen-sourced fields. Does not touch auction_end_at — that's
     eBay's domain (Gixen only provides relative time-to-end). COALESCE keeps
@@ -538,6 +545,18 @@ def cache_gixen_data(
     Caller must conn.commit() — this helper is hot-path inside the
     _sync_gixen loop where commits are batched at the end of the cycle.
     """
+    # BUI-116: dbidid is Gixen's internal row id, always present on a live snipe
+    # and needed by modify/remove. Write it unconditionally (its own statement,
+    # before the has_data guard) so a SCHEDULED snipe with no current_bid still
+    # gets its dbidid cached — otherwise the all-NULL early-return below would
+    # skip it and the edit fast-path could never warm up.
+    if dbidid:
+        conn.execute(
+            "UPDATE bids SET dbidid=? "
+            "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
+            (dbidid, item_id),
+        )
+
     has_data = any(v is not None for v in (title, seller, current_bid))
     if not has_data:
         return  # nothing to write, don't bump cached_at

@@ -988,3 +988,88 @@ def test_vanished_null_end_still_on_gixen_not_touched(api, monkeypatch):
 
     assert api.post("/api/sync").status_code == 200
     assert _read_db_row("850000005")["status"] == "PENDING"
+
+
+# ---------------------------------------------------------------------------
+# BUI-116: cached-dbidid edit fast-path + staleness fallback
+# ---------------------------------------------------------------------------
+
+def _seed_dbidid(item_id, dbidid):
+    conn = _dbconn()
+    conn.execute("UPDATE bids SET dbidid=? WHERE item_id=?", (dbidid, item_id))
+    conn.commit()
+    conn.close()
+
+
+def _read_dbidid(item_id):
+    conn = _dbconn()
+    row = conn.execute("SELECT dbidid FROM bids WHERE item_id=?", (item_id,)).fetchone()
+    conn.close()
+    return row["dbidid"] if row else None
+
+
+def test_edit_bid_uses_cached_dbidid(api):
+    api.post("/api/bids", json={"item_id": "810000001", "max_bid": 50.0})
+    _seed_dbidid("810000001", "cached5001")
+    r = api.patch("/api/bids/810000001", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 200
+    assert api.mock_gixen.modify_snipe.call_args.kwargs.get("dbidid") == "cached5001"
+
+
+def test_edit_bid_null_cache_passes_none(api):
+    api.post("/api/bids", json={"item_id": "810000002", "max_bid": 50.0})
+    r = api.patch("/api/bids/810000002", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 200
+    assert api.mock_gixen.modify_snipe.call_args.kwargs.get("dbidid") is None
+
+
+def test_edit_bid_stale_dbidid_falls_back_and_clears_cache(api):
+    from gixen_client import GixenModifyNotConfirmedError
+    api.post("/api/bids", json={"item_id": "810000003", "max_bid": 50.0})
+    _seed_dbidid("810000003", "stale")
+    # cached attempt unconfirmed; list-based fallback succeeds.
+    api.mock_gixen.modify_snipe.side_effect = [
+        GixenModifyNotConfirmedError("810000003", 75.0), None,
+    ]
+    r = api.patch("/api/bids/810000003", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 200
+    calls = api.mock_gixen.modify_snipe.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs.get("dbidid") == "stale"   # cached fast path first
+    assert calls[1].kwargs.get("dbidid") is None        # list-based fallback
+    assert _read_dbidid("810000003") is None            # stale cache cleared
+    rows = api.get("/api/bids").json()
+    assert next(b for b in rows if b["item_id"] == "810000003")["max_bid"] == 75.0
+
+
+def test_edit_bid_both_attempts_unconfirmed_returns_503(api):
+    from gixen_client import GixenModifyNotConfirmedError
+    api.post("/api/bids", json={"item_id": "810000004", "max_bid": 50.0})
+    _seed_dbidid("810000004", "stale")
+    api.mock_gixen.modify_snipe.side_effect = GixenModifyNotConfirmedError("810000004", 75.0)
+    r = api.patch("/api/bids/810000004", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 503
+    rows = api.get("/api/bids").json()
+    assert next(b for b in rows if b["item_id"] == "810000004")["max_bid"] == 50.0  # DB unchanged
+
+
+def test_remove_bid_uses_cached_dbidid(api):
+    api.post("/api/bids", json={"item_id": "820000001", "max_bid": 50.0})
+    _seed_dbidid("820000001", "cached9")
+    r = api.delete("/api/bids/820000001")
+    assert r.status_code == 200
+    assert api.mock_gixen.remove_snipe.call_args.kwargs.get("dbidid") == "cached9"
+
+
+def test_remove_bid_stale_dbidid_falls_back(api):
+    from gixen_client import GixenError
+    api.post("/api/bids", json={"item_id": "820000002", "max_bid": 50.0})
+    _seed_dbidid("820000002", "stale")
+    api.mock_gixen.remove_snipe.side_effect = [GixenError("still in list"), True]
+    r = api.delete("/api/bids/820000002")
+    assert r.status_code == 200
+    calls = api.mock_gixen.remove_snipe.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs.get("dbidid") == "stale"
+    assert calls[1].kwargs.get("dbidid") is None
+    assert _read_dbidid("820000002") is None

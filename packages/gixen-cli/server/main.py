@@ -22,7 +22,8 @@ from pydantic import BaseModel, field_validator
 
 from gixen_client import (
     GixenClient, GixenError, GixenConnectionError, GixenSnipeNotFoundError,
-    GixenAddNotConfirmedError, find_sibling_cleanup_targets,
+    GixenAddNotConfirmedError, GixenModifyNotConfirmedError,
+    find_sibling_cleanup_targets,
 )
 from gixen.plugins import (
     load_plugins,
@@ -278,6 +279,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
             snipe.get("title") or None,
             snipe.get("seller") or None,
             snipe.get("current_bid") or None,
+            snipe.get("dbidid") or None,  # BUI-116: warm the edit fast-path cache
         )
 
         gixen_status = snipe.get("status", "")
@@ -1126,20 +1128,87 @@ async def api_get_all_bids():
     return result
 
 
+def _cached_dbidid(db: sqlite3.Connection, item_id: str) -> str | None:
+    """BUI-116: the cached Gixen dbidid for a bid, or None on a cache miss.
+
+    Reads the live (PENDING) row first, falling back to any row. NULL until a
+    sync has warmed the cache, which simply means the edit takes the list path.
+    """
+    row = get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
+    if row is None:
+        return None
+    try:
+        return row["dbidid"]
+    except (KeyError, IndexError):
+        return None
+
+
+def _clear_cached_dbidid(db: sqlite3.Connection, item_id: str) -> None:
+    db.execute("UPDATE bids SET dbidid=NULL WHERE item_id=?", (item_id,))
+    db.commit()
+
+
+async def _modify_with_cache_fallback(
+    db: sqlite3.Connection, item_id: str, max_bid: Decimal,
+    bid_offset: int, snipe_group: int,
+) -> None:
+    """BUI-116: modify using the cached dbidid (fast path, no pre-POST list). If
+    a cached id was used but the modify couldn't be confirmed (stale id — the
+    snipe was re-created with a new dbidid), clear the cache and retry once via
+    the list-based lookup. Holds _api_lock across both attempts so the sequence
+    stays atomic. Exceptions propagate to the caller for HTTP mapping."""
+    cached = _cached_dbidid(db, item_id)
+    async with _api_lock:
+        try:
+            await asyncio.to_thread(
+                _api_client.modify_snipe, item_id, max_bid,
+                bid_offset=bid_offset, snipe_group=snipe_group, dbidid=cached,
+            )
+            return
+        except GixenModifyNotConfirmedError:
+            if cached is None:
+                raise  # already used the list path — genuinely unconfirmable
+            logger.warning(
+                "modify with cached dbidid for %s unconfirmed; clearing cache "
+                "and retrying via list lookup", item_id,
+            )
+            _clear_cached_dbidid(db, item_id)
+            await asyncio.to_thread(
+                _api_client.modify_snipe, item_id, max_bid,
+                bid_offset=bid_offset, snipe_group=snipe_group,  # dbidid=None
+            )
+
+
+async def _remove_with_cache_fallback(db: sqlite3.Connection, item_id: str) -> None:
+    """BUI-116: remove using the cached dbidid, falling back to the list-based
+    lookup if a cached id failed (stale id left the item in the list, or a
+    transient error). Holds _api_lock across both attempts."""
+    cached = _cached_dbidid(db, item_id)
+    async with _api_lock:
+        try:
+            await asyncio.to_thread(_api_client.remove_snipe, item_id, dbidid=cached)
+            return
+        except GixenError:
+            if cached is None:
+                raise
+            logger.warning(
+                "remove with cached dbidid for %s failed; clearing cache and "
+                "retrying via list lookup", item_id,
+            )
+            _clear_cached_dbidid(db, item_id)
+            await asyncio.to_thread(_api_client.remove_snipe, item_id)  # dbidid=None
+
+
 @app.patch("/api/bids/{item_id}")
 async def api_edit_bid(item_id: str, req: EditBidRequest):
     if not re.match(r"^\d+$", item_id):
         raise HTTPException(status_code=422, detail="item_id must be numeric")
     db = _get_db()
     try:
-        async with _api_lock:
-            await asyncio.to_thread(
-                _api_client.modify_snipe,
-                item_id,
-                Decimal(str(req.max_bid)),
-                bid_offset=req.bid_offset,
-                snipe_group=req.snipe_group,
-            )
+        await _modify_with_cache_fallback(
+            db, item_id, Decimal(str(req.max_bid)),
+            req.bid_offset, req.snipe_group,
+        )
     except GixenSnipeNotFoundError:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen")
     except GixenError as e:
@@ -1175,8 +1244,7 @@ async def api_remove_bid(item_id: str):
         raise HTTPException(status_code=422, detail="item_id must be numeric")
     db = _get_db()
     try:
-        async with _api_lock:
-            await asyncio.to_thread(_api_client.remove_snipe, item_id)
+        await _remove_with_cache_fallback(db, item_id)
     except GixenSnipeNotFoundError:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen")
     except GixenError as e:
