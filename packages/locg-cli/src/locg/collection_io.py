@@ -343,9 +343,27 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
             partial_to_idx[_partial_identity(row)] = i
 
         # ----- Phase 1: Reconciliation ----------------------------------------
+        # Manually-flagged best-guess rows always get the relaxed (exact-year)
+        # heuristic. BUI-122: also run it for *unflagged* pending agent_win rows
+        # whose exact identity is absent from this export. LOCG silently rewrites
+        # a just-pushed row's Release Date to its own canonical value (see
+        # docs/solutions/integration-issues/locg-bulk-import-recipe-2026-05-22.md),
+        # which breaks the Phase-2 exact make_identity match; the row would then
+        # insert as a duplicate while the original stayed pending forever. The
+        # `make_identity(r) not in exact_ids` guard preserves Phase-2 exact-match
+        # primacy — a win whose date round-tripped unchanged is handled by the
+        # standard merge, not routed through year-tolerant scoring (which would
+        # mis-flag it ambiguous against a same-year variant).
+        exact_ids = {make_identity(xr) for xr in xlsx_rows}
         flagged_indices = [
             i for i, r in enumerate(comics)
-            if r.get("needs_manual_variant") or r.get("needs_manual_series_canonical")
+            if r.get("needs_manual_variant")
+            or r.get("needs_manual_series_canonical")
+            or (
+                r.get("source") == "agent_win"
+                and r.get("pushed_to_locg_at") is None
+                and make_identity(r) not in exact_ids
+            )
         ]
 
         for ci in flagged_indices:
