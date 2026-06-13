@@ -78,17 +78,19 @@ Surface `ready_count` (collection rows that will upload), `manual_series_count`
 (rows withheld from the CSV — they stay pending until you resolve them in
 `.notes.md`), and `wish_list_count`.
 
-**Expected, not an error:** local-only wish-list adds (name only, no Series Name
-or Release Date) export with blank columns and LOCG will report them
-"Not Found." They are **not** lost — they persist on the server and feed
-seller-scan/collection-check. To get a wish onto LOCG itself, add it in the LOCG
-UI directly. (See `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.)
+**Owned-safe export (BUI-122):** the CSV's wish rows are only local-only adds you
+**don't** already own — derived wishes (already on LOCG) and owned books are
+excluded. This matters because wish rows carry `In Collection=0`; dumping the
+whole wish list previously **deleted owned-but-wished books** from the LOCG
+collection. With the fix the CSV can never remove a book you own. Genuine new
+wishes still import fine (LOCG adds a wish by title).
 
 ## Step 3: Upload to LOCG (manual — you)
 
 Open League of Comic Geeks → **My Comics → Bulk Import** and upload the CSV from
-`~/Downloads/locg-bulk-import-<ts>.csv`. Expect the collection rows to match and
-the blank wish rows to report "Not Found" (expected).
+`~/Downloads/locg-bulk-import-<ts>.csv`. Expect the collection rows to be added and
+the new-wish rows to be "Added to Wish List." No "Deleted from Collection" should
+appear — if it does, **stop** and report it (the export safety filter failed).
 
 **This is a manual step. Tell me when the upload is done.**
 
@@ -160,7 +162,7 @@ win-records cleanup in
 |---|---|
 | Re-export → re-upload without the intervening re-import | Always finish Step 5. Export does not mark rows pushed, so skipping the re-import re-emits the same rows as duplicate uploads |
 | Syncing without a backup | Step 1 is mandatory and hard-stops on failure |
-| Treating "Not Found" wish rows as an error | Expected — name-only wish adds don't bulk-import; they live on the server and still drive seller-scan/collection-check |
+| Seeing "Deleted from Collection" on upload | The export should never emit In Collection=0 for an owned book (BUI-122) — if you see deletions, STOP and report; the owned-safe filter regressed |
 | Claiming success when `added` is large | A large `added` means the re-import inserted duplicates instead of reconciling — STOP, investigate, restore from backup if needed |
 | Uploading the `.notes.md` rows | Only the `.csv` goes to LOCG; `.notes.md` lists rows withheld for manual resolution |
 | Running the LOCG web steps for the user | Steps 3–4 are manual (Playwright login + web UI) — wait for the user to confirm |

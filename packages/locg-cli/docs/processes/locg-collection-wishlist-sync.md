@@ -123,16 +123,25 @@ rebuilding from the export; commit `52d1e31`). Verified on real data 2026-06-13:
 69 local-only adds survived a full import unchanged. They are **not** silently
 lost.
 
-### ⚠️ Limitation: local wish-list adds don't bulk-import to LOCG
+### Wish-list adds DO reach LOCG — but the export is owned-safe (BUI-122)
 
-A name-only add exports with blank Series Name / Publisher / Release Date. Per
-the bulk-import recipe, Series Name + Release Date are **required** for a match,
-so LOCG reports these rows "Not Found" and does **not** ingest them. This is
-non-destructive: they persist on the server and keep driving seller-scan /
-collection-check. **If you want a wish to appear in the LOCG web UI**, add it
-there directly (then `collection import` pulls it back as a full `locg_export`
-wish row). There is no tooling to enrich a name-only add with the columns LOCG
-needs.
+Empirically (2026-06-13), LOCG Bulk Import **adds a wish-list row by title alone**
+— a name-only add (blank Series Name / Release Date) lands as "Added to Wish List"
+fine. (The "Release Date required → Not Found" rule in the bulk-import recipe
+applies to *collection* matches, not wish adds.)
+
+The danger was the opposite: wish rows carry `In Collection=0`, so re-dumping the
+**whole** wish list told LOCG to **remove** any wished book that was actually
+owned — this deleted 18 owned books during testing. Two fixes now prevent it:
+
+- **Export is owned-safe + diff-only** (`wish_rows_for_export`): it pushes only
+  **local-only adds that are not owned**. Derived wishes (already on LOCG) and any
+  owned book are excluded, so the CSV can never carry `In Collection=0` for a book
+  you own.
+- **`wishlist-add` skips owned issues** up front (collection-check per issue), so
+  owned books stop polluting the wish list in the first place.
+
+Net: genuine new wishes still sync to LOCG; owned books are never touched.
 
 ## Duplicate win-records cleanup (pre-existing)
 
@@ -189,9 +198,15 @@ already-owned dedup so they stop accumulating.
 ## What changed (BUI-122)
 
 - Source of truth corrected: gixen server store, not `data/locg/`.
-- BUI-47 marked fixed (local wish adds survive import); the wish-list "gap" is now
-  a documented LOCG bulk-import limitation, not data loss.
-- Import reconciliation extended to pending `agent_win` rows so LOCG re-dating a
-  pushed win no longer duplicates it or strands it pending.
-- The round-trip is now driven by `/comic:collection-sync` with a mandatory
-  backup and post-import safety check.
+- BUI-47 marked fixed (local wish adds survive import).
+- Import reconciliation extended to pending `agent_win` rows (publisher-wildcard,
+  exact-year) so LOCG re-dating a pushed win no longer duplicates it or strands it
+  pending; reconciliation never creates a duplicate-identity row.
+- **Export is owned-safe and diff-only.** First-run testing uploaded the whole
+  wish list with `In Collection=0` and **deleted 18 owned books** from the LOCG
+  collection (recovered by re-uploading them as `In Collection=1`). The export now
+  pushes only local-only, not-owned wishes — it can never delete an owned book.
+- **`wishlist-add` skips issues you already own** (the upstream cause: owned books
+  were being wish-listed, then deleted on export).
+- The round-trip is driven by `/comic:collection-sync` with a mandatory backup and
+  a post-import safety check.
