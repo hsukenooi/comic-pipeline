@@ -194,6 +194,11 @@ already-owned dedup so they stop accumulating.
   rather than reconciling. Restore from backup and investigate (likely a LOCG
   canonicalization beyond Release Date, e.g. a Series Name rewrite, that the
   exact-year reconciliation couldn't match).
+- **LOCG Bulk Import times out ("Error: timeout"):** LOCG's importer is flaky on
+  larger files — upload the CSV in **≤20-row batches** (re-uploading is safe; the
+  CSV is owned-safe and idempotent). If even small batches fail at 0%, it's a
+  LOCG-side backend outage (DevTools → Network shows `queue_import_comic` as
+  `(canceled)` and a multi-minute page load) — wait and retry later.
 
 ## What changed (BUI-122)
 

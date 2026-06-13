@@ -92,6 +92,27 @@ Open League of Comic Geeks → **My Comics → Bulk Import** and upload the CSV 
 the new-wish rows to be "Added to Wish List." No "Deleted from Collection" should
 appear — if it does, **stop** and report it (the export safety filter failed).
 
+**LOCG import is flaky — upload in small batches.** LOCG's importer times out on
+larger files (observed: ~20 rows succeeds; ~100 fails at 0% with "Error: timeout").
+If the CSV is more than ~20 rows, split it and upload one chunk at a time:
+
+```bash
+python3 - "$CSV" <<'PY'
+import csv,sys; rows=list(csv.reader(open(sys.argv[1]))); h,d=rows[0],rows[1:]
+for i in range(0,len(d),20):
+    p=sys.argv[1].replace(".csv",f"-batch-{i//20+1:02d}.csv")
+    csv.writer(open(p,"w",newline="")).writerows([h]+d[i:i+20]); print(p)
+PY
+```
+
+Re-uploading is **safe** — the CSV is owned-safe and idempotent (`In Collection=1`
+/ `In Wish List=1` re-applies as a no-op, never a delete), so retry freely.
+
+**If even small batches time out at 0%:** that's a LOCG-side outage, not your file.
+Check DevTools → Network for a `queue_import_comic` XHR showing `(canceled)` and a
+slow page load — both mean LOCG's import backend is degraded. Wait and retry later;
+nothing to fix on our end.
+
 **This is a manual step. Tell me when the upload is done.**
 
 ## Step 4: Re-export from LOCG (manual — you)
@@ -163,6 +184,8 @@ win-records cleanup in
 | Re-export → re-upload without the intervening re-import | Always finish Step 5. Export does not mark rows pushed, so skipping the re-import re-emits the same rows as duplicate uploads |
 | Syncing without a backup | Step 1 is mandatory and hard-stops on failure |
 | Seeing "Deleted from Collection" on upload | The export should never emit In Collection=0 for an owned book (BUI-122) — if you see deletions, STOP and report; the owned-safe filter regressed |
+| Uploading a large CSV in one shot | LOCG times out past ~20 rows; split into ≤20-row batches. Retry is safe (the CSV is idempotent/owned-safe) |
+| "Error: timeout" at 0% on small batches | LOCG's import backend is degraded (a `queue_import_comic` XHR shows `(canceled)`); wait and retry later — not a file problem |
 | Claiming success when `added` is large | A large `added` means the re-import inserted duplicates instead of reconciling — STOP, investigate, restore from backup if needed |
 | Uploading the `.notes.md` rows | Only the `.csv` goes to LOCG; `.notes.md` lists rows withheld for manual resolution |
 | Running the LOCG web steps for the user | Steps 3–4 are manual (Playwright login + web UI) — wait for the user to confirm |
