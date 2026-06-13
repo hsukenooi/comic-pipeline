@@ -147,9 +147,12 @@ Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = genuine LOCG-side adds)
 Wish-list:        unchanged (local-only adds preserved)
 ```
 
-Escalate if `pending_push_count` is still high after the sync (rows that didn't
-reconcile — check `.notes.md` and the server's `import-history.jsonl` for
-`ambiguous_reconciliation`).
+Some pending rows may legitimately remain: wins for a book the collection
+**already owns** (under a different identity) are left pending and logged
+`ambiguous_reconciliation` rather than merged or duplicated. Check `.notes.md`
+and the server's `import-history.jsonl`; resolve them via the duplicate
+win-records cleanup in
+`packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
 ## Common Mistakes
 

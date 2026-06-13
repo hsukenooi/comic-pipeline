@@ -63,10 +63,13 @@ two-phase merge — they **merge, never wipe**:
      on re-export (e.g. FF #86 `1969-05-01` → `1969-02-11`; see
      `docs/solutions/integration-issues/locg-bulk-import-recipe-2026-05-22.md`).
      On a single confident match the row's identity is rewritten, flags cleared,
-     `pushed_to_locg_at` set, `source` → `locg_export`. **Multiple candidates →
-     left pending and logged `ambiguous_reconciliation`** (a visible non-clear is
-     preferred over a silent wrong merge). **Different year → not reconciled**
-     (volume reboots stay distinct).
+     `pushed_to_locg_at` set, `source` → `locg_export`. A missing publisher on the
+     win (record-win rows have none) is treated as a wildcard, so LOCG populating
+     its canonical publisher doesn't block the match. **Multiple candidates, or a
+     target identity another row already holds → left pending and logged
+     `ambiguous_reconciliation`** (a visible non-clear is preferred over a silent
+     wrong merge — reconciliation never creates a duplicate-identity row).
+     **Different year → not reconciled** (volume reboots stay distinct).
 2. **Standard merge** — insert-or-update by identity tuple
    `(publisher, series, full_title, release_date)`; `full_title` renames are
    detected via the partial identity `(publisher, series, release_date)` and the
@@ -81,8 +84,11 @@ two-phase merge — they **merge, never wipe**:
   reconcile, which sets `pushed_to_locg_at`.
 - *Are wins lost if LOCG re-dates them?* **No (since BUI-122).** Before the fix, a
   re-dated win inserted as a duplicate and the original stayed pending forever; a
-  real-store dry-run produced +33 duplicate rows / 33 stuck. Now the year-tolerant
-  reconciliation clears them with zero duplicates.
+  real-store dry-run produced +33 duplicate rows / 33 stuck. The year-tolerant,
+  publisher-wildcard reconciliation now clears wins for books not already owned,
+  and **never creates a duplicate-identity row**. Wins for a book the collection
+  already owns (different identity) stay pending and are surfaced as collisions —
+  see "Duplicate win-records cleanup."
 - *Issues added directly in LOCG?* Arrive as new `locg_export` rows (`added`).
 - *Re-import before uploading the CSV?* **Safe** — pending rows aren't in the
   export yet, so they remain pending and untouched.
@@ -128,27 +134,42 @@ there directly (then `collection import` pulls it back as a full `locg_export`
 wish row). There is no tooling to enrich a name-only add with the columns LOCG
 needs.
 
-## One-time cleanup: pre-existing duplicate-identity rows
+## Duplicate win-records cleanup (pre-existing)
 
-The store contains two rows that share an identity tuple with a sibling
-(`Thor (Vol. 1) (1966 - 1996) #137` and `Uncanny X-Men (Vol. 1) (1980 - 2011)
-#210`, both blank publisher). Because `identity_to_idx` maps an identity to a
-single index, the redundant twin never clears pending and cannot reconcile under
-date canonicalization (it goes ambiguous). Clean up once, backup-gated — this is
-a manual edit, not automated:
+A dry-run against a copy of the production store (2026-06-13) found two classes
+of duplicate records that predate this work and are **independent of the sync
+mechanics** — the reconciliation fix deliberately leaves them pending (visible)
+rather than merge or duplicate them:
+
+1. **Exact-identity duplicates** — two rows sharing the full identity tuple
+   (`Thor (Vol. 1) (1966 - 1996) #137`, `Uncanny X-Men (Vol. 1) (1980 - 2011)
+   #210`, both blank publisher). `identity_to_idx` maps an identity to one index,
+   so the redundant twin never clears.
+2. **Same-book, different-identity duplicates** — a pending `agent_win` win for a
+   book the collection **already owns** as a `locg_export` row, where the two rows
+   differ only by publisher (None vs canonical) and/or fabricated vs canonical
+   date. On a real sync these surface as `ambiguous_reconciliation` /
+   collision warnings and stay pending (the dry-run found ~13 such rows). They are
+   leftover wins that record-win's already-owned dedup (BUI-34) didn't catch.
+
+Clean up once, backup-gated — manual, not automated:
 
 ```bash
 # On the server host. Back up first.
 cp -r ~/.gixen-server/collection-store ~/.gixen-server/collection-store.bak.dedup.$(date +%Y%m%d-%H%M%S)
-# Identify the duplicate-identity pairs and, for each, drop the pending
-# (pushed_to_locg_at == null) twin while keeping the pushed locg_export row.
-# Verify with `locg collection status` (LOCG_DATA_DIR=<store>) that row_count
-# and pending_push_count each drop by 2.
+# After a sync, inspect the store's import-history.jsonl for ambiguous_reconciliation
+# records and `locg collection status --verbose` for the residual pending count.
+# For each duplicate, drop the pending (pushed_to_locg_at == null, source=agent_win)
+# row when an owned locg_export row for the same book already exists; keep the owned
+# row. Re-check that row_count and pending_push_count fall as expected.
 ```
 
-After cleanup, a sync reconciles every pushed win with zero duplicates and zero
-stuck rows (verified: deduped dry-run reconciled all 33 date-shifted rows,
-`row_count` delta 0).
+After cleanup, a sync reconciles every remaining pushed win with zero duplicates
+and zero stuck rows (verified: a deduped, production-faithful dry-run reconciled
+the clean wins with `row_count` delta 0 and **no duplicate-identity rows in any
+scenario**). The duplicate win-records are the residual the post-import safety
+check is designed to surface — a follow-up could strengthen record-win's
+already-owned dedup so they stop accumulating.
 
 ## Recovery if something goes wrong
 
