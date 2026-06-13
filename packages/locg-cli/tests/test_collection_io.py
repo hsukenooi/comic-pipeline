@@ -1210,3 +1210,63 @@ def test_wish_list_cache_empty_when_no_wish_list_rows(tmp_path, monkeypatch):
     data = json.loads(wish_list_cache_path().read_text())
     assert data["items"] == []
     assert "updated_at" in data
+
+
+# ---------------------------------------------------------------------------
+# wish_rows_for_export (BUI-122): export must never emit In Collection=0 for an
+# owned book, and pushes only the local-only (diff) adds, not the full list.
+# ---------------------------------------------------------------------------
+
+def _seed_wish(items):
+    from locg.collection_io import wish_list_cache_path
+    p = wish_list_cache_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00+00:00", "items": items}))
+
+
+def test_wish_export_keeps_local_only_unowned(tmp_path):
+    """A local-only add for a book not in the collection is exported."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{"name": "Saga #1", "id": None}])
+    rows = wish_rows_for_export({"comics": []})
+    assert [r["full_title"] for r in rows] == ["Saga #1"]
+
+
+def test_wish_export_excludes_derived_wishes(tmp_path):
+    """A derived wish (carries series_name → LOCG already has it) is NOT exported."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{
+        "name": "Batman #1", "id": None,
+        "series_name": "Batman (1940 - 2011)", "publisher_name": "DC Comics",
+        "release_date": "1940-04-25",
+    }])
+    assert wish_rows_for_export({"comics": []}) == []
+
+
+def test_wish_export_excludes_owned_book(tmp_path):
+    """CRITICAL safety: a local-only add for a book that IS owned is excluded, so
+    the CSV can never carry In Collection=0 for it (the deletion bug)."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([
+        {"name": "Marvel Tales #228", "id": None},   # owned -> must be excluded
+        {"name": "Hellboy: Wake the Devil #1", "id": None},  # not owned -> kept
+    ])
+    payload = {"comics": [
+        {"full_title": "Marvel Tales #228", "in_collection": 1},
+    ]}
+    rows = wish_rows_for_export(payload)
+    titles = [r["full_title"] for r in rows]
+    assert "Marvel Tales #228" not in titles, "owned book must never be a wish row"
+    assert "Hellboy: Wake the Devil #1" in titles
+
+
+def test_wish_export_owned_match_is_dash_and_article_insensitive(tmp_path):
+    """Owned-exclusion normalizes en-dash/hyphen and a leading article, so an
+    owned 'Batman: One Bad Day – Two-Face #1' (en-dash) still excludes a wish add
+    written with a hyphen / 'The' prefix."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{"name": "Batman: One Bad Day - Two-Face #1", "id": None}])  # hyphen
+    payload = {"comics": [
+        {"full_title": "Batman: One Bad Day – Two-Face #1", "in_collection": 1},  # en-dash
+    ]}
+    assert wish_rows_for_export(payload) == []

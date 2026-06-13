@@ -712,6 +712,49 @@ def _load_wish_list_items() -> list[dict[str, Any]]:
     ]
 
 
+def _normalize_title(title: str) -> str:
+    """Loose full-title key for owned-vs-wished matching (dash + leading-article
+    insensitive, whitespace-collapsed). Deliberately generous: over-matching only
+    drops a wish from the export, while under-matching could let In Collection=0
+    delete an owned book — so we err toward exclusion."""
+    t = (title or "").strip().lower().replace("–", "-").replace("—", "-")
+    t = re.sub(r"^(the|a|an)\s+", "", t)
+    return re.sub(r"\s+", " ", t)
+
+
+def wish_rows_for_export(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Wish-list rows safe to include in the LOCG bulk-import CSV (BUI-122).
+
+    The CSV writes wish rows with ``In Collection=0``, which tells LOCG to *remove*
+    the book from the collection if it matches one. Re-dumping the whole wish list
+    therefore (a) re-uploads the LOCG-derived wishes LOCG already has, and worse
+    (b) deletes any wished book that is actually owned. This caused real
+    collection deletions during BUI-122 testing.
+
+    So the export now includes only:
+      - **local-only adds** (no ``series_name`` — the diff LOCG doesn't have yet;
+        derived wishes are already on LOCG and are dropped), AND
+      - that are **not owned** (title not in the collection's ``in_collection``
+        set), so an ``In Collection=0`` row can never delete an owned book.
+
+    Owned-but-wished books are simply not pushed; the wish stays local. Matching is
+    title-based and generous (see ``_normalize_title``) — owned-safe by design.
+    """
+    owned = {
+        _normalize_title(r.get("full_title"))
+        for r in payload.get("comics", [])
+        if r.get("in_collection")
+    }
+    out: list[dict[str, Any]] = []
+    for item in _load_wish_list_items():
+        if item.get("series_name"):
+            continue  # derived wish — LOCG already has it; re-emitting risks deletion
+        if _normalize_title(item.get("full_title")) in owned:
+            continue  # owned — never emit In Collection=0 for it
+        out.append(item)
+    return out
+
+
 def _row_to_csv_dict(row: dict[str, Any], in_wish_list: bool = False) -> dict[str, str | int]:
     """Map a cache row to the 21-column LOCG CSV recipe (R21–R31)."""
     return {
