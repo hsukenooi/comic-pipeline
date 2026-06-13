@@ -125,7 +125,18 @@ def _issue_token(full_title: str) -> str | None:
 
 
 def _publisher_matches(a: str, b: str) -> bool:
-    return (a or "").strip().lower() == (b or "").strip().lower()
+    # A missing publisher on either side is a wildcard, not a mismatch. agent_win
+    # rows are written with publisher_name=None (record-win has no publisher), so
+    # a strict compare against LOCG's canonical "Marvel Comics" would score every
+    # such row 0 and block reconciliation entirely (BUI-122). Series + issue +
+    # year still gate the match, so the publisher wildcard can't merge across
+    # genuinely different books. Only reject when BOTH sides name a publisher and
+    # they differ.
+    na = (a or "").strip().lower()
+    nb = (b or "").strip().lower()
+    if not na or not nb:
+        return True
+    return na == nb
 
 
 def _series_normalized_matches(a: str, b: str) -> bool:
@@ -343,9 +354,27 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
             partial_to_idx[_partial_identity(row)] = i
 
         # ----- Phase 1: Reconciliation ----------------------------------------
+        # Manually-flagged best-guess rows always get the relaxed (exact-year)
+        # heuristic. BUI-122: also run it for *unflagged* pending agent_win rows
+        # whose exact identity is absent from this export. LOCG silently rewrites
+        # a just-pushed row's Release Date to its own canonical value (see
+        # docs/solutions/integration-issues/locg-bulk-import-recipe-2026-05-22.md),
+        # which breaks the Phase-2 exact make_identity match; the row would then
+        # insert as a duplicate while the original stayed pending forever. The
+        # `make_identity(r) not in exact_ids` guard preserves Phase-2 exact-match
+        # primacy — a win whose date round-tripped unchanged is handled by the
+        # standard merge, not routed through year-tolerant scoring (which would
+        # mis-flag it ambiguous against a same-year variant).
+        exact_ids = {make_identity(xr) for xr in xlsx_rows}
         flagged_indices = [
             i for i, r in enumerate(comics)
-            if r.get("needs_manual_variant") or r.get("needs_manual_series_canonical")
+            if r.get("needs_manual_variant")
+            or r.get("needs_manual_series_canonical")
+            or (
+                r.get("source") == "agent_win"
+                and r.get("pushed_to_locg_at") is None
+                and make_identity(r) not in exact_ids
+            )
         ]
 
         for ci in flagged_indices:
@@ -377,6 +406,33 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 continue
 
             _score, _xi, xlsx_row = candidates[0]
+
+            # Collision guard (BUI-122): rewriting this row's identity to the
+            # matched export row's identity must not land on an identity another
+            # cache row already holds — that would create a duplicate-identity
+            # pair. This happens when the row is a win for a book already owned
+            # under LOCG's canonical identity (the agent_win row and the existing
+            # locg_export row are the same comic). Leave it pending and surface it
+            # rather than silently merging or duplicating (visible non-clear over
+            # silent wrong merge). The pre-existing duplicate-records condition is
+            # then resolved out-of-band (see the sync runbook's cleanup section).
+            target_identity = make_identity(xlsx_row)
+            collide = identity_to_idx.get(target_identity)
+            if collide is not None and collide != ci:
+                audit_records.append({
+                    "type": "ambiguous_reconciliation",
+                    "ts": now,
+                    "command": "import",
+                    "details": {
+                        "full_title": cache_row.get("full_title"),
+                        "reason": "identity_collision_with_existing_row",
+                    },
+                })
+                summary["warnings"].append(
+                    f"Reconciliation collision for '{cache_row.get('full_title')}' "
+                    "— a row with that identity already exists; left pending"
+                )
+                continue
 
             old_identity = make_identity(cache_row)
             old_partial = _partial_identity(cache_row)
@@ -654,6 +710,49 @@ def _load_wish_list_items() -> list[dict[str, Any]]:
         }
         for item in data.get("items", [])
     ]
+
+
+def _normalize_title(title: str) -> str:
+    """Loose full-title key for owned-vs-wished matching (dash + leading-article
+    insensitive, whitespace-collapsed). Deliberately generous: over-matching only
+    drops a wish from the export, while under-matching could let In Collection=0
+    delete an owned book — so we err toward exclusion."""
+    t = (title or "").strip().lower().replace("–", "-").replace("—", "-")
+    t = re.sub(r"^(the|a|an)\s+", "", t)
+    return re.sub(r"\s+", " ", t)
+
+
+def wish_rows_for_export(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Wish-list rows safe to include in the LOCG bulk-import CSV (BUI-122).
+
+    The CSV writes wish rows with ``In Collection=0``, which tells LOCG to *remove*
+    the book from the collection if it matches one. Re-dumping the whole wish list
+    therefore (a) re-uploads the LOCG-derived wishes LOCG already has, and worse
+    (b) deletes any wished book that is actually owned. This caused real
+    collection deletions during BUI-122 testing.
+
+    So the export now includes only:
+      - **local-only adds** (no ``series_name`` — the diff LOCG doesn't have yet;
+        derived wishes are already on LOCG and are dropped), AND
+      - that are **not owned** (title not in the collection's ``in_collection``
+        set), so an ``In Collection=0`` row can never delete an owned book.
+
+    Owned-but-wished books are simply not pushed; the wish stays local. Matching is
+    title-based and generous (see ``_normalize_title``) — owned-safe by design.
+    """
+    owned = {
+        _normalize_title(r.get("full_title"))
+        for r in payload.get("comics", [])
+        if r.get("in_collection")
+    }
+    out: list[dict[str, Any]] = []
+    for item in _load_wish_list_items():
+        if item.get("series_name"):
+            continue  # derived wish — LOCG already has it; re-emitting risks deletion
+        if _normalize_title(item.get("full_title")) in owned:
+            continue  # owned — never emit In Collection=0 for it
+        out.append(item)
+    return out
 
 
 def _row_to_csv_dict(row: dict[str, Any], in_wish_list: bool = False) -> dict[str, str | int]:

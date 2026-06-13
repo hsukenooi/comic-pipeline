@@ -312,6 +312,303 @@ def test_reconciliation_vol_mismatch_not_reconciled(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# import_xlsx — BUI-122: year-tolerant reconciliation for unflagged pending
+# agent_win rows (LOCG canonicalizes Release Date on re-export, breaking the
+# Phase-2 exact identity match). Uses a deterministic in-test XLSX rather than
+# the golden fixture so the date-shift / ambiguity scenarios are exact.
+# ---------------------------------------------------------------------------
+
+def _build_export_xlsx(path: Path, rows: list[dict[str, Any]]):
+    """Build a 21-column LOCG-format XLSX from row dicts.
+
+    Each row dict needs publisher/series/full_title/release_date; in_collection
+    defaults to 1, in_wish_list to 0.
+    """
+    import openpyxl
+    from locg.collection_io import LOCG_XLSX_HEADERS
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(list(LOCG_XLSX_HEADERS))
+    for r in rows:
+        ws.append([
+            r["publisher"], r["series"], r["full_title"], r["release_date"],
+            r.get("in_collection", 1), r.get("in_wish_list", 0), 0, None,
+            "Print", None, None, None, None, None, None, None, None,
+            None, None, None, None,
+        ])
+    wb.save(path)
+
+
+def test_pending_agent_win_reconciled_on_within_year_date_shift(tmp_path):
+    """BUI-122: an unflagged pending agent_win row whose export counterpart has
+    the same year but a different Release Date reconciles instead of duplicating."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Amazing Spider-Man",
+        full_title="Amazing Spider-Man #309",
+        release_date="1988-01-01",  # agent stamped Jan 1
+        needs_manual_series=False,  # NOT flagged — the new path
+        pushed=None,                # pending
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",
+        "series": "Amazing Spider-Man",
+        "full_title": "Amazing Spider-Man #309",
+        "release_date": "1988-02-11",  # LOCG canonicalized the date, same year
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if r["full_title"] == "Amazing Spider-Man #309"]
+    assert len(rows) == 1, "must reconcile in place, not insert a duplicate"
+    row = rows[0]
+    assert row["pushed_to_locg_at"] is not None, "pending must clear"
+    assert row["source"] == "locg_export"
+    assert row["release_date"] == "1988-02-11", "identity rewritten to LOCG canonical"
+    assert row["gixen_item_id"] == "42", "tracking field preserved"
+    assert result["reconciled"] >= 1
+    assert result["added"] == 0, "no new row inserted"
+
+
+def test_pending_agent_win_with_null_publisher_reconciles(tmp_path):
+    """BUI-122 production-faithful: agent_win rows are written with
+    publisher_name=None (record-win has no publisher), while LOCG's export
+    carries a canonical publisher. The row must still reconcile — a strict
+    publisher compare would score it 0 and strand it pending forever."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher=None,  # as written by record-win in production
+        series="Daredevil",
+        full_title="Daredevil #181",
+        release_date="1982-01-01",  # agent-stamped Jan 1
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",      # LOCG populates the publisher
+        "series": "Daredevil",
+        "full_title": "Daredevil #181",
+        "release_date": "1982-04-10",      # ...and canonicalizes the date (same year)
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if r["full_title"] == "Daredevil #181"]
+    assert len(rows) == 1, "null-publisher win must reconcile, not duplicate"
+    row = rows[0]
+    assert row["pushed_to_locg_at"] is not None, "pending must clear"
+    assert row["publisher_name"] == "Marvel Comics", "identity adopts LOCG canonical publisher"
+    assert result["reconciled"] >= 1
+    assert result["added"] == 0
+
+
+def test_pending_agent_win_exact_match_uses_phase2_not_reconciliation(tmp_path):
+    """KTD-2: a pending agent_win row whose EXACT identity is in the export is
+    handled by the Phase-2 standard merge, not routed through year-tolerant
+    reconciliation — so a same-year variant in the export can't make it ambiguous."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Amazing Spider-Man",
+        full_title="Amazing Spider-Man #300",
+        release_date="1988-05-10",
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [
+        # Exact identity match for the win:
+        {"publisher": "Marvel Comics", "series": "Amazing Spider-Man",
+         "full_title": "Amazing Spider-Man #300", "release_date": "1988-05-10"},
+        # A same-year variant that WOULD make reconciliation ambiguous if the
+        # win were routed through it:
+        {"publisher": "Marvel Comics", "series": "Amazing Spider-Man",
+         "full_title": "Amazing Spider-Man #300 Newsstand", "release_date": "1988-05-10"},
+    ])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    win_rows = [r for r in payload["comics"]
+                if r["full_title"] == "Amazing Spider-Man #300" and r.get("gixen_item_id") == "42"]
+    assert len(win_rows) == 1
+    row = win_rows[0]
+    assert row["pushed_to_locg_at"] is not None, "exact match must clear pending via Phase 2"
+    assert row["source"] == "locg_export"
+    assert row["needs_manual_series_canonical"] is False
+    assert result["updated"] >= 1, "matched via standard merge, not reconciliation"
+    assert not result["warnings"], "exact-match primacy must avoid an ambiguity warning"
+
+
+def test_pending_agent_win_collision_with_owned_row_left_pending(tmp_path):
+    """A pending agent_win win for a book already owned under LOCG's canonical
+    identity must NOT reconcile onto that existing row (which would create a
+    duplicate-identity pair). It is left pending and surfaced. This is the
+    pre-existing duplicate-records condition, resolved out-of-band."""
+    from locg.collection_io import import_xlsx, make_identity
+
+    cache = make_cache(tmp_path)
+    # Already-owned canonical row (from a prior import).
+    owned = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Daredevil",
+        full_title="Daredevil #181",
+        release_date="1982-04-10",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    owned["source"] = "locg_export"
+    # A pending win for the SAME book, recorded with no publisher + fabricated date.
+    win = make_agent_win_row(
+        publisher=None, series="Daredevil", full_title="Daredevil #181",
+        release_date="1982-01-01", gixen_item_id="99", pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([owned, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    # LOCG carries ONE canonical Daredevil #181 (it collapses the win into the
+    # owned copy on its side).
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Daredevil",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    dd = [r for r in payload["comics"] if r["full_title"] == "Daredevil #181"]
+    win_row = next(r for r in dd if r.get("gixen_item_id") == "99")
+    assert win_row["pushed_to_locg_at"] is None, "win must stay pending, not merge onto owned row"
+    # No duplicate-identity pair created.
+    idents = [make_identity(r) for r in payload["comics"]]
+    assert len(idents) == len(set(idents)), "no duplicate-identity rows"
+    assert result["reconciled"] == 0
+    assert result["warnings"], "collision must be surfaced as a warning"
+
+
+def test_pending_agent_win_cross_year_not_reconciled(tmp_path):
+    """A different YEAR (volume reboot) is not tolerated: the win stays pending and
+    the export row inserts as a genuinely new row."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="DC Comics",
+        series="Action Comics Annual",
+        full_title="Action Comics Annual #1",
+        release_date="1987-01-01",
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics", "series": "Action Comics Annual",
+        "full_title": "Action Comics Annual #1", "release_date": "2012-06-01",  # 2012 reboot
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = sorted(
+        (r for r in payload["comics"] if r["full_title"] == "Action Comics Annual #1"),
+        key=lambda r: r["release_date"],
+    )
+    assert len(rows) == 2, "different-year rows are distinct, not reconciled"
+    original = next(r for r in rows if r.get("gixen_item_id") == "42")
+    assert original["pushed_to_locg_at"] is None, "1987 win stays pending"
+    assert result["added"] == 1, "2012 export row inserts as new"
+    assert result["reconciled"] == 0
+
+
+def test_pending_agent_win_ambiguous_left_pending(tmp_path):
+    """When a pending agent_win row (no exact match) year-matches multiple export
+    rows, it is left pending with an ambiguous_reconciliation audit/warning rather
+    than guessing (duplicate-row policy: visible non-clear over silent wrong merge)."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Image Comics",
+        series="Spawn",
+        full_title="Spawn #300",
+        release_date="2019-01-01",  # agent date; export will not carry this exact date
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    # Two printings: same publisher/series/issue-token/year, different dates.
+    # Both score against the win (issue "300" + year 2019), so reconciliation is
+    # ambiguous. (A variant whose Full Title doesn't end in "#300" wouldn't score,
+    # since _reconcile_score requires an exact issue-token match.)
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Image Comics", "series": "Spawn",
+         "full_title": "Spawn #300", "release_date": "2019-08-28"},
+        {"publisher": "Image Comics", "series": "Spawn",
+         "full_title": "Spawn #300", "release_date": "2019-11-13"},
+    ])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    win_rows = [r for r in payload["comics"] if r.get("gixen_item_id") == "42"]
+    assert len(win_rows) == 1
+    assert win_rows[0]["pushed_to_locg_at"] is None, "ambiguous match stays pending"
+    assert result["reconciled"] == 0
+    assert result["warnings"], "an ambiguity warning must be surfaced"
+    audit_types = [
+        json.loads(line)["type"]
+        for line in (tmp_path / "import-history.jsonl").read_text().strip().splitlines()
+    ]
+    assert "ambiguous_reconciliation" in audit_types
+
+
+# ---------------------------------------------------------------------------
 # import_xlsx — renamed full_title persistence (R67)
 # ---------------------------------------------------------------------------
 
@@ -913,3 +1210,63 @@ def test_wish_list_cache_empty_when_no_wish_list_rows(tmp_path, monkeypatch):
     data = json.loads(wish_list_cache_path().read_text())
     assert data["items"] == []
     assert "updated_at" in data
+
+
+# ---------------------------------------------------------------------------
+# wish_rows_for_export (BUI-122): export must never emit In Collection=0 for an
+# owned book, and pushes only the local-only (diff) adds, not the full list.
+# ---------------------------------------------------------------------------
+
+def _seed_wish(items):
+    from locg.collection_io import wish_list_cache_path
+    p = wish_list_cache_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00+00:00", "items": items}))
+
+
+def test_wish_export_keeps_local_only_unowned(tmp_path):
+    """A local-only add for a book not in the collection is exported."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{"name": "Saga #1", "id": None}])
+    rows = wish_rows_for_export({"comics": []})
+    assert [r["full_title"] for r in rows] == ["Saga #1"]
+
+
+def test_wish_export_excludes_derived_wishes(tmp_path):
+    """A derived wish (carries series_name → LOCG already has it) is NOT exported."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{
+        "name": "Batman #1", "id": None,
+        "series_name": "Batman (1940 - 2011)", "publisher_name": "DC Comics",
+        "release_date": "1940-04-25",
+    }])
+    assert wish_rows_for_export({"comics": []}) == []
+
+
+def test_wish_export_excludes_owned_book(tmp_path):
+    """CRITICAL safety: a local-only add for a book that IS owned is excluded, so
+    the CSV can never carry In Collection=0 for it (the deletion bug)."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([
+        {"name": "Marvel Tales #228", "id": None},   # owned -> must be excluded
+        {"name": "Hellboy: Wake the Devil #1", "id": None},  # not owned -> kept
+    ])
+    payload = {"comics": [
+        {"full_title": "Marvel Tales #228", "in_collection": 1},
+    ]}
+    rows = wish_rows_for_export(payload)
+    titles = [r["full_title"] for r in rows]
+    assert "Marvel Tales #228" not in titles, "owned book must never be a wish row"
+    assert "Hellboy: Wake the Devil #1" in titles
+
+
+def test_wish_export_owned_match_is_dash_and_article_insensitive(tmp_path):
+    """Owned-exclusion normalizes en-dash/hyphen and a leading article, so an
+    owned 'Batman: One Bad Day – Two-Face #1' (en-dash) still excludes a wish add
+    written with a hyphen / 'The' prefix."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{"name": "Batman: One Bad Day - Two-Face #1", "id": None}])  # hyphen
+    payload = {"comics": [
+        {"full_title": "Batman: One Bad Day – Two-Face #1", "in_collection": 1},  # en-dash
+    ]}
+    assert wish_rows_for_export(payload) == []

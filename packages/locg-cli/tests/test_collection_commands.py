@@ -185,8 +185,10 @@ def test_export_manual_rows_excluded_from_csv(tmp_path, monkeypatch):
     assert "ASM #300 Newsstand" in notes_text
 
 
-def test_export_includes_wish_list_items(tmp_path, monkeypatch):
-    """Wish-list cache items appear in the CSV with In Collection=0, In Wish List=1."""
+def test_export_includes_local_only_wish_add(tmp_path, monkeypatch):
+    """A local-only wish add that isn't owned appears in the CSV with
+    In Collection=0, In Wish List=1 (BUI-122: derived wishes are excluded —
+    LOCG already has them — but genuine new local adds still push)."""
     import csv
     import locg.collection_io as cio
     import locg.commands as cmds
@@ -196,14 +198,8 @@ def test_export_includes_wish_list_items(tmp_path, monkeypatch):
     wish_path.write_text(json.dumps({
         "updated_at": "2026-05-22T00:00:00+00:00",
         "items": [
-            {
-                "name": "Batman #1",
-                "id": None,
-                "series_name": "Batman (1940 - 2011)",
-                "publisher_name": "DC Comics",
-                "release_date": "1940-04-25",
-                "media_format": "Print",
-            }
+            # local-only add (no series_name) — the diff LOCG doesn't have yet
+            {"name": "Saga #1", "id": None},
         ],
     }))
 
@@ -220,7 +216,7 @@ def test_export_includes_wish_list_items(tmp_path, monkeypatch):
         rows = list(csv.DictReader(f))
 
     assert len(rows) == 1
-    assert rows[0]["Full Title"] == "Batman #1"
+    assert rows[0]["Full Title"] == "Saga #1"
     assert rows[0]["In Collection"] == "0"
     assert rows[0]["In Wish List"] == "1"
 
