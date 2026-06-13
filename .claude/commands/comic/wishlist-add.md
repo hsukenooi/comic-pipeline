@@ -1,6 +1,6 @@
 ---
 name: comic:wishlist-add
-description: Look up a series on Metron and add each of its issues to the wish-list on the gixen server. Only Metron is queried for the lookup; LOCG is not. Use to wish-list a whole run at once.
+description: Look up a series on Metron and add each of its issues to the wish-list on the gixen server, skipping any issues you already own. Only Metron is queried for the lookup; LOCG is not. Use to wish-list a whole run at once.
 ---
 
 # Comic Wishlist Add
@@ -67,25 +67,46 @@ Record `issue_count` and the chosen `series` display name.
   Clamp to `1 … issue_count`; warn if the user asked for issues beyond
   `issue_count`.
 
-## Step 3: Preview (dry run) and confirm
+## Step 3: Skip issues you already own
 
-Before writing anything, print the exact titles that will be added and ask the
-user to confirm. **Stopping here is the dry run.**
+Wish-listing a book you already own is the bug that deleted real collection rows
+(BUI-122): an owned-but-wished book gets pushed to LOCG with `In Collection=0`,
+which removes it from the collection. Filter owned issues out **before** adding.
+
+For each resolved issue, ask the server's collection (no LOCG network needed):
+
+```bash
+# series = plain name (e.g. "Marvel Tales"); year = Metron year_began
+curl -sf "$GIXEN_SERVER_URL/api/comics/collection/check?series=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")&issue=<N>&year=<YEAR>"
+```
+
+- `{"match_status": "in_collection"}` → **owned, skip it** (don't wish-list).
+- `{"match_status": "not_in_cache"}` → not owned, keep it.
+- **HTTP 409** (store never imported) → ownership can't be verified. Warn the user
+  ("couldn't check ownership — collection not imported"), and proceed with all
+  issues. (The export fix is the safety net: even a wrongly-wished owned book is
+  no longer deleted — but flag it so the user knows the check was skipped.)
+
+Carry forward two lists: **to-add** (not owned) and **already-owned** (skipped).
+
+## Step 4: Preview (dry run) and confirm
+
+Before writing anything, print the issues that will be added, call out any already
+owned, and ask the user to confirm. **Stopping here is the dry run.**
 
 ```
-About to add 4 issues to the wish-list cache:
-  - Children of the Vault #1
-  - Children of the Vault #2
-  - Children of the Vault #3
-  - Children of the Vault #4
+Marvel Tales #223–239 (17 issues):
+  Already owned — skipping (8): #223, #226, #227, #228, #229, #231, #232, #234, #235
+  Will add to wish-list (9): #224, #225, #230, #233, #236, #237, #238, #239
 Proceed? (yes / no)
 ```
 
 Use the series name as the user typed it for the `#<N>` titles (the simplest,
 LOCG-searchable form). Mention that the Metron canonical name is
-`<series display name>` in case they prefer that.
+`<series display name>` in case they prefer that. If **all** issues are already
+owned, say so and stop — nothing to add.
 
-## Step 4: Add each issue
+## Step 5: Add each issue
 
 On confirmation, add one issue per call (`curl -sf` so a non-200 fails loudly):
 
@@ -102,17 +123,18 @@ returns `{"status": "ok", ...}`. It is not deduped, so don't re-run a title that
 already succeeded (it would create a duplicate). Stop and report if any call
 returns a non-200.
 
-## Step 5: Report
+## Step 6: Report
 
 ```
-**Wish-listed 4 issues of Children of the Vault (2023):**
-  #1, #2, #3, #4  →  server wish-list (N items total)
+**Wish-listed 9 issues of Marvel Tales:**
+  #224, #225, #230, #233, #236–239  →  server wish-list (N items total)
+  Skipped 8 already-owned issues.
 ```
 
-⚠️ **Sync caveat (BUI-47):** wish-list adds are **overwritten on the next full
-LOCG import** (import rebuilds the wish-list from the LOCG export's wish-list
-rows). To keep these: export (`GET /api/comics/collection/export`) and upload the
-CSV to LOCG **before** running another import. See
+**Sync note:** local wish-list adds **survive** a `collection import` (BUI-47 is
+fixed — they're re-appended, not wiped). To get them onto LOCG itself, run
+`/comic:collection-sync`; the export pushes only genuine new wishes and never
+touches owned books. See
 `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
 ## Common Mistakes
@@ -124,3 +146,4 @@ CSV to LOCG **before** running another import. See
 | Adding issues without a preview | Always show the title list and confirm first (Step 3) — that's the dry run |
 | Re-running the whole range after a partial failure | Re-add only the issues that didn't succeed; the wish-list endpoint does not dedupe |
 | Writing to `data/locg/wish-list.json` directly | Adds go to the server via `POST /api/comics/wish-list` — the repo file is no longer the source of truth (BUI-93) |
+| Wish-listing issues you already own | Collection-check each issue first (Step 3) and skip owned ones — wishing an owned book is what deleted collection rows in BUI-122 |
