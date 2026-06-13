@@ -92,6 +92,16 @@ two-phase merge — they **merge, never wipe**:
 - *Issues added directly in LOCG?* Arrive as new `locg_export` rows (`added`).
 - *Re-import before uploading the CSV?* **Safe** — pending rows aren't in the
   export yet, so they remain pending and untouched.
+- *Can a stale LOCG export un-own a book?* **No (since BUI-124).** The standard
+  merge **holds ownership downgrades**: if the export reports `In Collection=0`
+  for a row the server owns (`in_collection` truthy), the merge keeps the
+  existing value, logs an `ownership_downgrade_held` audit record, and bumps the
+  import summary's `ownership_downgrades_held` count instead of overwriting — so
+  a stale/bad LOCG state can't silently flip a book to not-owned and trigger a
+  duplicate buy via `collection-check`. A *real* un-collect (you sold a book and
+  un-collected it on LOCG) is a legitimate downgrade: it is **not auto-applied**
+  but surfaced for review (see the safety check below). Count changes that stay
+  owned (e.g. 2 → 1 copies) apply normally.
 
 ## How export works (collection)
 
@@ -190,6 +200,16 @@ already-owned dedup so they stop accumulating.
 - **Pending rows look stuck:** check `locg collection status --verbose` and the
   store's `import-history.jsonl` for `ambiguous_reconciliation` /
   `possibly_removed` records; resolve the flagged rows (`.notes.md`) and re-import.
+- **Held ownership downgrades (BUI-124):** a non-zero `ownership_downgrades_held`
+  in the import summary (or in `locg collection status`) means LOCG reported
+  `In Collection=0` for one or more owned books and the merge **kept them owned**
+  rather than un-owning them. Inspect the `ownership_downgrade_held` records in
+  `import-history.jsonl` (each carries the identity + `previous`/`incoming`
+  values) and decide per book: if it was a **real un-collect**, un-collect it on
+  the server (the held value is intentionally not auto-applied); if it was a
+  **stale/bad LOCG state**, no action is needed — ownership was preserved. Until
+  resolved on LOCG, each subsequent import re-holds and re-logs the same book
+  (safe, but expected noise).
 - **Import `added` was unexpectedly large:** the re-import inserted duplicates
   rather than reconciling. Restore from backup and investigate (likely a LOCG
   canonicalization beyond Release Date, e.g. a Series Name rewrite, that the

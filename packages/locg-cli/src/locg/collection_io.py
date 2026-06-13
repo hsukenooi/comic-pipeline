@@ -225,6 +225,56 @@ def _partial_identity(row: dict[str, Any]) -> tuple[str, str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Ownership-downgrade guard (BUI-124)
+# ---------------------------------------------------------------------------
+
+def _apply_locg_columns_held(
+    existing: dict[str, Any],
+    xlsx_row: dict[str, Any],
+    now: str,
+    audit_records: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> None:
+    """Copy an export row's LOCG columns onto an existing cache row, but HOLD an
+    ownership downgrade (BUI-124).
+
+    The gixen server is the source of truth (BUI-87), so a stale or bad LOCG
+    state must not silently un-own a book: if the existing row is owned
+    (``in_collection`` truthy) and the incoming export says not-owned
+    (``in_collection`` falsy), the previous value is preserved, an
+    ``ownership_downgrade_held`` audit record is written, and the run counter is
+    bumped — rather than overwriting and risking a duplicate buy via
+    ``collection-check``. Every other column still updates normally, and a
+    legitimate count change that stays owned (e.g. 2 → 1) copies through.
+
+    A genuine un-collect (you sold a book and un-collected it on LOCG) is a real
+    downgrade; it surfaces in the audit log / ``collection status`` for review
+    rather than being auto-applied. ``in_collection`` is not a user-managed
+    column, so holding it does not affect behavioral-drift detection.
+    """
+    prev_in_collection = existing.get("in_collection")
+    held = bool(prev_in_collection) and not bool(xlsx_row.get("in_collection"))
+
+    for col in LOCG_COLUMNS:
+        existing[col] = xlsx_row[col]
+
+    if held:
+        existing["in_collection"] = prev_in_collection
+        audit_records.append({
+            "type": "ownership_downgrade_held",
+            "ts": now,
+            "command": "import",
+            "details": {
+                "identity": list(make_identity(existing)),
+                "full_title": existing.get("full_title"),
+                "previous_in_collection": prev_in_collection,
+                "incoming_in_collection": xlsx_row.get("in_collection"),
+            },
+        })
+        summary["ownership_downgrades_held"] += 1
+
+
+# ---------------------------------------------------------------------------
 # Wish-list cache write
 # ---------------------------------------------------------------------------
 
@@ -318,7 +368,8 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
     Appends audit records to import-history.jsonl.
 
     Returns a summary dict: {added, updated, untouched, reconciled,
-    possibly_removed, behavioral_drift_count, warnings}.
+    possibly_removed, ownership_downgrades_held, behavioral_drift_count,
+    warnings}.
     """
     # Validate and parse outside the lock — bad files abort cleanly
     xlsx_rows = parse_xlsx(path)
@@ -330,6 +381,7 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         "untouched": 0,
         "reconciled": 0,
         "possibly_removed": 0,
+        "ownership_downgrades_held": 0,
         "behavioral_drift_count": 0,
         "warnings": [],
     }
@@ -492,8 +544,7 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 if partial_to_idx.get(old_partial) == ci:
                     del partial_to_idx[old_partial]
 
-                for col in LOCG_COLUMNS:
-                    existing[col] = xr[col]
+                _apply_locg_columns_held(existing, xr, now, audit_records, summary)
                 existing["last_seen_in_export_at"] = now
                 existing["source"] = "locg_export"
                 if existing.get("pushed_to_locg_at") is None:
@@ -534,8 +585,9 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                             existing["previous_full_title"] = old_title
 
                             pre_checksum = _user_column_checksum(existing)
-                            for col in LOCG_COLUMNS:
-                                existing[col] = xr[col]
+                            _apply_locg_columns_held(
+                                existing, xr, now, audit_records, summary
+                            )
                             existing["last_seen_in_export_at"] = now
                             existing["source"] = "locg_export"
                             if existing.get("pushed_to_locg_at") is None:

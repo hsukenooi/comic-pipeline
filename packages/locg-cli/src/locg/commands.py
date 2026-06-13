@@ -1462,6 +1462,11 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
 
     recon_success_rate: Optional[float] = None
     drift_events: Optional[int] = None
+    # Held ownership downgrades (BUI-124): imports that declined to silently
+    # un-own a book because LOCG reported in_collection=0 over an owned row.
+    # Surfaced here so they can be reviewed (a real un-collect applied, a stale
+    # LOCG state ignored) rather than silently dropping ownership.
+    ownership_downgrades_held: Optional[int] = None
     if cache.audit_path.exists():
         try:
             lines = cache.audit_path.read_text().strip().splitlines()
@@ -1477,6 +1482,9 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
             if total > 0:
                 recon_success_rate = round(recon / total, 2)
             drift_events = sum(1 for t in types if t == "behavioral_drift")
+            ownership_downgrades_held = sum(
+                1 for t in types if t == "ownership_downgrade_held"
+            )
         except OSError:
             pass
 
@@ -1488,6 +1496,7 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
         "median_agent_win_age_days": median_win_age,
         "reconciliation_success_rate_last_5_imports": recon_success_rate,
         "behavioral_drift_events_last_5_imports": drift_events,
+        "ownership_downgrades_held": ownership_downgrades_held,
     })
     return result
 
