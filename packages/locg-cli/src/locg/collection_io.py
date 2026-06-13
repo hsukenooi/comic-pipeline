@@ -125,7 +125,18 @@ def _issue_token(full_title: str) -> str | None:
 
 
 def _publisher_matches(a: str, b: str) -> bool:
-    return (a or "").strip().lower() == (b or "").strip().lower()
+    # A missing publisher on either side is a wildcard, not a mismatch. agent_win
+    # rows are written with publisher_name=None (record-win has no publisher), so
+    # a strict compare against LOCG's canonical "Marvel Comics" would score every
+    # such row 0 and block reconciliation entirely (BUI-122). Series + issue +
+    # year still gate the match, so the publisher wildcard can't merge across
+    # genuinely different books. Only reject when BOTH sides name a publisher and
+    # they differ.
+    na = (a or "").strip().lower()
+    nb = (b or "").strip().lower()
+    if not na or not nb:
+        return True
+    return na == nb
 
 
 def _series_normalized_matches(a: str, b: str) -> bool:
@@ -395,6 +406,33 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 continue
 
             _score, _xi, xlsx_row = candidates[0]
+
+            # Collision guard (BUI-122): rewriting this row's identity to the
+            # matched export row's identity must not land on an identity another
+            # cache row already holds — that would create a duplicate-identity
+            # pair. This happens when the row is a win for a book already owned
+            # under LOCG's canonical identity (the agent_win row and the existing
+            # locg_export row are the same comic). Leave it pending and surface it
+            # rather than silently merging or duplicating (visible non-clear over
+            # silent wrong merge). The pre-existing duplicate-records condition is
+            # then resolved out-of-band (see the sync runbook's cleanup section).
+            target_identity = make_identity(xlsx_row)
+            collide = identity_to_idx.get(target_identity)
+            if collide is not None and collide != ci:
+                audit_records.append({
+                    "type": "ambiguous_reconciliation",
+                    "ts": now,
+                    "command": "import",
+                    "details": {
+                        "full_title": cache_row.get("full_title"),
+                        "reason": "identity_collision_with_existing_row",
+                    },
+                })
+                summary["warnings"].append(
+                    f"Reconciliation collision for '{cache_row.get('full_title')}' "
+                    "— a row with that identity already exists; left pending"
+                )
+                continue
 
             old_identity = make_identity(cache_row)
             old_partial = _partial_identity(cache_row)

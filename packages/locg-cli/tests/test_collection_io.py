@@ -382,6 +382,48 @@ def test_pending_agent_win_reconciled_on_within_year_date_shift(tmp_path):
     assert result["added"] == 0, "no new row inserted"
 
 
+def test_pending_agent_win_with_null_publisher_reconciles(tmp_path):
+    """BUI-122 production-faithful: agent_win rows are written with
+    publisher_name=None (record-win has no publisher), while LOCG's export
+    carries a canonical publisher. The row must still reconcile — a strict
+    publisher compare would score it 0 and strand it pending forever."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher=None,  # as written by record-win in production
+        series="Daredevil",
+        full_title="Daredevil #181",
+        release_date="1982-01-01",  # agent-stamped Jan 1
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",      # LOCG populates the publisher
+        "series": "Daredevil",
+        "full_title": "Daredevil #181",
+        "release_date": "1982-04-10",      # ...and canonicalizes the date (same year)
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if r["full_title"] == "Daredevil #181"]
+    assert len(rows) == 1, "null-publisher win must reconcile, not duplicate"
+    row = rows[0]
+    assert row["pushed_to_locg_at"] is not None, "pending must clear"
+    assert row["publisher_name"] == "Marvel Comics", "identity adopts LOCG canonical publisher"
+    assert result["reconciled"] >= 1
+    assert result["added"] == 0
+
+
 def test_pending_agent_win_exact_match_uses_phase2_not_reconciliation(tmp_path):
     """KTD-2: a pending agent_win row whose EXACT identity is in the export is
     handled by the Phase-2 standard merge, not routed through year-tolerant
@@ -426,6 +468,56 @@ def test_pending_agent_win_exact_match_uses_phase2_not_reconciliation(tmp_path):
     assert row["needs_manual_series_canonical"] is False
     assert result["updated"] >= 1, "matched via standard merge, not reconciliation"
     assert not result["warnings"], "exact-match primacy must avoid an ambiguity warning"
+
+
+def test_pending_agent_win_collision_with_owned_row_left_pending(tmp_path):
+    """A pending agent_win win for a book already owned under LOCG's canonical
+    identity must NOT reconcile onto that existing row (which would create a
+    duplicate-identity pair). It is left pending and surfaced. This is the
+    pre-existing duplicate-records condition, resolved out-of-band."""
+    from locg.collection_io import import_xlsx, make_identity
+
+    cache = make_cache(tmp_path)
+    # Already-owned canonical row (from a prior import).
+    owned = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Daredevil",
+        full_title="Daredevil #181",
+        release_date="1982-04-10",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    owned["source"] = "locg_export"
+    # A pending win for the SAME book, recorded with no publisher + fabricated date.
+    win = make_agent_win_row(
+        publisher=None, series="Daredevil", full_title="Daredevil #181",
+        release_date="1982-01-01", gixen_item_id="99", pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([owned, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    # LOCG carries ONE canonical Daredevil #181 (it collapses the win into the
+    # owned copy on its side).
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Daredevil",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    dd = [r for r in payload["comics"] if r["full_title"] == "Daredevil #181"]
+    win_row = next(r for r in dd if r.get("gixen_item_id") == "99")
+    assert win_row["pushed_to_locg_at"] is None, "win must stay pending, not merge onto owned row"
+    # No duplicate-identity pair created.
+    idents = [make_identity(r) for r in payload["comics"]]
+    assert len(idents) == len(set(idents)), "no duplicate-identity rows"
+    assert result["reconciled"] == 0
+    assert result["warnings"], "collision must be surfaced as a warning"
 
 
 def test_pending_agent_win_cross_year_not_reconciled(tmp_path):
