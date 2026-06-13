@@ -1270,3 +1270,115 @@ def test_wish_export_owned_match_is_dash_and_article_insensitive(tmp_path):
         {"full_title": "Batman: One Bad Day – Two-Face #1", "in_collection": 1},  # en-dash
     ]}
     assert wish_rows_for_export(payload) == []
+
+
+# ---------------------------------------------------------------------------
+# import_xlsx — BUI-124: hold ownership downgrades in the Phase-2 standard merge.
+# The gixen server is the source of truth (BUI-87), so a LOCG export reporting
+# In Collection=0 over an owned row must NOT silently un-own the book (which
+# would make collection-check buy a duplicate). The downgrade is held (existing
+# in_collection preserved), flagged as ownership_downgrade_held, and counted.
+# ---------------------------------------------------------------------------
+
+def _import_owned_then(tmp_path: Path, first: dict[str, Any], second: dict[str, Any]):
+    """Import `first` (establishes an owned locg_export row), then `second`
+    (the candidate downgrade). Returns (cache, second_result)."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    xlsx1 = tmp_path / "first.xlsx"
+    _build_export_xlsx(xlsx1, [first])
+    import_xlsx(xlsx1, cache)
+
+    xlsx2 = tmp_path / "second.xlsx"
+    _build_export_xlsx(xlsx2, [second])
+    result = import_xlsx(xlsx2, cache)
+    return cache, result
+
+
+def _audit_types(tmp_path: Path) -> list[str]:
+    path = tmp_path / "import-history.jsonl"
+    if not path.exists():
+        return []
+    lines = path.read_text().strip().splitlines()
+    return [json.loads(l)["type"] for l in lines if l]
+
+
+def test_exact_identity_downgrade_held(tmp_path):
+    """Exact-identity update: an owned row stays owned when the re-export says
+    In Collection=0; the hold is flagged and counted."""
+    base = {
+        "publisher": "Marvel Comics", "series": "Daredevil",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }
+    cache, result = _import_owned_then(
+        tmp_path,
+        {**base, "in_collection": 1},
+        {**base, "in_collection": 0},
+    )
+
+    rows = [r for r in cache.load()["comics"] if r["full_title"] == "Daredevil #181"]
+    assert len(rows) == 1
+    assert rows[0]["in_collection"] == 1, "ownership must be preserved, not downgraded"
+    assert result["ownership_downgrades_held"] == 1
+    assert "ownership_downgrade_held" in _audit_types(tmp_path)
+
+
+def test_rename_branch_downgrade_held(tmp_path):
+    """Rename branch (same publisher/series/release_date, new full_title): an
+    owned row stays owned when the renamed export row says In Collection=0."""
+    cache, result = _import_owned_then(
+        tmp_path,
+        {"publisher": "Marvel Comics", "series": "Amazing Spider-Man",
+         "full_title": "Amazing Spider-Man #300", "release_date": "1988-05-10",
+         "in_collection": 1},
+        {"publisher": "Marvel Comics", "series": "Amazing Spider-Man",
+         "full_title": "Amazing Spider-Man #300 Direct", "release_date": "1988-05-10",
+         "in_collection": 0},
+    )
+
+    rows = cache.load()["comics"]
+    renamed = [r for r in rows if r["full_title"] == "Amazing Spider-Man #300 Direct"]
+    assert len(renamed) == 1, "rename must update in place, not insert"
+    assert renamed[0]["in_collection"] == 1, "ownership preserved across the rename"
+    assert renamed[0]["previous_full_title"] == "Amazing Spider-Man #300"
+    assert result["ownership_downgrades_held"] == 1
+    assert "ownership_downgrade_held" in _audit_types(tmp_path)
+
+
+def test_non_downgrade_copies_in_collection_normally(tmp_path):
+    """A re-export that keeps the book owned (In Collection=1) copies through and
+    is NOT flagged as a held downgrade."""
+    base = {
+        "publisher": "Marvel Comics", "series": "Daredevil",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }
+    cache, result = _import_owned_then(
+        tmp_path,
+        {**base, "in_collection": 1},
+        {**base, "in_collection": 1},
+    )
+
+    rows = [r for r in cache.load()["comics"] if r["full_title"] == "Daredevil #181"]
+    assert rows[0]["in_collection"] == 1
+    assert result["ownership_downgrades_held"] == 0
+    assert "ownership_downgrade_held" not in _audit_types(tmp_path)
+
+
+def test_count_decrease_that_stays_owned_copies_normally(tmp_path):
+    """in_collection is a copies-owned count; a decrease that stays truthy
+    (2 -> 1) is a normal update, not a downgrade — it copies through unflagged."""
+    base = {
+        "publisher": "Marvel Comics", "series": "Daredevil",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }
+    cache, result = _import_owned_then(
+        tmp_path,
+        {**base, "in_collection": 2},
+        {**base, "in_collection": 1},
+    )
+
+    rows = [r for r in cache.load()["comics"] if r["full_title"] == "Daredevil #181"]
+    assert rows[0]["in_collection"] == 1, "count change that stays owned applies"
+    assert result["ownership_downgrades_held"] == 0
+    assert "ownership_downgrade_held" not in _audit_types(tmp_path)
