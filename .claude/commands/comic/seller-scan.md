@@ -85,9 +85,53 @@ Progress info (listing count, match count) prints to stderr. Redirect to suppres
 seller_scan.py <seller> 2>/dev/null
 ```
 
+## Verify borderline matches (match_score < 0.7)
+
+The fuzzy matcher (issue-number-in-title + ≥50% series-token overlap) is deliberately loose so it doesn't miss a wish-list book — but that means a short or generic series name can produce a **false positive** (e.g. wish-list "Daredevil #1" matching a "Daredevil Annual #1" or an unrelated reprint). Those false positives are the leak at the **seller-scan → /comic:buy seam**: once a wrong URL flows into `/comic:buy`, identify + FMV will happily price the wrong book.
+
+**Gate:** only verify matches whose reported `match_score < 0.7`. Exact / near-exact matches (≥ 0.7) are trustworthy — don't spend an agent on them. If every surfaced match is ≥ 0.7, skip this step entirely.
+
+For each borderline match, dispatch a **`general-purpose` subagent** (one agent can take the whole borderline batch) with this prompt:
+
+```
+You are verifying whether an eBay listing genuinely matches a comic on a want-list,
+to stop a false positive from flowing into an automated bidding pipeline. You are
+ADVISORY ONLY — you decide MATCH / NO-MATCH / UNCERTAIN, you do not bid or buy.
+
+WANT-LIST ITEM: {wishlist_name}        (e.g. "Daredevil #1")
+EBAY LISTING TITLE: {listing_title}
+FUZZY MATCH SCORE: {match_score}
+
+Decide whether the listing is the SAME series AND the SAME issue number as the
+want-list item. Watch for these false-positive traps:
+- A different but similarly-named series (Annual, Giant-Size, "... Adventures",
+  "... Unlimited", a reprint/facsimile line, a different publisher's same-named title).
+- The issue number appearing in the title for another reason (a price, a year, a
+  lot count like "lot of 12", a different issue in a multi-book listing).
+- A volume/reboot mismatch (e.g. a 2016 vol. 5 #1 vs. the want-listed 1964 vol. 1 #1)
+  when the want-list item implies a specific era.
+
+Treat the want-list series as the source of truth. When the listing is plainly a
+DIFFERENT series or a DIFFERENT issue → NO-MATCH. When it clearly is the same
+book → MATCH. When you genuinely cannot tell from the title alone → UNCERTAIN
+(do NOT guess MATCH to be safe, and do NOT guess NO-MATCH to be safe).
+
+Output exactly:
+VERDICT: MATCH | NO-MATCH | UNCERTAIN
+REASON: <one line>
+```
+
+Fold the verdicts back into the match table as a **Verify** column, and split the hand-off list (no silent drops — the user must see exactly what was filtered and why):
+
+- **MATCH** → keep; flows into `/comic:buy`.
+- **UNCERTAIN** → keep but mark `⚠️ verify manually`; flows into `/comic:buy` only after the user eyeballs it (a title-only check can't see the cover).
+- **NO-MATCH** → **exclude from the URLs handed to `/comic:buy`**, but list it explicitly under a "Filtered as likely false positives" heading with the agent's one-line reason, so the user can override if the agent was wrong.
+
+This mirrors the rest of the pipeline's discipline: bias toward not losing a real match (UNCERTAIN stays in, gated on the user), and never silently drop.
+
 ## Feed matches into /comic:buy
 
-Copy the eBay URLs from the URL column and pass them to `/comic:buy`. The buy workflow will identify, check your collection, calculate FMV, and add snipes.
+Copy the eBay URLs from the URL column (MATCH rows, plus any UNCERTAIN rows the user cleared) and pass them to `/comic:buy`. The buy workflow will identify, check your collection, calculate FMV, and add snipes.
 
 ## Matching algorithm
 
@@ -104,7 +148,7 @@ Copy the eBay URLs from the URL column and pass them to `/comic:buy`. The buy wo
 | eBay rejected the seller filter | The resolved username isn't a valid eBay login username — re-check the `_ssn=` value and update the alias |
 | `Dropped N listing(s) from other sellers` | Safety net fired: eBay returned foreign sellers and they were filtered out. Usually means the alias points at the wrong/stale username |
 | 0 listings fetched | Seller may have no active auction listings; check their eBay page |
-| False positives (wrong comic) | Check match_score — scores near 0.5 with short series names can be ambiguous |
+| False positives (wrong comic) | Check match_score — scores near 0.5 with short series names can be ambiguous. Matches below 0.7 are auto-routed through the borderline match verifier (see "Verify borderline matches") before the buy hand-off |
 | Expected a match but got nothing new | It was already surfaced in a prior scan and hidden by default. Re-run with `--all` to see every match. |
 | `could not fetch/record seen item IDs` warning | Best-effort seen-tracking couldn't reach the server, so the scan showed all matches (safe fallback). Check `$GIXEN_SERVER_URL` is reachable if you want only-new filtering back. |
 | Wish list empty | seller-scan now fetches the wish-list from the gixen server (`GET /api/comics/wish-list`), not a local `locg` call. Check `curl -sf "$GIXEN_SERVER_URL/api/comics/wish-list"` returns items; if empty, run the LOCG import flow. |
