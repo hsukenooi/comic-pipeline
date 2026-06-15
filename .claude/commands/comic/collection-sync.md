@@ -22,21 +22,29 @@ login). This skill drives everything else and gates hard around them.
 
 ## Step 0: Resolve the server + bootstrap guard
 
-Resolve `GIXEN_SERVER_URL` (env var, hostname fallback — same as `/comic:fmv`)
-and confirm the server is healthy and has a collection before touching anything:
+Resolve and health-gate the server through the **shared comics-server call
+convention** (BUI-172, `docs/conventions/comics-server-call.md`) — never
+hand-roll URL resolution or `curl` error handling here:
 
 ```bash
-echo "${GIXEN_SERVER_URL:-UNSET}"; hostname
-# unset → MacBook (Hsus-MacBook-Air.local): http://mac-mini.tail9b7fa5.ts.net:8080
-#         Mac Mini: http://localhost:8080 ; neither → stop
-curl -sf "$GIXEN_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1   # GIXEN_SERVER_URL (env var, hostname fallback)
+comics_health_gate     || exit 1   # the process is up
+# BUI-157: route the status read through comics_curl too. /health is static, so
+# it passes even when the collection store is corrupt and /collection/status
+# 500s — comics_curl hard-fails on that 500 so it can't slip past the gate below.
+comics_curl "$GIXEN_SERVER_URL/api/comics/collection/status" \
+  || { echo "status check failed"; exit 1; }
 ```
 
-**If the health gate fails:** STOP — never sync against an unreachable server.
+**If the health gate or status call fails:** STOP — never sync against an
+unreachable or erroring server.
 
-**If `last_full_import` is null:** STOP with:
+**If `last_full_import` is absent or null:** STOP with:
 > Collection empty on the server — run a full LOCG import before syncing.
+
+(Assert the field is *present* and non-null — a 500 body has no `last_full_import`
+key at all, which `comics_curl`'s hard-fail already catches above.)
 
 Record `row_count` and `pending_push_count` from the status response as
 `ROWS_BEFORE` and `PENDING_BEFORE` — the post-import safety check (Step 6) needs
@@ -66,9 +74,16 @@ The export reads the **server** collection (read-only — it does not mark rows
 pushed) and returns the file contents; save them locally for the upload:
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/export" -o /tmp/sync-export.json
+# BUI-138: a FRESH temp file per run + a hard-fail BEFORE the parse. With the
+# old fixed temp path, a failed export (server down / 500) left the prior run's
+# file untouched and the next line happily built a CSV from STALE data.
+# comics_curl hard-fails on non-200, and mktemp guarantees no stale reuse.
+EXPORT_JSON="$(mktemp -t sync-export.XXXXXX)"
+comics_curl "$GIXEN_SERVER_URL/api/comics/collection/export" -o "$EXPORT_JSON" \
+  || { echo "export failed — not generating a CSV from stale data"; exit 1; }
 ts=$(date +%Y-%m-%dT%H%M%S)
-python3 -c "import json,os; d=json.load(open('/tmp/sync-export.json')); \
+CSV="$HOME/Downloads/locg-bulk-import-$ts.csv"   # BUI-158: bind for Step 3's split
+python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \
   base=os.path.expanduser(f'~/Downloads/locg-bulk-import-$ts'); \
   open(base+'.csv','w').write(d['csv']); open(base+'.notes.md','w').write(d['notes_md']); \
   print('csv:', base+'.csv'); print('ready:', d['ready_count'], '| manual_series:', d['manual_series_count'], '| wish:', d['wish_list_count'])"
@@ -101,7 +116,8 @@ appear — if it does, **stop** and report it (the export safety filter failed).
 
 **LOCG import is flaky — upload in small batches.** LOCG's importer times out on
 larger files (observed: ~20 rows succeeds; ~100 fails at 0% with "Error: timeout").
-If the CSV is more than ~20 rows, split it and upload one chunk at a time:
+If the CSV is more than ~20 rows, split it and upload one chunk at a time
+(`$CSV` is the path bound in Step 2 — BUI-158):
 
 ```bash
 python3 - "$CSV" <<'PY'
