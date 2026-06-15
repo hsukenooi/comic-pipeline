@@ -17,7 +17,7 @@ Use the eBay Browse API via `~/Projects/comic-pipeline/apps/ebay/src/ebay_fetch.
 
 ```python
 #!/usr/bin/env python3
-import base64, json, os, urllib.request, requests
+import base64, json, os, time, urllib.request, requests
 from pathlib import Path
 
 with open(Path("~/.config/ebay-fetch/config.json").expanduser()) as _f:
@@ -26,23 +26,42 @@ APP_ID = os.environ.get("EBAY_CLIENT_ID") or _cfg.get("client_id")
 CERT_ID = os.environ.get("EBAY_CLIENT_SECRET") or _cfg.get("client_secret")
 BASE_URL = "https://api.ebay.com"
 
+def _request_json(method, url, *, headers=None, params=None, data=None, what="request"):
+    # BUI-147: mirror ebay_fetch.py's contract — retry 429 with backoff and
+    # abort LOUDLY on a persistent non-200. Without this, a down/429/404 API
+    # returns an error body, .json() yields no image keys, and the listing is
+    # reported with image_count=0 — indistinguishable from a genuinely
+    # photo-less listing, so the Step 1.5 triage silently DROPs a real book.
+    for attempt in range(4):
+        resp = requests.request(method, url, headers=headers, params=params, data=data, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 429:
+            time.sleep(2 ** attempt)
+            continue
+        raise RuntimeError(f"{what}: HTTP {resp.status_code} {resp.text[:200]}")
+    raise RuntimeError(f"{what}: still rate-limited (429) after retries")
+
 def get_token():
     creds = base64.b64encode(f"{APP_ID}:{CERT_ID}".encode()).decode()
-    return requests.post(
-        f"{BASE_URL}/identity/v1/oauth2/token",
+    tok = _request_json(
+        "POST", f"{BASE_URL}/identity/v1/oauth2/token",
         headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
         data={"grant_type": "client_credentials", "scope": "https://api.ebay.com/oauth/api_scope"},
-        timeout=10,
-    ).json()["access_token"]
+        what="oauth token",
+    )
+    if "access_token" not in tok:  # guard: don't KeyError on a malformed body
+        raise RuntimeError(f"oauth token response missing access_token: {tok}")
+    return tok["access_token"]
 
 def download_listing(token, item_id, outdir):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     headers = {"Authorization": f"Bearer {token}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"}
-    data = requests.get(
-        f"{BASE_URL}/buy/browse/v1/item/get_item_by_legacy_id",
-        headers=headers, params={"legacy_item_id": item_id}, timeout=10,
-    ).json()
+    data = _request_json(
+        "GET", f"{BASE_URL}/buy/browse/v1/item/get_item_by_legacy_id",
+        headers=headers, params={"legacy_item_id": item_id}, what=f"item {item_id}",
+    )
     imgs = []
     if "image" in data:
         imgs.append(data["image"]["imageUrl"])
@@ -52,6 +71,10 @@ def download_listing(token, item_id, outdir):
         urllib.request.urlretrieve(url, outdir / f"img-{i:02d}.jpg")
     # Auction value signal for the value gate (Step 2): currentBidPrice/bidCount are
     # already in the Browse API response — capture them, no extra request needed.
+    # BUI-165: for a fixed-price (BIN) listing currentBidPrice is absent, so this
+    # falls back to the BIN price. current_price is therefore the live bid OR the
+    # BIN price (None only when no price field is present at all), and it counts
+    # toward the Step 2 value gate just like an auction bid does.
     price_node = data.get("currentBidPrice") or data.get("price") or {}
     try:
         current_price = float(price_node.get("value")) if price_node.get("value") is not None else None
@@ -60,7 +83,7 @@ def download_listing(token, item_id, outdir):
     return {
         "title": data.get("title", item_id),
         "image_count": len(imgs),
-        "current_price": current_price,            # USD float, or None for BIN/unknown
+        "current_price": current_price,            # USD float: live bid or BIN price; None only if absent
         "bid_count": data.get("bidCount"),         # int for auctions, None otherwise
     }
 
@@ -68,13 +91,21 @@ WORKDIR = "/tmp/comic-grading"
 items = [("comic-1", "178057470740"), ("comic-2", "178057488707"), ...]
 token = get_token()
 for label, item_id in items:
-    result = download_listing(token, item_id, f"{WORKDIR}/{label}")
+    try:
+        result = download_listing(token, item_id, f"{WORKDIR}/{label}")
+    except RuntimeError as e:
+        # BUI-147: a fetch failure is NOT zero images. Surface it loudly so the
+        # Step 1.5 triage doesn't DROP a real book as "un-gradeable".
+        print(f"{label}: FETCH FAILED — {e}")
+        continue
     price = result["current_price"]
     price_str = f"${price:.2f}" if price is not None else "n/a"
     print(f"{label}: {result['title']} — {result['image_count']} images — current bid {price_str} ({result['bid_count']} bids)")
 ```
 
-The printed `current_price` per comic is the **value signal for the Step 2 value gate** — capture it alongside the item id (e.g. keep the `result` dicts) so escalation can branch on auction value. `current_price` is `None` for fixed-price listings or when the field is absent; treat unknown value as "below threshold" (single grader) unless other signals say otherwise.
+The printed `current_price` per comic is the **value signal for the Step 2 value gate** — capture it alongside the item id (e.g. keep the `result` dicts) so escalation can branch on listing value. `current_price` is the auction's current bid or, for a fixed-price (BIN) listing, its Buy-It-Now price — **both count toward the value gate** (a $40 BIN is a high-value lot and escalates the same as a $40 auction). It is `None` only when no price field is present at all; treat a genuinely absent value as "below threshold" (single grader) unless other signals say otherwise (BUI-165).
+
+**A `FETCH FAILED` line is not an image-less listing (BUI-147).** If the download script prints `FETCH FAILED` for a comic (a down/429/404 eBay API), do **not** feed it to the triage pre-pass or drop it as "un-gradeable" — that's an API failure, not a photo-quality verdict. Re-run that item (the script retries 429 automatically); surface the failure to the user rather than silently grading 0 images.
 
 Output directory layout:
 ```
