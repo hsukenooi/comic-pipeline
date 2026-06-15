@@ -73,11 +73,18 @@ Wish-listing a book you already own is the bug that deleted real collection rows
 (BUI-122): an owned-but-wished book gets pushed to LOCG with `In Collection=0`,
 which removes it from the collection. Filter owned issues out **before** adding.
 
-For each resolved issue, ask the server's collection (no LOCG network needed):
+For each resolved issue, ask the server's collection (no LOCG network needed).
+**Check by series + issue only — do NOT pass `year`.** `year` is a *per-issue
+cover year* gated on `release_date.startswith(year)`, not a series disambiguator
+(BUI-129). Forwarding Metron's `year_began` (e.g. `1963` for a run whose issues
+actually shipped 1975–1991) filters out every owned mid-run issue and returns a
+false `not_in_cache` for the whole series — wish-listing books you already own,
+the exact BUI-122 deletion path Step 3 exists to prevent. Since wishlist-add
+checks by issue *number* it has no per-issue cover date to pass, so omit `year`:
 
 ```bash
-# series = plain name (e.g. "Marvel Tales"); year = Metron year_began
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/check?series=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")&issue=<N>&year=<YEAR>"
+# series = plain name (e.g. "Marvel Tales"); check by series + issue, NEVER year
+curl -sf "$GIXEN_SERVER_URL/api/comics/collection/check?series=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")&issue=<N>"
 ```
 
 - `{"match_status": "in_collection"}` → **owned, skip it** (don't wish-list).
@@ -165,3 +172,4 @@ overwritten by the next full `collection import` unless pushed to LOCG first.
 | Re-running the whole range after a partial failure | Re-add only the issues that didn't succeed; the wish-list endpoint does not dedupe |
 | Writing to `data/locg/wish-list.json` directly | Adds go to the server via `POST /api/comics/wish-list` — the repo file is no longer the source of truth (BUI-93) |
 | Wish-listing issues you already own | Collection-check each issue first (Step 3) and skip owned ones — wishing an owned book is what deleted collection rows in BUI-122 |
+| Passing `year` (Metron's `year_began`) to `collection/check` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`, not a series disambiguator. Forwarding a series start-year filters out every owned mid-run issue and returns a false `not_in_cache`, so an owned book gets wish-listed (BUI-129/BUI-131). Check by series + issue only |
