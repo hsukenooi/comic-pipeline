@@ -62,9 +62,16 @@ class VerifyRequest(BaseModel):
 
 
 class WishListAddRequest(BaseModel):
-    """POST /api/comics/wish-list — append one issue to the wish-list (BUI-92)."""
+    """POST /api/comics/wish-list — append one issue to the wish-list (BUI-92).
+
+    ``force`` (BUI-130) bypasses the already-owned guard. By default the endpoint
+    rejects a title already in the collection with 409, because wish-listing an
+    owned book is the BUI-122 data-loss trigger; ``force=true`` is the escape
+    hatch for the rare intentional case (a different printing/variant).
+    """
 
     title: str
+    force: bool = False
 
     @field_validator("title")
     @classmethod

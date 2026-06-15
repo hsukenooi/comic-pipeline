@@ -725,6 +725,109 @@ def cmd_wish_list_remove(title: str) -> dict[str, Any]:
     }
 
 
+# Wish-list entry names are written as "<Series> #<Issue>" by cmd_wish_list_add
+# (and by the /comic:wishlist-add skill). Split on the first "#" so the leading
+# text is the series and the token right after "#" is the issue. Trailing variant
+# text (e.g. "#300 (Direct)") is ignored for the ownership check.
+_WISH_NAME_RE = re.compile(r"^(?P<series>.*?)\s*#\s*(?P<issue>[0-9A-Za-z.\-]+)")
+
+
+def _split_wish_list_name(name: str) -> Optional[tuple[str, str]]:
+    """Split a wish-list entry name into ``(series, issue)``.
+
+    Returns ``None`` when the name has no ``#<issue>`` token or no series text
+    before it — those entries can't be ownership-checked and are reported as
+    ``unparseable`` rather than silently dropped.
+    """
+    m = _WISH_NAME_RE.match(name or "")
+    if m is None:
+        return None
+    series = m.group("series").strip()
+    issue = m.group("issue").strip()
+    if not series or not issue:
+        return None
+    return series, issue
+
+
+def cmd_wish_list_conflicts() -> dict[str, Any]:
+    """Audit the wish-list cache for items already in the collection (BUI-130).
+
+    Cross-references every wish-list entry against the collection cache — the
+    same per-item check ``/comic:wishlist-add`` runs at add time, applied
+    retroactively to the full list. A wish-listed book you already own is the
+    BUI-122 data-loss risk: ``/comic:collection-sync`` exports it with
+    ``In Collection=0``, which tells LOCG to *remove* it from the collection.
+
+    ``year`` is deliberately NOT passed to :func:`cmd_collection_check`: a
+    wish-list name carries only series + issue, never a per-issue cover date,
+    and forwarding a series start-year is exactly the BUI-129 bug (it filters
+    out every owned row whose release year differs).
+
+    Raises ``FileNotFoundError`` if the wish-list cache does not exist.
+    """
+    items = cmd_wish_list_from_cache()
+    conflicts: list[dict[str, Any]] = []
+    unparseable: list[str] = []
+    checked = 0
+    for it in items:
+        name = it.get("name") or ""
+        parsed = _split_wish_list_name(name)
+        if parsed is None:
+            unparseable.append(name)
+            continue
+        series, issue = parsed
+        checked += 1
+        result = cmd_collection_check(series=series, issue=issue)
+        if result["match_status"] == "in_collection":
+            conflicts.append({
+                "name": name,
+                "series": series,
+                "issue": issue,
+                "id": it.get("id"),
+                "full_title_matched": result["full_title_matched"],
+            })
+    return {
+        "total": len(items),
+        "checked": checked,
+        "unparseable": unparseable,
+        "conflicts": conflicts,
+    }
+
+
+def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
+    """Remove every wish-list entry already in the collection (BUI-130).
+
+    Re-derives the conflict set via :func:`cmd_wish_list_conflicts`, then removes
+    each by exact name with :func:`cmd_wish_list_remove`. Returns the removed
+    entries plus the remaining count, so the caller can report what was cleared
+    without a second audit. The GET audit is the dry-run preview; this performs
+    the removal.
+
+    Raises ``FileNotFoundError`` if the wish-list cache does not exist.
+    """
+    audit = cmd_wish_list_conflicts()
+    removed: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for conflict in audit["conflicts"]:
+        result = cmd_wish_list_remove(conflict["name"])
+        if "error" in result:
+            errors.append({"name": conflict["name"], "error": result["error"]})
+        else:
+            removed.append(result["removed"])
+    try:
+        remaining = len(cmd_wish_list_from_cache())
+    except FileNotFoundError:
+        remaining = 0
+    return {
+        "removed": removed,
+        "removed_count": len(removed),
+        "errors": errors,
+        "remaining": remaining,
+        "checked": audit["checked"],
+        "unparseable": audit["unparseable"],
+    }
+
+
 def cmd_read_list(client: LOCGClient, title: Optional[str] = None) -> list[dict[str, Any]]:
     """Get the user's read list."""
     return _get_user_list(client, "read", title=title)

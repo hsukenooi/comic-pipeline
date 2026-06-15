@@ -1466,3 +1466,127 @@ def test_record_win_integration_mix(tmp_path):
 
     manual_rows = [r for r in agent_rows if r["needs_manual_series_canonical"]]
     assert len(manual_rows) == 2
+
+
+# ---------------------------------------------------------------------------
+# BUI-130: wish-list / collection conflict audit + bulk removal
+# ---------------------------------------------------------------------------
+
+def _seed_wish_list(items: list[dict[str, Any]]) -> None:
+    """Write a wish-list.json to the conftest-isolated cache dir."""
+    from locg.config import wish_list_cache_path
+
+    path = wish_list_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"updated_at": "2026-06-01T00:00:00Z", "items": items}))
+
+
+def test_split_wish_list_name_parses_series_and_issue():
+    from locg.commands import _split_wish_list_name
+
+    assert _split_wish_list_name("Uncanny X-Men #148") == ("Uncanny X-Men", "148")
+    # Trailing variant text after the issue token is ignored.
+    assert _split_wish_list_name("Amazing Spider-Man #300 (Direct)") == (
+        "Amazing Spider-Man",
+        "300",
+    )
+    # No issue token or no series → unparseable.
+    assert _split_wish_list_name("Uncanny X-Men") is None
+    assert _split_wish_list_name("#148") is None
+    assert _split_wish_list_name("") is None
+
+
+def test_wish_list_conflicts_flags_owned_items(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row()])  # owns Amazing Spider-Man #300
+    _seed_wish_list([
+        {"name": "Amazing Spider-Man #300", "id": 111},
+        {"name": "X-Men #1", "id": None},
+    ])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert result["total"] == 2
+    assert result["checked"] == 2
+    assert result["unparseable"] == []
+    assert len(result["conflicts"]) == 1
+    conflict = result["conflicts"][0]
+    assert conflict["name"] == "Amazing Spider-Man #300"
+    assert conflict["series"] == "Amazing Spider-Man"
+    assert conflict["issue"] == "300"
+    assert conflict["id"] == 111
+    assert conflict["full_title_matched"] == "Amazing Spider-Man #300"
+
+
+def test_wish_list_conflicts_ignores_series_start_year(tmp_path, monkeypatch):
+    """BUI-129 workaround: the audit never passes a series start-year, so an
+    owned issue whose release year differs from the run's first year is still
+    flagged. (Forwarding year_began was the bug that hid 16 owned X-Men.)"""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Uncanny X-Men (1963 - 2011)",
+        full_title="Uncanny X-Men #148",
+        release_date="1981-08-01",  # run began 1963, issue released 1981
+    )])
+    _seed_wish_list([{"name": "Uncanny X-Men #148", "id": None}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["Uncanny X-Men #148"]
+
+
+def test_wish_list_conflicts_reports_unparseable(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row()])
+    _seed_wish_list([
+        {"name": "Amazing Spider-Man #300", "id": None},
+        {"name": "Just A Series Name", "id": None},  # no #issue
+    ])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert result["checked"] == 1
+    assert result["unparseable"] == ["Just A Series Name"]
+    assert len(result["conflicts"]) == 1
+
+
+def test_wish_list_conflicts_missing_cache_raises(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row()])
+    with pytest.raises(FileNotFoundError):
+        cmds.cmd_wish_list_conflicts()
+
+
+def test_wish_list_remove_conflicts_removes_only_owned(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row()])  # owns Amazing Spider-Man #300
+    _seed_wish_list([
+        {"name": "Amazing Spider-Man #300", "id": None},
+        {"name": "X-Men #1", "id": None},
+    ])
+
+    result = cmds.cmd_wish_list_remove_conflicts()
+
+    assert result["removed_count"] == 1
+    assert result["errors"] == []
+    assert result["remaining"] == 1
+    assert [r["name"] for r in result["removed"]] == ["Amazing Spider-Man #300"]
+
+    # The non-owned item survives; the owned one is gone.
+    remaining = cmds.cmd_wish_list_from_cache()
+    assert [it["name"] for it in remaining] == ["X-Men #1"]

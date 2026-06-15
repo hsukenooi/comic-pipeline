@@ -85,6 +85,13 @@ whole wish list previously **deleted owned-but-wished books** from the LOCG
 collection. With the fix the CSV can never remove a book you own. Genuine new
 wishes still import fine (LOCG adds a wish by title).
 
+**Optional pre-sync hygiene (BUI-130):** the export filter keeps owned books out
+of the *CSV*, but the stale owned-but-wished entries still sit in the wish-list
+itself. To clean them out at the source, audit first
+(`GET /api/comics/wish-list/conflicts` — dry run) and, if it surfaces any,
+`POST /api/comics/wish-list/remove-conflicts` to clear them in one call (no SSH).
+Both 409 if the collection was never imported.
+
 ## Step 3: Upload to LOCG (manual — you)
 
 Open League of Comic Geeks → **My Comics → Bulk Import** and upload the CSV from
