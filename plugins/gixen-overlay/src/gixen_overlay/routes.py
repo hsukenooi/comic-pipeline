@@ -106,14 +106,17 @@ async def api_list_comics(
     year: int | None = None,
     grade: float | None = None,
     locg_id: int | None = None,
+    locg_variant_id: int | None = None,
     max_age_days: float | None = None,
 ):
     """List comics enriched with FMV data.
 
     `locg_id` + `grade` is the canonical lookup for FMV cache reuse — see
-    `comic-fmv` (apps/fmv) and `/comic:fmv`. `max_age_days` excludes rows
-    whose `fmv_updated_at` is older than the cutoff so callers can't reuse
-    stale FMVs by accident.
+    `comic-fmv` (apps/fmv) and `/comic:fmv`. `locg_variant_id` (BUI-139) scopes
+    the lookup to one variant so a base cover and a Newsstand variant of the
+    same issue (same `locg_id`) don't reuse each other's FMV. `max_age_days`
+    excludes rows whose `fmv_updated_at` is older than the cutoff so callers
+    can't reuse stale FMVs by accident.
     """
     db = request.app.state.db
     rows = list_comics(
@@ -123,6 +126,7 @@ async def api_list_comics(
         year=year,
         grade=grade,
         locg_id=locg_id,
+        locg_variant_id=locg_variant_id,
         max_age_days=max_age_days,
     )
     return [dict(r) for r in rows]
@@ -801,11 +805,17 @@ async def api_extract_comics(request: Request):
                     locg_variant_id=primary_resolution.locg_variant_id if (primary_resolution and idx == 0) else None,
                 )
                 if parsed.grade is not None:
+                    # BUI-144/145: scope to the comic_id upsert_comic just
+                    # returned, not a title/issue re-match. The old query
+                    # ignored year AND variant, so a bid could link to a valued
+                    # FMV of a DIFFERENT edition (e.g. ASM 1963 #1 priced at the
+                    # 2018 reprint's FMV) — comic_id already encodes year+variant,
+                    # so this is correct for free and mirrors the no-grade branch.
                     existing_valued = db.execute(
-                        "SELECT f.id FROM fmv f JOIN comics c ON c.id = f.comic_id "
-                        "WHERE LOWER(c.title)=LOWER(?) AND c.issue=? AND f.grade=? AND f.low IS NOT NULL "
+                        "SELECT f.id FROM fmv f "
+                        "WHERE f.comic_id=? AND f.grade=? AND f.low IS NOT NULL "
                         "LIMIT 1",
-                        (parsed.series, issue, parsed.grade),
+                        (comic_id, parsed.grade),
                     ).fetchone()
                     if existing_valued:
                         fmv_id = existing_valued["id"]

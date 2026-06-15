@@ -125,6 +125,31 @@ class TestDbLookup:
                                         max_age_days=7)
         assert row is None  # locg_id mismatch → cache miss
 
+    def test_variant_blind_lookup_returns_correct_variant(self, server_url):
+        """BUI-139: a base cover and a Newsstand variant of one issue share the
+        same issue-level locg_id (only locg_variant_id differs), so a
+        locg_id+grade match alone is variant-blind and could reuse the wrong
+        price tier. A base request (locg_variant_id=None) returns only the
+        NULL-variant row; a specific-variant request returns only that variant.
+        The server here returns BOTH rows (simulating an old server that ignores
+        the param), so this also pins the client-side re-check."""
+        rows = [
+            {"id": 1, "locg_id": 1, "locg_variant_id": None, "grade": 9.4,
+             "fmv_low": 40, "fmv_updated_at": "2026-05-09T00:00:00"},
+            {"id": 2, "locg_id": 1, "locg_variant_id": 77, "grade": 9.4,
+             "fmv_low": 120, "fmv_updated_at": "2026-05-10T00:00:00"},
+        ]
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = rows
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            base = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.4,
+                                         locg_variant_id=None, max_age_days=7)
+            variant = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.4,
+                                            locg_variant_id=77, max_age_days=7)
+        assert base["id"] == 1 and base["fmv_low"] == 40       # base, not variant
+        assert variant["id"] == 2 and variant["fmv_low"] == 120  # variant, not base
+
     def test_empty_returns_none(self, server_url):
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
