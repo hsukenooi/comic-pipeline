@@ -46,10 +46,12 @@ from locg.commands import (
     cmd_collection_export,
     cmd_collection_import,
     cmd_collection_record_win,
+    cmd_collection_series_names,
     cmd_collection_status,
     cmd_wish_list_add,
     cmd_wish_list_conflicts,
     cmd_wish_list_from_cache,
+    cmd_wish_list_remove,
     cmd_wish_list_remove_conflicts,
 )
 from openpyxl.utils.exceptions import InvalidFileException
@@ -911,6 +913,21 @@ async def api_collection_status():
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
 
 
+@router.get("/api/comics/collection/series-names")
+async def api_collection_series_names():
+    """Series names present in the collection cache (BUI-129).
+
+    Lets a caller resolve a Metron/identify series name to the exact LOCG
+    catalog spelling before calling `/check` — or surface a "not found — did you
+    mean X?" hint — instead of trusting a silent `not_in_cache` that may just be
+    an exact-match miss. Provider-neutral, read-only."""
+    _ensure_collection_store()
+    try:
+        return cmd_collection_series_names()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+
+
 @router.get("/api/comics/wish-list")
 async def api_wish_list(title: str | None = None):
     """Wish-list read (R3) for seller-scan to match against. Returns
@@ -1122,6 +1139,33 @@ async def api_wish_list_add(req: WishListAddRequest):
     result = cmd_wish_list_add(req.title)
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
+    return result
+
+
+@router.delete("/api/comics/wish-list")
+async def api_wish_list_remove(title: str | None = None):
+    """Remove an issue from the wish-list on the server (BUI-128).
+
+    Mirrors `locg wish-list remove`. Uses a `title` query param rather than a
+    request body — cleaner REST for DELETE, and lets the caller hit
+    `DELETE /api/comics/wish-list?title=...`. Replaces the old SSH-into-the-Mac-
+    Mini-and-run-`locg wish-list remove` workaround that broke the
+    server-as-source-of-truth model.
+
+    Status codes: 422 for a blank title, 404 when the title isn't present (or the
+    wish-list was never imported), 200 on a successful removal. Like the POST
+    append, a removal is overwritten by the next full import unless pushed to
+    LOCG first.
+    """
+    _ensure_collection_store()
+    result = cmd_wish_list_remove(title or "")
+    if "error" in result:
+        # A blank title is a malformed request (422); every other error here
+        # means the title — or the wish-list cache itself — wasn't found (404).
+        is_blank = "non-empty" in result["error"]
+        raise HTTPException(
+            status_code=422 if is_blank else 404, detail=result["error"]
+        )
     return result
 
 

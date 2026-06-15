@@ -60,6 +60,7 @@ def test_locg_command_surface_resolves():
         cmd_wish_list_add,
         cmd_wish_list_conflicts,
         cmd_wish_list_from_cache,
+        cmd_wish_list_remove,
         cmd_wish_list_remove_conflicts,
     )
 
@@ -74,6 +75,7 @@ def test_locg_command_surface_resolves():
             cmd_wish_list_add,
             cmd_wish_list_from_cache,
             cmd_wish_list_conflicts,
+            cmd_wish_list_remove,
             cmd_wish_list_remove_conflicts,
             _split_wish_list_name,
         )

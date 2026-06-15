@@ -1738,6 +1738,28 @@ def cmd_collection_check(
     }
 
 
+def cmd_collection_series_names() -> dict[str, Any]:
+    """Return the canonical series names present in the collection cache.
+
+    The matcher gates a `not_in_cache` verdict behind an *exact* normalized
+    series-key match (BUI-26, to keep "Fantastic Four Annual" from satisfying a
+    "Fantastic Four" query). That exactness means a caller using a slightly-off
+    series name (Metron's "Uncanny X-Men (Vol. 1)" vs. the LOCG catalog's
+    "Uncanny X-Men") gets a silent miss with no hint why. This endpoint surfaces
+    the cache's actual series names so a caller can offer a "did you mean X?"
+    correction (BUI-129) instead of reporting a false "not owned".
+
+    The names come straight from `series_name_index`, which is rebuilt from
+    `source='locg_export'` rows on every import (R61), so it reflects the real
+    LOCG catalog spelling. Returns the canonical names sorted case-insensitively.
+    """
+    cache = CollectionCache()
+    payload = cache.load()
+    index: dict[str, str] = payload.get("series_name_index", {})
+    names = sorted(set(index.values()), key=str.lower)
+    return {"series_names": names, "count": len(names)}
+
+
 VARIANT_SUFFIX_MAP: dict[str, str] = {
     "newsstand": "Newsstand Edition",
     "newsstand edition": "Newsstand Edition",

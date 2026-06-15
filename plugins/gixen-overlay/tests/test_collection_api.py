@@ -173,6 +173,31 @@ def test_collection_status(client):
     assert "locg_cli_version" in body
 
 
+def test_series_names_empty_by_default(client):
+    """The seed fixture carries an empty series_name_index, so the endpoint
+    answers with an empty list (BUI-129)."""
+    r = client.get("/api/comics/collection/series-names")
+    assert r.status_code == 200
+    assert r.json() == {"series_names": [], "count": 0}
+
+
+def test_series_names_returns_canonical_names(client):
+    """Once the index is populated, the endpoint surfaces the catalog spellings
+    a caller can resolve an ambiguous query against (BUI-129)."""
+    payload = json.loads((client.store / "collection.json").read_text())
+    payload["series_name_index"] = {
+        "uncanny x-men": "Uncanny X-Men",
+        "amazing spider-man": "The Amazing Spider-Man",
+    }
+    (client.store / "collection.json").write_text(json.dumps(payload))
+
+    r = client.get("/api/comics/collection/series-names")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["series_names"] == ["The Amazing Spider-Man", "Uncanny X-Men"]
+    assert body["count"] == 2
+
+
 def test_collection_export_returns_csv(client):
     r = client.get("/api/comics/collection/export")
     assert r.status_code == 200
@@ -245,6 +270,37 @@ def test_wish_list_add_appends(client):
 def test_wish_list_add_rejects_empty_title(client):
     assert client.post("/api/comics/wish-list", json={"title": "   "}).status_code == 422
     assert client.post("/api/comics/wish-list", json={}).status_code == 422
+
+
+def test_wish_list_remove_deletes_item(client):
+    """BUI-128: DELETE removes the matching entry and returns the locg-cli
+    success shape."""
+    r = client.delete("/api/comics/wish-list", params={"title": "X-Men #1"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["removed"]["name"] == "X-Men #1"
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "X-Men #1" not in names
+
+
+def test_wish_list_remove_404_when_title_not_found(client):
+    r = client.delete("/api/comics/wish-list", params={"title": "Nonexistent #999"})
+    assert r.status_code == 404
+    # The other items are untouched.
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "X-Men #1" in names
+
+
+def test_wish_list_remove_422_when_title_blank(client):
+    assert client.delete("/api/comics/wish-list", params={"title": "   "}).status_code == 422
+    assert client.delete("/api/comics/wish-list").status_code == 422
+
+
+def test_wish_list_remove_404_when_never_imported(client):
+    (client.store / "wish-list.json").unlink()
+    r = client.delete("/api/comics/wish-list", params={"title": "X-Men #1"})
+    assert r.status_code == 404
 
 
 def test_import_requires_a_file(client):

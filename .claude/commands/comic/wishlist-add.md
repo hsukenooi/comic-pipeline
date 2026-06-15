@@ -143,6 +143,18 @@ fixed — they're re-appended, not wiped). To get them onto LOCG itself, run
 touches owned books. See
 `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
+**Removing a wished issue:** the wish-list also has a DELETE endpoint (BUI-128),
+so you no longer need to SSH into the Mac Mini to run `locg wish-list remove`:
+
+```bash
+curl -sf -X DELETE "$GIXEN_SERVER_URL/api/comics/wish-list?title=Children+of+the+Vault+%231"
+```
+
+Pass the exact `name` of the wished entry as the `title` query param (URL-encoded).
+Returns `{"status": "ok", "removed": {...}, "items": N}` on success, **404** if no
+entry matches that title, **422** if the title is blank. Like an add, a removal is
+overwritten by the next full `collection import` unless pushed to LOCG first.
+
 ## Common Mistakes
 
 | Mistake | Fix |
