@@ -97,6 +97,22 @@ def test_identify_documents_grade_from_description():
     )
 
 
+def test_seller_scan_doc_threshold_matches_emit_floor():
+    """BUI-167: seller-scan.md cited a 0.5 'partial overlap' score and a 0.7
+    gate, but seller_scan.py only emits matches at score >= 0.65, so a 0.5 is
+    never surfaced. Assert the doc references the real 0.65 floor and no longer
+    carries the dead '0.5 means partial' advice."""
+    src = (REPO_ROOT / "apps" / "ebay" / "src" / "seller_scan.py").read_text()
+    assert "best_score >= 0.65" in src, (
+        "seller_scan.py emit floor changed — update the doc + this contract"
+    )
+    doc = (SKILLS_DIR / "seller-scan.md").read_text()
+    assert "0.65" in doc, "seller-scan.md must reference the real 0.65 emit floor"
+    assert "0.5 means partial series overlap" not in doc, (
+        "dead '0.5 partial overlap' advice resurfaced — 0.5 is below the 0.65 floor"
+    )
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the

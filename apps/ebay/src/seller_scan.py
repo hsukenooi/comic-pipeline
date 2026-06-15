@@ -242,6 +242,24 @@ Pairs:
 
     verdicts = json.loads(m.group())
     verdict_map = {v["id"]: v.get("genuine", False) for v in verdicts}
+    reason_map = {v["id"]: v.get("reason", "") for v in verdicts}
+
+    # BUI-149: this internal Claude pass is the single verification gate, so it
+    # must not silently drop rejected candidates. Surface each one (with the
+    # model's reason) to stderr so the user can override if the verifier was
+    # wrong — the seller-scan skill no longer runs a redundant second verifier.
+    dropped = [(cand, reason_map.get(i, ""))
+               for i, cand in enumerate(matches, 1)
+               if not verdict_map.get(i, False)]
+    if dropped:
+        print(f"Filtered {len(dropped)} likely false positive(s) "
+              f"(Claude verification):", file=sys.stderr)
+        for cand, reason in dropped:
+            line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
+            if reason:
+                line += f"  — {reason}"
+            print(line, file=sys.stderr)
+
     return [m for i, m in enumerate(matches, 1) if verdict_map.get(i, False)]
 
 

@@ -456,3 +456,36 @@ class TestRecordItemsSeen:
             side_effect=seller_scan.requests.exceptions.ConnectionError("down"),
         ):
             seller_scan.record_items_seen(["111"], "tuners36")  # no exception
+
+
+class TestVerifyWithClaudeNoSilentDrop:
+    def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
+        """BUI-149: the script's internal Claude pass is the single verification
+        gate, so a rejected candidate must be surfaced (stderr) with its reason,
+        not silently dropped — the seller-scan skill no longer runs a second
+        verifier and relies on this audit trail."""
+        matches = [
+            {"title": "Amazing Spider-Man #300 NM Marvel 1988",
+             "wish_name": "Amazing Spider-Man #300"},
+            {"title": "Daredevil Annual #1", "wish_name": "Daredevil #1"},
+        ]
+        verdict_json = (
+            '[{"id":1,"genuine":true},'
+            '{"id":2,"genuine":false,"reason":"Annual, not the regular series"}]'
+        )
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text=verdict_json)]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        kept = seller_scan.verify_with_claude(matches)
+
+        # Only the genuine match is returned (unchanged behaviour).
+        assert [m["title"] for m in kept] == ["Amazing Spider-Man #300 NM Marvel 1988"]
+        # The rejected one is surfaced to stderr with its reason.
+        err = capsys.readouterr().err
+        assert "Filtered 1 likely false positive" in err
+        assert "Daredevil Annual #1" in err
+        assert "Annual, not the regular series" in err
