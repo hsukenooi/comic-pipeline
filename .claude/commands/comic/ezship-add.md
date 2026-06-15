@@ -14,14 +14,20 @@ Submit shipment orders to EZShip. Typically run after a won eBay auction has shi
 cd ~/Projects/comic-pipeline/apps/ezship && npx tsx src/cli.ts new -t {tracking} -c {carrier} [options]
 ```
 
-**Auth:** Session cookie at `~/.config/ezship/config.json`. If you get a session expiration error, ask the user to re-extract their cookie from the browser and update the config.
+**Auth:** Session cookie at `~/.config/ezship/config.json`. On a session-expiration error the CLI itself prints `Run: ezship set-cookie "<paste from DevTools>"` — use that subcommand (BUI-159); it edits the cookie field in place and writes valid JSON. Have the user paste a fresh cookie from DevTools and run:
+
+```bash
+cd ~/Projects/comic-pipeline/apps/ezship && npx tsx src/cli.ts set-cookie "<paste from DevTools>"
+```
+
+Only hand-create `config.json` if it doesn't exist yet — `set-cookie` requires an existing config.
 
 ## Input
 
 One or more orders, each with:
 - Tracking number
 - Carrier (UPS, FedEx, USPS, DHL, Amazon, Ontrac, Other)
-- Declared value in dollars (optional — default $10)
+- Declared value in **cents** (optional — CLI default `1000` = $10). If the user gives a dollar amount, multiply by 100 before passing `-d` (e.g. $25 → `-d 2500`).
 - Product name (optional — use comic title + issue, e.g. "Venom #3")
 - Remark (optional)
 
@@ -33,7 +39,7 @@ Warehouse defaults to `usa` — only override if the seller is shipping from Chi
 |---|---|---|
 | `--warehouse` | `usa` | Most eBay sellers ship from US |
 | `--category` | `Books` | Correct for comics |
-| `--declared-value` | omit (CLI default $10) | Never calculate from winning bids. Only pass `-d` if the user explicitly states a value. |
+| `--declared-value` | omit (CLI default `1000` = $10) | Never calculate from winning bids. Only pass `-d` if the user explicitly states a value — and pass it in **cents** (multiply the dollar amount by 100). |
 | `--product` | Comic title + issue | e.g. `"Amazing Spider-Man #300"` |
 
 ## Submit Orders
@@ -46,9 +52,9 @@ cd ~/Projects/comic-pipeline/apps/ezship && npx tsx src/cli.ts new \
   --category Books
 ```
 
-Omit `-d` unless the user explicitly provides a declared value. The CLI defaults to $10.
+Omit `-d` unless the user explicitly provides a declared value. `-d` is in **cents** — multiply a dollar amount by 100 (e.g. $25 → `-d 2500`); the CLI default `1000` = $10.
 
-Run one at a time — confirm each succeeds before submitting the next.
+Run one at a time. **Confirm success before the next (BUI-141):** mark `✅ Submitted` only if the command exits 0 *and* the printed `Response` does not carry `result: false` or an error `msg`/`message`. A non-zero exit or an error response means EZShip **rejected** the order — surface the message and mark it failed, never `✅ Submitted` (the CLI now exits non-zero on a `result: false` rejection).
 
 ## Output
 
@@ -65,5 +71,5 @@ Run one at a time — confirm each succeeds before submitting the next.
 |---|---|
 | Declared value as dollars | CLI takes cents — multiply by 100 |
 | Wrong carrier name | Must match exactly: UPS, FedEx, USPS, DHL, Amazon, Ontrac, Other |
-| Session expired error | Ask user to re-extract cookie from browser and update `~/.config/ezship/config.json` |
+| Session expired error | Run `npx tsx src/cli.ts set-cookie "<paste from DevTools>"` — don't hand-edit `config.json` |
 | Non-US seller | Set `-w guangzhou`, `-w shanghai`, or `-w taiwan` as appropriate |

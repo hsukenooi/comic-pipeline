@@ -138,6 +138,22 @@ def test_snipe_show_does_not_swallow_fetch_errors():
     assert "gixen list --json 2>/dev/null" not in doc
 
 
+def test_ezship_declared_value_units_agree():
+    """BUI-142: cli.ts's -d/--declared-value is in CENTS, but ezship-add.md
+    described it as dollars in its primary flow → an agent told "$25" ran
+    `-d 25` (25 cents), a 100x under-declaration. Assert the doc agrees with the
+    CLI unit and instructs the cents conversion."""
+    cli = (REPO_ROOT / "apps" / "ezship" / "src" / "cli.ts").read_text()
+    assert "--declared-value <cents>" in cli, (
+        "cli.ts declared-value unit changed — re-check the doc + this contract"
+    )
+    doc = (SKILLS_DIR / "ezship-add.md").read_text()
+    assert "Declared value in dollars" not in doc, (
+        "ezship-add.md describes -d as dollars while the CLI takes cents"
+    )
+    assert "cents" in doc, "ezship-add.md must state -d is in cents"
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the
