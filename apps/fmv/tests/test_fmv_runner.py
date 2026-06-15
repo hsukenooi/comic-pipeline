@@ -32,6 +32,50 @@ def _make_comp(price, grade, product_id="x"):
             "price": price, "grade": grade, "sold_date": "", "buying_format": ""}
 
 
+# ─── _is_fetch_error / fetch-error vs no-comps (BUI-143) ──────────────────────
+
+class TestFetchErrorSignal:
+    def test_all_queries_errored_is_fetch_error(self):
+        """A SerpApi quota/outage leaves comps empty with every query carrying an
+        'error' — distinct from a genuinely illiquid book."""
+        r = {"comp_count_total": 0,
+             "queries_used": [{"tier": "base", "error": "RateLimiter 10001"}]}
+        assert fmv_runner._is_fetch_error(r) is True
+
+    def test_clean_empty_pool_is_not_fetch_error(self):
+        """A book that genuinely has zero comps ran its queries cleanly (no
+        'error') — must NOT be flagged as a fetch error."""
+        r = {"comp_count_total": 0,
+             "queries_used": [{"tier": "base", "nkw": 0}]}
+        assert fmv_runner._is_fetch_error(r) is False
+
+    def test_book_with_comps_is_not_fetch_error(self):
+        r = {"comp_count_total": 5,
+             "queries_used": [{"tier": "base", "error": "x"}]}
+        assert fmv_runner._is_fetch_error(r) is False
+
+    def test_table_renders_fetch_err_distinct_from_na(self, capsys):
+        """The printed table must mark a fetch-failed book 'fetch-err', not the
+        same 'n/a' a legitimately empty book gets, and warn loudly."""
+        rows = [
+            {"input": {"title": "Outage Book", "issue": "1", "grade": 9.4},
+             "fmv": {"fmv_low": None}, "comp_count_total": 0,
+             "queries_used": [{"tier": "base", "error": "quota"}],
+             "source": "fresh"},
+            {"input": {"title": "Illiquid Book", "issue": "2", "grade": 9.4},
+             "fmv": {"fmv_low": None}, "comp_count_total": 0,
+             "queries_used": [{"tier": "base", "nkw": 0}],
+             "source": "fresh"},
+        ]
+        fmv_runner._print_table(rows)
+        out = capsys.readouterr()
+        combined = out.out + out.err
+        assert "fetch-err" in combined
+        assert "do not treat these as illiquid" in combined
+        # The genuinely-empty row still reads n/a (only one fetch-err row).
+        assert combined.count("fetch-err") >= 1
+
+
 # ─── _split_by_db_cache ───────────────────────────────────────────────────────
 
 class TestSplitByDbCache:

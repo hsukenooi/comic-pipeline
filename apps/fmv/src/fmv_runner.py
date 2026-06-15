@@ -466,6 +466,21 @@ def _write_json(path: str, data) -> None:
         Path(path).write_text(json.dumps(data, indent=2))
 
 
+def _is_fetch_error(r: dict) -> bool:
+    """BUI-143: distinguish a SerpApi fetch FAILURE (quota exhausted / outage)
+    from a book that genuinely has zero comps. Both yield n=0 and otherwise look
+    identical, so without this an operator can mistake an API outage for "these
+    books are illiquid" and bid blind. A fetch error leaves comps empty while
+    every query in queries_used carries an 'error'; a real no-comps book ran its
+    queries cleanly (no 'error' key)."""
+    if r.get("comp_count_total"):
+        return False
+    queries = r.get("queries_used") or []
+    if not queries:
+        return False
+    return all(q.get("error") for q in queries)
+
+
 def _print_table(rows: list[dict]) -> None:
     click.echo(f"{'#':>3}  {'Comic':<30} {'Grade':>5}  "
                f"{'FMV':<14} {'Med':>5}  {'n':>3}  {'CV':>5}  "
@@ -485,6 +500,12 @@ def _print_table(rows: list[dict]) -> None:
             fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']}"
             med_str = f"${fmv.get('median') or '?'}"
             mb_str = f"${fmv.get('max_bid') or '?'}"
+        elif _is_fetch_error(r):
+            # BUI-143: the SerpApi fetch FAILED for this book — not zero comps.
+            # Render distinctly so it isn't mistaken for a legitimately empty pool.
+            fmv_str = "fetch-err"
+            med_str = "—"
+            mb_str = "—"
         else:
             fmv_str = "n/a"
             med_str = "n/a"
@@ -494,4 +515,16 @@ def _print_table(rows: list[dict]) -> None:
             f"{fmv_str:<14} {med_str:>5}  {fmv.get('n','?'):>3}  "
             f"{fmv.get('cv_pct','?'):>5}  "
             f"{fmv.get('confidence','?'):<12} {mb_str:>7}  {r['source']}"
+        )
+
+    # BUI-143: a whole batch run during a SerpApi outage/quota-exhaustion would
+    # otherwise print every row as a bland 'n/a'. Surface the failure loudly so
+    # the operator checks the key/quota and re-runs instead of bidding blind.
+    n_fetch_err = sum(1 for r in rows if _is_fetch_error(r))
+    if n_fetch_err:
+        click.echo(
+            f"\n⚠️  {n_fetch_err} book(s) marked 'fetch-err': the SerpApi fetch "
+            f"FAILED (quota exhausted or outage), NOT zero comps. Check the "
+            f"SerpApi key/quota and re-run — do not treat these as illiquid.",
+            err=True,
         )
