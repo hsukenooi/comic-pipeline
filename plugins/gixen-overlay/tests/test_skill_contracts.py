@@ -208,6 +208,16 @@ def test_wishlist_add_reconciles_series_names():
     )
 
 
+def test_snipe_add_documents_failed_add_policy():
+    """BUI-168: snipe-add mandated sequential adds but gave no policy for a
+    mid-batch `gixen add` failure (a server that dies after the pre-flight
+    health check). Assert the skill documents a failed-add state + halt/continue
+    guidance, so a partial batch isn't reported as all-success."""
+    doc = (SKILLS_DIR / "snipe-add.md").read_text()
+    assert "❌ Failed" in doc, "snipe-add output has no Failed state"
+    assert "Handling a failed add" in doc, "snipe-add has no mid-batch failure policy"
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the

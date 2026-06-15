@@ -60,6 +60,22 @@ Compare each auction's current bid against the proposed max bid. If current bid 
 
 **Run sequentially** — Gixen sessions are stateful and parallel adds will fail.
 
+### Handling a failed add (BUI-168)
+
+The pre-flight health check can't catch a server that dies *between* adds. In
+server mode a Gixen error or a transient outage makes `gixen add` print an error
+to stderr and **exit non-zero** (the CLI `sys.exit(1)`s on a 503/connection
+error). On any non-zero `gixen add`:
+
+1. **Do not** record that item as `✅ Added` or silently continue as if it
+   succeeded — mark it `❌ Failed` in the output table with the error.
+2. **Re-check server health** before the next item (`curl -sf "$GIXEN_SERVER_URL/health"`).
+   If the server is down, STOP the batch and report which items were added and
+   which remain unattempted — don't keep firing adds at a dead server.
+3. At the end, **summarize added vs. failed vs. remaining** so the user knows
+   exactly which snipes landed and which to retry. Never emit an all-`✅` table
+   when an add failed.
+
 ### Available `add` flags (canonical)
 
 These are the flags that exist in `packages/gixen-cli/cli.py` today. Anything else (no `--comic`, `--issue`, or `--year`) is fictional — do not invent flags.
@@ -117,9 +133,11 @@ gixen list
 | # | Comic | Item ID | Max Bid | Status |
 |---|---|---|---|---|
 | 1 | Amazing Spider-Man #300 | 123456789 | $800 | ✅ Added |
-| 2 | Invincible #1 | 987654321 | $256 | ✅ Added |
+| 2 | Invincible #1 | 987654321 | $256 | ❌ Failed (server 503 — not added) |
 | 3 | Batman #608 | 555555555 | — | ⏭️ Skipped (BIN) |
 ```
+
+Status values: `✅ Added`, `❌ Failed (<reason> — not added)`, `⏭️ Skipped (BIN)`, and `⏸️ Not attempted` for items after a batch-halting failure. End with an added/failed/remaining count.
 
 ## Editing Existing Snipes
 
