@@ -101,6 +101,8 @@ resolution + BUI-34 already-owned dedup). On success it returns:
 
 `manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails, STOP** — do not report success.
 
+**Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200. Because Step 3 uses `curl -sf`, this halts the skill automatically — never report success on a partial_failure, and surface the `rows_written` so the user knows which wins still need recording.
+
 ## Step 4: Export to CSV
 
 The export reads the *server* collection and returns the file contents; save them
@@ -119,7 +121,18 @@ This writes a CSV at `~/Downloads/locg-bulk-import-<timestamp>.csv` plus a `.not
 
 ## Step 5: Report
 
-Print a summary:
+Re-fetch status **after** the write — `pending_push_count` is only produced by
+`/api/comics/collection/status`, never by the export, and the Step 0 read
+predates this run's wins, so it would undercount by exactly the rows you just
+added (BUI-156):
+
+```bash
+curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
+# read pending_push_count and oldest_pending_days from this fresh response
+```
+
+Print a summary (source `pending_push_count` from the fresh status read above,
+not from Step 0):
 
 ```
 **Added to local cache (N rows):**
