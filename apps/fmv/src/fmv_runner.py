@@ -133,7 +133,9 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
             needs.append({"_idx": i, **book})
             continue
         row = _db_lookup(server_url, locg_id=book["locg_id"],
-                         grade=book["grade"], max_age_days=max_age_days)
+                         grade=book["grade"],
+                         locg_variant_id=book.get("locg_variant_id"),
+                         max_age_days=max_age_days)
         if row:
             cached[i] = row
         else:
@@ -142,20 +144,30 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
 
 
 def _db_lookup(server_url: str, *, locg_id: int, grade: float,
+               locg_variant_id: int | None = None,
                max_age_days: float) -> dict | None:
     """Return the freshest matching FMV row, or None if not cached/stale.
 
     Defensive verification: even if the server returns rows, re-check
-    locg_id and grade match what we asked for. Older server versions silently
-    ignore unknown query params (FastAPI behavior), so without this check a
-    stale server would happily return ANY row at the matching grade and we'd
-    write the wrong comic's FMV onto the input book.
+    locg_id, grade, AND locg_variant_id match what we asked for. Older server
+    versions silently ignore unknown query params (FastAPI behavior), so
+    without this check a stale server would happily return ANY row at the
+    matching grade and we'd write the wrong comic's FMV onto the input book.
+
+    BUI-139: two variant rows of one issue share the same issue-level locg_id
+    (only locg_variant_id differs), so a locg_id+grade match is variant-blind.
+    A base cover (locg_variant_id=None) must reuse only a NULL-variant row, and
+    a specific variant only its own — re-check it here because an absent query
+    param can't express "NULL variant" to the server, only "no filter".
     """
+    params: dict = {"locg_id": locg_id, "grade": grade,
+                    "max_age_days": max_age_days}
+    if locg_variant_id is not None:
+        params["locg_variant_id"] = locg_variant_id
     try:
         resp = requests.get(
             f"{server_url}/api/comics",
-            params={"locg_id": locg_id, "grade": grade,
-                    "max_age_days": max_age_days},
+            params=params,
             timeout=15,
         )
         resp.raise_for_status()
@@ -169,6 +181,7 @@ def _db_lookup(server_url: str, *, locg_id: int, grade: float,
     # book falls through to a fresh fetch+compute instead of reusing the stub.
     rows = [r for r in rows
             if r.get("locg_id") == locg_id and r.get("grade") == grade
+            and r.get("locg_variant_id") == locg_variant_id
             and r.get("fmv_low") is not None]
     if not rows:
         return None

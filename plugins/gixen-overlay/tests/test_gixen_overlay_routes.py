@@ -326,6 +326,33 @@ def test_list_comics_by_locg_id(api):
     assert rows[0]["title"] == "Amazing Spider-Man"
 
 
+def test_list_comics_by_locg_variant_id_scopes_to_variant(api):
+    """BUI-139: a base cover and a Newsstand variant of one issue share the same
+    issue-level locg_id (only locg_variant_id differs). GET with locg_variant_id
+    must return only the matching-variant row, so comic-fmv can't reuse the base
+    cover's FMV for the variant (a different price tier)."""
+    # Base cover (NULL variant) and Newsstand variant: same title/issue/year +
+    # same locg_id, different locg_variant_id, different FMV.
+    api.post("/api/comics", json={
+        "title": "Ghost Rider", "issue": "1", "year": 1973,
+        "grade": 9.4, "fmv_low": 300, "fmv_high": 400, "fmv_confidence": "high",
+        "locg_id": 555,
+    })
+    api.post("/api/comics", json={
+        "title": "Ghost Rider", "issue": "1", "year": 1973, "variant": "Newsstand",
+        "grade": 9.4, "fmv_low": 900, "fmv_high": 1100, "fmv_confidence": "high",
+        "locg_id": 555, "locg_variant_id": 999,
+    })
+    # locg_id alone is variant-blind: both rows come back.
+    both = api.get("/api/comics", params={"locg_id": 555}).json()
+    assert len(both) == 2
+    # Scoped to the variant: only the Newsstand row.
+    variant = api.get("/api/comics", params={"locg_id": 555, "locg_variant_id": 999}).json()
+    assert len(variant) == 1
+    assert variant[0]["locg_variant_id"] == 999
+    assert variant[0]["fmv_low"] == 900
+
+
 def test_list_comics_max_age_days_excludes_stale(api):
     """GET /api/comics?max_age_days=N excludes rows past the cutoff."""
     from datetime import datetime, timedelta, timezone
@@ -529,6 +556,41 @@ def test_extract_comics_caps_title_reuses_existing_valued_fmv(api):
     raw.close()
     assert len(fmvs) == 1
     assert fmvs[0]["low"] == 50.0
+
+
+def test_extract_comics_graded_does_not_cross_editions(api):
+    """BUI-144/145: the graded branch must link the bid to the comic_id
+    upsert_comic just returned (which encodes year + variant), NOT re-match a
+    valued FMV by title/issue across editions. A 1963 ASM #1 bid must not borrow
+    the 2018 reprint's FMV."""
+    # Seed ASM #1 year=2018 with a valued FMV at 9.4.
+    assert api.post("/api/comics", json={
+        "title": "Amazing Spider-Man", "issue": "1", "year": 2018,
+        "grade": 9.4, "fmv_low": 30.0, "fmv_high": 45.0, "fmv_confidence": "high",
+    }).status_code == 200
+
+    # A bid whose eBay title parses to ASM #1 year=1963 grade 9.4 (NM).
+    api.post("/api/bids", json={"item_id": "777000001", "max_bid": 500.0})
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Amazing Spider-Man #1 1963 NM", "777000001"))
+    raw.commit()
+    raw.close()
+
+    assert api.post("/api/extract-comics").status_code == 200
+
+    # The bid's PRIMARY fmv must belong to the 1963 comic, not the 2018 edition.
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.row_factory = sqlite3.Row
+    row = raw.execute(
+        "SELECT c.year FROM bid_fmvs bf "
+        "JOIN fmv f ON f.id = bf.fmv_id JOIN comics c ON c.id = f.comic_id "
+        "JOIN bids b ON b.id = bf.bid_id "
+        "WHERE b.item_id = '777000001' AND bf.is_primary = 1"
+    ).fetchone()
+    raw.close()
+    assert row is not None
+    assert row["year"] == 1963  # NOT 2018 — no cross-edition FMV borrow
 
 
 def test_extract_comics_no_grade_links_to_existing_valued_fmv(api):

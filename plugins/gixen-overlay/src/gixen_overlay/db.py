@@ -1079,12 +1079,19 @@ def list_comics(
     year: int | None = None,
     grade: float | None = None,
     locg_id: int | None = None,
+    locg_variant_id: int | None = None,
     max_age_days: float | None = None,
 ) -> list[sqlite3.Row]:
     """Return comics enriched with FMV data. One row per (comic, fmv) pair.
 
     locg_id: filter to one canonical issue (used by comic-fmv to look up a
         fresh FMV by LOCG ID + grade without juggling title spellings).
+    locg_variant_id: BUI-139 — two variant rows of one issue share the same
+        issue-level locg_id (only locg_variant_id differs), so a locg_id+grade
+        lookup alone is variant-blind and can return a base cover's FMV for a
+        Newsstand variant (a different price tier). When set, scope to that
+        exact variant. (Base/NULL-variant disambiguation is done caller-side in
+        comic-fmv's _db_lookup, since an absent query param can't express NULL.)
     max_age_days: if set, only return rows where the joined fmv.updated_at
         is within the last N days. Stale rows are excluded so callers can't
         accidentally reuse outdated FMVs.
@@ -1105,6 +1112,9 @@ def list_comics(
     if locg_id is not None:
         clauses.append("c.locg_id = ?")
         params.append(locg_id)
+    if locg_variant_id is not None:
+        clauses.append("c.locg_variant_id = ?")
+        params.append(locg_variant_id)
     if max_age_days is not None:
         cutoff = (datetime.now(timezone.utc)
                   - timedelta(days=max_age_days)).isoformat()
