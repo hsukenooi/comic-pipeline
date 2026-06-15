@@ -338,6 +338,28 @@ def test_remove_bid(api):
     api.mock_gixen.remove_snipe.assert_called_once()
 
 
+def test_remove_bid_already_gone_tombstones_not_404(api):
+    """BUI-164: when the snipe has already vanished from Gixen (remove_snipe
+    raises GixenSnipeNotFoundError), the desired end state of a remove is
+    already true. The endpoint must tombstone the local row REMOVED, not 404
+    and leave it PENDING (where it lingers in /api/snipes and could re-fire)."""
+    from gixen_client import GixenSnipeNotFoundError
+
+    api.post("/api/bids", json={"item_id": "300000099", "max_bid": 50.0})
+    api.mock_gixen.remove_snipe.side_effect = GixenSnipeNotFoundError("gone from Gixen")
+
+    r = api.delete("/api/bids/300000099")
+    assert r.status_code == 200
+    assert r.json()["status"] == "REMOVED"
+
+    conn = sqlite3.connect(os.environ["DB_PATH"])
+    status = conn.execute(
+        "SELECT status FROM bids WHERE item_id='300000099'"
+    ).fetchone()[0]
+    conn.close()
+    assert status == "REMOVED"  # not left PENDING
+
+
 def test_purge(api):
     r = api.post("/api/purge", json={"sibling_ids": []})
     assert r.status_code == 200

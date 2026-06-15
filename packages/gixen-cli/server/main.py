@@ -1246,7 +1246,14 @@ async def api_remove_bid(item_id: str):
     try:
         await _remove_with_cache_fallback(db, item_id)
     except GixenSnipeNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen")
+        # BUI-164: the item is already absent from Gixen's list — the desired
+        # end state of a remove (snipe gone) is already true. Fall through to
+        # tombstone the local row instead of 404ing and leaving it PENDING,
+        # where it lingers in /api/snipes and, if never locally sniped, could
+        # still be re-fired by the local sniper.
+        logger.info(
+            "remove: %s already absent from Gixen — tombstoning REMOVED", item_id,
+        )
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
