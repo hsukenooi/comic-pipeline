@@ -8,8 +8,10 @@ on:
 jobs:
   # U8a/BUI-59: keep CI green on the monorepo layout and exercise the uv
   # workspace install (incl. the gixen-cli py-modules fix, KTD2) in a clean env.
-  # The full per-package test matrix (Playwright provisioning, etc.) is the
-  # deferred U8b follow-up — this job only proves the merge didn't make CI lie.
+  # BUI-140: CI now runs the per-package test suites — the previous job only
+  # smoke-imported symbols, so any regression to a guarded invariant (the
+  # BUI-50 tombstone filter, the R11 dupe-buy guard, the FMV FK chain, …)
+  # merged green. The suites are the merge gate now, not just import checks.
   workspace:
     runs-on: ubuntu-latest
     steps:
@@ -35,3 +37,59 @@ jobs:
       - name: Check plugin structure
         run: |
           uv run python -c "import ast; ast.parse(open('plugins/gixen-overlay/src/gixen_overlay/plugin.py').read()); print('plugin.py parses OK')"
+
+      # BUI-140: the workspace-member suites. Playwright is mocked in locg-cli's
+      # tests (no browser binaries needed), so a plain `uv run pytest` is safe.
+      # gixen-cli's integration-marked tests are excluded here (they need live
+      # Gixen/network); everything else is the merge gate.
+      - name: Test — gixen-cli
+        run: uv run pytest -m "not integration"
+        working-directory: packages/gixen-cli
+
+      - name: Test — locg-cli
+        run: uv run pytest
+        working-directory: packages/locg-cli
+
+      - name: Test — gixen-overlay
+        run: uv run pytest
+        working-directory: plugins/gixen-overlay
+
+  # apps/* are NOT uv workspace members (installed via `uv tool install` in
+  # scripts/install.sh). They each carry their own pyproject + .venv, so test
+  # them with a self-contained `uv run pytest` from their own dir. BUI-140.
+  apps-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # apps/ebay + apps/fmv don't declare pytest as a dependency (it's not
+      # part of their runtime), so provision it for the run with `--with`.
+      - name: Test — apps/ebay
+        run: uv run --with pytest pytest
+        working-directory: apps/ebay
+
+      - name: Test — apps/fmv
+        run: uv run --with pytest pytest
+        working-directory: apps/fmv
+
+  # ezship is a standalone TypeScript CLI (apps/ezship). vitest, not pytest.
+  ezship:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps + test
+        run: |
+          npm ci
+          npm test
+        working-directory: apps/ezship

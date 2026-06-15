@@ -10,6 +10,8 @@ Deliberately imports by string-free direct reference so a rename can't be masked
 """
 from __future__ import annotations
 
+import inspect
+
 
 def test_overlay_routes_importable_via_workspace():
     """Loading the overlay's routes module must succeed purely via the
@@ -79,4 +81,48 @@ def test_locg_command_surface_resolves():
             cmd_wish_list_remove_conflicts,
             _split_wish_list_name,
         )
+    )
+
+
+def _required_positional_count(fn) -> int:
+    """Number of required positional parameters (no default, positional-kind)."""
+    params = inspect.signature(fn).parameters.values()
+    return sum(
+        1
+        for p in params
+        if p.default is p.empty
+        and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    )
+
+
+def test_gixen_cli_private_helper_signatures_pinned():
+    """BUI-155: `callable()` is a near-meaningless contract for the cross-package
+    coupling surface — a rename's 'evil twin' (same name, changed arity) passes
+    the importability canary while breaking routes.py at runtime. Pin the exact
+    call shapes the overlay's call sites depend on (routes.py:189, 297, 593,
+    634-635) so an upstream arity change fails CI loudly instead of in prod.
+
+    These four `server.main`/`server.db` private helpers have NO overlay
+    integration test exercising them through the real symbols (route tests mock
+    them), so signature pinning is the only behavioral guard on their contract.
+    """
+    from server.db import get_bid_by_item_id
+    from server.main import (
+        _ensure_fresh_sync,
+        _iso_to_relative,
+        _spawn_fallback_task,
+    )
+
+    # routes.py:593 — `_iso_to_relative(end_date_iso)`: exactly one positional.
+    assert _required_positional_count(_iso_to_relative) == 1
+
+    # routes.py:189/297 — `get_bid_by_item_id(db, item_id)`: exactly two.
+    assert _required_positional_count(get_bid_by_item_id) == 2
+
+    # routes.py:634-635 — both called with no args; `_ensure_fresh_sync` is
+    # awaited, so it must stay a coroutine function.
+    assert _required_positional_count(_ensure_fresh_sync) == 0
+    assert _required_positional_count(_spawn_fallback_task) == 0
+    assert inspect.iscoroutinefunction(_ensure_fresh_sync), (
+        "routes.py:634 awaits _ensure_fresh_sync() — it must stay async"
     )
