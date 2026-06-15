@@ -54,12 +54,21 @@ export async function callRpc(
     throw new Error(`Failed to parse API response as JSON from ${endpoint}`);
   }
 
-  if (
-    (result as Record<string, unknown>).result === false &&
-    typeof (result as Record<string, unknown>).msg === "string" &&
-    ((result as Record<string, unknown>).msg as string).includes("please login")
-  ) {
-    throw new Error(SESSION_EXPIRED_MSG);
+  // BUI-141: EZShip signals a business-layer rejection in a 200 body via
+  // `result: false` (the session-expired case is just one such rejection). The
+  // old code only threw for the login message and RETURNED every other
+  // `result: false`, so the CLI exited 0 and the skill marked a rejected order
+  // "Submitted" — a silently lost order. Treat any `result: false` as a failure
+  // so the CLI exits non-zero; a successful order never returns `result: false`.
+  const r = result as Record<string, unknown>;
+  if (r.result === false) {
+    const msg = typeof r.msg === "string" ? r.msg : "";
+    if (msg.includes("please login")) {
+      throw new Error(SESSION_EXPIRED_MSG);
+    }
+    throw new Error(
+      `EZShip rejected the request: ${msg || JSON.stringify(result)}`
+    );
   }
 
   return result;
