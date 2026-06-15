@@ -11,9 +11,25 @@ Display active and recently ended Gixen snipes as formatted tables with eBay lin
 
 ## Fetch Data
 
+Per the shared comics-server convention (BUI-172,
+`docs/conventions/comics-server-call.md`), **a failed fetch must hard-fail
+loudly — never render an empty/degraded result from a failed call.** Do **not**
+blanket-`2>/dev/null` the fetch (BUI-151): in server/thin-client mode a
+server-down error goes to stderr with a non-zero exit and **no** stdout, so
+swallowing it and parsing the empty output renders "Active (0) / Recently Ended
+(0)" — falsely telling the user they have no snipes when the server is simply
+unreachable.
+
 ```bash
-gixen list --json 2>/dev/null
+SNIPES_JSON="$(gixen list --json)" || {
+  echo "gixen list failed — the Gixen server is unreachable or errored. NOT rendering empty tables." >&2
+  exit 1
+}
 ```
+
+**If the command exits non-zero or produces no parseable JSON, STOP and report
+the error** — don't render empty tables. A genuine "no snipes" result is the
+JSON array `[]` with exit 0; only that renders the zero-snipes case.
 
 ## Build Tables
 
@@ -50,17 +66,21 @@ eBay item URL format: `https://www.ebay.com/itm/{item_id}`
 
 Sort by most recently ended first. If end timestamps are unavailable from the CLI, display in the order returned and note that sort order is approximate.
 
-**Result column** — derive from the `status` field (not bid comparison):
+**Result column** — derive from the `status` field (not bid comparison).
+
+`gixen list --json` returns **two different `status` contracts** depending on mode (BUI-150), so the table must cover both:
+- **Server / thin-client mode** (`GIXEN_SERVER_URL` set — the production MacBook + Mac Mini setup): the server returns the **internal mapped** status, one of `WON` / `LOST` / `FAILED` / `ENDED`. The raw Gixen failure reason survives in `status_mirror`.
+- **Direct mode** (no server): the raw Gixen string (`BID UNDER ASKING PRICE`, `NETWORK ERROR`, …).
 
 | `status` value | Result label |
 |---|---|
-| `BID UNDER ASKING PRICE` | Outbid |
-| `NETWORK ERROR` | Not Bid ❌ |
-| `NETWORK ERROR: EBAY BID INCREMENT RULE NOT MET` | Not Bid ❌ |
-| Anything containing `WON` | Won ✅ |
+| `WON`, or anything containing `WON` | Won ✅ |
+| `LOST`, `BID UNDER ASKING PRICE`, `OUTBID` | Outbid |
+| `FAILED`, `NETWORK ERROR`, `NETWORK ERROR: …` | Not Bid ❌ |
+| `ENDED` | Ended (outcome unresolved — the eBay fallback may still refine it to Won/Outbid) |
 | Anything else | show raw status |
 
-If `status_mirror` differs from `status` and is not `N/A`, append it in parens: `Not Bid ❌ (mirror: EBAY BID INCREMENT RULE NOT MET)`.
+If `status_mirror` differs from `status` and is not `N/A`, append it in parens — in server mode this is where the `FAILED` reason lives: `Not Bid ❌ (mirror: EBAY BID INCREMENT RULE NOT MET)`.
 
 ```
 **Recently Ended (N):**
@@ -77,5 +97,5 @@ If `status_mirror` differs from `status` and is not `N/A`, append it in parens: 
 After the tables, call out anything that needs attention:
 
 - Any active snipe where current bid ≥ max bid (won't win — ask if user wants to raise the max or cancel)
-- Any recently ended with `NETWORK ERROR` on both main and mirror (Gixen failed to bid at all — consider re-sniping if relisted, or Gixen Plus for priority queue)
-- Any recently ended with `BID UNDER ASKING PRICE` where the gap between max bid and winning bid is small (might be worth raising max on future similar listings)
+- Any recently ended that resolved to **Not Bid ❌** (`FAILED` in server mode, or `NETWORK ERROR` in direct mode — check `status_mirror` for the reason): Gixen failed to bid at all — consider re-sniping if relisted, or Gixen Plus for priority queue
+- Any recently ended that resolved to **Outbid** (`LOST` in server mode, or `BID UNDER ASKING PRICE` in direct mode) where the gap between max bid and winning bid is small (might be worth raising max on future similar listings)
