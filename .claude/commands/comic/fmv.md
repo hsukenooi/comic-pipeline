@@ -176,9 +176,17 @@ Treat seller-grade `F` (loose "Fine") as suspect — sellers often misuse it for
 
 Build a grade → [prices] map. Compute median per bucket.
 
-### 3. Build the comp pool
+### 3. Build the comp pool (progressive widening + honesty guards)
 
-Try ±0.5 grades from target first. If <5 comps, widen to ±1.0.
+Start at ±0.5 grades from target and widen in 0.5 steps (±0.5 → ±1.0 → ±1.5 → ±2.0) until you have ≥5 grade-bearing comps or hit the ±2.0 ceiling. The `comic-fmv` CLI does this automatically; `--grade-window <n>` raises or lowers the ceiling without bypassing the guards below.
+
+After widening, a pool is **not** auto-priced — it is flagged `needs_manual` — when any of these hold (precedence: sparse → one-sided → too-wide):
+
+- **`too_sparse`** — fewer than 2 comps survive IQR trim. A lone comp is not a price.
+- **`one_sided`** — every comp sits strictly above OR strictly below the target grade (no bracket). Widening only reaches one direction, so the estimate would be biased (e.g. a NM+ 9.6 target whose comps top out at 9.0 — widening only drags it *down*). This is the case for hand-pricing via §7/§7a, not an automated number.
+- **`too_wide`** — the pool brackets the target but spans more than 2.0 grade points (e.g. comps at 5.0 and 9.0 for a 7.0 target). The median of a grade-smeared pool is meaningless because price is monotonic in grade.
+
+A flagged book emits no bid-able number; `comic-fmv` still writes the linked comic stub (so it's traceable) with `manual_review=<reason>` in the notes. **When you see `needs_manual`, either hand-price it via grade-curve interpolation (§7) or the CGC proxy (§7a), or leave it for manual review — do not invent a number from the smeared/one-sided pool.** Only a bracketed, bounded, ≥2-comp pool auto-prices.
 
 ### 4. IQR outlier removal
 
@@ -261,7 +269,9 @@ Use the midpoint of the range by default. Adjust toward the tighter end (10% / 1
 | ≥3 | any | MEDIUM-LOW |
 | <3 | — | LOW |
 
-Where `CV = stdev / median`. State which window (±0.5 vs ±1.0) was used.
+Where `CV = stdev / median`. State which window the pool was built at.
+
+**Wide-window cap:** a pool built at a window **wider than ±1.0** caps at MEDIUM confidence regardless of n and CV — a pool stitched together across ±1.5–±2.0 of grade can't claim HIGH/MEDIUM-HIGH no matter how many comps it has. (A genuinely thin or grade-mixed pool is flagged `needs_manual` per §3 and emits no number at all; the cap applies only to pools that still price.)
 
 ### 9. Within-grade adjustments
 
@@ -292,11 +302,13 @@ Manual fallback: skip these unless you're explicitly recomputing — re-running 
 | 1 | X-Men #31 (1967) | VF+ 8.5 | $100-175 | $135 | 9 | ±0.5 | 22% | HIGH | — |
 | 2 | ASM #5 (1963) | VG+ 4.5 | $1100-1300 | $1240 | 1 + curve | ±0.5 | n/a | LOW | Single direct 4.0 OW comp; interpolated |
 | 3 | MS #5 (1972) | VG 4.0 | $575-650 | $610 | CGC proxy | n/a | n/a | MEDIUM-LOW | CGC proxy: Heritage 4.0 avg $658; 10% raw discount |
+| 4 | FF #63 (1967) | NM+ 9.6 | needs_manual | — | 5 | ±1.0 | n/a | — | manual_review=one_sided — comps top out at 9.0; hand-price or skip |
 ```
 
 Always include:
-- The window used (±0.5 or ±1.0)
+- The window the pool was built at
 - N and CV
+- Whether the book was flagged `needs_manual` (and the reason: `one_sided` / `too_wide` / `too_sparse`) vs. auto-priced
 - Whether grade-curve interpolation was applied
 - Suspect comps flagged (with reason)
 - Hot-market signal if current bid > Q75
@@ -355,3 +367,5 @@ Confirm the `id` returned — that's the `comic_id` that will be linked to the b
 | Applying CGC proxy to books under $200 | Raw and CGC markets diverge too much below $200 — stick to raw eBay comps only |
 | Using CGC proxy as the primary method when raw comps exist | CGC proxy is a fallback — n < 3 raw comps AND value > $200 are both required to trigger it |
 | Forgetting to cap confidence when using CGC proxy | The discount estimate introduces irreducible uncertainty — max MEDIUM-LOW regardless of CGC data quality |
+| Forcing a number out of a one-sided or grade-smeared pool | If the pool doesn't bracket the target or spans >2.0 grades, it's flagged `needs_manual` — hand-price via §7/§7a or skip, don't report the smeared median |
+| Treating a `needs_manual` row like a no-comps row | A flagged book still has a linked comic stub (`manual_review=<reason>` in notes) and a real `comic_id` — it shows as `manual:<reason>` in the table, not `n/a` |

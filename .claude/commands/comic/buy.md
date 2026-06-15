@@ -108,6 +108,8 @@ comic-fmv --batch <working_list.json> --out <results.json>
 
 Each row in the output JSON includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen add`. A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid.
 
+**Needs-manual rows (BUI-86):** a row whose `fmv.flag_reason` is set (`one_sided`, `too_wide`, or `too_sparse`) could not be honestly auto-priced — its `fmv_low`/`fmv_high`/`max_bid` are all `null`. It still has a real `comic_id` (the comic stub was written), so the `comic_id: null` check above will **not** catch it. Gate on `fmv.flag_reason` instead: surface these rows as **needs-manual** and do not auto-propose a max bid. The user either hand-prices them (via the `fmv.md` interpolation / CGC-proxy methods) or skips them — never bid the absent number.
+
 ### The ID chain (why we capture `comic_id`)
 
 This is the chain that fixes the recurring "bids.comic_id and bids.fmv_id are NULL" bug (PER-140):
@@ -137,7 +139,10 @@ Flags worth knowing:
 | ≥3 | any | MEDIUM-LOW |
 | <3 | — | LOW |
 
+A pool built at a window wider than ±1.0 caps at MEDIUM regardless of n/CV (the CLI applies this; the row's `window` field shows the window used).
+
 **Flagging rules** (apply when presenting the table to the user):
+- `fmv.flag_reason` set → present as **needs-manual (`<reason>`)**, no max bid; user hand-prices or skips (see the needs-manual note in Step 3)
 - LOW or MEDIUM-LOW with `n ≤ 3` → call out explicitly; user may want to skip or set a conservative max
 - Auction ends within 24h → mark with **⚠️ ends <date>** in the Notes column. Always surface urgency before max-bid approval
 - CV >100% → suspect a wild outlier survived; check the comp pool in the JSON output
@@ -157,9 +162,12 @@ The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_fa
 | 1 | Amazing Spider-Man #300 | NM | $800–1000 | $800 | |
 | 2 | Invincible #1 | NM (assumed) | $270–320 | $192 | LOW conf, n=2, bid_haircut=0.60 |
 | 3 | Batman #609 | NM | $40–50 | $40 | ⚠️ ends 2026-05-11 |
+| 4 | Fantastic Four #63 | NM+ 9.6 | needs-manual | — | manual_review=one_sided — hand-price or skip |
 ```
 
 Clean-number rounding: $5 step below $50, $10 step from $50–$200, $25 step above $200.
+
+A `needs-manual` row (`fmv.flag_reason` set) has no CLI-computed max bid. Present it without a proposed number; the user supplies a hand-derived max bid (via the `fmv.md` interpolation / CGC-proxy methods) or skips it. Don't fabricate a max from the absent FMV.
 
 Gate: user approves or overrides each max bid.
 

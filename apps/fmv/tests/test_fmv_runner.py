@@ -173,6 +173,36 @@ class TestComputeOne:
         body = upsert_mock.call_args.args[1]
         assert body.get("locg_id") == 100
 
+    def test_grade_window_threads_through_without_bypassing_guard(self, server_url):
+        """BUI-86 AE4: --grade-window raises the ceiling but a one-sided book
+        stays flagged — the flag is never manufactured into a price."""
+        comps = [_make_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        result = {
+            "input": {"title": "FF", "issue": "63", "year": 1967, "grade": 9.6},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "FF", "issue": "63", "grade": 9.6},
+                server_url=server_url, grade_window=2.5)
+        assert out["fmv"]["flag_reason"] == "one_sided"
+        assert out["fmv"]["max_bid"] is None
+
+    def test_lower_grade_window_caps_reach(self, server_url):
+        """A tightened ceiling can't widen far enough → flags too_sparse for a
+        book that would otherwise have widened to gather a pool."""
+        comps = [_make_comp(100, 7.0), _make_comp(110, 8.0), _make_comp(120, 8.0)]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 7.0},
+            "comps": comps,
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 7.0},
+                server_url=server_url, grade_window=0.5)
+        assert out["fmv"]["window"] == 0.5
+        assert out["fmv"]["flag_reason"] == "too_sparse"
+
     def test_grade_confidence_threads_into_haircut(self, server_url):
         """BUI-51: grade_confidence on the batch envelope must reach compute_fmv
         and haircut the bid, and the upsert notes must surface it."""
@@ -313,6 +343,32 @@ class TestComputeOne:
         assert out["comic_id"] == 7
         assert out["fmv_id"] == 3
 
+    def test_flagged_book_upserts_stub_with_manual_token(self, server_url):
+        """BUI-86: a needs_manual book (one-sided pool) writes the same stub
+        shape as n=0 — null pricing, comps=pool size, confidence low — but its
+        fmv_notes carry the manual_review token, and comic_id is returned so it
+        stays linked."""
+        comps = [_make_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        result = {
+            "input": {"title": "FF", "issue": "63", "year": 1967, "grade": 9.6},
+            "comps": comps,
+        }
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"comic_id": 11, "fmv_id": 5, "id": 11}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "FF", "issue": "63", "grade": 9.6, "locg_id": 200},
+                server_url=server_url)
+
+        body = post_mock.call_args.kwargs["json"]
+        assert body["fmv_low"] is None and body["fmv_high"] is None
+        assert body["fmv_comps"] == 5            # un-priced pool size preserved
+        assert body["fmv_confidence"] == "low"   # forced LOW even though dense
+        assert "manual_review=one_sided" in body["fmv_notes"]
+        assert out["fmv"]["flag_reason"] == "one_sided"
+        assert out["comic_id"] == 11
+
     def test_unrecognized_grade_string_errors(self, server_url):
         """If the grade string can't be coerced, log and return an error
         row rather than silently passing it to fmv_math."""
@@ -442,6 +498,63 @@ class TestStitch:
         out = fmv_runner._stitch([book], cached, {})
         assert out[0]["fmv"]["bid_factor"] == fmv_runner.fmv_math.BASE_BID_FACTOR
         assert out[0]["fmv"]["max_bid"] == fmv_runner.fmv_math.clean_round(100 * 0.80)
+
+
+# ─── Flagged-state presentation (BUI-86) ─────────────────────────────────────
+
+class TestFlaggedPresentation:
+    def test_build_notes_carries_manual_token_and_span(self):
+        fmv = {"window": 1.0, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": "one_sided", "grade_span": 1.5, "bid_factor": 0.80}
+        notes = fmv_runner._build_notes(fmv)
+        assert "manual_review=one_sided" in notes
+        assert "span=1.5" in notes
+
+    def test_build_notes_omits_manual_token_when_priced(self):
+        fmv = {"window": 0.5, "cv_pct": "20%", "confidence": "HIGH",
+               "flag_reason": None, "grade_span": 0.0, "bid_factor": 0.80}
+        notes = fmv_runner._build_notes(fmv)
+        assert "manual_review" not in notes
+
+    def test_build_notes_no_bid_haircut_on_flagged_book(self):
+        # A flagged book's forced-LOW label yields factor 0.60, but it has no
+        # max bid — the bid_haircut token would be misleading, so it's suppressed.
+        fmv = {"window": 2.0, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": "too_wide", "grade_span": 4.0, "bid_factor": 0.60,
+               "grade_confidence": None}
+        notes = fmv_runner._build_notes(fmv)
+        assert "manual_review=too_wide" in notes
+        assert "bid_haircut" not in notes
+
+    def test_print_table_distinguishes_three_states(self, capsys):
+        rows = [
+            {"input": {"title": "Priced", "issue": "1", "grade": 8.0},
+             "fmv": {"flag_reason": None, "fmv_low": 100, "fmv_high": 150,
+                     "median": 125, "max_bid": 120, "n": 8, "cv_pct": "20%",
+                     "confidence": "HIGH"}, "source": "fresh"},
+            {"input": {"title": "Flagged", "issue": "2", "grade": 9.6},
+             "fmv": {"flag_reason": "one_sided", "fmv_low": None, "fmv_high": None,
+                     "median": None, "max_bid": None, "n": 5, "cv_pct": "n/a",
+                     "confidence": "LOW"}, "source": "fresh"},
+            {"input": {"title": "NoComps", "issue": "3", "grade": 7.0},
+             "fmv": {"flag_reason": None, "fmv_low": None, "fmv_high": None,
+                     "median": None, "max_bid": None, "n": 0, "cv_pct": "n/a",
+                     "confidence": "LOW"}, "source": "fresh"},
+        ]
+        fmv_runner._print_table(rows)
+        out = capsys.readouterr().out
+        assert "manual:one_sided" in out   # flagged row
+        assert "$100–$150" in out          # priced row
+        assert "n/a" in out                # no-comps row
+        # The flagged and no-comps rows must NOT render identically
+        assert out.count("manual:one_sided") == 1
+
+    def test_fmv_from_db_row_has_new_keys(self):
+        row = {"fmv_low": 50, "fmv_high": 100, "fmv_comps": 8,
+               "fmv_confidence": "high"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert "flag_reason" in out and out["flag_reason"] is None
+        assert "grade_span" in out and out["grade_span"] is None
 
 
 # ─── End-to-end (with mocks) ──────────────────────────────────────────────────
