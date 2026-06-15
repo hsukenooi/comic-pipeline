@@ -334,6 +334,28 @@ class TestTieredStrategy:
         assert "147295505028" not in ids
         assert "aaa" in ids
 
+    def test_self_exclusion_misses_when_product_id_differs(self, tmp_path, monkeypatch):
+        """BUI-160: comps are keyed by SerpApi product_id, a DIFFERENT identifier
+        namespace from the eBay item_id the --batch path carries. When the
+        self-listing surfaces under a product_id that isn't the seeded eBay
+        item_id, self-exclusion silently misses it. This locks that documented,
+        best-effort contract (self-exclusion is reliable only on a product_id
+        match) so a future change to the keying is caught."""
+        results = [[
+            # The self-listing's relist — but SerpApi gave it product_id "999",
+            # not the eBay item_id we seed below.
+            self._comp("999", title="ASM #142 FN Marvel"),
+            self._comp("aaa", title="ASM #142 VF Marvel"),
+        ] * 3]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps({
+            "title": "ASM", "issue": "142", "year": 1975, "grade": 6.5,
+            "item_id": "147295505028",  # eBay item_id — different namespace
+        }, "key")
+        ids = {c["product_id"] for c in out["comps"]}
+        # Not excluded: product_id 999 != the seeded eBay item_id.
+        assert "999" in ids
+
     def test_dedup_across_tiers(self, tmp_path, monkeypatch):
         # Same comp returned in tier 1 and tier 2 → only counted once
         c1 = self._comp("dup", title="ASM #142 FN+ Marvel 1975")

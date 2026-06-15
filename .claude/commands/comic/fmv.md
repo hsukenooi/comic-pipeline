@@ -33,6 +33,8 @@ Flags:
 
 The CLI prints a human-readable table to stdout and writes the full structured result to `--out`. Present the table to the user and carry the JSON forward to Step 4 of `/comic:buy`.
 
+**`fetch-err` ≠ `n/a` (BUI-143):** a row whose FMV column reads `fetch-err` (and the loud post-table warning) means the **SerpApi fetch failed** for that book — quota exhausted or an outage — **not** that the book has no comps. Treat a `fetch-err` row (or a whole batch that comes back all `fetch-err`/`n/a`) as a SerpApi failure: check the `SERPAPI_KEY`/quota and re-run. Never tell the user these books are illiquid or bid on them as if priced.
+
 **The rest of this file is the spec for the math the CLI implements** — read only when debugging the CLI, building a new consumer, or doing manual fallback computation.
 
 ---
@@ -45,28 +47,19 @@ If `gixen fmv` is unavailable, you can run the steps below by hand. SerpApi acce
 
 Before doing any research, verify the server is configured and up.
 
-**1. Resolve `GIXEN_SERVER_URL`:**
-
-The Gixen server runs on the Mac Mini. The MacBook connects to it via Tailscale; the Mac Mini uses localhost.
-
-```bash
-echo "${GIXEN_SERVER_URL:-UNSET}"
-hostname
-```
-
-If `GIXEN_SERVER_URL` is unset, infer it from the hostname:
-- `Hsus-MacBook-Air.local` → `http://mac-mini.tail9b7fa5.ts.net:8080`
-- `mac-mini` (or any Mac Mini hostname) → `http://localhost:8080`
-
-Set it for the current invocation and continue. If the hostname matches neither known machine, **stop** with: "`GIXEN_SERVER_URL` is not set and the machine is unrecognised. Set the variable manually and confirm the server is running."
-
-**2. Verify the server is responding:**
+Resolve and health-gate the server through the **shared comics-server call
+convention** (BUI-172, `docs/conventions/comics-server-call.md`) — don't
+hand-roll URL resolution or the health check here:
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/health"
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1   # GIXEN_SERVER_URL (env var, hostname fallback)
+comics_health_gate     || exit 1   # the server must answer
 ```
 
-If this fails or returns non-200, **stop immediately** with: "The Gixen server at `$GIXEN_SERVER_URL` is not responding. FMV data cannot be saved. Confirm the server is running before continuing." Do not proceed with any queries.
+If either step fails, **stop immediately** — the Gixen server is unreachable or
+the machine is unrecognised, so FMV data cannot be saved. Do not proceed with
+any queries.
 
 ## Input
 
@@ -101,7 +94,7 @@ curl -s "https://serpapi.com/search.json?engine=ebay&_nkw=%22{title}+{issue}%22+
 
 Skip tiers 2 and 3 by default — they're conditional, not always-on.
 
-**Self-exclusion:** if an active auction is being priced, drop any comp whose `item_id` matches the listing being valued. Re-listed auctions appear in `LH_Complete` results and self-bias the FMV.
+**Self-exclusion (best-effort — BUI-160):** if an active auction is being priced, drop any comp whose `item_id` matches the listing being valued. **Caveat:** comps are keyed by SerpApi `product_id`, which is a *different identifier namespace* from the eBay `item_id` the batch carries — so in the automated `comic-fmv --batch` path the seeded `item_id` usually won't match any comp's `product_id`, and a re-listed self-auction can survive into the comp pool and mildly self-bias the FMV upward. Self-exclusion is therefore reliable only when SerpApi happens to surface a matching `item_id` (or when you pass the actual SerpApi `product_id`); IQR trimming + the 80% bid haircut bound the residual bias. Don't rely on it as a hard guarantee.
 
 **Parse results:**
 
