@@ -617,9 +617,15 @@ def cmd_wish_list_add(title: str) -> dict[str, Any]:
 
     Writes ``{"name": title, "id": None}`` to ``data/locg/wish-list.json``
     using the same atomic write pattern as :func:`collection_io._write_wish_list_cache`
-    (tempfile + os.replace + chmod 600).  A subsequent ``locg collection import``
-    overwrites the cache with fresh XLSX data, so manually-added entries are
-    not preserved across imports.
+    (tempfile + os.replace + chmod 600).
+
+    Manual adds carry no ``series_name``, which marks them as local-only.
+    :func:`collection_io._write_wish_list_cache` preserves such entries across a
+    ``locg collection import`` (BUI-47): it rebuilds the export-derived set, then
+    re-appends any local-only entry whose name isn't already covered. A manual
+    add is deduped out only once it round-trips through a LOCG export and reappears
+    in the import. Until then it persists locally but is never pushed to LOCG —
+    there is no wish-list push path (cf. the collection's record-win round-trip).
     """
     title = (title or "").strip()
     if not title:
