@@ -67,12 +67,14 @@ jobs:
         with:
           enable-cache: true
 
+      # apps/ebay + apps/fmv don't declare pytest as a dependency (it's not
+      # part of their runtime), so provision it for the run with `--with`.
       - name: Test — apps/ebay
-        run: uv run pytest
+        run: uv run --with pytest pytest
         working-directory: apps/ebay
 
       - name: Test — apps/fmv
-        run: uv run pytest
+        run: uv run --with pytest pytest
         working-directory: apps/fmv
 
   # ezship is a standalone TypeScript CLI (apps/ezship). vitest, not pytest.
