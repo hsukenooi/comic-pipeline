@@ -121,7 +121,7 @@ Run `comic-fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetc
 comic-fmv --batch <working_list.json> --out <results.json>
 ```
 
-**Input:** Working list JSON: `[{item_id, title, issue, year, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Include `grade_confidence` (`high`|`medium`|`low`) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
+**Input:** Working list JSON: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Pass `publisher` for non-Marvel/DC titles and `variant` for non-base editions — both feed FMV accuracy (BUI-161). Include `grade_confidence` (`high`|`medium`|`medium-low`|`low` — all four levels; `medium-low` and `low` haircut differently, 0.70 vs 0.60) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
 
 **Output:** Human FMV table to stdout + structured JSON at `--out`. Carry the JSON forward to Step 4 **and Step 5**.
 
