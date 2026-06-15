@@ -90,6 +90,9 @@ class TestSplitByDbCache:
         assert needs[0]["_idx"] == 0
 
     def test_book_without_locg_id_goes_to_compute(self, server_url):
+        # BUI-153: the DB-FMV cache-skip requires a locg_id, so a title-derived
+        # book (grade set, no locg_id) always falls through to a fresh compute —
+        # which is why --max-age-days is inert in the orchestrated /comic:buy flow.
         books = [_make_book("1", "X", "1", 1990, 9.0)]
         with patch("fmv_runner._db_lookup") as lookup:
             cached, needs = fmv_runner._split_by_db_cache(
