@@ -188,6 +188,26 @@ def test_fmv_doc_uses_real_command_name():
     assert "comic-fmv" in doc
 
 
+def test_wishlist_add_resolves_server_via_shared_convention():
+    """BUI-170: wishlist-add's Step 0 was comment-only — it never inferred/SET
+    GIXEN_SERVER_URL when unset (missing the Mac Mini -> localhost mapping), so
+    it aborted on the Mac Mini. Assert it routes through the shared convention
+    that actually does the inference."""
+    doc = (SKILLS_DIR / "wishlist-add.md").read_text()
+    assert "comics_resolve_server" in doc
+    assert "comics_health_gate" in doc
+
+
+def test_wishlist_add_reconciles_series_names():
+    """BUI-171: wishlist-add must reconcile the Metron series name to the LOCG
+    catalog spelling (like collection-check does) before the ownership check, or
+    an alt-spelling false `not_in_cache` wish-lists an owned book."""
+    doc = (SKILLS_DIR / "wishlist-add.md").read_text()
+    assert "/api/comics/collection/series-names" in doc, (
+        "wishlist-add must call series-names to reconcile the catalog spelling"
+    )
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the

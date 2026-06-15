@@ -30,15 +30,20 @@ set -a; . ~/.config/locg/.env 2>/dev/null; set +a
 > Metron credentials not found. Add `METRON_USERNAME` and `METRON_PASSWORD` to
 > `~/.config/locg/.env` and retry.
 
-Also resolve the gixen server (the wish-list now lives there) and health-gate it
-— same `GIXEN_SERVER_URL` env + hostname fallback as `/comic:fmv`:
+Also resolve and health-gate the gixen server (the wish-list now lives there)
+through the shared comics-server convention (BUI-172,
+`docs/conventions/comics-server-call.md`). This actually **infers** the URL from
+the hostname when `GIXEN_SERVER_URL` is unset — including the Mac Mini →
+`localhost` mapping the old comment-only block omitted (BUI-170), so the skill no
+longer aborts on the Mac Mini where the correct answer is `localhost:8080`:
 
 ```bash
-echo "${GIXEN_SERVER_URL:-UNSET}"; hostname   # unset → MacBook: http://mac-mini.tail9b7fa5.ts.net:8080
-curl -sf "$GIXEN_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+comics_health_gate     || exit 1
 ```
 
-**If the health gate fails:** Stop — adds can't be written to an unreachable server.
+**If either fails:** Stop — adds can't be written to an unreachable server.
 
 ## Step 1: Look up the series on Metron
 
@@ -72,6 +77,24 @@ Record `issue_count` and the chosen `series` display name.
 Wish-listing a book you already own is the bug that deleted real collection rows
 (BUI-122): an owned-but-wished book gets pushed to LOCG with `In Collection=0`,
 which removes it from the collection. Filter owned issues out **before** adding.
+
+**First, reconcile the Metron series name to the LOCG catalog spelling (BUI-171),**
+the same defense `/comic:collection-check` uses. The matcher already neutralizes
+leading articles (`The`/`A`/`An`), `(Vol. N)`, and year suffixes, but a genuine
+alt-spelling (punctuation, abbreviation, Metron-vs-LOCG word choice) makes every
+owned issue return a false `not_in_cache` — which Step 3 reads as "not owned" and
+wish-lists a book you already own. Fetch the catalog's actual series names and
+match the Metron `series` against them:
+
+```bash
+comics_curl "$GIXEN_SERVER_URL/api/comics/collection/series-names" || exit 1
+```
+
+Normalized-match the Metron `series` (strip a leading article, lowercase) against
+the returned names. If a confident catalog match exists, use **that catalog
+spelling** as the `series` param in the per-issue check below. If none matches,
+proceed with the Metron name but note that ownership for this series couldn't be
+reconciled — a `not_in_cache` here may be a spelling miss, not genuinely un-owned.
 
 For each resolved issue, ask the server's collection (no LOCG network needed).
 **Check by series + issue only — do NOT pass `year`.** `year` is a *per-issue
