@@ -4,7 +4,7 @@
 
 ## Mission
 
-Resolve all 35 findings from the 2026-06-15 seam audit (**BUI-137 … BUI-171**), unsupervised, one batch at a time, merging each batch to `main` with green CI and closing each Linear issue as you go.
+Resolve all 35 findings from the 2026-06-15 seam audit plus 2 structural follow-ups that prevent the dominant bug class from recurring (**BUI-137 … BUI-173**), unsupervised, one batch at a time, merging each batch to `main` with green CI and closing each Linear issue as you go.
 
 - **Fix detail (source of truth):** [`docs/audit/2026-06-15-seam-audit.md`](./2026-06-15-seam-audit.md) — every BUI issue has a register entry with evidence (file:line), repro, suggested fix, and a regression test.
 - **Tracking:** Linear project *comic-pipeline Seam Audit Remediation* (team `BUI`).
@@ -65,8 +65,11 @@ For each batch in the order below:
 
 ## Execution order
 
-### Phase 0 — Safety net (do this FIRST; every later batch relies on it)
+### Phase 0 — Safety net + prevention rails (do this FIRST; every later batch relies on it)
+Build the rails before burning down the list, so the per-skill batches *consume* them instead of re-patching in isolation.
 - **Batch A:** BUI-140 (make CI run the package test suites) + BUI-155 (strengthen the workspace-imports canary). Files: `.github/workflows/ci.yml`, `plugins/gixen-overlay/tests/test_workspace_imports.py`. If enabling CI surfaces pre-existing failures, fix them, or mark genuinely-integration tests with the `integration` marker — document any quarantine in the PR. Do not merge until the configured suites are green.
+- **Batch A2:** BUI-172 — extract one shared comics-server call convention (resolve `GIXEN_SERVER_URL` + hostname fallback, health-gate, hard-fail loudly). This is the structural fix for the URL-resolution + silent-failure cluster. **Later skill batches that touch a server call (C/BUI-157, F/BUI-143, J/BUI-151, K/BUI-169, O/BUI-170, and BUI-154) must adopt this convention rather than patching their own copy** — when you reach them, replace the local glue with a reference to BUI-172's convention and close both.
+- **Batch A3:** BUI-173 — add the skill↔endpoint contract-test harness (depends on Batch A's CI). This is the structural fix for the `contract-mismatch` cluster. As you fix each documented-contract drift later (BUI-142, 148, 150, 161, 162, 163, 167), **add its assertion to this harness** so the same drift fails CI next time instead of resurfacing.
 
 ### Phase 1 — High (money / data-loss risk)
 - **Batch B:** BUI-137 + BUI-156 — overlay `routes.py` (record-win) + `.claude/commands/comic/collection-add.md`.
