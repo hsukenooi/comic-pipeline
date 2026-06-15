@@ -1,0 +1,7 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+[git]
+# Auto-archive a workspace when its PR merges, and delete the branch on archive,
+# so merged Conductor branches don't accumulate and require periodic cleanup (BUI-133).
+archive_on_merge = true
+delete_branch_on_archive = true
