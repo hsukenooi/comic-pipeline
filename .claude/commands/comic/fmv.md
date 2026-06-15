@@ -23,9 +23,11 @@ set -a && source ~/Projects/comic-pipeline/apps/ebay/.env && set +a
 comic-fmv --batch <working_list.json> --out <results.json>
 ```
 
-`--batch` JSON shape: `[{item_id, title, issue, year, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]`
+`--batch` JSON shape: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]`
 
-`grade_confidence` (optional, `high`|`medium`|`low`) is the photo-coverage confidence from `/comic:grade`. When present and low, it haircuts the max bid (see Step 6). Absent → standard 80% bid, no haircut (back-compat for seller-stated grades and manual runs).
+`publisher` and `variant` are optional but **load-bearing** (BUI-161): `ebay-sold-comps` appends `publisher` to the eBay search query — strongly recommended for non-Marvel/DC titles, where it's the primary noise filter that keeps trading cards / unrelated matches out of the comp pool — and `variant` (e.g. `Newsstand`, `Direct`) gives base vs variant editions distinct `comic_id`s (BUI-28), so omitting it conflates two sub-markets onto one comic.
+
+`grade_confidence` (optional, `high`|`medium`|`medium-low`|`low` — **four** levels, BUI-162) is the photo-coverage confidence from `/comic:grade`. When present and low, it haircuts the max bid (see Step 6) — `medium-low` and `low` haircut **differently** (0.70 vs 0.60), so don't collapse them. Absent → standard 80% bid, no haircut (back-compat for seller-stated grades and manual runs).
 
 Flags:
 - `--max-age-days N` (default 7): reuse FMVs already in the Gixen DB if `fmv_updated_at` is within N days
@@ -41,7 +43,7 @@ The CLI prints a human-readable table to stdout and writes the full structured r
 
 ## Manual fallback (only if the CLI is broken)
 
-If `gixen fmv` is unavailable, you can run the steps below by hand. SerpApi access requires `SERPAPI_KEY`; canonical location is `~/.config/ebay-fetch/config.json`.
+If `comic-fmv` is unavailable, you can run the steps below by hand. SerpApi access requires `SERPAPI_KEY`; canonical location is `~/.config/ebay-fetch/config.json`.
 
 ## Server Health Check
 

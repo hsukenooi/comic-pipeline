@@ -154,6 +154,40 @@ def test_ezship_declared_value_units_agree():
     assert "cents" in doc, "ezship-add.md must state -d is in cents"
 
 
+def test_fmv_batch_schema_documents_consumed_fields():
+    """BUI-161: ebay-sold-comps reads `publisher` (search-query noise filter) and
+    fmv_runner reads `variant` (distinct comic_id per edition, BUI-28), but the
+    documented --batch schema omitted both. Assert the fields the code consumes
+    are documented in fmv.md (and buy.md, which repeats the schema)."""
+    sold = (REPO_ROOT / "apps" / "ebay" / "src" / "sold_comps.py").read_text()
+    runner = (REPO_ROOT / "apps" / "fmv" / "src" / "fmv_runner.py").read_text()
+    assert 'book.get("publisher")' in sold, "sold_comps no longer reads publisher"
+    assert 'inp.get("variant")' in runner or 'inp["variant"]' in runner
+    for skill in ("fmv.md", "buy.md"):
+        doc = (SKILLS_DIR / skill).read_text()
+        assert "publisher" in doc, f"{skill} batch schema omits publisher (BUI-161)"
+        assert "variant" in doc, f"{skill} batch schema omits variant (BUI-161)"
+
+
+def test_fmv_grade_confidence_enum_matches_code():
+    """BUI-162: fmv.md documented 3 confidence levels but fmv_math normalizes 4
+    (adds medium-low, which haircuts to 0.70 vs low's 0.60). Assert every
+    documented level matches _GRADE_CONF_NORMALIZE's keys."""
+    math_src = (REPO_ROOT / "apps" / "fmv" / "src" / "fmv_math.py").read_text()
+    keys = set(re.findall(r'"(high|medium|medium-low|low)":', math_src))
+    assert keys == {"high", "medium", "medium-low", "low"}, keys
+    doc = (SKILLS_DIR / "fmv.md").read_text()
+    assert "medium-low" in doc, "fmv.md must document the 4th level medium-low (BUI-162)"
+
+
+def test_fmv_doc_uses_real_command_name():
+    """BUI-163: fmv.md referenced a non-existent `gixen fmv` fallback command;
+    the real CLI is `comic-fmv`. Assert the dead command name is gone."""
+    doc = (SKILLS_DIR / "fmv.md").read_text()
+    assert "gixen fmv" not in doc, "fmv.md references the non-existent `gixen fmv` command"
+    assert "comic-fmv" in doc
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the
