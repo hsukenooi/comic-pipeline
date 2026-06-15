@@ -49,6 +49,7 @@ from locg.commands import (
     cmd_collection_status,
     cmd_wish_list_add,
     cmd_wish_list_from_cache,
+    cmd_wish_list_remove,
 )
 from openpyxl.utils.exceptions import InvalidFileException
 
@@ -1044,6 +1045,33 @@ async def api_wish_list_add(req: WishListAddRequest):
     result = cmd_wish_list_add(req.title)
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
+    return result
+
+
+@router.delete("/api/comics/wish-list")
+async def api_wish_list_remove(title: str | None = None):
+    """Remove an issue from the wish-list on the server (BUI-128).
+
+    Mirrors `locg wish-list remove`. Uses a `title` query param rather than a
+    request body — cleaner REST for DELETE, and lets the caller hit
+    `DELETE /api/comics/wish-list?title=...`. Replaces the old SSH-into-the-Mac-
+    Mini-and-run-`locg wish-list remove` workaround that broke the
+    server-as-source-of-truth model.
+
+    Status codes: 422 for a blank title, 404 when the title isn't present (or the
+    wish-list was never imported), 200 on a successful removal. Like the POST
+    append, a removal is overwritten by the next full import unless pushed to
+    LOCG first.
+    """
+    _ensure_collection_store()
+    result = cmd_wish_list_remove(title or "")
+    if "error" in result:
+        # A blank title is a malformed request (422); every other error here
+        # means the title — or the wish-list cache itself — wasn't found (404).
+        is_blank = "non-empty" in result["error"]
+        raise HTTPException(
+            status_code=422 if is_blank else 404, detail=result["error"]
+        )
     return result
 
 

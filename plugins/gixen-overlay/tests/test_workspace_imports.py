@@ -58,6 +58,7 @@ def test_locg_command_surface_resolves():
         cmd_collection_status,
         cmd_wish_list_add,
         cmd_wish_list_from_cache,
+        cmd_wish_list_remove,
     )
 
     assert all(
@@ -70,5 +71,6 @@ def test_locg_command_surface_resolves():
             cmd_collection_status,
             cmd_wish_list_add,
             cmd_wish_list_from_cache,
+            cmd_wish_list_remove,
         )
     )
