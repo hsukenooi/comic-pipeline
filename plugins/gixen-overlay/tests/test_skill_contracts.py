@@ -81,6 +81,22 @@ def test_harness_actually_found_endpoints():
     )
 
 
+def test_identify_documents_grade_from_description():
+    """BUI-148: ebay_fetch.py emits a third grade signal, grade_from_description
+    (a grade found only in the listing body), but identify.md's field table
+    omitted it — so the skill mislabelled description-graded listings as having
+    no grade anywhere. Assert the field the script emits is documented, and the
+    skill keys its strong-warning rule on it (grade_from_description null too)."""
+    fetch_src = (REPO_ROOT / "apps" / "ebay" / "src" / "ebay_fetch.py").read_text()
+    assert '"grade_from_description"' in fetch_src, (
+        "ebay_fetch.py no longer emits grade_from_description — update this contract"
+    )
+    identify = (SKILLS_DIR / "identify.md").read_text()
+    assert "grade_from_description" in identify, (
+        "identify.md must document grade_from_description (the script emits it)"
+    )
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the

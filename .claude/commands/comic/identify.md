@@ -30,6 +30,15 @@ cd ~/Projects/comic-pipeline/apps/ebay && pip install -e . -q
 
 ## Step 2: Parse the JSON
 
+**Reconcile the array against your input first (BUI-166):** the array has one
+object per *successfully fetched* item — an item that 404s, hits a non-200, or
+exhausts its 429 retries is silently dropped (the error goes to **stderr**, exit
+stays 0). So always compare the returned object count to the number of IDs you
+passed, and for any input with no corresponding row, surface it as a fetch
+failure (quote the stderr line) rather than omitting it without comment. If the
+array is **empty**, treat it as a hard fetch failure — show the stderr and stop;
+do **not** present an empty identification table as a valid "nothing found."
+
 The response is a JSON array. Each object contains:
 
 | Field | What to use it for |
@@ -41,11 +50,12 @@ The response is a JSON array. Each object contains:
 | `end_date` | When the auction ends |
 | `grade` | Parsed condition — `(NM-)`, `(VF)`, etc. Null if not found |
 | `grade_source` | `"item_specifics"`, `"title"`, or `"missing"` |
+| `grade_from_description` | A grade the script found **only** in the body description (not the title/specifics). Populated when `grade_source` is `"missing"` but the description still states a grade — surface it as a weak, description-sourced grade. Null when no description grade exists. |
 | `variant` | Newsstand, Direct, Whitman, etc. Null if not found |
 | `item_specifics` | Full key-value pairs from the listing |
 | `seller` | eBay seller **username** (not the store display name). Carry it forward — it's the key for `/comic:buy`'s seller-reliability advisory and is stored on the snipe. |
 
-Flag items where `grade_source` is `"missing"` — but check the title first. If the grade appears explicitly in the title (e.g. "NM", "VF+", "FVF", "Fine+"), use it as the stated grade with a light note. Reserve a strong ⚠️ for listings with no grade signal anywhere in the title or description.
+Flag items where `grade_source` is `"missing"` — but check the title first. If the grade appears explicitly in the title (e.g. "NM", "VF+", "FVF", "Fine+"), use it as the stated grade with a light note. **Then check `grade_from_description` (BUI-148): if it is non-null, the script found a grade in the listing body — surface that as a weak, description-sourced grade with a light note, not "no grade."** Reserve a strong ⚠️ only for listings with no grade signal *anywhere* — i.e. `grade` is null **and** `grade_from_description` is null.
 
 ## Output
 
@@ -62,7 +72,7 @@ Present to user for confirmation:
 - The `#` column links directly to the eBay listing (`https://www.ebay.com/itm/{item_id}`). No separate Item ID column.
 - **Ends** shows time remaining, not the end date: `<60 min → "47m"`, `<24h → "18h"`, `≥1 day → "2d"`. Compute from current UTC time vs `end_date_iso`. Mark with ⚠️ in the Ends cell if under 24h.
 
-- Flag any listing where `grade_source` is `"missing"`
+- Flag any listing where `grade_source` is `"missing"` **and** `grade_from_description` is null (a true no-grade listing); if `grade_from_description` is present, treat it as a weak description-sourced grade instead of a strong warning
 - Flag Buy It Now listings — they're skipped at the Gixen step
 - Carry the `seller` username and the stated `grade` forward — `/comic:buy` uses
   the seller for its reliability advisory (Step 1) and stores both the seller
