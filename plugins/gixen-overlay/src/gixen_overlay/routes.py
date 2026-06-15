@@ -1098,9 +1098,30 @@ async def api_record_win(req: RecordWinRequest):
     """
     _ensure_collection_store()
     try:
-        return cmd_collection_record_win(req.wins)
+        result = cmd_collection_record_win(req.wins)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+
+    # BUI-137: cmd_collection_record_win commits in chunks of 25 and, if a chunk
+    # raises, logs the error, sets partial_failure=True, and CONTINUES — so a
+    # later chunk's wins are silently dropped while the function still returns
+    # normally. Returning that dict with HTTP 200 let `curl -sf` (the skill's
+    # only failure signal) read a partial commit as full success, silently
+    # losing recorded purchases. Raise a non-200 so any HTTP caller halts; carry
+    # the partial result in the detail so the user sees what was/wasn't written.
+    if result.get("partial_failure"):
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "partial_failure",
+                "message": (
+                    "one or more chunks failed to commit; some wins were NOT "
+                    "recorded — do not treat this as success"
+                ),
+                **result,
+            },
+        )
+    return result
 
 
 @router.post("/api/comics/wish-list")
