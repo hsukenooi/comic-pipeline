@@ -41,13 +41,16 @@ from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_ta
 # workspace-imports canary).
 from locg.collection_io import MAX_XLSX_BYTES
 from locg.commands import (
+    _split_wish_list_name,
     cmd_collection_check,
     cmd_collection_export,
     cmd_collection_import,
     cmd_collection_record_win,
     cmd_collection_status,
     cmd_wish_list_add,
+    cmd_wish_list_conflicts,
     cmd_wish_list_from_cache,
+    cmd_wish_list_remove_conflicts,
 )
 from openpyxl.utils.exceptions import InvalidFileException
 
@@ -921,6 +924,72 @@ async def api_wish_list(title: str | None = None):
         return []
 
 
+def _require_imported_collection() -> None:
+    """409 if the collection store has never been imported (BUI-130, R11).
+
+    An un-imported store answers ``not_in_cache`` for every comic, so a
+    wish-list conflict audit run against it would report zero conflicts — a
+    false "all clear" that hides real owned-but-wished books. Refuse rather than
+    emit an ownership answer we cannot stand behind. Mirrors the guard on
+    ``GET /api/comics/collection/check``.
+    """
+    try:
+        status = cmd_collection_status()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+    if status.get("last_full_import") is None:
+        raise HTTPException(
+            status_code=409,
+            detail="collection store has no import yet — cannot determine ownership "
+            "(refusing to audit the wish-list against an empty collection, R11)",
+        )
+
+
+@router.get("/api/comics/wish-list/conflicts")
+async def api_wish_list_conflicts():
+    """Audit the wish-list for items already in the collection (BUI-130, Part 1).
+
+    Cross-references every wish-list entry against the collection — the same
+    per-item check ``/comic:wishlist-add`` does at add time, applied
+    retroactively. Owned-but-wished books are the BUI-122 data-loss risk: a
+    sync exports them with ``In Collection=0`` and LOCG removes them. This is
+    the dry-run preview; ``POST .../remove-conflicts`` performs the removal.
+
+    Returns ``{total, checked, unparseable, conflicts:[{name, series, issue,
+    id, full_title_matched}]}``. 409 when the store was never imported (R11);
+    an absent wish-list yields an empty (zero-conflict) result.
+    """
+    _ensure_collection_store()
+    _require_imported_collection()
+    try:
+        return cmd_wish_list_conflicts()
+    except FileNotFoundError:
+        return {"total": 0, "checked": 0, "unparseable": [], "conflicts": []}
+
+
+@router.post("/api/comics/wish-list/remove-conflicts")
+async def api_wish_list_remove_conflicts():
+    """Remove every wish-list item already in the collection (BUI-130, Part 2).
+
+    Re-derives the conflict set server-side and removes each in one call, so the
+    Claremont-style cleanup no longer needs SSH into the Mac Mini. Returns
+    ``{removed, removed_count, errors, remaining, checked, unparseable}``. Same
+    409 never-imported guard as the audit (R11)."""
+    _ensure_collection_store()
+    _require_imported_collection()
+    try:
+        return cmd_wish_list_remove_conflicts()
+    except FileNotFoundError:
+        return {
+            "removed": [],
+            "removed_count": 0,
+            "errors": [],
+            "remaining": 0,
+            "checked": 0,
+            "unparseable": [],
+        }
+
+
 @router.get("/api/comics/collection/export")
 async def api_collection_export():
     """Export pending-push rows to a LOCG-bulk-import CSV (+ .notes.md), read
@@ -1023,8 +1092,33 @@ async def api_wish_list_add(req: WishListAddRequest):
 
     BUI-47 semantics carry over: a server-side wish-list append is still
     overwritten by the next full import unless exported to LOCG first.
+
+    BUI-130 (Part 3): reject a title already in the collection with 409 — the
+    same guard ``/comic:wishlist-add`` enforces, now at the API boundary so
+    anything that bypasses the skill can't create the BUI-122 conflict. Parsing
+    failures and stores that can't verify ownership fail open (the export-side
+    BUI-122 fix is the real safety net); pass ``force=true`` to override
+    intentionally (a different printing/variant).
     """
     _ensure_collection_store()
+    if not req.force:
+        parsed = _split_wish_list_name(req.title)
+        if parsed is not None:
+            series, issue = parsed
+            try:
+                check = cmd_collection_check(series=series, issue=issue)
+            except RuntimeError:
+                check = None  # store unavailable → fail open, don't block the add
+            if check is not None and check["match_status"] == "in_collection":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"'{req.title}' is already in the collection "
+                        f"({check['full_title_matched']}). Wish-listing an owned book "
+                        "risks deleting it on the next sync (BUI-122). Pass force=true "
+                        "to override."
+                    ),
+                )
     result = cmd_wish_list_add(req.title)
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])

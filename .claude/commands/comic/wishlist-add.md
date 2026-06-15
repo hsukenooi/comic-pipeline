@@ -123,6 +123,12 @@ returns `{"status": "ok", ...}`. It is not deduped, so don't re-run a title that
 already succeeded (it would create a duplicate). Stop and report if any call
 returns a non-200.
 
+**Owned-title guard (BUI-130):** `POST /api/comics/wish-list` now rejects an
+already-owned title with **409** at the API boundary (defense in depth behind
+Step 3's per-issue filter). If Step 3 was done correctly you'll never hit it; a
+409 here means the book is owned — skip it. To wish-list an owned book on
+purpose (a different printing/variant), pass `"force": true` in the body.
+
 ## Step 6: Report
 
 ```

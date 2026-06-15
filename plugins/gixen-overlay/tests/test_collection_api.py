@@ -340,3 +340,88 @@ def test_import_server_fault_is_not_masked_as_422(client):
                 "/api/comics/collection/import",
                 files={"file": ("import.xlsx", b"anything", "application/octet-stream")},
             )
+
+
+# --- BUI-130: wish-list conflict audit + bulk remove + add prevention --------
+
+def test_conflicts_flags_owned_wish_list_item(client):
+    """A wish-list entry the user owns is surfaced; an unowned one is not."""
+    _seed_wish_list(client.store, [
+        {"name": "Amazing Spider-Man #300", "id": 111},  # owned (matches ASM #300)
+        {"name": "X-Men #1", "id": None},                # not owned
+    ])
+    r = client.get("/api/comics/wish-list/conflicts")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 2
+    assert body["checked"] == 2
+    assert [c["name"] for c in body["conflicts"]] == ["Amazing Spider-Man #300"]
+    assert body["conflicts"][0]["full_title_matched"] == "The Amazing Spider-Man #300"
+
+
+def test_conflicts_excludes_wish_only_row(client):
+    """The default seed wish-lists Fantastic Four #48, which is in_collection=0
+    (wish/read but not owned). The copies-owned gate means it is NOT a conflict."""
+    r = client.get("/api/comics/wish-list/conflicts")
+    assert r.status_code == 200, r.text
+    assert r.json()["conflicts"] == []
+
+
+def test_conflicts_409_when_never_imported(client):
+    """An un-imported collection can't answer ownership — refuse rather than
+    report a false 'no conflicts' (R11)."""
+    (client.store / "collection.json").write_text(json.dumps({
+        "schema_version": 1,
+        "last_full_import": None,
+        "series_name_index": {},
+        "comics": [],
+    }))
+    assert client.get("/api/comics/wish-list/conflicts").status_code == 409
+
+
+def test_remove_conflicts_removes_only_owned(client):
+    _seed_wish_list(client.store, [
+        {"name": "Amazing Spider-Man #300", "id": None},  # owned
+        {"name": "X-Men #1", "id": None},                 # not owned
+    ])
+    r = client.post("/api/comics/wish-list/remove-conflicts")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["removed_count"] == 1
+    assert body["remaining"] == 1
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert names == {"X-Men #1"}
+
+
+def test_remove_conflicts_409_when_never_imported(client):
+    (client.store / "collection.json").write_text(json.dumps({
+        "schema_version": 1,
+        "last_full_import": None,
+        "series_name_index": {},
+        "comics": [],
+    }))
+    assert client.post("/api/comics/wish-list/remove-conflicts").status_code == 409
+
+
+def test_wish_list_add_rejects_owned_title(client):
+    """Part 3: the API boundary refuses to wish-list a book already owned."""
+    r = client.post("/api/comics/wish-list", json={"title": "Amazing Spider-Man #300"})
+    assert r.status_code == 409, r.text
+    # The owned title was not appended.
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Amazing Spider-Man #300" not in names
+
+
+def test_wish_list_add_force_overrides_owned(client):
+    r = client.post(
+        "/api/comics/wish-list",
+        json={"title": "Amazing Spider-Man #300", "force": True},
+    )
+    assert r.status_code == 200, r.text
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Amazing Spider-Man #300" in names
+
+
+def test_wish_list_add_allows_unowned_title(client):
+    r = client.post("/api/comics/wish-list", json={"title": "Daredevil #181"})
+    assert r.status_code == 200, r.text

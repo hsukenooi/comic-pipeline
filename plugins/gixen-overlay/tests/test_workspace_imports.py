@@ -51,13 +51,16 @@ def test_locg_command_surface_resolves():
     any is renamed in packages/locg-cli, this canary fails loudly (same role as
     the gixen-cli helper canary above)."""
     from locg.commands import (
+        _split_wish_list_name,
         cmd_collection_check,
         cmd_collection_export,
         cmd_collection_import,
         cmd_collection_record_win,
         cmd_collection_status,
         cmd_wish_list_add,
+        cmd_wish_list_conflicts,
         cmd_wish_list_from_cache,
+        cmd_wish_list_remove_conflicts,
     )
 
     assert all(
@@ -70,5 +73,8 @@ def test_locg_command_surface_resolves():
             cmd_collection_status,
             cmd_wish_list_add,
             cmd_wish_list_from_cache,
+            cmd_wish_list_conflicts,
+            cmd_wish_list_remove_conflicts,
+            _split_wish_list_name,
         )
     )
