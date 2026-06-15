@@ -355,6 +355,80 @@ def test_check_miss_returns_not_in_cache(tmp_path, monkeypatch):
     assert result["full_title_matched"] is None
 
 
+def test_check_year_is_per_issue_cover_year_not_series_start(tmp_path, monkeypatch):
+    """`year` gates on the issue's release_date, so passing a long-running
+    series' start year (year_began) wrongly filters out owned mid-run issues.
+
+    Regression for BUI-129: forwarding Metron's `year_began` (1963 for X-Men)
+    returned a false `not_in_cache` for issues that actually shipped years later.
+    The matcher is behaving as designed (per-issue year gate); the fix is that
+    callers must pass the per-issue cover year or omit `year` entirely.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    # X-Men #137 shipped 1980, but the series began in 1963.
+    _seed_cache(cache, [_agent_win_row(
+        series="Uncanny X-Men (1963 - 2011)",
+        full_title="Uncanny X-Men #137",
+        release_date="1980-09-01",
+    )])
+
+    # The wrong-year call (series start year) misses every mid-run issue.
+    wrong = cmds.cmd_collection_check(
+        series="Uncanny X-Men", issue="137", year="1963"
+    )
+    assert wrong["match_status"] == "not_in_cache"
+
+    # Omitting year (the BUI-129 caller fix) finds the owned issue.
+    omitted = cmds.cmd_collection_check(series="Uncanny X-Men", issue="137")
+    assert omitted["match_status"] == "in_collection"
+    assert omitted["full_title_matched"] == "Uncanny X-Men #137"
+
+    # Passing the correct per-issue cover year also finds it.
+    correct = cmds.cmd_collection_check(
+        series="Uncanny X-Men", issue="137", year="1980"
+    )
+    assert correct["match_status"] == "in_collection"
+
+
+# ---------------------------------------------------------------------------
+# cmd_collection_series_names (BUI-129)
+# ---------------------------------------------------------------------------
+
+def test_series_names_returns_sorted_canonical_names(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    def mutate(payload):
+        payload["series_name_index"] = {
+            "uncanny x-men": "Uncanny X-Men",
+            "amazing spider-man": "The Amazing Spider-Man",
+            "batman": "Batman",
+        }
+    cache.apply(mutate, command="seed")
+
+    result = cmds.cmd_collection_series_names()
+    # Sorted case-insensitively by the literal name ("Batman" < "The Amazing…").
+    assert result["series_names"] == [
+        "Batman",
+        "The Amazing Spider-Man",
+        "Uncanny X-Men",
+    ]
+    assert result["count"] == 3
+
+
+def test_series_names_empty_cache_returns_empty(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: make_cache(tmp_path))
+    result = cmds.cmd_collection_series_names()
+    assert result == {"series_names": [], "count": 0}
+
+
 def test_check_empty_cache_returns_not_in_cache(tmp_path, monkeypatch):
     import locg.commands as cmds
 

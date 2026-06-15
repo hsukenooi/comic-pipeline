@@ -173,6 +173,31 @@ def test_collection_status(client):
     assert "locg_cli_version" in body
 
 
+def test_series_names_empty_by_default(client):
+    """The seed fixture carries an empty series_name_index, so the endpoint
+    answers with an empty list (BUI-129)."""
+    r = client.get("/api/comics/collection/series-names")
+    assert r.status_code == 200
+    assert r.json() == {"series_names": [], "count": 0}
+
+
+def test_series_names_returns_canonical_names(client):
+    """Once the index is populated, the endpoint surfaces the catalog spellings
+    a caller can resolve an ambiguous query against (BUI-129)."""
+    payload = json.loads((client.store / "collection.json").read_text())
+    payload["series_name_index"] = {
+        "uncanny x-men": "Uncanny X-Men",
+        "amazing spider-man": "The Amazing Spider-Man",
+    }
+    (client.store / "collection.json").write_text(json.dumps(payload))
+
+    r = client.get("/api/comics/collection/series-names")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["series_names"] == ["The Amazing Spider-Man", "Uncanny X-Men"]
+    assert body["count"] == 2
+
+
 def test_collection_export_returns_csv(client):
     r = client.get("/api/comics/collection/export")
     assert r.status_code == 200
