@@ -113,6 +113,31 @@ def test_seller_scan_doc_threshold_matches_emit_floor():
     )
 
 
+def test_snipe_show_documents_server_mode_statuses():
+    """BUI-150: in server/thin-client mode /api/snipes returns the INTERNAL
+    mapped status (the values of _GIXEN_TERMINAL_MAP: WON/LOST/FAILED/ENDED),
+    not the raw Gixen strings. snipe-show.md's Result mapping must cover those,
+    or every non-win ended snipe renders a bare internal word instead of a
+    human label."""
+    main_src = (REPO_ROOT / "packages" / "gixen-cli" / "server" / "main.py").read_text()
+    # The internal terminal status values the server can emit.
+    internal = {"WON", "LOST", "FAILED", "ENDED"}
+    for status in internal:
+        assert f'"{status}"' in main_src, f"{status} no longer in gixen-cli — update contract"
+    doc = (SKILLS_DIR / "snipe-show.md").read_text()
+    for status in internal:
+        assert f"`{status}`" in doc, (
+            f"snipe-show.md must map the server-mode status {status} to a label"
+        )
+
+
+def test_snipe_show_does_not_swallow_fetch_errors():
+    """BUI-151: the fetch must not blanket-2>/dev/null, which hid server-down
+    errors and rendered empty tables as 'you have no snipes'."""
+    doc = (SKILLS_DIR / "snipe-show.md").read_text()
+    assert "gixen list --json 2>/dev/null" not in doc
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the
