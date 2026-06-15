@@ -45,6 +45,7 @@ from locg.commands import (
     cmd_collection_export,
     cmd_collection_import,
     cmd_collection_record_win,
+    cmd_collection_series_names,
     cmd_collection_status,
     cmd_wish_list_add,
     cmd_wish_list_from_cache,
@@ -904,6 +905,21 @@ async def api_collection_status():
     _ensure_collection_store()
     try:
         return cmd_collection_status()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+
+
+@router.get("/api/comics/collection/series-names")
+async def api_collection_series_names():
+    """Series names present in the collection cache (BUI-129).
+
+    Lets a caller resolve a Metron/identify series name to the exact LOCG
+    catalog spelling before calling `/check` — or surface a "not found — did you
+    mean X?" hint — instead of trusting a silent `not_in_cache` that may just be
+    an exact-match miss. Provider-neutral, read-only."""
+    _ensure_collection_store()
+    try:
+        return cmd_collection_series_names()
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
 

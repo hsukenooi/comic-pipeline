@@ -54,15 +54,25 @@ response — you need them for output banners.
 
 ## Step 1: Check each comic against the server
 
-For each comic, call the check endpoint. **Always pass `year`** when the
-identification has one — it disambiguates volumes and enables the masthead-alias
-fallback (BUI-46): e.g. a listing identified as "The Mighty Thor #154" (1968)
-only resolves to the owned catalog entry "Thor #154" when the year is supplied.
-Without a year that fallback is suppressed (to avoid colliding with same-masthead
-reboots like *The Mighty Thor* Vol. 3), so an owned comic can slip through.
+For each comic, call the check endpoint. **`year` is a per-issue cover year, not
+a series start year — pass it only when you have the cover date of *this exact
+issue*, and NEVER forward Metron's `year_began` / the series' first-published
+year (BUI-129).** The server gates a match on `release_date.startswith(year)`, so
+passing a long-running series' start year (e.g. `1963` for *Uncanny X-Men*, whose
+issues actually shipped 1975–1991) filters out every owned row and returns a
+false `not_in_cache` for the whole run. When all you have is the series start
+year, **omit `year`** — a correct ownership verdict beats the year-gated extras.
+
+When you *do* have the right per-issue year, it disambiguates volumes and enables
+the masthead-alias fallback (BUI-46): e.g. a listing identified as "The Mighty
+Thor #154" with that issue's cover year (1968) resolves to the owned catalog
+entry "Thor #154". Without a year that fallback is suppressed (to avoid colliding
+with same-masthead reboots like *The Mighty Thor* Vol. 3) — an acceptable trade
+versus the false-negative-for-the-whole-series risk of passing the wrong year.
 
 Use `curl -sf -G --data-urlencode` so series names with spaces are encoded and a
-non-200 makes curl exit non-zero:
+non-200 makes curl exit non-zero (each `year` below is the **cover year of that
+specific issue** — ASM #300 shipped 1988, Uncanny X-Men #179 shipped 1984):
 
 ```bash
 curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
@@ -151,12 +161,21 @@ curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
   > ⚠️ owned under series key "The Incredible Hulk" — identify dropped/added a leading article; confirm before bidding
 - If it still returns `not_in_cache`, leave the original verdict and add no flag.
 
-**Pattern C — ambiguous series name (wrong-volume risk).**
-When the series name is short/generic enough that the check may have resolved the
-wrong volume — especially `Amazing Spider-Man` passed without the leading `The` or
-without a `year` — flag and recommend the full canonical name + year for a
-re-check (e.g. `The Amazing Spider-Man (1963)`, not bare `Amazing Spider-Man`):
-> ⚠️ ambiguous series — confirm volume/canonical name (try "The Amazing Spider-Man (1963)" + year) before trusting this verdict
+**Pattern C — ambiguous / unrecognized series name (wrong-volume or silent-miss risk).**
+The matcher requires an *exact* normalized series-key match, so a series name that
+differs from the LOCG catalog spelling (e.g. Metron's `Uncanny X-Men (Vol. 1)` vs.
+the catalog's `Uncanny X-Men`) yields a silent `not_in_cache` even when owned
+(BUI-129). When a `not_in_cache` row's series name is short/generic, could be the
+wrong volume, or looks like a Metron-style name, fetch the cache's actual series
+names and check whether the queried name is present (or close to one):
+
+```bash
+curl -sf "$GIXEN_SERVER_URL/api/comics/collection/series-names"
+```
+
+If the queried series is **absent** from that list, the `not_in_cache` is suspect —
+flag and recommend re-checking under the matching catalog name:
+> ⚠️ ambiguous/unrecognized series — "Uncanny X-Men (Vol. 1)" is not a cache series name; did you mean "Uncanny X-Men"? Re-check under the catalog name before trusting this verdict
 
 Carry every flag into the Notes column of the Step 3 table and surface flagged rows
 separately at the Step 4 decision gate. The user decides; the disambiguator only
@@ -197,7 +216,7 @@ Remove skipped comics from the working list before passing to `/comic:fmv`.
 | Mistake | Fix |
 |---|---|
 | Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11). A silent miss buys a duplicate. |
-| Omitting `year` | Always pass the identified year — it disambiguates volumes and enables the masthead-alias fallback (BUI-46); without it an owned comic listed by its cover title can slip through |
+| Passing the series start year (`year_began`) as `year` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`. Forwarding a series' first-published year (e.g. `1963` for *Uncanny X-Men*) filters out every owned issue and returns a false `not_in_cache` for the whole run (BUI-129). Pass `year` only with this issue's actual cover year; otherwise omit it |
 | Running checks before the `/health` gate passes | Health-gate first; a check against a down server is worthless and dangerous |
 | Treating a stale-cache `not_in_cache` as confident "not in collection" | Apply the stale-cache downgrade when `cache_age_days > 14` |
 | Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — likely conflated with the base/annual series; flag and let the user confirm, don't silently skip |
