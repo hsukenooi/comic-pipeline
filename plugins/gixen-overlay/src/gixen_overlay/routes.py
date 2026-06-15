@@ -431,8 +431,16 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
         "missing": [],
     }
 
+    # BUI-152: an item_id can have multiple bids rows — a prior terminal
+    # (LOST/ENDED) or tombstoned (REMOVED) row plus a fresh PENDING re-add, or
+    # BUI-67 dedup losers. Without ORDER BY, fetchone() returns the OLDEST
+    # (lowest rowid) row, whose bid_fmvs/fmv_id were never populated for the new
+    # snipe — so verify would mis-verdict a fully-linked live bid as
+    # no_comic/fmv_stub. Resolve the freshest row, matching the convention in
+    # server.db.get_bid_by_item_id (ORDER BY id DESC LIMIT 1).
     bid = db.execute(
-        "SELECT id, fmv_id FROM bids WHERE item_id = ?", (item_id,)
+        "SELECT id, fmv_id FROM bids WHERE item_id = ? ORDER BY id DESC LIMIT 1",
+        (item_id,),
     ).fetchone()
     if bid is None:
         return {**base, "verdict": "no_bid", "missing": ["bids row"]}

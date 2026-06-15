@@ -11,10 +11,13 @@ This is a **warn-only** verification — it doesn't fix anything, just surfaces 
 
 ## Pre-flight
 
-Verify `GIXEN_SERVER_URL` is set and the server is up:
+Resolve and health-gate the server through the shared comics-server convention
+(BUI-172, `docs/conventions/comics-server-call.md`):
 
 ```bash
-echo "${GIXEN_SERVER_URL:-UNSET}" && curl -sf "$GIXEN_SERVER_URL/health"
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+comics_health_gate     || exit 1
 ```
 
 If either fails, stop with: "Cannot verify — the Gixen server isn't reachable. Skipping verification step."
@@ -34,11 +37,25 @@ A working list. Each entry needs `item_id` (eBay ID) and ideally `grade`. `locg_
 
 ## Call
 
+Route the POST through `comics_curl` so a non-200 (a 422 on a malformed
+working list, a 500, or a server drop after the health check) **hard-fails and
+surfaces the error body** instead of silently returning an empty string
+(BUI-169):
+
 ```bash
-curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/verify" \
+comics_curl -X POST "$GIXEN_SERVER_URL/api/comics/verify" \
   -H 'content-type: application/json' \
-  -d @working_list.verify.json
+  -d @working_list.verify.json || {
+    echo "Verification call failed — could not confirm linkage. Do NOT report all-clear." >&2
+    exit 1
+  }
 ```
+
+**If the POST fails or returns no parseable JSON, STOP** with the message above —
+never render a table or summary from a failed/empty response. This skill is the
+final wrap step of `/comic:buy` and runs warn-only, so a silent empty response
+would read as a false "nothing to flag" all-clear rather than "verification
+failed."
 
 ## Output
 

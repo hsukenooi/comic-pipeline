@@ -1407,6 +1407,48 @@ def test_verify_fully_linked(api):
     assert row["bid_fmv_id"] == row["fmv_id"]
 
 
+def test_verify_resolves_newest_bid_not_oldest(api):
+    """BUI-152: an item_id can have an older terminal/tombstoned bids row plus a
+    newer live re-add. The verify lookup had no ORDER BY, so fetchone() returned
+    the OLDEST (unlinked) row and mis-verdicted a fully-linked live snipe. Assert
+    verify resolves the newest row (ORDER BY id DESC)."""
+    db_path = os.environ["DB_PATH"]
+    item_id = "300000077"
+
+    # Older row: a REMOVED tombstone, unlinked (no bid_fmvs, fmv_id NULL).
+    api.post("/api/bids", json={"item_id": item_id, "max_bid": 50.0})
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    old_id = raw.execute("SELECT id FROM bids WHERE item_id=?", (item_id,)).fetchone()["id"]
+    raw.execute("UPDATE bids SET status='REMOVED' WHERE id=?", (old_id,))
+
+    # Newer row: a fresh PENDING re-add for the same eBay item.
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status) VALUES (?, ?, 'PENDING')",
+        (item_id, 100.0),
+    )
+    new_id = raw.execute(
+        "SELECT id FROM bids WHERE item_id=? ORDER BY id DESC LIMIT 1", (item_id,)
+    ).fetchone()["id"]
+    assert new_id > old_id
+
+    # Fully link comic + fmv + junction + fmv_id to the NEWER bid only.
+    raw.execute("INSERT OR IGNORE INTO comics (title, issue, year) VALUES ('Hulk','181',1974)")
+    cid = raw.execute("SELECT id FROM comics WHERE issue='181'").fetchone()["id"]
+    raw.execute("INSERT INTO fmv (comic_id, grade, low, high) VALUES (?, 9.2, 50, 70)", (cid,))
+    fid = raw.execute("SELECT id FROM fmv WHERE comic_id=? AND grade=9.2", (cid,)).fetchone()["id"]
+    raw.execute("UPDATE bids SET fmv_id=? WHERE id=?", (fid, new_id))
+    raw.execute("INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, 1)", (new_id, fid))
+    raw.commit()
+    raw.close()
+
+    r = api.post("/api/comics/verify", json={"items": [{"item_id": item_id, "grade": 9.2}]})
+    assert r.status_code == 200
+    row = r.json()["results"][0]
+    # Resolves the newest (linked) row, not the older REMOVED one → fully_linked.
+    assert row["verdict"] == "fully_linked", row
+
+
 def test_verify_no_bid(api):
     """item_id that never made it into the bids table."""
     r = api.post("/api/comics/verify", json={
