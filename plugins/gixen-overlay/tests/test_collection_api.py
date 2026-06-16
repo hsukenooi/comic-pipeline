@@ -541,3 +541,49 @@ def test_wish_list_add_force_overrides_owned(client):
 def test_wish_list_add_allows_unowned_title(client):
     r = client.post("/api/comics/wish-list", json={"title": "Daredevil #181"})
     assert r.status_code == 200, r.text
+
+
+def test_wish_list_add_year_catches_masthead_owned_book(client):
+    """BUI-184: with the per-issue cover year, the owned-guard's year-gated
+    masthead fallback catches a book stored under its base masthead — and without
+    the year it behaves exactly as before (backward-compatible)."""
+    _seed_collection(client.store, [{
+        "full_title": "Thor #154",
+        "series_name": "Thor",
+        "publisher_name": "Marvel Comics",
+        "release_date": "1968-07-01",
+        "in_collection": 1,
+    }])
+    # With the per-issue cover year, "The Mighty Thor" → owned "Thor" → 409.
+    owned = client.post(
+        "/api/comics/wish-list",
+        json={"title": "The Mighty Thor #154", "year": "1968"},
+    )
+    assert owned.status_code == 409, owned.text
+
+    # Without the year the masthead fallback can't fire → not blocked (the
+    # documented backward-compatible behavior; the export-side fix is the net).
+    no_year = client.post(
+        "/api/comics/wish-list", json={"title": "The Mighty Thor #154"}
+    )
+    assert no_year.status_code == 200, no_year.text
+
+
+def test_wish_list_add_wrong_year_fails_open_not_false_block(client):
+    """BUI-129 contract: a non-matching year must not falsely report owned. Own
+    Thor #154 (1968); a query with the wrong cover year doesn't 409 (the per-issue
+    year gate excludes the mismatched row) — a wrong year fails OPEN, it never
+    closes onto the wrong book. So the year must be the issue's actual cover
+    year, never year_began."""
+    _seed_collection(client.store, [{
+        "full_title": "Thor #154",
+        "series_name": "Thor",
+        "publisher_name": "Marvel Comics",
+        "release_date": "1968-07-01",
+        "in_collection": 1,
+    }])
+    r = client.post(
+        "/api/comics/wish-list",
+        json={"title": "The Mighty Thor #154", "year": "1975"},
+    )
+    assert r.status_code == 200, r.text

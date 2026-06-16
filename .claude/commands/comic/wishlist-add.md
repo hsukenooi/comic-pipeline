@@ -65,12 +65,26 @@ Each result has `id`, `series` (display name incl. year, e.g.
 
 Record `issue_count` and the chosen `series` display name.
 
-## Step 2: Resolve the issue list
+## Step 2: Resolve the issue list (with per-issue cover years)
 
-- No range given → issues `1 … issue_count`.
-- Range given → parse it (`1-4` → 1,2,3,4; `1,3,5` → those; `5-` → 5…issue_count).
-  Clamp to `1 … issue_count`; warn if the user asked for issues beyond
-  `issue_count`.
+Fetch the series' issues from Metron so each carries its **cover date**. The
+per-issue cover year is what the BUI-184 ownership check needs (Step 3) and is
+the ONLY safe year to pass it — never `year_began` (BUI-129). Paginate
+`/api/issue/`:
+
+```bash
+curl -s -u "$METRON_USERNAME:$METRON_PASSWORD" \
+  "https://metron.cloud/api/issue/?series_id=<SERIES_ID>&page=<N>"
+```
+
+Each result has `number` and `cover_date` (e.g. `"1968-07-01"`). Walk `next`
+until it is null; build a map `number → cover_year` (the 4-digit year of
+`cover_date`; leave it empty for an issue Metron has no `cover_date` for).
+
+- No range given → every issue `number` Metron returned.
+- Range given → parse it (`1-4` → 1,2,3,4; `1,3,5` → those; `5-` → 5…last) and
+  intersect with the returned numbers; warn about any requested number Metron
+  doesn't list.
 
 ## Step 3: Skip issues you already own
 
@@ -97,17 +111,24 @@ proceed with the Metron name but note that ownership for this series couldn't be
 reconciled — a `not_in_cache` here may be a spelling miss, not genuinely un-owned.
 
 For each resolved issue, ask the server's collection (no LOCG network needed).
-**Check by series + issue only — do NOT pass `year`.** `year` is a *per-issue
-cover year* gated on `release_date.startswith(year)`, not a series disambiguator
-(BUI-129). Forwarding Metron's `year_began` (e.g. `1963` for a run whose issues
-actually shipped 1975–1991) filters out every owned mid-run issue and returns a
-false `not_in_cache` for the whole series — wish-listing books you already own,
-the exact BUI-122 deletion path Step 3 exists to prevent. Since wishlist-add
-checks by issue *number* it has no per-issue cover date to pass, so omit `year`:
+**Pass the per-issue COVER year from Step 2 (BUI-184) — never `year_began`
+(BUI-129).** The `year` param is gated on `release_date.startswith(year)`, so it
+must be the issue's own cover year (Step 2's `cover_date`), NOT the series start
+year: forwarding `year_began` (e.g. `1963` for a run whose issues actually shipped
+1975–1991) filters out every owned mid-run issue and returns a false
+`not_in_cache` for the whole series — wish-listing books you already own, the
+exact BUI-122 deletion path Step 3 exists to prevent. With the *correct* cover
+year, the check's year-gated masthead fallback also catches a book stored under
+its base masthead (you ask for "The Mighty Thor #154", you own "Thor #154"). If
+Metron had no `cover_date` for an issue, **omit `year` for that issue** (the
+pre-184 behavior — safe; it just can't catch the masthead case):
 
 ```bash
-# series = plain name (e.g. "Marvel Tales"); check by series + issue, NEVER year
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/check?series=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")&issue=<N>"
+# series = reconciled catalog name; issue = <N>; year = THAT issue's cover year
+curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
+  --data-urlencode "series=<SERIES>" \
+  --data-urlencode "issue=<N>" \
+  --data-urlencode "year=<COVER_YEAR>"   # omit this line if no cover_date
 ```
 
 - `{"match_status": "in_collection"}` → **owned, skip it** (don't wish-list).
@@ -140,11 +161,16 @@ owned, say so and stop — nothing to add.
 
 On confirmation, add one issue per call (`curl -sf` so a non-200 fails loudly):
 
+Include each issue's **cover year** (Step 2) in the body so the server-side
+owned-guard's masthead fallback (BUI-184) gets the same catch the Step 3 filter
+does; omit `year` only for an issue Metron had no `cover_date` for.
+
 ```bash
 curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/wish-list" \
-  -H 'content-type: application/json' -d '{"title": "Children of the Vault #1"}'
+  -H 'content-type: application/json' \
+  -d '{"title": "The Mighty Thor #154", "year": "1968"}'
 curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/wish-list" \
-  -H 'content-type: application/json' -d '{"title": "Children of the Vault #2"}'
+  -H 'content-type: application/json' -d '{"title": "Children of the Vault #2"}'  # no cover_date → no year
 # …
 ```
 
@@ -153,11 +179,12 @@ returns `{"status": "ok", ...}`. It is not deduped, so don't re-run a title that
 already succeeded (it would create a duplicate). Stop and report if any call
 returns a non-200.
 
-**Owned-title guard (BUI-130):** `POST /api/comics/wish-list` now rejects an
+**Owned-title guard (BUI-130/BUI-184):** `POST /api/comics/wish-list` rejects an
 already-owned title with **409** at the API boundary (defense in depth behind
-Step 3's per-issue filter). If Step 3 was done correctly you'll never hit it; a
-409 here means the book is owned — skip it. To wish-list an owned book on
-purpose (a different printing/variant), pass `"force": true` in the body.
+Step 3's per-issue filter). With the per-issue `year` in the body it now also
+catches a masthead-stored owned book (BUI-184). If Step 3 was done correctly
+you'll never hit it; a 409 here means the book is owned — skip it. To wish-list
+an owned book on purpose (a different printing/variant), pass `"force": true`.
 
 ## Step 6: Report
 

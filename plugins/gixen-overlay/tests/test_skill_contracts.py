@@ -205,6 +205,24 @@ def test_fmv_batch_maps_by_id_not_position():
     )
 
 
+def test_wish_list_add_year_seam():
+    """BUI-184: the wish-list-add owned-guard forwards a per-issue cover year so
+    the year-gated masthead fallback can catch a base-masthead-stored owned book.
+    Assert the model carries `year`, the endpoint forwards it, and the skill
+    documents the correct (cover year) vs wrong (year_began) source."""
+    overlay_src = REPO_ROOT / "plugins" / "gixen-overlay" / "src" / "gixen_overlay"
+    models = (overlay_src / "models.py").read_text()
+    routes = (overlay_src / "routes.py").read_text()
+    assert "year: str | None" in models, "WishListAddRequest lost its year field (BUI-184)"
+    assert "cmd_collection_check(series=series, issue=issue, year=req.year)" in routes, (
+        "wish-list-add owned-guard no longer forwards the per-issue year (BUI-184)"
+    )
+    doc = (SKILLS_DIR / "wishlist-add.md").read_text()
+    assert "cover year" in doc and "year_began" in doc, (
+        "wishlist-add.md must document passing the per-issue cover year, never year_began"
+    )
+
+
 def test_ezship_declared_value_units_agree():
     """BUI-142: cli.ts's -d/--declared-value is in CENTS, but ezship-add.md
     described it as dollars in its primary flow → an agent told "$25" ran
