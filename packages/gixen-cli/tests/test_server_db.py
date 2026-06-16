@@ -142,14 +142,39 @@ def test_get_all_bids_returns_list(db):
 
 
 def test_mark_bids_purged_sets_status(db):
+    # mark_bids_purged is the completed-sweep, so it runs against resolved bids.
     insert_bid(db, "200000001", 50.0, 6, 0, "s")
     insert_bid(db, "200000002", 60.0, 6, 0, "s")
+    update_bid_status(db, "200000001", status="WON", winning_bid=45.0,
+                      resolved_at="2026-04-25T10:00:00")
+    update_bid_status(db, "200000002", status="LOST", winning_bid=None,
+                      resolved_at="2026-04-25T10:00:00")
     mark_bids_purged(db, ["200000001", "200000002"])
     row1 = get_bid_by_item_id(db, "200000001")
     row2 = get_bid_by_item_id(db, "200000002")
     assert row1["status"] == "REMOVED"
     assert row2["status"] == "REMOVED"
     assert row1["resolved_at"] is not None
+
+
+def test_mark_bids_purged_spares_live_pending_sharing_item_id(db):
+    """BUI-178: a completed-sweep must not tombstone a live PENDING row that
+    shares an item_id with an old resolved row (a re-listed/re-added item).
+    Only the resolved row is tombstoned; the live snipe survives.
+    """
+    # Old win for this item, then a re-add creates a new live PENDING row.
+    won_id = insert_bid(db, "200000003", 50.0, 6, 0, "s")
+    update_bid_status(db, "200000003", status="WON", winning_bid=45.0,
+                      resolved_at="2026-04-25T10:00:00")
+    pending_id = insert_bid(db, "200000003", 70.0, 6, 0, "s")
+
+    mark_bids_purged(db, ["200000003"])
+
+    won_row = db.execute("SELECT status FROM bids WHERE id=?", (won_id,)).fetchone()
+    pending_row = db.execute("SELECT status FROM bids WHERE id=?",
+                             (pending_id,)).fetchone()
+    assert won_row["status"] == "REMOVED"        # the resolved row is swept
+    assert pending_row["status"] == "PENDING"    # the live snipe is spared
 
 
 def test_mark_bids_purged_transitions_won_bid(db):
