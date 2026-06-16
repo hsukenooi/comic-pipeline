@@ -211,6 +211,16 @@ class GixenModifyNotConfirmedError(GixenError):
 # ---------------------------------------------------------------------------
 
 _LOGIN_COOLDOWN = 300  # seconds to wait after a failed login before retrying
+# BUI-118: a *transient* login failure (connectivity blip — ConnectionError /
+# Timeout / empty body, the BUI-77 classification) gets a short cooldown for the
+# first few consecutive occurrences, so one momentary blip mid-edit does not lock
+# all writes out for the full 300s. Only once transient failures pile up
+# (sustained outage) does the full _LOGIN_COOLDOWN arm. A genuine credentials
+# rejection (a real login page with no session id) still arms the full cooldown
+# on the first failure — that is the IP-rate-limit / real-auth case the cooldown
+# exists to protect.
+_TRANSIENT_LOGIN_COOLDOWN = 5  # seconds for an isolated connectivity blip
+_TRANSIENT_FAILURE_THRESHOLD = 3  # consecutive transient failures → full cooldown
 
 
 class GixenClient:
@@ -245,6 +255,14 @@ class GixenClient:
         self.session = _CurlSession()
         self.session_id: Optional[str] = None
         self._login_failed_at: Optional[float] = None  # monotonic timestamp
+        # BUI-118: how long the most recent failure armed the cooldown for. A
+        # transient blip arms only _TRANSIENT_LOGIN_COOLDOWN until enough
+        # consecutive transient failures accumulate; a credentials rejection
+        # arms the full _LOGIN_COOLDOWN immediately.
+        self._login_cooldown_secs: float = _LOGIN_COOLDOWN
+        # BUI-118: consecutive *transient* login failures since the last success.
+        # Reset to 0 on any successful login.
+        self._transient_login_failures: int = 0
         # BUI-117: instance-level successful-login throttle. A single edit's
         # recovery path can clear session_id and call login() up to ~6 times
         # during a Gixen flap (3 list_snipes × GET-500 + table-missing re-logins).
@@ -270,6 +288,32 @@ class GixenClient:
     # Authentication
     # ------------------------------------------------------------------
 
+    def _arm_login_cooldown(self, *, transient: bool) -> None:
+        """Record a failed login and arm the appropriate cooldown (BUI-118).
+
+        A *transient* failure (connectivity blip — ConnectionError/Timeout or an
+        empty body, the BUI-77 classification) only arms the short
+        ``_TRANSIENT_LOGIN_COOLDOWN`` until ``_TRANSIENT_FAILURE_THRESHOLD``
+        consecutive transient failures have piled up, at which point a sustained
+        outage is assumed and the full ``_LOGIN_COOLDOWN`` arms. A
+        non-transient failure (genuine credentials rejection) arms the full
+        cooldown immediately — that is the real-auth / IP-rate-limit case the
+        cooldown exists to protect against.
+        """
+        self._login_failed_at = time.monotonic()
+        if transient:
+            self._transient_login_failures += 1
+            if self._transient_login_failures >= _TRANSIENT_FAILURE_THRESHOLD:
+                self._login_cooldown_secs = _LOGIN_COOLDOWN
+            else:
+                self._login_cooldown_secs = _TRANSIENT_LOGIN_COOLDOWN
+        else:
+            # A real credentials rejection is not a blip — back off fully and
+            # immediately. Reset the transient counter: this failure is a
+            # different class of problem.
+            self._transient_login_failures = 0
+            self._login_cooldown_secs = _LOGIN_COOLDOWN
+
     @staticmethod
     def _connection_error(url: str, exc: Exception) -> "GixenConnectionError":
         """Wrap a transport-level failure in a GixenError-class connectivity error."""
@@ -290,7 +334,7 @@ class GixenClient:
         """
         if self._login_failed_at is not None:
             elapsed = time.monotonic() - self._login_failed_at
-            remaining = _LOGIN_COOLDOWN - elapsed
+            remaining = self._login_cooldown_secs - elapsed
             if remaining > 0:
                 raise GixenLoginError(
                     f"Login cooldown active — retry in {int(remaining)}s. "
@@ -327,27 +371,33 @@ class GixenClient:
             )
         except (requests.ConnectionError, requests.Timeout) as e:
             # Host unreachable / black-holed / timed out — never got a response.
-            # Classify as connectivity, not credentials (BUI-77).
-            self._login_failed_at = time.monotonic()
+            # Classify as connectivity, not credentials (BUI-77). Transient:
+            # one blip must not lock writes for the full cooldown (BUI-118).
+            self._arm_login_cooldown(transient=True)
             raise self._connection_error(LOGIN_URL, e) from e
         except Exception:
-            self._login_failed_at = time.monotonic()
+            # An unexpected error mid-login is treated as transient too — it is
+            # not a confirmed credentials rejection, so it should not arm the
+            # full cooldown on the first occurrence (BUI-118).
+            self._arm_login_cooldown(transient=True)
             raise
 
         # Gixen returns HTML with a meta-refresh containing the sessionid
         match = re.search(r'sessionid=(\d+)', resp.text)
         if not match:
-            self._login_failed_at = time.monotonic()
             # An empty/blank body with no sessionid is the signature of a
             # truncated connection or a flapping host, not an auth rejection —
             # a real rejection returns the login HTML (form + error). Only the
-            # latter is a credentials problem (BUI-77).
+            # latter is a credentials problem (BUI-77), and only it arms the
+            # full cooldown on the first failure (BUI-118).
             if not (resp.text or "").strip():
+                self._arm_login_cooldown(transient=True)
                 raise GixenConnectionError(
                     f"Gixen returned an empty response from {LOGIN_URL} — the "
                     "host is likely unreachable or flapping. This is a "
                     "connectivity problem, not a credentials problem."
                 )
+            self._arm_login_cooldown(transient=False)
             raise GixenLoginError(
                 "Login failed — Gixen returned a page with no session ID. "
                 "If credentials are correct, Gixen's login page may have "
@@ -355,6 +405,11 @@ class GixenClient:
             )
 
         self._login_failed_at = None
+        # BUI-118: a clean login clears the transient-failure streak and resets
+        # the armed cooldown duration back to the full default for the next
+        # genuine failure.
+        self._transient_login_failures = 0
+        self._login_cooldown_secs = _LOGIN_COOLDOWN
         self.session_id = match.group(1)
         # BUI-117: remember this good login so a same-edit burst of recovery
         # re-logins within _login_throttle reuses it instead of re-authenticating.

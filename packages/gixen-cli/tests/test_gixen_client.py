@@ -198,6 +198,146 @@ class TestLogin:
 
 
 # ---------------------------------------------------------------------------
+# Login cooldown (BUI-118)
+# ---------------------------------------------------------------------------
+
+class TestLoginCooldown:
+    """A single transient login blip must not lock writes for the full 300s
+    cooldown, while a real credentials rejection or a sustained outage still
+    backs off fully (BUI-118)."""
+
+    def _transient_session(self):
+        session = MagicMock()
+        session.post.side_effect = requests.ConnectTimeout("connect timed out")
+        return session
+
+    def test_single_transient_blip_does_not_block_next_write_for_full_cooldown(self):
+        """One ConnectionError/Timeout arms only the short transient cooldown,
+        so the next login attempt a few seconds later is allowed (not blocked
+        for the full 300s)."""
+        from gixen_client import _TRANSIENT_LOGIN_COOLDOWN, _LOGIN_COOLDOWN
+
+        client = _client()
+        client.session = self._transient_session()
+
+        clock = {"t": 1000.0}
+        with patch("gixen_client.time.monotonic", side_effect=lambda: clock["t"]):
+            with pytest.raises(GixenConnectionError):
+                client.login()
+            # Only the short cooldown is armed, not the full 300s.
+            assert client._login_cooldown_secs == _TRANSIENT_LOGIN_COOLDOWN
+            assert client._login_cooldown_secs < _LOGIN_COOLDOWN
+
+            # A retry just past the short cooldown is NOT blocked by the gate —
+            # it proceeds to actually hit the network again (and fails on the
+            # connection, not on the cooldown).
+            clock["t"] = 1000.0 + _TRANSIENT_LOGIN_COOLDOWN + 0.1
+            with pytest.raises(GixenConnectionError):
+                client.login()
+
+    def test_retry_within_short_window_still_blocked(self):
+        """Within the short transient window the gate still trips — the blip
+        gets a brief, not zero, backoff."""
+        client = _client()
+        client.session = self._transient_session()
+
+        clock = {"t": 0.0}
+        with patch("gixen_client.time.monotonic", side_effect=lambda: clock["t"]):
+            with pytest.raises(GixenConnectionError):
+                client.login()
+            clock["t"] = 1.0  # well inside _TRANSIENT_LOGIN_COOLDOWN
+            with pytest.raises(GixenLoginError, match="cooldown active"):
+                client.login()
+
+    def test_sustained_transient_failures_arm_full_cooldown(self):
+        """Repeated transient failures (a real outage, not a blip) escalate to
+        the full 300s cooldown once the threshold is crossed — no regression to
+        the IP-rate-limit protection."""
+        from gixen_client import (
+            _LOGIN_COOLDOWN,
+            _TRANSIENT_LOGIN_COOLDOWN,
+            _TRANSIENT_FAILURE_THRESHOLD,
+        )
+
+        client = _client()
+        client.session = self._transient_session()
+
+        clock = {"t": 0.0}
+        with patch("gixen_client.time.monotonic", side_effect=lambda: clock["t"]):
+            for i in range(1, _TRANSIENT_FAILURE_THRESHOLD + 1):
+                with pytest.raises(GixenConnectionError):
+                    client.login()
+                if i < _TRANSIENT_FAILURE_THRESHOLD:
+                    assert client._login_cooldown_secs == _TRANSIENT_LOGIN_COOLDOWN
+                else:
+                    assert client._login_cooldown_secs == _LOGIN_COOLDOWN
+                # Advance past the (short) cooldown so the next login attempt
+                # reaches the network instead of being gated.
+                clock["t"] += _TRANSIENT_LOGIN_COOLDOWN + 0.1
+
+            # After the threshold the full cooldown is armed: a write well inside
+            # the 300s window (but past the short window) is now blocked.
+            assert client._transient_login_failures >= _TRANSIENT_FAILURE_THRESHOLD
+            with pytest.raises(GixenLoginError, match="cooldown active"):
+                client.login()
+
+    def test_credentials_rejection_arms_full_cooldown_immediately(self):
+        """A genuine auth rejection (a login page with no session id) arms the
+        full 300s cooldown on the very first failure — the IP-rate-limit case
+        the cooldown exists to protect against."""
+        from gixen_client import _LOGIN_COOLDOWN
+
+        session = MagicMock()
+        resp = MagicMock()
+        resp.text = LOGIN_FAILED_HTML
+        session.post.return_value = resp
+
+        client = _client()
+        client.session = session
+
+        clock = {"t": 0.0}
+        with patch("gixen_client.time.monotonic", side_effect=lambda: clock["t"]):
+            with pytest.raises(GixenLoginError, match="Login failed"):
+                client.login()
+            assert client._login_cooldown_secs == _LOGIN_COOLDOWN
+            # A retry inside the full window (but past the short one) is blocked.
+            clock["t"] = 10.0
+            with pytest.raises(GixenLoginError, match="cooldown active"):
+                client.login()
+
+    def test_successful_login_resets_transient_streak(self):
+        """A clean login clears the transient-failure streak and resets the
+        armed cooldown back to the full default for the next genuine failure."""
+        from gixen_client import _LOGIN_COOLDOWN, _TRANSIENT_LOGIN_COOLDOWN
+
+        session = MagicMock()
+        # First call: transient blip. Second: success.
+        ok_resp = MagicMock()
+        ok_resp.text = LOGIN_REDIRECT_HTML
+        session.post.side_effect = [
+            requests.ConnectTimeout("blip"),
+            ok_resp,
+        ]
+
+        client = _client()
+        client.session = session
+
+        clock = {"t": 0.0}
+        with patch("gixen_client.time.monotonic", side_effect=lambda: clock["t"]):
+            with pytest.raises(GixenConnectionError):
+                client.login()
+            assert client._transient_login_failures == 1
+            assert client._login_cooldown_secs == _TRANSIENT_LOGIN_COOLDOWN
+
+            clock["t"] = _TRANSIENT_LOGIN_COOLDOWN + 0.1
+            sid = client.login()
+            assert sid == "99887766"
+            assert client._transient_login_failures == 0
+            assert client._login_cooldown_secs == _LOGIN_COOLDOWN
+            assert client._login_failed_at is None
+
+
+# ---------------------------------------------------------------------------
 # List snipes
 # ---------------------------------------------------------------------------
 
