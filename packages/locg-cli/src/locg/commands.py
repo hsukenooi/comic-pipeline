@@ -1610,7 +1610,7 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
     return result
 
 
-_ISSUE_TOKEN_RE = re.compile(r"#\s*(\d+[A-Za-z]?)\b")
+_ISSUE_TOKEN_RE = re.compile(r"#\s*(\d+(?:\.[A-Za-z0-9]+)?[A-Za-z]*)")
 
 
 def _split_full_title(full_title: str) -> tuple[str, Optional[str]]:

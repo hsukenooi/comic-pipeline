@@ -1590,3 +1590,128 @@ def test_wish_list_remove_conflicts_removes_only_owned(tmp_path, monkeypatch):
     # The non-owned item survives; the owned one is gone.
     remaining = cmds.cmd_wish_list_from_cache()
     assert [it["name"] for it in remaining] == ["X-Men #1"]
+
+
+# ---------------------------------------------------------------------------
+# BUI-175: decimal / point-issue token regressions
+# ---------------------------------------------------------------------------
+
+def test_split_full_title_decimal_issue_tokens():
+    """_split_full_title must parse decimal and multi-letter point issues."""
+    from locg.commands import _split_full_title
+
+    assert _split_full_title("X #1.MU") == ("X", "1.MU")
+    assert _split_full_title("Amazing Spider-Man #20.1") == ("Amazing Spider-Man", "20.1")
+    assert _split_full_title("Amazing Spider-Man #1.5") == ("Amazing Spider-Man", "1.5")
+
+
+def test_split_full_title_existing_letter_suffix_not_regressed():
+    """Single and multi-letter alpha suffixes (e.g. #1A, #1AU) still parse."""
+    from locg.commands import _split_full_title
+
+    assert _split_full_title("Web of Spider-Man #1A") == ("Web of Spider-Man", "1A")
+    assert _split_full_title("Marvel #1AU") == ("Marvel", "1AU")
+
+
+def test_split_full_title_normal_issues_unchanged():
+    """Plain numeric issues and series with qualifier words stay correct."""
+    from locg.commands import _split_full_title
+
+    assert _split_full_title("Thor #154") == ("Thor", "154")
+    assert _split_full_title("Fantastic Four Annual #6") == ("Fantastic Four Annual", "6")
+    assert _split_full_title("Watchmen") == ("Watchmen", None)
+
+
+def test_split_full_title_trailing_dot_not_captured():
+    """A trailing period after the issue number must not be consumed."""
+    from locg.commands import _split_full_title
+
+    series, token = _split_full_title("Thor #154.")
+    assert token == "154"
+
+
+def test_split_full_title_trailing_word_not_swallowed():
+    """A word after the issue token (e.g. 'Newsstand') must not extend the token."""
+    from locg.commands import _split_full_title
+
+    series, token = _split_full_title("Spider-Man #1 Newsstand")
+    assert token == "1"
+
+
+def test_check_matches_decimal_issue_token_mu(tmp_path, monkeypatch):
+    """#1.MU stored title must match issue='1.MU' query (BUI-175)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="The Amazing Spider-Man #1.MU",
+        series="The Amazing Spider-Man (1963 - 1998)",
+    )])
+
+    r = cmds.cmd_collection_check(series="The Amazing Spider-Man", issue="1.MU")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "The Amazing Spider-Man #1.MU"
+
+
+def test_check_matches_decimal_issue_token_numeric(tmp_path, monkeypatch):
+    """#20.1 stored title must match issue='20.1' query (BUI-175)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Amazing Spider-Man #20.1",
+        series="Amazing Spider-Man (1963 - 1998)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="20.1")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Amazing Spider-Man #20.1"
+
+
+def test_check_matches_decimal_issue_token_15(tmp_path, monkeypatch):
+    """#1.5 stored title must match issue='1.5' query (BUI-175)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Uncanny X-Men #1.5",
+        series="Uncanny X-Men (1963 - 2011)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Uncanny X-Men", issue="1.5")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Uncanny X-Men #1.5"
+
+
+def test_check_single_letter_suffix_not_regressed(tmp_path, monkeypatch):
+    """#1A still matches issue='1A' after the regex change (non-regression)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Web of Spider-Man #1A",
+        series="Web of Spider-Man (1985 - 1995)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Web of Spider-Man", issue="1A")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Web of Spider-Man #1A"
+
+
+def test_check_issue_1_does_not_match_stored_1_5(tmp_path, monkeypatch):
+    """issue='1' must NOT match a stored '#1.5' — no false positive (BUI-175)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Uncanny X-Men #1.5",
+        series="Uncanny X-Men (1963 - 2011)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Uncanny X-Men", issue="1")
+    assert r["match_status"] == "not_in_cache"
