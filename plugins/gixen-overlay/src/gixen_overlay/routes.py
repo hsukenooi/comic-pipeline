@@ -1187,6 +1187,20 @@ async def api_wish_list_add(req: WishListAddRequest):
         parsed = _split_wish_list_name(req.title)
         if parsed is not None:
             series, issue = parsed
+            # BUI-184 (design decision, deliberately unresolved): this omits
+            # `year`, so cmd_collection_check's year-gated masthead fallback
+            # (_SERIES_ALIASES, e.g. "The Mighty Thor" → owned "Thor") can't fire
+            # here — a book stored under its base masthead can slip past the 409
+            # owned-guard. Omitting `year` is intentional (BUI-129: forwarding a
+            # series start-year produced a false not_in_cache that hid 16 owned
+            # X-Men), and there is no per-issue year to pass: WishListAddRequest
+            # carries only {title, force} and _split_wish_list_name yields only
+            # (series, issue). Closing the gap means new plumbing — a per-issue
+            # cover year on the request + every caller (the /comic:wishlist-add
+            # skill) populating it — not a one-line toggle. Left as-is for now:
+            # the guard fails open by design and the export-side BUI-122 fix
+            # (collection-sync never exports an owned book as In Collection=0) is
+            # the real data-loss safety net. Revisit if the year plumbing lands.
             try:
                 check = cmd_collection_check(series=series, issue=issue)
             except RuntimeError:
