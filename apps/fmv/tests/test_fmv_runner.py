@@ -495,6 +495,19 @@ class TestUpsertFmv:
         assert body["fmv_confidence"] == "high"
         assert body["locg_id"] == 42
 
+    def test_upsert_fmv_fails_loud_on_post_error(self, server_url):
+        """BUI-186: a failed FMV upsert aborts the run (fail loud) instead of
+        returning None and proceeding with a book that was priced but never
+        linked (the downstream snipe-add FMV link would silently break)."""
+        import requests
+        inp = {"title": "X", "issue": "1", "year": 1990, "grade": 9.0}
+        fmv = {"fmv_low": 100, "fmv_high": 150, "n": 8, "confidence": "HIGH",
+               "window": 0.5, "cv_pct": "20%"}
+        with patch("fmv_runner.requests.post",
+                   side_effect=requests.ConnectionError("server down")):
+            with pytest.raises(SystemExit):
+                fmv_runner._upsert_fmv(server_url, inp, fmv)
+
     def test_collapses_finegrained_confidence(self, server_url):
         # MEDIUM-HIGH and MEDIUM both map to "medium"
         # MEDIUM-LOW and LOW both map to "low"

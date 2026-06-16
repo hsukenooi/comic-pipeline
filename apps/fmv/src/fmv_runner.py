@@ -394,8 +394,26 @@ def _extract_ids(row: dict | None) -> tuple[int | None, int | None]:
     return row.get("comic_id"), row.get("fmv_id")
 
 
-def _upsert_fmv(server_url: str, inp: dict, fmv: dict) -> dict | None:
-    """POST /api/comics with the computed FMV. Returns the row JSON or None."""
+def _post_json(url: str, body: dict, *, what: str) -> dict:
+    """POST JSON and return the parsed response, failing LOUD (BUI-186 / R11).
+
+    A timeout, connection error, or non-2xx aborts the run with a clear message
+    rather than returning None and letting the pipeline proceed on missing data:
+    an un-persisted FMV silently breaks the downstream snipe-add FMV link (the
+    book is priced but never linked, and verify reports it missing).
+    """
+    try:
+        resp = requests.post(url, json=body, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        click.echo(f"Error: {what} failed (POST {url}): {e}", err=True)
+        sys.exit(1)
+
+
+def _upsert_fmv(server_url: str, inp: dict, fmv: dict) -> dict:
+    """POST /api/comics with the computed FMV. Returns the row JSON, or aborts
+    the run on a failed call (BUI-186) rather than silently returning None."""
     body = {
         "title": inp["title"],
         "issue": str(inp["issue"]),
@@ -416,14 +434,11 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict) -> dict | None:
         # (etc.) get distinct comic_ids instead of being conflated.
         body["variant"] = inp["variant"]
 
-    try:
-        resp = requests.post(f"{server_url}/api/comics", json=body, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        click.echo(f"Warning: DB upsert failed for {inp.get('title')} "
-                   f"#{inp.get('issue')}: {e}", err=True)
-        return None
+    return _post_json(
+        f"{server_url}/api/comics",
+        body,
+        what=f"FMV upsert for {inp.get('title')} #{inp.get('issue')}",
+    )
 
 
 def _confidence_to_db_label(label: str) -> str:
