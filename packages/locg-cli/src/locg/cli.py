@@ -41,6 +41,7 @@ from locg.commands import (
     cmd_update,
     cmd_wish_list,
     cmd_wish_list_add,
+    cmd_wish_list_add_creator_run,
     cmd_wish_list_from_cache,
     cmd_wish_list_remove,
     parse_lookup_spec,
@@ -182,15 +183,43 @@ def create_parser() -> argparse.ArgumentParser:
     p_wish_add = wish_sub.add_parser(
         "add",
         parents=[common],
-        help="Append a manual entry to the local wish-list cache",
+        help="Append a manual entry to the local wish-list cache, or a whole creator run",
         epilog=(
             "Writes {name: <title>, id: null} to data/locg/wish-list.json. "
             "A subsequent `locg collection import` overwrites the cache from "
             "the LOCG XLSX export, so manually-added entries are not preserved "
-            "across imports."
+            "across imports. With --creator + --series-id, resolves the creator's "
+            "run on the series from Metron credits and adds the gap issues "
+            "(owned + already-wishlisted issues are filtered out first)."
         ),
     )
-    p_wish_add.add_argument("title", help="Title to record (e.g. 'Amazing Spider-Man #300')")
+    # `title` is the simple single-entry path; optional when --creator is used
+    # (the run resolver builds "<series> #<N>" titles from `title` as the series).
+    p_wish_add.add_argument(
+        "title",
+        help=(
+            "Title to record (e.g. 'Amazing Spider-Man #300'). With --creator, "
+            "this is the SERIES title used for the '<series> #<N>' wish entries."
+        ),
+    )
+    p_wish_add.add_argument(
+        "--creator",
+        help=(
+            "Resolve this creator's run on the series from Metron credits and add "
+            "the gap issues (e.g. --creator 'John Romita Jr.'). Requires --series-id."
+        ),
+    )
+    p_wish_add.add_argument(
+        "--role",
+        default="penciller",
+        help="Credit role to filter the run by (default: penciller).",
+    )
+    p_wish_add.add_argument(
+        "--series-id",
+        dest="series_id",
+        type=int,
+        help="Metron series id (required with --creator).",
+    )
     p_wish_remove = wish_sub.add_parser(
         "remove",
         parents=[common],
@@ -418,7 +447,19 @@ def main() -> None:
             if getattr(args, "wish_list_command", None) == "add":
                 # The subparser positional `title` shadows the parent's
                 # --title flag, so args.title is the value to append.
-                result = cmd_wish_list_add(args.title)
+                creator = getattr(args, "creator", None)
+                if creator:
+                    series_id = getattr(args, "series_id", None)
+                    if series_id is None:
+                        die("wish-list add --creator requires --series-id (the Metron series id)")
+                    result = cmd_wish_list_add_creator_run(
+                        series=args.title,
+                        creator=creator,
+                        series_id=series_id,
+                        role=getattr(args, "role", "penciller") or "penciller",
+                    )
+                else:
+                    result = cmd_wish_list_add(args.title)
             elif getattr(args, "wish_list_command", None) == "remove":
                 result = cmd_wish_list_remove(args.title)
             elif _wish_list_cached:

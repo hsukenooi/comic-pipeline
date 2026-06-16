@@ -251,11 +251,15 @@ def test_lookup_issue_detail_returns_variant_names():
     session = MagicMock()
     issue = MagicMock()
     issue.variants = [_mock_variant("Capullo Variant"), _mock_variant("Todd McFarlane Cover")]
+    issue.credits = []
     session.issue.return_value = issue
     client._session = session
 
     result = client.lookup_issue_detail(5)
-    assert result == {"variants": ["Capullo Variant", "Todd McFarlane Cover"]}
+    assert result == {
+        "variants": ["Capullo Variant", "Todd McFarlane Cover"],
+        "credits": [],
+    }
     session.issue.assert_called_once_with(5)
 
 
@@ -264,9 +268,10 @@ def test_lookup_issue_detail_no_variants():
     session = MagicMock()
     issue = MagicMock()
     issue.variants = []
+    issue.credits = []
     session.issue.return_value = issue
     client._session = session
-    assert client.lookup_issue_detail(5) == {"variants": []}
+    assert client.lookup_issue_detail(5) == {"variants": [], "credits": []}
 
 
 def test_lookup_issue_detail_swallows_exception():
@@ -283,6 +288,227 @@ def test_lookup_issue_detail_raises_credential_error(monkeypatch):
     client = MetronClient()
     with pytest.raises(MetronCredentialError):
         client.lookup_issue_detail(5)
+
+
+# ---------------------------------------------------------------------------
+# Credits extraction + creator-run resolver (BUI-134)
+# ---------------------------------------------------------------------------
+
+def _mock_role(name: str, id: int = 1) -> MagicMock:
+    r = MagicMock()
+    r.id = id
+    r.name = name
+    return r
+
+
+def _mock_credit(creator: str, roles: list[str], id: int = 1) -> MagicMock:
+    c = MagicMock()
+    c.id = id
+    c.creator = creator
+    c.role = [_mock_role(n) for n in roles]
+    return c
+
+
+def _mock_detail_issue(variants: list[str], credits: list[Any]) -> MagicMock:
+    issue = MagicMock()
+    issue.variants = [_mock_variant(v) for v in variants]
+    issue.credits = credits
+    return issue
+
+
+def _mock_base_issue(id: int, number: str, cover_date: str | None = "1984-01-01") -> MagicMock:
+    from datetime import date
+    i = MagicMock()
+    i.id = id
+    i.number = number
+    i.cover_date = date.fromisoformat(cover_date) if cover_date else None
+    return i
+
+
+def test_lookup_issue_detail_extracts_credits():
+    client = MetronClient()
+    session = MagicMock()
+    session.issue.return_value = _mock_detail_issue(
+        variants=["Direct Edition"],
+        credits=[
+            _mock_credit("John Romita Jr.", ["Penciller"]),
+            _mock_credit("Chris Claremont", ["Writer"]),
+        ],
+    )
+    client._session = session
+
+    result = client.lookup_issue_detail(42)
+    assert result["variants"] == ["Direct Edition"]
+    assert result["credits"] == [
+        {"creator": "John Romita Jr.", "creator_id": None, "roles": ["penciller"]},
+        {"creator": "Chris Claremont", "creator_id": None, "roles": ["writer"]},
+    ]
+
+
+def test_lookup_issue_detail_credits_empty_when_none():
+    client = MetronClient()
+    session = MagicMock()
+    session.issue.return_value = _mock_detail_issue(variants=[], credits=[])
+    client._session = session
+    assert client.lookup_issue_detail(1)["credits"] == []
+
+
+# --- resolve_creator: pin Metron id, disambiguate JR vs Sr -----------------
+
+def _mock_creator(id: int, name: str) -> MagicMock:
+    c = MagicMock()
+    c.id = id
+    c.name = name
+    return c
+
+
+def test_resolve_creator_single_match():
+    client = MetronClient()
+    session = MagicMock()
+    session.creators_list.return_value = [_mock_creator(355, "John Romita Jr.")]
+    client._session = session
+    assert client.resolve_creator("John Romita Jr.") == {"id": 355, "name": "John Romita Jr."}
+
+
+def test_resolve_creator_disambiguates_jr_from_sr_by_exact_name():
+    """JR and Sr both surface on a loose 'John Romita' query; exact name wins."""
+    client = MetronClient()
+    session = MagicMock()
+    session.creators_list.return_value = [
+        _mock_creator(10, "John Romita"),       # Sr.
+        _mock_creator(355, "John Romita Jr."),
+    ]
+    client._session = session
+    # Exact 'John Romita Jr.' pins the Jr. id, never the Sr.
+    assert client.resolve_creator("John Romita Jr.") == {"id": 355, "name": "John Romita Jr."}
+
+
+def test_resolve_creator_ambiguous_returns_none():
+    client = MetronClient()
+    session = MagicMock()
+    session.creators_list.return_value = [
+        _mock_creator(10, "John Romita"),
+        _mock_creator(355, "John Romita Jr."),
+    ]
+    client._session = session
+    # Loose query matches two, neither equals it exactly -> ambiguous -> None
+    assert client.resolve_creator("Romita") is None
+
+
+def test_resolve_creator_no_match_returns_none():
+    client = MetronClient()
+    session = MagicMock()
+    session.creators_list.return_value = []
+    client._session = session
+    assert client.resolve_creator("Nobody") is None
+
+
+# --- resolve_creator_run: BOTH stints, role filter, no-credit warning ------
+
+def test_resolve_creator_run_returns_both_stints():
+    """JR JR's Uncanny X-Men: #175–177 (stint 1) AND #287 + #300 (stint 2).
+
+    The candidate set from the issue-list creator filter spans both stints
+    (it's pinned by creator id, not memory), and each is confirmed as Penciller.
+    """
+    client = MetronClient()
+    session = MagicMock()
+    # issue-list creator filter returns the union of both stints
+    session.issues_list.return_value = [
+        _mock_base_issue(1001, "175"),
+        _mock_base_issue(1002, "176"),
+        _mock_base_issue(1003, "177"),
+        _mock_base_issue(2001, "287"),
+        _mock_base_issue(2002, "300"),
+    ]
+    # Every one of these has JR JR as Penciller
+    session.issue.side_effect = lambda _id: _mock_detail_issue(
+        variants=[],
+        credits=[_mock_credit("John Romita Jr.", ["Penciller"])],
+    )
+    client._session = session
+
+    run = client.resolve_creator_run(
+        series_id=99, creator_id=355, creator_name="John Romita Jr.", role="penciller",
+    )
+    numbers = [i["number"] for i in run["issues"]]
+    # Both stints present — the discontinuous #287/#300 are NOT dropped
+    assert numbers == ["175", "176", "177", "287", "300"]
+    assert run["warnings"] == []
+
+
+def test_resolve_creator_run_filters_by_role():
+    """An issue where the creator only WROTE (never pencilled) is excluded."""
+    client = MetronClient()
+    session = MagicMock()
+    session.issues_list.return_value = [
+        _mock_base_issue(1, "10"),  # penciller
+        _mock_base_issue(2, "11"),  # writer only — must be dropped
+    ]
+
+    def _detail(_id):
+        if _id == 1:
+            return _mock_detail_issue([], [_mock_credit("John Romita Jr.", ["Penciller"])])
+        return _mock_detail_issue([], [_mock_credit("John Romita Jr.", ["Writer"])])
+
+    session.issue.side_effect = _detail
+    client._session = session
+
+    run = client.resolve_creator_run(
+        series_id=1, creator_id=355, creator_name="John Romita Jr.", role="penciller",
+    )
+    assert [i["number"] for i in run["issues"]] == ["10"]
+
+
+def test_resolve_creator_run_warns_on_missing_credits():
+    """An issue Metron has no credits for is a low-confidence WARNING, not a silent drop."""
+    client = MetronClient()
+    session = MagicMock()
+    session.issues_list.return_value = [
+        _mock_base_issue(1, "10"),
+        _mock_base_issue(2, "11"),  # no credits at all
+    ]
+
+    def _detail(_id):
+        if _id == 1:
+            return _mock_detail_issue([], [_mock_credit("John Romita Jr.", ["Penciller"])])
+        return _mock_detail_issue([], [])  # thin Silver/Bronze book
+
+    session.issue.side_effect = _detail
+    client._session = session
+
+    run = client.resolve_creator_run(
+        series_id=1, creator_id=355, creator_name="John Romita Jr.", role="penciller",
+    )
+    assert [i["number"] for i in run["issues"]] == ["10"]
+    assert len(run["warnings"]) == 1
+    assert run["warnings"][0]["number"] == "11"
+    assert "no credits" in run["warnings"][0]["reason"]
+
+
+def test_resolve_creator_run_role_is_explicit_no_layouts_by_default():
+    """Default penciller does NOT auto-include 'breakdowns'/'layouts'."""
+    client = MetronClient()
+    session = MagicMock()
+    session.issues_list.return_value = [_mock_base_issue(1, "10")]
+    session.issue.side_effect = lambda _id: _mock_detail_issue(
+        [], [_mock_credit("John Romita Jr.", ["Breakdowns"])]
+    )
+    client._session = session
+    run = client.resolve_creator_run(
+        series_id=1, creator_id=355, creator_name="John Romita Jr.", role="penciller",
+    )
+    assert run["issues"] == []
+
+
+def test_resolve_creator_run_hard_failure_returns_none():
+    client = MetronClient()
+    session = MagicMock()
+    session.issues_list.side_effect = ConnectionError("down")
+    client._session = session
+    assert client.resolve_creator_run(
+        series_id=1, creator_id=1, creator_name="X", role="penciller",
+    ) is None
 
 
 # ---------------------------------------------------------------------------
