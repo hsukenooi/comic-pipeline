@@ -1776,3 +1776,45 @@ def test_check_variant_does_not_loosen_issue_match(tmp_path, monkeypatch):
 
     r = cmds.cmd_collection_check(series="Spawn", issue="9", variant="newsstand")
     assert r["match_status"] == "not_in_cache"
+
+
+# ---------------------------------------------------------------------------
+# BUI-184: _resolve_price must not IndexError / abort the record-win batch
+# ---------------------------------------------------------------------------
+
+def test_resolve_price_empty_or_whitespace_returns_none():
+    """An empty / whitespace current_bid must yield None, not raise IndexError."""
+    from locg.commands import _resolve_price
+
+    assert _resolve_price("") is None
+    assert _resolve_price("   ") is None
+    assert _resolve_price(None) is None
+    # Normal paths still parse.
+    assert _resolve_price("12.50 USD") == 12.50
+    assert _resolve_price(42) == 42.0
+    assert _resolve_price("not-a-price") is None
+
+
+def test_record_win_empty_current_bid_does_not_abort_batch(tmp_path):
+    """One win with an empty current_bid must not IndexError and abort the whole
+    batch; it is recorded with no price and the other wins still commit (BUI-184).
+    """
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", series="Spawn", issue="1", year=1992, current_bid=""),
+            _make_win(item_id="2", series="Spawn", issue="7", year=1993, current_bid=12.50),
+        ],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    # Both rows committed — the malformed win did not abort the batch.
+    assert result["rows_written"] == 2
+
+    payload = cache.load()
+    by_title = {r["full_title"]: r for r in payload["comics"]}
+    assert by_title["Spawn #1"]["price_paid"] is None
+    assert by_title["Spawn #7"]["price_paid"] == 12.50

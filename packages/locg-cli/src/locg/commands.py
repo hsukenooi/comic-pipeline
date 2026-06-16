@@ -1841,9 +1841,15 @@ def _resolve_price(raw: Any) -> Optional[float]:
         return None
     if isinstance(raw, (int, float)):
         return float(raw)
-    s = str(raw).split()[0]
+    # BUI-184: an empty / whitespace-only current_bid yields [] from .split(),
+    # so the old str(raw).split()[0] raised IndexError (not caught by the
+    # ValueError guard) and one malformed win aborted the whole record-win
+    # batch. Treat an empty value as "no price" instead of raising.
+    parts = str(raw).split()
+    if not parts:
+        return None
     try:
-        return float(s)
+        return float(parts[0])
     except ValueError:
         return None
 
