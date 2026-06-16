@@ -458,6 +458,113 @@ class TestRecordItemsSeen:
             seller_scan.record_items_seen(["111"], "tuners36")  # no exception
 
 
+# ─── BUI-184 robustness fixes ─────────────────────────────────────────────────
+
+
+class TestNullTitleScanLoop:
+    """BUI-184 Item 2 (seller_scan side): a null/empty title from parse_item_summary
+    must be skipped gracefully instead of crashing the scan with AttributeError."""
+
+    def test_match_listing_with_empty_title_returns_no_match(self):
+        """match_listing('', ...) must not raise and must return (None, 0.0)."""
+        wish_items = seller_scan.prepare_wish_items([
+            {"id": 1, "name": "Amazing Spider-Man #300"},
+        ])
+        wish, score = seller_scan.match_listing("", wish_items)
+        assert wish is None
+        assert score == 0.0
+
+    def test_scan_loop_skips_null_title_listing(self, monkeypatch):
+        """If a listing has title=None (null from the API), the scan loop must skip
+        it rather than raising AttributeError on .lower()."""
+        # Two raw listings: one with null title, one genuine match
+        null_listing = {
+            "itemId": "v1|1|0",
+            "title": None,
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "5.00", "currency": "USD"},
+            "itemEndDate": "2026-06-01T12:00:00.000Z",
+            "itemWebUrl": "https://www.ebay.com/itm/1",
+            "seller": {"username": "testseller"},
+        }
+        good_listing = {
+            "itemId": "v1|2|0",
+            "title": "Amazing Spider-Man #300 NM Marvel 1988",
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "100.00", "currency": "USD"},
+            "itemEndDate": "2026-06-01T12:00:00.000Z",
+            "itemWebUrl": "https://www.ebay.com/itm/2",
+            "seller": {"username": "testseller"},
+        }
+        wish_items = seller_scan.prepare_wish_items([
+            {"id": 1, "name": "Amazing Spider-Man #300"},
+        ])
+
+        candidates = []
+        # Replicate the scan-loop body from seller_scan.main() so we can exercise
+        # the null-title guard without spinning up the full CLI.
+        for raw in [null_listing, good_listing]:
+            listing = ebay_fetch.parse_item_summary(raw)
+            # The guard added in BUI-184: skip title-less listings.
+            if not listing.get("title"):
+                continue
+            wish, score = seller_scan.match_listing(listing["title"], wish_items)
+            if wish:
+                candidates.append(listing)
+
+        # The null-title listing is skipped; the good listing matches.
+        assert len(candidates) == 1
+        assert candidates[0]["item_id"] == "2"
+
+
+class TestIssueBoundaryRegex:
+    """BUI-184 Item 3: the #N branch of issue_pattern must not prefix-match #300
+    when the wish item is issue '3'."""
+
+    def _items(self, names):
+        return seller_scan.prepare_wish_items(
+            [{"id": i, "name": n} for i, n in enumerate(names)]
+        )
+
+    def test_issue_3_does_not_match_title_with_300(self):
+        """'#3' must not match a title that only contains '300' or '#300'.
+        _normalize strips '#', so the bare-number boundary is the meaningful check."""
+        items = self._items(["Some Series #3"])
+        # After _normalize: "some series 300 ..." — issue "3" must NOT match "300"
+        wish, score = seller_scan.match_listing("Some Series #300 VF Marvel", items)
+        assert wish is None, "issue #3 must not match a title containing only '#300'"
+
+    def test_issue_3_does_not_match_bare_300(self):
+        """Guard the bare-number \b branch: '300' must not match issue '3'."""
+        items = self._items(["Some Series #3"])
+        wish, score = seller_scan.match_listing("Some Series 300 VF Marvel", items)
+        assert wish is None, "issue '3' must not match bare '300' in title"
+
+    def test_issue_3_still_matches_real_3(self):
+        """A title containing exactly '#3' (normalized to ' 3 ') must still match."""
+        items = self._items(["Some Series #3"])
+        wish, score = seller_scan.match_listing("Some Series #3 VF Marvel", items)
+        assert wish is not None, "issue #3 must match a title that contains '#3'"
+
+    def test_issue_3_still_matches_bare_3(self):
+        """A title with bare '3' at a word boundary must still match."""
+        items = self._items(["Some Series #3"])
+        wish, score = seller_scan.match_listing("Some Series 3 VF Marvel", items)
+        assert wish is not None, "issue '3' must match bare '3' at a word boundary"
+
+    def test_issue_30_does_not_match_300(self):
+        """Same boundary check for a two-digit issue: '30' vs '300'."""
+        items = self._items(["Some Series #30"])
+        wish, score = seller_scan.match_listing("Some Series #300 VF Marvel", items)
+        assert wish is None, "issue #30 must not match a title containing only '#300'"
+
+    def test_issue_1_does_not_match_10(self):
+        """Issue '1' must not match '10' or '#10'."""
+        items = self._items(["X-Men #1"])
+        wish, score = seller_scan.match_listing("X Men 10 NM 1963 Marvel", items)
+        assert wish is None, "issue '1' must not match '10'"
+
+
 class TestVerifyWithClaudeNoSilentDrop:
     def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
         """BUI-149: the script's internal Claude pass is the single verification

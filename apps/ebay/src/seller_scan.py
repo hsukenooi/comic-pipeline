@@ -159,9 +159,14 @@ def match_listing(title, wish_items):
 
     for wish in wish_items:
         issue = wish["issue"]
-        # Issue number check: look for #N or space-bounded N
+        # Issue number check: look for #N or space-bounded N.
+        # BUI-184: add a trailing \b to the #\s*N branch so that "#3" does not
+        # prefix-match "#300". In practice _normalize() strips "#" before this
+        # runs (so the first branch rarely fires on a normalized title), but the
+        # trailing boundary hardens it defensively against any future caller that
+        # passes un-normalized input. Both branches now have symmetric boundaries.
         issue_pattern = re.compile(
-            r"(?:#\s*" + re.escape(issue) + r"|\b" + re.escape(issue) + r"\b)"
+            r"(?:#\s*" + re.escape(issue) + r"\b|\b" + re.escape(issue) + r"\b)"
         )
         if not issue_pattern.search(title_norm):
             continue
@@ -401,6 +406,11 @@ def main(argv=None):
     candidates = []
     for raw in raw_listings:
         listing = parse_item_summary(raw)
+        # BUI-184: defense in depth — parse_item_summary already coerces null
+        # titles to "" via `or ""`, but skip explicitly here too so that a
+        # title-less listing never reaches .lower() or match_listing at all.
+        if not listing.get("title"):
+            continue
         if "cgc" in listing["title"].lower():
             continue
         if listing["item_id"] in seen_ids:
