@@ -68,10 +68,20 @@ class WishListAddRequest(BaseModel):
     rejects a title already in the collection with 409, because wish-listing an
     owned book is the BUI-122 data-loss trigger; ``force=true`` is the escape
     hatch for the rare intentional case (a different printing/variant).
+
+    ``year`` (BUI-184) is the **per-issue cover year** of the book being
+    wish-listed (e.g. 1968 for ``"The Mighty Thor #154"``). Supplying it lets the
+    owned-guard's year-gated masthead fallback catch a book stored under its base
+    masthead (an owned ``"Thor #154"``). It is OPTIONAL and defaults to omitted —
+    when absent, the guard behaves exactly as before. CRITICAL (BUI-129): pass the
+    issue's *cover* year, never a series START year (``year_began``), or the
+    matcher's per-issue year gate falsely reports owned mid-run issues as
+    not-owned and the guard fails open.
     """
 
     title: str
     force: bool = False
+    year: str | None = None
 
     @field_validator("title")
     @classmethod
