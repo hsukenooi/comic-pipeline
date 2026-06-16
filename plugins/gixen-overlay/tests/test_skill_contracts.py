@@ -160,6 +160,51 @@ def test_no_skill_swallows_a_server_curl():
     )
 
 
+def test_shared_server_wrapper_is_fail_loud():
+    """BUI-191 (R2/BUI-186): the shared comics-server wrapper must stay fail-loud
+    — comics_curl forces --fail-with-body (non-200 → non-zero) and bounds the
+    call with --max-time, and the comics_get/comics_post aliases exist. A future
+    edit that drops the fail flag would let a non-200 read as empty success."""
+    sh = (REPO_ROOT / "scripts" / "comics-server.sh").read_text()
+    assert "--fail-with-body" in sh, "comics_curl no longer forces --fail-with-body"
+    assert "--max-time" in sh, "comics_curl lost its --max-time bound (BUI-186)"
+    for fn in ("comics_curl()", "comics_get()", "comics_post()"):
+        assert fn in sh, f"shared wrapper no longer defines {fn}"
+
+
+def test_ezship_dedup_documented_and_implemented():
+    """BUI-191 (BUI-180): order submission is deduped by tracking number. Assert
+    the code keeps the ledger guard AND ezship-add.md documents that a re-run
+    won't double-submit, so the seam can't silently regress to a double-ship."""
+    api = (REPO_ROOT / "apps" / "ezship" / "src" / "api.ts").read_text()
+    ledger = REPO_ROOT / "apps" / "ezship" / "src" / "order-ledger.ts"
+    assert ledger.exists(), "order-ledger.ts (BUI-180 dedup) is gone"
+    assert "findSubmittedOrder" in api, "submitNewOrder no longer checks the ledger"
+    assert "recordSubmittedOrder" in api, "submitNewOrder no longer records on success"
+    doc = (SKILLS_DIR / "ezship-add.md").read_text()
+    assert "BUI-180" in doc and "tracking number" in doc.lower(), (
+        "ezship-add.md must document the tracking-number dedup (re-run is a no-op)"
+    )
+
+
+def test_fmv_batch_maps_by_id_not_position():
+    """BUI-191 (BUI-174/187): the FMV batch maps subprocess results to books by an
+    echoed id, not list position. Assert ebay-sold-comps echoes the id and
+    fmv_runner maps by it — a regression to positional mapping fails CI."""
+    sold = (REPO_ROOT / "apps" / "ebay" / "src" / "sold_comps.py").read_text()
+    runner = (REPO_ROOT / "apps" / "fmv" / "src" / "fmv_runner.py").read_text()
+    assert '"_req_id"' in sold or "_req_id" in sold, (
+        "sold_comps no longer echoes the _req_id correlation id (BUI-174/187)"
+    )
+    assert "_req_id" in runner and "results_by_id" in runner, (
+        "fmv_runner no longer maps results back by id (BUI-174/187)"
+    )
+    # And the positional-ordinal mapping must not have crept back in.
+    assert "needs_indices[ordinal]" not in runner, (
+        "fmv_runner reintroduced positional subprocess mapping (BUI-174)"
+    )
+
+
 def test_ezship_declared_value_units_agree():
     """BUI-142: cli.ts's -d/--declared-value is in CENTS, but ezship-add.md
     described it as dollars in its primary flow → an agent told "$25" ran
