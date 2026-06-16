@@ -242,6 +242,22 @@ class TestPriceabilityGuards:
         assert out["flag_reason"] == "too_sparse"
         assert out["fmv_low"] is None and out["max_bid"] is None
 
+    def test_two_comp_wild_outlier_is_flagged(self):
+        # BUI-179: [$10, $5000-mistagged-slab] at the target grade is neither
+        # IQR-trimmed (len<3) nor too_sparse (n=2) — it must flag, not price a
+        # wild Q75 into an 0.80×high overpay.
+        comps = [_comp(10, 9.0), _comp(5000, 9.0)]
+        out = fm.compute_fmv(comps, target_grade=9.0)
+        assert out["flag_reason"] == "too_sparse"
+        assert out["fmv_high"] is None and out["max_bid"] is None
+
+    def test_two_comp_reasonable_spread_is_priced(self):
+        # A tight 2-comp pool (within SMALL_POOL_MAX_RATIO) still prices.
+        comps = [_comp(40, 9.0), _comp(55, 9.0)]
+        out = fm.compute_fmv(comps, target_grade=9.0)
+        assert out["flag_reason"] is None
+        assert out["fmv_high"] is not None and out["max_bid"] is not None
+
     def test_guard_precedence_sparse_before_one_sided(self):
         # A single comp that is also one-sided → sparse wins (documented order)
         comps = [_comp(100, 8.0)]

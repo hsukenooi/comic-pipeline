@@ -26,6 +26,7 @@ MAX_GRADE_WINDOW = 2.0       # widen ceiling (BUI-86)
 MIN_NARROW_POOL = 5          # widen-stop target: keep widening until this many comps
 MIN_PRICEABLE_POOL = 2       # sparse-flag floor: fewer trimmed comps → flag too_sparse
 MAX_GRADE_SPAN = 2.0         # too-wide guard: pool grade-span above this → flag
+SMALL_POOL_MAX_RATIO = 3.0   # 2-comp dispersion guard: hi/lo above this → flag (BUI-179)
 
 
 def build_pool(comps: Iterable[dict], target_grade: float,
@@ -250,6 +251,15 @@ def compute_fmv(comps: list[dict], target_grade: float,
     n = len(trimmed)
     cv_val = cv(trimmed)
     flag_reason, grade_span = _classify_pool(pool, target_grade, n)
+
+    # BUI-179: a 2-comp pool is never IQR-trimmed (len<3) and isn't too_sparse
+    # (n>=2), so a single mistagged slab ([$10, $5000]) would price at a wild Q75
+    # → 0.80×high overpay. Flag a tiny pool whose two prices diverge implausibly
+    # (hi/lo beyond SMALL_POOL_MAX_RATIO) as needs-manual rather than pricing it.
+    if flag_reason is None and n == 2:
+        lo, hi = min(trimmed), max(trimmed)
+        if lo <= 0 or hi / lo > SMALL_POOL_MAX_RATIO:
+            flag_reason = "too_sparse"
 
     label = confidence_label(n, cv_val)
     if flag_reason is not None:
