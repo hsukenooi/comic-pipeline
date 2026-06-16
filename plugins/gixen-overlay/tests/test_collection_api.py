@@ -297,6 +297,28 @@ def test_record_win_partial_failure_returns_non_200(client):
     assert detail["rows_written"] == 25
 
 
+def test_record_win_non_runtime_error_returns_useful_500(client):
+    """BUI-184: a non-RuntimeError raised mid-batch must surface as a 500 with a
+    useful detail (which says the commit state is uncertain), not an opaque 500.
+    """
+    with patch(
+        "gixen_overlay.routes.cmd_collection_record_win",
+        side_effect=ValueError("boom mid-batch"),
+    ):
+        win = {
+            "item_id": "115500008888",
+            "current_bid": "10.00",
+            "end_date_iso": "2026-06-04T18:00:00Z",
+            "identify_data": {"series": "Amazing Spider-Man", "issue": "401", "year": "1995"},
+        }
+        r = client.post("/api/comics/collection/record-win", json={"wins": [win]})
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "record_win_failed"
+    assert "uncertain" in detail["message"]
+    assert "ValueError" in detail["exception"]
+
+
 def test_wish_list_add_appends(client):
     r = client.post("/api/comics/wish-list", json={"title": "Daredevil #1"})
     assert r.status_code == 200, r.text

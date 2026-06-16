@@ -1123,7 +1123,28 @@ async def api_record_win(req: RecordWinRequest):
     try:
         result = cmd_collection_record_win(req.wins)
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"collection store unavailable: {exc}"
+        ) from exc
+    except Exception as exc:
+        # BUI-184: record-win previously translated only RuntimeError, so any
+        # other mid-batch exception surfaced as an opaque 500 with no signal
+        # about commit state. Translate it to a 500 the caller can act on — the
+        # commit state is uncertain, so the user must re-verify before trusting
+        # it. (cmd_collection_record_win chunk-commits and flags partial_failure
+        # for handled failures; this is the unhandled-exception backstop.)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "record_win_failed",
+                "message": (
+                    "record-win raised mid-batch; the commit state is uncertain "
+                    "— re-check the collection / re-import before treating any "
+                    "of these wins as recorded"
+                ),
+                "exception": f"{type(exc).__name__}: {exc}",
+            },
+        ) from exc
 
     # BUI-137: cmd_collection_record_win commits in chunks of 25 and, if a chunk
     # raises, logs the error, sets partial_failure=True, and CONTINUES — so a
