@@ -628,6 +628,37 @@ class TestFlaggedPresentation:
         assert "flag_reason" in out and out["flag_reason"] is None
         assert "grade_span" in out and out["grade_span"] is None
 
+    def test_falsy_zero_fmv_high_yields_zero_max_bid_not_none(self):
+        """BUI-182: a legitimate fmv_high of 0 must round to a 0 max_bid, not be
+        nulled by a falsy check."""
+        row = {"fmv_low": 0, "fmv_high": 0, "fmv_comps": 5,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["max_bid"] == 0
+
+    def test_wide_window_caps_confidence_on_cached_reuse(self):
+        """BUI-182: a stored row built past the wide-window boundary must reuse at
+        MEDIUM even if its persisted confidence label is HIGH."""
+        row = {"fmv_low": 60, "fmv_high": 100, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±1.5 | cv=20%"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["window"] == 1.5
+        assert out["confidence"] == "MEDIUM"
+
+    def test_narrow_window_keeps_stored_confidence(self):
+        row = {"fmv_low": 60, "fmv_high": 100, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±1.0 | cv=20%"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["window"] == 1.0
+        assert out["confidence"] == "HIGH"
+
+    def test_unparseable_notes_window_is_none_and_no_cap(self):
+        row = {"fmv_low": 60, "fmv_high": 100, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": ""}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["window"] is None
+        assert out["confidence"] == "HIGH"
+
 
 # ─── End-to-end (with mocks) ──────────────────────────────────────────────────
 

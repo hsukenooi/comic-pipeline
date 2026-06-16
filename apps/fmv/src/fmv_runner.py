@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -454,6 +455,27 @@ def _input_summary(book: dict) -> dict:
             if book.get(k) is not None}
 
 
+_WINDOW_RE = re.compile(r"window=±\s*([0-9.]+)")
+
+
+def _window_from_notes(notes: str | None) -> float | None:
+    """Recover the grade window the FMV was built at from persisted fmv_notes.
+
+    `_build_notes` writes `window=±{w}` into fmv_notes, so the cached path can
+    re-apply the wide-window confidence cap (BUI-182) without trusting the stored
+    label alone. Returns None when notes are absent or unparseable.
+    """
+    if not notes:
+        return None
+    m = _WINDOW_RE.search(notes)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
 def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     """Project a gixen-overlay `comics` row back into the fmv dict shape.
 
@@ -465,10 +487,21 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     """
     fmv_high = row.get("fmv_high")
     fmv_conf = (row.get("fmv_confidence") or "low").upper()
+    # BUI-182: re-apply the wide-grade-window confidence cap on reuse. A pool
+    # built past WIDE_GRADE_WINDOW can't claim HIGH/MEDIUM-HIGH (fmv_math R7).
+    # The fresh path caps the label before it's stored, but a row written by
+    # older code (or an external writer) may carry an un-capped confidence; the
+    # cached path used to trust the stored label alone, so reuse could bid above
+    # what a fresh recompute would allow. Recover the persisted window from
+    # fmv_notes and cap to MEDIUM before deriving the bid factor.
+    window = _window_from_notes(row.get("fmv_notes"))
+    if (window is not None and window > fmv_math.WIDE_GRADE_WINDOW
+            and fmv_math._rank(fmv_conf) > fmv_math._CONF_RANK["MEDIUM"]):
+        fmv_conf = "MEDIUM"
     factor = fmv_math.bid_factor(fmv_conf, grade_confidence)
     return {
         "n": row.get("fmv_comps") or 0,
-        "window": None,
+        "window": window,
         # BUI-86: shape parity with compute_fmv output. Flagged books are never
         # cache hits (_db_lookup filters null fmv_low), so a cached row is always
         # a priced book — flag_reason stays None — but the keys must exist for
@@ -478,7 +511,10 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "fmv_low": row.get("fmv_low"),
         "fmv_high": fmv_high,
         "median": None,
-        "max_bid": fmv_math.clean_round(fmv_high * factor) if fmv_high else None,
+        # BUI-182: `is not None`, not a falsy check — a legitimate fmv_high of 0
+        # must round to a 0 max_bid, not be nulled out.
+        "max_bid": (fmv_math.clean_round(fmv_high * factor)
+                    if fmv_high is not None else None),
         "cv": None,
         "cv_pct": "n/a",
         "confidence": fmv_conf,
