@@ -1897,6 +1897,16 @@ def cmd_collection_record_win(
     # cache, so wins for back-issues won before the last import aren't written as
     # duplicate pending rows. Uses the full_title prefix for series identity so
     # an Annual doesn't shadow the base issue (consistent with collection-check).
+    #
+    # BUI-184: this keys on the full_title PREFIX, not series_name, by design.
+    # Real LOCG exports file annuals/specials under the BASE series_name with the
+    # qualifier only in Full Title (88/98 of the sample's post-normalize series
+    # divergences are this shape, e.g. "The Amazing Spider-Man" / "...Annual #14";
+    # zero are the inverse masthead shape). Also keying on series_name would
+    # therefore collapse "...Annual #N" into base "#N" and false-skip a genuine
+    # base win — a skipped win later reads as owned and triggers a duplicate buy.
+    # The prefix basis errs toward recording (never hiding ownership) — the safe
+    # direction — so we intentionally do NOT broaden the key here.
     def _issue_key(token: str) -> str:
         return (token.strip().lstrip("0") or token.strip()).lower()
 

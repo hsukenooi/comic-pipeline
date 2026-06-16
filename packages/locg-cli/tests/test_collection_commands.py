@@ -1818,3 +1818,44 @@ def test_record_win_empty_current_bid_does_not_abort_batch(tmp_path):
     by_title = {r["full_title"]: r for r in payload["comics"]}
     assert by_title["Spawn #1"]["price_paid"] is None
     assert by_title["Spawn #7"]["price_paid"] == 12.50
+
+
+def test_record_win_dedup_does_not_collapse_annual_into_base(tmp_path):
+    """BUI-184 (record-win owned_index): the dedup must NOT collapse an Annual
+    into its base issue.
+
+    Real LOCG exports file annuals/specials under the BASE 'Series Name' with the
+    'Annual' qualifier living only in 'Full Title' (e.g. Series Name
+    "The Amazing Spider-Man" / Full Title "The Amazing Spider-Man Annual #14").
+    owned_index therefore keys on the Full Title PREFIX (which carries the
+    qualifier), not series_name — so an owned "... Annual #6" does not shadow a
+    genuine base "#6". Keying dedup on series_name (the tempting "shared series
+    key" fix) would false-skip the base issue → a re-won book later reads as
+    owned → duplicate buy. This test locks the safe direction.
+    """
+    from locg.commands import cmd_collection_record_win
+    from locg.collection_cache import rebuild_series_name_index
+
+    cache = make_cache(tmp_path)
+    # Mirrors real LOCG shape: base series_name, qualifier only in full_title.
+    _seed_cache(cache, [{
+        **_agent_win_row(
+            series="Fantastic Four",
+            full_title="Fantastic Four Annual #6",
+            release_date="1968-11-01",
+        ),
+        "source": "locg_export",
+    }])
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    # A base Fantastic Four #6 win is a different comic — it must be recorded.
+    result = cmd_collection_record_win(
+        [_make_win(series="Fantastic Four", issue="6", year=1962)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
