@@ -108,6 +108,22 @@ def record_items_seen(item_ids, seller):
 
 _STOPWORDS = frozenset({"the", "a", "an", "of", "and", "in", "vol", "comics"})
 
+# BUI-135: numeric grade tokens (CGC/CBCS slab grades and raw grade shorthand)
+# look like "7.0", "8.5", "9.2", "9.4". _normalize() replaces the "." with a
+# space, orphaning the integer part ("7.0" -> "7 0"); match_listing's bare-\bN\b
+# issue branch then matched that orphaned "7" as wish issue #7, producing
+# false positives at score 1.00 (seller comichunterlv: 61 of 62 false). Strip
+# the whole decimal-grade token *before* normalizing so neither half survives.
+# This catches the raw forms too ("F/VF 7.0", "VF/NM 9.0") which the literal
+# "cgc"-skip guard in main() does NOT — they carry no "cgc" string.
+_GRADE_RE = re.compile(r"\b\d{1,2}\.\d\b")
+
+
+def _strip_grades(text):
+    """Remove decimal grade tokens (e.g. '7.0', '9.4') so their integer part
+    can't be mistaken for an issue number. See BUI-135."""
+    return _GRADE_RE.sub(" ", text)
+
 
 def _normalize(text):
     """Lowercase and strip non-alphanumeric characters."""
@@ -153,7 +169,9 @@ def match_listing(title, wish_items):
     - Issue number present in title as #N or as isolated digits
     - At least 50% of series tokens present in title
     """
-    title_norm = _normalize(title)
+    # BUI-135: strip decimal grade tokens before normalizing so a slab/raw grade
+    # like "7.0" or "9.4" can't orphan its integer into a fake issue-number match.
+    title_norm = _normalize(_strip_grades(title))
     best = None
     best_score = 0.0
 

@@ -565,6 +565,83 @@ class TestIssueBoundaryRegex:
         assert wish is None, "issue '1' must not match '10'"
 
 
+class TestGradeDigitNotIssueNumber:
+    """BUI-135: the integer part of a numeric grade ('7.0', '9.4') must NOT
+    satisfy the issue-number match. The repro titles carry RAW grades with no
+    literal 'cgc', so the main()-level cgc-skip guard does not catch them —
+    match_listing itself must strip the grade token."""
+
+    def _items(self, names):
+        return seller_scan.prepare_wish_items(
+            [{"id": i, "name": n} for i, n in enumerate(names)]
+        )
+
+    def test_xmen_7_does_not_match_raw_grade_7_0(self):
+        """wish 'The X-Men #7' must NOT match 'Uncanny X-men #145 ... F/VF 7.0'."""
+        items = self._items(["The X-Men #7"])
+        wish, score = seller_scan.match_listing(
+            "Uncanny X-men #145 Marvel 1981 F/VF 7.0 Off White Pages", items
+        )
+        assert wish is None, "grade '7.0' must not satisfy issue #7"
+
+    def test_xmen_9_does_not_match_raw_grade_9_0(self):
+        """wish 'The X-Men #9' must NOT match a 'VF/NM 9.0' title."""
+        items = self._items(["The X-Men #9"])
+        wish, score = seller_scan.match_listing(
+            "Uncanny X-men #142 Marvel 1981 VF/NM 9.0 White Pages", items
+        )
+        assert wish is None, "grade '9.0' must not satisfy issue #9"
+
+    def test_series_300_issue_4_does_not_match_grade_9_4(self):
+        """wish '300 #4' must NOT match '#300 ... 9.4' (the 4 is the grade)."""
+        items = self._items(["300 #4"])
+        wish, score = seller_scan.match_listing(
+            "300 #1 Dark Horse 1998 CGC-style slab 9.4 White Pages", items
+        )
+        assert wish is None, "grade '9.4' must not satisfy issue #4"
+
+    def test_cgc_slab_grades_do_not_match(self):
+        """The 8.5 / 9.2 slab forms must not orphan their integer either."""
+        items = self._items(["Daredevil #8", "Hulk #9"])
+        wish, score = seller_scan.match_listing(
+            "Daredevil #181 Marvel 1982 graded 8.5 VF+", items
+        )
+        assert wish is None, "grade '8.5' must not satisfy issue #8"
+        wish, score = seller_scan.match_listing(
+            "Hulk #340 Marvel 1988 graded 9.2 NM-", items
+        )
+        assert wish is None, "grade '9.2' must not satisfy issue #9"
+
+    def test_genuine_match_survives_grade_strip(self):
+        """A real #N in the title must still match even alongside a grade token."""
+        items = self._items(["Moon Knight #15"])
+        wish, score = seller_scan.match_listing(
+            "Moon Knight #15 Marvel 1982 VF/NM 9.0 White Pages", items
+        )
+        assert wish is not None, "genuine issue #15 must still match"
+        assert wish["name"] == "Moon Knight #15"
+        assert score == 1.0
+
+    def test_comichunterlv_batch_returns_only_genuine(self):
+        """Repro: a batch of false-positive grade titles + one genuine match
+        should surface only the genuine one (Moon Knight #15)."""
+        items = self._items(
+            ["The X-Men #7", "The X-Men #9", "Moon Knight #15", "300 #4"]
+        )
+        titles = [
+            "Uncanny X-men #145 Marvel 1981 F/VF 7.0 Off White Pages",
+            "Uncanny X-men #142 Marvel 1981 VF/NM 9.0 White Pages",
+            "Moon Knight #15 Marvel 1982 VF 7.0 White Pages",
+            "300 #1 Dark Horse graded 9.4 White Pages",
+        ]
+        matched = [
+            seller_scan.match_listing(t, items)[0] for t in titles
+        ]
+        matched = [m for m in matched if m is not None]
+        assert len(matched) == 1, f"expected only the genuine match, got {matched}"
+        assert matched[0]["name"] == "Moon Knight #15"
+
+
 class TestVerifyWithClaudeNoSilentDrop:
     def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
         """BUI-149: the script's internal Claude pass is the single verification
