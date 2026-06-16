@@ -183,22 +183,6 @@ def _format_bid(bid_str: str | float | None) -> str:
         return bid_str
 
 
-def _calc_diff(max_bid: str | float | None, winning_bid: str | float | None) -> str:
-    """Calculate difference between max bid and winning bid."""
-    try:
-        max_str = str(max_bid)
-        win_str = str(winning_bid) if winning_bid is not None else ""
-        max_val = Decimal(max_str.split()[0]) if " " in max_str else Decimal(max_str)
-        win_val = Decimal(win_str.split()[0]) if " " in win_str else Decimal(win_str)
-        diff = max_val - win_val
-        if diff >= 0:
-            return click.style(f"+${diff:.2f}", fg="green")
-        else:
-            return click.style(f"-${abs(diff):.2f}", fg="red")
-    except (InvalidOperation, ValueError):
-        return ""
-
-
 def _get_ebay_bid_count(item_id: str) -> int | None:
     """Return current bid count for an eBay listing, or None if unavailable."""
     try:
