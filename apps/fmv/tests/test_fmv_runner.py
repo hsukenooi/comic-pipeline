@@ -828,3 +828,69 @@ class TestRunEndToEnd:
         sent_ids = [b["_req_id"] for b in captured["payload"]]
         assert sent_ids == [3, 7]
         assert all("_idx" not in b for b in captured["payload"])
+
+
+# ─── _fetch_comps robustness (BUI-184) ────────────────────────────────────────
+
+class TestFetchCompsRobustness:
+    def _wire(self, monkeypatch):
+        monkeypatch.setattr(fmv_runner.shutil, "which", lambda _b: "/usr/bin/ebay")
+
+    def _book(self, idx=0):
+        return {"_idx": idx, "title": "X", "issue": "1"}
+
+    def test_timeout_fails_loud(self, monkeypatch):
+        """A hung child must abort comic-fmv, not hang forever (BUI-184)."""
+        self._wire(monkeypatch)
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            raise fmv_runner.subprocess.TimeoutExpired(cmd, timeout)
+
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit):
+            fmv_runner._fetch_comps([self._book()], force=False)
+
+    def test_empty_output_fails_loud(self, monkeypatch):
+        """returncode 0 but an empty out file must fail loud, not crash (BUI-184)."""
+        self._wire(monkeypatch)
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            out_path = cmd[cmd.index("--out") + 1]
+            with open(out_path, "w") as fh:
+                fh.write("   ")
+            return type("R", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit):
+            fmv_runner._fetch_comps([self._book()], force=False)
+
+    def test_unparseable_output_fails_loud(self, monkeypatch):
+        """A partial/garbage out file fails loud with a clear error (BUI-184)."""
+        self._wire(monkeypatch)
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            out_path = cmd[cmd.index("--out") + 1]
+            with open(out_path, "w") as fh:
+                fh.write("{not json")
+            return type("R", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit):
+            fmv_runner._fetch_comps([self._book()], force=False)
+
+    def test_timeout_scales_with_batch_size(self, monkeypatch):
+        self._wire(monkeypatch)
+        seen = {}
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            seen["timeout"] = timeout
+            out_path = cmd[cmd.index("--out") + 1]
+            with open(out_path, "w") as fh:
+                fh.write("[]")
+            return type("R", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+        fmv_runner._fetch_comps([self._book(0), self._book(1), self._book(2)],
+                                force=False)
+        assert seen["timeout"] == (fmv_runner._SUBPROCESS_TIMEOUT_BASE
+                                   + 3 * fmv_runner._SUBPROCESS_TIMEOUT_PER_BOOK)

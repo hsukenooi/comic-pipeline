@@ -31,6 +31,12 @@ import fmv_math
 
 EBAY_SOLD_COMPS_BIN = "ebay-sold-comps"
 
+# BUI-184: ebay-sold-comps subprocess timeout, scaled with batch size. Each book
+# may run up to 3 SerpApi queries at a 15s HTTP timeout, fanned out across a
+# thread pool, so a generous per-book budget plus a fixed base.
+_SUBPROCESS_TIMEOUT_BASE = 60       # seconds
+_SUBPROCESS_TIMEOUT_PER_BOOK = 60   # seconds per book in the batch
+
 
 # Wish-list caches sometimes carry letter grades (e.g. "VF+") while sold_comps
 # resolves a numeric grade. fmv_math.build_pool() does `abs(c["grade"] - target)`
@@ -253,7 +259,20 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
         cmd = [EBAY_SOLD_COMPS_BIN, "--batch", in_path, "--out", out_path, "--quiet"]
         if force:
             cmd.append("--force")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # BUI-184: bound the child so a hung ebay-sold-comps can't hang comic-fmv
+        # forever. Scale with batch size (each book may run up to 3 SerpApi
+        # queries at a 15s HTTP timeout, fanned out across a thread pool).
+        timeout = _SUBPROCESS_TIMEOUT_BASE + _SUBPROCESS_TIMEOUT_PER_BOOK * len(books)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=timeout)
+        except subprocess.TimeoutExpired:
+            click.echo(
+                f"Error: {EBAY_SOLD_COMPS_BIN} timed out after {timeout}s on "
+                f"{len(books)} book(s).",
+                err=True,
+            )
+            sys.exit(1)
         if result.returncode != 0:
             click.echo(
                 f"Error: {EBAY_SOLD_COMPS_BIN} failed (exit {result.returncode}):\n"
@@ -261,7 +280,30 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
                 err=True,
             )
             sys.exit(1)
-        return json.loads(Path(out_path).read_text())
+        # BUI-184: a returncode-0 child can still leave an empty/partial out file
+        # (killed between create and write, disk-full). Guard the read+parse and
+        # fail loud rather than crash with an opaque JSONDecodeError mid-batch.
+        try:
+            raw = Path(out_path).read_text()
+        except OSError as e:
+            click.echo(f"Error: could not read {EBAY_SOLD_COMPS_BIN} output: {e}",
+                       err=True)
+            sys.exit(1)
+        if not raw.strip():
+            click.echo(
+                f"Error: {EBAY_SOLD_COMPS_BIN} exited 0 but wrote no output "
+                "(empty results file).",
+                err=True,
+            )
+            sys.exit(1)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            click.echo(
+                f"Error: {EBAY_SOLD_COMPS_BIN} produced unparseable output: {e}",
+                err=True,
+            )
+            sys.exit(1)
     finally:
         for p in (in_path, out_path):
             try:
