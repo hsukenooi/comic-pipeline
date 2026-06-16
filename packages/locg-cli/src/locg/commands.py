@@ -1653,7 +1653,14 @@ def _match_owned_issue(
     """Return the full_title of an owned cache row matching the series key +
     issue (+ optional variant/year), or None. Shared by the direct and the
     alias-fallback passes of cmd_collection_check.
+
+    `variant` is a SOFT preference, not a hard filter (BUI-176): an owned row
+    that matches series + issue (+ year) still counts as in-collection even when
+    its stored title lacks the variant word — otherwise a variant-qualified
+    query (e.g. "newsstand") hides the owned base issue and the pipeline
+    re-buys it. When a variant-bearing owned row does exist, it is preferred.
     """
+    fallback: Optional[str] = None
     for row in comics:
         # in_collection is a copies-owned count (0 = wish-list / pull / read but
         # not owned). Only owned rows count as "in collection" (BUI-26 bug D).
@@ -1680,9 +1687,6 @@ def _match_owned_issue(
             if issue.strip().lower() not in full_title.lower():
                 continue
 
-        if variant and variant.lower() not in full_title.lower():
-            continue
-
         # BUI-105: only reject on a year mismatch when the row actually carries a
         # release_date. A dateless owned row (e.g. an index-resolved record-win
         # written before its date was stamped) must not be silently excluded by
@@ -1691,9 +1695,19 @@ def _match_owned_issue(
         if year and release_date and not release_date.startswith(str(year)):
             continue
 
-        return full_title
+        # BUI-176: variant is a soft preference. With no variant requested, the
+        # first series+issue match wins (unchanged behavior). With a variant
+        # requested, a variant-bearing row wins immediately; an otherwise-correct
+        # base row is held as a fallback so ownership is still reported rather
+        # than a false not_in_cache that triggers a duplicate buy.
+        if not variant:
+            return full_title
+        if variant.lower() in full_title.lower():
+            return full_title
+        if fallback is None:
+            fallback = full_title
 
-    return None
+    return fallback
 
 
 def cmd_collection_check(

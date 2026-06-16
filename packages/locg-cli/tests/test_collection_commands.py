@@ -1715,3 +1715,64 @@ def test_check_issue_1_does_not_match_stored_1_5(tmp_path, monkeypatch):
 
     r = cmds.cmd_collection_check(series="Uncanny X-Men", issue="1")
     assert r["match_status"] == "not_in_cache"
+
+
+# ---------------------------------------------------------------------------
+# BUI-176: variant qualifier must not hide an owned base issue
+# ---------------------------------------------------------------------------
+
+def test_check_variant_supplied_matches_owned_base_issue(tmp_path, monkeypatch):
+    """A variant qualifier on the query must NOT hide an owned base issue.
+
+    Regression for BUI-176: when `variant` was a hard filter, a newsstand query
+    against a stored plain "#1" reported not_in_cache and the pipeline re-bought
+    a comic already owned. Variant is now a soft preference.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Spawn #1",
+        series="Spawn (1992 - Present)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Spawn", issue="1", variant="newsstand")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Spawn #1"
+
+
+def test_check_variant_prefers_variant_bearing_row(tmp_path, monkeypatch):
+    """When both a base and a variant-bearing owned row exist, prefer the variant
+    one — regardless of cache order (BUI-176)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    # Base row stored first, variant row second: the variant row must still win.
+    _seed_cache(cache, [
+        _agent_win_row(full_title="Spawn #1", series="Spawn (1992 - Present)",
+                       gixen_item_id="1"),
+        _agent_win_row(full_title="Spawn #1 Newsstand", series="Spawn (1992 - Present)",
+                       gixen_item_id="2"),
+    ])
+
+    r = cmds.cmd_collection_check(series="Spawn", issue="1", variant="newsstand")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Spawn #1 Newsstand"
+
+
+def test_check_variant_does_not_loosen_issue_match(tmp_path, monkeypatch):
+    """The soft-variant change must not make a wrong issue count as owned: a
+    variant query for an un-owned issue still reports not_in_cache (BUI-176)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Spawn #1",
+        series="Spawn (1992 - Present)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Spawn", issue="9", variant="newsstand")
+    assert r["match_status"] == "not_in_cache"
