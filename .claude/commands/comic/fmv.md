@@ -333,6 +333,7 @@ curl -s -X POST $GIXEN_SERVER_URL/api/comics \
 - `issue` — issue number as string; use a range for lots (e.g. `"337-339"`)
 - `grade` — numeric only (e.g. `8.5`); omit or `null` if unknown
 - `fmv_confidence` — must be `"high"`, `"medium"`, or `"low"`
+- `fmv_flag_reason` — **(BUI-132)** set to the `needs_manual` reason (`"one_sided"`, `"too_wide"`, or `"too_sparse"`) when the book was flagged (§3); omit/`null` for an auto-priced book. This is now a **structured column**, not just a `manual_review=<reason>` token in `fmv_notes`. Posting it makes the row first-class `needs_manual`: `/comic:verify` reports it as `needs_manual` (not `fmv_stub`), and the upsert **clears any previously-cached price** for that comic+grade so a book that later flags can't keep a stale auto-priced number. (A plain n=0 no-comps stub posts with `fmv_flag_reason` omitted and so never wipes a real price.)
 - `locg_id` — from the LOCG ID resolved in `/comic:collection-check`; omit entirely if unresolved (don't pass null)
 - `locg_variant_id` — include only if a separate variant entry was found on LOCG
 

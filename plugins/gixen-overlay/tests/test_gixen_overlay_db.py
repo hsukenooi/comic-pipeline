@@ -81,6 +81,32 @@ def test_create_tables_is_idempotent(db):
     assert "bid_fmvs" in tables
 
 
+def test_create_tables_adds_flag_reason_to_legacy_fmv(db):
+    """BUI-132: a pre-BUI-132 fmv table (no flag_reason column) gets the column
+    added by re-running create_tables, preserving existing rows. Version-skew
+    tolerant and idempotent."""
+    cid = _insert_comic(db)
+    # Simulate an older fmv row written before the column existed.
+    db.execute("ALTER TABLE fmv DROP COLUMN flag_reason")
+    db.execute(
+        "INSERT INTO fmv (comic_id, grade, low, high) VALUES (?, 9.2, 100, 200)",
+        (cid,),
+    )
+    db.commit()
+    cols = {r[1] for r in db.execute("PRAGMA table_info(fmv)")}
+    assert "flag_reason" not in cols
+
+    create_tables(db)  # re-run: should add the column
+    cols = {r[1] for r in db.execute("PRAGMA table_info(fmv)")}
+    assert "flag_reason" in cols
+    row = db.execute("SELECT low, flag_reason FROM fmv WHERE grade=9.2").fetchone()
+    assert row["low"] == 100  # existing row preserved
+    assert row["flag_reason"] is None
+
+    # Idempotent: a second run is a no-op (no error).
+    create_tables(db)
+
+
 # ---------------------------------------------------------------------------
 # upsert_comic (identity-only)
 # ---------------------------------------------------------------------------
@@ -324,6 +350,67 @@ def test_upsert_fmv_subsequent_call_with_low_sets_updated_at(db):
     upsert_fmv(db, cid, 9.2, low=500.0)
     row = db.execute("SELECT updated_at FROM fmv WHERE id=?", (fid,)).fetchone()
     assert row["updated_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# upsert_fmv flag_reason (BUI-132)
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_fmv_stores_flag_reason(db):
+    cid = _insert_comic(db)
+    fid = upsert_fmv(db, cid, 9.6, flag_reason="one_sided")
+    row = db.execute("SELECT flag_reason, low FROM fmv WHERE id=?", (fid,)).fetchone()
+    assert row["flag_reason"] == "one_sided"
+    assert row["low"] is None
+
+
+def test_upsert_fmv_newly_flagged_book_clears_stale_price(db):
+    """BUI-132 residual #2: a previously-priced book that later flags must drop
+    its now-stale auto-priced low/high/comps — not COALESCE-keep them."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(db, cid, 9.6, low=800.0, high=1000.0, comps=12, confidence="high")
+    # Re-upsert as a needs_manual flag (no fresh price).
+    upsert_fmv(db, cid, 9.6, flag_reason="too_wide")
+    row = db.execute(
+        "SELECT low, high, comps, flag_reason FROM fmv WHERE id=?", (fid,)
+    ).fetchone()
+    assert row["low"] is None
+    assert row["high"] is None
+    assert row["comps"] is None
+    assert row["flag_reason"] == "too_wide"
+
+
+def test_upsert_fmv_n0_stub_does_not_wipe_real_price(db):
+    """BUI-132 constraint: the n=0 stub guard must survive. An unflagged stub
+    (no comps, no flag) re-upserted over a real price keeps the price — only a
+    flagged row clears it."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(db, cid, 9.6, low=800.0, high=1000.0, comps=12)
+    # An n=0 stub: no FMV fields, no flag_reason.
+    upsert_fmv(db, cid, 9.6)
+    row = db.execute(
+        "SELECT low, high, comps, flag_reason FROM fmv WHERE id=?", (fid,)
+    ).fetchone()
+    assert row["low"] == 800.0
+    assert row["high"] == 1000.0
+    assert row["comps"] == 12
+    assert row["flag_reason"] is None
+
+
+def test_upsert_fmv_fresh_price_clears_prior_flag(db):
+    """A book that was flagged needs_manual but later prices cleanly is no longer
+    needs_manual: a fresh-price upsert (low set, no flag) stores the price AND
+    clears the stale flag, so verify won't wrongly report it as needs_manual."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(db, cid, 9.6, flag_reason="too_sparse")
+    upsert_fmv(db, cid, 9.6, low=500.0, high=700.0, comps=8)
+    row = db.execute(
+        "SELECT low, high, flag_reason FROM fmv WHERE id=?", (fid,)
+    ).fetchone()
+    assert row["low"] == 500.0
+    assert row["high"] == 700.0
+    assert row["flag_reason"] is None
 
 
 # ---------------------------------------------------------------------------

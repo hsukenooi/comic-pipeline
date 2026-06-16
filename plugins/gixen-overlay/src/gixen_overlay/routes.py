@@ -164,6 +164,7 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
             comps=req.fmv_comps,
             confidence=req.fmv_confidence,
             notes=req.fmv_notes,
+            flag_reason=req.fmv_flag_reason,
         )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return {**dict(row), "comic_id": comic_id, "fmv_id": fmv_id}
@@ -396,6 +397,7 @@ async def api_verify(req: VerifyRequest, request: Request):
       - `no_bid`         — no bids row for item_id
       - `no_comic`       — no comic linked via bid_fmvs (or via locg_id if given)
       - `no_fmv_at_grade`— comic exists but no fmv row at the requested grade
+      - `needs_manual`   — fmv flagged (BUI-86/BUI-132): intentionally unpriceable, hand-price it
       - `fmv_stub`       — fmv row exists but low/high are NULL (`/comic:fmv` never ran)
       - `partial`        — fmv populated but bid_fmvs junction or bids.fmv_id is missing
       - `fully_linked`   — all five checks pass
@@ -450,7 +452,7 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
     # All comics linked to this bid via the junction, plus optional grade filter.
     fmv_query = (
         "SELECT bf.fmv_id, bf.is_primary, "
-        "       f.grade, f.low, f.high, "
+        "       f.grade, f.low, f.high, f.flag_reason, "
         "       c.id AS comic_id, c.title, c.issue, c.year, c.locg_id "
         "FROM bid_fmvs bf "
         "JOIN fmv f ON f.id = bf.fmv_id "
@@ -489,6 +491,20 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
         return {**base, "verdict": "no_fmv_at_grade",
                 "missing": [f"fmv row at grade {grade}"],
                 "comic_id": match["comic_id"],
+                "bid_fmv_id": bid["fmv_id"]}
+
+    # fmv exists at the right grade. Is it an intentionally-unpriceable book?
+    # BUI-132: a needs_manual book (BUI-86) carries a structured flag_reason and
+    # has NULL low/high *by design* — it would otherwise fall through to the
+    # fmv_stub branch below and wrongly advise "re-run /comic:fmv" (a no-op,
+    # since re-running just re-flags it). Emit a DISTINCT verdict so the caller
+    # tells the user to hand-price it instead.
+    if match["flag_reason"] is not None:
+        return {**base, "verdict": "needs_manual",
+                "missing": [],
+                "flag_reason": match["flag_reason"],
+                "comic_id": match["comic_id"],
+                "fmv_id": match["fmv_id"],
                 "bid_fmv_id": bid["fmv_id"]}
 
     # fmv exists at the right grade. Is it stubbed?

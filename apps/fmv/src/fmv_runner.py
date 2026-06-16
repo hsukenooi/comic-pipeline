@@ -424,6 +424,12 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict) -> dict:
         "fmv_comps": fmv["n"],
         "fmv_confidence": _confidence_to_db_label(fmv["confidence"]),
         "fmv_notes": _build_notes(fmv),
+        # BUI-132: post the needs_manual reason as a structured column (not just
+        # the `manual_review=<reason>` notes token) so /comic:verify can verdict
+        # `needs_manual` and the upsert clears any stale price on a flagged book.
+        # None for an auto-priced book → server stores NULL (not flagged) and, on
+        # a re-price, clears any prior flag.
+        "fmv_flag_reason": fmv.get("flag_reason"),
     }
     if inp.get("locg_id"):
         body["locg_id"] = inp["locg_id"]

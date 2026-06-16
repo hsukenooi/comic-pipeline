@@ -15,6 +15,7 @@ class UpsertComicRequest(BaseModel):
     fmv_comps: int | None = None
     fmv_confidence: str | None = None
     fmv_notes: str | None = None
+    fmv_flag_reason: str | None = None
     locg_id: int | None = None
     locg_variant_id: int | None = None
 
@@ -23,6 +24,19 @@ class UpsertComicRequest(BaseModel):
     def validate_confidence(cls, v: str | None) -> str | None:
         if v is not None and v not in ("high", "medium", "low"):
             raise ValueError("fmv_confidence must be high, medium, or low")
+        return v
+
+    @field_validator("fmv_flag_reason")
+    @classmethod
+    def validate_flag_reason(cls, v: str | None) -> str | None:
+        # BUI-132: the BUI-86 needs_manual reasons. Empty string is normalized
+        # to None (no flag) so callers can post "" to mean "not flagged".
+        if v is not None and v.strip() == "":
+            return None
+        if v is not None and v not in ("one_sided", "too_wide", "too_sparse"):
+            raise ValueError(
+                "fmv_flag_reason must be one_sided, too_wide, or too_sparse"
+            )
         return v
 
 

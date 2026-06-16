@@ -302,6 +302,48 @@ def test_upsert_comic_invalid_confidence_returns_422(api):
     assert r.status_code == 422
 
 
+def test_upsert_comic_newly_flagged_clears_stale_price(api):
+    """BUI-132 residual #2 end-to-end: POST a priced FMV, then re-POST the same
+    comic+grade as needs_manual (fmv_flag_reason set, no price). The stale price
+    must be cleared and the flag stored."""
+    priced = {"title": "Fantastic Four", "issue": "63", "year": 1967,
+              "grade": 9.6, "fmv_low": 800.0, "fmv_high": 1000.0, "fmv_comps": 12}
+    api.post("/api/comics", json=priced)
+    api.post("/api/comics", json={
+        "title": "Fantastic Four", "issue": "63", "year": 1967,
+        "grade": 9.6, "fmv_flag_reason": "one_sided",
+    })
+    rows = api.get("/api/comics", params={"grade": 9.6}).json()
+    assert len(rows) == 1
+    assert rows[0]["fmv_low"] is None
+    assert rows[0]["fmv_high"] is None
+    assert rows[0]["fmv_flag_reason"] == "one_sided"
+
+
+def test_upsert_comic_n0_stub_does_not_wipe_real_price(api):
+    """BUI-132 constraint: the n=0 stub guard survives. A bare stub POST (grade
+    only, no price, no flag) over a priced row keeps the price."""
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974,
+        "grade": 9.8, "fmv_low": 5000.0, "fmv_high": 7000.0, "fmv_comps": 6,
+    })
+    api.post("/api/comics", json={
+        "title": "Hulk", "issue": "181", "year": 1974, "grade": 9.8,
+    })
+    rows = api.get("/api/comics", params={"grade": 9.8}).json()
+    assert rows[0]["fmv_low"] == 5000.0
+    assert rows[0]["fmv_high"] == 7000.0
+    assert rows[0]["fmv_flag_reason"] is None
+
+
+def test_upsert_comic_invalid_flag_reason_returns_422(api):
+    r = api.post("/api/comics", json={
+        "title": "X-Men", "issue": "1", "year": 1963, "grade": 9.0,
+        "fmv_flag_reason": "bogus_reason",
+    })
+    assert r.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # GET /api/comics — locg_id and max_age_days filters (comic-fmv cache lookup)
 # ---------------------------------------------------------------------------
@@ -900,7 +942,7 @@ def _set_bid_fields(db_path, item_id, **fields):
 
 
 def _link_comic(db_path, item_id, *, title, issue, year, grade,
-                fmv_low=None, fmv_high=None, is_primary=True):
+                fmv_low=None, fmv_high=None, is_primary=True, flag_reason=None):
     """Create a comic + fmv row and link it to a bid via bid_fmvs."""
     raw = sqlite3.connect(db_path)
     raw.row_factory = sqlite3.Row
@@ -914,8 +956,9 @@ def _link_comic(db_path, item_id, *, title, issue, year, grade,
             (title, issue, year),
         ).fetchone()["id"]
         raw.execute(
-            "INSERT OR REPLACE INTO fmv (comic_id, grade, low, high) VALUES (?, ?, ?, ?)",
-            (cid, grade, fmv_low, fmv_high),
+            "INSERT OR REPLACE INTO fmv (comic_id, grade, low, high, flag_reason) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (cid, grade, fmv_low, fmv_high, flag_reason),
         )
         fid = raw.execute(
             "SELECT id FROM fmv WHERE comic_id=? AND grade=?", (cid, grade)
@@ -1501,6 +1544,25 @@ def test_verify_fmv_stub(api):
     assert row["verdict"] == "fmv_stub"
     assert "fmv.low" in row["missing"]
     assert "fmv.high" in row["missing"]
+
+
+def test_verify_needs_manual_flagged_book_is_distinct_from_fmv_stub(api):
+    """BUI-132: a needs_manual book (BUI-86) has NULL low/high *by design* and a
+    structured flag_reason. It must verdict `needs_manual`, NOT `fmv_stub` — the
+    latter would advise re-running /comic:fmv, a no-op for an unpriceable book."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "300000044", "max_bid": 50.0})
+    _link_comic(db_path, "300000044",
+                title="Fantastic Four", issue="63", year=1967,
+                grade=9.6, fmv_low=None, fmv_high=None, flag_reason="one_sided")
+
+    r = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "300000044", "grade": 9.6}],
+    })
+    row = r.json()["results"][0]
+    assert row["verdict"] == "needs_manual"
+    assert row["flag_reason"] == "one_sided"
+    assert row["missing"] == []
 
 
 def test_verify_no_fmv_at_grade(api):
