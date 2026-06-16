@@ -983,8 +983,12 @@ def upsert_fmv(
     bare n=0 stub (no price, no flag):
 
     - A newly-FLAGGED book (incoming flag_reason set) clears its stale
-      auto-priced low/high/comps and stores the flag — a book that now needs
-      manual pricing must not keep a stale number (BUI-86 residual #2).
+      auto-priced low/high/comps AND overwrites confidence/notes with the
+      incoming (typically NULL) values, then stores the flag — a book that now
+      needs manual pricing must not keep a stale number or stale auto-price
+      metadata (confidence='high', notes) (BUI-86 residual #2). The automated
+      fmv_runner path overwrites notes/forces confidence=low anyway, but a
+      direct flag-only POST ({grade, fmv_flag_reason}) relies on this.
     - A freshly-PRICED book (incoming low/high set, no flag) stores the new price
       and CLEARS any prior flag — a book that used to be unpriceable but now
       prices cleanly is no longer needs_manual.
@@ -1015,8 +1019,15 @@ def upsert_fmv(
                                ELSE COALESCE(excluded.high,  high) END,
             comps       = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.comps
                                ELSE COALESCE(excluded.comps, comps) END,
-            confidence  = COALESCE(excluded.confidence, confidence),
-            notes       = COALESCE(excluded.notes,      notes),
+            -- A flagged incoming row also drops stale auto-price metadata: a
+            -- flag-only POST ({grade, fmv_flag_reason}) carries NULL confidence
+            -- and notes, so it must overwrite (not COALESCE-keep) the prior
+            -- priced row's confidence/notes — else a needs_manual book would
+            -- surface the old auto-price's confidence='high'/notes on /comics.
+            confidence  = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.confidence
+                               ELSE COALESCE(excluded.confidence, confidence) END,
+            notes       = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.notes
+                               ELSE COALESCE(excluded.notes,      notes) END,
             -- A flagged row stores its flag; a freshly-priced row clears any
             -- prior flag (incoming low set ⇒ no longer needs_manual); a bare
             -- n=0 stub leaves the flag untouched.

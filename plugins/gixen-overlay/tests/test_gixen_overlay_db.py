@@ -381,6 +381,30 @@ def test_upsert_fmv_newly_flagged_book_clears_stale_price(db):
     assert row["flag_reason"] == "too_wide"
 
 
+def test_upsert_fmv_flag_only_post_clears_stale_confidence_and_notes(db):
+    """BUI-132 code-review: a flag-only re-POST ({grade, flag_reason}) over a
+    priced row must drop the old auto-price's confidence and notes too — not just
+    low/high/comps — else a needs_manual book surfaces the stale 'high'
+    confidence / auto-price notes on the /comics dashboard."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(
+        db, cid, 9.6, low=800.0, high=1000.0, comps=12,
+        confidence="high", notes="window=±0.2 | auto",
+    )
+    # Flag-only payload: no confidence, no notes (what verify.md/fmv.md instruct).
+    upsert_fmv(db, cid, 9.6, flag_reason="one_sided")
+    row = db.execute(
+        "SELECT low, high, comps, confidence, notes, flag_reason FROM fmv WHERE id=?",
+        (fid,),
+    ).fetchone()
+    assert row["low"] is None
+    assert row["high"] is None
+    assert row["comps"] is None
+    assert row["confidence"] is None
+    assert row["notes"] is None
+    assert row["flag_reason"] == "one_sided"
+
+
 def test_upsert_fmv_n0_stub_does_not_wipe_real_price(db):
     """BUI-132 constraint: the n=0 stub guard must survive. An unflagged stub
     (no comps, no flag) re-upserted over a real price keeps the price — only a
