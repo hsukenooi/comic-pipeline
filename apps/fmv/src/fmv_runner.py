@@ -61,6 +61,16 @@ def _coerce_grade(value) -> float | None:
 
 # ─── Public entry point ──────────────────────────────────────────────────────
 
+def _fail_mapping(detail: str) -> None:
+    """Abort the run loudly on a subprocess result/identity mismatch (BUI-174/187).
+
+    Mapping comps to the wrong comic silently computes a bid cap from another
+    book's pool, so this is a hard failure, never a best-effort fallback.
+    """
+    click.echo(f"Error: {detail}", err=True)
+    sys.exit(1)
+
+
 def run(*, batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool,
         quiet: bool, server_url: str | None,
@@ -94,16 +104,38 @@ def run(*, batch_path: str | None, out_path: str | None,
     if needs_compute:
         fresh_results = _fetch_comps(needs_compute, force=force)
 
-    # 3. Run FMV math + DB upsert for fresh books, keyed by original input idx
-    needs_indices = [b["_idx"] for b in needs_compute]
+    # 3. Run FMV math + DB upsert for fresh books, mapped back to inputs by an
+    #    explicit id — never by list position (BUI-174/187). The subprocess fans
+    #    out across a ThreadPoolExecutor and a dropped/reordered result would
+    #    otherwise upsert comic A's comps onto comic B (wrong bid cap, silent).
+    #    Each result echoes its _req_id (the original input index); we require an
+    #    exact 1:1 id round-trip and fail loud on any mismatch rather than guess.
     fresh_fmvs: dict[int, dict] = {}
-    for ordinal, result in enumerate(fresh_results):
-        if ordinal >= len(needs_indices):
-            break
-        idx = needs_indices[ordinal]
-        fresh_fmvs[idx] = _compute_and_upsert_one(
-            result, books[idx], server_url=server_url, grade_window=grade_window,
-        )
+    if needs_compute:
+        sent_ids = [b["_idx"] for b in needs_compute]
+        results_by_id: dict[int, dict] = {}
+        for result in fresh_results:
+            rid = (result.get("input") or {}).get("_req_id")
+            if rid in results_by_id:
+                _fail_mapping(
+                    f"ebay-sold-comps returned a duplicate result id ({rid!r})."
+                )
+            results_by_id[rid] = result
+        sent_set = set(sent_ids)
+        missing = [i for i in sent_ids if i not in results_by_id]
+        unexpected = [k for k in results_by_id if k not in sent_set]
+        if len(fresh_results) != len(needs_compute) or missing or unexpected:
+            _fail_mapping(
+                f"ebay-sold-comps result/identity mismatch: sent "
+                f"{len(needs_compute)} books, got {len(fresh_results)} results; "
+                f"missing ids={missing}, unexpected ids={unexpected}. Refusing to "
+                "map comps positionally (would price the wrong comic)."
+            )
+        for idx in sent_ids:
+            fresh_fmvs[idx] = _compute_and_upsert_one(
+                results_by_id[idx], books[idx],
+                server_url=server_url, grade_window=grade_window,
+            )
 
     # 4. Stitch cached + fresh in input order
     final = _stitch(books, cached, fresh_fmvs)
@@ -203,8 +235,13 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
         )
         sys.exit(1)
 
-    # Strip the orchestrator's _idx field; ebay-sold-comps doesn't expect it
-    payload = [{k: v for k, v in b.items() if k != "_idx"} for b in books]
+    # Strip the orchestrator's _idx but thread a stable correlation id (_req_id,
+    # = the original input index) the subprocess echoes back, so run() can map
+    # results to inputs by identity instead of fragile list position (BUI-174/187).
+    payload = [
+        {**{k: v for k, v in b.items() if k != "_idx"}, "_req_id": b["_idx"]}
+        for b in books
+    ]
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as ftmp:
         json.dump(payload, ftmp)
@@ -239,6 +276,9 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
                             grade_window: float | None = None) -> dict:
     """Run FMV math + DB upsert for a single book. Returns the assembled result."""
     inp = result.get("input") or {}
+    # _req_id is an internal correlation key (BUI-174/187); drop it before it can
+    # leak into the upsert body or the emitted result.
+    inp.pop("_req_id", None)
     overrides = {k: v for k, v in original_book.items()
                  if k not in ("_idx",) and v is not None}
     # Don't let a wish-list string grade clobber a numeric grade resolved by

@@ -365,6 +365,24 @@ class TestTieredStrategy:
                                   "key")
         assert len([c for c in out["comps"] if c["product_id"] == "dup"]) == 1
 
+    def test_echoes_req_id_when_present(self, tmp_path, monkeypatch):
+        """BUI-174/187: a caller-threaded correlation id round-trips in the echoed
+        input so a batch driver can map results by identity, not list position."""
+        self._wire(tmp_path, monkeypatch, [[self._comp("1")]])
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5, "_req_id": 7},
+            "key",
+        )
+        assert out["input"]["_req_id"] == 7
+
+    def test_omits_req_id_when_absent(self, tmp_path, monkeypatch):
+        """A standalone caller (no _req_id) gets a clean input echo, no null key."""
+        self._wire(tmp_path, monkeypatch, [[self._comp("1")]])
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
+        )
+        assert "_req_id" not in out["input"]
+
 
 # ─── End-to-end-ish: batch driver ────────────────────────────────────────────
 

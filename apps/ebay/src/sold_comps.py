@@ -368,15 +368,23 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                                     grade_label=label)
             _run("grade-targeted", grade_nkw)
 
+    out_input = {
+        "item_id": self_id or None,
+        "title": title,
+        "issue": issue,
+        "year": year,
+        "publisher": publisher,
+        "grade": target_grade,
+    }
+    # BUI-174/187: echo back the caller's correlation id (when present) so a
+    # batch driver can map results to inputs by identity, not list position.
+    # A bare item_id is not reliable (may be absent or shared), so the id is a
+    # dedicated field threaded by the caller; standalone callers omit it.
+    req_id = book.get("_req_id")
+    if req_id is not None:
+        out_input["_req_id"] = req_id
     return {
-        "input": {
-            "item_id": self_id or None,
-            "title": title,
-            "issue": issue,
-            "year": year,
-            "publisher": publisher,
-            "grade": target_grade,
-        },
+        "input": out_input,
         "queries_used": queries_used,
         "comps": comps,
     }
