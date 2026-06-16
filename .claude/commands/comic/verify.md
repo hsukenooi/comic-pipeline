@@ -76,7 +76,8 @@ Verdicts (ladder — first failure wins):
 | Verdict | Meaning |
 |---|---|
 | `fully_linked` | All five checks pass — comic, fmv (with low+high), junction, bids.fmv_id |
-| `fmv_stub` | Comic + fmv at grade exist but `fmv.low`/`fmv.high` are NULL — `/comic:fmv` never computed FMV |
+| `needs_manual` | Comic + fmv at grade exist but the fmv is **intentionally unpriceable** — flagged `needs_manual` (BUI-86) with a structured `flag_reason` (`one_sided` / `too_wide` / `too_sparse`). `fmv.low`/`fmv.high` are NULL *by design*; this is NOT a missing-FMV stub. Re-running `/comic:fmv` is a no-op — hand-price it. |
+| `fmv_stub` | Comic + fmv at grade exist but `fmv.low`/`fmv.high` are NULL and the row is NOT flagged — `/comic:fmv` never computed FMV |
 | `partial` | fmv populated but `bids.fmv_id` is null or mismatches the matched fmv |
 | `no_fmv_at_grade` | Comic linked, but no `fmv` row at the bid's grade |
 | `no_comic` | No comic linked to the bid (and no match via `locg_id` if given) |
@@ -97,6 +98,7 @@ Surface a table for the user. Use the verdict column to scan for issues:
 
 If `summary.issues > 0`, after the table give the user one-line guidance per verdict:
 
+- `needs_manual` → "This book is flagged `needs_manual` (reason: `<flag_reason>`) — its comp pool can't be auto-priced. Hand-price it via grade-curve interpolation or the CGC proxy (see `/comic:fmv` §7/§7a), or skip. Do NOT re-run `/comic:fmv` — it will just re-flag it."
 - `fmv_stub` → "Run `/comic:fmv` for this comic at the missing grade(s)."
 - `no_fmv_at_grade` → "The bid's grade doesn't have an FMV row yet. Run `/comic:fmv` at this grade."
 - `no_comic` → "No comic linked. Run `POST /api/extract-comics` or re-run `/comic:snipe-add` with `--locg-id` set."

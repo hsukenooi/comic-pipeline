@@ -408,6 +408,9 @@ class TestComputeOne:
         assert body["fmv_high"] is None
         assert body["fmv_comps"] == 0
         assert body["fmv_confidence"] == "low"
+        # BUI-132: an n=0 stub is NOT flagged — it posts a null flag_reason so the
+        # server's COALESCE keeps any prior real price (the n=0 stub guard).
+        assert body["fmv_flag_reason"] is None
 
         assert out["source"] == "fresh"
         assert out["fmv"]["n"] == 0
@@ -438,6 +441,9 @@ class TestComputeOne:
         assert body["fmv_comps"] == 5            # un-priced pool size preserved
         assert body["fmv_confidence"] == "low"   # forced LOW even though dense
         assert "manual_review=one_sided" in body["fmv_notes"]
+        # BUI-132: the flag now also rides a structured column, not just the
+        # fmv_notes token, so the server can verdict needs_manual + clear stale price.
+        assert body["fmv_flag_reason"] == "one_sided"
         assert out["fmv"]["flag_reason"] == "one_sided"
         assert out["comic_id"] == 11
 

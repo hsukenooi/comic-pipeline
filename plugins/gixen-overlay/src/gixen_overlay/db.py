@@ -44,6 +44,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             comps       INTEGER,
             confidence  TEXT CHECK(confidence IN ('high', 'medium', 'low') OR confidence IS NULL),
             notes       TEXT,
+            flag_reason TEXT,
             updated_at  TEXT,
             UNIQUE(comic_id, grade)
         )
@@ -81,6 +82,9 @@ def create_tables(conn: sqlite3.Connection) -> None:
     _migrate_sweep_allcaps_orphans(conn)
     # variant column must exist before the unique-index migration references it.
     _migrate_add_variant_column(conn)
+    # flag_reason column must be added AFTER the fmv-split / year-nullable rebuilds
+    # above (those recreate `fmv` from the pre-BUI-132 schema), so it survives them.
+    _migrate_add_fmv_flag_reason_column(conn)
     _migrate_lowercase_title_indexes(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
@@ -145,6 +149,25 @@ def _migrate_add_variant_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(comics)")}
     if "variant" not in cols:
         conn.execute("ALTER TABLE comics ADD COLUMN variant TEXT")
+
+
+def _migrate_add_fmv_flag_reason_column(conn: sqlite3.Connection) -> None:
+    """Add the nullable `flag_reason` column to fmv if absent (BUI-132).
+
+    Promotes the BUI-86 needs_manual state from an in-process field + an
+    `fmv_notes` `manual_review=<reason>` token to a first-class DB column, so
+    `/comic:verify` can emit a distinct `needs_manual` verdict and the upsert can
+    clear a now-stale price on a newly-flagged book (without weakening the n=0
+    stub guard — see upsert_fmv).
+
+    Additive and idempotent, mirroring _migrate_add_variant_column. A NULL
+    flag_reason means "not flagged" (priced or a plain n=0 stub); a non-NULL
+    value is one of one_sided / too_wide / too_sparse. Version-skew tolerant: a
+    DB written by older overlay code simply lacks the column until this runs.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fmv)")}
+    if "flag_reason" not in cols:
+        conn.execute("ALTER TABLE fmv ADD COLUMN flag_reason TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -949,26 +972,73 @@ def upsert_fmv(
     comps: int | None = None,
     confidence: str | None = None,
     notes: str | None = None,
+    flag_reason: str | None = None,
 ) -> int:
-    """Upsert a per-grade FMV row. Returns the fmv id."""
+    """Upsert a per-grade FMV row. Returns the fmv id.
+
+    `flag_reason` (BUI-132) carries the BUI-86 needs_manual state as a structured
+    column (one_sided / too_wide / too_sparse, or NULL for not-flagged). The
+    discriminator that lets the upsert distinguish three cases is whether the
+    incoming row is a real FMV *decision* (it carries a price or a flag) vs. a
+    bare n=0 stub (no price, no flag):
+
+    - A newly-FLAGGED book (incoming flag_reason set) clears its stale
+      auto-priced low/high/comps AND overwrites confidence/notes with the
+      incoming (typically NULL) values, then stores the flag — a book that now
+      needs manual pricing must not keep a stale number or stale auto-price
+      metadata (confidence='high', notes) (BUI-86 residual #2). The automated
+      fmv_runner path overwrites notes/forces confidence=low anyway, but a
+      direct flag-only POST ({grade, fmv_flag_reason}) relies on this.
+    - A freshly-PRICED book (incoming low/high set, no flag) stores the new price
+      and CLEARS any prior flag — a book that used to be unpriceable but now
+      prices cleanly is no longer needs_manual.
+    - A bare n=0 STUB (no price, no flag) COALESCE-preserves the existing price
+      and flag — this is the n=0 stub guard, and it is NOT weakened here: the
+      stub path is reached only when excluded.flag_reason IS NULL AND
+      excluded.low IS NULL, so it can never wipe a real price.
+    """
     if grade is None:
         raise ValueError("grade is required for upsert_fmv")
-    has_value = any(v is not None for v in (low, high, comps, confidence, notes))
+    flag_reason = flag_reason or None
+    has_value = any(
+        v is not None for v in (low, high, comps, confidence, notes, flag_reason)
+    )
     now = datetime.now(timezone.utc).isoformat() if has_value else None
     conn.execute(
         """
-        INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, notes, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, notes, flag_reason, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(comic_id, grade) DO UPDATE SET
-            low         = COALESCE(excluded.low,        low),
-            high        = COALESCE(excluded.high,       high),
-            comps       = COALESCE(excluded.comps,      comps),
-            confidence  = COALESCE(excluded.confidence, confidence),
-            notes       = COALESCE(excluded.notes,      notes),
-            updated_at  = CASE WHEN excluded.low IS NOT NULL THEN excluded.updated_at
+            -- A flagged incoming row clears the stale auto-priced number; an
+            -- unflagged incoming row (a fresh price OR a bare n=0 stub)
+            -- COALESCE-preserves it. The n=0 stub guard lives in the COALESCE:
+            -- a stub's NULL low can't overwrite a real price.
+            low         = CASE WHEN excluded.flag_reason IS NOT NULL THEN NULL
+                               ELSE COALESCE(excluded.low,   low) END,
+            high        = CASE WHEN excluded.flag_reason IS NOT NULL THEN NULL
+                               ELSE COALESCE(excluded.high,  high) END,
+            comps       = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.comps
+                               ELSE COALESCE(excluded.comps, comps) END,
+            -- A flagged incoming row also drops stale auto-price metadata: a
+            -- flag-only POST ({grade, fmv_flag_reason}) carries NULL confidence
+            -- and notes, so it must overwrite (not COALESCE-keep) the prior
+            -- priced row's confidence/notes — else a needs_manual book would
+            -- surface the old auto-price's confidence='high'/notes on /comics.
+            confidence  = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.confidence
+                               ELSE COALESCE(excluded.confidence, confidence) END,
+            notes       = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.notes
+                               ELSE COALESCE(excluded.notes,      notes) END,
+            -- A flagged row stores its flag; a freshly-priced row clears any
+            -- prior flag (incoming low set ⇒ no longer needs_manual); a bare
+            -- n=0 stub leaves the flag untouched.
+            flag_reason = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.flag_reason
+                               WHEN excluded.low IS NOT NULL THEN NULL
+                               ELSE flag_reason END,
+            updated_at  = CASE WHEN excluded.low IS NOT NULL OR excluded.flag_reason IS NOT NULL
+                               THEN excluded.updated_at
                                ELSE updated_at END
         """,
-        (comic_id, grade, low, high, comps, confidence, notes, now),
+        (comic_id, grade, low, high, comps, confidence, notes, flag_reason, now),
     )
     conn.commit()
     row = conn.execute(
@@ -1129,6 +1199,7 @@ def list_comics(
                f.id AS fmv_id, f.grade,
                f.low AS fmv_low, f.high AS fmv_high, f.comps AS fmv_comps,
                f.confidence AS fmv_confidence, f.notes AS fmv_notes,
+               f.flag_reason AS fmv_flag_reason,
                f.updated_at AS fmv_updated_at
         FROM comics c
         LEFT JOIN fmv f ON f.comic_id = c.id
