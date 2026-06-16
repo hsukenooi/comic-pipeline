@@ -648,6 +648,23 @@ async def _run_ebay_fallback() -> None:
                 #      means we likely lost (strict < instead of <=).
                 #   2. local_snipe_result starts with "ERR:" → our bid never
                 #      landed; mark LOST regardless of price.
+                #
+                # BUI-146 (accepted risk, won't-fix — do NOT "fix" naively):
+                # a snipe the user CANCELLED in Gixen's web UI while still live
+                # also reaches here once its auction ends, and a final price
+                # below max_bid then stamps a phantom WON even though we never
+                # bid. The trigger (cancel a *live* snipe directly on Gixen) is
+                # near-unreachable in this deployment and the user reconciles
+                # against the real eBay payment, so it's accepted. Crucially,
+                # this same inference is how genuine wins are recovered when
+                # Gixen drops an ended snipe before sync reads its WON status —
+                # with the local sniper disabled, local_snipe_result is always
+                # NULL, so requiring local bid-evidence (or never inferring WON
+                # for vanished rows) would SUPPRESS REAL WINS. If you ever do
+                # fix this, do it by disambiguating at vanish-time on the
+                # auction end (still-live → REMOVED, like the BUI-85 path), not
+                # by gating the WON inference here. See BUI-146 for the full
+                # analysis.
                 local_result = row["local_snipe_result"] or ""
                 if local_result.startswith("ERR:") or final_amount >= float(row["max_bid"]):
                     inferred_status = "LOST"
