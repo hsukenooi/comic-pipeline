@@ -118,11 +118,28 @@ _STOPWORDS = frozenset({"the", "a", "an", "of", "and", "in", "vol", "comics"})
 # "cgc"-skip guard in main() does NOT — they carry no "cgc" string.
 _GRADE_RE = re.compile(r"\b\d{1,2}\.\d\b")
 
+# BUI-135 (code-review follow-up): a grade written WITHOUT a decimal still
+# orphans into a fake issue number ("VF/NM 9" -> bare "9" matched wish #9).
+# Strip a bare integer ONLY when it's prefixed by a grade-letter token
+# (VF, NM, FN, GD, VG, F, G, optionally combined like "F/VF" or "NM+"), so we
+# kill grade-shorthand digits without touching a plain "\bN\b" that has no
+# grade word in front of it (e.g. "X-Men 9" or "#9" must still match issue 9 —
+# the matcher's loose bias is preserved).
+_GRADE_LETTER_RE = re.compile(
+    r"\b(?:VF|NM|FN|GD|VG|F|G)(?:[/+-]*(?:VF|NM|FN|GD|VG|F|G))*[/+-]*\s*\d{1,2}\b",
+    re.IGNORECASE,
+)
+
 
 def _strip_grades(text):
-    """Remove decimal grade tokens (e.g. '7.0', '9.4') so their integer part
-    can't be mistaken for an issue number. See BUI-135."""
-    return _GRADE_RE.sub(" ", text)
+    """Remove grade tokens so their digits can't be mistaken for an issue
+    number. Covers decimal grades ('7.0', '9.4') and grade-letter-prefixed
+    bare integers ('VF 9', 'VF/NM 9', 'NM 8', 'FN+ 6'). A plain bare integer
+    with no grade-letter prefix is deliberately left alone so a real issue
+    number ('X-Men 9', '#9') still matches. See BUI-135."""
+    text = _GRADE_RE.sub(" ", text)
+    text = _GRADE_LETTER_RE.sub(" ", text)
+    return text
 
 
 def _normalize(text):

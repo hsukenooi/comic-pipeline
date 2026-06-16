@@ -641,6 +641,59 @@ class TestGradeDigitNotIssueNumber:
         assert len(matched) == 1, f"expected only the genuine match, got {matched}"
         assert matched[0]["name"] == "Moon Knight #15"
 
+    # BUI-135 code-review follow-up: grade written WITHOUT a decimal.
+
+    def test_vf_9_does_not_match_issue_9(self):
+        """A bare 'VF 9' grade must NOT orphan into wish issue #9."""
+        items = self._items(["The X-Men #9"])
+        wish, score = seller_scan.match_listing(
+            "Uncanny X-men #142 Marvel 1981 VF 9 White Pages", items
+        )
+        assert wish is None, "grade 'VF 9' must not satisfy issue #9"
+
+    def test_vf_nm_9_does_not_match_issue_9(self):
+        """The combined 'VF/NM 9' grade (no decimal) must NOT match issue #9."""
+        items = self._items(["The X-Men #9"])
+        wish, score = seller_scan.match_listing(
+            "Uncanny X-men #142 Marvel 1981 VF/NM 9 White Pages", items
+        )
+        assert wish is None, "grade 'VF/NM 9' must not satisfy issue #9"
+
+    def test_nm_8_does_not_match_issue_8(self):
+        """'NM 8' must NOT orphan into wish issue #8."""
+        items = self._items(["Daredevil #8"])
+        wish, score = seller_scan.match_listing(
+            "Daredevil #181 Marvel 1982 NM 8 White Pages", items
+        )
+        assert wish is None, "grade 'NM 8' must not satisfy issue #8"
+
+    def test_fn_plus_6_does_not_match_issue_6(self):
+        """'FN+ 6' must NOT orphan into wish issue #6."""
+        items = self._items(["Hulk #6"])
+        wish, score = seller_scan.match_listing(
+            "Hulk #181 Marvel 1974 FN+ 6 Off White", items
+        )
+        assert wish is None, "grade 'FN+ 6' must not satisfy issue #6"
+
+    def test_genuine_hash_9_still_matches_with_grade_word_elsewhere(self):
+        """A real '#9' must still match even when a grade word sits elsewhere."""
+        items = self._items(["The X-Men #9"])
+        wish, score = seller_scan.match_listing(
+            "The X-Men #9 Marvel VF condition White Pages", items
+        )
+        assert wish is not None, "genuine issue #9 must still match"
+        assert wish["name"] == "The X-Men #9"
+
+    def test_no_grade_prefix_bare_9_still_matches(self):
+        """A bare issue number with NO grade-letter prefix must still match —
+        the matcher's loose bias is preserved."""
+        items = self._items(["The X-Men #9"])
+        wish, score = seller_scan.match_listing(
+            "The X-Men 9 Marvel 1965 White Pages", items
+        )
+        assert wish is not None, "bare '9' with no grade prefix must match issue 9"
+        assert wish["name"] == "The X-Men #9"
+
 
 class TestVerifyWithClaudeNoSilentDrop:
     def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
