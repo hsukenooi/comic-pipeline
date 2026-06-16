@@ -496,6 +496,95 @@ class TestGetToken:
             with pytest.raises(SystemExit):
                 ebay_fetch.get_token("bad-id", "bad-secret", ebay_fetch.PRODUCTION_BASE)
 
+    # ── BUI-184 Item 1: get_token retry + 429 handling ───────────────────────
+
+    def test_429_retries_then_succeeds(self, tmp_path, monkeypatch):
+        """A transient 429 on the token POST must NOT kill the run.
+        The retry loop should back off and return the token on the next attempt."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        rate_limited = MagicMock()
+        rate_limited.status_code = 429
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"access_token": "retried-token", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", side_effect=[rate_limited, ok]):
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "retried-token"
+        # Must have slept before retrying (exponential backoff: 2^0 = 1s)
+        mock_sleep.assert_called_once_with(1)
+
+    def test_5xx_retries_then_succeeds(self, tmp_path, monkeypatch):
+        """A transient 503 on the token POST must also be retried."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        server_error = MagicMock()
+        server_error.status_code = 503
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"access_token": "recovered-token", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", side_effect=[server_error, ok]):
+            with patch("ebay_fetch.time.sleep"):
+                token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "recovered-token"
+
+    def test_exhausted_retries_exits(self, tmp_path, monkeypatch):
+        """If every attempt is rate-limited, sys.exit(1) after the budget is exhausted."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        rate_limited = MagicMock()
+        rate_limited.status_code = 429
+
+        # 3 retries → 3 rate-limited responses
+        with patch("ebay_fetch.requests.post", return_value=rate_limited):
+            with patch("ebay_fetch.time.sleep"):
+                with pytest.raises(SystemExit):
+                    ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+    def test_non_retryable_4xx_exits_immediately(self, tmp_path, monkeypatch):
+        """A 401 is not retryable; must exit after the first attempt (no backoff sleep)."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        unauthorized = MagicMock()
+        unauthorized.status_code = 401
+
+        with patch("ebay_fetch.requests.post", return_value=unauthorized) as mock_post:
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                with pytest.raises(SystemExit):
+                    ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        # Called once only — no retry on non-retryable 4xx
+        assert mock_post.call_count == 1
+        mock_sleep.assert_not_called()
+
+    # ── BUI-184 Item 2: null title in parse_item_summary ─────────────────────
+
+    def test_null_title_becomes_empty_string(self):
+        """Browse API can return 'title': null; parse_item_summary must coerce it to ''
+        so downstream .lower() calls never raise AttributeError."""
+        item = {
+            "itemId": "v1|999|0",
+            "title": None,  # explicit null from the API
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "10.00", "currency": "USD"},
+            "itemEndDate": "2026-06-01T12:00:00.000Z",
+            "itemWebUrl": "https://www.ebay.com/itm/999",
+            "seller": {"username": "testseller"},
+        }
+        parsed = ebay_fetch.parse_item_summary(item)
+        # title must be a string, never None
+        assert parsed["title"] == ""
+        assert isinstance(parsed["title"], str)
+        # .lower() must not raise
+        _ = parsed["title"].lower()
+
 
 # ============================================================
 # Integration Tests — hit real eBay API

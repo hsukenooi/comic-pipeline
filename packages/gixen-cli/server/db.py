@@ -604,8 +604,16 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     # placeholders contains only '?' chars — no user data is interpolated
     placeholders = ",".join("?" * len(item_ids))
     # Tombstone completed bids. Renamed PURGED -> REMOVED in BUI-49.
+    #
+    # BUI-178: guard on status, like delete_bid/update_bid_status. The partial
+    # unique index only forbids two PENDING rows, so a re-listed/re-added item
+    # can have a live PENDING row alongside an old WON/LOST row sharing the
+    # item_id. Without this filter the completed-sweep tombstones BOTH and the
+    # live snipe silently vanishes. Only tombstone resolved (completed) rows.
     conn.execute(
-        f"UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id IN ({placeholders})",
+        f"UPDATE bids SET status='REMOVED', resolved_at=? "
+        f"WHERE item_id IN ({placeholders}) "
+        f"AND status NOT IN ('PENDING', 'PURGED', 'REMOVED')",
         [now, *item_ids],
     )
     conn.commit()

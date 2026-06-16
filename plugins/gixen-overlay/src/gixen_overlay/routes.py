@@ -1,6 +1,7 @@
 """Comic FastAPI routes for the gixen-overlay plugin."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -955,7 +956,11 @@ async def api_wish_list(title: str | None = None):
     _ensure_collection_store()
     try:
         return cmd_wish_list_from_cache(title)
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
+        # BUI-184: a missing OR corrupt wish-list cache yields an empty list, not
+        # a 500. An empty wish-list is a correct, non-dangerous answer (a miss
+        # only fails to surface a wanted book; it cannot buy a dupe), and a 500
+        # here would break seller-scan entirely on a single bad write.
         return []
 
 
@@ -1118,7 +1123,28 @@ async def api_record_win(req: RecordWinRequest):
     try:
         result = cmd_collection_record_win(req.wins)
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"collection store unavailable: {exc}"
+        ) from exc
+    except Exception as exc:
+        # BUI-184: record-win previously translated only RuntimeError, so any
+        # other mid-batch exception surfaced as an opaque 500 with no signal
+        # about commit state. Translate it to a 500 the caller can act on — the
+        # commit state is uncertain, so the user must re-verify before trusting
+        # it. (cmd_collection_record_win chunk-commits and flags partial_failure
+        # for handled failures; this is the unhandled-exception backstop.)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "record_win_failed",
+                "message": (
+                    "record-win raised mid-batch; the commit state is uncertain "
+                    "— re-check the collection / re-import before treating any "
+                    "of these wins as recorded"
+                ),
+                "exception": f"{type(exc).__name__}: {exc}",
+            },
+        ) from exc
 
     # BUI-137: cmd_collection_record_win commits in chunks of 25 and, if a chunk
     # raises, logs the error, sets partial_failure=True, and CONTINUES — so a
@@ -1161,6 +1187,20 @@ async def api_wish_list_add(req: WishListAddRequest):
         parsed = _split_wish_list_name(req.title)
         if parsed is not None:
             series, issue = parsed
+            # BUI-184 (design decision, deliberately unresolved): this omits
+            # `year`, so cmd_collection_check's year-gated masthead fallback
+            # (_SERIES_ALIASES, e.g. "The Mighty Thor" → owned "Thor") can't fire
+            # here — a book stored under its base masthead can slip past the 409
+            # owned-guard. Omitting `year` is intentional (BUI-129: forwarding a
+            # series start-year produced a false not_in_cache that hid 16 owned
+            # X-Men), and there is no per-issue year to pass: WishListAddRequest
+            # carries only {title, force} and _split_wish_list_name yields only
+            # (series, issue). Closing the gap means new plumbing — a per-issue
+            # cover year on the request + every caller (the /comic:wishlist-add
+            # skill) populating it — not a one-line toggle. Left as-is for now:
+            # the guard fails open by design and the export-side BUI-122 fix
+            # (collection-sync never exports an owned book as In Collection=0) is
+            # the real data-loss safety net. Revisit if the year plumbing lands.
             try:
                 check = cmd_collection_check(series=series, issue=issue)
             except RuntimeError:

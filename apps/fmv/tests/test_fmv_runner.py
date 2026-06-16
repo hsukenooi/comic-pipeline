@@ -628,6 +628,37 @@ class TestFlaggedPresentation:
         assert "flag_reason" in out and out["flag_reason"] is None
         assert "grade_span" in out and out["grade_span"] is None
 
+    def test_falsy_zero_fmv_high_yields_zero_max_bid_not_none(self):
+        """BUI-182: a legitimate fmv_high of 0 must round to a 0 max_bid, not be
+        nulled by a falsy check."""
+        row = {"fmv_low": 0, "fmv_high": 0, "fmv_comps": 5,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["max_bid"] == 0
+
+    def test_wide_window_caps_confidence_on_cached_reuse(self):
+        """BUI-182: a stored row built past the wide-window boundary must reuse at
+        MEDIUM even if its persisted confidence label is HIGH."""
+        row = {"fmv_low": 60, "fmv_high": 100, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±1.5 | cv=20%"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["window"] == 1.5
+        assert out["confidence"] == "MEDIUM"
+
+    def test_narrow_window_keeps_stored_confidence(self):
+        row = {"fmv_low": 60, "fmv_high": 100, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±1.0 | cv=20%"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["window"] == 1.0
+        assert out["confidence"] == "HIGH"
+
+    def test_unparseable_notes_window_is_none_and_no_cap(self):
+        row = {"fmv_low": 60, "fmv_high": 100, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": ""}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["window"] is None
+        assert out["confidence"] == "HIGH"
+
 
 # ─── End-to-end (with mocks) ──────────────────────────────────────────────────
 
@@ -671,8 +702,10 @@ class TestRunEndToEnd:
 
         fake_comps = [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]]
         fake_result = [{
-            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 9.0,
-                      "item_id": "1"},
+            # _req_id echoes the original input index (BUI-174/187); the real
+            # _fetch_comps + ebay-sold-comps carry it, so the mock must too.
+            "input": {"_req_id": 0, "title": "X", "issue": "1", "year": 1990,
+                      "grade": 9.0, "item_id": "1"},
             "comps": fake_comps,
             "queries_used": [{"tier": "base", "cached": False}],
         }]
@@ -696,3 +729,168 @@ class TestRunEndToEnd:
             fmv_runner.run(batch_path=str(batch_path), out_path=None,
                            max_age_days=7, force=False,
                            quiet=True, server_url=None)
+
+    def test_fresh_results_mapped_by_id_not_position(self, tmp_path, server_url):
+        """BUI-174/187: if the subprocess returns results in a different order,
+        each book must still get ITS OWN comps — not its neighbour's."""
+        batch = [
+            {"item_id": "A", "title": "Aaa", "issue": "1", "year": 1990, "grade": 9.0},
+            {"item_id": "B", "title": "Bbb", "issue": "2", "year": 1991, "grade": 9.0},
+        ]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out.json"
+
+        low = [_make_comp(p, 9.0, product_id=f"l{p}") for p in [10, 11, 12, 13, 14]]
+        high = [_make_comp(p, 9.0, product_id=f"h{p}") for p in
+                [1000, 1100, 1200, 1300, 1400]]
+        # Returned REVERSED relative to the input order; each carries its _req_id
+        # (book A == idx 0 == low pool; book B == idx 1 == high pool).
+        reordered = [
+            {"input": {"_req_id": 1, "title": "Bbb", "issue": "2", "year": 1991,
+                       "grade": 9.0, "item_id": "B"}, "comps": high, "queries_used": []},
+            {"input": {"_req_id": 0, "title": "Aaa", "issue": "1", "year": 1990,
+                       "grade": 9.0, "item_id": "A"}, "comps": low, "queries_used": []},
+        ]
+        with patch("fmv_runner._fetch_comps", return_value=reordered), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        out = json.loads(out_path.read_text())
+        # Output stays in input order; book A keeps the LOW pool, book B the HIGH.
+        assert out[0]["input"]["title"] == "Aaa"
+        assert out[1]["input"]["title"] == "Bbb"
+        assert out[0]["fmv"]["fmv_high"] < 100      # would be ~1300 if mapped by position
+        assert out[1]["fmv"]["fmv_high"] > 500
+
+    def test_result_count_mismatch_fails_loud(self, tmp_path, server_url):
+        """A dropped result (count mismatch) must abort, never map positionally."""
+        batch = [
+            {"item_id": "A", "title": "Aaa", "issue": "1", "year": 1990, "grade": 9.0},
+            {"item_id": "B", "title": "Bbb", "issue": "2", "year": 1991, "grade": 9.0},
+        ]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+
+        only_one = [{"input": {"_req_id": 0, "title": "Aaa", "issue": "1",
+                               "year": 1990, "grade": 9.0, "item_id": "A"},
+                     "comps": [], "queries_used": []}]
+        with patch("fmv_runner._fetch_comps", return_value=only_one), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            with pytest.raises(SystemExit):
+                fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                               max_age_days=7, force=False, quiet=True,
+                               server_url=server_url)
+
+    def test_missing_req_id_fails_loud(self, tmp_path, server_url):
+        """A result without a _req_id (e.g. a stale ebay-sold-comps that doesn't
+        echo it) must fail loud, not silently mis-map (version-skew guard)."""
+        batch = [{"item_id": "A", "title": "Aaa", "issue": "1", "year": 1990,
+                  "grade": 9.0}]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+
+        no_id = [{"input": {"title": "Aaa", "issue": "1", "year": 1990,
+                            "grade": 9.0, "item_id": "A"},
+                  "comps": [], "queries_used": []}]
+        with patch("fmv_runner._fetch_comps", return_value=no_id), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            with pytest.raises(SystemExit):
+                fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                               max_age_days=7, force=False, quiet=True,
+                               server_url=server_url)
+
+    def test_fetch_comps_threads_req_id_into_subprocess_payload(self, tmp_path,
+                                                                monkeypatch):
+        """BUI-174/187 (fmv→ebay direction): _fetch_comps must send a _req_id with
+        each book so the subprocess can echo it back."""
+        captured = {}
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            # cmd = [bin, --batch, in_path, --out, out_path, --quiet, ...]
+            in_path = cmd[cmd.index("--batch") + 1]
+            out_path = cmd[cmd.index("--out") + 1]
+            with open(in_path) as fh:
+                captured["payload"] = json.load(fh)
+            with open(out_path, "w") as fh:
+                fh.write("[]")
+            return type("R", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(fmv_runner.shutil, "which", lambda _b: "/usr/bin/ebay")
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+
+        books = [{"_idx": 3, "title": "X", "issue": "1"},
+                 {"_idx": 7, "title": "Y", "issue": "2"}]
+        fmv_runner._fetch_comps(books, force=False)
+
+        sent_ids = [b["_req_id"] for b in captured["payload"]]
+        assert sent_ids == [3, 7]
+        assert all("_idx" not in b for b in captured["payload"])
+
+
+# ─── _fetch_comps robustness (BUI-184) ────────────────────────────────────────
+
+class TestFetchCompsRobustness:
+    def _wire(self, monkeypatch):
+        monkeypatch.setattr(fmv_runner.shutil, "which", lambda _b: "/usr/bin/ebay")
+
+    def _book(self, idx=0):
+        return {"_idx": idx, "title": "X", "issue": "1"}
+
+    def test_timeout_fails_loud(self, monkeypatch):
+        """A hung child must abort comic-fmv, not hang forever (BUI-184)."""
+        self._wire(monkeypatch)
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            raise fmv_runner.subprocess.TimeoutExpired(cmd, timeout)
+
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit):
+            fmv_runner._fetch_comps([self._book()], force=False)
+
+    def test_empty_output_fails_loud(self, monkeypatch):
+        """returncode 0 but an empty out file must fail loud, not crash (BUI-184)."""
+        self._wire(monkeypatch)
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            out_path = cmd[cmd.index("--out") + 1]
+            with open(out_path, "w") as fh:
+                fh.write("   ")
+            return type("R", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit):
+            fmv_runner._fetch_comps([self._book()], force=False)
+
+    def test_unparseable_output_fails_loud(self, monkeypatch):
+        """A partial/garbage out file fails loud with a clear error (BUI-184)."""
+        self._wire(monkeypatch)
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            out_path = cmd[cmd.index("--out") + 1]
+            with open(out_path, "w") as fh:
+                fh.write("{not json")
+            return type("R", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+        with pytest.raises(SystemExit):
+            fmv_runner._fetch_comps([self._book()], force=False)
+
+    def test_timeout_scales_with_batch_size(self, monkeypatch):
+        self._wire(monkeypatch)
+        seen = {}
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            seen["timeout"] = timeout
+            out_path = cmd[cmd.index("--out") + 1]
+            with open(out_path, "w") as fh:
+                fh.write("[]")
+            return type("R", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+        fmv_runner._fetch_comps([self._book(0), self._book(1), self._book(2)],
+                                force=False)
+        assert seen["timeout"] == (fmv_runner._SUBPROCESS_TIMEOUT_BASE
+                                   + 3 * fmv_runner._SUBPROCESS_TIMEOUT_PER_BOOK)

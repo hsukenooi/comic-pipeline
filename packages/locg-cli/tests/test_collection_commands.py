@@ -1590,3 +1590,272 @@ def test_wish_list_remove_conflicts_removes_only_owned(tmp_path, monkeypatch):
     # The non-owned item survives; the owned one is gone.
     remaining = cmds.cmd_wish_list_from_cache()
     assert [it["name"] for it in remaining] == ["X-Men #1"]
+
+
+# ---------------------------------------------------------------------------
+# BUI-175: decimal / point-issue token regressions
+# ---------------------------------------------------------------------------
+
+def test_split_full_title_decimal_issue_tokens():
+    """_split_full_title must parse decimal and multi-letter point issues."""
+    from locg.commands import _split_full_title
+
+    assert _split_full_title("X #1.MU") == ("X", "1.MU")
+    assert _split_full_title("Amazing Spider-Man #20.1") == ("Amazing Spider-Man", "20.1")
+    assert _split_full_title("Amazing Spider-Man #1.5") == ("Amazing Spider-Man", "1.5")
+
+
+def test_split_full_title_existing_letter_suffix_not_regressed():
+    """Single and multi-letter alpha suffixes (e.g. #1A, #1AU) still parse."""
+    from locg.commands import _split_full_title
+
+    assert _split_full_title("Web of Spider-Man #1A") == ("Web of Spider-Man", "1A")
+    assert _split_full_title("Marvel #1AU") == ("Marvel", "1AU")
+
+
+def test_split_full_title_normal_issues_unchanged():
+    """Plain numeric issues and series with qualifier words stay correct."""
+    from locg.commands import _split_full_title
+
+    assert _split_full_title("Thor #154") == ("Thor", "154")
+    assert _split_full_title("Fantastic Four Annual #6") == ("Fantastic Four Annual", "6")
+    assert _split_full_title("Watchmen") == ("Watchmen", None)
+
+
+def test_split_full_title_trailing_dot_not_captured():
+    """A trailing period after the issue number must not be consumed."""
+    from locg.commands import _split_full_title
+
+    series, token = _split_full_title("Thor #154.")
+    assert token == "154"
+
+
+def test_split_full_title_trailing_word_not_swallowed():
+    """A word after the issue token (e.g. 'Newsstand') must not extend the token."""
+    from locg.commands import _split_full_title
+
+    series, token = _split_full_title("Spider-Man #1 Newsstand")
+    assert token == "1"
+
+
+def test_check_matches_decimal_issue_token_mu(tmp_path, monkeypatch):
+    """#1.MU stored title must match issue='1.MU' query (BUI-175)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="The Amazing Spider-Man #1.MU",
+        series="The Amazing Spider-Man (1963 - 1998)",
+    )])
+
+    r = cmds.cmd_collection_check(series="The Amazing Spider-Man", issue="1.MU")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "The Amazing Spider-Man #1.MU"
+
+
+def test_check_matches_decimal_issue_token_numeric(tmp_path, monkeypatch):
+    """#20.1 stored title must match issue='20.1' query (BUI-175)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Amazing Spider-Man #20.1",
+        series="Amazing Spider-Man (1963 - 1998)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="20.1")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Amazing Spider-Man #20.1"
+
+
+def test_check_matches_decimal_issue_token_15(tmp_path, monkeypatch):
+    """#1.5 stored title must match issue='1.5' query (BUI-175)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Uncanny X-Men #1.5",
+        series="Uncanny X-Men (1963 - 2011)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Uncanny X-Men", issue="1.5")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Uncanny X-Men #1.5"
+
+
+def test_check_single_letter_suffix_not_regressed(tmp_path, monkeypatch):
+    """#1A still matches issue='1A' after the regex change (non-regression)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Web of Spider-Man #1A",
+        series="Web of Spider-Man (1985 - 1995)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Web of Spider-Man", issue="1A")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Web of Spider-Man #1A"
+
+
+def test_check_issue_1_does_not_match_stored_1_5(tmp_path, monkeypatch):
+    """issue='1' must NOT match a stored '#1.5' — no false positive (BUI-175)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Uncanny X-Men #1.5",
+        series="Uncanny X-Men (1963 - 2011)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Uncanny X-Men", issue="1")
+    assert r["match_status"] == "not_in_cache"
+
+
+# ---------------------------------------------------------------------------
+# BUI-176: variant qualifier must not hide an owned base issue
+# ---------------------------------------------------------------------------
+
+def test_check_variant_supplied_matches_owned_base_issue(tmp_path, monkeypatch):
+    """A variant qualifier on the query must NOT hide an owned base issue.
+
+    Regression for BUI-176: when `variant` was a hard filter, a newsstand query
+    against a stored plain "#1" reported not_in_cache and the pipeline re-bought
+    a comic already owned. Variant is now a soft preference.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Spawn #1",
+        series="Spawn (1992 - Present)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Spawn", issue="1", variant="newsstand")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Spawn #1"
+
+
+def test_check_variant_prefers_variant_bearing_row(tmp_path, monkeypatch):
+    """When both a base and a variant-bearing owned row exist, prefer the variant
+    one — regardless of cache order (BUI-176)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    # Base row stored first, variant row second: the variant row must still win.
+    _seed_cache(cache, [
+        _agent_win_row(full_title="Spawn #1", series="Spawn (1992 - Present)",
+                       gixen_item_id="1"),
+        _agent_win_row(full_title="Spawn #1 Newsstand", series="Spawn (1992 - Present)",
+                       gixen_item_id="2"),
+    ])
+
+    r = cmds.cmd_collection_check(series="Spawn", issue="1", variant="newsstand")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Spawn #1 Newsstand"
+
+
+def test_check_variant_does_not_loosen_issue_match(tmp_path, monkeypatch):
+    """The soft-variant change must not make a wrong issue count as owned: a
+    variant query for an un-owned issue still reports not_in_cache (BUI-176)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Spawn #1",
+        series="Spawn (1992 - Present)",
+    )])
+
+    r = cmds.cmd_collection_check(series="Spawn", issue="9", variant="newsstand")
+    assert r["match_status"] == "not_in_cache"
+
+
+# ---------------------------------------------------------------------------
+# BUI-184: _resolve_price must not IndexError / abort the record-win batch
+# ---------------------------------------------------------------------------
+
+def test_resolve_price_empty_or_whitespace_returns_none():
+    """An empty / whitespace current_bid must yield None, not raise IndexError."""
+    from locg.commands import _resolve_price
+
+    assert _resolve_price("") is None
+    assert _resolve_price("   ") is None
+    assert _resolve_price(None) is None
+    # Normal paths still parse.
+    assert _resolve_price("12.50 USD") == 12.50
+    assert _resolve_price(42) == 42.0
+    assert _resolve_price("not-a-price") is None
+
+
+def test_record_win_empty_current_bid_does_not_abort_batch(tmp_path):
+    """One win with an empty current_bid must not IndexError and abort the whole
+    batch; it is recorded with no price and the other wins still commit (BUI-184).
+    """
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", series="Spawn", issue="1", year=1992, current_bid=""),
+            _make_win(item_id="2", series="Spawn", issue="7", year=1993, current_bid=12.50),
+        ],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    # Both rows committed — the malformed win did not abort the batch.
+    assert result["rows_written"] == 2
+
+    payload = cache.load()
+    by_title = {r["full_title"]: r for r in payload["comics"]}
+    assert by_title["Spawn #1"]["price_paid"] is None
+    assert by_title["Spawn #7"]["price_paid"] == 12.50
+
+
+def test_record_win_dedup_does_not_collapse_annual_into_base(tmp_path):
+    """BUI-184 (record-win owned_index): the dedup must NOT collapse an Annual
+    into its base issue.
+
+    Real LOCG exports file annuals/specials under the BASE 'Series Name' with the
+    'Annual' qualifier living only in 'Full Title' (e.g. Series Name
+    "The Amazing Spider-Man" / Full Title "The Amazing Spider-Man Annual #14").
+    owned_index therefore keys on the Full Title PREFIX (which carries the
+    qualifier), not series_name — so an owned "... Annual #6" does not shadow a
+    genuine base "#6". Keying dedup on series_name (the tempting "shared series
+    key" fix) would false-skip the base issue → a re-won book later reads as
+    owned → duplicate buy. This test locks the safe direction.
+    """
+    from locg.commands import cmd_collection_record_win
+    from locg.collection_cache import rebuild_series_name_index
+
+    cache = make_cache(tmp_path)
+    # Mirrors real LOCG shape: base series_name, qualifier only in full_title.
+    _seed_cache(cache, [{
+        **_agent_win_row(
+            series="Fantastic Four",
+            full_title="Fantastic Four Annual #6",
+            release_date="1968-11-01",
+        ),
+        "source": "locg_export",
+    }])
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    # A base Fantastic Four #6 win is a different comic — it must be recorded.
+    result = cmd_collection_record_win(
+        [_make_win(series="Fantastic Four", issue="6", year=1962)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1

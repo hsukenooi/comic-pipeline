@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,12 @@ import fmv_math
 
 
 EBAY_SOLD_COMPS_BIN = "ebay-sold-comps"
+
+# BUI-184: ebay-sold-comps subprocess timeout, scaled with batch size. Each book
+# may run up to 3 SerpApi queries at a 15s HTTP timeout, fanned out across a
+# thread pool, so a generous per-book budget plus a fixed base.
+_SUBPROCESS_TIMEOUT_BASE = 60       # seconds
+_SUBPROCESS_TIMEOUT_PER_BOOK = 60   # seconds per book in the batch
 
 
 # Wish-list caches sometimes carry letter grades (e.g. "VF+") while sold_comps
@@ -60,6 +67,16 @@ def _coerce_grade(value) -> float | None:
 
 
 # ─── Public entry point ──────────────────────────────────────────────────────
+
+def _fail_mapping(detail: str) -> None:
+    """Abort the run loudly on a subprocess result/identity mismatch (BUI-174/187).
+
+    Mapping comps to the wrong comic silently computes a bid cap from another
+    book's pool, so this is a hard failure, never a best-effort fallback.
+    """
+    click.echo(f"Error: {detail}", err=True)
+    sys.exit(1)
+
 
 def run(*, batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool,
@@ -94,16 +111,38 @@ def run(*, batch_path: str | None, out_path: str | None,
     if needs_compute:
         fresh_results = _fetch_comps(needs_compute, force=force)
 
-    # 3. Run FMV math + DB upsert for fresh books, keyed by original input idx
-    needs_indices = [b["_idx"] for b in needs_compute]
+    # 3. Run FMV math + DB upsert for fresh books, mapped back to inputs by an
+    #    explicit id — never by list position (BUI-174/187). The subprocess fans
+    #    out across a ThreadPoolExecutor and a dropped/reordered result would
+    #    otherwise upsert comic A's comps onto comic B (wrong bid cap, silent).
+    #    Each result echoes its _req_id (the original input index); we require an
+    #    exact 1:1 id round-trip and fail loud on any mismatch rather than guess.
     fresh_fmvs: dict[int, dict] = {}
-    for ordinal, result in enumerate(fresh_results):
-        if ordinal >= len(needs_indices):
-            break
-        idx = needs_indices[ordinal]
-        fresh_fmvs[idx] = _compute_and_upsert_one(
-            result, books[idx], server_url=server_url, grade_window=grade_window,
-        )
+    if needs_compute:
+        sent_ids = [b["_idx"] for b in needs_compute]
+        results_by_id: dict[int, dict] = {}
+        for result in fresh_results:
+            rid = (result.get("input") or {}).get("_req_id")
+            if rid in results_by_id:
+                _fail_mapping(
+                    f"ebay-sold-comps returned a duplicate result id ({rid!r})."
+                )
+            results_by_id[rid] = result
+        sent_set = set(sent_ids)
+        missing = [i for i in sent_ids if i not in results_by_id]
+        unexpected = [k for k in results_by_id if k not in sent_set]
+        if len(fresh_results) != len(needs_compute) or missing or unexpected:
+            _fail_mapping(
+                f"ebay-sold-comps result/identity mismatch: sent "
+                f"{len(needs_compute)} books, got {len(fresh_results)} results; "
+                f"missing ids={missing}, unexpected ids={unexpected}. Refusing to "
+                "map comps positionally (would price the wrong comic)."
+            )
+        for idx in sent_ids:
+            fresh_fmvs[idx] = _compute_and_upsert_one(
+                results_by_id[idx], books[idx],
+                server_url=server_url, grade_window=grade_window,
+            )
 
     # 4. Stitch cached + fresh in input order
     final = _stitch(books, cached, fresh_fmvs)
@@ -203,8 +242,13 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
         )
         sys.exit(1)
 
-    # Strip the orchestrator's _idx field; ebay-sold-comps doesn't expect it
-    payload = [{k: v for k, v in b.items() if k != "_idx"} for b in books]
+    # Strip the orchestrator's _idx but thread a stable correlation id (_req_id,
+    # = the original input index) the subprocess echoes back, so run() can map
+    # results to inputs by identity instead of fragile list position (BUI-174/187).
+    payload = [
+        {**{k: v for k, v in b.items() if k != "_idx"}, "_req_id": b["_idx"]}
+        for b in books
+    ]
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as ftmp:
         json.dump(payload, ftmp)
@@ -215,7 +259,20 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
         cmd = [EBAY_SOLD_COMPS_BIN, "--batch", in_path, "--out", out_path, "--quiet"]
         if force:
             cmd.append("--force")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # BUI-184: bound the child so a hung ebay-sold-comps can't hang comic-fmv
+        # forever. Scale with batch size (each book may run up to 3 SerpApi
+        # queries at a 15s HTTP timeout, fanned out across a thread pool).
+        timeout = _SUBPROCESS_TIMEOUT_BASE + _SUBPROCESS_TIMEOUT_PER_BOOK * len(books)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=timeout)
+        except subprocess.TimeoutExpired:
+            click.echo(
+                f"Error: {EBAY_SOLD_COMPS_BIN} timed out after {timeout}s on "
+                f"{len(books)} book(s).",
+                err=True,
+            )
+            sys.exit(1)
         if result.returncode != 0:
             click.echo(
                 f"Error: {EBAY_SOLD_COMPS_BIN} failed (exit {result.returncode}):\n"
@@ -223,7 +280,30 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
                 err=True,
             )
             sys.exit(1)
-        return json.loads(Path(out_path).read_text())
+        # BUI-184: a returncode-0 child can still leave an empty/partial out file
+        # (killed between create and write, disk-full). Guard the read+parse and
+        # fail loud rather than crash with an opaque JSONDecodeError mid-batch.
+        try:
+            raw = Path(out_path).read_text()
+        except OSError as e:
+            click.echo(f"Error: could not read {EBAY_SOLD_COMPS_BIN} output: {e}",
+                       err=True)
+            sys.exit(1)
+        if not raw.strip():
+            click.echo(
+                f"Error: {EBAY_SOLD_COMPS_BIN} exited 0 but wrote no output "
+                "(empty results file).",
+                err=True,
+            )
+            sys.exit(1)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            click.echo(
+                f"Error: {EBAY_SOLD_COMPS_BIN} produced unparseable output: {e}",
+                err=True,
+            )
+            sys.exit(1)
     finally:
         for p in (in_path, out_path):
             try:
@@ -239,6 +319,9 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
                             grade_window: float | None = None) -> dict:
     """Run FMV math + DB upsert for a single book. Returns the assembled result."""
     inp = result.get("input") or {}
+    # _req_id is an internal correlation key (BUI-174/187); drop it before it can
+    # leak into the upsert body or the emitted result.
+    inp.pop("_req_id", None)
     overrides = {k: v for k, v in original_book.items()
                  if k not in ("_idx",) and v is not None}
     # Don't let a wish-list string grade clobber a numeric grade resolved by
@@ -414,6 +497,27 @@ def _input_summary(book: dict) -> dict:
             if book.get(k) is not None}
 
 
+_WINDOW_RE = re.compile(r"window=±\s*([0-9.]+)")
+
+
+def _window_from_notes(notes: str | None) -> float | None:
+    """Recover the grade window the FMV was built at from persisted fmv_notes.
+
+    `_build_notes` writes `window=±{w}` into fmv_notes, so the cached path can
+    re-apply the wide-window confidence cap (BUI-182) without trusting the stored
+    label alone. Returns None when notes are absent or unparseable.
+    """
+    if not notes:
+        return None
+    m = _WINDOW_RE.search(notes)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
 def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     """Project a gixen-overlay `comics` row back into the fmv dict shape.
 
@@ -425,10 +529,21 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     """
     fmv_high = row.get("fmv_high")
     fmv_conf = (row.get("fmv_confidence") or "low").upper()
+    # BUI-182: re-apply the wide-grade-window confidence cap on reuse. A pool
+    # built past WIDE_GRADE_WINDOW can't claim HIGH/MEDIUM-HIGH (fmv_math R7).
+    # The fresh path caps the label before it's stored, but a row written by
+    # older code (or an external writer) may carry an un-capped confidence; the
+    # cached path used to trust the stored label alone, so reuse could bid above
+    # what a fresh recompute would allow. Recover the persisted window from
+    # fmv_notes and cap to MEDIUM before deriving the bid factor.
+    window = _window_from_notes(row.get("fmv_notes"))
+    if (window is not None and window > fmv_math.WIDE_GRADE_WINDOW
+            and fmv_math._rank(fmv_conf) > fmv_math._CONF_RANK["MEDIUM"]):
+        fmv_conf = "MEDIUM"
     factor = fmv_math.bid_factor(fmv_conf, grade_confidence)
     return {
         "n": row.get("fmv_comps") or 0,
-        "window": None,
+        "window": window,
         # BUI-86: shape parity with compute_fmv output. Flagged books are never
         # cache hits (_db_lookup filters null fmv_low), so a cached row is always
         # a priced book — flag_reason stays None — but the keys must exist for
@@ -438,7 +553,10 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "fmv_low": row.get("fmv_low"),
         "fmv_high": fmv_high,
         "median": None,
-        "max_bid": fmv_math.clean_round(fmv_high * factor) if fmv_high else None,
+        # BUI-182: `is not None`, not a falsy check — a legitimate fmv_high of 0
+        # must round to a 0 max_bid, not be nulled out.
+        "max_bid": (fmv_math.clean_round(fmv_high * factor)
+                    if fmv_high is not None else None),
         "cv": None,
         "cv_pct": "n/a",
         "confidence": fmv_conf,

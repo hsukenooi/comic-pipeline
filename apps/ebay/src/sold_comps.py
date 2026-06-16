@@ -36,6 +36,10 @@ DEFAULT_MAX_WORKERS = 10
 THIN_RESULTS_THRESHOLD = 5     # auto-broaden (drop year) if base returns fewer
 GRADE_TAGGED_THRESHOLD = 10    # add grade-targeted query if base returns fewer
 
+# Retry policy for transient SerpApi failures (Timeout, ConnectionError, 429/5xx)
+FETCH_MAX_RETRIES = 3
+FETCH_BACKOFF_BASE = 2  # seconds: sleep(FETCH_BACKOFF_BASE ** attempt)
+
 
 # ─── SERPAPI_KEY loader ──────────────────────────────────────────────────────
 
@@ -152,8 +156,26 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
         if cached is not None:
             return cached, True
 
-    resp = requests.get(request_url(canonical, api_key), timeout=SERPAPI_TIMEOUT_SEC)
-    resp.raise_for_status()
+    last_exc: Exception | None = None
+    for attempt in range(FETCH_MAX_RETRIES):
+        try:
+            resp = requests.get(request_url(canonical, api_key), timeout=SERPAPI_TIMEOUT_SEC)
+            resp.raise_for_status()
+            break  # success — exit retry loop
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status is not None and (status == 429 or status >= 500):
+                last_exc = exc
+            else:
+                raise  # non-retryable 4xx — propagate immediately
+        if attempt < FETCH_MAX_RETRIES - 1:
+            time.sleep(FETCH_BACKOFF_BASE ** attempt)
+    else:
+        # All attempts exhausted — re-raise the last transient exception
+        raise last_exc  # type: ignore[misc]
+
     data = resp.json()
 
     if "error" in data:
@@ -204,7 +226,26 @@ def hard_exclude(title: str) -> bool:
 
 # Fixed numeric regex: covers the full CGC scale including 9.2/9.4/9.6/9.9.
 # The previous form `\b([0-9]\.[058])\b` silently dropped those.
-_NUMERIC_GRADE_RE = re.compile(r'\b([0-9]\.[02-9])\b')
+#
+# BUI-183: exclude price/measurement context.
+#   Negative lookbehinds (fixed-width):
+#     (?<!\$)  — reject when preceded by a dollar sign (price: $9.5)
+#     (?<!x )(?<!X )  — reject when preceded by "x " (second number in a
+#                       dimension pair: 2.5 x 3.5); requires exactly one space
+#                       so "X-Men" (hyphen, not space) is unaffected.
+#   Negative lookahead:
+#     (?!\s*(?:in(?:ch(?:es?)?)?\b|cm\b|mm\b|lbs?\b|oz\b|x\b|ship(?:ping)?\b|["']))
+#     — reject when the number is immediately followed (past optional whitespace)
+#       by a measurement or shipping unit.  `x\b` catches the first number in a
+#       dimension pair ("2.5 x"); word boundary on each unit prevents false
+#       matches inside longer words.
+_NUMERIC_GRADE_RE = re.compile(
+    r'(?<!\$)(?<!x )(?<!X )'
+    r'\b([0-9]\.[02-9])'
+    r'(?!\w)'  # restore the original trailing boundary: a digit/letter immediately
+               # after (e.g. "9.50", "5.50 dollars") is a price/number, not a grade
+    r'(?!\s*(?:in(?:ch(?:es?)?)?\b|cm\b|mm\b|lbs?\b|oz\b|x\b|ship(?:ping)?\b|["\']))'
+)
 
 # Letter combos — most specific first. Order matters: slash-combos (e.g.
 # VF/NM) must be checked before their single-letter components (NM), since
@@ -322,7 +363,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     def _run(tier: str, nkw: str) -> int:
         try:
             data, cache_hit = fetch(nkw, api_key, force=force, ttl_sec=ttl_sec)
-        except SerpApiError as e:
+        except (SerpApiError, requests.RequestException) as e:
             queries_used.append({"tier": tier, "nkw": nkw, "error": str(e)})
             return 0
         added = 0
@@ -368,15 +409,23 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                                     grade_label=label)
             _run("grade-targeted", grade_nkw)
 
+    out_input = {
+        "item_id": self_id or None,
+        "title": title,
+        "issue": issue,
+        "year": year,
+        "publisher": publisher,
+        "grade": target_grade,
+    }
+    # BUI-174/187: echo back the caller's correlation id (when present) so a
+    # batch driver can map results to inputs by identity, not list position.
+    # A bare item_id is not reliable (may be absent or shared), so the id is a
+    # dedicated field threaded by the caller; standalone callers omit it.
+    req_id = book.get("_req_id")
+    if req_id is not None:
+        out_input["_req_id"] = req_id
     return {
-        "input": {
-            "item_id": self_id or None,
-            "title": title,
-            "issue": issue,
-            "year": year,
-            "publisher": publisher,
-            "grade": target_grade,
-        },
+        "input": out_input,
         "queries_used": queries_used,
         "comps": comps,
     }

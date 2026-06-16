@@ -109,24 +109,48 @@ def get_token(client_id, client_secret, base_url):
         except (json.JSONDecodeError, KeyError):
             pass  # Treat corrupted cache as a cache miss
 
-    # Request new token
+    # Request new token — bounded retry loop mirrors the pattern in fetch_item().
+    # 429 (rate-limited) and 5xx (transient server errors) are retried with
+    # exponential backoff. Non-retryable 4xx errors (e.g. 401 bad credentials)
+    # exit immediately. BUI-184: a one-shot sys.exit on the first non-200 killed
+    # the whole run on a transient auth hiccup.
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-    resp = requests.post(
-        f"{base_url}/identity/v1/oauth2/token",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Authorization": f"Basic {credentials}",
-        },
-        data={
-            "grant_type": "client_credentials",
-            "scope": "https://api.ebay.com/oauth/api_scope",
-        },
-        timeout=10,
-    )
+    retries = 3
+    for attempt in range(retries):
+        resp = requests.post(
+            f"{base_url}/identity/v1/oauth2/token",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {credentials}",
+            },
+            data={
+                "grant_type": "client_credentials",
+                "scope": "https://api.ebay.com/oauth/api_scope",
+            },
+            timeout=10,
+        )
 
-    if resp.status_code != 200:
-        print(f"Error: Authentication failed ({resp.status_code})", file=sys.stderr)
-        sys.exit(1)
+        if resp.status_code == 200:
+            break
+        elif resp.status_code == 429 or resp.status_code >= 500:
+            # Transient — back off and retry if budget remains.
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(
+                    f"Token request failed ({resp.status_code}), retrying in {wait}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+            else:
+                print(
+                    f"Error: Authentication failed ({resp.status_code}) after {retries} attempts",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        else:
+            # Non-retryable 4xx (bad credentials, etc.) — exit immediately.
+            print(f"Error: Authentication failed ({resp.status_code})", file=sys.stderr)
+            sys.exit(1)
 
     token_data = resp.json()
     access_token = token_data["access_token"]
@@ -456,7 +480,10 @@ def parse_item_summary(item):
     m = re.search(r"\|(\d+)\|", item_id_raw)
     item_id = m.group(1) if m else item_id_raw
 
-    title = item.get("title", "")
+    # BUI-184: use `or ""` rather than `.get("title", "")` so that an explicit
+    # null value in the API response ("title": null) is coerced to an empty
+    # string at the source — preventing AttributeError on .lower() downstream.
+    title = item.get("title") or ""
     buying_options = item.get("buyingOptions", [])
 
     if "AUCTION" in buying_options:

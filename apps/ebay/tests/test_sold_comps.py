@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import requests
 
 import sold_comps as sc
 
@@ -54,6 +55,45 @@ class TestParseGrade:
         assert sc.parse_grade("VF/NM 9.0 bright") == 9.0
         # The numeric 9.0 wins, but if it weren't there, VF/NM would still give 9.0
         assert sc.parse_grade("VF/NM bright") == 9.0
+
+    # ── BUI-183: price/measurement context must NOT be mis-read as a grade ──
+
+    @pytest.mark.parametrize("title", [
+        # Price context ($ prefix)
+        "$9.5 shipping",
+        "price $9.5",
+        # Measurement units following the number
+        "lot 3.5 inches",
+        "lot 3.5 inch",
+        "ships 9.5 oz",
+        "size 2.5 cm",
+        "3.5 mm wide",
+        "2.5 lbs weight",
+        "3.5 lb box",
+        "9.5 in long",
+        # Dimension separator (x)
+        "ruler 2.5 x 3.5",
+        "2.5 x 3.5 size",
+        # X.X0 price-like forms: a trailing digit means it's a number, not a
+        # one-decimal grade (the restored trailing boundary, BUI-183).
+        "comic 5.50 dollars",
+        "lot of 9.50 value",
+    ])
+    def test_price_measurement_context_excluded(self, title):
+        """Numbers in price or measurement context must never be parsed as a grade."""
+        assert sc.parse_grade(title) is None
+
+    @pytest.mark.parametrize("title,expected", [
+        # Bare numeric grades with trailing non-unit words must still parse
+        ("ASM #300 9.8", 9.8),
+        ("X-Men #1 6.0 nice", 6.0),
+        # Titles starting with X- must not be blocked by the dimension-x lookbehind
+        ("X-Men #1 9.8", 9.8),
+        ("X-Factor #6 9.4", 9.4),
+    ])
+    def test_bare_numeric_grades_survive(self, title, expected):
+        """Bare numeric grades with non-unit trailing words must still be detected."""
+        assert sc.parse_grade(title) == expected
 
 
 # ─── Hard excludes ────────────────────────────────────────────────────────────
@@ -365,6 +405,24 @@ class TestTieredStrategy:
                                   "key")
         assert len([c for c in out["comps"] if c["product_id"] == "dup"]) == 1
 
+    def test_echoes_req_id_when_present(self, tmp_path, monkeypatch):
+        """BUI-174/187: a caller-threaded correlation id round-trips in the echoed
+        input so a batch driver can map results by identity, not list position."""
+        self._wire(tmp_path, monkeypatch, [[self._comp("1")]])
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5, "_req_id": 7},
+            "key",
+        )
+        assert out["input"]["_req_id"] == 7
+
+    def test_omits_req_id_when_absent(self, tmp_path, monkeypatch):
+        """A standalone caller (no _req_id) gets a clean input echo, no null key."""
+        self._wire(tmp_path, monkeypatch, [[self._comp("1")]])
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
+        )
+        assert "_req_id" not in out["input"]
+
 
 # ─── End-to-end-ish: batch driver ────────────────────────────────────────────
 
@@ -401,3 +459,132 @@ class TestBatch:
         results = sc.run_batch(books, "key")
         assert len(results) == 1
         assert "error" in results[0]
+
+
+# ─── Retry / transient-error tests ───────────────────────────────────────────
+
+class TestFetchRetry:
+    """Tests for the bounded retry/backoff added to fetch() for transient errors."""
+
+    def _mock_response(self, organic_results=None, ebay_url=None, status_code=200):
+        """Build a mock requests.Response for a successful (2xx) reply."""
+        m = MagicMock()
+        body = {
+            "organic_results": organic_results or [],
+            "search_metadata": {"ebay_url": ebay_url or "https://www.ebay.com/?LH_Sold=1"},
+        }
+        m.json = MagicMock(return_value=body)
+        if status_code == 200:
+            m.raise_for_status = MagicMock()  # no-op
+        else:
+            http_err = requests.HTTPError(response=MagicMock(status_code=status_code))
+            m.raise_for_status = MagicMock(side_effect=http_err)
+        m.status_code = status_code
+        return m
+
+    def test_retry_then_succeed_timeout(self, tmp_path, monkeypatch):
+        """fetch() retries on Timeout and returns data when the second call succeeds."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        good_response = self._mock_response(
+            ebay_url="https://www.ebay.com/?LH_Sold=1",
+            organic_results=[{"product_id": "42"}],
+        )
+        call_count = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise requests.Timeout("timed out")
+            return good_response
+
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            data, cache_hit = sc.fetch("test", "key")
+
+        assert cache_hit is False
+        assert data["organic_results"] == [{"product_id": "42"}]
+        assert call_count["n"] == 2  # failed once, then succeeded
+
+    def test_retry_then_succeed_503(self, tmp_path, monkeypatch):
+        """fetch() retries on a 503 HTTPError and returns data on the second call."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        good_response = self._mock_response(
+            ebay_url="https://www.ebay.com/?LH_Sold=1",
+            organic_results=[{"product_id": "7"}],
+        )
+        call_count = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                bad = MagicMock()
+                bad.status_code = 503
+                err = requests.HTTPError(response=bad)
+                bad.raise_for_status = MagicMock(side_effect=err)
+                bad.json = MagicMock(return_value={})
+                # raise_for_status is called by fetch() on the response
+                bad.raise_for_status.side_effect = err
+                # Return the bad mock so fetch calls raise_for_status on it
+                return bad
+            return good_response
+
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            data, cache_hit = sc.fetch("test", "key")
+
+        assert data["organic_results"] == [{"product_id": "7"}]
+        assert call_count["n"] == 2
+
+    def test_exhausted_transient_error_reraises(self, tmp_path, monkeypatch):
+        """fetch() re-raises after exhausting all retries."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        with patch("sold_comps.requests.get",
+                   side_effect=requests.ConnectionError("no route to host")):
+            with pytest.raises(requests.ConnectionError):
+                sc.fetch("test", "key")
+
+    def test_non_retryable_4xx_not_retried(self, tmp_path, monkeypatch):
+        """A 404 is NOT retried — requests.get is called exactly once."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        bad = MagicMock()
+        bad.status_code = 404
+        http_err = requests.HTTPError(response=bad)
+        bad.raise_for_status = MagicMock(side_effect=http_err)
+        bad.json = MagicMock(return_value={})
+
+        with patch("sold_comps.requests.get", return_value=bad) as mock_get:
+            with pytest.raises(requests.HTTPError):
+                sc.fetch("test", "key")
+            assert mock_get.call_count == 1
+
+    def test_run_records_connection_error_not_crash(self, tmp_path, monkeypatch):
+        """_run in fetch_book_comps records a RequestException as a query error,
+        not as a top-level crash. comps remains empty and no exception propagates."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0):
+            raise requests.ConnectionError("refused")
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5},
+            "key",
+        )
+
+        # No exception propagated; comps empty
+        assert out["comps"] == []
+        # At least the base query recorded the error
+        assert len(out["queries_used"]) >= 1
+        errors = [q for q in out["queries_used"] if "error" in q]
+        assert len(errors) >= 1
+        assert "refused" in errors[0]["error"]
+
+
