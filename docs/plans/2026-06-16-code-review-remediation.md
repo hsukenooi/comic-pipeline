@@ -44,6 +44,10 @@ gap.
 - **Follow the `linear-method` skill** for all Linear state changes (§5). Move an
   issue to **In Progress** the moment you start it; add a closing comment and set
   **Done** only after its PR merges.
+- **Model routing (hybrid) — see §7.** Run *this* driving session on **Opus**. It
+  implements the Opus-tier branches itself (judgment / behavior-preserving /
+  interactive) and **delegates Sonnet/Haiku-tier branches to subagents** with the
+  model pinned. Every branch in §3 carries a **Model:** line.
 - **Commit message format:** Conventional Commits, reference the issue, and end
   with the trailer:
   ```
@@ -92,6 +96,7 @@ box is ticked.
 #### Branch 1 — `fix/locg-matcher`  *(highest value: stops duplicate buys)*
 Issues: **BUI-175, BUI-176** + BUI-184 matcher items.
 Files: `packages/locg-cli/src/locg/commands.py`; tests in `packages/locg-cli/tests/`.
+Model: **Sonnet** (delegate) — but **escalate BUI-176 to Opus** (variant-matching semantics need judgment); the driver can do BUI-176 itself or spawn an Opus subagent for it.
 Commits:
 1. `fix(locg): match decimal/point issue numbers like #1.MU (BUI-175)` — widen
    `_ISSUE_TOKEN_RE`, align comparison; add matcher test.
@@ -106,6 +111,7 @@ Commits:
 Issues: **BUI-174, BUI-187, BUI-182, BUI-179** + BUI-184 fmv items.
 Files: `apps/fmv/src/fmv_runner.py`, `apps/fmv/src/fmv_math.py`,
 `apps/ebay/src/sold_comps.py` (id echo only); tests in `apps/fmv/tests/`.
+Model: **Opus — keep on the driver** (cross-process contract + the subtle wide-window confidence caps).
 > BUI-187 (id-keyed subprocess mapping) **is** the systemic fix for BUI-174 — do
 > them as one change and close both.
 Commits:
@@ -123,6 +129,7 @@ Commits:
 Issues: **BUI-177, BUI-183** + BUI-184 ebay items.
 Files: `apps/ebay/src/sold_comps.py`, `apps/ebay/src/ebay_fetch.py`,
 `apps/ebay/src/seller_scan.py`; tests in `apps/ebay/tests/`.
+Model: **Sonnet** (delegate) — well-specified.
 > Do **after** Branch 2 (both touch `sold_comps.py`); pull `main` first.
 Commits:
 1. `fix(ebay): catch transient SerpApi errors + retry/backoff (BUI-177)` —
@@ -137,6 +144,7 @@ Commits:
 Issues: **BUI-178** + BUI-184 gixen items.
 Files: `packages/gixen-cli/server/db.py`, `packages/gixen-cli/server/main.py`,
 `packages/gixen-cli/cli.py`; tests in `packages/gixen-cli/tests/`.
+Model: **Sonnet** (delegate) — BUI-178 is clear; the `_calc_diff` removal is **Haiku**-trivial.
 Commits:
 1. `fix(gixen-server): guard mark_bids_purged against live PENDING rows (BUI-178)` —
    add status filter to the UPDATE; add a test that hands it a PENDING+completed
@@ -148,6 +156,7 @@ Commits:
 #### Branch 5 — `fix/ezship`
 Issues: **BUI-180, BUI-181** + BUI-184 ezship items.
 Files: `apps/ezship/src/api.ts` (+ `cli.ts` if needed); tests in `apps/ezship/test/`.
+Model: **Sonnet** (delegate) — well-specified.
 Commits:
 1. `fix(ezship): add idempotency key to order submission (BUI-180)` — dedup by
    `trackingNo`; vitest for the duplicate-submit path.
@@ -160,6 +169,7 @@ Commits:
 Issues: BUI-184 overlay items only.
 Files: `plugins/gixen-overlay/src/gixen_overlay/routes.py`; tests in
 `plugins/gixen-overlay/tests/`.
+Model: **Opus — keep on the driver** (the BUI-184 wish-list `year` item is a design decision that needs the human — do **not** delegate to a non-interactive subagent).
 Commits:
 1. `fix(overlay): return empty wish-list on corrupt cache, not 500 (BUI-184)` —
    `routes.py:958` also catch `json.JSONDecodeError`.
@@ -176,6 +186,7 @@ Commits:
 
 #### Branch 7 — `chore/lint-typecheck-ci`
 Issues: **BUI-185, BUI-188**.
+Model: **Sonnet** (delegate) — broad but mechanical; escalate to Opus only if a ruff rule choice turns contentious.
 Commits (multiple): add `[tool.ruff.lint]` to root + each app/package
 `pyproject.toml` (apps aren't workspace members); fix the surfaced bare-except /
 falsy-zero sites **per subsystem, one commit each**; add the `lint` CI job; add a
@@ -183,6 +194,7 @@ falsy-zero sites **per subsystem, one commit each**; add the `lint` CI job; add 
 on `fmv_runner.py` + overlay `routes.py` to start).
 
 #### Branch 8 — `refactor/fail-loud-http`
+Model: **Opus — keep on the driver** (cross-cutting refactor; must preserve behavior across many callsites).
 Issue: **BUI-186**. Shared `get_json`/`post_json` (timeout + `raise_for_status` +
 raise on `RequestException`, never return `{}`/`None`); refactor callsites
 (`fmv_runner.py:340` `_upsert_fmv`, `seller_scan.py`, `sold_comps.py`,
@@ -191,17 +203,20 @@ wrapper next to `comics_resolve_server`; generalize the BUI-151 anti-`2>/dev/nul
 test. One commit for the helper, one per refactored area.
 
 #### Branch 9 — `refactor/parsing-module`
+Model: **Opus — keep on the driver** (consolidation must not reintroduce the BUI-175/183 bugs).
 Issue: **BUI-189**. Consolidate price/issue/grade parsing into one tested module
 (Hypothesis property tests). **Fold in the BUI-175/BUI-183 fixes** — move that
 logic into the module and keep the existing tests green; do not reintroduce the old
 truncating/over-matching behavior.
 
 #### Branch 10 — `test/golden-fixtures`
+Model: **Opus — keep on the driver** (the historical bugs must be encoded correctly).
 Issue: **BUI-190**. Frozen matcher fixtures (capture GSFF, leading-article Hulks,
 BUI-129 X-Men, plus the BUI-175/176 cases) and FMV-math fixtures (comps→fmv/
 confidence/haircut). Bring the FMV baseline into the repo so CI runs it.
 
 #### Branch 11 — `test/contract-harness`
+Model: **Sonnet** (delegate) — extends an existing pattern.
 Issue: **BUI-191**. Extend `test_skill_contracts.py` with the new seam guards from
 Branches 5/8/2 (skill curl is fail-loud; ezship dedup documented; FMV batch carries
 an id).
@@ -255,3 +270,52 @@ Notes:
 - The overlay import canary and the skill-contract harness still pass.
 - No new silent-failure paths: every network/subprocess call either succeeds or
   raises (R11).
+
+## 7. Model routing (hybrid)
+
+**Run this driving session on Opus.** The driver owns everything that is
+judgment-heavy, interactive, or shared state: planning, reading issues, the Linear
+state transitions (§5), running the package tests, committing, and opening PRs.
+Per ticket it then does one of two things based on the branch's **Model:** line in §3:
+
+- **Opus — keep on the driver:** the driver implements the branch *itself*. Use for
+  cross-process contracts, behavior-preserving refactors, fixture work, and
+  anything that may need to pause and ask the human (e.g. the BUI-184 overlay
+  `year` decision). **Never delegate these** — a subagent can't ask you mid-run.
+- **Sonnet / Haiku (delegate):** the driver spawns a subagent with the model
+  pinned to do the *implementation + tests only*, then reviews the result and does
+  the commit/PR/Linear itself.
+
+### How the driver delegates a ticket
+
+```
+Agent(
+  subagent_type: "general-purpose",
+  model: "sonnet",          # or "haiku" for the trivial ones; enum: opus|sonnet|haiku|fable
+  description: "Implement BUI-XXX",
+  prompt: "<issue body from `linear issue view BUI-XXX`>
+           <the relevant §2 repo facts + the file:line + the commit breakdown for this ticket>
+           Implement the fix AND a regression test that fails on the old code.
+           Run the package's test suite (see §4) and report the result.
+           Return: the diff, the test command + output, and anything you couldn't resolve.
+           Do NOT commit, push, open a PR, or touch Linear — the driver does that."
+)
+```
+
+Then the driver: re-runs the package tests to confirm, makes the commit(s) per the
+branch's breakdown, opens the PR, and updates Linear.
+
+### Rules
+
+- **One model per branch by default** (the §3 **Model:** line). Escalate an
+  individual ticket where noted — e.g. Branch 1 is Sonnet but **BUI-176 → Opus**
+  (the driver either does BUI-176 itself or spawns an Opus subagent for just that
+  ticket, while delegating BUI-175 to Sonnet).
+- **Subagents are stateless and non-interactive.** Hand them full context (issue
+  body + §2 facts + file:line); never rely on them to ask follow-ups or to know
+  prior branches.
+- **Commit / PR / Linear stay on the driver**, always — so history, issue links,
+  and the closing comments are consistent regardless of who wrote the diff.
+- **Tiering rule of thumb:** Opus = cross-process contracts, behavior-preserving
+  refactors, judgment, or human-in-the-loop. Sonnet = well-specified fixes.
+  Haiku = purely mechanical edits (e.g. dead-code removal).
