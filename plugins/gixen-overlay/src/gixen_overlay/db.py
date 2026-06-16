@@ -72,6 +72,16 @@ def create_tables(conn: sqlite3.Connection) -> None:
             first_seen_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    # BUI-121: remember which WON snipes have already been recorded into the
+    # collection, so a second run of /comic:collection-add skips them instead of
+    # re-POSTing everything and relying on the server's already-owned dedup.
+    # Standalone — no FK to bids/comics — same additive pattern as seller_scan_seen.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS collection_wins_seen (
+            item_id        TEXT PRIMARY KEY,
+            first_seen_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS migration_state (
             migration TEXT PRIMARY KEY
@@ -1246,6 +1256,41 @@ def mark_items_seen(
         cur = conn.execute(
             "INSERT OR IGNORE INTO seller_scan_seen (item_id, seller) VALUES (?, ?)",
             (item_id, seller),
+        )
+        inserted += cur.rowcount
+    conn.commit()
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Collection-wins seen-tracking (BUI-121)
+# ---------------------------------------------------------------------------
+
+
+def get_collection_wins_seen(conn: sqlite3.Connection) -> set[str]:
+    """Return the set of item_ids already recorded into the collection.
+
+    Used by /comic:collection-add to skip WON snipes that were processed in a
+    prior run. No seller dimension — every recorded win is globally unique by
+    item_id.
+    """
+    rows = conn.execute("SELECT item_id FROM collection_wins_seen").fetchall()
+    return {r["item_id"] for r in rows}
+
+
+def mark_collection_wins_seen(
+    conn: sqlite3.Connection, item_ids: list[str]
+) -> int:
+    """Record item_ids as processed wins. Returns the number of newly-inserted rows.
+
+    INSERT OR IGNORE preserves the original first_seen_at on a re-mark, so the
+    timestamp reflects when a win was *first* processed.
+    """
+    inserted = 0
+    for item_id in item_ids:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO collection_wins_seen (item_id) VALUES (?)",
+            (item_id,),
         )
         inserted += cur.rowcount
     conn.commit()

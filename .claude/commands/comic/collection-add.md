@@ -43,9 +43,29 @@ Filter to wins:
 
 If no wins, print "No won auctions to add." and stop.
 
+## Step 1b: Fetch already-processed wins (BUI-121)
+
+Fetch the seen set so this run can skip wins already recorded in a prior run.
+Best-effort — a failed call falls back to processing all wins (same pattern as
+seller-scan):
+
+```bash
+SEEN_IDS=$(curl -sf "$GIXEN_SERVER_URL/api/comics/collection/record-win/seen" \
+  | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin)['item_ids']))" \
+  2>/dev/null || echo "")
+```
+
+From the filtered WON snipes in Step 1, exclude any whose `item_id` appears in
+`SEEN_IDS`. Call the remaining wins **new wins**.
+
+If there are no new wins, print:
+> All won auctions already processed. Nothing new to record.
+
+…and stop (skip Steps 2–5 entirely).
+
 ## Step 2: Build the record-win JSON
 
-For each won snipe, build one entry in this format:
+For each **new** won snipe, build one entry in this format:
 
 ```json
 {
@@ -99,9 +119,24 @@ resolution + BUI-34 already-owned dedup). On success it returns:
 }
 ```
 
-`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails, STOP** — do not report success.
+`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails, STOP** — do not report success and do not mark the item IDs seen.
 
 **Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200. Because Step 3 uses `curl -sf`, this halts the skill automatically — never report success on a partial_failure, and surface the `rows_written` so the user knows which wins still need recording.
+
+## Step 3b: Mark new wins seen (BUI-121)
+
+Only after a **successful** record-win POST, mark the new item IDs as processed
+so future runs skip them. Best-effort — a failed mark is non-fatal (the
+already-owned dedup will catch a re-POST):
+
+```bash
+# Build {"item_ids": ["111", "222", ...]} from the item_ids of the new wins
+python3 -c "import json; ids=[w['item_id'] for w in json.load(open('/tmp/wins.json'))['wins']]; print(json.dumps({'item_ids': ids}))" \
+  | curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/collection/record-win/seen" \
+    -H 'content-type: application/json' \
+    -d @- \
+  || echo "Warning: could not mark wins seen (non-fatal)"
+```
 
 ## Step 4: Export to CSV
 
@@ -159,3 +194,4 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Recording wins against an unreachable server | Health-gate first; if the POST fails, STOP and report — don't claim success |
 | Passing LOCG IDs as part of record-win input | `record-win` does not take LOCG IDs; it resolves series via Metron and the server collection |
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
+| Marking wins seen before the POST succeeds | Only mark seen after a successful record-win POST — a failed call means wins weren't recorded |

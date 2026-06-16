@@ -214,6 +214,50 @@ def test_seller_scan_seen_filters_by_seller(api):
 
 
 # ---------------------------------------------------------------------------
+# BUI-121: collection-wins seen-tracking endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_collection_wins_seen_empty_on_fresh_db(api):
+    r = api.get("/api/comics/collection/record-win/seen")
+    assert r.status_code == 200
+    assert r.json() == {"item_ids": []}
+
+
+def test_collection_wins_seen_post_then_get_roundtrips(api):
+    r = api.post(
+        "/api/comics/collection/record-win/seen",
+        json={"item_ids": ["111", "222"]},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"marked": 2}
+    assert api.get("/api/comics/collection/record-win/seen").json() == {
+        "item_ids": ["111", "222"]
+    }
+
+
+def test_collection_wins_seen_post_is_idempotent(api):
+    api.post("/api/comics/collection/record-win/seen", json={"item_ids": ["111"]})
+    # Re-marking an existing id inserts nothing new.
+    r = api.post(
+        "/api/comics/collection/record-win/seen",
+        json={"item_ids": ["111", "333"]},
+    )
+    assert r.json() == {"marked": 1}
+    assert api.get("/api/comics/collection/record-win/seen").json() == {
+        "item_ids": ["111", "333"]
+    }
+
+
+def test_collection_wins_seen_accumulates_across_posts(api):
+    api.post("/api/comics/collection/record-win/seen", json={"item_ids": ["111"]})
+    api.post("/api/comics/collection/record-win/seen", json={"item_ids": ["222"]})
+    assert api.get("/api/comics/collection/record-win/seen").json() == {
+        "item_ids": ["111", "222"]
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /api/comics
 # ---------------------------------------------------------------------------
 
