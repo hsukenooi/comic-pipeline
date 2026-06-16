@@ -1,6 +1,7 @@
 """Comic FastAPI routes for the gixen-overlay plugin."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -955,7 +956,11 @@ async def api_wish_list(title: str | None = None):
     _ensure_collection_store()
     try:
         return cmd_wish_list_from_cache(title)
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
+        # BUI-184: a missing OR corrupt wish-list cache yields an empty list, not
+        # a 500. An empty wish-list is a correct, non-dangerous answer (a miss
+        # only fails to surface a wanted book; it cannot buy a dupe), and a 500
+        # here would break seller-scan entirely on a single bad write.
         return []
 
 

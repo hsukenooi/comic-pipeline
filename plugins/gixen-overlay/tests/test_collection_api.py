@@ -162,6 +162,15 @@ def test_wish_list_empty_when_never_imported(client):
     assert r.json() == []
 
 
+def test_wish_list_empty_on_corrupt_cache(client):
+    """BUI-184: a corrupt wish-list JSON yields an empty list, not a 500 —
+    seller-scan must not break entirely on a single bad write."""
+    (client.store / "wish-list.json").write_text("{ this is not json")
+    r = client.get("/api/comics/wish-list")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
 # --- status / export -------------------------------------------------------
 
 def test_collection_status(client):
