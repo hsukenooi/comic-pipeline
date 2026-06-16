@@ -7,6 +7,10 @@ from typing import Any, Optional
 
 from bs4 import BeautifulSoup, Tag
 
+# BUI-189: price parsing is centralized in locg.parsing (re-exported here so the
+# existing `from locg.parser import extract_price` callers keep working).
+from locg.parsing import extract_price  # noqa: F401
+
 
 def parse_list_response(text: str) -> tuple[int, BeautifulSoup]:
     """Parse a JSON response from /comic/get_comics.
@@ -29,12 +33,6 @@ def extract_id_from_href(href: str) -> Optional[int]:
     """Extract numeric ID from a URL like /comic/9559460/batman-8."""
     m = re.search(r"/(\d+)/", href)
     return int(m.group(1)) if m else None
-
-
-def extract_price(text: str) -> Optional[float]:
-    """Extract price from text like ' · $4.99'."""
-    m = re.search(r"\$(\d+\.?\d*)", text)
-    return float(m.group(1)) if m else None
 
 
 def extract_date_timestamp(tag: Tag) -> Optional[str]:

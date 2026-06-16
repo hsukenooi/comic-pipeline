@@ -38,7 +38,7 @@ Source = "https://github.com/hsukenooi/locg-cli"
 "Issue Tracker" = "https://github.com/hsukenooi/locg-cli/issues"
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "hypothesis"]
 
 [project.scripts]
 locg = "locg.cli:main"

@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +245,7 @@ def _migrate_fmv_split(conn: sqlite3.Connection) -> None:
                  row["fmv_comps"], row["fmv_confidence"], row["fmv_notes"],
                  now if row["fmv_low"] is not None else None),
             )
-            fmv_lookup[key] = cur.lastrowid
+            fmv_lookup[key] = cur.lastrowid  # type: ignore[assignment]  # INSERT always yields int lastrowid
             fmv_inserted += 1
         else:
             fmv_id = existing["id"]
@@ -764,7 +765,7 @@ def upsert_comic(
             (title, issue, year, variant, locg_id, locg_variant_id),
         )
         conn.commit()
-        return cur.lastrowid
+        return cur.lastrowid  # type: ignore[return-value]  # INSERT always yields int lastrowid
 
     # Yearless insert. Prefer an existing yeared row if one exists — never
     # create a yearless duplicate next to a yeared canonical row.
@@ -808,7 +809,7 @@ def upsert_comic(
         (title, issue, variant, locg_id, locg_variant_id),
     )
     conn.commit()
-    return cur.lastrowid
+    return cur.lastrowid  # type: ignore[return-value]  # INSERT always yields int lastrowid
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1097,8 @@ def list_comics(
         is within the last N days. Stale rows are excluded so callers can't
         accidentally reuse outdated FMVs.
     """
-    clauses, params = [], []
+    clauses: list[str] = []
+    params: list[Any] = []
     if title is not None:
         clauses.append("LOWER(c.title) = LOWER(?)")
         params.append(title)

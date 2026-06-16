@@ -125,7 +125,7 @@ class LOCGClient:
         logger.debug("Attempting auto-login from LOCG_USERNAME/LOCG_PASSWORD")
         try:
             ok = self.login(username, password)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # auto-login best-effort; network/credential errors → False
             logger.warning("Auto-login failed: %s", e)
             return False
         if ok:

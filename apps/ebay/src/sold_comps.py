@@ -90,7 +90,7 @@ def _cache_get(path: Path, ttl_sec: int) -> dict | None:
         return None
     try:
         return json.loads(path.read_text())
-    except Exception:
+    except Exception:  # noqa: BLE001  # cache read — corrupt/partial file, return None
         return None
 
 
@@ -465,7 +465,7 @@ def run_batch(books: list[dict], api_key: str, *, force: bool = False,
             i = futures[fut]
             try:
                 results[i] = fut.result()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # batch boundary — capture per-book errors, continue
                 book = books[i]
                 results[i] = {
                     "input": book,

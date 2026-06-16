@@ -21,6 +21,7 @@ from locg.collection_cache import CollectionCache, _normalize_series_key
 from locg.config import wish_list_cache_path
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
+from locg.parsing import normalize_issue_key, split_full_title as _split_full_title
 
 logger = logging.getLogger("locg")
 
@@ -69,7 +70,7 @@ def _validate_price(value: str) -> str:
     try:
         f = float(value)
     except (ValueError, TypeError):
-        raise ValueError(f"Invalid price {value!r}: must be numeric")
+        raise ValueError(f"Invalid price {value!r}: must be numeric") from None
     if not math.isfinite(f):
         raise ValueError(f"Invalid price {value!r}: must be a finite number")
     if f < 0:
@@ -1394,7 +1395,7 @@ def cmd_lookup(
                 entry = extract_comic_lists(detail_soup)
                 lists = entry.get("lists") or {}
                 row["in_collection"] = bool(lists.get("collection", False))
-            except Exception:
+            except Exception:  # noqa: BLE001  # best-effort collection membership fetch; failure → assume False
                 row["in_collection"] = False
         else:
             # Fresh result: membership already parsed from search response.
@@ -1610,24 +1611,9 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
     return result
 
 
-_ISSUE_TOKEN_RE = re.compile(r"#\s*(\d+(?:\.[A-Za-z0-9]+)?[A-Za-z]*)")
-
-
-def _split_full_title(full_title: str) -> tuple[str, Optional[str]]:
-    """Split a cached ``full_title`` into ``(series_portion, issue_token)``.
-
-    ``"Thor #154"``                -> ``("Thor", "154")``
-    ``"Fantastic Four Annual #6"`` -> ``("Fantastic Four Annual", "6")``
-    ``"Watchmen"`` (no ``#N``)     -> ``("Watchmen", None)``
-
-    The series portion is everything before the ``#N`` token, so qualifier words
-    like ``Annual`` / ``King-Size Annual`` stay attached to the series identity
-    instead of being silently collapsed into the base series (BUI-26).
-    """
-    m = _ISSUE_TOKEN_RE.search(full_title)
-    if m:
-        return full_title[: m.start()].strip(), m.group(1)
-    return full_title.strip(), None
+# BUI-189: _split_full_title (the matcher's series/issue split) is the canonical
+# issue-token parser in locg.parsing, imported as _split_full_title above. Kept
+# here only as a reference to where it lives.
 
 
 # Cover/masthead title (normalized) -> LOCG catalog base series (normalized),
@@ -1906,10 +1892,8 @@ def cmd_collection_record_win(
     # therefore collapse "...Annual #N" into base "#N" and false-skip a genuine
     # base win — a skipped win later reads as owned and triggers a duplicate buy.
     # The prefix basis errs toward recording (never hiding ownership) — the safe
-    # direction — so we intentionally do NOT broaden the key here.
-    def _issue_key(token: str) -> str:
-        return (token.strip().lstrip("0") or token.strip()).lower()
-
+    # direction — so we intentionally do NOT broaden the key here. The token key
+    # is normalize_issue_key from locg.parsing (BUI-189, shared with the probe).
     owned_index: set[tuple[str, str]] = set()
     for r in payload.get("comics", []):
         if not r.get("in_collection"):
@@ -1917,7 +1901,7 @@ def cmd_collection_record_win(
         prefix, token = _split_full_title(r.get("full_title") or "")
         if token is None:
             continue
-        owned_index.add((_normalize_series_key(prefix), _issue_key(token)))
+        owned_index.add((_normalize_series_key(prefix), normalize_issue_key(token)))
 
     rows_written = 0
     chunks_committed = 0
@@ -1995,7 +1979,7 @@ def cmd_collection_record_win(
             # (variant Spawn back-issues already owned).
             if issue_num and (
                 _normalize_series_key(canonical_series),
-                _issue_key(issue_num),
+                normalize_issue_key(issue_num),
             ) in owned_index:
                 skipped_already_owned += 1
                 skipped_already_owned_titles.append(f"{canonical_series} #{issue_num}")
@@ -2106,7 +2090,7 @@ def cmd_collection_record_win(
             metron_lookups_succeeded += chunk_metron_succeeded
             metron_variant_lookups_attempted += chunk_variant_detail_attempted
             metron_variant_matches += chunk_variant_matches
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # batch import — log chunk failure, continue remaining chunks
             logger.error("Chunk commit failed: %s", exc)
             partial_failure = True
 

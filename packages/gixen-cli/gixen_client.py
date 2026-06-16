@@ -80,7 +80,7 @@ class _CurlSession:
                 timeout=timeout + 10,
             )
         except subprocess.TimeoutExpired:
-            raise requests.ReadTimeout(f"curl timed out for {url}")
+            raise requests.ReadTimeout(f"curl timed out for {url}") from None
 
         # A non-zero curl exit is a transport-level failure (DNS, connect, TLS,
         # timeout) — stdout is typically empty. Parsing it would yield a
@@ -850,7 +850,7 @@ class GixenClient:
                 try:
                     Decimal(snipe["max_bid"])
                 except InvalidOperation:
-                    raise GixenParseError(f"Non-numeric max bid: {snipe['max_bid']}")
+                    raise GixenParseError(f"Non-numeric max bid: {snipe['max_bid']}") from None
 
             snipes.append(snipe)
 

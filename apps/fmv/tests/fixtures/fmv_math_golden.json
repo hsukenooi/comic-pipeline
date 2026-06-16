@@ -1,0 +1,110 @@
+{
+  "bracketed_priced": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM-HIGH",
+    "flag_reason": null,
+    "fmv_high": 130,
+    "fmv_low": 110,
+    "grade_span": 1.0,
+    "max_bid": 100,
+    "median": 120,
+    "n": 5,
+    "window": 0.5
+  },
+  "grade_haircut_low_confidence": {
+    "bid_factor": 0.6,
+    "confidence": "HIGH",
+    "flag_reason": null,
+    "fmv_high": 130,
+    "fmv_low": 110,
+    "grade_span": 0.0,
+    "max_bid": 80,
+    "median": 120,
+    "n": 8,
+    "window": 0.5
+  },
+  "narrow_high": {
+    "bid_factor": 0.8,
+    "confidence": "HIGH",
+    "flag_reason": null,
+    "fmv_high": 130,
+    "fmv_low": 110,
+    "grade_span": 0.0,
+    "max_bid": 100,
+    "median": 120,
+    "n": 9,
+    "window": 0.5
+  },
+  "one_sided_flag": {
+    "bid_factor": 0.8,
+    "confidence": "LOW",
+    "flag_reason": "one_sided",
+    "fmv_high": null,
+    "fmv_low": null,
+    "grade_span": 0.0,
+    "max_bid": null,
+    "median": null,
+    "n": 5,
+    "window": 1.0
+  },
+  "too_sparse_single_comp": {
+    "bid_factor": 0.8,
+    "confidence": "LOW",
+    "flag_reason": "too_sparse",
+    "fmv_high": null,
+    "fmv_low": null,
+    "grade_span": 0.0,
+    "max_bid": null,
+    "median": null,
+    "n": 1,
+    "window": 2.0
+  },
+  "too_wide_flag": {
+    "bid_factor": 0.8,
+    "confidence": "LOW",
+    "flag_reason": "too_wide",
+    "fmv_high": null,
+    "fmv_low": null,
+    "grade_span": 4.0,
+    "max_bid": null,
+    "median": null,
+    "n": 3,
+    "window": 2.0
+  },
+  "two_comp_tight": {
+    "bid_factor": 0.8,
+    "confidence": "LOW",
+    "flag_reason": null,
+    "fmv_high": 50,
+    "fmv_low": 45,
+    "grade_span": 0.0,
+    "max_bid": 40,
+    "median": 50,
+    "n": 2,
+    "window": 2.0
+  },
+  "two_comp_wild_outlier": {
+    "bid_factor": 0.8,
+    "confidence": "LOW",
+    "flag_reason": "too_sparse",
+    "fmv_high": null,
+    "fmv_low": null,
+    "grade_span": 0.0,
+    "max_bid": null,
+    "median": null,
+    "n": 2,
+    "window": 2.0
+  },
+  "wide_window_caps_medium": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM",
+    "flag_reason": null,
+    "fmv_high": 130,
+    "fmv_low": 110,
+    "grade_span": 1.5,
+    "max_bid": 100,
+    "median": 120,
+    "n": 9,
+    "window": 1.5
+  }
+}
