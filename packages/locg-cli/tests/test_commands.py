@@ -2002,14 +2002,38 @@ def test_cmd_wish_list_add_rejects_empty_title(tmp_path):
 # cmd_wish_list_add_creator_run (BUI-134)
 # ---------------------------------------------------------------------------
 
+def _mark_collection_imported(tmp_path):
+    """Stamp the isolated collection cache as imported (last_full_import set).
+
+    The R11 guard in cmd_wish_list_add_creator_run refuses to write when the
+    collection cache was never imported (last_full_import is None). Tests that
+    exercise the *owned-filter* (not the guard itself) must mark the cache as
+    initialized first, mirroring a real `locg collection import`.
+    """
+    from datetime import datetime, timezone
+    from locg.collection_cache import CollectionCache
+    cache = CollectionCache()
+    cache.load()
+
+    def mutate(payload):
+        payload["last_full_import"] = datetime.now(timezone.utc).isoformat()
+
+    cache.apply(mutate, command="seed")
+
+
 def _seed_collection_owned(tmp_path, rows):
-    """Seed the isolated collection cache with owned rows for ownership checks."""
+    """Seed the isolated collection cache with owned rows for ownership checks.
+
+    Also stamps last_full_import so the R11 never-imported guard is satisfied.
+    """
+    from datetime import datetime, timezone
     from locg.collection_cache import CollectionCache
     cache = CollectionCache()
     cache.load()
 
     def mutate(payload):
         payload["comics"].extend(rows)
+        payload["last_full_import"] = datetime.now(timezone.utc).isoformat()
         # Rebuild series_name_index so the matcher's exact key check passes.
         from locg.commands import _normalize_series_key
         for r in rows:
@@ -2088,6 +2112,7 @@ def test_creator_run_surfaces_warnings(tmp_path, monkeypatch):
     """No-credit warnings from the resolver are passed through to the caller."""
     from locg.commands import cmd_wish_list_add_creator_run
 
+    _mark_collection_imported(tmp_path)
     _patch_metron_run(
         monkeypatch,
         creator={"id": 355, "name": "John Romita Jr."},
@@ -2108,6 +2133,7 @@ def test_creator_run_unresolvable_creator_errors(tmp_path, monkeypatch):
     """An ambiguous / unknown creator is a hard error, not a silent guess."""
     from locg.commands import cmd_wish_list_add_creator_run
 
+    _mark_collection_imported(tmp_path)
     _patch_metron_run(monkeypatch, creator=None, run=None)
     result = cmd_wish_list_add_creator_run(
         series="Uncanny X-Men", creator="Romita", series_id=99,
@@ -2120,6 +2146,53 @@ def test_creator_run_requires_creator(tmp_path):
     from locg.commands import cmd_wish_list_add_creator_run
     result = cmd_wish_list_add_creator_run(series="X", creator="  ", series_id=1)
     assert "error" in result
+
+
+def test_creator_run_refuses_when_collection_never_imported(tmp_path, monkeypatch):
+    """R11 / BUI-122 footgun: an uninitialized collection cache must REFUSE the
+    write, not wish-list every issue as a false 'not owned'."""
+    from locg.commands import cmd_wish_list_add_creator_run, wish_list_cache_path
+
+    # Cache never imported (last_full_import is None) — the default empty state.
+    inst = _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "175", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+
+    assert "error" in result
+    assert "never imported" in result["error"]
+    # Refused BEFORE any Metron call or write — nothing wish-listed.
+    inst.resolve_creator.assert_not_called()
+    inst.resolve_creator_run.assert_not_called()
+    assert not wish_list_cache_path().exists()
+
+
+def test_creator_run_empty_role_falls_back_to_penciller(tmp_path, monkeypatch):
+    """An empty --role string falls back to penciller (no silent empty run)."""
+    from locg.commands import cmd_wish_list_add_creator_run
+
+    _mark_collection_imported(tmp_path)
+    inst = _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={"issues": [], "warnings": []},
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99, role="",
+    )
+    assert result["role"] == "penciller"
+    # The resolver was called with the defaulted role, not the empty string.
+    _, kwargs = inst.resolve_creator_run.call_args
+    assert kwargs["role"] == "penciller"
 
 
 # ---------------------------------------------------------------------------

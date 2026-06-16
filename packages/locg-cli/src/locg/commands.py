@@ -709,10 +709,34 @@ def cmd_wish_list_add_creator_run(
 
     series = (series or "").strip()
     creator = (creator or "").strip()
+    role = (role or "penciller").strip().lower() or "penciller"
     if not series:
         return {"error": "wish-list add: series must be non-empty"}
     if not creator:
         return {"error": "wish-list add: --creator must be non-empty"}
+
+    # R11 guard (BUI-122 footgun): the owned filter below treats a `not_in_cache`
+    # verdict as "not owned → safe to wish-list". On an uninitialized collection
+    # cache (`last_full_import` null), `cmd_collection_check` answers `not_in_cache`
+    # for EVERY issue, so the whole run would be wish-listed including books the
+    # user already owns — and a wished owned book gets pushed to LOCG with
+    # `In Collection=0`, deleting the collection row (BUI-122). The MacBook's local
+    # store is uninitialized (the gixen server is the source of truth), so this is
+    # the common case there. Refuse the write rather than silently mis-filter,
+    # mirroring the server endpoint's 409 never-imported guard
+    # (routes.py /api/comics/collection/check, R11).
+    coll_payload = CollectionCache().load()
+    if coll_payload.get("last_full_import") is None:
+        return {
+            "error": (
+                "Collection cache never imported — refusing to wish-list a creator "
+                "run, because every issue would falsely check as 'not owned' (R11) "
+                "and an owned-but-wished book is deleted from the collection on the "
+                "next sync (BUI-122). Run `locg collection import <export.xlsx>` "
+                "first, or point the store at the gixen server (LOCG_DATA_DIR), "
+                "then retry."
+            )
+        }
 
     metron = MetronClient()
 
@@ -788,7 +812,7 @@ def cmd_wish_list_add_creator_run(
         "series": series,
         "creator": resolved["name"],
         "creator_id": resolved["id"],
-        "role": (role or "penciller").strip().lower(),
+        "role": role,
         "series_id": series_id,
         "run_issue_count": len(run_issues),
         "added": added,
