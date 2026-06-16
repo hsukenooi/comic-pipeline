@@ -459,17 +459,26 @@ async def _sync_loop() -> None:
 def _parse_time_to_end(s: str) -> timedelta | None:
     """Parse Gixen relative time string like '1 d, 20 h, 59 m' into a timedelta."""
     total = 0
+    matched = False
     for part in s.split(","):
         part = part.strip()
         if m := re.match(r"(\d+)\s*d", part):
             total += int(m.group(1)) * 86400
+            matched = True
         elif m := re.match(r"(\d+)\s*h", part):
             total += int(m.group(1)) * 3600
+            matched = True
         elif m := re.match(r"(\d+)\s*m", part):
             total += int(m.group(1)) * 60
+            matched = True
         elif m := re.match(r"(\d+)\s*s", part):
             total += int(m.group(1))
-    return timedelta(seconds=total) if total else None
+            matched = True
+    # BUI-184: gate on "did any part parse", not "is total truthy". A snipe seen
+    # at exactly "0 s" parses to 0 seconds (auction about to end) and must yield
+    # timedelta(0) so auction_end_at is set and the local sniper fires it — only a
+    # genuinely unparseable/empty string returns None.
+    return timedelta(seconds=total) if matched else None
 
 
 SNIPER_INTERVAL = 10  # check every 10 seconds

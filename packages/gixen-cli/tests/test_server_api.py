@@ -1095,3 +1095,33 @@ def test_remove_bid_stale_dbidid_falls_back(api):
     assert calls[0].kwargs.get("dbidid") == "stale"
     assert calls[1].kwargs.get("dbidid") is None
     assert _read_dbidid("820000002") is None
+
+
+# ─── _parse_time_to_end (BUI-184) ─────────────────────────────────────────────
+
+def test_parse_time_to_end_zero_seconds_is_timedelta_not_none():
+    """A snipe seen at exactly '0 s' parses to timedelta(0) so auction_end_at is
+    set and the local sniper fires it — not None (BUI-184)."""
+    import server.main as m
+    from datetime import timedelta
+
+    assert m._parse_time_to_end("0 s") == timedelta(seconds=0)
+    assert m._parse_time_to_end("0 m, 0 s") == timedelta(seconds=0)
+
+
+def test_parse_time_to_end_unparseable_is_none():
+    """A genuinely empty/unparseable string still returns None."""
+    import server.main as m
+
+    assert m._parse_time_to_end("") is None
+    assert m._parse_time_to_end("ENDED") is None
+    assert m._parse_time_to_end("garbage") is None
+
+
+def test_parse_time_to_end_normal_values():
+    import server.main as m
+    from datetime import timedelta
+
+    assert m._parse_time_to_end("1 d, 20 h, 59 m") == timedelta(
+        days=1, hours=20, minutes=59)
+    assert m._parse_time_to_end("45 s") == timedelta(seconds=45)
