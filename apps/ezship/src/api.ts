@@ -1,6 +1,11 @@
 import type { Config, ApiResponse, SubmitNewOrderRequest } from "./types.js";
 import { mapWarehouse } from "./types.js";
 import { getHeaders } from "./auth.js";
+import {
+  LEDGER_PATH,
+  findSubmittedOrder,
+  recordSubmittedOrder,
+} from "./order-ledger.js";
 
 const SESSION_EXPIRED_MSG =
   "Session expired. Run: ezship set-cookie \"<paste from DevTools>\"";
@@ -121,8 +126,21 @@ const DEFAULT_CATEGORY = {
 
 export async function submitNewOrder(
   config: Config,
-  opts: NewOrderOptions
+  opts: NewOrderOptions,
+  ledgerPath: string = LEDGER_PATH
 ): Promise<ApiResponse> {
+  // BUI-180: refuse to re-POST a tracking number we've already submitted, so a
+  // re-run does not create a second real shipment.
+  const prior = findSubmittedOrder(opts.trackingNo, ledgerPath);
+  if (prior) {
+    throw new Error(
+      `Order for tracking ${opts.trackingNo} was already submitted at ` +
+        `${prior.submittedAt}${prior.orderId ? ` (order ${prior.orderId})` : ""}. ` +
+        `Refusing to submit a duplicate. To override, remove that entry from ` +
+        `${ledgerPath}.`
+    );
+  }
+
   const warehouseInfo = mapWarehouse(opts.warehouse);
 
   const body: SubmitNewOrderRequest = {
@@ -161,5 +179,23 @@ export async function submitNewOrder(
     },
   };
 
-  return callRpc(config, "ezShipOrder.OrderPublic/SubmitNewOrder", body);
+  // callRpc throws on any non-success (BUI-181), so reaching past it means the
+  // order was accepted — record it so a re-run is deduped.
+  const result = await callRpc(
+    config,
+    "ezShipOrder.OrderPublic/SubmitNewOrder",
+    body
+  );
+  const data = (result as Record<string, unknown>).data;
+  const orderId =
+    data && typeof data === "object"
+      ? ((data as Record<string, unknown>).orderId ??
+          (data as Record<string, unknown>).id)
+      : undefined;
+  recordSubmittedOrder(
+    opts.trackingNo,
+    { orderId: orderId != null ? String(orderId) : undefined },
+    ledgerPath
+  );
+  return result;
 }
