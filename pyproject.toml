@@ -12,8 +12,9 @@
 members = ["packages/*", "plugins/*"]
 
 # pytest is available across every workspace member for `uv run pytest`.
+# hypothesis (BUI-189) powers the property-based parsing tests in locg-cli.
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "hypothesis"]
 
 [tool.ruff.lint]
 # BUI-185: bare/blind-except rules only — keep the gate minimal so it catches

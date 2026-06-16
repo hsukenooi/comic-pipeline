@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from locg.config import wish_list_cache_path
+from locg.parsing import trailing_issue_token
 
 from locg.collection_cache import (
     LOCG_COLUMNS,
@@ -114,14 +115,14 @@ def parse_xlsx(path: Path) -> list[dict[str, Any]]:
 # Reconciliation heuristic (R60)
 # ---------------------------------------------------------------------------
 
-_ISSUE_TOKEN_RE = re.compile(r"#\s*(\d+[A-Za-z]?)\s*$")
 _VOL_ANNOTATION_RE = re.compile(r"\(Vol\.\s*\d+\)", re.IGNORECASE)
 
-
-def _issue_token(full_title: str) -> str | None:
-    """Extract the issue number token, e.g. 'ASM #300' → '300'."""
-    m = _ISSUE_TOKEN_RE.search(full_title)
-    return m.group(1).lower() if m else None
+# BUI-189: the trailing issue-token extractor is the shared parser in
+# locg.parsing — its narrow local copy here still had the BUI-175 truncation
+# (decimal/point issues like "#1.MU" parsed to None in reconciliation). The
+# shared version keeps the same end-anchored "trailing #N only" semantics while
+# capturing the full token.
+_issue_token = trailing_issue_token
 
 
 def _publisher_matches(a: str, b: str) -> bool:
