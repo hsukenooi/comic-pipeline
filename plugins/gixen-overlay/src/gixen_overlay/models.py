@@ -98,6 +98,12 @@ class SellerScanSeenRequest(BaseModel):
     seller: str | None = None
 
 
+class CollectionWinsSeenRequest(BaseModel):
+    """POST /api/comics/collection/record-win/seen — mark win item_ids as processed (BUI-121)."""
+
+    item_ids: list[str]
+
+
 class RecordWinRequest(BaseModel):
     """POST /api/comics/collection/record-win — append won auctions (BUI-92).
 

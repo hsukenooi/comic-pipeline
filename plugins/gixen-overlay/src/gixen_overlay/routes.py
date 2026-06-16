@@ -21,6 +21,8 @@ from gixen_overlay.db import (
     sweep_orphan_yearless_comics,
     get_seen_item_ids,
     mark_items_seen,
+    get_collection_wins_seen,
+    mark_collection_wins_seen,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import (
@@ -31,6 +33,7 @@ from gixen_overlay.models import (
     WishListAddRequest,
     RecordWinRequest,
     SellerScanSeenRequest,
+    CollectionWinsSeenRequest,
 )
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
@@ -1270,4 +1273,33 @@ async def api_seller_scan_seen_add(request: Request, req: SellerScanSeenRequest)
     first_seen_at. Returns ``{"marked": <newly-inserted count>}``."""
     db = request.app.state.db
     inserted = mark_items_seen(db, req.item_ids, req.seller)
+    return {"marked": inserted}
+
+
+# ---------------------------------------------------------------------------
+# BUI-121: collection-wins seen-tracking. Lets /comic:collection-add skip WON
+# snipes already processed in a prior run rather than re-POSTing them all and
+# relying on the server's already-owned dedup. Best-effort on the client: a
+# failed call only costs a duplicate POST (dedup still catches it), never a
+# skipped win.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/comics/collection/record-win/seen")
+async def api_collection_wins_seen(request: Request):
+    """Return item_ids already processed by /comic:collection-add as ``{"item_ids": [...]}``.
+
+    Used at the start of a collection-add run so the skill can skip wins that
+    were recorded on a previous run.
+    """
+    db = request.app.state.db
+    return {"item_ids": sorted(get_collection_wins_seen(db))}
+
+
+@router.post("/api/comics/collection/record-win/seen")
+async def api_collection_wins_seen_add(request: Request, req: CollectionWinsSeenRequest):
+    """Mark win item_ids as processed. Idempotent — re-marking keeps the first
+    first_seen_at. Returns ``{"marked": <newly-inserted count>}``."""
+    db = request.app.state.db
+    inserted = mark_collection_wins_seen(db, req.item_ids)
     return {"marked": inserted}

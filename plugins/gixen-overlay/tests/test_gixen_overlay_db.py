@@ -16,6 +16,8 @@ from gixen_overlay.db import (
     sweep_orphan_yearless_comics,
     get_seen_item_ids,
     mark_items_seen,
+    get_collection_wins_seen,
+    mark_collection_wins_seen,
 )
 
 
@@ -1017,3 +1019,50 @@ def test_mark_items_seen_preserves_first_seen_at(db):
     # INSERT OR IGNORE keeps the original timestamp and seller.
     assert row["first_seen_at"] == first
     assert row["seller"] == "tuners36"
+
+
+# ---------------------------------------------------------------------------
+# BUI-121: collection-wins seen-tracking helpers
+# ---------------------------------------------------------------------------
+
+
+def test_collection_wins_seen_table_exists():
+    conn = _make_db()
+    create_tables(conn)
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "collection_wins_seen" in tables
+    conn.close()
+
+
+def test_collection_wins_seen_table_is_idempotent():
+    # create_tables runs on every server start; calling it twice must not error.
+    conn = _make_db()
+    create_tables(conn)
+    create_tables(conn)
+    assert get_collection_wins_seen(conn) == set()
+    conn.close()
+
+
+def test_mark_and_get_collection_wins_seen(db):
+    assert mark_collection_wins_seen(db, ["111", "222"]) == 2
+    assert get_collection_wins_seen(db) == {"111", "222"}
+
+
+def test_mark_collection_wins_seen_is_idempotent(db):
+    mark_collection_wins_seen(db, ["111"])
+    # Re-marking inserts nothing new and preserves the original row.
+    assert mark_collection_wins_seen(db, ["111", "333"]) == 1
+    assert get_collection_wins_seen(db) == {"111", "333"}
+
+
+def test_mark_collection_wins_seen_preserves_first_seen_at(db):
+    mark_collection_wins_seen(db, ["111"])
+    first = db.execute(
+        "SELECT first_seen_at FROM collection_wins_seen WHERE item_id='111'"
+    ).fetchone()["first_seen_at"]
+    mark_collection_wins_seen(db, ["111"])
+    row = db.execute(
+        "SELECT first_seen_at FROM collection_wins_seen WHERE item_id='111'"
+    ).fetchone()
+    # INSERT OR IGNORE keeps the original timestamp.
+    assert row["first_seen_at"] == first
