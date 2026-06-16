@@ -674,6 +674,132 @@ def cmd_wish_list_add(title: str) -> dict[str, Any]:
     }
 
 
+def cmd_wish_list_add_creator_run(
+    series: str,
+    creator: str,
+    series_id: int,
+    role: str = "penciller",
+    year: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resolve a creator's run on a series from Metron and wish-list the gaps (BUI-134).
+
+    "Add creator X's run on series Y to the wish-list" has no ground-truth source
+    in model memory, which silently drops DISCONTINUOUS runs (e.g. John Romita
+    Jr.'s Uncanny X-Men #175–211 AND his ~1993 #287/#300–311 second stint).
+    This grounds run membership in Metron's per-issue creator credits.
+
+    Flow:
+      1. Pin the creator's Metron id (``resolve_creator``) so "John Romita Jr."
+         and "Sr." never collide. A name that can't be unambiguously resolved
+         is an error, not a silent guess.
+      2. Resolve the EXACT issue set the creator pencils (``resolve_creator_run``,
+         ``role`` default ``"penciller"``). Both stints, gaps and all.
+      3. Filter out issues already **owned** (per-issue collection check, by
+         that issue's cover year — never a series start year, BUI-129) and
+         already **wish-listed** (the local cache), reusing the same filtering
+         the numeric-range path applies.
+      4. Append the remaining ``"<series> #<N>"`` titles to the wish-list cache.
+
+    ``series`` is the title used for the ``"<series> #<N>"`` wish entries (the
+    LOCG-searchable form). ``series_id`` is the Metron series id (resolved by the
+    caller / skill). Returns added / skipped breakdowns plus any low-confidence
+    warnings for issues Metron had no credits for.
+    """
+    from locg.metron import MetronClient
+
+    series = (series or "").strip()
+    creator = (creator or "").strip()
+    if not series:
+        return {"error": "wish-list add: series must be non-empty"}
+    if not creator:
+        return {"error": "wish-list add: --creator must be non-empty"}
+
+    metron = MetronClient()
+
+    resolved = metron.resolve_creator(creator)
+    if resolved is None:
+        return {
+            "error": (
+                f"Could not unambiguously resolve creator {creator!r} on Metron "
+                "(zero or multiple matches). Use the exact Metron creator name "
+                "to disambiguate (e.g. 'John Romita Jr.' vs 'John Romita')."
+            )
+        }
+
+    run = metron.resolve_creator_run(
+        series_id=series_id,
+        creator_id=resolved["id"],
+        creator_name=resolved["name"],
+        role=role,
+    )
+    if run is None:
+        return {
+            "error": (
+                f"Metron creator-run lookup failed for {resolved['name']!r} "
+                f"(id={resolved['id']}) on series_id={series_id}."
+            )
+        }
+
+    run_issues = run["issues"]
+    warnings = run["warnings"]
+
+    # Load existing wish-list names once for already-wishlisted dedup.
+    try:
+        existing = cmd_wish_list_from_cache()
+    except FileNotFoundError:
+        existing = []
+    wished_names = {(it.get("name") or "").strip().lower() for it in existing}
+
+    to_add: list[dict[str, Any]] = []
+    already_owned: list[str] = []
+    already_wishlisted: list[str] = []
+
+    for issue in run_issues:
+        number = issue.get("number")
+        if number is None:
+            continue
+        title = f"{series} #{number}"
+        # Per-issue cover YEAR (never a series start year — BUI-129/BUI-184).
+        cover = issue.get("cover_date") or ""
+        cover_year = cover[:4] if cover else None
+
+        owned = cmd_collection_check(series=series, issue=str(number), year=cover_year)
+        if owned["match_status"] == "in_collection":
+            already_owned.append(title)
+            continue
+
+        if title.strip().lower() in wished_names:
+            already_wishlisted.append(title)
+            continue
+
+        to_add.append({"title": title, "number": number})
+
+    added: list[str] = []
+    errors: list[dict[str, Any]] = []
+    for item in to_add:
+        result = cmd_wish_list_add(item["title"])
+        if "error" in result:
+            errors.append({"title": item["title"], "error": result["error"]})
+        else:
+            added.append(item["title"])
+
+    return {
+        "status": "ok" if not errors else "partial",
+        "series": series,
+        "creator": resolved["name"],
+        "creator_id": resolved["id"],
+        "role": (role or "penciller").strip().lower(),
+        "series_id": series_id,
+        "run_issue_count": len(run_issues),
+        "added": added,
+        "added_count": len(added),
+        "already_owned": already_owned,
+        "already_wishlisted": already_wishlisted,
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+
 def cmd_wish_list_remove(title: str) -> dict[str, Any]:
     """Remove the first matching entry from the local wish-list cache.
 

@@ -1999,6 +1999,130 @@ def test_cmd_wish_list_add_rejects_empty_title(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# cmd_wish_list_add_creator_run (BUI-134)
+# ---------------------------------------------------------------------------
+
+def _seed_collection_owned(tmp_path, rows):
+    """Seed the isolated collection cache with owned rows for ownership checks."""
+    from locg.collection_cache import CollectionCache
+    cache = CollectionCache()
+    cache.load()
+
+    def mutate(payload):
+        payload["comics"].extend(rows)
+        # Rebuild series_name_index so the matcher's exact key check passes.
+        from locg.commands import _normalize_series_key
+        for r in rows:
+            key = _normalize_series_key(r["series_name"].split(" (")[0])
+            payload.setdefault("series_name_index", {})[key] = r["series_name"].split(" (")[0]
+
+    cache.apply(mutate, command="seed")
+
+
+def _owned_row(series_name, full_title, release_date):
+    return {
+        "series_name": series_name,
+        "full_title": full_title,
+        "release_date": release_date,
+        "in_collection": 1,
+        "source": "locg_export",
+        "needs_manual_variant": False,
+        "needs_manual_series_canonical": False,
+    }
+
+
+def _patch_metron_run(monkeypatch, *, creator, run):
+    """Patch MetronClient so resolve_creator/resolve_creator_run return canned data."""
+    import locg.metron as metron_mod
+    from unittest.mock import MagicMock
+
+    inst = MagicMock()
+    inst.resolve_creator.return_value = creator
+    inst.resolve_creator_run.return_value = run
+    monkeypatch.setattr(metron_mod, "MetronClient", lambda: inst)
+    return inst
+
+
+def test_creator_run_adds_gap_issues_filtering_owned_and_wishlisted(tmp_path, monkeypatch):
+    """Owned + already-wishlisted issues are filtered out before any write."""
+    from locg.commands import cmd_wish_list_add_creator_run, cmd_wish_list_from_cache
+
+    # Own #176; already wish-listed #177.
+    _seed_collection_owned(tmp_path, [
+        _owned_row("Uncanny X-Men", "Uncanny X-Men #176", "1983-12-01"),
+    ])
+    _make_wish_list_cache(tmp_path, items=[
+        {"name": "Uncanny X-Men #177", "id": None},
+    ])
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [
+                {"number": "175", "metron_id": 1, "cover_date": "1983-11-01"},
+                {"number": "176", "metron_id": 2, "cover_date": "1983-12-01"},  # owned
+                {"number": "177", "metron_id": 3, "cover_date": "1984-01-01"},  # wished
+                {"number": "287", "metron_id": 4, "cover_date": "1992-04-01"},  # stint 2
+            ],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99, role="penciller",
+    )
+
+    assert result["status"] == "ok"
+    assert result["added"] == ["Uncanny X-Men #175", "Uncanny X-Men #287"]
+    assert result["already_owned"] == ["Uncanny X-Men #176"]
+    assert result["already_wishlisted"] == ["Uncanny X-Men #177"]
+
+    names = {it["name"] for it in cmd_wish_list_from_cache()}
+    assert "Uncanny X-Men #175" in names
+    assert "Uncanny X-Men #287" in names  # discontinuous second stint added
+    assert "Uncanny X-Men #176" not in names  # owned never written
+
+
+def test_creator_run_surfaces_warnings(tmp_path, monkeypatch):
+    """No-credit warnings from the resolver are passed through to the caller."""
+    from locg.commands import cmd_wish_list_add_creator_run
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "175", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [{"number": "200", "metron_id": 9, "reason": "no credits in Metron"}],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+    assert result["added"] == ["Uncanny X-Men #175"]
+    assert result["warnings"][0]["number"] == "200"
+
+
+def test_creator_run_unresolvable_creator_errors(tmp_path, monkeypatch):
+    """An ambiguous / unknown creator is a hard error, not a silent guess."""
+    from locg.commands import cmd_wish_list_add_creator_run
+
+    _patch_metron_run(monkeypatch, creator=None, run=None)
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="Romita", series_id=99,
+    )
+    assert "error" in result
+    assert "resolve creator" in result["error"]
+
+
+def test_creator_run_requires_creator(tmp_path):
+    from locg.commands import cmd_wish_list_add_creator_run
+    result = cmd_wish_list_add_creator_run(series="X", creator="  ", series_id=1)
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
 # cmd_wish_list_remove
 # ---------------------------------------------------------------------------
 

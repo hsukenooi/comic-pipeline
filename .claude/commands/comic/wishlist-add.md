@@ -212,6 +212,61 @@ Returns `{"status": "ok", "removed": {...}, "items": N}` on success, **404** if 
 entry matches that title, **422** if the title is blank. Like an add, a removal is
 overwritten by the next full `collection import` unless pushed to LOCG first.
 
+## Creator runs (BUI-134): "add X's run on series Y"
+
+"Add John Romita Jr.'s run on Uncanny X-Men to the wish-list" has **no
+ground-truth source in model memory** — and memory silently drops DISCONTINUOUS
+runs. Asked for JR JR's Uncanny X-Men pencils, an agent recalls only #175–211
+and misses his ~1993 second stint (#287, #300–311). **Never enumerate a creator
+run from memory.** Ground it in Metron's per-issue creator credits via the
+`locg` resolver:
+
+```bash
+# series = the LOCG-searchable title used for the "<series> #<N>" wish entries
+# --series-id = the Metron series id (from the Step 1 series lookup)
+# --creator   = the EXACT Metron creator name (disambiguates JR vs Sr by id)
+# --role      = credit role to filter by (default: penciller)
+locg wish-list add "Uncanny X-Men" \
+  --creator "John Romita Jr." --series-id <METRON_SERIES_ID> --role penciller
+```
+
+What it does, in order:
+1. **Pins the creator's Metron id** (`/creator/?name=`). "John Romita Jr." and
+   "John Romita" (Sr.) are distinct ids — the resolver matches by id, never a
+   loose name string. An ambiguous or unknown name is a **hard error**, not a
+   guess; pass the exact Metron creator name.
+2. **Resolves the EXACT issue set** the creator holds `--role` on, from each
+   issue's Metron credits. The candidate set comes from Metron's issue-list
+   `creator` filter (so BOTH stints are in scope), then each issue's credits
+   confirm the role. This returns the discontinuous #287/#300–311 stint that
+   memory drops.
+3. **Filters owned + already-wishlisted issues** before any write — owned via
+   the same per-issue collection check (by that issue's **cover year**, never
+   `year_began`, BUI-129), already-wishlisted via the local cache.
+4. Appends the remaining `"<series> #<N>"` titles to the wish-list cache.
+
+**Role is EXPLICIT.** The default `penciller` matches **only** a `Penciller`
+credit — it does NOT auto-include `Breakdowns`, `Layouts`, `Co-Penciller`, etc.
+To widen the run, pass that role name explicitly (`--role breakdowns`); you can
+only request one role per call.
+
+**Low-confidence WARNING on thin credits.** Metron's credit data is sparse/
+occasionally wrong on older Silver/Bronze books. An issue in the candidate set
+that Metron has **no credits at all** for is reported in the result's `warnings`
+(not silently treated as "not in the run"). Surface these to the user — the run
+membership for those issues is unverified and may need a manual eyeball.
+
+The result JSON carries `added`, `already_owned`, `already_wishlisted`,
+`warnings`, `creator`/`creator_id` (the pinned Metron id), and `run_issue_count`.
+Show the user the preview (added vs skipped vs warnings) and confirm before this
+is treated as final, same as the numeric-range path.
+
+> Note: the `locg wish-list add` path writes the **local** cache. The
+> server-backed `POST /api/comics/wish-list` flow above (Steps 1–6) is the
+> machine-visible path; the creator-run resolver is currently a local-cache
+> convenience for enumerating the exact issue set. When adding to the server,
+> feed the resolved issue numbers into the Step 5 `POST` loop.
+
 ## Common Mistakes
 
 | Mistake | Fix |
@@ -223,3 +278,5 @@ overwritten by the next full `collection import` unless pushed to LOCG first.
 | Writing to `data/locg/wish-list.json` directly | Adds go to the server via `POST /api/comics/wish-list` — the repo file is no longer the source of truth (BUI-93) |
 | Wish-listing issues you already own | Collection-check each issue first (Step 3) and skip owned ones — wishing an owned book is what deleted collection rows in BUI-122 |
 | Passing `year` (Metron's `year_began`) to `collection/check` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`, not a series disambiguator. Forwarding a series start-year filters out every owned mid-run issue and returns a false `not_in_cache`, so an owned book gets wish-listed (BUI-129/BUI-131). Check by series + issue only |
+| Enumerating a creator's run from memory | Memory silently drops DISCONTINUOUS stints (JR JR's 1993 Uncanny X-Men return). Use `locg wish-list add --creator … --series-id …`, which grounds the run in Metron credits (BUI-134) |
+| Conflating same-name creators | "John Romita Jr." vs "John Romita" (Sr.) are distinct Metron ids; the resolver pins the id. Always pass the exact Metron creator name |

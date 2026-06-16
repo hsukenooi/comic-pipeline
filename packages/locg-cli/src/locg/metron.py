@@ -121,15 +121,25 @@ class MetronClient:
             return None
 
     def lookup_issue_detail(self, metron_id: int) -> Optional[dict[str, Any]]:
-        """Fetch full issue detail (incl. variant cover names) for a Metron id.
+        """Fetch full issue detail (variant cover names + creator credits) for a id.
 
         ``issues_list`` (used by :meth:`lookup_issue`) returns lightweight
-        ``BaseIssue`` records with no variants, so variant resolution needs the
-        detail endpoint ``session.issue(metron_id)`` (BUI-33).
+        ``BaseIssue`` records with no variants and no credits, so variant
+        resolution and creator-run resolution both need the detail endpoint
+        ``session.issue(metron_id)`` (BUI-33, BUI-134).
 
-        Returns ``{"variants": [name, ...]}`` — the names of every variant cover
-        Metron has for the issue — or ``None`` on any failure. MetronCredentialError
-        is re-raised so a batch can disable Metron rather than retry per win.
+        Returns ``{"variants": [name, ...], "credits": [{"creator": name,
+        "creator_id": id, "roles": [role, ...]}, ...]}`` — the variant cover
+        names plus every creator credit Metron has for the issue — or ``None``
+        on any failure. MetronCredentialError is re-raised so a batch can
+        disable Metron rather than retry per win.
+
+        Note on ``creator_id``: a mokkari ``Credit`` exposes ``id`` (the credit
+        row id, **not** the creator id) and ``creator`` (the creator's canonical
+        name string). The creator id is therefore not available from the credit
+        itself; callers that need to pin a creator id resolve it separately via
+        :meth:`resolve_creator` and match on the canonical name. ``creator_id``
+        is surfaced as ``None`` here for forward-compatibility.
         """
         try:
             session = self._get_session()
@@ -138,12 +148,179 @@ class MetronClient:
                 v.name for v in (getattr(issue, "variants", None) or [])
                 if getattr(v, "name", None)
             ]
-            return {"variants": variants}
+            credits = self._extract_credits(issue)
+            return {"variants": variants, "credits": credits}
         except MetronCredentialError:
             raise
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip variant enrichment
             logger.debug("Metron issue-detail lookup failed for id %s: %s", metron_id, exc)
             return None
+
+    @staticmethod
+    def _extract_credits(issue: Any) -> list[dict[str, Any]]:
+        """Pull ``[{creator, creator_id, roles}]`` from a mokkari issue detail.
+
+        Each mokkari ``Credit`` has ``creator`` (canonical name string) and
+        ``role`` (a ``list`` of ``GenericItem``, each with ``id``/``name``).
+        Roles are lowercased so callers can compare case-insensitively.
+        """
+        out: list[dict[str, Any]] = []
+        for credit in (getattr(issue, "credits", None) or []):
+            creator = getattr(credit, "creator", None)
+            if not creator:
+                continue
+            roles = [
+                r.name.strip().lower()
+                for r in (getattr(credit, "role", None) or [])
+                if getattr(r, "name", None)
+            ]
+            out.append({
+                "creator": creator,
+                "creator_id": None,
+                "roles": roles,
+            })
+        return out
+
+    def resolve_creator(self, name: str) -> Optional[dict[str, Any]]:
+        """Resolve a creator name to a Metron creator ``{id, name}`` (BUI-134).
+
+        Pins the creator's Metron id so "John Romita Jr." and "John Romita Sr."
+        can never be conflated by a loose name match. Returns the canonical
+        record on an unambiguous match, else ``None``:
+
+        - exactly one candidate                         -> use it
+        - multiple, exactly one whose name equals the
+          query case-insensitively                      -> that one
+        - otherwise (zero, or still ambiguous)          -> ``None``
+
+        The canonical ``name`` is what later filters the per-issue credits
+        (whose ``creator`` field is a name string, not an id). MetronCredentialError
+        is re-raised so callers can disable Metron for the rest of a batch.
+        """
+        try:
+            session = self._get_session()
+            candidates = session.creators_list({"name": name})
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                c = candidates[0]
+                return {"id": c.id, "name": c.name}
+            query_norm = name.strip().lower()
+            exact = [c for c in candidates if (c.name or "").strip().lower() == query_norm]
+            if len(exact) == 1:
+                c = exact[0]
+                return {"id": c.id, "name": c.name}
+            logger.debug(
+                "Metron creator ambiguous for %r: %d candidates",
+                name, len(candidates),
+            )
+            return None
+        except MetronCredentialError:
+            raise
+        except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None
+            logger.debug("Metron creator lookup failed for %r: %s", name, exc)
+            return None
+
+    def resolve_creator_run(
+        self,
+        series_id: int,
+        creator_id: int,
+        creator_name: str,
+        role: str = "penciller",
+    ) -> Optional[dict[str, Any]]:
+        """Resolve the EXACT set of issues a creator holds ``role`` on (BUI-134).
+
+        Grounds creator-run membership in Metron's per-issue credits rather than
+        model memory, which silently drops DISCONTINUOUS runs (e.g. John Romita
+        Jr.'s Uncanny X-Men #175–211 AND his ~1993 #287/#300–311 second stint).
+
+        Strategy:
+          1. ``issues_list({series, creator: creator_id})`` returns the candidate
+             set — every issue where this creator (pinned by **id**, so JR vs Sr
+             never collide) has *any* credit. This is what catches both stints.
+          2. For each candidate, fetch the issue detail and confirm the creator
+             actually holds ``role`` (default ``"penciller"``). The issue-list
+             ``creator`` filter is role-agnostic, so an issue where JR only wrote
+             (never pencilled) is dropped here.
+          3. An issue whose detail carries **no credits at all** can't be
+             confirmed or refuted — Metron's credit data is thin on older
+             Silver/Bronze books — so it is reported as a low-confidence warning
+             rather than silently treated as "not in the run".
+
+        ``role`` matching is EXPLICIT: an issue is in the run iff the creator has
+        a credit whose role set contains ``role`` (case-insensitive). The default
+        ``"penciller"`` does NOT auto-include ``layouts``/``breakdowns``/etc.;
+        pass those role names explicitly to widen it.
+
+        Returns ``{"issues": [{number, metron_id, cover_date}], "warnings":
+        [{number, metron_id, reason}]}`` sorted by numeric issue number, or
+        ``None`` on a hard API failure. ``issues`` is the confirmed run;
+        ``warnings`` flags no-credit issues for the caller to surface.
+        """
+        role_norm = (role or "").strip().lower()
+        try:
+            session = self._get_session()
+            candidates = session.issues_list(
+                {"series": series_id, "creator": creator_id}
+            )
+        except MetronCredentialError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Metron creator-run candidate lookup failed (series=%s creator=%s): %s",
+                series_id, creator_id, exc,
+            )
+            return None
+
+        creator_norm = (creator_name or "").strip().lower()
+        in_run: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+
+        for cand in candidates:
+            metron_id = getattr(cand, "id", None)
+            number = getattr(cand, "number", None)
+            if metron_id is None:
+                continue
+            detail = self.lookup_issue_detail(metron_id)
+            cover = getattr(cand, "cover_date", None)
+            cover_iso = cover.isoformat() if cover else None
+            if detail is None:
+                warnings.append({
+                    "number": number,
+                    "metron_id": metron_id,
+                    "reason": "issue detail fetch failed",
+                })
+                continue
+            credits = detail.get("credits") or []
+            if not credits:
+                warnings.append({
+                    "number": number,
+                    "metron_id": metron_id,
+                    "reason": "no credits in Metron (older book?) — run membership unverified",
+                })
+                continue
+            holds_role = any(
+                (c.get("creator") or "").strip().lower() == creator_norm
+                and role_norm in (c.get("roles") or [])
+                for c in credits
+            )
+            if holds_role:
+                in_run.append({
+                    "number": number,
+                    "metron_id": metron_id,
+                    "cover_date": cover_iso,
+                })
+
+        def _num_key(entry: dict[str, Any]) -> tuple[float, str]:
+            raw = str(entry.get("number") or "")
+            try:
+                return (float(raw), raw)
+            except ValueError:
+                return (float("inf"), raw)
+
+        in_run.sort(key=_num_key)
+        warnings.sort(key=_num_key)
+        return {"issues": in_run, "warnings": warnings}
 
     def format_series_name(self, series_data: dict[str, Any]) -> str:
         """Format a canonical series name per R62.
