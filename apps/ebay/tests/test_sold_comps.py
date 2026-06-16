@@ -56,6 +56,45 @@ class TestParseGrade:
         # The numeric 9.0 wins, but if it weren't there, VF/NM would still give 9.0
         assert sc.parse_grade("VF/NM bright") == 9.0
 
+    # ── BUI-183: price/measurement context must NOT be mis-read as a grade ──
+
+    @pytest.mark.parametrize("title", [
+        # Price context ($ prefix)
+        "$9.5 shipping",
+        "price $9.5",
+        # Measurement units following the number
+        "lot 3.5 inches",
+        "lot 3.5 inch",
+        "ships 9.5 oz",
+        "size 2.5 cm",
+        "3.5 mm wide",
+        "2.5 lbs weight",
+        "3.5 lb box",
+        "9.5 in long",
+        # Dimension separator (x)
+        "ruler 2.5 x 3.5",
+        "2.5 x 3.5 size",
+        # X.X0 price-like forms: a trailing digit means it's a number, not a
+        # one-decimal grade (the restored trailing boundary, BUI-183).
+        "comic 5.50 dollars",
+        "lot of 9.50 value",
+    ])
+    def test_price_measurement_context_excluded(self, title):
+        """Numbers in price or measurement context must never be parsed as a grade."""
+        assert sc.parse_grade(title) is None
+
+    @pytest.mark.parametrize("title,expected", [
+        # Bare numeric grades with trailing non-unit words must still parse
+        ("ASM #300 9.8", 9.8),
+        ("X-Men #1 6.0 nice", 6.0),
+        # Titles starting with X- must not be blocked by the dimension-x lookbehind
+        ("X-Men #1 9.8", 9.8),
+        ("X-Factor #6 9.4", 9.4),
+    ])
+    def test_bare_numeric_grades_survive(self, title, expected):
+        """Bare numeric grades with non-unit trailing words must still be detected."""
+        assert sc.parse_grade(title) == expected
+
 
 # ─── Hard excludes ────────────────────────────────────────────────────────────
 
