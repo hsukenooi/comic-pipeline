@@ -5,6 +5,14 @@ import { getHeaders } from "./auth.js";
 const SESSION_EXPIRED_MSG =
   "Session expired. Run: ezship set-cookie \"<paste from DevTools>\"";
 
+// BUI-184: bound a stalled connection so order submission can't block forever.
+const REQUEST_TIMEOUT_MS = 30_000;
+
+// BUI-184: all HTTP redirect statuses. EZShip bounces an expired session to its
+// login page; previously only 302/303 mapped to the "session expired" message
+// and 301/307/308 fell through to a generic error that hid the real fix.
+const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
+
 export async function callRpc(
   config: Config,
   endpoint: string,
@@ -13,6 +21,8 @@ export async function callRpc(
   const url = `${config.apiBaseUrl}/${endpoint}`;
   const headers = getHeaders(config);
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(url, {
@@ -20,14 +30,22 @@ export async function callRpc(
       headers,
       body: JSON.stringify(body),
       redirect: "manual",
+      signal: controller.signal,
     });
   } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(
+        `Request to ${endpoint} timed out after ${REQUEST_TIMEOUT_MS}ms`
+      );
+    }
     throw new Error(
       `Network error calling ${endpoint}: ${err instanceof Error ? err.message : String(err)}`
     );
+  } finally {
+    clearTimeout(timer);
   }
 
-  if (response.status === 302 || response.status === 303) {
+  if (REDIRECT_CODES.has(response.status)) {
     const location = response.headers.get("location") ?? "";
     if (location.includes("/Account/Login")) {
       throw new Error(SESSION_EXPIRED_MSG);
@@ -35,7 +53,7 @@ export async function callRpc(
     throw new Error(`Unexpected redirect to: ${location || "(empty Location header)"}`);
   }
 
-  if (!response.ok && response.status !== 302 && response.status !== 303) {
+  if (!response.ok && !REDIRECT_CODES.has(response.status)) {
     let body = "";
     try {
       body = await response.text();
@@ -54,24 +72,31 @@ export async function callRpc(
     throw new Error(`Failed to parse API response as JSON from ${endpoint}`);
   }
 
-  // BUI-141: EZShip signals a business-layer rejection in a 200 body via
-  // `result: false` (the session-expired case is just one such rejection). The
-  // old code only threw for the login message and RETURNED every other
-  // `result: false`, so the CLI exited 0 and the skill marked a rejected order
-  // "Submitted" — a silently lost order. Treat any `result: false` as a failure
-  // so the CLI exits non-zero; a successful order never returns `result: false`.
+  // BUI-141 / BUI-181: a SubmitNewOrder success returns `result: true`. The old
+  // code only rejected an explicit `result: false`, so a 200 body of
+  // `{error:"duplicate tracking"}`, `{result:"false"}` (string), or one omitting
+  // `result` entirely passed through and the CLI exited 0 — a failed/rejected
+  // order reported as "Submitted". Require success to be the explicit positive
+  // `result === true`; treat anything else as a failure so the CLI exits non-zero.
   const r = result as Record<string, unknown>;
-  if (r.result === false) {
-    const msg = typeof r.msg === "string" ? r.msg : "";
-    if (msg.includes("please login")) {
-      throw new Error(SESSION_EXPIRED_MSG);
-    }
-    throw new Error(
-      `EZShip rejected the request: ${msg || JSON.stringify(result)}`
-    );
+  if (r.result === true) {
+    return result;
   }
 
-  return result;
+  const msg =
+    typeof r.msg === "string"
+      ? r.msg
+      : typeof r.error === "string"
+        ? r.error
+        : typeof r.message === "string"
+          ? r.message
+          : "";
+  if (msg.includes("please login")) {
+    throw new Error(SESSION_EXPIRED_MSG);
+  }
+  throw new Error(
+    `EZShip did not confirm success (no result:true): ${msg || JSON.stringify(result)}`
+  );
 }
 
 export interface NewOrderOptions {
