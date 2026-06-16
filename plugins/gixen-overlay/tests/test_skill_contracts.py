@@ -86,14 +86,24 @@ def test_identify_documents_grade_from_description():
     (a grade found only in the listing body), but identify.md's field table
     omitted it — so the skill mislabelled description-graded listings as having
     no grade anywhere. Assert the field the script emits is documented, and the
-    skill keys its strong-warning rule on it (grade_from_description null too)."""
+    skill keys its strong-warning rule on it (grade_from_description null too).
+
+    BUI-195: the identify fetch+parse step moved into the comic-identifier
+    subagent (`.claude/agents/comic-identifier.md`) to keep raw JSON out of the
+    main context — so the parse contract (this field's table) now lives there.
+    Accept the field documented in EITHER identify.md or the subagent, so the
+    BUI-148 contract holds wherever the identify flow keeps its parse table."""
     fetch_src = (REPO_ROOT / "apps" / "ebay" / "src" / "ebay_fetch.py").read_text()
     assert '"grade_from_description"' in fetch_src, (
         "ebay_fetch.py no longer emits grade_from_description — update this contract"
     )
     identify = (SKILLS_DIR / "identify.md").read_text()
-    assert "grade_from_description" in identify, (
-        "identify.md must document grade_from_description (the script emits it)"
+    identifier_agent = (
+        REPO_ROOT / ".claude" / "agents" / "comic-identifier.md"
+    ).read_text()
+    assert "grade_from_description" in identify or "grade_from_description" in identifier_agent, (
+        "the identify flow must document grade_from_description (the script emits "
+        "it) — in identify.md or the comic-identifier subagent (BUI-195)"
     )
 
 
