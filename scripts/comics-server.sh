@@ -54,9 +54,12 @@ comics_health_gate() {
 # -o file, …); it forces --fail-with-body so a non-200 exits non-zero while
 # still surfacing the error body on stderr, and never swallows failure into an
 # empty success. Stdout carries the response body for the success path.
+# BUI-186: --max-time bounds a hung/half-open connection so a stalled server
+# can't block a skill step forever (a hang is as silent as a swallowed error).
+COMICS_CURL_MAX_TIME="${COMICS_CURL_MAX_TIME:-30}"
 comics_curl() {
   local body status
-  body="$(curl -sS --fail-with-body "$@")"
+  body="$(curl -sS --fail-with-body --max-time "$COMICS_CURL_MAX_TIME" "$@")"
   status=$?
   if [ "$status" -ne 0 ]; then
     echo "comics-server call FAILED (curl exit $status): $*" >&2
@@ -64,4 +67,16 @@ comics_curl() {
     return "$status"
   fi
   printf '%s' "$body"
+}
+
+# BUI-186: thin GET/POST aliases over comics_curl so a skill never hand-rolls a
+# raw curl (where the 2>/dev/null / "|| echo" swallow crept in). Both inherit
+# comics_curl's fail-loud + --max-time behavior.
+#   comics_get  "$GIXEN_SERVER_URL/api/comics/collection/status"
+#   comics_post "$GIXEN_SERVER_URL/api/comics/wish-list" -H 'Content-Type: application/json' -d "$json"
+comics_get() {
+  comics_curl "$@"
+}
+comics_post() {
+  comics_curl -X POST "$@"
 }

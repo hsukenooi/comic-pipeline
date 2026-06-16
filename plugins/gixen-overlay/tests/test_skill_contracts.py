@@ -138,6 +138,28 @@ def test_snipe_show_does_not_swallow_fetch_errors():
     assert "gixen list --json 2>/dev/null" not in doc
 
 
+def test_no_skill_swallows_a_server_curl():
+    """BUI-151 generalized (BUI-186): no /comic:* skill may pipe a comics-server
+    curl to 2>/dev/null or '|| echo', which would hide a server-down / non-200 as
+    an empty 'no results' answer the agent could act on (dupe-buy, price-on-no-
+    data). Server calls must fail loud — via comics_curl/comics_get/comics_post
+    or a bare `curl -sf`/`--fail`."""
+    swallow_re = re.compile(r"\|\|\s*echo")
+    offenders = []
+    for md in sorted(SKILLS_DIR.glob("*.md")):
+        for i, line in enumerate(md.read_text().splitlines(), 1):
+            # Only lines that actually hit the comics server with curl.
+            if "curl" not in line:
+                continue
+            if "GIXEN_SERVER_URL" not in line and "/api/comics" not in line:
+                continue
+            if "2>/dev/null" in line or swallow_re.search(line):
+                offenders.append(f"{md.name}:{i}: {line.strip()}")
+    assert not offenders, (
+        "a server curl swallows failure into empty output:\n" + "\n".join(offenders)
+    )
+
+
 def test_ezship_declared_value_units_agree():
     """BUI-142: cli.ts's -d/--declared-value is in CENTS, but ezship-add.md
     described it as dollars in its primary flow → an agent told "$25" ran
