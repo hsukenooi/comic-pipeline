@@ -36,6 +36,10 @@ DEFAULT_MAX_WORKERS = 10
 THIN_RESULTS_THRESHOLD = 5     # auto-broaden (drop year) if base returns fewer
 GRADE_TAGGED_THRESHOLD = 10    # add grade-targeted query if base returns fewer
 
+# Retry policy for transient SerpApi failures (Timeout, ConnectionError, 429/5xx)
+FETCH_MAX_RETRIES = 3
+FETCH_BACKOFF_BASE = 2  # seconds: sleep(FETCH_BACKOFF_BASE ** attempt)
+
 
 # ─── SERPAPI_KEY loader ──────────────────────────────────────────────────────
 
@@ -152,8 +156,26 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
         if cached is not None:
             return cached, True
 
-    resp = requests.get(request_url(canonical, api_key), timeout=SERPAPI_TIMEOUT_SEC)
-    resp.raise_for_status()
+    last_exc: Exception | None = None
+    for attempt in range(FETCH_MAX_RETRIES):
+        try:
+            resp = requests.get(request_url(canonical, api_key), timeout=SERPAPI_TIMEOUT_SEC)
+            resp.raise_for_status()
+            break  # success — exit retry loop
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status is not None and (status == 429 or status >= 500):
+                last_exc = exc
+            else:
+                raise  # non-retryable 4xx — propagate immediately
+        if attempt < FETCH_MAX_RETRIES - 1:
+            time.sleep(FETCH_BACKOFF_BASE ** attempt)
+    else:
+        # All attempts exhausted — re-raise the last transient exception
+        raise last_exc  # type: ignore[misc]
+
     data = resp.json()
 
     if "error" in data:
@@ -322,7 +344,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     def _run(tier: str, nkw: str) -> int:
         try:
             data, cache_hit = fetch(nkw, api_key, force=force, ttl_sec=ttl_sec)
-        except SerpApiError as e:
+        except (SerpApiError, requests.RequestException) as e:
             queries_used.append({"tier": tier, "nkw": nkw, "error": str(e)})
             return 0
         added = 0
