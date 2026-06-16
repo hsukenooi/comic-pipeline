@@ -681,7 +681,7 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         for record in audit_records:
             try:
                 cache.append_audit(record)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  # best-effort audit log; I/O failure must not abort import
                 logger.warning("Failed to write audit record: %s", exc)
 
     cache.apply(do_merge, command="import")

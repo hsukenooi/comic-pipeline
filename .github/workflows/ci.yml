@@ -77,6 +77,36 @@ jobs:
         run: uv run --with pytest pytest
         working-directory: apps/fmv
 
+  # BUI-185: ruff bare/blind-except lint gate. Runs from the repo root so it
+  # covers all packages, plugins, and apps in one pass. The rule set is minimal
+  # (E722 bare-except, BLE001 blind-Exception, B904 raise-without-from) — just
+  # the exception-handling hygiene rules, not the full ruff default set.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint — ruff bare/blind-except check
+        run: uvx ruff check .
+
+  # BUI-188: non-strict mypy type check on the two most None-juggling files.
+  # The workspace must be synced first so gixen_overlay imports resolve.
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync workspace (packages/* + plugins/*)
+        run: uv sync --all-packages
+
+      - name: Type check — mypy (non-strict, targeted files)
+        run: uvx mypy --ignore-missing-imports apps/fmv/src/fmv_runner.py plugins/gixen-overlay/src/gixen_overlay/routes.py
+
   # ezship is a standalone TypeScript CLI (apps/ezship). vitest, not pytest.
   ezship:
     runs-on: ubuntu-latest
@@ -88,8 +118,14 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install deps + test
-        run: |
-          npm ci
-          npm test
+      - name: Install deps
+        run: npm ci
+        working-directory: apps/ezship
+
+      - name: Type check — tsc --noEmit (BUI-188)
+        run: npx tsc --noEmit
+        working-directory: apps/ezship
+
+      - name: Test
+        run: npm test
         working-directory: apps/ezship

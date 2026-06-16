@@ -144,10 +144,10 @@ def _rebuild_bids_table(
                 "CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)"
             )
         conn.execute(f"RELEASE {savepoint_name}")
-    except Exception:
+    except Exception:  # noqa: BLE001  # migration failure — rollback savepoint, then re-raise
         try:
             conn.execute(f"ROLLBACK TO {savepoint_name}")
-        except Exception:
+        except Exception:  # noqa: BLE001  # rollback itself may fail; suppress, re-raise original
             pass
         raise
     finally:
@@ -212,10 +212,10 @@ def _repair_bid_fmvs_fk(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)"
         )
         conn.execute("RELEASE bui79_repair")
-    except Exception:
+    except Exception:  # noqa: BLE001  # migration failure — rollback savepoint, then re-raise
         try:
             conn.execute("ROLLBACK TO bui79_repair")
-        except Exception:
+        except Exception:  # noqa: BLE001  # rollback itself may fail; suppress, re-raise original
             pass
         raise
     finally:
@@ -386,10 +386,10 @@ def _dedup_pending_and_index(conn: sqlite3.Connection) -> None:
             "ON bids(item_id) WHERE status='PENDING'"
         )
         conn.execute("RELEASE bui67_dedup")
-    except Exception:
+    except Exception:  # noqa: BLE001  # migration failure — rollback savepoint, then re-raise
         try:
             conn.execute("ROLLBACK TO bui67_dedup")
-        except Exception:
+        except Exception:  # noqa: BLE001  # rollback itself may fail; suppress, re-raise original
             pass
         raise
     conn.commit()

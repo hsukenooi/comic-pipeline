@@ -169,7 +169,7 @@ def load_plugins() -> pluggy.PluginManager:
     # from pluggy includes the offending plugin name.
     try:
         pm.check_pending()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # pluggy validation — log all plugin errors, then continue
         _logger.error("Plugin validation failed: %s", exc)
 
     if registered:

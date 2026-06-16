@@ -69,7 +69,7 @@ def _validate_price(value: str) -> str:
     try:
         f = float(value)
     except (ValueError, TypeError):
-        raise ValueError(f"Invalid price {value!r}: must be numeric")
+        raise ValueError(f"Invalid price {value!r}: must be numeric") from None
     if not math.isfinite(f):
         raise ValueError(f"Invalid price {value!r}: must be a finite number")
     if f < 0:
@@ -1394,7 +1394,7 @@ def cmd_lookup(
                 entry = extract_comic_lists(detail_soup)
                 lists = entry.get("lists") or {}
                 row["in_collection"] = bool(lists.get("collection", False))
-            except Exception:
+            except Exception:  # noqa: BLE001  # best-effort collection membership fetch; failure → assume False
                 row["in_collection"] = False
         else:
             # Fresh result: membership already parsed from search response.
@@ -2106,7 +2106,7 @@ def cmd_collection_record_win(
             metron_lookups_succeeded += chunk_metron_succeeded
             metron_variant_lookups_attempted += chunk_variant_detail_attempted
             metron_variant_matches += chunk_variant_matches
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # batch import — log chunk failure, continue remaining chunks
             logger.error("Chunk commit failed: %s", exc)
             partial_failure = True
 

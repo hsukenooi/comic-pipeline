@@ -511,7 +511,7 @@ def main() -> None:
         die(str(e), code=1)
     except KeyboardInterrupt:
         sys.exit(130)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # CLI top-level handler — translate any unexpected error to exit 4
         die(str(e), code=4)
     finally:
         if client is not None:

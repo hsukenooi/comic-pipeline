@@ -127,7 +127,7 @@ def run(*, batch_path: str | None, out_path: str | None,
                 _fail_mapping(
                     f"ebay-sold-comps returned a duplicate result id ({rid!r})."
                 )
-            results_by_id[rid] = result
+            results_by_id[rid] = result  # type: ignore[index]  # rid is int at runtime; .get() returns Any
         sent_set = set(sent_ids)
         missing = [i for i in sent_ids if i not in results_by_id]
         unexpected = [k for k in results_by_id if k not in sent_set]

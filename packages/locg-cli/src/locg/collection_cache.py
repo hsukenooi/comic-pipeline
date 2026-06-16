@@ -329,7 +329,7 @@ class CollectionCache:
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("another locg-cli operation in progress")
+                        raise TimeoutError("another locg-cli operation in progress") from None
                     time.sleep(0.05)
 
             try:

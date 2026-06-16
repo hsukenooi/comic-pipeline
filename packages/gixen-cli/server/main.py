@@ -773,7 +773,7 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(_ebay_fallback_task, timeout=2.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # lifespan shutdown — log any stray error from background task
             logger.warning("lifespan: fallback task raised on cancel: %s", e)
 
     if sniper_task:
@@ -1027,9 +1027,9 @@ async def api_add_bid(req: AddBidRequest):
             )
             return {**dict(row), "created": created}
     except GixenError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except requests.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
+        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}") from e
 
 
 @app.get("/api/snipes")
@@ -1235,12 +1235,12 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             db, item_id, Decimal(str(req.max_bid)),
             req.bid_offset, req.snipe_group,
         )
-    except GixenSnipeNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen")
+    except GixenSnipeNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen") from e
     except GixenError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except requests.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}")
+        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}") from e
 
     update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
 
@@ -1281,7 +1281,7 @@ async def api_remove_bid(item_id: str):
             "remove: %s already absent from Gixen — tombstoning REMOVED", item_id,
         )
     except GixenError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
     delete_bid(db, item_id)
     # Response status mirrors the soft-delete tombstone, renamed PURGED ->
@@ -1322,7 +1322,7 @@ async def api_purge(req: PurgeRequest):
         async with _api_lock:
             await asyncio.to_thread(_api_client.purge_completed)
     except GixenError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
     # 5. Mark completed bids with the soft-delete tombstone (REMOVED) in DB
     mark_bids_purged(db, completed_ids)

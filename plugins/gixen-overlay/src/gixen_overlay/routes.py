@@ -7,6 +7,7 @@ import re
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -206,7 +207,7 @@ async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
     return {"item_id": item_id, "fmv_id": fmv_row["fmv_id"], "linked": True}
 
 
-def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[object | None, list[str]]:
+def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[Any | None, list[str]]:
     """Resolve fmv_id for link-fmv. Returns (row, list-of-strategies-attempted).
 
     Strategies are tried in order and short-circuit on first hit. The
@@ -425,7 +426,7 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
     a denormalized pointer that should agree with the primary `bid_fmvs` row
     — we check both because past incidents (PER-90) showed they can drift.
     """
-    base = {
+    base: dict[str, Any] = {
         "item_id": item_id,
         "grade": grade,
         "locg_id": locg_id,
@@ -780,7 +781,7 @@ async def api_extract_comics(request: Request):
         title = row["ebay_title"]
         try:
             parsed = parse_title(title)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # per-snipe parse — capture error, continue batch
             errors.append({"item_id": item_id, "error": f"parse failed: {e}"})
             continue
 
@@ -850,7 +851,7 @@ async def api_extract_comics(request: Request):
                 linked += 1
             else:
                 skipped.append({"item_id": item_id, "reason": "no grade parsed"})
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # per-snipe FMV link — capture error, continue batch
             errors.append({"item_id": item_id, "error": f"link failed: {e}"})
 
     return {
@@ -904,7 +905,7 @@ async def api_collection_check(
     try:
         result = cmd_collection_check(series=series, issue=issue, variant=variant, year=year)
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
     # R11 defense-in-depth at the endpoint, not just in the skill: a store that
     # was never imported answers `not_in_cache` for EVERY comic. Returning that
     # as a 200 lets any caller that skips the bootstrap status guard read it as
@@ -929,7 +930,7 @@ async def api_collection_status():
     try:
         return cmd_collection_status()
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
 
 
 @router.get("/api/comics/collection/series-names")
@@ -944,7 +945,7 @@ async def api_collection_series_names():
     try:
         return cmd_collection_series_names()
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
 
 
 @router.get("/api/comics/wish-list")
@@ -976,7 +977,7 @@ def _require_imported_collection() -> None:
     try:
         status = cmd_collection_status()
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
     if status.get("last_full_import") is None:
         raise HTTPException(
             status_code=409,
@@ -1042,7 +1043,7 @@ async def api_collection_export():
         try:
             result = cmd_collection_export(out_path=str(csv_path))
         except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+            raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
         csv_text = Path(result["csv_path"]).read_text()
         notes_path = Path(result["notes_md_path"])
         notes_text = notes_path.read_text() if notes_path.exists() else ""
@@ -1097,12 +1098,12 @@ async def api_collection_import(file: UploadFile = File(...)):
                 tmp.write(chunk)
         return cmd_collection_import(tmp_path)
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}")
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
     except (InvalidFileException, zipfile.BadZipFile, ValueError, KeyError) as exc:
         # Bad/corrupt/wrong-shape upload -> client error. Anything else (OSError,
         # an internal merge bug) is NOT caught here, so it surfaces as a 500
         # rather than being mislabeled a client error.
-        raise HTTPException(status_code=422, detail=f"import failed: bad upload ({exc})")
+        raise HTTPException(status_code=422, detail=f"import failed: bad upload ({exc})") from exc
     finally:
         if tmp_path is not None:
             try:

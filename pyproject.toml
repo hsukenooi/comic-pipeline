@@ -14,3 +14,14 @@ members = ["packages/*", "plugins/*"]
 # pytest is available across every workspace member for `uv run pytest`.
 [dependency-groups]
 dev = ["pytest"]
+
+[tool.ruff.lint]
+# BUI-185: bare/blind-except rules only — keep the gate minimal so it catches
+# real exception-handling issues without surfacing hundreds of style violations.
+select = ["E722", "BLE001", "B904"]
+
+[tool.mypy]
+# BUI-188: non-strict mypy config for the targeted two-file gate.
+# ignore_missing_imports avoids failures on third-party stubs (fastapi, click,
+# requests, etc.) that aren't installed in the mypy invocation environment.
+ignore_missing_imports = true

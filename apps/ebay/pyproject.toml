@@ -28,3 +28,7 @@ sources = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.ruff.lint]
+# BUI-185: bare/blind-except rules only.
+select = ["E722", "BLE001", "B904"]

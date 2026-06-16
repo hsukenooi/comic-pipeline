@@ -196,7 +196,7 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
         m = re.search(r'x-bid-count.*?<span[^>]*>(\d+)\s*bid', resp.text, re.IGNORECASE | re.DOTALL)
         if m:
             return int(m.group(1))
-    except Exception:
+    except Exception:  # noqa: BLE001  # best-effort bid-count scrape; any failure → None
         pass
     return None
 

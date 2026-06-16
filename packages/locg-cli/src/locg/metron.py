@@ -116,7 +116,7 @@ class MetronClient:
             }
         except MetronCredentialError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip enrichment
             logger.debug("Metron lookup failed for %r #%s: %s", series_query, issue_number, exc)
             return None
 
@@ -141,7 +141,7 @@ class MetronClient:
             return {"variants": variants}
         except MetronCredentialError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip variant enrichment
             logger.debug("Metron issue-detail lookup failed for id %s: %s", metron_id, exc)
             return None
 
