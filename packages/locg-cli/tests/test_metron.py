@@ -511,6 +511,67 @@ def test_resolve_creator_run_hard_failure_returns_none():
     ) is None
 
 
+def test_resolve_creator_run_same_name_collision_is_warned_not_included():
+    """Same-name different-id namesake must NOT silently add an issue to the run (BUI-198).
+
+    Scenario: we are resolving "John Romita Jr." (id=355) as Penciller.  The
+    issue-list creator filter returns issue #42 because creator 355 holds a Writer
+    credit on it.  But a different Metron creator with the identical canonical name
+    (a namesake, id=400) also credits issue #42 as Penciller.  mokkari's Credit
+    carries no creator id — only the name string — so these two credits appear as
+    two separate entries both with creator="John Romita Jr.".
+
+    Without the guard, the name+role check would wrongly confirm #42 as penciller
+    (matching the namesake's credit).  The guard detects two entries sharing the
+    same creator name and demotes the issue to a warning instead of adding it to
+    the run.
+    """
+    client = MetronClient()
+    session = MagicMock()
+    # Candidate set: issue #42 was returned by the id-pinned issue-list filter
+    # (creator 355 has a Writer credit on it), plus issue #10 which is legitimately
+    # pencilled by creator 355 (single credit entry, no collision).
+    session.issues_list.return_value = [
+        _mock_base_issue(101, "10"),   # clean penciller credit — should be in run
+        _mock_base_issue(142, "42"),   # same-name collision — must NOT be in run
+    ]
+
+    def _detail(_id: int) -> MagicMock:
+        if _id == 101:
+            # Normal case: one credit entry, creator pencilled it.
+            return _mock_detail_issue(
+                [], [_mock_credit("John Romita Jr.", ["Penciller"])]
+            )
+        # Issue #42: two separate credit entries both named "John Romita Jr." —
+        # one is the resolved creator (Writer, id=355) and one is the namesake
+        # (Penciller, id=400).  mokkari Credit exposes only the name string, so
+        # both entries look identical to the name-based check.
+        return _mock_detail_issue(
+            [],
+            [
+                _mock_credit("John Romita Jr.", ["Writer"],    id=901),
+                _mock_credit("John Romita Jr.", ["Penciller"], id=902),
+            ],
+        )
+
+    session.issue.side_effect = _detail
+    client._session = session
+
+    run = client.resolve_creator_run(
+        series_id=1, creator_id=355, creator_name="John Romita Jr.", role="penciller",
+    )
+
+    # Issue #10 is confirmed (single credit, no collision).
+    assert [i["number"] for i in run["issues"]] == ["10"]
+
+    # Issue #42 is flagged as a warning, NOT silently included in the run.
+    assert len(run["warnings"]) == 1
+    w = run["warnings"][0]
+    assert w["number"] == "42"
+    assert "same-name collision" in w["reason"]
+    assert "BUI-198" in w["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Credential error — raised, not swallowed
 # ---------------------------------------------------------------------------
