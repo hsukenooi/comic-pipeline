@@ -552,11 +552,18 @@ def test_check_ignores_unowned_rows(tmp_path, monkeypatch):
 
 
 def test_check_mighty_thor_masthead_alias(tmp_path, monkeypatch):
-    """'The Mighty Thor #154' (cover title, 1968) resolves to the owned
-    'Thor #154' via the year-gated masthead alias (BUI-46).
+    """'The Mighty Thor #154' (cover title) resolves to the owned 'Thor #154'
+    via the masthead alias (BUI-46, broadened in BUI-197).
 
     This was the original BUI-26 false negative — the comic that got sniped
     while owned because identify reports the cover masthead, not the catalog name.
+
+    BUI-197 routes the alias through owned_match_keys, so it now fires WITH or
+    WITHOUT a year. The no-year case is the safe direction for the buy path (an
+    over-broad "owned" only causes a missed buy, never a duplicate buy) and is
+    required for the conflicts audit + owned-safe export, which pass no year.
+    Era-collision protection on the buy path is preserved by the year gate when a
+    year IS supplied (see test_check_masthead_alias_year_gate_prevents_collision).
     """
     import locg.commands as cmds
 
@@ -570,15 +577,14 @@ def test_check_mighty_thor_masthead_alias(tmp_path, monkeypatch):
 
     # The catalog name works directly:
     assert cmds.cmd_collection_check(series="Thor", issue="154")["match_status"] == "in_collection"
-    # The cover/masthead name resolves via the year-gated alias:
+    # The cover/masthead name resolves via the alias, with a matching year:
     r = cmds.cmd_collection_check(series="The Mighty Thor", issue="154", year="1968")
     assert r["match_status"] == "in_collection"
     assert r["full_title_matched"] == "Thor #154"
-    # Without a year the alias does NOT fire — offline safety, since the masthead
-    # is shared with the distinct 'The Mighty Thor (Vol. 3)' 2015 series:
-    assert cmds.cmd_collection_check(
-        series="The Mighty Thor", issue="154"
-    )["match_status"] == "not_in_cache"
+    # BUI-197: the alias now also fires WITHOUT a year (audit/export path).
+    r2 = cmds.cmd_collection_check(series="The Mighty Thor", issue="154")
+    assert r2["match_status"] == "in_collection"
+    assert r2["full_title_matched"] == "Thor #154"
 
 
 def test_check_masthead_alias_year_gate_prevents_collision(tmp_path, monkeypatch):
@@ -598,6 +604,100 @@ def test_check_masthead_alias_year_gate_prevents_collision(tmp_path, monkeypatch
     # (Vol. 3) era must NOT report it as owned.
     assert cmds.cmd_collection_check(
         series="The Mighty Thor", issue="5", year="2016"
+    )["match_status"] == "not_in_cache"
+
+
+# --- BUI-197: broader masthead aliases on the buy-path check ---
+
+def test_check_uncanny_xmen_masthead_alias_headline_case(tmp_path, monkeypatch):
+    """BUI-197 headline: query 'Uncanny X-Men #137' resolves to the owned
+    'The X-Men #137'. The classic split already covers #137 (≤141), but this
+    confirms the masthead equivalence end-to-end on the buy-path check, both
+    directions and without a year."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The X-Men (Vol. 1) (1963 - 1981)",
+        full_title="The X-Men #137",
+        release_date="1980-09-01",
+    )])
+
+    # Query masthead 'Uncanny X-Men' finds the owned 'The X-Men' copy (no year):
+    r = cmds.cmd_collection_check(series="Uncanny X-Men", issue="137")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "The X-Men #137"
+
+
+def test_check_xmen_masthead_alias_reverse_direction(tmp_path, monkeypatch):
+    """Reverse direction: collection holds 'Uncanny X-Men', query uses 'X-Men'.
+    Symmetric alias equivalence must resolve regardless of which side holds the
+    masthead. Uses a #142+ issue so the classic split would file it under
+    Uncanny — the alias still covers a base 'X-Men' query."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Uncanny X-Men (Vol. 1) (1980 - 2011)",
+        full_title="Uncanny X-Men #200",
+        release_date="1985-12-01",
+    )])
+
+    r = cmds.cmd_collection_check(series="X-Men", issue="200")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Uncanny X-Men #200"
+
+
+def test_check_incredible_hulk_masthead_alias_both_directions(tmp_path, monkeypatch):
+    """BUI-197: Incredible Hulk ↔ Hulk masthead alias resolves both directions,
+    with and without a year."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="The Incredible Hulk (1968 - 1999)",
+            full_title="The Incredible Hulk #181",
+            release_date="1974-11-01",
+            gixen_item_id="hulk-181",
+        ),
+        _agent_win_row(
+            series="Hulk (2008 - 2012)",
+            full_title="Hulk #1",
+            release_date="2008-03-01",
+            gixen_item_id="hulk-1",
+        ),
+    ])
+
+    # Collection holds 'The Incredible Hulk', query uses 'Hulk':
+    r1 = cmds.cmd_collection_check(series="Hulk", issue="181")
+    assert r1["match_status"] == "in_collection"
+    assert r1["full_title_matched"] == "The Incredible Hulk #181"
+
+    # Collection holds 'Hulk', query uses 'Incredible Hulk':
+    r2 = cmds.cmd_collection_check(series="Incredible Hulk", issue="1", year="2008")
+    assert r2["match_status"] == "in_collection"
+    assert r2["full_title_matched"] == "Hulk #1"
+
+
+def test_check_alias_does_not_match_unowned_issue(tmp_path, monkeypatch):
+    """An alias must not over-match: owning 'Thor #154' does not make an unowned
+    'The Mighty Thor #999' report as in_collection (issue-level precision)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 1) (1966 - 1996)",
+        full_title="Thor #154",
+        release_date="1968-05-02",
+    )])
+
+    assert cmds.cmd_collection_check(
+        series="The Mighty Thor", issue="999"
     )["match_status"] == "not_in_cache"
 
 
@@ -1756,6 +1856,68 @@ def test_wish_list_conflicts_finds_leading_article_variant(tmp_path, monkeypatch
     result = cmds.cmd_wish_list_conflicts()
 
     assert [c["name"] for c in result["conflicts"]] == ["Incredible Hulk #181"]
+
+
+def test_wish_list_conflicts_finds_thor_masthead_alias(tmp_path, monkeypatch):
+    """BUI-197: 'The Mighty Thor #300' wished, owned as 'Thor #300'. The audit
+    passes NO year, so the masthead alias must resolve year-free (the old
+    year-gated _SERIES_ALIASES path was dead in the audit)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 1) (1966 - 1996)",
+        full_title="Thor #300",
+        release_date="1980-10-01",
+    )])
+    _seed_wish_list([{"name": "The Mighty Thor #300", "id": 300}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["The Mighty Thor #300"]
+    assert result["conflicts"][0]["full_title_matched"] == "Thor #300"
+
+
+def test_wish_list_conflicts_finds_hulk_masthead_alias(tmp_path, monkeypatch):
+    """BUI-197: 'Incredible Hulk #377' wished, owned as 'The Incredible Hulk
+    #377' — masthead alias caught in the no-year audit."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Incredible Hulk (1968 - 1999)",
+        full_title="The Incredible Hulk #377",
+        release_date="1991-01-01",
+    )])
+    _seed_wish_list([{"name": "Incredible Hulk #377", "id": 377}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["Incredible Hulk #377"]
+
+
+def test_wish_list_conflicts_finds_annual_masthead_alias(tmp_path, monkeypatch):
+    """BUI-197: an annual under one masthead, wished under another. Owned as
+    'Uncanny X-Men Annual #9', wished as 'X-Men Annual #9'. The annual qualifier
+    is stripped, the base series alias-expanded, and the qualifier re-applied, so
+    the cross-masthead annual is found (outside the #141/#142 split)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Uncanny X-Men Annual (1980 - 2011)",
+        full_title="Uncanny X-Men Annual #9",
+        release_date="1985-12-01",
+    )])
+    _seed_wish_list([{"name": "X-Men Annual #9", "id": 909}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["X-Men Annual #9"]
+    assert result["conflicts"][0]["full_title_matched"] == "Uncanny X-Men Annual #9"
 
 
 def test_wish_list_conflicts_reports_unparseable(tmp_path, monkeypatch):

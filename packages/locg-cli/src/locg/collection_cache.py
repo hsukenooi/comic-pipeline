@@ -266,41 +266,150 @@ def _xmen_classic_split(issue_num: Optional[str], year: Any) -> Optional[str]:
     return _XMEN_EARLY_SERIES if n <= _XMEN_SPLIT_BOUNDARY else _XMEN_LATE_SERIES
 
 
+# Masthead aliases (BUI-197). A series whose masthead drifts over its run is
+# filed by LOCG under a name that drops or swaps a masthead adjective — e.g. the
+# COLLECTION holds "The X-Men #137" while a buy-path query or wish uses
+# "Uncanny X-Men #137". An exact-key match misses the owned copy, so the buy path
+# re-buys a duplicate and (worse) the owned-safe export emits the wished book as
+# ``In Collection=0`` and LOCG DELETES the owned copy (the BUI-200 26-deleted
+# incident; the masthead-alias variant of it is what BUI-197 closes).
+#
+# Each entry maps two normalized series keys (post-:func:`_normalize_series_key`,
+# i.e. article + (Vol. N) + year decoration already stripped, lowercased) that
+# name the SAME run under different mastheads. The relation is made SYMMETRIC and
+# transitively closed below (:data:`_ALIAS_GROUPS`), so equivalence holds
+# regardless of which side the collection vs the query happens to hold.
+#
+# This is consulted by :func:`owned_match_keys` — the single source of
+# cross-series equivalence for collection-check, the conflicts audit, AND the
+# owned-safe export. It carries NO year, so it works in the no-year audit/export
+# (the old year-gated _SERIES_ALIASES fallback in commands.py was dead there).
+#
+# CAUTION (era collision): only add a pair when the dropped/added adjective names
+# the SAME run, never a distinct same-masthead reuse (e.g. the modern
+# "The Mighty Thor (Vol. 3)" 2015 is a different series from "Thor" Vol. 1 — but
+# they share the issue-number space only by coincidence; the alias makes them
+# *candidates*, and the per-issue (series, issue) match plus, on the buy path,
+# the year gate are what keep a genuinely-different era from matching). Extend
+# conservatively and verify the LOCG catalog spelling against the live
+# series-names endpoint before adding.
+_MASTHEAD_ALIAS_PAIRS: tuple[tuple[str, str], ...] = (
+    ("mighty thor", "thor"),
+    ("invincible iron man", "iron man"),
+    ("incredible hulk", "hulk"),
+    ("uncanny x-men", "x-men"),
+)
+
+
+def _build_alias_groups(
+    pairs: tuple[tuple[str, str], ...],
+) -> dict[str, frozenset[str]]:
+    """Close the alias pairs into symmetric, transitive equivalence groups.
+
+    Returns norm_key -> frozenset of all keys equivalent to it (including
+    itself). Symmetric (a↔b) and transitive (a~b, b~c ⇒ a~c) so the masthead
+    equivalence holds no matter which name the collection vs the query holds.
+    """
+    adj: dict[str, set[str]] = {}
+    for a, b in pairs:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    groups: dict[str, frozenset[str]] = {}
+    for node in adj:
+        if node in groups:
+            continue
+        # BFS over the symmetric adjacency to gather the full component.
+        seen: set[str] = set()
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(adj.get(cur, ()))
+        frozen = frozenset(seen)
+        for member in seen:
+            groups[member] = frozen
+    return groups
+
+
+_ALIAS_GROUPS: dict[str, frozenset[str]] = _build_alias_groups(_MASTHEAD_ALIAS_PAIRS)
+
+# An "Annual" (or "Annuals") qualifier sits between the base series and the issue
+# token in the full_title ("X-Men Annual #9" -> series portion "X-Men Annual"),
+# so it normalizes to key "x-men annual" — outside both the split keys and the
+# alias table, and annuals get missed (BUI-197). Strip a trailing Annual
+# qualifier to recover the base series key, then alias-expand THAT, so an annual
+# resolves to its base run's alias/split set. The stripped qualifier is re-applied
+# to every expanded key so "x-men annual" matches "uncanny x-men annual" (not the
+# regular run "uncanny x-men").
+_ANNUAL_SUFFIX_RE = re.compile(r"\s+annuals?$", re.IGNORECASE)
+
+
+def _alias_keys_for(norm_key: str) -> frozenset[str]:
+    """All normalized keys equivalent to ``norm_key`` via the masthead alias table.
+
+    Handles a trailing ``Annual`` qualifier by aliasing the base series key and
+    re-applying the qualifier to each result, so annuals share their run's alias
+    set. Always includes ``norm_key`` itself.
+    """
+    direct = _ALIAS_GROUPS.get(norm_key)
+    if direct is not None:
+        return direct
+    m = _ANNUAL_SUFFIX_RE.search(norm_key)
+    if m is not None:
+        base = norm_key[: m.start()].strip()
+        suffix = norm_key[m.start():]  # e.g. " annual"
+        base_group = _ALIAS_GROUPS.get(base)
+        if base_group is not None:
+            return frozenset(f"{k}{suffix}" for k in base_group)
+    return frozenset({norm_key})
+
+
 def owned_match_keys(series: str, issue_num: Optional[str]) -> frozenset[str]:
     """Normalized series keys under which a (series, issue) could be *owned*.
 
-    The data-loss guard at the heart of BUI-200: deciding "is this wished book
-    already owned?" by the LITERAL series name misses owned copies filed under a
-    DIFFERENT name variant for the same run, so the export emits an
+    The data-loss guard at the heart of BUI-200/BUI-197: deciding "is this wished
+    book already owned?" by the LITERAL series name misses owned copies filed
+    under a DIFFERENT name variant for the same run, so the export emits an
     ``In Collection=0`` wish row that tells LOCG to delete the owned copy (the
     confirmed 26-deleted-X-Men incident).
 
-    This returns the *set* of normalized keys (see :func:`_normalize_series_key`,
-    which already folds leading article + ``(Vol. N)`` + year-range / bare-year
-    decoration) that an owned copy of this issue could legitimately appear under.
-    A match against ANY key means owned. The set always includes the query's own
-    normalized key; it additionally adds the OTHER masthead of the classic X-Men
-    split when the issue number puts the owned copy on the other side of the
-    LOCG filing boundary:
+    This is the SINGLE source of cross-series equivalence — collection-check, the
+    conflicts audit, and the owned-safe export all route through it, so they
+    benefit identically and consistently. It returns the *set* of normalized keys
+    (see :func:`_normalize_series_key`, which already folds leading article +
+    ``(Vol. N)`` + year-range / bare-year decoration) that an owned copy of this
+    issue could legitimately appear under. A match against ANY key means owned.
 
-    * ``x-men`` (LOCG: ``The X-Men``) holds #1–141.
-    * ``uncanny x-men`` holds #142+.
+    The set always includes the query's own normalized key, and adds:
 
-    So a wish written ``Uncanny X-Men #107`` (issue ≤ 141) must also match an
-    owned ``The X-Men #107`` and vice-versa. This works WITHOUT a year — the
-    conflicts audit deliberately passes no year (BUI-129) — because the split is
-    a pure issue-number boundary. ``year`` is intentionally not a parameter here:
-    callers without a year must still get the cross-masthead key.
+    * **The classic X-Men issue-number split** (BUI-199/BUI-200): ``x-men``
+      (LOCG ``The X-Men``) holds #1–141, ``uncanny x-men`` holds #142+. So a wish
+      ``Uncanny X-Men #107`` (≤141) also matches an owned ``The X-Men #107``.
+    * **Masthead aliases** (BUI-197, :data:`_MASTHEAD_ALIAS_PAIRS`): symmetric
+      adjective-dropping equivalences (``incredible hulk``↔``hulk``,
+      ``mighty thor``↔``thor``, ``invincible iron man``↔``iron man``,
+      ``uncanny x-men``↔``x-men``) covering the variants the issue-number split
+      can't — annuals, relaunches, and any issue outside the #141/#142 boundary.
+    * **Annual-aware keys**: a trailing ``Annual`` qualifier is stripped, its base
+      alias-expanded, and the qualifier re-applied, so ``x-men annual`` matches
+      ``uncanny x-men annual``.
 
-    This builds the *structure* for normalized (series, issue) matching. The
-    broader masthead alias TABLE (Uncanny↔X-Men beyond the classic split, and
-    other adjective-dropping mastheads) is owned by BUI-197, which extends
-    ``_SERIES_ALIASES`` and layers an audit allowlist on top of this seam.
+    Everything here works WITHOUT a year — the conflicts audit deliberately
+    passes none (BUI-129) — because every relation is a pure series/issue-key
+    rule. ``year`` is intentionally NOT a parameter: callers without a year still
+    get the full cross-series key set. Per-issue (series, issue) matching at the
+    call sites (and, on the buy path, the year gate) keep a genuinely-different
+    same-name era from being treated as owned.
     """
     query_key = _normalize_series_key(series)
-    keys = {query_key}
-    # Cross-masthead only for the classic X-Men split keys — never let the
-    # issue-number boundary leak into unrelated series (e.g. "Batman #100").
+    keys: set[str] = {query_key}
+    # Masthead aliases (+ annual-aware) — the broad, year-free equivalence.
+    keys |= _alias_keys_for(query_key)
+    # The classic X-Men issue-number split: add the OTHER masthead only when the
+    # issue number puts the owned copy on the other side of the LOCG boundary.
+    # Scoped to the split keys so the boundary never leaks into unrelated series.
     if query_key in _XMEN_SPLIT_KEYS:
         canonical = _xmen_classic_split(issue_num, None)
         if canonical is not None:

@@ -544,9 +544,11 @@ def test_wish_list_add_allows_unowned_title(client):
 
 
 def test_wish_list_add_year_catches_masthead_owned_book(client):
-    """BUI-184: with the per-issue cover year, the owned-guard's year-gated
-    masthead fallback catches a book stored under its base masthead — and without
-    the year it behaves exactly as before (backward-compatible)."""
+    """BUI-184/BUI-197: the owned-guard catches a book stored under its base
+    masthead. BUI-197 routed the masthead alias through owned_match_keys, so the
+    guard now fires WITH or WITHOUT a year — the no-year case is the safe
+    direction (it blocks a wished-already-owned book from entering the list and
+    later being exported as In Collection=0)."""
     _seed_collection(client.store, [{
         "full_title": "Thor #154",
         "series_name": "Thor",
@@ -561,12 +563,13 @@ def test_wish_list_add_year_catches_masthead_owned_book(client):
     )
     assert owned.status_code == 409, owned.text
 
-    # Without the year the masthead fallback can't fire → not blocked (the
-    # documented backward-compatible behavior; the export-side fix is the net).
+    # BUI-197: WITHOUT the year the masthead alias now also fires → still 409.
+    # This is strictly safer — it closes the no-year hole that let an owned book
+    # be wish-listed and then deleted on the next sync.
     no_year = client.post(
         "/api/comics/wish-list", json={"title": "The Mighty Thor #154"}
     )
-    assert no_year.status_code == 200, no_year.text
+    assert no_year.status_code == 409, no_year.text
 
 
 def test_wish_list_add_wrong_year_fails_open_not_false_block(client):

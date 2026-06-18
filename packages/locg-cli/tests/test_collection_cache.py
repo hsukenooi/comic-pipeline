@@ -722,3 +722,68 @@ def test_resolve_unknown_key_returns_none():
     """An unknown normalized key returns None (Metron fallback fires)."""
     from locg.collection_cache import resolve_series_for_win
     assert resolve_series_for_win("totally-unknown", "1", 2000, {}, None) is None
+
+
+# --- BUI-197: owned_match_keys masthead aliases (single source of equivalence) ---
+
+def test_owned_match_keys_includes_self():
+    from locg.collection_cache import owned_match_keys
+    assert "batman" in owned_match_keys("Batman", "100")
+
+
+def test_owned_match_keys_masthead_alias_symmetric():
+    """Alias equivalence is symmetric: each masthead expands to the other,
+    regardless of which side the query holds."""
+    from locg.collection_cache import owned_match_keys
+    assert "thor" in owned_match_keys("The Mighty Thor", "300")
+    assert "mighty thor" in owned_match_keys("Thor", "300")
+    assert "hulk" in owned_match_keys("Incredible Hulk", "181")
+    assert "incredible hulk" in owned_match_keys("Hulk", "181")
+    assert "iron man" in owned_match_keys("Invincible Iron Man", "1")
+    assert "invincible iron man" in owned_match_keys("Iron Man", "1")
+    assert "x-men" in owned_match_keys("Uncanny X-Men", "200")
+    assert "uncanny x-men" in owned_match_keys("X-Men", "200")
+
+
+def test_owned_match_keys_no_year_needed():
+    """The alias expansion takes no year — required for the no-year conflicts
+    audit + export."""
+    from locg.collection_cache import owned_match_keys
+    # The function has no year parameter at all; result is purely series/issue.
+    assert "thor" in owned_match_keys("The Mighty Thor", "1")
+
+
+def test_owned_match_keys_unrelated_series_not_cross_linked():
+    """An unaliased series expands only to itself — no spurious cross-link that
+    could make two genuinely-different runs match (era-collision guard)."""
+    from locg.collection_cache import owned_match_keys
+    keys = owned_match_keys("Daredevil", "1")
+    assert keys == frozenset({"daredevil"})
+
+
+def test_owned_match_keys_xmen_split_still_works():
+    """The classic X-Men issue-number split survives alongside the alias table:
+    #137 (<=141) cross-links to the early masthead too."""
+    from locg.collection_cache import owned_match_keys, _normalize_series_key
+    keys = owned_match_keys("Uncanny X-Men", "137")
+    assert "x-men" in keys
+    assert _normalize_series_key("The X-Men (Vol. 1) (1963 - 1981)") in keys
+
+
+def test_owned_match_keys_annual_alias_expansion():
+    """An annual-suffixed series resolves to its base run's alias set with the
+    Annual qualifier re-applied: 'X-Men Annual' matches 'uncanny x-men annual'."""
+    from locg.collection_cache import owned_match_keys
+    keys = owned_match_keys("X-Men Annual", "9")
+    assert "x-men annual" in keys
+    assert "uncanny x-men annual" in keys
+    # And the regular run key is NOT pulled in (annual stays an annual).
+    assert "x-men" not in keys
+    assert "uncanny x-men" not in keys
+
+
+def test_owned_match_keys_annual_plural_suffix():
+    """A plural 'Annuals' qualifier is also recognized."""
+    from locg.collection_cache import owned_match_keys
+    keys = owned_match_keys("Hulk Annuals", "1")
+    assert "incredible hulk annuals" in keys
