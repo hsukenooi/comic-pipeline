@@ -113,8 +113,16 @@ def empty_payload() -> dict[str, Any]:
     }
 
 
+# Dash variants LOCG/Metron use in year ranges: ASCII hyphen-minus, en-dash
+# (U+2013), em-dash (U+2014), and minus sign (U+2212). collection_io already
+# normalizes en-dashes on the input side, so a decorated string reaching these
+# regexes may carry any of them (BUI-199 finding 4).
+_DASH_CLASS = r"[-–—−]"
+
 # Patterns stripped from series names to produce normalized index keys
-_YEAR_RANGE_RE = re.compile(r"\s*\(\d{4}\s*-\s*(\d{4}|Present)\)", re.IGNORECASE)
+_YEAR_RANGE_RE = re.compile(
+    rf"\s*\(\d{{4}}\s*{_DASH_CLASS}\s*(\d{{4}}|Present)\)", re.IGNORECASE
+)
 _VOL_RE = re.compile(r"\s*\(Vol\.\s*\d+\)", re.IGNORECASE)
 # Also strip bare 4-digit year in parens: (1993)
 _BARE_YEAR_RE = re.compile(r"\s*\(\d{4}\)")
@@ -138,6 +146,211 @@ def _normalize_series_key(series_name: str) -> str:
     return s.strip().lower()
 
 
+def base_series_name(decorated: str) -> str:
+    """Strip LOCG series-name decoration to the bare catalog series string.
+
+    LOCG's *series_name* keeps the ``(Vol. N)`` / ``(YYYY)`` / ``(YYYY - YYYY)`` /
+    ``(YYYY - Present)`` decoration (e.g. ``Fantastic Four (Vol. 3) (1997 - 2012)``);
+    its *full_title* does NOT (e.g. ``Fantastic Four #72``). This strips that
+    parenthetical decoration so a full_title can be built from the base name.
+
+    Verified against 1432 export rows: series_name KEEPS the decoration,
+    full_title does NOT (BUI-199).
+
+    The leading article is deliberately PRESERVED — LOCG often keeps it in the
+    catalog string (e.g. ``The X-Men``, ``The Avengers``), so blindly stripping
+    "The" would produce a full_title LOCG cannot match. (Contrast
+    ``_normalize_series_key``, which DOES strip the article for index identity.)
+    """
+    s = decorated.strip()
+    stripped = _YEAR_RANGE_RE.sub("", s)
+    stripped = _VOL_RE.sub("", stripped)
+    stripped = _BARE_YEAR_RE.sub("", stripped)
+    stripped = stripped.strip()
+    # BUI-199 finding 6: a candidate that is pure decoration (e.g. "(1991)")
+    # would strip to "" and later yield " #1". Fall back to the original.
+    return stripped if stripped else s
+
+
+def base_full_title(canonical_series: str, issue_num: Optional[str]) -> str:
+    """Build a LOCG-matchable full_title: base (undecorated) series + issue.
+
+    Strips the ``(Vol. N) (YYYY - YYYY)`` decoration off ``canonical_series``
+    (LOCG's full_title carries no decoration) and appends ``#<issue>`` when an
+    issue number is present.
+    """
+    base = base_series_name(canonical_series)
+    return f"{base} #{issue_num}" if issue_num else base
+
+
+# Open-ended end sentinel — reserved for "(YYYY - Present)" ONLY. A bare single
+# year "(YYYY)" is a one-year range (YYYY, YYYY), not open-ended (finding 2).
+_OPEN_END = 9999
+
+# Year-range extraction for volume resolution: captures the begin year and the
+# end token (a 4-digit year or "Present") from a decorated series name.
+_YEAR_RANGE_CAPTURE_RE = re.compile(
+    rf"\((\d{{4}})\s*{_DASH_CLASS}\s*(\d{{4}}|Present)\)", re.IGNORECASE
+)
+
+
+def series_year_range(decorated: str) -> Optional[tuple[int, int]]:
+    """Extract (begin_year, end_year) from a decorated series name, or None.
+
+    ``(YYYY - Present)`` yields an open-ended range whose end is a far-future
+    sentinel (9999). A bare single year ``(YYYY)`` is a ONE-year range
+    ``(YYYY, YYYY)`` — NOT open-ended (BUI-199 finding 2). Dash variants
+    (en/em-dash) are accepted (finding 4).
+    """
+    m = _YEAR_RANGE_CAPTURE_RE.search(decorated)
+    if m:
+        begin = int(m.group(1))
+        end_tok = m.group(2)
+        end = _OPEN_END if end_tok.lower() == "present" else int(end_tok)
+        return (begin, end)
+    bare = _BARE_YEAR_RE.search(decorated)
+    if bare:
+        yr = int(bare.group(0).strip().strip("()"))
+        return (yr, yr)
+    return None
+
+
+def _issue_num_int(issue_num: str) -> Optional[int]:
+    """Leading integer of an issue token (``"107"`` -> 107, ``"107a"`` -> 107)."""
+    m = re.match(r"\s*(\d+)", str(issue_num))
+    return int(m.group(1)) if m else None
+
+
+def _coerce_year(year: Any) -> Optional[int]:
+    """Coerce an identify/cover year (int, "1979", "1979-05-10") to an int year."""
+    if year is None:
+        return None
+    m = re.match(r"(\d{4})", str(year).strip())
+    return int(m.group(1)) if m else None
+
+
+# The LOCG X-Men series split (BUI-199): LOCG files X-Men #1–141 under
+# "The X-Men (Vol. 1) (1963 - 1981)" and #142+ under
+# "Uncanny X-Men (Vol. 1) (1980 - 2011)". /comic:identify emits either masthead
+# ("X-Men" or "Uncanny X-Men"), so both normalized keys are part of this split:
+# "x-men" (leading "The" stripped) and "uncanny x-men".
+#
+# These two classic volumes have OVERLAPPING year ranges (both contain 1980 and
+# 1981), so a year alone cannot disambiguate a boundary win. The issue-number
+# boundary (#1–141 -> early, #142+ -> late) is the tie-breaker for that overlap
+# and for the no-year case. Crucially the split is scoped to the CLASSIC era:
+# a modern relaunch (e.g. 2019 X-Men #1) must NOT be forced into Vol. 1 — its
+# year falls outside both classic ranges, so it falls through to the normal
+# year/era candidate resolution (and to Metron when nothing matches).
+_XMEN_SPLIT_KEYS = frozenset({"x-men", "uncanny x-men"})
+_XMEN_SPLIT_BOUNDARY = 141
+_XMEN_EARLY_SERIES = "The X-Men (Vol. 1) (1963 - 1981)"
+_XMEN_LATE_SERIES = "Uncanny X-Men (Vol. 1) (1980 - 2011)"
+_XMEN_CLASSIC_MIN = 1963
+_XMEN_CLASSIC_MAX = 2011
+
+
+def _xmen_classic_split(issue_num: Optional[str], year: Any) -> Optional[str]:
+    """Resolve the classic X-Men split by issue number, or None if out of era.
+
+    Returns the early/late classic volume only when the win is within the
+    classic era (year absent, or 1963–2011); a modern-era year returns None so
+    the caller falls through to normal year/era resolution + Metron.
+    """
+    yr = _coerce_year(year)
+    if yr is not None and not (_XMEN_CLASSIC_MIN <= yr <= _XMEN_CLASSIC_MAX):
+        return None
+    n = _issue_num_int(issue_num) if issue_num else None
+    if n is None:
+        return None
+    return _XMEN_EARLY_SERIES if n <= _XMEN_SPLIT_BOUNDARY else _XMEN_LATE_SERIES
+
+
+def _best_volume_by_year(candidates: list[str], yr: int) -> Optional[str]:
+    """Pick the candidate whose year range contains ``yr``, most specific first.
+
+    Deterministic regardless of candidate order (BUI-199 finding 3): among all
+    ranges that contain the year, prefer the NARROWEST span; a closed range
+    beats an open ``Present`` range; ties break on the earliest begin year then
+    the candidate string. Candidates with no parseable range are ignored.
+    """
+    scored: list[tuple[int, int, int, str, str]] = []
+    for cand in candidates:
+        rng = series_year_range(cand)
+        if rng is None or not (rng[0] <= yr <= rng[1]):
+            continue
+        span = rng[1] - rng[0]
+        is_open = 1 if rng[1] == _OPEN_END else 0  # closed (0) sorts before open (1)
+        scored.append((span, is_open, rng[0], cand, cand))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+    return scored[0][4]
+
+
+def resolve_series_for_win(
+    norm_key: str,
+    issue_num: Optional[str],
+    year: Any,
+    series_name_index: dict[str, str],
+    volume_candidates: Optional[dict[str, list[str]]] = None,
+) -> Optional[str]:
+    """Resolve the LOCG canonical *series_name* for a win.
+
+    Returns the decorated canonical series name, or None when ``norm_key`` is
+    unknown OR no volume can be resolved (the caller then falls back to Metron /
+    manual resolution).
+
+    Beyond a plain ``series_name_index`` lookup this corrects the BUI-199
+    volume-mislabeling failures:
+
+    * **Volume by era** — the one-to-one index collapses every volume of a
+      series onto whichever one was indexed (e.g. 1979 ``Iron Man #124`` tagged
+      ``(Vol. 8) (2026 - Present)``). When ``year`` is known and multiple
+      volumes share the key, pick the volume whose range CONTAINS the year,
+      most-specific (narrowest) first — deterministic regardless of order.
+    * **The classic X-Men split** — ``The X-Men`` (#1–141) vs ``Uncanny X-Men``
+      (#142+) by issue-number boundary, applied ONLY within the classic era so
+      a modern relaunch falls through to normal resolution / Metron.
+
+    ``volume_candidates`` (norm_key -> [decorated names]) is the multi-volume
+    map from :func:`build_volume_candidates`; when omitted the resolver behaves
+    like a plain index lookup (plus the classic X-Men split).
+    """
+    yr = _coerce_year(year)
+
+    # Classic X-Men split: only fires within the classic era; a modern-era year
+    # returns None here and falls through (then to Metron). The issue-number
+    # boundary tie-breaks the two volumes' overlapping ranges (1980–1981).
+    if norm_key in _XMEN_SPLIT_KEYS:
+        split = _xmen_classic_split(issue_num, year)
+        if split is not None:
+            return split
+
+    candidates: list[str] = []
+    if volume_candidates and norm_key in volume_candidates:
+        candidates = list(volume_candidates[norm_key])
+    elif norm_key in series_name_index:
+        candidates = [series_name_index[norm_key]]
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Multiple volumes share this key — disambiguate by year/era when we can.
+    if yr is not None:
+        best = _best_volume_by_year(candidates, yr)
+        if best is not None:
+            return best
+        # Year known but no candidate range contains it (e.g. a modern relaunch
+        # not yet in the local export) — return None so Metron resolves it
+        # rather than silently picking a wrong volume.
+        return None
+    # No year — fall back to the single index entry (deterministic).
+    return series_name_index.get(norm_key) or candidates[0]
+
+
 def rebuild_series_name_index(payload: dict[str, Any]) -> dict[str, str]:
     """Rebuild series_name_index from source='locg_export' rows only (R61)."""
     index: dict[str, str] = {}
@@ -148,6 +361,28 @@ def rebuild_series_name_index(payload: dict[str, Any]) -> dict[str, str]:
                 key = _normalize_series_key(sn)
                 index[key] = sn
     return index
+
+
+def build_volume_candidates(payload: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each normalized series key -> every distinct canonical volume name.
+
+    Unlike :func:`rebuild_series_name_index` (one-to-one, last writer wins),
+    this preserves ALL volumes filed under a key so a win can be matched to the
+    volume whose year-range contains the issue's era (BUI-199). Built from
+    source='locg_export' rows only (R61).
+    """
+    multi: dict[str, list[str]] = {}
+    for row in payload.get("comics", []):
+        if row.get("source") != "locg_export":
+            continue
+        sn = row.get("series_name") or ""
+        if not sn:
+            continue
+        key = _normalize_series_key(sn)
+        bucket = multi.setdefault(key, [])
+        if sn not in bucket:
+            bucket.append(sn)
+    return multi
 
 
 def _write_atomic(dest: Path, content: str) -> None:

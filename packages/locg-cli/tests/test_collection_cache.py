@@ -621,3 +621,104 @@ def test_last_writer_populated(tmp_path):
     assert lw["pid"] == os.getpid()
     assert lw["command"] == "mycommand"
     assert "ts" in lw
+
+
+# ---------------------------------------------------------------------------
+# BUI-199: series-name normalization + volume resolution helpers
+# ---------------------------------------------------------------------------
+
+def test_base_series_name_strips_decoration():
+    from locg.collection_cache import base_series_name
+    assert base_series_name("Fantastic Four (Vol. 3) (1997 - 2012)") == "Fantastic Four"
+    assert base_series_name("Spawn (1992 - Present)") == "Spawn"
+    assert base_series_name("X-Force (1991)") == "X-Force"
+    # Leading article preserved (LOCG keeps it in the catalog string).
+    assert base_series_name("The X-Men (Vol. 1) (1963 - 1981)") == "The X-Men"
+
+
+def test_base_series_name_strips_endash_range():
+    """En-dash year ranges must be stripped too (BUI-199 finding 4)."""
+    from locg.collection_cache import base_series_name
+    assert base_series_name("The X-Men (Vol. 1) (1963 – 1981)") == "The X-Men"
+    # Em-dash variant as well.
+    assert base_series_name("Daredevil (1964 — 1998)") == "Daredevil"
+
+
+def test_base_full_title_endash_no_decoration_leaks():
+    """An en-dash decorated series must not leak into full_title (Cause 1)."""
+    from locg.collection_cache import base_full_title
+    ft = base_full_title("Uncanny X-Men (Vol. 1) (1980 – 2011)", "142")
+    assert ft == "Uncanny X-Men #142"
+    assert "(" not in ft and "–" not in ft
+
+
+def test_base_series_name_pure_decoration_falls_back():
+    """A string that strips to empty falls back to the original (finding 6)."""
+    from locg.collection_cache import base_series_name, base_full_title
+    assert base_series_name("(1991)") == "(1991)"
+    # base_full_title must never produce a leading-space " #1".
+    assert not base_full_title("(1991)", "1").startswith(" ")
+
+
+def test_series_year_range_endash_and_bare_year():
+    from locg.collection_cache import series_year_range
+    assert series_year_range("X-Men (Vol. 1) (1963 - 1981)") == (1963, 1981)
+    assert series_year_range("X-Men (Vol. 1) (1963 – 1981)") == (1963, 1981)
+    assert series_year_range("Spawn (1992 - Present)") == (1992, 9999)
+    # Bare single year is a ONE-year range, NOT open-ended (finding 2).
+    assert series_year_range("X-Force (1991)") == (1991, 1991)
+    assert series_year_range("No Years Here") is None
+
+
+def test_series_year_range_bare_year_excludes_later_year():
+    """A 2016 win must NOT match X-Force (1991) (finding 2)."""
+    from locg.collection_cache import series_year_range
+    begin, end = series_year_range("X-Force (1991)")
+    assert not (begin <= 2016 <= end)
+
+
+def test_resolve_volume_overlapping_ranges_picks_narrowest():
+    """Boundary-year overlap (Hulk 1999) resolves to the narrowest range,
+    deterministically regardless of candidate order (finding 3)."""
+    from locg.collection_cache import resolve_series_for_win
+    early = "Hulk (Vol. 1) (1962 - 1999)"
+    late = "Hulk (Vol. 2) (1999 - 2008)"
+    candidates = {"hulk": [early, late]}
+    # 1999 is in both; the narrower (1999-2008) span wins.
+    assert resolve_series_for_win("hulk", "1", 1999, {}, candidates) == late
+    # Order must not matter.
+    candidates_rev = {"hulk": [late, early]}
+    assert resolve_series_for_win("hulk", "1", 1999, {}, candidates_rev) == late
+
+
+def test_resolve_volume_closed_beats_open_present():
+    """A closed range containing the year beats an open (Present) range."""
+    from locg.collection_cache import resolve_series_for_win
+    closed = "Thor (Vol. 1) (1966 - 1996)"
+    open_present = "Thor (Vol. 6) (2020 - Present)"
+    candidates = {"thor": [open_present, closed]}
+    assert resolve_series_for_win("thor", "300", 1980, {}, candidates) == closed
+
+
+def test_resolve_xmen_boundary_pair():
+    """Paired boundary test: #141 -> early, #142 -> late (classic era)."""
+    from locg.collection_cache import resolve_series_for_win
+    assert resolve_series_for_win("x-men", "141", 1980, {}, None) == "The X-Men (Vol. 1) (1963 - 1981)"
+    assert resolve_series_for_win("x-men", "142", 1981, {}, None) == "Uncanny X-Men (Vol. 1) (1980 - 2011)"
+
+
+def test_resolve_xmen_modern_relaunch_not_classic():
+    """A modern X-Men #1 (2019) must NOT be forced into Vol. 1; with no modern
+    candidate it returns None so the caller falls back to Metron."""
+    from locg.collection_cache import resolve_series_for_win
+    # Empty index/candidates: must not short-circuit into the classic split.
+    assert resolve_series_for_win("x-men", "1", 2019, {}, None) is None
+    # With a modern candidate present, that volume is picked.
+    modern = "X-Men (Vol. 5) (2019 - 2021)"
+    assert resolve_series_for_win("x-men", "1", 2019, {}, {"x-men": [modern]}) == modern
+
+
+def test_resolve_unknown_key_returns_none():
+    """An unknown normalized key returns None (Metron fallback fires)."""
+    from locg.collection_cache import resolve_series_for_win
+    assert resolve_series_for_win("totally-unknown", "1", 2000, {}, None) is None

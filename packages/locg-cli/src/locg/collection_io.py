@@ -808,13 +808,42 @@ def wish_rows_for_export(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+# BUI-105 placeholder: when no Metron data backs a win, record-win stamps
+# release_date = "{identify_year}-01-01" so a year-gated collection-check still
+# matches. That placeholder is correct in the STORE, but LOCG Bulk Import
+# matches on the EXACT Release Date — a wrong Jan-1 date reads as "Not Found",
+# whereas a BLANK date still matches by publisher+series+title (and the
+# year-precise round-trip restores LOCG's canonical date on re-import).
+_PLACEHOLDER_DATE_RE = re.compile(r"^\d{4}-01-01$")
+
+
+def _is_placeholder_release_date(row: dict[str, Any]) -> bool:
+    """True only for a BUI-105 placeholder date, detected by INTENT not shape.
+
+    record-win stamps the ``YYYY-01-01`` placeholder ONLY when no Metron data
+    backed the win (``metron_data is None`` -> stored ``metron_id is None``). A
+    Metron-sourced ``cover_date`` for a genuine January book is also
+    ``YYYY-01-01`` but is a REAL date and must be kept (R66, BUI-199 finding 5).
+    So require both an agent_win row AND a missing metron_id before treating a
+    Jan-1 date as a placeholder.
+    """
+    if row.get("source") != "agent_win":
+        return False
+    if row.get("metron_id") is not None:
+        return False
+    return bool(_PLACEHOLDER_DATE_RE.match(str(row.get("release_date") or "")))
+
+
 def _row_to_csv_dict(row: dict[str, Any], in_wish_list: bool = False) -> dict[str, str | int]:
     """Map a cache row to the 21-column LOCG CSV recipe (R21–R31)."""
+    # BUI-199 Cause 2: omit the Release Date for placeholder-dated agent_win rows
+    # so LOCG matches by title+series instead of rejecting a wrong exact date.
+    release_date = "" if _is_placeholder_release_date(row) else (row.get("release_date") or "")
     return {
         "Publisher Name": row.get("publisher_name") or "",
         "Series Name": row.get("series_name") or "",
         "Full Title": row.get("full_title") or "",
-        "Release Date": row.get("release_date") or "",
+        "Release Date": release_date,
         "In Collection": 0 if in_wish_list else 1,
         "In Wish List": 1 if in_wish_list else 0,
         "Marked Read": 0,
