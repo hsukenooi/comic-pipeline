@@ -1013,6 +1013,29 @@ def test_record_win_xmen_split_late_issue(tmp_path):
     assert row["full_title"] == "Uncanny X-Men #142"
 
 
+def test_record_win_xmen_modern_relaunch_uses_metron(tmp_path):
+    """BUI-199 finding 1: a modern X-Men #1 (2019) must NOT be forced into
+    The X-Men (Vol. 1). With no local volume it falls through to Metron, whose
+    canonical name is used."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    # Empty index/candidates for the x-men key: the classic split must NOT fire.
+    metron = _metron_hit("X-Men (2019 - 2021)", year_began=2019, year_end=2021)
+    result = cmd_collection_record_win(
+        [_make_win(series="X-Men", issue="1", year=2019)],
+        cache=cache,
+        metron=metron,
+    )
+
+    # The classic split short-circuit would have prevented any Metron call.
+    metron.lookup_issue.assert_called_once()
+    assert result["metron_lookups_attempted"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "X-Men (2019 - 2021)"
+    assert row["full_title"] == "X-Men #1"
+
+
 def test_record_win_volume_resolved_by_year_iron_man(tmp_path):
     """BUI-199 Cause 3: a 1979 Iron Man #124 win picks the 1968 volume, not the
     collapsed (Vol. 8) (2026 - Present) index entry."""

@@ -908,6 +908,35 @@ def test_generate_csv_omits_placeholder_release_date(tmp_path):
     assert by_title["Real Book #1"][rd_idx] == "1988-05-10"
 
 
+def test_generate_csv_keeps_real_metron_jan1_date(tmp_path):
+    """BUI-199 finding 5: a real Metron-sourced YYYY-01-01 cover_date (metron_id
+    set) is KEPT on export; only a metron_id-less placeholder is blanked."""
+    import csv, io
+    from locg.collection_io import generate_csv
+
+    metron_jan = _make_ready_row(
+        full_title="Metron Jan Book #1", release_date="1988-01-01"
+    )
+    metron_jan["metron_id"] = 12345  # real Metron-backed date
+
+    placeholder = _make_ready_row(
+        full_title="Placeholder Book #1", release_date="1988-01-01"
+    )
+    placeholder["metron_id"] = None  # BUI-105 placeholder
+
+    out = tmp_path / "out.csv"
+    generate_csv([metron_jan, placeholder], out)
+
+    reader = list(csv.reader(io.StringIO(out.read_text())))
+    header = reader[0]
+    rd_idx = header.index("Release Date")
+    ft_idx = header.index("Full Title")
+    by_title = {row[ft_idx]: row for row in reader[1:]}
+
+    assert by_title["Metron Jan Book #1"][rd_idx] == "1988-01-01"
+    assert by_title["Placeholder Book #1"][rd_idx] == ""
+
+
 def test_generate_csv_keeps_placeholder_date_for_non_agent_win(tmp_path):
     """The placeholder-date omission is scoped to agent_win rows only — a
     locg_export row with a Jan-1 date keeps it (it is LOCG's real date)."""

@@ -818,8 +818,18 @@ _PLACEHOLDER_DATE_RE = re.compile(r"^\d{4}-01-01$")
 
 
 def _is_placeholder_release_date(row: dict[str, Any]) -> bool:
-    """True for an agent_win row whose release_date is a BUI-105 YYYY-01-01 stamp."""
+    """True only for a BUI-105 placeholder date, detected by INTENT not shape.
+
+    record-win stamps the ``YYYY-01-01`` placeholder ONLY when no Metron data
+    backed the win (``metron_data is None`` -> stored ``metron_id is None``). A
+    Metron-sourced ``cover_date`` for a genuine January book is also
+    ``YYYY-01-01`` but is a REAL date and must be kept (R66, BUI-199 finding 5).
+    So require both an agent_win row AND a missing metron_id before treating a
+    Jan-1 date as a placeholder.
+    """
     if row.get("source") != "agent_win":
+        return False
+    if row.get("metron_id") is not None:
         return False
     return bool(_PLACEHOLDER_DATE_RE.match(str(row.get("release_date") or "")))
 
