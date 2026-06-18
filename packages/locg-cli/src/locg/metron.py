@@ -326,9 +326,24 @@ class MetronClient:
                     ),
                 })
                 continue
-            holds_role = bool(matching_credits) and role_norm in (
-                matching_credits[0].get("roles") or []
-            )
+            if not matching_credits:
+                # The issue is in the id-constrained candidate set (the resolved creator
+                # has *some* credit here), yet no credit's name string matches the resolved
+                # canonical name.  This is name drift — punctuation/comma variants like
+                # "John Romita, Jr." vs "John Romita Jr." — not a real absence.  Exclude it
+                # from the run (we can't confirm the role) but WARN so a truncated run is
+                # visible rather than a silent drop (BUI-198).
+                warnings.append({
+                    "number": number,
+                    "metron_id": metron_id,
+                    "reason": (
+                        f"no credit name matched {creator_name!r} despite the id-pinned "
+                        "candidate filter — likely name drift (punctuation variant); "
+                        "run membership unverified (BUI-198)"
+                    ),
+                })
+                continue
+            holds_role = role_norm in (matching_credits[0].get("roles") or [])
             if holds_role:
                 in_run.append({
                     "number": number,

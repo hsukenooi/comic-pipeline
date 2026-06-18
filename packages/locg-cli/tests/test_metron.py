@@ -568,7 +568,50 @@ def test_resolve_creator_run_same_name_collision_is_warned_not_included():
     assert len(run["warnings"]) == 1
     w = run["warnings"][0]
     assert w["number"] == "42"
+    assert w["metron_id"] == 142
     assert "same-name collision" in w["reason"]
+    assert "BUI-198" in w["reason"]
+
+
+def test_resolve_creator_run_name_drift_is_warned_not_silently_dropped():
+    """A candidate whose credit name differs from the canonical name is WARNED (BUI-198).
+
+    The issue is in the id-pinned candidate set (the resolved creator has *some*
+    credit on it), but the credit's name string is a punctuation variant
+    ("John Romita, Jr." vs the resolved "John Romita Jr.").  No credit matches the
+    canonical name, so the issue can't be confirmed for the run — but it must be
+    surfaced as a warning so a truncated run is visible, not a silent drop.
+    """
+    client = MetronClient()
+    session = MagicMock()
+    session.issues_list.return_value = [
+        _mock_base_issue(101, "10"),   # clean match — should be in run
+        _mock_base_issue(155, "15"),   # name drift — must be warned, not in run
+    ]
+
+    def _detail(_id: int) -> MagicMock:
+        if _id == 101:
+            return _mock_detail_issue(
+                [], [_mock_credit("John Romita Jr.", ["Penciller"])]
+            )
+        # Comma-variant name string: no match against the resolved canonical name.
+        return _mock_detail_issue(
+            [], [_mock_credit("John Romita, Jr.", ["Penciller"])]
+        )
+
+    session.issue.side_effect = _detail
+    client._session = session
+
+    run = client.resolve_creator_run(
+        series_id=1, creator_id=355, creator_name="John Romita Jr.", role="penciller",
+    )
+
+    assert [i["number"] for i in run["issues"]] == ["10"]
+    assert len(run["warnings"]) == 1
+    w = run["warnings"][0]
+    assert w["number"] == "15"
+    assert w["metron_id"] == 155
+    assert "no credit name matched" in w["reason"]
     assert "BUI-198" in w["reason"]
 
 
