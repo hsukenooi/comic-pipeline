@@ -1207,13 +1207,15 @@ async def api_wish_list_add(req: WishListAddRequest):
         parsed = _split_wish_list_name(req.title)
         if parsed is not None:
             series, issue = parsed
-            # BUI-184 (resolved): forward the caller-supplied per-issue cover
-            # year (req.year) so cmd_collection_check's year-gated masthead
-            # fallback (_SERIES_ALIASES, e.g. "The Mighty Thor" → owned "Thor")
-            # can catch a book stored under its base masthead. `year` is optional
-            # — when absent (req.year is None) this behaves exactly as before, so
-            # there's no regression for callers that don't send it. The BUI-129
-            # trap (forwarding a series START year that hides owned mid-run
+            # BUI-184/BUI-197: forward the caller-supplied per-issue cover year
+            # (req.year) so cmd_collection_check can catch a book stored under its
+            # base masthead. As of BUI-197 the masthead alias is resolved via
+            # owned_match_keys, which is year-free, so the guard now fires WITH or
+            # WITHOUT a year (e.g. "The Mighty Thor #154" → owned "Thor #154"
+            # blocks even when req.year is None) — strictly safer. When a year IS
+            # supplied it still tightens the match (a wrong-era owned row is
+            # rejected by the release-date filter, so a wrong year fails OPEN). The
+            # BUI-129 trap (forwarding a series START year that hides owned mid-run
             # issues) is the CALLER's responsibility: WishListAddRequest.year is
             # documented as the per-issue cover year, never year_began.
             try:

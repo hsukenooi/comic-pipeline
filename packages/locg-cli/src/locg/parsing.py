@@ -29,6 +29,16 @@ ISSUE_TOKEN_RE = re.compile(r"#\s*(" + _ISSUE_CORE + r")")
 # ``#N`` anchored to the end (the reconciler's trailing-token extractor).
 ISSUE_TOKEN_TRAILING_RE = re.compile(r"#\s*(" + _ISSUE_CORE + r")\s*$")
 
+# Permissive ``#token`` for the OWNERSHIP-CHECK split only (BUI-197): the digit-led
+# core (``ISSUE_TOKEN_RE``) rejects non-digit-led tokens like ``#A1`` / ``#annual``
+# / ``#1-A``, which would make a wish "unparseable" and SKIP the owned-vs-wished
+# comparison entirely — reintroducing the In-Collection=0 deletion of an owned
+# copy filed under an alias name. This pattern matches the FIRST ``#`` followed by
+# any run of issue-ish chars (the old ``_WISH_NAME_RE`` token class), so the audit
+# and the export can still compare such wishes. It is used ONLY for ownership
+# matching, never for money/price parsing or the LOCG reconciler.
+_PERMISSIVE_ISSUE_RE = re.compile(r"#\s*([0-9A-Za-z][0-9A-Za-z.\-]*)")
+
 # Price: a ``$`` then a (possibly comma-grouped) integer part and optional
 # decimals. The comma group is stripped before float().
 _PRICE_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)")
@@ -49,6 +59,30 @@ def split_full_title(full_title: str) -> tuple[str, Optional[str]]:
     if m:
         return full_title[: m.start()].strip(), m.group(1)
     return full_title.strip(), None
+
+
+def split_series_issue_for_ownership(title: str) -> tuple[str, Optional[str]]:
+    """Split a title into ``(series_portion, issue_token)`` for OWNERSHIP checks.
+
+    The SINGLE parser the conflicts audit AND the owned-safe export both use to
+    compare a wish against the collection (BUI-197 parser parity). It first tries
+    the canonical digit-led :func:`split_full_title`; if that finds no issue token
+    it falls back to the permissive ``#token`` pattern so non-digit-led tokens
+    (``#A1``, ``#annual``, ``#1-A``) are STILL split and compared rather than
+    treated as unparseable — closing the deletion hole where such a wish skipped
+    the owned-vs-wished check and got exported ``In Collection=0`` over an owned
+    copy filed under an alias name.
+
+    Returns ``(series, None)`` only when there is no ``#`` token at all (a true
+    TPB/OGN/special), which the title-string path handles.
+    """
+    series, issue = split_full_title(title)
+    if issue is not None:
+        return series, issue
+    m = _PERMISSIVE_ISSUE_RE.search(title or "")
+    if m:
+        return (title or "")[: m.start()].strip(), m.group(1)
+    return series, None
 
 
 def trailing_issue_token(full_title: str) -> Optional[str]:

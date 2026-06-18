@@ -21,7 +21,11 @@ from locg.collection_cache import CollectionCache, _normalize_series_key, owned_
 from locg.config import wish_list_cache_path
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
-from locg.parsing import normalize_issue_key, split_full_title as _split_full_title
+from locg.parsing import (
+    normalize_issue_key,
+    split_full_title as _split_full_title,
+    split_series_issue_for_ownership,
+)
 
 logger = logging.getLogger("locg")
 
@@ -883,24 +887,33 @@ def cmd_wish_list_remove(title: str) -> dict[str, Any]:
 
 
 # Wish-list entry names are written as "<Series> #<Issue>" by cmd_wish_list_add
-# (and by the /comic:wishlist-add skill). Split on the first "#" so the leading
-# text is the series and the token right after "#" is the issue. Trailing variant
-# text (e.g. "#300 (Direct)") is ignored for the ownership check.
-_WISH_NAME_RE = re.compile(r"^(?P<series>.*?)\s*#\s*(?P<issue>[0-9A-Za-z.\-]+)")
+# (and by the /comic:wishlist-add skill).
+#
+# BUI-197 parser parity: this used to parse with its OWN regex
+# (``#\s*([0-9A-Za-z.\-]+)``) while the owned-safe export parsed titles with the
+# digit-led ``split_full_title``. The two disagreed on tokens like ``#A1`` /
+# ``#annual`` / ``#1-A``, so a clean conflicts audit did NOT prove the exported
+# CSV was owned-safe — worse, the digit-led parser made such a wish "unparseable",
+# SKIPPING the ownership check, so an owned copy under an alias name got exported
+# In Collection=0 and deleted. Both the audit and the export now go through the
+# SINGLE shared :func:`split_series_issue_for_ownership`, which falls back to a
+# permissive ``#token`` for non-digit-led tokens, so they stay in lockstep AND
+# never silently skip a wish.
 
 
 def _split_wish_list_name(name: str) -> Optional[tuple[str, str]]:
     """Split a wish-list entry name into ``(series, issue)``.
 
-    Returns ``None`` when the name has no ``#<issue>`` token or no series text
-    before it — those entries can't be ownership-checked and are reported as
-    ``unparseable`` rather than silently dropped.
+    Uses the shared :func:`split_series_issue_for_ownership` so the audit and the
+    owned-safe export agree on every issue token, including non-digit-led ones
+    (``#A1``, ``#annual``, ``#1-A``) that the digit-led parser would drop
+    (BUI-197 parser parity + deletion-hole fix). Returns ``None`` only when the
+    name has no ``#`` token at all or no series text before it — those entries
+    can't be ownership-checked and are reported as ``unparseable`` rather than
+    silently dropped.
     """
-    m = _WISH_NAME_RE.match(name or "")
-    if m is None:
-        return None
-    series = m.group("series").strip()
-    issue = m.group("issue").strip()
+    series, issue = split_series_issue_for_ownership(name or "")
+    series = series.strip()
     if not series or not issue:
         return None
     return series, issue
@@ -1766,16 +1779,15 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
 # here only as a reference to where it lives.
 
 
-# Cover/masthead title (normalized) -> LOCG catalog base series (normalized),
-# for series whose catalog name drops a masthead adjective. Used as a year-gated
-# fallback in cmd_collection_check (BUI-46): "The Mighty Thor #154" (1968) should
-# resolve to the owned "Thor #154" without colliding with the distinct
-# "The Mighty Thor (Vol. 3)" 2015 series. Verified against the real catalog; extend
-# conservatively (only when the LOCG series name genuinely drops the adjective).
-_SERIES_ALIASES: dict[str, str] = {
-    "mighty thor": "thor",
-    "invincible iron man": "iron man",
-}
+# BUI-197: the cover/masthead alias table that used to live here
+# (``_SERIES_ALIASES``, a one-directional, year-gated, check-only fallback) was
+# removed. Cross-series masthead equivalence is now the SINGLE responsibility of
+# :func:`locg.collection_cache.owned_match_keys`, which is symmetric, year-free,
+# and consulted identically by the buy-path check, the conflicts audit, and the
+# owned-safe export. The buy-path era-collision protection that the year gate
+# provided survives because the ``owned_match_keys`` loop below still forwards
+# ``year`` to :func:`_match_owned_issue` (a wrong-era owned row is rejected by the
+# release-date filter), so no separate year-gated alias path is needed.
 
 
 def _match_owned_issue(
@@ -1785,6 +1797,7 @@ def _match_owned_issue(
     issue: str,
     variant: Optional[str],
     year: Optional[str],
+    require_dated: bool = False,
 ) -> Optional[str]:
     """Return the full_title of an owned cache row matching the series key +
     issue (+ optional variant/year), or None. Shared by the direct and the
@@ -1795,6 +1808,15 @@ def _match_owned_issue(
     its stored title lacks the variant word — otherwise a variant-qualified
     query (e.g. "newsstand") hides the owned base issue and the pipeline
     re-buys it. When a variant-bearing owned row does exist, it is preferred.
+
+    `require_dated` (BUI-197 MUST-FIX 2): when True AND a `year` is supplied, a
+    DATELESS owned row is rejected instead of fail-open-matched. This is set ONLY
+    for the alias/cross-masthead passes — a year-free alias makes
+    ``owned_match_keys('Hulk','1')`` overlap a classic ``Incredible Hulk #1``, so
+    a dateless classic copy would otherwise falsely satisfy a year-bearing modern
+    relaunch query (``Hulk #1`` 2021) and skip a legitimate buy. The exact-key
+    pass keeps the BUI-105 fail-open behavior (``require_dated=False``): a
+    dateless same-series record-win must still match.
     """
     fallback: Optional[str] = None
     for row in comics:
@@ -1804,7 +1826,11 @@ def _match_owned_issue(
             continue
 
         full_title = row.get("full_title") or ""
-        title_series, title_issue = _split_full_title(full_title)
+        # BUI-197: permissive ownership split so an owned row with a non-digit-led
+        # token ("Thor Annual #A1") parses to (series, issue) instead of (whole
+        # title, None) — otherwise its series key carries the "#A1" and never
+        # matches, so the audit silently misses an owned book under an alias name.
+        title_series, title_issue = split_series_issue_for_ownership(full_title)
 
         # Series identity comes from the title prefix, so "Fantastic Four Annual"
         # does not satisfy a plain "Fantastic Four" query (BUI-26 bug C).
@@ -1827,7 +1853,12 @@ def _match_owned_issue(
         # release_date. A dateless owned row (e.g. an index-resolved record-win
         # written before its date was stamped) must not be silently excluded by
         # the year gate — treat absent dates as a year match, not a miss.
+        # BUI-197 MUST-FIX 2: but an ALIAS-derived match (require_dated) on a
+        # dateless row, when a year IS known, IS rejected — the year-free alias
+        # would otherwise collide two genuinely-different same-masthead eras.
         release_date = row.get("release_date") or ""
+        if year and not release_date and require_dated:
+            continue
         if year and release_date and not release_date.startswith(str(year)):
             continue
 
@@ -1868,34 +1899,33 @@ def cmd_collection_check(
 
     matched = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
 
-    # BUI-200: an owned copy can be filed under a DIFFERENT series-name variant
-    # for the same run (the X-Men split: "Uncanny X-Men #107" wished vs owned
-    # "The X-Men #107"). Try every normalized key the issue could be owned under
-    # — owned_match_keys folds article/Vol/year decoration AND the issue-number
-    # masthead split. This runs WITHOUT a year (the conflicts audit passes none),
-    # so the cross-masthead owned book is found and the export can't emit an
+    # BUI-200/BUI-197: an owned copy can be filed under a DIFFERENT series-name
+    # variant for the same run — the classic X-Men issue-number split
+    # ("Uncanny X-Men #107" wished vs owned "The X-Men #107") AND broader masthead
+    # aliases (Incredible Hulk↔Hulk, Mighty Thor↔Thor, Invincible Iron Man↔Iron
+    # Man, Uncanny X-Men↔X-Men for annuals/relaunches). owned_match_keys is the
+    # single source of that equivalence: it folds article/Vol/year decoration, the
+    # issue-number split, the symmetric alias table, and annual-aware keys. ``year``
+    # is still forwarded to _match_owned_issue, so on the buy path a wrong-era
+    # owned row is rejected by the release-date filter (era-collision protection);
+    # with no year (the conflicts audit) the alias keys still resolve so the
+    # cross-masthead owned book is found and the export can't emit an
     # In Collection=0 row that deletes it (the 26-deleted-X-Men data-loss bug).
     if matched is None:
         for alt_key in owned_match_keys(series, issue):
             if alt_key == series_key:
                 continue
+            # require_dated=True: an alias/cross-masthead match on a DATELESS
+            # owned row is rejected when a year is known (MUST-FIX 2 — stops a
+            # dateless classic "Incredible Hulk #1" from falsely satisfying a
+            # year-bearing "Hulk #1" 2021 relaunch query). With NO year the alias
+            # over-matches (the safe over-exclusion direction for the audit/export).
             matched = _match_owned_issue(
-                comics, alt_key, issue_stripped, issue, variant, year
+                comics, alt_key, issue_stripped, issue, variant, year,
+                require_dated=True,
             )
             if matched is not None:
                 break
-
-    # BUI-46: masthead/cover-title fallback. If the cover title ("The Mighty
-    # Thor") missed, retry against the LOCG catalog base ("Thor"). Year-gated:
-    # only attempt with a year, and the year filter in _match_owned_issue then
-    # ensures the era matches, so it can't collide with a distinct same-masthead
-    # series (e.g. The Mighty Thor (Vol. 3), 2015).
-    if matched is None and year:
-        alias_key = _SERIES_ALIASES.get(series_key)
-        if alias_key is not None:
-            matched = _match_owned_issue(
-                comics, alias_key, issue_stripped, issue, variant, year
-            )
 
     if matched is not None:
         return {
