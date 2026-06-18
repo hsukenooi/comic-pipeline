@@ -848,10 +848,10 @@ def test_record_win_index_path_found_by_year_gated_check(tmp_path, monkeypatch):
         metron=_null_metron(),
     )
 
-    # The win's title carries the canonical series name (with its date range),
-    # as record-win builds it from the index value; the matcher strips the
-    # parenthetical via _normalize_series_key, so the bare-series query matches.
-    assert cache.load()["comics"][-1]["full_title"] == "Amazing Spider-Man (1963 - 1998) #300"
+    # BUI-199: full_title is built from the BASE series name (no parenthetical
+    # decoration) so LOCG Bulk Import can match it. series_name keeps the
+    # decoration; full_title does not.
+    assert cache.load()["comics"][-1]["full_title"] == "Amazing Spider-Man #300"
 
     # collection-check always passes --year; the just-won book must be found.
     monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
@@ -859,7 +859,7 @@ def test_record_win_index_path_found_by_year_gated_check(tmp_path, monkeypatch):
         series="Amazing Spider-Man", issue="300", year="1988"
     )
     assert result["match_status"] == "in_collection"
-    assert result["full_title_matched"] == "Amazing Spider-Man (1963 - 1998) #300"
+    assert result["full_title_matched"] == "Amazing Spider-Man #300"
 
 
 def test_record_win_index_path_dateless_when_no_year(tmp_path):
@@ -908,6 +908,153 @@ def test_record_win_series_from_metron(tmp_path):
     row = payload["comics"][-1]
     assert row["series_name"] == "Amazing Spider-Man (1963 - 1998)"
     assert row["needs_manual_series_canonical"] is False
+
+
+# --- BUI-199: full_title is built from the BASE (undecorated) series name ---
+
+def _seed_export_series(cache, series_names: list[str]) -> None:
+    """Seed locg_export rows for each decorated series name and rebuild the index."""
+    from locg.collection_cache import (
+        build_volume_candidates,
+        rebuild_series_name_index,
+    )
+    rows = [
+        {
+            **_agent_win_row(series=sn, full_title=f"{sn} #1"),
+            "source": "locg_export",
+            "gixen_item_id": f"seed-{i}",
+        }
+        for i, sn in enumerate(series_names)
+    ]
+    _seed_cache(cache, rows)
+
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+        payload["_volume_candidates"] = build_volume_candidates(payload)
+
+    cache.apply(rebuild, command="test-rebuild")
+
+
+def test_record_win_full_title_strips_decoration_index_path(tmp_path):
+    """BUI-199 Cause 1 (index path): full_title carries NO parenthetical
+    decoration even though the canonical series_name does."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, ["Fantastic Four (Vol. 3) (1997 - 2012)"])
+
+    cmd_collection_record_win(
+        [_make_win(series="Fantastic Four", issue="72", year=2003)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "Fantastic Four (Vol. 3) (1997 - 2012)"
+    assert row["full_title"] == "Fantastic Four #72"
+    assert "(" not in row["full_title"]
+
+
+def test_record_win_full_title_strips_decoration_metron_path(tmp_path):
+    """BUI-199 Cause 1 (Metron path): full_title from format_series_name is
+    also stripped of its (year - year) decoration."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_hit("Amazing Spider-Man (1963 - 1998)")
+    cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man", issue="300")],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "Amazing Spider-Man (1963 - 1998)"
+    assert row["full_title"] == "Amazing Spider-Man #300"
+    assert "(" not in row["full_title"]
+
+
+# --- BUI-199 Cause 3 + X-Men split: volume/series resolved by issue + era ---
+
+def test_record_win_xmen_split_early_issue(tmp_path):
+    """BUI-199 split: X-Men #107 (<=141) resolves to The X-Men, not Uncanny."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    # The index happens to hold the LATE volume under the shared "x-men" key.
+    _seed_export_series(cache, ["Uncanny X-Men (Vol. 1) (1980 - 2011)"])
+
+    cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="107", year=1977)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "The X-Men (Vol. 1) (1963 - 1981)"
+    assert row["full_title"] == "The X-Men #107"
+
+
+def test_record_win_xmen_split_late_issue(tmp_path):
+    """BUI-199 split: X-Men #142 (>141) resolves to Uncanny X-Men."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, ["The X-Men (Vol. 1) (1963 - 1981)"])
+
+    cmd_collection_record_win(
+        [_make_win(series="X-Men", issue="142", year=1981)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "Uncanny X-Men (Vol. 1) (1980 - 2011)"
+    assert row["full_title"] == "Uncanny X-Men #142"
+
+
+def test_record_win_volume_resolved_by_year_iron_man(tmp_path):
+    """BUI-199 Cause 3: a 1979 Iron Man #124 win picks the 1968 volume, not the
+    collapsed (Vol. 8) (2026 - Present) index entry."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, [
+        "Iron Man (Vol. 1) (1968 - 1996)",
+        "Iron Man (Vol. 8) (2026 - Present)",
+    ])
+
+    cmd_collection_record_win(
+        [_make_win(series="Iron Man", issue="124", year=1979)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "Iron Man (Vol. 1) (1968 - 1996)"
+    assert row["full_title"] == "Iron Man #124"
+
+
+def test_record_win_volume_resolved_by_year_avengers(tmp_path):
+    """BUI-199 Cause 3: a 1968 Avengers #52 win picks the 1963 volume, not the
+    2018 volume that LOCG's wrong-issue add came from."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, [
+        "The Avengers (Vol. 8) (2018 - 2023)",
+        "The Avengers (Vol. 1) (1963 - 1996)",
+    ])
+
+    cmd_collection_record_win(
+        [_make_win(series="Avengers", issue="52", year=1968)],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "The Avengers (Vol. 1) (1963 - 1996)"
+    assert row["full_title"] == "The Avengers #52"
 
 
 def test_record_win_series_manual_fallback(tmp_path):
@@ -1050,7 +1197,10 @@ def test_record_win_metron_variant_match(tmp_path):
     assert result["manual_variant_count"] == 0
 
     row = cache.load()["comics"][-1]
-    assert row["full_title"] == "Spawn (1992 - Present) #313 Capullo Variant"
+    # BUI-199: full_title uses the BASE series name (decoration stripped), with
+    # the matched variant suffix appended. series_name keeps the decoration.
+    assert row["full_title"] == "Spawn #313 Capullo Variant"
+    assert row["series_name"] == "Spawn (1992 - Present)"
     assert row["needs_manual_variant"] is False
 
 

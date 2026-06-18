@@ -2015,6 +2015,9 @@ def cmd_collection_record_win(
         _normalize_series_key,
         _next_seq,
         _utcnow_iso,
+        base_full_title,
+        build_volume_candidates,
+        resolve_series_for_win,
     )
     from locg.metron import MetronClient, MetronCredentialError
 
@@ -2025,6 +2028,10 @@ def cmd_collection_record_win(
 
     payload = cache.load()
     series_name_index: dict[str, str] = payload.get("series_name_index", {})
+    # BUI-199: a one-to-one series_name_index collapses every volume of a series
+    # onto whichever one was indexed last. Build the full per-key volume map so a
+    # year-bearing win can be matched to the volume whose range contains its era.
+    volume_candidates = build_volume_candidates(payload)
     existing_titles: set[str] = {
         row.get("full_title", "") for row in payload.get("comics", [])
     }
@@ -2105,8 +2112,14 @@ def cmd_collection_record_win(
             needs_manual_series = False
             metron_data: Optional[dict[str, Any]] = None
 
-            if norm_key in series_name_index:
-                canonical_series = series_name_index[norm_key]
+            # BUI-199: resolve the canonical series by issue-number boundary
+            # (the LOCG X-Men split) and by year/era (the right volume), not by
+            # blindly taking the single series_name_index entry.
+            resolved_series = resolve_series_for_win(
+                norm_key, issue_num, year_raw, series_name_index, volume_candidates
+            )
+            if resolved_series is not None:
+                canonical_series = resolved_series
             elif not metron_disabled:
                 try:
                     chunk_metron_attempted += 1
@@ -2137,11 +2150,17 @@ def cmd_collection_record_win(
 
             # R32: variant handling
             needs_manual_variant = False
-            base_full_title = f"{canonical_series} #{issue_num}" if issue_num else canonical_series
+            # BUI-199 Cause 1: full_title must use the BASE series name, not the
+            # decorated canonical_series. LOCG's full_title carries no
+            # "(Vol. N) (YYYY - YYYY)" decoration (e.g. "Fantastic Four #72",
+            # not "Fantastic Four (Vol. 3) (1997 - 2012) #72"), so a decorated
+            # full_title is unmatchable by LOCG Bulk Import. The stored
+            # series_name stays decorated/unchanged.
+            base_title = base_full_title(canonical_series, issue_num or None)
             if variant_text:
                 suffix = VARIANT_SUFFIX_MAP.get(variant_text)
                 if suffix:
-                    full_title = f"{base_full_title} {suffix}"
+                    full_title = f"{base_title} {suffix}"
                 else:
                     # BUI-33: Metron variant resolution. The lightweight
                     # lookup_issue has no variants, so fetch issue detail and
@@ -2165,17 +2184,17 @@ def cmd_collection_record_win(
                             )
 
                     if matched_variant:
-                        full_title = f"{base_full_title} {matched_variant}"
+                        full_title = f"{base_title} {matched_variant}"
                         chunk_variant_matches += 1
-                    elif base_full_title in existing_titles:
+                    elif base_title in existing_titles:
                         # Base issue already owned — attach to the canonical entry.
-                        full_title = base_full_title
+                        full_title = base_title
                     else:
-                        full_title = base_full_title
+                        full_title = base_title
                         needs_manual_variant = True
                         chunk_manual_variant += 1
             else:
-                full_title = base_full_title
+                full_title = base_title
 
             # release_date: prefer store_date, fall back to cover_date
             release_date: Optional[str] = None
