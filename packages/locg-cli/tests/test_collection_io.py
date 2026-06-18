@@ -1331,6 +1331,37 @@ def test_wish_export_excludes_owned_book(tmp_path):
     assert "Hellboy: Wake the Devil #1" in titles
 
 
+def test_wish_export_excludes_owned_xmen_masthead_split(tmp_path):
+    """BUI-200 REGRESSION (the 26-deleted-books bug): a wish written under one
+    X-Men masthead must NOT be exported as In Collection=0 when the owned copy is
+    filed under the OTHER masthead. LOCG files #1-141 under 'The X-Men' and #142+
+    under 'Uncanny X-Men'; a literal-title match misses this and the resulting
+    In Collection=0 row deletes the owned copy."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([
+        {"name": "Uncanny X-Men #107", "id": None},  # owned as "The X-Men #107"
+        {"name": "Uncanny X-Men #142", "id": None},  # genuinely not owned -> kept
+    ])
+    payload = {"comics": [
+        {"full_title": "The X-Men #107", "in_collection": 1},
+    ]}
+    titles = [r["full_title"] for r in wish_rows_for_export(payload)]
+    assert "Uncanny X-Men #107" not in titles, "owned cross-masthead book must never export"
+    assert "Uncanny X-Men #142" in titles
+
+
+def test_wish_export_excludes_owned_leading_article_variant(tmp_path):
+    """BUI-200: owned under a leading-article + decorated series name, wished
+    without the article. The normalized (series, issue) match excludes it so no
+    In Collection=0 row is emitted for the owned book."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{"name": "Incredible Hulk #181", "id": None}])
+    payload = {"comics": [
+        {"full_title": "The Incredible Hulk #181", "in_collection": 1},
+    ]}
+    assert wish_rows_for_export(payload) == []
+
+
 def test_wish_export_owned_match_is_dash_and_article_insensitive(tmp_path):
     """Owned-exclusion normalizes en-dash/hyphen and a leading article, so an
     owned 'Batman: One Bad Day – Two-Face #1' (en-dash) still excludes a wish add

@@ -1714,6 +1714,50 @@ def test_wish_list_conflicts_ignores_series_start_year(tmp_path, monkeypatch):
     assert [c["name"] for c in result["conflicts"]] == ["Uncanny X-Men #148"]
 
 
+def test_wish_list_conflicts_finds_xmen_masthead_split(tmp_path, monkeypatch):
+    """BUI-200 data-loss case: owned as 'The X-Men #107', wished as
+    'Uncanny X-Men #107'. LOCG files #1-141 under 'The X-Men' and #142+ under
+    'Uncanny X-Men', so a literal-series match misses the conflict and the export
+    emits In Collection=0 — deleting the owned copy (the 26-deleted-X-Men bug).
+    The audit passes NO year, so the issue-number masthead split must match
+    without one."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The X-Men (Vol. 1) (1963 - 1981)",
+        full_title="The X-Men #107",
+        release_date="1977-10-01",
+    )])
+    _seed_wish_list([{"name": "Uncanny X-Men #107", "id": 207}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["Uncanny X-Men #107"]
+    assert result["conflicts"][0]["full_title_matched"] == "The X-Men #107"
+
+
+def test_wish_list_conflicts_finds_leading_article_variant(tmp_path, monkeypatch):
+    """BUI-200: owned under a leading-article variant ('The Incredible Hulk')
+    must be flagged when wished without the article ('Incredible Hulk'). The
+    normalized series key strips the article so the conflict is caught."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Incredible Hulk (1968 - 1999)",
+        full_title="The Incredible Hulk #181",
+        release_date="1974-11-01",
+    )])
+    _seed_wish_list([{"name": "Incredible Hulk #181", "id": 181}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["Incredible Hulk #181"]
+
+
 def test_wish_list_conflicts_reports_unparseable(tmp_path, monkeypatch):
     import locg.commands as cmds
 
