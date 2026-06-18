@@ -21,7 +21,11 @@ from locg.collection_cache import CollectionCache, _normalize_series_key, owned_
 from locg.config import wish_list_cache_path
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
-from locg.parsing import normalize_issue_key, split_full_title as _split_full_title
+from locg.parsing import (
+    normalize_issue_key,
+    split_full_title as _split_full_title,
+    split_series_issue_for_ownership,
+)
 
 logger = logging.getLogger("locg")
 
@@ -886,24 +890,29 @@ def cmd_wish_list_remove(title: str) -> dict[str, Any]:
 # (and by the /comic:wishlist-add skill).
 #
 # BUI-197 parser parity: this used to parse with its OWN regex
-# (``#\s*([0-9A-Za-z.\-]+)``) while the owned-safe export parses titles with the
-# shared ``split_full_title`` (``ISSUE_TOKEN_RE``, digit-led). The two disagreed
-# on tokens like ``#A1`` / ``#annual`` / ``#1-A``, so a clean conflicts audit did
-# NOT prove the exported CSV was owned-safe. Both now go through the SINGLE shared
-# parser (``split_full_title``), so "audit reports a conflict" and "export does
-# not emit that owned book as In Collection=0" stay in lockstep.
+# (``#\s*([0-9A-Za-z.\-]+)``) while the owned-safe export parsed titles with the
+# digit-led ``split_full_title``. The two disagreed on tokens like ``#A1`` /
+# ``#annual`` / ``#1-A``, so a clean conflicts audit did NOT prove the exported
+# CSV was owned-safe — worse, the digit-led parser made such a wish "unparseable",
+# SKIPPING the ownership check, so an owned copy under an alias name got exported
+# In Collection=0 and deleted. Both the audit and the export now go through the
+# SINGLE shared :func:`split_series_issue_for_ownership`, which falls back to a
+# permissive ``#token`` for non-digit-led tokens, so they stay in lockstep AND
+# never silently skip a wish.
 
 
 def _split_wish_list_name(name: str) -> Optional[tuple[str, str]]:
     """Split a wish-list entry name into ``(series, issue)``.
 
-    Uses the shared :func:`split_full_title` so the audit and the owned-safe
-    export agree on every issue token (BUI-197 parser parity). Returns ``None``
-    when the name has no ``#<issue>`` token or no series text before it — those
-    entries can't be ownership-checked and are reported as ``unparseable`` rather
-    than silently dropped.
+    Uses the shared :func:`split_series_issue_for_ownership` so the audit and the
+    owned-safe export agree on every issue token, including non-digit-led ones
+    (``#A1``, ``#annual``, ``#1-A``) that the digit-led parser would drop
+    (BUI-197 parser parity + deletion-hole fix). Returns ``None`` only when the
+    name has no ``#`` token at all or no series text before it — those entries
+    can't be ownership-checked and are reported as ``unparseable`` rather than
+    silently dropped.
     """
-    series, issue = _split_full_title(name or "")
+    series, issue = split_series_issue_for_ownership(name or "")
     series = series.strip()
     if not series or not issue:
         return None
@@ -1788,6 +1797,7 @@ def _match_owned_issue(
     issue: str,
     variant: Optional[str],
     year: Optional[str],
+    require_dated: bool = False,
 ) -> Optional[str]:
     """Return the full_title of an owned cache row matching the series key +
     issue (+ optional variant/year), or None. Shared by the direct and the
@@ -1798,6 +1808,15 @@ def _match_owned_issue(
     its stored title lacks the variant word — otherwise a variant-qualified
     query (e.g. "newsstand") hides the owned base issue and the pipeline
     re-buys it. When a variant-bearing owned row does exist, it is preferred.
+
+    `require_dated` (BUI-197 MUST-FIX 2): when True AND a `year` is supplied, a
+    DATELESS owned row is rejected instead of fail-open-matched. This is set ONLY
+    for the alias/cross-masthead passes — a year-free alias makes
+    ``owned_match_keys('Hulk','1')`` overlap a classic ``Incredible Hulk #1``, so
+    a dateless classic copy would otherwise falsely satisfy a year-bearing modern
+    relaunch query (``Hulk #1`` 2021) and skip a legitimate buy. The exact-key
+    pass keeps the BUI-105 fail-open behavior (``require_dated=False``): a
+    dateless same-series record-win must still match.
     """
     fallback: Optional[str] = None
     for row in comics:
@@ -1807,7 +1826,11 @@ def _match_owned_issue(
             continue
 
         full_title = row.get("full_title") or ""
-        title_series, title_issue = _split_full_title(full_title)
+        # BUI-197: permissive ownership split so an owned row with a non-digit-led
+        # token ("Thor Annual #A1") parses to (series, issue) instead of (whole
+        # title, None) — otherwise its series key carries the "#A1" and never
+        # matches, so the audit silently misses an owned book under an alias name.
+        title_series, title_issue = split_series_issue_for_ownership(full_title)
 
         # Series identity comes from the title prefix, so "Fantastic Four Annual"
         # does not satisfy a plain "Fantastic Four" query (BUI-26 bug C).
@@ -1830,7 +1853,12 @@ def _match_owned_issue(
         # release_date. A dateless owned row (e.g. an index-resolved record-win
         # written before its date was stamped) must not be silently excluded by
         # the year gate — treat absent dates as a year match, not a miss.
+        # BUI-197 MUST-FIX 2: but an ALIAS-derived match (require_dated) on a
+        # dateless row, when a year IS known, IS rejected — the year-free alias
+        # would otherwise collide two genuinely-different same-masthead eras.
         release_date = row.get("release_date") or ""
+        if year and not release_date and require_dated:
+            continue
         if year and release_date and not release_date.startswith(str(year)):
             continue
 
@@ -1887,8 +1915,14 @@ def cmd_collection_check(
         for alt_key in owned_match_keys(series, issue):
             if alt_key == series_key:
                 continue
+            # require_dated=True: an alias/cross-masthead match on a DATELESS
+            # owned row is rejected when a year is known (MUST-FIX 2 — stops a
+            # dateless classic "Incredible Hulk #1" from falsely satisfying a
+            # year-bearing "Hulk #1" 2021 relaunch query). With NO year the alias
+            # over-matches (the safe over-exclusion direction for the audit/export).
             matched = _match_owned_issue(
-                comics, alt_key, issue_stripped, issue, variant, year
+                comics, alt_key, issue_stripped, issue, variant, year,
+                require_dated=True,
             )
             if matched is not None:
                 break

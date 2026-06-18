@@ -26,7 +26,7 @@ from locg.collection_cache import (
     owned_match_keys,
     rebuild_series_name_index,
 )
-from locg.parsing import normalize_issue_key, split_full_title
+from locg.parsing import normalize_issue_key, split_series_issue_for_ownership
 
 logger = logging.getLogger("locg")
 
@@ -792,7 +792,13 @@ def _owned_series_issue_index(payload: dict[str, Any]) -> set[tuple[str, str]]:
     for r in payload.get("comics", []):
         if not r.get("in_collection"):
             continue
-        series_portion, issue_token = split_full_title(r.get("full_title") or "")
+        # BUI-197: use the permissive ownership split so an owned row with a
+        # non-digit-led token (e.g. "Thor Annual #A1") is still indexed and can
+        # exclude a wish under an alias name — the digit-led split returned None
+        # here, leaving only the non-alias-aware title-string fallback.
+        series_portion, issue_token = split_series_issue_for_ownership(
+            r.get("full_title") or ""
+        )
         if issue_token is None:
             continue  # TPB/OGN/special — handled by the title-string path below
         issue_key = normalize_issue_key(issue_token)
@@ -847,12 +853,14 @@ def _wish_owned_by_series_issue(
 ) -> bool:
     """True if ``full_title`` is owned under any normalized (series, issue) variant.
 
-    Parses the wish title into (series, issue), then checks every normalized key
-    the issue could be owned under (:func:`owned_match_keys`) against the owned
-    index. Owned-safe: an unparseable title (no ``#N``) returns False here and is
-    left to the title-string path, which never under-matches an owned book.
+    Parses the wish title into (series, issue) via the shared permissive
+    ownership split (BUI-197 — so non-digit-led tokens like ``#A1`` are compared,
+    not skipped), then checks every normalized key the issue could be owned under
+    (:func:`owned_match_keys`) against the owned index. Owned-safe: a title with
+    no ``#`` token at all returns False here and is left to the title-string path,
+    which never under-matches an owned book.
     """
-    series_portion, issue_token = split_full_title(full_title)
+    series_portion, issue_token = split_series_issue_for_ownership(full_title)
     if issue_token is None:
         return False
     issue_key = normalize_issue_key(issue_token)

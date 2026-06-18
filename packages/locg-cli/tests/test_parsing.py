@@ -11,6 +11,7 @@ from locg.parsing import (
     extract_price,
     normalize_issue_key,
     split_full_title,
+    split_series_issue_for_ownership,
     trailing_issue_token,
 )
 
@@ -84,3 +85,30 @@ def test_normalize_issue_key_idempotent_and_lower(token):
 def test_normalize_issue_key_strips_leading_zeros():
     assert normalize_issue_key("007") == "7"
     assert normalize_issue_key("0") == "0"
+
+
+# --- split_series_issue_for_ownership (BUI-197) ------------------------------
+
+def test_ownership_split_digit_led_matches_split_full_title():
+    """For digit-led tokens it is identical to split_full_title (the canonical
+    parser stays primary)."""
+    for t in ("Thor #154", "Fantastic Four Annual #6", "X #1.MU", "Foo #1-A"):
+        assert split_series_issue_for_ownership(t) == split_full_title(t)
+
+
+def test_ownership_split_recovers_non_digit_led_tokens():
+    """The deletion-hole fix: non-digit-led tokens the digit-led parser drops are
+    still split, so the owned-vs-wished check is never skipped."""
+    assert split_full_title("Thor Annual #A1")[1] is None  # digit-led drops it
+    assert split_series_issue_for_ownership("Thor Annual #A1") == ("Thor Annual", "A1")
+    assert split_series_issue_for_ownership("X-Men #annual") == ("X-Men", "annual")
+    assert split_series_issue_for_ownership("The Mighty Thor Annual #A1") == (
+        "The Mighty Thor Annual",
+        "A1",
+    )
+
+
+def test_ownership_split_no_hash_returns_none():
+    """A true TPB/OGN/special (no '#') still returns None so the title-string
+    path handles it."""
+    assert split_series_issue_for_ownership("Watchmen") == ("Watchmen", None)

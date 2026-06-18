@@ -1920,6 +1920,89 @@ def test_wish_list_conflicts_finds_annual_masthead_alias(tmp_path, monkeypatch):
     assert result["conflicts"][0]["full_title_matched"] == "Uncanny X-Men Annual #9"
 
 
+def test_wish_list_conflicts_finds_non_digit_issue_token_alias(tmp_path, monkeypatch):
+    """BUI-197 MUST-FIX 1 (deletion hole): a wish whose issue token is NOT
+    digit-led ('#A1') must still be ownership-checked, not bucketed as
+    'unparseable' and skipped. Owned 'Thor Annual #A1', wished 'The Mighty Thor
+    Annual #A1' (masthead alias + non-digit token) — the audit must flag it so the
+    export doesn't emit In Collection=0 over the owned copy."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor Annual (1966 - 1994)",
+        full_title="Thor Annual #A1",
+        release_date="1966-01-01",
+    )])
+    _seed_wish_list([{"name": "The Mighty Thor Annual #A1", "id": 11}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert result["unparseable"] == [], "non-digit token must not be skipped"
+    assert [c["name"] for c in result["conflicts"]] == ["The Mighty Thor Annual #A1"]
+    assert result["conflicts"][0]["full_title_matched"] == "Thor Annual #A1"
+
+
+def test_check_dateless_alias_row_rejected_when_year_known(tmp_path, monkeypatch):
+    """BUI-197 MUST-FIX 2: a DATELESS owned row matched only via an ALIAS key is
+    rejected when the query carries a year — so a dateless classic
+    'The Incredible Hulk #1' (1962) does NOT falsely satisfy a year-bearing
+    'Hulk #1' (2021 relaunch) query, which would skip a legitimate buy."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Incredible Hulk (1962 - 1962)",
+        full_title="The Incredible Hulk #1",
+        release_date=None,  # dateless owned classic
+    )])
+
+    r = cmds.cmd_collection_check(series="Hulk", issue="1", year="2021")
+    assert r["match_status"] == "not_in_cache", "dateless alias row must not block a year-bearing buy"
+
+
+def test_check_dated_alias_row_matches_with_correct_year(tmp_path, monkeypatch):
+    """BUI-197 MUST-FIX 2 (positive): a DATED owned row still matches via an alias
+    key when the query year agrees — 'The Incredible Hulk #1' (1962) is owned for
+    a 'Hulk #1' year=1962 query."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Incredible Hulk (1962 - 1962)",
+        full_title="The Incredible Hulk #1",
+        release_date="1962-05-01",
+    )])
+
+    r = cmds.cmd_collection_check(series="Hulk", issue="1", year="1962")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "The Incredible Hulk #1"
+
+
+def test_check_dateless_alias_row_still_matches_with_no_year(tmp_path, monkeypatch):
+    """BUI-197 MUST-FIX 2 (documented tradeoff): with NO year the alias over-match
+    is kept on purpose — the audit/export path passes no year, and an over-broad
+    'owned' there only over-EXCLUDES a wish (the safe direction), never deletes a
+    book. A dateless classic 'The Incredible Hulk #1' DOES match a no-year
+    'Hulk #1' query. (The buy path always passes a year, so it gets MUST-FIX 2's
+    stricter dateless handling instead.)"""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Incredible Hulk (1962 - 1962)",
+        full_title="The Incredible Hulk #1",
+        release_date=None,
+    )])
+
+    r = cmds.cmd_collection_check(series="Hulk", issue="1")
+    assert r["match_status"] == "in_collection"
+
+
 def test_wish_list_conflicts_reports_unparseable(tmp_path, monkeypatch):
     import locg.commands as cmds
 

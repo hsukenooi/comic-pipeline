@@ -1416,28 +1416,52 @@ def test_wish_export_excludes_owned_annual_masthead_alias(tmp_path):
     assert wish_rows_for_export(payload) == []
 
 
+def test_wish_export_excludes_owned_non_digit_issue_token_alias(tmp_path):
+    """BUI-197 MUST-FIX 1 (deletion hole): a wish with a NON-digit-led issue token
+    ('#A1') owned under an alias name must NOT be emitted In Collection=0. The
+    digit-led parser dropped the token, the title-string fallback doesn't alias
+    mastheads, so the owned copy would have been deleted. The permissive ownership
+    split + alias-aware (series,issue) index now exclude it."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{"name": "The Mighty Thor Annual #A1", "id": None}])
+    payload = {"comics": [
+        {"full_title": "Thor Annual #A1", "in_collection": 1},  # owned under alias name
+    ]}
+    assert wish_rows_for_export(payload) == [], "owned non-digit-token book must never export"
+
+
 # --- BUI-197: audit ↔ export parser parity ---
 
 def test_audit_export_parser_parity(tmp_path, monkeypatch):
     """The conflicts audit and the owned-safe export must agree on EVERY wish
     title: an audit conflict ⇒ the export does NOT emit that owned book as
     In Collection=0 (and a non-conflict local-only wish IS emitted). Both now go
-    through the single shared split_full_title parser, so a clean audit proves an
-    owned-safe CSV. Covers the tokens the two regexes used to disagree on."""
+    through the single shared split_series_issue_for_ownership parser, so a clean
+    audit proves an owned-safe CSV. Crucially this covers NON-digit-led tokens
+    (#A1, #annual, #1-A) — the BUI-197 deletion hole, where the digit-led parser
+    made such a wish 'unparseable', skipped the ownership check, and exported it
+    In Collection=0 over an owned copy filed under an alias name."""
     import locg.commands as cmds
 
-    # A shared owned corpus + a wish set whose tokens stressed the old divergence.
+    # A shared owned corpus + a wish set whose tokens stressed the old divergence,
+    # including the non-digit-led tokens that reopened the deletion hole.
     owned = [
         ("Thor (Vol. 1) (1966 - 1996)", "Thor #300", "1980-10-01"),
         ("The Incredible Hulk (1968 - 1999)", "The Incredible Hulk #181", "1974-11-01"),
         ("Uncanny X-Men Annual (1980 - 2011)", "Uncanny X-Men Annual #9", "1985-12-01"),
         ("The X-Men (Vol. 1) (1963 - 1981)", "The X-Men #137", "1980-09-01"),
+        ("Thor Annual (1966 - 1994)", "Thor Annual #A1", "1966-01-01"),   # non-digit token
+        ("The Incredible Hulk (1968 - 1999)", "The Incredible Hulk #annual", "1978-01-01"),
+        ("Thor (Vol. 1) (1966 - 1996)", "Thor #1-A", "1966-01-01"),       # hyphen-suffix token
     ]
     wishes = [
         {"name": "The Mighty Thor #300", "id": 1},        # owned via alias
         {"name": "Incredible Hulk #181", "id": 2},        # owned via alias
         {"name": "X-Men Annual #9", "id": 3},             # owned via annual alias
         {"name": "Uncanny X-Men #137", "id": 4},          # owned via split
+        {"name": "The Mighty Thor Annual #A1", "id": 7},  # owned via alias + #A1 token
+        {"name": "Incredible Hulk #annual", "id": 8},     # owned via alias + word token
+        {"name": "The Mighty Thor #1-A", "id": 9},        # owned via alias + #1-A token
         {"name": "The Mighty Thor #999", "id": 5},        # genuinely not owned
         {"name": "Saga #1", "id": 6},                     # genuinely not owned
     ]
@@ -1452,10 +1476,13 @@ def test_audit_export_parser_parity(tmp_path, monkeypatch):
     cache.apply(lambda p: p["comics"].extend(owned_rows), command="seed")
     _seed_wish(wishes)  # the audit reads the same wish-list cache the export does
     audit = cmds.cmd_wish_list_conflicts()
+    assert audit["unparseable"] == [], "no wish (incl. non-digit tokens) may be skipped"
     conflict_names = {c["name"] for c in audit["conflicts"]}
     assert conflict_names == {
         "The Mighty Thor #300", "Incredible Hulk #181",
         "X-Men Annual #9", "Uncanny X-Men #137",
+        "The Mighty Thor Annual #A1", "Incredible Hulk #annual",
+        "The Mighty Thor #1-A",
     }
 
     # --- export side: same wish-list cache (no series_name → local-only adds) and
