@@ -104,16 +104,31 @@ Surface `ready_count` (collection rows that will upload), `manual_series_count`
 (rows withheld from the CSV — they stay pending until you resolve them in
 `.notes.md`), and `wish_list_count`.
 
-**Owned-safe export (BUI-122/BUI-200):** the CSV's wish rows are only local-only
-adds you **don't** already own under ANY name variant — derived wishes (already
-on LOCG) and owned books are excluded. Ownership is matched on normalized
-*(series, issue)*, not literal title, so a book owned under a different masthead
-(`The X-Men #107` vs a wished `Uncanny X-Men #107`) is still recognized and never
-emitted as `In Collection=0`. This is the structural guard against the 26-deleted
--X-Men deletion. Genuine new wishes still import fine (LOCG adds a wish by title).
+**Owned-safe export — what is and is NOT guaranteed (BUI-122/BUI-200):** the
+CSV's wish rows are only local-only adds (derived wishes already on LOCG are
+dropped), and the export excludes a wish when it can match an owned copy on
+normalized *(series, issue)* rather than literal title. **Read these limits
+carefully — this is a delete-capable workflow and the guarantee is partial.**
 
-This is defense in depth, not a license to dump wishes blindly — the procedure
-below still splits wins from wishes and previews every upload.
+**Structurally owned-safe now** (the export will NOT emit `In Collection=0` for an
+owned copy in these cases):
+- leading-article variants (`The X-Men` ↔ `X-Men`),
+- `(Vol. N)` and year-range / bare-year decoration (`Fantastic Four (Vol. 3) (1997 - 2012)` ↔ `Fantastic Four`),
+- the **classic X-Men main-run split only**: `The X-Men #1–141` ↔ `Uncanny X-Men #142+`.
+
+**NOT yet structurally covered** — the export can still emit `In Collection=0` for
+a book you own when the wish and the owned copy differ by any of these, so they
+rely entirely on the import preview (below):
+- other masthead aliases — `The Mighty Thor` ↔ `Thor`, `Invincible Iron Man` ↔ `Iron Man`, `Tales of Suspense` → `Iron Man`,
+- subtitle / adjective relaunches — `X-Men: Legacy`, `Astonishing X-Men`, etc.,
+- Annuals (`X-Men Annual` vs `X-Men`),
+- spelling differences — `&` vs `and`, accents, dotted abbreviations (`Marvel Two-In-One` vs `Marvel Two in One`).
+
+These uncovered cases are tracked under **BUI-197**. Until it lands, the **LOCG
+import preview + abort-on-"Deleted from Collection." (Steps 3 / 3b) is the
+load-bearing defense, not optional.** Keep the wish push opt-in and off by default
+(Step 3b); for wins alone, deletion is structurally impossible, so the bulk of a
+normal sync is safe.
 
 ## Step 2a: Split the CSV into wins-only and wish-only files
 
@@ -193,6 +208,13 @@ comics_curl -X POST "$GIXEN_SERVER_URL/api/comics/wish-list/remove-conflicts"
 
 Both 409 if the collection was never imported. **Do not proceed to a wish push
 (Step 3b) until the conflicts audit reports zero conflicts.**
+
+**A clean conflicts audit is a strong signal, not a proof of owned-safety.** The
+audit and the export parse issue tokens slightly differently and apply the same
+partial variant coverage as above, so a zero-conflict result does NOT guarantee
+the export carries no `In Collection=0` for an owned book. The LOCG import preview
+remains the final gate. (Parser parity between the audit and the export is being
+unified in BUI-197.)
 
 ## Step 3: Probe, then upload the WINS file to LOCG (manual — you)
 
