@@ -47,6 +47,27 @@ safety check. The steps it drives (and you can do by hand against the API):
 re-import (step 5). Export does **not** mark rows pushed, so skipping the
 re-import re-emits the same rows as duplicate uploads.
 
+### Safety practices (Step 3 upload)
+
+Hard-won on the first real sync (see
+`docs/solutions/integration-issues/locg-bulk-import-sync-learnings-2026-06-17.md`):
+
+- **Prefer wins-only.** The baseline sync is add-only collection wins. Treat
+  **wish-list pushing as a separate, opted-in step** that runs only *after* the
+  conflicts audit is clean and conflicts are removed (`GET` then `POST`
+  `/api/comics/wish-list/conflicts` · `/remove-conflicts`). Wish rows carry
+  `In Collection=0` and can **delete owned books**.
+- **Use LOCG's import preview.** Bulk Import previews every "Deleted from
+  Collection" / "Added" / "Not Found" outcome *before* writing. Review it and
+  **abort on any unexpected "Deleted from Collection."**
+- **Probe with a small mixed batch first.** When matching behavior is uncertain,
+  upload ~4 representative rows (one owned, one not-owned, one dated, one undated)
+  to isolate the variables — don't re-upload the whole file to re-test a guess.
+- **Every row needs complete, exact data or it won't match:** `Publisher Name` +
+  the **exact canonical** `Series Name` + the **exact** `Full Title` + an
+  **accurate** Release Date. A partial/wrong cell lands as `Not Found`; an
+  all-dateless batch hangs the importer.
+
 ## How import merges (collection)
 
 `POST /api/comics/collection/import` (and `locg collection import`) run a
