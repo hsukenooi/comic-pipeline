@@ -299,11 +299,51 @@ class MetronClient:
                     "reason": "no credits in Metron (older book?) — run membership unverified",
                 })
                 continue
-            holds_role = any(
-                (c.get("creator") or "").strip().lower() == creator_norm
-                and role_norm in (c.get("roles") or [])
-                for c in credits
-            )
+            # Collect all credit entries whose creator name matches (case-insensitive).
+            # mokkari Credit.creator is a name string, NOT a creator id — the id on the
+            # credit row is the credit-row id, not the Metron creator id (BUI-198).
+            # If two distinct Metron creators share the same canonical name and both
+            # credit this issue (e.g. the resolved creator as Writer and a namesake as
+            # Penciller), they will appear as two separate credit entries with the same
+            # creator string.  Detecting two entries for the same name is therefore the
+            # only in-band signal that a same-name collision may be present; when found,
+            # the issue is demoted to a warning rather than silently added to the run.
+            matching_credits = [
+                c for c in credits
+                if (c.get("creator") or "").strip().lower() == creator_norm
+            ]
+            if len(matching_credits) > 1:
+                # Multiple credit entries share this creator name → possible same-name
+                # collision between distinct Metron creators (BUI-198).  Can't confirm
+                # run membership without a creator-id on the credit; surface as warning.
+                warnings.append({
+                    "number": number,
+                    "metron_id": metron_id,
+                    "reason": (
+                        f"same-name collision guard: {len(matching_credits)} credit entries "
+                        f"share the name {creator_name!r} — run membership unverified "
+                        "(mokkari Credit carries no creator id; BUI-198)"
+                    ),
+                })
+                continue
+            if not matching_credits:
+                # The issue is in the id-constrained candidate set (the resolved creator
+                # has *some* credit here), yet no credit's name string matches the resolved
+                # canonical name.  This is name drift — punctuation/comma variants like
+                # "John Romita, Jr." vs "John Romita Jr." — not a real absence.  Exclude it
+                # from the run (we can't confirm the role) but WARN so a truncated run is
+                # visible rather than a silent drop (BUI-198).
+                warnings.append({
+                    "number": number,
+                    "metron_id": metron_id,
+                    "reason": (
+                        f"no credit name matched {creator_name!r} despite the id-pinned "
+                        "candidate filter — likely name drift (punctuation variant); "
+                        "run membership unverified (BUI-198)"
+                    ),
+                })
+                continue
+            holds_role = role_norm in (matching_credits[0].get("roles") or [])
             if holds_role:
                 in_run.append({
                     "number": number,
