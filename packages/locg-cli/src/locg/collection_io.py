@@ -23,8 +23,10 @@ from locg.collection_cache import (
     _normalize_series_key,
     _utcnow_iso,
     make_identity,
+    owned_match_keys,
     rebuild_series_name_index,
 )
+from locg.parsing import normalize_issue_key, split_full_title
 
 logger = logging.getLogger("locg")
 
@@ -775,37 +777,89 @@ def _normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", t)
 
 
+def _owned_series_issue_index(payload: dict[str, Any]) -> set[tuple[str, str]]:
+    """Set of ``(normalized_series_key, normalized_issue_key)`` for owned rows.
+
+    BUI-200: the owned-safe check must match on normalized (series, issue), not
+    the literal title, because an owned copy can be filed under a different
+    series-name variant than the wish (the X-Men split, leading-article / Vol /
+    year decoration). Each owned row is indexed under EVERY masthead variant it
+    could be matched against (:func:`owned_match_keys` adds the cross-masthead
+    key for the classic X-Men split), so a wish written under either masthead
+    finds it.
+    """
+    index: set[tuple[str, str]] = set()
+    for r in payload.get("comics", []):
+        if not r.get("in_collection"):
+            continue
+        series_portion, issue_token = split_full_title(r.get("full_title") or "")
+        if issue_token is None:
+            continue  # TPB/OGN/special — handled by the title-string path below
+        issue_key = normalize_issue_key(issue_token)
+        for key in owned_match_keys(series_portion, issue_token):
+            index.add((key, issue_key))
+    return index
+
+
 def wish_rows_for_export(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Wish-list rows safe to include in the LOCG bulk-import CSV (BUI-122).
+    """Wish-list rows safe to include in the LOCG bulk-import CSV (BUI-122/BUI-200).
 
     The CSV writes wish rows with ``In Collection=0``, which tells LOCG to *remove*
     the book from the collection if it matches one. Re-dumping the whole wish list
     therefore (a) re-uploads the LOCG-derived wishes LOCG already has, and worse
     (b) deletes any wished book that is actually owned. This caused real
-    collection deletions during BUI-122 testing.
+    collection deletions during BUI-122 testing, and the BUI-200 incident deleted
+    26 owned X-Men when the owned copy was filed under a different masthead.
 
     So the export now includes only:
       - **local-only adds** (no ``series_name`` — the diff LOCG doesn't have yet;
         derived wishes are already on LOCG and are dropped), AND
-      - that are **not owned** (title not in the collection's ``in_collection``
-        set), so an ``In Collection=0`` row can never delete an owned book.
+      - that are **not owned under ANY name variant** — checked two ways, both
+        owned-safe (over-exclusion only drops a wish, under-exclusion deletes a
+        book): a normalized ``(series, issue)`` match (BUI-200 — catches the
+        X-Men split + article/Vol/year variants), and the older generous
+        title-string match (BUI-122 — dash/article-insensitive, and the only
+        path for issueless TPB/OGN rows).
 
-    Owned-but-wished books are simply not pushed; the wish stays local. Matching is
-    title-based and generous (see ``_normalize_title``) — owned-safe by design.
+    Owned-but-wished books are simply not pushed; the wish stays local.
     """
-    owned = {
+    owned_titles = {
         _normalize_title(r.get("full_title"))
         for r in payload.get("comics", [])
         if r.get("in_collection")
     }
+    owned_series_issue = _owned_series_issue_index(payload)
     out: list[dict[str, Any]] = []
     for item in _load_wish_list_items():
         if item.get("series_name"):
             continue  # derived wish — LOCG already has it; re-emitting risks deletion
-        if _normalize_title(item.get("full_title")) in owned:
-            continue  # owned — never emit In Collection=0 for it
+        full_title = item.get("full_title") or ""
+        if _normalize_title(full_title) in owned_titles:
+            continue  # owned (title match) — never emit In Collection=0 for it
+        if _wish_owned_by_series_issue(full_title, owned_series_issue):
+            continue  # owned under a different name variant (BUI-200)
         out.append(item)
     return out
+
+
+def _wish_owned_by_series_issue(
+    full_title: str, owned_series_issue: set[tuple[str, str]]
+) -> bool:
+    """True if ``full_title`` is owned under any normalized (series, issue) variant.
+
+    Parses the wish title into (series, issue), then checks every normalized key
+    the issue could be owned under (:func:`owned_match_keys`) against the owned
+    index. Owned-safe: an unparseable title (no ``#N``) returns False here and is
+    left to the title-string path, which never under-matches an owned book.
+    """
+    series_portion, issue_token = split_full_title(full_title)
+    if issue_token is None:
+        return False
+    issue_key = normalize_issue_key(issue_token)
+    return any(
+        (key, issue_key) in owned_series_issue
+        for key in owned_match_keys(series_portion, issue_token)
+    )
 
 
 # BUI-105 placeholder: when no Metron data backs a win, record-win stamps

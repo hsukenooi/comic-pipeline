@@ -266,6 +266,48 @@ def _xmen_classic_split(issue_num: Optional[str], year: Any) -> Optional[str]:
     return _XMEN_EARLY_SERIES if n <= _XMEN_SPLIT_BOUNDARY else _XMEN_LATE_SERIES
 
 
+def owned_match_keys(series: str, issue_num: Optional[str]) -> frozenset[str]:
+    """Normalized series keys under which a (series, issue) could be *owned*.
+
+    The data-loss guard at the heart of BUI-200: deciding "is this wished book
+    already owned?" by the LITERAL series name misses owned copies filed under a
+    DIFFERENT name variant for the same run, so the export emits an
+    ``In Collection=0`` wish row that tells LOCG to delete the owned copy (the
+    confirmed 26-deleted-X-Men incident).
+
+    This returns the *set* of normalized keys (see :func:`_normalize_series_key`,
+    which already folds leading article + ``(Vol. N)`` + year-range / bare-year
+    decoration) that an owned copy of this issue could legitimately appear under.
+    A match against ANY key means owned. The set always includes the query's own
+    normalized key; it additionally adds the OTHER masthead of the classic X-Men
+    split when the issue number puts the owned copy on the other side of the
+    LOCG filing boundary:
+
+    * ``x-men`` (LOCG: ``The X-Men``) holds #1–141.
+    * ``uncanny x-men`` holds #142+.
+
+    So a wish written ``Uncanny X-Men #107`` (issue ≤ 141) must also match an
+    owned ``The X-Men #107`` and vice-versa. This works WITHOUT a year — the
+    conflicts audit deliberately passes no year (BUI-129) — because the split is
+    a pure issue-number boundary. ``year`` is intentionally not a parameter here:
+    callers without a year must still get the cross-masthead key.
+
+    This builds the *structure* for normalized (series, issue) matching. The
+    broader masthead alias TABLE (Uncanny↔X-Men beyond the classic split, and
+    other adjective-dropping mastheads) is owned by BUI-197, which extends
+    ``_SERIES_ALIASES`` and layers an audit allowlist on top of this seam.
+    """
+    query_key = _normalize_series_key(series)
+    keys = {query_key}
+    # Cross-masthead only for the classic X-Men split keys — never let the
+    # issue-number boundary leak into unrelated series (e.g. "Batman #100").
+    if query_key in _XMEN_SPLIT_KEYS:
+        canonical = _xmen_classic_split(issue_num, None)
+        if canonical is not None:
+            keys.add(_normalize_series_key(canonical))
+    return frozenset(keys)
+
+
 def _best_volume_by_year(candidates: list[str], yr: int) -> Optional[str]:
     """Pick the candidate whose year range contains ``yr``, most specific first.
 

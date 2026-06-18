@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 
 from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
-from locg.collection_cache import CollectionCache, _normalize_series_key
+from locg.collection_cache import CollectionCache, _normalize_series_key, owned_match_keys
 from locg.config import wish_list_cache_path
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
@@ -1867,6 +1867,23 @@ def cmd_collection_check(
     issue_stripped = str(issue).strip().lstrip("0") or str(issue).strip()
 
     matched = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
+
+    # BUI-200: an owned copy can be filed under a DIFFERENT series-name variant
+    # for the same run (the X-Men split: "Uncanny X-Men #107" wished vs owned
+    # "The X-Men #107"). Try every normalized key the issue could be owned under
+    # — owned_match_keys folds article/Vol/year decoration AND the issue-number
+    # masthead split. This runs WITHOUT a year (the conflicts audit passes none),
+    # so the cross-masthead owned book is found and the export can't emit an
+    # In Collection=0 row that deletes it (the 26-deleted-X-Men data-loss bug).
+    if matched is None:
+        for alt_key in owned_match_keys(series, issue):
+            if alt_key == series_key:
+                continue
+            matched = _match_owned_issue(
+                comics, alt_key, issue_stripped, issue, variant, year
+            )
+            if matched is not None:
+                break
 
     # BUI-46: masthead/cover-title fallback. If the cover title ("The Mighty
     # Thor") missed, retry against the LOCG catalog base ("Thor"). Year-gated:
