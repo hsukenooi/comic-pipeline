@@ -34,6 +34,7 @@ from gixen_overlay.models import (
     RecordWinRequest,
     SellerScanSeenRequest,
     CollectionWinsSeenRequest,
+    CollectionCheckBatchRequest,
 )
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id
@@ -938,6 +939,58 @@ async def api_collection_check(
             "(refusing to report 'not owned', R11)",
         )
     return result
+
+
+@router.post("/api/comics/collection/check/batch")
+async def api_collection_check_batch(req: CollectionCheckBatchRequest):
+    """Batch collection-ownership check (BUI-204).
+
+    Accepts a list of ``{series, issue, year?, variant?}`` pairs and returns a
+    per-item result list, each entry carrying the same verdict shape the
+    single-item ``GET /api/comics/collection/check`` returns
+    (``{match_status, full_title_matched, cache_age_days}``) plus its echoed
+    ``series``/``issue`` so the caller can correlate without relying on order.
+    Eliminates the per-issue HTTP fan-out ``/comic:wishlist-add`` used to do.
+
+    Each pair is run through the *same* ``cmd_collection_check`` matcher, so the
+    `match_status` semantics (``in_collection`` / ``not_in_cache``, leading-article
+    normalization, the year-gated masthead fallback) are identical to the
+    single-item endpoint — this is a fan-out, not a reimplementation.
+
+    R11 is preserved as a whole-batch guard: a never-imported store would answer
+    ``not_in_cache`` for every item, so rather than returning a list of
+    confident-looking "not owned" verdicts we 409 the entire call (the same
+    refusal the single-item endpoint makes, lifted to the batch boundary). A
+    corrupt/crashed store surfaces as 500. An empty ``items`` list is a 422.
+    """
+    if not req.items:
+        raise HTTPException(status_code=422, detail="items must be a non-empty list")
+    _ensure_collection_store()
+
+    # R11 whole-batch guard: refuse the entire call against a never-imported
+    # store instead of emitting a per-item "not owned" we cannot stand behind.
+    # cache_age_days is None iff last_full_import is null, so the cheapest probe
+    # is the status read used by the other guards in this module.
+    _require_imported_collection()
+
+    results: list[dict[str, Any]] = []
+    for item in req.items:
+        try:
+            result = cmd_collection_check(
+                series=item.series,
+                issue=item.issue,
+                variant=item.variant,
+                year=item.year,
+            )
+        except RuntimeError as exc:
+            # A store that crashes mid-batch is a hard failure for the whole
+            # call (R11): never let one item's failure read as "not owned".
+            raise HTTPException(
+                status_code=500, detail=f"collection store unavailable: {exc}"
+            ) from exc
+        results.append({"series": item.series, "issue": item.issue, **result})
+
+    return {"count": len(results), "results": results}
 
 
 @router.get("/api/comics/collection/status")
