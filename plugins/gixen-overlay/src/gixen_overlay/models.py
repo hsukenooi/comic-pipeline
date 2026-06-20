@@ -105,6 +105,42 @@ class WishListAddRequest(BaseModel):
         return v
 
 
+class CollectionCheckItem(BaseModel):
+    """One (series, issue, [year], [variant]) pair for the batch check.
+
+    Mirrors the query params of the single-item `GET
+    /api/comics/collection/check`. ``year`` is the issue's **cover year**
+    (never a series start year — the BUI-129 trap); it is gated on
+    ``release_date.startswith(year)`` and is optional.
+    """
+
+    series: str
+    issue: str
+    year: str | None = None
+    variant: str | None = None
+
+    @field_validator("series", "issue")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("series and issue must be non-empty")
+        return v
+
+
+class CollectionCheckBatchRequest(BaseModel):
+    """POST /api/comics/collection/check/batch (BUI-204).
+
+    A list of (series, issue, year?, variant?) pairs checked in one call,
+    eliminating the per-issue HTTP fan-out `/comic:wishlist-add` used to do.
+    Each item is verified with the exact same matcher the single-item endpoint
+    uses, and the per-item result shape is identical (R11 preserved: an
+    un-imported store fails the whole call rather than reporting every item
+    'not owned').
+    """
+
+    items: list[CollectionCheckItem]
+
+
 class SellerScanSeenRequest(BaseModel):
     """POST /api/comics/seller-scan/seen — mark item_ids as already surfaced (BUI-113)."""
 

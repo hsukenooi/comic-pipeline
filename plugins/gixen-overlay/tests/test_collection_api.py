@@ -140,6 +140,92 @@ def test_check_requires_series_and_issue(client):
     assert client.get("/api/comics/collection/check", params={"issue": "1"}).status_code == 422
 
 
+# --- collection check (batch, BUI-204) -------------------------------------
+
+def test_check_batch_mixed_owned_and_not(client):
+    """A multi-item happy path: each pair gets the same verdict the single-item
+    endpoint would, echoed with its series+issue so the caller can correlate."""
+    r = client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [
+            {"series": "Amazing Spider-Man", "issue": "300", "year": "1988"},
+            {"series": "Batman", "issue": "1", "year": "1940"},
+            {"series": "Fantastic Four", "issue": "48", "year": "1966"},  # in_collection=0
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 3
+    by_key = {(x["series"], x["issue"]): x for x in body["results"]}
+    assert by_key[("Amazing Spider-Man", "300")]["match_status"] == "in_collection"
+    assert by_key[("Amazing Spider-Man", "300")]["full_title_matched"] == "The Amazing Spider-Man #300"
+    assert by_key[("Batman", "1")]["match_status"] == "not_in_cache"
+    # in_collection=0 row is not owned — the copies-owned gate holds in batch too.
+    assert by_key[("Fantastic Four", "48")]["match_status"] == "not_in_cache"
+
+
+def test_check_batch_per_item_matches_single_endpoint(client):
+    """Each batch result must equal what the single-item endpoint returns for the
+    same pair — the batch is a fan-out, not a reimplementation."""
+    pairs = [
+        {"series": "The Amazing Spider-Man", "issue": "300", "year": "1988"},
+        {"series": "Batman", "issue": "1", "year": "1940"},
+    ]
+    batch = client.post(
+        "/api/comics/collection/check/batch", json={"items": pairs}
+    ).json()["results"]
+    for pair, got in zip(pairs, batch):
+        single = client.get("/api/comics/collection/check", params=pair).json()
+        # The batch entry is the single verdict plus echoed series/issue.
+        assert {k: got[k] for k in single} == single
+
+
+def test_check_batch_rejects_empty_items(client):
+    assert client.post(
+        "/api/comics/collection/check/batch", json={"items": []}
+    ).status_code == 422
+
+
+def test_check_batch_rejects_blank_series_or_issue(client):
+    assert client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [{"series": "  ", "issue": "1"}]},
+    ).status_code == 422
+    assert client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [{"series": "Batman", "issue": "  "}]},
+    ).status_code == 422
+
+
+def test_check_batch_refuses_when_store_never_imported(client):
+    """R11 lifted to the batch boundary: a never-imported store must NOT answer a
+    list of 'not owned' verdicts — the whole call 409s, like the single endpoint."""
+    (client.store / "collection.json").unlink()
+    r = client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [{"series": "Batman", "issue": "1", "year": "1940"}]},
+    )
+    assert r.status_code == 409
+
+
+def test_check_batch_year_catches_masthead_owned_book(client):
+    """Parity with the single-item year-gated masthead fallback (BUI-184): with
+    the per-issue cover year, 'The Mighty Thor #154' resolves to owned 'Thor'."""
+    _seed_collection(client.store, [{
+        "full_title": "Thor #154",
+        "series_name": "Thor",
+        "publisher_name": "Marvel Comics",
+        "release_date": "1968-07-01",
+        "in_collection": 1,
+    }])
+    r = client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [{"series": "The Mighty Thor", "issue": "154", "year": "1968"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["results"][0]["match_status"] == "in_collection"
+
+
 # --- wish-list -------------------------------------------------------------
 
 def test_wish_list_returns_items(client):

@@ -52,6 +52,18 @@ curl -s -u "$METRON_USERNAME:$METRON_PASSWORD" \
   "https://metron.cloud/api/series/?name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")"
 ```
 
+**Filter by start year server-side when you know it (BUI-204).** The bare `name`
+search can return hundreds of rows (an unfiltered `X-Men` returned 327) — the
+full payload is the single biggest token cost of this skill. When the user
+supplied a year, or you otherwise know the run's start year, add Metron's
+`year_began` query param so the server returns only the matching series instead
+of every same-named title:
+
+```bash
+curl -s -u "$METRON_USERNAME:$METRON_PASSWORD" \
+  "https://metron.cloud/api/series/?name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")&year_began=<YEAR>"
+```
+
 Each result has `id`, `series` (display name incl. year, e.g.
 `"Children of the Vault (2023)"`), `year_began`, and `issue_count`.
 
@@ -59,9 +71,12 @@ Each result has `id`, `series` (display name incl. year, e.g.
 - Exactly one result → use it.
 - Multiple results → show the user the candidates (`series` + `year_began` +
   `issue_count`) and ask which one. If the user supplied a year, prefer the
-  series whose `year_began` matches.
+  series whose `year_began` matches (or just add `&year_began=<YEAR>` above to
+  narrow the search before you ever see the candidates).
 - Zero results → stop and report that Metron has no series by that name (suggest
-  the user check spelling or supply the exact Metron title).
+  the user check spelling or supply the exact Metron title). If you used a
+  `year_began` filter, retry once without it before declaring zero — the year may
+  have been wrong, not the name.
 
 Record `issue_count` and the chosen `series` display name.
 
@@ -110,8 +125,13 @@ spelling** as the `series` param in the per-issue check below. If none matches,
 proceed with the Metron name but note that ownership for this series couldn't be
 reconciled — a `not_in_cache` here may be a spelling miss, not genuinely un-owned.
 
-For each resolved issue, ask the server's collection (no LOCG network needed).
-**Pass the per-issue COVER year from Step 2 (BUI-184) — never `year_began`
+Check every resolved issue against the server's collection in **one batch call**
+(BUI-204), not a serial per-issue loop. The batch endpoint runs the exact same
+matcher the single-item `check` does, so the verdicts are identical — it just
+collapses N round-trips into one and cuts the token cost of the per-issue
+`curl` chatter.
+
+**Pass each issue's COVER year from Step 2 (BUI-184) — never `year_began`
 (BUI-129).** The `year` param is gated on `release_date.startswith(year)`, so it
 must be the issue's own cover year (Step 2's `cover_date`), NOT the series start
 year: forwarding `year_began` (e.g. `1963` for a run whose issues actually shipped
@@ -120,25 +140,62 @@ year: forwarding `year_began` (e.g. `1963` for a run whose issues actually shipp
 exact BUI-122 deletion path Step 3 exists to prevent. With the *correct* cover
 year, the check's year-gated masthead fallback also catches a book stored under
 its base masthead (you ask for "The Mighty Thor #154", you own "Thor #154"). If
-Metron had no `cover_date` for an issue, **omit `year` for that issue** (the
-pre-184 behavior — safe; it just can't catch the masthead case):
+Metron had no `cover_date` for an issue, **omit `year` for that item** (the
+pre-184 behavior — safe; it just can't catch the masthead case).
+
+Build the request body as a list of `{series, issue, year?}` items — `series` is
+the reconciled catalog name, `issue` is each `<N>`, `year` is THAT issue's cover
+year (drop the key entirely for an issue with no `cover_date`):
 
 ```bash
-# series = reconciled catalog name; issue = <N>; year = THAT issue's cover year
-curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
-  --data-urlencode "series=<SERIES>" \
-  --data-urlencode "issue=<N>" \
-  --data-urlencode "year=<COVER_YEAR>"   # omit this line if no cover_date
+# Build items.json programmatically from your number→cover_year map, e.g.:
+#   {"items":[{"series":"Uncanny X-Men","issue":"185","year":"1984"},
+#             {"series":"Uncanny X-Men","issue":"186","year":"1984"}, ...]}
+curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/collection/check/batch" \
+  -H 'content-type: application/json' \
+  -d @items.json
 ```
+
+The response is `{"count": N, "results": [{series, issue, match_status,
+full_title_matched, cache_age_days}, ...]}` — one entry per input item, echoing
+its `series`/`issue` so you can correlate by key (don't rely on order). Per item:
 
 - `{"match_status": "in_collection"}` → **owned, skip it** (don't wish-list).
 - `{"match_status": "not_in_cache"}` → not owned, keep it.
-- **HTTP 409** (store never imported) → ownership can't be verified. Warn the user
-  ("couldn't check ownership — collection not imported"), and proceed with all
-  issues. (The export fix is the safety net: even a wrongly-wished owned book is
-  no longer deleted — but flag it so the user knows the check was skipped.)
+
+The batch call's HTTP status is the whole-batch signal:
+
+- **HTTP 409** (store never imported) → ownership can't be verified for ANY item.
+  Warn the user ("couldn't check ownership — collection not imported"), and
+  proceed with all issues. (The export fix is the safety net: even a wrongly-
+  wished owned book is no longer deleted — but flag it so the user knows the
+  check was skipped.) Because `curl -sf` exits non-zero on the 409, capture the
+  status explicitly (e.g. `-o body -w '%{http_code}'`) so you can distinguish
+  this expected case from a real network failure rather than silently treating
+  every issue as un-owned (R11 — a failed call must never read as "not owned").
+- **Any other non-200** (500, network error) → hard-fail; do not wish-list
+  anything from a failed check (R11).
 
 Carry forward two lists: **to-add** (not owned) and **already-owned** (skipped).
+
+## Step 3b: Skip issues already on the wish-list (single in-memory scan)
+
+The wish-list endpoint does **not** dedupe (Step 5), so re-adding a title already
+wished creates a duplicate. Filter those out up front — but fetch the wish-list
+**once** and scan it **in memory** (BUI-204), not re-fetched or re-grepped per
+issue. A real wish-list is large (685 items in the motivating run); a per-issue
+grep over that payload is the redundant work this step removes.
+
+```bash
+comics_curl "$GIXEN_SERVER_URL/api/comics/wish-list" || exit 1
+```
+
+Parse the returned `[{name, id, ...}]` **once** into a set keyed by
+`(series, issue)` — split each `name` on the trailing `#<N>` the same way Step 4
+forms titles, normalize (lowercase, strip a leading article) so the key matches
+your to-add titles. Then for each to-add issue do an O(1) lookup against that set:
+already present → drop it from **to-add** (note it as "already wished"); absent →
+keep it. Do not call the wish-list endpoint again inside the loop.
 
 ## Step 4: Preview (dry run) and confirm
 
@@ -280,3 +337,6 @@ is treated as final, same as the numeric-range path.
 | Passing `year` (Metron's `year_began`) to `collection/check` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`, not a series disambiguator. Forwarding a series start-year filters out every owned mid-run issue and returns a false `not_in_cache`, so an owned book gets wish-listed (BUI-129/BUI-131). Check by series + issue only |
 | Enumerating a creator's run from memory | Memory silently drops DISCONTINUOUS stints (JR JR's 1993 Uncanny X-Men return). Use `locg wish-list add --creator … --series-id …`, which grounds the run in Metron credits (BUI-134) |
 | Conflating same-name creators | "John Romita Jr." vs "John Romita" (Sr.) are distinct Metron ids; the resolver pins the id. Always pass the exact Metron creator name |
+| Checking ownership one issue at a time (serial `GET .../check`) | Use the single batch call `POST /api/comics/collection/check/batch` (BUI-204) — same matcher, one round-trip, far fewer tokens |
+| Fetching the bare Metron `?name=` search for a huge series | Add `&year_began=<YEAR>` when the start year is known (BUI-204) — the unfiltered search can return hundreds of rows |
+| Re-fetching / re-grepping the wish-list per issue | Fetch `GET /api/comics/wish-list` once, parse into a `(series, issue)` set, do O(1) lookups (BUI-204) |
