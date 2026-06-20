@@ -166,6 +166,11 @@ curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
 # read pending_push_count and oldest_pending_days from this fresh response
 ```
 
+Note: `oldest_pending_days` is the age of the oldest uncleared pending item — it
+is **not** "days since last sync." Items with `needs_manual_series_canonical=true`
+never get cleared by an automated CSV export; they require a manual LOCG add
+followed by a full `/comic:collection-sync` round-trip.
+
 Print a summary (source `pending_push_count` from the fresh status read above,
 not from Step 0):
 
@@ -195,3 +200,4 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Passing LOCG IDs as part of record-win input | `record-win` does not take LOCG IDs; it resolves series via Metron and the server collection |
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
 | Marking wins seen before the POST succeeds | Only mark seen after a successful record-win POST — a failed call means wins weren't recorded |
+| Confusing `oldest_pending_days` with "days since last sync" | `oldest_pending_days` = age of oldest uncleared item; use `last_full_import` from status for sync recency |
