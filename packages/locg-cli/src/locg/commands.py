@@ -992,7 +992,19 @@ def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
         if "error" in result:
             errors.append({"name": conflict["name"], "error": result["error"]})
         else:
-            removed.append(result["removed"])
+            # BUI-208 U2: fulfillment-drop touches ONLY wish state (cmd_wish_list_remove
+            # rewrites wish-list.json and nothing else — never a collection row). Log and
+            # surface the matched owned identity so the drop is visible in the sync plan,
+            # never silent.
+            matched = conflict.get("full_title_matched")
+            logger.info(
+                "fulfillment-drop: removed wish %r — owned as %r",
+                conflict["name"], matched,
+            )
+            entry = dict(result["removed"]) if isinstance(result.get("removed"), dict) \
+                else {"name": conflict["name"]}
+            entry["matched_owned"] = matched
+            removed.append(entry)
     try:
         remaining = len(cmd_wish_list_from_cache())
     except FileNotFoundError:

@@ -2054,6 +2054,33 @@ def test_wish_list_remove_conflicts_removes_only_owned(tmp_path, monkeypatch):
     assert [it["name"] for it in remaining] == ["X-Men #1"]
 
 
+def test_wish_list_remove_conflicts_surfaces_owner_and_spares_collection(tmp_path, monkeypatch):
+    """BUI-208 U2: fulfillment-drop surfaces the matched owned identity and
+    mutates ONLY wish state — the collection file is never touched."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row()])  # owns Amazing Spider-Man #300
+    _seed_wish_list([
+        {"name": "Amazing Spider-Man #300", "id": None, "source": "local"},
+        {"name": "X-Men #1", "id": None, "source": "local"},
+    ])
+
+    collection_path = tmp_path / "collection.json"
+    before = collection_path.read_bytes()
+
+    result = cmds.cmd_wish_list_remove_conflicts()
+
+    # The matched owned identity is surfaced on each drop (also logged at INFO).
+    assert result["removed_count"] == 1
+    assert result["removed"][0]["name"] == "Amazing Spider-Man #300"
+    assert result["removed"][0]["matched_owned"] == "Amazing Spider-Man #300"
+
+    # Fulfillment-drop touches ONLY wish state: the collection file is byte-unchanged.
+    assert collection_path.read_bytes() == before
+
+
 # ---------------------------------------------------------------------------
 # BUI-175: decimal / point-issue token regressions
 # ---------------------------------------------------------------------------
