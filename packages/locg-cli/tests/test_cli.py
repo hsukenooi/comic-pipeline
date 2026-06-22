@@ -461,9 +461,9 @@ def test_cli_wish_list_add_skips_client_and_writes_cache(monkeypatch, tmp_path, 
 
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "ok"
-    assert out["added"] == {"name": "Amazing Spider-Man #300", "id": None}
+    assert out["added"] == {"name": "Amazing Spider-Man #300", "id": None, "source": "local"}
 
     # Cache file should now exist with the added item.  Use the (test-isolated)
     # path patched by the autouse `_isolate_wish_list_cache` fixture in conftest.
     payload = json.loads(locg.cli.wish_list_cache_path().read_text())
-    assert payload["items"][-1] == {"name": "Amazing Spider-Man #300", "id": None}
+    assert payload["items"][-1] == {"name": "Amazing Spider-Man #300", "id": None, "source": "local"}

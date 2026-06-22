@@ -43,6 +43,7 @@ from locg.commands import (
     cmd_wish_list_add,
     cmd_wish_list_add_creator_run,
     cmd_wish_list_from_cache,
+    cmd_wish_list_migrate_source,
     cmd_wish_list_remove,
     parse_lookup_spec,
 )
@@ -226,6 +227,15 @@ def create_parser() -> argparse.ArgumentParser:
         help="Remove a title from the local wish-list cache",
     )
     p_wish_remove.add_argument("title", help="Exact title to remove (e.g. 'Amazing Spider-Man #300')")
+    wish_sub.add_parser(
+        "migrate-source",
+        parents=[common],
+        help="Backfill an explicit source ('local'/'export') field on every wish-list entry (BUI-208)",
+        epilog=(
+            "Writes a verified .bak copy of wish-list.json, then stamps "
+            "source on each entry lacking one. Idempotent; a second run is a no-op."
+        ),
+    )
 
     # read-list
     p = sub.add_parser("read-list", parents=[common], help="View your read list (requires login)")
@@ -368,10 +378,10 @@ def main() -> None:
     # wish-list skips Playwright when the local cache exists; it still needs a
     # client when no cache is present (live fallback, R5).
     _wish_list_cached = args.command == "wish-list" and wish_list_cache_path().exists()
-    # wish-list add/remove are pure local-cache writes — never need a client.
+    # wish-list add/remove/migrate-source are pure local-cache writes — never need a client.
     _wish_list_add = (
         args.command == "wish-list"
-        and getattr(args, "wish_list_command", None) in ("add", "remove")
+        and getattr(args, "wish_list_command", None) in ("add", "remove", "migrate-source")
     )
     _needs_client = not (
         args.command == "cache"
@@ -462,6 +472,8 @@ def main() -> None:
                     result = cmd_wish_list_add(args.title)
             elif getattr(args, "wish_list_command", None) == "remove":
                 result = cmd_wish_list_remove(args.title)
+            elif getattr(args, "wish_list_command", None) == "migrate-source":
+                result = cmd_wish_list_migrate_source()
             elif _wish_list_cached:
                 try:
                     result = cmd_wish_list_from_cache(title=args.title)

@@ -539,13 +539,18 @@ mirror-up (deferred).
 
 - **U1 — Single-home wishlist store + durable remove.** Make `wish-list.json` the
   one authority; each entry carries identity + `added_at` + an explicit
-  **`source: local|export`** field (replacing the `series_name`-absence sentinel in
-  `_local_only_wish_items` / `wish_rows_for_export`, §4.5). One-time migration
-  consolidating **all** of today's wishes (the `in_wish_list==1` rows *and* the
-  file-based local adds), gated on a **verified backup** written outside the store
-  dir (abort if the write or read-back fails). Stop the import from *sourcing*
-  wishes. (`collection_io.py`, `commands.py` `cmd_wish_list_*`, `routes.py` wish
-  endpoints.)
+  **`source: local|export`** field. The **load-bearing swap** is `wish_rows_for_export`
+  (`collection_io.py:840`, the export-push gate that decides what reaches LOCG) — it
+  must key on `source == "export" → skip` instead of `series_name` truthiness, or
+  BUI-122 deletion risk returns; `_local_only_wish_items` switches too. The import
+  **stops touching `wish-list.json` entirely** — remove the `in_wish_list==1` filter
+  (`:678`) and the trailing `_write_wish_list_cache(wish_rows)` call (and that
+  function + its BUI-47 re-append, now unneeded); the raw `in_wish_list` LOCG column
+  stays stored verbatim but inert (OQ-1). Migration = a one-time **field-backfill**
+  stamping `source` on existing `wish-list.json` entries (`series_name` present →
+  `export`, absent → `local`), behind a verified backup. `cmd_wish_list_add` sets
+  `source: local`; remove deletes durably. (`collection_io.py`, `commands.py`
+  `cmd_wish_list_*`, `routes.py` wish endpoints.)
 - **U2 — Fulfillment-drop in sync.** Generalize the BUI-130 conflicts audit to run
   as part of sync: owned book ⇒ drop matching wish, keep owned. Generous matching
   (both error directions cheap), enforced by a test that it mutates **only** wish
@@ -587,12 +592,15 @@ mirror-up (deferred).
   event table yet.
 
 **Open (resolve during implementation or with the user):**
-- **OQ-1 — Migration shape (partly resolved).** The structural parts are now
-  decided: carry **all** current wishes forward, key local-vs-export on an explicit
-  `source` field, gate on a verified backup (§4.5/U1). Still open: whether to retain
-  `in_wish_list` on collection rows as a derived read-only convenience or delete it —
-  needs a consumer inventory (does any `/comic:*` skill or dashboard tab read the
-  flag directly rather than `wish-list.json`?).
+- **OQ-1 — Migration shape (RESOLVED 2026-06-22).** Consumer inventory: the
+  `in_wish_list` row flag has **exactly one reader** — the import filter U1 removes
+  (`collection_io.py:678`). Nothing else reads it (the matcher keys on
+  `in_collection`; every wish surface reads `wish-list.json`). **Decided:** the flag
+  is no longer authoritative — leave the raw LOCG column stored verbatim (R6) but
+  inert; do not keep it as a derived field (it would have zero readers). The
+  migration is a **field-backfill** on the existing `wish-list.json` (which already
+  holds every wish from the last import), `source = export if series_name else local`
+  — not a reconstruction, so the R3 data-loss exposure is smaller than first feared.
 - **OQ-2 — Fulfillment matching grain.** It can be generous (both errors cheap),
   but should it reuse the existing matcher (with its masthead-alias gap) or a
   looser title/series match? Lean: reuse the matcher; accept that a masthead-alias
@@ -618,10 +626,11 @@ mirror-up (deferred).
   Collection=0` up-row (machine gate, §5); LOCG's preview is the human backstop.
   Mirror-up (the only `In Collection=0` emitter for wishes) is opt-in, gated, and
   blocked until a masthead-alias owned-safe fixture passes (U4).
-- **R3 — The wish-state migration loses data.** Gated on a **verified** backup
-  (written and read back outside the store dir before any mutation; abort on
-  failure), diff-reviewed, reversible from `.bak`. The migration carries *all*
-  current wishes forward (§4.5), not just local-only adds.
+- **R3 — The wish-state migration loses data.** Lower than first feared: it is a
+  **field-backfill** on the existing `wish-list.json` (which already contains every
+  wish — the import rebuilds it each run today), not a reconstruction. Still gated on
+  a **verified** backup (written and read back outside the store dir before any
+  mutation; abort on failure), diff-reviewed, reversible from `.bak`.
 - **R4 — F8 lets a regression merge green.** Production-shaped fixtures + a local
   `uv run pytest` gate in the runbook; do not trust CI.
 - **R5 — Option B silently drops a wish the user added on LOCG.** Mitigation: the
@@ -666,8 +675,9 @@ phone-add cosmetic-vs-functional cost split (§4.4); sync cadence stated (§5); 
 output shape + U4 scope narrowed (§9).
 
 **Residual / still open:**
-- **OQ-1** — retain-vs-delete the `in_wish_list` flag: needs a consumer inventory
-  before implementation.
+- **OQ-1** — RESOLVED (2026-06-22): consumer inventory found the flag has one reader
+  (the import filter U1 removes); deleted as authoritative, migration is a field-
+  backfill. See §10/§9 U1.
 - **OQ-2** — fulfillment reuses the matcher; a masthead-alias miss leaves a fulfilled
   wish as clutter (now *visible* via logging). Accepted unless it bites.
 - **Cadence** (§5) is an assumption to confirm against real usage.

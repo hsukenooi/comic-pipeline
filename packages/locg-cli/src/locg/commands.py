@@ -620,17 +620,16 @@ def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]
 def cmd_wish_list_add(title: str) -> dict[str, Any]:
     """Append a manual entry to the local wish-list cache.
 
-    Writes ``{"name": title, "id": None}`` to ``data/locg/wish-list.json``
-    using the same atomic write pattern as :func:`collection_io._write_wish_list_cache`
-    (tempfile + os.replace + chmod 600).
+    Writes ``{"name": title, "id": None, "source": "local"}`` to
+    ``data/locg/wish-list.json`` using the same atomic write pattern as the rest
+    of the wish-list cache writers (tempfile + os.replace + chmod 600).
 
-    Manual adds carry no ``series_name``, which marks them as local-only.
-    :func:`collection_io._write_wish_list_cache` preserves such entries across a
-    ``locg collection import`` (BUI-47): it rebuilds the export-derived set, then
-    re-appends any local-only entry whose name isn't already covered. A manual
-    add is deduped out only once it round-trips through a LOCG export and reappears
-    in the import. Until then it persists locally but is never pushed to LOCG —
-    there is no wish-list push path (cf. the collection's record-win round-trip).
+    Manual adds carry ``source: "local"`` (BUI-208), which marks them as the
+    local diff LOCG doesn't have yet. Since the LOCG import no longer rewrites
+    ``wish-list.json`` (BUI-208), a local add — or a server-side removal — is
+    durable across a ``locg collection import``. There is no wish-list push path
+    (cf. the collection's record-win round-trip), so a local entry persists
+    until it is removed.
     """
     title = (title or "").strip()
     if not title:
@@ -646,7 +645,7 @@ def cmd_wish_list_add(title: str) -> dict[str, Any]:
     else:
         items = []
 
-    entry = {"name": title, "id": None}
+    entry = {"name": title, "id": None, "source": "local"}
     items.append(entry)
 
     new_payload = {
@@ -884,6 +883,16 @@ def cmd_wish_list_remove(title: str) -> dict[str, Any]:
         "items": len(new_items),
         "path": str(path),
     }
+
+
+def cmd_wish_list_migrate_source() -> dict[str, Any]:
+    """Backfill an explicit ``source`` field onto every wish-list entry (BUI-208).
+
+    Thin wrapper over :func:`collection_io.migrate_wish_list_source` — a
+    backup-gated, idempotent field-stamp. Returns its result dict for JSON output.
+    """
+    from locg.collection_io import migrate_wish_list_source
+    return migrate_wish_list_source()
 
 
 # Wish-list entry names are written as "<Series> #<Issue>" by cmd_wish_list_add

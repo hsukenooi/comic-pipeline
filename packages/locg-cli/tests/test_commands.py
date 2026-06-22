@@ -1948,11 +1948,11 @@ def test_cmd_wish_list_add_creates_cache_when_missing(tmp_path):
     result = cmd_wish_list_add("Amazing Spider-Man #300")
 
     assert result["status"] == "ok"
-    assert result["added"] == {"name": "Amazing Spider-Man #300", "id": None}
+    assert result["added"] == {"name": "Amazing Spider-Man #300", "id": None, "source": "local"}
     assert result["items"] == 1
 
     payload = _json.loads(wish_list_cache_path().read_text())
-    assert payload["items"] == [{"name": "Amazing Spider-Man #300", "id": None}]
+    assert payload["items"] == [{"name": "Amazing Spider-Man #300", "id": None, "source": "local"}]
     assert "updated_at" in payload
 
 
@@ -1967,7 +1967,7 @@ def test_cmd_wish_list_add_appends_to_existing_cache(tmp_path):
     payload = _json.loads(wish_list_cache_path().read_text())
     names = [item["name"] for item in payload["items"]]
     assert names == [item["name"] for item in seeded] + ["Batman #224"]
-    assert payload["items"][-1] == {"name": "Batman #224", "id": None}
+    assert payload["items"][-1] == {"name": "Batman #224", "id": None, "source": "local"}
 
 
 def test_cmd_wish_list_add_then_read_returns_new_entry(tmp_path):
