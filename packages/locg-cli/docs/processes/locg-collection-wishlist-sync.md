@@ -138,21 +138,27 @@ clear pending; do not upload the same CSV twice.
 
 ## Wish-list model
 
-- Stored in the server store's `wish-list.json` (`{name, id, series_name?, ...}`
+- Stored in the server store's `wish-list.json` (`{name, id, source, series_name?, ...}`
   items). `seller-scan` and `collection-check` read it over the API — **the LOCG
   web UI is not in the buy-workflow read path.**
 - `POST /api/comics/wish-list` (and `locg wish-list add`) appends a local-only
-  entry `{name, id: null}` (no series/publisher/release_date).
-- `collection import` **rebuilds** the export-derived wish entries from the
-  import's `in_wish_list==1` rows, then **re-appends local-only adds**.
+  entry `{name, id: null, source: "local"}`.
+- **The Mac Mini is the single source of truth for wish state (BUI-208).** Each
+  entry is classified by an explicit `source` field (`local` vs `export`), with a
+  `series_name`-absence fallback for un-migrated entries. Run
+  `locg wish-list migrate-source` once to backfill `source` (backup-gated,
+  idempotent).
 
-### ✅ BUI-47 fixed: local wish-list adds survive imports
+### ✅ BUI-208: server-side wish removals are durable (supersedes the BUI-47 fix)
 
-Local-only `wish-list add` entries (those with no `series_name`) are **preserved**
-across `collection import` (`_write_wish_list_cache` re-appends them after
-rebuilding from the export; commit `52d1e31`). Verified on real data 2026-06-13:
-69 local-only adds survived a full import unchanged. They are **not** silently
-lost.
+The `collection import` **no longer rewrites `wish-list.json`** — it leaves the
+file untouched (the old `_write_wish_list_cache` rebuild is gone). So a local add,
+*and a server-side removal*, survive a `collection import` **by construction** —
+there is no second copy of a wish to resurrect. This dissolves the BUI-206
+resurrection bug (a removed wish reappearing on the next import) rather than
+patching it. The owned-safe export-push gate keys on `source == "export"` (skip —
+LOCG already has it); local wishes are pushed only via the opt-in
+`?push_wishes=true` export (the default export is wins-only — see below).
 
 ### Wish-list adds DO reach LOCG — but the export is owned-safe (BUI-122)
 
@@ -235,11 +241,14 @@ already-owned dedup so they stop accumulating.
   rather than reconciling. Restore from backup and investigate (likely a LOCG
   canonicalization beyond Release Date, e.g. a Series Name rewrite, that the
   exact-year reconciliation couldn't match).
-- **LOCG Bulk Import times out ("Error: timeout"):** LOCG's importer is flaky on
-  larger files — upload the CSV in **≤20-row batches** (re-uploading is safe; the
-  CSV is owned-safe and idempotent). If even small batches fail at 0%, it's a
-  LOCG-side backend outage (DevTools → Network shows `queue_import_comic` as
-  `(canceled)` and a multi-minute page load) — wait and retry later.
+- **LOCG Bulk Import times out ("Error: timeout"):** the cause is
+  **incomplete/dateless rows, not batch size** — there is **no row-count limit**
+  (the earlier "≤20-row batches" guidance was a misdiagnosis). Ensure every row is
+  complete + exact (publisher + canonical series + exact full_title + accurate
+  Release Date); an all-dateless batch hangs. Re-uploading is safe (idempotent). If
+  a *complete* upload still fails at 0%, it's a LOCG-side backend outage (DevTools →
+  Network shows `queue_import_comic` as `(canceled)` and a multi-minute page load) —
+  wait and retry later.
 
 ## What changed (BUI-122)
 
