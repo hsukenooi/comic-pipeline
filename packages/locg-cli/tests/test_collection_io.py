@@ -1344,6 +1344,26 @@ def test_wish_export_excludes_owned_xmen_masthead_split(tmp_path):
     assert "Uncanny X-Men #142" in titles
 
 
+def test_wish_export_excludes_owned_when_source_defeats_gate(tmp_path):
+    """BUI-208 adversarial: an entry carrying a series_name BUT an explicit
+    `source` != 'export' defeats the source gate (it classifies as local and
+    reaches the body, unlike the old series_name gate which would have excluded
+    it). Deletion safety must then rest on the unconditional owned-safe backstop:
+    the owned book is STILL excluded, so no In Collection=0 row is ever emitted
+    for it. Locks in the single-layer guarantee the adversarial review relied on."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{
+        "name": "Uncanny X-Men #107", "id": None,
+        "series_name": "Uncanny X-Men",  # would exclude under the OLD gate
+        "source": "local",               # contradictory explicit source — defeats the new gate
+    }])
+    payload = {"comics": [
+        {"full_title": "The X-Men #107", "in_collection": 1},  # owned under the other masthead
+    ]}
+    titles = [r["full_title"] for r in wish_rows_for_export(payload)]
+    assert titles == [], "owned book must never export even when the source gate is defeated"
+
+
 def test_wish_export_excludes_owned_leading_article_variant(tmp_path):
     """BUI-200: owned under a leading-article + decorated series name, wished
     without the article. The normalized (series, issue) match excludes it so no
