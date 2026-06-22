@@ -844,6 +844,39 @@ def _make_ready_row(
     }
 
 
+def test_generate_csv_wish_rows_default_raises(tmp_path):
+    """BUI-208 machine gate: non-empty wish_rows with the default
+    allow_uncollect=False refuses to write (would emit In Collection=0 rows
+    that tell LOCG to DELETE owned titles)."""
+    import pytest
+    from locg.collection_io import generate_csv
+    out = tmp_path / "out.csv"
+    with pytest.raises(ValueError, match="In Collection=0"):
+        generate_csv([_make_ready_row()], out, wish_rows=[_make_ready_row()])
+    assert not out.exists()
+
+
+def test_generate_csv_wish_rows_with_allow_uncollect_writes(tmp_path):
+    """With allow_uncollect=True the wish rows are appended as In Collection=0,
+    In Wish List=1 (the explicit owned-safe wish push)."""
+    import csv
+    from locg.collection_io import generate_csv
+    out = tmp_path / "out.csv"
+    generate_csv(
+        [_make_ready_row(full_title="ASM #84")],
+        out,
+        wish_rows=[_make_ready_row(full_title="Saga #1")],
+        allow_uncollect=True,
+    )
+    with open(out, newline="") as f:
+        rows = list(csv.DictReader(f))
+    by_title = {r["Full Title"]: r for r in rows}
+    assert by_title["ASM #84"]["In Collection"] == "1"
+    assert by_title["ASM #84"]["In Wish List"] == "0"
+    assert by_title["Saga #1"]["In Collection"] == "0"
+    assert by_title["Saga #1"]["In Wish List"] == "1"
+
+
 def test_generate_csv_row_count(tmp_path):
     """10 ready rows produce a 10-row CSV (plus header)."""
     import csv

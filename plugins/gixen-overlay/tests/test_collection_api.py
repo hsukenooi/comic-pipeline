@@ -304,6 +304,34 @@ def test_collection_export_returns_csv(client):
     assert isinstance(body["ready_count"], int)
 
 
+def test_collection_export_wins_only_by_default(client):
+    """BUI-208: the default export is wins-only — no wish rows, so the CSV can
+    never carry an In Collection=0 row (the LOCG-delete trigger)."""
+    import csv
+    import io
+
+    body = client.get("/api/comics/collection/export").json()
+    assert body["wish_list_count"] == 0
+    assert body["pushed_wishes"] is False
+    rows = list(csv.DictReader(io.StringIO(body["csv"])))
+    assert all(row["In Collection"] != "0" for row in rows)
+
+
+def test_collection_export_push_wishes_includes_local_only_wish(client):
+    """?push_wishes=true is the explicit owned-safe wish mirror: the local-only,
+    not-owned wish ("X-Men #1") ships as an In Collection=0 row."""
+    import csv
+    import io
+
+    body = client.get("/api/comics/collection/export", params={"push_wishes": "true"}).json()
+    assert body["pushed_wishes"] is True
+    assert body["wish_list_count"] >= 1
+    rows = list(csv.DictReader(io.StringIO(body["csv"])))
+    wish_rows = [row for row in rows if row["In Wish List"] == "1"]
+    assert any(row["In Collection"] == "0" for row in wish_rows)
+    assert "X-Men #1" in {row["Full Title"] for row in wish_rows}
+
+
 # ===========================================================================
 # BUI-92: write endpoints
 # ===========================================================================

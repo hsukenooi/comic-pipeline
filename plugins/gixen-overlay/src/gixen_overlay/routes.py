@@ -1104,16 +1104,20 @@ async def api_wish_list_remove_conflicts():
 
 
 @router.get("/api/comics/collection/export")
-async def api_collection_export():
+async def api_collection_export(push_wishes: bool = False):
     """Export pending-push rows to a LOCG-bulk-import CSV (+ .notes.md), read
     from the server store, for the collection-add round-trip. Returns the file
     *contents* (``csv``, ``notes_md``) plus the counts so the caller can save
-    them locally and upload to LOCG."""
+    them locally and upload to LOCG.
+
+    Wins-only by default — the default export can never emit ``In Collection=0``
+    (the LOCG-delete trigger). ``push_wishes=true`` is the opt-in, owned-safe
+    wish mirror (deferred per BUI-208 OQ-3)."""
     _ensure_collection_store()
     with tempfile.TemporaryDirectory() as tmp:
         csv_path = Path(tmp) / "locg-bulk-import.csv"
         try:
-            result = cmd_collection_export(out_path=str(csv_path))
+            result = cmd_collection_export(out_path=str(csv_path), push_wishes=push_wishes)
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
         csv_text = Path(result["csv_path"]).read_text()

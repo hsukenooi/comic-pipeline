@@ -923,13 +923,30 @@ def generate_csv(
     ready_rows: list[dict[str, Any]],
     out_path: Path,
     wish_rows: list[dict[str, Any]] | None = None,
+    *,
+    allow_uncollect: bool = False,
 ) -> None:
     """Write ready-to-upload rows to a LOCG-compatible 21-column CSV.
 
     Uses csv.QUOTE_MINIMAL. My Rating column always present with blank body (R27).
     Wish-list rows are appended with In Collection=0, In Wish List=1.
+
+    BUI-208 machine gate: a wish row carries ``In Collection=0``, which tells
+    LOCG to *remove* the title from the collection on upload — the data-loss
+    trigger. So if ``wish_rows`` is non-empty this refuses to write unless the
+    caller passes ``allow_uncollect=True`` (an explicit, owned-safe wish push).
+    The default wins-only export can therefore never emit an ``In Collection=0``
+    row.
     """
     import csv as _csv
+
+    if wish_rows and not allow_uncollect:
+        raise ValueError(
+            "Refusing to emit In Collection=0 rows in a wins-only export "
+            "(BUI-208 machine gate): a wish row tells LOCG to DELETE the title "
+            "from the collection. Pass allow_uncollect=True for an explicit, "
+            "owned-safe wish push."
+        )
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

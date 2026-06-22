@@ -207,10 +207,12 @@ def test_export_includes_local_only_wish_add(tmp_path, monkeypatch):
     monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
 
     out_csv = tmp_path / "out.csv"
-    result = cmds.cmd_collection_export(str(out_csv))
+    # BUI-208: wish rows ship only on the explicit owned-safe opt-in.
+    result = cmds.cmd_collection_export(str(out_csv), push_wishes=True)
 
     assert result["wish_list_count"] == 1
     assert result["ready_count"] == 0
+    assert result["pushed_wishes"] is True
 
     with open(out_csv, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -219,6 +221,41 @@ def test_export_includes_local_only_wish_add(tmp_path, monkeypatch):
     assert rows[0]["Full Title"] == "Saga #1"
     assert rows[0]["In Collection"] == "0"
     assert rows[0]["In Wish List"] == "1"
+
+
+def test_export_wins_only_by_default_excludes_wishes(tmp_path, monkeypatch):
+    """BUI-208 machine gate: the default export is wins-only — no wish rows,
+    no In Collection=0 row, wish_list_count==0, pushed_wishes is False."""
+    import csv
+    import locg.collection_io as cio
+    import locg.commands as cmds
+
+    wish_path = cio.wish_list_cache_path()
+    wish_path.parent.mkdir(parents=True, exist_ok=True)
+    wish_path.write_text(json.dumps({
+        "updated_at": "2026-05-22T00:00:00+00:00",
+        "items": [{"name": "Saga #1", "id": None}],
+    }))
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(full_title="Amazing Spider-Man #300")])
+
+    out_csv = tmp_path / "out.csv"
+    result = cmds.cmd_collection_export(str(out_csv))
+
+    assert result["wish_list_count"] == 0
+    assert result["pushed_wishes"] is False
+    assert result["ready_count"] == 1
+
+    with open(out_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert all(r["In Collection"] != "0" for r in rows)
+    assert all(r["In Wish List"] != "1" for r in rows)
+    titles = {r["Full Title"] for r in rows}
+    assert "Saga #1" not in titles
+    assert "Amazing Spider-Man #300" in titles
 
 
 def test_export_collection_and_wish_list_combined(tmp_path, monkeypatch):
@@ -239,10 +276,12 @@ def test_export_collection_and_wish_list_combined(tmp_path, monkeypatch):
     _seed_cache(cache, [_agent_win_row(full_title="Amazing Spider-Man #300")])
 
     out_csv = tmp_path / "out.csv"
-    result = cmds.cmd_collection_export(str(out_csv))
+    # BUI-208: wish rows ship only on the explicit owned-safe opt-in.
+    result = cmds.cmd_collection_export(str(out_csv), push_wishes=True)
 
     assert result["ready_count"] == 1
     assert result["wish_list_count"] == 1
+    assert result["pushed_wishes"] is True
 
     with open(out_csv, newline="") as f:
         rows = list(csv.DictReader(f))

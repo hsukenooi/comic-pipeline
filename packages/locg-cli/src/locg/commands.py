@@ -1658,11 +1658,20 @@ def _oldest_pending_days(rows: list[dict[str, Any]]) -> Optional[int]:
     return (now - oldest).days if oldest is not None else None
 
 
-def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
+def cmd_collection_export(
+    out_path: Optional[str] = None, push_wishes: bool = False
+) -> dict[str, Any]:
     """Export pending-push rows to a LOCG-compatible CSV + .notes.md companion.
 
+    Wins-only by default (BUI-208 machine gate): wish rows carry
+    ``In Collection=0``, which tells LOCG to *delete* the title from the
+    collection on upload, so the default export emits only owned wins and can
+    never produce an ``In Collection=0`` row. Pass ``push_wishes=True`` for the
+    explicit, owned-safe wish mirror (deferred per BUI-208 OQ-3) — that is the
+    only path that includes the local-only wish adds.
+
     Returns {csv_path, notes_md_path, ready_count, manual_variant_count,
-    manual_series_count, wish_list_count, oldest_pending_days}.
+    manual_series_count, wish_list_count, oldest_pending_days, pushed_wishes}.
     """
     from datetime import datetime
     from pathlib import Path as _Path
@@ -1674,7 +1683,8 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
     # BUI-122: only push local-only wish adds that aren't already owned. Re-dumping
     # the whole wish list re-uploaded LOCG-derived wishes and, because wish rows
     # carry In Collection=0, deleted owned-but-wished books from the collection.
-    wish_rows = wish_rows_for_export(payload)
+    # BUI-208: wins-only by default — wish rows ship only on the explicit opt-in.
+    wish_rows = wish_rows_for_export(payload) if push_wishes else []
 
     if out_path is None:
         ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
@@ -1684,7 +1694,7 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
 
     notes_dest = dest.with_suffix(".notes.md")
 
-    generate_csv(ready, dest, wish_rows=wish_rows)
+    generate_csv(ready, dest, wish_rows=wish_rows, allow_uncollect=push_wishes)
     generate_notes_md(ready, manual_variant, manual_series, notes_dest)
 
     all_pending = ready + manual_variant + manual_series
@@ -1696,6 +1706,7 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
         "manual_series_count": len(manual_series),
         "wish_list_count": len(wish_rows),
         "oldest_pending_days": _oldest_pending_days(all_pending),
+        "pushed_wishes": push_wishes,
     }
 
 
