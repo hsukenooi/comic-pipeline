@@ -2227,6 +2227,42 @@ def cmd_collection_record_win(
                 skipped_already_owned_titles.append(f"{canonical_series} #{issue_num}")
                 continue
 
+            # BUI-210: when the series resolved via series_name_index (the common
+            # case — metron_data stays None), we still have no release_date, so
+            # the row would fall through to the {year}-01-01 placeholder, which
+            # the export blanks → the row ships dateless and an all-dateless
+            # batch hangs LOCG's importer. Do a Metron *issue* lookup purely to
+            # populate a real date; do NOT touch canonical_series (the
+            # index-resolved value is more reliable than Metron's
+            # format_series_name here). Runs after the BUI-34 dedup continue so
+            # we never spend a Metron call on a skipped already-owned win, and
+            # before the variant block so variant resolution can reuse metron_id.
+            #
+            # Reprint guard: a naive lookup_issue("The X-Men", "59", 1970) can
+            # return a collected-edition/reprint date (observed: 2005-03-09).
+            # Only accept the result if the returned store/cover date's YEAR
+            # matches the win's year_raw; otherwise reject it and keep the
+            # placeholder fallback below.
+            if metron_data is None and issue_num and not metron_disabled:
+                year_str = str(year_raw).strip() if year_raw is not None else ""
+                if re.fullmatch(r"\d{4}", year_str):
+                    try:
+                        chunk_metron_attempted += 1
+                        looked_up = metron.lookup_issue(series_raw, issue_num, year_raw)
+                        if looked_up:
+                            looked_date = (
+                                looked_up.get("store_date")
+                                or looked_up.get("cover_date")
+                            )
+                            if looked_date and str(looked_date).startswith(year_str):
+                                chunk_metron_succeeded += 1
+                                metron_data = looked_up
+                    except MetronCredentialError:
+                        metron_disabled = True
+                        logger.warning(
+                            "Metron credentials not configured; falling back to placeholder release date."
+                        )
+
             # R32: variant handling
             needs_manual_variant = False
             # BUI-199 Cause 1: full_title must use the BASE series name, not the
