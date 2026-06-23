@@ -33,15 +33,76 @@ server.
 
 ## Step 1: Pull won auctions
 
+There are **two pull sources**. They return the *same kind* of data (ended
+snipes) in **different shapes**, so the WON filter and field mapping differ —
+pick the source first, then apply the matching filter below.
+
+**Decision rule — which source to pull:**
+
+1. **PREFER `/api/comics/history`** (bounded ~7-day window, server-side enriched,
+   tiny payload). Use it whenever the window you need is covered — i.e. the last
+   successful collection-add run was within the past 7 days. The seen-set state
+   note (`last collection-add run` date in memory / the prior run's cutoff) is
+   the simplest signal: if you can establish the last run was ≤7 days ago, the
+   history endpoint covers every win since then.
+2. **FALL BACK to `gixen list --json`** (full history, ~310 items) **only** when
+   the needed window predates the endpoint's 7-day horizon — a first run, a run
+   after a long gap, or any case where you **cannot** establish that the last
+   run was within the past 7 days. When in doubt, use the CLI fallback: a
+   slightly larger pull is harmless (the seen-set in Step 1b still excludes
+   already-recorded wins), but a missed older win is the worse failure.
+
+Don't over-engineer the date math — this choice only affects **completeness** of
+the pull, not correctness. The seen-set (Step 1b) is what actually prevents
+double-recording; the window choice just decides how far back you can see.
+
+**Source A — history endpoint (preferred):**
+
+```bash
+curl -sf "$GIXEN_SERVER_URL/api/comics/history"
+```
+
+Returns a JSON **array** of row objects. Filter to wins by **`status` only**:
+- `status` contains `WON` (case-insensitive)
+
+Do **NOT** filter on `time_to_end` for this source — the endpoint returns it as a
+relative phrase (e.g. `"2 days ago"`), never the literal `"ENDED"`, so that
+check would drop every row. The endpoint already guarantees rows are
+ended-and-recent (past 7 days) and non-tombstoned, so `status` contains `WON` is
+the complete filter.
+
+**Source B — CLI fallback (`gixen list --json`):**
+
 ```bash
 gixen list --json 2>/dev/null
 ```
 
-Filter to wins:
+This dumps the entire snipe history. Filter to wins with **both** conditions
+(this is the only source where `time_to_end` really is the literal `"ENDED"`):
 - `time_to_end == "ENDED"`
 - `status` contains `WON` (case-insensitive)
 
+**Then, for whichever source you used, deduplicate by `item_id`** (keep the first
+occurrence) before continuing. The history endpoint already dedups server-side,
+but the CLI fallback does not and the general contract requires it — so apply
+this normalization unconditionally.
+
 If no wins, print "No won auctions to add." and stop.
+
+### Field mapping (history row → record-win entry)
+
+The history row shape **differs** from `gixen list --json`. When you pulled from
+the history endpoint, read these fields to build each Step 2 entry:
+
+| History row field | Used as | Notes |
+|---|---|---|
+| `item_id` | `item_id` | string |
+| `current_bid` | `current_bid` | e.g. `"222.50 USD"` — maps directly |
+| `end_date_iso` | `end_date_iso` | ISO timestamp — maps directly |
+| `title` | source for parsing `identify_data` | series/issue/year/variant, same as the CLI path |
+
+(`gixen list --json` exposes the same logical fields under its own shape; the
+`title`-parsing and JSON-build steps below apply to both.)
 
 ## Step 1b: Fetch already-processed wins (BUI-121)
 
@@ -55,8 +116,15 @@ SEEN_IDS=$(curl -sf "$GIXEN_SERVER_URL/api/comics/collection/record-win/seen" \
   2>/dev/null || echo "")
 ```
 
-From the filtered WON snipes in Step 1, exclude any whose `item_id` appears in
-`SEEN_IDS`. Call the remaining wins **new wins**.
+From the filtered, deduped WON snipes in Step 1 (whichever pull source you used),
+exclude any whose `item_id` appears in `SEEN_IDS`. Call the remaining wins
+**new wins**.
+
+**The two mechanisms compose.** Step 1's source choice *narrows the pull* (how
+far back you can see — 7 days via the endpoint, or all of history via the CLI);
+the seen-set here *excludes already-recorded wins*. The seen-set remains the
+**primary dedup mechanism** and runs identically regardless of pull source — so a
+larger CLI-fallback pull never re-records anything the seen-set already covers.
 
 If there are no new wins, print:
 > All won auctions already processed. Nothing new to record.
@@ -166,6 +234,11 @@ curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
 # read pending_push_count and oldest_pending_days from this fresh response
 ```
 
+Note: `oldest_pending_days` is the age of the oldest uncleared pending item — it
+is **not** "days since last sync." Items with `needs_manual_series_canonical=true`
+never get cleared by an automated CSV export; they require a manual LOCG add
+followed by a full `/comic:collection-sync` round-trip.
+
 Print a summary (source `pending_push_count` from the fresh status read above,
 not from Step 0):
 
@@ -195,3 +268,6 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Passing LOCG IDs as part of record-win input | `record-win` does not take LOCG IDs; it resolves series via Metron and the server collection |
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
 | Marking wins seen before the POST succeeds | Only mark seen after a successful record-win POST — a failed call means wins weren't recorded |
+| Confusing `oldest_pending_days` with "days since last sync" | `oldest_pending_days` = age of oldest uncleared item; use `last_full_import` from status for sync recency |
+| Applying the `time_to_end == "ENDED"` filter to `/api/comics/history` | The endpoint returns `time_to_end` as a relative string (e.g. `"2 days ago"`), never `"ENDED"` — that filter drops every row. For the history source, filter on `status` contains `WON` only; the `"ENDED"` check is for the `gixen list --json` fallback path only |
+| Pulling from `/api/comics/history` when the needed window predates 7 days | The endpoint only returns snipes ended in the past 7 days. On a first run or after a >7-day gap (any time you can't confirm the last run was within 7 days), fall back to `gixen list --json` so older wins aren't missed |
