@@ -169,10 +169,12 @@ for r in rows:
 print(f"{len(rows)} win rows; {len(bad)} flagged")
 for ft, iss in bad:
     print(" -", ft, "::", "; ".join(iss))
-# An ALL-dateless batch HANGS LOCG's importer — guard it.
-dateless = sum(1 for r in rows if not r["Release Date"].strip())
-if rows and dateless == len(rows):
-    print("ABORT: every row is dateless — LOCG's importer hangs on an all-dateless batch.")
+# Dateless rows HANG LOCG's importer. A single blank-date row matches fine, but a
+# batch that is all (or nearly all) dateless spins the importer at 0% — backfill first.
+dateless = [r["Full Title"] for r in rows if not r["Release Date"].strip()]
+if dateless:
+    print(f"DATELESS: {len(dateless)}/{len(rows)} rows lack a Release Date — backfill before upload:")
+    for ft in dateless: print("  -", ft)
 PY
 ```
 
@@ -180,7 +182,16 @@ PY
 with a canonical series + exact full_title + accurate release date) before
 uploading. Partial or wrong rows import as "Not Found"; an all-dateless batch
 hangs. **Rows must be complete and exact: publisher + canonical series + exact
-full_title (no decoration) + accurate release date.** Then also clean the
+full_title (no decoration) + accurate release date.**
+
+**If any rows are DATELESS, backfill their Release Date before uploading** — do
+**not** upload a dateless batch (it hangs the importer at 0%). The durable fix is
+record-win populating dates (BUI-210); until then, follow the tiered procedure in
+**`references/date-backfill.md`** (cadence/Metron first, web-research sub-agent only
+for the residual). Fill the dates into the already-generated CSV (don't re-export —
+the export re-blanks placeholders), then continue.
+
+Then also clean the
 wish-list itself so no owned-but-wished entry survives to be pushed in Step 3b:
 
 ```bash
