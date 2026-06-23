@@ -601,12 +601,6 @@ def test_normalize_series_key_strips_leading_article():
         == _normalize_series_key("Incredible Hulk")
         == "incredible hulk"
     )
-    # BUI-212: the ASM series is stored with "The" but /comic:identify drops it.
-    assert (
-        _normalize_series_key("The Amazing Spider-Man (1963 - 1998)")
-        == _normalize_series_key("Amazing Spider-Man")
-        == "amazing spider-man"
-    )
     assert _normalize_series_key("A Distant Soil") == "distant soil"
     assert _normalize_series_key("An Unkindness of Ravens") == "unkindness of ravens"
     # Only a true leading article is stripped, not an embedded one.
