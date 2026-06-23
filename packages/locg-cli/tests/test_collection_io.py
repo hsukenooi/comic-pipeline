@@ -844,6 +844,39 @@ def _make_ready_row(
     }
 
 
+def test_generate_csv_wish_rows_default_raises(tmp_path):
+    """BUI-208 machine gate: non-empty wish_rows with the default
+    allow_uncollect=False refuses to write (would emit In Collection=0 rows
+    that tell LOCG to DELETE owned titles)."""
+    import pytest
+    from locg.collection_io import generate_csv
+    out = tmp_path / "out.csv"
+    with pytest.raises(ValueError, match="In Collection=0"):
+        generate_csv([_make_ready_row()], out, wish_rows=[_make_ready_row()])
+    assert not out.exists()
+
+
+def test_generate_csv_wish_rows_with_allow_uncollect_writes(tmp_path):
+    """With allow_uncollect=True the wish rows are appended as In Collection=0,
+    In Wish List=1 (the explicit owned-safe wish push)."""
+    import csv
+    from locg.collection_io import generate_csv
+    out = tmp_path / "out.csv"
+    generate_csv(
+        [_make_ready_row(full_title="ASM #84")],
+        out,
+        wish_rows=[_make_ready_row(full_title="Saga #1")],
+        allow_uncollect=True,
+    )
+    with open(out, newline="") as f:
+        rows = list(csv.DictReader(f))
+    by_title = {r["Full Title"]: r for r in rows}
+    assert by_title["ASM #84"]["In Collection"] == "1"
+    assert by_title["ASM #84"]["In Wish List"] == "0"
+    assert by_title["Saga #1"]["In Collection"] == "0"
+    assert by_title["Saga #1"]["In Wish List"] == "1"
+
+
 def test_generate_csv_row_count(tmp_path):
     """10 ready rows produce a 10-row CSV (plus header)."""
     import csv
@@ -1149,138 +1182,99 @@ def test_pending_push_already_pushed_excluded(tmp_path):
 # import_xlsx — wish-list cache
 # ---------------------------------------------------------------------------
 
-def test_import_xlsx_writes_wish_list_cache(tmp_path, monkeypatch):
-    """import_xlsx writes wish-list.json alongside collection.json."""
+def test_import_leaves_existing_wish_list_untouched(tmp_path):
+    """BUI-208: import_xlsx no longer touches wish-list.json — an existing cache
+    is left byte-for-byte identical (so a server-side removal stays durable)."""
     from locg.collection_io import import_xlsx, wish_list_cache_path
-    cache = make_cache(tmp_path)
-    import_xlsx(SAMPLE_XLSX, cache)
-    wl_path = wish_list_cache_path()
-    assert wl_path.exists()
-    data = json.loads(wl_path.read_text())
-    assert "updated_at" in data
-    assert "items" in data
-
-
-def test_wish_list_cache_item_count(tmp_path):
-    """wish-list.json contains exactly the rows where in_wish_list == 1."""
-    from locg.collection_io import import_xlsx, wish_list_cache_path
-    cache = make_cache(tmp_path)
-    import_xlsx(SAMPLE_XLSX, cache)
-    payload = cache.load()
-    expected = sum(1 for r in payload["comics"] if r.get("in_wish_list") == 1)
-    data = json.loads(wish_list_cache_path().read_text())
-    assert len(data["items"]) == expected
-    assert expected > 0  # fixture has wish-list rows
-
-
-def test_wish_list_cache_item_shape(tmp_path):
-    """Each wish-list cache entry has name (from full_title) and id: null."""
-    from locg.collection_io import import_xlsx, wish_list_cache_path
-    cache = make_cache(tmp_path)
-    import_xlsx(SAMPLE_XLSX, cache)
-    payload = cache.load()
-    xl_wish = {r["full_title"] for r in payload["comics"] if r.get("in_wish_list") == 1}
-    data = json.loads(wish_list_cache_path().read_text())
-    for item in data["items"]:
-        assert item["name"] in xl_wish
-        assert item["id"] is None
-
-
-def test_wish_list_cache_updated_at_is_iso_timestamp(tmp_path):
-    """wish-list.json envelope contains a valid ISO 8601 UTC timestamp."""
-    from datetime import datetime, timezone
-    from locg.collection_io import import_xlsx, wish_list_cache_path
-    cache = make_cache(tmp_path)
-    import_xlsx(SAMPLE_XLSX, cache)
-    data = json.loads(wish_list_cache_path().read_text())
-    ts = data["updated_at"]
-    # Should parse without error and be timezone-aware
-    parsed = datetime.fromisoformat(ts)
-    assert parsed.tzinfo is not None
-
-
-def test_wish_list_cache_overwritten_on_reimport(tmp_path):
-    """Re-importing overwrites wish-list.json rather than appending."""
-    from locg.collection_io import import_xlsx, wish_list_cache_path
-    cache = make_cache(tmp_path)
-    import_xlsx(SAMPLE_XLSX, cache)
-    first_mtime = wish_list_cache_path().stat().st_mtime_ns
-    import_xlsx(SAMPLE_XLSX, cache)
-    second_mtime = wish_list_cache_path().stat().st_mtime_ns
-    # Second import must have produced a fresh file
-    assert second_mtime >= first_mtime
-    data = json.loads(wish_list_cache_path().read_text())
-    assert isinstance(data["items"], list)
-
-
-def test_import_preserves_local_wish_list_add(tmp_path):
-    """A local `wish-list add` survives a subsequent import (BUI-47).
-
-    Regression: import used to overwrite wish-list.json from the export's
-    in_wish_list rows, silently dropping local-only adds.
-    """
-    from locg.collection_io import import_xlsx, wish_list_cache_path
-    import locg.commands as cmds
-
-    cmds.cmd_wish_list_add("Saga #1")  # local-only add, not in the fixture export
-    cache = make_cache(tmp_path)
-    import_xlsx(SAMPLE_XLSX, cache)
-
-    items = json.loads(wish_list_cache_path().read_text())["items"]
-    saga = [i for i in items if i["name"] == "Saga #1"]
-    assert len(saga) == 1, "local wish-list add must survive the import"
-    assert saga[0].get("series_name") is None  # still a local-only entry
-    assert any(i.get("series_name") for i in items)  # export rows present too
-
-
-def test_write_wish_list_cache_dedups_local_when_in_export(tmp_path):
-    """A local add that now appears in the export is not duplicated (BUI-47)."""
-    from locg.collection_io import _write_wish_list_cache, wish_list_cache_path
 
     p = wish_list_cache_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({
         "updated_at": "2026-05-30T00:00:00+00:00",
-        "items": [{"name": "Batman #1", "id": None}],  # local-only add
+        "items": [
+            {"name": "Saga #1", "id": None, "source": "local"},
+            {"name": "Batman #1", "id": None, "series_name": "Batman (1940 - 2011)",
+             "source": "export"},
+        ],
     }))
-
-    # The same title now arrives from the LOCG export (carries a series_name).
-    _write_wish_list_cache([{
-        "full_title": "Batman #1",
-        "series_name": "Batman (1940 - 2011)",
-        "publisher_name": "DC Comics",
-        "release_date": "1940-04-25",
-        "media_format": "Print",
-    }])
-
-    items = json.loads(p.read_text())["items"]
-    batman = [i for i in items if i["name"] == "Batman #1"]
-    assert len(batman) == 1, "must dedupe, not duplicate"
-    assert batman[0]["series_name"] == "Batman (1940 - 2011)"  # export version wins
-
-
-def test_wish_list_cache_empty_when_no_wish_list_rows(tmp_path, monkeypatch):
-    """An XLSX with zero wish-list rows writes items: [] without error."""
-    import openpyxl
-    from locg.collection_io import import_xlsx, wish_list_cache_path, LOCG_XLSX_HEADERS
-
-    # Build a minimal XLSX with one collection-only row (in_wish_list=0)
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.append(list(LOCG_XLSX_HEADERS))
-    ws.append([
-        "Marvel", "X-Men", "X-Men #1", "1963-09-01",
-        1, 0, 0, None, "Print", None, None, None, None,
-        None, None, None, None, None, None, None, None,
-    ])
-    xlsx_path = tmp_path / "no_wish.xlsx"
-    wb.save(xlsx_path)
+    before = p.read_bytes()
 
     cache = make_cache(tmp_path)
-    import_xlsx(xlsx_path, cache)
-    data = json.loads(wish_list_cache_path().read_text())
-    assert data["items"] == []
-    assert "updated_at" in data
+    import_xlsx(SAMPLE_XLSX, cache)
+
+    assert p.read_bytes() == before, "import must not rewrite wish-list.json"
+
+
+def test_local_remove_stays_gone_after_import(tmp_path):
+    """BUI-206/BUI-208 HEADLINE: a local add removed via cmd_wish_list_remove
+    stays gone after a subsequent import — durability is now structural because
+    the import never rewrites wish-list.json."""
+    from locg.collection_io import import_xlsx, wish_list_cache_path
+    import locg.commands as cmds
+
+    cmds.cmd_wish_list_add("Saga #1")
+    cmds.cmd_wish_list_add("Daredevil #181")
+    cmds.cmd_wish_list_remove("Saga #1")  # the durable removal
+
+    cache = make_cache(tmp_path)
+    import_xlsx(SAMPLE_XLSX, cache)
+
+    names = {i["name"] for i in json.loads(wish_list_cache_path().read_text())["items"]}
+    assert "Saga #1" not in names, "a removed local wish must not reappear after import"
+    assert "Daredevil #181" in names, "the un-removed local wish must remain"
+
+
+def test_migrate_wish_list_source(tmp_path):
+    """BUI-208: migrate stamps an explicit source on every entry, verifies a
+    backup, and is idempotent."""
+    from locg.collection_io import migrate_wish_list_source, wish_list_cache_path
+
+    p = wish_list_cache_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({
+        "updated_at": "2026-05-30T00:00:00+00:00",
+        "items": [
+            {"name": "Batman #1", "id": None, "series_name": "Batman (1940 - 2011)"},
+            {"name": "Saga #1", "id": None},
+        ],
+    }))
+
+    result = migrate_wish_list_source()
+    assert result["migrated"] == 2
+    assert result["total"] == 2
+
+    # Backup exists and verifies byte-for-byte against the pre-migration content.
+    backup = Path(result["backup"])
+    assert backup.exists()
+    assert json.loads(backup.read_text())["items"][1]["name"] == "Saga #1"
+    assert "source" not in json.loads(backup.read_text())["items"][1]
+
+    items = {i["name"]: i for i in json.loads(p.read_text())["items"]}
+    assert items["Batman #1"]["source"] == "export"
+    assert items["Saga #1"]["source"] == "local"
+
+    # Idempotent: a second run stamps nothing new.
+    result2 = migrate_wish_list_source()
+    assert result2["migrated"] == 0
+    assert result2["total"] == 2
+
+
+def test_migrate_wish_list_source_absent_cache(tmp_path):
+    """BUI-208: migrate on a missing cache is a clean no-op."""
+    from locg.collection_io import migrate_wish_list_source
+    assert migrate_wish_list_source() == {"migrated": 0, "backup": None}
+
+
+def test_wish_list_add_writes_source_local(tmp_path):
+    """BUI-208: cmd_wish_list_add stamps source='local' on the appended entry."""
+    import locg.commands as cmds
+    from locg.collection_io import wish_list_cache_path
+
+    cmds.cmd_wish_list_add("Saga #1")
+    items = json.loads(wish_list_cache_path().read_text())["items"]
+    saga = [i for i in items if i["name"] == "Saga #1"]
+    assert len(saga) == 1
+    assert saga[0]["source"] == "local"
 
 
 # ---------------------------------------------------------------------------
@@ -1348,6 +1342,26 @@ def test_wish_export_excludes_owned_xmen_masthead_split(tmp_path):
     titles = [r["full_title"] for r in wish_rows_for_export(payload)]
     assert "Uncanny X-Men #107" not in titles, "owned cross-masthead book must never export"
     assert "Uncanny X-Men #142" in titles
+
+
+def test_wish_export_excludes_owned_when_source_defeats_gate(tmp_path):
+    """BUI-208 adversarial: an entry carrying a series_name BUT an explicit
+    `source` != 'export' defeats the source gate (it classifies as local and
+    reaches the body, unlike the old series_name gate which would have excluded
+    it). Deletion safety must then rest on the unconditional owned-safe backstop:
+    the owned book is STILL excluded, so no In Collection=0 row is ever emitted
+    for it. Locks in the single-layer guarantee the adversarial review relied on."""
+    from locg.collection_io import wish_rows_for_export
+    _seed_wish([{
+        "name": "Uncanny X-Men #107", "id": None,
+        "series_name": "Uncanny X-Men",  # would exclude under the OLD gate
+        "source": "local",               # contradictory explicit source — defeats the new gate
+    }])
+    payload = {"comics": [
+        {"full_title": "The X-Men #107", "in_collection": 1},  # owned under the other masthead
+    ]}
+    titles = [r["full_title"] for r in wish_rows_for_export(payload)]
+    assert titles == [], "owned book must never export even when the source gate is defeated"
 
 
 def test_wish_export_excludes_owned_leading_article_variant(tmp_path):

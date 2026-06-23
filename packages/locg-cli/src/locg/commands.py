@@ -620,17 +620,16 @@ def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]
 def cmd_wish_list_add(title: str) -> dict[str, Any]:
     """Append a manual entry to the local wish-list cache.
 
-    Writes ``{"name": title, "id": None}`` to ``data/locg/wish-list.json``
-    using the same atomic write pattern as :func:`collection_io._write_wish_list_cache`
-    (tempfile + os.replace + chmod 600).
+    Writes ``{"name": title, "id": None, "source": "local"}`` to
+    ``data/locg/wish-list.json`` using the same atomic write pattern as the rest
+    of the wish-list cache writers (tempfile + os.replace + chmod 600).
 
-    Manual adds carry no ``series_name``, which marks them as local-only.
-    :func:`collection_io._write_wish_list_cache` preserves such entries across a
-    ``locg collection import`` (BUI-47): it rebuilds the export-derived set, then
-    re-appends any local-only entry whose name isn't already covered. A manual
-    add is deduped out only once it round-trips through a LOCG export and reappears
-    in the import. Until then it persists locally but is never pushed to LOCG —
-    there is no wish-list push path (cf. the collection's record-win round-trip).
+    Manual adds carry ``source: "local"`` (BUI-208), which marks them as the
+    local diff LOCG doesn't have yet. Since the LOCG import no longer rewrites
+    ``wish-list.json`` (BUI-208), a local add — or a server-side removal — is
+    durable across a ``locg collection import``. There is no wish-list push path
+    (cf. the collection's record-win round-trip), so a local entry persists
+    until it is removed.
     """
     title = (title or "").strip()
     if not title:
@@ -646,7 +645,7 @@ def cmd_wish_list_add(title: str) -> dict[str, Any]:
     else:
         items = []
 
-    entry = {"name": title, "id": None}
+    entry = {"name": title, "id": None, "source": "local"}
     items.append(entry)
 
     new_payload = {
@@ -886,6 +885,16 @@ def cmd_wish_list_remove(title: str) -> dict[str, Any]:
     }
 
 
+def cmd_wish_list_migrate_source() -> dict[str, Any]:
+    """Backfill an explicit ``source`` field onto every wish-list entry (BUI-208).
+
+    Thin wrapper over :func:`collection_io.migrate_wish_list_source` — a
+    backup-gated, idempotent field-stamp. Returns its result dict for JSON output.
+    """
+    from locg.collection_io import migrate_wish_list_source
+    return migrate_wish_list_source()
+
+
 # Wish-list entry names are written as "<Series> #<Issue>" by cmd_wish_list_add
 # (and by the /comic:wishlist-add skill).
 #
@@ -983,7 +992,19 @@ def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
         if "error" in result:
             errors.append({"name": conflict["name"], "error": result["error"]})
         else:
-            removed.append(result["removed"])
+            # BUI-208 U2: fulfillment-drop touches ONLY wish state (cmd_wish_list_remove
+            # rewrites wish-list.json and nothing else — never a collection row). Log and
+            # surface the matched owned identity so the drop is visible in the sync plan,
+            # never silent.
+            matched = conflict.get("full_title_matched")
+            logger.info(
+                "fulfillment-drop: removed wish %r — owned as %r",
+                conflict["name"], matched,
+            )
+            entry = dict(result["removed"]) if isinstance(result.get("removed"), dict) \
+                else {"name": conflict["name"]}
+            entry["matched_owned"] = matched
+            removed.append(entry)
     try:
         remaining = len(cmd_wish_list_from_cache())
     except FileNotFoundError:
@@ -1637,11 +1658,20 @@ def _oldest_pending_days(rows: list[dict[str, Any]]) -> Optional[int]:
     return (now - oldest).days if oldest is not None else None
 
 
-def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
+def cmd_collection_export(
+    out_path: Optional[str] = None, push_wishes: bool = False
+) -> dict[str, Any]:
     """Export pending-push rows to a LOCG-compatible CSV + .notes.md companion.
 
+    Wins-only by default (BUI-208 machine gate): wish rows carry
+    ``In Collection=0``, which tells LOCG to *delete* the title from the
+    collection on upload, so the default export emits only owned wins and can
+    never produce an ``In Collection=0`` row. Pass ``push_wishes=True`` for the
+    explicit, owned-safe wish mirror (deferred per BUI-208 OQ-3) — that is the
+    only path that includes the local-only wish adds.
+
     Returns {csv_path, notes_md_path, ready_count, manual_variant_count,
-    manual_series_count, wish_list_count, oldest_pending_days}.
+    manual_series_count, wish_list_count, oldest_pending_days, pushed_wishes}.
     """
     from datetime import datetime
     from pathlib import Path as _Path
@@ -1653,7 +1683,8 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
     # BUI-122: only push local-only wish adds that aren't already owned. Re-dumping
     # the whole wish list re-uploaded LOCG-derived wishes and, because wish rows
     # carry In Collection=0, deleted owned-but-wished books from the collection.
-    wish_rows = wish_rows_for_export(payload)
+    # BUI-208: wins-only by default — wish rows ship only on the explicit opt-in.
+    wish_rows = wish_rows_for_export(payload) if push_wishes else []
 
     if out_path is None:
         ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
@@ -1663,7 +1694,7 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
 
     notes_dest = dest.with_suffix(".notes.md")
 
-    generate_csv(ready, dest, wish_rows=wish_rows)
+    generate_csv(ready, dest, wish_rows=wish_rows, allow_uncollect=push_wishes)
     generate_notes_md(ready, manual_variant, manual_series, notes_dest)
 
     all_pending = ready + manual_variant + manual_series
@@ -1675,6 +1706,7 @@ def cmd_collection_export(out_path: Optional[str] = None) -> dict[str, Any]:
         "manual_series_count": len(manual_series),
         "wish_list_count": len(wish_rows),
         "oldest_pending_days": _oldest_pending_days(all_pending),
+        "pushed_wishes": push_wishes,
     }
 
 

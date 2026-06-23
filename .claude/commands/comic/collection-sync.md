@@ -130,33 +130,17 @@ load-bearing defense, not optional.** Keep the wish push opt-in and off by defau
 (Step 3b); for wins alone, deletion is structurally impossible, so the bulk of a
 normal sync is safe.
 
-## Step 2a: Split the CSV into wins-only and wish-only files
+## Step 2a: The export is wins-only by default (machine gate)
 
-**Default to wins-only.** Wins (`In Collection=1`) can only *add* to the
-collection — they can never delete a book. Wishes (`In Collection=0`) are the
-only rows that can delete, so they are pushed as a SEPARATE, explicitly
-opted-in step (Step 3b) and only after the wish-list has been conflict-cleaned
-(Step 2b). Split the single export CSV on the `In Collection` column (index 4):
-
-```bash
-python3 - "$CSV" <<'PY'
-import csv, sys
-path = sys.argv[1]
-rows = list(csv.reader(open(path)))
-h, d = rows[0], rows[1:]
-wins  = [r for r in d if r[4] == "1"]   # In Collection=1 — add-only, safe
-wishes= [r for r in d if r[4] == "0"]   # In Collection=0 — CAN DELETE; gated
-wpath = path.replace(".csv", "-wins.csv")
-qpath = path.replace(".csv", "-wishes.csv")
-csv.writer(open(wpath, "w", newline="")).writerows([h] + wins)
-csv.writer(open(qpath, "w", newline="")).writerows([h] + wishes)
-print("wins :", wpath, f"({len(wins)} rows, In Collection=1)")
-print("wishes:", qpath, f"({len(wishes)} rows, In Collection=0 — review before pushing)")
-PY
-```
-
-Report both counts. The **wins file is what you sync by default.** The wishes
-file is only uploaded if the user explicitly opts in (Step 3b).
+**No client-side split is needed.** As of BUI-208 the export ships **only wins**
+(`In Collection=1`): the Mac Mini's `generate_csv` *refuses* to emit any
+`In Collection=0` row unless an explicit owned-safe wish push is requested
+(`?push_wishes=true`). So the file from Step 2 **is** your wins file, and the
+default sync is structurally incapable of deleting a collection book — wins can
+only add. Wishes (the only rows that can delete) are pushed solely via the
+separate, opt-in Step 3b, and only after the wish-list has been conflict-cleaned
+(Step 2b). `wish_list_count` from Step 2 will be `0` on a default (wins-only)
+export — that is expected.
 
 ## Step 2b: Pre-sync data-quality audit (BUI-199)
 
@@ -168,7 +152,7 @@ single bad row can also hang a whole batch. Inspect the wins file:
 ```bash
 python3 - "$CSV" <<'PY'
 import csv, re, sys
-path = sys.argv[1].replace(".csv", "-wins.csv")
+path = sys.argv[1]   # the export is already wins-only (Step 2a)
 rows = list(csv.DictReader(open(path)))
 bad = []
 for r in rows:
@@ -207,7 +191,10 @@ comics_curl -X POST "$GIXEN_SERVER_URL/api/comics/wish-list/remove-conflicts"
 ```
 
 Both 409 if the collection was never imported. **Do not proceed to a wish push
-(Step 3b) until the conflicts audit reports zero conflicts.**
+(Step 3b) until the conflicts audit reports zero conflicts.** This conflicts
+audit + remove is the sync's **fulfillment-drop** (BUI-208 U2): a wished book you
+now own has its wish dropped and the owned copy kept; it touches only wish state
+(never a collection row), and each drop is logged with the matched owned identity.
 
 **A clean conflicts audit is a strong signal, not a proof of owned-safety.** The
 audit and the export parse issue tokens slightly differently and apply the same
@@ -216,65 +203,68 @@ the export carries no `In Collection=0` for an owned book. The LOCG import previ
 remains the final gate. (Parser parity between the audit and the export is being
 unified in BUI-197.)
 
-## Step 3: Probe, then upload the WINS file to LOCG (manual — you)
+## Step 3: Probe, then upload the wins CSV to LOCG (manual — you)
 
-Open League of Comic Geeks → **My Comics → Bulk Import**. Upload the **wins file**
-(`...-wins.csv`).
+Open League of Comic Geeks → **My Comics → Bulk Import**. Upload the CSV from
+Step 2 (it is wins-only).
 
-**Probe first.** Before the full upload, take a small mixed batch (≤5 rows from
-the wins file) and upload it alone. LOCG shows an import **preview/result** —
-read it row by row:
+**Probe first.** Before the full upload, take a small mixed batch (≤5 rows) and
+upload it alone. LOCG shows an import **preview/result** — read it row by row:
 
 - Expect every row to be **"Added to Collection"** (or already present).
 - **ABORT immediately on ANY "Deleted from Collection." line** — a win row should
   never delete. If you see one, STOP, do not upload the rest, and report it; the
   owned-safe export regressed and the Step 1 backup must be restored.
 
-Only after a clean probe, upload the remaining rows. **LOCG import is flaky —
-upload in ≤20-row batches.** LOCG's importer times out on larger files (observed:
-~20 rows succeeds; ~100 fails at 0% with "Error: timeout"). Split the wins file:
-
-```bash
-python3 - "$CSV" <<'PY'
-import csv,sys
-src=sys.argv[1].replace(".csv","-wins.csv")
-rows=list(csv.reader(open(src))); h,d=rows[0],rows[1:]
-for i in range(0,len(d),20):
-    p=src.replace(".csv",f"-batch-{i//20+1:02d}.csv")
-    csv.writer(open(p,"w",newline="")).writerows([h]+d[i:i+20]); print(p)
-PY
-```
+Only after a clean probe, upload the rest. **The constraint that matters is data
+completeness, not row count** — there is no row limit. (The earlier "≤20 rows per
+batch" belief was a misdiagnosis: the hangs were caused by incomplete/dateless
+rows, not batch size.) Every row must be complete and exact — publisher +
+canonical series + exact full_title (no decoration) + accurate Release Date —
+which Step 2b already audited. An **incomplete or all-dateless batch hangs** the
+importer; a complete batch uploads fine at any size.
 
 Re-uploading is **safe** — wins are idempotent (`In Collection=1` re-applies as a
-no-op, never a delete), so retry freely. **Watch every batch's preview/result and
-abort on any "Deleted from Collection."**
+no-op, never a delete), so retry freely. **Watch the preview/result and abort on
+any "Deleted from Collection."**
 
-**If even small batches time out at 0%:** that's a LOCG-side outage, not your file.
-Check DevTools → Network for a `queue_import_comic` XHR showing `(canceled)` and a
-slow page load — both mean LOCG's import backend is degraded. Wait and retry later;
-nothing to fix on our end.
+**If a complete upload still times out at 0%:** that's a LOCG-side outage, not your
+file. Check DevTools → Network for a `queue_import_comic` XHR showing `(canceled)`
+and a slow page load — both mean LOCG's import backend is degraded. Wait and retry
+later; nothing to fix on our end.
 
 **This is a manual step. Tell me when the wins upload is done.**
 
-## Step 3b: (Optional, opt-in) Push the wish-list file
+## Step 3b: (Optional, opt-in, deferred) Push the wish-list file
 
 **Skip this unless the user explicitly asks to push new wishes.** Wish rows carry
-`In Collection=0` and are the ONLY rows that can delete a book. Push them only
-after **all** of:
+`In Collection=0` and are the ONLY rows that can delete a book; the wish→LOCG
+mirror is **deferred by default** (BUI-208 OQ-3). Push wishes only after **all** of:
 
 1. Step 2b reported **zero** wish-list conflicts (no owned-but-wished entries).
-2. The wishes file (`...-wishes.csv`) is non-empty and the user has opted in.
+2. The user has explicitly opted in.
 
-Probe the wishes file the same way (≤5 rows), reading LOCG's preview:
+Generate the owned-safe wishes CSV with the **opt-in** export — the only path that
+emits `In Collection=0` (the machine gate otherwise refuses it):
+
+```bash
+comics_curl "$GIXEN_SERVER_URL/api/comics/collection/export?push_wishes=true" -o "$EXPORT_JSON" \
+  || { echo "wish export failed"; exit 1; }
+python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \
+  p=os.path.expanduser(f'~/Downloads/locg-wishes-$ts.csv'); \
+  open(p,'w').write(d['csv']); print('wishes csv:', p, '| wish rows:', d['wish_list_count'])"
+```
+
+Probe it the same way (≤5 rows), reading LOCG's preview:
 
 - Expect every row to be **"Added to Wish List."**
 - **ABORT on ANY "Deleted from Collection."** — that means a wished book is owned
   under a variant the export missed. STOP, do not upload the rest, report it, and
   restore from the Step 1 backup if a deletion already landed.
 
-Only after a clean probe, upload the rest in ≤20-row batches (same split, against
-`...-wishes.csv`). The wishes file is owned-safe by construction (BUI-200), but
-the preview is the last line of defense — never skip it.
+Only after a clean probe, upload the rest (complete-and-exact, no row-count limit).
+The wishes CSV is owned-safe by construction (BUI-200), but the preview is the last
+line of defense — never skip it.
 
 ## Step 4: Re-export from LOCG (manual — you)
 
@@ -342,7 +332,8 @@ win-records cleanup in
 
 | Mistake | Fix |
 |---|---|
-| Uploading the full export CSV in one shot | Split it (Step 2a) — sync the **wins** file by default; the wishes file is a separate opt-in (Step 3b). Wins can only add; wishes can delete |
+| Trying to push wishes in the default sync | The export is wins-only (BUI-208 machine gate — it refuses to emit `In Collection=0`); wishes are a separate opt-in export (`?push_wishes=true`, Step 3b), gated on a clean conflicts audit. Wins can only add; wishes can delete |
+| Splitting the CSV in ≤20-row batches | No row limit — that was a misdiagnosis (the hangs were incomplete/dateless rows). Upload complete-and-exact rows at any size |
 | Pushing wishes without cleaning conflicts first | Step 3b is gated on Step 2b reporting **zero** wish-list conflicts. An owned-but-wished entry pushed as In Collection=0 deletes the owned copy |
 | Skipping the probe / not reading the import preview | Always probe ≤5 rows and read LOCG's per-row result first. **ABORT on any "Deleted from Collection."** — that is the data-loss signal |
 | Skipping the pre-sync data-quality audit | Run Step 2b. Decorated full_titles, Jan-1 placeholder dates, and volume mislabels (BUI-199) read as "Not Found"; an all-dateless batch hangs the importer |

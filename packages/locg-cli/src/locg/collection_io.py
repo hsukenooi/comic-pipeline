@@ -278,60 +278,55 @@ def _apply_locg_columns_held(
 
 
 # ---------------------------------------------------------------------------
-# Wish-list cache write
+# Wish-list source classification + migration (BUI-208)
 # ---------------------------------------------------------------------------
 
-def _local_only_wish_items(path: Path) -> list[dict[str, Any]]:
-    """Existing wish-list entries that were added locally (BUI-47).
+def _wish_source(item: dict[str, Any]) -> str:
+    """Classify a wish-list entry as ``"local"`` or ``"export"`` (BUI-208).
 
-    Entries created by ``locg wish-list add`` carry only ``name``/``id``;
-    export-derived entries always carry a ``series_name``. Anything without a
-    ``series_name`` is therefore a local-only add that hasn't round-tripped
-    through a LOCG export yet.
+    ``wish-list.json`` is the single source of truth for wish state, keyed on an
+    explicit ``source`` field. Prefer the explicit value when present; otherwise
+    fall back to the legacy "absence of ``series_name``" sentinel so un-migrated
+    entries keep working: an export-derived entry always carried a
+    ``series_name``, a local ``wish-list add`` never did.
     """
-    if not path.exists():
-        return []
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return []
-    return [it for it in data.get("items", []) if not it.get("series_name")]
+    return item.get("source") or ("export" if item.get("series_name") else "local")
 
 
-def _write_wish_list_cache(wish_rows: list[dict[str, Any]]) -> None:
-    """Atomically (re)write wish-list.json from imported collection rows.
+def migrate_wish_list_source() -> dict[str, Any]:
+    """Backfill an explicit ``source`` field onto every wish-list entry (BUI-208).
 
-    Preserves local-only ``wish-list add`` entries (BUI-47): the export-derived
-    set is rebuilt from the incoming rows, then any local-only entry (no
-    ``series_name``) whose name isn't already covered is re-appended, so manual
-    adds survive imports instead of being silently dropped. Once an add
-    round-trips through a LOCG export it appears in ``wish_rows`` and the
-    local copy is deduped out by name.
+    Backup-gated, idempotent field-stamp: writes a verified ``.bak`` copy of
+    ``wish-list.json`` (and aborts before any mutation if the backup doesn't
+    read back byte-for-byte identical), then stamps ``item["source"]`` on every
+    item that lacks an explicit one (via :func:`_wish_source`), bumps
+    ``updated_at`` and rewrites atomically (tempfile + os.replace + chmod 600).
 
-    Follows the IDCache._save() pattern: tempfile + os.replace + chmod 600.
-    No fsync needed — this is a best-effort read-only cache.
+    Returns ``{"migrated": <stamped count>, "backup": <path|None>, "total": <n>}``;
+    if the cache is absent, returns ``{"migrated": 0, "backup": None}``.
     """
     path = wish_list_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        return {"migrated": 0, "backup": None}
 
-    items = [
-        {
-            "name": row.get("full_title") or "",
-            "id": None,
-            "series_name": row.get("series_name"),
-            "publisher_name": row.get("publisher_name"),
-            "release_date": row.get("release_date"),
-            "media_format": row.get("media_format"),
-        }
-        for row in wish_rows
-    ]
-    covered = {it["name"] for it in items}
-    for local in _local_only_wish_items(path):
-        name = local.get("name") or ""
-        if name and name not in covered:
-            items.append(local)
-            covered.add(name)
+    original = path.read_bytes()
+
+    ts = datetime.now(timezone.utc).isoformat().replace(":", "")
+    backup = path.with_name(f"{path.name}.bak.{ts}")
+    backup.write_bytes(original)
+    backup.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
+    if backup.read_bytes() != original:
+        raise RuntimeError(
+            f"wish-list migration aborted: backup {backup} did not verify byte-for-byte"
+        )
+
+    data = json.loads(original.decode())
+    items: list[dict[str, Any]] = data.get("items") or []
+    migrated = 0
+    for item in items:
+        if not item.get("source"):
+            item["source"] = _wish_source(item)
+            migrated += 1
 
     payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -353,6 +348,8 @@ def _write_wish_list_cache(wish_rows: list[dict[str, Any]]) -> None:
             except OSError:
                 pass
         raise
+
+    return {"migrated": migrated, "backup": str(backup), "total": len(items)}
 
 
 # ---------------------------------------------------------------------------
@@ -392,12 +389,8 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
     # Collect audit records to append after each merge step.
     # append_audit is called inside the mutate_fn (safe: uses a different file).
     audit_records: list[dict[str, Any]] = []
-    # Wish-list rows are captured inside do_merge and written after apply() succeeds,
-    # so both caches only update when the full import completes successfully.
-    wish_rows: list[dict[str, Any]] = []
 
     def do_merge(payload: dict[str, Any]) -> None:
-        nonlocal wish_rows
         comics = payload["comics"]
 
         # Full identity index: (publisher, series, full_title, release_date) → idx
@@ -674,10 +667,10 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         payload["last_full_import"] = now
         payload["last_import_source"] = str(path)
 
-        # Capture wish-list rows for writing after apply() completes.
-        wish_rows = [
-            r for r in payload["comics"] if r.get("in_wish_list") == 1
-        ]
+        # BUI-208: the import no longer touches wish-list.json. wish-list.json is
+        # the single source of truth for wish state (keyed on `source`), so a
+        # server-side wish removal stays durable across an import. The raw
+        # in_wish_list LOCG column is still stored verbatim on collection rows.
 
         # Flush audit records while still inside apply (append_audit uses a
         # separate file so it does not need the cache lock)
@@ -688,7 +681,6 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 logger.warning("Failed to write audit record: %s", exc)
 
     cache.apply(do_merge, command="import")
-    _write_wish_list_cache(wish_rows)
     return summary
 
 
@@ -762,6 +754,7 @@ def _load_wish_list_items() -> list[dict[str, Any]]:
             "release_date": item.get("release_date") or "",
             "price_paid": None,
             "date_purchased": None,
+            "source": _wish_source(item),
         }
         for item in data.get("items", [])
     ]
@@ -837,8 +830,8 @@ def wish_rows_for_export(payload: dict[str, Any]) -> list[dict[str, Any]]:
     owned_series_issue = _owned_series_issue_index(payload)
     out: list[dict[str, Any]] = []
     for item in _load_wish_list_items():
-        if item.get("series_name"):
-            continue  # derived wish — LOCG already has it; re-emitting risks deletion
+        if item.get("source") == "export":
+            continue  # source==export — LOCG already has it; re-emitting risks deletion
         full_title = item.get("full_title") or ""
         if _normalize_title(full_title) in owned_titles:
             continue  # owned (title match) — never emit In Collection=0 for it
@@ -930,13 +923,30 @@ def generate_csv(
     ready_rows: list[dict[str, Any]],
     out_path: Path,
     wish_rows: list[dict[str, Any]] | None = None,
+    *,
+    allow_uncollect: bool = False,
 ) -> None:
     """Write ready-to-upload rows to a LOCG-compatible 21-column CSV.
 
     Uses csv.QUOTE_MINIMAL. My Rating column always present with blank body (R27).
     Wish-list rows are appended with In Collection=0, In Wish List=1.
+
+    BUI-208 machine gate: a wish row carries ``In Collection=0``, which tells
+    LOCG to *remove* the title from the collection on upload — the data-loss
+    trigger. So if ``wish_rows`` is non-empty this refuses to write unless the
+    caller passes ``allow_uncollect=True`` (an explicit, owned-safe wish push).
+    The default wins-only export can therefore never emit an ``In Collection=0``
+    row.
     """
     import csv as _csv
+
+    if wish_rows and not allow_uncollect:
+        raise ValueError(
+            "Refusing to emit In Collection=0 rows in a wins-only export "
+            "(BUI-208 machine gate): a wish row tells LOCG to DELETE the title "
+            "from the collection. Pass allow_uncollect=True for an explicit, "
+            "owned-safe wish push."
+        )
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
