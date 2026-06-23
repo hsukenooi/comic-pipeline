@@ -383,6 +383,10 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         "possibly_removed": 0,
         "ownership_downgrades_held": 0,
         "behavioral_drift_count": 0,
+        # BUI-211: pending agent_win rows auto-healed away because the book is
+        # already owned under an established locg_export identity (folds in
+        # cleanup_duplicates.py class 1 — same-book/different-identity dup wins).
+        "auto_healed_duplicates": 0,
         "warnings": [],
     }
 
@@ -392,6 +396,12 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
 
     def do_merge(payload: dict[str, Any]) -> None:
         comics = payload["comics"]
+
+        # BUI-211: indices of pending agent_win rows auto-healed away (redundant
+        # duplicates of an established owned row). We cannot delete from `comics`
+        # mid-loop — indices feed identity_to_idx, Phase 2, and possibly-removed
+        # — so we collect them here and filter once, after all phases complete.
+        healed_drop: set[int] = set()
 
         # Full identity index: (publisher, series, full_title, release_date) → idx
         identity_to_idx: dict[tuple, int] = {}
@@ -467,6 +477,44 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
             target_identity = make_identity(xlsx_row)
             collide = identity_to_idx.get(target_identity)
             if collide is not None and collide != ci:
+                # BUI-211: auto-heal the safe case (folds in cleanup_duplicates.py
+                # class 1 — same-book/different-identity dup wins). If the collision
+                # target is an *established owned* row (locg_export or already
+                # pushed, AND in_collection) and THIS row is a pending agent_win,
+                # the two are the same owned book: the win is a redundant leftover
+                # that record-win's dedup missed (the owned copy was usually
+                # imported after the win was recorded). Drop the pending win, keep
+                # the established owned row — no "left pending" warning needed.
+                target_row = comics[collide]
+                target_established_owned = (
+                    (
+                        target_row.get("source") == "locg_export"
+                        or bool(target_row.get("pushed_to_locg_at"))
+                    )
+                    and bool(target_row.get("in_collection"))
+                )
+                cache_row_pending_win = (
+                    cache_row.get("source") == "agent_win"
+                    and cache_row.get("pushed_to_locg_at") is None
+                )
+                if target_established_owned and cache_row_pending_win:
+                    healed_drop.add(ci)
+                    summary["auto_healed_duplicates"] += 1
+                    audit_records.append({
+                        "type": "auto_healed_duplicate_win",
+                        "ts": now,
+                        "command": "import",
+                        "details": {
+                            "full_title": cache_row.get("full_title"),
+                            "kept_identity": list(target_identity),
+                        },
+                    })
+                    # Skip the rest of this iteration (like the leave-pending path):
+                    # do NOT rewrite identity or touch indices for a dropped row.
+                    continue
+
+                # Not an established-owned collision (e.g. two pending rows): keep
+                # the existing leave-pending behavior exactly.
                 audit_records.append({
                     "type": "ambiguous_reconciliation",
                     "ts": now,
@@ -642,6 +690,20 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 comics.append(new_row)
                 identity_to_idx[make_identity(new_row)] = len(comics) - 1
                 summary["added"] += 1
+
+        # ----- Drop auto-healed duplicate wins (BUI-211) ----------------------
+        # Filter the redundant pending agent_win rows now that all index-bearing
+        # phases (reconcile, standard merge, rename) are done. Doing it here —
+        # before possibly-removed, the series-name index rebuild, and the write —
+        # guarantees the persisted/returned collection excludes the dropped rows
+        # and that row_count reflects the drops. identity_to_idx / partial_to_idx
+        # are not used past this point, so they need no rebuild; the only
+        # remaining consumers iterate `comics` directly. A healed row is a pending
+        # agent_win (pushed_to_locg_at is None), so it can never satisfy the
+        # possibly-removed predicate below — it is a dedup heal, not a removal.
+        if healed_drop:
+            comics = [r for i, r in enumerate(comics) if i not in healed_drop]
+            payload["comics"] = comics
 
         # ----- Possibly-removed rows ------------------------------------------
         for row in comics:

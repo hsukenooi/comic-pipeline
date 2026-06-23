@@ -470,11 +470,14 @@ def test_pending_agent_win_exact_match_uses_phase2_not_reconciliation(tmp_path):
     assert not result["warnings"], "exact-match primacy must avoid an ambiguity warning"
 
 
-def test_pending_agent_win_collision_with_owned_row_left_pending(tmp_path):
-    """A pending agent_win win for a book already owned under LOCG's canonical
-    identity must NOT reconcile onto that existing row (which would create a
-    duplicate-identity pair). It is left pending and surfaced. This is the
-    pre-existing duplicate-records condition, resolved out-of-band."""
+def test_pending_agent_win_collision_with_owned_row_auto_healed(tmp_path):
+    """BUI-211: a pending agent_win win for a book already owned under an
+    established locg_export identity must AUTO-HEAL — the redundant pending win
+    is dropped, the owned row survives. (Pre-BUI-211 this was left pending +
+    warned; that folded cleanup_duplicates.py class 1 into the reconciler.)
+
+    This is also the 2026-06-23 production scenario: the two rows differ by
+    publisher (None vs canonical) AND date (placeholder 1982-01-01 vs real)."""
     from locg.collection_io import import_xlsx, make_identity
 
     cache = make_cache(tmp_path)
@@ -511,13 +514,69 @@ def test_pending_agent_win_collision_with_owned_row_left_pending(tmp_path):
     payload = cache.load()
 
     dd = [r for r in payload["comics"] if r["full_title"] == "Daredevil #181"]
-    win_row = next(r for r in dd if r.get("gixen_item_id") == "99")
-    assert win_row["pushed_to_locg_at"] is None, "win must stay pending, not merge onto owned row"
+    # The redundant pending win is gone.
+    assert not any(r.get("gixen_item_id") == "99" for r in dd), "pending win must be healed away"
+    # The established owned row survives, still owned.
+    owned_row = next(r for r in dd if r["source"] == "locg_export")
+    assert owned_row["in_collection"], "owned row survives owned"
+    assert owned_row["pushed_to_locg_at"] is not None
+    assert len(dd) == 1, "exactly one Daredevil #181 remains (no duplicate-identity pair)"
+    # No duplicate-identity pair anywhere.
+    idents = [make_identity(r) for r in payload["comics"]]
+    assert len(idents) == len(set(idents)), "no duplicate-identity rows"
+    assert result["auto_healed_duplicates"] >= 1
+    assert result["reconciled"] == 0
+    assert result["possibly_removed"] == 0, "a dedup heal is not a removal"
+    assert not any("left pending" in w for w in result["warnings"]), \
+        "healed case must not emit a leave-pending warning"
+
+
+def test_two_pending_rows_collision_left_pending(tmp_path):
+    """BUI-211 negative: when the collision target is NOT an established owned
+    row (here two pending agent_win rows for the same book, neither pushed), the
+    EXISTING leave-pending + warning behavior is preserved — no heal."""
+    from locg.collection_io import import_xlsx, make_identity
+
+    cache = make_cache(tmp_path)
+    # An UNFLAGGED pending win whose EXACT identity matches the export (handled by
+    # Phase 2 — it becomes the established target the second win collides with).
+    target = make_agent_win_row(
+        publisher="Marvel Comics", series="Daredevil",
+        full_title="Daredevil #181", release_date="1982-04-10",
+        gixen_item_id="11", pushed=None,
+    )
+    # A second pending win for the same book with a fabricated date → routed
+    # through Phase-1 reconciliation, collides with `target` once Phase 2 would
+    # claim the canonical identity. But Phase 1 runs first; the collision target
+    # at that point is still the pending `target` row (source=agent_win, not
+    # established), so it must be left pending — not healed.
+    win = make_agent_win_row(
+        publisher=None, series="Daredevil", full_title="Daredevil #181",
+        release_date="1982-01-01", gixen_item_id="99", pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([target, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Daredevil",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    # The colliding pending win (id 99) is left pending (not healed away).
+    win_row = next(r for r in payload["comics"] if r.get("gixen_item_id") == "99")
+    assert win_row["pushed_to_locg_at"] is None, "win must stay pending — target not established-owned"
+    assert result["auto_healed_duplicates"] == 0, "no heal against a non-established target"
+    assert any("left pending" in w for w in result["warnings"]), "collision must still warn"
     # No duplicate-identity pair created.
     idents = [make_identity(r) for r in payload["comics"]]
     assert len(idents) == len(set(idents)), "no duplicate-identity rows"
-    assert result["reconciled"] == 0
-    assert result["warnings"], "collision must be surfaced as a warning"
 
 
 def test_pending_agent_win_cross_year_not_reconciled(tmp_path):
@@ -558,6 +617,47 @@ def test_pending_agent_win_cross_year_not_reconciled(tmp_path):
     assert original["pushed_to_locg_at"] is None, "1987 win stays pending"
     assert result["added"] == 1, "2012 export row inserts as new"
     assert result["reconciled"] == 0
+
+
+def test_clean_reconcile_no_collision_not_healed(tmp_path):
+    """BUI-211 no-regression: a normal pending win that reconciles cleanly (its
+    matched export identity collides with NOTHING) still merges as before — it is
+    reconciled, not falsely healed away."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Daredevil",
+        full_title="Daredevil #181",
+        release_date="1982-01-01",  # placeholder; export canonicalizes (same year)
+        needs_manual_series=False,
+        gixen_item_id="77",
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Daredevil",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if r["full_title"] == "Daredevil #181"]
+    assert len(rows) == 1, "reconciled in place, not duplicated"
+    row = rows[0]
+    assert row["gixen_item_id"] == "77", "the win row survived (was reconciled, not dropped)"
+    assert row["pushed_to_locg_at"] is not None, "pending cleared"
+    assert row["source"] == "locg_export"
+    assert result["reconciled"] >= 1
+    assert result["auto_healed_duplicates"] == 0, "no collision → no heal"
 
 
 def test_pending_agent_win_ambiguous_left_pending(tmp_path):
