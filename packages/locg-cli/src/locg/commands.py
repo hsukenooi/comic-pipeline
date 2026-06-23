@@ -1891,8 +1891,23 @@ def _match_owned_issue(
         release_date = row.get("release_date") or ""
         if year and not release_date and require_dated:
             continue
-        if year and release_date and not release_date.startswith(str(year)):
-            continue
+        # BUI-214: tolerate the cover-vs-on-sale year skew. `/comic:wishlist-add`
+        # passes Metron's `cover_date` year, but LOCG stores the earlier *on-sale*
+        # `release_date`, so a cover-year-1983 book can be stored as 1982-xx. The
+        # skew is physically bounded (release_year ∈ {cover_year, cover_year−1}),
+        # so accept year OR year−1 — never year+1, which would widen the gate
+        # enough to collide adjacent eras (e.g. a 1963 run vs a 2018 relaunch).
+        if year and release_date:
+            year_str = str(year)
+            try:
+                prev_year_str = str(int(year_str) - 1)
+            except (TypeError, ValueError):
+                prev_year_str = None
+            if not (
+                release_date.startswith(year_str)
+                or (prev_year_str is not None and release_date.startswith(prev_year_str))
+            ):
+                continue
 
         # BUI-176: variant is a soft preference. With no variant requested, the
         # first series+issue match wins (unchanged behavior). With a variant

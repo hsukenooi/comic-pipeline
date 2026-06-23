@@ -433,6 +433,94 @@ def test_check_year_is_per_issue_cover_year_not_series_start(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# cmd_collection_check year-skew tolerance (BUI-214)
+# ---------------------------------------------------------------------------
+
+def test_check_year_minus_one_tolerated_on_cover_vs_on_sale_skew(tmp_path, monkeypatch):
+    """BUI-214: `/comic:wishlist-add` passes Metron's cover-date year, but LOCG
+    stores the earlier *on-sale* release_date. ASM #238 has cover year 1983 yet
+    shipped 1982 — the exact-year gate wrongly returned not_in_cache and the
+    owned book got re-wish-listed (BUI-122 data-loss trigger). year−1 must match.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #238",
+        release_date="1982-03-01",
+    )])
+
+    # The cover year (1983) is one ahead of the stored on-sale year (1982).
+    skewed = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="238", year="1983"
+    )
+    assert skewed["match_status"] == "in_collection"
+    assert skewed["full_title_matched"] == "Amazing Spider-Man #238"
+
+
+def test_check_exact_year_still_matches_no_regression(tmp_path, monkeypatch):
+    """BUI-214: widening to year−1 must not break the exact-year hit."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #238",
+        release_date="1982-03-01",
+    )])
+
+    exact = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="238", year="1982"
+    )
+    assert exact["match_status"] == "in_collection"
+    assert exact["full_title_matched"] == "Amazing Spider-Man #238"
+
+
+def test_check_far_era_collision_still_rejected(tmp_path, monkeypatch):
+    """BUI-214: the ±1 window must not let a relaunch query match a classic run.
+    A book owned ONLY as a 1963-shipped issue must stay not_in_cache for a 2018
+    relaunch query — 2018 vs 1963 is far outside the tolerance.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #1",
+        release_date="1963-03-01",
+    )])
+
+    relaunch = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="1", year="2018"
+    )
+    assert relaunch["match_status"] == "not_in_cache"
+
+
+def test_check_year_minus_two_not_tolerated(tmp_path, monkeypatch):
+    """BUI-214: confirm we widened by EXACTLY one. A query year of 1983 must NOT
+    match a row stored as 1981-xx (year−2 is outside the bounded skew).
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #238",
+        release_date="1981-03-01",
+    )])
+
+    too_far = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="238", year="1983"
+    )
+    assert too_far["match_status"] == "not_in_cache"
+
+
+# ---------------------------------------------------------------------------
 # cmd_collection_series_names (BUI-129)
 # ---------------------------------------------------------------------------
 
