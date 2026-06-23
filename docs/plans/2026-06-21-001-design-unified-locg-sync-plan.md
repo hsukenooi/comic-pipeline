@@ -651,7 +651,6 @@ mirror-up (deferred).
 
 ## 13. Notes
 
-- **Review aid — DELETE BEFORE MERGE:** an Obsidian symlink at `/Users/hsukenooi/Projects/Brain v3.0/BUI-208 LOCG Sync Design.md` points to this file so the mermaid diagrams render in Obsidian during review. Remove it when this doc merges: `rm "/Users/hsukenooi/Projects/Brain v3.0/BUI-208 LOCG Sync Design.md"`.
 - This supersedes **BUI-206** (its bug is D2/D3 above).
 - Code touchpoints: `packages/locg-cli/src/locg/collection_io.py` (import merge,
   `_write_wish_list_cache`, `wish_rows_for_export`), `commands.py`
@@ -681,5 +680,3 @@ output shape + U4 scope narrowed (§9).
 - **OQ-2** — fulfillment reuses the matcher; a masthead-alias miss leaves a fulfilled
   wish as clutter (now *visible* via logging). Accepted unless it bites.
 - **Cadence** (§5) is an assumption to confirm against real usage.
-- The §13 "DELETE BEFORE MERGE" symlink note is an intentional, self-removing review
-  aid (scope reviewer flagged it; left deliberately until merge).
