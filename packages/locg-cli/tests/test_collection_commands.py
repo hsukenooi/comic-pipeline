@@ -952,16 +952,20 @@ def test_record_win_series_from_index(tmp_path):
 
     assert result["rows_written"] == 1
     assert result["manual_series_count"] == 0
-    assert result["metron_lookups_attempted"] == 0  # index hit, no Metron needed
-    metron.lookup_issue.assert_not_called()
+    # BUI-210: the index path no longer resolves the SERIES via Metron, but it
+    # does attempt a Metron *issue* lookup to backfill a real release_date. Here
+    # the stub returns None (Metron miss), so we fall back to the placeholder.
+    metron.lookup_issue.assert_called_once()
 
     payload = cache.load()
     row = payload["comics"][-1]
     assert row["series_name"] == "Amazing Spider-Man (1963 - 1998)"
     assert row["source"] == "agent_win"
-    # BUI-105: no Metron date on the index path, so stamp a best-effort
+    # BUI-105/BUI-210: Metron missed (stub returns None), so stamp a best-effort
     # release_date from the identify year (Jan 1) instead of leaving it None.
+    # The index-resolved series_name is preserved (not overwritten by Metron).
     assert row["release_date"] == "1988-01-01"
+    assert row["metron_id"] is None
 
 
 def test_record_win_index_path_found_by_year_gated_check(tmp_path, monkeypatch):
@@ -1612,6 +1616,122 @@ def test_record_win_metron_no_dates_blank_release_date(tmp_path):
     row = payload["comics"][-1]
     assert row["release_date"] is None
     assert row["needs_manual_variant"] is False  # R66: blank date → no variant flag
+
+
+# --- BUI-210: real release date on the series_name_index path ---
+
+def _index_seeded_cache(tmp_path):
+    """Cache with a locg_export row so the series resolves via series_name_index
+    (the no-Metron-for-series path) — the BUI-210 scenario."""
+    from locg.collection_cache import rebuild_series_name_index
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(series="The X-Men (1963 - 1981)", full_title="The X-Men #1"),
+        "source": "locg_export",
+    }])
+    cache.apply(
+        lambda payload: payload.__setitem__(
+            "series_name_index", rebuild_series_name_index(payload)
+        ),
+        command="test-rebuild",
+    )
+    return cache
+
+
+def test_record_win_index_path_backfills_real_metron_date(tmp_path):
+    """BUI-210: a win whose series is in series_name_index gets a REAL
+    release_date from a Metron issue lookup (not a {year}-01-01 placeholder),
+    with a non-null metron_id, while keeping the index-resolved series_name."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 777,
+        "cover_date": "1970-08-01",
+        "store_date": "1970-06-09",
+        "series_year_began": 1963,
+        "series_year_end": 1981,
+        "series_name": "The X-Men",
+        "series_id": 7,
+    }
+
+    result = cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    metron.lookup_issue.assert_called_once()
+    # format_series_name must NOT be consulted — the index-resolved series wins.
+    metron.format_series_name.assert_not_called()
+
+    row = cache.load()["comics"][-1]
+    # store_date preferred over cover_date; this is a real date, not 1970-01-01.
+    assert row["release_date"] == "1970-06-09"
+    assert row["metron_id"] == 777
+    # Index-resolved series name is preserved (the decorated volume form from
+    # resolve_series_for_win), NOT overwritten by Metron's bare "The X-Men".
+    assert row["series_name"].startswith("The X-Men (")
+    assert row["series_name"] != "The X-Men"
+
+
+def test_record_win_index_path_rejects_reprint_year_mismatch(tmp_path):
+    """BUI-210 reprint guard: a Metron date whose year ≠ the win's year (a
+    collected-edition/reprint, e.g. The X-Men #59 → 2005) is rejected, and the
+    {year}-01-01 placeholder is kept."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 888,
+        "cover_date": "2005-03-09",  # reprint year, not 1970
+        "store_date": "2005-03-09",
+        "series_year_began": 1963,
+        "series_year_end": 1981,
+        "series_name": "The X-Men",
+        "series_id": 7,
+    }
+
+    cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    # Reprint rejected → placeholder kept, metron_id stays None so the export
+    # blanks the placeholder (rather than shipping a wrong 2005 date).
+    assert row["release_date"] == "1970-01-01"
+    assert row["metron_id"] is None
+
+
+def test_record_win_index_path_credential_error_keeps_placeholder(tmp_path):
+    """BUI-210: a MetronCredentialError during the index-path date backfill
+    degrades gracefully to the placeholder — no crash."""
+    from locg.commands import cmd_collection_record_win
+    from locg.metron import MetronCredentialError
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.side_effect = MetronCredentialError("no creds")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1970-01-01"
+    assert row["metron_id"] is None
 
 
 # --- Duplicate detection ---
