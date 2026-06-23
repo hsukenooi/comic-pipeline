@@ -226,6 +226,22 @@ def test_check_batch_year_catches_masthead_owned_book(client):
     assert r.json()["results"][0]["match_status"] == "in_collection"
 
 
+def test_check_batch_leading_article_dropped(client):
+    """Batch check returns in_collection when the query omits the leading article
+    but the collection stores the series with 'The' (BUI-212 / ASM #238 scenario).
+
+    The series-key normalizer strips 'The'/'A'/'An' on both sides (BUI-45), so
+    'Amazing Spider-Man' must match owned 'The Amazing Spider-Man #300'."""
+    r = client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [{"series": "Amazing Spider-Man", "issue": "300", "year": "1988"}]},
+    )
+    assert r.status_code == 200, r.text
+    result = r.json()["results"][0]
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "The Amazing Spider-Man #300"
+
+
 # --- wish-list -------------------------------------------------------------
 
 def test_wish_list_returns_items(client):
