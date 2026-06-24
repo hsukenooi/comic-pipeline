@@ -65,11 +65,13 @@ curl -sf "$GIXEN_SERVER_URL/api/comics/history"
 Returns a JSON **array** of row objects. Filter to wins by **`status` only**:
 - `status` contains `WON` (case-insensitive)
 
-Do **NOT** filter on `time_to_end` for this source — the endpoint returns it as a
-relative phrase (e.g. `"2 days ago"`), never the literal `"ENDED"`, so that
-check would drop every row. The endpoint already guarantees rows are
-ended-and-recent (past 7 days) and non-tombstoned, so `status` contains `WON` is
-the complete filter.
+No `time_to_end` filter is needed for this source: the endpoint already returns
+only auctions that have **ended** in the past 7 days, and excludes the
+tombstone, so `status` contains `WON` is the complete filter. (Every history row
+actually carries `time_to_end == "ENDED"` — `_iso_to_relative` returns `"ENDED"`
+for any past auction, and the endpoint only surfaces past auctions — so adding
+that check would be redundant, not necessary. The relevant difference from the
+CLI source below is *scope*, not the `time_to_end` value.)
 
 **Source B — CLI fallback (`gixen list --json`):**
 
@@ -77,8 +79,10 @@ the complete filter.
 gixen list --json 2>/dev/null
 ```
 
-This dumps the entire snipe history. Filter to wins with **both** conditions
-(this is the only source where `time_to_end` really is the literal `"ENDED"`):
+This dumps the entire snipe list, **including still-live (PENDING) snipes** whose
+auctions haven't ended. So here you need **both** conditions — the
+`time_to_end == "ENDED"` check is what excludes the live snipes that the history
+endpoint never returns in the first place:
 - `time_to_end == "ENDED"`
 - `status` contains `WON` (case-insensitive)
 
@@ -269,5 +273,5 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
 | Marking wins seen before the POST succeeds | Only mark seen after a successful record-win POST — a failed call means wins weren't recorded |
 | Confusing `oldest_pending_days` with "days since last sync" | `oldest_pending_days` = age of oldest uncleared item; use `last_full_import` from status for sync recency |
-| Applying the `time_to_end == "ENDED"` filter to `/api/comics/history` | The endpoint returns `time_to_end` as a relative string (e.g. `"2 days ago"`), never `"ENDED"` — that filter drops every row. For the history source, filter on `status` contains `WON` only; the `"ENDED"` check is for the `gixen list --json` fallback path only |
+| Assuming `/api/comics/history` needs the `time_to_end == "ENDED"` filter | It doesn't, and not for the reason you might think: every history row is *already* ended, so `time_to_end` is always `"ENDED"` there (`_iso_to_relative` returns `"ENDED"` for past auctions). The filter would be redundant, not harmful. Use `status` contains `WON` only. The `"ENDED"` check matters only for `gixen list --json`, which also dumps still-live PENDING snipes |
 | Pulling from `/api/comics/history` when the needed window predates 7 days | The endpoint only returns snipes ended in the past 7 days. On a first run or after a >7-day gap (any time you can't confirm the last run was within 7 days), fall back to `gixen list --json` so older wins aren't missed |
