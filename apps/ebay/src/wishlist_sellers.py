@@ -50,7 +50,9 @@ from ebay_fetch import (
     search_by_keyword,
 )
 from seller_scan import (
+    _normalize,
     _server_base,
+    _strip_grades,
     fetch_seen_item_ids,
     fetch_wish_list,
     hard_reject,
@@ -83,11 +85,26 @@ def is_degenerate_series(wish_item: dict) -> bool:
     tokens = wish_item.get("_tokens") or []
     return len(tokens) == 1 and tokens[0].isdigit()
 
+# ─── Title-key helper ─────────────────────────────────────────────────────────
+
+def _title_key(title: str) -> str:
+    """Stable cache key for a listing title.
+
+    Strip grade tokens (decimal CGC grades and grade-letter+integer combos)
+    then normalize to lowercase alphanumeric.  The same comic title from two
+    different sellers, or a relisted item with a new item_id, produces the
+    same key — enabling cross-seller and relist cache hits.
+    """
+    return _normalize(_strip_grades(title))
+
+
 # ─── Verdict cache ────────────────────────────────────────────────────────────
-# SQLite DB keyed by (listing_id, wish_name).  Compound key is intentional:
-# one listing can legitimately match more than one wish item, so the verdict is
-# per (listing, wish-item) pair while the ≥2 count dedups by listing.
-# (plan Decision 4 / R9)
+# SQLite DB keyed by (title_key, wish_name).  title_key = _normalize(_strip_grades(title)),
+# so the same comic title from two different sellers or a relisted item with a
+# new item_id still hits the cache.  Compound key is intentional: one listing
+# can legitimately match more than one wish item, so the verdict is per (title,
+# wish) pair.  Cross-seller dedup in main() ensures one Haiku call per unique
+# key per run.  (plan Decision 4 / R9 / BUI-223)
 
 _VERDICT_DB_ENV = "WISHLIST_SELLERS_VERDICT_DB"
 _DEFAULT_VERDICT_DB = Path.home() / ".cache" / "wishlist-sellers" / "verdicts.db"
@@ -99,22 +116,37 @@ def verdict_db_path() -> Path:
     return Path(env) if env else _DEFAULT_VERDICT_DB
 
 
+_VERDICT_COLUMNS = {"title_key", "wish_name", "genuine"}
+
+
 def verdict_init_db(db_path: Path) -> None:
-    """Ensure the verdicts DB directory and table exist."""
+    """Ensure the verdicts DB directory and table exist.
+
+    Auto-heals a stale schema: if the table already exists but its column set
+    does not match {title_key, wish_name, genuine} (e.g. an old DB that still
+    has `listing_id`), the table is dropped and recreated.  The cache is a
+    disposable derived artifact — no migration needed.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as con:
+        rows = con.execute("PRAGMA table_info(verdicts)").fetchall()
+        if rows:
+            # Table exists — check column names (column name is index 1 in each row)
+            existing_cols = {r[1] for r in rows}
+            if existing_cols != _VERDICT_COLUMNS:
+                con.execute("DROP TABLE verdicts")
         con.execute(
             """CREATE TABLE IF NOT EXISTS verdicts (
-                listing_id  TEXT NOT NULL,
+                title_key   TEXT NOT NULL,
                 wish_name   TEXT NOT NULL,
                 genuine     INTEGER NOT NULL,
-                PRIMARY KEY (listing_id, wish_name)
+                PRIMARY KEY (title_key, wish_name)
             )"""
         )
         con.commit()
 
 
-def verdict_get(listing_id: str, wish_name: str, *, db_path: Path | None = None) -> bool | None:
+def verdict_get(title_key: str, wish_name: str, *, db_path: Path | None = None) -> bool | None:
     """Return cached verdict (True/False) or None if not in cache.
 
     Returns None for any DB error so callers treat it as a cache miss.
@@ -125,8 +157,8 @@ def verdict_get(listing_id: str, wish_name: str, *, db_path: Path | None = None)
     try:
         with sqlite3.connect(path) as con:
             row = con.execute(
-                "SELECT genuine FROM verdicts WHERE listing_id=? AND wish_name=?",
-                (listing_id, wish_name),
+                "SELECT genuine FROM verdicts WHERE title_key=? AND wish_name=?",
+                (title_key, wish_name),
             ).fetchone()
         return bool(row[0]) if row is not None else None
     except sqlite3.Error:
@@ -134,7 +166,7 @@ def verdict_get(listing_id: str, wish_name: str, *, db_path: Path | None = None)
 
 
 def verdict_put(
-    listing_id: str,
+    title_key: str,
     wish_name: str,
     genuine: bool,
     *,
@@ -145,8 +177,8 @@ def verdict_put(
     verdict_init_db(path)
     with sqlite3.connect(path) as con:
         con.execute(
-            "INSERT OR REPLACE INTO verdicts (listing_id, wish_name, genuine) VALUES (?,?,?)",
-            (listing_id, wish_name, int(genuine)),
+            "INSERT OR REPLACE INTO verdicts (title_key, wish_name, genuine) VALUES (?,?,?)",
+            (title_key, wish_name, int(genuine)),
         )
         con.commit()
 
@@ -294,12 +326,15 @@ def apply_verdict_cache(matches: list, db_path: Path) -> tuple[list, list, list]
     cached_genuine  — previously verified as genuine; keep them.
     cached_false    — previously rejected; discard (caller never sends to verify).
     uncached        — no prior verdict; caller sends to verify_with_claude.
+
+    Cache lookup uses _title_key(m["title"]) so relists and cross-seller
+    duplicates of the same comic hit the cache regardless of their item_id.
     """
     cached_genuine: list = []
     cached_false: list = []
     uncached: list = []
     for m in matches:
-        v = verdict_get(m["item_id"], m["wish_name"], db_path=db_path)
+        v = verdict_get(_title_key(m["title"]), m["wish_name"], db_path=db_path)
         if v is True:
             cached_genuine.append(m)
         elif v is False:
@@ -549,16 +584,41 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
     )
 
     if uncached:
+        # Cross-seller dedup: same normalized title + wish_name → one Haiku call.
+        # Build one representative per (title_key, wish_name) pair so the verify
+        # model receives each distinct comic exactly once across all sellers.
+        rep_map: dict[tuple, dict] = {}
+        for m in uncached:
+            key = (_title_key(m["title"]), m["wish_name"])
+            if key not in rep_map:
+                rep_map[key] = m
+        representatives = list(rep_map.values())
+        deduped_count = len(uncached) - len(representatives)
+        if deduped_count:
+            print(
+                f"  Cross-seller dedup: {len(uncached)} uncached → "
+                f"{len(representatives)} unique (title, wish) pair(s) to verify",
+                file=sys.stderr,
+            )
         print(
-            f"  Verifying {len(uncached)} uncached candidate(s) with Claude Haiku...",
+            f"  Verifying {len(representatives)} uncached candidate(s) with Claude Haiku...",
             file=sys.stderr,
         )
-        verified = verify_with_claude(uncached)
-        # Persist new verdicts
-        verified_keys = {(m["item_id"], m["wish_name"]) for m in verified}
+        verified_reps = verify_with_claude(representatives)
+        # Keys that came back as genuine from verify
+        genuine_keys = {(_title_key(m["title"]), m["wish_name"]) for m in verified_reps}
+        # Fan the verdict back out to ALL uncached listings sharing each key
+        verified = [
+            m for m in uncached
+            if (_title_key(m["title"]), m["wish_name"]) in genuine_keys
+        ]
+        # Persist one verdict row per (title_key, wish_name) — not per listing
+        persisted: set[tuple] = set()
         for m in uncached:
-            genuine = (m["item_id"], m["wish_name"]) in verified_keys
-            verdict_put(m["item_id"], m["wish_name"], genuine, db_path=db_path)
+            key = (_title_key(m["title"]), m["wish_name"])
+            if key not in persisted:
+                verdict_put(key[0], m["wish_name"], key in genuine_keys, db_path=db_path)
+                persisted.add(key)
     else:
         verified = []
 

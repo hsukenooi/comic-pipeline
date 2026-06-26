@@ -8,6 +8,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import sqlite3
+
 import pytest
 
 import wishlist_sellers as ws
@@ -254,8 +256,8 @@ class TestVerdictCache:
         ws.verdict_put("222", "ASM #129", False, db_path=self.db_path)
         assert ws.verdict_get("222", "ASM #129", db_path=self.db_path) is False
 
-    def test_compound_key_same_listing_different_wish(self):
-        """One listing can have distinct verdicts for different wish items."""
+    def test_compound_key_same_title_key_different_wish(self):
+        """Same title_key can have distinct verdicts for different wish items."""
         ws.verdict_put("333", "ASM #129", True, db_path=self.db_path)
         ws.verdict_put("333", "X-Men #94", False, db_path=self.db_path)
         assert ws.verdict_get("333", "ASM #129", db_path=self.db_path) is True
@@ -270,6 +272,46 @@ class TestVerdictCache:
         missing = tmp_path / "nonexistent.db"
         assert ws.verdict_get("x", "y", db_path=missing) is None
 
+    def test_stale_schema_auto_healed(self, tmp_path):
+        """A DB with the old listing_id schema is silently dropped and recreated.
+
+        On the next call to verdict_init_db the table is rebuilt with title_key,
+        so verdict_put and verdict_get work without raising OperationalError.
+        The stale row from the old schema is gone (cache purge is acceptable).
+        """
+        stale_db = tmp_path / "stale.db"
+        # Seed the OLD schema (listing_id PK instead of title_key)
+        with sqlite3.connect(stale_db) as con:
+            con.execute(
+                """CREATE TABLE verdicts (
+                    listing_id  TEXT NOT NULL,
+                    wish_name   TEXT NOT NULL,
+                    genuine     INTEGER NOT NULL,
+                    PRIMARY KEY (listing_id, wish_name)
+                )"""
+            )
+            con.execute(
+                "INSERT INTO verdicts VALUES (?,?,?)",
+                ("old_item_id", "ASM #129", 1),
+            )
+            con.commit()
+
+        # verdict_init_db should detect the mismatch and auto-heal (no exception)
+        ws.verdict_init_db(stale_db)
+
+        # New-schema round-trip must work
+        ws.verdict_put("amazing spider man  129 vf", "ASM #129", True, db_path=stale_db)
+        assert ws.verdict_get("amazing spider man  129 vf", "ASM #129", db_path=stale_db) is True
+
+        # Stale row is gone — the old listing_id key no longer exists in the table
+        with sqlite3.connect(stale_db) as con:
+            row = con.execute(
+                "SELECT * FROM verdicts WHERE wish_name=? AND genuine=1", ("ASM #129",)
+            ).fetchone()
+        # Only the new row should be present (title_key column, not listing_id)
+        assert row is not None
+        assert row[0] == "amazing spider man  129 vf"  # title_key column
+
 
 # ─── apply_verdict_cache ──────────────────────────────────────────────────────
 
@@ -279,12 +321,15 @@ class TestApplyVerdictCache:
         self.db_path = tmp_path / "verdicts.db"
 
     def test_splits_into_three_buckets_correctly(self):
+        # Use different wish_names so that same title with different wish_names
+        # produces distinct (title_key, wish_name) cache entries.
         m_genuine = make_match(item_id="1", wish_name="ASM #129")
-        m_false = make_match(item_id="2", wish_name="ASM #129")
-        m_uncached = make_match(item_id="3", wish_name="ASM #129")
-        ws.verdict_put("1", "ASM #129", True, db_path=self.db_path)
-        ws.verdict_put("2", "ASM #129", False, db_path=self.db_path)
-        # item 3 not written → None → uncached
+        m_false = make_match(item_id="2", wish_name="X-Men #94")
+        m_uncached = make_match(item_id="3", wish_name="Hulk #181")
+        # Pre-seed by title_key (not item_id) — the new cache key
+        ws.verdict_put(ws._title_key(m_genuine["title"]), "ASM #129", True, db_path=self.db_path)
+        ws.verdict_put(ws._title_key(m_false["title"]), "X-Men #94", False, db_path=self.db_path)
+        # m_uncached has wish_name "Hulk #181" — no cache entry → uncached
 
         genuine, false_, uncached = ws.apply_verdict_cache(
             [m_genuine, m_false, m_uncached], self.db_path
@@ -296,7 +341,8 @@ class TestApplyVerdictCache:
     def test_cached_false_lands_in_false_not_uncached(self):
         """Key assertion: a cached-false item must appear in false_, never uncached."""
         m = make_match(item_id="99", wish_name="ASM #129")
-        ws.verdict_put("99", "ASM #129", False, db_path=self.db_path)
+        # Pre-seed by title_key so apply_verdict_cache finds the entry
+        ws.verdict_put(ws._title_key(m["title"]), "ASM #129", False, db_path=self.db_path)
 
         _, false_, uncached = ws.apply_verdict_cache([m], self.db_path)
         assert len(false_) == 1
@@ -418,7 +464,13 @@ class TestVerdictCachePipeline:
         m2 = make_match(seller="sellerA", item_id="2", wish_name="X-Men #94")
         m3 = make_match(seller="sellerA", item_id="3", wish_name="Amazing Spider-Man #129",
                         title="Amazing Spider-Man #129 Annual-fake")
-        ws.verdict_put("3", "Amazing Spider-Man #129", False, db_path=db_path)
+        # Pre-seed by title_key so apply_verdict_cache classifies m3 as cached_false
+        ws.verdict_put(
+            ws._title_key("Amazing Spider-Man #129 Annual-fake"),
+            "Amazing Spider-Man #129",
+            False,
+            db_path=db_path,
+        )
 
         wish_list = [
             {"id": "w1", "name": "Amazing Spider-Man #129"},
@@ -490,18 +542,21 @@ class TestVerdictCachePipeline:
         ):
             ws.main([])
 
-        # Verdicts must be persisted in the cache
-        assert ws.verdict_get("10", "Amazing Spider-Man #129", db_path=db_path) is True
-        assert ws.verdict_get("11", "X-Men #94", db_path=db_path) is True
+        # Verdicts must be persisted by title_key (not item_id)
+        # Both m1 and m2 use the default title "Amazing Spider-Man #129 VF"
+        tk = ws._title_key("Amazing Spider-Man #129 VF")
+        assert ws.verdict_get(tk, "Amazing Spider-Man #129", db_path=db_path) is True
+        assert ws.verdict_get(tk, "X-Men #94", db_path=db_path) is True
 
     def test_second_run_uses_cache_no_verify_call(self, tmp_path):
         """On a re-run where all survivors are cached, verify_with_claude is not called."""
         db_path = tmp_path / "v.db"
         m1 = make_match(seller="S", item_id="20", wish_name="Amazing Spider-Man #129")
         m2 = make_match(seller="S", item_id="21", wish_name="X-Men #94")
-        # Pre-seed both as genuine
-        ws.verdict_put("20", "Amazing Spider-Man #129", True, db_path=db_path)
-        ws.verdict_put("21", "X-Men #94", True, db_path=db_path)
+        # Pre-seed both as genuine by title_key (both use default title)
+        tk = ws._title_key("Amazing Spider-Man #129 VF")
+        ws.verdict_put(tk, "Amazing Spider-Man #129", True, db_path=db_path)
+        ws.verdict_put(tk, "X-Men #94", True, db_path=db_path)
 
         wish_list, wish_items = _two_wish_items()
         mock_verify = MagicMock()
@@ -749,3 +804,181 @@ class TestFanoutGuards:
         # 50 variants collapse to 1 distinct book → below the ≥2 gate.
         assert "s1" not in output
         assert "No sellers" in output
+
+
+# ─── BUI-223: title-keyed cache + cross-seller dedup ─────────────────────────
+
+class TestTitleKey:
+    """Unit tests for the _title_key helper."""
+
+    def test_is_stable(self):
+        """Same title produces the same key on every call."""
+        title = "Amazing Spider-Man #129 VF/NM 9.0"
+        assert ws._title_key(title) == ws._title_key(title)
+
+    def test_strips_decimal_grade(self):
+        """Decimal grade tokens (CGC slab grades) are removed from the key."""
+        key = ws._title_key("X-Men #94 9.8")
+        # The decimal grade "9.8" must not survive as a continuous digit run
+        assert "9.8" not in key.replace(" ", "")
+        # But the issue number 94 is preserved
+        assert "94" in key
+
+    def test_normalizes_punctuation(self):
+        """Non-alphanumeric characters become spaces (hash, hyphen, parens)."""
+        key = ws._title_key("X-Men #94 (1977)")
+        assert "-" not in key
+        assert "#" not in key
+        assert "(" not in key
+
+    def test_lowercased(self):
+        """Output is always lowercase."""
+        assert ws._title_key("Amazing Spider-Man #129 VF") == ws._title_key(
+            "amazing spider-man #129 vf"
+        )
+
+    def test_same_title_different_item_ids(self):
+        """Two listings with identical titles produce the same key (relist scenario)."""
+        title = "Incredible Hulk #181 FN/VF"
+        assert ws._title_key(title) == ws._title_key(title)
+
+
+class TestTitleKeyedCache:
+    """BUI-223: cache is keyed by (title_key, wish_name), not (item_id, wish_name)."""
+
+    @pytest.fixture(autouse=True)
+    def _db(self, tmp_path):
+        self.db_path = tmp_path / "verdicts.db"
+
+    def test_different_item_id_same_title_is_cache_hit(self):
+        """A relist with a new item_id but same title → cache HIT."""
+        title = "X-Men #94 NM"
+        wish_name = "X-Men #94"
+        # Seed the cache as if a previous item was verified
+        ws.verdict_put(ws._title_key(title), wish_name, True, db_path=self.db_path)
+        # New listing — different item_id, same title
+        relisted = make_match(item_id="new_999", wish_name=wish_name, title=title)
+        genuine, _false, uncached = ws.apply_verdict_cache([relisted], self.db_path)
+        assert len(genuine) == 1
+        assert genuine[0]["item_id"] == "new_999"
+        assert len(uncached) == 0
+
+    def test_different_title_is_cache_miss(self):
+        """A listing with a different title is NOT a cache hit even if it matches
+        the same wish item."""
+        title_a = "X-Men #94 NM"
+        title_b = "X-Men #94 FN"  # different condition → different title → different key
+        wish_name = "X-Men #94"
+        ws.verdict_put(ws._title_key(title_a), wish_name, True, db_path=self.db_path)
+        m = make_match(item_id="1", wish_name=wish_name, title=title_b)
+        _genuine, _false, uncached = ws.apply_verdict_cache([m], self.db_path)
+        # title_b has a different key from title_a → cache miss
+        # (title_b not seeded, so it lands in uncached)
+        assert len(uncached) == 1
+
+
+class TestCrossSellerDedup:
+    """BUI-223: same title from multiple sellers → one Haiku call per unique (title, wish)."""
+
+    def test_two_sellers_same_title_one_verify_call(self, tmp_path):
+        """Same title from sellers A and B → verify called once with one representative."""
+        db_path = tmp_path / "v.db"
+        shared_title = "Amazing Spider-Man #129 VF"
+        m_a = make_match(seller="sellerA", item_id="a1", wish_name="Amazing Spider-Man #129",
+                         title=shared_title)
+        m_b = make_match(seller="sellerB", item_id="b1", wish_name="Amazing Spider-Man #129",
+                         title=shared_title)
+        # Second distinct wish book so both sellers pass the ≥2 gate
+        m_a2 = make_match(seller="sellerA", item_id="a2", wish_name="X-Men #94",
+                          title="X-Men #94 NM")
+        m_b2 = make_match(seller="sellerB", item_id="b2", wish_name="X-Men #94",
+                          title="X-Men #94 NM")
+        wish_list, wish_items = _two_wish_items()
+
+        mock_verify = MagicMock(side_effect=lambda reps: reps)
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m_a, m_b], [m_a2, m_b2]]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        # verify_with_claude must be called exactly once
+        mock_verify.assert_called_once()
+        sent = mock_verify.call_args[0][0]
+        # 4 uncached listings but only 2 unique (title_key, wish_name) pairs →
+        # only 2 representatives sent to verify (one per pair)
+        sent_keys = {(ws._title_key(m["title"]), m["wish_name"]) for m in sent}
+        assert len(sent) == 2, f"Expected 2 representatives, got {len(sent)}"
+        assert len(sent_keys) == 2
+
+    def test_cross_seller_dedup_both_sellers_genuine_in_output(self, tmp_path):
+        """After dedup, both sellers still appear genuine in the final output."""
+        db_path = tmp_path / "v.db"
+        shared_title = "Amazing Spider-Man #129 VF"
+        m_a = make_match(seller="sellerA", item_id="a1", wish_name="Amazing Spider-Man #129",
+                         title=shared_title)
+        m_b = make_match(seller="sellerB", item_id="b1", wish_name="Amazing Spider-Man #129",
+                         title=shared_title)
+        m_a2 = make_match(seller="sellerA", item_id="a2", wish_name="X-Men #94",
+                          title="X-Men #94 NM")
+        m_b2 = make_match(seller="sellerB", item_id="b2", wish_name="X-Men #94",
+                          title="X-Men #94 NM")
+        wish_list, wish_items = _two_wish_items()
+
+        output, _, _ = _run_main(
+            [[m_a, m_b], [m_a2, m_b2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=None,  # uses default: all matches returned genuine
+        )
+
+        # Both sellers have 2 genuine matches → both surface
+        assert "sellerA" in output
+        assert "sellerB" in output
+
+    def test_warm_rerun_makes_zero_verify_calls(self, tmp_path):
+        """A fully warm re-run (all title_keys cached) makes no Haiku calls."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="S", item_id="100", wish_name="Amazing Spider-Man #129",
+                        title="Amazing Spider-Man #129 VF")
+        m2 = make_match(seller="S", item_id="101", wish_name="X-Men #94",
+                        title="X-Men #94 NM")
+        # Pre-warm the cache by title_key
+        ws.verdict_put(ws._title_key(m1["title"]), "Amazing Spider-Man #129", True, db_path=db_path)
+        ws.verdict_put(ws._title_key(m2["title"]), "X-Men #94", True, db_path=db_path)
+        wish_list, wish_items = _two_wish_items()
+        mock_verify = MagicMock()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        mock_verify.assert_not_called()
