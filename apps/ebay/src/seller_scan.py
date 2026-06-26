@@ -361,6 +361,15 @@ def verify_with_claude(matches):
         return []
 
     _load_dotenv(Path(__file__).parent.parent / ".env")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "Error: ANTHROPIC_API_KEY is not set (checked the environment and "
+            "apps/ebay/.env). Claude verification cannot run — refusing to "
+            "surface unverified matches. Export ANTHROPIC_API_KEY or add it to "
+            "apps/ebay/.env, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     client = anthropic.Anthropic()
 
     kept = []

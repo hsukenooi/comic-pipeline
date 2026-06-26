@@ -78,6 +78,7 @@ def _run_main(
     server_base: str = "",
     verify_return: list | None = None,
     json_output: bool = False,
+    extra_args: list | None = None,
 ) -> tuple[str, MagicMock, MagicMock]:
     """Run main() with standard mocks; return (stdout, mock_verify, mock_record)."""
     if wish_list is None or wish_items is None:
@@ -109,6 +110,8 @@ def _run_main(
     ):
         buf = io.StringIO()
         argv = ["--json"] if json_output else []
+        if extra_args:
+            argv = argv + extra_args
         with redirect_stdout(buf):
             ws.main(argv)
         return buf.getvalue(), mock_verify, mock_record
@@ -126,15 +129,27 @@ class TestDedupMatches:
         # Higher score is kept
         assert result[0]["score"] == 0.9
 
-    def test_different_item_ids_both_kept(self):
-        m1 = make_match(item_id="1")
-        m2 = make_match(item_id="2")
+    def test_variant_copies_of_same_book_collapse(self):
+        """Two different listings (variant covers) of the SAME wish book from one
+        seller collapse to one representative — the cheapest."""
+        m1 = make_match(seller="A", item_id="1", wish_name="Aliens vs Avengers #1",
+                        price="$15.00")
+        m2 = make_match(seller="A", item_id="2", wish_name="Aliens vs Avengers #1",
+                        price="$12.00")
+        result = ws.dedup_matches([m1, m2])
+        assert len(result) == 1
+        assert result[0]["item_id"] == "2"  # cheapest representative kept
+
+    def test_different_books_same_seller_both_kept(self):
+        """Two DIFFERENT wish books from one seller are both kept (combine-ship)."""
+        m1 = make_match(seller="A", item_id="1", wish_name="ASM #129")
+        m2 = make_match(seller="A", item_id="2", wish_name="X-Men #94")
         assert len(ws.dedup_matches([m1, m2])) == 2
 
-    def test_different_sellers_same_item_both_kept(self):
-        """Two sellers listing the same physical item count separately."""
-        m1 = make_match(seller="A", item_id="1")
-        m2 = make_match(seller="B", item_id="1")
+    def test_different_sellers_same_book_both_kept(self):
+        """Same book from two sellers counts separately (per-seller dedup)."""
+        m1 = make_match(seller="A", item_id="1", wish_name="ASM #129")
+        m2 = make_match(seller="B", item_id="1", wish_name="ASM #129")
         assert len(ws.dedup_matches([m1, m2])) == 2
 
     def test_empty_input_returns_empty(self):
@@ -641,3 +656,96 @@ class TestEndToEndHappyPath:
         assert set(recorded_ids) == {"400", "401"}
         # Global seen set: seller arg must be None (plan R11)
         assert mock_record.call_args[0][1] is None
+
+
+class TestRunFlags:
+    """--limit and --no-record-seen (bounded / repeatable smoke runs)."""
+
+    def test_no_record_seen_skips_seen_write(self, tmp_path):
+        """--no-record-seen surfaces sellers but never writes to the seen-store."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="s1", item_id="100", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="s1", item_id="101", wish_name="X-Men #94")
+
+        output, _, mock_record = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            verify_return=[m1, m2],
+            extra_args=["--no-record-seen"],
+        )
+
+        assert "s1" in output            # seller still surfaced
+        mock_record.assert_not_called()  # but nothing written to seen-store
+
+    def test_records_seen_without_flag(self, tmp_path):
+        """Default (no flag) DOES write to the seen-store — guards the flag's effect."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="s1", item_id="100", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="s1", item_id="101", wish_name="X-Men #94")
+
+        _, _, mock_record = _run_main(
+            [[m1], [m2]], db_path=db_path, verify_return=[m1, m2],
+        )
+
+        mock_record.assert_called_once()
+
+    def test_limit_processes_only_first_n_wish_items(self, tmp_path):
+        """--limit 1 stops after the first wish item, so the same-seller pair
+        never both appear → the ≥2 gate drops the lone match."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="s1", item_id="100", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="s1", item_id="101", wish_name="X-Men #94")
+
+        output, _, _ = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            verify_return=[m1, m2],
+            extra_args=["--limit", "1"],
+        )
+
+        # Only the first wish item is processed → a single match for s1 →
+        # below the ≥2 threshold → no sellers surfaced.
+        assert "s1" not in output
+        assert "No sellers" in output
+
+
+class TestFanoutGuards:
+    """Skip degenerate numeric-series names + cap per-item noise (smoke finding)."""
+
+    def test_is_degenerate_series(self):
+        assert ws.is_degenerate_series({"name": "300 #1", "_tokens": ["300"]}) is True
+        assert ws.is_degenerate_series({"name": "52 #1", "_tokens": ["52"]}) is True
+        assert ws.is_degenerate_series({"name": "1985 #1", "_tokens": ["1985"]}) is True
+        # multi-token / alpha series are NOT degenerate
+        assert ws.is_degenerate_series(
+            {"name": "Amazing Spider-Man #1", "_tokens": ["amazing", "spider", "man"]}
+        ) is False
+        # single short ALPHA token (X-Men → ["men"]) is kept — issue # constrains it
+        assert ws.is_degenerate_series({"name": "X-Men #1", "_tokens": ["men"]}) is False
+        assert ws.is_degenerate_series({"name": "x", "_tokens": []}) is False
+
+    def test_degenerate_series_skipped_from_search(self, tmp_path):
+        """A numeric-series wish item is skipped, so match is never invoked and
+        the run completes clean (empty side_effect would StopIteration if not)."""
+        db_path = tmp_path / "v.db"
+        wl = [{"id": "d", "name": "300 #1"}]
+        wi = [{"id": "d", "name": "300 #1", "series": "300", "issue": "1",
+               "_tokens": ["300"]}]
+        output, _, _ = _run_main([], db_path=db_path, wish_list=wl, wish_items=wi)
+        assert "No sellers" in output
+
+    def test_variant_saturation_is_not_a_combine_signal(self, tmp_path):
+        """A seller with many variant copies of ONE wish book (and no second
+        book) must NOT pass the ≥2 gate — distinct books, not listings."""
+        db_path = tmp_path / "v.db"
+        wl, wi = _two_wish_items()
+        # First wish item: 50 variant listings of the SAME book from one seller.
+        variants = [make_match(seller="s1", item_id=str(3000 + i),
+                               wish_name="Amazing Spider-Man #129",
+                               price=f"${10 + i}.00") for i in range(50)]
+        output, _, _ = _run_main([variants, []], db_path=db_path,
+                                 wish_list=wl, wish_items=wi,
+                                 verify_return=variants)
+        # 50 variants collapse to 1 distinct book → below the ≥2 gate.
+        assert "s1" not in output
+        assert "No sellers" in output

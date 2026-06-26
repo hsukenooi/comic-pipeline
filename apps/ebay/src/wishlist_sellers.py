@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -63,6 +64,24 @@ from seller_scan import (
 # Mirror seller_scan.match_listing's internal 0.65 threshold; match_listing
 # already returns (None, 0.0) below it, so this gate is belt-and-suspenders.
 MATCH_SCORE_FLOOR: float = 0.65
+
+# ─── Fan-out guard (smoke-test finding) ────────────────────────────────────────
+# A wish item whose series tokenizes to a single PURELY-NUMERIC token (e.g.
+# "300", "52", "1985") produces a hopelessly broad eBay keyword search and a
+# permissive match — one such item matched ~500 junk listings live. These are
+# skipped from the automated fan-out and surfaced for manual checking instead.
+# (No per-item match cap: a high count for a real series is variant-cover
+# saturation, not noise, and is exactly where multi-book sellers live — the
+# per-(seller, book) dedup + distinct-book ≥2 gate handle volume correctly.)
+def is_degenerate_series(wish_item: dict) -> bool:
+    """True if the wish item's series is too generic to fan out automatically.
+
+    Trigger: the series reduces to a single purely-numeric token (the "300"
+    class). Single short *alphabetic* tokens (e.g. X-Men → ["men"]) are left
+    alone — the issue number constrains those to tight result sets in practice.
+    """
+    tokens = wish_item.get("_tokens") or []
+    return len(tokens) == 1 and tokens[0].isdigit()
 
 # ─── Verdict cache ────────────────────────────────────────────────────────────
 # SQLite DB keyed by (listing_id, wish_name).  Compound key is intentional:
@@ -171,24 +190,54 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
     return matches
 
 
-def dedup_matches(matches: list) -> list:
-    """Dedup by (seller, item_id), keeping the entry with the highest score.
+def _price_value(m: dict) -> float:
+    """Numeric price for choosing the cheapest representative; inf if unparseable."""
+    raw = m.get("price")
+    if not raw:
+        return float("inf")
+    digits = re.sub(r"[^0-9.]", "", str(raw))
+    try:
+        return float(digits) if digits else float("inf")
+    except ValueError:
+        return float("inf")
 
-    A single listing surfaced under multiple wish-item searches counts at most
-    once per seller toward the ≥2 gate (plan R5a/C3).
+
+def dedup_matches(matches: list) -> list:
+    """Collapse matches to one representative per distinct wish *book* per seller.
+
+    Two passes:
+      1. (seller, item_id) — a single physical listing surfaced under multiple
+         wish searches is one comic, so keep its highest-score attribution
+         (plan R5a/C3): one listing → one wish book.
+      2. (seller, wish_name) — collapse variant copies of the SAME wish book
+         from one seller (e.g. a dozen variant covers of Aliens vs Avengers #1)
+         into ONE representative, the cheapest. (smoke-test finding)
+
+    After this, each seller has at most one entry per distinct wish book, so the
+    downstream ≥2 gate counts distinct *books* — the true combine-shipping
+    signal — not duplicate variant listings of a single book.
     """
-    best: dict[tuple, dict] = {}
+    # Pass 1: one entry per physical listing, best attribution.
+    by_listing: dict[tuple, dict] = {}
     for m in matches:
         key = (m.get("seller"), m.get("item_id"))
-        if key not in best or m["score"] > best[key]["score"]:
-            best[key] = m
-    return list(best.values())
+        if key not in by_listing or m["score"] > by_listing[key]["score"]:
+            by_listing[key] = m
+    # Pass 2: one representative (cheapest) per (seller, wish book).
+    by_book: dict[tuple, dict] = {}
+    for m in by_listing.values():
+        key = (m.get("seller"), m.get("wish_name"))
+        if key not in by_book or _price_value(m) < _price_value(by_book[key]):
+            by_book[key] = m
+    return list(by_book.values())
 
 
 def group_and_gate(matches: list, *, min_matches: int = 2) -> dict:
-    """Group matches by seller; drop sellers with < min_matches entries.
+    """Group matches by seller; drop sellers with < min_matches DISTINCT books.
 
-    Returns {seller_id: [match, ...]} for qualifying sellers only.
+    Expects matches already collapsed by dedup_matches (one entry per
+    (seller, wish book)), so each seller's entry count equals its distinct-book
+    count. Returns {seller_id: [match, ...]} for qualifying sellers only.
     """
     groups: dict[str, list] = {}
     for m in matches:
@@ -343,6 +392,18 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         default=None,
         help="eBay environment (overrides config)",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Process only the first N matchable wish items (for quick/bounded runs)",
+    )
+    parser.add_argument(
+        "--no-record-seen",
+        action="store_true",
+        help="Do not write surfaced listings to the seen-store (repeatable/dry runs)",
+    )
     args = parser.parse_args(argv)
 
     # ── Step 1: fetch wish list ───────────────────────────────────────────────
@@ -374,6 +435,13 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         )
         sys.exit(1)
 
+    if args.limit is not None:
+        wish_items = wish_items[: args.limit]
+        print(
+            f"  --limit {args.limit}: processing {len(wish_items)} wish item(s)",
+            file=sys.stderr,
+        )
+
     # ── Step 2: eBay OAuth token ──────────────────────────────────────────────
     client_id, client_secret, base_url = load_config()
     if args.env:
@@ -381,8 +449,19 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
     token = get_token(client_id, client_secret, base_url)
 
     # ── Steps 3–5: per-wish search → active filter → match ───────────────────
+    # Skip degenerate series (e.g. "300") from the automated fan-out; surface
+    # them for manual checking instead of exploding the search.
+    skipped_degenerate = [w["name"] for w in wish_items if is_degenerate_series(w)]
+    searchable = [w for w in wish_items if not is_degenerate_series(w)]
+    if skipped_degenerate:
+        print(
+            f"  Skipping {len(skipped_degenerate)} generic-name item(s) "
+            f"(numeric series — search by hand): {', '.join(skipped_degenerate)}",
+            file=sys.stderr,
+        )
+
     all_matches: list = []
-    for wish_item in wish_items:
+    for wish_item in searchable:
         keyword = f'{wish_item["series"]} #{wish_item["issue"]}'
         results = ebay_search_cache.get(keyword)
         if results is None:
@@ -400,7 +479,10 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
 
     # ── Step 6: dedup by (seller, item_id) ───────────────────────────────────
     all_matches = dedup_matches(all_matches)
-    print(f"  {len(all_matches)} match(es) after dedup (by seller+listing)", file=sys.stderr)
+    print(
+        f"  {len(all_matches)} distinct (seller, book) match(es) after dedup",
+        file=sys.stderr,
+    )
 
     if not all_matches:
         print("No wish-list matches found on eBay.", file=sys.stderr)
@@ -492,8 +574,13 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
 
     # ── Step 12: record seen (global, seller=None — R11) ─────────────────────
     final_item_ids = [m["item_id"] for ms in grouped.values() for m in ms]
-    if final_item_ids:
+    if final_item_ids and not args.no_record_seen:
         record_items_seen(final_item_ids, None)
+    elif args.no_record_seen and final_item_ids:
+        print(
+            f"  --no-record-seen: not writing {len(final_item_ids)} item(s) to seen-store",
+            file=sys.stderr,
+        )
 
     # ── Step 13: emit ─────────────────────────────────────────────────────────
     _emit(grouped=grouped, json_output=args.json_output)

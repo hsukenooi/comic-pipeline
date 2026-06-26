@@ -875,8 +875,27 @@ class TestHardRejectCleanMatch:
 # ─── verify_with_claude chunking (BUI-221 Part B) ────────────────────────────
 
 
+class TestVerifyWithClaudeMissingKey:
+    def test_missing_api_key_exits_cleanly(self, capsys, monkeypatch):
+        """No ANTHROPIC_API_KEY → clean error + exit, not a raw traceback.
+        Matters for the unattended wishlist-sellers scheduled run."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        # Make _load_dotenv a no-op so it can't pull a key from a real .env.
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: {})
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
+        assert exc.value.code == 1
+        assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+
 class TestVerifyWithClaudeChunking:
     """Verify chunked calling and fail-closed behaviour of verify_with_claude."""
+
+    @pytest.fixture(autouse=True)
+    def _set_api_key(self, monkeypatch):
+        # The key-presence guard runs before the (mocked) client; tests must
+        # provide a dummy key so they exercise the chunking logic, not the guard.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
 
     def _make_matches(self, n):
         return [
@@ -991,6 +1010,10 @@ class TestVerifyWithClaudeChunking:
 
 
 class TestVerifyWithClaudeNoSilentDrop:
+    @pytest.fixture(autouse=True)
+    def _set_api_key(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+
     def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
         """BUI-149: the script's internal Claude pass is the single verification
         gate, so a rejected candidate must be surfaced (stderr) with its reason,
