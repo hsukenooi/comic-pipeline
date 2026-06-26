@@ -982,3 +982,208 @@ class TestCrossSellerDedup:
             ws.main([])
 
         mock_verify.assert_not_called()
+
+
+# ─── BUI-224: pristine-match shortcut ────────────────────────────────────────
+
+class TestIsPristineMatch:
+    """Unit tests for the is_pristine_match predicate (BUI-224)."""
+
+    def test_clean_grade_noise_is_pristine(self):
+        """A clean title with only a grade abbreviation trailing is pristine."""
+        m = make_match(
+            title="X-Men #94 NM",
+            series="X-Men",
+            issue="94",
+            score=1.0,
+            wish_name="X-Men #94",
+        )
+        assert ws.is_pristine_match(m) is True
+
+    def test_condition_and_era_noise_is_pristine(self):
+        """Condition abbreviation + newsstand era token trailing → pristine."""
+        m = make_match(
+            title="Amazing Spider-Man #129 VF newsstand",
+            series="Amazing Spider-Man",
+            issue="129",
+            score=1.0,
+            wish_name="Amazing Spider-Man #129",
+        )
+        assert ws.is_pristine_match(m) is True
+
+    def test_annual_in_title_not_pristine(self):
+        """Annual in title (but not in series) → hard_reject catches it → not pristine."""
+        m = make_match(
+            title="X-Men #94 Annual",
+            series="X-Men",
+            issue="94",
+            score=1.0,
+            wish_name="X-Men #94",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_subtitle_token_not_pristine(self):
+        """Trailing subtitle token outside allow-list → not pristine (routes to Haiku)."""
+        m = make_match(
+            title="Spider-Man #129 Noir",
+            series="Spider-Man",
+            issue="129",
+            score=1.0,
+            wish_name="Spider-Man #129",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_score_below_one_not_pristine(self):
+        """Score below 1.0 → not pristine regardless of title shape."""
+        m = make_match(
+            title="X-Men #94 NM",
+            series="X-Men",
+            issue="94",
+            score=0.9,
+            wish_name="X-Men #94",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_wrong_series_tokens_interrupt_prefix(self):
+        """'Aliens vs Avengers #1' against wish series 'Aliens': 'vs' sits where
+        the issue should be → prefix fails → not pristine (routes to Haiku)."""
+        m = make_match(
+            title="Aliens vs Avengers #1",
+            series="Aliens",
+            issue="1",
+            score=1.0,
+            wish_name="Aliens #1",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_per132_wrong_series_not_pristine(self):
+        """PER-132-style wrong-series match: 'Wolverine Origins #1 VF' for wish
+        'Wolverine #1' — 'Origins' interrupts the expected prefix → not pristine."""
+        m = make_match(
+            title="Wolverine Origins #1 VF",
+            series="Wolverine",
+            issue="1",
+            score=1.0,
+            wish_name="Wolverine #1",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_title_year_trailing_is_pristine(self):
+        """A bare year after the issue is a pure number → always allowed → pristine."""
+        m = make_match(
+            title="Amazing Spider-Man #129 1974",
+            series="Amazing Spider-Man",
+            issue="129",
+            score=1.0,
+            wish_name="Amazing Spider-Man #129",
+        )
+        assert ws.is_pristine_match(m) is True
+
+    def test_first_print_noise_is_pristine(self):
+        """Printing-era token '1st' trailing the issue → in allow-list → pristine."""
+        m = make_match(
+            title="Amazing Spider-Man #300 VF 1st",
+            series="Amazing Spider-Man",
+            issue="300",
+            score=1.0,
+            wish_name="Amazing Spider-Man #300",
+        )
+        assert ws.is_pristine_match(m) is True
+
+
+class TestPristineMatchFunnel:
+    """BUI-224: pristine shortcut integration in the main() pipeline."""
+
+    def test_pristine_not_sent_to_verify_appears_genuine_and_persisted(self, tmp_path):
+        """A pristine match is not sent to verify_with_claude, yet it appears in
+        the final output as genuine and its verdict is persisted to the cache."""
+        db_path = tmp_path / "v.db"
+        # m1: score=1.0, grade-only trailing token → pristine
+        m1 = make_match(
+            seller="sellerA", item_id="1", wish_name="Amazing Spider-Man #129",
+            title="Amazing Spider-Man #129 NM",
+            series="Amazing Spider-Man", issue="129", score=1.0,
+        )
+        # m2: score=1.0 but 'Noir' trailing token → not pristine → sent to verify
+        m2 = make_match(
+            seller="sellerA", item_id="2", wish_name="X-Men #94",
+            title="X-Men #94 Noir",
+            series="X-Men", issue="94", score=1.0,
+        )
+        wish_list, wish_items = _two_wish_items()
+
+        # verify_with_claude returns m2 as genuine (m1 never reaches it)
+        output, mock_verify, _ = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m2],
+        )
+
+        # verify must be called — but NOT with m1 (pristine)
+        mock_verify.assert_called_once()
+        sent_ids = {m["item_id"] for m in mock_verify.call_args[0][0]}
+        assert "1" not in sent_ids, "pristine m1 must not be sent to verify"
+        assert "2" in sent_ids, "ambiguous m2 must be sent to verify"
+
+        # Both matches are genuine → sellerA has 2 → appears in output
+        assert "sellerA" in output
+
+        # Pristine verdict for m1 must be persisted as genuine by title_key
+        tk_m1 = ws._title_key("Amazing Spider-Man #129 NM")
+        assert ws.verdict_get(tk_m1, "Amazing Spider-Man #129", db_path=db_path) is True
+
+    def test_all_pristine_no_verify_call(self, tmp_path):
+        """When all uncached candidates are pristine, verify_with_claude is not called."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(
+            seller="sellerA", item_id="1", wish_name="Amazing Spider-Man #129",
+            title="Amazing Spider-Man #129 NM",
+            series="Amazing Spider-Man", issue="129", score=1.0,
+        )
+        m2 = make_match(
+            seller="sellerA", item_id="2", wish_name="X-Men #94",
+            title="X-Men #94 VF",
+            series="X-Men", issue="94", score=1.0,
+        )
+        wish_list, wish_items = _two_wish_items()
+
+        _, mock_verify, _ = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[],  # never called
+        )
+
+        mock_verify.assert_not_called()
+
+    def test_pristine_warm_rerun_hits_cache_no_verify(self, tmp_path):
+        """A re-run where the pristine verdict is already cached never calls verify
+        (it goes through apply_verdict_cache as cached_genuine, not through is_pristine)."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(
+            seller="sellerA", item_id="1", wish_name="Amazing Spider-Man #129",
+            title="Amazing Spider-Man #129 NM",
+            series="Amazing Spider-Man", issue="129", score=1.0,
+        )
+        m2 = make_match(
+            seller="sellerA", item_id="2", wish_name="X-Men #94",
+            title="X-Men #94 VF",
+            series="X-Men", issue="94", score=1.0,
+        )
+        # Pre-seed both verdicts as genuine (simulating a prior pristine run)
+        ws.verdict_put(ws._title_key(m1["title"]), "Amazing Spider-Man #129", True, db_path=db_path)
+        ws.verdict_put(ws._title_key(m2["title"]), "X-Men #94", True, db_path=db_path)
+        wish_list, wish_items = _two_wish_items()
+
+        _, mock_verify, _ = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[],
+        )
+
+        mock_verify.assert_not_called()

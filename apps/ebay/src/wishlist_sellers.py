@@ -98,6 +98,101 @@ def _title_key(title: str) -> str:
     return _normalize(_strip_grades(title))
 
 
+# ─── Pristine-match shortcut ──────────────────────────────────────────────────
+# Conservative pre-verify shortcut: a score-1.0 listing whose title is exactly
+# "full-series-words + issue + noise" can bypass Haiku entirely.  The false
+# positives that Haiku catches arise from ambiguous titles — wrong series,
+# wrong edition, cross-over sub-titles.  A title that begins with every
+# series word in order and has only condition/era noise after the issue number
+# has ~zero false-positive risk.
+
+# Trailing tokens (post-issue) that indicate condition, grade, or printing
+# style but NOT a different series or sub-title.  Only purely-alphabetic tokens
+# need checking — bare numbers (years, copy counts) are always allowed.
+# Two named constants so condition-noise and print/era-noise can be tuned
+# independently without restructuring code.
+_PRISTINE_COND_TOKENS: frozenset[str] = frozenset({
+    # Grade abbreviations (after _normalize → all lowercase)
+    "vf", "nm", "fn", "gd", "vg", "vgfn", "fnvf", "vfnm", "nmmt",
+    # Grade words
+    "fine", "near", "mint", "good",
+    # Market / slab descriptors
+    "raw", "key", "hot",
+})
+
+_PRISTINE_PRINT_TOKENS: frozenset[str] = frozenset({
+    # Print / distribution / era noise
+    "newsstand", "direct", "pence",
+    "1st", "2nd", "3rd", "4th", "5th",
+    "first", "second", "third",
+    "print", "printing",
+})
+
+# Combined allow-list consulted by is_pristine_match for trailing tokens.
+_PRISTINE_TRAILING_ALLOW: frozenset[str] = _PRISTINE_COND_TOKENS | _PRISTINE_PRINT_TOKENS
+
+
+def is_pristine_match(match: dict) -> bool:
+    """Return True only if this match is unambiguously a clean single-issue copy.
+
+    A match is pristine iff ALL of:
+      1. score == 1.0  (every series token matched).
+      2. Exact-prefix shape: the normalized title begins with every word in the
+         normalized series name, followed by the issue number — with no tokens
+         interspersed — and any tokens that follow the issue are only "noise"
+         (condition/grade abbreviations, pure numbers/years, printing/era tokens
+         in _PRISTINE_TRAILING_ALLOW).  Any trailing alphabetic token outside
+         that set → False.
+      3. hard_reject(title, _series, _issue) is False.
+
+    Uses the full normalized series words (``_normalize(series).split()``) for
+    the prefix, not the filtered ``_series_tokens()`` list, so single-letter
+    words like the "x" in "X-Men" are included in the expected prefix.
+
+    When in doubt returns False — Haiku handles anything ambiguous.  BE STRICT:
+    only accept the clearest cases to avoid false positives.
+    """
+    if match.get("score") != 1.0:
+        return False
+
+    title = match.get("title") or ""
+    series = match.get("_series") or ""
+    issue = match.get("_issue") or ""
+
+    if not title or not series or not issue:
+        return False
+
+    # Condition 3: hard_reject should already have filtered these upstream, but
+    # confirm defensively — a hard-rejected title is never pristine.
+    if hard_reject(title, series, issue):
+        return False
+
+    # Condition 2: exact-prefix shape.
+    # Build the expected prefix from ALL normalized series words + the issue
+    # number.  Using _normalize(series).split() (not _series_tokens) preserves
+    # single-letter words like the "x" in "X-Men" so the prefix is complete.
+    title_norm = _normalize(_strip_grades(title))
+    series_words = _normalize(series).split()
+    title_tokens = title_norm.split()
+
+    expected = series_words + [issue]
+
+    if len(title_tokens) < len(expected):
+        return False
+    if title_tokens[: len(expected)] != expected:
+        return False
+
+    # Any tokens after the expected prefix must be harmless noise.
+    trailing = title_tokens[len(expected):]
+    for t in trailing:
+        if t.isdigit():
+            continue  # bare number (year, copy count) — always allowed
+        if t not in _PRISTINE_TRAILING_ALLOW:
+            return False
+
+    return True
+
+
 # ─── Verdict cache ────────────────────────────────────────────────────────────
 # SQLite DB keyed by (title_key, wish_name).  title_key = _normalize(_strip_grades(title)),
 # so the same comic title from two different sellers or a relisted item with a
@@ -584,45 +679,67 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
     )
 
     if uncached:
-        # Cross-seller dedup: same normalized title + wish_name → one Haiku call.
-        # Build one representative per (title_key, wish_name) pair so the verify
-        # model receives each distinct comic exactly once across all sellers.
-        rep_map: dict[tuple, dict] = {}
-        for m in uncached:
-            key = (_title_key(m["title"]), m["wish_name"])
-            if key not in rep_map:
-                rep_map[key] = m
-        representatives = list(rep_map.values())
-        deduped_count = len(uncached) - len(representatives)
-        if deduped_count:
+        # BUI-224: deterministic shortcut — pristine score-1.0 listings skip Haiku.
+        # Split before cross-seller dedup so only ambiguous candidates go to verify.
+        pristine_direct = [m for m in uncached if is_pristine_match(m)]
+        needs_verify = [m for m in uncached if not is_pristine_match(m)]
+
+        if pristine_direct:
             print(
-                f"  Cross-seller dedup: {len(uncached)} uncached → "
-                f"{len(representatives)} unique (title, wish) pair(s) to verify",
+                f"  Deterministic shortcut: {len(pristine_direct)} pristine match(es) skipped Haiku",
                 file=sys.stderr,
             )
-        print(
-            f"  Verifying {len(representatives)} uncached candidate(s) with Claude Haiku...",
-            file=sys.stderr,
-        )
-        verified_reps = verify_with_claude(representatives)
-        # Keys that came back as genuine from verify
-        genuine_keys = {(_title_key(m["title"]), m["wish_name"]) for m in verified_reps}
-        # Fan the verdict back out to ALL uncached listings sharing each key
-        verified = [
-            m for m in uncached
-            if (_title_key(m["title"]), m["wish_name"]) in genuine_keys
-        ]
-        # Persist one verdict row per (title_key, wish_name) — not per listing
-        persisted: set[tuple] = set()
-        for m in uncached:
-            key = (_title_key(m["title"]), m["wish_name"])
-            if key not in persisted:
-                verdict_put(key[0], m["wish_name"], key in genuine_keys, db_path=db_path)
-                persisted.add(key)
+            # Persist as genuine by (title_key, wish_name) so re-runs hit the cache.
+            persisted_pristine: set[tuple] = set()
+            for m in pristine_direct:
+                key = (_title_key(m["title"]), m["wish_name"])
+                if key not in persisted_pristine:
+                    verdict_put(key[0], m["wish_name"], True, db_path=db_path)
+                    persisted_pristine.add(key)
+
+        if needs_verify:
+            # Cross-seller dedup: same normalized title + wish_name → one Haiku call.
+            # Build one representative per (title_key, wish_name) pair so the verify
+            # model receives each distinct comic exactly once across all sellers.
+            rep_map: dict[tuple, dict] = {}
+            for m in needs_verify:
+                key = (_title_key(m["title"]), m["wish_name"])
+                if key not in rep_map:
+                    rep_map[key] = m
+            representatives = list(rep_map.values())
+            deduped_count = len(needs_verify) - len(representatives)
+            if deduped_count:
+                print(
+                    f"  Cross-seller dedup: {len(needs_verify)} uncached → "
+                    f"{len(representatives)} unique (title, wish) pair(s) to verify",
+                    file=sys.stderr,
+                )
+            print(
+                f"  Verifying {len(representatives)} uncached candidate(s) with Claude Haiku...",
+                file=sys.stderr,
+            )
+            verified_reps = verify_with_claude(representatives)
+            # Keys that came back as genuine from verify
+            genuine_keys = {(_title_key(m["title"]), m["wish_name"]) for m in verified_reps}
+            # Fan the verdict back out to ALL needs_verify listings sharing each key
+            verified = [
+                m for m in needs_verify
+                if (_title_key(m["title"]), m["wish_name"]) in genuine_keys
+            ]
+            # Persist one verdict row per (title_key, wish_name) — not per listing
+            persisted: set[tuple] = set()
+            for m in needs_verify:
+                key = (_title_key(m["title"]), m["wish_name"])
+                if key not in persisted:
+                    verdict_put(key[0], m["wish_name"], key in genuine_keys, db_path=db_path)
+                    persisted.add(key)
+        else:
+            verified = []
     else:
+        pristine_direct = []
         verified = []
 
-    survivors = cached_genuine + verified
+    survivors = cached_genuine + pristine_direct + verified
 
     # ── Step 11: re-apply ≥2 gate post-verify ────────────────────────────────
     # A seller can fall below 2 if some of its matches are rejected by verify.
