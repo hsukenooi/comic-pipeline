@@ -710,6 +710,286 @@ class TestGradeDigitNotIssueNumber:
         assert wish["name"] == "The X-Men #9"
 
 
+# ─── hard_reject pre-filter (BUI-221 Part A) ─────────────────────────────────
+
+
+class TestHardRejectCGC:
+    def test_cgc_in_title_rejected(self):
+        assert seller_scan.hard_reject(
+            "CGC Amazing Spider-Man #300 9.8 NM", "Amazing Spider-Man", "300"
+        )
+
+    def test_cgc_lowercase_rejected(self):
+        assert seller_scan.hard_reject(
+            "amazing spider-man #300 cgc 9.4", "Amazing Spider-Man", "300"
+        )
+
+    def test_no_cgc_not_rejected_by_rule1(self):
+        # A raw ungraded title must NOT be rejected on account of rule 1.
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man #300 NM Marvel 1988", "Amazing Spider-Man", "300"
+        )
+
+
+class TestHardRejectEditionMismatch:
+    def test_annual_rejected_for_regular_series(self):
+        # "Avengers Annual #1" must not satisfy a wish for "The Avengers".
+        assert seller_scan.hard_reject(
+            "Avengers Annual #1", "The Avengers", "1"
+        )
+
+    def test_annual_kept_for_annual_series(self):
+        # Wish series IS "Avengers Annual" — title is a genuine match.
+        assert not seller_scan.hard_reject(
+            "Avengers Annual #1", "Avengers Annual", "1"
+        )
+
+    def test_giant_size_hyphenated_rejected(self):
+        assert seller_scan.hard_reject(
+            "Giant-Size X-Men #1 Marvel 1975", "X-Men", "1"
+        )
+
+    def test_giant_size_spaced_rejected(self):
+        assert seller_scan.hard_reject(
+            "Giant Size X-Men #1 Marvel 1975", "X-Men", "1"
+        )
+
+    def test_giant_size_kept_for_giant_size_series(self):
+        assert not seller_scan.hard_reject(
+            "Giant-Size X-Men #1", "Giant-Size X-Men", "1"
+        )
+
+    def test_king_size_hyphenated_rejected(self):
+        assert seller_scan.hard_reject(
+            "King-Size Spider-Man #1", "Amazing Spider-Man", "1"
+        )
+
+    def test_king_size_spaced_rejected(self):
+        assert seller_scan.hard_reject(
+            "King Size Spider-Man #1", "Amazing Spider-Man", "1"
+        )
+
+    def test_special_rejected_for_regular_series(self):
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man Special #5", "Amazing Spider-Man", "5"
+        )
+
+    def test_special_kept_when_series_contains_special(self):
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man Special #5", "Amazing Spider-Man Special", "5"
+        )
+
+    def test_treasury_rejected_for_regular_series(self):
+        assert seller_scan.hard_reject(
+            "Superman vs Muhammad Ali Treasury Edition", "Superman", "1"
+        )
+
+    def test_treasury_kept_for_treasury_series(self):
+        # Treasury editions are typically unnumbered one-shots; pass issue=None
+        # so rule 4 (missing issue number) does not apply, isolating rule 2.
+        assert not seller_scan.hard_reject(
+            "Superman vs Muhammad Ali Treasury Edition", "Superman Treasury", None
+        )
+
+
+class TestHardRejectLot:
+    def test_lot_of_rejected(self):
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man lot of 5 comics", "Amazing Spider-Man", "300"
+        )
+
+    def test_lot_with_leading_count_rejected(self):
+        assert seller_scan.hard_reject(
+            "10 lot X-Men Marvel Comics", "X-Men", "1"
+        )
+
+    def test_lot_with_trailing_count_rejected(self):
+        assert seller_scan.hard_reject(
+            "X-Men lot 5 books", "X-Men", "1"
+        )
+
+    def test_collection_rejected(self):
+        assert seller_scan.hard_reject(
+            "X-Men Complete Collection 1-50", "X-Men", "1"
+        )
+
+    def test_complete_run_rejected(self):
+        assert seller_scan.hard_reject(
+            "Daredevil #1-50 Complete Run Marvel Bronze Age", "Daredevil", "1"
+        )
+
+    def test_set_of_rejected(self):
+        assert seller_scan.hard_reject(
+            "Set of 4 Avengers Marvel comics", "The Avengers", "4"
+        )
+
+    def test_issue_range_rejected(self):
+        # "#1-#10" issue range is a multi-comic lot.
+        assert seller_scan.hard_reject(
+            "X-Men #1-#10 Bronze Age Lot", "X-Men", "1"
+        )
+
+    def test_bare_issue_range_rejected(self):
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man 129-150 Bronze Age", "Amazing Spider-Man", "129"
+        )
+
+
+class TestHardRejectMissingIssue:
+    def test_title_missing_issue_number_rejected(self):
+        # Title has no "300" — obvious wrong listing.
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man NM Marvel 1988", "Amazing Spider-Man", "300"
+        )
+
+    def test_title_has_wrong_issue_number_rejected(self):
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man #299 NM Marvel", "Amazing Spider-Man", "300"
+        )
+
+    def test_issue_none_skips_rule4(self):
+        # issue=None → rule 4 does not apply; only rules 1-3 can trigger.
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man NM Marvel 1988", "Amazing Spider-Man", None
+        )
+
+
+class TestHardRejectCleanMatch:
+    def test_clean_match_not_rejected(self):
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man #300 NM Marvel 1988", "Amazing Spider-Man", "300"
+        )
+
+    def test_clean_match_with_publisher_info(self):
+        assert not seller_scan.hard_reject(
+            "Fantastic Four #48 VF Silver Surfer Marvel", "Fantastic Four", "48"
+        )
+
+    def test_clean_match_with_grade_stripped(self):
+        # Grade digits must not confuse the issue check (BUI-135 integration).
+        assert not seller_scan.hard_reject(
+            "Moon Knight #15 Marvel 1982 VF/NM 9.0", "Moon Knight", "15"
+        )
+
+
+# ─── verify_with_claude chunking (BUI-221 Part B) ────────────────────────────
+
+
+class TestVerifyWithClaudeChunking:
+    """Verify chunked calling and fail-closed behaviour of verify_with_claude."""
+
+    def _make_matches(self, n):
+        return [
+            {"title": f"Comic Series #{i}", "wish_name": f"Comic Series #{i}"}
+            for i in range(1, n + 1)
+        ]
+
+    def _genuine_response(self, count):
+        """Mock response where all ``count`` verdicts are genuine=True."""
+        verdicts = [{"id": i, "genuine": True} for i in range(1, count + 1)]
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text=json.dumps(verdicts))]
+        return fake_resp
+
+    def test_250_candidates_produce_3_api_calls(self, monkeypatch):
+        """250 candidates → 3 chunks: [100, 100, 50] → 3 messages.create calls."""
+        matches = self._make_matches(250)
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._genuine_response(100),
+            self._genuine_response(100),
+            self._genuine_response(50),
+        ]
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert fake_client.messages.create.call_count == 3
+        assert len(result) == 250
+
+    def test_chunk_indices_are_local_not_global(self, monkeypatch):
+        """Each chunk's prompt uses 1-based indices local to that chunk, not
+        global position, so verdicts correlate correctly across chunk boundaries."""
+        matches = self._make_matches(150)  # 2 chunks: [100, 50]
+
+        # Chunk 2: only id=1 (local) is genuine — corresponds to global match #101.
+        verdicts_chunk1 = [{"id": i, "genuine": True} for i in range(1, 101)]
+        verdicts_chunk2 = [{"id": i, "genuine": i == 1} for i in range(1, 51)]
+
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            MagicMock(content=[MagicMock(text=json.dumps(verdicts_chunk1))]),
+            MagicMock(content=[MagicMock(text=json.dumps(verdicts_chunk2))]),
+        ]
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        # 100 from chunk 1 + 1 from chunk 2 = 101
+        assert len(result) == 101
+        # The surviving item from chunk 2 is global index 101 (title "Comic Series #101")
+        assert result[-1]["title"] == "Comic Series #101"
+
+    def test_unparseable_chunk_fails_closed(self, monkeypatch, capsys):
+        """A chunk whose response contains no JSON array is dropped entirely."""
+        matches = self._make_matches(3)
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text="I cannot help with that request.")]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert result == []
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+    def test_verdict_count_mismatch_fails_closed(self, monkeypatch, capsys):
+        """A chunk where len(verdicts) != len(chunk) is dropped entirely."""
+        matches = self._make_matches(5)
+        # Return only 3 verdicts for 5 candidates.
+        verdicts = [{"id": i, "genuine": True} for i in range(1, 4)]
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text=json.dumps(verdicts))]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert result == []
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+    def test_good_chunk_after_bad_chunk_still_kept(self, monkeypatch, capsys):
+        """A bad first chunk drops its candidates but a good second chunk is kept."""
+        matches = self._make_matches(150)  # 2 chunks: [100, 50]
+
+        bad_resp = MagicMock()
+        bad_resp.content = [MagicMock(text="no json here")]
+        good_resp = MagicMock()
+        verdicts = [{"id": i, "genuine": True} for i in range(1, 51)]
+        good_resp.content = [MagicMock(text=json.dumps(verdicts))]
+
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [bad_resp, good_resp]
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        # First 100 dropped (bad chunk); last 50 kept.
+        assert len(result) == 50
+        assert result[0]["title"] == "Comic Series #101"
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+
 class TestVerifyWithClaudeNoSilentDrop:
     def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
         """BUI-149: the script's internal Claude pass is the single verification

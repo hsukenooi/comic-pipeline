@@ -134,6 +134,30 @@ def record_items_seen(item_ids, seller):
 
 _STOPWORDS = frozenset({"the", "a", "an", "of", "and", "in", "vol", "comics"})
 
+# Edition words that signal a special printing type.  If a listing title
+# contains one but the wish-item series does NOT, the listing is an obvious
+# non-match and can be rejected before fuzzy scoring (hard_reject rule 2).
+# Giant[-\s]Size and King[-\s]Size match both hyphenated and spaced forms.
+_EDITION_PATTERNS = [
+    re.compile(r"\bannual\b", re.IGNORECASE),
+    re.compile(r"\bgiant[\s-]size\b", re.IGNORECASE),
+    re.compile(r"\bking[\s-]size\b", re.IGNORECASE),
+    re.compile(r"\bspecial\b", re.IGNORECASE),
+    re.compile(r"\btreasury\b", re.IGNORECASE),
+]
+
+# Multi-comic-lot signals.  Any match → listing is a bundle, not a single issue.
+_LOT_RE = re.compile(
+    r"\blot\s+of\b"           # "lot of"
+    r"|\b\d+\s+lot\b"         # "5 lot", "10-comic lot"
+    r"|\blot\s+\d+"           # "lot 5", "lot 10"
+    r"|\bcollection\b"         # "complete collection", "run collection"
+    r"|\bcomplete\s+run\b"     # "complete run"
+    r"|\bset\s+of\b"          # "set of 10"
+    r"|#?\d+\s*-\s*#?\d+",    # issue range: "#1-#10" or "1-10"
+    re.IGNORECASE,
+)
+
 # BUI-135: numeric grade tokens (CGC/CBCS slab grades and raw grade shorthand)
 # look like "7.0", "8.5", "9.2", "9.4". _normalize() replaces the "." with a
 # space, orphaning the integer part ("7.0" -> "7 0"); match_listing's bare-\bN\b
@@ -246,6 +270,53 @@ def match_listing(title, wish_items):
     return None, 0.0
 
 
+def hard_reject(title, series, issue):
+    """Return True if the listing title is an obvious non-match for this wish item.
+
+    Conservative pre-filter: only drops clear mismatches — never rejects a
+    genuine single-issue copy.  Callers (e.g. the wishlist-sellers funnel)
+    should call this before match_listing to shrink the candidate pool cheaply.
+
+    Rules applied in order:
+      1. CGC slab — "cgc" in title.  This scan is raw/ungraded only; mirrors
+         the existing ``if "cgc" in ...`` skip in main() so callers using
+         hard_reject get that guard for free.
+      2. Edition mismatch — title contains Annual / Giant-Size / Giant Size /
+         King-Size / King Size / Special / Treasury (word-boundary,
+         case-insensitive) but the wish-item ``series`` does NOT contain that
+         same word.  Example: "Avengers Annual #1" is rejected for a wish item
+         whose series is "The Avengers", but kept for "Avengers Annual".
+      3. Multi-comic lot — title matches a lot/collection/complete-run/set-of
+         or issue-range pattern (e.g. "#1–#10").
+      4. Missing issue number — if ``issue`` is not None, the normalised title
+         must contain it as a bounded token (#N or bare N), using the same
+         word-boundary regex as match_listing so the two are consistent.
+    """
+    # Rule 1: CGC slab
+    if "cgc" in title.lower():
+        return True
+
+    # Rule 2: edition mismatch
+    for pat in _EDITION_PATTERNS:
+        if pat.search(title) and not pat.search(series):
+            return True
+
+    # Rule 3: multi-comic lot
+    if _LOT_RE.search(title):
+        return True
+
+    # Rule 4: missing issue number (same logic as match_listing)
+    if issue is not None:
+        title_norm = _normalize(_strip_grades(title))
+        issue_pat = re.compile(
+            r"(?:#\s*" + re.escape(issue) + r"\b|\b" + re.escape(issue) + r"\b)"
+        )
+        if not issue_pat.search(title_norm):
+            return True
+
+    return False
+
+
 # ─── Claude verification ──────────────────────────────────────────────────────
 
 def _load_dotenv(path):
@@ -265,18 +336,43 @@ def _load_dotenv(path):
         pass
 
 
+# Maximum candidates per Claude API call.  At ~30–50 output tokens/verdict,
+# the 8 096-token cap limits a single call to ~150–270 candidates before
+# silent truncation; 100 keeps a comfortable margin and caps cost per call.
+_VERIFY_CHUNK_SIZE = 100
+
+
 def verify_with_claude(matches):
-    """Filter candidates to genuine matches using a single Claude API call."""
+    """Filter candidates to genuine matches using chunked Claude API calls.
+
+    Candidates are processed in batches of at most _VERIFY_CHUNK_SIZE per call
+    so that a large run never silently truncates the response.  Indices in each
+    prompt are 1-based and local to the chunk so the correlation logic is
+    identical to the single-call version.
+
+    Fail-closed: if a chunk's response cannot be parsed OR the number of
+    returned verdicts does not match the number of candidates sent, that chunk
+    is REJECTED entirely (those candidates are dropped) and a warning is
+    printed to stderr.  Better to miss a borderline listing than to surface
+    false positives unattended.  This replaces the previous fail-open fallback
+    that returned all candidates on a parse error.
+    """
     if not matches:
         return []
 
     _load_dotenv(Path(__file__).parent.parent / ".env")
     client = anthropic.Anthropic()
-    pairs = "\n".join(
-        f'{i+1}. Listing: "{m["title"]}"\n   Wish item: "{m["wish_name"]}"'
-        for i, m in enumerate(matches)
-    )
-    prompt = f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
+
+    kept = []
+    for chunk_start in range(0, len(matches), _VERIFY_CHUNK_SIZE):
+        chunk = matches[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
+        chunk_label = f"{chunk_start + 1}–{chunk_start + len(chunk)}"
+
+        pairs = "\n".join(
+            f'{idx}. Listing: "{cand["title"]}"\n   Wish item: "{cand["wish_name"]}"'
+            for idx, cand in enumerate(chunk, 1)
+        )
+        prompt = f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
 
 Reject if:
 - Different series sharing words (Spider-Man Noir vs Amazing Spider-Man, X-Factor vs X-Men, Superior/Ultimate Spider-Man vs Amazing Spider-Man)
@@ -294,39 +390,67 @@ or
 Pairs:
 {pairs}"""
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=8096,
-        messages=[{"role": "user", "content": prompt}],
-    )
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=8096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text
+        json_match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not json_match:
+            print(
+                f"Warning: could not parse Claude response for candidates "
+                f"{chunk_label}; dropping chunk (fail-closed)",
+                file=sys.stderr,
+            )
+            continue
 
-    text = response.content[0].text
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if not m:
-        print("Warning: could not parse Claude response, returning all candidates", file=sys.stderr)
-        return matches
+        try:
+            verdicts = json.loads(json_match.group())
+        except json.JSONDecodeError:
+            print(
+                f"Warning: invalid JSON in Claude response for candidates "
+                f"{chunk_label}; dropping chunk (fail-closed)",
+                file=sys.stderr,
+            )
+            continue
 
-    verdicts = json.loads(m.group())
-    verdict_map = {v["id"]: v.get("genuine", False) for v in verdicts}
-    reason_map = {v["id"]: v.get("reason", "") for v in verdicts}
+        if len(verdicts) != len(chunk):
+            print(
+                f"Warning: Claude returned {len(verdicts)} verdict(s) for "
+                f"{len(chunk)} candidate(s) ({chunk_label}); "
+                f"dropping chunk (fail-closed)",
+                file=sys.stderr,
+            )
+            continue
 
-    # BUI-149: this internal Claude pass is the single verification gate, so it
-    # must not silently drop rejected candidates. Surface each one (with the
-    # model's reason) to stderr so the user can override if the verifier was
-    # wrong — the seller-scan skill no longer runs a redundant second verifier.
-    dropped = [(cand, reason_map.get(i, ""))
-               for i, cand in enumerate(matches, 1)
-               if not verdict_map.get(i, False)]
-    if dropped:
-        print(f"Filtered {len(dropped)} likely false positive(s) "
-              f"(Claude verification):", file=sys.stderr)
-        for cand, reason in dropped:
-            line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
-            if reason:
-                line += f"  — {reason}"
-            print(line, file=sys.stderr)
+        verdict_map = {v["id"]: v.get("genuine", False) for v in verdicts}
+        reason_map = {v["id"]: v.get("reason", "") for v in verdicts}
 
-    return [m for i, m in enumerate(matches, 1) if verdict_map.get(i, False)]
+        # BUI-149: surface each rejected candidate (with the model's reason) to
+        # stderr so the user can override if the verifier was wrong.
+        dropped = [
+            (cand, reason_map.get(idx, ""))
+            for idx, cand in enumerate(chunk, 1)
+            if not verdict_map.get(idx, False)
+        ]
+        if dropped:
+            print(
+                f"Filtered {len(dropped)} likely false positive(s) "
+                f"(Claude verification):",
+                file=sys.stderr,
+            )
+            for cand, reason in dropped:
+                line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
+                if reason:
+                    line += f"  — {reason}"
+                print(line, file=sys.stderr)
+
+        kept.extend(
+            cand for idx, cand in enumerate(chunk, 1) if verdict_map.get(idx, False)
+        )
+
+    return kept
 
 
 # ─── Output ───────────────────────────────────────────────────────────────────
