@@ -6,8 +6,8 @@ description: Run the full LOCG collection round-trip safely — backup, export p
 # Comic Collection Sync
 
 Push pending collection wins up to League of Comic Geeks and reconcile them back,
-on the server-backed store (BUI-87/93: the **gixen server** is the source of
-truth across machines, not `data/locg/`). This is the only flow that closes the
+on the server-backed store (BUI-87/93: the **comics server** on the Mac Mini is
+the source of truth across machines, not `data/locg/`). This is the only flow that closes the
 loop — `/comic:collection-add` records wins and exports a CSV, but nothing
 re-imports the LOCG export to clear "pending" until you run this.
 
@@ -39,12 +39,12 @@ hand-roll URL resolution or `curl` error handling here:
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1   # GIXEN_SERVER_URL (env var, hostname fallback)
+comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
 comics_health_gate     || exit 1   # the process is up
 # BUI-157: route the status read through comics_curl too. /health is static, so
 # it passes even when the collection store is corrupt and /collection/status
 # 500s — comics_curl hard-fails on that 500 so it can't slip past the gate below.
-comics_curl "$GIXEN_SERVER_URL/api/comics/collection/status" \
+comics_curl "$COMICS_SERVER_URL/api/comics/collection/status" \
   || { echo "status check failed"; exit 1; }
 ```
 
@@ -64,11 +64,11 @@ them.
 ## Step 1: Back up the server store
 
 Back up the canonical store **before** any write, so any surprise is fully
-reversible. The store lives beside the gixen DB on the server host
+reversible. The store lives beside the comics server's DB on the server host
 (`~/.gixen-server/collection-store/`):
 
 ```bash
-# On the Mac Mini (GIXEN_SERVER_URL → localhost): local copy.
+# On the Mac Mini (COMICS_SERVER_URL → localhost): local copy.
 # From the MacBook: run it over ssh on the mini.
 BACKUP="collection-store.bak.$(date +%Y%m%d-%H%M%S)"
 case "$(hostname)" in
@@ -90,7 +90,7 @@ pushed) and returns the file contents; save them locally for the upload:
 # file untouched and the next line happily built a CSV from STALE data.
 # comics_curl hard-fails on non-200, and mktemp guarantees no stale reuse.
 EXPORT_JSON="$(mktemp -t sync-export.XXXXXX)"
-comics_curl "$GIXEN_SERVER_URL/api/comics/collection/export" -o "$EXPORT_JSON" \
+comics_curl "$COMICS_SERVER_URL/api/comics/collection/export" -o "$EXPORT_JSON" \
   || { echo "export failed — not generating a CSV from stale data"; exit 1; }
 ts=$(date +%Y-%m-%dT%H%M%S)
 CSV="$HOME/Downloads/locg-bulk-import-$ts.csv"   # BUI-158: bind for Step 3's split
@@ -196,9 +196,9 @@ wish-list itself so no owned-but-wished entry survives to be pushed in Step 3b:
 
 ```bash
 # Dry-run audit (BUI-130) — surfaces owned-but-wished entries before any push.
-comics_curl "$GIXEN_SERVER_URL/api/comics/wish-list/conflicts"
+comics_curl "$COMICS_SERVER_URL/api/comics/wish-list/conflicts"
 # If it lists any conflicts, clear them in one call (no SSH):
-comics_curl -X POST "$GIXEN_SERVER_URL/api/comics/wish-list/remove-conflicts"
+comics_curl -X POST "$COMICS_SERVER_URL/api/comics/wish-list/remove-conflicts"
 ```
 
 Both 409 if the collection was never imported. **Do not proceed to a wish push
@@ -259,7 +259,7 @@ Generate the owned-safe wishes CSV with the **opt-in** export — the only path 
 emits `In Collection=0` (the machine gate otherwise refuses it):
 
 ```bash
-comics_curl "$GIXEN_SERVER_URL/api/comics/collection/export?push_wishes=true" -o "$EXPORT_JSON" \
+comics_curl "$COMICS_SERVER_URL/api/comics/collection/export?push_wishes=true" -o "$EXPORT_JSON" \
   || { echo "wish export failed"; exit 1; }
 python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \
   p=os.path.expanduser(f'~/Downloads/locg-wishes-$ts.csv'); \
@@ -291,7 +291,7 @@ BUI-122), sets `pushed_to_locg_at`, and re-appends local-only wish adds:
 
 ```bash
 # Replace <XLSX> with the path from Step 4.
-curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/collection/import" \
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/import" \
   -F "file=@<XLSX>"
 ```
 
@@ -303,7 +303,7 @@ fails, STOP** — do not report success; the backup from Step 1 is intact.
 Re-read status and compare against the Step 0 snapshot:
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
+curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 ```
 
 Assert all of:

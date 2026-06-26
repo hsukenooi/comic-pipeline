@@ -42,19 +42,36 @@ def _make_client() -> GixenClient:
     return GixenClient(username=username, password=password)
 
 
+# BUI-220: the canonical env var is COMICS_SERVER_URL (this is the comics
+# server, not the Gixen bidding service). GIXEN_SERVER_URL is a deprecated alias
+# still read as a fallback; using it emits a one-line deprecation warning (once).
+_DEPRECATION_WARNED = False
+
+
 def _server_url() -> str | None:
-    return os.getenv("GIXEN_SERVER_URL", "").rstrip("/") or None
+    global _DEPRECATION_WARNED
+    url = os.getenv("COMICS_SERVER_URL", "")
+    if not url:
+        legacy = os.getenv("GIXEN_SERVER_URL", "")
+        if legacy and not _DEPRECATION_WARNED:
+            click.echo(
+                "warning: GIXEN_SERVER_URL is deprecated; use COMICS_SERVER_URL",
+                err=True,
+            )
+            _DEPRECATION_WARNED = True
+        url = legacy
+    return url.rstrip("/") or None
 
 
 def _server_request(method: str, path: str, **kwargs) -> dict | list:
-    """Make a request to the gixen server. Raises SystemExit on failure."""
+    """Make a request to the comics server. Raises SystemExit on failure."""
     url = f"{_server_url()}{path}"
     try:
         resp = getattr(requests, method)(url, **kwargs)
         resp.raise_for_status()
         return resp.json()
     except requests.ConnectionError:
-        click.echo("Error: Server unreachable. Is the gixen server running?", err=True)
+        click.echo("Error: Server unreachable. Is the comics server running?", err=True)
         sys.exit(1)
     except requests.Timeout:
         click.echo("Error: Server timed out.", err=True)
@@ -312,7 +329,7 @@ def add(
     # Existing direct-Gixen path
     if seller is not None or seller_grade is not None or photo_grade is not None:
         click.echo(
-            "⚠️  --seller/--seller-grade/--photo-grade require GIXEN_SERVER_URL "
+            "⚠️  --seller/--seller-grade/--photo-grade require COMICS_SERVER_URL "
             "(server mode); ignored in direct-Gixen mode.",
             err=True,
         )
@@ -482,7 +499,7 @@ def remove(item_id: str):
 def sync():
     """Sync server DB with live Gixen (picks up snipes added via the web UI)."""
     if not _server_url():
-        click.echo("Error: GIXEN_SERVER_URL not set — sync only applies to server mode.", err=True)
+        click.echo("Error: COMICS_SERVER_URL not set — sync only applies to server mode.", err=True)
         sys.exit(1)
     result = _server_request("post", "/api/sync")
     click.echo(f"Synced {result.get('synced', '?')} snipes from Gixen.")

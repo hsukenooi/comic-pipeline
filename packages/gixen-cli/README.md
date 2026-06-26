@@ -82,7 +82,8 @@ uvicorn server.main:app --reload
 ```
 
 Once the server is running, point the CLI at it by setting
-`GIXEN_SERVER_URL` in your `.env` — writes (add/edit/remove/purge) are
+`COMICS_SERVER_URL` in your `.env` (the older name `GIXEN_SERVER_URL` is still
+accepted as a deprecated alias) — writes (add/edit/remove/purge) are
 proxied to the server and reads pull from its database.
 
 ## Plugin Architecture

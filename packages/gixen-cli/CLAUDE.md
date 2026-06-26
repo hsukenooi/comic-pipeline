@@ -24,7 +24,7 @@ python cli.py edit <item_id> <max_bid>
 python cli.py remove <item_id>
 python cli.py purge
 
-# Run the CLI (thin-client mode — set GIXEN_SERVER_URL in .env)
+# Run the CLI (thin-client mode — set COMICS_SERVER_URL in .env)
 python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
 python cli.py sync                  # pull latest Gixen state into server DB
 
@@ -40,7 +40,7 @@ bash server/install.sh
 Three components:
 
 - **`gixen_client.py`** — `GixenClient` class that manages a `requests.Session`, handles login via HTML form POST, extracts session IDs from meta-refresh redirects, and parses the snipe table from raw HTML using regex. All Gixen operations (add/modify/remove/purge) work by POSTing form data to `home_2.php` with the session ID as a query param. Auto-re-logins on session expiration.
-- **`cli.py`** — Click CLI. When `GIXEN_SERVER_URL` is set in `.env`, routes writes (add/edit/remove/purge) to the FastAPI server and reads (`list`) from `GET /api/snipes`. When not set, talks directly to Gixen (existing behavior).
+- **`cli.py`** — Click CLI. When `COMICS_SERVER_URL` is set in `.env` (the deprecated alias `GIXEN_SERVER_URL` is still honored), routes writes (add/edit/remove/purge) to the FastAPI server and reads (`list`) from `GET /api/snipes`. When not set, talks directly to Gixen (existing behavior).
 - **`server/`** — FastAPI app (`main.py`) with SQLite storage (`db.py`) and LaunchAgent installer (`install.sh`). Proxies Gixen operations, stores bid history, and serves the web dashboard. `/api/snipes` pulls live state from Gixen synchronously on each visit (deduped within `_SYNC_TTL=5s` across concurrent calls) and reads cached rows from SQLite — no background sync loop. eBay's Browse API is invoked only as a fire-and-forget fallback when an auction has ended without a captured `winning_bid`. Server credentials and DB path are configured via `~/.gixen-server/.env`. Plugins register additional routes, DB tables, and dashboard tabs via the `gixen.plugins` entry-point group (see `gixen/plugins.py`).
 
 ## Key Details

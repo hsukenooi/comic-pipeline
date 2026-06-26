@@ -2,10 +2,25 @@
 
 > Shared domain vocabulary for this project — entities, named processes, and status concepts with project-specific meaning. Seeded with core domain vocabulary, then accretes as ce-compound and ce-compound-refresh process learnings; direct edits are fine. Glossary only, not a spec or catch-all.
 
+## Naming (BUI-220)
+
+> **Gixen names the bidding service only; the thing that stores your data is the comics server, which runs on the Mac Mini.**
+
+"Gixen" is overloaded and easy to misapply. It correctly names the **external** bidding service (gixen.com) we push snipe bids to. It does **not** name our self-hosted server, its URL, its data dir, or its launchd job — those store the collection/wish-list/listings/FMV/bids and have nothing to do with Gixen the company. The conflation is at the **server** layer, not the CLI layer: the `gixen-cli` package and the `gixen` console script are named correctly (they automate the Gixen bidding service); the FastAPI server they host was mislabeled "the gixen server" and is really **the comics server**.
+
+| Term | Meaning |
+| --- | --- |
+| **Gixen** | The external bidding service at gixen.com that we push snipe bids to. Keep "gixen" wording for the `gixen` console script, the `bids` table, snipe/sniping operations, and the bidding service itself. |
+| **Comics server** | Our self-hosted FastAPI app (the host of `gixen-cli`'s server + the gixen-overlay plugin). Stores the collection, wish-list, listings, FMV, and bids; serves `/api/comics/*` and `/api/snipes`. This is what was wrongly called "the gixen server." |
+| **Mac Mini** | The physical host the comics server runs on. |
+| **LOCG** | League of Comic Geeks — the external collection tool we sync to (a downstream mirror, not the source of truth). |
+
+The canonical env var for the comics server URL is **`COMICS_SERVER_URL`**; `GIXEN_SERVER_URL` is a deprecated alias that is still accepted.
+
 ## Collection & Lists
 
 ### Collection
-The canonical record of the comics you own. The **gixen server store is the source of truth**; League of Comic Geeks (LOCG) is a downstream mirror used for browsing and bulk sync, not the system of record.
+The canonical record of the comics you own. The **comics server store (on the Mac Mini) is the source of truth**; League of Comic Geeks (LOCG) is a downstream mirror used for browsing and bulk sync, not the system of record.
 
 ### Wish List
 Comics you want but do not own. Distinct from the Pull List. The **Mac Mini (server) is authoritative** for the wish list (BUI-208, Option B): wishes are added via `/comic:wishlist-add` and reads (e.g. seller scanning) come from the server, never LOCG. Wish state lives in a single store (`wish-list.json`) keyed on an explicit `source: local | export` field; the LOCG import does **not** source wishes, so a server-side removal is durable across an import (this dissolves the old BUI-206 resurrection bug). LOCG is a downstream mirror; mirroring wishes *up* to LOCG is an opt-in, owned-safe step, deferred by default.

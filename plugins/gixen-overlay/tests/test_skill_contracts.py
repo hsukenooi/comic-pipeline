@@ -161,7 +161,11 @@ def test_no_skill_swallows_a_server_curl():
             # Only lines that actually hit the comics server with curl.
             if "curl" not in line:
                 continue
-            if "GIXEN_SERVER_URL" not in line and "/api/comics" not in line:
+            if (
+                "COMICS_SERVER_URL" not in line
+                and "GIXEN_SERVER_URL" not in line
+                and "/api/comics" not in line
+            ):
                 continue
             if "2>/dev/null" in line or swallow_re.search(line):
                 offenders.append(f"{md.name}:{i}: {line.strip()}")

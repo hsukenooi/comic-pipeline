@@ -37,7 +37,7 @@ from gixen_overlay.models import (
     CollectionCheckBatchRequest,
 )
 from gixen_overlay.title_parser import parse_title
-from server.db import get_bid_by_item_id
+from server.db import get_bid_by_item_id, resolve_server_dir
 from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task
 
 # BUI-91/92: the overlay wraps locg-cli's existing collection + wish-list logic
@@ -81,16 +81,18 @@ def _ensure_collection_store() -> None:
     ``<repo>/data/locg`` → ``~/.cache/locg``. On the Mac Mini's editable checkout
     the default would be the repo's ``data/locg/`` — the very location BUI-93
     retires as the source of truth. So when ``LOCG_DATA_DIR`` is unset we point
-    it at a server-owned directory beside the gixen DB
+    it at a server-owned directory beside the comics-server DB
     (``<dir(DB_PATH)>/collection-store``, default
-    ``~/.gixen-server/collection-store``). The directory is named neutrally, not
-    "locg" (R1: "the path is not named for LOCG"). An explicitly-set
-    ``LOCG_DATA_DIR`` always wins, so the Mac Mini launch env and the tests
-    (which point it at a tmp dir) both override this default.
+    ``~/.comics-server/collection-store``, with a ``~/.gixen-server`` fallback
+    for the not-yet-migrated live server — see ``resolve_server_dir``). The
+    directory is named neutrally, not "locg" (R1: "the path is not named for
+    LOCG"). An explicitly-set ``LOCG_DATA_DIR`` always wins, so the Mac Mini
+    launch env and the tests (which point it at a tmp dir) both override this
+    default.
     """
     if os.environ.get("LOCG_DATA_DIR", "").strip():
         return
-    db_path = Path(os.environ.get("DB_PATH") or (Path.home() / ".gixen-server" / "db.sqlite"))
+    db_path = Path(os.environ.get("DB_PATH") or (resolve_server_dir() / "db.sqlite"))
     store = db_path.parent / "collection-store"
     store.mkdir(parents=True, exist_ok=True)
     os.environ["LOCG_DATA_DIR"] = str(store)

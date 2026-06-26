@@ -6,7 +6,30 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path.home() / ".gixen-server" / "db.sqlite"
+def resolve_server_dir() -> Path:
+    """Resolve the comics-server data dir with a safe fallback (BUI-220).
+
+    The canonical default is ``~/.comics-server`` (this is the comics server,
+    not the Gixen bidding service). But the live Mac Mini still boots from the
+    legacy ``~/.gixen-server`` until that data is physically moved, so:
+
+      1. ``~/.comics-server`` if it exists (post-migration / fresh installs), else
+      2. ``~/.gixen-server`` if it exists (the live server keeps working), else
+      3. ``~/.comics-server`` (the canonical default for a clean machine).
+
+    This makes the rename safe to merge without Mac Mini access — nothing boots
+    from an empty dir.
+    """
+    new = Path.home() / ".comics-server"
+    legacy = Path.home() / ".gixen-server"
+    if new.exists():
+        return new
+    if legacy.exists():
+        return legacy
+    return new
+
+
+DB_PATH = resolve_server_dir() / "db.sqlite"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bids (

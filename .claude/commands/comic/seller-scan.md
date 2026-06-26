@@ -52,7 +52,7 @@ cd ~/Projects/comic-pipeline/apps/ebay && \
 
 By default the scan **hides wish-list matches it has already surfaced in a prior
 run**, so a repeat scan shows only listings you haven't seen before. The seen
-set is owned by the gixen server (`/api/comics/seller-scan/seen`), so the
+set is owned by the comics server (`/api/comics/seller-scan/seen`), so the
 MacBook and Mac Mini share one memory — scanning the same seller from either
 machine won't re-surface the same matches.
 
@@ -116,7 +116,7 @@ Copy the eBay URLs from the URL column (MATCH rows, plus any UNCERTAIN rows the 
 | 0 listings fetched | Seller may have no active auction listings; check their eBay page |
 | False positives (wrong comic) | Every surfaced match (score ≥ 0.65) has already passed the script's internal Claude verification; the 0.65–0.69 band is borderline and worth eyeballing on the listing page. Rejected candidates are printed to stderr (`Filtered N likely false positive(s)`) — check there if a real match seems missing |
 | Expected a match but got nothing new | It was already surfaced in a prior scan and hidden by default. Re-run with `--all` to see every match. |
-| `could not fetch/record seen item IDs` warning | Best-effort seen-tracking couldn't reach the server, so the scan showed all matches (safe fallback). Check `$GIXEN_SERVER_URL` is reachable if you want only-new filtering back. |
-| Wish list empty | seller-scan now fetches the wish-list from the gixen server (`GET /api/comics/wish-list`), not a local `locg` call. Check `curl -sf "$GIXEN_SERVER_URL/api/comics/wish-list"` returns items; if empty, run the LOCG import flow. |
-| `GIXEN_SERVER_URL is not set` | seller-scan fetches the wish-list over HTTP (apps/ebay can't import locg). Set `GIXEN_SERVER_URL` (MacBook → `http://mac-mini.tail9b7fa5.ts.net:8080`) and re-run. |
+| `could not fetch/record seen item IDs` warning | Best-effort seen-tracking couldn't reach the server, so the scan showed all matches (safe fallback). Check `$COMICS_SERVER_URL` is reachable if you want only-new filtering back. |
+| Wish list empty | seller-scan now fetches the wish-list from the comics server (`GET /api/comics/wish-list`), not a local `locg` call. Check `curl -sf "$COMICS_SERVER_URL/api/comics/wish-list"` returns items; if empty, run the LOCG import flow. |
+| `COMICS_SERVER_URL is not set` | seller-scan fetches the wish-list over HTTP (apps/ebay can't import locg). Set `COMICS_SERVER_URL` (MacBook → `http://mac-mini.tail9b7fa5.ts.net:8080`) and re-run. |
 | Rate limit error | Re-run after a few seconds; the Browse API allows retries |

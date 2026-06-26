@@ -27,8 +27,9 @@ import fmv_runner
                    "NOT bypass the one-sided/spread guards (a guarded book stays "
                    "flagged for manual pricing).")
 @click.option("--quiet", is_flag=True, help="Suppress the human table on stdout.")
-@click.option("--server-url", envvar="GIXEN_SERVER_URL", default=None,
-              help="Gixen server URL (also reads GIXEN_SERVER_URL).")
+@click.option("--server-url", envvar=["COMICS_SERVER_URL", "GIXEN_SERVER_URL"], default=None,
+              help="Comics server URL (reads COMICS_SERVER_URL, "
+                   "falling back to the deprecated GIXEN_SERVER_URL).")
 def cli(batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool, grade_window: float | None,
         quiet: bool, server_url: str | None) -> None:
@@ -51,6 +52,13 @@ def cli(batch_path: str | None, out_path: str | None,
         "grade": 8.0, "locg_id": 1081721, "locg_variant_id": null,
         "publisher": "dark horse", "notes": "..."}, ...]
     """
+    # BUI-220: warn when the server URL was supplied only via the deprecated
+    # GIXEN_SERVER_URL env (the canonical name is COMICS_SERVER_URL).
+    if not os.environ.get("COMICS_SERVER_URL") and os.environ.get("GIXEN_SERVER_URL"):
+        click.echo(
+            "warning: GIXEN_SERVER_URL is deprecated; use COMICS_SERVER_URL",
+            err=True,
+        )
     fmv_runner.run(
         batch_path=batch_path,
         out_path=out_path,

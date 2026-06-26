@@ -11,13 +11,13 @@ Compute fair market value from real eBay sold transactions. No multiplier math �
 
 **Default path: `comic-fmv`.** It handles fetch (via `ebay-sold-comps`), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
 
-Before running, ensure `SERPAPI_KEY` and `GIXEN_SERVER_URL` are set. If either is missing, source the canonical env file first:
+Before running, ensure `SERPAPI_KEY` and `COMICS_SERVER_URL` are set. If either is missing, source the canonical env file first:
 
 ```bash
 set -a && source ~/Projects/comic-pipeline/apps/ebay/.env && set +a
 ```
 
-`SERPAPI_KEY` lives in `~/Projects/comic-pipeline/apps/ebay/.env`. `GIXEN_SERVER_URL` is machine-dependent — see the Server Health Check section below.
+`SERPAPI_KEY` lives in `~/Projects/comic-pipeline/apps/ebay/.env`. `COMICS_SERVER_URL` is machine-dependent — see the Server Health Check section below.
 
 ```bash
 comic-fmv --batch <working_list.json> --out <results.json>
@@ -30,7 +30,7 @@ comic-fmv --batch <working_list.json> --out <results.json>
 `grade_confidence` (optional, `high`|`medium`|`medium-low`|`low` — **four** levels, BUI-162) is the photo-coverage confidence from `/comic:grade`. When present and low, it haircuts the max bid (see Step 6) — `medium-low` and `low` haircut **differently** (0.70 vs 0.60), so don't collapse them. Absent → standard 80% bid, no haircut (back-compat for seller-stated grades and manual runs).
 
 Flags:
-- `--max-age-days N` (default 7): reuse FMVs already in the Gixen DB if `fmv_updated_at` is within N days
+- `--max-age-days N` (default 7): reuse FMVs already in the comics server's DB if `fmv_updated_at` is within N days
 - `--force`: bypass both the SerpApi cache and the DB cache and recompute everything
 
 The CLI prints a human-readable table to stdout and writes the full structured result to `--out`. Present the table to the user and carry the JSON forward to Step 4 of `/comic:buy`.
@@ -55,11 +55,11 @@ hand-roll URL resolution or the health check here:
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1   # GIXEN_SERVER_URL (env var, hostname fallback)
+comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
 comics_health_gate     || exit 1   # the server must answer
 ```
 
-If either step fails, **stop immediately** — the Gixen server is unreachable or
+If either step fails, **stop immediately** — the comics server is unreachable or
 the machine is unrecognised, so FMV data cannot be saved. Do not proceed with
 any queries.
 
@@ -285,7 +285,7 @@ For an active auction with 30+ bids that has already crossed your computed Q75, 
 Two caches insulate this skill from SerpApi's 250/month free tier and from re-running compute we already did. The CLI handles both automatically; the manual fallback should respect them.
 
 1. **SerpApi response cache (`ebay-fetch sold-comps`)** — cache key `sha256(canonical_query_url)`, stored at `~/.cache/ebay-sold-comps/<sha>.json`, TTL 7 days. eBay sold prices for older books move slowly; one fresh fetch per book per week is plenty. Bypass with `--force`.
-2. **DB FMV cache (Gixen `comics` table)** — before any SerpApi call, look up the existing row by `(locg_id, grade)` and reuse if `fmv_updated_at` is within `--max-age-days N` (default 7). Bypass with `--force`. The `POST /api/comics` endpoint always touches `fmv_updated_at` on FMV-field updates, so the freshness check is reliable.
+2. **DB FMV cache (the comics server's `comics` table)** — before any SerpApi call, look up the existing row by `(locg_id, grade)` and reuse if `fmv_updated_at` is within `--max-age-days N` (default 7). Bypass with `--force`. The `POST /api/comics` endpoint always touches `fmv_updated_at` on FMV-field updates, so the freshness check is reliable.
 
 Manual fallback: skip these unless you're explicitly recomputing — re-running by hand spends API calls that the CLI would have served from cache.
 
@@ -313,7 +313,7 @@ Always include:
 Upsert each comic into the `comics` table immediately after computing FMV. This is the authoritative step for comic metadata — `/comic:snipe-add` links bids to these records, not the other way around.
 
 ```bash
-curl -s -X POST $GIXEN_SERVER_URL/api/comics \
+curl -s -X POST $COMICS_SERVER_URL/api/comics \
   -H "Content-Type: application/json" \
   -d '{
     "title": "X-Men",

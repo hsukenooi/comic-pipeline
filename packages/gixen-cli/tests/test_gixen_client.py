@@ -1227,7 +1227,12 @@ class TestCliListJson:
              "current_bid": "5.00 USD", "time_to_end": "1 h", "status": "SCHEDULED"},
         ]
 
+        # Pin _server_url so the test is hermetic w.r.t. an ambient
+        # COMICS_SERVER_URL/GIXEN_SERVER_URL — otherwise the BUI-220 deprecation
+        # warning (stderr) mixes into CliRunner's captured output and breaks the
+        # JSON parse.
         with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value="http://localhost:8080"), \
              patch("cli._server_request", return_value=snipes):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = snipes
@@ -1246,6 +1251,7 @@ class TestCliListJson:
         runner = CliRunner()
 
         with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value="http://localhost:8080"), \
              patch("cli._server_request", return_value=[]):
             mock_client = MagicMock()
             mock_client.list_snipes.return_value = []
@@ -1819,8 +1825,8 @@ from cli import cli as cli_app
 
 
 def test_cli_add_posts_to_server(monkeypatch):
-    """When GIXEN_SERVER_URL is set, `add` POSTs to server."""
-    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+    """When COMICS_SERVER_URL is set, `add` POSTs to server."""
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://localhost:8080")
     monkeypatch.setenv("GIXEN_USERNAME", "u")
     monkeypatch.setenv("GIXEN_PASSWORD", "p")
 
@@ -1843,10 +1849,38 @@ def test_cli_add_posts_to_server(monkeypatch):
             assert "/api/bids" in call_url
 
 
+def test_cli_add_accepts_deprecated_gixen_server_url(monkeypatch):
+    """BUI-220: COMICS_SERVER_URL is canonical, but the deprecated
+    GIXEN_SERVER_URL alias must still route to the server (with a one-line
+    deprecation warning) when it's the only one set."""
+    import cli as cli_mod
+    monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
+    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+    monkeypatch.setattr(cli_mod, "_DEPRECATION_WARNED", False)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        with patch("cli.requests") as mock_req:
+            mock_resp = MagicMock()
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = {
+                "item_id": "123456789", "status": "PENDING", "max_bid": 50.0
+            }
+            mock_req.post.return_value = mock_resp
+            mock_req.get.return_value = mock_resp
+
+            result = runner.invoke(cli_app, ["add", "123456789", "50.00"])
+            assert result.exit_code == 0
+            assert "Added snipe" in result.output
+            assert "deprecated" in result.output.lower()
+            mock_req.post.assert_called_once()
+            assert "/api/bids" in mock_req.post.call_args[0][0]
+
+
 def test_cli_server_unreachable_shows_error(monkeypatch):
     """When server is unreachable, add fails with clear message."""
     import requests as req_lib
-    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://localhost:8080")
     monkeypatch.setenv("GIXEN_USERNAME", "u")
     monkeypatch.setenv("GIXEN_PASSWORD", "p")
 
@@ -1863,8 +1897,8 @@ def test_cli_server_unreachable_shows_error(monkeypatch):
 
 
 def test_cli_edit_patches_server(monkeypatch):
-    """When GIXEN_SERVER_URL is set, `edit` sends PATCH to /api/bids/{item_id}."""
-    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+    """When COMICS_SERVER_URL is set, `edit` sends PATCH to /api/bids/{item_id}."""
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://localhost:8080")
 
     runner = CliRunner()
     with patch("cli.requests") as mock_req:
@@ -1881,8 +1915,8 @@ def test_cli_edit_patches_server(monkeypatch):
 
 
 def test_cli_remove_deletes_server(monkeypatch):
-    """When GIXEN_SERVER_URL is set, `remove` sends DELETE to /api/bids/{item_id}."""
-    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+    """When COMICS_SERVER_URL is set, `remove` sends DELETE to /api/bids/{item_id}."""
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://localhost:8080")
 
     runner = CliRunner()
     with patch("cli.requests") as mock_req:
@@ -1899,8 +1933,8 @@ def test_cli_remove_deletes_server(monkeypatch):
 
 
 def test_cli_purge_posts_to_server(monkeypatch):
-    """When GIXEN_SERVER_URL is set, `purge` sends POST to /api/purge."""
-    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+    """When COMICS_SERVER_URL is set, `purge` sends POST to /api/purge."""
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://localhost:8080")
 
     runner = CliRunner()
     with patch("cli.requests") as mock_req:
@@ -1918,7 +1952,7 @@ def test_cli_purge_posts_to_server(monkeypatch):
 
 def test_cli_purge_dry_run_server_mode(monkeypatch):
     """purge --dry-run in server mode prints a message and makes no HTTP request."""
-    monkeypatch.setenv("GIXEN_SERVER_URL", "http://localhost:8080")
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://localhost:8080")
 
     runner = CliRunner()
     with patch("cli.requests") as mock_req:

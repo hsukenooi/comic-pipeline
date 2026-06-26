@@ -1,12 +1,12 @@
 ---
 name: comic:collection-check
-description: Check if identified comics are already in your collection via the gixen server API. Use when deciding whether to buy a comic to avoid duplicates.
+description: Check if identified comics are already in your collection via the comics server API. Use when deciding whether to buy a comic to avoid duplicates.
 ---
 
 # Comic Collection Check
 
 Check whether identified comics are already in your collection by querying the
-gixen server's collection API (`/api/comics/collection/*`). The server is the
+comics server's collection API (`/api/comics/collection/*`). The server is the
 single source of truth across machines (BUI-87), so both the MacBook and the Mac
 Mini see the same answer.
 
@@ -21,24 +21,24 @@ from the `/comic:identify` output table or provided directly by the user.
 
 ## Step 0: Resolve the server + bootstrap guard
 
-Resolve `GIXEN_SERVER_URL` (env var, with a hostname fallback) and confirm the
+Resolve `COMICS_SERVER_URL` (env var, with a hostname fallback) and confirm the
 server is up before any checks — same pattern as `/comic:fmv` and
 `/comic:snipe-add`:
 
 ```bash
-echo "${GIXEN_SERVER_URL:-UNSET}"; hostname
+echo "${COMICS_SERVER_URL:-UNSET}"; hostname
 ```
 
-If `GIXEN_SERVER_URL` is unset, infer it:
+If `COMICS_SERVER_URL` is unset, infer it:
 - `Hsus-MacBook-Air.local` → `http://mac-mini.tail9b7fa5.ts.net:8080`
 - a Mac Mini hostname → `http://localhost:8080`
-- neither → **stop** ("machine is unrecognised — set GIXEN_SERVER_URL").
+- neither → **stop** ("machine is unrecognised — set COMICS_SERVER_URL").
 
 Health gate, then read collection status:
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
+curl -sf "$COMICS_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
+curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 ```
 
 **If the health gate or status call fails:** STOP immediately — the collection
@@ -75,12 +75,12 @@ non-200 makes curl exit non-zero (each `year` below is the **cover year of that
 specific issue** — ASM #300 shipped 1988, Uncanny X-Men #179 shipped 1984):
 
 ```bash
-curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
+curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
   --data-urlencode "series=Amazing Spider-Man" \
   --data-urlencode "issue=300" \
   --data-urlencode "year=1988"
 
-curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
+curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
   --data-urlencode "series=Uncanny X-Men" \
   --data-urlencode "issue=179" \
   --data-urlencode "year=1984" \
@@ -147,7 +147,7 @@ the check **once** with the article toggled (add `The ` if absent; strip it if
 present), passing the same `issue`/`year`/`variant`:
 
 ```bash
-curl -sf -G "$GIXEN_SERVER_URL/api/comics/collection/check" \
+curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
   --data-urlencode "series=The Incredible Hulk" \
   --data-urlencode "issue=330" \
   --data-urlencode "year=1987"
@@ -170,7 +170,7 @@ wrong volume, or looks like a Metron-style name, fetch the cache's actual series
 names and check whether the queried name is present (or close to one):
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/series-names"
+curl -sf "$COMICS_SERVER_URL/api/comics/collection/series-names"
 ```
 
 If the queried series is **absent** from that list, the `not_in_cache` is suspect —

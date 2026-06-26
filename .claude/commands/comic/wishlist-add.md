@@ -1,12 +1,12 @@
 ---
 name: comic:wishlist-add
-description: Look up a series on Metron and add each of its issues to the wish-list on the gixen server, skipping any issues you already own. Only Metron is queried for the lookup; LOCG is not. Use to wish-list a whole run at once.
+description: Look up a series on Metron and add each of its issues to the wish-list on the comics server, skipping any issues you already own. Only Metron is queried for the lookup; LOCG is not. Use to wish-list a whole run at once.
 ---
 
 # Comic Wishlist Add
 
-Add every issue of a series (or a sub-range) to the wish-list on the gixen server
-(BUI-87). The issue count comes from **Metron** (metron.cloud); **no LOCG network
+Add every issue of a series (or a sub-range) to the wish-list on the comics server
+(on the Mac Mini; BUI-87). The issue count comes from **Metron** (metron.cloud); **no LOCG network
 access is required** — adds go to the server's canonical wish-list via
 `POST /api/comics/wish-list`, so they're visible on both machines immediately.
 
@@ -30,10 +30,10 @@ set -a; . ~/.config/locg/.env 2>/dev/null; set +a
 > Metron credentials not found. Add `METRON_USERNAME` and `METRON_PASSWORD` to
 > `~/.config/locg/.env` and retry.
 
-Also resolve and health-gate the gixen server (the wish-list now lives there)
+Also resolve and health-gate the comics server (the wish-list now lives there)
 through the shared comics-server convention (BUI-172,
 `docs/conventions/comics-server-call.md`). This actually **infers** the URL from
-the hostname when `GIXEN_SERVER_URL` is unset — including the Mac Mini →
+the hostname when `COMICS_SERVER_URL` is unset — including the Mac Mini →
 `localhost` mapping the old comment-only block omitted (BUI-170), so the skill no
 longer aborts on the Mac Mini where the correct answer is `localhost:8080`:
 
@@ -116,7 +116,7 @@ wish-lists a book you already own. Fetch the catalog's actual series names and
 match the Metron `series` against them:
 
 ```bash
-comics_curl "$GIXEN_SERVER_URL/api/comics/collection/series-names" || exit 1
+comics_curl "$COMICS_SERVER_URL/api/comics/collection/series-names" || exit 1
 ```
 
 Normalized-match the Metron `series` (strip a leading article, lowercase) against
@@ -151,7 +151,7 @@ year (drop the key entirely for an issue with no `cover_date`):
 # Build items.json programmatically from your number→cover_year map, e.g.:
 #   {"items":[{"series":"Uncanny X-Men","issue":"185","year":"1984"},
 #             {"series":"Uncanny X-Men","issue":"186","year":"1984"}, ...]}
-curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/collection/check/batch" \
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
   -H 'content-type: application/json' \
   -d @items.json
 ```
@@ -187,7 +187,7 @@ issue. A real wish-list is large (685 items in the motivating run); a per-issue
 grep over that payload is the redundant work this step removes.
 
 ```bash
-comics_curl "$GIXEN_SERVER_URL/api/comics/wish-list" || exit 1
+comics_curl "$COMICS_SERVER_URL/api/comics/wish-list" || exit 1
 ```
 
 Parse the returned `[{name, id, ...}]` **once** into a set keyed by
@@ -223,10 +223,10 @@ owned-guard's masthead fallback (BUI-184) gets the same catch the Step 3 filter
 does; omit `year` only for an issue Metron had no `cover_date` for.
 
 ```bash
-curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/wish-list" \
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list" \
   -H 'content-type: application/json' \
   -d '{"title": "The Mighty Thor #154", "year": "1968"}'
-curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/wish-list" \
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list" \
   -H 'content-type: application/json' -d '{"title": "Children of the Vault #2"}'  # no cover_date → no year
 # …
 ```
@@ -261,7 +261,7 @@ touches owned books. See
 so you no longer need to SSH into the Mac Mini to run `locg wish-list remove`:
 
 ```bash
-curl -sf -X DELETE "$GIXEN_SERVER_URL/api/comics/wish-list?title=Children+of+the+Vault+%231"
+curl -sf -X DELETE "$COMICS_SERVER_URL/api/comics/wish-list?title=Children+of+the+Vault+%231"
 ```
 
 Pass the exact `name` of the wished entry as the `title` query param (URL-encoded).

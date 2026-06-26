@@ -4,9 +4,11 @@ collection store (BUI-125).
 
 This is a **one-time, manual** maintenance script — not part of the everyday
 `locg` CLI surface — for the data-hygiene issues a BUI-122 dry-run surfaced in
-the server store (`~/.gixen-server/collection-store/`). It is independent of the
-sync mechanics; it removes leftover junk the import reconciler deliberately
-leaves *pending and visible* rather than merging or duplicating.
+the comics-server store (`~/.comics-server/collection-store/`, with a
+`~/.gixen-server` fallback until the data is physically migrated). It is
+independent of the sync mechanics; it removes leftover junk the import
+reconciler deliberately leaves *pending and visible* rather than merging or
+duplicating.
 
 Three classes (see packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md
 "Duplicate win-records cleanup"):
@@ -35,7 +37,8 @@ atomically (tempfile + os.replace).
 
 Usage (on the server host):
 
-    # inspect — read-only, default store dir ~/.gixen-server/collection-store
+    # inspect — read-only, default store dir ~/.comics-server/collection-store
+    # (falls back to ~/.gixen-server/collection-store until data is migrated)
     python3 scripts/cleanup_duplicates.py
 
     # against an arbitrary store copy
@@ -63,7 +66,26 @@ from locg.collection_cache import _normalize_series_key, make_identity
 from locg.collection_io import _normalize_title
 from locg.commands import _split_full_title
 
-DEFAULT_STORE_DIR = Path.home() / ".gixen-server" / "collection-store"
+def _resolve_store_dir() -> Path:
+    """Comics-server collection store with a safe fallback (BUI-220).
+
+    Mirrors gixen-cli's ``server.db.resolve_server_dir`` without importing it
+    (locg-cli must not depend back on gixen-cli): ``~/.comics-server`` if it
+    exists, else the legacy ``~/.gixen-server`` while it still does, else the
+    canonical ``~/.comics-server``. Returns the ``collection-store`` subdir.
+    """
+    new = Path.home() / ".comics-server"
+    legacy = Path.home() / ".gixen-server"
+    if new.exists():
+        base = new
+    elif legacy.exists():
+        base = legacy
+    else:
+        base = new
+    return base / "collection-store"
+
+
+DEFAULT_STORE_DIR = _resolve_store_dir()
 
 
 def _issue_key(token: str) -> str:

@@ -22,7 +22,7 @@ unreachable.
 
 ```bash
 SNIPES_JSON="$(gixen list --json)" || {
-  echo "gixen list failed — the Gixen server is unreachable or errored. NOT rendering empty tables." >&2
+  echo "gixen list failed — the comics server (or Gixen in direct mode) is unreachable or errored. NOT rendering empty tables." >&2
   exit 1
 }
 ```
@@ -69,7 +69,7 @@ Sort by most recently ended first. If end timestamps are unavailable from the CL
 **Result column** — derive from the `status` field (not bid comparison).
 
 `gixen list --json` returns **two different `status` contracts** depending on mode (BUI-150), so the table must cover both:
-- **Server / thin-client mode** (`GIXEN_SERVER_URL` set — the production MacBook + Mac Mini setup): the server returns the **internal mapped** status, one of `WON` / `LOST` / `FAILED` / `ENDED`. The raw Gixen failure reason survives in `status_mirror`.
+- **Server / thin-client mode** (`COMICS_SERVER_URL` set — the production MacBook + Mac Mini setup): the server returns the **internal mapped** status, one of `WON` / `LOST` / `FAILED` / `ENDED`. The raw Gixen failure reason survives in `status_mirror`.
 - **Direct mode** (no server): the raw Gixen string (`BID UNDER ASKING PRICE`, `NETWORK ERROR`, …).
 
 | `status` value | Result label |

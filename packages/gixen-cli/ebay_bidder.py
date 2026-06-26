@@ -19,9 +19,15 @@ from typing import Any
 
 import httpx
 
+from server.db import resolve_server_dir
+
 logger = logging.getLogger(__name__)
 
-COOKIES_FILE = Path.home() / ".gixen-server" / "ebay_cookies.json"
+# BUI-220: these live in the comics-server data dir (only the directory path is
+# the comics server — the bidding itself is genuinely Gixen). resolve_server_dir
+# tracks ~/.comics-server with a ~/.gixen-server fallback, so the path stays
+# correct after the physical migration.
+COOKIES_FILE = resolve_server_dir() / "ebay_cookies.json"
 
 _BID_REVIEW_URL = "https://offer.ebay.com/ws/eBayISAPI.dll?MakeBid&item={item_id}&maxbid={max_bid:.2f}"
 _BID_POST_URL   = "https://offer.ebay.com/ws/eBayISAPI.dll?MakeBid"
@@ -227,7 +233,7 @@ async def setup_session() -> None:
     Saves cookies to COOKIES_FILE for use by place_bid()."""
     from playwright.async_api import async_playwright
 
-    CONTEXT_PATH = Path.home() / ".gixen-server" / "ebay_browser"
+    CONTEXT_PATH = resolve_server_dir() / "ebay_browser"
     CONTEXT_PATH.mkdir(parents=True, exist_ok=True)
 
     pw = await async_playwright().start()

@@ -1,6 +1,6 @@
 ---
 name: comic:verify
-description: Verify a working list of comics is fully linked end-to-end in the gixen DB (bids → bid_fmvs → fmv → comics). Use after /comic:buy or /comic:snipe-add to confirm the pipeline didn't silently drop a write.
+description: Verify a working list of comics is fully linked end-to-end in the comics server's DB (bids → bid_fmvs → fmv → comics). Use after /comic:buy or /comic:snipe-add to confirm the pipeline didn't silently drop a write.
 ---
 
 # Comic Verify
@@ -20,7 +20,7 @@ comics_resolve_server || exit 1
 comics_health_gate     || exit 1
 ```
 
-If either fails, stop with: "Cannot verify — the Gixen server isn't reachable. Skipping verification step."
+If either fails, stop with: "Cannot verify — the comics server isn't reachable. Skipping verification step."
 
 ## Input
 
@@ -43,7 +43,7 @@ surfaces the error body** instead of silently returning an empty string
 (BUI-169):
 
 ```bash
-comics_curl -X POST "$GIXEN_SERVER_URL/api/comics/verify" \
+comics_curl -X POST "$COMICS_SERVER_URL/api/comics/verify" \
   -H 'content-type: application/json' \
   -d @working_list.verify.json || {
     echo "Verification call failed — could not confirm linkage. Do NOT report all-clear." >&2
@@ -103,7 +103,7 @@ If `summary.issues > 0`, after the table give the user one-line guidance per ver
 - `no_fmv_at_grade` → "The bid's grade doesn't have an FMV row yet. Run `/comic:fmv` at this grade."
 - `no_comic` → "No comic linked. Run `POST /api/extract-comics` or re-run `/comic:snipe-add` with `--locg-id` set."
 - `partial` → "Junction or `bids.fmv_id` is out of sync. Surface to user for manual reconciliation."
-- `no_bid` → "Snipe never landed in the DB. Confirm `GIXEN_SERVER_URL` was set during `/comic:snipe-add` and the snipe is on Gixen."
+- `no_bid` → "Snipe never landed in the DB. Confirm `COMICS_SERVER_URL` was set during `/comic:snipe-add` and the snipe is on Gixen."
 
 ## When to invoke
 
@@ -113,7 +113,7 @@ If `summary.issues > 0`, after the table give the user one-line guidance per ver
 
 ## Notes
 
-- This skill does not write — it's read-only against the gixen DB. Safe to run repeatedly.
+- This skill does not write — it's read-only against the comics server's DB. Safe to run repeatedly.
 - Lots (item_ids linked to multiple comics): pass one row per `(item_id, grade)` you want to confirm. The endpoint walks all `bid_fmvs` for the bid and matches by grade (and `locg_id` if given).
 - `bids.fmv_id` mismatch with the matched fmv shows up as `partial` — this is the PER-90 footgun (denormalized pointer drifted from the canonical primary row).
 - **LOCG collection verification** (did the comic land in LOCG with the right state?) is handled by step 7 of `/comic:collection-add` — it runs inline in the same Playwright session and checks `in_collection`, `wish_removed`, and `db_linked`. This skill covers the bid→fmv→comic DB chain only.
