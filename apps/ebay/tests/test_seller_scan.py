@@ -362,7 +362,7 @@ class TestMatchListing:
 
 class TestFetchWishList:
     def test_returns_parsed_items(self, monkeypatch):
-        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080")
         resp = MagicMock()
         resp.raise_for_status.return_value = None
         resp.json.return_value = [{"id": 1, "name": "Daredevil #1"}]
@@ -373,12 +373,25 @@ class TestFetchWishList:
         assert get.call_args[0][0] == "http://mac-mini.example:8080/api/comics/wish-list"
 
     def test_hard_fails_when_server_url_unset(self, monkeypatch):
+        monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
         monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
         with pytest.raises(SystemExit):
             seller_scan.fetch_wish_list()
 
+    def test_deprecated_gixen_server_url_still_resolves(self, monkeypatch):
+        # BUI-220: COMICS_SERVER_URL is canonical, but the deprecated
+        # GIXEN_SERVER_URL alias must still resolve when it's the only one set.
+        monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
+        monkeypatch.setenv("GIXEN_SERVER_URL", "http://legacy.example:8080")
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = [{"id": 1, "name": "Daredevil #1"}]
+        with patch("seller_scan.requests.get", return_value=resp) as get:
+            assert seller_scan.fetch_wish_list() == [{"id": 1, "name": "Daredevil #1"}]
+        assert get.call_args[0][0] == "http://legacy.example:8080/api/comics/wish-list"
+
     def test_hard_fails_when_server_unreachable(self, monkeypatch):
-        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080")
         with patch(
             "seller_scan.requests.get",
             side_effect=seller_scan.requests.exceptions.ConnectionError("down"),
@@ -392,7 +405,7 @@ class TestFetchWishList:
 
 class TestFetchSeenItemIds:
     def test_returns_set_on_success(self, monkeypatch):
-        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080/")
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080/")
         resp = MagicMock()
         resp.raise_for_status.return_value = None
         resp.json.return_value = {"item_ids": ["111", "222"]}
@@ -405,6 +418,7 @@ class TestFetchSeenItemIds:
         assert get.call_args[1]["params"] == {"seller": "tuners36"}
 
     def test_empty_set_when_server_url_unset(self, monkeypatch):
+        monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
         monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
         with patch("seller_scan.requests.get") as get:
             assert seller_scan.fetch_seen_item_ids("tuners36") == set()
@@ -413,7 +427,7 @@ class TestFetchSeenItemIds:
     def test_soft_fails_to_empty_set_when_unreachable(self, monkeypatch):
         # Unlike the wish-list, a failed seen-read must NOT abort — it falls back
         # to showing all matches (a duplicate is safe; a hidden match is not).
-        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080")
         with patch(
             "seller_scan.requests.get",
             side_effect=seller_scan.requests.exceptions.ConnectionError("down"),
@@ -423,7 +437,7 @@ class TestFetchSeenItemIds:
 
 class TestRecordItemsSeen:
     def test_posts_item_ids(self, monkeypatch):
-        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080/")
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080/")
         resp = MagicMock()
         resp.raise_for_status.return_value = None
         with patch("seller_scan.requests.post", return_value=resp) as post:
@@ -437,12 +451,13 @@ class TestRecordItemsSeen:
         }
 
     def test_noop_on_empty_item_ids(self, monkeypatch):
-        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080")
         with patch("seller_scan.requests.post") as post:
             seller_scan.record_items_seen([], "tuners36")
         post.assert_not_called()
 
     def test_noop_when_server_url_unset(self, monkeypatch):
+        monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
         monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
         with patch("seller_scan.requests.post") as post:
             seller_scan.record_items_seen(["111"], "tuners36")
@@ -450,7 +465,7 @@ class TestRecordItemsSeen:
 
     def test_swallows_post_failure(self, monkeypatch):
         # Best-effort: a failed record must not raise.
-        monkeypatch.setenv("GIXEN_SERVER_URL", "http://mac-mini.example:8080")
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080")
         with patch(
             "seller_scan.requests.post",
             side_effect=seller_scan.requests.exceptions.ConnectionError("down"),

@@ -21,16 +21,16 @@ At each step, present results to the user and wait for approval before proceedin
 
 ## Step 0: Resolve the server
 
-Resolve `GIXEN_SERVER_URL` **once, up front** via the shared comics-server
+Resolve `COMICS_SERVER_URL` **once, up front** via the shared comics-server
 convention (BUI-172), so every server-touching step — including Step 1's seller
 advisory — uses the same resolved URL (BUI-154):
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1   # sets + exports GIXEN_SERVER_URL
+comics_resolve_server || exit 1   # sets + exports COMICS_SERVER_URL
 ```
 
-Without this, Step 1's `curl` ran against an unset `GIXEN_SERVER_URL` (empty
+Without this, Step 1's `curl` ran against an unset `COMICS_SERVER_URL` (empty
 host) and the seller-reliability advisory silently no-op'd for the whole run —
 suppressing the over-grader signal that informs the Step 2.5 photo-grade
 decision. The leaf skills still health-gate the server at their own steps.
@@ -50,10 +50,10 @@ Gate: user confirms identifications are correct. Flag Buy It Now listings — th
 
 For each distinct seller in the table, query the seller's grading track record
 (cheap local GET; best-effort — on any error treat as no history and proceed).
-`GIXEN_SERVER_URL` is already resolved in Step 0, so this advisory actually runs:
+`COMICS_SERVER_URL` is already resolved in Step 0, so this advisory actually runs:
 
 ```bash
-curl -s "$GIXEN_SERVER_URL/api/seller-reliability?seller=<seller_username>"
+curl -s "$COMICS_SERVER_URL/api/seller-reliability?seller=<seller_username>"
 ```
 
 When `sample_size >= 1`, surface a line before the user decides whether to grade
@@ -144,7 +144,7 @@ fmv_runner.py → result["comic_id"]
 If the `comic_id` is dropped at any step the snipe still records, but the dashboard loses condition and FMV data for that bid. Step 5 is where most past sessions broke the chain.
 
 Flags worth knowing:
-- `--max-age-days N` (default 7) — reuses FMVs already in the Gixen DB if `fmv_updated_at` is recent. **Note (BUI-153):** DB-FMV reuse only fires for books that carry a `locg_id`, but the orchestrated buy flow derives series/issue from the eBay title and never resolves one — so this cache-skip is effectively inert in `/comic:buy` and every run recomputes FMV from comps (the ebay-sold-comps SerpApi response cache still applies). `--max-age-days` engages on the standalone `comic-fmv` path when the batch carries explicit `locg_id`s.
+- `--max-age-days N` (default 7) — reuses FMVs already in the comics server's DB if `fmv_updated_at` is recent. **Note (BUI-153):** DB-FMV reuse only fires for books that carry a `locg_id`, but the orchestrated buy flow derives series/issue from the eBay title and never resolves one — so this cache-skip is effectively inert in `/comic:buy` and every run recomputes FMV from comps (the ebay-sold-comps SerpApi response cache still applies). `--max-age-days` engages on the standalone `comic-fmv` path when the batch carries explicit `locg_id`s.
 - `--force` — bypasses both SerpApi and DB caches; use only when you suspect a stale comp pool
 
 **Confidence rubric** (CLI returns these labels; surface them in your presentation):

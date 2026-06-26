@@ -11,8 +11,9 @@ open gap). Behavior here was verified 2026-06-13 (BUI-122) against the code in
 
 ## Mental model
 
-- **The gixen server is the source of truth**, not `data/locg/`. The canonical
-  store lives on the server host at `~/.gixen-server/collection-store/`
+- **The comics server (on the Mac Mini) is the source of truth**, not
+  `data/locg/`. The canonical store lives on the server host at
+  `~/.gixen-server/collection-store/`
   (`collection.json` + rotating `.bak.0/1/2`, `wish-list.json`). `data/locg/` is
   now a gitignored local working cache, not repo-versioned.
 - All sync goes through the server API (`/api/comics/collection/*`,
@@ -252,7 +253,7 @@ already-owned dedup so they stop accumulating.
 
 ## What changed (BUI-122)
 
-- Source of truth corrected: gixen server store, not `data/locg/`.
+- Source of truth corrected: comics server store, not `data/locg/`.
 - BUI-47 marked fixed (local wish adds survive import).
 - Import reconciliation extended to pending `agent_win` rows (publisher-wildcard,
   exact-year) so LOCG re-dating a pushed win no longer duplicates it or strands it

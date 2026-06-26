@@ -1,12 +1,12 @@
 ---
 name: comic:collection-add
-description: Record won Gixen auctions into the collection on the gixen server, then export a CSV ready to upload to LOCG. No Playwright, no LOCG network access required.
+description: Record won Gixen auctions into the collection on the comics server, then export a CSV ready to upload to LOCG. No Playwright, no LOCG network access required.
 ---
 
 # Comic Collection Add
 
-Record won Gixen auctions into the collection on the gixen server (BUI-87) in one
-batch, then export a CSV for LOCG upload. The server is the single source of
+Record won Gixen auctions into the collection on the comics server (on the Mac
+Mini; BUI-87) in one batch, then export a CSV for LOCG upload. The server is the single source of
 truth across machines, so a win recorded here is visible on the other machine
 immediately — no git round-trip (R8). No Playwright, no live LOCG session needed.
 
@@ -14,15 +14,15 @@ immediately — no git round-trip (R8). No Playwright, no live LOCG session need
 
 ## Step 0: Resolve the server + bootstrap guard
 
-Resolve `GIXEN_SERVER_URL` (env var, with a hostname fallback — same as
+Resolve `COMICS_SERVER_URL` (env var, with a hostname fallback — same as
 `/comic:fmv`) and confirm the server is up before writing:
 
 ```bash
-echo "${GIXEN_SERVER_URL:-UNSET}"; hostname
+echo "${COMICS_SERVER_URL:-UNSET}"; hostname
 # unset → MacBook (Hsus-MacBook-Air.local): http://mac-mini.tail9b7fa5.ts.net:8080
 #         Mac Mini: http://localhost:8080 ; neither → stop
-curl -sf "$GIXEN_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
+curl -sf "$COMICS_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
+curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 ```
 
 **If the health gate fails:** STOP — do not record wins against an unreachable
@@ -59,7 +59,7 @@ double-recording; the window choice just decides how far back you can see.
 **Source A — history endpoint (preferred):**
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/api/comics/history"
+curl -sf "$COMICS_SERVER_URL/api/comics/history"
 ```
 
 Returns a JSON **array** of row objects. Filter to wins by **`status` only**:
@@ -115,7 +115,7 @@ Best-effort — a failed call falls back to processing all wins (same pattern as
 seller-scan):
 
 ```bash
-SEEN_IDS=$(curl -sf "$GIXEN_SERVER_URL/api/comics/collection/record-win/seen" \
+SEEN_IDS=$(curl -sf "$COMICS_SERVER_URL/api/comics/collection/record-win/seen" \
   | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin)['item_ids']))" \
   2>/dev/null || echo "")
 ```
@@ -173,7 +173,7 @@ to the server's record-win endpoint (`curl -sf` so a non-200 fails loudly):
 
 ```bash
 # /tmp/wins.json contains: {"wins": [ {entry}, {entry}, ... ]}
-curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/collection/record-win" \
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win" \
   -H 'content-type: application/json' \
   -d @/tmp/wins.json
 ```
@@ -204,7 +204,7 @@ already-owned dedup will catch a re-POST):
 ```bash
 # Build {"item_ids": ["111", "222", ...]} from the item_ids of the new wins
 python3 -c "import json; ids=[w['item_id'] for w in json.load(open('/tmp/wins.json'))['wins']]; print(json.dumps({'item_ids': ids}))" \
-  | curl -sf -X POST "$GIXEN_SERVER_URL/api/comics/collection/record-win/seen" \
+  | curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win/seen" \
     -H 'content-type: application/json' \
     -d @- \
   || echo "Warning: could not mark wins seen (non-fatal)"
@@ -216,7 +216,7 @@ The export reads the *server* collection and returns the file contents; save the
 locally for the LOCG upload:
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/export" -o /tmp/export.json
+curl -sf "$COMICS_SERVER_URL/api/comics/collection/export" -o /tmp/export.json
 ts=$(date +%Y-%m-%dT%H%M%S)
 python3 -c "import json,sys,os; d=json.load(open('/tmp/export.json')); \
   base=os.path.expanduser(f'~/Downloads/locg-bulk-import-$ts'); \
@@ -234,7 +234,7 @@ predates this run's wins, so it would undercount by exactly the rows you just
 added (BUI-156):
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/api/comics/collection/status"
+curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 # read pending_push_count and oldest_pending_days from this fresh response
 ```
 

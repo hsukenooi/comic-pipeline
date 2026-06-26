@@ -88,7 +88,7 @@ def run(*, batch_path: str | None, out_path: str | None,
     fmv_math's default ceiling. It does not bypass the priceability guards.
     """
     if not server_url:
-        click.echo("Error: GIXEN_SERVER_URL must be set. The fmv command "
+        click.echo("Error: COMICS_SERVER_URL must be set. The fmv command "
                    "needs the server for cache reuse and DB upsert.", err=True)
         sys.exit(1)
 

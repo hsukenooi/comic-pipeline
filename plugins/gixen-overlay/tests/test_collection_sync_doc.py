@@ -32,7 +32,7 @@ def test_export_does_not_reuse_fixed_stale_temp_file(text):
 def test_export_hard_fails_before_parsing(text):
     """BUI-138: the export call must hard-fail (and stop) before the python parse,
     so a failed fetch can't fall through to building a CSV."""
-    assert 'comics_curl "$GIXEN_SERVER_URL/api/comics/collection/export"' in text
+    assert 'comics_curl "$COMICS_SERVER_URL/api/comics/collection/export"' in text
     # the export line chains a failure guard that exits before the parse
     assert "not generating a CSV from stale data" in text
 
@@ -44,7 +44,7 @@ def test_step0_routes_through_shared_server_convention(text):
     assert "scripts/comics-server.sh" in text
     assert "comics_resolve_server" in text
     assert "comics_health_gate" in text
-    assert 'comics_curl "$GIXEN_SERVER_URL/api/comics/collection/status"' in text
+    assert 'comics_curl "$COMICS_SERVER_URL/api/comics/collection/status"' in text
 
 
 def test_no_dangling_csv_variable(text):

@@ -36,21 +36,21 @@ Round to a clean number (e.g., $136 → $135). User can override per comic.
 
 Before doing anything else, verify the server is configured and up.
 
-Check that `GIXEN_SERVER_URL` is set:
+Check that `COMICS_SERVER_URL` is set:
 
 ```bash
-echo "${GIXEN_SERVER_URL:-UNSET}"
+echo "${COMICS_SERVER_URL:-UNSET}"
 ```
 
-If it is not set, **stop immediately** with: "`GIXEN_SERVER_URL` is not set. Snipes cannot be recorded in the DB. Set the variable and confirm the server is running before continuing." Do not proceed.
+If it is not set, **stop immediately** with: "`COMICS_SERVER_URL` is not set. Snipes cannot be recorded in the DB. Set the variable and confirm the server is running before continuing." Do not proceed.
 
 Verify the server is responding:
 
 ```bash
-curl -sf "$GIXEN_SERVER_URL/health"
+curl -sf "$COMICS_SERVER_URL/health"
 ```
 
-If this fails or returns non-200, **stop immediately** with: "The Gixen server at `$GIXEN_SERVER_URL` is not responding. Snipes cannot be recorded in the DB. Confirm the server is running before continuing." Do not proceed.
+If this fails or returns non-200, **stop immediately** with: "The comics server at `$COMICS_SERVER_URL` is not responding. Snipes cannot be recorded in the DB. Confirm the server is running before continuing." Do not proceed.
 
 **2. Bid amounts**
 
@@ -69,7 +69,7 @@ error). On any non-zero `gixen add`:
 
 1. **Do not** record that item as `✅ Added` or silently continue as if it
    succeeded — mark it `❌ Failed` in the output table with the error.
-2. **Re-check server health** before the next item (`curl -sf "$GIXEN_SERVER_URL/health"`).
+2. **Re-check server health** before the next item (`curl -sf "$COMICS_SERVER_URL/health"`).
    If the server is down, STOP the batch and report which items were added and
    which remain unattempted — don't keep firing adds at a dead server.
 3. At the end, **summarize added vs. failed vs. remaining** so the user knows
@@ -119,7 +119,7 @@ If the grade is unknown, omit `--grade` (and `--comic-id` — link-fmv only fire
 gixen add {item_id} {max_bid}
 ```
 
-If `GIXEN_SERVER_URL` is not set (direct Gixen mode, no overlay DB), the same minimal form applies — linking is a no-op without the server.
+If `COMICS_SERVER_URL` is not set (direct Gixen mode, no overlay DB), the same minimal form applies — linking is a no-op without the server.
 
 After all adds, verify:
 

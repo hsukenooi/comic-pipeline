@@ -23,6 +23,32 @@ from ebay_fetch import (
 )
 
 
+# ─── Server URL resolution (BUI-220) ──────────────────────────────────────────
+
+_DEPRECATION_WARNED = False
+
+
+def _server_base():
+    """Return the comics server base URL (trailing slash trimmed), or "".
+
+    BUI-220: the canonical env var is COMICS_SERVER_URL; GIXEN_SERVER_URL is a
+    deprecated alias still read as a fallback. Using only the old var emits a
+    one-line deprecation warning to stderr (once).
+    """
+    global _DEPRECATION_WARNED
+    base = os.environ.get("COMICS_SERVER_URL", "").rstrip("/")
+    if base:
+        return base
+    legacy = os.environ.get("GIXEN_SERVER_URL", "").rstrip("/")
+    if legacy and not _DEPRECATION_WARNED:
+        print(
+            "warning: GIXEN_SERVER_URL is deprecated; use COMICS_SERVER_URL",
+            file=sys.stderr,
+        )
+        _DEPRECATION_WARNED = True
+    return legacy
+
+
 # ─── Wish list fetching ───────────────────────────────────────────────────────
 
 def fetch_wish_list():
@@ -36,10 +62,10 @@ def fetch_wish_list():
     condition (never returns a partial or empty list silently) so a scan can't
     run against a stale or empty wish list because the server was down.
     """
-    base = os.environ.get("GIXEN_SERVER_URL", "").rstrip("/")
+    base = _server_base()
     if not base:
         print(
-            "Error: GIXEN_SERVER_URL is not set — cannot reach the wish-list API.\n"
+            "Error: COMICS_SERVER_URL is not set — cannot reach the wish-list API.\n"
             "Set it in ~/.zshrc (MacBook → http://mac-mini.tail9b7fa5.ts.net:8080; "
             "Mac Mini → http://localhost:8080).",
             file=sys.stderr,
@@ -70,7 +96,7 @@ def fetch_seen_item_ids(seller):
     buy. So any failure → empty set + a warning, and the scan continues showing
     all matches.
     """
-    base = os.environ.get("GIXEN_SERVER_URL", "").rstrip("/")
+    base = _server_base()
     if not base:
         return set()
     url = f"{base}/api/comics/seller-scan/seen"
@@ -91,7 +117,7 @@ def record_items_seen(item_ids, seller):
 
     Warns on failure but never aborts (see fetch_seen_item_ids for the rationale).
     """
-    base = os.environ.get("GIXEN_SERVER_URL", "").rstrip("/")
+    base = _server_base()
     if not base or not item_ids:
         return
     url = f"{base}/api/comics/seller-scan/seen"
