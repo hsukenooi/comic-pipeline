@@ -391,10 +391,12 @@ Reject if:
 - Modern renumbered issue matching an original issue number (e.g. #10 (811))
 - Series name only in a subtitle or story description, not the actual series
 
-Respond with only a JSON array, one object per pair in order:
-{{"id": 1, "genuine": true}}
-or
-{{"id": 1, "genuine": false, "reason": "brief reason"}}
+Respond with a JSON array containing ONLY the ids you are REJECTING, each with a brief reason:
+[{{"id": 3, "reason": "X-Factor not X-Men"}}, {{"id": 7, "reason": "annual vs regular"}}]
+
+If nothing is rejected, return [].
+
+Any candidate id NOT present in your response is treated as genuine.
 
 Pairs:
 {pairs}"""
@@ -415,7 +417,7 @@ Pairs:
             continue
 
         try:
-            verdicts = json.loads(json_match.group())
+            rejected_list = json.loads(json_match.group())
         except json.JSONDecodeError:
             print(
                 f"Warning: invalid JSON in Claude response for candidates "
@@ -424,39 +426,45 @@ Pairs:
             )
             continue
 
-        if len(verdicts) != len(chunk):
+        # Validate: every returned object must have an int id strictly within
+        # the chunk's 1-based range.  A missing key, non-int id, or out-of-range
+        # id indicates a malformed response → reject the whole chunk (fail-closed).
+        valid_ids = set(range(1, len(chunk) + 1))
+        try:
+            rejected_ids: dict[int, str] = {}
+            for v in rejected_list:
+                rid = v["id"]  # KeyError if missing
+                if not isinstance(rid, int):
+                    raise ValueError(f"non-int id: {rid!r}")
+                if rid not in valid_ids:
+                    raise ValueError(f"id {rid} out of range 1..{len(chunk)}")
+                rejected_ids[rid] = v.get("reason", "")
+        except (KeyError, ValueError, TypeError) as exc:
             print(
-                f"Warning: Claude returned {len(verdicts)} verdict(s) for "
-                f"{len(chunk)} candidate(s) ({chunk_label}); "
-                f"dropping chunk (fail-closed)",
+                f"Warning: invalid rejected-ids in Claude response for candidates "
+                f"{chunk_label} ({exc}); dropping chunk (fail-closed)",
                 file=sys.stderr,
             )
             continue
 
-        verdict_map = {v["id"]: v.get("genuine", False) for v in verdicts}
-        reason_map = {v["id"]: v.get("reason", "") for v in verdicts}
-
         # BUI-149: surface each rejected candidate (with the model's reason) to
         # stderr so the user can override if the verifier was wrong.
-        dropped = [
-            (cand, reason_map.get(idx, ""))
-            for idx, cand in enumerate(chunk, 1)
-            if not verdict_map.get(idx, False)
-        ]
-        if dropped:
+        if rejected_ids:
             print(
-                f"Filtered {len(dropped)} likely false positive(s) "
+                f"Filtered {len(rejected_ids)} likely false positive(s) "
                 f"(Claude verification):",
                 file=sys.stderr,
             )
-            for cand, reason in dropped:
-                line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
-                if reason:
-                    line += f"  — {reason}"
-                print(line, file=sys.stderr)
+            for idx, cand in enumerate(chunk, 1):
+                if idx in rejected_ids:
+                    reason = rejected_ids[idx]
+                    line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
+                    if reason:
+                        line += f"  — {reason}"
+                    print(line, file=sys.stderr)
 
         kept.extend(
-            cand for idx, cand in enumerate(chunk, 1) if verdict_map.get(idx, False)
+            cand for idx, cand in enumerate(chunk, 1) if idx not in rejected_ids
         )
 
     return kept

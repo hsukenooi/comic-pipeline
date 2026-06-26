@@ -904,10 +904,9 @@ class TestVerifyWithClaudeChunking:
         ]
 
     def _genuine_response(self, count):
-        """Mock response where all ``count`` verdicts are genuine=True."""
-        verdicts = [{"id": i, "genuine": True} for i in range(1, count + 1)]
+        """Mock response where all ``count`` candidates are genuine (empty rejects list)."""
         fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text=json.dumps(verdicts))]
+        fake_resp.content = [MagicMock(text="[]")]
         return fake_resp
 
     def test_250_candidates_produce_3_api_calls(self, monkeypatch):
@@ -932,14 +931,14 @@ class TestVerifyWithClaudeChunking:
         global position, so verdicts correlate correctly across chunk boundaries."""
         matches = self._make_matches(150)  # 2 chunks: [100, 50]
 
-        # Chunk 2: only id=1 (local) is genuine — corresponds to global match #101.
-        verdicts_chunk1 = [{"id": i, "genuine": True} for i in range(1, 101)]
-        verdicts_chunk2 = [{"id": i, "genuine": i == 1} for i in range(1, 51)]
+        # Chunk 2: reject ids 2-50 (local), keep only id=1 (local) →
+        # corresponds to global match #101.
+        rejected_chunk2 = [{"id": i, "reason": "test"} for i in range(2, 51)]
 
         fake_client = MagicMock()
         fake_client.messages.create.side_effect = [
-            MagicMock(content=[MagicMock(text=json.dumps(verdicts_chunk1))]),
-            MagicMock(content=[MagicMock(text=json.dumps(verdicts_chunk2))]),
+            MagicMock(content=[MagicMock(text="[]")]),
+            MagicMock(content=[MagicMock(text=json.dumps(rejected_chunk2))]),
         ]
         monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
         monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
@@ -967,13 +966,13 @@ class TestVerifyWithClaudeChunking:
         err = capsys.readouterr().err
         assert "fail-closed" in err
 
-    def test_verdict_count_mismatch_fails_closed(self, monkeypatch, capsys):
-        """A chunk where len(verdicts) != len(chunk) is dropped entirely."""
+    def test_out_of_range_id_fails_closed(self, monkeypatch, capsys):
+        """A rejected-id outside 1..len(chunk) causes the whole chunk to drop."""
         matches = self._make_matches(5)
-        # Return only 3 verdicts for 5 candidates.
-        verdicts = [{"id": i, "genuine": True} for i in range(1, 4)]
+        # id=6 is out of range for a 5-candidate chunk.
+        rejected = [{"id": 6, "reason": "phantom id"}]
         fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text=json.dumps(verdicts))]
+        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
         fake_client = MagicMock()
         fake_client.messages.create.return_value = fake_resp
         monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
@@ -985,6 +984,54 @@ class TestVerifyWithClaudeChunking:
         err = capsys.readouterr().err
         assert "fail-closed" in err
 
+    def test_non_int_id_fails_closed(self, monkeypatch, capsys):
+        """A rejected-id that is not an integer causes the whole chunk to drop."""
+        matches = self._make_matches(5)
+        rejected = [{"id": "two", "reason": "string id"}]
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert result == []
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+    def test_missing_id_key_fails_closed(self, monkeypatch, capsys):
+        """A rejected object with no 'id' key causes the whole chunk to drop."""
+        matches = self._make_matches(5)
+        rejected = [{"reason": "forgot the id"}]
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert result == []
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+    def test_empty_array_keeps_all_candidates(self, monkeypatch):
+        """[] response means nothing rejected — all candidates returned."""
+        matches = self._make_matches(5)
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text="[]")]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert len(result) == 5
+
     def test_good_chunk_after_bad_chunk_still_kept(self, monkeypatch, capsys):
         """A bad first chunk drops its candidates but a good second chunk is kept."""
         matches = self._make_matches(150)  # 2 chunks: [100, 50]
@@ -992,8 +1039,7 @@ class TestVerifyWithClaudeChunking:
         bad_resp = MagicMock()
         bad_resp.content = [MagicMock(text="no json here")]
         good_resp = MagicMock()
-        verdicts = [{"id": i, "genuine": True} for i in range(1, 51)]
-        good_resp.content = [MagicMock(text=json.dumps(verdicts))]
+        good_resp.content = [MagicMock(text="[]")]  # nothing rejected → all 50 kept
 
         fake_client = MagicMock()
         fake_client.messages.create.side_effect = [bad_resp, good_resp]
@@ -1024,10 +1070,7 @@ class TestVerifyWithClaudeNoSilentDrop:
              "wish_name": "Amazing Spider-Man #300"},
             {"title": "Daredevil Annual #1", "wish_name": "Daredevil #1"},
         ]
-        verdict_json = (
-            '[{"id":1,"genuine":true},'
-            '{"id":2,"genuine":false,"reason":"Annual, not the regular series"}]'
-        )
+        verdict_json = '[{"id":2,"reason":"Annual, not the regular series"}]'
         fake_resp = MagicMock()
         fake_resp.content = [MagicMock(text=verdict_json)]
         fake_client = MagicMock()
