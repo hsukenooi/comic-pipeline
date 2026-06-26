@@ -1,0 +1,643 @@
+"""Tests for wishlist_sellers.py — the multi-seller wish-list scan funnel."""
+
+from __future__ import annotations
+
+import io
+import json
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import wishlist_sellers as ws
+
+
+# ─── Fixtures / helpers ───────────────────────────────────────────────────────
+
+def make_match(
+    seller: str = "sellerA",
+    item_id: str = "111",
+    wish_name: str = "Amazing Spider-Man #129",
+    title: str = "Amazing Spider-Man #129 VF",
+    price: str = "$50.00",
+    series: str = "Amazing Spider-Man",
+    issue: str = "129",
+    score: float = 0.9,
+    end_date: str = "2026-07-01 12:00",
+    listing_url: str = "https://www.ebay.com/itm/111",
+) -> dict:
+    """Build a minimal match dict matching the pipeline's internal shape."""
+    return {
+        "seller": seller,
+        "item_id": item_id,
+        "title": title,
+        "wish_name": wish_name,
+        "price": price,
+        "end_date": end_date,
+        "end_date_iso": "2026-07-01T12:00:00Z",
+        "listing_url": listing_url,
+        "score": score,
+        "_series": series,
+        "_issue": issue,
+    }
+
+
+def _two_wish_items() -> tuple[list, list]:
+    """Return (wish_list, wish_items) for ASM #129 + X-Men #94."""
+    wish_list = [
+        {"id": "w1", "name": "Amazing Spider-Man #129"},
+        {"id": "w2", "name": "X-Men #94"},
+    ]
+    wish_items = [
+        {
+            "id": "w1",
+            "name": "Amazing Spider-Man #129",
+            "series": "Amazing Spider-Man",
+            "issue": "129",
+            "_tokens": ["amazing", "spider", "man"],
+        },
+        {
+            "id": "w2",
+            "name": "X-Men #94",
+            "series": "X-Men",
+            "issue": "94",
+            "_tokens": ["xmen"],
+        },
+    ]
+    return wish_list, wish_items
+
+
+def _run_main(
+    matches_by_wish: list[list],
+    *,
+    db_path: Path,
+    wish_list: list | None = None,
+    wish_items: list | None = None,
+    seen: set | None = None,
+    server_base: str = "",
+    verify_return: list | None = None,
+    json_output: bool = False,
+) -> tuple[str, MagicMock, MagicMock]:
+    """Run main() with standard mocks; return (stdout, mock_verify, mock_record)."""
+    if wish_list is None or wish_items is None:
+        wish_list, wish_items = _two_wish_items()
+    if seen is None:
+        seen = set()
+    if verify_return is None:
+        # By default verify passes everything through
+        verify_return = [m for ms in matches_by_wish for m in ms]
+
+    mock_verify = MagicMock(return_value=verify_return)
+    mock_record = MagicMock()
+
+    with (
+        patch.object(ws, "fetch_wish_list", return_value=wish_list),
+        patch.object(ws, "prepare_wish_items", return_value=wish_items),
+        patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+        patch("wishlist_sellers.get_token", return_value="tok"),
+        patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+        patch("wishlist_sellers.search_by_keyword", return_value=[]),
+        patch("wishlist_sellers.ebay_search_cache.put"),
+        patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+        patch.object(ws, "match_results_for_wish", side_effect=list(matches_by_wish)),
+        patch.object(ws, "fetch_seen_item_ids", return_value=seen),
+        patch.object(ws, "_server_base", return_value=server_base),
+        patch.object(ws, "verdict_db_path", return_value=db_path),
+        patch.object(ws, "verify_with_claude", mock_verify),
+        patch.object(ws, "record_items_seen", mock_record),
+    ):
+        buf = io.StringIO()
+        argv = ["--json"] if json_output else []
+        with redirect_stdout(buf):
+            ws.main(argv)
+        return buf.getvalue(), mock_verify, mock_record
+
+
+# ─── dedup_matches ────────────────────────────────────────────────────────────
+
+class TestDedupMatches:
+    def test_same_seller_item_id_collapsed_to_one(self):
+        """Same (seller, item_id) from two wish searches → single entry."""
+        m1 = make_match(seller="A", item_id="1", wish_name="ASM #129", score=0.8)
+        m2 = make_match(seller="A", item_id="1", wish_name="Spider-Man #129", score=0.9)
+        result = ws.dedup_matches([m1, m2])
+        assert len(result) == 1
+        # Higher score is kept
+        assert result[0]["score"] == 0.9
+
+    def test_different_item_ids_both_kept(self):
+        m1 = make_match(item_id="1")
+        m2 = make_match(item_id="2")
+        assert len(ws.dedup_matches([m1, m2])) == 2
+
+    def test_different_sellers_same_item_both_kept(self):
+        """Two sellers listing the same physical item count separately."""
+        m1 = make_match(seller="A", item_id="1")
+        m2 = make_match(seller="B", item_id="1")
+        assert len(ws.dedup_matches([m1, m2])) == 2
+
+    def test_empty_input_returns_empty(self):
+        assert ws.dedup_matches([]) == []
+
+
+# ─── group_and_gate ───────────────────────────────────────────────────────────
+
+class TestGroupAndGate:
+    def test_single_match_seller_dropped(self):
+        """Seller with exactly 1 match is dropped by the ≥2 gate."""
+        m = make_match(seller="lone_wolf")
+        assert "lone_wolf" not in ws.group_and_gate([m])
+
+    def test_two_match_seller_kept(self):
+        m1 = make_match(seller="A", item_id="1", wish_name="ASM #129")
+        m2 = make_match(seller="A", item_id="2", wish_name="X-Men #94")
+        grouped = ws.group_and_gate([m1, m2])
+        assert "A" in grouped
+        assert len(grouped["A"]) == 2
+
+    def test_mixed_sellers_correct_split(self):
+        """Two-match seller kept; one-match seller dropped."""
+        m1 = make_match(seller="keeper", item_id="1")
+        m2 = make_match(seller="keeper", item_id="2")
+        m3 = make_match(seller="dropper", item_id="3")
+        grouped = ws.group_and_gate([m1, m2, m3])
+        assert "keeper" in grouped
+        assert "dropper" not in grouped
+
+    def test_empty_input_returns_empty_dict(self):
+        assert ws.group_and_gate([]) == {}
+
+
+# ─── batch_check_owned ────────────────────────────────────────────────────────
+
+class TestBatchCheckOwned:
+    def test_in_collection_returned_as_owned(self):
+        payload = {"count": 1, "results": [
+            {"series": "X-Men", "issue": "94", "match_status": "in_collection",
+             "full_title_matched": True, "cache_age_days": 1},
+        ]}
+        with patch("requests.post") as mock_post:
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=MagicMock(return_value=payload),
+            )
+            owned = ws.batch_check_owned([("X-Men", "94")], "http://server")
+        assert ("X-Men", "94") in owned
+
+    def test_not_in_cache_not_returned(self):
+        payload = {"count": 1, "results": [
+            {"series": "X-Men", "issue": "94", "match_status": "not_in_cache",
+             "full_title_matched": False, "cache_age_days": 0},
+        ]}
+        with patch("requests.post") as mock_post:
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=MagicMock(return_value=payload),
+            )
+            owned = ws.batch_check_owned([("X-Men", "94")], "http://server")
+        assert owned == set()
+
+    def test_409_causes_sys_exit(self):
+        """409 from server = collection not imported → hard-fail (plan R10/R11)."""
+        with patch("requests.post") as mock_post:
+            mock_post.return_value = MagicMock(
+                status_code=409,
+                text="collection not imported",
+            )
+            with pytest.raises(SystemExit):
+                ws.batch_check_owned([("X-Men", "94")], "http://server")
+
+    def test_empty_pairs_makes_no_request(self):
+        with patch("requests.post") as mock_post:
+            result = ws.batch_check_owned([], "http://server")
+        mock_post.assert_not_called()
+        assert result == set()
+
+    def test_network_error_causes_sys_exit(self):
+        import requests as req
+        with patch("requests.post", side_effect=req.exceptions.ConnectionError("down")):
+            with pytest.raises(SystemExit):
+                ws.batch_check_owned([("X-Men", "94")], "http://server")
+
+
+# ─── Verdict cache unit tests ─────────────────────────────────────────────────
+
+class TestVerdictCache:
+    @pytest.fixture(autouse=True)
+    def _db(self, tmp_path):
+        self.db_path = tmp_path / "verdicts.db"
+
+    def test_get_returns_none_for_unknown(self):
+        assert ws.verdict_get("999", "ASM #129", db_path=self.db_path) is None
+
+    def test_put_then_get_genuine(self):
+        ws.verdict_put("111", "ASM #129", True, db_path=self.db_path)
+        assert ws.verdict_get("111", "ASM #129", db_path=self.db_path) is True
+
+    def test_put_then_get_false(self):
+        ws.verdict_put("222", "ASM #129", False, db_path=self.db_path)
+        assert ws.verdict_get("222", "ASM #129", db_path=self.db_path) is False
+
+    def test_compound_key_same_listing_different_wish(self):
+        """One listing can have distinct verdicts for different wish items."""
+        ws.verdict_put("333", "ASM #129", True, db_path=self.db_path)
+        ws.verdict_put("333", "X-Men #94", False, db_path=self.db_path)
+        assert ws.verdict_get("333", "ASM #129", db_path=self.db_path) is True
+        assert ws.verdict_get("333", "X-Men #94", db_path=self.db_path) is False
+
+    def test_put_overwrites_previous_verdict(self):
+        ws.verdict_put("444", "ASM #129", True, db_path=self.db_path)
+        ws.verdict_put("444", "ASM #129", False, db_path=self.db_path)
+        assert ws.verdict_get("444", "ASM #129", db_path=self.db_path) is False
+
+    def test_get_returns_none_when_db_absent(self, tmp_path):
+        missing = tmp_path / "nonexistent.db"
+        assert ws.verdict_get("x", "y", db_path=missing) is None
+
+
+# ─── apply_verdict_cache ──────────────────────────────────────────────────────
+
+class TestApplyVerdictCache:
+    @pytest.fixture(autouse=True)
+    def _db(self, tmp_path):
+        self.db_path = tmp_path / "verdicts.db"
+
+    def test_splits_into_three_buckets_correctly(self):
+        m_genuine = make_match(item_id="1", wish_name="ASM #129")
+        m_false = make_match(item_id="2", wish_name="ASM #129")
+        m_uncached = make_match(item_id="3", wish_name="ASM #129")
+        ws.verdict_put("1", "ASM #129", True, db_path=self.db_path)
+        ws.verdict_put("2", "ASM #129", False, db_path=self.db_path)
+        # item 3 not written → None → uncached
+
+        genuine, false_, uncached = ws.apply_verdict_cache(
+            [m_genuine, m_false, m_uncached], self.db_path
+        )
+        assert [m["item_id"] for m in genuine] == ["1"]
+        assert [m["item_id"] for m in false_] == ["2"]
+        assert [m["item_id"] for m in uncached] == ["3"]
+
+    def test_cached_false_lands_in_false_not_uncached(self):
+        """Key assertion: a cached-false item must appear in false_, never uncached."""
+        m = make_match(item_id="99", wish_name="ASM #129")
+        ws.verdict_put("99", "ASM #129", False, db_path=self.db_path)
+
+        _, false_, uncached = ws.apply_verdict_cache([m], self.db_path)
+        assert len(false_) == 1
+        assert len(uncached) == 0
+
+
+# ─── Empty wish list ──────────────────────────────────────────────────────────
+
+class TestEmptyWishList:
+    def test_empty_list_exits_nonzero(self):
+        with patch.object(ws, "fetch_wish_list", return_value=[]):
+            with pytest.raises(SystemExit) as exc:
+                ws.main([])
+            assert exc.value.code != 0
+
+    def test_no_matchable_items_exits_nonzero(self):
+        """Items without #N (GNs, HCs, TPBs) produce no wish_items → exit."""
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=[
+                {"id": "1", "name": "Secret Wars HC"},
+            ]),
+            patch.object(ws, "prepare_wish_items", return_value=[]),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                ws.main([])
+            assert exc.value.code != 0
+
+
+# ─── Owned filter ─────────────────────────────────────────────────────────────
+
+class TestOwnedFilter:
+    def test_owned_match_dropped_from_output(self, tmp_path):
+        """A match whose (series, issue) is in_collection must not appear in output."""
+        m1 = make_match(seller="S", item_id="1", wish_name="Amazing Spider-Man #129",
+                        series="Amazing Spider-Man", issue="129")
+        m2 = make_match(seller="S", item_id="2", wish_name="X-Men #94",
+                        series="X-Men", issue="94")
+        # Make m1's series/issue owned; m2 not owned
+        owned_payload = {"count": 2, "results": [
+            {"series": "Amazing Spider-Man", "issue": "129",
+             "match_status": "in_collection", "full_title_matched": True, "cache_age_days": 0},
+            {"series": "X-Men", "issue": "94",
+             "match_status": "not_in_cache", "full_title_matched": False, "cache_age_days": 0},
+        ]}
+
+        mock_verify = MagicMock(return_value=[m2])
+        mock_record = MagicMock()
+        wish_list, wish_items = _two_wish_items()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value="http://server"),
+            patch("requests.post") as mock_post,
+            patch.object(ws, "verdict_db_path", return_value=tmp_path / "v.db"),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen", mock_record),
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=MagicMock(return_value=owned_payload),
+            )
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ws.main([])
+            output = buf.getvalue()
+
+        # After dropping ASM #129 (owned), seller S has only X-Men #94 → drops below ≥2
+        # Output should say no sellers found
+        assert "No sellers found" in output
+
+    def test_409_from_owned_check_hard_fails(self, tmp_path):
+        """409 from collection/check/batch → sys.exit (plan R10/R11)."""
+        m1 = make_match(seller="S", item_id="1")
+        m2 = make_match(seller="S", item_id="2")
+        wish_list, wish_items = _two_wish_items()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value="http://server"),
+            patch("requests.post") as mock_post,
+            patch.object(ws, "verdict_db_path", return_value=tmp_path / "v.db"),
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=409,
+                text="collection not imported",
+            )
+            with pytest.raises(SystemExit):
+                ws.main([])
+
+
+# ─── Verdict cache pipeline integration ───────────────────────────────────────
+
+class TestVerdictCachePipeline:
+    def test_cached_false_not_sent_to_verify(self, tmp_path):
+        """A cached-false listing is dropped without calling verify_with_claude for it."""
+        db_path = tmp_path / "v.db"
+        # sellerA has 3 matches: m1/m2 are uncached, m3 is cached-false.
+        # After the ≥2 pre-verify gate, all three are candidates.
+        # apply_verdict_cache puts m3 in false_, so verify only gets [m1, m2].
+        m1 = make_match(seller="sellerA", item_id="1", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="sellerA", item_id="2", wish_name="X-Men #94")
+        m3 = make_match(seller="sellerA", item_id="3", wish_name="Amazing Spider-Man #129",
+                        title="Amazing Spider-Man #129 Annual-fake")
+        ws.verdict_put("3", "Amazing Spider-Man #129", False, db_path=db_path)
+
+        wish_list = [
+            {"id": "w1", "name": "Amazing Spider-Man #129"},
+            {"id": "w2", "name": "X-Men #94"},
+            {"id": "w3", "name": "Amazing Spider-Man #129"},  # extra search producing m3
+        ]
+        wish_items = [
+            {"id": "w1", "name": "Amazing Spider-Man #129",
+             "series": "Amazing Spider-Man", "issue": "129", "_tokens": ["amazing"]},
+            {"id": "w2", "name": "X-Men #94",
+             "series": "X-Men", "issue": "94", "_tokens": ["xmen"]},
+            {"id": "w3", "name": "Amazing Spider-Man #129",
+             "series": "Amazing Spider-Man", "issue": "129", "_tokens": ["amazing"]},
+        ]
+
+        mock_verify = MagicMock(return_value=[m1, m2])
+        mock_record = MagicMock()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            # Three wish items → three side-effect values
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2], [m3]]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen", mock_record),
+        ):
+            ws.main([])
+
+        # verify should have been called — but NOT with m3
+        mock_verify.assert_called_once()
+        sent_ids = {m["item_id"] for m in mock_verify.call_args[0][0]}
+        assert "3" not in sent_ids, "cached-false m3 must not be sent to verify"
+        assert "1" in sent_ids
+        assert "2" in sent_ids
+
+    def test_uncached_listing_sent_to_verify_and_verdict_persisted(self, tmp_path):
+        """Uncached listing → sent to verify; verdict is written to cache."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="S", item_id="10", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="S", item_id="11", wish_name="X-Men #94")
+
+        mock_verify = MagicMock(return_value=[m1, m2])
+        wish_list, wish_items = _two_wish_items()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        # Verdicts must be persisted in the cache
+        assert ws.verdict_get("10", "Amazing Spider-Man #129", db_path=db_path) is True
+        assert ws.verdict_get("11", "X-Men #94", db_path=db_path) is True
+
+    def test_second_run_uses_cache_no_verify_call(self, tmp_path):
+        """On a re-run where all survivors are cached, verify_with_claude is not called."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="S", item_id="20", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="S", item_id="21", wish_name="X-Men #94")
+        # Pre-seed both as genuine
+        ws.verdict_put("20", "Amazing Spider-Man #129", True, db_path=db_path)
+        ws.verdict_put("21", "X-Men #94", True, db_path=db_path)
+
+        wish_list, wish_items = _two_wish_items()
+        mock_verify = MagicMock()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        mock_verify.assert_not_called()
+
+
+# ─── Post-verify re-gate ──────────────────────────────────────────────────────
+
+class TestPostVerifyReGate:
+    def test_group_and_gate_drops_seller_below_two_post_verify(self):
+        """group_and_gate on a 1-match set correctly drops the seller."""
+        m = make_match(seller="X", item_id="99")
+        assert "X" not in ws.group_and_gate([m])
+
+    def test_pipeline_drops_seller_that_falls_below_two_after_verify(self, tmp_path):
+        """End-to-end: seller starts with 2 candidates; verify keeps 1 → dropped."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="sellerX", item_id="1", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="sellerX", item_id="2", wish_name="X-Men #94")
+        # verify keeps only m1
+        wish_list, wish_items = _two_wish_items()
+
+        buf = io.StringIO()
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", return_value=[m1]),  # only m1 kept
+            patch.object(ws, "record_items_seen"),
+        ):
+            with redirect_stdout(buf):
+                ws.main([])
+
+        output = buf.getvalue()
+        # sellerX falls below 2 after verify → not in output
+        assert "sellerX" not in output
+        assert "No sellers found" in output
+
+
+# ─── End-to-end happy path ────────────────────────────────────────────────────
+
+class TestEndToEndHappyPath:
+    def test_table_output_contains_seller_and_wish_items(self, tmp_path):
+        """Full pipeline: two genuine matches → compact table with seller and wish items."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="comicseller1", item_id="100",
+                        wish_name="Amazing Spider-Man #129", price="$120.00")
+        m2 = make_match(seller="comicseller1", item_id="101",
+                        wish_name="X-Men #94", price="$80.00")
+        wish_list, wish_items = _two_wish_items()
+
+        output, _, mock_record = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],
+        )
+
+        assert "comicseller1" in output
+        assert "Amazing Spider-Man #129" in output
+        assert "X-Men #94" in output
+
+    def test_json_output_valid_and_no_private_fields(self, tmp_path):
+        """--json emits valid JSON; private keys _series/_issue are stripped."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="comicseller1", item_id="200",
+                        wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="comicseller1", item_id="201", wish_name="X-Men #94")
+        wish_list, wish_items = _two_wish_items()
+
+        output, _, _ = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        assert len(data) == 1
+        assert data[0]["seller"] == "comicseller1"
+        assert len(data[0]["matches"]) == 2
+        for match in data[0]["matches"]:
+            assert "_series" not in match
+            assert "_issue" not in match
+
+    def test_seen_items_dropped_before_output(self, tmp_path):
+        """Items already in the global seen set are hidden from the report."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="S", item_id="300", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="S", item_id="301", wish_name="X-Men #94")
+        wish_list, wish_items = _two_wish_items()
+
+        output, _, _ = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            seen={"300", "301"},  # both already seen
+            verify_return=[],
+        )
+        # No survivors → no sellers
+        assert "S" not in output
+
+    def test_record_items_seen_called_with_final_ids(self, tmp_path):
+        """record_items_seen is called with the final genuine item IDs."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="S", item_id="400", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="S", item_id="401", wish_name="X-Men #94")
+        wish_list, wish_items = _two_wish_items()
+
+        _, _, mock_record = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],
+        )
+
+        mock_record.assert_called_once()
+        recorded_ids = mock_record.call_args[0][0]
+        assert set(recorded_ids) == {"400", "401"}
+        # Global seen set: seller arg must be None (plan R11)
+        assert mock_record.call_args[0][1] is None
