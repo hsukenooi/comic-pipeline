@@ -481,6 +481,47 @@ def era_mismatch(title: str, series_name: "str | None") -> bool:
     return False
 
 
+def publication_year_mismatch(aspects: "dict | None", series_name: "str | None") -> bool:
+    """Return True (reject) when item-specifics clearly contradict the wish series era.
+
+    FAIL-OPEN design (BUI-229): returns False when any needed signal is missing.
+
+    Priority:
+      1. ``Publication Year`` present and parseable as a 4-digit int: reject iff
+         outside ``[begin-1, end+1]`` (same ±1 tolerance as era_mismatch).
+      2. ``Publication Year`` absent: conservative fallback only when the series
+         range END < 1992 AND the ``Era`` aspect indicates Modern Age (1992-Now).
+         Rationale: vol-1 runs ending in 1992–1998 are also "Modern Age", so an
+         Era-only reject would false-reject genuine bronze/copper books.  The
+         fallback fires only when the series definitively ended before 1992.
+
+    Reuses ``series_year_range`` for the year range.
+    """
+    if not aspects or not series_name:
+        return False
+    yr_range = series_year_range(series_name)
+    if yr_range is None:
+        return False
+    begin, end = yr_range
+
+    pub_year_raw = aspects.get("Publication Year")
+    if pub_year_raw is not None:
+        try:
+            pub_year = int(str(pub_year_raw).strip())
+        except (ValueError, TypeError):
+            return False  # unparseable → fail-open
+        if len(str(pub_year)) != 4:
+            return False  # not a 4-digit year → fail-open
+        return not (begin - 1 <= pub_year <= end + 1)
+
+    # Publication Year absent — conservative Era fallback (only pre-1992 series).
+    if end < 1992:
+        era = str(aspects.get("Era", "")).lower()
+        if "modern age" in era:
+            return True
+    return False
+
+
 # ─── Reprint / non-original-format lexicon (BUI-227) ────────────────────────
 # Unambiguous markers that indicate a reprint, collected edition, or otherwise
 # non-original single-issue format.  Conservative: only terms that would NEVER

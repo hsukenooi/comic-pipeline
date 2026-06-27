@@ -104,6 +104,7 @@ def _run_main(
         patch("wishlist_sellers.ebay_search_cache.put"),
         patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
         patch.object(ws, "match_results_for_wish", side_effect=list(matches_by_wish)),
+        patch.object(ws, "get_item_aspects", return_value=None),
         patch.object(ws, "fetch_seen_item_ids", return_value=seen),
         patch.object(ws, "_server_base", return_value=server_base),
         patch.object(ws, "verdict_db_path", return_value=db_path),
@@ -1492,3 +1493,236 @@ class TestMatchResultsForWishBui227:
         data = json.loads(output)
         for match in data[0]["matches"]:
             assert "_series_name" not in match
+
+
+# ─── BUI-229: item-specifics era gate ────────────────────────────────────────
+
+
+def _make_bare_title_match_with_series_name(
+    seller: str = "sellerA",
+    item_id: str = "500",
+    wish_name: str = "Amazing Spider-Man #7",
+    title: str = "Amazing Spider-Man #7 VF",
+    series: str = "Amazing Spider-Man",
+    issue: str = "7",
+    series_name: "str | None" = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+) -> dict:
+    """Build a bare-title match (no paren year, no vol) with _series_name set.
+
+    This is the class of match that qualifies for an item-specifics lookup in the
+    BUI-229 gate: _title_paren_years(title)==[] and _title_volume(title) is None
+    and _series_name is truthy.
+    """
+    m = make_match(
+        seller=seller,
+        item_id=item_id,
+        wish_name=wish_name,
+        title=title,
+        series=series,
+        issue=issue,
+    )
+    m["_series_name"] = series_name
+    return m
+
+
+class TestItemSpecificsGate:
+    """BUI-229: item-specifics Publication Year gate for bare-title residual."""
+
+    def test_bare_title_out_of_era_pub_year_dropped(self, tmp_path):
+        """A bare-title match with Publication Year=2014 for a 1963-range wish is dropped."""
+        db_path = tmp_path / "v.db"
+        # m1: bare title, Publication Year=2014 → outside 1963-1998 range → dropped
+        m1 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="501", wish_name="Amazing Spider-Man #7",
+        )
+        # m2: second match so seller passes the ≥2 gate
+        m2 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="502", wish_name="X-Men #94",
+            title="X-Men #94 VF",
+            series="X-Men", issue="94",
+            series_name="X-Men (Vol. 1) (1963 - 1981)",
+        )
+
+        mock_aspects = MagicMock(
+            side_effect=lambda item_id, tok, base_url: (
+                {"Publication Year": "2014"} if item_id == "501"
+                else {"Publication Year": "1977"}  # in-era for X-Men 1963-1981
+            )
+        )
+        mock_verify = MagicMock(return_value=[m2])
+        wish_list, wish_items = _two_wish_items()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "get_item_aspects", mock_aspects),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ws.main([])
+
+        # m1 dropped by item-specifics gate → sellerA has only m2 → below ≥2
+        output = buf.getvalue()
+        assert "sellerA" not in output
+        assert "No sellers" in output
+
+    def test_bare_title_in_era_pub_year_kept(self, tmp_path):
+        """A bare-title match with an in-era Publication Year is kept."""
+        db_path = tmp_path / "v.db"
+        m1 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="601", wish_name="Amazing Spider-Man #7",
+        )
+        m2 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="602", wish_name="X-Men #94",
+            title="X-Men #94 VF",
+            series="X-Men", issue="94",
+            series_name="X-Men (Vol. 1) (1963 - 1981)",
+        )
+
+        # Both in-era: ASM 1963-1998 → pub year 1964; X-Men 1963-1981 → pub year 1977
+        mock_aspects = MagicMock(
+            side_effect=lambda item_id, tok, base_url: (
+                {"Publication Year": "1964"} if item_id == "601"
+                else {"Publication Year": "1977"}
+            )
+        )
+        mock_verify = MagicMock(return_value=[m1, m2])
+        wish_list, wish_items = _two_wish_items()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "get_item_aspects", mock_aspects),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ws.main([])
+
+        output = buf.getvalue()
+        # Both matches survived → sellerA has ≥2 → appears in output
+        assert "sellerA" in output
+
+    def test_paren_year_title_not_looked_up(self, tmp_path):
+        """A match whose title already has a parenthesized year is NOT sent to get_item_aspects."""
+        db_path = tmp_path / "v.db"
+        # Title has "(1964)" — _title_paren_years returns [1964] → not bare-title
+        m1 = make_match(
+            seller="sellerA", item_id="701", wish_name="Amazing Spider-Man #7",
+            title="Amazing Spider-Man (1964) #7 VF",
+        )
+        m1["_series_name"] = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+        m2 = make_match(
+            seller="sellerA", item_id="702", wish_name="X-Men #94",
+            title="X-Men (1977) #94 FN",
+        )
+        m2["_series_name"] = None
+        wish_list, wish_items = _two_wish_items()
+        mock_aspects = MagicMock()
+        mock_verify = MagicMock(return_value=[m1, m2])
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "get_item_aspects", mock_aspects),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        # get_item_aspects must not have been called for either match (both have paren years)
+        mock_aspects.assert_not_called()
+
+    def test_no_item_specifics_flag_disables_gate(self, tmp_path):
+        """--no-item-specifics prevents get_item_aspects from being called at all."""
+        db_path = tmp_path / "v.db"
+        # Bare-title match with _series_name set → would normally trigger the gate
+        m1 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="801", wish_name="Amazing Spider-Man #7",
+        )
+        m2 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="802", wish_name="X-Men #94",
+            title="X-Men #94 VF", series="X-Men", issue="94",
+            series_name="X-Men (Vol. 1) (1963 - 1981)",
+        )
+        wish_list, wish_items = _two_wish_items()
+        mock_aspects = MagicMock()
+        mock_verify = MagicMock(return_value=[m1, m2])
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "get_item_aspects", mock_aspects),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main(["--no-item-specifics"])
+
+        mock_aspects.assert_not_called()
+
+    def test_fail_open_on_none_aspects(self, tmp_path):
+        """get_item_aspects returning None (fetch error) keeps the listing."""
+        db_path = tmp_path / "v.db"
+        m1 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="901", wish_name="Amazing Spider-Man #7",
+        )
+        m2 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="902", wish_name="X-Men #94",
+            title="X-Men #94 VF", series="X-Men", issue="94",
+            series_name="X-Men (Vol. 1) (1963 - 1981)",
+        )
+        wish_list, wish_items = _two_wish_items()
+        mock_verify = MagicMock(return_value=[m1, m2])
+
+        output, _, _ = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],
+        )
+        # _run_main patches get_item_aspects to return None → fail-open → both kept
+        assert "sellerA" in output

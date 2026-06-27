@@ -45,6 +45,7 @@ import ebay_search_cache
 from ebay_fetch import (
     PRODUCTION_BASE,
     SANDBOX_BASE,
+    get_item_aspects,
     get_token,
     load_config,
     search_by_keyword,
@@ -55,12 +56,15 @@ from seller_scan import (
     _reprint_reject,
     _server_base,
     _strip_grades,
+    _title_paren_years,
+    _title_volume,
     era_mismatch,
     fetch_seen_item_ids,
     fetch_wish_list,
     hard_reject,
     match_listing,
     prepare_wish_items,
+    publication_year_mismatch,
     record_items_seen,
     verify_with_claude,
 )
@@ -570,6 +574,17 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
             "Use 'bin' for Buy It Now only, or 'all' for both auction and BIN."
         ),
     )
+    parser.add_argument(
+        "--no-item-specifics",
+        action="store_true",
+        dest="no_item_specifics",
+        help=(
+            "Skip the eBay item-specifics era filter for bare-title matches (BUI-229). "
+            "By default, bare-title matches (no parenthesized year, no 'vol N') are "
+            "checked against the Publication Year aspect to catch modern-series "
+            "false positives that the title-based gates cannot see."
+        ),
+    )
     args = parser.parse_args(argv)
 
     mode = args.buying_options
@@ -666,6 +681,34 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
     hidden = before - len(all_matches)
     if hidden:
         print(f"  {hidden} already-seen match(es) dropped", file=sys.stderr)
+
+    # ── Step 7.5: item-specifics era gate for bare-title residual (BUI-229) ─────
+    # Apply only to matches whose title carries no era signal (no parenthesized
+    # year, no "vol N") — the cases era_mismatch cannot catch.  Fetches
+    # localizedAspects from the Browse API for each qualifying match and drops
+    # those whose Publication Year (or Era fallback) contradicts the wish series
+    # era.  Fail-open: missing aspects / network errors → keep the listing.
+    if not args.no_item_specifics and all_matches:
+        checked = 0
+        dropped_is = 0
+        filtered: list = []
+        for m in all_matches:
+            sn = m.get("_series_name")
+            title = m.get("title") or ""
+            if sn and not _title_paren_years(title) and _title_volume(title) is None:
+                checked += 1
+                aspects = get_item_aspects(m["item_id"], token, base_url)
+                if publication_year_mismatch(aspects, sn):
+                    dropped_is += 1
+                    continue
+            filtered.append(m)
+        all_matches = filtered
+        if checked:
+            print(
+                f"  Item-specifics era filter: checked {checked} bare-title"
+                f" candidate(s), dropped {dropped_is}",
+                file=sys.stderr,
+            )
 
     # ── Step 8: drop owned via batch endpoint (R10) ───────────────────────────
     base_server = _server_base()

@@ -944,3 +944,84 @@ class TestIntegrationCLI:
         assert result.returncode == 0
         data = json.loads(result.stdout)
         assert set(data[0].keys()) == {"item_id", "title"}
+
+
+# ─── BUI-229: get_item_aspects ────────────────────────────────────────────────
+
+
+class TestGetItemAspects:
+    """get_item_aspects fetches and parses eBay localizedAspects (BUI-229)."""
+
+    def _mock_200(self, aspects_list):
+        """Return a mock 200 response with localizedAspects."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"localizedAspects": aspects_list}
+        return mock_resp
+
+    def test_parses_localized_aspects_to_flat_dict(self, tmp_path, monkeypatch):
+        """A 200 response with localizedAspects is parsed into {name: value}."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        aspects_list = [
+            {"type": "STRING", "name": "Publication Year", "value": "2014"},
+            {"type": "STRING", "name": "Era", "value": "Modern Age (1992-Now)"},
+            {"type": "STRING", "name": "Series Title", "value": "Amazing Spider-Man"},
+        ]
+        with patch("requests.get", return_value=self._mock_200(aspects_list)):
+            result = ebay_fetch.get_item_aspects("123456", "tok", "https://api.ebay.com")
+        assert result == {
+            "Publication Year": "2014",
+            "Era": "Modern Age (1992-Now)",
+            "Series Title": "Amazing Spider-Man",
+        }
+
+    def test_returns_none_on_non_200(self, tmp_path, monkeypatch):
+        """Non-200 response → None (fail-open)."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        with patch("requests.get", return_value=mock_resp):
+            result = ebay_fetch.get_item_aspects("999", "tok", "https://api.ebay.com")
+        assert result is None
+
+    def test_returns_none_on_network_error(self, tmp_path, monkeypatch):
+        """Network error (ConnectionError) → None (fail-open)."""
+        import requests as req
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        with patch("requests.get", side_effect=req.exceptions.ConnectionError("down")):
+            result = ebay_fetch.get_item_aspects("999", "tok", "https://api.ebay.com")
+        assert result is None
+
+    def test_returns_none_when_no_localized_aspects(self, tmp_path, monkeypatch):
+        """200 response without a localizedAspects key → None (fail-open)."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"title": "Amazing Spider-Man #7"}
+        with patch("requests.get", return_value=mock_resp):
+            result = ebay_fetch.get_item_aspects("888", "tok", "https://api.ebay.com")
+        assert result is None
+
+    def test_disk_cache_hit_skips_network(self, tmp_path, monkeypatch):
+        """A fresh cache file is returned without making an HTTP request."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        cached_aspects = {"Publication Year": "1964", "Era": "Silver Age (1956-1969)"}
+        path = ebay_fetch._aspects_cache_path("777")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cached_aspects))
+
+        with patch("requests.get") as mock_get:
+            result = ebay_fetch.get_item_aspects("777", "tok", "https://api.ebay.com")
+
+        mock_get.assert_not_called()
+        assert result == cached_aspects
+
+    def test_result_written_to_disk_cache(self, tmp_path, monkeypatch):
+        """A successful fetch writes the aspects to the disk cache."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        aspects_list = [{"name": "Publication Year", "value": "1975"}]
+        with patch("requests.get", return_value=self._mock_200(aspects_list)):
+            ebay_fetch.get_item_aspects("42", "tok", "https://api.ebay.com")
+
+        cached = ebay_fetch._aspects_cache_get("42")
+        assert cached == {"Publication Year": "1975"}

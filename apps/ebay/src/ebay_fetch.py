@@ -689,6 +689,98 @@ def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_optio
     return all_items[:max_results]
 
 
+# ─── Aspects disk cache (BUI-229) ─────────────────────────────────────────────
+# Per-item disk cache for localizedAspects (get_item_by_legacy_id responses).
+# Keyed by numeric item_id; 7-day TTL matches the search-cache default — aspects
+# data is stable for in-flight listings.
+
+_ASPECTS_CACHE_DIR: Path = Path.home() / ".cache" / "ebay-fetch" / "aspects"
+_ASPECTS_CACHE_TTL_SEC: int = 7 * 24 * 3600  # 7 days
+
+
+def _aspects_cache_path(item_id: str) -> Path:
+    """Return the path where item aspects would be cached."""
+    return _ASPECTS_CACHE_DIR / f"{item_id}.json"
+
+
+def _aspects_cache_get(item_id: str) -> "dict | None":
+    """Return cached aspects dict if present and fresh, else None."""
+    path = _aspects_cache_path(item_id)
+    if not path.exists():
+        return None
+    age = time.time() - path.stat().st_mtime
+    if age > _ASPECTS_CACHE_TTL_SEC:
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001  # corrupt/partial file → cache miss
+        return None
+
+
+def _aspects_cache_put(item_id: str, aspects: dict) -> None:
+    """Write aspects dict to the item-level disk cache (atomic tmp→rename)."""
+    path = _aspects_cache_path(item_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(aspects))
+    tmp.replace(path)
+
+
+def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries: int = 3) -> "dict | None":
+    """Fetch a flat {name: value} dict of item aspects from eBay.
+
+    Calls get_item_by_legacy_id and parses ``localizedAspects`` into a flat dict
+    (e.g. {"Publication Year": "2014", "Era": "Modern Age (1992-Now)", ...}).
+    Results are cached on disk for 7 days (keyed by item_id) so re-runs are cheap.
+
+    Fail-open: returns None on any HTTP/network/parse error.  Errors are silently
+    swallowed — the aspects gate is advisory, not load-bearing.  The caller treats
+    None as "no signal" and keeps the listing.
+
+    Request/retry/pacing style mirrors search_by_keyword.
+    """
+    cached = _aspects_cache_get(legacy_item_id)
+    if cached is not None:
+        return cached
+
+    url = f"{base_url}/buy/browse/v1/item/get_item_by_legacy_id"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    }
+    params = {"legacy_item_id": legacy_item_id}
+
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+        except requests.exceptions.RequestException:
+            return None  # network error → fail-open
+        if resp.status_code == 200:
+            break
+        if resp.status_code == 429 and attempt < retries - 1:
+            time.sleep(2 ** attempt)
+            continue
+        return None  # non-retryable or last retry → fail-open
+
+    try:
+        data = resp.json()
+    except (ValueError, AttributeError):
+        return None
+
+    raw_aspects = data.get("localizedAspects")
+    if not isinstance(raw_aspects, list):
+        return None
+
+    aspects: dict = {
+        item.get("name"): item.get("value")
+        for item in raw_aspects
+        if item.get("name")
+    }
+    _aspects_cache_put(legacy_item_id, aspects)
+    return aspects
+
+
 def truncate(text, width):
     """Truncate text to width with ellipsis."""
     if not text:

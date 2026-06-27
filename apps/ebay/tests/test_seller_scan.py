@@ -1587,3 +1587,106 @@ class TestVerifyWithClaudePromptEnrichment:
         kept = seller_scan.verify_with_claude(matches)
         assert len(kept) == 1
         assert kept[0]["title"] == "Amazing Spider-Man #7"
+
+
+# ─── BUI-229: publication_year_mismatch ──────────────────────────────────────
+
+
+class TestPublicationYearMismatch:
+    """publication_year_mismatch uses eBay item-specifics to reject wrong-era listings."""
+
+    # Helper: a 1963-range series (Amazing Spider-Man Vol 1)
+    _ASM_1963 = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+    # Helper: a pre-1992 series (Wolverine Vol 1)
+    _WOL_1982 = "Wolverine (Vol. 1) (1982 - 2003)"
+    # Helper: pre-1992 series that definitively ended pre-1992
+    _FF_1961 = "Fantastic Four (Vol. 1) (1961 - 1996)"
+    # Silver-age only (ended 1969)
+    _SA_1963 = "X-Men (Vol. 1) (1963 - 1981)"
+
+    def test_pub_year_out_of_range_returns_true(self):
+        """Publication Year clearly outside the series range → True (reject)."""
+        aspects = {"Publication Year": "2014", "Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is True
+
+    def test_pub_year_in_range_returns_false(self):
+        """Publication Year within the series range → False (keep)."""
+        aspects = {"Publication Year": "1964", "Era": "Silver Age (1956-1969)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    def test_pub_year_within_plus_one_tolerance_returns_false(self):
+        """Publication Year == end+1 is kept (±1 tolerance, same as era_mismatch)."""
+        # ASM Vol 1 ends 1998; pub year 1999 is within ±1
+        aspects = {"Publication Year": "1999"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    def test_pub_year_within_minus_one_tolerance_returns_false(self):
+        """Publication Year == begin-1 is kept (±1 tolerance)."""
+        # ASM Vol 1 begins 1963; pub year 1962 is within ±1
+        aspects = {"Publication Year": "1962"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    def test_pub_year_just_outside_tolerance_returns_true(self):
+        """Publication Year == end+2 is rejected (outside ±1 tolerance)."""
+        # ASM Vol 1 ends 1998; pub year 2000 is outside
+        aspects = {"Publication Year": "2000"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is True
+
+    def test_missing_aspects_fail_open(self):
+        """aspects=None → False (fail-open)."""
+        assert seller_scan.publication_year_mismatch(None, self._ASM_1963) is False
+
+    def test_empty_aspects_fail_open(self):
+        """Empty aspects dict → False (fail-open; series_year_range might return a range
+        but no pub-year signal is present → Era fallback also absent)."""
+        assert seller_scan.publication_year_mismatch({}, self._ASM_1963) is False
+
+    def test_missing_series_name_fail_open(self):
+        """series_name=None → False (fail-open)."""
+        aspects = {"Publication Year": "2014"}
+        assert seller_scan.publication_year_mismatch(aspects, None) is False
+
+    def test_empty_series_name_fail_open(self):
+        """Empty series_name → False (fail-open)."""
+        aspects = {"Publication Year": "2014"}
+        assert seller_scan.publication_year_mismatch(aspects, "") is False
+
+    def test_series_name_without_year_range_fail_open(self):
+        """Series name with no decorated year range → series_year_range returns None → False."""
+        aspects = {"Publication Year": "2014"}
+        assert seller_scan.publication_year_mismatch(aspects, "Amazing Spider-Man") is False
+
+    def test_pub_year_absent_era_modern_series_ended_pre_1992_returns_true(self):
+        """Publication Year absent + Era=Modern Age + series ended before 1992 → True."""
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        # X-Men Vol 1 ran 1963-1981 — definitively pre-1992
+        assert seller_scan.publication_year_mismatch(aspects, self._SA_1963) is True
+
+    def test_pub_year_absent_era_modern_series_1992_run_returns_false(self):
+        """Publication Year absent + Era=Modern Age + series ended 2003 → False.
+
+        A 1982-2003 series overlaps Modern Age, so Era alone cannot reject it.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        # Wolverine Vol 1 ran 1982-2003 — overlaps Modern Age → cannot reject
+        assert seller_scan.publication_year_mismatch(aspects, self._WOL_1982) is False
+
+    def test_pub_year_absent_era_silver_not_modern_returns_false(self):
+        """Publication Year absent + Era is NOT Modern Age → False (fail-open)."""
+        aspects = {"Era": "Silver Age (1956-1969)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._SA_1963) is False
+
+    def test_pub_year_absent_no_era_aspect_returns_false(self):
+        """Publication Year absent + no Era key → False (fail-open)."""
+        aspects = {"Series Title": "X-Men"}
+        assert seller_scan.publication_year_mismatch(aspects, self._SA_1963) is False
+
+    def test_unparseable_pub_year_fail_open(self):
+        """Non-integer Publication Year → False (fail-open)."""
+        aspects = {"Publication Year": "circa 2014"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    def test_non_four_digit_pub_year_fail_open(self):
+        """A 3-digit or 5-digit Publication Year → False (fail-open; not a valid year)."""
+        aspects = {"Publication Year": "14"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
