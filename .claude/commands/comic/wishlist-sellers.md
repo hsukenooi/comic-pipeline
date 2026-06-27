@@ -76,6 +76,21 @@ wishlist-sellers --env production    # force the production eBay endpoint
 wishlist-sellers --env sandbox       # force sandbox
 ```
 
+### `--no-item-specifics` (default: item-specifics era filter ON)
+
+For bare-title matches — listings with no parenthesized year and no "vol N" in the title — the script fetches the eBay item-specifics (Publication Year / Era) aspect via the Browse API and drops listings whose publication year falls outside the wish series' era (BUI-229). This catches modern-series false positives that the title-based gates cannot see.
+
+Pass `--no-item-specifics` to skip this step (useful for bounded runs where you want to avoid the extra Browse API calls and prefer to let Haiku verify handle residual ambiguity).
+
+## Series and era filtering
+
+The pipeline runs several deterministic gates to avoid surfacing the wrong volume of a long-running series (e.g. the 2022 Amazing Spider-Man relaunch when you want the 1963 original), before any Haiku call:
+
+- **Parenthesized-year / vol N gate** — if a listing title contains a parenthesized year (e.g. "(2022)") or an explicit volume marker ("vol 2") that contradicts the wish series' era, the listing is dropped.
+- **Reprint and digital-code reject** — facsimile editions, reprints, and digital-code-only listings are dropped unconditionally.
+- **Item-specifics era filter** — for bare titles with no era signal, the Publication Year aspect is fetched and checked against the wish series' year range (see `--no-item-specifics` above).
+- **Era hint to Haiku** — the verify prompt includes the wish series' decorated name (e.g. "The Amazing Spider-Man (1963 - 1998)") as a "Correct series:" line, so Haiku can reject vol/relaunch mismatches that the deterministic gates missed.
+
 ## Only new finds by default
 
 The script shares the **global seen set** (`/api/comics/seller-scan/seen`, keyed by `item_id`) with `/comic:seller-scan`. A listing that was surfaced by either tool — regardless of which seller it was grouped under — is recorded as seen and will not re-appear in future runs.
@@ -117,7 +132,7 @@ When run as a skill, present the per-seller blocks clearly so the user can decid
 Three layers make steady-state runs near-free:
 
 1. **7-day eBay search cache** — keyword search results are stored under `~/.cache/wishlist-sellers/`, keyed by `(mode, keyword)`. A second run with the same `--buying-options` within the week skips all eBay calls for items whose cache is still fresh; only new or expired items hit the API. Changing `--buying-options` (e.g. switching from `auction` to `all`) starts a fresh cache fill because the namespaces are separate.
-2. **Verdict cache** — Haiku's "is this really the book?" verdict for each `(listing_id, wish-item)` pair is stored in a SQLite DB at `~/.cache/wishlist-sellers/verdicts.db`. A listing that survived the first run's verify step is not re-verified; neither is a listing that was rejected. On a warm re-run, Haiku is called only for listings that appeared since the last run.
+2. **Verdict cache** — Haiku's "is this really the book?" verdict for each `(title_key, wish_name)` pair is stored in a SQLite DB at `~/.cache/wishlist-sellers/verdicts.db`. `title_key` is the listing title after stripping grade tokens (e.g. "CGC 9.8", "VF/NM") and normalizing to lowercase alphanumeric — not the `item_id`. Two benefits follow (BUI-223): the same comic title from multiple sellers is verified once per run (cross-seller dedup), and a relisted item with a new item ID but the same title is an instant cache hit. On a warm re-run, Haiku is called only for titles not seen in any prior run.
 3. **Seen-item filter** — listings already surfaced to you are dropped before grouping and before verify, so they contribute zero LLM cost and zero output noise.
 
 A typical weekly re-run does: full cache hit on searches → zero eBay calls → a small verify pass on new listings only → output only if a seller crosses the ≥2 threshold with new material.
