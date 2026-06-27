@@ -343,6 +343,7 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
                 "_series": series,
                 "_issue": issue,
                 "_series_name": wish_series_name,
+                "_release_year": wish_item.get("_release_year"),
             })
     return matches
 
@@ -698,7 +699,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
             if sn and not _title_paren_years(title) and _title_volume(title) is None:
                 checked += 1
                 aspects = get_item_aspects(m["item_id"], token, base_url)
-                if publication_year_mismatch(aspects, sn):
+                if publication_year_mismatch(aspects, sn, m.get("_release_year")):
                     dropped_is += 1
                     continue
             filtered.append(m)

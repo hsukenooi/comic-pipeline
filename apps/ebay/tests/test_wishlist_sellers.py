@@ -1506,6 +1506,7 @@ def _make_bare_title_match_with_series_name(
     series: str = "Amazing Spider-Man",
     issue: str = "7",
     series_name: "str | None" = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+    release_year: "str | None" = None,
 ) -> dict:
     """Build a bare-title match (no paren year, no vol) with _series_name set.
 
@@ -1522,6 +1523,7 @@ def _make_bare_title_match_with_series_name(
         issue=issue,
     )
     m["_series_name"] = series_name
+    m["_release_year"] = release_year
     return m
 
 
@@ -1726,3 +1728,113 @@ class TestItemSpecificsGate:
         )
         # _run_main patches get_item_aspects to return None → fail-open → both kept
         assert "sellerA" in output
+
+
+# ─── BUI-231: era fallback by issue year ─────────────────────────────────────
+
+
+class TestMatchResultsForWishReleaseYear:
+    """match_results_for_wish propagates _release_year onto the match dict (BUI-231)."""
+
+    def _wish_item(self) -> dict:
+        return {
+            "id": "w1",
+            "name": "Amazing Spider-Man #7",
+            "series": "Amazing Spider-Man",
+            "issue": "7",
+            "_tokens": ["amazing", "spider", "man"],
+            "_series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+            "_release_year": "1964",
+        }
+
+    def _result(self, title: str = "Amazing Spider-Man #7 VF") -> dict:
+        return {
+            "title": title,
+            "item_id": "1",
+            "seller": "comicseller",
+            "current_price": "$10.00",
+            "end_date": "2026-07-01",
+            "end_date_iso": "2026-07-01T12:00:00Z",
+            "listing_url": "https://www.ebay.com/itm/1",
+        }
+
+    def test_release_year_carried_on_match_dict(self):
+        """_release_year from the wish item is propagated into the match dict."""
+        matches = ws.match_results_for_wish([self._result()], self._wish_item())
+        assert len(matches) == 1
+        assert matches[0].get("_release_year") == "1964"
+
+    def test_release_year_none_when_wish_has_no_release_year(self):
+        """_release_year is None in the match dict when the wish item has no release year."""
+        wish = self._wish_item()
+        wish["_release_year"] = None
+        matches = ws.match_results_for_wish([self._result()], wish)
+        assert len(matches) == 1
+        assert matches[0].get("_release_year") is None
+
+
+class TestItemSpecificsEraFallbackByIssueYear:
+    """BUI-231: item-specifics Era fallback fires on per-issue release year, not series-end."""
+
+    def test_era_modern_issue_year_pre1992_drops_listing(self, tmp_path):
+        """Bare-title listing with Era=Modern Age is dropped when _release_year='1964'.
+
+        ASM Vol.1 ran 1963-1998 so the old series-end gate (end=1998 ≥ 1992) would
+        NOT fire.  The per-issue year (1964 < 1992) correctly rejects the listing.
+        Also asserts _release_year is carried on the match dict and passed to
+        publication_year_mismatch via the Step 7.5 call.
+        """
+        db_path = tmp_path / "v.db"
+        # m1: 1964 wish + bare title → Era=Modern Age → dropped by issue-year gate
+        m1 = _make_bare_title_match_with_series_name(
+            seller="sellerA",
+            item_id="1001",
+            wish_name="Amazing Spider-Man #7",
+            release_year="1964",
+        )
+        # m2: title with explicit paren year → bypasses item-specifics gate entirely
+        m2 = make_match(
+            seller="sellerA",
+            item_id="1002",
+            wish_name="X-Men #94",
+            title="X-Men (1977) #94 FN",
+        )
+        m2["_series_name"] = "X-Men (Vol. 1) (1963 - 1981)"
+        m2["_release_year"] = "1977"
+
+        # Assert _release_year is carried on the match dict before passing to main
+        assert m1.get("_release_year") == "1964"
+
+        wish_list, wish_items = _two_wish_items()
+        mock_aspects = MagicMock(return_value={"Era": "Modern Age (1992-Now)"})
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1], [m2]]),
+            patch.object(ws, "get_item_aspects", mock_aspects),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", MagicMock(return_value=[])),
+            patch.object(ws, "record_items_seen"),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ws.main([])
+
+        # m1 (1964 wish + Era=Modern Age) dropped → sellerA has only m2 (paren-year
+        # title bypasses gate) → count=1 < 2 → no sellers in output.
+        output = buf.getvalue()
+        assert "sellerA" not in output
+        assert "No sellers" in output
+
+        # get_item_aspects called exactly once — only for m1 (bare title); m2
+        # (paren year) is excluded from the gate check.
+        mock_aspects.assert_called_once()

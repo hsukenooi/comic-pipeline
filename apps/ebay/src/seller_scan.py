@@ -481,7 +481,11 @@ def era_mismatch(title: str, series_name: "str | None") -> bool:
     return False
 
 
-def publication_year_mismatch(aspects: "dict | None", series_name: "str | None") -> bool:
+def publication_year_mismatch(
+    aspects: "dict | None",
+    series_name: "str | None",
+    release_year: "str | None" = None,
+) -> bool:
     """Return True (reject) when item-specifics clearly contradict the wish series era.
 
     FAIL-OPEN design (BUI-229): returns False when any needed signal is missing.
@@ -489,11 +493,16 @@ def publication_year_mismatch(aspects: "dict | None", series_name: "str | None")
     Priority:
       1. ``Publication Year`` present and parseable as a 4-digit int: reject iff
          outside ``[begin-1, end+1]`` (same ±1 tolerance as era_mismatch).
-      2. ``Publication Year`` absent: conservative fallback only when the series
-         range END < 1992 AND the ``Era`` aspect indicates Modern Age (1992-Now).
-         Rationale: vol-1 runs ending in 1992–1998 are also "Modern Age", so an
-         Era-only reject would false-reject genuine bronze/copper books.  The
-         fallback fires only when the series definitively ended before 1992.
+      2. ``Publication Year`` absent: conservative fallback using the ``Era`` aspect
+         and the per-issue release year (BUI-231):
+         - Parse ``release_year`` (4-char string from prepare_wish_items) into
+           ``iy`` (int) if possible.
+         - If ``Era`` contains "modern age":
+           * ``iy is not None`` and ``iy < 1992`` → return True (reject: the wished
+             issue predates Modern Age but the listing's Era says Modern Age).
+           * ``iy is None`` and series range ``end < 1992`` → return True (old
+             series-end fallback: preserves behavior when no per-issue year).
+         - Otherwise → return False (fail-open).
 
     Reuses ``series_year_range`` for the year range.
     """
@@ -514,11 +523,24 @@ def publication_year_mismatch(aspects: "dict | None", series_name: "str | None")
             return False  # not a 4-digit year → fail-open
         return not (begin - 1 <= pub_year <= end + 1)
 
-    # Publication Year absent — conservative Era fallback (only pre-1992 series).
-    if end < 1992:
-        era = str(aspects.get("Era", "")).lower()
-        if "modern age" in era:
-            return True
+    # Publication Year absent — Era fallback (BUI-231: gate on per-issue year).
+    era = str(aspects.get("Era", "")).lower()
+    if "modern age" in era:
+        # Parse per-issue release year if provided.
+        iy: "int | None" = None
+        if release_year is not None:
+            try:
+                parsed = int(str(release_year).strip())
+                if len(str(parsed)) == 4:
+                    iy = parsed
+            except (ValueError, TypeError):
+                pass
+        if iy is not None:
+            # Issue year known: reject only when it predates Modern Age.
+            return iy < 1992
+        else:
+            # No per-issue year: fall back to series-end (pre-BUI-231 behavior).
+            return end < 1992
     return False
 
 

@@ -1690,3 +1690,57 @@ class TestPublicationYearMismatch:
         """A 3-digit or 5-digit Publication Year → False (fail-open; not a valid year)."""
         aspects = {"Publication Year": "14"}
         assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    # ── BUI-231: Era fallback gated on per-issue release_year ─────────────────
+
+    def test_era_fallback_issue_year_pre1992_returns_true(self):
+        """No Pub Year + Era=Modern Age + release_year='1964' (< 1992) → True.
+
+        ASM Vol.1 ran 1963-1998 so the old series-end fallback (end ≥ 1992)
+        would NOT fire.  The per-issue year (1964) correctly rejects a modern
+        listing for a pre-Modern Age wish.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "1964") is True
+
+    def test_era_fallback_issue_year_post1992_returns_false(self):
+        """No Pub Year + Era=Modern Age + release_year='1995' (≥ 1992) → False.
+
+        A 1995 wished issue falls within Modern Age; can't reject on Era alone.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "1995") is False
+
+    def test_era_fallback_release_year_none_series_end_1998_returns_false(self):
+        """No Pub Year + Era=Modern Age + release_year=None + series end=1998 → False.
+
+        Old series-end fallback: end=1998 ≥ 1992 → doesn't fire even without
+        per-issue year.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, None) is False
+
+    def test_era_fallback_release_year_none_series_ended_pre1992_returns_true(self):
+        """No Pub Year + Era=Modern Age + release_year=None + series end 1981 → True.
+
+        Old series-end fallback is preserved when no per-issue year is available.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        # _SA_1963 ends 1981 < 1992 → old fallback still fires
+        assert seller_scan.publication_year_mismatch(aspects, self._SA_1963, None) is True
+
+    def test_era_fallback_not_modern_age_returns_false(self):
+        """No Pub Year + Era=Silver Age + release_year='1964' → False (not modern age)."""
+        aspects = {"Era": "Silver Age (1956-1969)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "1964") is False
+
+    def test_pub_year_present_takes_priority_out_of_range(self):
+        """Publication Year present and out-of-range → True, regardless of release_year."""
+        aspects = {"Publication Year": "2014", "Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "1964") is True
+
+    def test_pub_year_present_takes_priority_in_range(self):
+        """Publication Year present and in-range → False, regardless of release_year."""
+        aspects = {"Publication Year": "1964", "Era": "Modern Age (1992-Now)"}
+        # release_year="2020" would normally be post-1992 (keep), but pub year wins
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "2020") is False
