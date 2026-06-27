@@ -1353,3 +1353,126 @@ class TestMatchResultsForWishEraGate:
         # era_mismatch returns False when series_name is None → listing reaches
         # match_listing, which may or may not match; we only assert no crash.
         assert isinstance(matches, list)
+
+
+# ─── BUI-227: match_results_for_wish era + reprint + _series_name ─────────────
+
+
+class TestMatchResultsForWishBui227:
+    """BUI-227 additions: compound era reject, reprint reject, _series_name propagation."""
+
+    def _wish_item_1963(
+        self,
+        series: str = "Amazing Spider-Man",
+        issue: str = "7",
+    ) -> dict:
+        return {
+            "id": "w1",
+            "name": f"{series} #{issue}",
+            "series": series,
+            "issue": issue,
+            "_tokens": ["amazing", "spider", "man"],
+            "_series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+            "_release_year": "1964",
+        }
+
+    def _result(self, title: str, item_id: str = "1") -> dict:
+        return {
+            "title": title,
+            "item_id": item_id,
+            "seller": "comicseller",
+            "current_price": "$10.00",
+            "end_date": "2026-07-01",
+            "end_date_iso": "2026-07-01T12:00:00Z",
+            "listing_url": "https://www.ebay.com/itm/" + item_id,
+        }
+
+    def test_compound_paren_out_of_era_dropped(self):
+        """'(Marvel Comics December 2014)' for a 1963-range wish is rejected."""
+        wish = self._wish_item_1963()
+        results = [self._result(
+            "Amazing Spider-Man #7 (Marvel Comics December 2014)", "1"
+        )]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "compound out-of-era paren should be rejected"
+
+    def test_compound_paren_in_era_kept(self):
+        """'(Marvel Comics October 1984)' for a 1963-1998 range passes the gate."""
+        wish = self._wish_item_1963(issue="7")
+        results = [self._result(
+            "Amazing Spider-Man #7 (Marvel Comics October 1984)", "2"
+        )]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "compound in-era paren should pass the era gate"
+
+    def test_facsimile_listing_dropped(self):
+        """A facsimile listing is rejected by _reprint_reject before match_listing."""
+        wish = self._wish_item_1963()
+        results = [self._result("Amazing Spider-Man #7 Facsimile Edition", "3")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "facsimile listing should be dropped"
+
+    def test_tpb_listing_dropped(self):
+        """A TPB listing is rejected by _reprint_reject."""
+        wish = self._wish_item_1963()
+        results = [self._result("Amazing Spider-Man TPB vol 1", "4")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "tpb listing should be dropped"
+
+    def test_omnibus_listing_dropped(self):
+        """An omnibus listing is rejected by _reprint_reject."""
+        wish = self._wish_item_1963()
+        results = [self._result("Amazing Spider-Man Omnibus vol 1 HC", "5")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "omnibus listing should be dropped"
+
+    def test_in_era_plain_listing_kept(self):
+        """A normal in-era listing passes both era and reprint gates."""
+        wish = self._wish_item_1963()
+        results = [self._result("Amazing Spider-Man #7 VF Marvel 1964", "6")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "plain in-era listing should be kept"
+
+    def test_series_name_propagated_to_match_dict(self):
+        """Emitted match dicts carry _series_name from the wish item."""
+        wish = self._wish_item_1963()
+        results = [self._result("Amazing Spider-Man #7 VF", "7")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1
+        assert matches[0]["_series_name"] == "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+    def test_series_name_none_propagated(self):
+        """If the wish item has _series_name=None, match dicts carry None."""
+        wish = {
+            "id": "w2",
+            "name": "Amazing Spider-Man #7",
+            "series": "Amazing Spider-Man",
+            "issue": "7",
+            "_tokens": ["amazing", "spider", "man"],
+            "_series_name": None,
+        }
+        results = [self._result("Amazing Spider-Man #7 VF", "8")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1
+        assert matches[0]["_series_name"] is None
+
+    def test_series_name_stripped_from_json_output(self, tmp_path):
+        """_series_name (a private field) is not present in --json output."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="S", item_id="1", wish_name="Amazing Spider-Man #129")
+        m1["_series_name"] = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+        m2 = make_match(seller="S", item_id="2", wish_name="X-Men #94")
+        m2["_series_name"] = None
+        wish_list, wish_items = _two_wish_items()
+
+        output, _, _ = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],
+            json_output=True,
+        )
+        data = json.loads(output)
+        for match in data[0]["matches"]:
+            assert "_series_name" not in match

@@ -383,24 +383,45 @@ def series_volume(series_name: str) -> "int | None":
     return int(m.group(1)) if m else None
 
 
-def _title_paren_year(title: str) -> "int | None":
-    """Extract the first parenthesized 4-digit year (1930–2035) from a title.
+def _title_paren_years(title: str) -> "list[int]":
+    """Extract every 4-digit year (1930–2035) from every parenthetical group in a title.
 
     Only parenthesized years are extracted (high precision).  Bare years in
     listing titles are too ambiguous for deterministic rejection and are left to
     Haiku.
+
+    Handles compound parentheticals like "(Marvel Comics December 2014)" as well
+    as multiple groups like "(1963) (CGC 2024)".
+
+    Examples:
+      "Amazing Spider-Man (2022) #7"                    → [2022]
+      "Amazing Spider-Man #7 (Marvel Comics Dec 2014)"  → [2014]
+      "Batman (1940) #100 NM"                           → [1940]
+      "Some Book (1963) (CGC 2024)"                     → [1963, 2024]
+      "Amazing Spider-Man #7 VF"                        → []
+    """
+    years: list[int] = []
+    for group in re.findall(r"\([^)]*\)", title or ""):
+        for m in re.finditer(r"\b(\d{4})\b", group):
+            yr = int(m.group(1))
+            if 1930 <= yr <= 2035:
+                years.append(yr)
+    return years
+
+
+def _title_paren_year(title: str) -> "int | None":
+    """Extract the first parenthesized 4-digit year (1930–2035) from a title.
+
+    Thin wrapper around _title_paren_years for callers that only need the first
+    year.  Kept for backward compatibility.
 
     Examples:
       "Amazing Spider-Man (2022) #7"  → 2022
       "Amazing Spider-Man #7 VF"      → None
       "Batman (1940) #100 NM"         → 1940
     """
-    m = re.search(r"\((\d{4})\)", title or "")
-    if m:
-        yr = int(m.group(1))
-        if 1930 <= yr <= 2035:
-            return yr
-    return None
+    yrs = _title_paren_years(title)
+    return yrs[0] if yrs else None
 
 
 def _title_volume(title: str) -> "int | None":
@@ -425,9 +446,12 @@ def era_mismatch(title: str, series_name: "str | None") -> bool:
     the user wants) is worse than a false accept.  Returns False whenever a
     needed signal is missing from either side.  Only two high-precision signals:
 
-      1. Parenthesized year in the title vs. the series year range — e.g.
+      1. Parenthesized years in the title vs. the series year range — e.g.
          "Amazing Spider-Man (2022) #7" vs. a 1963-range wish item.
          Tolerance: ±1 year to mirror the BUI-214 cover-vs-onsale skew.
+         All years from all parenthetical groups are checked; reject only if
+         NONE of them fall within the range (so "(1963) (CGC 2024)" for a
+         1963-range series is KEPT because 1963 is in range).
 
       2. Explicit "vol N" in the title vs. the series volume number — e.g.
          "X-Men Vol 2 #94" vs. a Vol. 1 wish item.
@@ -438,13 +462,13 @@ def era_mismatch(title: str, series_name: "str | None") -> bool:
     if not series_name:
         return False
 
-    # Signal 1: parenthesized year in title vs. series year range.
-    title_yr = _title_paren_year(title)
-    if title_yr is not None:
+    # Signal 1: parenthesized years in title vs. series year range.
+    yrs = _title_paren_years(title)
+    if yrs:
         yr_range = series_year_range(series_name)
         if yr_range is not None:
             begin, end = yr_range
-            if not (begin - 1 <= title_yr <= end + 1):
+            if not any(begin - 1 <= yr <= end + 1 for yr in yrs):
                 return True
 
     # Signal 2: explicit volume in title vs. series volume.
@@ -454,6 +478,38 @@ def era_mismatch(title: str, series_name: "str | None") -> bool:
         if wish_vol is not None and title_vol != wish_vol:
             return True
 
+    return False
+
+
+# ─── Reprint / non-original-format lexicon (BUI-227) ────────────────────────
+# Unambiguous markers that indicate a reprint, collected edition, or otherwise
+# non-original single-issue format.  Conservative: only terms that would NEVER
+# appear in a genuine first-print single-issue listing.  Do NOT add "variant"
+# or other terms that legitimately appear on original copies.
+
+_REPRINT_MARKERS: frozenset[str] = frozenset({
+    "facsimile",
+    "true believers",
+    "marvel tales",
+    "epic collection",
+    "omnibus",
+    "trade paperback",
+    "tpb",
+    "2nd printing",
+    "second printing",
+})
+
+
+def _reprint_reject(title: str) -> bool:
+    """Return True if the listing title contains a non-original-format marker.
+
+    Case-insensitive; each marker is matched as a whole word or phrase (not a
+    substring of another word) using look-around assertions.
+    """
+    t = (title or "").lower()
+    for marker in _REPRINT_MARKERS:
+        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
+            return True
     return False
 
 
@@ -517,10 +573,20 @@ def verify_with_claude(matches):
         chunk = matches[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
         chunk_label = f"{chunk_start + 1}–{chunk_start + len(chunk)}"
 
-        pairs = "\n".join(
-            f'{idx}. Listing: "{cand["title"]}"\n   Wish item: "{cand["wish_name"]}"'
-            for idx, cand in enumerate(chunk, 1)
-        )
+        # Build pairs text.  When the candidate carries a decorated series name
+        # (_series_name, stripped from output by _emit), include it as a
+        # "Correct series:" hint so Haiku knows the exact era the user wants.
+        pairs_parts = []
+        for idx, cand in enumerate(chunk, 1):
+            pair_text = (
+                f'{idx}. Listing: "{cand["title"]}"\n'
+                f'   Wish item: "{cand["wish_name"]}"'
+            )
+            sn = cand.get("_series_name")
+            if sn:
+                pair_text += f"\n   Correct series: {sn}"
+            pairs_parts.append(pair_text)
+        pairs = "\n".join(pairs_parts)
         prompt = f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
 
 Reject if:
@@ -530,7 +596,7 @@ Reject if:
 - Promotional reprint (Trick or Read, LCSD, Amazon promo, Undeluxe)
 - Modern renumbered issue matching an original issue number (e.g. #10 (811))
 - Series name only in a subtitle or story description, not the actual series
-- Different series VOLUME / relaunch sharing the exact title (e.g. Amazing Spider-Man 2022 or 2018 relaunch vs the 1963 original; 'vol N' or a (YYYY) in the title indicating a later volume than the wished one)
+- Different series VOLUME / relaunch: if the 'Correct series' line shows a specific era, reject listings where 'vol N' or a (YYYY) indicates a different era than the one shown
 
 Respond with a JSON array containing ONLY the ids you are REJECTING, each with a brief reason:
 [{{"id": 3, "reason": "X-Factor not X-Men"}}, {{"id": 7, "reason": "annual vs regular"}}]

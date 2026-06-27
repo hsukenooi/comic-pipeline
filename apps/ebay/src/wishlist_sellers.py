@@ -51,6 +51,7 @@ from ebay_fetch import (
 )
 from seller_scan import (
     _normalize,
+    _reprint_reject,
     _server_base,
     _strip_grades,
     era_mismatch,
@@ -297,7 +298,7 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
 
     Returns a list of match dicts each carrying:
     {seller, item_id, title, wish_name, price, end_date, end_date_iso,
-     listing_url, score, _series, _issue}
+     listing_url, score, _series, _issue, _series_name}
     """
     series = wish_item["series"]
     issue = wish_item["issue"]
@@ -315,6 +316,9 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
         # Fail-open (era_mismatch returns False) when any signal is missing.
         if era_mismatch(title, wish_series_name):
             continue
+        # BUI-227: conservative reprint/non-original-format reject.
+        if _reprint_reject(title):
+            continue
         wish, score = match_listing(title, [wish_item])
         if wish is not None and score >= MATCH_SCORE_FLOOR:
             matches.append({
@@ -327,9 +331,10 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
                 "end_date_iso": item.get("end_date_iso"),
                 "listing_url": item.get("listing_url"),
                 "score": round(score, 2),
-                # Private fields for owned-check dedup; stripped before output
+                # Private fields for Haiku context + dedup; stripped before output
                 "_series": series,
                 "_issue": issue,
+                "_series_name": wish_series_name,
             })
     return matches
 
