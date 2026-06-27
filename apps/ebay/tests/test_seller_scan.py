@@ -1509,6 +1509,79 @@ class TestDigitalReject:
         assert seller_scan._digital_reject("") is False
 
 
+# ─── BUI-232: trading-card / TCG reject ──────────────────────────────────────
+
+
+class TestTradingCardReject:
+    def test_fleer_real_listing_rejected(self):
+        """Confirmed dcsports87 false positive: Fleer card matching ASM issue number."""
+        assert seller_scan._trading_card_reject(
+            "1994 Fleer The Amazing Spider-Man Venom Suspended Animation #4"
+        ) is True
+
+    def test_fleer_carnage_rejected(self):
+        """Second dcsports87 false positive: Fleer Carnage card."""
+        assert seller_scan._trading_card_reject(
+            "1994 Fleer The Amazing Spider-Man Carnage Suspended Animation #5"
+        ) is True
+
+    def test_upper_deck_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "2024 UPPER DECK MARVEL Avengers #7 trading card"
+        ) is True
+
+    def test_topps_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "2004 Topps Amazing Spider-Man #129 base card"
+        ) is True
+
+    def test_skybox_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "1993 SkyBox Marvel Universe Series IV card #129"
+        ) is True
+
+    def test_panini_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "Panini Marvel sticker collection #300"
+        ) is True
+
+    def test_mtg_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "2025 MTG Magic: The Gathering Spider-Man Secret Lair #4"
+        ) is True
+
+    def test_magic_the_gathering_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "Magic the Gathering Amazing Spider-Man Secret Lair Drop #4"
+        ) is True
+
+    def test_trading_card_phrase_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "Amazing Spider-Man #300 trading card NM"
+        ) is True
+
+    def test_trading_cards_plural_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "Marvel trading cards lot Amazing Spider-Man"
+        ) is True
+
+    def test_case_insensitive(self):
+        assert seller_scan._trading_card_reject("FLEER Amazing Spider-Man #4") is True
+        assert seller_scan._trading_card_reject("upper deck marvel #7") is True
+
+    def test_normal_comic_title_not_rejected(self):
+        assert (
+            seller_scan._trading_card_reject("Amazing Spider-Man #300 NM Marvel 1988") is False
+        )
+
+    def test_trading_alone_not_rejected(self):
+        """'trading' without 'card(s)' must NOT trigger — fails on substring."""
+        assert seller_scan._trading_card_reject("Amazing Spider-Man #1 trading post") is False
+
+    def test_empty_title_not_rejected(self):
+        assert seller_scan._trading_card_reject("") is False
+
+
 # ─── BUI-227: verify_with_claude prompt enrichment ───────────────────────────
 
 

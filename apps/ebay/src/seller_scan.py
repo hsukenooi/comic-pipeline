@@ -604,6 +604,39 @@ def _digital_reject(title: str) -> bool:
     return False
 
 
+# ─── Trading-card / TCG lexicon (BUI-232) ────────────────────────────────────
+# Markers that categorically identify a trading card or TCG product rather than
+# a comic book.  Conservative: only terms that would NEVER appear in a genuine
+# comic listing.  "psa", "card", and "marvel" are intentionally excluded as too
+# ambiguous.
+
+_TRADING_CARD_MARKERS: frozenset[str] = frozenset({
+    "fleer",
+    "topps",
+    "upper deck",
+    "skybox",
+    "panini",
+    "mtg",
+    "magic the gathering",
+    "trading card",
+    "trading cards",
+})
+
+
+def _trading_card_reject(title: str) -> bool:
+    """Return True if the listing title is a trading card or TCG product.
+
+    Case-insensitive whole-word/phrase match (same mechanism as _reprint_reject
+    and _digital_reject).  Only categorically trading-card/TCG terms are in the
+    marker set — ambiguous terms are excluded.
+    """
+    t = (title or "").lower()
+    for marker in _TRADING_CARD_MARKERS:
+        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
+            return True
+    return False
+
+
 # ─── Claude verification ──────────────────────────────────────────────────────
 
 def _load_dotenv(path):

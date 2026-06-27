@@ -58,6 +58,7 @@ from seller_scan import (
     _strip_grades,
     _title_paren_years,
     _title_volume,
+    _trading_card_reject,
     era_mismatch,
     fetch_seen_item_ids,
     fetch_wish_list,
@@ -326,6 +327,9 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
             continue
         # BUI-230: digital-code / no-physical-comic reject.
         if _digital_reject(title):
+            continue
+        # BUI-232: trading-card / TCG reject.
+        if _trading_card_reject(title):
             continue
         wish, score = match_listing(title, [wish_item])
         if wish is not None and score >= MATCH_SCORE_FLOOR:

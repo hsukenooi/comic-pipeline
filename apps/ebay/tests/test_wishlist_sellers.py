@@ -1495,6 +1495,55 @@ class TestMatchResultsForWishBui227:
             assert "_series_name" not in match
 
 
+# ─── BUI-232: trading-card reject in match_results_for_wish ─────────────────
+
+
+class TestMatchResultsForWishTradingCardReject:
+    """BUI-232: Fleer / Topps / MTG listings are dropped before match_listing."""
+
+    def _wish_item(
+        self,
+        series: str = "Amazing Spider-Man",
+        issue: str = "4",
+    ) -> dict:
+        return {
+            "id": "w1",
+            "name": f"{series} #{issue}",
+            "series": series,
+            "issue": issue,
+            "_tokens": ["amazing", "spider", "man"],
+            "_series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+            "_release_year": "1964",
+        }
+
+    def _result(self, title: str, item_id: str = "1") -> dict:
+        return {
+            "title": title,
+            "item_id": item_id,
+            "seller": "dcsports87",
+            "current_price": "$5.00",
+            "end_date": "2026-07-01",
+            "end_date_iso": "2026-07-01T12:00:00Z",
+            "listing_url": "https://www.ebay.com/itm/" + item_id,
+        }
+
+    def test_fleer_card_dropped(self):
+        """The confirmed dcsports87 Fleer card false positive is rejected."""
+        wish = self._wish_item()
+        results = [self._result(
+            "1994 Fleer The Amazing Spider-Man Venom Suspended Animation #4", "1"
+        )]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "Fleer trading card should be dropped"
+
+    def test_normal_in_era_comic_kept(self):
+        """A normal in-era comic listing for the same wish item is NOT dropped."""
+        wish = self._wish_item()
+        results = [self._result("Amazing Spider-Man #4 VF Marvel 1963", "2")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "genuine comic listing should be kept"
+
+
 # ─── BUI-229: item-specifics era gate ────────────────────────────────────────
 
 
