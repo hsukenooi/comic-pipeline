@@ -1471,6 +1471,44 @@ class TestReprintReject:
         assert seller_scan._reprint_reject("") is False
 
 
+# ─── BUI-230: digital-code / no-physical reject ──────────────────────────────
+
+
+class TestDigitalReject:
+    def test_no_physical_rejected(self):
+        assert seller_scan._digital_reject(
+            "Amazing Spider-Man #7 DIGITAL CODE ONLY!!! [NO PHYSICAL COMIC BOOK]"
+        ) is True
+
+    def test_code_only_rejected(self):
+        assert seller_scan._digital_reject("Amazing Spider-Man #4 Code Only") is True
+
+    def test_digital_only_rejected(self):
+        assert seller_scan._digital_reject("X-Men #94 Digital Only Edition") is True
+
+    def test_digital_copy_only_rejected(self):
+        assert seller_scan._digital_reject("Daredevil #1 Digital Copy Only") is True
+
+    def test_case_insensitive(self):
+        assert seller_scan._digital_reject("ASM #7 no physical") is True
+
+    def test_with_bonus_digital_code_not_rejected(self):
+        """A physical comic sold WITH a digital code bonus must NOT be dropped."""
+        assert seller_scan._digital_reject(
+            "Amazing Spider-Man #1 NM with Digital Code"
+        ) is False
+
+    def test_bare_digital_code_not_rejected(self):
+        """Bare 'digital code' (no 'only'/'no physical') is a bonus, not a reject."""
+        assert seller_scan._digital_reject("Amazing Spider-Man #1 includes digital code") is False
+
+    def test_normal_title_not_rejected(self):
+        assert seller_scan._digital_reject("Amazing Spider-Man #7 VF") is False
+
+    def test_empty_title_not_rejected(self):
+        assert seller_scan._digital_reject("") is False
+
+
 # ─── BUI-227: verify_with_claude prompt enrichment ───────────────────────────
 
 

@@ -50,6 +50,7 @@ from ebay_fetch import (
     search_by_keyword,
 )
 from seller_scan import (
+    _digital_reject,
     _normalize,
     _reprint_reject,
     _server_base,
@@ -318,6 +319,9 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
             continue
         # BUI-227: conservative reprint/non-original-format reject.
         if _reprint_reject(title):
+            continue
+        # BUI-230: digital-code / no-physical-comic reject.
+        if _digital_reject(title):
             continue
         wish, score = match_listing(title, [wish_item])
         if wish is not None and score >= MATCH_SCORE_FLOOR:

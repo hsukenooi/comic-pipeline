@@ -1433,6 +1433,22 @@ class TestMatchResultsForWishBui227:
         matches = ws.match_results_for_wish(results, wish)
         assert len(matches) == 1, "plain in-era listing should be kept"
 
+    def test_digital_code_only_listing_dropped(self):
+        """BUI-230: a 'DIGITAL CODE ONLY [NO PHYSICAL COMIC BOOK]' listing is dropped."""
+        wish = self._wish_item_1963()
+        results = [self._result(
+            "Amazing Spider-Man #7 DIGITAL CODE ONLY!!! [NO PHYSICAL COMIC BOOK]", "9"
+        )]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "digital-code-only listing should be dropped"
+
+    def test_with_digital_code_bonus_listing_kept(self):
+        """BUI-230: a physical comic sold WITH a digital code bonus is NOT dropped."""
+        wish = self._wish_item_1963()
+        results = [self._result("Amazing Spider-Man #7 VF Marvel 1964 with Digital Code", "10")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "physical comic with bonus digital code should be kept"
+
     def test_series_name_propagated_to_match_dict(self):
         """Emitted match dicts carry _series_name from the wish item."""
         wish = self._wish_item_1963()

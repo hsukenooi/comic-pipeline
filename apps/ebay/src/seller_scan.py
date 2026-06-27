@@ -513,6 +513,34 @@ def _reprint_reject(title: str) -> bool:
     return False
 
 
+# ─── Digital-code / no-physical-comic lexicon (BUI-230) ──────────────────────
+# Markers that indicate the listing is a DIGITAL REDEEM CODE or otherwise has no
+# physical comic — never what a raw-comic buyer wants.  Conservative: only
+# phrases that mean "this IS just a code / there is no physical book".  Do NOT
+# add a bare "digital code": many genuine physical modern comics are sold "with
+# digital code" as a bonus, and rejecting those would be a false negative.
+_DIGITAL_MARKERS: frozenset[str] = frozenset({
+    "no physical",
+    "code only",
+    "digital only",
+    "digital copy only",
+})
+
+
+def _digital_reject(title: str) -> bool:
+    """Return True if the listing is a digital code / no-physical-comic offer.
+
+    Case-insensitive whole-word/phrase match (same mechanism as _reprint_reject).
+    Conservative by design — see _DIGITAL_MARKERS: a title that merely says it
+    "includes/with digital code" alongside a physical book is NOT rejected.
+    """
+    t = (title or "").lower()
+    for marker in _DIGITAL_MARKERS:
+        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
+            return True
+    return False
+
+
 # ─── Claude verification ──────────────────────────────────────────────────────
 
 def _load_dotenv(path):
