@@ -305,6 +305,245 @@ class TestPrepareWishItems:
         assert "the" not in items[0]["_tokens"]
         assert "amazing" in items[0]["_tokens"]
 
+    # BUI-226: era-data fields
+    def test_carries_series_name(self):
+        """_series_name propagates the raw LOCG decorated series name."""
+        wish = [{
+            "id": 1,
+            "name": "Amazing Spider-Man #300",
+            "series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        }]
+        items = seller_scan.prepare_wish_items(wish)
+        assert items[0]["_series_name"] == "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+    def test_carries_release_year(self):
+        """_release_year is the first 4 chars of release_date."""
+        wish = [{
+            "id": 1,
+            "name": "Amazing Spider-Man #300",
+            "release_date": "1988-05-10",
+        }]
+        items = seller_scan.prepare_wish_items(wish)
+        assert items[0]["_release_year"] == "1988"
+
+    def test_series_name_none_when_missing(self):
+        """Items without series_name (local-only) get _series_name=None."""
+        wish = [{"id": 1, "name": "Amazing Spider-Man #300"}]
+        items = seller_scan.prepare_wish_items(wish)
+        assert items[0]["_series_name"] is None
+
+    def test_release_year_none_when_missing(self):
+        """Items without release_date get _release_year=None."""
+        wish = [{"id": 1, "name": "Amazing Spider-Man #300"}]
+        items = seller_scan.prepare_wish_items(wish)
+        assert items[0]["_release_year"] is None
+
+
+# ─── BUI-226: era disambiguation helpers ─────────────────────────────────────
+
+
+class TestSeriesYearRange:
+    """series_year_range — ported from locg.collection_cache."""
+
+    def test_range(self):
+        assert seller_scan.series_year_range(
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+        ) == (1963, 1998)
+
+    def test_range_en_dash(self):
+        """En-dash variant in the year range."""
+        assert seller_scan.series_year_range(
+            "X-Men (Vol. 1) (1963–1981)"
+        ) == (1963, 1981)
+
+    def test_open_ended_present(self):
+        assert seller_scan.series_year_range(
+            "The Amazing Spider-Man (2022 - Present)"
+        ) == (2022, 9999)
+
+    def test_bare_single_year(self):
+        """A bare (YYYY) is a one-year range, not open-ended."""
+        assert seller_scan.series_year_range("Wolverine (1988)") == (1988, 1988)
+
+    def test_no_year_returns_none(self):
+        assert seller_scan.series_year_range("Amazing Spider-Man") is None
+
+    def test_empty_string_returns_none(self):
+        assert seller_scan.series_year_range("") is None
+
+    def test_none_returns_none(self):
+        # Guard against None input
+        assert seller_scan.series_year_range(None) is None  # type: ignore[arg-type]
+
+
+class TestSeriesVolume:
+    def test_vol_dot(self):
+        assert seller_scan.series_volume(
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+        ) == 1
+
+    def test_volume_word(self):
+        assert seller_scan.series_volume("Wolverine (Volume 2) (1982 - 2003)") == 2
+
+    def test_vol_no_dot(self):
+        assert seller_scan.series_volume("X-Men (Vol 3) (2010 - 2014)") == 3
+
+    def test_no_vol_returns_none(self):
+        assert seller_scan.series_volume("Amazing Spider-Man (1963 - 1998)") is None
+
+    def test_empty_returns_none(self):
+        assert seller_scan.series_volume("") is None
+
+
+class TestTitleParenYear:
+    def test_year_in_parens(self):
+        assert seller_scan._title_paren_year("Amazing Spider-Man (2022) #7") == 2022
+
+    def test_early_year(self):
+        assert seller_scan._title_paren_year("Batman (1940) #100 NM") == 1940
+
+    def test_no_paren_year(self):
+        """Bare year without parens is not extracted."""
+        assert seller_scan._title_paren_year("Amazing Spider-Man #7 VF 1963") is None
+
+    def test_out_of_range_year_ignored(self):
+        """A parenthesized year outside [1930, 2035] is not returned."""
+        assert seller_scan._title_paren_year("Batman (1900) #1") is None
+        assert seller_scan._title_paren_year("Something (2100) #1") is None
+
+    def test_empty_returns_none(self):
+        assert seller_scan._title_paren_year("") is None
+
+
+class TestTitleVolume:
+    def test_vol_n(self):
+        assert seller_scan._title_volume("Amazing Spider-Man Vol 3 #7") == 3
+
+    def test_volume_n(self):
+        assert seller_scan._title_volume("X-Men Volume 1 #94") == 1
+
+    def test_vol_dot_n(self):
+        assert seller_scan._title_volume("Spider-Man Vol. 2 #1") == 2
+
+    def test_no_vol_returns_none(self):
+        assert seller_scan._title_volume("Amazing Spider-Man #7 VF") is None
+
+    def test_empty_returns_none(self):
+        assert seller_scan._title_volume("") is None
+
+
+class TestEraMismatch:
+    # ─── Fail-open: missing signal → False ───────────────────────────────────
+
+    def test_no_series_name_fail_open(self):
+        """No series_name → False (can't discriminate)."""
+        assert seller_scan.era_mismatch("Amazing Spider-Man (2022) #7", None) is False
+
+    def test_empty_series_name_fail_open(self):
+        assert seller_scan.era_mismatch("Amazing Spider-Man (2022) #7", "") is False
+
+    def test_no_title_year_fail_open(self):
+        """Title has no parenthesized year → year check skipped → False."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #7 VF",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_series_name_no_year_range_fail_open(self):
+        """Series name has no year decoration → False."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2022) #7",
+            "Amazing Spider-Man",
+        ) is False
+
+    def test_no_title_vol_fail_open(self):
+        """Title has no explicit 'vol N' → volume check skipped → False."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #7 VF",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_series_no_vol_fail_open(self):
+        """Series has no vol. decoration → volume check skipped → False."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man Vol 2 #7",
+            "The Amazing Spider-Man (1963 - 1998)",
+        ) is False
+
+    # ─── Year check: out-of-range → True ─────────────────────────────────────
+
+    def test_year_out_of_range_rejected(self):
+        """(2022) title vs 1963-1998 range → mismatch."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2022) #7",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is True
+
+    def test_year_in_range_accepted(self):
+        """(1984) title vs 1963-1998 range → no mismatch."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1984) #247",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_year_at_lower_boundary_accepted(self):
+        """Year exactly at begin is within range (±1 tolerance means begin-1 is also OK)."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1963) #1",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_year_at_begin_minus_1_accepted(self):
+        """Year = begin - 1 is within ±1 tolerance (cover-vs-onsale skew, BUI-214)."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1962) #1",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_year_at_end_plus_1_accepted(self):
+        """Year = end + 1 is within ±1 tolerance."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1999) #441",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_year_at_end_plus_2_rejected(self):
+        """Year = end + 2 is outside the ±1 window → reject."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2000) #1",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is True
+
+    def test_year_in_open_ended_range_accepted(self):
+        """A (2024) title for a (2022 - Present) series is fine."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2024) #50",
+            "The Amazing Spider-Man (2022 - Present)",
+        ) is False
+
+    def test_old_year_against_open_ended_rejected(self):
+        """A (1965) title for a (2022 - Present) series → reject."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1965) #7",
+            "The Amazing Spider-Man (2022 - Present)",
+        ) is True
+
+    # ─── Volume check: mismatch → True ───────────────────────────────────────
+
+    def test_vol_mismatch_rejected(self):
+        """Title says Vol 2, wish is Vol. 1 → reject."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man Vol 2 #7",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is True
+
+    def test_vol_match_accepted(self):
+        """Title says Vol 1, wish is Vol. 1 → no mismatch."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man Vol 1 #7",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
 
 class TestMatchListing:
     def _items(self, names):
@@ -710,7 +949,390 @@ class TestGradeDigitNotIssueNumber:
         assert wish["name"] == "The X-Men #9"
 
 
+# ─── hard_reject pre-filter (BUI-221 Part A) ─────────────────────────────────
+
+
+class TestHardRejectCGC:
+    def test_cgc_in_title_rejected(self):
+        assert seller_scan.hard_reject(
+            "CGC Amazing Spider-Man #300 9.8 NM", "Amazing Spider-Man", "300"
+        )
+
+    def test_cgc_lowercase_rejected(self):
+        assert seller_scan.hard_reject(
+            "amazing spider-man #300 cgc 9.4", "Amazing Spider-Man", "300"
+        )
+
+    def test_no_cgc_not_rejected_by_rule1(self):
+        # A raw ungraded title must NOT be rejected on account of rule 1.
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man #300 NM Marvel 1988", "Amazing Spider-Man", "300"
+        )
+
+
+class TestHardRejectEditionMismatch:
+    def test_annual_rejected_for_regular_series(self):
+        # "Avengers Annual #1" must not satisfy a wish for "The Avengers".
+        assert seller_scan.hard_reject(
+            "Avengers Annual #1", "The Avengers", "1"
+        )
+
+    def test_annual_kept_for_annual_series(self):
+        # Wish series IS "Avengers Annual" — title is a genuine match.
+        assert not seller_scan.hard_reject(
+            "Avengers Annual #1", "Avengers Annual", "1"
+        )
+
+    def test_giant_size_hyphenated_rejected(self):
+        assert seller_scan.hard_reject(
+            "Giant-Size X-Men #1 Marvel 1975", "X-Men", "1"
+        )
+
+    def test_giant_size_spaced_rejected(self):
+        assert seller_scan.hard_reject(
+            "Giant Size X-Men #1 Marvel 1975", "X-Men", "1"
+        )
+
+    def test_giant_size_kept_for_giant_size_series(self):
+        assert not seller_scan.hard_reject(
+            "Giant-Size X-Men #1", "Giant-Size X-Men", "1"
+        )
+
+    def test_king_size_hyphenated_rejected(self):
+        assert seller_scan.hard_reject(
+            "King-Size Spider-Man #1", "Amazing Spider-Man", "1"
+        )
+
+    def test_king_size_spaced_rejected(self):
+        assert seller_scan.hard_reject(
+            "King Size Spider-Man #1", "Amazing Spider-Man", "1"
+        )
+
+    def test_special_cover_not_rejected_for_regular_series(self):
+        # BUI-221 Finding 3: bare \bspecial\b was too broad — "Special Edition
+        # cover" / "Holiday Special variant" are legitimate descriptors on
+        # original single issues.  Removed from _EDITION_PATTERNS so these
+        # titles are not hard-rejected before Claude can verify them.
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man #5 Special Edition Cover", "Amazing Spider-Man", "5"
+        )
+
+    def test_holiday_special_variant_not_rejected(self):
+        # Another "special" descriptor that is a valid cover variant, not an
+        # edition type.
+        assert not seller_scan.hard_reject(
+            "X-Men #94 Holiday Special Variant Cover", "X-Men", "94"
+        )
+
+    def test_special_kept_when_series_contains_special(self):
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man Special #5", "Amazing Spider-Man Special", "5"
+        )
+
+    def test_annual_still_rejected_for_regular_series_after_special_removal(self):
+        # Confirm Annual (a true edition type) still rejects even after the
+        # \bspecial\b removal.
+        assert seller_scan.hard_reject(
+            "Avengers Annual #10", "The Avengers", "10"
+        )
+
+    def test_treasury_rejected_for_regular_series(self):
+        assert seller_scan.hard_reject(
+            "Superman vs Muhammad Ali Treasury Edition", "Superman", "1"
+        )
+
+    def test_treasury_kept_for_treasury_series(self):
+        # Treasury editions are typically unnumbered one-shots; pass issue=None
+        # so rule 4 (missing issue number) does not apply, isolating rule 2.
+        assert not seller_scan.hard_reject(
+            "Superman vs Muhammad Ali Treasury Edition", "Superman Treasury", None
+        )
+
+
+class TestHardRejectLot:
+    def test_lot_of_rejected(self):
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man lot of 5 comics", "Amazing Spider-Man", "300"
+        )
+
+    def test_lot_with_leading_count_rejected(self):
+        assert seller_scan.hard_reject(
+            "10 lot X-Men Marvel Comics", "X-Men", "1"
+        )
+
+    def test_lot_with_trailing_count_rejected(self):
+        assert seller_scan.hard_reject(
+            "X-Men lot 5 books", "X-Men", "1"
+        )
+
+    def test_collection_rejected(self):
+        assert seller_scan.hard_reject(
+            "X-Men Complete Collection 1-50", "X-Men", "1"
+        )
+
+    def test_complete_run_rejected(self):
+        assert seller_scan.hard_reject(
+            "Daredevil #1-50 Complete Run Marvel Bronze Age", "Daredevil", "1"
+        )
+
+    def test_set_of_rejected(self):
+        assert seller_scan.hard_reject(
+            "Set of 4 Avengers Marvel comics", "The Avengers", "4"
+        )
+
+    def test_issue_range_rejected(self):
+        # "#1-#10" issue range is a multi-comic lot; # on the first number anchors it.
+        assert seller_scan.hard_reject(
+            "X-Men #1-#10 Bronze Age Lot", "X-Men", "1"
+        )
+
+    def test_hash_anchored_bare_end_range_rejected(self):
+        # "#1-10" (# only on first number) is still a lot.
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man #129-150 Bronze Age", "Amazing Spider-Man", "129"
+        )
+
+    def test_bare_number_range_not_rejected_as_lot(self):
+        # BUI-221 Finding 1: bare digits without a leading '#' (e.g. "129-150")
+        # look like a year range or price span — no longer treated as a lot signal
+        # to avoid false-rejecting single-issue titles that include run years.
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man 129-150 Bronze Age", "Amazing Spider-Man", "129"
+        )
+
+    def test_run_year_range_in_title_not_lot(self):
+        # BUI-221 Finding 1 regression: "(YYYY-YYYY)" series run info in a
+        # single-issue title must NOT be mistaken for an issue-range lot.
+        assert not seller_scan.hard_reject(
+            "Uncanny X-Men #266 (1981-2011) 1st Gambit", "Uncanny X-Men", "266"
+        )
+
+
+class TestHardRejectMissingIssue:
+    def test_title_missing_issue_number_rejected(self):
+        # Title has no "300" — obvious wrong listing.
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man NM Marvel 1988", "Amazing Spider-Man", "300"
+        )
+
+    def test_title_has_wrong_issue_number_rejected(self):
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man #299 NM Marvel", "Amazing Spider-Man", "300"
+        )
+
+    def test_issue_none_skips_rule4(self):
+        # issue=None → rule 4 does not apply; only rules 1-3 can trigger.
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man NM Marvel 1988", "Amazing Spider-Man", None
+        )
+
+
+class TestHardRejectCleanMatch:
+    def test_clean_match_not_rejected(self):
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man #300 NM Marvel 1988", "Amazing Spider-Man", "300"
+        )
+
+    def test_clean_match_with_publisher_info(self):
+        assert not seller_scan.hard_reject(
+            "Fantastic Four #48 VF Silver Surfer Marvel", "Fantastic Four", "48"
+        )
+
+    def test_clean_match_with_grade_stripped(self):
+        # Grade digits must not confuse the issue check (BUI-135 integration).
+        assert not seller_scan.hard_reject(
+            "Moon Knight #15 Marvel 1982 VF/NM 9.0", "Moon Knight", "15"
+        )
+
+
+# ─── verify_with_claude chunking (BUI-221 Part B) ────────────────────────────
+
+
+class TestVerifyWithClaudeMissingKey:
+    def test_missing_api_key_exits_cleanly(self, capsys, monkeypatch):
+        """No ANTHROPIC_API_KEY → clean error + exit, not a raw traceback.
+        Matters for the unattended wishlist-sellers scheduled run."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        # Make _load_dotenv a no-op so it can't pull a key from a real .env.
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: {})
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
+        assert exc.value.code == 1
+        assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+
+class TestVerifyWithClaudeChunking:
+    """Verify chunked calling and fail-closed behaviour of verify_with_claude."""
+
+    @pytest.fixture(autouse=True)
+    def _set_api_key(self, monkeypatch):
+        # The key-presence guard runs before the (mocked) client; tests must
+        # provide a dummy key so they exercise the chunking logic, not the guard.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+
+    def _make_matches(self, n):
+        return [
+            {"title": f"Comic Series #{i}", "wish_name": f"Comic Series #{i}"}
+            for i in range(1, n + 1)
+        ]
+
+    def _genuine_response(self, count):
+        """Mock response where all ``count`` candidates are genuine (empty rejects list)."""
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text="[]")]
+        return fake_resp
+
+    def test_250_candidates_produce_3_api_calls(self, monkeypatch):
+        """250 candidates → 3 chunks: [100, 100, 50] → 3 messages.create calls."""
+        matches = self._make_matches(250)
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._genuine_response(100),
+            self._genuine_response(100),
+            self._genuine_response(50),
+        ]
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert fake_client.messages.create.call_count == 3
+        assert len(result) == 250
+
+    def test_chunk_indices_are_local_not_global(self, monkeypatch):
+        """Each chunk's prompt uses 1-based indices local to that chunk, not
+        global position, so verdicts correlate correctly across chunk boundaries."""
+        matches = self._make_matches(150)  # 2 chunks: [100, 50]
+
+        # Chunk 2: reject ids 2-50 (local), keep only id=1 (local) →
+        # corresponds to global match #101.
+        rejected_chunk2 = [{"id": i, "reason": "test"} for i in range(2, 51)]
+
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            MagicMock(content=[MagicMock(text="[]")]),
+            MagicMock(content=[MagicMock(text=json.dumps(rejected_chunk2))]),
+        ]
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        # 100 from chunk 1 + 1 from chunk 2 = 101
+        assert len(result) == 101
+        # The surviving item from chunk 2 is global index 101 (title "Comic Series #101")
+        assert result[-1]["title"] == "Comic Series #101"
+
+    def test_unparseable_chunk_fails_closed(self, monkeypatch, capsys):
+        """A chunk whose response contains no JSON array is dropped entirely."""
+        matches = self._make_matches(3)
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text="I cannot help with that request.")]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert result == []
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+    def test_out_of_range_id_fails_closed(self, monkeypatch, capsys):
+        """A rejected-id outside 1..len(chunk) causes the whole chunk to drop."""
+        matches = self._make_matches(5)
+        # id=6 is out of range for a 5-candidate chunk.
+        rejected = [{"id": 6, "reason": "phantom id"}]
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert result == []
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+    def test_non_int_id_fails_closed(self, monkeypatch, capsys):
+        """A rejected-id that is not an integer causes the whole chunk to drop."""
+        matches = self._make_matches(5)
+        rejected = [{"id": "two", "reason": "string id"}]
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert result == []
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+    def test_missing_id_key_fails_closed(self, monkeypatch, capsys):
+        """A rejected object with no 'id' key causes the whole chunk to drop."""
+        matches = self._make_matches(5)
+        rejected = [{"reason": "forgot the id"}]
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert result == []
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+    def test_empty_array_keeps_all_candidates(self, monkeypatch):
+        """[] response means nothing rejected — all candidates returned."""
+        matches = self._make_matches(5)
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text="[]")]
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        assert len(result) == 5
+
+    def test_good_chunk_after_bad_chunk_still_kept(self, monkeypatch, capsys):
+        """A bad first chunk drops its candidates but a good second chunk is kept."""
+        matches = self._make_matches(150)  # 2 chunks: [100, 50]
+
+        bad_resp = MagicMock()
+        bad_resp.content = [MagicMock(text="no json here")]
+        good_resp = MagicMock()
+        good_resp.content = [MagicMock(text="[]")]  # nothing rejected → all 50 kept
+
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [bad_resp, good_resp]
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        # First 100 dropped (bad chunk); last 50 kept.
+        assert len(result) == 50
+        assert result[0]["title"] == "Comic Series #101"
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+
+
 class TestVerifyWithClaudeNoSilentDrop:
+    @pytest.fixture(autouse=True)
+    def _set_api_key(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+
     def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
         """BUI-149: the script's internal Claude pass is the single verification
         gate, so a rejected candidate must be surfaced (stderr) with its reason,
@@ -721,10 +1343,7 @@ class TestVerifyWithClaudeNoSilentDrop:
              "wish_name": "Amazing Spider-Man #300"},
             {"title": "Daredevil Annual #1", "wish_name": "Daredevil #1"},
         ]
-        verdict_json = (
-            '[{"id":1,"genuine":true},'
-            '{"id":2,"genuine":false,"reason":"Annual, not the regular series"}]'
-        )
+        verdict_json = '[{"id":2,"reason":"Annual, not the regular series"}]'
         fake_resp = MagicMock()
         fake_resp.content = [MagicMock(text=verdict_json)]
         fake_client = MagicMock()
@@ -741,3 +1360,497 @@ class TestVerifyWithClaudeNoSilentDrop:
         assert "Filtered 1 likely false positive" in err
         assert "Daredevil Annual #1" in err
         assert "Annual, not the regular series" in err
+
+
+# ─── BUI-227: _title_paren_years ─────────────────────────────────────────────
+
+
+class TestTitleParenYears:
+    def test_compound_paren_extracts_year(self):
+        """Compound group like "(Marvel Comics December 2014)" yields [2014]."""
+        assert seller_scan._title_paren_years(
+            "Amazing Spider-Man #7 (Marvel Comics December 2014)"
+        ) == [2014]
+
+    def test_bare_paren_year(self):
+        assert seller_scan._title_paren_years("Batman (1940) #100 NM") == [1940]
+
+    def test_multiple_groups_multiple_years(self):
+        """Two parenthetical groups each with a year → both returned in order."""
+        result = seller_scan._title_paren_years("Some Book (1963) (CGC 2024)")
+        assert result == [1963, 2024]
+
+    def test_out_of_range_years_ignored(self):
+        """Years outside [1930, 2035] are silently dropped."""
+        assert seller_scan._title_paren_years("Book (1900) #1") == []
+        assert seller_scan._title_paren_years("Book (2100) #1") == []
+
+    def test_no_paren_year_returns_empty(self):
+        """Bare (un-parenthesized) year is not extracted."""
+        assert seller_scan._title_paren_years("Amazing Spider-Man #7 VF 1963") == []
+
+    def test_empty_title_returns_empty(self):
+        assert seller_scan._title_paren_years("") == []
+
+    def test_mixed_range_and_out_of_range(self):
+        """Only in-range years survive when the group has multiple 4-digit numbers."""
+        result = seller_scan._title_paren_years("Book (Marvel 2014 1900) #1")
+        assert result == [2014]
+
+    # _title_paren_year backward compat (thin wrapper)
+    def test_paren_year_wrapper_returns_first(self):
+        assert seller_scan._title_paren_year(
+            "Some Book (1963) (CGC 2024)"
+        ) == 1963
+
+    def test_paren_year_wrapper_none_on_empty(self):
+        assert seller_scan._title_paren_year("") is None
+
+
+# ─── BUI-227: era_mismatch compound / multi-year cases ───────────────────────
+
+
+class TestEraMismatchCompound:
+    def test_compound_paren_out_of_era_rejected(self):
+        """Compound "(Marvel Comics December 2014)" for a 1963-range series → reject."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #7 (Marvel Comics December 2014)",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is True
+
+    def test_compound_paren_in_era_kept(self):
+        """Compound "(Marvel Comics October 1984)" for a 1963-1998 series → keep."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #247 (Marvel Comics October 1984)",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_multi_year_one_in_era_kept(self):
+        """"(1963) (CGC 2024)" — 1963 is in range → keep (don't reject just because
+        2024 is also present)."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #1 (1963) (CGC 2024)",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_multi_year_none_in_era_rejected(self):
+        """Both years out of range → reject."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #7 (2014) (CGC 2022)",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is True
+
+
+# ─── BUI-227: _reprint_reject ─────────────────────────────────────────────────
+
+
+class TestReprintReject:
+    def test_facsimile_rejected(self):
+        assert seller_scan._reprint_reject(
+            "Amazing Spider-Man #1 Facsimile Edition"
+        ) is True
+
+    def test_true_believers_rejected(self):
+        assert seller_scan._reprint_reject(
+            "True Believers Amazing Spider-Man #1"
+        ) is True
+
+    def test_marvel_tales_rejected(self):
+        assert seller_scan._reprint_reject("Marvel Tales #100 reprinting ASM") is True
+
+    def test_epic_collection_rejected(self):
+        assert seller_scan._reprint_reject(
+            "Amazing Spider-Man Epic Collection vol 1"
+        ) is True
+
+    def test_omnibus_rejected(self):
+        assert seller_scan._reprint_reject("Avengers Omnibus vol 1 HC") is True
+
+    def test_trade_paperback_rejected(self):
+        assert seller_scan._reprint_reject(
+            "X-Men Trade Paperback Days of Future Past"
+        ) is True
+
+    def test_tpb_rejected(self):
+        assert seller_scan._reprint_reject("X-Men TPB NM condition") is True
+
+    def test_2nd_printing_rejected(self):
+        assert seller_scan._reprint_reject("Amazing Spider-Man #300 2nd Printing") is True
+
+    def test_second_printing_rejected(self):
+        assert seller_scan._reprint_reject(
+            "Amazing Spider-Man #300 Second Printing NM"
+        ) is True
+
+    def test_case_insensitive(self):
+        assert seller_scan._reprint_reject("FACSIMILE EDITION ASM #1") is True
+        assert seller_scan._reprint_reject("asm #1 OMNIBUS") is True
+
+    def test_normal_title_not_rejected(self):
+        assert (
+            seller_scan._reprint_reject("Amazing Spider-Man #300 NM Marvel 1988") is False
+        )
+
+    def test_variant_not_rejected(self):
+        """'variant' is a legitimate first-print term — must NOT be in the lexicon."""
+        assert (
+            seller_scan._reprint_reject("Amazing Spider-Man #1 Variant Cover NM") is False
+        )
+
+    def test_tpb_as_substring_not_rejected(self):
+        """'tpb' must only match as a whole word; 'atpb' should not trigger."""
+        assert seller_scan._reprint_reject("atpbbook #1") is False
+
+    def test_empty_title_not_rejected(self):
+        assert seller_scan._reprint_reject("") is False
+
+
+# ─── BUI-230: digital-code / no-physical reject ──────────────────────────────
+
+
+class TestDigitalReject:
+    def test_no_physical_rejected(self):
+        assert seller_scan._digital_reject(
+            "Amazing Spider-Man #7 DIGITAL CODE ONLY!!! [NO PHYSICAL COMIC BOOK]"
+        ) is True
+
+    def test_code_only_rejected(self):
+        assert seller_scan._digital_reject("Amazing Spider-Man #4 Code Only") is True
+
+    def test_digital_only_rejected(self):
+        assert seller_scan._digital_reject("X-Men #94 Digital Only Edition") is True
+
+    def test_digital_copy_only_rejected(self):
+        assert seller_scan._digital_reject("Daredevil #1 Digital Copy Only") is True
+
+    def test_case_insensitive(self):
+        assert seller_scan._digital_reject("ASM #7 no physical") is True
+
+    def test_with_bonus_digital_code_not_rejected(self):
+        """A physical comic sold WITH a digital code bonus must NOT be dropped."""
+        assert seller_scan._digital_reject(
+            "Amazing Spider-Man #1 NM with Digital Code"
+        ) is False
+
+    def test_bare_digital_code_not_rejected(self):
+        """Bare 'digital code' (no 'only'/'no physical') is a bonus, not a reject."""
+        assert seller_scan._digital_reject("Amazing Spider-Man #1 includes digital code") is False
+
+    def test_normal_title_not_rejected(self):
+        assert seller_scan._digital_reject("Amazing Spider-Man #7 VF") is False
+
+    def test_empty_title_not_rejected(self):
+        assert seller_scan._digital_reject("") is False
+
+
+# ─── BUI-232: trading-card / TCG reject ──────────────────────────────────────
+
+
+class TestTradingCardReject:
+    def test_fleer_real_listing_rejected(self):
+        """Confirmed dcsports87 false positive: Fleer card matching ASM issue number."""
+        assert seller_scan._trading_card_reject(
+            "1994 Fleer The Amazing Spider-Man Venom Suspended Animation #4"
+        ) is True
+
+    def test_fleer_carnage_rejected(self):
+        """Second dcsports87 false positive: Fleer Carnage card."""
+        assert seller_scan._trading_card_reject(
+            "1994 Fleer The Amazing Spider-Man Carnage Suspended Animation #5"
+        ) is True
+
+    def test_upper_deck_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "2024 UPPER DECK MARVEL Avengers #7 trading card"
+        ) is True
+
+    def test_topps_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "2004 Topps Amazing Spider-Man #129 base card"
+        ) is True
+
+    def test_skybox_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "1993 SkyBox Marvel Universe Series IV card #129"
+        ) is True
+
+    def test_panini_comic_not_rejected(self):
+        # BUI-221 Finding 7: Panini is also a comic publisher (Panini Comics /
+        # Marvel UK reprints) so "panini" alone is not an unambiguous trading-
+        # card marker.  Removed from _TRADING_CARD_MARKERS.
+        assert seller_scan._trading_card_reject(
+            "Panini Comics Amazing Spider-Man #300 UK Reprint"
+        ) is False
+
+    def test_mtg_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "2025 MTG Magic: The Gathering Spider-Man Secret Lair #4"
+        ) is True
+
+    def test_magic_the_gathering_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "Magic the Gathering Amazing Spider-Man Secret Lair Drop #4"
+        ) is True
+
+    def test_trading_card_phrase_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "Amazing Spider-Man #300 trading card NM"
+        ) is True
+
+    def test_trading_cards_plural_rejected(self):
+        assert seller_scan._trading_card_reject(
+            "Marvel trading cards lot Amazing Spider-Man"
+        ) is True
+
+    def test_case_insensitive(self):
+        assert seller_scan._trading_card_reject("FLEER Amazing Spider-Man #4") is True
+        assert seller_scan._trading_card_reject("upper deck marvel #7") is True
+
+    def test_normal_comic_title_not_rejected(self):
+        assert (
+            seller_scan._trading_card_reject("Amazing Spider-Man #300 NM Marvel 1988") is False
+        )
+
+    def test_trading_alone_not_rejected(self):
+        """'trading' without 'card(s)' must NOT trigger — fails on substring."""
+        assert seller_scan._trading_card_reject("Amazing Spider-Man #1 trading post") is False
+
+    def test_empty_title_not_rejected(self):
+        assert seller_scan._trading_card_reject("") is False
+
+
+# ─── BUI-227: verify_with_claude prompt enrichment ───────────────────────────
+
+
+class TestVerifyWithClaudePromptEnrichment:
+    """_series_name carried on candidates lands in the prompt as 'Correct series:' line."""
+
+    @pytest.fixture(autouse=True)
+    def _set_api_key(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+
+    def _capture_prompt(self, matches, monkeypatch):
+        """Run verify_with_claude with mocked client; return the prompt string sent."""
+        prompts_seen = []
+
+        def fake_create(**kwargs):
+            prompts_seen.append(kwargs["messages"][0]["content"])
+            resp = MagicMock()
+            resp.content = [MagicMock(text="[]")]
+            return resp
+
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = fake_create
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        seller_scan.verify_with_claude(matches)
+        return prompts_seen[0]
+
+    def test_series_name_present_adds_correct_series_line(self, monkeypatch):
+        """When _series_name is non-empty the prompt block includes the line."""
+        matches = [{
+            "title": "Amazing Spider-Man #7",
+            "wish_name": "Amazing Spider-Man #7",
+            "_series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        }]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "Correct series: The Amazing Spider-Man (Vol. 1) (1963 - 1998)" in prompt
+
+    def test_series_name_absent_no_correct_series_line(self, monkeypatch):
+        """When _series_name is missing the 'Correct series:' line is omitted."""
+        matches = [{"title": "Amazing Spider-Man #7", "wish_name": "Amazing Spider-Man #7"}]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "Correct series:" not in prompt
+
+    def test_series_name_none_no_correct_series_line(self, monkeypatch):
+        """Explicit _series_name=None also omits the line."""
+        matches = [{
+            "title": "Amazing Spider-Man #7",
+            "wish_name": "Amazing Spider-Man #7",
+            "_series_name": None,
+        }]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "Correct series:" not in prompt
+
+    def test_rejects_only_parsing_still_works(self, monkeypatch):
+        """The enriched prompt doesn't break the JSON rejects-only parsing contract."""
+        matches = [
+            {
+                "title": "Amazing Spider-Man #7",
+                "wish_name": "Amazing Spider-Man #7",
+                "_series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+            },
+            {
+                "title": "Daredevil Annual #1",
+                "wish_name": "Daredevil #1",
+                "_series_name": "Daredevil (1964 - 1998)",
+            },
+        ]
+        fake_client = MagicMock()
+        # Reject id=2 (Daredevil Annual)
+        fake_client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text='[{"id":2,"reason":"annual vs regular"}]')]
+        )
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        kept = seller_scan.verify_with_claude(matches)
+        assert len(kept) == 1
+        assert kept[0]["title"] == "Amazing Spider-Man #7"
+
+
+# ─── BUI-229: publication_year_mismatch ──────────────────────────────────────
+
+
+class TestPublicationYearMismatch:
+    """publication_year_mismatch uses eBay item-specifics to reject wrong-era listings."""
+
+    # Helper: a 1963-range series (Amazing Spider-Man Vol 1)
+    _ASM_1963 = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+    # Helper: a pre-1992 series (Wolverine Vol 1)
+    _WOL_1982 = "Wolverine (Vol. 1) (1982 - 2003)"
+    # Helper: pre-1992 series that definitively ended pre-1992
+    _FF_1961 = "Fantastic Four (Vol. 1) (1961 - 1996)"
+    # Silver-age only (ended 1969)
+    _SA_1963 = "X-Men (Vol. 1) (1963 - 1981)"
+
+    def test_pub_year_out_of_range_returns_true(self):
+        """Publication Year clearly outside the series range → True (reject)."""
+        aspects = {"Publication Year": "2014", "Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is True
+
+    def test_pub_year_in_range_returns_false(self):
+        """Publication Year within the series range → False (keep)."""
+        aspects = {"Publication Year": "1964", "Era": "Silver Age (1956-1969)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    def test_pub_year_within_plus_one_tolerance_returns_false(self):
+        """Publication Year == end+1 is kept (±1 tolerance, same as era_mismatch)."""
+        # ASM Vol 1 ends 1998; pub year 1999 is within ±1
+        aspects = {"Publication Year": "1999"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    def test_pub_year_within_minus_one_tolerance_returns_false(self):
+        """Publication Year == begin-1 is kept (±1 tolerance)."""
+        # ASM Vol 1 begins 1963; pub year 1962 is within ±1
+        aspects = {"Publication Year": "1962"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    def test_pub_year_just_outside_tolerance_returns_true(self):
+        """Publication Year == end+2 is rejected (outside ±1 tolerance)."""
+        # ASM Vol 1 ends 1998; pub year 2000 is outside
+        aspects = {"Publication Year": "2000"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is True
+
+    def test_missing_aspects_fail_open(self):
+        """aspects=None → False (fail-open)."""
+        assert seller_scan.publication_year_mismatch(None, self._ASM_1963) is False
+
+    def test_empty_aspects_fail_open(self):
+        """Empty aspects dict → False (fail-open; series_year_range might return a range
+        but no pub-year signal is present → Era fallback also absent)."""
+        assert seller_scan.publication_year_mismatch({}, self._ASM_1963) is False
+
+    def test_missing_series_name_fail_open(self):
+        """series_name=None → False (fail-open)."""
+        aspects = {"Publication Year": "2014"}
+        assert seller_scan.publication_year_mismatch(aspects, None) is False
+
+    def test_empty_series_name_fail_open(self):
+        """Empty series_name → False (fail-open)."""
+        aspects = {"Publication Year": "2014"}
+        assert seller_scan.publication_year_mismatch(aspects, "") is False
+
+    def test_series_name_without_year_range_fail_open(self):
+        """Series name with no decorated year range → series_year_range returns None → False."""
+        aspects = {"Publication Year": "2014"}
+        assert seller_scan.publication_year_mismatch(aspects, "Amazing Spider-Man") is False
+
+    def test_pub_year_absent_era_modern_series_ended_pre_1992_returns_true(self):
+        """Publication Year absent + Era=Modern Age + series ended before 1992 → True."""
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        # X-Men Vol 1 ran 1963-1981 — definitively pre-1992
+        assert seller_scan.publication_year_mismatch(aspects, self._SA_1963) is True
+
+    def test_pub_year_absent_era_modern_series_1992_run_returns_false(self):
+        """Publication Year absent + Era=Modern Age + series ended 2003 → False.
+
+        A 1982-2003 series overlaps Modern Age, so Era alone cannot reject it.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        # Wolverine Vol 1 ran 1982-2003 — overlaps Modern Age → cannot reject
+        assert seller_scan.publication_year_mismatch(aspects, self._WOL_1982) is False
+
+    def test_pub_year_absent_era_silver_not_modern_returns_false(self):
+        """Publication Year absent + Era is NOT Modern Age → False (fail-open)."""
+        aspects = {"Era": "Silver Age (1956-1969)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._SA_1963) is False
+
+    def test_pub_year_absent_no_era_aspect_returns_false(self):
+        """Publication Year absent + no Era key → False (fail-open)."""
+        aspects = {"Series Title": "X-Men"}
+        assert seller_scan.publication_year_mismatch(aspects, self._SA_1963) is False
+
+    def test_unparseable_pub_year_fail_open(self):
+        """Non-integer Publication Year → False (fail-open)."""
+        aspects = {"Publication Year": "circa 2014"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    def test_non_four_digit_pub_year_fail_open(self):
+        """A 3-digit or 5-digit Publication Year → False (fail-open; not a valid year)."""
+        aspects = {"Publication Year": "14"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963) is False
+
+    # ── BUI-231: Era fallback gated on per-issue release_year ─────────────────
+
+    def test_era_fallback_issue_year_pre1992_returns_true(self):
+        """No Pub Year + Era=Modern Age + release_year='1964' (< 1992) → True.
+
+        ASM Vol.1 ran 1963-1998 so the old series-end fallback (end ≥ 1992)
+        would NOT fire.  The per-issue year (1964) correctly rejects a modern
+        listing for a pre-Modern Age wish.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "1964") is True
+
+    def test_era_fallback_issue_year_post1992_returns_false(self):
+        """No Pub Year + Era=Modern Age + release_year='1995' (≥ 1992) → False.
+
+        A 1995 wished issue falls within Modern Age; can't reject on Era alone.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "1995") is False
+
+    def test_era_fallback_release_year_none_series_end_1998_returns_false(self):
+        """No Pub Year + Era=Modern Age + release_year=None + series end=1998 → False.
+
+        Old series-end fallback: end=1998 ≥ 1992 → doesn't fire even without
+        per-issue year.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, None) is False
+
+    def test_era_fallback_release_year_none_series_ended_pre1992_returns_true(self):
+        """No Pub Year + Era=Modern Age + release_year=None + series end 1981 → True.
+
+        Old series-end fallback is preserved when no per-issue year is available.
+        """
+        aspects = {"Era": "Modern Age (1992-Now)"}
+        # _SA_1963 ends 1981 < 1992 → old fallback still fires
+        assert seller_scan.publication_year_mismatch(aspects, self._SA_1963, None) is True
+
+    def test_era_fallback_not_modern_age_returns_false(self):
+        """No Pub Year + Era=Silver Age + release_year='1964' → False (not modern age)."""
+        aspects = {"Era": "Silver Age (1956-1969)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "1964") is False
+
+    def test_pub_year_present_takes_priority_out_of_range(self):
+        """Publication Year present and out-of-range → True, regardless of release_year."""
+        aspects = {"Publication Year": "2014", "Era": "Modern Age (1992-Now)"}
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "1964") is True
+
+    def test_pub_year_present_takes_priority_in_range(self):
+        """Publication Year present and in-range → False, regardless of release_year."""
+        aspects = {"Publication Year": "1964", "Era": "Modern Age (1992-Now)"}
+        # release_year="2020" would normally be post-1992 (keep), but pub year wins
+        assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "2020") is False

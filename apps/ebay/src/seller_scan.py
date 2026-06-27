@@ -134,6 +134,34 @@ def record_items_seen(item_ids, seller):
 
 _STOPWORDS = frozenset({"the", "a", "an", "of", "and", "in", "vol", "comics"})
 
+# Edition words that signal a special printing type.  If a listing title
+# contains one but the wish-item series does NOT, the listing is an obvious
+# non-match and can be rejected before fuzzy scoring (hard_reject rule 2).
+# Giant[-\s]Size and King[-\s]Size match both hyphenated and spaced forms.
+# "special" is intentionally excluded: it's a common cover/variant descriptor
+# ("Special Edition cover", "Holiday Special variant") and a hard-reject on
+# bare \bspecial\b causes too many false negatives (BUI-221 Finding 3).
+_EDITION_PATTERNS = [
+    re.compile(r"\bannual\b", re.IGNORECASE),
+    re.compile(r"\bgiant[\s-]size\b", re.IGNORECASE),
+    re.compile(r"\bking[\s-]size\b", re.IGNORECASE),
+    re.compile(r"\btreasury\b", re.IGNORECASE),
+]
+
+# Multi-comic-lot signals.  Any match → listing is a bundle, not a single issue.
+_LOT_RE = re.compile(
+    r"\blot\s+of\b"           # "lot of"
+    r"|\b\d+\s+lot\b"         # "5 lot", "10-comic lot"
+    r"|\blot\s+\d+"           # "lot 5", "lot 10"
+    r"|\bcollection\b"         # "complete collection", "run collection"
+    r"|\bcomplete\s+run\b"     # "complete run"
+    r"|\bset\s+of\b"          # "set of 10"
+    r"|#\d+\s*-\s*#?\d+",     # issue range: "#1-#10" or "#1-10" (# required on
+                               # the first number so bare "YYYY-YYYY" run ranges
+                               # in single-issue titles don't false-reject)
+    re.IGNORECASE,
+)
+
 # BUI-135: numeric grade tokens (CGC/CBCS slab grades and raw grade shorthand)
 # look like "7.0", "8.5", "9.2", "9.4". _normalize() replaces the "." with a
 # space, orphaning the integer part ("7.0" -> "7 0"); match_listing's bare-\bN\b
@@ -195,12 +223,19 @@ def prepare_wish_items(wish_list):
         tokens = _series_tokens(series)
         if not tokens or issue is None:
             continue
+        # BUI-226: carry raw LOCG series_name (decorated, e.g.
+        # "The Amazing Spider-Man (Vol. 1) (1963 - 1998)") and release year
+        # for era-gate disambiguation.  _series_name may be None for ~9% of
+        # local-only items that were added without a Metron round-trip.
+        release_date = item.get("release_date") or ""
         out.append({
             "id": item.get("id"),
             "name": name,
             "series": series,
             "issue": issue,
             "_tokens": tokens,
+            "_series_name": item.get("series_name"),
+            "_release_year": release_date[:4] or None,
         })
     return out
 
@@ -246,6 +281,366 @@ def match_listing(title, wish_items):
     return None, 0.0
 
 
+def hard_reject(title, series, issue):
+    """Return True if the listing title is an obvious non-match for this wish item.
+
+    Conservative pre-filter: only drops clear mismatches — never rejects a
+    genuine single-issue copy.  Callers (e.g. the wishlist-sellers funnel)
+    should call this before match_listing to shrink the candidate pool cheaply.
+
+    Rules applied in order:
+      1. CGC slab — "cgc" in title.  This scan is raw/ungraded only; mirrors
+         the existing ``if "cgc" in ...`` skip in main() so callers using
+         hard_reject get that guard for free.
+      2. Edition mismatch — title contains Annual / Giant-Size / Giant Size /
+         King-Size / King Size / Special / Treasury (word-boundary,
+         case-insensitive) but the wish-item ``series`` does NOT contain that
+         same word.  Example: "Avengers Annual #1" is rejected for a wish item
+         whose series is "The Avengers", but kept for "Avengers Annual".
+      3. Multi-comic lot — title matches a lot/collection/complete-run/set-of
+         or issue-range pattern (e.g. "#1–#10").
+      4. Missing issue number — if ``issue`` is not None, the normalised title
+         must contain it as a bounded token (#N or bare N), using the same
+         word-boundary regex as match_listing so the two are consistent.
+    """
+    # Rule 1: CGC slab
+    if "cgc" in title.lower():
+        return True
+
+    # Rule 2: edition mismatch
+    for pat in _EDITION_PATTERNS:
+        if pat.search(title) and not pat.search(series):
+            return True
+
+    # Rule 3: multi-comic lot
+    if _LOT_RE.search(title):
+        return True
+
+    # Rule 4: missing issue number (same logic as match_listing)
+    if issue is not None:
+        title_norm = _normalize(_strip_grades(title))
+        issue_pat = re.compile(
+            r"(?:#\s*" + re.escape(issue) + r"\b|\b" + re.escape(issue) + r"\b)"
+        )
+        if not issue_pat.search(title_norm):
+            return True
+
+    return False
+
+
+# ─── Series-volume (era) disambiguation (BUI-226) ────────────────────────────
+# Helpers for matching listings against the correct series era/volume.
+#
+# series_year_range is ported from
+# packages/locg-cli/src/locg/collection_cache.py — keep in sync if the locg
+# source changes.  The locg version uses the same _DASH_CLASS / regex shapes;
+# they are inlined here because apps/ebay is NOT a uv workspace member and
+# cannot import locg.
+
+_ERA_DASH_CLASS = r"[-–—−]"  # ASCII hyphen, en-dash, em-dash, minus
+_ERA_YEAR_RANGE_RE = re.compile(
+    rf"\((\d{{4}})\s*{_ERA_DASH_CLASS}\s*(\d{{4}}|Present)\)", re.IGNORECASE
+)
+_ERA_BARE_YEAR_RE = re.compile(r"\s*\(\d{4}\)")
+_ERA_OPEN_END = 9999  # sentinel for "(YYYY - Present)" open-ended ranges
+
+
+def series_year_range(series_name: str) -> "tuple[int, int] | None":
+    """Extract (begin_year, end_year) from a decorated LOCG series name, or None.
+
+    Ported from packages/locg-cli/src/locg/collection_cache.py.
+    ``(YYYY - Present)`` → open-ended (begin_year, 9999).
+    A bare single year ``(YYYY)`` → (YYYY, YYYY) — not open-ended.
+    Dash variants (en/em-dash) are accepted.
+
+    Examples:
+      "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"  → (1963, 1998)
+      "The Amazing Spider-Man (2022 - Present)"         → (2022, 9999)
+      "Wolverine (1988)"                                → (1988, 1988)
+    """
+    if not series_name:
+        return None
+    m = _ERA_YEAR_RANGE_RE.search(series_name)
+    if m:
+        begin = int(m.group(1))
+        end_tok = m.group(2)
+        end = _ERA_OPEN_END if end_tok.lower() == "present" else int(end_tok)
+        return (begin, end)
+    bare = _ERA_BARE_YEAR_RE.search(series_name)
+    if bare:
+        yr = int(bare.group(0).strip().strip("()"))
+        return (yr, yr)
+    return None
+
+
+def series_volume(series_name: str) -> "int | None":
+    """Extract the volume number from a decorated LOCG series name, or None.
+
+    Handles "(Vol. N)" and "(Volume N)" (case-insensitive).
+
+    Examples:
+      "The Amazing Spider-Man (Vol. 1) (1963 - 1998)" → 1
+      "Wolverine (Volume 2) (1982 - 2003)"             → 2
+      "Batman #100"                                    → None
+    """
+    m = re.search(r"\(Vol(?:ume)?\.?\s*(\d+)\)", series_name or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _title_paren_years(title: str) -> "list[int]":
+    """Extract every 4-digit year (1930–2035) from every parenthetical group in a title.
+
+    Only parenthesized years are extracted (high precision).  Bare years in
+    listing titles are too ambiguous for deterministic rejection and are left to
+    Haiku.
+
+    Handles compound parentheticals like "(Marvel Comics December 2014)" as well
+    as multiple groups like "(1963) (CGC 2024)".
+
+    Examples:
+      "Amazing Spider-Man (2022) #7"                    → [2022]
+      "Amazing Spider-Man #7 (Marvel Comics Dec 2014)"  → [2014]
+      "Batman (1940) #100 NM"                           → [1940]
+      "Some Book (1963) (CGC 2024)"                     → [1963, 2024]
+      "Amazing Spider-Man #7 VF"                        → []
+    """
+    years: list[int] = []
+    for group in re.findall(r"\([^)]*\)", title or ""):
+        for m in re.finditer(r"\b(\d{4})\b", group):
+            yr = int(m.group(1))
+            if 1930 <= yr <= 2035:
+                years.append(yr)
+    return years
+
+
+def _title_paren_year(title: str) -> "int | None":
+    """Extract the first parenthesized 4-digit year (1930–2035) from a title.
+
+    Thin wrapper around _title_paren_years for callers that only need the first
+    year.  Kept for backward compatibility.
+
+    Examples:
+      "Amazing Spider-Man (2022) #7"  → 2022
+      "Amazing Spider-Man #7 VF"      → None
+      "Batman (1940) #100 NM"         → 1940
+    """
+    yrs = _title_paren_years(title)
+    return yrs[0] if yrs else None
+
+
+def _title_volume(title: str) -> "int | None":
+    """Extract an explicit volume number from a listing title, or None.
+
+    Matches "vol N", "vol. N", "volume N" (case-insensitive, word-boundary).
+    Parenthesized years are handled separately by _title_paren_year.
+
+    Examples:
+      "Amazing Spider-Man Vol 3 #7"  → 3
+      "X-Men Volume 1 #94"           → 1
+      "Amazing Spider-Man #7 VF"     → None
+    """
+    m = re.search(r"\bvol(?:ume)?\.?\s*(\d+)\b", title or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def era_mismatch(title: str, series_name: "str | None") -> bool:
+    """Return True (reject) only when the listing title clearly contradicts the wish era.
+
+    FAIL-OPEN design (BUI-226): a false reject (dropping a genuine in-era copy
+    the user wants) is worse than a false accept.  Returns False whenever a
+    needed signal is missing from either side.  Only two high-precision signals:
+
+      1. Parenthesized years in the title vs. the series year range — e.g.
+         "Amazing Spider-Man (2022) #7" vs. a 1963-range wish item.
+         Tolerance: ±1 year to mirror the BUI-214 cover-vs-onsale skew.
+         All years from all parenthetical groups are checked; reject only if
+         NONE of them fall within the range (so "(1963) (CGC 2024)" for a
+         1963-range series is KEPT because 1963 is in range).
+
+      2. Explicit "vol N" in the title vs. the series volume number — e.g.
+         "X-Men Vol 2 #94" vs. a Vol. 1 wish item.
+
+    Bare/ambiguous years (no parentheses) and any other signals are left to
+    the Haiku verify step.
+    """
+    if not series_name:
+        return False
+
+    # Signal 1: parenthesized years in title vs. series year range.
+    yrs = _title_paren_years(title)
+    if yrs:
+        yr_range = series_year_range(series_name)
+        if yr_range is not None:
+            begin, end = yr_range
+            if not any(begin - 1 <= yr <= end + 1 for yr in yrs):
+                return True
+
+    # Signal 2: explicit volume in title vs. series volume.
+    title_vol = _title_volume(title)
+    if title_vol is not None:
+        wish_vol = series_volume(series_name)
+        if wish_vol is not None and title_vol != wish_vol:
+            return True
+
+    return False
+
+
+def publication_year_mismatch(
+    aspects: "dict | None",
+    series_name: "str | None",
+    release_year: "str | None" = None,
+) -> bool:
+    """Return True (reject) when item-specifics clearly contradict the wish series era.
+
+    FAIL-OPEN design (BUI-229): returns False when any needed signal is missing.
+
+    Priority:
+      1. ``Publication Year`` present and parseable as a 4-digit int: reject iff
+         outside ``[begin-1, end+1]`` (same ±1 tolerance as era_mismatch).
+      2. ``Publication Year`` absent: conservative fallback using the ``Era`` aspect
+         and the per-issue release year (BUI-231):
+         - Parse ``release_year`` (4-char string from prepare_wish_items) into
+           ``iy`` (int) if possible.
+         - If ``Era`` contains "modern age":
+           * ``iy is not None`` and ``iy < 1992`` → return True (reject: the wished
+             issue predates Modern Age but the listing's Era says Modern Age).
+           * ``iy is None`` and series range ``end < 1992`` → return True (old
+             series-end fallback: preserves behavior when no per-issue year).
+         - Otherwise → return False (fail-open).
+
+    Reuses ``series_year_range`` for the year range.
+    """
+    if not aspects or not series_name:
+        return False
+    yr_range = series_year_range(series_name)
+    if yr_range is None:
+        return False
+    begin, end = yr_range
+
+    pub_year_raw = aspects.get("Publication Year")
+    if pub_year_raw is not None:
+        try:
+            pub_year = int(str(pub_year_raw).strip())
+        except (ValueError, TypeError):
+            return False  # unparseable → fail-open
+        if len(str(pub_year)) != 4:
+            return False  # not a 4-digit year → fail-open
+        return not (begin - 1 <= pub_year <= end + 1)
+
+    # Publication Year absent — Era fallback (BUI-231: gate on per-issue year).
+    era = str(aspects.get("Era", "")).lower()
+    if "modern age" in era:
+        # Parse per-issue release year if provided.
+        iy: "int | None" = None
+        if release_year is not None:
+            try:
+                parsed = int(str(release_year).strip())
+                if len(str(parsed)) == 4:
+                    iy = parsed
+            except (ValueError, TypeError):
+                pass
+        if iy is not None:
+            # Issue year known: reject only when it predates Modern Age.
+            return iy < 1992
+        else:
+            # No per-issue year: fall back to series-end (pre-BUI-231 behavior).
+            return end < 1992
+    return False
+
+
+# ─── Reprint / non-original-format lexicon (BUI-227) ────────────────────────
+# Unambiguous markers that indicate a reprint, collected edition, or otherwise
+# non-original single-issue format.  Conservative: only terms that would NEVER
+# appear in a genuine first-print single-issue listing.  Do NOT add "variant"
+# or other terms that legitimately appear on original copies.
+
+_REPRINT_MARKERS: frozenset[str] = frozenset({
+    "facsimile",
+    "true believers",
+    "marvel tales",
+    "epic collection",
+    "omnibus",
+    "trade paperback",
+    "tpb",
+    "2nd printing",
+    "second printing",
+})
+
+
+def _reprint_reject(title: str) -> bool:
+    """Return True if the listing title contains a non-original-format marker.
+
+    Case-insensitive; each marker is matched as a whole word or phrase (not a
+    substring of another word) using look-around assertions.
+    """
+    t = (title or "").lower()
+    for marker in _REPRINT_MARKERS:
+        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
+            return True
+    return False
+
+
+# ─── Digital-code / no-physical-comic lexicon (BUI-230) ──────────────────────
+# Markers that indicate the listing is a DIGITAL REDEEM CODE or otherwise has no
+# physical comic — never what a raw-comic buyer wants.  Conservative: only
+# phrases that mean "this IS just a code / there is no physical book".  Do NOT
+# add a bare "digital code": many genuine physical modern comics are sold "with
+# digital code" as a bonus, and rejecting those would be a false negative.
+_DIGITAL_MARKERS: frozenset[str] = frozenset({
+    "no physical",
+    "code only",
+    "digital only",
+    "digital copy only",
+})
+
+
+def _digital_reject(title: str) -> bool:
+    """Return True if the listing is a digital code / no-physical-comic offer.
+
+    Case-insensitive whole-word/phrase match (same mechanism as _reprint_reject).
+    Conservative by design — see _DIGITAL_MARKERS: a title that merely says it
+    "includes/with digital code" alongside a physical book is NOT rejected.
+    """
+    t = (title or "").lower()
+    for marker in _DIGITAL_MARKERS:
+        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
+            return True
+    return False
+
+
+# ─── Trading-card / TCG lexicon (BUI-232) ────────────────────────────────────
+# Markers that categorically identify a trading card or TCG product rather than
+# a comic book.  Conservative: only terms that would NEVER appear in a genuine
+# comic listing.  "psa", "card", and "marvel" are intentionally excluded as too
+# ambiguous.  "panini" is also excluded because Panini Comics / Marvel UK is a
+# legitimate comic publisher, so "panini" alone is not unambiguous (BUI-221 F7).
+
+_TRADING_CARD_MARKERS: frozenset[str] = frozenset({
+    "fleer",
+    "topps",
+    "upper deck",
+    "skybox",
+    "mtg",
+    "magic the gathering",
+    "trading card",
+    "trading cards",
+})
+
+
+def _trading_card_reject(title: str) -> bool:
+    """Return True if the listing title is a trading card or TCG product.
+
+    Case-insensitive whole-word/phrase match (same mechanism as _reprint_reject
+    and _digital_reject).  Only categorically trading-card/TCG terms are in the
+    marker set — ambiguous terms are excluded.
+    """
+    t = (title or "").lower()
+    for marker in _TRADING_CARD_MARKERS:
+        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
+            return True
+    return False
+
+
 # ─── Claude verification ──────────────────────────────────────────────────────
 
 def _load_dotenv(path):
@@ -265,18 +660,62 @@ def _load_dotenv(path):
         pass
 
 
+# Maximum candidates per Claude API call.  At ~30–50 output tokens/verdict,
+# the 8 096-token cap limits a single call to ~150–270 candidates before
+# silent truncation; 100 keeps a comfortable margin and caps cost per call.
+_VERIFY_CHUNK_SIZE = 100
+
+
 def verify_with_claude(matches):
-    """Filter candidates to genuine matches using a single Claude API call."""
+    """Filter candidates to genuine matches using chunked Claude API calls.
+
+    Candidates are processed in batches of at most _VERIFY_CHUNK_SIZE per call
+    so that a large run never silently truncates the response.  Indices in each
+    prompt are 1-based and local to the chunk so the correlation logic is
+    identical to the single-call version.
+
+    Fail-closed: if a chunk's response cannot be parsed OR the number of
+    returned verdicts does not match the number of candidates sent, that chunk
+    is REJECTED entirely (those candidates are dropped) and a warning is
+    printed to stderr.  Better to miss a borderline listing than to surface
+    false positives unattended.  This replaces the previous fail-open fallback
+    that returned all candidates on a parse error.
+    """
     if not matches:
         return []
 
     _load_dotenv(Path(__file__).parent.parent / ".env")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "Error: ANTHROPIC_API_KEY is not set (checked the environment and "
+            "apps/ebay/.env). Claude verification cannot run — refusing to "
+            "surface unverified matches. Export ANTHROPIC_API_KEY or add it to "
+            "apps/ebay/.env, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     client = anthropic.Anthropic()
-    pairs = "\n".join(
-        f'{i+1}. Listing: "{m["title"]}"\n   Wish item: "{m["wish_name"]}"'
-        for i, m in enumerate(matches)
-    )
-    prompt = f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
+
+    kept = []
+    for chunk_start in range(0, len(matches), _VERIFY_CHUNK_SIZE):
+        chunk = matches[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
+        chunk_label = f"{chunk_start + 1}–{chunk_start + len(chunk)}"
+
+        # Build pairs text.  When the candidate carries a decorated series name
+        # (_series_name, stripped from output by _emit), include it as a
+        # "Correct series:" hint so Haiku knows the exact era the user wants.
+        pairs_parts = []
+        for idx, cand in enumerate(chunk, 1):
+            pair_text = (
+                f'{idx}. Listing: "{cand["title"]}"\n'
+                f'   Wish item: "{cand["wish_name"]}"'
+            )
+            sn = cand.get("_series_name")
+            if sn:
+                pair_text += f"\n   Correct series: {sn}"
+            pairs_parts.append(pair_text)
+        pairs = "\n".join(pairs_parts)
+        prompt = f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
 
 Reject if:
 - Different series sharing words (Spider-Man Noir vs Amazing Spider-Man, X-Factor vs X-Men, Superior/Ultimate Spider-Man vs Amazing Spider-Man)
@@ -285,48 +724,85 @@ Reject if:
 - Promotional reprint (Trick or Read, LCSD, Amazon promo, Undeluxe)
 - Modern renumbered issue matching an original issue number (e.g. #10 (811))
 - Series name only in a subtitle or story description, not the actual series
+- Different series VOLUME / relaunch: if the 'Correct series' line shows a specific era, reject listings where 'vol N' or a (YYYY) indicates a different era than the one shown
 
-Respond with only a JSON array, one object per pair in order:
-{{"id": 1, "genuine": true}}
-or
-{{"id": 1, "genuine": false, "reason": "brief reason"}}
+Respond with a JSON array containing ONLY the ids you are REJECTING, each with a brief reason:
+[{{"id": 3, "reason": "X-Factor not X-Men"}}, {{"id": 7, "reason": "annual vs regular"}}]
+
+If nothing is rejected, return [].
+
+Any candidate id NOT present in your response is treated as genuine.
 
 Pairs:
 {pairs}"""
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=8096,
-        messages=[{"role": "user", "content": prompt}],
-    )
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=8096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text
+        json_match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not json_match:
+            print(
+                f"Warning: could not parse Claude response for candidates "
+                f"{chunk_label}; dropping chunk (fail-closed)",
+                file=sys.stderr,
+            )
+            continue
 
-    text = response.content[0].text
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if not m:
-        print("Warning: could not parse Claude response, returning all candidates", file=sys.stderr)
-        return matches
+        try:
+            rejected_list = json.loads(json_match.group())
+        except json.JSONDecodeError:
+            print(
+                f"Warning: invalid JSON in Claude response for candidates "
+                f"{chunk_label}; dropping chunk (fail-closed)",
+                file=sys.stderr,
+            )
+            continue
 
-    verdicts = json.loads(m.group())
-    verdict_map = {v["id"]: v.get("genuine", False) for v in verdicts}
-    reason_map = {v["id"]: v.get("reason", "") for v in verdicts}
+        # Validate: every returned object must have an int id strictly within
+        # the chunk's 1-based range.  A missing key, non-int id, or out-of-range
+        # id indicates a malformed response → reject the whole chunk (fail-closed).
+        valid_ids = set(range(1, len(chunk) + 1))
+        try:
+            rejected_ids: dict[int, str] = {}
+            for v in rejected_list:
+                rid = v["id"]  # KeyError if missing
+                if not isinstance(rid, int):
+                    raise ValueError(f"non-int id: {rid!r}")
+                if rid not in valid_ids:
+                    raise ValueError(f"id {rid} out of range 1..{len(chunk)}")
+                rejected_ids[rid] = v.get("reason", "")
+        except (KeyError, ValueError, TypeError) as exc:
+            print(
+                f"Warning: invalid rejected-ids in Claude response for candidates "
+                f"{chunk_label} ({exc}); dropping chunk (fail-closed)",
+                file=sys.stderr,
+            )
+            continue
 
-    # BUI-149: this internal Claude pass is the single verification gate, so it
-    # must not silently drop rejected candidates. Surface each one (with the
-    # model's reason) to stderr so the user can override if the verifier was
-    # wrong — the seller-scan skill no longer runs a redundant second verifier.
-    dropped = [(cand, reason_map.get(i, ""))
-               for i, cand in enumerate(matches, 1)
-               if not verdict_map.get(i, False)]
-    if dropped:
-        print(f"Filtered {len(dropped)} likely false positive(s) "
-              f"(Claude verification):", file=sys.stderr)
-        for cand, reason in dropped:
-            line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
-            if reason:
-                line += f"  — {reason}"
-            print(line, file=sys.stderr)
+        # BUI-149: surface each rejected candidate (with the model's reason) to
+        # stderr so the user can override if the verifier was wrong.
+        if rejected_ids:
+            print(
+                f"Filtered {len(rejected_ids)} likely false positive(s) "
+                f"(Claude verification):",
+                file=sys.stderr,
+            )
+            for idx, cand in enumerate(chunk, 1):
+                if idx in rejected_ids:
+                    reason = rejected_ids[idx]
+                    line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
+                    if reason:
+                        line += f"  — {reason}"
+                    print(line, file=sys.stderr)
 
-    return [m for i, m in enumerate(matches, 1) if verdict_map.get(i, False)]
+        kept.extend(
+            cand for idx, cand in enumerate(chunk, 1) if idx not in rejected_ids
+        )
+
+    return kept
 
 
 # ─── Output ───────────────────────────────────────────────────────────────────

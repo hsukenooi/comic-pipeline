@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import requests
 
 import ebay_fetch
 
@@ -586,6 +587,267 @@ class TestGetToken:
         _ = parsed["title"].lower()
 
 
+class TestSearchByKeyword:
+    """Unit tests for search_by_keyword() — all network calls mocked."""
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _make_item(self, item_id, title="Comic Book"):
+        """Minimal itemSummary dict accepted by parse_item_summary()."""
+        return {
+            "itemId": f"v1|{item_id}|0",
+            "title": title,
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "10.00", "currency": "USD"},
+            "itemEndDate": "2026-12-01T00:00:00.000Z",
+            "itemWebUrl": f"https://www.ebay.com/itm/{item_id}",
+            "seller": {"username": "testseller"},
+        }
+
+    def _make_resp(self, items, total=None):
+        """Build a MagicMock response whose .json() returns {itemSummaries, total}."""
+        if total is None:
+            total = len(items)
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.json.return_value = {"itemSummaries": items, "total": total}
+        return mock
+
+    # ── encoding tests ───────────────────────────────────────────────────────
+
+    def test_hash_encoded_as_percent23(self):
+        """'#' in keyword must be encoded to '%23' so it isn't silently dropped
+        as a URL fragment separator."""
+        mock_resp = self._make_resp([])
+        with patch("ebay_fetch.requests.get", return_value=mock_resp) as mock_get:
+            with patch("ebay_fetch.time.sleep"):
+                ebay_fetch.search_by_keyword(
+                    "Amazing Spider-Man #129", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        params = mock_get.call_args[1]["params"]
+        assert "%23" in params, f"Expected %23 in params, got: {params}"
+        assert "q=" in params
+        # The issue number must survive encoding (not truncated at '#')
+        assert "129" in params
+
+    def test_spaces_encoded(self):
+        """Spaces in keyword must be percent-encoded, not left raw."""
+        mock_resp = self._make_resp([])
+        with patch("ebay_fetch.requests.get", return_value=mock_resp) as mock_get:
+            with patch("ebay_fetch.time.sleep"):
+                ebay_fetch.search_by_keyword(
+                    "Amazing Spider-Man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        params = mock_get.call_args[1]["params"]
+        # quote(safe="") encodes spaces as %20
+        assert "%20" in params, f"Expected %20 in params, got: {params}"
+
+    def test_buying_options_braces_are_literal(self):
+        """The buyingOptions:{...} braces must reach eBay unencoded."""
+        mock_resp = self._make_resp([])
+        with patch("ebay_fetch.requests.get", return_value=mock_resp) as mock_get:
+            with patch("ebay_fetch.time.sleep"):
+                ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        params = mock_get.call_args[1]["params"]
+        assert "buyingOptions:{" in params, (
+            f"Expected literal 'buyingOptions:{{' in params, got: {params}"
+        )
+
+    # ── filter content tests ─────────────────────────────────────────────────
+
+    def test_default_filter_includes_auction_and_fixed_price(self):
+        """Default buying_options must be AUCTION|FIXED_PRICE (NOT auction-only)."""
+        mock_resp = self._make_resp([])
+        with patch("ebay_fetch.requests.get", return_value=mock_resp) as mock_get:
+            with patch("ebay_fetch.time.sleep"):
+                ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        params = mock_get.call_args[1]["params"]
+        assert "AUCTION|FIXED_PRICE" in params, (
+            f"Expected AUCTION|FIXED_PRICE in params, got: {params}"
+        )
+
+    def test_custom_buying_options(self):
+        """Caller can override buying_options to AUCTION-only."""
+        mock_resp = self._make_resp([])
+        with patch("ebay_fetch.requests.get", return_value=mock_resp) as mock_get:
+            with patch("ebay_fetch.time.sleep"):
+                ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE,
+                    buying_options="AUCTION",
+                )
+        params = mock_get.call_args[1]["params"]
+        assert "buyingOptions:{AUCTION}" in params
+        assert "FIXED_PRICE" not in params
+
+    def test_marketplace_header_set(self):
+        """X-EBAY-C-MARKETPLACE-ID must be EBAY_US."""
+        mock_resp = self._make_resp([])
+        with patch("ebay_fetch.requests.get", return_value=mock_resp) as mock_get:
+            with patch("ebay_fetch.time.sleep"):
+                ebay_fetch.search_by_keyword(
+                    "spider-man", "mytoken", ebay_fetch.PRODUCTION_BASE
+                )
+        headers = mock_get.call_args[1]["headers"]
+        assert headers["X-EBAY-C-MARKETPLACE-ID"] == "EBAY_US"
+        assert headers["Authorization"] == "Bearer mytoken"
+
+    # ── pagination / max_results tests ───────────────────────────────────────
+
+    def test_pagination_stops_at_max_results(self):
+        """Pagination must stop once max_results accumulated items are collected."""
+        # 3 pages × 200 items = 600 total; max_results=500 → expect exactly 500 returned
+        # and exactly 3 calls (offsets 0, 200, 400).
+        items_batch = [self._make_item(i) for i in range(200)]
+        resps = [
+            self._make_resp(items_batch, total=600),  # page 1: offset 0
+            self._make_resp(items_batch, total=600),  # page 2: offset 200
+            self._make_resp(items_batch, total=600),  # page 3: offset 400 → offset becomes 600 >= 500
+        ]
+        with patch("ebay_fetch.requests.get", side_effect=resps) as mock_get:
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE, max_results=500
+                )
+        assert len(results) == 500
+        assert mock_get.call_count == 3
+
+    def test_pagination_stops_when_total_exhausted(self):
+        """If the API reports fewer results than max_results, stop naturally."""
+        items = [self._make_item(i) for i in range(5)]
+        mock_resp = self._make_resp(items, total=5)
+        with patch("ebay_fetch.requests.get", return_value=mock_resp) as mock_get:
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE, max_results=500
+                )
+        assert len(results) == 5
+        assert mock_get.call_count == 1
+
+    # ── empty result ─────────────────────────────────────────────────────────
+
+    def test_empty_result_handled_gracefully(self):
+        """An empty itemSummaries list must return [] without error."""
+        mock_resp = self._make_resp([])
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "nonexistent xzxzxz", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        assert results == []
+
+    # ── sleep tests ───────────────────────────────────────────────────────────
+
+    def test_sleep_called_after_each_page(self):
+        """time.sleep(2) must be called after every successful page fetch."""
+        pages = [
+            self._make_resp([self._make_item(i) for i in range(200)], total=400),
+            self._make_resp([self._make_item(i) for i in range(200, 400)], total=400),
+        ]
+        with patch("ebay_fetch.requests.get", side_effect=pages):
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE, max_results=1000
+                )
+        # 2 pages → 2 sleeps
+        assert mock_sleep.call_count == 2
+        mock_sleep.assert_called_with(2)
+
+    def test_sleep_is_always_2_seconds(self):
+        """The per-page sleep must be exactly 2 s (not the backoff sleep)."""
+        mock_resp = self._make_resp([self._make_item(1)], total=1)
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                ebay_fetch.search_by_keyword(
+                    "x-men", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        # Only one page — sleep(2) called once, never sleep(1) or sleep(4) (backoff)
+        mock_sleep.assert_called_once_with(2)
+
+    # ── return shape tests ────────────────────────────────────────────────────
+
+    def test_returns_parsed_dicts_with_seller(self):
+        """Returned dicts must be from parse_item_summary(), including seller field."""
+        item = self._make_item(12345, title="Amazing Spider-Man #1")
+        mock_resp = self._make_resp([item], total=1)
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        assert len(results) == 1
+        r = results[0]
+        assert r["item_id"] == "12345"
+        assert r["title"] == "Amazing Spider-Man #1"
+        assert r["seller"] == "testseller"
+        assert "listing_url" in r
+        assert "current_price" in r
+
+    # ── error / retry tests ───────────────────────────────────────────────────
+
+    def test_429_retried_then_succeeds(self):
+        """A 429 on the first attempt must be retried; result returned on success."""
+        rate_limited = MagicMock()
+        rate_limited.status_code = 429
+
+        ok = self._make_resp([self._make_item(1)], total=1)
+
+        with patch("ebay_fetch.requests.get", side_effect=[rate_limited, ok]):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE, retries=2
+                )
+        assert len(results) == 1
+
+    def test_http_error_returns_partial_results(self, capsys):
+        """A non-retryable error mid-pagination returns items collected so far."""
+        # Page 1 succeeds, page 2 fails → should return page 1's items
+        page1 = self._make_resp([self._make_item(i) for i in range(5)], total=10)
+        page2_err = MagicMock()
+        page2_err.status_code = 500
+        page2_err.text = "Internal Server Error"
+
+        with patch("ebay_fetch.requests.get", side_effect=[page1, page2_err]):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        # Returns the 5 items from page 1
+        assert len(results) == 5
+        assert "Error searching by keyword" in capsys.readouterr().err
+
+    def test_network_error_on_second_page_returns_first_page(self, capsys):
+        """ConnectionError mid-pagination returns whatever was collected so far without raising."""
+        page1 = self._make_resp([self._make_item(i) for i in range(5)], total=10)
+
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=[page1, requests.exceptions.ConnectionError("timeout")],
+        ):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        assert len(results) == 5
+        assert "Network error" in capsys.readouterr().err
+
+    def test_network_error_on_first_page_returns_empty(self, capsys):
+        """ConnectionError on the very first page returns [] without raising."""
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=requests.exceptions.ConnectionError("no route to host"),
+        ):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        assert results == []
+        assert "Network error" in capsys.readouterr().err
+
+
 # ============================================================
 # Integration Tests — hit real eBay API
 # ============================================================
@@ -711,3 +973,84 @@ class TestIntegrationCLI:
         assert result.returncode == 0
         data = json.loads(result.stdout)
         assert set(data[0].keys()) == {"item_id", "title"}
+
+
+# ─── BUI-229: get_item_aspects ────────────────────────────────────────────────
+
+
+class TestGetItemAspects:
+    """get_item_aspects fetches and parses eBay localizedAspects (BUI-229)."""
+
+    def _mock_200(self, aspects_list):
+        """Return a mock 200 response with localizedAspects."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"localizedAspects": aspects_list}
+        return mock_resp
+
+    def test_parses_localized_aspects_to_flat_dict(self, tmp_path, monkeypatch):
+        """A 200 response with localizedAspects is parsed into {name: value}."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        aspects_list = [
+            {"type": "STRING", "name": "Publication Year", "value": "2014"},
+            {"type": "STRING", "name": "Era", "value": "Modern Age (1992-Now)"},
+            {"type": "STRING", "name": "Series Title", "value": "Amazing Spider-Man"},
+        ]
+        with patch("requests.get", return_value=self._mock_200(aspects_list)):
+            result = ebay_fetch.get_item_aspects("123456", "tok", "https://api.ebay.com")
+        assert result == {
+            "Publication Year": "2014",
+            "Era": "Modern Age (1992-Now)",
+            "Series Title": "Amazing Spider-Man",
+        }
+
+    def test_returns_none_on_non_200(self, tmp_path, monkeypatch):
+        """Non-200 response → None (fail-open)."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        with patch("requests.get", return_value=mock_resp):
+            result = ebay_fetch.get_item_aspects("999", "tok", "https://api.ebay.com")
+        assert result is None
+
+    def test_returns_none_on_network_error(self, tmp_path, monkeypatch):
+        """Network error (ConnectionError) → None (fail-open)."""
+        import requests as req
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        with patch("requests.get", side_effect=req.exceptions.ConnectionError("down")):
+            result = ebay_fetch.get_item_aspects("999", "tok", "https://api.ebay.com")
+        assert result is None
+
+    def test_returns_none_when_no_localized_aspects(self, tmp_path, monkeypatch):
+        """200 response without a localizedAspects key → None (fail-open)."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"title": "Amazing Spider-Man #7"}
+        with patch("requests.get", return_value=mock_resp):
+            result = ebay_fetch.get_item_aspects("888", "tok", "https://api.ebay.com")
+        assert result is None
+
+    def test_disk_cache_hit_skips_network(self, tmp_path, monkeypatch):
+        """A fresh cache file is returned without making an HTTP request."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        cached_aspects = {"Publication Year": "1964", "Era": "Silver Age (1956-1969)"}
+        path = ebay_fetch._aspects_cache_path("777")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cached_aspects))
+
+        with patch("requests.get") as mock_get:
+            result = ebay_fetch.get_item_aspects("777", "tok", "https://api.ebay.com")
+
+        mock_get.assert_not_called()
+        assert result == cached_aspects
+
+    def test_result_written_to_disk_cache(self, tmp_path, monkeypatch):
+        """A successful fetch writes the aspects to the disk cache."""
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        aspects_list = [{"name": "Publication Year", "value": "1975"}]
+        with patch("requests.get", return_value=self._mock_200(aspects_list)):
+            ebay_fetch.get_item_aspects("42", "tok", "https://api.ebay.com")
+
+        cached = ebay_fetch._aspects_cache_get("42")
+        assert cached == {"Publication Year": "1975"}

@@ -625,6 +625,169 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
     return kept
 
 
+def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_options="AUCTION|FIXED_PRICE", retries=3):
+    """Search eBay Browse API by keyword, returning parsed item summaries.
+
+    The item→sellers counterpart to search_seller_listings(): instead of
+    filtering by seller, this searches across all sellers by keyword. Returns
+    a list of dicts from parse_item_summary(), each already carrying the
+    `seller` field. Useful for cross-seller wish-list scans.
+
+    Encoding: the keyword is URL-encoded via quote(keyword, safe="") so that
+    special characters like '#' (URL fragment separator) and spaces survive the
+    query string intact ('#129' → '%23129'; ' ' → '%20'). The buyingOptions
+    filter braces must reach eBay literally — passing a dict to requests would
+    percent-encode them and eBay would silently reject the filter (same BUI-68
+    issue as search_seller_listings). The query string is therefore built by hand,
+    encoding only the keyword.
+
+    Paginates in pages of up to 200 until results exhausted or max_results
+    reached. Sleeps 2 s after each successful page to respect eBay's ~1 call/2 s
+    recommendation across potentially hundreds of keyword searches.
+    """
+    url = f"{base_url}/buy/browse/v1/item_summary/search"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    }
+
+    safe_kw = quote(keyword, safe="")
+    all_items = []
+    offset = 0
+    page_size = 200
+
+    while True:
+        filter_val = f"buyingOptions:{{{buying_options}}}"
+        query = f"q={safe_kw}&filter={filter_val}&limit={page_size}&offset={offset}"
+
+        for attempt in range(retries):
+            try:
+                resp = requests.get(url, headers=headers, params=query, timeout=15)
+            except requests.exceptions.RequestException as exc:
+                print(
+                    f"Network error searching by keyword '{keyword}': {exc}",
+                    file=sys.stderr,
+                )
+                return all_items[:max_results]
+            if resp.status_code == 200:
+                break
+            if resp.status_code == 429 and attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"Rate limited, retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                print(
+                    f"Error searching by keyword: HTTP {resp.status_code}: {resp.text[:200]}",
+                    file=sys.stderr,
+                )
+                return all_items[:max_results]
+
+        data = resp.json()
+        page_items = data.get("itemSummaries", [])
+        all_items.extend(parse_item_summary(item) for item in page_items)
+        offset += len(page_items)
+        total = data.get("total", 0)
+
+        time.sleep(2)
+
+        if not page_items or offset >= total or offset >= max_results:
+            break
+
+    return all_items[:max_results]
+
+
+# ─── Aspects disk cache (BUI-229) ─────────────────────────────────────────────
+# Per-item disk cache for localizedAspects (get_item_by_legacy_id responses).
+# Keyed by numeric item_id; 7-day TTL matches the search-cache default — aspects
+# data is stable for in-flight listings.
+
+_ASPECTS_CACHE_DIR: Path = Path.home() / ".cache" / "ebay-fetch" / "aspects"
+_ASPECTS_CACHE_TTL_SEC: int = 7 * 24 * 3600  # 7 days
+
+
+def _aspects_cache_path(item_id: str) -> Path:
+    """Return the path where item aspects would be cached."""
+    return _ASPECTS_CACHE_DIR / f"{item_id}.json"
+
+
+def _aspects_cache_get(item_id: str) -> "dict | None":
+    """Return cached aspects dict if present and fresh, else None."""
+    path = _aspects_cache_path(item_id)
+    if not path.exists():
+        return None
+    age = time.time() - path.stat().st_mtime
+    if age > _ASPECTS_CACHE_TTL_SEC:
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001  # corrupt/partial file → cache miss
+        return None
+
+
+def _aspects_cache_put(item_id: str, aspects: dict) -> None:
+    """Write aspects dict to the item-level disk cache (atomic tmp→rename)."""
+    path = _aspects_cache_path(item_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(aspects))
+    tmp.replace(path)
+
+
+def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries: int = 3) -> "dict | None":
+    """Fetch a flat {name: value} dict of item aspects from eBay.
+
+    Calls get_item_by_legacy_id and parses ``localizedAspects`` into a flat dict
+    (e.g. {"Publication Year": "2014", "Era": "Modern Age (1992-Now)", ...}).
+    Results are cached on disk for 7 days (keyed by item_id) so re-runs are cheap.
+
+    Fail-open: returns None on any HTTP/network/parse error.  Errors are silently
+    swallowed — the aspects gate is advisory, not load-bearing.  The caller treats
+    None as "no signal" and keeps the listing.
+
+    Request/retry/pacing style mirrors search_by_keyword.
+    """
+    cached = _aspects_cache_get(legacy_item_id)
+    if cached is not None:
+        return cached
+
+    url = f"{base_url}/buy/browse/v1/item/get_item_by_legacy_id"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    }
+    params = {"legacy_item_id": legacy_item_id}
+
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+        except requests.exceptions.RequestException:
+            return None  # network error → fail-open
+        if resp.status_code == 200:
+            break
+        if resp.status_code == 429 and attempt < retries - 1:
+            time.sleep(2 ** attempt)
+            continue
+        return None  # non-retryable or last retry → fail-open
+
+    try:
+        data = resp.json()
+    except (ValueError, AttributeError):
+        return None
+
+    raw_aspects = data.get("localizedAspects")
+    if not isinstance(raw_aspects, list):
+        return None
+
+    aspects: dict = {
+        item.get("name"): item.get("value")
+        for item in raw_aspects
+        if item.get("name")
+    }
+    _aspects_cache_put(legacy_item_id, aspects)
+    return aspects
+
+
 def truncate(text, width):
     """Truncate text to width with ellipsis."""
     if not text:
