@@ -15,6 +15,7 @@ Pipeline (per the plan's diagram):
   7.  Drop already-seen via global seen set, seller=None (R11).
   8.  Drop owned via batch collection-check; 409 = hard-fail (R10/R11).
   9.  Group by seller; drop sellers with < 2 distinct matches (R12).
+  9.5 Item-specifics era gate for bare-title ≥2 candidates; re-apply ≥2 gate (BUI-229).
   10. Split by verdict cache; run Haiku verify on uncached survivors (R8/R9).
   11. Write new verdicts; re-apply ≥2 gate.
   12. Record all final item_ids as seen (global, seller=None — R11).
@@ -204,7 +205,12 @@ def is_pristine_match(match: dict) -> bool:
     trailing = title_tokens[len(expected):]
     for t in trailing:
         if t.isdigit():
-            continue  # bare number (year, copy count) — always allowed
+            # A 4-digit year in 1930–2035 signals a potential relaunch edition
+            # (e.g. "X-Men #1 2019") and must disqualify pristine so Haiku verifies.
+            # A bare non-year number (copy count, lot size) is harmless.
+            if 1930 <= int(t) <= 2035:
+                return False
+            continue
         if t not in _PRISTINE_TRAILING_ALLOW:
             return False
 
@@ -333,8 +339,11 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
             continue
         wish, score = match_listing(title, [wish_item])
         if wish is not None and score >= MATCH_SCORE_FLOOR:
+            seller = item.get("seller")
+            if not seller:
+                continue  # drop: seller=None misbuckets as "_unknown_" in group_and_gate
             matches.append({
-                "seller": item.get("seller"),
+                "seller": seller,
                 "item_id": item.get("item_id"),
                 "title": title,
                 "wish_name": wish_name,
@@ -687,34 +696,6 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
     if hidden:
         print(f"  {hidden} already-seen match(es) dropped", file=sys.stderr)
 
-    # ── Step 7.5: item-specifics era gate for bare-title residual (BUI-229) ─────
-    # Apply only to matches whose title carries no era signal (no parenthesized
-    # year, no "vol N") — the cases era_mismatch cannot catch.  Fetches
-    # localizedAspects from the Browse API for each qualifying match and drops
-    # those whose Publication Year (or Era fallback) contradicts the wish series
-    # era.  Fail-open: missing aspects / network errors → keep the listing.
-    if not args.no_item_specifics and all_matches:
-        checked = 0
-        dropped_is = 0
-        filtered: list = []
-        for m in all_matches:
-            sn = m.get("_series_name")
-            title = m.get("title") or ""
-            if sn and not _title_paren_years(title) and _title_volume(title) is None:
-                checked += 1
-                aspects = get_item_aspects(m["item_id"], token, base_url)
-                if publication_year_mismatch(aspects, sn, m.get("_release_year")):
-                    dropped_is += 1
-                    continue
-            filtered.append(m)
-        all_matches = filtered
-        if checked:
-            print(
-                f"  Item-specifics era filter: checked {checked} bare-title"
-                f" candidate(s), dropped {dropped_is}",
-                file=sys.stderr,
-            )
-
     # ── Step 8: drop owned via batch endpoint (R10) ───────────────────────────
     base_server = _server_base()
     if base_server:
@@ -753,8 +734,40 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         _emit(grouped={}, json_output=args.json_output)
         return 0
 
-    # Flatten post-gate survivors for verdict-cache split
+    # ── Step 7.5 (moved): item-specifics era gate — runs only on ≥2 candidates ──
+    # Flattening after the ≥2 gate avoids paying getItem calls for singleton-seller
+    # or already-owned listings.  Apply only to bare-title matches (no parenthesized
+    # year, no "vol N") whose series name is known — the cases era_mismatch cannot
+    # catch.  Fail-open: missing aspects / network errors → keep the listing.
     candidates = [m for ms in grouped.values() for m in ms]
+    if not args.no_item_specifics and candidates:
+        checked = 0
+        dropped_is = 0
+        filtered: list = []
+        for m in candidates:
+            sn = m.get("_series_name")
+            title = m.get("title") or ""
+            if sn and not _title_paren_years(title) and _title_volume(title) is None:
+                checked += 1
+                aspects = get_item_aspects(m["item_id"], token, base_url)
+                if publication_year_mismatch(aspects, sn, m.get("_release_year")):
+                    dropped_is += 1
+                    continue
+            filtered.append(m)
+        candidates = filtered
+        if checked:
+            print(
+                f"  Item-specifics era filter: checked {checked} bare-title"
+                f" candidate(s), dropped {dropped_is}",
+                file=sys.stderr,
+            )
+        # Re-apply ≥2 gate after item-specifics drops (mirrors Step 11 post-verify re-gate)
+        grouped = group_and_gate(candidates)
+        if not grouped:
+            print("No sellers with ≥2 matches found.", file=sys.stderr)
+            _emit(grouped={}, json_output=args.json_output)
+            return 0
+        candidates = [m for ms in grouped.values() for m in ms]
 
     # ── Step 10: verdict cache split → verify uncached (R8/R9) ───────────────
     db_path = verdict_db_path()
@@ -769,8 +782,15 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
     if uncached:
         # BUI-224: deterministic shortcut — pristine score-1.0 listings skip Haiku.
         # Split before cross-seller dedup so only ambiguous candidates go to verify.
-        pristine_direct = [m for m in uncached if is_pristine_match(m)]
-        needs_verify = [m for m in uncached if not is_pristine_match(m)]
+        # Evaluate is_pristine_match once per item (not twice) by partitioning in
+        # a single pass.
+        pristine_direct = []
+        needs_verify = []
+        for m in uncached:
+            if is_pristine_match(m):
+                pristine_direct.append(m)
+            else:
+                needs_verify.append(m)
 
         if pristine_direct:
             print(

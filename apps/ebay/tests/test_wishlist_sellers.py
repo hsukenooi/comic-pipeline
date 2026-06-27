@@ -186,6 +186,38 @@ class TestGroupAndGate:
     def test_empty_input_returns_empty_dict(self):
         assert ws.group_and_gate([]) == {}
 
+    def test_none_seller_dropped_before_grouping(self):
+        """match_results_for_wish drops items with seller=None so they never reach
+        group_and_gate and cannot form a bogus ≥2 group under '_unknown_'."""
+        wish_item = {
+            "id": "w1",
+            "name": "ASM #129",
+            "series": "Amazing Spider-Man",
+            "issue": "129",
+            "_tokens": ["amazing", "spider", "man"],
+            "_series_name": None,
+            "_release_year": None,
+        }
+        result_no_seller = {
+            "title": "Amazing Spider-Man #129 VF",
+            "item_id": "999",
+            "seller": None,  # ← the problematic case
+            "current_price": "$50.00",
+            "end_date": "2026-07-01",
+            "end_date_iso": "2026-07-01T12:00:00Z",
+            "listing_url": "https://www.ebay.com/itm/999",
+        }
+        with (
+            patch.object(ws, "hard_reject", return_value=False),
+            patch.object(ws, "era_mismatch", return_value=False),
+            patch.object(ws, "_reprint_reject", return_value=False),
+            patch.object(ws, "_digital_reject", return_value=False),
+            patch.object(ws, "_trading_card_reject", return_value=False),
+            patch.object(ws, "match_listing", return_value=(wish_item, 1.0)),
+        ):
+            matches = ws.match_results_for_wish([result_no_seller], wish_item)
+        assert matches == [], "None-seller item must be dropped before the matches list"
+
 
 # ─── batch_check_owned ────────────────────────────────────────────────────────
 
@@ -1171,14 +1203,36 @@ class TestIsPristineMatch:
         )
         assert ws.is_pristine_match(m) is False
 
-    def test_title_year_trailing_is_pristine(self):
-        """A bare year after the issue is a pure number → always allowed → pristine."""
+    def test_title_year_trailing_is_not_pristine(self):
+        """A bare year in 1930–2035 after the issue disqualifies pristine (relaunch risk)."""
         m = make_match(
             title="Amazing Spider-Man #129 1974",
             series="Amazing Spider-Man",
             issue="129",
             score=1.0,
             wish_name="Amazing Spider-Man #129",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_modern_relaunch_year_not_pristine(self):
+        """'X-Men #1 2019 NM' — bare year 2019 in 1930-2035 → not pristine."""
+        m = make_match(
+            title="X-Men #1 2019 NM",
+            series="X-Men",
+            issue="1",
+            score=1.0,
+            wish_name="X-Men #1",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_non_year_number_trailing_is_pristine(self):
+        """A bare non-year integer (e.g. copy count '3') is harmless → pristine."""
+        m = make_match(
+            title="X-Men #1 NM 3",
+            series="X-Men",
+            issue="1",
+            score=1.0,
+            wish_name="X-Men #1",
         )
         assert ws.is_pristine_match(m) is True
 
@@ -1777,6 +1831,60 @@ class TestItemSpecificsGate:
         )
         # _run_main patches get_item_aspects to return None → fail-open → both kept
         assert "sellerA" in output
+
+    def test_singleton_seller_skips_item_specifics_gate(self, tmp_path):
+        """get_item_aspects is NOT called for a singleton seller's bare-title listing
+        because group_and_gate drops that seller before the item-specifics gate runs.
+        It IS called for bare-title listings belonging to a qualifying (≥2) seller.
+        """
+        db_path = tmp_path / "v.db"
+        # sellerA: 2 bare-title matches → passes group_and_gate → item-specifics gate runs
+        m1 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="5001", wish_name="Amazing Spider-Man #7",
+        )
+        m2 = _make_bare_title_match_with_series_name(
+            seller="sellerA", item_id="5002", wish_name="X-Men #94",
+            title="X-Men #94 VF", series="X-Men", issue="94",
+            series_name="X-Men (Vol. 1) (1963 - 1981)",
+        )
+        # sellerB: only 1 bare-title match → singleton, dropped by group_and_gate
+        m3 = _make_bare_title_match_with_series_name(
+            seller="sellerB", item_id="5003", wish_name="Amazing Spider-Man #7",
+        )
+        wish_list, wish_items = _two_wish_items()
+        # in-era pub year for both sellerA matches so they survive the gate
+        mock_aspects = MagicMock(return_value={"Publication Year": "1964"})
+        mock_verify = MagicMock(return_value=[m1, m2])
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            # First wish (ASM #7) yields m1 (sellerA) + m3 (sellerB); second yields m2 (sellerA)
+            patch.object(ws, "match_results_for_wish", side_effect=[[m1, m3], [m2]]),
+            patch.object(ws, "get_item_aspects", mock_aspects),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", mock_verify),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        called_ids = {call[0][0] for call in mock_aspects.call_args_list}
+        # sellerB's singleton (5003) must NOT reach get_item_aspects — dropped by group_and_gate
+        assert "5003" not in called_ids, (
+            "singleton seller's listing must not reach the item-specifics gate"
+        )
+        # sellerA's bare-title matches are in the ≥2 group — at least one was checked
+        assert called_ids & {"5001", "5002"}, (
+            "≥2 seller's bare-title matches must be checked by the item-specifics gate"
+        )
 
 
 # ─── BUI-231: era fallback by issue year ─────────────────────────────────────
