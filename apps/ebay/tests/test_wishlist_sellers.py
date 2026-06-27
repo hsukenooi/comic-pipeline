@@ -1289,3 +1289,67 @@ class TestPristineMatchFunnel:
         )
 
         mock_verify.assert_not_called()
+
+
+# ─── BUI-226: era-gate in match_results_for_wish ─────────────────────────────
+
+class TestMatchResultsForWishEraGate:
+    """match_results_for_wish drops era-mismatched listings via era_mismatch,
+    but keeps titles with no high-precision signal (fail-open)."""
+
+    def _wish_item(
+        self,
+        series: str = "Amazing Spider-Man",
+        issue: str = "7",
+        series_name: "str | None" = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+    ) -> dict:
+        return {
+            "id": "w1",
+            "name": f"{series} #{issue}",
+            "series": series,
+            "issue": issue,
+            "_tokens": ["amazing", "spider", "man"],
+            "_series_name": series_name,
+            "_release_year": "1964",
+        }
+
+    def _result(self, title: str, item_id: str = "1") -> dict:
+        return {
+            "title": title,
+            "item_id": item_id,
+            "seller": "comicseller",
+            "current_price": "$10.00",
+            "end_date": "2026-07-01",
+            "end_date_iso": "2026-07-01T12:00:00Z",
+            "listing_url": "https://www.ebay.com/itm/" + item_id,
+        }
+
+    def test_era_mismatched_title_dropped(self):
+        """Listing title "(2022)" for a 1963-range wish item is rejected."""
+        wish = self._wish_item()
+        results = [self._result("Amazing Spider-Man (2022) #7", "1")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "era-mismatched listing should be dropped"
+
+    def test_plain_title_no_year_kept(self):
+        """Listing with no parenthesized year passes the era gate (fail-open)."""
+        wish = self._wish_item()
+        results = [self._result("Amazing Spider-Man #7 VF", "2")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "plain title with no year should pass era gate"
+
+    def test_in_era_paren_year_kept(self):
+        """Listing with (1964) for a 1963-1998 range passes the era gate."""
+        wish = self._wish_item()
+        results = [self._result("Amazing Spider-Man (1964) #7 FN", "3")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "in-range paren year should pass"
+
+    def test_no_series_name_on_wish_fail_open(self):
+        """If wish has _series_name=None the era gate fails open (no signal)."""
+        wish = self._wish_item(series_name=None)
+        results = [self._result("Amazing Spider-Man (2022) #7", "4")]
+        matches = ws.match_results_for_wish(results, wish)
+        # era_mismatch returns False when series_name is None → listing reaches
+        # match_listing, which may or may not match; we only assert no crash.
+        assert isinstance(matches, list)

@@ -53,6 +53,7 @@ from seller_scan import (
     _normalize,
     _server_base,
     _strip_grades,
+    era_mismatch,
     fetch_seen_item_ids,
     fetch_wish_list,
     hard_reject,
@@ -301,12 +302,18 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
     series = wish_item["series"]
     issue = wish_item["issue"]
     wish_name = wish_item["name"]
+    wish_series_name = wish_item.get("_series_name")
     matches = []
     for item in results:
         title = item.get("title") or ""
         if not title:
             continue
         if hard_reject(title, series, issue):
+            continue
+        # BUI-226: deterministic era-gate — reject listings whose parenthesized
+        # year or explicit volume number clearly contradicts the wish series era.
+        # Fail-open (era_mismatch returns False) when any signal is missing.
+        if era_mismatch(title, wish_series_name):
             continue
         wish, score = match_listing(title, [wish_item])
         if wish is not None and score >= MATCH_SCORE_FLOOR:

@@ -219,12 +219,19 @@ def prepare_wish_items(wish_list):
         tokens = _series_tokens(series)
         if not tokens or issue is None:
             continue
+        # BUI-226: carry raw LOCG series_name (decorated, e.g.
+        # "The Amazing Spider-Man (Vol. 1) (1963 - 1998)") and release year
+        # for era-gate disambiguation.  _series_name may be None for ~9% of
+        # local-only items that were added without a Metron round-trip.
+        release_date = item.get("release_date") or ""
         out.append({
             "id": item.get("id"),
             "name": name,
             "series": series,
             "issue": issue,
             "_tokens": tokens,
+            "_series_name": item.get("series_name"),
+            "_release_year": release_date[:4] or None,
         })
     return out
 
@@ -317,6 +324,139 @@ def hard_reject(title, series, issue):
     return False
 
 
+# ─── Series-volume (era) disambiguation (BUI-226) ────────────────────────────
+# Helpers for matching listings against the correct series era/volume.
+#
+# series_year_range is ported from
+# packages/locg-cli/src/locg/collection_cache.py — keep in sync if the locg
+# source changes.  The locg version uses the same _DASH_CLASS / regex shapes;
+# they are inlined here because apps/ebay is NOT a uv workspace member and
+# cannot import locg.
+
+_ERA_DASH_CLASS = r"[-–—−]"  # ASCII hyphen, en-dash, em-dash, minus
+_ERA_YEAR_RANGE_RE = re.compile(
+    rf"\((\d{{4}})\s*{_ERA_DASH_CLASS}\s*(\d{{4}}|Present)\)", re.IGNORECASE
+)
+_ERA_BARE_YEAR_RE = re.compile(r"\s*\(\d{4}\)")
+_ERA_OPEN_END = 9999  # sentinel for "(YYYY - Present)" open-ended ranges
+
+
+def series_year_range(series_name: str) -> "tuple[int, int] | None":
+    """Extract (begin_year, end_year) from a decorated LOCG series name, or None.
+
+    Ported from packages/locg-cli/src/locg/collection_cache.py.
+    ``(YYYY - Present)`` → open-ended (begin_year, 9999).
+    A bare single year ``(YYYY)`` → (YYYY, YYYY) — not open-ended.
+    Dash variants (en/em-dash) are accepted.
+
+    Examples:
+      "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"  → (1963, 1998)
+      "The Amazing Spider-Man (2022 - Present)"         → (2022, 9999)
+      "Wolverine (1988)"                                → (1988, 1988)
+    """
+    if not series_name:
+        return None
+    m = _ERA_YEAR_RANGE_RE.search(series_name)
+    if m:
+        begin = int(m.group(1))
+        end_tok = m.group(2)
+        end = _ERA_OPEN_END if end_tok.lower() == "present" else int(end_tok)
+        return (begin, end)
+    bare = _ERA_BARE_YEAR_RE.search(series_name)
+    if bare:
+        yr = int(bare.group(0).strip().strip("()"))
+        return (yr, yr)
+    return None
+
+
+def series_volume(series_name: str) -> "int | None":
+    """Extract the volume number from a decorated LOCG series name, or None.
+
+    Handles "(Vol. N)" and "(Volume N)" (case-insensitive).
+
+    Examples:
+      "The Amazing Spider-Man (Vol. 1) (1963 - 1998)" → 1
+      "Wolverine (Volume 2) (1982 - 2003)"             → 2
+      "Batman #100"                                    → None
+    """
+    m = re.search(r"\(Vol(?:ume)?\.?\s*(\d+)\)", series_name or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _title_paren_year(title: str) -> "int | None":
+    """Extract the first parenthesized 4-digit year (1930–2035) from a title.
+
+    Only parenthesized years are extracted (high precision).  Bare years in
+    listing titles are too ambiguous for deterministic rejection and are left to
+    Haiku.
+
+    Examples:
+      "Amazing Spider-Man (2022) #7"  → 2022
+      "Amazing Spider-Man #7 VF"      → None
+      "Batman (1940) #100 NM"         → 1940
+    """
+    m = re.search(r"\((\d{4})\)", title or "")
+    if m:
+        yr = int(m.group(1))
+        if 1930 <= yr <= 2035:
+            return yr
+    return None
+
+
+def _title_volume(title: str) -> "int | None":
+    """Extract an explicit volume number from a listing title, or None.
+
+    Matches "vol N", "vol. N", "volume N" (case-insensitive, word-boundary).
+    Parenthesized years are handled separately by _title_paren_year.
+
+    Examples:
+      "Amazing Spider-Man Vol 3 #7"  → 3
+      "X-Men Volume 1 #94"           → 1
+      "Amazing Spider-Man #7 VF"     → None
+    """
+    m = re.search(r"\bvol(?:ume)?\.?\s*(\d+)\b", title or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def era_mismatch(title: str, series_name: "str | None") -> bool:
+    """Return True (reject) only when the listing title clearly contradicts the wish era.
+
+    FAIL-OPEN design (BUI-226): a false reject (dropping a genuine in-era copy
+    the user wants) is worse than a false accept.  Returns False whenever a
+    needed signal is missing from either side.  Only two high-precision signals:
+
+      1. Parenthesized year in the title vs. the series year range — e.g.
+         "Amazing Spider-Man (2022) #7" vs. a 1963-range wish item.
+         Tolerance: ±1 year to mirror the BUI-214 cover-vs-onsale skew.
+
+      2. Explicit "vol N" in the title vs. the series volume number — e.g.
+         "X-Men Vol 2 #94" vs. a Vol. 1 wish item.
+
+    Bare/ambiguous years (no parentheses) and any other signals are left to
+    the Haiku verify step.
+    """
+    if not series_name:
+        return False
+
+    # Signal 1: parenthesized year in title vs. series year range.
+    title_yr = _title_paren_year(title)
+    if title_yr is not None:
+        yr_range = series_year_range(series_name)
+        if yr_range is not None:
+            begin, end = yr_range
+            if not (begin - 1 <= title_yr <= end + 1):
+                return True
+
+    # Signal 2: explicit volume in title vs. series volume.
+    title_vol = _title_volume(title)
+    if title_vol is not None:
+        wish_vol = series_volume(series_name)
+        if wish_vol is not None and title_vol != wish_vol:
+            return True
+
+    return False
+
+
 # ─── Claude verification ──────────────────────────────────────────────────────
 
 def _load_dotenv(path):
@@ -390,6 +530,7 @@ Reject if:
 - Promotional reprint (Trick or Read, LCSD, Amazon promo, Undeluxe)
 - Modern renumbered issue matching an original issue number (e.g. #10 (811))
 - Series name only in a subtitle or story description, not the actual series
+- Different series VOLUME / relaunch sharing the exact title (e.g. Amazing Spider-Man 2022 or 2018 relaunch vs the 1963 original; 'vol N' or a (YYYY) in the title indicating a later volume than the wished one)
 
 Respond with a JSON array containing ONLY the ids you are REJECTING, each with a brief reason:
 [{{"id": 3, "reason": "X-Factor not X-Men"}}, {{"id": 7, "reason": "annual vs regular"}}]

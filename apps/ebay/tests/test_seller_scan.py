@@ -305,6 +305,245 @@ class TestPrepareWishItems:
         assert "the" not in items[0]["_tokens"]
         assert "amazing" in items[0]["_tokens"]
 
+    # BUI-226: era-data fields
+    def test_carries_series_name(self):
+        """_series_name propagates the raw LOCG decorated series name."""
+        wish = [{
+            "id": 1,
+            "name": "Amazing Spider-Man #300",
+            "series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        }]
+        items = seller_scan.prepare_wish_items(wish)
+        assert items[0]["_series_name"] == "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+    def test_carries_release_year(self):
+        """_release_year is the first 4 chars of release_date."""
+        wish = [{
+            "id": 1,
+            "name": "Amazing Spider-Man #300",
+            "release_date": "1988-05-10",
+        }]
+        items = seller_scan.prepare_wish_items(wish)
+        assert items[0]["_release_year"] == "1988"
+
+    def test_series_name_none_when_missing(self):
+        """Items without series_name (local-only) get _series_name=None."""
+        wish = [{"id": 1, "name": "Amazing Spider-Man #300"}]
+        items = seller_scan.prepare_wish_items(wish)
+        assert items[0]["_series_name"] is None
+
+    def test_release_year_none_when_missing(self):
+        """Items without release_date get _release_year=None."""
+        wish = [{"id": 1, "name": "Amazing Spider-Man #300"}]
+        items = seller_scan.prepare_wish_items(wish)
+        assert items[0]["_release_year"] is None
+
+
+# ─── BUI-226: era disambiguation helpers ─────────────────────────────────────
+
+
+class TestSeriesYearRange:
+    """series_year_range — ported from locg.collection_cache."""
+
+    def test_range(self):
+        assert seller_scan.series_year_range(
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+        ) == (1963, 1998)
+
+    def test_range_en_dash(self):
+        """En-dash variant in the year range."""
+        assert seller_scan.series_year_range(
+            "X-Men (Vol. 1) (1963–1981)"
+        ) == (1963, 1981)
+
+    def test_open_ended_present(self):
+        assert seller_scan.series_year_range(
+            "The Amazing Spider-Man (2022 - Present)"
+        ) == (2022, 9999)
+
+    def test_bare_single_year(self):
+        """A bare (YYYY) is a one-year range, not open-ended."""
+        assert seller_scan.series_year_range("Wolverine (1988)") == (1988, 1988)
+
+    def test_no_year_returns_none(self):
+        assert seller_scan.series_year_range("Amazing Spider-Man") is None
+
+    def test_empty_string_returns_none(self):
+        assert seller_scan.series_year_range("") is None
+
+    def test_none_returns_none(self):
+        # Guard against None input
+        assert seller_scan.series_year_range(None) is None  # type: ignore[arg-type]
+
+
+class TestSeriesVolume:
+    def test_vol_dot(self):
+        assert seller_scan.series_volume(
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+        ) == 1
+
+    def test_volume_word(self):
+        assert seller_scan.series_volume("Wolverine (Volume 2) (1982 - 2003)") == 2
+
+    def test_vol_no_dot(self):
+        assert seller_scan.series_volume("X-Men (Vol 3) (2010 - 2014)") == 3
+
+    def test_no_vol_returns_none(self):
+        assert seller_scan.series_volume("Amazing Spider-Man (1963 - 1998)") is None
+
+    def test_empty_returns_none(self):
+        assert seller_scan.series_volume("") is None
+
+
+class TestTitleParenYear:
+    def test_year_in_parens(self):
+        assert seller_scan._title_paren_year("Amazing Spider-Man (2022) #7") == 2022
+
+    def test_early_year(self):
+        assert seller_scan._title_paren_year("Batman (1940) #100 NM") == 1940
+
+    def test_no_paren_year(self):
+        """Bare year without parens is not extracted."""
+        assert seller_scan._title_paren_year("Amazing Spider-Man #7 VF 1963") is None
+
+    def test_out_of_range_year_ignored(self):
+        """A parenthesized year outside [1930, 2035] is not returned."""
+        assert seller_scan._title_paren_year("Batman (1900) #1") is None
+        assert seller_scan._title_paren_year("Something (2100) #1") is None
+
+    def test_empty_returns_none(self):
+        assert seller_scan._title_paren_year("") is None
+
+
+class TestTitleVolume:
+    def test_vol_n(self):
+        assert seller_scan._title_volume("Amazing Spider-Man Vol 3 #7") == 3
+
+    def test_volume_n(self):
+        assert seller_scan._title_volume("X-Men Volume 1 #94") == 1
+
+    def test_vol_dot_n(self):
+        assert seller_scan._title_volume("Spider-Man Vol. 2 #1") == 2
+
+    def test_no_vol_returns_none(self):
+        assert seller_scan._title_volume("Amazing Spider-Man #7 VF") is None
+
+    def test_empty_returns_none(self):
+        assert seller_scan._title_volume("") is None
+
+
+class TestEraMismatch:
+    # ─── Fail-open: missing signal → False ───────────────────────────────────
+
+    def test_no_series_name_fail_open(self):
+        """No series_name → False (can't discriminate)."""
+        assert seller_scan.era_mismatch("Amazing Spider-Man (2022) #7", None) is False
+
+    def test_empty_series_name_fail_open(self):
+        assert seller_scan.era_mismatch("Amazing Spider-Man (2022) #7", "") is False
+
+    def test_no_title_year_fail_open(self):
+        """Title has no parenthesized year → year check skipped → False."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #7 VF",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_series_name_no_year_range_fail_open(self):
+        """Series name has no year decoration → False."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2022) #7",
+            "Amazing Spider-Man",
+        ) is False
+
+    def test_no_title_vol_fail_open(self):
+        """Title has no explicit 'vol N' → volume check skipped → False."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #7 VF",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_series_no_vol_fail_open(self):
+        """Series has no vol. decoration → volume check skipped → False."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man Vol 2 #7",
+            "The Amazing Spider-Man (1963 - 1998)",
+        ) is False
+
+    # ─── Year check: out-of-range → True ─────────────────────────────────────
+
+    def test_year_out_of_range_rejected(self):
+        """(2022) title vs 1963-1998 range → mismatch."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2022) #7",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is True
+
+    def test_year_in_range_accepted(self):
+        """(1984) title vs 1963-1998 range → no mismatch."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1984) #247",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_year_at_lower_boundary_accepted(self):
+        """Year exactly at begin is within range (±1 tolerance means begin-1 is also OK)."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1963) #1",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_year_at_begin_minus_1_accepted(self):
+        """Year = begin - 1 is within ±1 tolerance (cover-vs-onsale skew, BUI-214)."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1962) #1",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_year_at_end_plus_1_accepted(self):
+        """Year = end + 1 is within ±1 tolerance."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1999) #441",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
+    def test_year_at_end_plus_2_rejected(self):
+        """Year = end + 2 is outside the ±1 window → reject."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2000) #1",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is True
+
+    def test_year_in_open_ended_range_accepted(self):
+        """A (2024) title for a (2022 - Present) series is fine."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2024) #50",
+            "The Amazing Spider-Man (2022 - Present)",
+        ) is False
+
+    def test_old_year_against_open_ended_rejected(self):
+        """A (1965) title for a (2022 - Present) series → reject."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1965) #7",
+            "The Amazing Spider-Man (2022 - Present)",
+        ) is True
+
+    # ─── Volume check: mismatch → True ───────────────────────────────────────
+
+    def test_vol_mismatch_rejected(self):
+        """Title says Vol 2, wish is Vol. 1 → reject."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man Vol 2 #7",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is True
+
+    def test_vol_match_accepted(self):
+        """Title says Vol 1, wish is Vol. 1 → no mismatch."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man Vol 1 #7",
+            "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+        ) is False
+
 
 class TestMatchListing:
     def _items(self, names):
