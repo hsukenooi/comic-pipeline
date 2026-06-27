@@ -661,7 +661,14 @@ def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_optio
         query = f"q={safe_kw}&filter={filter_val}&limit={page_size}&offset={offset}"
 
         for attempt in range(retries):
-            resp = requests.get(url, headers=headers, params=query, timeout=15)
+            try:
+                resp = requests.get(url, headers=headers, params=query, timeout=15)
+            except requests.exceptions.RequestException as exc:
+                print(
+                    f"Network error searching by keyword '{keyword}': {exc}",
+                    file=sys.stderr,
+                )
+                return all_items[:max_results]
             if resp.status_code == 200:
                 break
             if resp.status_code == 429 and attempt < retries - 1:

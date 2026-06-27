@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import requests
 
 import ebay_fetch
 
@@ -817,6 +818,34 @@ class TestSearchByKeyword:
         # Returns the 5 items from page 1
         assert len(results) == 5
         assert "Error searching by keyword" in capsys.readouterr().err
+
+    def test_network_error_on_second_page_returns_first_page(self, capsys):
+        """ConnectionError mid-pagination returns whatever was collected so far without raising."""
+        page1 = self._make_resp([self._make_item(i) for i in range(5)], total=10)
+
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=[page1, requests.exceptions.ConnectionError("timeout")],
+        ):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        assert len(results) == 5
+        assert "Network error" in capsys.readouterr().err
+
+    def test_network_error_on_first_page_returns_empty(self, capsys):
+        """ConnectionError on the very first page returns [] without raising."""
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=requests.exceptions.ConnectionError("no route to host"),
+        ):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE
+                )
+        assert results == []
+        assert "Network error" in capsys.readouterr().err
 
 
 # ============================================================
