@@ -764,6 +764,108 @@ class TestRunFlags:
         assert "No sellers" in output
 
 
+class TestBuyingOptionsFlag:
+    """BUI-225: --buying-options flag mapping, default, and funnel wiring."""
+
+    def _run_capturing_search(
+        self,
+        argv: list,
+        *,
+        tmp_path,
+    ) -> tuple:
+        """Run main() with minimal mocks; return (mock_search, mock_cache_get, mock_cache_put)."""
+        wish_list = [{"id": "w1", "name": "Amazing Spider-Man #129"}]
+        wish_items = [
+            {
+                "id": "w1",
+                "name": "Amazing Spider-Man #129",
+                "series": "Amazing Spider-Man",
+                "issue": "129",
+                "_tokens": ["amazing", "spider", "man"],
+            }
+        ]
+        mock_search = MagicMock(return_value=[])
+        mock_cache_get = MagicMock(return_value=None)
+        mock_cache_put = MagicMock()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", mock_cache_get),
+            patch("wishlist_sellers.search_by_keyword", mock_search),
+            patch("wishlist_sellers.ebay_search_cache.put", mock_cache_put),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", return_value=[]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=tmp_path / "v.db"),
+            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "record_items_seen"),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ws.main(argv)
+
+        return mock_search, mock_cache_get, mock_cache_put
+
+    def test_map_covers_all_choices(self):
+        """_BUYING_OPTIONS_MAP has the correct eBay filter string for each choice."""
+        assert ws._BUYING_OPTIONS_MAP["auction"] == "AUCTION"
+        assert ws._BUYING_OPTIONS_MAP["bin"] == "FIXED_PRICE"
+        assert ws._BUYING_OPTIONS_MAP["all"] == "AUCTION|FIXED_PRICE"
+
+    def test_default_is_auction(self, tmp_path):
+        """No --buying-options flag → default 'auction' → AUCTION sent to search_by_keyword."""
+        mock_search, _, _ = self._run_capturing_search([], tmp_path=tmp_path)
+        kwargs = mock_search.call_args[1]
+        assert kwargs.get("buying_options") == "AUCTION"
+
+    def test_auction_flag_maps_to_AUCTION(self, tmp_path):
+        """--buying-options auction → buying_options='AUCTION' passed to search."""
+        mock_search, _, _ = self._run_capturing_search(
+            ["--buying-options", "auction"], tmp_path=tmp_path
+        )
+        assert mock_search.call_args[1].get("buying_options") == "AUCTION"
+
+    def test_bin_flag_maps_to_FIXED_PRICE(self, tmp_path):
+        """--buying-options bin → buying_options='FIXED_PRICE' passed to search."""
+        mock_search, _, _ = self._run_capturing_search(
+            ["--buying-options", "bin"], tmp_path=tmp_path
+        )
+        assert mock_search.call_args[1].get("buying_options") == "FIXED_PRICE"
+
+    def test_all_flag_maps_to_AUCTION_FIXED_PRICE(self, tmp_path):
+        """--buying-options all → buying_options='AUCTION|FIXED_PRICE' passed to search."""
+        mock_search, _, _ = self._run_capturing_search(
+            ["--buying-options", "all"], tmp_path=tmp_path
+        )
+        assert mock_search.call_args[1].get("buying_options") == "AUCTION|FIXED_PRICE"
+
+    def test_funnel_passes_mode_to_cache_get(self, tmp_path):
+        """cache.get is called with mode='auction' when --buying-options auction (default)."""
+        _, mock_cache_get, _ = self._run_capturing_search([], tmp_path=tmp_path)
+        kwargs = mock_cache_get.call_args[1]
+        assert kwargs.get("mode") == "auction"
+
+    def test_funnel_passes_mode_to_cache_put(self, tmp_path):
+        """cache.put is called with mode='all' when --buying-options all."""
+        _, _, mock_cache_put = self._run_capturing_search(
+            ["--buying-options", "all"], tmp_path=tmp_path
+        )
+        kwargs = mock_cache_put.call_args[1]
+        assert kwargs.get("mode") == "all"
+
+    def test_funnel_cache_mode_matches_flag(self, tmp_path):
+        """cache.get and cache.put both receive the same mode as the --buying-options flag."""
+        _, mock_cache_get, mock_cache_put = self._run_capturing_search(
+            ["--buying-options", "bin"], tmp_path=tmp_path
+        )
+        assert mock_cache_get.call_args[1].get("mode") == "bin"
+        assert mock_cache_put.call_args[1].get("mode") == "bin"
+
+
 class TestFanoutGuards:
     """Skip degenerate numeric-series names + cap per-item noise (smoke finding)."""
 

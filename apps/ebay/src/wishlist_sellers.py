@@ -67,6 +67,16 @@ from seller_scan import (
 # already returns (None, 0.0) below it, so this gate is belt-and-suspenders.
 MATCH_SCORE_FLOOR: float = 0.65
 
+# ─── Buying-options map ────────────────────────────────────────────────────────
+# Maps the --buying-options CLI choice to the eBay Browse API filter value.
+# "auction" is the default: we prefer to find live, time-pressured auctions
+# rather than BIN listings, which are lower-urgency and searchable anytime.
+_BUYING_OPTIONS_MAP: dict[str, str] = {
+    "auction": "AUCTION",
+    "bin":     "FIXED_PRICE",
+    "all":     "AUCTION|FIXED_PRICE",
+}
+
 # ─── Fan-out guard (smoke-test finding) ────────────────────────────────────────
 # A wish item whose series tokenizes to a single PURELY-NUMERIC token (e.g.
 # "300", "52", "1985") produces a hopelessly broad eBay keyword search and a
@@ -534,7 +544,21 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         action="store_true",
         help="Do not write surfaced listings to the seen-store (repeatable/dry runs)",
     )
+    parser.add_argument(
+        "--buying-options",
+        choices=["auction", "bin", "all"],
+        default="auction",
+        dest="buying_options",
+        help=(
+            "eBay buying-options filter (default: auction — auction listings only). "
+            "Use 'bin' for Buy It Now only, or 'all' for both auction and BIN."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    mode = args.buying_options
+    ebay_buying = _BUYING_OPTIONS_MAP[mode]
+    print(f"  Buying options: {mode} (eBay filter {ebay_buying})", file=sys.stderr)
 
     # ── Step 1: fetch wish list ───────────────────────────────────────────────
     print("Fetching wish list...", file=sys.stderr)
@@ -593,11 +617,11 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
     all_matches: list = []
     for wish_item in searchable:
         keyword = f'{wish_item["series"]} #{wish_item["issue"]}'
-        results = ebay_search_cache.get(keyword)
+        results = ebay_search_cache.get(keyword, mode=mode)
         if results is None:
             print(f"  Searching eBay: {keyword}", file=sys.stderr)
-            results = search_by_keyword(keyword, token, base_url)
-            ebay_search_cache.put(keyword, results)
+            results = search_by_keyword(keyword, token, base_url, buying_options=ebay_buying)
+            ebay_search_cache.put(keyword, results, mode=mode)
         else:
             print(f"  Cache hit: {keyword}", file=sys.stderr)
         # Drop ended listings from cache before matching (R3a)

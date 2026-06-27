@@ -41,6 +41,64 @@ def test_cache_key_strips_whitespace():
     assert cache.cache_key("  Amazing Spider-Man #1  ") == cache.cache_key("Amazing Spider-Man #1")
 
 
+# ─── cache_key mode namespacing (BUI-225) ─────────────────────────────────────
+
+def test_cache_key_different_modes_produce_different_keys():
+    """Same keyword with different modes must produce different keys."""
+    kw = "Amazing Spider-Man #129"
+    assert cache.cache_key(kw, "auction") != cache.cache_key(kw, "all")
+    assert cache.cache_key(kw, "auction") != cache.cache_key(kw, "bin")
+    assert cache.cache_key(kw, "bin") != cache.cache_key(kw, "all")
+
+
+def test_cache_key_mode_stable():
+    """Same keyword + same mode always produces the same key."""
+    kw = "X-Men #94"
+    assert cache.cache_key(kw, "auction") == cache.cache_key(kw, "auction")
+
+
+def test_cache_path_different_modes_produce_different_paths():
+    """Same keyword with different modes must resolve to different file paths."""
+    kw = "Fantastic Four #48"
+    assert cache.cache_path(kw, "auction") != cache.cache_path(kw, "all")
+
+
+def test_no_cross_contamination_auction_put_not_visible_to_all_get():
+    """put(..., mode='auction') must NOT be visible to get(..., mode='all')."""
+    keyword = "Hulk #181"
+    items = [{"title": "Hulk #181 VG"}]
+    cache.put(keyword, items, mode="auction")
+    assert cache.get(keyword, mode="all") is None
+
+
+def test_no_cross_contamination_all_put_not_visible_to_auction_get():
+    """put(..., mode='all') must NOT be visible to get(..., mode='auction')."""
+    keyword = "Daredevil #168"
+    items = [{"title": "Daredevil #168 FN"}]
+    cache.put(keyword, items, mode="all")
+    assert cache.get(keyword, mode="auction") is None
+
+
+def test_round_trip_with_explicit_mode():
+    """put + get with the same explicit mode returns the stored items."""
+    keyword = "Iron Fist #14"
+    items = [{"title": "Iron Fist #14 NM"}]
+    cache.put(keyword, items, mode="auction")
+    assert cache.get(keyword, mode="auction") == items
+
+
+def test_default_mode_backward_compatible():
+    """Omitting mode uses the 'all' namespace; existing code paths keep working."""
+    keyword = "Captain America #100"
+    items = [{"title": "Cap #100"}]
+    # put without mode → "all" namespace
+    cache.put(keyword, items)
+    # get without mode → "all" namespace → should hit
+    assert cache.get(keyword) == items
+    # get with explicit "all" → same namespace → should also hit
+    assert cache.get(keyword, mode="all") == items
+
+
 # ─── put / get round-trip ─────────────────────────────────────────────────────
 
 def test_put_then_get_returns_same_items():

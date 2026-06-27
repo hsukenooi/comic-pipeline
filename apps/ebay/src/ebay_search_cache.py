@@ -7,11 +7,16 @@ as a clean public API instead of private helpers.
 
 Public API
 ----------
-cache_key(keyword)            -> str          SHA-256 hex of the canonical keyword
-cache_path(keyword)           -> Path         CACHE_DIR / f"{cache_key}.json"
-get(keyword, *, ttl_sec=...)  -> list | None  fresh cache hit or None
-put(keyword, items)           -> None         write items list to cache
-filter_active(items, *, now)  -> list         drop listings whose end_date_iso is past
+cache_key(keyword, mode="all")            -> str          SHA-256 hex of the canonical (mode, keyword) pair
+cache_path(keyword, mode="all")           -> Path         CACHE_DIR / f"{cache_key}.json"
+get(keyword, *, mode="all", ttl_sec=...)  -> list | None  fresh cache hit or None
+put(keyword, items, *, mode="all")        -> None         write items list to cache
+filter_active(items, *, now)              -> list         drop listings whose end_date_iso is past
+
+The *mode* parameter namespaces the cache so that auction-only results never
+cross-contaminate mixed (AUCTION|FIXED_PRICE) results.  Recognised values mirror
+the --buying-options CLI choices: "auction", "bin", "all".  Callers that omit
+mode get the legacy "all" namespace — backward-compatible with existing caches.
 """
 
 from __future__ import annotations
@@ -28,26 +33,34 @@ DEFAULT_CACHE_TTL_SEC: int = 7 * 24 * 3600  # 7 days
 
 # ─── Key / path helpers ───────────────────────────────────────────────────────
 
-def cache_key(keyword: str) -> str:
-    """Return the SHA-256 hex digest of the canonical (lowercased, stripped) keyword."""
-    canonical = keyword.strip().lower()
+def cache_key(keyword: str, mode: str = "all") -> str:
+    """Return the SHA-256 hex digest of the canonical (mode, keyword) pair.
+
+    *mode* namespaces the key so that auction-only and mixed results never
+    share the same cache slot.  Callers that omit *mode* get the "all"
+    namespace, which matches the legacy single-mode behaviour.
+    """
+    canonical = f"{mode.strip().lower()}\n{keyword.strip().lower()}"
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def cache_path(keyword: str) -> Path:
-    """Return the Path where the cached results for *keyword* would be stored."""
-    return CACHE_DIR / f"{cache_key(keyword)}.json"
+def cache_path(keyword: str, mode: str = "all") -> Path:
+    """Return the Path where the cached results for *keyword* / *mode* would be stored."""
+    return CACHE_DIR / f"{cache_key(keyword, mode)}.json"
 
 
 # ─── Cache read / write ───────────────────────────────────────────────────────
 
-def get(keyword: str, *, ttl_sec: int = DEFAULT_CACHE_TTL_SEC) -> list | None:
+def get(keyword: str, *, mode: str = "all", ttl_sec: int = DEFAULT_CACHE_TTL_SEC) -> list | None:
     """Return the cached list of result dicts if present and fresh, else None.
 
     "Fresh" means the file's mtime is within *ttl_sec* seconds of now.
     A missing, expired, or corrupt file all return None (never raise).
+
+    *mode* must match the value used when the results were stored; different
+    modes map to different cache files (no cross-contamination).
     """
-    path = cache_path(keyword)
+    path = cache_path(keyword, mode)
     if not path.exists():
         return None
     age = time.time() - path.stat().st_mtime
@@ -62,12 +75,15 @@ def get(keyword: str, *, ttl_sec: int = DEFAULT_CACHE_TTL_SEC) -> list | None:
         return None
 
 
-def put(keyword: str, items: list) -> None:
-    """Write *items* (list of result dicts) to the cache for *keyword*.
+def put(keyword: str, items: list, *, mode: str = "all") -> None:
+    """Write *items* (list of result dicts) to the cache for *keyword* / *mode*.
 
     Uses an atomic tmp→rename write (mirrors sold_comps._cache_put).
+
+    *mode* namespaces the file so that auction-only and mixed results never
+    overwrite each other.
     """
-    path = cache_path(keyword)
+    path = cache_path(keyword, mode)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(items))

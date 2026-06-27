@@ -37,8 +37,10 @@ which wishlist-sellers   # should resolve
 **Installed console script** (after `./scripts/install.sh`):
 
 ```bash
-wishlist-sellers                 # human table, progress to stderr
-wishlist-sellers --json          # compact JSON for programmatic use
+wishlist-sellers                          # auction-only (default), human table
+wishlist-sellers --json                   # compact JSON for programmatic use
+wishlist-sellers --buying-options all     # include Buy It Now listings too
+wishlist-sellers --buying-options bin     # Buy It Now only
 ```
 
 **Dev form** (no install required):
@@ -54,6 +56,18 @@ Progress (item count, cache hit/miss, match counts, verify counts) prints to **s
 ```bash
 wishlist-sellers 2>/dev/null
 ```
+
+### `--buying-options` (default: `auction`)
+
+Controls which eBay listing types are searched. The default is **auction-only** — this is intentional: auctions are time-pressured, so a seller holding two of your wish books in auctions is the highest-urgency combine-shipping opportunity.
+
+| Flag value | eBay filter | When to use |
+|---|---|---|
+| `auction` (default) | `AUCTION` | Auction listings only — time-sensitive, highest priority |
+| `bin` | `FIXED_PRICE` | Buy It Now only — low-urgency, can be purchased any time |
+| `all` | `AUCTION\|FIXED_PRICE` | Both types — broadest scan, slowest to narrow to action items |
+
+The cache is **namespaced by mode** — an auction-only run never reads or overwrites a mixed (`all`) cache, and vice versa. Running with `--buying-options all` after a default auction run will make fresh eBay calls for all items (the caches are separate).
 
 **Environment flag** (rare — overrides the config file default):
 
@@ -102,7 +116,7 @@ When run as a skill, present the per-seller blocks clearly so the user can decid
 
 Three layers make steady-state runs near-free:
 
-1. **7-day eBay search cache** — keyword search results are stored under `~/.cache/wishlist-sellers/`. A second run within the week skips all eBay calls for items whose cache is still fresh; only new or expired items hit the API.
+1. **7-day eBay search cache** — keyword search results are stored under `~/.cache/wishlist-sellers/`, keyed by `(mode, keyword)`. A second run with the same `--buying-options` within the week skips all eBay calls for items whose cache is still fresh; only new or expired items hit the API. Changing `--buying-options` (e.g. switching from `auction` to `all`) starts a fresh cache fill because the namespaces are separate.
 2. **Verdict cache** — Haiku's "is this really the book?" verdict for each `(listing_id, wish-item)` pair is stored in a SQLite DB at `~/.cache/wishlist-sellers/verdicts.db`. A listing that survived the first run's verify step is not re-verified; neither is a listing that was rejected. On a warm re-run, Haiku is called only for listings that appeared since the last run.
 3. **Seen-item filter** — listings already surfaced to you are dropped before grouping and before verify, so they contribute zero LLM cost and zero output noise.
 
