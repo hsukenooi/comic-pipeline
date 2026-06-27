@@ -138,11 +138,13 @@ _STOPWORDS = frozenset({"the", "a", "an", "of", "and", "in", "vol", "comics"})
 # contains one but the wish-item series does NOT, the listing is an obvious
 # non-match and can be rejected before fuzzy scoring (hard_reject rule 2).
 # Giant[-\s]Size and King[-\s]Size match both hyphenated and spaced forms.
+# "special" is intentionally excluded: it's a common cover/variant descriptor
+# ("Special Edition cover", "Holiday Special variant") and a hard-reject on
+# bare \bspecial\b causes too many false negatives (BUI-221 Finding 3).
 _EDITION_PATTERNS = [
     re.compile(r"\bannual\b", re.IGNORECASE),
     re.compile(r"\bgiant[\s-]size\b", re.IGNORECASE),
     re.compile(r"\bking[\s-]size\b", re.IGNORECASE),
-    re.compile(r"\bspecial\b", re.IGNORECASE),
     re.compile(r"\btreasury\b", re.IGNORECASE),
 ]
 
@@ -154,7 +156,9 @@ _LOT_RE = re.compile(
     r"|\bcollection\b"         # "complete collection", "run collection"
     r"|\bcomplete\s+run\b"     # "complete run"
     r"|\bset\s+of\b"          # "set of 10"
-    r"|#?\d+\s*-\s*#?\d+",    # issue range: "#1-#10" or "1-10"
+    r"|#\d+\s*-\s*#?\d+",     # issue range: "#1-#10" or "#1-10" (# required on
+                               # the first number so bare "YYYY-YYYY" run ranges
+                               # in single-issue titles don't false-reject)
     re.IGNORECASE,
 )
 
@@ -608,14 +612,14 @@ def _digital_reject(title: str) -> bool:
 # Markers that categorically identify a trading card or TCG product rather than
 # a comic book.  Conservative: only terms that would NEVER appear in a genuine
 # comic listing.  "psa", "card", and "marvel" are intentionally excluded as too
-# ambiguous.
+# ambiguous.  "panini" is also excluded because Panini Comics / Marvel UK is a
+# legitimate comic publisher, so "panini" alone is not unambiguous (BUI-221 F7).
 
 _TRADING_CARD_MARKERS: frozenset[str] = frozenset({
     "fleer",
     "topps",
     "upper deck",
     "skybox",
-    "panini",
     "mtg",
     "magic the gathering",
     "trading card",

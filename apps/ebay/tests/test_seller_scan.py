@@ -1008,14 +1008,32 @@ class TestHardRejectEditionMismatch:
             "King Size Spider-Man #1", "Amazing Spider-Man", "1"
         )
 
-    def test_special_rejected_for_regular_series(self):
-        assert seller_scan.hard_reject(
-            "Amazing Spider-Man Special #5", "Amazing Spider-Man", "5"
+    def test_special_cover_not_rejected_for_regular_series(self):
+        # BUI-221 Finding 3: bare \bspecial\b was too broad — "Special Edition
+        # cover" / "Holiday Special variant" are legitimate descriptors on
+        # original single issues.  Removed from _EDITION_PATTERNS so these
+        # titles are not hard-rejected before Claude can verify them.
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man #5 Special Edition Cover", "Amazing Spider-Man", "5"
+        )
+
+    def test_holiday_special_variant_not_rejected(self):
+        # Another "special" descriptor that is a valid cover variant, not an
+        # edition type.
+        assert not seller_scan.hard_reject(
+            "X-Men #94 Holiday Special Variant Cover", "X-Men", "94"
         )
 
     def test_special_kept_when_series_contains_special(self):
         assert not seller_scan.hard_reject(
             "Amazing Spider-Man Special #5", "Amazing Spider-Man Special", "5"
+        )
+
+    def test_annual_still_rejected_for_regular_series_after_special_removal(self):
+        # Confirm Annual (a true edition type) still rejects even after the
+        # \bspecial\b removal.
+        assert seller_scan.hard_reject(
+            "Avengers Annual #10", "The Avengers", "10"
         )
 
     def test_treasury_rejected_for_regular_series(self):
@@ -1063,14 +1081,30 @@ class TestHardRejectLot:
         )
 
     def test_issue_range_rejected(self):
-        # "#1-#10" issue range is a multi-comic lot.
+        # "#1-#10" issue range is a multi-comic lot; # on the first number anchors it.
         assert seller_scan.hard_reject(
             "X-Men #1-#10 Bronze Age Lot", "X-Men", "1"
         )
 
-    def test_bare_issue_range_rejected(self):
+    def test_hash_anchored_bare_end_range_rejected(self):
+        # "#1-10" (# only on first number) is still a lot.
         assert seller_scan.hard_reject(
+            "Amazing Spider-Man #129-150 Bronze Age", "Amazing Spider-Man", "129"
+        )
+
+    def test_bare_number_range_not_rejected_as_lot(self):
+        # BUI-221 Finding 1: bare digits without a leading '#' (e.g. "129-150")
+        # look like a year range or price span — no longer treated as a lot signal
+        # to avoid false-rejecting single-issue titles that include run years.
+        assert not seller_scan.hard_reject(
             "Amazing Spider-Man 129-150 Bronze Age", "Amazing Spider-Man", "129"
+        )
+
+    def test_run_year_range_in_title_not_lot(self):
+        # BUI-221 Finding 1 regression: "(YYYY-YYYY)" series run info in a
+        # single-issue title must NOT be mistaken for an issue-range lot.
+        assert not seller_scan.hard_reject(
+            "Uncanny X-Men #266 (1981-2011) 1st Gambit", "Uncanny X-Men", "266"
         )
 
 
@@ -1540,10 +1574,13 @@ class TestTradingCardReject:
             "1993 SkyBox Marvel Universe Series IV card #129"
         ) is True
 
-    def test_panini_rejected(self):
+    def test_panini_comic_not_rejected(self):
+        # BUI-221 Finding 7: Panini is also a comic publisher (Panini Comics /
+        # Marvel UK reprints) so "panini" alone is not an unambiguous trading-
+        # card marker.  Removed from _TRADING_CARD_MARKERS.
         assert seller_scan._trading_card_reject(
-            "Panini Marvel sticker collection #300"
-        ) is True
+            "Panini Comics Amazing Spider-Man #300 UK Reprint"
+        ) is False
 
     def test_mtg_rejected(self):
         assert seller_scan._trading_card_reject(
