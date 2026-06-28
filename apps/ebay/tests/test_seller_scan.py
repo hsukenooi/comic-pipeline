@@ -1107,6 +1107,86 @@ class TestHardRejectLot:
             "Uncanny X-Men #266 (1981-2011) 1st Gambit", "Uncanny X-Men", "266"
         )
 
+    # ── BUI-243: quantity-word-prefixed range + complete-set signals ──────────
+
+    def test_batman_dkr_books_range_rejected(self):
+        # BUI-243: "Books 1-4" is a full-run bundle, not the single #4.
+        title = "Batman: The Dark Knight Returns Books 1-4 issues 2-4=1st print 1=2nd print"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(
+            title, "Batman: The Dark Knight Returns", "4"
+        )
+
+    def test_lot_re_books_range(self):
+        # BUI-243: "Books 1-4" matched by _LOT_RE.
+        assert seller_scan._LOT_RE.search("Batman Books 1-4")
+
+    def test_lot_re_issues_range(self):
+        # BUI-243: "issues 2-4" matched by _LOT_RE.
+        assert seller_scan._LOT_RE.search("Dark Knight issues 2-4 1st print")
+
+    def test_lot_re_issue_range_singular(self):
+        # BUI-243: singular "issue 1-6" matched by _LOT_RE.
+        assert seller_scan._LOT_RE.search("Spider-Man issue 1-6 lot")
+
+    def test_lot_re_issues_through(self):
+        # BUI-243: "issues 1 through 6" matched by _LOT_RE.
+        assert seller_scan._LOT_RE.search("X-Men issues 1 through 6 bronze age")
+
+    def test_lot_re_books_through(self):
+        # BUI-243: "books 1 through 4" matched by _LOT_RE.
+        assert seller_scan._LOT_RE.search("Daredevil books 1 through 4")
+
+    def test_lot_re_complete_set(self):
+        # BUI-243: "complete set" matched by _LOT_RE.
+        assert seller_scan._LOT_RE.search("Batman Year One complete set NM")
+
+    def test_year_range_carveout_bare_no_quantity_word(self):
+        # BUI-243 carve-out: a bare "YYYY-YYYY" span with NO quantity-word prefix
+        # must NOT be caught by _LOT_RE (would otherwise hard-reject single issues).
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #4 1962-1963 Silver Age Marvel"
+        )
+
+    def test_year_range_carveout_not_hard_rejected(self):
+        # BUI-243 carve-out via hard_reject: the same title must pass through.
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man #4 1962-1963 Silver Age Marvel",
+            "Amazing Spider-Man",
+            "4",
+        )
+
+    def test_existing_hash_range_still_rejected(self):
+        # BUI-243 regression: #\d+-#?\d+ branch still fires (BUI-221 baseline).
+        assert seller_scan._LOT_RE.search("Amazing Spider-Man #1-#10 Bronze Age")
+        assert seller_scan._LOT_RE.search("Amazing Spider-Man #129-150 Bronze Age")
+
+    # ── BUI-243 review fix: a YEAR span after "issue"/"book" is NOT a range ────
+    # The \d{1,3} bound stops the quantity-word branch from reading a 4-digit year
+    # span (e.g. "First Issue 1962-1963") as an issue range — these are genuine
+    # single key issues and must NOT be dropped.
+
+    def test_year_after_issue_word_not_lot_first_issue(self):
+        # Exact review-reported title: the year span must NOT be lot-matched.
+        # (hard_reject still drops it — but via the unrelated CGC-slab rule, so
+        # the lot-path assertion is on a raw variant below.)
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #1 First Issue 1962-1963 CGC"
+        )
+        raw = "Amazing Spider-Man #1 First Issue 1962-1963 Marvel"
+        assert not seller_scan._LOT_RE.search(raw)
+        assert not seller_scan.hard_reject(raw, "Amazing Spider-Man", "1")
+
+    def test_year_after_issue_word_not_lot_key_issue(self):
+        title = "Amazing Spider-Man #1 Key Issue 1962-1964 Marvel"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "Amazing Spider-Man", "1")
+
+    def test_year_after_issue_word_not_lot_xmen(self):
+        title = "X-Men #1 issue 1963-1964 Silver Age"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "X-Men", "1")
+
 
 class TestHardRejectMissingIssue:
     def test_title_missing_issue_number_rejected(self):
@@ -1159,6 +1239,73 @@ class TestVerifyWithClaudeMissingKey:
             seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
         assert exc.value.code == 1
         assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+    # BUI-241: regression tests for multi-path .env fallback -------------------
+
+    def test_key_loaded_from_file_relative_path(self, monkeypatch):
+        """Key loaded from file-relative .env → no SystemExit (BUI-241 Option A).
+
+        Simulates a seller_scan.py that lives in an --editable install so
+        Path(__file__).parent.parent/.env resolves back into the source tree."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("COMIC_PIPELINE_ENV", raising=False)
+
+        def _stub_load(path):
+            # Simulate file-relative .env containing the key.  Use monkeypatch.setenv
+            # (not raw os.environ assignment) so the key is torn down at test end.
+            monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-bui241-file-relative")
+
+        monkeypatch.setattr(seller_scan, "_load_dotenv", _stub_load)
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="[]")]
+        )
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+
+        # Should NOT raise SystemExit — key was found via file-relative path.
+        result = seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
+        assert isinstance(result, list)
+
+    def test_comic_pipeline_env_fallback_consulted(self, monkeypatch):
+        """$COMIC_PIPELINE_ENV path is tried when file-relative .env has no key (BUI-241 Option B)."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        custom_env_path = "/tmp/custom-bui241.env"
+        monkeypatch.setenv("COMIC_PIPELINE_ENV", custom_env_path)
+
+        # Stub _load_dotenv to set the key only when called with the COMIC_PIPELINE_ENV path.
+        # This simulates the file-relative .env lacking the key but COMIC_PIPELINE_ENV having it.
+        def _selective_load(path):
+            if str(path) == custom_env_path:
+                # Use monkeypatch.setenv (not raw os.environ assignment) so the
+                # key is torn down at test end and doesn't leak to later tests.
+                monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-bui241-comic-pipeline-env")
+
+        monkeypatch.setattr(seller_scan, "_load_dotenv", _selective_load)
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="[]")]
+        )
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+
+        # Should NOT raise SystemExit — key found via $COMIC_PIPELINE_ENV.
+        result = seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
+        assert isinstance(result, list)
+
+    def test_hard_fail_when_all_fallback_paths_miss(self, capsys, monkeypatch):
+        """SystemExit(1) when ANTHROPIC_API_KEY absent from env and all .env files (BUI-241)."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("COMIC_PIPELINE_ENV", raising=False)
+        # All three candidate paths are no-ops.
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "ANTHROPIC_API_KEY" in err
+        # Error message should name the home-dir fallback path, confirming it lists
+        # actual candidate paths rather than a static hardcoded string.
+        assert ".config/comic-pipeline" in err
 
 
 class TestVerifyWithClaudeChunking:
@@ -1441,6 +1588,132 @@ class TestEraMismatchCompound:
         ) is True
 
 
+# ─── BUI-240: era_mismatch per-issue release year ────────────────────────────
+
+
+class TestEraMismatchReleaseYear:
+    """BUI-240: era_mismatch with per-issue release_year (tighter than series-range)."""
+
+    _ASM_V1 = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+    # ── Headline regression: Vol.1-end vs Vol.2-relaunch boundary ────────────
+
+    def test_asm_1999_vol2_relaunch_rejected_for_1963_wish(self):
+        """ASM Vol.2-relaunch 1999 listing is rejected for an ASM #2 wish with release_year=1963.
+
+        The 1999 parenthesized year lands on the old series-range end+1 boundary
+        (which used to fail-open); the per-issue year gate (iy=1963, band [1962, 1964])
+        correctly rejects it.  (BUI-240 headline regression)
+        """
+        assert seller_scan.era_mismatch(
+            "The Amazing Spider-Man #2 (Marvel Comics February 1999)",
+            self._ASM_V1,
+            "1963",
+        ) is True
+
+    def test_asm_1999_compound_paren_rejected_for_1963_wish(self):
+        """Another 1999 compound-paren ASM listing correctly rejected (BUI-240)."""
+        assert seller_scan.era_mismatch(
+            "The Amazing Spider-Man #4 (Marvel Comics April 1999)",
+            self._ASM_V1,
+            "1963",
+        ) is True
+
+    # ── Genuine in-era copies accepted ───────────────────────────────────────
+
+    def test_genuine_in_era_copy_accepted(self):
+        """A listing with a (1963) paren for a release_year=1963 wish item is kept."""
+        assert seller_scan.era_mismatch(
+            "The Amazing Spider-Man #2 (1963)",
+            self._ASM_V1,
+            "1963",
+        ) is False
+
+    # ── ±1 tolerance around the per-issue release year ────────────────────────
+
+    def test_title_year_at_release_plus_1_accepted(self):
+        """Title year = release_year + 1 is within ±1 tolerance → kept."""
+        assert seller_scan.era_mismatch(
+            "The Amazing Spider-Man #2 (1964)",
+            self._ASM_V1,
+            "1963",
+        ) is False
+
+    def test_title_year_at_release_minus_1_accepted(self):
+        """Title year = release_year - 1 is within ±1 tolerance → kept."""
+        assert seller_scan.era_mismatch(
+            "The Amazing Spider-Man #2 (1962)",
+            self._ASM_V1,
+            "1963",
+        ) is False
+
+    def test_title_year_outside_plus_1_rejected(self):
+        """Title year = release_year + 3 is outside ±1 → rejected."""
+        assert seller_scan.era_mismatch(
+            "The Amazing Spider-Man #2 (1966)",
+            self._ASM_V1,
+            "1963",
+        ) is True
+
+    # ── release_year=None falls back to the series-range check ───────────────
+
+    def test_no_release_year_fallback_in_range_accepted(self):
+        """release_year=None + title year 1999 (=end+1) for 1963-1998 range → False.
+
+        With no per-issue year, the series-range fallback applies and
+        1999=end+1 is within the ±1 tolerance band → kept.
+        """
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1999) #441",
+            self._ASM_V1,
+            None,
+        ) is False
+
+    def test_no_release_year_fallback_out_of_range_rejected(self):
+        """release_year=None + title year 2022 for 1963-1998 range → True (rejected)."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2022) #7",
+            self._ASM_V1,
+            None,
+        ) is True
+
+    # ── No parenthesized year in title → fail-open regardless of release_year ─
+
+    def test_no_title_paren_year_fail_open_with_release_year(self):
+        """Bare year (not parenthesized) in title → False even when release_year is set."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man #2 VF 1963",
+            self._ASM_V1,
+            "1963",
+        ) is False
+
+    # ── series_name=None → False (fail-open) ─────────────────────────────────
+
+    def test_series_name_none_fail_open_with_release_year(self):
+        """series_name=None → False even when release_year is set."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1999) #2",
+            None,
+            "1963",
+        ) is False
+
+    # ── Backward compat: 2-arg form still works ───────────────────────────────
+
+    def test_two_arg_form_still_works_reject(self):
+        """Existing 2-arg callers (release_year defaults to None) still rejected correctly."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (2022) #7",
+            self._ASM_V1,
+        ) is True
+
+    def test_two_arg_form_still_works_accept(self):
+        """Existing 2-arg callers (release_year defaults to None) still accepted correctly."""
+        assert seller_scan.era_mismatch(
+            "Amazing Spider-Man (1984) #247",
+            self._ASM_V1,
+        ) is False
+
+
 # ─── BUI-227: _reprint_reject ─────────────────────────────────────────────────
 
 
@@ -1619,6 +1892,212 @@ class TestTradingCardReject:
         assert seller_scan._trading_card_reject("") is False
 
 
+# ─── BUI-239: foreign-edition / foreign-market reprint reject ────────────────
+
+
+class TestForeignEditionReject:
+    """BUI-239: deterministic pre-verify reject for foreign-language/market reprints.
+
+    Three La Prensa titles drove this: all must be caught before any API call.
+    Conservative: bare nationality/language adjectives ("mexican", "spanish")
+    are intentionally NOT in the set — only unambiguous publisher names and
+    edition phrases are included.
+    """
+
+    # ── Observed La Prensa repro titles ──────────────────────────────────────
+
+    def test_la_prensa_sandman_rejected(self):
+        """BUI-239 repro: ASM #4 La Prensa listing → True."""
+        assert seller_scan._foreign_edition_reject(
+            "AMAZING SPIDER-MAN #4 VARIANT 1963 Sandman First appearance mexican la prensa"
+        ) is True
+
+    def test_la_prensa_electro_rejected(self):
+        """BUI-239 repro: ASM #9 La Prensa listing → True."""
+        assert seller_scan._foreign_edition_reject(
+            "AMAZING SPIDER-MAN #9 VARIANT 1963 ELECTRO FIRST appearance mexican la prensa SPANISH"
+        ) is True
+
+    def test_la_prensa_edicion_rejected(self):
+        """BUI-239 repro: ASM #10 La Prensa listing (contains 'EDICION') → True."""
+        assert seller_scan._foreign_edition_reject(
+            "AMAZING SPIDER-MAN #10 VARIANT 1963 EDICION mexican la prensa SPANISH"
+        ) is True
+
+    # ── Individual markers ────────────────────────────────────────────────────
+
+    def test_la_prensa_marker(self):
+        assert seller_scan._foreign_edition_reject("Amazing Spider-Man #4 la prensa") is True
+
+    def test_novedades_marker(self):
+        assert seller_scan._foreign_edition_reject("Amazing Spider-Man #1 novedades edition") is True
+
+    def test_ediciones_marker(self):
+        assert seller_scan._foreign_edition_reject("X-Men #1 ediciones mexico") is True
+
+    def test_edicion_marker(self):
+        assert seller_scan._foreign_edition_reject("Amazing Spider-Man #10 edicion 1963") is True
+
+    def test_en_espanol_with_accent_rejected(self):
+        """'en español' (with ñ, U+00F1) must be caught — accent form (BUI-239)."""
+        assert seller_scan._foreign_edition_reject(
+            "Amazing Spider-Man #4 1963 en español la prensa"
+        ) is True
+
+    def test_espanol_ascii_rejected(self):
+        """'espanol' (ASCII, no tilde) must also be caught (BUI-239)."""
+        assert seller_scan._foreign_edition_reject(
+            "Amazing Spider-Man #4 1963 espanol edition"
+        ) is True
+
+    def test_spanish_edition_phrase_rejected(self):
+        assert seller_scan._foreign_edition_reject(
+            "Amazing Spider-Man #4 Spanish Edition 1963"
+        ) is True
+
+    def test_foreign_edition_phrase_rejected(self):
+        assert seller_scan._foreign_edition_reject(
+            "Amazing Spider-Man #4 foreign edition 1963"
+        ) is True
+
+    def test_case_insensitive(self):
+        assert seller_scan._foreign_edition_reject("ASM #4 LA PRENSA MEXICAN") is True
+        assert seller_scan._foreign_edition_reject("ASM #4 EDICION MEXICAN") is True
+        assert seller_scan._foreign_edition_reject("ASM #4 SPANISH EDITION") is True
+
+    # ── Genuine US copies must pass (return False) ────────────────────────────
+
+    def test_genuine_us_copy_not_rejected(self):
+        """A plain US copy with no foreign marker must pass → False."""
+        assert seller_scan._foreign_edition_reject(
+            "Amazing Spider-Man #4 1963 Sandman 1st appearance VF"
+        ) is False
+
+    def test_normal_comic_title_not_rejected(self):
+        assert seller_scan._foreign_edition_reject(
+            "Amazing Spider-Man #300 NM Marvel 1988"
+        ) is False
+
+    def test_empty_title_not_rejected(self):
+        assert seller_scan._foreign_edition_reject("") is False
+
+    # ── Conservative carve-out: bare adjectives NOT caught deterministically ──
+
+    def test_bare_mexican_adjective_not_rejected(self):
+        """BUI-239 conservative design: bare 'mexican' alone is NOT deterministically
+        rejected — left to Haiku.  Documents the intentional carve-out."""
+        assert seller_scan._foreign_edition_reject(
+            "Amazing Spider-Man #4 mexican villain story arc"
+        ) is False
+
+    def test_bare_spanish_adjective_not_rejected(self):
+        """BUI-239 conservative design: bare 'spanish' alone is NOT deterministically
+        rejected — e.g. 'Spanish Harlem' or character descriptor."""
+        assert seller_scan._foreign_edition_reject(
+            "Amazing Spider-Man #4 spanish story arc"
+        ) is False
+
+    # ── Boundary check: 'espanol' must not match inside longer words ──────────
+
+    def test_espanol_not_substring_matched(self):
+        """'espanol' must only match at a word boundary, not inside a longer word."""
+        # A contrived string where 'espanol' appears as a substring — must NOT match.
+        assert seller_scan._foreign_edition_reject("myespanolfoo #1") is False
+
+
+# ─── BUI-244: later-printing / non-first-print reject ────────────────────────
+
+
+class TestSecondPrintReject:
+    """BUI-244: _second_print_reject catches later-pressing listings that the
+    existing _REPRINT_MARKERS set misses (e.g. "second print" without "-ing").
+
+    Mirrors the structure of TestReprintReject above.
+    """
+
+    # ── Reject cases (returns True) ───────────────────────────────────────────
+
+    def test_vengeance_of_bane_second_print_rejected(self):
+        """BUI-244 repro: the exact Batman: Vengeance of Bane #1 second-print title."""
+        assert seller_scan._second_print_reject(
+            "Batman Vengeance Of Bane #1 1993 II DC comics Second Print 1st Appearance Smith"
+        ) is True
+
+    def test_second_print_rejected(self):
+        """Bare 'second print' (no -ing) → True."""
+        assert seller_scan._second_print_reject("X-Men #1 second print") is True
+
+    def test_2nd_print_rejected(self):
+        """'2nd print' → True."""
+        assert seller_scan._second_print_reject("Amazing Spider-Man #300 2nd print NM") is True
+
+    def test_2nd_printing_rejected(self):
+        """'2nd printing' → True (handles the -ing suffix)."""
+        assert seller_scan._second_print_reject("Amazing Spider-Man #300 2nd printing NM") is True
+
+    def test_3rd_print_rejected(self):
+        """'3rd print' → True."""
+        assert seller_scan._second_print_reject("Spawn #1 3rd print") is True
+
+    def test_third_printing_rejected(self):
+        """'third printing' → True."""
+        assert seller_scan._second_print_reject("Batman #1 third printing") is True
+
+    def test_later_printing_rejected(self):
+        """'later printing' → True."""
+        assert seller_scan._second_print_reject("X-Men #94 later printing VF") is True
+
+    def test_reprint_rejected(self):
+        """'reprint' → True."""
+        assert seller_scan._second_print_reject("Amazing Fantasy #15 reprint VF") is True
+
+    def test_reprints_plural_rejected(self):
+        """'reprints' (plural) → True."""
+        assert seller_scan._second_print_reject("Marvel reprints Amazing Spider-Man #1") is True
+
+    def test_case_insensitive(self):
+        """Match is case-insensitive."""
+        assert seller_scan._second_print_reject("Batman #1 SECOND PRINT") is True
+        assert seller_scan._second_print_reject("X-Men #1 2ND PRINTING") is True
+        assert seller_scan._second_print_reject("Amazing Fantasy #15 REPRINT") is True
+
+    # ── Keep cases (returns False) — must NOT be filtered ─────────────────────
+
+    def test_first_print_not_rejected(self):
+        """'first print' is an original copy — must return False."""
+        assert seller_scan._second_print_reject("X-Men #1 first print NM") is False
+
+    def test_1st_print_not_rejected(self):
+        """'1st print' is an original copy — must return False."""
+        assert seller_scan._second_print_reject("Amazing Spider-Man #300 1st print") is False
+
+    def test_newsstand_not_rejected(self):
+        """Newsstand edition is an original-copy distribution variant — must return False."""
+        assert seller_scan._second_print_reject("X-Men #94 newsstand VF") is False
+
+    def test_direct_not_rejected(self):
+        """Direct edition is an original-copy distribution variant — must return False."""
+        assert seller_scan._second_print_reject("Amazing Spider-Man #129 direct VF") is False
+
+    def test_plain_title_not_rejected(self):
+        """A plain title with no print token → False."""
+        assert seller_scan._second_print_reject("Amazing Spider-Man #4 VF") is False
+
+    def test_bare_printing_without_ordinal_not_rejected(self):
+        """Bare 'printing' without an ordinal prefix is NOT caught (left to Haiku)."""
+        assert seller_scan._second_print_reject("Fine printing condition Batman #1") is False
+
+    def test_empty_title_not_rejected(self):
+        assert seller_scan._second_print_reject("") is False
+
+    def test_none_title_not_rejected(self):
+        assert seller_scan._second_print_reject(None) is False  # type: ignore[arg-type]
+
+    def test_facsimile_not_rejected(self):
+        """'Facsimile' is handled by _reprint_reject, not _second_print_reject — returns False."""
+        assert seller_scan._second_print_reject("Amazing Spider-Man #1 Facsimile Edition") is False
+
+
 # ─── BUI-227: verify_with_claude prompt enrichment ───────────────────────────
 
 
@@ -1697,6 +2176,29 @@ class TestVerifyWithClaudePromptEnrichment:
         kept = seller_scan.verify_with_claude(matches)
         assert len(kept) == 1
         assert kept[0]["title"] == "Amazing Spider-Man #7"
+
+    def test_foreign_edition_bullet_in_prompt(self, monkeypatch):
+        """BUI-239: the foreign-edition reject bullet is present in the Haiku prompt.
+
+        Kept loose (substring check only) so sibling tickets adding their own
+        bullets can land without breaking this assertion.
+        """
+        matches = [{"title": "Amazing Spider-Man #4", "wish_name": "Amazing Spider-Man #4"}]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "Foreign-language or foreign-market reprint/edition" in prompt
+
+    def test_sequential_run_bullet_in_prompt(self, monkeypatch):
+        """BUI-243: the sequential-run / complete-set reject bullet is in the Haiku prompt."""
+        matches = [{"title": "Batman #4", "wish_name": "Batman #4"}]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "Numbered sequential run or complete multi-issue set" in prompt
+
+    def test_later_printing_bullet_in_prompt(self, monkeypatch):
+        """BUI-244: the later-printing / reprint reject bullet is in the Haiku prompt."""
+        matches = [{"title": "Batman: Vengeance of Bane #1", "wish_name": "Batman: Vengeance of Bane #1"}]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "Later printing / reprint of a key issue" in prompt
+        assert "Newsstand and Direct editions are NOT reprints" in prompt
 
 
 # ─── BUI-229: publication_year_mismatch ──────────────────────────────────────
