@@ -1452,13 +1452,23 @@ class TestMatchResultsForWishBui227:
         assert matches == [], "compound out-of-era paren should be rejected"
 
     def test_compound_paren_in_era_kept(self):
-        """'(Marvel Comics October 1984)' for a 1963-1998 range passes the gate."""
+        """BUI-240: '(Marvel Comics October 1984)' for an ASM #7 wish (release_year=1964)
+        is NOW REJECTED by the per-issue-year gate.
+
+        Previously this listing was kept because 1984 falls within the series-range
+        [1962, 1999] (±1 of 1963-1998).  With the tighter per-issue-year check
+        (iy=1964, acceptance band [1963, 1965]), 1984 is outside the band and the
+        listing is correctly rejected — a 1963/1964 issue would not appear in a
+        1984 compound parenthetical on a genuine first-print copy.
+        """
         wish = self._wish_item_1963(issue="7")
         results = [self._result(
             "Amazing Spider-Man #7 (Marvel Comics October 1984)", "2"
         )]
         matches = ws.match_results_for_wish(results, wish)
-        assert len(matches) == 1, "compound in-era paren should pass the era gate"
+        assert matches == [], (
+            "BUI-240: 1984 compound paren for a 1964 wish is rejected by per-issue-year gate"
+        )
 
     def test_facsimile_listing_dropped(self):
         """A facsimile listing is rejected by _reprint_reject before match_listing."""
@@ -1596,6 +1606,205 @@ class TestMatchResultsForWishTradingCardReject:
         results = [self._result("Amazing Spider-Man #4 VF Marvel 1963", "2")]
         matches = ws.match_results_for_wish(results, wish)
         assert len(matches) == 1, "genuine comic listing should be kept"
+
+
+# ─── BUI-239: foreign-edition reject in match_results_for_wish ───────────────
+
+
+class TestMatchResultsForWishForeignEditionReject:
+    """BUI-239: La Prensa / foreign-edition listings are dropped before match_listing."""
+
+    def _wish_item(
+        self,
+        series: str = "Amazing Spider-Man",
+        issue: str = "4",
+    ) -> dict:
+        return {
+            "id": "w1",
+            "name": f"{series} #{issue}",
+            "series": series,
+            "issue": issue,
+            "_tokens": ["amazing", "spider", "man"],
+            "_series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+            "_release_year": "1963",
+        }
+
+    def _result(self, title: str, item_id: str = "1") -> dict:
+        return {
+            "title": title,
+            "item_id": item_id,
+            "seller": "la_prensa_seller",
+            "current_price": "$349.99",
+            "end_date": "2026-07-01",
+            "end_date_iso": "2026-07-01T12:00:00Z",
+            "listing_url": "https://www.ebay.com/itm/" + item_id,
+        }
+
+    def test_la_prensa_listing_dropped(self):
+        """BUI-239 repro: La Prensa listing is dropped from match results."""
+        wish = self._wish_item(issue="4")
+        results = [self._result(
+            "AMAZING SPIDER-MAN #4 VARIANT 1963 Sandman First appearance mexican la prensa",
+            "1",
+        )]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "La Prensa foreign-edition listing should be dropped"
+
+    def test_edicion_listing_dropped(self):
+        """BUI-239 repro: 'EDICION mexican la prensa' title is dropped."""
+        wish = self._wish_item(issue="10")
+        results = [self._result(
+            "AMAZING SPIDER-MAN #10 VARIANT 1963 EDICION mexican la prensa SPANISH",
+            "2",
+        )]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "EDICION foreign-edition listing should be dropped"
+
+    def test_genuine_us_copy_kept(self):
+        """A genuine US copy with no foreign-edition markers is NOT dropped."""
+        wish = self._wish_item(issue="4")
+        results = [self._result("Amazing Spider-Man #4 1963 Sandman 1st appearance VF", "3")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "genuine US copy should be kept"
+
+
+# ─── BUI-244: later-printing reject in match_results_for_wish ────────────────
+
+
+class TestMatchResultsForWishSecondPrintReject:
+    """BUI-244: later-printing listings (second print, reprint) are dropped
+    before match_listing, mirroring TestMatchResultsForWishBui227."""
+
+    def _wish_item(
+        self,
+        series: str = "Batman: Vengeance of Bane",
+        issue: str = "1",
+    ) -> dict:
+        return {
+            "id": "w1",
+            "name": f"{series} #{issue}",
+            "series": series,
+            "issue": issue,
+            "_tokens": ["batman", "vengeance", "bane"],
+            "_series_name": "Batman: Vengeance of Bane (1993)",
+            "_release_year": "1993",
+        }
+
+    def _result(self, title: str, item_id: str = "1") -> dict:
+        return {
+            "title": title,
+            "item_id": item_id,
+            "seller": "dc_seller",
+            "current_price": "$49.99",
+            "end_date": "2026-07-01",
+            "end_date_iso": "2026-07-01T12:00:00Z",
+            "listing_url": "https://www.ebay.com/itm/" + item_id,
+        }
+
+    def test_vengeance_of_bane_second_print_dropped(self):
+        """BUI-244 repro: the reported second-print listing is dropped."""
+        wish = self._wish_item()
+        results = [self._result(
+            "Batman Vengeance Of Bane #1 1993 II DC comics Second Print 1st Appearance Smith",
+            "1",
+        )]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "Second Print listing should be dropped by _second_print_reject"
+
+    def test_2nd_printing_dropped(self):
+        """'2nd printing' listing is rejected before match_listing."""
+        wish = self._wish_item()
+        results = [self._result("Batman Vengeance of Bane #1 2nd printing", "2")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "2nd printing listing should be dropped"
+
+    def test_reprint_listing_dropped(self):
+        """'reprint' listing is rejected before match_listing."""
+        wish = self._wish_item()
+        results = [self._result("Batman Vengeance of Bane #1 reprint 1993 NM", "3")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == [], "reprint listing should be dropped"
+
+    def test_genuine_first_print_kept(self):
+        """A genuine first-print listing is NOT dropped by _second_print_reject."""
+        wish = self._wish_item()
+        results = [self._result("Batman Vengeance of Bane #1 1993 NM 1st Bane", "4")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "genuine first-print listing should be kept"
+
+    def test_newsstand_copy_kept(self):
+        """A newsstand copy is NOT dropped (original distribution variant)."""
+        wish = self._wish_item(series="Amazing Spider-Man", issue="129")
+        wish["_tokens"] = ["amazing", "spider", "man"]
+        wish["_series_name"] = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+        wish["_release_year"] = "1974"
+        results = [self._result("Amazing Spider-Man #129 newsstand VF 1st Punisher", "5")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert len(matches) == 1, "newsstand copy should be kept"
+
+
+# ─── BUI-244: pristine-match token cleanup ────────────────────────────────────
+
+
+class TestIsPristineMatchBui244:
+    """BUI-244: after removing '2nd', '3rd', 'print', 'printing', 'second',
+    'third' from _PRISTINE_PRINT_TOKENS, a title like 'X-Men #1 2nd Print'
+    must NOT qualify as pristine."""
+
+    def test_2nd_print_not_pristine(self):
+        """'X-Men #1 2nd Print' — '2nd' and 'print' no longer in allow-list → not pristine."""
+        m = make_match(
+            title="X-Men #1 2nd Print",
+            series="X-Men",
+            issue="1",
+            score=1.0,
+            wish_name="X-Men #1",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_second_print_not_pristine(self):
+        """'Amazing Spider-Man #300 second print' — 'second' and 'print' removed → not pristine."""
+        m = make_match(
+            title="Amazing Spider-Man #300 second print",
+            series="Amazing Spider-Man",
+            issue="300",
+            score=1.0,
+            wish_name="Amazing Spider-Man #300",
+        )
+        assert ws.is_pristine_match(m) is False
+
+    def test_first_print_still_pristine(self):
+        """'Amazing Spider-Man #300 1st print' — '1st' is kept → still pristine."""
+        m = make_match(
+            title="Amazing Spider-Man #300 1st",
+            series="Amazing Spider-Man",
+            issue="300",
+            score=1.0,
+            wish_name="Amazing Spider-Man #300",
+        )
+        assert ws.is_pristine_match(m) is True
+
+    def test_newsstand_still_pristine(self):
+        """'Amazing Spider-Man #129 VF newsstand' — 'newsstand' is kept → still pristine."""
+        m = make_match(
+            title="Amazing Spider-Man #129 VF newsstand",
+            series="Amazing Spider-Man",
+            issue="129",
+            score=1.0,
+            wish_name="Amazing Spider-Man #129",
+        )
+        assert ws.is_pristine_match(m) is True
+
+    def test_direct_still_pristine(self):
+        """'X-Men #94 NM direct' — 'direct' is kept → still pristine."""
+        m = make_match(
+            title="X-Men #94 NM direct",
+            series="X-Men",
+            issue="94",
+            score=1.0,
+            wish_name="X-Men #94",
+        )
+        assert ws.is_pristine_match(m) is True
 
 
 # ─── BUI-229: item-specifics era gate ────────────────────────────────────────
@@ -1995,3 +2204,248 @@ class TestItemSpecificsEraFallbackByIssueYear:
         # get_item_aspects called exactly once — only for m1 (bare title); m2
         # (paren year) is excluded from the gate check.
         mock_aspects.assert_called_once()
+
+
+# ─── BUI-242: keyword fan-out deduplication ───────────────────────────────────
+
+
+class TestKeywordDedup:
+    """BUI-242: multi-volume wish items that share a keyword get ONE eBay search."""
+
+    def _make_avengers_v1(self) -> dict:
+        return {
+            "id": "w1", "name": "The Avengers #1",
+            "series": "The Avengers", "issue": "1",
+            "_tokens": ["avengers"],
+            "_series_name": "The Avengers (Vol. 1) (1963 - 1996)",
+            "_release_year": "1963",
+        }
+
+    def _make_avengers_v8(self) -> dict:
+        return {
+            "id": "w2", "name": "The Avengers #1",
+            "series": "The Avengers", "issue": "1",
+            "_tokens": ["avengers"],
+            "_series_name": "The Avengers (Vol. 8) (2018 - 2023)",
+            "_release_year": "2018",
+        }
+
+    def _base_patches(self, tmp_path):
+        """Return the common context-manager patches for BUI-242 tests."""
+        return {
+            "load_config": ("id", "sec", "https://api.ebay.com"),
+        }
+
+    def test_identical_keyword_produces_one_search(self, tmp_path):
+        """Two wish items with the same series+issue produce exactly ONE eBay search.
+
+        BUI-242 regression: before the fix, two Avengers #1 wish items (different
+        volumes) each triggered a separate search_by_keyword call, burning a --limit
+        slot and double-logging 'Searching eBay: The Avengers #1'.
+        """
+        db_path = tmp_path / "v.db"
+        avengers_v1 = self._make_avengers_v1()
+        avengers_v8 = self._make_avengers_v8()
+        wish_list = [
+            {"id": "w1", "name": "The Avengers #1"},
+            {"id": "w2", "name": "The Avengers #1"},
+        ]
+        wish_items = [avengers_v1, avengers_v8]
+
+        mock_search = MagicMock(return_value=[])
+        mock_cache_get = MagicMock(return_value=None)
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", mock_cache_get),
+            patch("wishlist_sellers.search_by_keyword", mock_search),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", return_value=[]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        # BUI-242: only ONE search for the shared keyword
+        mock_search.assert_called_once()
+        assert mock_search.call_args[0][0] == "The Avengers #1"
+        # Only ONE cache lookup for the shared keyword
+        mock_cache_get.assert_called_once()
+        assert mock_cache_get.call_args[0][0] == "The Avengers #1"
+
+    def test_identical_keyword_cache_hit_produces_one_cache_get(self, tmp_path):
+        """A warm cache for two same-keyword wish items → one cache.get call, not two."""
+        db_path = tmp_path / "v.db"
+        avengers_v1 = self._make_avengers_v1()
+        avengers_v8 = self._make_avengers_v8()
+        wish_list = [
+            {"id": "w1", "name": "The Avengers #1"},
+            {"id": "w2", "name": "The Avengers #1"},
+        ]
+        wish_items = [avengers_v1, avengers_v8]
+
+        # Return cached results on get → no search_by_keyword call
+        mock_cache_get = MagicMock(return_value=[])
+        mock_search = MagicMock()
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", mock_cache_get),
+            patch("wishlist_sellers.search_by_keyword", mock_search),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", return_value=[]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        # Only ONE cache lookup (not one per wish item)
+        mock_cache_get.assert_called_once()
+        # No search needed — cache hit
+        mock_search.assert_not_called()
+
+    def test_identical_keyword_both_wish_items_run_through_match(self, tmp_path):
+        """Two wish items sharing a keyword are BOTH run through match_results_for_wish.
+
+        BUI-242: the shared eBay results must be matched against each wish item's
+        distinct era gates (e.g. 1963-era vs 2018-era Avengers #1).
+        """
+        db_path = tmp_path / "v.db"
+        avengers_v1 = self._make_avengers_v1()
+        avengers_v8 = self._make_avengers_v8()
+        wish_list = [
+            {"id": "w1", "name": "The Avengers #1"},
+            {"id": "w2", "name": "The Avengers #1"},
+        ]
+        wish_items = [avengers_v1, avengers_v8]
+
+        mock_match = MagicMock(return_value=[])
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", mock_match),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main([])
+
+        # BUI-242: match_results_for_wish called TWICE — once per wish item
+        assert mock_match.call_count == 2
+        called_wish_items = [call[0][1] for call in mock_match.call_args_list]
+        assert avengers_v1 in called_wish_items
+        assert avengers_v8 in called_wish_items
+
+    def test_limit_bounds_distinct_keywords_not_raw_items(self, tmp_path):
+        """--limit N processes N distinct search keywords, not N raw wish items.
+
+        BUI-242: with wish items producing keywords [Avengers #1, Avengers #1,
+        X-Men #1, Thor #1] (3 distinct), --limit 2 runs exactly 2 eBay searches
+        (Avengers #1 and X-Men #1), leaving Thor #1 unsearched.
+        """
+        db_path = tmp_path / "v.db"
+        # Two Avengers #1 (same keyword), one X-Men #1, one Thor #1
+        avengers_v1 = self._make_avengers_v1()
+        avengers_v8 = self._make_avengers_v8()
+        xmen = {
+            "id": "w3", "name": "X-Men #1",
+            "series": "X-Men", "issue": "1",
+            "_tokens": ["xmen"],
+            "_series_name": None, "_release_year": None,
+        }
+        thor = {
+            "id": "w4", "name": "Thor #1",
+            "series": "Thor", "issue": "1",
+            "_tokens": ["thor"],
+            "_series_name": None, "_release_year": None,
+        }
+        wish_list = [{"id": x, "name": "..."} for x in ["w1", "w2", "w3", "w4"]]
+        wish_items = [avengers_v1, avengers_v8, xmen, thor]
+
+        mock_search = MagicMock(return_value=[])
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", mock_search),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", return_value=[]),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main(["--limit", "2"])
+
+        # BUI-242: --limit 2 → only 2 distinct keyword searches
+        assert mock_search.call_count == 2
+        searched_keywords = [call[0][0] for call in mock_search.call_args_list]
+        assert "The Avengers #1" in searched_keywords
+        assert "X-Men #1" in searched_keywords
+        assert "Thor #1" not in searched_keywords
+
+    def test_limit_one_with_duplicate_keyword_runs_both_items(self, tmp_path):
+        """--limit 1 where the only keyword is shared by two wish items → both
+        items are run through match_results_for_wish (1 search, 2 match calls)."""
+        db_path = tmp_path / "v.db"
+        avengers_v1 = self._make_avengers_v1()
+        avengers_v8 = self._make_avengers_v8()
+        wish_list = [
+            {"id": "w1", "name": "The Avengers #1"},
+            {"id": "w2", "name": "The Avengers #1"},
+        ]
+        wish_items = [avengers_v1, avengers_v8]
+
+        mock_search = MagicMock(return_value=[])
+        mock_match = MagicMock(return_value=[])
+
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch("wishlist_sellers.load_config", return_value=("id", "sec", "https://api.ebay.com")),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", mock_search),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", mock_match),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verdict_db_path", return_value=db_path),
+            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "record_items_seen"),
+        ):
+            ws.main(["--limit", "1"])
+
+        # 1 unique keyword → 1 search
+        mock_search.assert_called_once()
+        # But BOTH wish items run through match (the keyword covers both volumes)
+        assert mock_match.call_count == 2

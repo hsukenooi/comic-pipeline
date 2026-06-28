@@ -31,7 +31,10 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 echo "Installing ebay-tools (ebay-fetch, ebay-sold-comps, seller-scan)..."
-uv tool install --reinstall "$REPO_ROOT/apps/ebay"
+# BUI-241: --editable so the file-relative _load_dotenv() in seller_scan.py
+# resolves back into the source tree (apps/ebay/.env) regardless of caller cwd;
+# secrets stay out of the built wheel.
+uv tool install --reinstall --editable "$REPO_ROOT/apps/ebay"
 
 echo "Installing comic-fmv..."
 uv tool install --reinstall "$REPO_ROOT/apps/fmv"

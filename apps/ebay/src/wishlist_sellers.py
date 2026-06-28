@@ -53,8 +53,10 @@ from ebay_fetch import (
 )
 from seller_scan import (
     _digital_reject,
+    _foreign_edition_reject,  # BUI-239
     _normalize,
     _reprint_reject,
+    _second_print_reject,  # BUI-244
     _server_base,
     _strip_grades,
     _title_paren_years,
@@ -140,11 +142,16 @@ _PRISTINE_COND_TOKENS: frozenset[str] = frozenset({
 })
 
 _PRISTINE_PRINT_TOKENS: frozenset[str] = frozenset({
-    # Print / distribution / era noise
+    # Print / distribution / era noise — only original-copy distribution signals.
+    # BUI-244: removed "2nd", "3rd", "4th", "5th", "second", "third", "print",
+    # "printing" — a title containing these tokens indicates a later pressing
+    # (e.g. "X-Men #1 2nd Print") and must never be auto-accepted as pristine.
+    # It should be caught by _second_print_reject before reaching is_pristine_match,
+    # and if it somehow slips past (edge case), the pristine shortcut will correctly
+    # route it to Haiku.  "newsstand", "direct", "pence", "1st", and "first" are
+    # legitimate original-copy distribution descriptors and are kept.
     "newsstand", "direct", "pence",
-    "1st", "2nd", "3rd", "4th", "5th",
-    "first", "second", "third",
-    "print", "printing",
+    "1st", "first",
 })
 
 # Combined allow-list consulted by is_pristine_match for trailing tokens.
@@ -326,7 +333,9 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
         # BUI-226: deterministic era-gate — reject listings whose parenthesized
         # year or explicit volume number clearly contradicts the wish series era.
         # Fail-open (era_mismatch returns False) when any signal is missing.
-        if era_mismatch(title, wish_series_name):
+        # BUI-240: pass the per-issue release year so the tighter issue-year
+        # gate fires instead of the coarser series-range boundary.
+        if era_mismatch(title, wish_series_name, wish_item.get("_release_year")):  # BUI-240
             continue
         # BUI-227: conservative reprint/non-original-format reject.
         if _reprint_reject(title):
@@ -336,6 +345,12 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
             continue
         # BUI-232: trading-card / TCG reject.
         if _trading_card_reject(title):
+            continue
+        # BUI-239: foreign-language / foreign-market reprint reject.
+        if _foreign_edition_reject(title):
+            continue
+        # BUI-244: later-printing / non-first-print reject.
+        if _second_print_reject(title):
             continue
         wish, score = match_listing(title, [wish_item])
         if wish is not None and score >= MATCH_SCORE_FLOOR:
@@ -634,13 +649,6 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         )
         sys.exit(1)
 
-    if args.limit is not None:
-        wish_items = wish_items[: args.limit]
-        print(
-            f"  --limit {args.limit}: processing {len(wish_items)} wish item(s)",
-            file=sys.stderr,
-        )
-
     # ── Step 2: eBay OAuth token ──────────────────────────────────────────────
     client_id, client_secret, base_url = load_config()
     if args.env:
@@ -659,9 +667,29 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
             file=sys.stderr,
         )
 
-    all_matches: list = []
+    # BUI-242: group wish items by eBay search keyword to deduplicate searches for
+    # multi-volume series that share the same series+issue string (e.g. two entries
+    # for "The Avengers #1" — one for Vol. 1 (1963) and one for Vol. 8 (2018)).
+    # Dicts preserve insertion order (Python 3.7+) so the grouping is deterministic.
+    keyword_to_items: dict[str, list] = {}
     for wish_item in searchable:
         keyword = f'{wish_item["series"]} #{wish_item["issue"]}'
+        keyword_to_items.setdefault(keyword, []).append(wish_item)
+
+    # BUI-242: apply --limit to bound the count of DISTINCT eBay search keywords.
+    # --limit N processes the first N unique keywords (stable, first-occurrence order).
+    if args.limit is not None:
+        limited_kws = list(keyword_to_items.keys())[: args.limit]
+        keyword_to_items = {k: keyword_to_items[k] for k in limited_kws}
+        total_items = sum(len(v) for v in keyword_to_items.values())
+        print(
+            f"  --limit {args.limit}: processing {len(keyword_to_items)} unique keyword(s) "
+            f"({total_items} wish item(s))",
+            file=sys.stderr,
+        )
+
+    all_matches: list = []
+    for keyword, wish_items_for_kw in keyword_to_items.items():  # BUI-242
         results = ebay_search_cache.get(keyword, mode=mode)
         if results is None:
             print(f"  Searching eBay: {keyword}", file=sys.stderr)
@@ -671,8 +699,11 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
             print(f"  Cache hit: {keyword}", file=sys.stderr)
         # Drop ended listings from cache before matching (R3a)
         results = ebay_search_cache.filter_active(results)
-        hits = match_results_for_wish(results, wish_item)
-        all_matches.extend(hits)
+        # BUI-242: run match_results_for_wish for ALL wish items sharing this keyword
+        # (e.g. two Avengers #1 volumes) so their distinct era gates both apply.
+        for wish_item in wish_items_for_kw:
+            hits = match_results_for_wish(results, wish_item)
+            all_matches.extend(hits)
 
     print(f"  {len(all_matches)} raw match(es) before dedup", file=sys.stderr)
 
