@@ -164,9 +164,14 @@ _LOT_RE = re.compile(
     # The bare-number range branch requires a quantity word as prefix so that a bare
     # "YYYY-YYYY" year-span in a single-issue title (e.g. "ASM #4 1962-1963") never
     # matches.  '#' is handled by the existing #\d+-#?\d+ branch above.
-    r"|\b(?:books?|issues?)\s*\d+\s*-\s*#?\d+\b"
+    # The \d{1,3} bound (NOT \d+) is load-bearing: it stops a 4-digit YEAR span that
+    # follows the quantity word — e.g. "First Issue 1962-1963", "Key Issue 1962-1964",
+    # "issue 1963-1964" — from being read as an issue range. Issue numbers in a range
+    # are 1-3 digits; a >999 issue in a range is vanishingly rare (and the failure
+    # direction there is a missed lot-reject, which is the safe side).
+    r"|\b(?:books?|issues?)\s*\d{1,3}\s*-\s*#?\d{1,3}\b"
     # BUI-243: spelled-out range — "issues 1 through 6", "books 1 through 4"
-    r"|\b(?:books?|issues?)\s+\d+\s+through\s+\d+\b",
+    r"|\b(?:books?|issues?)\s+\d{1,3}\s+through\s+\d{1,3}\b",
     re.IGNORECASE,
 )
 

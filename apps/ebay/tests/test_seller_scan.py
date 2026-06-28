@@ -1161,6 +1161,32 @@ class TestHardRejectLot:
         assert seller_scan._LOT_RE.search("Amazing Spider-Man #1-#10 Bronze Age")
         assert seller_scan._LOT_RE.search("Amazing Spider-Man #129-150 Bronze Age")
 
+    # ── BUI-243 review fix: a YEAR span after "issue"/"book" is NOT a range ────
+    # The \d{1,3} bound stops the quantity-word branch from reading a 4-digit year
+    # span (e.g. "First Issue 1962-1963") as an issue range — these are genuine
+    # single key issues and must NOT be dropped.
+
+    def test_year_after_issue_word_not_lot_first_issue(self):
+        # Exact review-reported title: the year span must NOT be lot-matched.
+        # (hard_reject still drops it — but via the unrelated CGC-slab rule, so
+        # the lot-path assertion is on a raw variant below.)
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #1 First Issue 1962-1963 CGC"
+        )
+        raw = "Amazing Spider-Man #1 First Issue 1962-1963 Marvel"
+        assert not seller_scan._LOT_RE.search(raw)
+        assert not seller_scan.hard_reject(raw, "Amazing Spider-Man", "1")
+
+    def test_year_after_issue_word_not_lot_key_issue(self):
+        title = "Amazing Spider-Man #1 Key Issue 1962-1964 Marvel"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "Amazing Spider-Man", "1")
+
+    def test_year_after_issue_word_not_lot_xmen(self):
+        title = "X-Men #1 issue 1963-1964 Silver Age"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "X-Men", "1")
+
 
 class TestHardRejectMissingIssue:
     def test_title_missing_issue_number_rejected(self):
