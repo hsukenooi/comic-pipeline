@@ -1,4 +1,10 @@
-"""Excel import and collection merge pipeline for the local collection cache."""
+"""Excel import and collection merge pipeline for the local collection cache.
+
+BUI-257: LOCG is programmatically inaccessible. The BUI-208 unified sync
+functions here (``import_xlsx``, ``generate_csv``, ``migrate_wish_list_source``,
+etc.) must only be driven by the manual, user-invoked /comic:collection-sync
+skill — never called automatically or on a timer.
+"""
 from __future__ import annotations
 
 import hashlib

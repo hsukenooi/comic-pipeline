@@ -48,7 +48,12 @@ def _wrap_response(api_response: APIResponse) -> _PlaywrightResponse:
 
 
 class LOCGClient:
-    """HTTP client that uses real Chrome via Playwright to bypass Cloudflare."""
+    """HTTP client that uses real Chrome via Playwright to bypass Cloudflare.
+
+    BUI-257: LOCG is programmatically inaccessible — never instantiate this
+    client from a background/scheduled task. It must only be reached via the
+    manual, user-invoked /comic:collection-sync skill.
+    """
 
     def __init__(self) -> None:
         self._playwright_instance = sync_playwright().start()
