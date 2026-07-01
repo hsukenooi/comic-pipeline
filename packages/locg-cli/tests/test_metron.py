@@ -1,6 +1,7 @@
 """Tests for the Metron API wrapper (Unit 5)."""
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -221,12 +222,16 @@ def test_lookup_issue_swallows_generic_exception():
 
 
 def test_lookup_issue_swallows_rate_limit():
+    """After a rate limit AND its retry both fail, the caller still gets None."""
     from mokkari.exceptions import RateLimitError
     client, session = _make_client_with_session(
         series_list=[_mock_series()],
     )
     session.issues_list.side_effect = RateLimitError("rate limited", retry_after=60)
-    assert client.lookup_issue("Fantastic Four", "1") is None
+    with patch("locg.metron.time.sleep"):
+        assert client.lookup_issue("Fantastic Four", "1") is None
+    # One retry attempt -> the call happens twice, not just once.
+    assert session.issues_list.call_count == 2
 
 
 def test_lookup_issue_swallows_api_error():
@@ -234,6 +239,51 @@ def test_lookup_issue_swallows_api_error():
     client, session = _make_client_with_session()
     session.series_list.side_effect = ApiError("404 not found")
     assert client.lookup_issue("Nonexistent", "1") is None
+
+
+# ---------------------------------------------------------------------------
+# lookup_issue — rate-limit retry (BUI-260)
+# ---------------------------------------------------------------------------
+
+def test_lookup_issue_retries_once_after_rate_limit_and_succeeds():
+    """A RateLimitError on the first attempt is retried once and can still succeed."""
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session(
+        issues_list=[_mock_issue(id=100)],
+    )
+    session.series_list.side_effect = [
+        RateLimitError("rate limited", retry_after=5),
+        [_mock_series(id=1)],
+    ]
+
+    with patch("locg.metron.time.sleep") as mock_sleep:
+        result = client.lookup_issue("Fantastic Four", "1")
+
+    assert result is not None
+    assert result["metron_id"] == 100
+    assert session.series_list.call_count == 2
+    mock_sleep.assert_called_once_with(5)
+
+
+def test_lookup_issue_gives_up_after_second_rate_limit(caplog):
+    """A RateLimitError on both the original call and the retry gives up -> None.
+
+    Also verifies the wait is capped at _RATE_LIMIT_MAX_SLEEP (60s) even
+    though Metron reported a longer retry_after, and that the event is
+    logged at WARNING (not the DEBUG level used for a genuine no-match).
+    """
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = RateLimitError("rate limited", retry_after=90)
+
+    with patch("locg.metron.time.sleep") as mock_sleep:
+        with caplog.at_level(logging.WARNING, logger="locg"):
+            result = client.lookup_issue("Fantastic Four", "1")
+
+    assert result is None
+    assert session.series_list.call_count == 2
+    mock_sleep.assert_called_once_with(60)  # capped, not the reported 90
+    assert any("rate limit" in rec.message.lower() for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------

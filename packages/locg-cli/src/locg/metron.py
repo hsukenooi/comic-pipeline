@@ -1,11 +1,58 @@
 """Thin mokkari wrapper for Metron API series + issue lookup."""
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import time
 from typing import Any, Optional
 
+from mokkari.exceptions import RateLimitError
+
 logger = logging.getLogger("locg")
+
+# Metron enforces 20 req/min burst + 5,000/day sustained and reports a
+# ``retry_after`` on RateLimitError. Cap the wait regardless of what Metron
+# reports: this client can be called synchronously from inside an async route
+# handler on a single-worker server, so an unbounded sleep would wedge it
+# (BUI-255 lesson) — a single capped retry, not escalating backoff, is the
+# intended behavior (BUI-260).
+_RATE_LIMIT_MAX_SLEEP = 60.0
+
+
+def _retry_once_on_rate_limit(func):
+    """Decorator: on ``RateLimitError``, sleep (capped) and retry the call ONCE.
+
+    Every public lookup below used to catch ``RateLimitError`` with the same
+    blanket ``except Exception`` used for a genuine "no match found," so a
+    throttled call and an absent comic were indistinguishable — the caller
+    silently got ``None`` either way and never actually asked Metron (BUI-260).
+    This decorator intercepts ``RateLimitError`` before that blanket handler,
+    logs at ``warning`` (a rate-limit event is not a routine miss), waits
+    ``min(exc.retry_after, _RATE_LIMIT_MAX_SLEEP)``, and retries once. Only a
+    second ``RateLimitError`` — from the retry itself — falls through to
+    ``None``.
+    """
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except RateLimitError as exc:
+            wait = min(max(exc.retry_after, 0), _RATE_LIMIT_MAX_SLEEP)
+            logger.warning(
+                "Metron rate limit hit in %s; retrying once after %.1fs",
+                func.__name__, wait,
+            )
+            time.sleep(wait)
+            try:
+                return func(self, *args, **kwargs)
+            except RateLimitError:
+                logger.warning(
+                    "Metron rate limit hit again in %s after retry; giving up",
+                    func.__name__,
+                )
+                return None
+    return wrapper
 
 
 class MetronCredentialError(RuntimeError):
@@ -64,6 +111,7 @@ class MetronClient:
                 matches.append(s)
         return matches[0] if len(matches) == 1 else None
 
+    @_retry_once_on_rate_limit
     def lookup_issue(
         self, series_query: str, issue_number: str | int, year: Any = None
     ) -> Optional[dict[str, Any]]:
@@ -116,10 +164,13 @@ class MetronClient:
             }
         except MetronCredentialError:
             raise
+        except RateLimitError:
+            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip enrichment
             logger.debug("Metron lookup failed for %r #%s: %s", series_query, issue_number, exc)
             return None
 
+    @_retry_once_on_rate_limit
     def lookup_issue_detail(self, metron_id: int) -> Optional[dict[str, Any]]:
         """Fetch full issue detail (variant cover names + creator credits) for a id.
 
@@ -152,6 +203,8 @@ class MetronClient:
             return {"variants": variants, "credits": credits}
         except MetronCredentialError:
             raise
+        except RateLimitError:
+            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip variant enrichment
             logger.debug("Metron issue-detail lookup failed for id %s: %s", metron_id, exc)
             return None
@@ -181,6 +234,7 @@ class MetronClient:
             })
         return out
 
+    @_retry_once_on_rate_limit
     def resolve_creator(self, name: str) -> Optional[dict[str, Any]]:
         """Resolve a creator name to a Metron creator ``{id, name}`` (BUI-134).
 
@@ -217,10 +271,13 @@ class MetronClient:
             return None
         except MetronCredentialError:
             raise
+        except RateLimitError:
+            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None
             logger.debug("Metron creator lookup failed for %r: %s", name, exc)
             return None
 
+    @_retry_once_on_rate_limit
     def resolve_creator_run(
         self,
         series_id: int,
@@ -265,6 +322,8 @@ class MetronClient:
             )
         except MetronCredentialError:
             raise
+        except RateLimitError:
+            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001
             logger.debug(
                 "Metron creator-run candidate lookup failed (series=%s creator=%s): %s",
