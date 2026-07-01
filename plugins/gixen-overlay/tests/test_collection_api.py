@@ -109,6 +109,11 @@ def test_check_owned(client):
     assert body["match_status"] == "in_collection"
     assert body["full_title_matched"] == "The Amazing Spider-Man #300"
     assert body["cache_age_days"] is not None
+    # BUI-249: provenance fields — a direct series-key match is "exact", never
+    # "alias", and carries the matched row's decorated series name + date.
+    assert body["match_kind"] == "exact"
+    assert body["matched_series_name"] == "The Amazing Spider-Man"
+    assert body["matched_release_date"] == "1988-05-01"
 
 
 def test_check_owned_with_leading_article_dropped(client):
@@ -126,6 +131,10 @@ def test_check_not_owned_returns_not_in_cache(client):
     body = r.json()
     assert body["match_status"] == "not_in_cache"
     assert body["full_title_matched"] is None
+    # BUI-249: no verdict, no provenance to report (R11).
+    assert body["matched_series_name"] is None
+    assert body["matched_release_date"] is None
+    assert body["match_kind"] is None
 
 
 def test_check_wishlist_only_row_is_not_owned(client):
@@ -224,6 +233,55 @@ def test_check_batch_year_catches_masthead_owned_book(client):
     )
     assert r.status_code == 200, r.text
     assert r.json()["results"][0]["match_status"] == "in_collection"
+
+
+def test_check_alias_match_flags_wrong_volume(client):
+    """BUI-249: the alias pass can land on an owned issue of the WRONG volume —
+    querying 'The Mighty Thor #5' (Vol.3, 2015) with no year resolves to the
+    owned 'Thor #5' (Vol.1, 1966) via the masthead alias in owned_match_keys.
+    That's a silent false positive: the intended Mighty Thor Vol.3 #5 is NOT
+    owned. match_kind == "alias" plus the matched row's decorated series name
+    and release date are how a caller detects this and flags "confirm volume"
+    instead of trusting the bare in_collection verdict."""
+    _seed_collection(client.store, [{
+        "full_title": "Thor #5",
+        "series_name": "Thor (Vol. 1) (1966 - 1996)",
+        "publisher_name": "Marvel Comics",
+        "release_date": "1966-08-01",
+        "in_collection": 1,
+    }])
+    r = client.get(
+        "/api/comics/collection/check",
+        params={"series": "The Mighty Thor", "issue": "5"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["match_status"] == "in_collection"
+    assert body["full_title_matched"] == "Thor #5"
+    assert body["match_kind"] == "alias"
+    assert body["matched_series_name"] == "Thor (Vol. 1) (1966 - 1996)"
+    assert body["matched_release_date"] == "1966-08-01"
+
+
+def test_check_batch_alias_match_flags_wrong_volume(client):
+    """Same false positive as test_check_alias_match_flags_wrong_volume, via the
+    batch endpoint — the provenance fields must be present there too."""
+    _seed_collection(client.store, [{
+        "full_title": "Thor #5",
+        "series_name": "Thor (Vol. 1) (1966 - 1996)",
+        "publisher_name": "Marvel Comics",
+        "release_date": "1966-08-01",
+        "in_collection": 1,
+    }])
+    r = client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [{"series": "The Mighty Thor", "issue": "5"}]},
+    )
+    assert r.status_code == 200, r.text
+    result = r.json()["results"][0]
+    assert result["match_status"] == "in_collection"
+    assert result["match_kind"] == "alias"
+    assert result["matched_series_name"] == "Thor (Vol. 1) (1966 - 1996)"
 
 
 # --- wish-list -------------------------------------------------------------

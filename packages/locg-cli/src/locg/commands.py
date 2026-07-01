@@ -1830,10 +1830,17 @@ def _match_owned_issue(
     variant: Optional[str],
     year: Optional[str],
     require_dated: bool = False,
-) -> Optional[str]:
-    """Return the full_title of an owned cache row matching the series key +
-    issue (+ optional variant/year), or None. Shared by the direct and the
-    alias-fallback passes of cmd_collection_check.
+) -> Optional[dict[str, Any]]:
+    """Return the owned cache ROW matching the series key + issue (+ optional
+    variant/year), or None. Shared by the direct and the alias-fallback passes
+    of cmd_collection_check.
+
+    BUI-249: returns the full row (not just its full_title) so the caller can
+    surface match provenance — the alias pass can land on an owned issue of
+    the WRONG volume/era (e.g. "The Mighty Thor #5" resolving to an owned
+    Thor Vol.1/Vol.4/Vol.6 row when the intended Mighty Thor Vol.3 #5 is not
+    owned), and `matched_series_name`/`matched_release_date` are how a caller
+    detects that.
 
     `variant` is a SOFT preference, not a hard filter (BUI-176): an owned row
     that matches series + issue (+ year) still counts as in-collection even when
@@ -1850,7 +1857,7 @@ def _match_owned_issue(
     pass keeps the BUI-105 fail-open behavior (``require_dated=False``): a
     dateless same-series record-win must still match.
     """
-    fallback: Optional[str] = None
+    fallback: Optional[dict[str, Any]] = None
     for row in comics:
         # in_collection is a copies-owned count (0 = wish-list / pull / read but
         # not owned). Only owned rows count as "in collection" (BUI-26 bug D).
@@ -1915,11 +1922,11 @@ def _match_owned_issue(
         # base row is held as a fallback so ownership is still reported rather
         # than a false not_in_cache that triggers a duplicate buy.
         if not variant:
-            return full_title
+            return row
         if variant.lower() in full_title.lower():
-            return full_title
+            return row
         if fallback is None:
-            fallback = full_title
+            fallback = row
 
     return fallback
 
@@ -1932,8 +1939,17 @@ def cmd_collection_check(
 ) -> dict[str, Any]:
     """Check whether a comic is in the local collection cache.
 
-    Returns {match_status, full_title_matched, cache_age_days}.
+    Returns {match_status, full_title_matched, matched_series_name,
+    matched_release_date, match_kind, cache_age_days}.
     match_status: "in_collection" | "not_in_cache".
+
+    BUI-249: matched_series_name/matched_release_date/match_kind surface the
+    matched row's provenance so a caller can detect an alias match that landed
+    on the wrong volume/era (see _match_owned_issue). They are null whenever
+    match_status is "not_in_cache" (R11 — no verdict, no provenance to report).
+    match_kind is "exact" when series_key matched directly, "alias" when it
+    only matched via owned_match_keys' cross-masthead fallback — "alias" is
+    the signal a caller should treat as "confirm volume before trusting this".
     """
     cache = CollectionCache()
     payload = cache.load()
@@ -1944,7 +1960,8 @@ def cmd_collection_check(
     # Strip leading zeros for the issue token comparison
     issue_stripped = str(issue).strip().lstrip("0") or str(issue).strip()
 
-    matched = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
+    matched_row = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
+    match_kind: Optional[str] = "exact" if matched_row is not None else None
 
     # BUI-200/BUI-197: an owned copy can be filed under a DIFFERENT series-name
     # variant for the same run — the classic X-Men issue-number split
@@ -1958,7 +1975,7 @@ def cmd_collection_check(
     # with no year (the conflicts audit) the alias keys still resolve so the
     # cross-masthead owned book is found and the export can't emit an
     # In Collection=0 row that deletes it (the 26-deleted-X-Men data-loss bug).
-    if matched is None:
+    if matched_row is None:
         for alt_key in owned_match_keys(series, issue):
             if alt_key == series_key:
                 continue
@@ -1967,23 +1984,30 @@ def cmd_collection_check(
             # dateless classic "Incredible Hulk #1" from falsely satisfying a
             # year-bearing "Hulk #1" 2021 relaunch query). With NO year the alias
             # over-matches (the safe over-exclusion direction for the audit/export).
-            matched = _match_owned_issue(
+            matched_row = _match_owned_issue(
                 comics, alt_key, issue_stripped, issue, variant, year,
                 require_dated=True,
             )
-            if matched is not None:
+            if matched_row is not None:
+                match_kind = "alias"
                 break
 
-    if matched is not None:
+    if matched_row is not None:
         return {
             "match_status": "in_collection",
-            "full_title_matched": matched,
+            "full_title_matched": matched_row.get("full_title") or "",
+            "matched_series_name": matched_row.get("series_name"),
+            "matched_release_date": matched_row.get("release_date"),
+            "match_kind": match_kind,
             "cache_age_days": cache_age,
         }
 
     return {
         "match_status": "not_in_cache",
         "full_title_matched": None,
+        "matched_series_name": None,
+        "matched_release_date": None,
+        "match_kind": None,
         "cache_age_days": cache_age,
     }
 

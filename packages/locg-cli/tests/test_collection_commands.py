@@ -703,15 +703,51 @@ def test_check_mighty_thor_masthead_alias(tmp_path, monkeypatch):
     )])
 
     # The catalog name works directly:
-    assert cmds.cmd_collection_check(series="Thor", issue="154")["match_status"] == "in_collection"
+    direct = cmds.cmd_collection_check(series="Thor", issue="154")
+    assert direct["match_status"] == "in_collection"
+    # BUI-249: a direct series-key match is "exact", never "alias".
+    assert direct["match_kind"] == "exact"
     # The cover/masthead name resolves via the alias, with a matching year:
     r = cmds.cmd_collection_check(series="The Mighty Thor", issue="154", year="1968")
     assert r["match_status"] == "in_collection"
     assert r["full_title_matched"] == "Thor #154"
+    # BUI-249: an alias-pass match is flagged so a caller can confirm volume.
+    assert r["match_kind"] == "alias"
+    assert r["matched_series_name"] == "Thor (Vol. 1) (1966 - 1996)"
+    assert r["matched_release_date"] == "1968-05-02"
     # BUI-197: the alias now also fires WITHOUT a year (audit/export path).
     r2 = cmds.cmd_collection_check(series="The Mighty Thor", issue="154")
     assert r2["match_status"] == "in_collection"
     assert r2["full_title_matched"] == "Thor #154"
+    assert r2["match_kind"] == "alias"
+
+
+def test_check_mighty_thor_alias_false_positive_wrong_volume(tmp_path, monkeypatch):
+    """BUI-249: the alias pass can land on an owned issue of the WRONG volume.
+
+    Owning 'Thor #5' (Vol.1, 1966) makes a no-year 'The Mighty Thor #5' query
+    (the intended Mighty Thor Vol.3, 2015) report in_collection via the
+    masthead alias — a silent false positive, since the Vol.3 book is not
+    actually owned. match_kind == "alias" (plus the matched row's decorated
+    series name / release date) is how a caller detects this instead of
+    trusting the bare in_collection verdict.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 1) (1966 - 1996)",
+        full_title="Thor #5",
+        release_date="1966-08-01",
+    )])
+
+    r = cmds.cmd_collection_check(series="The Mighty Thor", issue="5")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Thor #5"
+    assert r["match_kind"] == "alias"
+    assert r["matched_series_name"] == "Thor (Vol. 1) (1966 - 1996)"
+    assert r["matched_release_date"] == "1966-08-01"
 
 
 def test_check_masthead_alias_year_gate_prevents_collision(tmp_path, monkeypatch):

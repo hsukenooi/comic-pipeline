@@ -92,9 +92,19 @@ Each call returns:
 {
   "match_status": "in_collection",
   "full_title_matched": "Amazing Spider-Man #300",
+  "matched_series_name": "The Amazing Spider-Man (1963 - 1998)",
+  "matched_release_date": "1988-05-01",
+  "match_kind": "exact",
   "cache_age_days": 3
 }
 ```
+
+`matched_series_name`/`matched_release_date`/`match_kind` are the matched row's
+provenance (BUI-249): `matched_series_name` is the LOCG catalog's *decorated*
+series name (carries volume + year), `matched_release_date` is that row's stored
+date, and `match_kind` is `"exact"` (series key matched directly) or `"alias"`
+(matched only via the cross-masthead fallback, e.g. Thor ↔ The Mighty Thor). All
+three are `null` when `match_status` is `not_in_cache`. See Step 2.5 Pattern D.
 
 > **If any check call fails (curl non-zero / connection error / non-200): STOP
 > the entire check.** Report the server error to the user and render NO verdicts
@@ -177,6 +187,22 @@ If the queried series is **absent** from that list, the `not_in_cache` is suspec
 flag and recommend re-checking under the matching catalog name:
 > ⚠️ ambiguous/unrecognized series — "Uncanny X-Men (Vol. 1)" is not a cache series name; did you mean "Uncanny X-Men"? Re-check under the catalog name before trusting this verdict
 
+**Pattern D — masthead-alias match, unconfirmed volume (false positive, BUI-249).**
+This one is mechanized, not heuristic: when a row returns `in_collection` AND
+`match_kind == "alias"`, the verdict only matched because the query's masthead
+(e.g. "The Mighty Thor") aliases to a differently-named owned row ("Thor") —
+`_MASTHEAD_ALIAS_PAIRS` has no notion of *which* volume/era, so it can land on
+an owned issue from the wrong run (a real case: owning `Thor #5` Vol. 1 (1966)
+falsely satisfies a "The Mighty Thor #5" Vol. 3 (2015) query). No re-query is
+needed — read the volume/year straight off the response and flag:
+> ⚠️ alias match — matched "{matched_series_name}" ({matched_release_date}); confirm this is the same volume as the listing before skipping
+
+If `matched_release_date`'s year is clearly the wrong era for the listing (e.g.
+a 1966 match against a 2015-era query), treat the flag as a likely false
+positive; if the era is ambiguous, still flag for the user rather than guessing.
+A `match_kind == "exact"` row needs no such flag — the series key matched
+directly.
+
 Carry every flag into the Notes column of the Step 3 table and surface flagged rows
 separately at the Step 4 decision gate. The user decides; the disambiguator only
 makes the ambiguity visible.
@@ -184,13 +210,18 @@ makes the ambiguity visible.
 ## Step 3: Output table
 
 ```
-| # | Comic | In Cache? | Full Title Matched | Cache Age | Notes |
-|---|---|---|---|---|---|
-| 1 | Amazing Spider-Man #300 | ❌ Not in collection | — | 3 days | |
-| 2 | Invincible #1 | ✅ In collection | Invincible #1 | 3 days | |
-| 3 | Uncanny X-Men #179 (Newsstand) | ✅ In collection (canonical) | Uncanny X-Men #179 | 3 days | ⚠️ canonical match — listing variant not disambiguated |
-| 4 | Batman #608 | ⚠️ Not in cache | — | 16 days | cache stale — manual LOCG check recommended |
+| # | Comic | In Cache? | Full Title Matched | Matched Volume | Cache Age | Notes |
+|---|---|---|---|---|---|---|
+| 1 | Amazing Spider-Man #300 | ❌ Not in collection | — | — | 3 days | |
+| 2 | Invincible #1 | ✅ In collection | Invincible #1 | Invincible (2021) | 3 days | |
+| 3 | Uncanny X-Men #179 (Newsstand) | ✅ In collection (canonical) | Uncanny X-Men #179 | Uncanny X-Men (1981) | 3 days | ⚠️ canonical match — listing variant not disambiguated |
+| 4 | Batman #608 | ⚠️ Not in cache | — | — | 16 days | cache stale — manual LOCG check recommended |
+| 5 | The Mighty Thor #5 | ✅ In collection | Thor #5 | Thor (Vol. 1) (1966 - 1996) | 3 days | ⚠️ alias match — confirm same volume as listing |
 ```
+
+**Matched Volume** is `matched_series_name` (falls back to `—` when `not_in_cache`)
+— it's the decorated catalog name (carries volume + year), so a Pattern D flag is
+visible right in the table without opening the raw response.
 
 Cache age is the same value for every row (it's a property of the import date,
 not the comic).
@@ -207,7 +238,7 @@ Ask the user how to handle results:
 - **Skip** comics already in collection (most common)
 - **Continue anyway** (condition upgrade — they want a better copy)
 - **Stale-cache cases**: surface separately so the user can manually verify before bidding
-- **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` should not be auto-skipped, and a Pattern-B/C flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
+- **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` should not be auto-skipped, and a Pattern-B/C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
 
 Remove skipped comics from the working list before passing to `/comic:fmv`.
 
@@ -221,4 +252,5 @@ Remove skipped comics from the working list before passing to `/comic:fmv`.
 | Treating a stale-cache `not_in_cache` as confident "not in collection" | Apply the stale-cache downgrade when `cache_age_days > 14` |
 | Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — likely conflated with the base/annual series; flag and let the user confirm, don't silently skip |
 | Trusting a `not_in_cache` for a series with a leading article | Step 2.5 Pattern B — re-query with `The` toggled; a successful alternate-key call is R11-safe, a failed one is an R11 STOP |
+| Trusting an `in_collection` verdict with `match_kind: "alias"` without checking the volume | Step 2.5 Pattern D — the masthead alias has no notion of volume/era; read `matched_series_name`/`matched_release_date` and flag for the user to confirm (BUI-249) |
 | Letting the disambiguator flip a verdict on its own | It's advisory — it flags ambiguity for the user, it never invents ownership or overrides the hard-fail (R11) |
