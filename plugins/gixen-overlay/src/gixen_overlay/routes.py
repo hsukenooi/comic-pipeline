@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_ta
 # write paths) behind /api/comics/* instead of porting any of it to SQL. These
 # imports prove the locg workspace dependency resolves (exercised by the
 # workspace-imports canary).
+from locg.collection_cache import CollectionCache
 from locg.collection_io import MAX_XLSX_BYTES
 from locg.commands import (
     _split_wish_list_name,
@@ -1245,6 +1247,130 @@ async def api_record_win(req: RecordWinRequest):
             },
         )
     return result
+
+
+@router.delete("/api/comics/collection")
+async def api_collection_delete(
+    series: str,
+    issue: str,
+    year: str | None = None,
+    variant: str | None = None,
+    dry_run: bool = False,
+):
+    """Remove a single erroneous entry from the collection (BUI-254).
+
+    The collection's only write paths were `import` (bulk) and `record-win`
+    (append) — there was no way to undo one mistaken entry short of exporting it
+    with `In Collection=0` and letting LOCG delete it on sync, the exact
+    mechanism that caused the BUI-122 data-loss incident. This is a deliberate
+    HARD delete instead, not a tombstone: unlike the `bids` table (BUI-49),
+    where the tombstone protects against an *automated* sweep/live-cancel, this
+    endpoint is only ever invoked manually for a single confirmed mistake, so a
+    tombstone would just be dead weight the read paths have to keep filtering
+    (the BUI-50 lesson: an added filter is an added way to forget the filter).
+    The full removed record is returned AND logged to the import-history audit
+    log, so a mistaken removal can still be manually reversed via `record-win`
+    or a fresh import even with no live row to restore from.
+
+    Locates the row with the SAME matcher `cmd_collection_check` uses (masthead
+    aliases, the X-Men issue-number split, leading-zero/leading-article
+    normalization) — not a reimplementation. `in_collection` is a copies-owned
+    count (BUI-249/250/251): a row with more than one copy is decremented, a
+    single-copy row is removed outright, so deleting one erroneous copy never
+    un-owns the others. Pass `dry_run=true` to preview the record that WOULD be
+    removed/decremented without mutating the store (the same dry-run-then-
+    confirm shape `/comic:wishlist-add` and `/comic:collection-sync` use).
+
+    404 when no owned row matches; 409 when the store was never imported (R11).
+    """
+    series = series.strip()
+    issue = issue.strip()
+    if not series or not issue:
+        raise HTTPException(status_code=422, detail="series and issue must both be non-empty")
+
+    _ensure_collection_store()
+    _require_imported_collection()
+
+    try:
+        check = cmd_collection_check(series=series, issue=issue, variant=variant, year=year)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+    if check["match_status"] != "in_collection":
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{series} #{issue}' is not in the collection — nothing to remove",
+        )
+    full_title = check["full_title_matched"]
+
+    cache = CollectionCache()
+
+    if dry_run:
+        # Read-only preview: no lock, no mutation, no audit entry. Re-reads
+        # rather than reusing the check above so the previewed record reflects
+        # the store at read time, not a snapshot from before this request.
+        payload = cache.load()
+        row = next(
+            (
+                r for r in payload.get("comics", [])
+                if r.get("in_collection") and r.get("full_title") == full_title
+            ),
+            None,
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"'{series} #{issue}' is not in the collection — nothing to remove",
+            )
+        copies = row.get("in_collection") or 0
+        return {
+            "status": "preview",
+            "action": "would_decrement" if copies > 1 else "would_remove",
+            "would_remove": dict(row),
+            "remaining_copies": copies - 1 if copies > 1 else 0,
+        }
+
+    removed: dict[str, Any] | None = None
+    action: str | None = None
+    remaining_copies = 0
+
+    def _mutate(payload: dict[str, Any]) -> None:
+        nonlocal removed, action, remaining_copies
+        comics = payload.get("comics", [])
+        for i, row in enumerate(comics):
+            if row.get("in_collection") and row.get("full_title") == full_title:
+                removed = dict(row)
+                copies = row.get("in_collection") or 0
+                if copies > 1:
+                    row["in_collection"] = copies - 1
+                    action = "decremented"
+                    remaining_copies = copies - 1
+                else:
+                    del comics[i]
+                    action = "removed"
+                break
+
+    cache.apply(_mutate, command="collection-delete")
+
+    if removed is None:
+        # Lost a race with a concurrent write between the check above and the
+        # locked apply() call — the row was already gone by the time the lock
+        # was acquired.
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{series} #{issue}' is not in the collection — nothing to remove",
+        )
+
+    # Log the full removed record so a mistaken deletion can be manually
+    # reversed via record-win/re-import even though this is a hard delete with
+    # no tombstone row to restore from.
+    cache.append_audit({
+        "type": "collection_delete",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "command": "collection-delete",
+        "details": {"query": {"series": series, "issue": issue}, "action": action, "removed": removed},
+    })
+
+    return {"status": "ok", "action": action, "removed": removed, "remaining_copies": remaining_copies}
 
 
 @router.post("/api/comics/wish-list")
