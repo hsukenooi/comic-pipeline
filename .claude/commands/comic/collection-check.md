@@ -95,6 +95,7 @@ Each call returns:
   "matched_series_name": "The Amazing Spider-Man (1963 - 1998)",
   "matched_release_date": "1988-05-01",
   "match_kind": "exact",
+  "in_wish_list": false,
   "cache_age_days": 3
 }
 ```
@@ -105,6 +106,14 @@ series name (carries volume + year), `matched_release_date` is that row's stored
 date, and `match_kind` is `"exact"` (series key matched directly) or `"alias"`
 (matched only via the cross-masthead fallback, e.g. Thor ↔ The Mighty Thor). All
 three are `null` when `match_status` is `not_in_cache`. See Step 2.5 Pattern D.
+
+`in_wish_list` (BUI-250) is always a plain boolean, present on every verdict.
+`match_status: "not_in_cache"` conflates two different states — a genuinely
+untracked issue, and a row that exists but is catalogued with zero owned copies
+(on the wish list / pull list / read list). `in_wish_list: true` on a
+`not_in_cache` result means the second case: **treat it as "already on your
+wish list, not owned" in the output table, not as "untracked."** This is a
+direct field read, not a heuristic — it needs no Step 2.5 disambiguation.
 
 > **If any check call fails (curl non-zero / connection error / non-200): STOP
 > the entire check.** Report the server error to the user and render NO verdicts
@@ -217,11 +226,19 @@ makes the ambiguity visible.
 | 3 | Uncanny X-Men #179 (Newsstand) | ✅ In collection (canonical) | Uncanny X-Men #179 | Uncanny X-Men (1981) | 3 days | ⚠️ canonical match — listing variant not disambiguated |
 | 4 | Batman #608 | ⚠️ Not in cache | — | — | 16 days | cache stale — manual LOCG check recommended |
 | 5 | The Mighty Thor #5 | ✅ In collection | Thor #5 | Thor (Vol. 1) (1966 - 1996) | 3 days | ⚠️ alias match — confirm same volume as listing |
+| 6 | Hulk (Vol. 5) #9 | 📋 Wishlisted (not owned) | — | — | 3 days | |
 ```
 
 **Matched Volume** is `matched_series_name` (falls back to `—` when `not_in_cache`)
 — it's the decorated catalog name (carries volume + year), so a Pattern D flag is
 visible right in the table without opening the raw response.
+
+**In Cache?** has three renderings, not two (BUI-250): `✅ In collection` for
+`match_status: "in_collection"`, `📋 Wishlisted (not owned)` for
+`match_status: "not_in_cache"` with `in_wish_list: true`, and `❌ Not in
+collection` for `match_status: "not_in_cache"` with `in_wish_list: false`. Row 6
+is untracked at Full Title Matched / Matched Volume regardless — those columns
+only ever come from an `in_collection` match.
 
 Cache age is the same value for every row (it's a property of the import date,
 not the comic).
@@ -237,6 +254,7 @@ Ask the user how to handle results:
 
 - **Skip** comics already in collection (most common)
 - **Continue anyway** (condition upgrade — they want a better copy)
+- **Wishlisted-not-owned (`📋`)**: not a duplicate risk — proceed like any other `not_in_cache` comic — but worth a callout since the user has already flagged it as wanted
 - **Stale-cache cases**: surface separately so the user can manually verify before bidding
 - **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` should not be auto-skipped, and a Pattern-B/C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
 
@@ -253,4 +271,5 @@ Remove skipped comics from the working list before passing to `/comic:fmv`.
 | Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — likely conflated with the base/annual series; flag and let the user confirm, don't silently skip |
 | Trusting a `not_in_cache` for a series with a leading article | Step 2.5 Pattern B — re-query with `The` toggled; a successful alternate-key call is R11-safe, a failed one is an R11 STOP |
 | Trusting an `in_collection` verdict with `match_kind: "alias"` without checking the volume | Step 2.5 Pattern D — the masthead alias has no notion of volume/era; read `matched_series_name`/`matched_release_date` and flag for the user to confirm (BUI-249) |
+| Rendering every `not_in_cache` result as plain "Not in collection" | Check `in_wish_list` first (BUI-250) — `true` means a row exists (wish list / pull / read) but isn't owned; render `📋 Wishlisted (not owned)`, not `❌ Not in collection` |
 | Letting the disambiguator flip a verdict on its own | It's advisory — it flags ambiguity for the user, it never invents ownership or overrides the hard-fail (R11) |

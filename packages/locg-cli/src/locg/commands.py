@@ -1931,6 +1931,73 @@ def _match_owned_issue(
     return fallback
 
 
+def _match_wishlisted_issue(
+    comics: list[dict[str, Any]],
+    series_key: str,
+    issue_stripped: str,
+    issue: str,
+    year: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Return a TRACKED-BUT-NOT-OWNED cache row (``in_collection == 0``)
+    matching the series key + issue (+ optional year), or None.
+
+    BUI-250: `_match_owned_issue` skips these rows entirely (BUI-26 bug D — a
+    copies-owned count of 0 must never read as "owned"), which is correct for
+    ownership but means `cmd_collection_check` cannot tell "genuinely
+    untracked" from "catalogued on the wish list, just not owned yet" — both
+    collapsed into the same `not_in_cache` verdict. Confirmed via the BUI-247
+    audit: Hulk (Vol. 5) #9 has a real `in_collection=0` row, indistinguishable
+    from a never-added issue like New Mutants #1 before this function existed.
+
+    Deliberately narrower than `_match_owned_issue`: no variant preference (a
+    wish-list row has no meaningful variant qualifier to prefer between
+    candidates) and no masthead-alias fallback (`owned_match_keys`) — this is
+    an advisory signal, not a duplicate-buy gate, so it isn't worth stacking a
+    second kind of cross-masthead guessing on top of BUI-249's. The SAME year
+    gate as ownership applies when `year` is supplied: without it, a
+    same-masthead wish row from a different era (e.g. a wishlisted 2008
+    "Hulk #1" flagging a query about the 1962 "Hulk #1") would reproduce the
+    exact wrong-era false-positive BUI-249 addressed for ownership — so
+    year-gating here mirrors the ownership pass's accept-year-or-year-minus-1
+    rule exactly.
+    """
+    for row in comics:
+        if row.get("in_collection"):
+            continue  # owned rows are _match_owned_issue's job, not this one
+
+        full_title = row.get("full_title") or ""
+        title_series, title_issue = split_series_issue_for_ownership(full_title)
+        if _normalize_series_key(title_series) != series_key:
+            continue
+
+        if title_issue is not None:
+            norm_title_issue = title_issue.lstrip("0") or title_issue
+            if norm_title_issue.lower() != issue_stripped.lower():
+                continue
+        else:
+            if issue.strip().lower() not in full_title.lower():
+                continue
+
+        # Same accept-year-or-year-minus-1 rule as _match_owned_issue (BUI-214),
+        # applied only when both a query year and a stored date exist.
+        release_date = row.get("release_date") or ""
+        if year and release_date:
+            year_str = str(year)
+            try:
+                prev_year_str = str(int(year_str) - 1)
+            except (TypeError, ValueError):
+                prev_year_str = None
+            if not (
+                release_date.startswith(year_str)
+                or (prev_year_str is not None and release_date.startswith(prev_year_str))
+            ):
+                continue
+
+        return row
+
+    return None
+
+
 def cmd_collection_check(
     series: str,
     issue: str,
@@ -1940,7 +2007,7 @@ def cmd_collection_check(
     """Check whether a comic is in the local collection cache.
 
     Returns {match_status, full_title_matched, matched_series_name,
-    matched_release_date, match_kind, cache_age_days}.
+    matched_release_date, match_kind, in_wish_list, cache_age_days}.
     match_status: "in_collection" | "not_in_cache".
 
     BUI-249: matched_series_name/matched_release_date/match_kind surface the
@@ -1950,6 +2017,16 @@ def cmd_collection_check(
     match_kind is "exact" when series_key matched directly, "alias" when it
     only matched via owned_match_keys' cross-masthead fallback — "alias" is
     the signal a caller should treat as "confirm volume before trusting this".
+
+    BUI-250: `not_in_cache` was overloading two distinct states — a genuinely
+    untracked issue vs. a row that exists but is catalogued with
+    `in_collection == 0` (on the wish list / pull / read but never owned).
+    `in_wish_list` (always a bool, computed independently of match_status via
+    _match_wishlisted_issue) distinguishes them: false means no tracked row was
+    found at all, true means one was found. It's reported for every verdict —
+    including "in_collection" — rather than only for "not_in_cache", since a
+    duplicate row (one owned edition, one wish-list-only edition of the same
+    issue) is a real, if rare, possibility.
     """
     cache = CollectionCache()
     payload = cache.load()
@@ -1962,6 +2039,7 @@ def cmd_collection_check(
 
     matched_row = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
     match_kind: Optional[str] = "exact" if matched_row is not None else None
+    in_wish_list = _match_wishlisted_issue(comics, series_key, issue_stripped, issue, year) is not None
 
     # BUI-200/BUI-197: an owned copy can be filed under a DIFFERENT series-name
     # variant for the same run — the classic X-Men issue-number split
@@ -1999,6 +2077,7 @@ def cmd_collection_check(
             "matched_series_name": matched_row.get("series_name"),
             "matched_release_date": matched_row.get("release_date"),
             "match_kind": match_kind,
+            "in_wish_list": in_wish_list,
             "cache_age_days": cache_age,
         }
 
@@ -2008,6 +2087,7 @@ def cmd_collection_check(
         "matched_series_name": None,
         "matched_release_date": None,
         "match_kind": None,
+        "in_wish_list": in_wish_list,
         "cache_age_days": cache_age,
     }
 

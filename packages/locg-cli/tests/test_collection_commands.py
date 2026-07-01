@@ -678,6 +678,60 @@ def test_check_ignores_unowned_rows(tmp_path, monkeypatch):
     assert cmds.cmd_collection_check(series="Detective Comics", issue="27")["match_status"] == "in_collection"
 
 
+def test_check_distinguishes_untracked_wishlisted_and_owned(tmp_path, monkeypatch):
+    """BUI-250: not_in_cache used to conflate 'no row at all' with 'a row exists
+    but in_collection == 0' (on the wish list / pull / read, never owned) — the
+    BUI-247 audit found Hulk (Vol. 5) #9 in the latter state, indistinguishable
+    from a genuinely untracked issue like New Mutants #1. `in_wish_list` makes
+    the three states distinguishable: untracked (False), wishlisted-not-owned
+    (True, still not_in_cache), and owned (in_collection, in_wish_list False —
+    no separate wish-list-only row exists for the same issue)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    wishlisted = _agent_win_row(series="Hulk (Vol. 5) (2023 - Present)", full_title="Hulk #9")
+    wishlisted["in_collection"] = 0
+    owned = _agent_win_row(series="New Mutants (Vol. 1) (1983 - 1991)", full_title="New Mutants #98")
+    _seed_cache(cache, [wishlisted, owned])
+
+    untracked = cmds.cmd_collection_check(series="New Mutants", issue="1")
+    assert untracked["match_status"] == "not_in_cache"
+    assert untracked["in_wish_list"] is False
+
+    wish_only = cmds.cmd_collection_check(series="Hulk", issue="9")
+    assert wish_only["match_status"] == "not_in_cache"
+    assert wish_only["in_wish_list"] is True
+
+    owned_result = cmds.cmd_collection_check(series="New Mutants", issue="98")
+    assert owned_result["match_status"] == "in_collection"
+    assert owned_result["in_wish_list"] is False
+
+
+def test_check_wish_row_year_gate_prevents_wrong_era_flag(tmp_path, monkeypatch):
+    """BUI-250: in_wish_list applies the same accept-year-or-year-minus-1 gate
+    as ownership — a wish-list row from a different era must not flag a query
+    for a different volume's issue (mirrors the BUI-249 wrong-era concern)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    wishlisted_2008 = _agent_win_row(
+        series="Hulk (2008 - 2012)", full_title="Hulk #1", release_date="2008-03-01",
+    )
+    wishlisted_2008["in_collection"] = 0
+    _seed_cache(cache, [wishlisted_2008])
+
+    # Same masthead, different era — the 1962 Hulk #1 query must not be flagged.
+    result = cmds.cmd_collection_check(series="Hulk", issue="1", year="1962")
+    assert result["match_status"] == "not_in_cache"
+    assert result["in_wish_list"] is False
+
+    # The matching era does flag it.
+    result2 = cmds.cmd_collection_check(series="Hulk", issue="1", year="2008")
+    assert result2["in_wish_list"] is True
+
+
 def test_check_mighty_thor_masthead_alias(tmp_path, monkeypatch):
     """'The Mighty Thor #154' (cover title) resolves to the owned 'Thor #154'
     via the masthead alias (BUI-46, broadened in BUI-197).

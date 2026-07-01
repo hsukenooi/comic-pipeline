@@ -135,6 +135,8 @@ def test_check_not_owned_returns_not_in_cache(client):
     assert body["matched_series_name"] is None
     assert body["matched_release_date"] is None
     assert body["match_kind"] is None
+    # BUI-250: no row at all — genuinely untracked, not just unowned.
+    assert body["in_wish_list"] is False
 
 
 def test_check_wishlist_only_row_is_not_owned(client):
@@ -142,6 +144,23 @@ def test_check_wishlist_only_row_is_not_owned(client):
     as owned — the copies-owned gate (BUI-26 bug D)."""
     r = client.get("/api/comics/collection/check", params={"series": "Fantastic Four", "issue": "48", "year": "1966"})
     assert r.json()["match_status"] == "not_in_cache"
+
+
+def test_check_wishlist_only_row_flags_in_wish_list(client):
+    """BUI-250: the same in_collection=0 row from test_check_wishlist_only_row_is_not_owned
+    is a tracked-but-not-owned row, not a genuinely untracked issue — in_wish_list
+    distinguishes it from test_check_not_owned_returns_not_in_cache's true miss."""
+    r = client.get("/api/comics/collection/check", params={"series": "Fantastic Four", "issue": "48", "year": "1966"})
+    body = r.json()
+    assert body["match_status"] == "not_in_cache"
+    assert body["in_wish_list"] is True
+
+
+def test_check_owned_row_reports_in_wish_list_false(client):
+    """An owned row with no separate wish-list-only edition of the same issue
+    reports in_wish_list False alongside match_status in_collection."""
+    r = client.get("/api/comics/collection/check", params={"series": "Amazing Spider-Man", "issue": "300", "year": "1988"})
+    assert r.json()["in_wish_list"] is False
 
 
 def test_check_requires_series_and_issue(client):
@@ -233,6 +252,35 @@ def test_check_batch_year_catches_masthead_owned_book(client):
     )
     assert r.status_code == 200, r.text
     assert r.json()["results"][0]["match_status"] == "in_collection"
+
+
+def test_check_batch_distinguishes_untracked_wishlisted_and_owned(client):
+    """BUI-250: same three-way distinction as the single endpoint, via batch.
+    Untracked (in_wish_list False), wishlisted-not-owned (still not_in_cache,
+    in_wish_list True), and owned (in_wish_list False) must all be visible in
+    one fan-out call."""
+    r = client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [
+            {"series": "Batman", "issue": "1", "year": "1940"},  # untracked
+            {"series": "Fantastic Four", "issue": "48", "year": "1966"},  # wishlisted, in_collection=0
+            {"series": "Amazing Spider-Man", "issue": "300", "year": "1988"},  # owned
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    by_key = {(x["series"], x["issue"]): x for x in r.json()["results"]}
+
+    untracked = by_key[("Batman", "1")]
+    assert untracked["match_status"] == "not_in_cache"
+    assert untracked["in_wish_list"] is False
+
+    wishlisted = by_key[("Fantastic Four", "48")]
+    assert wishlisted["match_status"] == "not_in_cache"
+    assert wishlisted["in_wish_list"] is True
+
+    owned = by_key[("Amazing Spider-Man", "300")]
+    assert owned["match_status"] == "in_collection"
+    assert owned["in_wish_list"] is False
 
 
 def test_check_alias_match_flags_wrong_volume(client):
