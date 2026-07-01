@@ -208,11 +208,9 @@ class TestGroupAndGate:
             "listing_url": "https://www.ebay.com/itm/999",
         }
         with (
-            patch.object(ws, "hard_reject", return_value=False),
-            patch.object(ws, "era_mismatch", return_value=False),
-            patch.object(ws, "_reprint_reject", return_value=False),
-            patch.object(ws, "_digital_reject", return_value=False),
-            patch.object(ws, "_trading_card_reject", return_value=False),
+            # BUI-245: hard_reject/era_mismatch/reprint/digital/trading-card
+            # are now one shared gate — patch the single entry point.
+            patch.object(ws, "should_reject", return_value=False),
             patch.object(ws, "match_listing", return_value=(wish_item, 1.0)),
         ):
             matches = ws.match_results_for_wish([result_no_seller], wish_item)

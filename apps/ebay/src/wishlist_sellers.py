@@ -52,17 +52,11 @@ from ebay_fetch import (
     search_by_keyword,
 )
 from seller_scan import (
-    _digital_reject,
-    _foreign_edition_reject,  # BUI-239
     _normalize,
-    _reprint_reject,
-    _second_print_reject,  # BUI-244
     _server_base,
     _strip_grades,
     _title_paren_years,
     _title_volume,
-    _trading_card_reject,
-    era_mismatch,
     fetch_seen_item_ids,
     fetch_wish_list,
     hard_reject,
@@ -70,6 +64,7 @@ from seller_scan import (
     prepare_wish_items,
     publication_year_mismatch,
     record_items_seen,
+    should_reject,  # BUI-245: shared deterministic reject chain
     verify_with_claude,
 )
 
@@ -328,29 +323,14 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
         title = item.get("title") or ""
         if not title:
             continue
-        if hard_reject(title, series, issue):
-            continue
-        # BUI-226: deterministic era-gate — reject listings whose parenthesized
-        # year or explicit volume number clearly contradicts the wish series era.
-        # Fail-open (era_mismatch returns False) when any signal is missing.
-        # BUI-240: pass the per-issue release year so the tighter issue-year
-        # gate fires instead of the coarser series-range boundary.
-        if era_mismatch(title, wish_series_name, wish_item.get("_release_year")):  # BUI-240
-            continue
-        # BUI-227: conservative reprint/non-original-format reject.
-        if _reprint_reject(title):
-            continue
-        # BUI-230: digital-code / no-physical-comic reject.
-        if _digital_reject(title):
-            continue
-        # BUI-232: trading-card / TCG reject.
-        if _trading_card_reject(title):
-            continue
-        # BUI-239: foreign-language / foreign-market reprint reject.
-        if _foreign_edition_reject(title):
-            continue
-        # BUI-244: later-printing / non-first-print reject.
-        if _second_print_reject(title):
+        # BUI-245: hard_reject, era_mismatch (BUI-226/BUI-240), and the
+        # reprint/digital/trading-card/foreign-edition/second-print rejects
+        # (BUI-227/230/232/239/244) now live in one shared gate chain —
+        # seller_scan.should_reject() — so this funnel and seller_scan.main()'s
+        # candidate loop can never drift apart on what counts as an obvious
+        # non-match. Fail-open on era signals when release_year/series_name
+        # are missing (unchanged from before the extraction).
+        if should_reject(title, series, issue, wish_series_name, wish_item.get("_release_year")):
             continue
         wish, score = match_listing(title, [wish_item])
         if wish is not None and score >= MATCH_SCORE_FLOOR:

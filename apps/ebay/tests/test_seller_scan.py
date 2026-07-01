@@ -2356,3 +2356,189 @@ class TestPublicationYearMismatch:
         aspects = {"Publication Year": "1964", "Era": "Modern Age (1992-Now)"}
         # release_year="2020" would normally be post-1992 (keep), but pub year wins
         assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "2020") is False
+
+
+# ─── BUI-245: should_reject (shared deterministic gate chain) ────────────────
+
+
+class TestShouldReject:
+    """should_reject() is the single gate chain shared by seller_scan.main() and
+    wishlist_sellers.match_results_for_wish(). Each underlying gate already has
+    its own thorough test class (TestHardRejectCGC, TestReprintReject, etc.) —
+    these tests just confirm should_reject wires every one of them in, so a
+    True from any single gate propagates."""
+
+    _ASM_1963 = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+    def test_clean_match_not_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 VF Marvel", "Amazing Spider-Man", "15",
+        ) is False
+
+    def test_cgc_slab_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 CGC 9.4", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_edition_mismatch_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man Annual #15", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_lot_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 lot of 5", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_missing_issue_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #16 VF Marvel", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_era_mismatch_rejected(self):
+        """A parenthesized year outside the wish's release-year window rejects."""
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 (1999) VF", "Amazing Spider-Man",
+            "15", self._ASM_1963, "1964",
+        ) is True
+
+    def test_era_mismatch_fails_open_without_series_name(self):
+        """Same title, but no series_name passed → era gate can't fire."""
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 (1999) VF", "Amazing Spider-Man", "15",
+        ) is False
+
+    def test_reprint_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 Omnibus", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_digital_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 Digital Only", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_trading_card_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 Topps card", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_foreign_edition_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 La Prensa", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_second_print_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 2nd Printing", "Amazing Spider-Man", "15",
+        ) is True
+
+
+# ─── BUI-245: seller_scan.main() candidate loop — deterministic gate + hint ──
+
+
+class TestMainCandidateLoopGateChain:
+    """Regression coverage for BUI-245: seller_scan.main()'s candidate loop must
+    run the same deterministic reject chain as wishlist_sellers.match_results_for_wish()
+    and must carry _series_name onto candidates so verify_with_claude's
+    "Correct series:" era hint activates.
+
+    Repro (BUI-245): "Spectacular Spider-Man #15" scores 0.67 against wish item
+    "The Amazing Spider-Man #15" (spider + man = 2/3 tokens) — high enough to
+    clear match_listing's 0.65 floor, so none of the deterministic gates catch
+    it (no edition/lot/reprint/digital/trading-card/foreign-edition marker, and
+    no parenthesized year for era_mismatch to compare). The fix relies on the
+    "Correct series:" hint reaching Haiku, which is exactly what these tests
+    verify is now wired through from the main() loop.
+    """
+
+    def _wish_items(self):
+        return seller_scan.prepare_wish_items([{
+            "id": "w1",
+            "name": "The Amazing Spider-Man #15",
+            "series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+            "release_date": "1964-08-01",
+        }])
+
+    def _run_scan_loop_body(self, raw_titles, wish_items):
+        """Replicate the scan-loop body from seller_scan.main() (mirrors
+        TestNullTitleScanLoop's approach) so the fix can be exercised without
+        spinning up the full CLI."""
+        candidates = []
+        seen_ids = set()
+        for item_id, title in raw_titles:
+            if not title:
+                continue
+            if "cgc" in title.lower():
+                continue
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            wish, score = seller_scan.match_listing(title, wish_items)
+            if not wish:
+                continue
+            if seller_scan.should_reject(
+                title, wish["series"], wish["issue"],
+                wish.get("_series_name"), wish.get("_release_year"),
+            ):
+                continue
+            candidates.append({
+                "item_id": item_id,
+                "title": title,
+                "wish_id": wish["id"],
+                "wish_name": wish["name"],
+                "match_score": round(score, 2),
+                "_series_name": wish.get("_series_name"),
+                "_release_year": wish.get("_release_year"),
+            })
+        return candidates
+
+    def test_cross_series_candidate_not_deterministically_rejected(self):
+        """should_reject alone does not catch this pair — confirms the failure
+        mode described in BUI-245 (the case must reach Haiku, not be dropped
+        deterministically)."""
+        wish_items = self._wish_items()
+        candidates = self._run_scan_loop_body(
+            [("1", "Spectacular Spider-Man #15 VF Marvel 1979")], wish_items
+        )
+        assert len(candidates) == 1
+
+    def test_cross_series_candidate_carries_series_name_hint(self):
+        """The candidate dict built by the main()-loop replica carries
+        _series_name so verify_with_claude's era hint activates (BUI-245 fix)."""
+        wish_items = self._wish_items()
+        candidates = self._run_scan_loop_body(
+            [("1", "Spectacular Spider-Man #15 VF Marvel 1979")], wish_items
+        )
+        assert candidates[0]["_series_name"] == "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+    def test_cross_series_candidate_rejected_end_to_end_via_claude_hint(self, monkeypatch):
+        """End-to-end: the candidate built by main()'s loop is sent to
+        verify_with_claude with the "Correct series:" hint present in the
+        prompt, and a Claude response rejecting it (as the hint enables) drops
+        it from the final matches — the BUI-245 false positive is gone."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+        wish_items = self._wish_items()
+        candidates = self._run_scan_loop_body(
+            [("1", "Spectacular Spider-Man #15 VF Marvel 1979")], wish_items
+        )
+
+        prompts_seen = []
+
+        def fake_create(**kwargs):
+            prompts_seen.append(kwargs["messages"][0]["content"])
+            resp = MagicMock()
+            resp.content = [MagicMock(
+                text='[{"id":1,"reason":"Spectacular Spider-Man not Amazing Spider-Man"}]'
+            )]
+            return resp
+
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = fake_create
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        kept = seller_scan.verify_with_claude(candidates)
+
+        assert "Correct series: The Amazing Spider-Man (Vol. 1) (1963 - 1998)" in prompts_seen[0]
+        assert kept == []

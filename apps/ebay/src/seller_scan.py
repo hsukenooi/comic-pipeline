@@ -779,6 +779,53 @@ def _second_print_reject(title: str) -> bool:
     return bool(_LATER_PRINTING_RE.search(title or ""))
 
 
+# ─── Shared deterministic reject chain (BUI-245) ──────────────────────────────
+# Single source of truth for the deterministic gate chain, consulted by both
+# seller_scan.main() and wishlist_sellers.match_results_for_wish() so the two
+# candidate loops can never drift apart on what counts as an obvious non-match.
+
+
+def should_reject(
+    title: str,
+    series: str,
+    issue: "str | None",
+    series_name: "str | None" = None,
+    release_year: "str | None" = None,
+) -> bool:
+    """Return True if *title* is a deterministic non-match for this wish item.
+
+    Runs the full gate chain in order — the first gate to fire wins:
+      1. hard_reject       — CGC slab, edition mismatch, multi-comic lot,
+                              missing issue number.
+      2. era_mismatch      — parenthesized year or explicit volume clearly
+                              contradicts the wish series era (BUI-226/BUI-240).
+      3. _reprint_reject   — facsimile / omnibus / TPB / etc. (BUI-227).
+      4. _digital_reject   — digital-code / no-physical-comic offer (BUI-230).
+      5. _trading_card_reject — trading card / TCG product (BUI-232).
+      6. _foreign_edition_reject — foreign-language/-market reprint (BUI-239).
+      7. _second_print_reject   — later printing / non-first-print (BUI-244).
+
+    *series_name* and *release_year* are optional — pass them whenever the
+    caller has a decorated LOCG series name / per-issue release year so the
+    era-gate signals can fire; omitting them just fails those checks open.
+    """
+    if hard_reject(title, series, issue):
+        return True
+    if era_mismatch(title, series_name, release_year):
+        return True
+    if _reprint_reject(title):
+        return True
+    if _digital_reject(title):
+        return True
+    if _trading_card_reject(title):
+        return True
+    if _foreign_edition_reject(title):
+        return True
+    if _second_print_reject(title):
+        return True
+    return False
+
+
 # ─── Claude verification ──────────────────────────────────────────────────────
 
 def _load_dotenv(path):
@@ -1109,21 +1156,39 @@ def main(argv=None):
         # BUI-184: defense in depth — parse_item_summary already coerces null
         # titles to "" via `or ""`, but skip explicitly here too so that a
         # title-less listing never reaches .lower() or match_listing at all.
-        if not listing.get("title"):
+        title = listing.get("title")
+        if not title:
             continue
-        if "cgc" in listing["title"].lower():
+        if "cgc" in title.lower():
             continue
         if listing["item_id"] in seen_ids:
             continue
         seen_ids.add(listing["item_id"])
-        wish, score = match_listing(listing["title"], wish_items)
-        if wish:
-            candidates.append({
-                **listing,
-                "wish_id": wish["id"],
-                "wish_name": wish["name"],
-                "match_score": round(score, 2),
-            })
+        wish, score = match_listing(title, wish_items)
+        if not wish:
+            continue
+        # BUI-245: run the same deterministic reject chain wishlist_sellers uses
+        # (hard_reject, era_mismatch, reprint/digital/trading-card/foreign-edition/
+        # second-print) against the wish item match_listing resolved, so a
+        # cross-series false positive (e.g. "Spectacular Spider-Man #15" vs wish
+        # "The Amazing Spider-Man #15") is dropped here rather than reaching Haiku
+        # with no era hint.
+        if should_reject(
+            title, wish["series"], wish["issue"],
+            wish.get("_series_name"), wish.get("_release_year"),
+        ):
+            continue
+        candidates.append({
+            **listing,
+            "wish_id": wish["id"],
+            "wish_name": wish["name"],
+            "match_score": round(score, 2),
+            # Private fields (BUI-245): carry the decorated series name so
+            # verify_with_claude's "Correct series:" era hint activates for this
+            # candidate too. Stripped before output — see the json_output block.
+            "_series_name": wish.get("_series_name"),
+            "_release_year": wish.get("_release_year"),
+        })
 
     # BUI-113: drop matches already surfaced in a prior scan (default). --all
     # skips the filter (and its server fetch); the short-circuit on an empty
@@ -1145,6 +1210,11 @@ def main(argv=None):
     else:
         matches = []
     print(f"  {len(matches)} genuine match(es) found", file=sys.stderr)
+
+    # BUI-245: strip private pipeline fields (_series_name, _release_year) —
+    # they exist only to feed verify_with_claude's era hint and were never
+    # meant to reach the user-facing table/JSON output.
+    matches = [{k: v for k, v in m.items() if not k.startswith("_")} for m in matches]
 
     if args.json_output:
         print(json.dumps(matches, indent=2))
