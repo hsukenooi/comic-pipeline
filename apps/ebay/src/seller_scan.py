@@ -148,11 +148,27 @@ _EDITION_PATTERNS = [
     re.compile(r"\btreasury\b", re.IGNORECASE),
 ]
 
+# BUI-261: shared building block for the generic numeric-list branches below.
+# Matches one lot "member": an optional '#' + a 1-3 digit run, bounded so it
+# can never bind to part of a longer run (a 4-digit YEAR, or the "6" in a SKU
+# token like "X6" — \b requires a non-word char on both sides, and a letter
+# immediately touching a digit is NOT a boundary) and never bind to half of a
+# decimal grade ("9.4/9.6" — the lookaround pair excludes any digit run that
+# is directly preceded or followed by a '.').  This is what makes the generic
+# separator-chain branches below safe to add without regressing the BUI-243
+# guards (year-span carve-out, SKU tokens) or false-firing on grade ratios.
+_LOT_MEMBER = r"#?\s*(?<!\.)\b\d{1,3}\b(?!\.\d)"
+
 # Multi-comic-lot signals.  Any match → listing is a bundle, not a single issue.
 _LOT_RE = re.compile(
     r"\blot\s+of\b"           # "lot of"
     r"|\b\d+\s+lot\b"         # "5 lot", "10-comic lot"
     r"|\blot\s+\d+"           # "lot 5", "lot 10"
+    # BUI-261: bare "lot" catch-all. Comics titles essentially never use "lot"
+    # as anything but a bundle signal, so this alone subsumes the three
+    # narrower branches above — they're kept for documentation/history and
+    # because their tests assert the exact substrings.
+    r"|\blot\b"
     r"|\bcollection\b"         # "complete collection", "run collection"
     r"|\bcomplete\s+run\b"     # "complete run"
     r"|\bcomplete\s+set\b"     # BUI-243: "complete set" (full-run bundles)
@@ -171,9 +187,61 @@ _LOT_RE = re.compile(
     # direction there is a missed lot-reject, which is the safe side).
     r"|\b(?:books?|issues?)\s*\d{1,3}\s*-\s*#?\d{1,3}\b"
     # BUI-243: spelled-out range — "issues 1 through 6", "books 1 through 4"
-    r"|\b(?:books?|issues?)\s+\d{1,3}\s+through\s+\d{1,3}\b",
+    r"|\b(?:books?|issues?)\s+\d{1,3}\s+through\s+\d{1,3}\b"
+    # BUI-261: bare "#N through M" / "N through M" — the branch above requires
+    # a literal "issues"/"books" word; real titles often drop it entirely
+    # (e.g. "The Eternals #1 through 10").
+    r"|#\d{1,3}\s+through\s+\d{1,3}\b"
+    r"|\b\d{1,3}\s+through\s+\d{1,3}\b"
+    # BUI-261: generic numeric-list detector — 3+ members chained by any mix
+    # of comma/slash/ampersand/dash ("164/165/166/168", "33,45,50,53,63,81,86",
+    # "92-93-94-95-96", "#64, #65 & #66"). Requiring 2+ separators (3+ members)
+    # for a comma/dash-only chain preserves the BUI-221/BUI-243 carve-out for a
+    # bare 2-member dash pair ("129-150", "1962-1963") — those stay ambiguous
+    # (year span / price span) and are intentionally left alone.
+    rf"|{_LOT_MEMBER}(?:\s*[,/&-]\s*{_LOT_MEMBER}){{2,}}"
+    # BUI-261: a 2-member slash or ampersand pair is unambiguous on its own —
+    # "&" and "/" are never used to write a single number or a year/price span
+    # ("Dark Knight Returns # 1 & 3", "STRANGE TALES 164/165").
+    rf"|{_LOT_MEMBER}\s*[/&]\s*{_LOT_MEMBER}",
     re.IGNORECASE,
 )
+
+# ─── Lot count vs. parsed-range mismatch (BUI-261) ───────────────────────────
+
+_LOT_STATED_COUNT_RE = re.compile(r"\blot\s+of\s+(\d{1,3})\b", re.IGNORECASE)
+_LOT_ISSUE_RANGE_RE = re.compile(r"#\s*(\d{1,3})\s*-\s*#?\s*(\d{1,3})\b")
+
+
+def lot_count_mismatch(title: str) -> bool:
+    """Return True if a stated "Lot of N" count contradicts the size of an
+    explicit "#start-end" issue range also present in the title.
+
+    Example: "Lot of 11 Comics ... #1-10" claims 11 books over a range that
+    only spans 10 issues — a parsing red flag worth surfacing rather than
+    silently trusting either number.
+
+    FAIL-OPEN (BUI-261): this is a diagnostic flag for a caller to act on
+    (e.g. log a warning, or double-check before expanding a lot into
+    constituent issues) — not a rejection gate; _LOT_RE already hard-rejects
+    anything phrased as "lot of N" regardless of what this returns. Returns
+    False whenever the stated count or an explicit range is missing, or the
+    range is malformed (end < start) — ambiguous input is never reported as
+    a mismatch.
+    """
+    stated_m = _LOT_STATED_COUNT_RE.search(title or "")
+    if not stated_m:
+        return False
+    stated = int(stated_m.group(1))
+
+    range_m = _LOT_ISSUE_RANGE_RE.search(title)
+    if not range_m:
+        return False
+    start, end = int(range_m.group(1)), int(range_m.group(2))
+    if end < start:
+        return False
+    return (end - start + 1) != stated
+
 
 # BUI-135: numeric grade tokens (CGC/CBCS slab grades and raw grade shorthand)
 # look like "7.0", "8.5", "9.2", "9.4". _normalize() replaces the "." with a

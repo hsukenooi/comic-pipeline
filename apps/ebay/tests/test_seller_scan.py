@@ -1188,6 +1188,146 @@ class TestHardRejectLot:
         assert not seller_scan.hard_reject(title, "X-Men", "1")
 
 
+# ─── BUI-261: _LOT_RE missed formats (live false-negatives) ──────────────────
+
+
+class TestLotReMissedFormats:
+    """BUI-247 audit dry-runs found real eBay lot titles that slipped past
+    _LOT_RE. Each format below is a real observed title shape; every one must
+    now be detected as a lot (and therefore hard-rejected)."""
+
+    def test_slash_list_rejected(self):
+        title = "STRANGE TALES 164/165/166/168"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "Strange Tales", "164")
+
+    def test_ampersand_pair_rejected(self):
+        title = "Dark Knight Returns # 1 & 3"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(
+            title, "Batman: The Dark Knight Returns", "1"
+        )
+
+    def test_comma_ampersand_mixed_list_rejected(self):
+        title = "ASM #64, #65 & #66"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "Amazing Spider-Man", "64")
+
+    def test_bare_comma_list_ending_in_lot_rejected(self):
+        title = "Avengers 33,45,50,53,63,81,86 Marvel Silver/Bronze Age Lot"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "The Avengers", "33")
+
+    def test_dash_separated_list_rejected(self):
+        title = "AVENGERS 92-93-94-95-96 Marvel Bronze Age Lot"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "The Avengers", "92")
+
+    def test_bare_hash_through_rejected(self):
+        # BUI-261: no "issues"/"books" word — the pre-existing through-branch
+        # required one; real titles often drop it.
+        title = "The Eternals #1 through 10"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "Eternals", "1")
+
+    def test_bare_no_hash_through_rejected(self):
+        title = "Eternals 1 through 10 Marvel"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "Eternals", "1")
+
+    # ── Two-member slash/ampersand pairs are unambiguous on their own ────────
+
+    def test_two_member_slash_pair_rejected(self):
+        assert seller_scan._LOT_RE.search("Amazing Spider-Man #1/2")
+
+    def test_two_member_ampersand_pair_rejected(self):
+        assert seller_scan._LOT_RE.search("X-Men #94 & #95")
+
+
+class TestLotCountMismatch:
+    """BUI-261: lot_count_mismatch() flags a stated 'Lot of N' count that
+    contradicts an explicit '#start-end' range in the same title — a parsing
+    red flag surfaced for a caller to act on (fail-open, not a rejection gate:
+    _LOT_RE already hard-rejects any 'lot of N' phrasing regardless)."""
+
+    def test_count_lower_than_range_flagged(self):
+        # "Lot of 11" claimed over a #1-10 range (only 10 issues) — BUI-261 example.
+        assert seller_scan.lot_count_mismatch(
+            "Lot of 11 Comics Amazing Spider-Man #1-10"
+        ) is True
+
+    def test_count_matches_range_not_flagged(self):
+        assert seller_scan.lot_count_mismatch(
+            "Lot of 10 Comics Amazing Spider-Man #1-10"
+        ) is False
+
+    def test_no_stated_count_fails_open(self):
+        assert seller_scan.lot_count_mismatch(
+            "Amazing Spider-Man #1-10 Marvel Lot"
+        ) is False
+
+    def test_no_explicit_range_fails_open(self):
+        assert seller_scan.lot_count_mismatch(
+            "Lot of 11 Amazing Spider-Man Comics"
+        ) is False
+
+    def test_malformed_range_end_before_start_fails_open(self):
+        assert seller_scan.lot_count_mismatch(
+            "Lot of 5 Comics Amazing Spider-Man #10-1"
+        ) is False
+
+    def test_empty_title_fails_open(self):
+        assert seller_scan.lot_count_mismatch("") is False
+
+
+class TestLotReBui243GuardsPreserved:
+    """BUI-261 regression: re-assert every BUI-243 false-reject carve-out
+    (year spans, SKU-adjacent digits) still passes after extending _LOT_RE
+    with the new generic numeric-list/through/bare-lot branches."""
+
+    def test_year_span_after_issue_number_still_not_lot(self):
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #4 1962-1963 Silver Age Marvel"
+        )
+
+    def test_year_span_after_first_issue_word_still_not_lot(self):
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #1 First Issue 1962-1963 Marvel"
+        )
+
+    def test_year_span_after_key_issue_word_still_not_lot(self):
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #1 Key Issue 1962-1964 Marvel"
+        )
+
+    def test_bare_two_member_dash_range_still_not_lot(self):
+        # BUI-221 carve-out: a bare 2-member dash pair with no '#' anchor and
+        # no quantity word stays ambiguous (ended run years / price span).
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man 129-150 Bronze Age"
+        )
+
+    def test_series_run_year_range_in_parens_still_not_lot(self):
+        assert not seller_scan._LOT_RE.search(
+            "Uncanny X-Men #266 (1981-2011) 1st Gambit"
+        )
+
+    def test_decimal_grade_ratio_not_mistaken_for_slash_list(self):
+        # BUI-261: a decimal-grade comparison ("9.4/9.6") must not be misread
+        # as a 2-member slash list ("4/9") by the new generic detector.
+        assert not seller_scan._LOT_RE.search(
+            "CGC 9.4/9.6 slab pair Amazing Spider-Man #300"
+        )
+
+    def test_sku_letter_digit_token_not_mistaken_for_lot_member(self):
+        # BUI-261: a SKU token like "X6" must not be read as a lone lot member
+        # (no word boundary between a letter and an immediately-adjacent digit).
+        assert not seller_scan._LOT_RE.search("Moon Knight X6 Marvel 1982")
+
+    def test_sku_paren_code_not_mistaken_for_lot_member(self):
+        assert not seller_scan._LOT_RE.search("Fantastic Four (CZ) 48 VF")
+
+
 class TestHardRejectMissingIssue:
     def test_title_missing_issue_number_rejected(self):
         # Title has no "300" — obvious wrong listing.
