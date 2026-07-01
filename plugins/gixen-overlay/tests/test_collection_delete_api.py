@@ -374,6 +374,9 @@ def test_delete_409_when_pin_is_ambiguous_across_dateless_duplicates(client):
     ]
     _seed_collection(client.store, dupes)
 
+    collection_path = client.store / "collection.json"
+    before = collection_path.read_bytes()
+
     r = client.delete("/api/comics/collection", params={"series": "Uncanny X-Men", "issue": "142"})
     assert r.status_code == 409
 
@@ -382,6 +385,14 @@ def test_delete_409_when_pin_is_ambiguous_across_dateless_duplicates(client):
         "/api/comics/collection/check", params={"series": "Uncanny X-Men", "issue": "142"}
     ).json()
     assert check["match_status"] == "in_collection"
+
+    # A refused (409) delete is a true no-op: the cheap pre-check refuses
+    # BEFORE cache.apply() runs, so it never rotates the .bak ring or rewrites
+    # last_writer metadata for a delete that never actually happened. Assert
+    # the store file is byte-for-byte unchanged, and that no backup was
+    # created (repeated ambiguous calls must not churn/evict the backup ring).
+    assert collection_path.read_bytes() == before
+    assert not (client.store / "collection.json.bak.0").exists()
 
 
 def test_delete_dry_run_409_when_pin_is_ambiguous(client):

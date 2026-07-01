@@ -1387,6 +1387,25 @@ async def api_collection_delete(
             "remaining_copies": copies - 1 if copies > 1 else 0,
         }
 
+    # Cheap no-lock pre-check: refuse an ambiguous pin BEFORE touching
+    # cache.apply(), so a refused (409) delete is a true no-op — it doesn't
+    # rotate the .bak ring or rewrite last_writer metadata for a delete that
+    # never actually happened. Repeated ambiguous calls would otherwise churn
+    # the backup ring and could evict older, distinct backups. The in-`_mutate`
+    # ambiguity guard below stays as the authoritative, race-safe backstop: if
+    # the store changes between this pre-check and the lock (e.g. a second
+    # copy of the same dateless row is imported in between), that guard still
+    # catches it before any row is touched.
+    if len(_pinned_collection_rows(cache.load().get("comics", []), full_title, matched_release_date)) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ambiguous match: multiple owned rows share full_title="
+                f"{full_title!r} and release_date={matched_release_date!r} — "
+                "refusing to guess which one to remove"
+            ),
+        )
+
     removed: dict[str, Any] | None = None
     action: str | None = None
     remaining_copies = 0
