@@ -232,3 +232,179 @@ def test_delete_409_when_never_imported_dry_run_too(client):
         params={"series": "Amazing Spider-Man", "issue": "300", "year": "1988", "dry_run": "true"},
     )
     assert r.status_code == 409
+
+
+def test_delete_single_dateless_row_is_deletable_not_a_false_404(client):
+    """S1 follow-up: matched_release_date can be "" (empty string), not just
+    None, for an owned-but-dateless row (cmd_collection_check reads it
+    straight off the row). The pin must normalize "" and None the same way on
+    BOTH sides of the comparison — otherwise the one owned row that IS the
+    match gets excluded by its own release_date and the endpoint 404s on a
+    book that is, in fact, sitting right there in the collection."""
+    _seed_collection(client.store, [{
+        "full_title": "Conan the Barbarian #1",
+        "series_name": "Conan the Barbarian",
+        "publisher_name": "Marvel Comics",
+        "release_date": "",  # dateless owned row
+        "in_collection": 1,
+    }])
+
+    r = client.delete(
+        "/api/comics/collection",
+        params={"series": "Conan the Barbarian", "issue": "1", "year": "1970"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["removed"]["full_title"] == "Conan the Barbarian #1"
+
+    check = client.get(
+        "/api/comics/collection/check",
+        params={"series": "Conan the Barbarian", "issue": "1", "year": "1970"},
+    ).json()
+    assert check["match_status"] == "not_in_cache"
+
+
+# --- S1 regression: full_title alone is not unique across eras -------------
+#
+# LOCG's full_title carries no year (BUI-199 — "Hulk #1", not "Hulk (2008)
+# #1"), so a collection holding both the 1962 and 2008 "Hulk #1" has TWO owned
+# rows with an identical full_title. Locating the row to delete by full_title
+# alone would silently touch whichever row happens to come first in the list,
+# not necessarily the era the `year` param asked for. The endpoint must pin on
+# `matched_release_date` too so it deletes the SAME row cmd_collection_check
+# resolved via its year gate.
+
+_HULK_TWO_ERAS = [
+    {
+        "full_title": "Hulk #1",
+        "series_name": "Hulk",
+        "publisher_name": "Marvel Comics",
+        "release_date": "1962-05-01",
+        "in_collection": 1,
+    },
+    {
+        "full_title": "Hulk #1",
+        "series_name": "Hulk",
+        "publisher_name": "Marvel Comics",
+        "release_date": "2008-06-01",
+        "in_collection": 1,
+    },
+]
+
+
+def test_delete_pins_by_release_date_removes_requested_era(client):
+    _seed_collection(client.store, _HULK_TWO_ERAS)
+
+    r = client.delete("/api/comics/collection", params={"series": "Hulk", "issue": "1", "year": "2008"})
+    assert r.status_code == 200, r.text
+    assert r.json()["removed"]["release_date"] == "2008-06-01"
+
+    # The 1962 copy survives untouched.
+    survivor = client.get(
+        "/api/comics/collection/check", params={"series": "Hulk", "issue": "1", "year": "1962"}
+    ).json()
+    assert survivor["match_status"] == "in_collection"
+    assert survivor["matched_release_date"] == "1962-05-01"
+
+    # The 2008 copy is really gone — not just decremented, each row here is a
+    # single copy.
+    gone = client.get(
+        "/api/comics/collection/check", params={"series": "Hulk", "issue": "1", "year": "2008"}
+    ).json()
+    assert gone["match_status"] == "not_in_cache"
+
+
+def test_delete_pins_by_release_date_reverse_era(client):
+    """Same setup, deleting the OTHER era — proves the pin follows the `year`
+    param, not a fixed first/last-row bias."""
+    _seed_collection(client.store, _HULK_TWO_ERAS)
+
+    r = client.delete("/api/comics/collection", params={"series": "Hulk", "issue": "1", "year": "1962"})
+    assert r.status_code == 200, r.text
+    assert r.json()["removed"]["release_date"] == "1962-05-01"
+
+    survivor = client.get(
+        "/api/comics/collection/check", params={"series": "Hulk", "issue": "1", "year": "2008"}
+    ).json()
+    assert survivor["match_status"] == "in_collection"
+    assert survivor["matched_release_date"] == "2008-06-01"
+
+
+def test_delete_dry_run_pins_by_release_date(client):
+    """The preview uses the same pinning predicate as the real delete, so it
+    previews the era actually requested, not just the first row by title."""
+    _seed_collection(client.store, _HULK_TWO_ERAS)
+
+    r = client.delete(
+        "/api/comics/collection",
+        params={"series": "Hulk", "issue": "1", "year": "2008", "dry_run": "true"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["would_remove"]["release_date"] == "2008-06-01"
+
+    # Both eras still owned — a preview never mutates.
+    for yr, date in (("1962", "1962-05-01"), ("2008", "2008-06-01")):
+        check = client.get(
+            "/api/comics/collection/check", params={"series": "Hulk", "issue": "1", "year": yr}
+        ).json()
+        assert check["match_status"] == "in_collection"
+        assert check["matched_release_date"] == date
+
+
+def test_delete_409_when_pin_is_ambiguous_across_dateless_duplicates(client):
+    """Two owned rows share both full_title AND a missing release_date — the
+    pin can't disambiguate them, so the endpoint refuses with 409 rather than
+    silently deleting whichever comes first."""
+    dupes = [
+        {
+            "full_title": "Uncanny X-Men #142",
+            "series_name": "Uncanny X-Men",
+            "publisher_name": "Marvel Comics",
+            "release_date": None,
+            "in_collection": 1,
+        },
+        {
+            "full_title": "Uncanny X-Men #142",
+            "series_name": "Uncanny X-Men",
+            "publisher_name": "Marvel Comics",
+            "release_date": None,
+            "in_collection": 1,
+        },
+    ]
+    _seed_collection(client.store, dupes)
+
+    r = client.delete("/api/comics/collection", params={"series": "Uncanny X-Men", "issue": "142"})
+    assert r.status_code == 409
+
+    # Refusing to guess means no mutation happened — both rows survive.
+    check = client.get(
+        "/api/comics/collection/check", params={"series": "Uncanny X-Men", "issue": "142"}
+    ).json()
+    assert check["match_status"] == "in_collection"
+
+
+def test_delete_dry_run_409_when_pin_is_ambiguous(client):
+    dupes = [
+        {
+            "full_title": "Uncanny X-Men #142",
+            "series_name": "Uncanny X-Men",
+            "publisher_name": "Marvel Comics",
+            "release_date": None,
+            "in_collection": 1,
+        },
+        {
+            "full_title": "Uncanny X-Men #142",
+            "series_name": "Uncanny X-Men",
+            "publisher_name": "Marvel Comics",
+            "release_date": None,
+            "in_collection": 1,
+        },
+    ]
+    _seed_collection(client.store, dupes)
+
+    r = client.delete(
+        "/api/comics/collection",
+        params={"series": "Uncanny X-Men", "issue": "142", "dry_run": "true"},
+    )
+    assert r.status_code == 409

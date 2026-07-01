@@ -1262,6 +1262,28 @@ async def api_record_win(req: RecordWinRequest):
     return result
 
 
+def _pinned_collection_rows(
+    comics: list[dict[str, Any]], full_title: str, release_date: str | None
+) -> list[dict[str, Any]]:
+    """Owned rows matching BOTH `full_title` and `release_date` (BUI-254 S1).
+
+    `full_title` alone is not a unique key: LOCG's `full_title` carries no year
+    (BUI-199 — "Hulk #1", not "Hulk (2008) #1"), so a collection owning both the
+    1962 and 2008 "Hulk #1" has TWO owned rows with an identical `full_title`.
+    `cmd_collection_check`'s year gate already resolved that ambiguity down to
+    ONE row (its `matched_release_date` is that exact row's `release_date`, or
+    `None` when the matched row is itself dateless) — pin on it too so the row
+    this endpoint touches is provably the SAME row `cmd_collection_check`
+    reported as in_collection, not just "the first row with this title".
+    """
+    return [
+        row for row in comics
+        if row.get("in_collection")
+        and row.get("full_title") == full_title
+        and (row.get("release_date") or None) == release_date
+    ]
+
+
 @router.delete("/api/comics/collection")
 async def api_collection_delete(
     series: str,
@@ -1287,14 +1309,24 @@ async def api_collection_delete(
 
     Locates the row with the SAME matcher `cmd_collection_check` uses (masthead
     aliases, the X-Men issue-number split, leading-zero/leading-article
-    normalization) — not a reimplementation. `in_collection` is a copies-owned
-    count (BUI-249/250/251): a row with more than one copy is decremented, a
+    normalization, the year gate) — not a reimplementation. The row is then
+    pinned by `full_title` AND `release_date` together (`_pinned_collection_rows`,
+    BUI-254 S1): `full_title` alone can collide across eras of the same issue
+    number (e.g. two owned "Hulk #1" rows, 1962 and 2008), so a bare
+    `full_title` match could silently touch the wrong one. If the pin still
+    matches more than one row (e.g. two genuinely dateless rows sharing a
+    title), that's an unresolvable ambiguity — refuse with 409 rather than
+    guess via first-match. `in_collection` is a copies-owned count
+    (BUI-249/250/251): a row with more than one copy is decremented, a
     single-copy row is removed outright, so deleting one erroneous copy never
     un-owns the others. Pass `dry_run=true` to preview the record that WOULD be
     removed/decremented without mutating the store (the same dry-run-then-
-    confirm shape `/comic:wishlist-add` and `/comic:collection-sync` use).
+    confirm shape `/comic:wishlist-add` and `/comic:collection-sync` use) — the
+    preview and the real delete share the exact same pinning predicate, so what
+    you preview is what you'd delete.
 
-    404 when no owned row matches; 409 when the store was never imported (R11).
+    404 when no owned row matches; 409 when the store was never imported (R11)
+    or when the pin is ambiguous.
     """
     series = series.strip()
     issue = issue.strip()
@@ -1314,6 +1346,15 @@ async def api_collection_delete(
             detail=f"'{series} #{issue}' is not in the collection — nothing to remove",
         )
     full_title = check["full_title_matched"]
+    # Normalize "" to None here, once: cmd_collection_check sets
+    # matched_release_date straight from the matched row's release_date, which
+    # can be "" (not just missing) for an owned-but-dateless row — the year
+    # gate fail-opens on an empty date, so such a row still reports
+    # in_collection. _pinned_collection_rows folds the ROW side's
+    # release_date the same "" -> None way; if this side stayed unnormalized
+    # ("" != None), the pin would reject the very row cmd_collection_check
+    # just confirmed is owned, 404ing a legitimately deletable dateless row.
+    matched_release_date = check.get("matched_release_date") or None
 
     cache = CollectionCache()
 
@@ -1322,18 +1363,22 @@ async def api_collection_delete(
         # rather than reusing the check above so the previewed record reflects
         # the store at read time, not a snapshot from before this request.
         payload = cache.load()
-        row = next(
-            (
-                r for r in payload.get("comics", [])
-                if r.get("in_collection") and r.get("full_title") == full_title
-            ),
-            None,
-        )
-        if row is None:
+        candidates = _pinned_collection_rows(payload.get("comics", []), full_title, matched_release_date)
+        if not candidates:
             raise HTTPException(
                 status_code=404,
                 detail=f"'{series} #{issue}' is not in the collection — nothing to remove",
             )
+        if len(candidates) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"ambiguous match: {len(candidates)} owned rows share full_title="
+                    f"{full_title!r} and release_date={matched_release_date!r} — "
+                    "refusing to guess which one to remove"
+                ),
+            )
+        row = candidates[0]
         copies = row.get("in_collection") or 0
         return {
             "status": "preview",
@@ -1345,24 +1390,45 @@ async def api_collection_delete(
     removed: dict[str, Any] | None = None
     action: str | None = None
     remaining_copies = 0
+    ambiguous_count = 0
 
     def _mutate(payload: dict[str, Any]) -> None:
-        nonlocal removed, action, remaining_copies
+        nonlocal removed, action, remaining_copies, ambiguous_count
         comics = payload.get("comics", [])
-        for i, row in enumerate(comics):
-            if row.get("in_collection") and row.get("full_title") == full_title:
-                removed = dict(row)
-                copies = row.get("in_collection") or 0
-                if copies > 1:
-                    row["in_collection"] = copies - 1
-                    action = "decremented"
-                    remaining_copies = copies - 1
-                else:
-                    del comics[i]
-                    action = "removed"
-                break
+        candidates = [
+            i for i, row in enumerate(comics)
+            if row.get("in_collection")
+            and row.get("full_title") == full_title
+            and (row.get("release_date") or None) == matched_release_date
+        ]
+        if len(candidates) > 1:
+            ambiguous_count = len(candidates)
+            return
+        if not candidates:
+            return
+        i = candidates[0]
+        row = comics[i]
+        removed = dict(row)
+        copies = row.get("in_collection") or 0
+        if copies > 1:
+            row["in_collection"] = copies - 1
+            action = "decremented"
+            remaining_copies = copies - 1
+        else:
+            del comics[i]
+            action = "removed"
 
     cache.apply(_mutate, command="collection-delete")
+
+    if ambiguous_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ambiguous match: {ambiguous_count} owned rows share full_title="
+                f"{full_title!r} and release_date={matched_release_date!r} — "
+                "refusing to guess which one to remove"
+            ),
+        )
 
     if removed is None:
         # Lost a race with a concurrent write between the check above and the
