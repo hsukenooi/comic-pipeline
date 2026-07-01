@@ -2182,6 +2182,36 @@ def _fuzzy_variant_match(variant_text: str, names: list[str]) -> Optional[str]:
 RECORD_WIN_CHUNK_SIZE = 25
 
 
+def _check_metron_degraded(metron: Any, metron_disabled: bool) -> bool:
+    """BUI-255: trip the per-batch Metron breaker on throttle/timeout.
+
+    ``metron.degraded`` is set by ``MetronClient``'s rate-limit-retry decorator
+    (BUI-260, exhausted a single capped 60s retry) or by a connection-error
+    ``ApiError`` — i.e. Metron itself signaling "this call failed because I'm
+    throttled/unreachable", never a genuine, exception-free "no match". Once
+    tripped, the caller stops calling Metron for the rest of the batch (same
+    fallback ``MetronCredentialError`` already uses) instead of repeating a
+    capped-but-still-real sleep on every remaining row — a 44-row batch could
+    otherwise stack dozens of 60s sleeps and wedge the single-worker server
+    that runs this synchronously (see BUI-247's record-win incident).
+
+    ``is True`` (identity, not truthiness) so an unconfigured ``MagicMock``
+    metron stub in a test — whose ``.degraded`` auto-vivifies as a truthy
+    ``Mock`` — never falsely trips this without the test explicitly setting
+    ``metron.degraded = True``.
+    """
+    if metron_disabled:
+        return True
+    if getattr(metron, "degraded", False) is True:
+        logger.warning(
+            "Metron rate-limited/unreachable; disabling for the rest of this "
+            "record-win batch (remaining rows fall back to "
+            "needs_manual_series_canonical)."
+        )
+        return True
+    return False
+
+
 def _resolve_price(raw: Any) -> Optional[float]:
     """Parse price from a float or a '12.50 USD' string."""
     if raw is None:
@@ -2341,6 +2371,8 @@ def cmd_collection_record_win(
                 except MetronCredentialError:
                     metron_disabled = True
                     logger.warning("Metron credentials not configured; falling back to manual series resolution.")
+                else:
+                    metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
             if canonical_series is None:
                 canonical_series = series_raw
@@ -2394,6 +2426,8 @@ def cmd_collection_record_win(
                         logger.warning(
                             "Metron credentials not configured; falling back to placeholder release date."
                         )
+                    else:
+                        metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
             # R32: variant handling
             needs_manual_variant = False
@@ -2429,6 +2463,8 @@ def cmd_collection_record_win(
                             logger.warning(
                                 "Metron credentials not configured; skipping variant resolution."
                             )
+                        else:
+                            metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
                     if matched_variant:
                         full_title = f"{base_title} {matched_variant}"

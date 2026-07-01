@@ -7,7 +7,7 @@ import os
 import time
 from typing import Any, Optional
 
-from mokkari.exceptions import RateLimitError
+from mokkari.exceptions import ApiError, RateLimitError
 
 logger = logging.getLogger("locg")
 
@@ -18,6 +18,19 @@ logger = logging.getLogger("locg")
 # (BUI-255 lesson) — a single capped retry, not escalating backoff, is the
 # intended behavior (BUI-260).
 _RATE_LIMIT_MAX_SLEEP = 60.0
+
+# mokkari's own hardcoded prefix (session.py: `_execute_http_request`) for a
+# ``requests`` ``ConnectionError``/``ReadTimeout`` it re-wraps as ``ApiError``
+# before it ever reaches us — the underlying timeout exception isn't
+# preserved, so this string is the only in-band signal that a failure was a
+# transport-level timeout/outage rather than a data-shape or 404 ApiError
+# (BUI-255). mokkari's request timeout is a hardcoded 20s
+# (``mokkari.session.REQUEST_TIMEOUT``), so this fires at most once per call.
+_CONNECTION_ERROR_PREFIX = "Connection error:"
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    return isinstance(exc, ApiError) and str(exc).startswith(_CONNECTION_ERROR_PREFIX)
 
 
 def _retry_once_on_rate_limit(func):
@@ -32,9 +45,19 @@ def _retry_once_on_rate_limit(func):
     ``min(exc.retry_after, _RATE_LIMIT_MAX_SLEEP)``, and retries once. Only a
     second ``RateLimitError`` — from the retry itself — falls through to
     ``None``.
+
+    Also maintains ``self.degraded`` (BUI-255): reset to ``False`` at the
+    start of every decorated call, then flipped ``True`` only by a failure
+    path — here on an exhausted retry, or inside the method body itself on a
+    connection-error ``ApiError`` (see ``_is_connection_error``). A batch
+    caller (``cmd_collection_record_win``) polls this after a ``None`` result
+    to tell "Metron is throttled/unreachable, stop calling it for the rest of
+    the batch" apart from a genuine, exception-free "no match" — which never
+    touches the flag and leaves it at the optimistic reset.
     """
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
+        self.degraded = False
         try:
             return func(self, *args, **kwargs)
         except RateLimitError as exc:
@@ -51,6 +74,7 @@ def _retry_once_on_rate_limit(func):
                     "Metron rate limit hit again in %s after retry; giving up",
                     func.__name__,
                 )
+                self.degraded = True
                 return None
     return wrapper
 
@@ -64,6 +88,12 @@ class MetronClient:
 
     def __init__(self) -> None:
         self._session: Any = None
+        # BUI-255: True after the most recent call failed because Metron is
+        # throttled (rate-limit retry exhausted) or unreachable (connection
+        # timeout) — as opposed to a genuine, exception-free "no match". A
+        # batch caller checks this to disable Metron for the rest of a batch
+        # instead of retrying (and sleeping) on every remaining row.
+        self.degraded = False
 
     def _get_session(self) -> Any:
         if self._session is not None:
@@ -167,6 +197,8 @@ class MetronClient:
         except RateLimitError:
             raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip enrichment
+            if _is_connection_error(exc):
+                self.degraded = True
             logger.debug("Metron lookup failed for %r #%s: %s", series_query, issue_number, exc)
             return None
 
@@ -206,6 +238,8 @@ class MetronClient:
         except RateLimitError:
             raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip variant enrichment
+            if _is_connection_error(exc):
+                self.degraded = True
             logger.debug("Metron issue-detail lookup failed for id %s: %s", metron_id, exc)
             return None
 
@@ -274,6 +308,8 @@ class MetronClient:
         except RateLimitError:
             raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None
+            if _is_connection_error(exc):
+                self.degraded = True
             logger.debug("Metron creator lookup failed for %r: %s", name, exc)
             return None
 
@@ -325,6 +361,8 @@ class MetronClient:
         except RateLimitError:
             raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001
+            if _is_connection_error(exc):
+                self.degraded = True
             logger.debug(
                 "Metron creator-run candidate lookup failed (series=%s creator=%s): %s",
                 series_id, creator_id, exc,

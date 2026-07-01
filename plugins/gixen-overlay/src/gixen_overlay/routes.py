@@ -1,6 +1,7 @@
 """Comic FastAPI routes for the gixen-overlay plugin."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -1199,10 +1200,22 @@ async def api_record_win(req: RecordWinRequest):
     Mirrors `locg collection record-win`; the Metron series resolution and
     BUI-34 already-owned dedup are unchanged (owned by locg-cli). Returns the
     same summary metrics the CLI does.
+
+    BUI-255: `cmd_collection_record_win` is synchronous and can block for a
+    while — each new series costs a Metron lookup, and a throttled Metron can
+    add a capped-but-real 60s sleep per call (BUI-260's rate-limit retry;
+    BUI-255's own batch breaker stops it from repeating that on every row,
+    but the FIRST throttled row still sleeps once). Calling it directly on
+    this coroutine would block the single-worker event loop for that whole
+    stretch — every other endpoint (e.g. GET .../status) would hang until the
+    batch finished, which is exactly what happened during the BUI-247 audit.
+    `asyncio.to_thread` runs it on a worker thread so the loop stays
+    responsive; this matches the pattern gixen-cli's own server/main.py
+    already uses for its blocking calls.
     """
     _ensure_collection_store()
     try:
-        result = cmd_collection_record_win(req.wins)
+        result = await asyncio.to_thread(cmd_collection_record_win, req.wins)
     except RuntimeError as exc:
         raise HTTPException(
             status_code=500, detail=f"collection store unavailable: {exc}"

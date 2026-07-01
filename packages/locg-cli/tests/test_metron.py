@@ -287,6 +287,92 @@ def test_lookup_issue_gives_up_after_second_rate_limit(caplog):
 
 
 # ---------------------------------------------------------------------------
+# MetronClient.degraded — throttle/timeout signal for batch callers (BUI-255)
+# ---------------------------------------------------------------------------
+
+def test_degraded_false_by_default():
+    client = MetronClient()
+    assert client.degraded is False
+
+
+def test_degraded_false_on_genuine_no_match():
+    """An exception-free 'no match' must NOT trip the degraded flag."""
+    client, _ = _make_client_with_session(series_list=[])
+    assert client.lookup_issue("Unknown Series", "1") is None
+    assert client.degraded is False
+
+
+def test_degraded_true_after_rate_limit_retry_exhausted():
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = RateLimitError("rate limited", retry_after=5)
+
+    with patch("locg.metron.time.sleep"):
+        result = client.lookup_issue("Fantastic Four", "1")
+
+    assert result is None
+    assert client.degraded is True
+
+
+def test_degraded_false_after_rate_limit_retry_succeeds():
+    """A retry that succeeds must NOT leave the batch breaker tripped."""
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session(
+        issues_list=[_mock_issue(id=100)],
+    )
+    session.series_list.side_effect = [
+        RateLimitError("rate limited", retry_after=5),
+        [_mock_series(id=1)],
+    ]
+
+    with patch("locg.metron.time.sleep"):
+        result = client.lookup_issue("Fantastic Four", "1")
+
+    assert result is not None
+    assert client.degraded is False
+
+
+def test_degraded_true_on_connection_error():
+    """A transport-level ApiError (mokkari's wrapped ConnectionError/ReadTimeout)
+    trips the breaker; a plain data-shape ApiError does not."""
+    from mokkari.exceptions import ApiError
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = ApiError("Connection error: timed out")
+
+    assert client.lookup_issue("Fantastic Four", "1") is None
+    assert client.degraded is True
+
+
+def test_degraded_false_on_non_connection_api_error():
+    from mokkari.exceptions import ApiError
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = ApiError("404 not found")
+
+    assert client.lookup_issue("Fantastic Four", "1") is None
+    assert client.degraded is False
+
+
+def test_degraded_resets_on_next_successful_call():
+    """degraded reflects only the MOST RECENT call, not a sticky latch."""
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session(
+        series_list=[_mock_series()],
+        issues_list=[_mock_issue(id=100)],
+    )
+    session.series_list.side_effect = RateLimitError("rate limited", retry_after=5)
+    with patch("locg.metron.time.sleep"):
+        assert client.lookup_issue("Fantastic Four", "1") is None
+    assert client.degraded is True
+
+    # A fresh, healthy call clears it.
+    session.series_list.side_effect = None
+    session.series_list.return_value = [_mock_series(id=1)]
+    result = client.lookup_issue("Fantastic Four", "1")
+    assert result is not None
+    assert client.degraded is False
+
+
+# ---------------------------------------------------------------------------
 # lookup_issue_detail — variant cover names (BUI-33)
 # ---------------------------------------------------------------------------
 

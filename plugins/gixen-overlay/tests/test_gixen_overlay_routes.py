@@ -258,6 +258,88 @@ def test_collection_wins_seen_accumulates_across_posts(api):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/comics/collection/record-win (BUI-255: async offload)
+# ---------------------------------------------------------------------------
+
+
+def test_record_win_offloaded_does_not_block_other_endpoints(api):
+    """A slow record-win call must not freeze the rest of the server.
+
+    Regression test for the BUI-247 audit finding: `cmd_collection_record_win`
+    used to run directly on the request coroutine, so a Metron rate-limit
+    sleep inside it blocked the ENTIRE single-worker event loop — every other
+    endpoint (e.g. GET /api/comics) hung until the batch finished, requiring a
+    server restart. `asyncio.to_thread` (BUI-255) now offloads the call to a
+    worker thread so the event loop keeps serving other requests concurrently.
+
+    The mock uses a plain blocking wait (not `asyncio.sleep`) — that's what
+    actually wedges an un-offloaded coroutine; an awaited `asyncio.sleep`
+    would yield the loop either way and wouldn't reproduce the bug.
+    """
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def _slow_record_win(wins):
+        # Blocks only the worker thread this runs on, not the event loop —
+        # exactly what a real Metron rate-limit sleep (BUI-260) would do.
+        release.wait(timeout=5)
+        return {
+            "rows_written": len(wins),
+            "chunks_committed": 1,
+            "skipped_already_owned": 0,
+            "skipped_already_owned_titles": [],
+            "manual_variant_count": 0,
+            "manual_series_count": 0,
+            "metron_lookups_attempted": 0,
+            "metron_lookups_succeeded": 0,
+            "metron_variant_lookups_attempted": 0,
+            "metron_variant_matches": 0,
+            "partial_failure": False,
+        }
+
+    result_holder: dict = {}
+
+    def _post_record_win():
+        result_holder["response"] = api.post(
+            "/api/comics/collection/record-win",
+            json={
+                "wins": [{
+                    "item_id": "1",
+                    "current_bid": 10.0,
+                    "end_date_iso": "2026-01-01T00:00:00Z",
+                    "identify_data": {"series": "X-Men", "issue": "1"},
+                }],
+            },
+        )
+
+    with patch(
+        "gixen_overlay.routes.cmd_collection_record_win",
+        side_effect=_slow_record_win,
+    ):
+        thread = threading.Thread(target=_post_record_win)
+        thread.start()
+        try:
+            # Give the POST a moment to actually start and block on release.wait().
+            time.sleep(0.2)
+            start = time.monotonic()
+            other = api.get("/api/comics")
+            elapsed = time.monotonic() - start
+        finally:
+            release.set()
+            thread.join(timeout=5)
+
+    assert other.status_code == 200
+    # Must return promptly — NOT queued behind the still-blocked record-win
+    # call (which only releases after `release.set()` above).
+    assert elapsed < 2.0
+
+    assert result_holder["response"].status_code == 200
+    assert result_holder["response"].json()["rows_written"] == 1
+
+
+# ---------------------------------------------------------------------------
 # POST /api/comics
 # ---------------------------------------------------------------------------
 

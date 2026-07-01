@@ -2083,6 +2083,73 @@ def test_record_win_metron_credential_error_disables_metron(tmp_path):
     assert metron.lookup_issue.call_count == 1
 
 
+# --- BUI-255: throttle/timeout trips the batch breaker like credential errors ---
+
+def test_record_win_metron_degraded_disables_metron(tmp_path):
+    """A throttled/unreachable Metron (MetronClient.degraded) trips the same
+    per-batch breaker as MetronCredentialError: after the first call reports
+    degraded, remaining rows fall back to manual and Metron is never called
+    again — instead of retrying (and sleeping) on every remaining row."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.degraded = False
+
+    def _throttled_lookup(*_args, **_kwargs):
+        # Simulates a real MetronClient after its BUI-260 rate-limit retry
+        # is exhausted: returns None (no exception) but flips .degraded True.
+        metron.degraded = True
+        return None
+
+    metron.lookup_issue.side_effect = _throttled_lookup
+
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", series="Ghost Rider", issue="1"),
+            _make_win(item_id="2", series="Ghost Rider", issue="2"),
+        ],
+        cache=cache,
+        metron=metron,
+    )
+
+    # Both rows still get written (the batch completes and commits); Metron
+    # is called exactly once — the breaker trips before row 2 ever asks it.
+    assert result["rows_written"] == 2
+    assert result["manual_series_count"] == 2
+    assert result["partial_failure"] is False
+    assert metron.lookup_issue.call_count == 1
+
+
+def test_record_win_metron_degraded_false_does_not_disable(tmp_path):
+    """A genuine, exception-free 'no match' (degraded stays False) must NOT
+    trip the breaker — every row still gets its own Metron attempt."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.degraded = False
+    metron.lookup_issue.return_value = None  # plain miss, not a throttle
+
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", series="Ghost Rider", issue="1"),
+            _make_win(item_id="2", series="Ghost Rider", issue="2"),
+        ],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["rows_written"] == 2
+    assert result["manual_series_count"] == 2
+    # Each row gets its own series-resolution attempt AND its own BUI-210
+    # date-backfill attempt (metron_data stays None both times) — 2 calls per
+    # row, 4 total — proving the breaker never tripped and skipped none of them.
+    assert metron.lookup_issue.call_count == 4
+
+
 def test_record_win_duplicate_gixen_id_updates_not_inserts(tmp_path):
     """Same gixen_item_id recorded twice → second write updates, not duplicates."""
     from locg.commands import cmd_collection_record_win
