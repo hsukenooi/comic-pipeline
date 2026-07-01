@@ -1822,6 +1822,40 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
 # release-date filter), so no separate year-gated alias path is needed.
 
 
+def _year_gate_accepts(year: Optional[str], release_date: str) -> bool:
+    """Return True when `release_date`'s year is within the accepted window of
+    `year`, or when either is missing (no gating possible — fail open, same as
+    always). Shared by `_match_owned_issue` and `_match_wishlisted_issue` so the
+    two matchers can never drift on what "same era" means.
+
+    BUI-214 introduced a year-OR-year-minus-1 tolerance for the cover-vs-onsale
+    skew (`/comic:wishlist-add` passes Metron's `cover_date` year, but LOCG
+    stores the earlier on-sale `release_date` — a January-cover issue often
+    ships the previous December). BUI-251 widened this to a SYMMETRIC ±1 window
+    (`year-1`, `year`, `year+1`): the BUI-247 purchase-history audit found
+    confirmed-owned books (Avengers #1 2013, Thor #5 2016) whose stored
+    `release_date` sits ONE YEAR LATER than the query year — the opposite skew
+    direction, seen on late-in-year cover dates whose actual on-sale slipped
+    into the following January. The one-directional window covered only the
+    first skew, producing false `not_in_cache` negatives on stock that was
+    actually owned. ±1 (not wider) is deliberate: the gate's real job is
+    rejecting a DIFFERENT VOLUME published years apart (a 1962 Hulk #1 vs. a
+    2008 Hulk #1) — see test_check_year_gate_two_year_gap_still_rejected for
+    the boundary this must keep holding.
+    """
+    if not year or not release_date:
+        return True
+    year_str = str(year)
+    candidates = {year_str}
+    try:
+        year_int = int(year_str)
+        candidates.add(str(year_int - 1))
+        candidates.add(str(year_int + 1))
+    except (TypeError, ValueError):
+        pass
+    return any(release_date.startswith(candidate) for candidate in candidates)
+
+
 def _match_owned_issue(
     comics: list[dict[str, Any]],
     series_key: str,
@@ -1898,23 +1932,12 @@ def _match_owned_issue(
         release_date = row.get("release_date") or ""
         if year and not release_date and require_dated:
             continue
-        # BUI-214: tolerate the cover-vs-on-sale year skew. `/comic:wishlist-add`
-        # passes Metron's `cover_date` year, but LOCG stores the earlier *on-sale*
-        # `release_date`, so a cover-year-1983 book can be stored as 1982-xx. The
-        # skew is physically bounded (release_year ∈ {cover_year, cover_year−1}),
-        # so accept year OR year−1 — never year+1, which would widen the gate
-        # enough to collide adjacent eras (e.g. a 1963 run vs a 2018 relaunch).
-        if year and release_date:
-            year_str = str(year)
-            try:
-                prev_year_str = str(int(year_str) - 1)
-            except (TypeError, ValueError):
-                prev_year_str = None
-            if not (
-                release_date.startswith(year_str)
-                or (prev_year_str is not None and release_date.startswith(prev_year_str))
-            ):
-                continue
+        # BUI-214/BUI-251: tolerate the cover-vs-on-sale year skew (see
+        # _year_gate_accepts) — accept year−1, year, or year+1, not an exact
+        # match, so a genuine one-year skew in either direction doesn't read
+        # as a wrong-era row.
+        if not _year_gate_accepts(year, release_date):
+            continue
 
         # BUI-176: variant is a soft preference. With no variant requested, the
         # first series+issue match wins (unchanged behavior). With a variant
@@ -1954,12 +1977,11 @@ def _match_wishlisted_issue(
     candidates) and no masthead-alias fallback (`owned_match_keys`) — this is
     an advisory signal, not a duplicate-buy gate, so it isn't worth stacking a
     second kind of cross-masthead guessing on top of BUI-249's. The SAME year
-    gate as ownership applies when `year` is supplied: without it, a
-    same-masthead wish row from a different era (e.g. a wishlisted 2008
-    "Hulk #1" flagging a query about the 1962 "Hulk #1") would reproduce the
-    exact wrong-era false-positive BUI-249 addressed for ownership — so
-    year-gating here mirrors the ownership pass's accept-year-or-year-minus-1
-    rule exactly.
+    gate as ownership applies when `year` is supplied (`_year_gate_accepts`):
+    without it, a same-masthead wish row from a different era (e.g. a
+    wishlisted 2008 "Hulk #1" flagging a query about the 1962 "Hulk #1") would
+    reproduce the exact wrong-era false-positive BUI-249 addressed for
+    ownership — so year-gating here mirrors the ownership pass exactly.
     """
     for row in comics:
         if row.get("in_collection"):
@@ -1978,20 +2000,11 @@ def _match_wishlisted_issue(
             if issue.strip().lower() not in full_title.lower():
                 continue
 
-        # Same accept-year-or-year-minus-1 rule as _match_owned_issue (BUI-214),
-        # applied only when both a query year and a stored date exist.
+        # Same _year_gate_accepts window as _match_owned_issue (BUI-214/BUI-251)
+        # — kept in one shared function so the two matchers can't drift.
         release_date = row.get("release_date") or ""
-        if year and release_date:
-            year_str = str(year)
-            try:
-                prev_year_str = str(int(year_str) - 1)
-            except (TypeError, ValueError):
-                prev_year_str = None
-            if not (
-                release_date.startswith(year_str)
-                or (prev_year_str is not None and release_date.startswith(prev_year_str))
-            ):
-                continue
+        if not _year_gate_accepts(year, release_date):
+            continue
 
         return row
 

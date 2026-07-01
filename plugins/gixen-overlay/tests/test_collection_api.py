@@ -283,6 +283,29 @@ def test_check_batch_distinguishes_untracked_wishlisted_and_owned(client):
     assert owned["in_wish_list"] is False
 
 
+def test_check_year_plus_one_skew_no_longer_false_negatives(client):
+    """BUI-251: reproduces the BUI-247 audit finding at the HTTP layer —
+    Avengers #1 (2013), confirmed owned, returned not_in_cache when queried
+    WITH its year because the stored release_date sits one year LATER than the
+    query year (the opposite skew direction from BUI-214's year-minus-1 case).
+    The symmetric ±1 window must resolve it as in_collection."""
+    _seed_collection(client.store, [{
+        "full_title": "Avengers #1",
+        "series_name": "Avengers (Vol. 5) (2013 - 2015)",
+        "publisher_name": "Marvel Comics",
+        "release_date": "2014-01-08",
+        "in_collection": 1,
+    }])
+    r = client.get(
+        "/api/comics/collection/check",
+        params={"series": "Avengers", "issue": "1", "year": "2013"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["match_status"] == "in_collection"
+    assert body["full_title_matched"] == "Avengers #1"
+
+
 def test_check_alias_match_flags_wrong_volume(client):
     """BUI-249: the alias pass can land on an owned issue of the WRONG volume —
     querying 'The Mighty Thor #5' (Vol.3, 2015) with no year resolves to the

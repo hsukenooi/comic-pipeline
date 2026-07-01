@@ -521,6 +521,150 @@ def test_check_year_minus_two_not_tolerated(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# cmd_collection_check year gate widened to a SYMMETRIC ±1 window (BUI-251)
+# ---------------------------------------------------------------------------
+
+def test_check_year_plus_one_avengers_false_negative_fixed(tmp_path, monkeypatch):
+    """BUI-251: reproduces the BUI-247 audit finding — Avengers #1 (2013),
+    confirmed owned, returned not_in_cache when queried WITH its year because
+    the stored release_date sits ONE YEAR LATER than the query year (the
+    opposite skew direction from BUI-214's year-minus-1 case — a late
+    solicitation whose actual on-sale slipped into the following January).
+    The asymmetric year-OR-year-minus-1 window missed this; the symmetric
+    ±1 window must catch it.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Avengers (Vol. 5) (2013 - 2015)",
+        full_title="Avengers #1",
+        release_date="2014-01-08",
+    )])
+
+    result = cmds.cmd_collection_check(series="Avengers", issue="1", year="2013")
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Avengers #1"
+
+
+def test_check_year_plus_one_thor_false_negative_fixed(tmp_path, monkeypatch):
+    """BUI-251: the second reproduced case — Thor #5 (2016), confirmed owned,
+    same year+1 skew as the Avengers case above."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 5) (2016 - 2018)",
+        full_title="Thor #5",
+        release_date="2017-02-01",
+    )])
+
+    result = cmds.cmd_collection_check(series="Thor", issue="5", year="2016")
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Thor #5"
+
+
+def test_check_year_plus_two_not_tolerated(tmp_path, monkeypatch):
+    """BUI-251: confirm the widened window is exactly ±1, not wider — mirrors
+    test_check_year_minus_two_not_tolerated on the other side. A query year of
+    1983 must NOT match a row stored as 1985-xx (year+2 is outside the window)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #238",
+        release_date="1985-03-01",
+    )])
+
+    too_far = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="238", year="1983"
+    )
+    assert too_far["match_status"] == "not_in_cache"
+
+
+def test_check_year_gate_two_year_gap_still_rejected(tmp_path, monkeypatch):
+    """BUI-251: the ±1 widening must not reopen cross-volume collisions — the
+    entire reason the year gate exists. A 1962 Vol. 1 #1 must NOT satisfy a
+    2021 Vol. 5 #1 query, and a 2021 Vol. 5 #1 must NOT satisfy a 1962 query,
+    even with the wider window (2021 vs 1962 is far outside ±1 either way)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Hulk (Vol. 1) (1962 - 1963)",
+        full_title="Hulk #1",
+        release_date="1962-05-01",
+        gixen_item_id="hulk-1962",
+    )])
+
+    assert cmds.cmd_collection_check(
+        series="Hulk", issue="1", year="2021"
+    )["match_status"] == "not_in_cache"
+
+    cache2 = make_cache(tmp_path / "vol5")
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache2)
+    _seed_cache(cache2, [_agent_win_row(
+        series="Hulk (Vol. 5) (2021 - Present)",
+        full_title="Hulk #1",
+        release_date="2021-06-01",
+        gixen_item_id="hulk-2021",
+    )])
+
+    assert cmds.cmd_collection_check(
+        series="Hulk", issue="1", year="1962"
+    )["match_status"] == "not_in_cache"
+
+
+def test_check_wish_row_year_plus_one_tolerated(tmp_path, monkeypatch):
+    """BUI-251: the widened ±1 window applies to the wish-list gate too
+    (_match_wishlisted_issue shares _year_gate_accepts with _match_owned_issue)
+    — a wishlisted row with the same year+1 skew as the Avengers/Thor cases
+    must flag in_wish_list."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    wishlisted = _agent_win_row(
+        series="Avengers (Vol. 5) (2013 - 2015)",
+        full_title="Avengers #1",
+        release_date="2014-01-08",
+    )
+    wishlisted["in_collection"] = 0
+    _seed_cache(cache, [wishlisted])
+
+    result = cmds.cmd_collection_check(series="Avengers", issue="1", year="2013")
+    assert result["match_status"] == "not_in_cache"
+    assert result["in_wish_list"] is True
+
+
+def test_check_wish_row_year_plus_two_not_tolerated(tmp_path, monkeypatch):
+    """BUI-251: the wish-list gate's window is also exactly ±1, not wider —
+    mirrors test_check_year_plus_two_not_tolerated for _match_wishlisted_issue."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    wishlisted = _agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #238",
+        release_date="1985-03-01",
+    )
+    wishlisted["in_collection"] = 0
+    _seed_cache(cache, [wishlisted])
+
+    result = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="238", year="1983"
+    )
+    assert result["match_status"] == "not_in_cache"
+    assert result["in_wish_list"] is False
+
+
+# ---------------------------------------------------------------------------
 # cmd_collection_series_names (BUI-129)
 # ---------------------------------------------------------------------------
 
