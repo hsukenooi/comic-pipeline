@@ -95,6 +95,10 @@ metron_curl() {
       [ -n "$retry_after" ] || retry_after=1
       echo "metron_curl: 429 rate-limited; sleeping Retry-After=${retry_after}s (attempt $((attempt + 1))/${METRON_CURL_MAX_RETRIES})" >&2
       rm -f "$body_file" "$headers_file"
+      # Assumes Retry-After is the numeric-seconds form, which is what Metron
+      # sends. `sleep` would reject the alternate HTTP-date form (e.g. "Wed,
+      # 21 Oct 2026 07:28:00 GMT"); that form is not handled — a known,
+      # accepted limitation rather than a general RFC 7231 implementation.
       sleep "$retry_after"
       attempt=$((attempt + 1))
       continue
@@ -110,6 +114,12 @@ metron_curl() {
       continue
     fi
 
+    # Anything else — including http_status "000", which curl -w reports for a
+    # TOTAL failure (DNS lookup, connection refused, --max-time timeout, no
+    # HTTP response at all) — falls through here and fails without retry.
+    # Deliberately conservative: we only retry the two codes Metron's docs
+    # call out as transient (429, 5xx); a network blip that never reached the
+    # server is surfaced immediately rather than silently retried.
     echo "metron_curl call FAILED (HTTP ${http_status}): ${url}" >&2
     [ -s "$body_file" ] && cat "$body_file" >&2
     rm -f "$body_file" "$headers_file"
