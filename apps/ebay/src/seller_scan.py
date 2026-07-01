@@ -200,10 +200,18 @@ _LOT_RE = re.compile(
     # bare 2-member dash pair ("129-150", "1962-1963") — those stay ambiguous
     # (year span / price span) and are intentionally left alone.
     rf"|{_LOT_MEMBER}(?:\s*[,/&-]\s*{_LOT_MEMBER}){{2,}}"
-    # BUI-261: a 2-member slash or ampersand pair is unambiguous on its own —
-    # "&" and "/" are never used to write a single number or a year/price span
-    # ("Dark Knight Returns # 1 & 3", "STRANGE TALES 164/165").
-    rf"|{_LOT_MEMBER}\s*[/&]\s*{_LOT_MEMBER}",
+    # BUI-261 (PR review fix): a 2-member AMPERSAND pair is unambiguous on its
+    # own — "&" is never used to write a single number or a year/price span
+    # ("Dark Knight Returns # 1 & 3"). "/" is deliberately EXCLUDED from this
+    # 2-member branch (unlike the 3+ member branch above): "/" is overloaded
+    # in real listings with ratio/incentive variants and half-issues — "ASM
+    # #300 1/100 variant", "Batman #92 1/25 variant", "Batman #1/2" (a Wizard
+    # half-issue) are all genuine SINGLE-issue titles, not lots, and hard_reject
+    # must never drop a genuine single-issue copy. A genuine 2-member slash
+    # LOT ("STRANGE TALES 164/165") falls through to Haiku instead — the safe
+    # under-reject direction; a 3+ member slash chain ("164/165/166") is still
+    # caught by the branch above.
+    rf"|{_LOT_MEMBER}\s*&\s*{_LOT_MEMBER}",
     re.IGNORECASE,
 )
 
@@ -395,6 +403,17 @@ def hard_reject(title, series, issue):
 
     # Rule 3: multi-comic lot
     if _LOT_RE.search(title):
+        # BUI-261 (PR review fix): surface a stated-count vs parsed-range
+        # contradiction instead of silently trusting either number — e.g.
+        # "Lot of 11 Comics ... #1-10" claims 11 books over a 10-issue range.
+        # hard_reject is the single choke point both should_reject call sites
+        # (seller_scan.main() and wishlist_sellers.match_results_for_wish)
+        # already run through, so this is the cheapest place to flag it live.
+        if lot_count_mismatch(title):
+            print(
+                f"Warning: lot count/range mismatch in title: {title!r}",
+                file=sys.stderr,
+            )
         return True
 
     # Rule 4: missing issue number (same logic as match_listing)
@@ -977,8 +996,9 @@ def verify_with_claude(matches):
         chunk_label = f"{chunk_start + 1}–{chunk_start + len(chunk)}"
 
         # Build pairs text.  When the candidate carries a decorated series name
-        # (_series_name, stripped from output by _emit), include it as a
-        # "Correct series:" hint so Haiku knows the exact era the user wants.
+        # (_series_name, stripped from output before printing — see the
+        # underscore-key filter in main()), include it as a "Correct series:"
+        # hint so Haiku knows the exact era the user wants.
         pairs_parts = []
         for idx, cand in enumerate(chunk, 1):
             pair_text = (

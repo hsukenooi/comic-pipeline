@@ -1235,13 +1235,42 @@ class TestLotReMissedFormats:
         assert seller_scan._LOT_RE.search(title)
         assert seller_scan.hard_reject(title, "Eternals", "1")
 
-    # ── Two-member slash/ampersand pairs are unambiguous on their own ────────
-
-    def test_two_member_slash_pair_rejected(self):
-        assert seller_scan._LOT_RE.search("Amazing Spider-Man #1/2")
+    # ── A 2-member ampersand pair is unambiguous on its own ───────────────────
 
     def test_two_member_ampersand_pair_rejected(self):
         assert seller_scan._LOT_RE.search("X-Men #94 & #95")
+
+    # ── PR review fix: "/" dropped from the 2-member branch ──────────────────
+    # "/" is overloaded with ratio/incentive-variant and half-issue notation in
+    # real listings — a bare 2-member slash pair must NOT be treated as a lot
+    # (hard_reject must never drop a genuine single-issue copy). A 2-member
+    # slash LOT ("STRANGE TALES 164/165") now falls through to Haiku instead —
+    # the safe under-reject direction; 3+ member slash chains are still caught
+    # by the generic list branch (see test_slash_list_rejected above).
+
+    def test_two_member_slash_pair_not_rejected(self):
+        assert not seller_scan._LOT_RE.search("Amazing Spider-Man #1/2")
+
+    def test_ratio_variant_1_of_100_not_rejected(self):
+        title = "Amazing Spider-Man #300 1/100 variant"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "Amazing Spider-Man", "300")
+
+    def test_ratio_variant_1_of_25_not_rejected(self):
+        title = "Batman #92 1/25 variant"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "Batman", "92")
+
+    def test_ratio_variant_1_of_50_not_rejected(self):
+        title = "X-Men #1 1/50 Skan variant"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "X-Men", "1")
+
+    def test_half_issue_slash_not_rejected(self):
+        # "Batman #1/2" — a Wizard-style half-issue, not a lot.
+        title = "Batman #1/2"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "Batman", "1")
 
 
 class TestLotCountMismatch:
@@ -1278,6 +1307,33 @@ class TestLotCountMismatch:
 
     def test_empty_title_fails_open(self):
         assert seller_scan.lot_count_mismatch("") is False
+
+
+class TestLotCountMismatchWiredIntoHardReject:
+    """PR review fix: lot_count_mismatch() was defined + tested but had no
+    non-test caller (dead code) — the BUI-261 AC wanted it "surfaced (logged/
+    flagged), not silently trusted". hard_reject's lot branch (rule 3) is the
+    single choke point both should_reject call sites already run through, so
+    it now calls lot_count_mismatch() and emits a stderr warning on a hit."""
+
+    def test_mismatch_prints_warning(self, capsys):
+        title = "Lot of 11 Comics Amazing Spider-Man #1-10"
+        assert seller_scan.hard_reject(title, "Amazing Spider-Man", "1") is True
+        err = capsys.readouterr().err
+        assert "lot count/range mismatch" in err
+        assert title in err
+
+    def test_matching_count_prints_no_warning(self, capsys):
+        title = "Lot of 10 Comics Amazing Spider-Man #1-10"
+        assert seller_scan.hard_reject(title, "Amazing Spider-Man", "1") is True
+        err = capsys.readouterr().err
+        assert "lot count/range mismatch" not in err
+
+    def test_non_lot_title_prints_no_warning(self, capsys):
+        title = "Amazing Spider-Man #300 NM Marvel 1988"
+        assert seller_scan.hard_reject(title, "Amazing Spider-Man", "300") is False
+        err = capsys.readouterr().err
+        assert "lot count/range mismatch" not in err
 
 
 class TestLotReBui243GuardsPreserved:
