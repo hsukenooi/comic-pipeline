@@ -21,29 +21,26 @@ from the `/comic:identify` output table or provided directly by the user.
 
 ## Step 0: Resolve the server + bootstrap guard
 
-Resolve `COMICS_SERVER_URL` (env var, with a hostname fallback) and confirm the
-server is up before any checks — same pattern as `/comic:fmv` and
-`/comic:snipe-add`:
+Resolve and health-gate the comics server through the **shared comics-server
+call convention** (BUI-172, `docs/conventions/comics-server-call.md`) — don't
+hand-roll URL resolution or the health check here:
 
 ```bash
-echo "${COMICS_SERVER_URL:-UNSET}"; hostname
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
+comics_health_gate     || exit 1   # the server must answer
 ```
 
-If `COMICS_SERVER_URL` is unset, infer it:
-- `Hsus-MacBook-Air.local` → `http://mac-mini.tail9b7fa5.ts.net:8080`
-- a Mac Mini hostname → `http://localhost:8080`
-- neither → **stop** ("machine is unrecognised — set COMICS_SERVER_URL").
+**If either step fails: STOP immediately** — the collection cannot be checked,
+so do not proceed to bidding. Do not report any comic as "not in collection".
 
-Health gate, then read collection status:
+Then read collection status:
 
 ```bash
-curl -sf "$COMICS_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
 curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 ```
 
-**If the health gate or status call fails:** STOP immediately — the collection
-cannot be checked, so do not proceed to bidding. Do not report any comic as "not
-in collection".
+**If the status call fails:** STOP immediately — same rule as above.
 
 **If `last_full_import` is null:** Stop with:
 > Collection empty on the server — run a full LOCG import (`/comic:collection-add`
