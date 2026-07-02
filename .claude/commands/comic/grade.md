@@ -191,16 +191,9 @@ Always note these. Do not claim CGC accuracy.
 
 | Mistake | Fix |
 |---------|-----|
-| Scraping eBay HTML for images | Use the Browse API (`get_item_by_legacy_id`) — returns `image` + `additionalImages` URLs directly, no bot detection |
-| Using firecrawl/WebFetch for eBay images | Both are blocked by eBay bot detection — use Browse API only |
 | Grading from WebFetch text output | WebFetch returns markdown text, not images — useless for visual grading |
 | Giving all 3 agents the same agent name | Use distinct names (e.g., `grader-c1-a`, `grader-c1-b`) so results are traceable |
-| Running graders sequentially | Dispatch in a single message. First pass: cheap books batched (≤`BATCH_MAX` per agent, U9), not-cheap books one grader each; escalation pass: the extra 2 panel graders for any book that tripped a gate, as separate independent agents |
-| Batching a near-cap or escalation-bound book with the cheap group | Grade it on its own — a book heading for a 3-grader panel needs an independent grader A, not a shared batched context |
-| Fanning out 3 graders for every comic | Value-gate it (Step 2): 1 grader first, escalate to 3 only on value ≥ threshold or an ambiguous/near-cap grade. State the grader count + reason per comic |
 | Escalating every 2-photo lot because its range is wide | A wide range at MEDIUM-LOW/LOW confidence is coverage-driven — more graders can't see the missing views, so it does NOT escalate (Step 2 trigger 2). Only escalate on a wide range at MEDIUM+ confidence, a near-cap grade, restoration, or value |
 | Auto-dropping a book in triage because it looks like a beater | Condition is not a triage kill — there's no FMV floor at grade time. FLAG suspected beaters for the user; only DROP un-gradeable photos or confirmed non-matches (Step 1.5). When unsure, KEEP |
-| Including related-listing images | Extract carousel IDs from the `ux-image-carousel-container` section only |
-| Inflating grade because it's a key issue | Grade physical condition only — key issue premium belongs in FMV, not grade |
-| Capping the grade over a printed credit/signature | Printed credits, facsimile signatures, barcodes, and price boxes are in the print layer — never defects (PRINT-LAYER RULE). Only a post-print autograph caps. When unsure, do NOT cap |
-| Skipping the caveat section | Always disclaim photo-based limitations so user knows the confidence level |
+| Inflating grade because it's a key issue | Grade physical condition only — key issue premium belongs in FMV, not grade (criteria live in the `comic-grader` subagent, not this skill) |
+| Capping the grade over a printed credit/signature | Printed credits, facsimile signatures, barcodes, and price boxes are in the print layer — never defects (PRINT-LAYER RULE, in the `comic-grader` subagent). Only a post-print autograph caps. When unsure, do NOT cap |

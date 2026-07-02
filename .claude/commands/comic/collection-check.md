@@ -263,10 +263,5 @@ Remove skipped comics from the working list before passing to `/comic:fmv`.
 |---|---|
 | Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11 — see the callout at the top of this skill) |
 | Passing the series start year (`year_began`) as `year` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`. Forwarding a series' first-published year (e.g. `1963` for *Uncanny X-Men*) filters out every owned issue and returns a false `not_in_cache` for the whole run (BUI-129). Pass `year` only with this issue's actual cover year; otherwise omit it |
-| Running checks before the `/health` gate passes | Health-gate first; a check against a down server is worthless and dangerous |
-| Treating a stale-cache `not_in_cache` as confident "not in collection" | Apply the stale-cache downgrade when `cache_age_days > 14` |
-| Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — likely conflated with the base/annual series; flag and let the user confirm, don't silently skip |
-| Trusting a `not_in_cache` for a series with a leading article | Step 2.5 Pattern B — re-query with `The` toggled; a successful alternate-key call is R11-safe, a failed one is an R11 STOP |
-| Trusting an `in_collection` verdict with `match_kind: "alias"` without checking the volume | Step 2.5 Pattern D — the masthead alias has no notion of volume/era; read `matched_series_name`/`matched_release_date` and flag for the user to confirm (BUI-249) |
-| Rendering every `not_in_cache` result as plain "Not in collection" | Check `in_wish_list` first (BUI-250) — `true` means a row exists (wish list / pull / read) but isn't owned; render `📋 Wishlisted (not owned)`, not `❌ Not in collection` |
+| Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — a confirmed, repeating false-positive (Giant-Size Fantastic Four vs. an owned Fantastic Four Annual); flag and let the user confirm, don't silently skip |
 | Letting the disambiguator flip a verdict on its own | It's advisory — it flags ambiguity for the user, it never invents ownership or overrides the hard-fail (R11) |

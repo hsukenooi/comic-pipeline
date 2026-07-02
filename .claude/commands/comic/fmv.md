@@ -371,24 +371,8 @@ Confirm the `id` returned — that's the `comic_id` that will be linked to the b
 | Mistake | Fix |
 |---|---|
 | Passing `LH_Sold=1` / `LH_Complete=1` to SerpApi | SerpApi's eBay engine drops them silently — use `show_only=Sold`. Verify by grepping the returned `search_metadata.ebay_url` for `LH_Sold=1` |
-| Trusting low medians without checking the eBay URL | An impossibly low median (e.g. <$5 for a Bronze-Age VF) usually means the sold filter didn't apply — re-verify the URL |
-| Always firing 3 queries (base + broader + grade-targeted) | Run base only by default; auto-broaden if <5 results; add grade-targeted only if <10 grade-tagged comps. Always-on tier 3 is wasted spend on Copper-and-newer books |
-| Letting the active auction comp itself | Drop the listing's own `product_id` from the result set (note: SerpApi field is `product_id`, not `item_id`) |
 | Mixing quartile methods between IQR and FMV range | Use `statistics.quantiles(method='inclusive')` for both. The default `'exclusive'` over-dilates IQR on small samples and lets outliers survive |
 | Numeric grade regex `\b([0-9]\.[058])\b` (old) | Use `\b([0-9]\.[02-9])\b` — the old form silently dropped 9.2/9.4/9.6/9.9 comps |
-| Eyeballing outliers | Use IQR × 1.5 — and add a "suspect" tier for grade-curve violators |
-| Treating loose "F" as Fine | Seller-grade `F` is suspect — often used for Fair too |
-| Blending newsstand and direct | They're distinct sub-markets at the same grade |
-| Foreign editions in the comp pool | UK Pence, Brazilian, Mexican, Italian, Spanish editions price differently — exclude unless target is foreign |
-| Page-quality blind spot | "OW pages" copies sell higher than "tan" at same grade — note in adjustments |
-| Treating "FN+ 6.5" raw at $242 as a real 6.5 | Likely incomplete or mis-listed — flag as suspect, don't include |
 | Stating "Medium" confidence by feel | Use the rubric: n + CV decide it |
-| Including "raw" as a search keyword | Most sellers don't use it — returns near-zero comps |
-| Not quoting the title + issue | `spawn 98` matches "Curse of Spawn #12" and trading cards; `"Spawn 98"` requires the exact phrase — primary noise-reduction technique |
-| Forgetting to exclude graded copies | Always add `-cgc -cbcs -graded -slab` to the query, plus `-psa -pgx` |
-| Quiet bidding above discipline because "the market disagrees" | Surface the conflict to the user instead of silently overriding |
-| Applying CGC proxy to books under $200 | Raw and CGC markets diverge too much below $200 — stick to raw eBay comps only |
-| Using CGC proxy as the primary method when raw comps exist | CGC proxy is a fallback — n < 3 raw comps AND value > $200 are both required to trigger it |
-| Forgetting to cap confidence when using CGC proxy | The discount estimate introduces irreducible uncertainty — max MEDIUM-LOW regardless of CGC data quality |
 | Forcing a number out of a one-sided or grade-smeared pool | If the pool doesn't bracket the target or spans >2.0 grades, it's flagged `needs_manual` — hand-price via §7/§7a or skip, don't report the smeared median |
 | Treating a `needs_manual` row like a no-comps row | A flagged book still has a linked comic stub (`manual_review=<reason>` in notes) and a real `comic_id` — it shows as `manual:<reason>` in the table, not `n/a` |

@@ -141,10 +141,6 @@ Run the listings from one seller sequentially through `/comic:buy` — Gixen ses
 | Mistake | Fix |
 |---|---|
 | Wish-list books without an issue number never appear | Items like "Secret Wars HC" or "Watchmen TPB" have no `#N` in the name and are silently skipped by the matcher. This is by design — they are not searchable as individual issues. They will never surface here regardless of how many sellers carry them. |
-| Treating the opaque seller ID as a contactable handle | The ID (e.g. `a4k92xbp7…`) is an immutable internal identifier, not a store name or username. Open any listing link to see the seller's profile and contact them. |
-| `COMICS_SERVER_URL is not set` error | The script hard-fails before fetching the wish list. Set `COMICS_SERVER_URL` in `~/.zshrc` (MacBook → `http://mac-mini.tail9b7fa5.ts.net:8080`; Mac Mini → `http://localhost:8080`) and re-run. |
-| Expecting the skill to place bids or snipes | It is discovery and reporting only. Take the listing URLs from the output and hand them to `/comic:buy` yourself. |
-| `wishlist-sellers: command not found` | The console script was not installed. Re-run `./scripts/install.sh` from the repo root after pulling this feature — `uv tool install` on `apps/ebay` is what puts it on PATH. |
 | 409 from the collection-check endpoint | The collection was never imported on this server. Run the LOCG import flow (`/comic:collection-add`) before re-running — the script hard-fails on a 409 rather than treating ownership as "unknown" (that would surface books you already own). |
 | First run seems to hang | A cold first run searches eBay for every matchable wish-list item (~685 items at ~2 s each = ~20 min). This is expected. Progress prints to stderr — run without `2>/dev/null` to watch the cache-fill. Subsequent runs are far faster. |
 | Re-run shows no new sellers even though auctions changed | Check that the 7-day search cache has not expired and the seen-item filter is not hiding results from a prior run. To debug, confirm `COMICS_SERVER_URL` is set and check `~/.cache/wishlist-sellers/`. |

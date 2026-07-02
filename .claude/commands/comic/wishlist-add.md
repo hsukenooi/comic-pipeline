@@ -337,15 +337,9 @@ is treated as final, same as the numeric-range path.
 
 | Mistake | Fix |
 |---|---|
-| Hitting LOCG to get the issue count | Use the Metron series API — `issue_count` is in the series result; LOCG is not needed |
-| Guessing the issue count | Always read `issue_count` from Metron; don't assume a run length |
-| Adding issues without a preview | Always show the title list and confirm first (Step 3) — that's the dry run |
 | Re-running the whole range after a partial failure | Re-add only the issues that didn't succeed; the wish-list endpoint does not dedupe |
 | Writing to `data/locg/wish-list.json` directly | Adds go to the server via `POST /api/comics/wish-list` — the repo file is no longer the source of truth (BUI-93) |
 | Wish-listing issues you already own | Collection-check each issue first (Step 3) and skip owned ones — wishing an owned book is what deleted collection rows in BUI-122 |
 | Passing `year` (Metron's `year_began`) to `collection/check` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`, not a series disambiguator. Forwarding a series start-year filters out every owned mid-run issue and returns a false `not_in_cache`, so an owned book gets wish-listed (BUI-129/BUI-131). Check by series + issue only |
 | Enumerating a creator's run from memory | Memory silently drops DISCONTINUOUS stints (JR JR's 1993 Uncanny X-Men return). Use `locg wish-list add --creator … --series-id …`, which grounds the run in Metron credits (BUI-134) |
 | Conflating same-name creators | "John Romita Jr." vs "John Romita" (Sr.) are distinct Metron ids; the resolver pins the id. Always pass the exact Metron creator name |
-| Checking ownership one issue at a time (serial `GET .../check`) | Use the single batch call `POST /api/comics/collection/check/batch` (BUI-204) — same matcher, one round-trip, far fewer tokens |
-| Fetching the bare Metron `?name=` search for a huge series | Add `&year_began=<YEAR>` when the start year is known (BUI-204) — the unfiltered search can return hundreds of rows |
-| Re-fetching / re-grepping the wish-list per issue | Fetch `GET /api/comics/wish-list` once, parse into a `(series, issue)` set, do O(1) lookups (BUI-204) |

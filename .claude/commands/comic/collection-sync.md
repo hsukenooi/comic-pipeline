@@ -377,15 +377,9 @@ win-records cleanup in
 | Mistake | Fix |
 |---|---|
 | Trying to push wishes in the default sync | The export is wins-only (BUI-208 machine gate — it refuses to emit `In Collection=0`); wishes are a separate opt-in export (`?push_wishes=true`, Step 3b), gated on a clean conflicts audit. Wins can only add; wishes can delete |
-| Splitting the CSV in ≤20-row batches | No row limit — that was a misdiagnosis (the hangs were incomplete/dateless rows). Upload complete-and-exact rows at any size |
 | Pushing wishes without cleaning conflicts first | Step 3b is gated on Step 2b reporting **zero** wish-list conflicts. An owned-but-wished entry pushed as In Collection=0 deletes the owned copy |
-| Skipping the probe / not reading the import preview | Always probe ≤5 rows and read LOCG's per-row result first. **ABORT on any "Deleted from Collection."** — that is the data-loss signal |
-| Skipping the pre-sync data-quality audit | Run Step 2b. Decorated full_titles, Jan-1 placeholder dates, and volume mislabels (BUI-199) read as "Not Found"; an all-dateless batch hangs the importer |
-| Uploading partial/wrong rows | Rows must be complete and exact: publisher + canonical series + exact full_title (no `(Vol.)`/year decoration) + accurate release date — else LOCG returns "Not Found" |
-| Re-export → re-upload without the intervening re-import | Always finish Step 5. Export does not mark rows pushed, so skipping the re-import re-emits the same rows as duplicate uploads |
 | Syncing without a backup | Step 1 is mandatory and hard-stops on failure |
 | Seeing "Deleted from Collection" on upload | A win/wish row should never delete (BUI-122/BUI-200) — STOP, do not upload the rest, report it, restore from the Step 1 backup if a deletion landed |
 | "Error: timeout" at 0% on small batches | LOCG's import backend is degraded (a `queue_import_comic` XHR shows `(canceled)`); wait and retry later — not a file problem |
 | Claiming success when `added` is large | A large `added` means the re-import inserted duplicates instead of reconciling — STOP, investigate, restore from backup if needed |
 | Uploading the `.notes.md` rows | Only the `.csv` files go to LOCG; `.notes.md` lists rows withheld for manual resolution |
-| Running the LOCG web steps for the user | Steps 3, 3b and 4 are manual (Playwright login + web UI) — wait for the user to confirm |
