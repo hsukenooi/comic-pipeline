@@ -540,15 +540,10 @@ def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list]
     """Split verdict-cache-miss matches into pristine (deterministic) and
     Claude-verified survivors, persisting new verdicts to the cache.
 
-    Lifted verbatim from main()'s Step 10 "verdict cache split → verify
-    uncached" block: same pristine/needs-verify split, same cross-seller
-    dedup by (title_key, wish_name), same call to verify_with_claude, same
-    fan-out of the verified verdict back to every listing sharing a key, same
-    verdict_put persistence, and the same printed diagnostics. Returns
-    (pristine_direct, verified) exactly as main() previously assigned those
-    two locals — including the `[] , []` result when `uncached` is empty,
-    mirroring the original `if uncached: ... else: pristine_direct = [];
-    verified = []` branch.
+    Dedups needs-verify candidates cross-seller by (title_key, wish_name),
+    calls verify_with_claude, fans the verified verdict back to every listing
+    sharing a key, and persists new verdicts via verdict_put. Returns
+    (pristine_direct, verified) — both empty lists when `uncached` is empty.
     """
     if not uncached:
         return [], []

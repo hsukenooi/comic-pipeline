@@ -791,9 +791,7 @@ def _link_issue_to_bid(
 ) -> bool:
     """Upsert one comic/issue and link it to `bid_id` via fmv_id.
 
-    Lifted verbatim from the per-issue body of api_extract_comics's linking
-    loop. Returns True iff a bids -> bid_fmvs junction row was written for
-    this issue.
+    Returns True iff a bids -> bid_fmvs junction row was written for this issue.
     """
     comic_id = upsert_comic(
         db,
@@ -1350,8 +1348,7 @@ def _is_pinned_collection_row(
     `full_title` and `release_date`? See `_pinned_collection_rows` for the
     full rationale. Shared by the dry-run preview, the pre-check, and the
     locked `_mutate` closure in `api_collection_delete` so all three apply
-    the identical classification (lifted verbatim, unifying what were
-    previously separate copies of this same condition).
+    the identical classification.
     """
     return (
         row.get("in_collection")

@@ -20,8 +20,12 @@ from locg.client import AuthRequired, LOCGClient
 from locg.collection_cache import (
     CollectionCache,
     _coerce_year,
+    _next_seq,
     _normalize_series_key,
+    _utcnow_iso,
+    base_full_title,
     owned_match_keys,
+    resolve_series_for_win,
     series_year_range,
 )
 from locg.config import wish_list_cache_path
@@ -2411,7 +2415,6 @@ def _build_win_row(
       - "metron_attempted" / "metron_succeeded" / "manual_series" / "manual_variant" /
         "variant_detail_attempted" / "variant_matches": int deltas for this win
     """
-    from locg.collection_cache import _next_seq, _utcnow_iso, base_full_title, resolve_series_for_win
     from locg.metron import MetronCredentialError
 
     metron_attempted = 0
@@ -2714,13 +2717,9 @@ def cmd_collection_record_win(
     from locg.collection_cache import (
         CollectionCache,
         _normalize_series_key,
-        _next_seq,
-        _utcnow_iso,
-        base_full_title,
         build_volume_candidates,
-        resolve_series_for_win,
     )
-    from locg.metron import MetronClient, MetronCredentialError
+    from locg.metron import MetronClient
 
     if cache is None:
         cache = CollectionCache()

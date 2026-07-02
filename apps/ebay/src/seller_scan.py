@@ -269,9 +269,8 @@ def _verify_via_claude_cli(prompt: str) -> str:
 def _build_verification_prompt(chunk, edition_words, foreign_examples, later_printing_examples):
     """Build the Claude verification prompt text for one chunk of candidates.
 
-    Pure block lifted verbatim from verify_with_claude's per-chunk loop — same
-    pairs-text assembly (including the optional "Correct series:" hint) and
-    the same prompt template, byte-for-byte.
+    Assembles the numbered listing/wish pairs (with an optional "Correct
+    series:" hint per candidate) into the verification prompt template.
     """
     pairs_parts = []
     for idx, cand in enumerate(chunk, 1):
@@ -314,10 +313,9 @@ def _parse_verification_response(text, chunk, chunk_label):
 
     Returns the subset of `chunk` NOT rejected (the list to extend `kept`
     with), or None if the response could not be parsed/validated.  None means
-    "drop this chunk" (fail-closed) — lifted verbatim from verify_with_claude's
-    per-chunk loop: same exceptions caught (json.JSONDecodeError; KeyError,
-    ValueError, TypeError during id validation), same warning messages, same
-    fail-closed semantics, same BUI-149 rejected-candidate stderr listing.
+    "drop this chunk" (fail-closed): catches json.JSONDecodeError plus
+    KeyError/ValueError/TypeError during id validation, emits the warning
+    messages, and prints the BUI-149 rejected-candidate stderr listing.
     """
     json_match = re.search(r"\[.*\]", text, re.DOTALL)
     if not json_match:
