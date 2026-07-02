@@ -1,6 +1,7 @@
 """Tests for seller_scan and the ebay_fetch seller search functions."""
 
 import json
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1424,94 +1425,21 @@ class TestHardRejectCleanMatch:
 # ─── verify_with_claude chunking (BUI-221 Part B) ────────────────────────────
 
 
-class TestVerifyWithClaudeMissingKey:
-    def test_missing_api_key_exits_cleanly(self, capsys, monkeypatch):
-        """No ANTHROPIC_API_KEY → clean error + exit, not a raw traceback.
-        Matters for the unattended wishlist-sellers scheduled run."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        # Make _load_dotenv a no-op so it can't pull a key from a real .env.
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: {})
-        with pytest.raises(SystemExit) as exc:
-            seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
-        assert exc.value.code == 1
-        assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
-
-    # BUI-241: regression tests for multi-path .env fallback -------------------
-
-    def test_key_loaded_from_file_relative_path(self, monkeypatch):
-        """Key loaded from file-relative .env → no SystemExit (BUI-241 Option A).
-
-        Simulates a seller_scan.py that lives in an --editable install so
-        Path(__file__).parent.parent/.env resolves back into the source tree."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.delenv("COMIC_PIPELINE_ENV", raising=False)
-
-        def _stub_load(path):
-            # Simulate file-relative .env containing the key.  Use monkeypatch.setenv
-            # (not raw os.environ assignment) so the key is torn down at test end.
-            monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-bui241-file-relative")
-
-        monkeypatch.setattr(seller_scan, "_load_dotenv", _stub_load)
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = MagicMock(
-            content=[MagicMock(text="[]")]
-        )
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-
-        # Should NOT raise SystemExit — key was found via file-relative path.
-        result = seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
-        assert isinstance(result, list)
-
-    def test_comic_pipeline_env_fallback_consulted(self, monkeypatch):
-        """$COMIC_PIPELINE_ENV path is tried when file-relative .env has no key (BUI-241 Option B)."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
-        custom_env_path = "/tmp/custom-bui241.env"
-        monkeypatch.setenv("COMIC_PIPELINE_ENV", custom_env_path)
-
-        # Stub _load_dotenv to set the key only when called with the COMIC_PIPELINE_ENV path.
-        # This simulates the file-relative .env lacking the key but COMIC_PIPELINE_ENV having it.
-        def _selective_load(path):
-            if str(path) == custom_env_path:
-                # Use monkeypatch.setenv (not raw os.environ assignment) so the
-                # key is torn down at test end and doesn't leak to later tests.
-                monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-bui241-comic-pipeline-env")
-
-        monkeypatch.setattr(seller_scan, "_load_dotenv", _selective_load)
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = MagicMock(
-            content=[MagicMock(text="[]")]
-        )
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-
-        # Should NOT raise SystemExit — key found via $COMIC_PIPELINE_ENV.
-        result = seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
-        assert isinstance(result, list)
-
-    def test_hard_fail_when_all_fallback_paths_miss(self, capsys, monkeypatch):
-        """SystemExit(1) when ANTHROPIC_API_KEY absent from env and all .env files (BUI-241)."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.delenv("COMIC_PIPELINE_ENV", raising=False)
-        # All three candidate paths are no-ops.
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
-        with pytest.raises(SystemExit) as exc:
-            seller_scan.verify_with_claude([{"title": "X #1", "wish_name": "X #1"}])
-        assert exc.value.code == 1
-        err = capsys.readouterr().err
-        assert "ANTHROPIC_API_KEY" in err
-        # Error message should name the home-dir fallback path, confirming it lists
-        # actual candidate paths rather than a static hardcoded string.
-        assert ".config/comic-pipeline" in err
-
-
 class TestVerifyWithClaudeChunking:
-    """Verify chunked calling and fail-closed behaviour of verify_with_claude."""
+    """Verify chunked calling and fail-closed behaviour of verify_with_claude.
+
+    BUI-270: transport is now the `claude` CLI (subscription auth), not the
+    Anthropic SDK — tests monkeypatch seller_scan._verify_via_claude_cli
+    directly rather than an SDK client.
+    """
 
     @pytest.fixture(autouse=True)
-    def _set_api_key(self, monkeypatch):
-        # The key-presence guard runs before the (mocked) client; tests must
-        # provide a dummy key so they exercise the chunking logic, not the guard.
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    def _claude_on_path(self, monkeypatch):
+        # BUI-270: verify_with_claude preflights shutil.which("claude"); stub it
+        # truthy so the chunking tests exercise the loop, not the preflight.
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
 
     def _make_matches(self, n):
         return [
@@ -1519,27 +1447,20 @@ class TestVerifyWithClaudeChunking:
             for i in range(1, n + 1)
         ]
 
-    def _genuine_response(self, count):
-        """Mock response where all ``count`` candidates are genuine (empty rejects list)."""
-        fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text="[]")]
-        return fake_resp
-
-    def test_250_candidates_produce_3_api_calls(self, monkeypatch):
-        """250 candidates → 3 chunks: [100, 100, 50] → 3 messages.create calls."""
+    def test_250_candidates_produce_3_cli_calls(self, monkeypatch):
+        """250 candidates → 3 chunks: [100, 100, 50] → 3 CLI calls."""
         matches = self._make_matches(250)
-        fake_client = MagicMock()
-        fake_client.messages.create.side_effect = [
-            self._genuine_response(100),
-            self._genuine_response(100),
-            self._genuine_response(50),
-        ]
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        calls = []
+
+        def fake_verify(prompt):
+            calls.append(prompt)
+            return "[]"
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
         result = seller_scan.verify_with_claude(matches)
 
-        assert fake_client.messages.create.call_count == 3
+        assert len(calls) == 3
         assert len(result) == 250
 
     def test_chunk_indices_are_local_not_global(self, monkeypatch):
@@ -1550,14 +1471,11 @@ class TestVerifyWithClaudeChunking:
         # Chunk 2: reject ids 2-50 (local), keep only id=1 (local) →
         # corresponds to global match #101.
         rejected_chunk2 = [{"id": i, "reason": "test"} for i in range(2, 51)]
+        responses = iter(["[]", json.dumps(rejected_chunk2)])
 
-        fake_client = MagicMock()
-        fake_client.messages.create.side_effect = [
-            MagicMock(content=[MagicMock(text="[]")]),
-            MagicMock(content=[MagicMock(text=json.dumps(rejected_chunk2))]),
-        ]
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(
+            seller_scan, "_verify_via_claude_cli", lambda prompt: next(responses)
+        )
 
         result = seller_scan.verify_with_claude(matches)
 
@@ -1569,12 +1487,11 @@ class TestVerifyWithClaudeChunking:
     def test_unparseable_chunk_fails_closed(self, monkeypatch, capsys):
         """A chunk whose response contains no JSON array is dropped entirely."""
         matches = self._make_matches(3)
-        fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text="I cannot help with that request.")]
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = fake_resp
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: "I cannot help with that request.",
+        )
 
         result = seller_scan.verify_with_claude(matches)
 
@@ -1587,12 +1504,9 @@ class TestVerifyWithClaudeChunking:
         matches = self._make_matches(5)
         # id=6 is out of range for a 5-candidate chunk.
         rejected = [{"id": 6, "reason": "phantom id"}]
-        fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = fake_resp
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(
+            seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
+        )
 
         result = seller_scan.verify_with_claude(matches)
 
@@ -1604,12 +1518,9 @@ class TestVerifyWithClaudeChunking:
         """A rejected-id that is not an integer causes the whole chunk to drop."""
         matches = self._make_matches(5)
         rejected = [{"id": "two", "reason": "string id"}]
-        fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = fake_resp
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(
+            seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
+        )
 
         result = seller_scan.verify_with_claude(matches)
 
@@ -1621,12 +1532,9 @@ class TestVerifyWithClaudeChunking:
         """A rejected object with no 'id' key causes the whole chunk to drop."""
         matches = self._make_matches(5)
         rejected = [{"reason": "forgot the id"}]
-        fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text=json.dumps(rejected))]
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = fake_resp
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(
+            seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
+        )
 
         result = seller_scan.verify_with_claude(matches)
 
@@ -1637,12 +1545,7 @@ class TestVerifyWithClaudeChunking:
     def test_empty_array_keeps_all_candidates(self, monkeypatch):
         """[] response means nothing rejected — all candidates returned."""
         matches = self._make_matches(5)
-        fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text="[]")]
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = fake_resp
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", lambda prompt: "[]")
 
         result = seller_scan.verify_with_claude(matches)
 
@@ -1651,16 +1554,11 @@ class TestVerifyWithClaudeChunking:
     def test_good_chunk_after_bad_chunk_still_kept(self, monkeypatch, capsys):
         """A bad first chunk drops its candidates but a good second chunk is kept."""
         matches = self._make_matches(150)  # 2 chunks: [100, 50]
+        responses = iter(["no json here", "[]"])  # 2nd chunk: nothing rejected → all 50 kept
 
-        bad_resp = MagicMock()
-        bad_resp.content = [MagicMock(text="no json here")]
-        good_resp = MagicMock()
-        good_resp.content = [MagicMock(text="[]")]  # nothing rejected → all 50 kept
-
-        fake_client = MagicMock()
-        fake_client.messages.create.side_effect = [bad_resp, good_resp]
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(
+            seller_scan, "_verify_via_claude_cli", lambda prompt: next(responses)
+        )
 
         result = seller_scan.verify_with_claude(matches)
 
@@ -1670,11 +1568,146 @@ class TestVerifyWithClaudeChunking:
         err = capsys.readouterr().err
         assert "fail-closed" in err
 
+    def test_transient_cli_error_folds_into_fail_closed_drop(self, monkeypatch, capsys):
+        """BUI-270: a *transient* claude CLI transport failure (nonzero exit /
+        timeout / empty output — surfaced by _verify_via_claude_cli as a
+        RuntimeError) on ONE chunk, while another chunk succeeds, folds into the
+        same fail-closed chunk-drop as a parse failure — the failed chunk's
+        candidates are dropped, the good chunk's kept, and no SystemExit (the
+        verifier is reachable, so this isn't a global failure)."""
+        matches = self._make_matches(150)  # 2 chunks: [100, 50]
+
+        def responses():
+            yield "raise"       # chunk 1 → transport failure
+            yield "[]"          # chunk 2 → success, nothing rejected
+        gen = responses()
+
+        def fake_verify(prompt):
+            val = next(gen)
+            if val == "raise":
+                raise RuntimeError("claude CLI failed: some stderr text")
+            return val
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        result = seller_scan.verify_with_claude(matches)
+
+        # Chunk 1's 100 dropped (transport failed); chunk 2's 50 kept.
+        assert len(result) == 50
+        assert result[0]["title"] == "Comic Series #101"
+        err = capsys.readouterr().err
+        assert "fail-closed" in err
+        assert "claude CLI failed" in err
+
+    def test_all_chunks_transport_fail_hard_exits(self, monkeypatch, capsys):
+        """BUI-270 safety net: if EVERY chunk fails at the transport layer (zero
+        successful model calls) the verifier is globally broken (bad auth / all
+        timeouts). Hard-fail with SystemExit(1) rather than return an empty list
+        the caller would render as a genuine "no matches" table."""
+        matches = self._make_matches(150)  # 2 chunks — both fail transport
+
+        def fake_verify(prompt):
+            raise RuntimeError("claude CLI failed: not logged in")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude(matches)
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "every candidate chunk" in err
+
+    def test_single_chunk_transport_fail_hard_exits(self, monkeypatch, capsys):
+        """A one-chunk run where that only chunk fails transport is still an
+        all-chunks-failed run → SystemExit(1), not an empty return."""
+        matches = self._make_matches(3)  # 1 chunk
+
+        def fake_verify(prompt):
+            raise RuntimeError("claude CLI timed out: ...")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude(matches)
+        assert exc.value.code == 1
+
+    def test_missing_claude_cli_preflight_exits(self, monkeypatch, capsys):
+        """BUI-270 preflight: `claude` absent from PATH → SystemExit(1) with an
+        actionable message, before any chunk is attempted — never an empty table
+        that reads as no-match."""
+        # Override the autouse truthy stub: simulate claude not installed.
+        monkeypatch.setattr(seller_scan.shutil, "which", lambda name: None)
+        called = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: called.append(prompt) or "[]",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude(self._make_matches(3))
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "`claude` CLI was not found on PATH" in err
+        # Preflight fires before the loop — the transport is never called.
+        assert called == []
+
+
+class TestVerifyViaClaudeCli:
+    """BUI-270: the `claude` CLI transport helper itself — nonzero exit,
+    timeout, and empty output must all raise RuntimeError so verify_with_claude's
+    fail-closed except clause catches them."""
+
+    def test_success_returns_stdout(self, monkeypatch):
+        def fake_run(cmd, input, capture_output, text, timeout):
+            assert cmd[0] == "claude"
+            assert "--model" in cmd
+            assert "claude-haiku-4-5-20251001" in cmd
+            assert input == "some prompt"
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        result = seller_scan._verify_via_claude_cli("some prompt")
+
+        assert result == "[]\n"
+
+    def test_nonzero_exit_raises_runtime_error(self, monkeypatch):
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="", stderr="not logged in"
+            )
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="not logged in"):
+            seller_scan._verify_via_claude_cli("some prompt")
+
+    def test_timeout_raises_runtime_error(self, monkeypatch):
+        def fake_run(cmd, input, capture_output, text, timeout):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            seller_scan._verify_via_claude_cli("some prompt")
+
+    def test_empty_stdout_raises_runtime_error(self, monkeypatch):
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(cmd, 0, stdout="   \n", stderr="")
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="empty output"):
+            seller_scan._verify_via_claude_cli("some prompt")
+
 
 class TestVerifyWithClaudeNoSilentDrop:
     @pytest.fixture(autouse=True)
-    def _set_api_key(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    def _claude_on_path(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
 
     def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
         """BUI-149: the script's internal Claude pass is the single verification
@@ -1687,12 +1720,9 @@ class TestVerifyWithClaudeNoSilentDrop:
             {"title": "Daredevil Annual #1", "wish_name": "Daredevil #1"},
         ]
         verdict_json = '[{"id":2,"reason":"Annual, not the regular series"}]'
-        fake_resp = MagicMock()
-        fake_resp.content = [MagicMock(text=verdict_json)]
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = fake_resp
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(
+            seller_scan, "_verify_via_claude_cli", lambda prompt: verdict_json
+        )
 
         kept = seller_scan.verify_with_claude(matches)
 
@@ -2301,23 +2331,20 @@ class TestVerifyWithClaudePromptEnrichment:
     """_series_name carried on candidates lands in the prompt as 'Correct series:' line."""
 
     @pytest.fixture(autouse=True)
-    def _set_api_key(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    def _claude_on_path(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
 
     def _capture_prompt(self, matches, monkeypatch):
-        """Run verify_with_claude with mocked client; return the prompt string sent."""
+        """Run verify_with_claude with a mocked CLI transport; return the prompt sent."""
         prompts_seen = []
 
-        def fake_create(**kwargs):
-            prompts_seen.append(kwargs["messages"][0]["content"])
-            resp = MagicMock()
-            resp.content = [MagicMock(text="[]")]
-            return resp
+        def fake_verify(prompt):
+            prompts_seen.append(prompt)
+            return "[]"
 
-        fake_client = MagicMock()
-        fake_client.messages.create.side_effect = fake_create
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
         seller_scan.verify_with_claude(matches)
         return prompts_seen[0]
 
@@ -2361,13 +2388,12 @@ class TestVerifyWithClaudePromptEnrichment:
                 "_series_name": "Daredevil (1964 - 1998)",
             },
         ]
-        fake_client = MagicMock()
         # Reject id=2 (Daredevil Annual)
-        fake_client.messages.create.return_value = MagicMock(
-            content=[MagicMock(text='[{"id":2,"reason":"annual vs regular"}]')]
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: '[{"id":2,"reason":"annual vs regular"}]',
         )
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
 
         kept = seller_scan.verify_with_claude(matches)
         assert len(kept) == 1
@@ -2407,22 +2433,19 @@ class TestVerifyWithClaudeRejectBulletsFromLexicons:
     covered above)."""
 
     @pytest.fixture(autouse=True)
-    def _set_api_key(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    def _claude_on_path(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
 
     def _capture_prompt(self, matches, monkeypatch):
         prompts_seen = []
 
-        def fake_create(**kwargs):
-            prompts_seen.append(kwargs["messages"][0]["content"])
-            resp = MagicMock()
-            resp.content = [MagicMock(text="[]")]
-            return resp
+        def fake_verify(prompt):
+            prompts_seen.append(prompt)
+            return "[]"
 
-        fake_client = MagicMock()
-        fake_client.messages.create.side_effect = fake_create
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
         seller_scan.verify_with_claude(matches)
         return prompts_seen[0]
 
@@ -2781,7 +2804,6 @@ class TestMainCandidateLoopGateChain:
         verify_with_claude with the "Correct series:" hint present in the
         prompt, and a Claude response rejecting it (as the hint enables) drops
         it from the final matches — the BUI-245 false positive is gone."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
         wish_items = self._wish_items()
         candidates = self._run_scan_loop_body(
             [("1", "Spectacular Spider-Man #15 VF Marvel 1979")], wish_items
@@ -2789,18 +2811,16 @@ class TestMainCandidateLoopGateChain:
 
         prompts_seen = []
 
-        def fake_create(**kwargs):
-            prompts_seen.append(kwargs["messages"][0]["content"])
-            resp = MagicMock()
-            resp.content = [MagicMock(
-                text='[{"id":1,"reason":"Spectacular Spider-Man not Amazing Spider-Man"}]'
-            )]
-            return resp
+        def fake_verify(prompt):
+            prompts_seen.append(prompt)
+            return '[{"id":1,"reason":"Spectacular Spider-Man not Amazing Spider-Man"}]'
 
-        fake_client = MagicMock()
-        fake_client.messages.create.side_effect = fake_create
-        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
-        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        # BUI-270: stub the preflight truthy so verify_with_claude reaches the
+        # (mocked) transport instead of exiting on a missing `claude` binary.
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
         kept = seller_scan.verify_with_claude(candidates)
 

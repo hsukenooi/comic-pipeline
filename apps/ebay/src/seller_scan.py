@@ -5,10 +5,10 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
-from pathlib import Path
 
-import anthropic
 import requests
 
 from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for callers
@@ -235,80 +235,74 @@ def match_listing(title, wish_items):
 
 # ─── Claude verification ──────────────────────────────────────────────────────
 
-def _load_dotenv(path):
-    """Load key=value pairs from a .env file into os.environ (if not already set)."""
-    import os
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                key = key.strip()
-                if key and key not in os.environ:
-                    os.environ[key] = val.strip()
-    except FileNotFoundError:
-        pass
-
-
-# Maximum candidates per Claude API call.  At ~30–50 output tokens/verdict,
-# the 8 096-token cap limits a single call to ~150–270 candidates before
+# Maximum candidates per Claude CLI call.  At ~30–50 output tokens/verdict,
+# an 8 096-token cap limits a single call to ~150–270 candidates before
 # silent truncation; 100 keeps a comfortable margin and caps cost per call.
 _VERIFY_CHUNK_SIZE = 100
 
 
+def _verify_via_claude_cli(prompt: str) -> str:
+    """Run the verify prompt through the `claude` CLI (subscription auth, no
+    ANTHROPIC_API_KEY needed — BUI-270). The prompt goes via stdin (not argv)
+    to avoid ARG_MAX/escaping issues on a 100-candidate chunk.
+
+    Raises RuntimeError on any transport failure (nonzero exit, timeout, or
+    empty stdout) so the caller can fold it into the existing fail-closed
+    chunk-drop path — a CLI hiccup must never leak an unverified match.
+    """
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", "claude-haiku-4-5-20251001",
+             "--output-format", "text"],
+            input=prompt, capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"claude CLI timed out: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"claude CLI failed to start: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "claude CLI failed")
+    if not result.stdout.strip():
+        raise RuntimeError("claude CLI returned empty output")
+    return result.stdout
+
+
 def verify_with_claude(matches):
-    """Filter candidates to genuine matches using chunked Claude API calls.
+    """Filter candidates to genuine matches using chunked claude CLI calls.
 
     Candidates are processed in batches of at most _VERIFY_CHUNK_SIZE per call
     so that a large run never silently truncates the response.  Indices in each
     prompt are 1-based and local to the chunk so the correlation logic is
     identical to the single-call version.
 
-    Fail-closed: if a chunk's response cannot be parsed OR the number of
-    returned verdicts does not match the number of candidates sent, that chunk
-    is REJECTED entirely (those candidates are dropped) and a warning is
-    printed to stderr.  Better to miss a borderline listing than to surface
-    false positives unattended.  This replaces the previous fail-open fallback
-    that returned all candidates on a parse error.
+    Two failure tiers (BUI-270):
+
+    - A *transient* per-chunk failure — an unparseable response, a mismatched
+      verdict count, or a single CLI call that errors/times out — drops just
+      that chunk (fail-closed: better to miss a borderline listing than to
+      surface false positives unattended) and a warning is printed to stderr.
+    - A *global* verifier failure must fail LOUDLY, never quietly return an
+      empty list that reads as "this seller has no matching books" when in
+      reality verification never ran.  Two guards cover this: a preflight
+      shutil.which("claude") check (CLI not installed), and an
+      all-chunks-transport-failed safety net (e.g. broken subscription auth or
+      every call timing out — which `which` can't detect).  Both sys.exit(1)
+      with a clear, actionable message, mirroring the old key-gate ergonomics.
     """
     if not matches:
         return []
 
-    # BUI-241: try .env candidates in order until the key lands in the environment.
-    # (1) file-relative path — works under --editable install (primary, Option A fix)
-    # (2) $COMIC_PIPELINE_ENV — an explicit full path to a .env file, if set
-    # (3) stable user location — ~/.config/comic-pipeline/.env (Option B fallback)
-    _dotenv_candidates = [
-        Path(__file__).parent.parent / ".env",
-        *(
-            [Path(os.environ["COMIC_PIPELINE_ENV"])]
-            if os.environ.get("COMIC_PIPELINE_ENV")
-            else []
-        ),
-        Path.home() / ".config" / "comic-pipeline" / ".env",
-    ]
-    for _candidate in _dotenv_candidates:
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            break
-        _load_dotenv(_candidate)
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        _checked = ", ".join(str(p) for p in _dotenv_candidates)
-        _env_hint = (
-            " or set $COMIC_PIPELINE_ENV to a .env file path"
-            if not os.environ.get("COMIC_PIPELINE_ENV")
-            else ""
-        )
+    # BUI-270 preflight: a missing `claude` binary is a global failure — every
+    # chunk would fail-closed and the caller would render an empty table that
+    # looks like a genuine no-match.  Fail loudly once with an actionable hint.
+    if shutil.which("claude") is None:
         print(
-            f"Error: ANTHROPIC_API_KEY is not set (checked the environment and "
-            f"{_checked}). Claude verification cannot run — refusing to "
-            f"surface unverified matches. Export ANTHROPIC_API_KEY, add it to "
-            f"one of the files above{_env_hint}, then re-run.",
+            "Error: the `claude` CLI was not found on PATH. Claude "
+            "verification cannot run — refusing to surface unverified matches. "
+            "Install and authenticate the claude CLI, then re-run.",
             file=sys.stderr,
         )
         sys.exit(1)
-    client = anthropic.Anthropic()
 
     # BUI-253 Step 5: render the reject-list bullets that duplicate a
     # deterministic comic_identity lexicon FROM that lexicon, once per call —
@@ -321,6 +315,13 @@ def verify_with_claude(matches):
     _later_printing_examples = later_printing_examples()
 
     kept = []
+    # BUI-270 safety-net counters: a successful transport call (model actually
+    # returned text, regardless of whether we could parse it) proves the
+    # verifier is reachable.  If EVERY chunk fails at the transport layer, the
+    # verifier is globally broken (bad auth / all timeouts) — that's an
+    # environment failure, not a genuine "everything rejected", so we hard-fail
+    # after the loop rather than return an empty list that looks like no-match.
+    transport_ok = 0
     for chunk_start in range(0, len(matches), _VERIFY_CHUNK_SIZE):
         chunk = matches[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
         chunk_label = f"{chunk_start + 1}–{chunk_start + len(chunk)}"
@@ -364,12 +365,17 @@ Any candidate id NOT present in your response is treated as genuine.
 Pairs:
 {pairs}"""
 
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=8096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text
+        try:
+            text = _verify_via_claude_cli(prompt)
+        except RuntimeError as exc:
+            print(
+                f"Warning: claude CLI verification failed for candidates "
+                f"{chunk_label} ({exc}); dropping chunk (fail-closed)",
+                file=sys.stderr,
+            )
+            continue
+        transport_ok += 1
+
         json_match = re.search(r"\[.*\]", text, re.DOTALL)
         if not json_match:
             print(
@@ -429,6 +435,21 @@ Pairs:
         kept.extend(
             cand for idx, cand in enumerate(chunk, 1) if idx not in rejected_ids
         )
+
+    # BUI-270 safety net: at least one chunk existed (matches is non-empty) but
+    # not a single transport call succeeded → the verifier is globally broken
+    # (e.g. subscription auth failed, or every call timed out).  Fail loudly
+    # rather than return an empty list the caller would render as "no matches".
+    if transport_ok == 0:
+        print(
+            "Error: claude CLI verification failed for every candidate chunk "
+            "(no successful model call). The verifier appears globally "
+            "unavailable — likely broken subscription auth or repeated "
+            "timeouts. Refusing to surface unverified matches; check `claude` "
+            "auth and re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     return kept
 
