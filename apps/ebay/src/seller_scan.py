@@ -5,9 +5,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 import requests
 
@@ -275,16 +275,34 @@ def verify_with_claude(matches):
     prompt are 1-based and local to the chunk so the correlation logic is
     identical to the single-call version.
 
-    Fail-closed: if a chunk's response cannot be parsed, the CLI call itself
-    fails (nonzero exit / timeout / empty output), OR the number of returned
-    verdicts does not match the number of candidates sent, that chunk is
-    REJECTED entirely (those candidates are dropped) and a warning is printed
-    to stderr.  Better to miss a borderline listing than to surface false
-    positives unattended.  This replaces the previous fail-open fallback that
-    returned all candidates on a parse error.
+    Two failure tiers (BUI-270):
+
+    - A *transient* per-chunk failure — an unparseable response, a mismatched
+      verdict count, or a single CLI call that errors/times out — drops just
+      that chunk (fail-closed: better to miss a borderline listing than to
+      surface false positives unattended) and a warning is printed to stderr.
+    - A *global* verifier failure must fail LOUDLY, never quietly return an
+      empty list that reads as "this seller has no matching books" when in
+      reality verification never ran.  Two guards cover this: a preflight
+      shutil.which("claude") check (CLI not installed), and an
+      all-chunks-transport-failed safety net (e.g. broken subscription auth or
+      every call timing out — which `which` can't detect).  Both sys.exit(1)
+      with a clear, actionable message, mirroring the old key-gate ergonomics.
     """
     if not matches:
         return []
+
+    # BUI-270 preflight: a missing `claude` binary is a global failure — every
+    # chunk would fail-closed and the caller would render an empty table that
+    # looks like a genuine no-match.  Fail loudly once with an actionable hint.
+    if shutil.which("claude") is None:
+        print(
+            "Error: the `claude` CLI was not found on PATH. Claude "
+            "verification cannot run — refusing to surface unverified matches. "
+            "Install and authenticate the claude CLI, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # BUI-253 Step 5: render the reject-list bullets that duplicate a
     # deterministic comic_identity lexicon FROM that lexicon, once per call —
@@ -297,6 +315,13 @@ def verify_with_claude(matches):
     _later_printing_examples = later_printing_examples()
 
     kept = []
+    # BUI-270 safety-net counters: a successful transport call (model actually
+    # returned text, regardless of whether we could parse it) proves the
+    # verifier is reachable.  If EVERY chunk fails at the transport layer, the
+    # verifier is globally broken (bad auth / all timeouts) — that's an
+    # environment failure, not a genuine "everything rejected", so we hard-fail
+    # after the loop rather than return an empty list that looks like no-match.
+    transport_ok = 0
     for chunk_start in range(0, len(matches), _VERIFY_CHUNK_SIZE):
         chunk = matches[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
         chunk_label = f"{chunk_start + 1}–{chunk_start + len(chunk)}"
@@ -349,6 +374,7 @@ Pairs:
                 file=sys.stderr,
             )
             continue
+        transport_ok += 1
 
         json_match = re.search(r"\[.*\]", text, re.DOTALL)
         if not json_match:
@@ -409,6 +435,21 @@ Pairs:
         kept.extend(
             cand for idx, cand in enumerate(chunk, 1) if idx not in rejected_ids
         )
+
+    # BUI-270 safety net: at least one chunk existed (matches is non-empty) but
+    # not a single transport call succeeded → the verifier is globally broken
+    # (e.g. subscription auth failed, or every call timed out).  Fail loudly
+    # rather than return an empty list the caller would render as "no matches".
+    if transport_ok == 0:
+        print(
+            "Error: claude CLI verification failed for every candidate chunk "
+            "(no successful model call). The verifier appears globally "
+            "unavailable — likely broken subscription auth or repeated "
+            "timeouts. Refusing to surface unverified matches; check `claude` "
+            "auth and re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     return kept
 

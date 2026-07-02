@@ -1433,6 +1433,14 @@ class TestVerifyWithClaudeChunking:
     directly rather than an SDK client.
     """
 
+    @pytest.fixture(autouse=True)
+    def _claude_on_path(self, monkeypatch):
+        # BUI-270: verify_with_claude preflights shutil.which("claude"); stub it
+        # truthy so the chunking tests exercise the loop, not the preflight.
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
+
     def _make_matches(self, n):
         return [
             {"title": f"Comic Series #{i}", "wish_name": f"Comic Series #{i}"}
@@ -1560,24 +1568,89 @@ class TestVerifyWithClaudeChunking:
         err = capsys.readouterr().err
         assert "fail-closed" in err
 
-    def test_cli_error_folds_into_fail_closed_drop(self, monkeypatch, capsys):
-        """BUI-270: a claude CLI transport failure (nonzero exit / timeout /
-        empty output — surfaced by _verify_via_claude_cli as a RuntimeError)
-        must fold into the same fail-closed chunk-drop as a parse failure —
-        never surface an unverified match."""
-        matches = self._make_matches(3)
+    def test_transient_cli_error_folds_into_fail_closed_drop(self, monkeypatch, capsys):
+        """BUI-270: a *transient* claude CLI transport failure (nonzero exit /
+        timeout / empty output — surfaced by _verify_via_claude_cli as a
+        RuntimeError) on ONE chunk, while another chunk succeeds, folds into the
+        same fail-closed chunk-drop as a parse failure — the failed chunk's
+        candidates are dropped, the good chunk's kept, and no SystemExit (the
+        verifier is reachable, so this isn't a global failure)."""
+        matches = self._make_matches(150)  # 2 chunks: [100, 50]
+
+        def responses():
+            yield "raise"       # chunk 1 → transport failure
+            yield "[]"          # chunk 2 → success, nothing rejected
+        gen = responses()
 
         def fake_verify(prompt):
-            raise RuntimeError("claude CLI failed: some stderr text")
+            val = next(gen)
+            if val == "raise":
+                raise RuntimeError("claude CLI failed: some stderr text")
+            return val
 
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
         result = seller_scan.verify_with_claude(matches)
 
-        assert result == []
+        # Chunk 1's 100 dropped (transport failed); chunk 2's 50 kept.
+        assert len(result) == 50
+        assert result[0]["title"] == "Comic Series #101"
         err = capsys.readouterr().err
         assert "fail-closed" in err
         assert "claude CLI failed" in err
+
+    def test_all_chunks_transport_fail_hard_exits(self, monkeypatch, capsys):
+        """BUI-270 safety net: if EVERY chunk fails at the transport layer (zero
+        successful model calls) the verifier is globally broken (bad auth / all
+        timeouts). Hard-fail with SystemExit(1) rather than return an empty list
+        the caller would render as a genuine "no matches" table."""
+        matches = self._make_matches(150)  # 2 chunks — both fail transport
+
+        def fake_verify(prompt):
+            raise RuntimeError("claude CLI failed: not logged in")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude(matches)
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "every candidate chunk" in err
+
+    def test_single_chunk_transport_fail_hard_exits(self, monkeypatch, capsys):
+        """A one-chunk run where that only chunk fails transport is still an
+        all-chunks-failed run → SystemExit(1), not an empty return."""
+        matches = self._make_matches(3)  # 1 chunk
+
+        def fake_verify(prompt):
+            raise RuntimeError("claude CLI timed out: ...")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude(matches)
+        assert exc.value.code == 1
+
+    def test_missing_claude_cli_preflight_exits(self, monkeypatch, capsys):
+        """BUI-270 preflight: `claude` absent from PATH → SystemExit(1) with an
+        actionable message, before any chunk is attempted — never an empty table
+        that reads as no-match."""
+        # Override the autouse truthy stub: simulate claude not installed.
+        monkeypatch.setattr(seller_scan.shutil, "which", lambda name: None)
+        called = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: called.append(prompt) or "[]",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude(self._make_matches(3))
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "`claude` CLI was not found on PATH" in err
+        # Preflight fires before the loop — the transport is never called.
+        assert called == []
 
 
 class TestVerifyViaClaudeCli:
@@ -1630,6 +1703,12 @@ class TestVerifyViaClaudeCli:
 
 
 class TestVerifyWithClaudeNoSilentDrop:
+    @pytest.fixture(autouse=True)
+    def _claude_on_path(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
+
     def test_dropped_candidates_logged_to_stderr(self, capsys, monkeypatch):
         """BUI-149: the script's internal Claude pass is the single verification
         gate, so a rejected candidate must be surfaced (stderr) with its reason,
@@ -2251,6 +2330,12 @@ class TestSecondPrintReject:
 class TestVerifyWithClaudePromptEnrichment:
     """_series_name carried on candidates lands in the prompt as 'Correct series:' line."""
 
+    @pytest.fixture(autouse=True)
+    def _claude_on_path(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
+
     def _capture_prompt(self, matches, monkeypatch):
         """Run verify_with_claude with a mocked CLI transport; return the prompt sent."""
         prompts_seen = []
@@ -2346,6 +2431,12 @@ class TestVerifyWithClaudeRejectBulletsFromLexicons:
     what should_reject actually checks. These assert the ACTUAL lexicon
     contents land in the prompt, not just the stable lead-in phrase (already
     covered above)."""
+
+    @pytest.fixture(autouse=True)
+    def _claude_on_path(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
 
     def _capture_prompt(self, matches, monkeypatch):
         prompts_seen = []
@@ -2724,6 +2815,11 @@ class TestMainCandidateLoopGateChain:
             prompts_seen.append(prompt)
             return '[{"id":1,"reason":"Spectacular Spider-Man not Amazing Spider-Man"}]'
 
+        # BUI-270: stub the preflight truthy so verify_with_claude reaches the
+        # (mocked) transport instead of exiting on a missing `claude` binary.
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
         kept = seller_scan.verify_with_claude(candidates)
