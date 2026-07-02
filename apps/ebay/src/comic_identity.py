@@ -532,10 +532,6 @@ _TRADING_CARD_MARKERS: frozenset[str] = frozenset({
     "impel",
     "keepsake",
     "signagraph",
-    # BUI-269: sold_comps.py's HARD_EXCLUDE_RE had this die-cast/collectible
-    # brand grouped alongside its trading-card markers — folded in here so
-    # the reconciled lexicon keeps it.
-    "johnny lightning",
 })
 
 
@@ -789,11 +785,35 @@ _FMV_FOREIGN_MARKET_MARKERS: frozenset[str] = frozenset({
 # Non-comic collectibles sold_comps also excluded alongside its trading-card
 # markers (action figures, die-cast-scale toys) — precise phrases with no
 # bare-adjective false-positive risk, so no split-lexicon caveat needed here.
+#
+# "johnny lightning" (a die-cast toy brand) lives here, NOT in
+# _TRADING_CARD_MARKERS: that trading-card set feeds should_reject/hard_reject
+# (the purchase-decision path), and BUI-269's scope is comp-pool exclusion, so
+# a comp-only marker belongs in this comp-only set — not a widening of the
+# conservative purchase-reject lexicon.
 _FMV_COLLECTIBLE_MARKERS: frozenset[str] = frozenset({
     "action figure",
     "1:6 scale",
     "collectible figure",
+    "johnny lightning",
 })
+
+# Multi-issue lot shapes that the pre-BUI-269 sold_comps HARD_EXCLUDE_RE caught
+# but the shared _LOT_RE (purchase-decision path) does NOT: a SPACE-separated
+# hash-issue list ("#1 #2", "#1 #2 #3") and a 2-MEMBER COMMA pair ("#64, #65").
+# _LOT_RE's comma branch needs 3+ members and it has no space separator, so
+# without this a 2-3 book lot would leak into the FMV comp pool and inflate the
+# average (a false-INCLUDE — the expensive direction). Kept comp-only (checked
+# by is_comp_excluded, never merged into _LOT_RE) so it can't make the
+# conservative purchase path reject more (BUI-239). The comma member is bounded
+# to 1-3 digits so "#1, 2018" (a hash then a YEAR) is not mistaken for a lot.
+_FMV_LOT_RE = re.compile(
+    r"""
+    \#\d+\s+\#\d+                    # space-separated hash issues: "#1 #2" (any length)
+    | \#\d{1,4}\s*,\s*\#?\d{1,3}\b   # 2-member comma pair: "#64, #65" / "#64, 65"
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 def is_comp_excluded(title: str) -> bool:
@@ -812,6 +832,8 @@ def is_comp_excluded(title: str) -> bool:
     own separate condition/grading excludes for concerns those don't cover).
     """
     if _LOT_RE.search(title or ""):
+        return True
+    if _FMV_LOT_RE.search(title or ""):  # BUI-269: comp-only lot shapes _LOT_RE misses
         return True
     if _reprint_reject(title):
         return True

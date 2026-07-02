@@ -126,6 +126,13 @@ class TestHardExclude:
         "ASM #1 Spain edition",
         "ASM #1 Ebal edition",
         "Spawn #1 Johnny Lightning promo",
+        # BUI-269 (Opus PR#119 review): multi-issue lot shapes the reconciled
+        # lexicon must still exclude from the comp pool — the shared _LOT_RE
+        # misses these, so is_comp_excluded's comp-only _FMV_LOT_RE covers them.
+        "Amazing Spider-Man #1 #2 #3 CGC",   # space-separated hash list (3)
+        "Hulk #181 #182",                     # space-separated hash pair (2)
+        "ASM #64, #65",                       # 2-member comma pair (both hashed)
+        "ASM #64, 65",                        # 2-member comma pair (2nd unhashed)
     ])
     def test_excludes(self, title):
         assert sc.hard_exclude(title)
@@ -135,6 +142,13 @@ class TestHardExclude:
         "Uncanny X-Men #185 VF Marvel",
         "Batman #226 1970 Neal Adams cover",
         "Aliens vs Predator #2 Dark Horse 1990",
+        # BUI-269 (Opus PR#119 review): a single issue must NOT be caught by the
+        # new comp-only lot regex — it has only one # token.
+        "Amazing Spider-Man #300",
+        "X-Men #266 CGC 9.8",
+        # comma edge: "#1, 2018" is a hash then a YEAR, not a 2-issue lot —
+        # _FMV_LOT_RE bounds the comma member to 1-3 digits to avoid this.
+        "Detective Comics #1, 2018",
     ])
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)
