@@ -1741,6 +1741,22 @@ def _seed_owned_spawn(cache, full_title="Spawn #98", in_collection=1):
     )
 
 
+def _seed_owned_row(cache, series, full_title, in_collection=1, release_date="1988-05-10"):
+    """Seed a single owned locg_export row under an arbitrary decorated
+    ``series`` (BUI-267 cross-era/volume test support — ``_seed_owned_spawn``
+    hardcodes the Spawn series name)."""
+    from locg.collection_cache import rebuild_series_name_index
+    _seed_cache(cache, [{
+        **_agent_win_row(series=series, full_title=full_title, release_date=release_date),
+        "in_collection": in_collection,
+        "source": "locg_export",
+    }])
+    cache.apply(
+        lambda p: p.__setitem__("series_name_index", rebuild_series_name_index(p)),
+        command="test-rebuild",
+    )
+
+
 def test_record_win_skips_already_owned(tmp_path):
     """A win for an issue already owned in the cache is skipped, not duplicated."""
     from locg.commands import cmd_collection_record_win
@@ -1749,13 +1765,19 @@ def test_record_win_skips_already_owned(tmp_path):
     _seed_owned_spawn(cache, "Spawn #98")
 
     result = cmd_collection_record_win(
-        [_make_win(series="Spawn", issue="98")],
+        # year within the seeded "Spawn (1992 - Present)" range (BUI-267 era gate).
+        [_make_win(series="Spawn", issue="98", year=1999)],
         cache=cache, metron=_null_metron(),
     )
 
     assert result["skipped_already_owned"] == 1
     assert result["rows_written"] == 0
     assert result["skipped_already_owned_titles"] == ["Spawn (1992 - Present) #98"]
+    assert result["skipped_already_owned_detail"] == [{
+        "win": "Spawn (1992 - Present) #98",
+        "matched_series_name": "Spawn (1992 - Present)",
+        "matched_release_date": "1988-05-10",
+    }]
     # No new agent_win row written
     assert [r for r in cache.load()["comics"] if r["source"] == "agent_win"] == []
 
@@ -1800,7 +1822,87 @@ def test_record_win_dedup_ignores_variant(tmp_path):
     _seed_owned_spawn(cache, "Spawn #313")
 
     result = cmd_collection_record_win(
-        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        # year within the seeded "Spawn (1992 - Present)" range (BUI-267 era gate).
+        [_make_win(series="Spawn", issue="313", year=2004, variant_text="Capullo Variant")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    assert result["rows_written"] == 0
+
+
+# --- BUI-267: era/volume-aware dedup + surfaced skip provenance ---
+
+def test_record_win_dedup_does_not_conflate_cross_era_volume(tmp_path):
+    """New Gods #7 (1971 Kirby) must NOT be deduped against an owned
+    'The New Gods (Vol. 5) (2024 - 2025)' #7 — same masthead+issue, unrelated
+    era/volume (the reported BUI-267 false skip)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(cache, "The New Gods (Vol. 5) (2024 - 2025)", "New Gods #7")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="New Gods", issue="7", year=1971)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
+def test_record_win_dedup_surfaces_matched_row_on_skip(tmp_path):
+    """A genuine skip surfaces which owned row it matched (series_name + year),
+    so a caller can catch a cross-era/variant false match (BUI-267)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_spawn(cache, "Spawn #98")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="98", year=1999)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    detail = result["skipped_already_owned_detail"]
+    assert len(detail) == 1
+    assert detail[0]["matched_series_name"] == "Spawn (1992 - Present)"
+    assert detail[0]["matched_release_date"] == "1988-05-10"
+
+
+def test_record_win_dedup_newsstand_vs_base_not_conflated(tmp_path):
+    """A base-edition win must not be deduped against an owned Newsstand copy
+    (the reported Uncanny X-Men #201 false skip, BUI-267)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 Newsstand Edition",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
+def test_record_win_dedup_newsstand_still_dedupes_newsstand(tmp_path):
+    """A Newsstand win IS deduped against an owned Newsstand copy of the same
+    issue (BUI-267 regression: the edition gate must not over-block genuine
+    matches)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 Newsstand Edition",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985, variant_text="newsstand")],
         cache=cache, metron=_null_metron(),
     )
 
