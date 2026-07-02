@@ -946,7 +946,16 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
     ``year`` is deliberately NOT passed to :func:`cmd_collection_check`: a
     wish-list name carries only series + issue, never a per-issue cover date,
     and forwarding a series start-year is exactly the BUI-129 bug (it filters
-    out every owned row whose release year differs).
+    out every owned row whose release year differs). Consequently this audit
+    can land on the WRONG volume/era of a same-numbered issue (BUI-266: a
+    decoy UK-reprint "The Avengers (1973 - 1976)" #52 matched against an owned
+    1968 Vol. 1, and a base "Uncanny X-Men #201" wish matched an owned
+    Newsstand copy). Each conflict therefore carries the SAME BUI-249
+    provenance fields ``cmd_collection_check`` returns (``series_name``,
+    ``release_date`` of the matched row) so a caller can visually catch a
+    cross-era/cross-edition false match before removing it — see
+    :func:`cmd_wish_list_remove_conflicts`, which is the removal half of this
+    audit and never removes anything not surfaced here first.
 
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
     """
@@ -970,6 +979,10 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
                 "issue": issue,
                 "id": it.get("id"),
                 "full_title_matched": result["full_title_matched"],
+                # BUI-266: matched-row provenance, so a decoy/cross-era match
+                # is visible before this conflict is removed.
+                "series_name": result["matched_series_name"],
+                "release_date": result["matched_release_date"],
             })
     return {
         "total": len(items),
@@ -979,8 +992,24 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
     }
 
 
-def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
-    """Remove every wish-list entry already in the collection (BUI-130).
+def cmd_wish_list_remove_conflicts(names: Optional[list[str]] = None) -> dict[str, Any]:
+    """Remove wish-list entries already in the collection (BUI-130).
+
+    BUI-266: this used to unconditionally sweep the ENTIRE conflict set in one
+    call — a caller intending to clear a handful of just-discovered conflicts
+    had no way to avoid ALSO removing every other pre-existing conflict
+    already sitting in the wish-list (the BUI-259 incident: 114 removed when
+    ~6 were intended, including decoy cross-volume/cross-edition false
+    matches — see :func:`cmd_wish_list_conflicts`). Pass ``names`` (the
+    wish-list entry ``name`` field, exactly as returned by
+    :func:`cmd_wish_list_conflicts`) to SCOPE the removal to that set — a name
+    re-checked against a FRESH audit, not just echoed back, so a name that is
+    no longer a genuine conflict (already removed, or never one — a stale or
+    hand-typed name) is reported as an error rather than silently accepted.
+    Omit ``names`` to remove every current conflict, matching the original
+    global-sweep behavior; the HTTP layer (``api_wish_list_remove_conflicts``)
+    gates that unscoped path behind an explicit ``confirm=true``, returning a
+    non-mutating preview otherwise.
 
     Re-derives the conflict set via :func:`cmd_wish_list_conflicts`, then removes
     each by exact name with :func:`cmd_wish_list_remove`. Returns the removed
@@ -991,9 +1020,25 @@ def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
     """
     audit = cmd_wish_list_conflicts()
-    removed: list[dict[str, Any]] = []
+    conflicts_by_name: dict[str, dict[str, Any]] = {c["name"]: c for c in audit["conflicts"]}
+
     errors: list[dict[str, Any]] = []
-    for conflict in audit["conflicts"]:
+    if names is None:
+        targets = list(audit["conflicts"])
+    else:
+        targets = []
+        for name in names:
+            conflict = conflicts_by_name.get(name)
+            if conflict is None:
+                errors.append({
+                    "name": name,
+                    "error": "not a current wish-list/collection conflict — skipped, nothing removed",
+                })
+            else:
+                targets.append(conflict)
+
+    removed: list[dict[str, Any]] = []
+    for conflict in targets:
         result = cmd_wish_list_remove(conflict["name"])
         if "error" in result:
             errors.append({"name": conflict["name"], "error": result["error"]})
@@ -1010,6 +1055,11 @@ def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
             entry = dict(result["removed"]) if isinstance(result.get("removed"), dict) \
                 else {"name": conflict["name"]}
             entry["matched_owned"] = matched
+            # BUI-266: same provenance the audit surfaced, carried onto the
+            # actual removal record so a reviewer can see exactly what era/
+            # edition each removed wish was matched against.
+            entry["matched_series_name"] = conflict.get("series_name")
+            entry["matched_release_date"] = conflict.get("release_date")
             removed.append(entry)
     try:
         remaining = len(cmd_wish_list_from_cache())
@@ -1018,6 +1068,7 @@ def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
     return {
         "removed": removed,
         "removed_count": len(removed),
+        "scoped": names is not None,
         "errors": errors,
         "remaining": remaining,
         "checked": audit["checked"],

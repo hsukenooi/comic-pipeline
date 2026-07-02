@@ -2773,10 +2773,110 @@ def test_wish_list_remove_conflicts_removes_only_owned(tmp_path, monkeypatch):
     assert result["errors"] == []
     assert result["remaining"] == 1
     assert [r["name"] for r in result["removed"]] == ["Amazing Spider-Man #300"]
+    assert result["scoped"] is False
 
     # The non-owned item survives; the owned one is gone.
     remaining = cmds.cmd_wish_list_from_cache()
     assert [it["name"] for it in remaining] == ["X-Men #1"]
+
+
+def test_wish_list_conflicts_surface_matched_row_provenance(tmp_path, monkeypatch):
+    """BUI-266: each conflict carries the matched owned row's series_name +
+    release_date (BUI-249 provenance), so a caller can spot a decoy
+    cross-era/cross-edition match before removing it."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Avengers (1963 - 1996)",
+        full_title="Avengers #52",
+        release_date="1968-05-01",
+    )])
+    _seed_wish_list([{"name": "Avengers #52", "id": 52}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert len(result["conflicts"]) == 1
+    conflict = result["conflicts"][0]
+    assert conflict["series_name"] == "The Avengers (1963 - 1996)"
+    assert conflict["release_date"] == "1968-05-01"
+
+
+def test_wish_list_remove_conflicts_scoped_touches_only_named_set(tmp_path, monkeypatch):
+    """BUI-266: passing ``names`` scopes removal to that set only — a
+    pre-existing conflict NOT named stays untouched (the BUI-259 incident:
+    114 removed when ~6 were intended)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(full_title="Amazing Spider-Man #300"),
+        _agent_win_row(series="X-Men (2019 - 2021)", full_title="X-Men #1"),
+    ])
+    _seed_wish_list([
+        {"name": "Amazing Spider-Man #300", "id": 1},
+        {"name": "X-Men #1", "id": 2},
+    ])
+
+    result = cmds.cmd_wish_list_remove_conflicts(names=["Amazing Spider-Man #300"])
+
+    assert result["scoped"] is True
+    assert result["removed_count"] == 1
+    assert [r["name"] for r in result["removed"]] == ["Amazing Spider-Man #300"]
+    assert result["errors"] == []
+    # The un-named "X-Men #1" conflict must survive untouched.
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"X-Men #1"}
+
+
+def test_wish_list_remove_conflicts_scoped_rejects_stale_name(tmp_path, monkeypatch):
+    """BUI-266: a name that is NOT a current conflict (already removed, never
+    one, or a typo) is reported as an error, never silently accepted — the
+    scoped path re-checks against a fresh audit rather than trusting the
+    caller's list."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(full_title="Amazing Spider-Man #300")])
+    _seed_wish_list([
+        {"name": "Amazing Spider-Man #300", "id": 1},
+        {"name": "Not A Conflict #1", "id": 2},  # not owned — not a conflict
+    ])
+
+    result = cmds.cmd_wish_list_remove_conflicts(names=["Not A Conflict #1"])
+
+    assert result["removed_count"] == 0
+    assert result["removed"] == []
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["name"] == "Not A Conflict #1"
+    # Nothing was mutated — both wishes remain.
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Amazing Spider-Man #300", "Not A Conflict #1"}
+
+
+def test_wish_list_remove_conflicts_scoped_carries_provenance(tmp_path, monkeypatch):
+    """A scoped removal's returned entry carries the same matched-row
+    provenance the audit surfaced (BUI-266)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Avengers (1963 - 1996)",
+        full_title="Avengers #52",
+        release_date="1968-05-01",
+    )])
+    _seed_wish_list([{"name": "Avengers #52", "id": 52}])
+
+    result = cmds.cmd_wish_list_remove_conflicts(names=["Avengers #52"])
+
+    assert result["removed_count"] == 1
+    entry = result["removed"][0]
+    assert entry["matched_series_name"] == "The Avengers (1963 - 1996)"
+    assert entry["matched_release_date"] == "1968-05-01"
 
 
 def test_wish_list_remove_conflicts_surfaces_owner_and_spares_collection(tmp_path, monkeypatch):
