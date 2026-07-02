@@ -462,6 +462,9 @@ _REPRINT_MARKERS: frozenset[str] = frozenset({
     "tpb",
     "2nd printing",
     "second printing",
+    "retold",  # BUI-253 PR-review fix (S1): sold_comps.py's manual-fallback
+    # lexicon already flagged "retold" as a reprint marker; comic_identity's
+    # lexicon was missing it entirely.
 })
 
 
@@ -522,6 +525,13 @@ _TRADING_CARD_MARKERS: frozenset[str] = frozenset({
     "magic the gathering",
     "trading card",
     "trading cards",
+    # BUI-253 PR-review fix (S1): these four brand names were in
+    # sold_comps.py's manual-fallback lexicon but never made it into this
+    # deterministic lexicon — a real coverage gap on the primary path.
+    "donruss",
+    "impel",
+    "keepsake",
+    "signagraph",
 })
 
 
@@ -880,6 +890,10 @@ _COLLECTED_EDITION_MARKERS: frozenset[str] = frozenset({
 _FACSIMILE_MARKERS: frozenset[str] = frozenset({"facsimile"})
 _PROMO_REPRINT_MARKERS: frozenset[str] = frozenset({
     "true believers", "marvel tales", "2nd printing", "second printing",
+    "retold",  # BUI-253 PR-review fix (S1): also added to _REPRINT_MARKERS
+    # above so should_reject's deterministic path and identify_comic's
+    # edition classification both recognize it — one lexicon addition,
+    # kept in both places since they're intentionally split by kind.
 })
 
 
@@ -925,7 +939,19 @@ def _classify_edition_kind(title: str) -> str:
 # The primary, high-confidence issue signal: an explicit "#N" (optionally with
 # a trailing letter/suffix, e.g. "#1A") — same shape as _parse_wish_name's
 # issue group so the two conventions line up.
-_ISSUE_HASH_RE = re.compile(r"#\s*(\d+\w*)")
+#
+# BUI-253 PR-review nit (N1): also captures a decimal POINT-ISSUE ("#700.1",
+# a real Marvel numbering convention for interstitial issues) instead of
+# silently truncating to "700". Safe to add: the "#" anchor means this can
+# never collide with a grade decimal ("VF 9.4") — no seller ever hash-prefixes
+# a raw grade — and no existing test title contains a "#N.N" shape.
+#
+# Deliberately did NOT extend this to also capture a HALF-issue slash
+# ("#1/2") — "Batman #1/2" is a locked-in BUI-261 PR-review test case
+# (test_half_issue_slash_not_misread_as_lot) asserting issue=="1" (matching
+# convention: a half-issue scores against the WHOLE-number wish item), and
+# capturing "1/2" instead would break that existing, deliberate behavior.
+_ISSUE_HASH_RE = re.compile(r"#\s*(\d+(?:\.\d+)?\w*)")
 
 # A parenthetical group that is PURELY a year or year range — "(2022)",
 # "(1963 - 1998)", "(2022 - Present)" — stripped out of the extracted series
@@ -1006,6 +1032,32 @@ _LOT_RANGE_PATTERNS = [
     re.compile(r"\b(?:books?|issues?)\s*(\d{1,3})\s*-\s*#?\s*(\d{1,3})\b", re.IGNORECASE),
     # "#1 through 10" / "1 through 10" (spelled-out range, hash optional)
     re.compile(r"(?:#\s*)?(\d{1,3})\s+through\s+(\d{1,3})\b", re.IGNORECASE),
+    # BUI-253 PR-review fix (B1, blocking): a BARE 2-member dash range with no
+    # '#'/quantity-word/'through' anchor at all — "ASM 48-50 lot", "Amazing
+    # Spider-Man 48-50 comic lot". Without this, such a title fell through to
+    # _LOT_LIST_RE (which also accepts '-' as a separator, for the 3+-member
+    # chain case) and got parsed as the literal LIST ["48","50"] — silently
+    # DROPPING #49 (a real data-loss bug: collection-add records one entry
+    # per constituent, so the missing issue never gets recorded as owned).
+    #
+    # Must be tried LAST (after the more specific anchored patterns above)
+    # and must NEVER fire on a 3+-member dash CHAIN ("92-93-94-95-96") — that
+    # is a literal LIST (a real title can skip numbers within a chain), not a
+    # range, and naively range-computing any adjacent pair out of a longer
+    # chain would silently invent numbers that were never in the title —
+    # e.g. for "92-94-96", a naive 2-number match on "94-96" would wrongly
+    # imply a "95". The lookbehind/lookahead pair below reject any pair that has
+    # ANOTHER dash-number directly attached on either side, so only a truly
+    # ISOLATED "A-B" pair (no third chain member touching it) can match —
+    # _LOT_LIST_RE remains the sole path for anything longer. Reuses the same
+    # decimal-grade guard _LOT_MEMBER uses (a CGC-style "9.4-9.6" grade span
+    # must never be misread as an issue range) and the same \d{1,3} bound
+    # (4-digit year spans like "1962-1963" can never match — same BUI-243
+    # guard as everywhere else in this module).
+    re.compile(
+        r"(?<!\d-)(?<!\.)\b(\d{1,3})\b(?!\.\d)\s*-\s*"
+        r"(?<!\.)\b(\d{1,3})\b(?!\.\d)(?!\s*-\s*#?\d)"
+    ),
 ]
 
 # Explicit LISTS — separator-delimited individual members that must NOT be
@@ -1110,22 +1162,10 @@ def identify_comic(title: "str | None") -> ComicIdentity:
     if _foreign_edition_reject(raw_title):
         identity.reject_reasons.append("foreign-language/-market edition")
 
-    # --- lot detection + expansion (BUI-243/BUI-261) -----------------------
-    identity.is_lot = bool(_LOT_RE.search(raw_title))
-    count_mismatch = False
-    if identity.is_lot:
-        identity.constituent_issues = _expand_lot_issues(raw_title)
-        count_mismatch = lot_count_mismatch(raw_title)
-        if count_mismatch:
-            identity.reject_reasons.append(
-                "lot count/range mismatch: stated count disagrees with parsed range"
-            )
-        if not identity.constituent_issues:
-            identity.reject_reasons.append(
-                "lot detected but constituent issues could not be parsed"
-            )
-
     # --- edition classification ---------------------------------------------
+    # BUI-253 PR-review fix (S2): classified BEFORE lot detection now (used
+    # to run after) so the lot check below can consult it — see the S2 note
+    # there for why the ordering matters.
     identity.edition = _classify_edition_kind(raw_title)
     if identity.edition == "facsimile":
         identity.reject_reasons.append("facsimile reprint, not an original")
@@ -1141,6 +1181,34 @@ def identify_comic(title: "str | None") -> ComicIdentity:
     # only, not inherently a reject signal (hard_reject already handles the
     # "mismatches the WISHED series' own edition" case; identify_comic has no
     # wish item to compare against here).
+
+    # --- lot detection + expansion (BUI-243/BUI-261) -----------------------
+    # BUI-253 PR-review fix (S2, should-fix): a collected/facsimile/reprint
+    # edition is always a single purchasable SKU, never a multi-issue bundle
+    # — but _LOT_RE's bare \bcollection\b branch (from "complete collection"/
+    # "run collection") also fires on "Epic Collection" (a _COLLECTED_EDITION
+    # _MARKERS entry), so "X-Men Epic Collection Vol 3" was getting
+    # is_lot=True AND edition="collected" simultaneously — a contradictory
+    # identity (a lot with no constituent_issues but ALSO the wrong 0.3/0.5
+    # confidence tier instead of the "collected" 0.6 tier). Force is_lot=
+    # False for these three edition kinds regardless of what _LOT_RE finds;
+    # none of them should ever expand into constituent_issues.
+    identity.is_lot = (
+        identity.edition not in ("collected", "facsimile", "reprint")
+        and bool(_LOT_RE.search(raw_title))
+    )
+    count_mismatch = False
+    if identity.is_lot:
+        identity.constituent_issues = _expand_lot_issues(raw_title)
+        count_mismatch = lot_count_mismatch(raw_title)
+        if count_mismatch:
+            identity.reject_reasons.append(
+                "lot count/range mismatch: stated count disagrees with parsed range"
+            )
+        if not identity.constituent_issues:
+            identity.reject_reasons.append(
+                "lot detected but constituent issues could not be parsed"
+            )
 
     # --- series + issue extraction ------------------------------------------
     hash_m = _ISSUE_HASH_RE.search(stripped)

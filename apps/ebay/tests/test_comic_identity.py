@@ -29,6 +29,20 @@ class TestIdentifyComicCleanSingleIssue:
         ident = ci.identify_comic("Batman #1A Variant Cover")
         assert ident.issue == "1A"
 
+    def test_decimal_point_issue_captured_in_full(self):
+        """PR-review nit (N1): a real Marvel point-issue numbering convention
+        ("#700.1") must not be silently truncated to "700"."""
+        ident = ci.identify_comic("Amazing Spider-Man #700.1 Marvel 2011")
+        assert ident.issue == "700.1"
+        assert ident.series == "Amazing Spider-Man"
+
+    def test_half_issue_slash_still_reports_whole_number(self):
+        """N1 was deliberately NOT extended to half-issue slashes — "Batman
+        #1/2" must keep reporting issue="1" (the locked-in BUI-261 behavior:
+        a half-issue scores against the whole-number wish item), not "1/2"."""
+        ident = ci.identify_comic("Batman #1/2")
+        assert ident.issue == "1"
+
     def test_case_preserved_in_series(self):
         ident = ci.identify_comic("fantastic four #48 vf")
         assert ident.series == "fantastic four"
@@ -201,6 +215,23 @@ class TestIdentifyComicCollectedEdition:
     def test_epic_collection_classified_as_collected(self):
         ident = ci.identify_comic("X-Men Epic Collection: Second Genesis")
         assert ident.edition == "collected"
+        # PR-review fix (S2): "Collection" also matches _LOT_RE's bare
+        # \bcollection\b branch — must not also come back is_lot=True.
+        assert ident.is_lot is False
+
+    def test_epic_collection_not_misdetected_as_lot(self):
+        """PR-review fix (S2, should-fix): "X-Men Epic Collection Vol 3" was
+        getting is_lot=True (via _LOT_RE's bare \\bcollection\\b branch
+        matching "Collection" inside "Epic Collection") AND edition=
+        "collected" simultaneously — a contradictory identity (empty
+        constituent_issues plus the wrong confidence tier). A collected
+        edition is a single SKU, never a multi-issue lot."""
+        ident = ci.identify_comic("X-Men Epic Collection Vol 3")
+        assert ident.is_lot is False
+        assert ident.edition == "collected"
+        assert ident.confidence == 0.6
+        assert ident.constituent_issues == []
+        assert ident.volume == 3
 
     def test_collected_edition_missing_issue_is_not_a_parse_failure(self):
         """A collected edition legitimately has no single issue number — this
@@ -252,6 +283,21 @@ class TestIdentifyComicFacsimileAndReprint:
         assert ident.edition == "single-issue"
         assert ident.reject_reasons == []
 
+    def test_retold_classified_as_reprint(self):
+        """PR-review fix (S1): "retold" was in sold_comps.py's manual-fallback
+        lexicon but missing entirely from comic_identity — a real coverage
+        gap. Now in both _REPRINT_MARKERS (should_reject's deterministic
+        path) and _PROMO_REPRINT_MARKERS (identify_comic's edition
+        classification)."""
+        ident = ci.identify_comic("Amazing Spider-Man #300 Retold Edition")
+        assert ident.edition == "reprint"
+        assert any("later printing" in r for r in ident.reject_reasons)
+
+    def test_retold_rejected_by_should_reject(self):
+        assert ci.should_reject(
+            "Amazing Spider-Man #300 Retold Edition", "Amazing Spider-Man", "300"
+        ) is True
+
 
 # ─── Lot detection + expansion (every BUI-261 format) ─────────────────────
 
@@ -292,6 +338,55 @@ class TestIdentifyComicLotExpansion:
         assert ident.is_lot is True
         assert ident.series == "AVENGERS"
         assert ident.constituent_issues == ["92", "93", "94", "95", "96"]
+
+    def test_bare_two_member_dash_range_expanded_inclusive(self):
+        """PR-review fix (B1, blocking): a bare "A-B" dash range with no
+        '#'/quantity-word/'through' anchor at all was previously falling
+        through to the LIST parser and returning only ["48","50"] — silently
+        DROPPING #49. This is a real data-loss bug (collection-add records
+        one entry per constituent, so #49 would never get recorded as
+        owned). Must now expand inclusively like any other range."""
+        ident = ci.identify_comic("Amazing Spider-Man 48-50 comic lot")
+        assert ident.is_lot is True
+        assert ident.series == "Amazing Spider-Man"
+        assert ident.constituent_issues == ["48", "49", "50"]
+
+    def test_bare_two_member_dash_range_minimal_title(self):
+        ident = ci.identify_comic("ASM 48-50 lot")
+        assert ident.constituent_issues == ["48", "49", "50"]
+
+    def test_nonconsecutive_three_member_dash_chain_stays_literal_list(self):
+        """The B1 fix must NOT regress the 3+-member dash CHAIN case into a
+        computed range: "92-94-96" must stay the literal list ["92","94","96"]
+        (proving 96 does NOT get treated as a range endpoint with 92, which
+        would wrongly imply 93 exists) — this is what distinguishes a bare
+        2-member range (expand) from a 3+-member chain (literal list)."""
+        ident = ci.identify_comic("Avengers 92-94-96 lot")
+        assert ident.is_lot is True
+        assert ident.series == "Avengers"
+        assert ident.constituent_issues == ["92", "94", "96"]
+        assert "93" not in ident.constituent_issues
+        assert "95" not in ident.constituent_issues
+
+    def test_consecutive_five_member_dash_chain_still_literal_list(self):
+        """Re-assertion: the B1 fix must not change the existing consecutive
+        5-member dash-chain case (test_dash_separated_list_expanded above) —
+        it must still resolve via the literal-list path, not get short-
+        circuited into a range by matching an arbitrary internal pair."""
+        ident = ci.identify_comic("AVENGERS 92-93-94-95-96 Marvel Bronze Age Lot")
+        assert ident.constituent_issues == ["92", "93", "94", "95", "96"]
+
+    def test_bare_dash_year_span_in_non_lot_title_untouched(self):
+        """A bare 2-member dash pair that's actually a 4-digit year span in a
+        genuine single-issue (non-lot) title must remain completely
+        unaffected by the B1 fix — is_lot stays False (no lot signal at all
+        in this title) so lot expansion never even runs, and the pattern
+        itself can't match 4-digit numbers regardless (same \\d{1,3} bound
+        used everywhere else in this module)."""
+        ident = ci.identify_comic("Amazing Spider-Man #4 1962-1963 Silver Age Marvel")
+        assert ident.is_lot is False
+        assert ident.issue == "4"
+        assert ident.constituent_issues == []
 
     def test_hash_range_expanded_inclusive(self):
         ident = ci.identify_comic("Amazing Spider-Man #1-#10 Bronze Age Lot")
@@ -356,6 +451,16 @@ class TestIdentifyComicLotCountMismatch:
         assert "Lot" not in ident.series
         assert ident.series == "Amazing Spider-Man"
 
+    def test_mid_string_lot_boilerplate_stripped_from_series(self):
+        """PR-review polish: the boilerplate must be stripped wherever it
+        falls, not just when it's anchored at the very start of the title —
+        "Avengers Lot of 11 Comics #1-10" must yield series="Avengers", not
+        "Avengers Lot of 11 Comics"."""
+        ident = ci.identify_comic("Avengers Lot of 11 Comics #1-10")
+        assert ident.series == "Avengers"
+        assert "Lot" not in ident.series
+        assert ident.constituent_issues == [str(n) for n in range(1, 11)]
+
 
 # ─── Deterministic reject-reason population (mirrors should_reject's lexicons) ─
 
@@ -371,6 +476,25 @@ class TestIdentifyComicRejectReasons:
 
     def test_trading_card_flagged(self):
         ident = ci.identify_comic("1990 Fleer Marvel Trading Card #1")
+        assert "trading card / TCG product" in ident.reject_reasons
+
+    def test_donruss_trading_card_flagged(self):
+        """PR-review fix (S1): Donruss/Impel/Keepsake/Signagraph were in
+        sold_comps.py's manual-fallback lexicon but missing from
+        _TRADING_CARD_MARKERS — a real coverage gap on the primary path."""
+        ident = ci.identify_comic("1991 Donruss Marvel Universe Card #5")
+        assert "trading card / TCG product" in ident.reject_reasons
+
+    def test_impel_trading_card_flagged(self):
+        ident = ci.identify_comic("Impel Marvel Universe Series 2 Card #10")
+        assert "trading card / TCG product" in ident.reject_reasons
+
+    def test_keepsake_trading_card_flagged(self):
+        ident = ci.identify_comic("Keepsake Comics Marvel Card")
+        assert "trading card / TCG product" in ident.reject_reasons
+
+    def test_signagraph_trading_card_flagged(self):
+        ident = ci.identify_comic("Signagraph Marvel Card")
         assert "trading card / TCG product" in ident.reject_reasons
 
     def test_foreign_edition_flagged(self):
@@ -426,6 +550,39 @@ class TestIdentifyComicConfidenceTiers:
 
     def test_tier_0_0_whitespace_only_title(self):
         assert ci.identify_comic("   ").confidence == 0.0
+
+
+# ─── EDITION_LABELS / _EDITION_PATTERNS drift guard ────────────────────────
+
+
+class TestEditionLabelsInSyncWithEditionPatterns:
+    """PR-review nit (N3): EDITION_LABELS is a hand-maintained parallel to
+    _EDITION_PATTERNS (Step 1, byte-identical — can't move or change), used
+    only to render the Haiku verify-prompt's edition-mismatch bullet (BUI-253
+    Step 5). Nothing enforces the two stay in sync if a future edit adds/
+    removes an edition word from one without the other — these tests catch
+    that drift."""
+
+    def test_same_count(self):
+        assert len(ci.EDITION_LABELS) == len(ci._EDITION_PATTERNS)
+
+    def test_every_label_matches_exactly_one_edition_pattern(self):
+        for label in ci.EDITION_LABELS:
+            sample = f"Test {label} #1"
+            matches = [p for p in ci._EDITION_PATTERNS if p.search(sample)]
+            assert len(matches) == 1, (
+                f"{label!r} should match exactly one _EDITION_PATTERNS entry, "
+                f"matched {len(matches)}"
+            )
+
+    def test_every_edition_pattern_has_a_matching_label(self):
+        """The reverse direction — every _EDITION_PATTERNS entry must be
+        represented by at least one EDITION_LABELS sample, so a newly-added
+        pattern with no corresponding label is caught too."""
+        for pat in ci._EDITION_PATTERNS:
+            assert any(
+                pat.search(f"Test {label} #1") for label in ci.EDITION_LABELS
+            ), f"pattern {pat.pattern!r} has no matching EDITION_LABELS entry"
 
 
 # ─── Edge cases ─────────────────────────────────────────────────────────────
