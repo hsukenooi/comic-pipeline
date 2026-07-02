@@ -810,7 +810,9 @@ _FMV_COLLECTIBLE_MARKERS: frozenset[str] = frozenset({
 _FMV_LOT_RE = re.compile(
     r"""
     \#\d+\s+\#\d+                    # space-separated hash issues: "#1 #2" (any length)
-    | \#\d{1,4}\s*,\s*\#?\d{1,3}\b   # 2-member comma pair: "#64, #65" / "#64, 65"
+    | \#\d{1,4}\s*,\s*\#?\d{1,3}(?!\.\d)\b   # 2-member comma pair: "#64, #65" / "#64, 65"
+                                             # (?!\.\d): don't match a decimal grade
+                                             # after a comma, e.g. "#300, 9.8 CGC"
     """,
     re.IGNORECASE | re.VERBOSE,
 )

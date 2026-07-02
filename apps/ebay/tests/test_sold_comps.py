@@ -149,6 +149,9 @@ class TestHardExclude:
         # comma edge: "#1, 2018" is a hash then a YEAR, not a 2-issue lot —
         # _FMV_LOT_RE bounds the comma member to 1-3 digits to avoid this.
         "Detective Comics #1, 2018",
+        # comma edge: "#300, 9.8" is a hash then a decimal GRADE, not a lot —
+        # the (?!\.\d) lookahead keeps this single graded issue in the comp pool.
+        "Amazing Spider-Man #300, 9.8 CGC",
     ])
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)
