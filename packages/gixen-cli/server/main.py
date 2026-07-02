@@ -1061,6 +1061,31 @@ async def api_add_bid(req: AddBidRequest):
         raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}") from e
 
 
+def _serialize_snipe_row(item: dict) -> dict:
+    """Shared row shape for /api/snipes and /api/history (BUI-273). The two
+    endpoints differ only in their WHERE filter — this is the parity surface
+    that BUI-50 drifted on, so keep it as the single source of truth.
+    """
+    end_date_iso = item.get("auction_end_at")
+    return {
+        "item_id": item["item_id"],
+        "title": item.get("ebay_title") or None,
+        "current_bid": item.get("cached_current_bid"),
+        "max_bid": f"{item['max_bid']:.2f} USD",
+        "bid_offset": item["bid_offset"],
+        "snipe_group": item["snipe_group"],
+        "time_to_end": _iso_to_relative(end_date_iso),
+        "end_date_iso": end_date_iso,
+        "status": item["status"],
+        "status_mirror": item.get("status_mirror"),
+        "winning_bid": item.get("winning_bid"),
+        "seller": item.get("seller"),
+        "cached_at": item.get("cached_at"),
+        "local_snipe_at": item.get("local_snipe_at"),
+        "local_snipe_result": item.get("local_snipe_result"),
+    }
+
+
 @app.get("/api/snipes")
 async def api_get_snipes():
     """Pull-on-visit. Synchronously refreshes from Gixen (deduped within
@@ -1079,29 +1104,7 @@ async def api_get_snipes():
         ORDER BY added_at DESC
     """).fetchall()
 
-    result = []
-    for row in rows:
-        item = dict(row)
-        end_date_iso = item.get("auction_end_at")
-        result.append({
-            "item_id": item["item_id"],
-            "title": item.get("ebay_title") or None,
-            "current_bid": item.get("cached_current_bid"),
-            "max_bid": f"{item['max_bid']:.2f} USD",
-            "bid_offset": item["bid_offset"],
-            "snipe_group": item["snipe_group"],
-            "time_to_end": _iso_to_relative(end_date_iso),
-            "end_date_iso": end_date_iso,
-            "status": item["status"],
-            "status_mirror": item.get("status_mirror"),
-            "winning_bid": item.get("winning_bid"),
-            "seller": item.get("seller"),
-            "cached_at": item.get("cached_at"),
-            "local_snipe_at": item.get("local_snipe_at"),
-            "local_snipe_result": item.get("local_snipe_result"),
-        })
-
-    return result
+    return [_serialize_snipe_row(dict(row)) for row in rows]
 
 
 @app.get("/api/history")
@@ -1129,28 +1132,7 @@ async def api_get_history():
         ORDER BY COALESCE(b.auction_end_at, b.resolved_at) DESC
     """).fetchall()
 
-    result = []
-    for row in rows:
-        item = dict(row)
-        end_date_iso = item.get("auction_end_at")
-        result.append({
-            "item_id": item["item_id"],
-            "title": item.get("ebay_title") or None,
-            "current_bid": item.get("cached_current_bid"),
-            "max_bid": f"{item['max_bid']:.2f} USD",
-            "bid_offset": item["bid_offset"],
-            "snipe_group": item["snipe_group"],
-            "time_to_end": _iso_to_relative(end_date_iso),
-            "end_date_iso": end_date_iso,
-            "status": item["status"],
-            "status_mirror": item.get("status_mirror"),
-            "winning_bid": item.get("winning_bid"),
-            "seller": item.get("seller"),
-            "cached_at": item.get("cached_at"),
-            "local_snipe_at": item.get("local_snipe_at"),
-            "local_snipe_result": item.get("local_snipe_result"),
-        })
-    return result
+    return [_serialize_snipe_row(dict(row)) for row in rows]
 
 
 @app.get("/api/bids")
