@@ -2582,10 +2582,34 @@ def cmd_collection_record_win(
             else:
                 full_title = base_title
 
-            # release_date: prefer store_date, fall back to cover_date
+            # release_date: prefer store_date, fall back to cover_date.
+            #
+            # BUI-268: same reprint guard as the BUI-210 date-only lookup below
+            # — this metron_data can come from the FIRST Metron call (the R36
+            # step-2 series-resolution path a few lines up, used when
+            # series_name_index has no entry), which has no year filter of its
+            # own. Left unguarded, a reprint/collected-edition store_date
+            # (observed: Infinity Gauntlet #1 stamped 2022-09-14 from a 2022
+            # reprint hit, despite series_name correctly resolving to "The
+            # Infinity Gauntlet (1991) (1991 - 1991)") got written onto an
+            # otherwise-correct 1991 row, so a later year-gated
+            # collection-check for the real 1991 issue found the row and
+            # rejected it as a mismatched era. Only accept the Metron date when
+            # its year matches year_raw; a mismatch is dropped (R66: a Metron
+            # hit that lacks a trustworthy date stays blank — the relaxed year
+            # gate then fail-opens on this row rather than falsely rejecting a
+            # genuinely-owned copy).
             release_date: Optional[str] = None
             if metron_data:
-                release_date = metron_data.get("store_date") or metron_data.get("cover_date")
+                candidate_date = metron_data.get("store_date") or metron_data.get("cover_date")
+                year_str = str(year_raw).strip() if year_raw is not None else ""
+                if (
+                    re.fullmatch(r"\d{4}", year_str)
+                    and candidate_date
+                    and not str(candidate_date).startswith(year_str)
+                ):
+                    candidate_date = None
+                release_date = candidate_date
 
             # BUI-105: when no Metron data backs this win (the series_name_index
             # path, or the bare-series manual fallback), there is no Metron date,

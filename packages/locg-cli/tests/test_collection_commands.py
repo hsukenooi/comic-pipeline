@@ -1375,6 +1375,81 @@ def test_record_win_series_from_metron(tmp_path):
     assert row["needs_manual_series_canonical"] is False
 
 
+def test_record_win_metron_series_resolution_reprint_guard(tmp_path):
+    """BUI-268: metron_data from the FIRST Metron call (series resolution, no
+    series_name_index entry) can carry a reprint/collected-edition date — the
+    reported Infinity Gauntlet #1 case, where Metron correctly resolved the
+    series to 'The Infinity Gauntlet (1991) (1991 - 1991)' but its cover_date
+    was a 2022 reprint's. Left unguarded, that date got written verbatim, so a
+    later year-gated collection-check for the real 1991 issue rejected the row
+    as a different era. The date must be dropped (left blank, R66) when its
+    year disagrees with the win's own year."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 999,
+        "cover_date": "2022-09-14",  # a 2022 reprint's date, not the 1991 original
+        "store_date": None,
+        "series_year_began": 1991,
+        "series_year_end": 1991,
+        "series_name": "Infinity Gauntlet",
+        "series_id": 42,
+    }
+    metron.format_series_name.return_value = "The Infinity Gauntlet (1991) (1991 - 1991)"
+    metron.degraded = False
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Infinity Gauntlet", issue="1", year=1991)],
+        cache=cache, metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "The Infinity Gauntlet (1991) (1991 - 1991)"
+    assert row["release_date"] is None
+
+
+def test_record_win_metron_series_resolution_matching_date_kept(tmp_path):
+    """The reprint guard (BUI-268) only rejects a MISMATCHED year — a Metron
+    date that agrees with the win's year is still written normally."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_hit("Amazing Spider-Man (1963 - 1998)")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man", issue="300", year=1988)],
+        cache=cache, metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1988-05-10"
+
+
+def test_check_infinity_gauntlet_no_article_matches_stored_the_prefixed(tmp_path, monkeypatch):
+    """BUI-268 regression: a bare 'Infinity Gauntlet' query matches an owned
+    row stored under 'The Infinity Gauntlet ...', and a year-gated query for
+    the issue's real year still finds it once the reprint-date guard (above)
+    keeps release_date from being corrupted by a reprint hit."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Infinity Gauntlet (1991) (1991 - 1991)",
+        full_title="The Infinity Gauntlet #1",
+        release_date=None,  # BUI-268: reprint guard leaves this blank
+    )])
+
+    result = cmds.cmd_collection_check(series="Infinity Gauntlet", issue="1", year="1991")
+    assert result["match_status"] == "in_collection"
+    assert result["matched_series_name"] == "The Infinity Gauntlet (1991) (1991 - 1991)"
+
+
 # --- BUI-199: full_title is built from the BASE (undecorated) series name ---
 
 def _seed_export_series(cache, series_names: list[str]) -> None:
