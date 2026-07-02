@@ -1057,20 +1057,6 @@ def upsert_fmv(
     return row["id"]
 
 
-def set_bid_fmv(conn: sqlite3.Connection, bid_id: int, fmv_id: int | None) -> None:
-    """Set or clear bids.fmv_id."""
-    conn.execute("UPDATE bids SET fmv_id=? WHERE id=?", (fmv_id, bid_id))
-    conn.commit()
-
-
-def get_fmv_for_bid(conn: sqlite3.Connection, bid_id: int) -> sqlite3.Row | None:
-    """Return the fmv row linked via bids.fmv_id, or None."""
-    return conn.execute(
-        "SELECT f.* FROM bids b JOIN fmv f ON f.id = b.fmv_id WHERE b.id=?",
-        (bid_id,),
-    ).fetchone()
-
-
 def link_fmv_to_bid(
     conn: sqlite3.Connection,
     bid_id: int,
