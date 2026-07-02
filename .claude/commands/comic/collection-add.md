@@ -162,9 +162,27 @@ For each **new** won snipe, build one entry in this format:
 **Source priority for `identify_data`:**
 
 1. **In-session context** — if this skill is being called from `/comic:buy` and you already identified the comics in Step 1, use those identifications directly.
-2. **Parse from gixen title** — extract series, issue, and year from the snipe's `title` field. For lots, build one entry per issue. If the title is ambiguous (e.g., "Marvel Silver Age Lot"), ask the user once before proceeding.
+2. **Parse from gixen title via `comic-identify` (BUI-253)** — run the canonical
+   title-parser on the snipe's `title` field instead of parsing it yourself:
 
-Do not leave `series` or `issue` blank — if you cannot determine them, ask the user for that specific snipe.
+   ```bash
+   comic-identify "Ghost Rider #1 Marvel 1973 Newsstand"
+   # {"series": "Ghost Rider", "issue": "1", "year": 1973, "edition": "single-issue",
+   #  "is_lot": false, "constituent_issues": [], "reject_reasons": [], "confidence": 1.0, ...}
+   ```
+
+   Map its output straight into `identify_data`: `series` → `series`, `issue` → `issue`,
+   `year` → `year` (omit if `null`). There's no direct `variant_text` field — infer it
+   from the title as before (Newsstand/Direct/etc. aren't part of ComicIdentity).
+
+   **For lots** (`"is_lot": true`): build one `identify_data` entry per issue number in
+   `constituent_issues`, all sharing the extracted `series`. If `constituent_issues` is
+   empty (a bundle whose contents couldn't be parsed — e.g. "Marvel Silver Age Lot") or
+   `confidence` is low, ask the user once before proceeding rather than guessing.
+
+Do not leave `series` or `issue` blank — if `comic-identify` can't determine them
+(`series`/`issue` are `null`, or `confidence` is low), ask the user for that specific
+snipe rather than guessing.
 
 ## Step 3: Record wins
 

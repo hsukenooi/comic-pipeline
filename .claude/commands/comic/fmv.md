@@ -116,19 +116,46 @@ Not every result is a valid comp. Three tiers:
 
 ### Hard exclude (drop entirely)
 
+**Deterministic identity excludes — via `comic-identify` (BUI-253):** when filtering
+manually (not running the `comic-fmv` CLI, which applies its own hard-exclude regex —
+see note below), pipe each candidate title through the canonical title-parser instead of
+eyeballing it for lot/reprint/foreign-edition/trading-card keywords:
+
+```bash
+comic-identify "Amazing Spider-Man #48-50 Lot"
+# {"is_lot": true, "constituent_issues": ["48","49","50"], ...}
+```
+
+Drop the comp if:
+- `"is_lot"` is `true` — lots / multi-issue bundles (`"lot"`, `#48-50`, `#15 & #16`,
+  comma/slash/dash chains, "N through M" — every BUI-261 format is already handled).
+- `"edition"` is `"facsimile"` or `"reprint"` — facsimile editions, Marvel Tales/True
+  Believers reprints, 2nd printings, "retold" editions.
+- `reject_reasons` contains `"foreign-language/-market edition"` — La Prensa / Spanish-
+  language reprints. **Narrower than the classic FMV markers below** — see the Foreign
+  editions (supplement) bullet.
+- `reject_reasons` contains `"trading card / TCG product"` — trading cards, Upper Deck,
+  Fleer, etc.
+
+**Manual/condition excludes — not identity concerns, no CLI for these:**
+
 - **Coverless / damaged structurally** — "coverless", "no cover", "cover torn", "cvr off", "detached"
 - **Missing content** — "missing pin-up", "missing wrap", "missing pages", "non story page missing"
-- **Lots / multi-issue bundles** — "lot", `#48-50`, `#15 & #16`, `& strange tales`, etc.
-- **Reprints / facsimile editions** — "reprint", "2024 reprint", "facsimile", "marvel tales", "retold"
-- **Foreign editions** — "rare uk", "rare brazil", "rare mexico", "norway", "australia", "italian", "spain", "ebal", "pence", "9d variant"
-- **Wrong volume** — "vol 2/3/4/5/6/7", later-run issues with same number (e.g., for ASM #5 1963 exclude `#75 vol 5`, `#288`)
+- **Foreign editions (supplement)** — "rare uk", "rare brazil", "rare mexico", "norway", "australia", "italian", "spain", "ebal", "pence", "9d variant" — `comic-identify`'s foreign-edition lexicon (La Prensa/Spanish-focused) doesn't cover these yet; keep checking for them manually until BUI-253 widens it
+- **Wrong volume** — "vol 2/3/4/5/6/7", later-run issues with same number (e.g., for ASM #5 1963 exclude `#75 vol 5`, `#288`). `comic-identify` reports a `volume` field per title, but there's no wish item here to compare it against — use judgment against the target book's known volume/year
 - **Other graders** — "psa", "pgx" (alongside the existing `-cgc -cbcs -graded -slab`)
 - **McFarlane Toys / figures** — "1:6 scale", "collectible figure", "action figure"
-- **Trading cards** — "Upper Deck", "trading card", "Johnny Lightning", "Keepsake", "Signagraph", "Donruss", "Impel", "Fleer", "PSA" (sports card grader)
 - **Premium-distorting** — "signed by", "stan lee" (autograph), "Signature Series"
 - **WW Live Sale results** — titles starting with "WW LIVE SALE" swing erratically
 - **Junk listings** — "space filler", "single panel", "production acetate"
 - **Restored copies / waterstain** unless target is also in that state
+
+**Note:** the default `comic-fmv` CLI path applies its own hard-exclude regex
+(`apps/ebay/src/sold_comps.py`, `HARD_EXCLUDE_RE`) automatically — you only need the
+`comic-identify` calls above when filtering comps by hand (debugging the CLI, or a
+manual fallback run with no `comic-fmv` available). That regex independently duplicates
+some of the same lot/reprint/foreign/trading-card detection `comic-identify` now
+canonicalizes; consolidating it is tracked as a BUI-253 follow-up, not done here.
 
 ### Suspect (flag, manual review — do NOT auto-include in FMV)
 

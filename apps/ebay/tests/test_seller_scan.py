@@ -2397,6 +2397,74 @@ class TestVerifyWithClaudePromptEnrichment:
         assert "Newsstand and Direct editions are NOT reprints" in prompt
 
 
+class TestVerifyWithClaudeRejectBulletsFromLexicons:
+    """BUI-253 Step 5: the reject-list bullets that duplicate a deterministic
+    comic_identity lexicon are BUILT from that lexicon (comic_identity.
+    EDITION_LABELS / foreign_edition_examples() / later_printing_examples())
+    instead of hand-typed prose — so the prompt can't silently drift from
+    what should_reject actually checks. These assert the ACTUAL lexicon
+    contents land in the prompt, not just the stable lead-in phrase (already
+    covered above)."""
+
+    @pytest.fixture(autouse=True)
+    def _set_api_key(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+
+    def _capture_prompt(self, matches, monkeypatch):
+        prompts_seen = []
+
+        def fake_create(**kwargs):
+            prompts_seen.append(kwargs["messages"][0]["content"])
+            resp = MagicMock()
+            resp.content = [MagicMock(text="[]")]
+            return resp
+
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = fake_create
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+        seller_scan.verify_with_claude(matches)
+        return prompts_seen[0]
+
+    def test_edition_bullet_includes_all_four_edition_labels(self, monkeypatch):
+        """Before BUI-253 this bullet only said "Annual, Giant-Size" — King-Size
+        and Treasury were silently missing from Haiku's reminder even though
+        hard_reject's _EDITION_PATTERNS has always checked all four. Sourcing
+        the bullet from comic_identity.EDITION_LABELS fixes that gap."""
+        matches = [{"title": "X #1", "wish_name": "X #1"}]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        for label in seller_scan.EDITION_LABELS:
+            assert label in prompt
+        assert seller_scan.EDITION_LABELS == ("Annual", "Giant-Size", "King-Size", "Treasury")
+
+    def test_foreign_edition_bullet_contains_actual_lexicon_markers(self, monkeypatch):
+        """The bullet must contain the REAL _FOREIGN_EDITION_MARKERS entries,
+        not just a hand-picked example — proving it's generated, not typed."""
+        matches = [{"title": "X #1", "wish_name": "X #1"}]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "la prensa" in prompt
+        assert "novedades" in prompt
+        assert "espanol" in prompt
+
+    def test_later_printing_bullet_contains_actual_lexicon_markers(self, monkeypatch):
+        matches = [{"title": "X #1", "wish_name": "X #1"}]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "2nd printing" in prompt
+        assert "second printing" in prompt
+
+    def test_reject_bullets_are_stable_across_calls(self, monkeypatch):
+        """The rendered bullets don't depend on the candidates passed in —
+        confirms they're computed from the module-level lexicons, not
+        per-candidate data."""
+        matches_a = [{"title": "X #1", "wish_name": "X #1"}]
+        matches_b = [{"title": "Y #99", "wish_name": "Y #99"}]
+        prompt_a = self._capture_prompt(matches_a, monkeypatch)
+        prompt_b = self._capture_prompt(matches_b, monkeypatch)
+        bullets_a = prompt_a.split("Reject if:")[1].split("Respond with")[0]
+        bullets_b = prompt_b.split("Reject if:")[1].split("Respond with")[0]
+        assert bullets_a == bullets_b
+
+
 # ─── BUI-229: publication_year_mismatch ──────────────────────────────────────
 
 

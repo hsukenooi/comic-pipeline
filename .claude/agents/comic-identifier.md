@@ -51,7 +51,7 @@ Fields to use from each object:
 | Field | What to use it for |
 |---|---|
 | `item_id` | Row identifier |
-| `title` | Full listing title — derive series and issue number from this |
+| `title` | Full listing title — run through `comic-identify` (below) to get series/issue, don't parse it yourself |
 | `listing_type` | `"Auction"` or `"BIN"` |
 | `current_price` | Current bid (auctions) or buy price (BIN) |
 | `end_date` | When the auction ends (ISO-8601) |
@@ -61,6 +61,24 @@ Fields to use from each object:
 | `variant` | Newsstand, Direct, Whitman, etc. Null if not found |
 | `item_specifics` | Full key-value pairs from the listing |
 | `seller` | eBay seller username (not the store display name) |
+
+**Series + issue extraction (BUI-253):** run each listing's `title` through the
+canonical title-parser instead of eyeballing it — this is the same parser
+seller-scan/wishlist-sellers/comic-fmv use, so identifications stay consistent
+across every `/comic:*` skill:
+
+```bash
+comic-identify "AMAZING SPIDER-MAN #300 NM Marvel 1988 VENOM"
+# {"series": "Amazing Spider-Man", "issue": "300", "year": 1988,
+#  "edition": "single-issue", "is_lot": false, "constituent_issues": [],
+#  "reject_reasons": [], "confidence": 1.0, ...}
+```
+
+Use `series` for the **Comic** column and `issue` for the **Issue** column (prefix
+with `#`). If `"is_lot": true`, put the constituent range in the Issue column (e.g.
+`#48-50`) and flag it — a lot is not a single-issue identification. If `confidence`
+is low (≤ 0.3) or `series`/`issue` came back `null`, flag the row with a note instead
+of guessing (e.g. `⚠️ Could not parse series/issue from title`).
 
 **Grade logic:**
 - `grade_source` is `"missing"` → check the title first; if the grade appears explicitly
@@ -99,7 +117,7 @@ Rules:
   null (a true no-grade listing); if `grade_from_description` is present, show it as a weak
   description-sourced grade instead.
 - Flag Buy It Now listings with `⚠️ Buy It Now` in Notes — they're skipped at the Gixen step.
-- Series and issue are not returned directly by the API — derive them from the `title` field.
+- Series and issue are not returned directly by the API — run `comic-identify` on the `title` field (see Step 2 above), don't parse it by hand.
 - Include the `seller` username in the Seller column exactly as returned (it's the key for
   seller-reliability lookups and is stored on the snipe).
 
