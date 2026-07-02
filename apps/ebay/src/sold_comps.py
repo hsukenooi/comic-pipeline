@@ -24,6 +24,8 @@ from pathlib import Path
 
 import requests
 
+import comic_identity
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 CACHE_DIR = Path.home() / ".cache" / "ebay-sold-comps"
@@ -198,19 +200,21 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
 
 
 # ─── Hard excludes ────────────────────────────────────────────────────────────
+#
+# BUI-269: the lot/reprint/foreign-edition/trading-card checks that used to
+# live in this regex are now sourced from comic_identity.is_comp_excluded()
+# (apps/ebay/src/comic_identity.py) — that module is the single source of
+# truth, reconciling this lexicon with the near-identical one seller_scan.py
+# used to hand-maintain (BUI-253). What remains here is condition/grading/
+# damage exclusion with no analog in comic_identity: it isn't about comic
+# *identity* at all, so it stays local to the FMV comp pipeline.
 
-HARD_EXCLUDE_RE = re.compile(
+LOCAL_EXCLUDE_RE = re.compile(
     r'''
     coverless | no\s+cover | cover\s+torn | cvr\s+off | detached\s+cover |
     missing\s+pages? | missing\s+pin | missing\s+wrap |
-    \blot\b | \#\d+\s*[-,&]\s*\#?\d+ | \#\d+\s+\#\d+ |
-    reprint | facsimile | marvel\s+tales | retold |
-    \buk\b | pence | 9d\s+variant | rare\s+brazil | rare\s+mexico |
-    norway | australia | italian | \bspain\b | ebal |
     vol[\s.]?[2-9] | \bv[2-9]\b |
     \bpsa\b | \bpgx\b |
-    action\s+figure | 1:6\s+scale | collectible\s+figure |
-    trading\s+card | upper\s+deck | johnny\s+lightning |
     signed\s+by | stan\s+lee.*sign | signature\s+series |
     ww\s+live\s+sale | space\s+filler | restored | water.?stain
     ''',
@@ -219,7 +223,7 @@ HARD_EXCLUDE_RE = re.compile(
 
 
 def hard_exclude(title: str) -> bool:
-    return bool(HARD_EXCLUDE_RE.search(title))
+    return comic_identity.is_comp_excluded(title) or bool(LOCAL_EXCLUDE_RE.search(title))
 
 
 # ─── Grade parsing ────────────────────────────────────────────────────────────

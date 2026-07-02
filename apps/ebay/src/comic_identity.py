@@ -751,6 +751,105 @@ def should_reject(
     return False
 
 
+# ─── FMV comp-exclusion (BUI-269) ────────────────────────────────────────────
+# sold_comps.py (apps/ebay/src/sold_comps.py, run automatically by comic-fmv
+# via ebay-sold-comps) carried a THIRD, independently hand-maintained copy of
+# the lot/reprint/foreign-edition/trading-card exclude logic above, and it had
+# drifted: sold_comps knew about UK/pence/Norway/Australia/Italian/Spain
+# market markers that never made it into this module, and vice versa. BUI-269
+# reconciles the two so comic_identity is the single source of truth.
+#
+# The bare geographic/market markers below are deliberately kept OUT of
+# _FOREIGN_EDITION_MARKERS above rather than merged into it: that lexicon
+# feeds hard_reject/should_reject, which gate a real purchase decision
+# (wishlist-sellers, identify_comic) and are intentionally conservative about
+# bare nationality words (BUI-239) — a false reject there costs a missed
+# purchase. is_comp_excluded() below only decides whether to drop ONE
+# comparable listing from an FMV price average; a false exclude there just
+# shrinks the comp pool slightly, a much cheaper mistake. So the two paths
+# share the same reprint/trading-card/foreign-edition base but the
+# comp-exclusion path additionally unions in these higher-risk markers.
+_FMV_FOREIGN_MARKET_MARKERS: frozenset[str] = frozenset({
+    "uk",
+    "pence",
+    "9d variant",
+    "rare brazil",
+    "rare mexico",
+    "norway",
+    "australia",
+    "italian",
+    "spain",
+    "ebal",
+})
+
+# Non-comic collectibles sold_comps also excluded alongside its trading-card
+# markers (action figures, die-cast-scale toys) — precise phrases with no
+# bare-adjective false-positive risk, so no split-lexicon caveat needed here.
+#
+# "johnny lightning" (a die-cast toy brand) lives here, NOT in
+# _TRADING_CARD_MARKERS: that trading-card set feeds should_reject/hard_reject
+# (the purchase-decision path), and BUI-269's scope is comp-pool exclusion, so
+# a comp-only marker belongs in this comp-only set — not a widening of the
+# conservative purchase-reject lexicon.
+_FMV_COLLECTIBLE_MARKERS: frozenset[str] = frozenset({
+    "action figure",
+    "1:6 scale",
+    "collectible figure",
+    "johnny lightning",
+})
+
+# Multi-issue lot shapes that the pre-BUI-269 sold_comps HARD_EXCLUDE_RE caught
+# but the shared _LOT_RE (purchase-decision path) does NOT: a SPACE-separated
+# hash-issue list ("#1 #2", "#1 #2 #3") and a 2-MEMBER COMMA pair ("#64, #65").
+# _LOT_RE's comma branch needs 3+ members and it has no space separator, so
+# without this a 2-3 book lot would leak into the FMV comp pool and inflate the
+# average (a false-INCLUDE — the expensive direction). Kept comp-only (checked
+# by is_comp_excluded, never merged into _LOT_RE) so it can't make the
+# conservative purchase path reject more (BUI-239). The comma member is bounded
+# to 1-3 digits so "#1, 2018" (a hash then a YEAR) is not mistaken for a lot.
+_FMV_LOT_RE = re.compile(
+    r"""
+    \#\d+\s+\#\d+                    # space-separated hash issues: "#1 #2" (any length)
+    | \#\d{1,4}\s*,\s*\#?\d{1,3}(?!\.\d)\b   # 2-member comma pair: "#64, #65" / "#64, 65"
+                                             # (?!\.\d): don't match a decimal grade
+                                             # after a comma, e.g. "#300, 9.8 CGC"
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def is_comp_excluded(title: str) -> bool:
+    """Return True if *title* should be excluded as an eBay-sold-listing FMV
+    comparable (BUI-269 — the single source of truth for
+    sold_comps.hard_exclude()'s lot/reprint/foreign-edition/trading-card
+    checks).
+
+    Unlike should_reject/hard_reject, there is no candidate wish (series,
+    issue) to compare against here — sold_comps only has a bare sold-listing
+    title — so this reuses the WISH-INDEPENDENT reject helpers (lot
+    detection, reprint/trading-card/foreign-edition lexicons) plus the
+    comp-exclusion-only market/collectible markers above. It does NOT run
+    hard_reject's issue-number-missing or edition-vs-series checks (both
+    require a wish item) or era_mismatch/_digital_reject (sold_comps has its
+    own separate condition/grading excludes for concerns those don't cover).
+    """
+    if _LOT_RE.search(title or ""):
+        return True
+    if _FMV_LOT_RE.search(title or ""):  # BUI-269: comp-only lot shapes _LOT_RE misses
+        return True
+    if _reprint_reject(title):
+        return True
+    if _trading_card_reject(title):
+        return True
+    if _foreign_edition_reject(title):
+        return True
+    if _marker_hit(title, _FMV_FOREIGN_MARKET_MARKERS):
+        return True
+    if _marker_hit(title, _FMV_COLLECTIBLE_MARKERS):
+        return True
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # BUI-253 Step 2: standalone freeform-title → comic-identity extraction.
 #

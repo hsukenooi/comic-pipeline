@@ -195,17 +195,51 @@ Then also clean the
 wish-list itself so no owned-but-wished entry survives to be pushed in Step 3b:
 
 ```bash
-# Dry-run audit (BUI-130) — surfaces owned-but-wished entries before any push.
+# Dry-run audit (BUI-130). Each conflict now carries the matched owned row's
+# provenance — `series_name` + `release_date` (BUI-249/BUI-266) — because this
+# audit is year/variant-blind by necessity (a wish-list name has no per-issue
+# year), so it can land on the WRONG volume/era of a same-numbered issue.
 comics_curl "$COMICS_SERVER_URL/api/comics/wish-list/conflicts"
-# If it lists any conflicts, clear them in one call (no SSH):
-comics_curl -X POST "$COMICS_SERVER_URL/api/comics/wish-list/remove-conflicts"
 ```
 
-Both 409 if the collection was never imported. **Do not proceed to a wish push
-(Step 3b) until the conflicts audit reports zero conflicts.** This conflicts
-audit + remove is the sync's **fulfillment-drop** (BUI-208 U2): a wished book you
-now own has its wish dropped and the owned copy kept; it touches only wish state
-(never a collection row), and each drop is logged with the matched owned identity.
+**Review each conflict's provenance before removing anything (BUI-266).** For
+every conflict, compare the wished book's real era/edition against the matched
+owned row's `series_name`/`release_date`:
+
+- **Genuine conflict** — the owned row is the *same* book you wished (same
+  volume/era, same print edition). Safe to drop the wish (you now own it).
+- **Decoy — do NOT remove** — a *different* comic that only shares a masthead +
+  issue number: a cross-era match (e.g. a wished 1968 *Avengers* #52 matched
+  against an owned UK-reprint `The Avengers (1973 - 1976)` #52) or the opposite
+  print edition (a base `Uncanny X-Men #201` wish matched against an owned
+  *Newsstand* copy). Removing these is the **BUI-259 114-item over-removal
+  bug** — leave them wishlisted.
+
+Then remove **only the reviewed genuine conflicts**, scoped by their exact
+`name` values from the audit:
+
+```bash
+# Scoped removal (BUI-266). Each name is re-checked against a FRESH audit, so a
+# stale/non-conflict name errors out instead of removing the wrong book.
+comics_curl -X POST "$COMICS_SERVER_URL/api/comics/wish-list/remove-conflicts" \
+  -H 'Content-Type: application/json' \
+  -d '{"names": ["<exact name from the audit>", "..."]}'
+```
+
+**The unscoped POST (no body) no longer removes anything (BUI-266 foot-gun
+guard)** — it returns a non-mutating dry-run preview (`dry_run: true`). Passing
+`{"confirm": true}` still performs the original *remove-every-conflict* global
+sweep, but that reintroduces the decoy risk above, so use it **only** after
+reviewing the full audit and confirming there are no decoys. Prefer scoped
+`names`.
+
+Both endpoints 409 if the collection was never imported. **Do not proceed to a
+wish push (Step 3b) until every *genuine* conflict has been dropped** (decoys
+left in the audit are false positives, not owned-but-wished entries — they must
+not block the push, and must not be removed). This conflicts audit + scoped
+remove is the sync's **fulfillment-drop** (BUI-208 U2): a wished book you now own
+has its wish dropped and the owned copy kept; it touches only wish state (never a
+collection row), and each drop is logged with the matched owned identity.
 
 **A clean conflicts audit is a strong signal, not a proof of owned-safety.** The
 audit and the export parse issue tokens slightly differently and apply the same

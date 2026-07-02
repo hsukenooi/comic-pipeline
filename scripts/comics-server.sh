@@ -73,13 +73,16 @@ comics_health_gate() {
 # can't block a skill step forever (a hang is as silent as a swallowed error).
 COMICS_CURL_MAX_TIME="${COMICS_CURL_MAX_TIME:-30}"
 comics_curl() {
-  local body status
+  # BUI-264: `status` is a reserved read-only special var in zsh (alias for
+  # `$?`) — `local status` throws "read-only variable: status" there, so use
+  # http_status (matches scripts/metron-curl.sh's convention).
+  local body http_status
   body="$(curl -sS --fail-with-body --max-time "$COMICS_CURL_MAX_TIME" "$@")"
-  status=$?
-  if [ "$status" -ne 0 ]; then
-    echo "comics-server call FAILED (curl exit $status): $*" >&2
+  http_status=$?
+  if [ "$http_status" -ne 0 ]; then
+    echo "comics-server call FAILED (curl exit $http_status): $*" >&2
     [ -n "$body" ] && echo "$body" >&2
-    return "$status"
+    return "$http_status"
   fi
   printf '%s' "$body"
 }

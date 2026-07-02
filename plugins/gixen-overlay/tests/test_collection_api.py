@@ -738,7 +738,10 @@ def test_conflicts_409_when_never_imported(client):
     assert client.get("/api/comics/wish-list/conflicts").status_code == 409
 
 
-def test_remove_conflicts_removes_only_owned(client):
+def test_remove_conflicts_unscoped_without_confirm_is_dry_run(client):
+    """BUI-266 (P1): an unscoped call with no ``confirm`` must NOT mutate — it
+    returns the same preview as the GET audit. This is the safe default that
+    closes the BUI-259 incident (114 removed when ~6 were intended)."""
     _seed_wish_list(client.store, [
         {"name": "Amazing Spider-Man #300", "id": None},  # owned
         {"name": "X-Men #1", "id": None},                 # not owned
@@ -746,10 +749,55 @@ def test_remove_conflicts_removes_only_owned(client):
     r = client.post("/api/comics/wish-list/remove-conflicts")
     assert r.status_code == 200, r.text
     body = r.json()
+    assert body["dry_run"] is True
+    assert body["removed_count"] == 0
+    assert [c["name"] for c in body["conflicts"]] == ["Amazing Spider-Man #300"]
+    # Nothing was mutated.
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert names == {"Amazing Spider-Man #300", "X-Men #1"}
+
+
+def test_remove_conflicts_confirm_true_sweeps_all(client):
+    """The original global-sweep behavior is still reachable via an explicit
+    ``confirm: true`` — for a caller that has already reviewed the preview."""
+    _seed_wish_list(client.store, [
+        {"name": "Amazing Spider-Man #300", "id": None},  # owned
+        {"name": "X-Men #1", "id": None},                 # not owned
+    ])
+    r = client.post("/api/comics/wish-list/remove-conflicts", json={"confirm": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
     assert body["removed_count"] == 1
     assert body["remaining"] == 1
+    assert body["scoped"] is False
     names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
     assert names == {"X-Men #1"}
+
+
+def test_remove_conflicts_scoped_by_names_touches_only_named_set(client):
+    """BUI-266: passing ``names`` scopes removal to exactly that set, so a
+    caller can review the audit's provenance and remove only the confirmed
+    conflicts without sweeping any other pre-existing one."""
+    _seed_wish_list(client.store, [
+        {"name": "Amazing Spider-Man #300", "id": None},  # owned
+        {"name": "X-Men #1", "id": None},                 # not owned
+    ])
+    r = client.post(
+        "/api/comics/wish-list/remove-conflicts",
+        json={"names": ["Amazing Spider-Man #300"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["removed_count"] == 1
+    assert body["scoped"] is True
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert names == {"X-Men #1"}
+
+
+def test_remove_conflicts_rejects_non_string_names(client):
+    _seed_wish_list(client.store, [{"name": "Amazing Spider-Man #300", "id": None}])
+    r = client.post("/api/comics/wish-list/remove-conflicts", json={"names": [123]})
+    assert r.status_code == 422
 
 
 def test_remove_conflicts_409_when_never_imported(client):

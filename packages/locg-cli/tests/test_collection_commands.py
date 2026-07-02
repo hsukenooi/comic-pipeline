@@ -1375,6 +1375,81 @@ def test_record_win_series_from_metron(tmp_path):
     assert row["needs_manual_series_canonical"] is False
 
 
+def test_record_win_metron_series_resolution_reprint_guard(tmp_path):
+    """BUI-268: metron_data from the FIRST Metron call (series resolution, no
+    series_name_index entry) can carry a reprint/collected-edition date — the
+    reported Infinity Gauntlet #1 case, where Metron correctly resolved the
+    series to 'The Infinity Gauntlet (1991) (1991 - 1991)' but its cover_date
+    was a 2022 reprint's. Left unguarded, that date got written verbatim, so a
+    later year-gated collection-check for the real 1991 issue rejected the row
+    as a different era. The date must be dropped (left blank, R66) when its
+    year disagrees with the win's own year."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 999,
+        "cover_date": "2022-09-14",  # a 2022 reprint's date, not the 1991 original
+        "store_date": None,
+        "series_year_began": 1991,
+        "series_year_end": 1991,
+        "series_name": "Infinity Gauntlet",
+        "series_id": 42,
+    }
+    metron.format_series_name.return_value = "The Infinity Gauntlet (1991) (1991 - 1991)"
+    metron.degraded = False
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Infinity Gauntlet", issue="1", year=1991)],
+        cache=cache, metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "The Infinity Gauntlet (1991) (1991 - 1991)"
+    assert row["release_date"] is None
+
+
+def test_record_win_metron_series_resolution_matching_date_kept(tmp_path):
+    """The reprint guard (BUI-268) only rejects a MISMATCHED year — a Metron
+    date that agrees with the win's year is still written normally."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_hit("Amazing Spider-Man (1963 - 1998)")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man", issue="300", year=1988)],
+        cache=cache, metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1988-05-10"
+
+
+def test_check_infinity_gauntlet_no_article_matches_stored_the_prefixed(tmp_path, monkeypatch):
+    """BUI-268 regression: a bare 'Infinity Gauntlet' query matches an owned
+    row stored under 'The Infinity Gauntlet ...', and a year-gated query for
+    the issue's real year still finds it once the reprint-date guard (above)
+    keeps release_date from being corrupted by a reprint hit."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Infinity Gauntlet (1991) (1991 - 1991)",
+        full_title="The Infinity Gauntlet #1",
+        release_date=None,  # BUI-268: reprint guard leaves this blank
+    )])
+
+    result = cmds.cmd_collection_check(series="Infinity Gauntlet", issue="1", year="1991")
+    assert result["match_status"] == "in_collection"
+    assert result["matched_series_name"] == "The Infinity Gauntlet (1991) (1991 - 1991)"
+
+
 # --- BUI-199: full_title is built from the BASE (undecorated) series name ---
 
 def _seed_export_series(cache, series_names: list[str]) -> None:
@@ -1741,6 +1816,22 @@ def _seed_owned_spawn(cache, full_title="Spawn #98", in_collection=1):
     )
 
 
+def _seed_owned_row(cache, series, full_title, in_collection=1, release_date="1988-05-10"):
+    """Seed a single owned locg_export row under an arbitrary decorated
+    ``series`` (BUI-267 cross-era/volume test support — ``_seed_owned_spawn``
+    hardcodes the Spawn series name)."""
+    from locg.collection_cache import rebuild_series_name_index
+    _seed_cache(cache, [{
+        **_agent_win_row(series=series, full_title=full_title, release_date=release_date),
+        "in_collection": in_collection,
+        "source": "locg_export",
+    }])
+    cache.apply(
+        lambda p: p.__setitem__("series_name_index", rebuild_series_name_index(p)),
+        command="test-rebuild",
+    )
+
+
 def test_record_win_skips_already_owned(tmp_path):
     """A win for an issue already owned in the cache is skipped, not duplicated."""
     from locg.commands import cmd_collection_record_win
@@ -1749,13 +1840,19 @@ def test_record_win_skips_already_owned(tmp_path):
     _seed_owned_spawn(cache, "Spawn #98")
 
     result = cmd_collection_record_win(
-        [_make_win(series="Spawn", issue="98")],
+        # year within the seeded "Spawn (1992 - Present)" range (BUI-267 era gate).
+        [_make_win(series="Spawn", issue="98", year=1999)],
         cache=cache, metron=_null_metron(),
     )
 
     assert result["skipped_already_owned"] == 1
     assert result["rows_written"] == 0
     assert result["skipped_already_owned_titles"] == ["Spawn (1992 - Present) #98"]
+    assert result["skipped_already_owned_detail"] == [{
+        "win": "Spawn (1992 - Present) #98",
+        "matched_series_name": "Spawn (1992 - Present)",
+        "matched_release_date": "1988-05-10",
+    }]
     # No new agent_win row written
     assert [r for r in cache.load()["comics"] if r["source"] == "agent_win"] == []
 
@@ -1800,7 +1897,87 @@ def test_record_win_dedup_ignores_variant(tmp_path):
     _seed_owned_spawn(cache, "Spawn #313")
 
     result = cmd_collection_record_win(
-        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        # year within the seeded "Spawn (1992 - Present)" range (BUI-267 era gate).
+        [_make_win(series="Spawn", issue="313", year=2004, variant_text="Capullo Variant")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    assert result["rows_written"] == 0
+
+
+# --- BUI-267: era/volume-aware dedup + surfaced skip provenance ---
+
+def test_record_win_dedup_does_not_conflate_cross_era_volume(tmp_path):
+    """New Gods #7 (1971 Kirby) must NOT be deduped against an owned
+    'The New Gods (Vol. 5) (2024 - 2025)' #7 — same masthead+issue, unrelated
+    era/volume (the reported BUI-267 false skip)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(cache, "The New Gods (Vol. 5) (2024 - 2025)", "New Gods #7")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="New Gods", issue="7", year=1971)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
+def test_record_win_dedup_surfaces_matched_row_on_skip(tmp_path):
+    """A genuine skip surfaces which owned row it matched (series_name + year),
+    so a caller can catch a cross-era/variant false match (BUI-267)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_spawn(cache, "Spawn #98")
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="98", year=1999)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    detail = result["skipped_already_owned_detail"]
+    assert len(detail) == 1
+    assert detail[0]["matched_series_name"] == "Spawn (1992 - Present)"
+    assert detail[0]["matched_release_date"] == "1988-05-10"
+
+
+def test_record_win_dedup_newsstand_vs_base_not_conflated(tmp_path):
+    """A base-edition win must not be deduped against an owned Newsstand copy
+    (the reported Uncanny X-Men #201 false skip, BUI-267)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 Newsstand Edition",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
+def test_record_win_dedup_newsstand_still_dedupes_newsstand(tmp_path):
+    """A Newsstand win IS deduped against an owned Newsstand copy of the same
+    issue (BUI-267 regression: the edition gate must not over-block genuine
+    matches)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 Newsstand Edition",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985, variant_text="newsstand")],
         cache=cache, metron=_null_metron(),
     )
 
@@ -2596,10 +2773,110 @@ def test_wish_list_remove_conflicts_removes_only_owned(tmp_path, monkeypatch):
     assert result["errors"] == []
     assert result["remaining"] == 1
     assert [r["name"] for r in result["removed"]] == ["Amazing Spider-Man #300"]
+    assert result["scoped"] is False
 
     # The non-owned item survives; the owned one is gone.
     remaining = cmds.cmd_wish_list_from_cache()
     assert [it["name"] for it in remaining] == ["X-Men #1"]
+
+
+def test_wish_list_conflicts_surface_matched_row_provenance(tmp_path, monkeypatch):
+    """BUI-266: each conflict carries the matched owned row's series_name +
+    release_date (BUI-249 provenance), so a caller can spot a decoy
+    cross-era/cross-edition match before removing it."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Avengers (1963 - 1996)",
+        full_title="Avengers #52",
+        release_date="1968-05-01",
+    )])
+    _seed_wish_list([{"name": "Avengers #52", "id": 52}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert len(result["conflicts"]) == 1
+    conflict = result["conflicts"][0]
+    assert conflict["series_name"] == "The Avengers (1963 - 1996)"
+    assert conflict["release_date"] == "1968-05-01"
+
+
+def test_wish_list_remove_conflicts_scoped_touches_only_named_set(tmp_path, monkeypatch):
+    """BUI-266: passing ``names`` scopes removal to that set only — a
+    pre-existing conflict NOT named stays untouched (the BUI-259 incident:
+    114 removed when ~6 were intended)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(full_title="Amazing Spider-Man #300"),
+        _agent_win_row(series="X-Men (2019 - 2021)", full_title="X-Men #1"),
+    ])
+    _seed_wish_list([
+        {"name": "Amazing Spider-Man #300", "id": 1},
+        {"name": "X-Men #1", "id": 2},
+    ])
+
+    result = cmds.cmd_wish_list_remove_conflicts(names=["Amazing Spider-Man #300"])
+
+    assert result["scoped"] is True
+    assert result["removed_count"] == 1
+    assert [r["name"] for r in result["removed"]] == ["Amazing Spider-Man #300"]
+    assert result["errors"] == []
+    # The un-named "X-Men #1" conflict must survive untouched.
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"X-Men #1"}
+
+
+def test_wish_list_remove_conflicts_scoped_rejects_stale_name(tmp_path, monkeypatch):
+    """BUI-266: a name that is NOT a current conflict (already removed, never
+    one, or a typo) is reported as an error, never silently accepted — the
+    scoped path re-checks against a fresh audit rather than trusting the
+    caller's list."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(full_title="Amazing Spider-Man #300")])
+    _seed_wish_list([
+        {"name": "Amazing Spider-Man #300", "id": 1},
+        {"name": "Not A Conflict #1", "id": 2},  # not owned — not a conflict
+    ])
+
+    result = cmds.cmd_wish_list_remove_conflicts(names=["Not A Conflict #1"])
+
+    assert result["removed_count"] == 0
+    assert result["removed"] == []
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["name"] == "Not A Conflict #1"
+    # Nothing was mutated — both wishes remain.
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Amazing Spider-Man #300", "Not A Conflict #1"}
+
+
+def test_wish_list_remove_conflicts_scoped_carries_provenance(tmp_path, monkeypatch):
+    """A scoped removal's returned entry carries the same matched-row
+    provenance the audit surfaced (BUI-266)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Avengers (1963 - 1996)",
+        full_title="Avengers #52",
+        release_date="1968-05-01",
+    )])
+    _seed_wish_list([{"name": "Avengers #52", "id": 52}])
+
+    result = cmds.cmd_wish_list_remove_conflicts(names=["Avengers #52"])
+
+    assert result["removed_count"] == 1
+    entry = result["removed"][0]
+    assert entry["matched_series_name"] == "The Avengers (1963 - 1996)"
+    assert entry["matched_release_date"] == "1968-05-01"
 
 
 def test_wish_list_remove_conflicts_surfaces_owner_and_spares_collection(tmp_path, monkeypatch):

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from gixen_overlay.db import (
@@ -1074,8 +1074,13 @@ async def api_wish_list_conflicts():
     the dry-run preview; ``POST .../remove-conflicts`` performs the removal.
 
     Returns ``{total, checked, unparseable, conflicts:[{name, series, issue,
-    id, full_title_matched}]}``. 409 when the store was never imported (R11);
-    an absent wish-list yields an empty (zero-conflict) result.
+    id, full_title_matched, series_name, release_date}]}``. ``series_name``/
+    ``release_date`` (BUI-266) are the matched owned row's BUI-249 provenance
+    — this audit is year/variant-blind by necessity (a wish-list name carries
+    no per-issue year), so review these before scoping a
+    ``POST .../remove-conflicts`` call to catch a decoy cross-era/cross-edition
+    match. 409 when the store was never imported (R11); an absent wish-list
+    yields an empty (zero-conflict) result.
     """
     _ensure_collection_store()
     _require_imported_collection()
@@ -1086,16 +1091,57 @@ async def api_wish_list_conflicts():
 
 
 @router.post("/api/comics/wish-list/remove-conflicts")
-async def api_wish_list_remove_conflicts():
-    """Remove every wish-list item already in the collection (BUI-130, Part 2).
+async def api_wish_list_remove_conflicts(payload: dict = Body(default={})):
+    """Remove wish-list item(s) already in the collection (BUI-130, Part 2).
 
-    Re-derives the conflict set server-side and removes each in one call, so the
-    Claremont-style cleanup no longer needs SSH into the Mac Mini. Returns
-    ``{removed, removed_count, errors, remaining, checked, unparseable}``. Same
-    409 never-imported guard as the audit (R11)."""
+    BUI-266 (P1 data foot-gun): this endpoint used to unconditionally sweep
+    the ENTIRE conflict set — a caller clearing a handful of just-discovered
+    conflicts had no way to avoid also removing every OTHER pre-existing
+    conflict already in the wish-list. The BUI-259 incident removed 114 wishes
+    when ~6 were intended, including decoy cross-volume/cross-edition false
+    matches (a UK-reprint "The Avengers (1973 - 1976)" #52 pulled against an
+    owned 1968 Vol. 1; a base "Uncanny X-Men #201" pulled against an owned
+    Newsstand copy) — the audit is year/variant-blind by necessity (a
+    wish-list name carries no per-issue year), so a caller MUST be able to
+    review each match's provenance before it's removed.
+
+    Body (all optional, JSON): ``{"names": [...], "confirm": bool}``.
+
+    * ``names``: scope the removal to exactly these wish-list ``name`` values
+      (as returned by ``GET .../conflicts``). Each is re-checked against a
+      FRESH audit — a name that is no longer a genuine conflict is reported as
+      an error, never silently removed. This is the RECOMMENDED path: run the
+      GET audit, review each conflict's ``series_name``/``release_date``
+      provenance for a decoy, then submit only the reviewed names.
+    * No ``names`` and ``confirm`` is not ``true``: returns the SAME preview
+      the GET audit returns (with ``dry_run: true``) and mutates nothing —
+      the safe default for an unscoped call.
+    * No ``names`` and ``confirm: true``: removes every current conflict (the
+      original global-sweep behavior), for a caller that has already reviewed
+      the audit and explicitly wants everything cleared.
+
+    Returns ``{removed, removed_count, errors, remaining, checked,
+    unparseable, scoped}`` (mutating calls) or the audit shape plus
+    ``dry_run: true`` (preview). Same 409 never-imported guard as the audit
+    (R11). Each removed entry carries ``matched_series_name`` /
+    ``matched_release_date`` — the BUI-249 provenance of the owned row it was
+    matched against.
+    """
     _ensure_collection_store()
     _require_imported_collection()
+    names = payload.get("names")
+    if names is not None and (
+        not isinstance(names, list) or not all(isinstance(n, str) for n in names)
+    ):
+        raise HTTPException(status_code=422, detail="'names' must be a list of strings")
+    confirm = bool(payload.get("confirm", False))
+
     try:
+        if names:
+            return cmd_wish_list_remove_conflicts(names=names)
+        if not confirm:
+            audit = cmd_wish_list_conflicts()
+            return {**audit, "dry_run": True, "removed": [], "removed_count": 0}
         return cmd_wish_list_remove_conflicts()
     except FileNotFoundError:
         return {

@@ -244,7 +244,7 @@ def _iso_to_relative(end_date_iso: str | None) -> str:
 # Gixen sync helper (used by api_purge and ended-bid resolution)
 # ---------------------------------------------------------------------------
 
-async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
+async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: bool = False) -> list:
     """Pull current Gixen state and update DB. Returns the snipes list.
 
     For every snipe Gixen returns, refresh the cached title/seller/current_bid
@@ -255,6 +255,11 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
     fallback can backfill winning_bid. (Vanished-but-still-in-future rows are
     left as PENDING — that's the "user removed via Gixen web UI before
     auction end" case, where we have no signal to act on yet.)
+
+    `reraise` lets a caller (namely `_sync_loop`, BUI-263) distinguish "Gixen
+    genuinely unreachable" from "Gixen reached fine, zero live snipes right
+    now" — both used to collapse to an empty list, which made a quiet week
+    of no active snipes look identical to a sustained outage.
     """
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
@@ -262,9 +267,13 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient) -> list:
         # Gixen unreachable at the network layer (BUI-77) — distinct, honest
         # signal so the operator isn't sent chasing credentials.
         logger.warning("_sync_gixen: Gixen unreachable (connectivity, not creds): %s", e)
+        if reraise:
+            raise
         return []
     except GixenError as e:
         logger.warning("_sync_gixen: GixenError (suppressed): %s", e)
+        if reraise:
+            raise
         return []
 
     now_dt = datetime.now(timezone.utc)
@@ -440,19 +449,31 @@ async def _sync_loop() -> None:
         try:
             if _sync_client is not None:
                 db = _get_db()
-                result = await _sync_gixen(db, _sync_client)
-                if result:
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-        except Exception:
+                # reraise=True: a call that *returns* (even an empty list —
+                # e.g. no live snipes right now) is success. Only a raised
+                # GixenConnectionError/GixenError counts as a failure; BUI-263
+                # found the old "falsy result == failure" check was mistaking
+                # a quiet week of zero snipes for 177+ hours of outage.
+                await _sync_gixen(db, _sync_client, reraise=True)
+            consecutive_failures = 0
+            last_error = None
+        except (GixenConnectionError, GixenError) as e:
+            # Already logged with the specific reason inside _sync_gixen —
+            # don't also dump a full traceback here on every retry.
+            consecutive_failures += 1
+            last_error = e
+        except Exception as e:
             logger.exception("_sync_loop: unexpected error, continuing")
             consecutive_failures += 1
+            last_error = e
 
         # Exponential backoff: SYNC_INTERVAL, 2x, 4x, ..., capped at 1 hour
         delay = min(SYNC_INTERVAL * (2 ** consecutive_failures), _SYNC_BACKOFF_MAX)
         if consecutive_failures:
-            logger.warning("_sync_loop: %d consecutive failure(s), sleeping %ds", consecutive_failures, delay)
+            logger.warning(
+                "_sync_loop: %d consecutive failure(s) (%s: %s), sleeping %ds",
+                consecutive_failures, type(last_error).__name__, last_error, delay,
+            )
         await asyncio.sleep(delay)
 
 

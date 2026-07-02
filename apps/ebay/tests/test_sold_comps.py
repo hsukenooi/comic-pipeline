@@ -114,6 +114,25 @@ class TestHardExclude:
         "ASM #129 signed by Stan Lee",
         "WW Live Sale ASM result",
         "X-Men #1 restored copy",
+        # BUI-269: previously sold_comps-only markers, now unioned into
+        # comic_identity — pin that reconciling the two lexicons didn't drop
+        # coverage on the sold_comps side.
+        "ASM #300 9d variant UK",
+        "Fantastic Four #1 rare Brazil edition",
+        "Amazing Spider-Man #1 rare Mexico edition",
+        "Batman #1 Norway edition",
+        "Superman #1 Australia edition",
+        "ASM #1 Italian edition",
+        "ASM #1 Spain edition",
+        "ASM #1 Ebal edition",
+        "Spawn #1 Johnny Lightning promo",
+        # BUI-269 (Opus PR#119 review): multi-issue lot shapes the reconciled
+        # lexicon must still exclude from the comp pool — the shared _LOT_RE
+        # misses these, so is_comp_excluded's comp-only _FMV_LOT_RE covers them.
+        "Amazing Spider-Man #1 #2 #3 CGC",   # space-separated hash list (3)
+        "Hulk #181 #182",                     # space-separated hash pair (2)
+        "ASM #64, #65",                       # 2-member comma pair (both hashed)
+        "ASM #64, 65",                        # 2-member comma pair (2nd unhashed)
     ])
     def test_excludes(self, title):
         assert sc.hard_exclude(title)
@@ -123,6 +142,16 @@ class TestHardExclude:
         "Uncanny X-Men #185 VF Marvel",
         "Batman #226 1970 Neal Adams cover",
         "Aliens vs Predator #2 Dark Horse 1990",
+        # BUI-269 (Opus PR#119 review): a single issue must NOT be caught by the
+        # new comp-only lot regex — it has only one # token.
+        "Amazing Spider-Man #300",
+        "X-Men #266 CGC 9.8",
+        # comma edge: "#1, 2018" is a hash then a YEAR, not a 2-issue lot —
+        # _FMV_LOT_RE bounds the comma member to 1-3 digits to avoid this.
+        "Detective Comics #1, 2018",
+        # comma edge: "#300, 9.8" is a hash then a decimal GRADE, not a lot —
+        # the (?!\.\d) lookahead keeps this single graded issue in the comp pool.
+        "Amazing Spider-Man #300, 9.8 CGC",
     ])
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)

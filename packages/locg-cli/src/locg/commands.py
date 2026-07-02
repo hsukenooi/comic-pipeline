@@ -17,11 +17,17 @@ from bs4 import BeautifulSoup
 
 from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
-from locg.collection_cache import CollectionCache, _normalize_series_key, owned_match_keys
+from locg.collection_cache import (
+    CollectionCache,
+    _normalize_series_key,
+    owned_match_keys,
+    series_year_range,
+)
 from locg.config import wish_list_cache_path
 from locg.models import extract_comic_detail, extract_comic_lists, extract_issue, extract_my_details, extract_series
 from locg.parser import parse_list_response, parse_page
 from locg.parsing import (
+    ISSUE_TOKEN_RE,
     normalize_issue_key,
     split_full_title as _split_full_title,
     split_series_issue_for_ownership,
@@ -940,7 +946,16 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
     ``year`` is deliberately NOT passed to :func:`cmd_collection_check`: a
     wish-list name carries only series + issue, never a per-issue cover date,
     and forwarding a series start-year is exactly the BUI-129 bug (it filters
-    out every owned row whose release year differs).
+    out every owned row whose release year differs). Consequently this audit
+    can land on the WRONG volume/era of a same-numbered issue (BUI-266: a
+    decoy UK-reprint "The Avengers (1973 - 1976)" #52 matched against an owned
+    1968 Vol. 1, and a base "Uncanny X-Men #201" wish matched an owned
+    Newsstand copy). Each conflict therefore carries the SAME BUI-249
+    provenance fields ``cmd_collection_check`` returns (``series_name``,
+    ``release_date`` of the matched row) so a caller can visually catch a
+    cross-era/cross-edition false match before removing it — see
+    :func:`cmd_wish_list_remove_conflicts`, which is the removal half of this
+    audit and never removes anything not surfaced here first.
 
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
     """
@@ -964,6 +979,10 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
                 "issue": issue,
                 "id": it.get("id"),
                 "full_title_matched": result["full_title_matched"],
+                # BUI-266: matched-row provenance, so a decoy/cross-era match
+                # is visible before this conflict is removed.
+                "series_name": result["matched_series_name"],
+                "release_date": result["matched_release_date"],
             })
     return {
         "total": len(items),
@@ -973,8 +992,24 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
     }
 
 
-def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
-    """Remove every wish-list entry already in the collection (BUI-130).
+def cmd_wish_list_remove_conflicts(names: Optional[list[str]] = None) -> dict[str, Any]:
+    """Remove wish-list entries already in the collection (BUI-130).
+
+    BUI-266: this used to unconditionally sweep the ENTIRE conflict set in one
+    call — a caller intending to clear a handful of just-discovered conflicts
+    had no way to avoid ALSO removing every other pre-existing conflict
+    already sitting in the wish-list (the BUI-259 incident: 114 removed when
+    ~6 were intended, including decoy cross-volume/cross-edition false
+    matches — see :func:`cmd_wish_list_conflicts`). Pass ``names`` (the
+    wish-list entry ``name`` field, exactly as returned by
+    :func:`cmd_wish_list_conflicts`) to SCOPE the removal to that set — a name
+    re-checked against a FRESH audit, not just echoed back, so a name that is
+    no longer a genuine conflict (already removed, or never one — a stale or
+    hand-typed name) is reported as an error rather than silently accepted.
+    Omit ``names`` to remove every current conflict, matching the original
+    global-sweep behavior; the HTTP layer (``api_wish_list_remove_conflicts``)
+    gates that unscoped path behind an explicit ``confirm=true``, returning a
+    non-mutating preview otherwise.
 
     Re-derives the conflict set via :func:`cmd_wish_list_conflicts`, then removes
     each by exact name with :func:`cmd_wish_list_remove`. Returns the removed
@@ -985,9 +1020,25 @@ def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
     """
     audit = cmd_wish_list_conflicts()
-    removed: list[dict[str, Any]] = []
+    conflicts_by_name: dict[str, dict[str, Any]] = {c["name"]: c for c in audit["conflicts"]}
+
     errors: list[dict[str, Any]] = []
-    for conflict in audit["conflicts"]:
+    if names is None:
+        targets = list(audit["conflicts"])
+    else:
+        targets = []
+        for name in names:
+            conflict = conflicts_by_name.get(name)
+            if conflict is None:
+                errors.append({
+                    "name": name,
+                    "error": "not a current wish-list/collection conflict — skipped, nothing removed",
+                })
+            else:
+                targets.append(conflict)
+
+    removed: list[dict[str, Any]] = []
+    for conflict in targets:
         result = cmd_wish_list_remove(conflict["name"])
         if "error" in result:
             errors.append({"name": conflict["name"], "error": result["error"]})
@@ -1004,6 +1055,11 @@ def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
             entry = dict(result["removed"]) if isinstance(result.get("removed"), dict) \
                 else {"name": conflict["name"]}
             entry["matched_owned"] = matched
+            # BUI-266: same provenance the audit surfaced, carried onto the
+            # actual removal record so a reviewer can see exactly what era/
+            # edition each removed wish was matched against.
+            entry["matched_series_name"] = conflict.get("series_name")
+            entry["matched_release_date"] = conflict.get("release_date")
             removed.append(entry)
     try:
         remaining = len(cmd_wish_list_from_cache())
@@ -1012,6 +1068,7 @@ def cmd_wish_list_remove_conflicts() -> dict[str, Any]:
     return {
         "removed": removed,
         "removed_count": len(removed),
+        "scoped": names is not None,
         "errors": errors,
         "remaining": remaining,
         "checked": audit["checked"],
@@ -2179,6 +2236,93 @@ def _fuzzy_variant_match(variant_text: str, names: list[str]) -> Optional[str]:
     return best_name if best_score >= _VARIANT_MATCH_THRESHOLD else None
 
 
+def _owned_row_variant_suffix(full_title: str) -> Optional[str]:
+    """Text trailing the issue token in a full_title, e.g. ``"Newsstand Edition"``.
+
+    Empty/whitespace-only trailing text (the common case — no print-edition
+    qualifier) normalizes to ``None``.
+    """
+    m = ISSUE_TOKEN_RE.search(full_title or "")
+    if not m:
+        return None
+    tail = full_title[m.end():].strip()
+    return tail or None
+
+
+def _dedup_variant_compatible(variant_text: str, candidate_suffix: Optional[str]) -> bool:
+    """True unless the win and an owned row are provably DISTINCT print editions.
+
+    BUI-267: a known edition suffix (Newsstand/Direct/2nd Printing/Facsimile —
+    :data:`VARIANT_SUFFIX_MAP`) names a genuinely separate LOCG catalog entry,
+    so a base win must not be deduped against an owned Newsstand copy (or vice
+    versa) — the reported Uncanny X-Men #201 base win incorrectly skipped
+    against an owned Newsstand #201. An unrecognized ``variant_text`` (e.g. a
+    cover-artist variant like "Capullo Variant") can't be reliably normalized
+    against a suffix, so it stays permissive — preserving the pre-existing
+    BUI-34 behavior of deduping through cosmetic cover variants.
+
+    Known limitation (safe direction): recognition is by EXACT
+    :data:`VARIANT_SUFFIX_MAP` key, so a novel phrasing like
+    ``"newsstand variant"`` (not a map key) reads as ``None`` and stays
+    permissive — a newsstand win against an owned newsstand row then dedups
+    through, at worst producing a duplicate owned row (never hiding a new
+    win). The load-bearing direction — a *base* win must NOT dedup against an
+    owned Newsstand row — always holds, because the owned row's parsed
+    ``candidate_suffix`` ("Newsstand Edition") IS a map key. VARIANT_SUFFIX_MAP
+    isn't widened here on purpose: it also feeds the full_title builder
+    (see its other consumer), so new keys would change more than this check.
+    """
+    known_win_suffix = VARIANT_SUFFIX_MAP.get(variant_text) if variant_text else None
+    known_candidate_suffix = (
+        VARIANT_SUFFIX_MAP.get(candidate_suffix.lower()) if candidate_suffix else None
+    )
+    if known_win_suffix is None and known_candidate_suffix is None:
+        return True
+    return known_win_suffix == known_candidate_suffix
+
+
+def _year_of_date(date_str: Optional[str]) -> Optional[int]:
+    """Leading 4-digit year of a date-ish string, or None."""
+    if not date_str:
+        return None
+    m = re.match(r"(\d{4})", str(date_str))
+    return int(m.group(1)) if m else None
+
+
+def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]) -> bool:
+    """True unless ``candidate_row``'s era provably conflicts with ``win_year``.
+
+    BUI-267: the bare (series, issue) dedup key collides across unrelated
+    volumes/eras that happen to share a masthead and issue number — reported:
+    New Gods #7 (1971 Kirby) skipped against an owned "The New Gods (Vol. 5)
+    (2024 - 2025)" #7. Permissive when either side's year is unknown/
+    unparseable, matching BUI-34's original bias toward never hiding a
+    genuinely-new win behind an uncertain match.
+
+    Known tradeoff (deliberately unchanged — safe direction): a bare
+    single-year owned decoration like ``"The Amazing Spider-Man (1963)"``
+    parses to the degenerate range ``(1963, 1963)`` (a start-year, not a true
+    one-year series), so a later-issue win for that same title (e.g. year
+    1988) reads as era-INCOMPATIBLE and records a DUPLICATE owned row rather
+    than deduping. That is the safe direction (a dup, never hiding ownership —
+    BUI-34's bias), and it is why we do NOT collapse ``start == end`` to
+    "permissive": doing so would re-open the exact cross-era false-SKIP this
+    function exists to close (New Gods #7 1971 vs an owned 2024 Vol. 5 #7)
+    whenever the owned row happened to carry only a bare start-year. Genuine
+    cross-era matches we must catch carry full ``(YYYY - YYYY)`` ranges, so the
+    strict check still fires correctly for them.
+    """
+    if win_year is None:
+        return True
+    rng = series_year_range(candidate_row.get("series_name") or "")
+    if rng is not None:
+        return rng[0] <= win_year <= rng[1]
+    candidate_year = _year_of_date(candidate_row.get("release_date"))
+    if candidate_year is not None:
+        return candidate_year == win_year
+    return True
+
+
 RECORD_WIN_CHUNK_SIZE = 25
 
 
@@ -2292,19 +2436,31 @@ def cmd_collection_record_win(
     # The prefix basis errs toward recording (never hiding ownership) — the safe
     # direction — so we intentionally do NOT broaden the key here. The token key
     # is normalize_issue_key from locg.parsing (BUI-189, shared with the probe).
-    owned_index: set[tuple[str, str]] = set()
+    #
+    # BUI-267: keyed to a LIST of owned rows (not a bare presence set) so the
+    # dedup check below can compare era (series_name/release_date year) and
+    # print edition (Newsstand/Direct suffix) before treating a bare (series,
+    # issue) collision as a genuine duplicate — an unrelated same-numbered
+    # issue from another volume/era, or the opposite print edition, must not
+    # silently swallow a genuinely-new win.
+    owned_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for r in payload.get("comics", []):
         if not r.get("in_collection"):
             continue
         prefix, token = _split_full_title(r.get("full_title") or "")
         if token is None:
             continue
-        owned_index.add((_normalize_series_key(prefix), normalize_issue_key(token)))
+        key = (_normalize_series_key(prefix), normalize_issue_key(token))
+        owned_index.setdefault(key, []).append(r)
 
     rows_written = 0
     chunks_committed = 0
     skipped_already_owned = 0
     skipped_already_owned_titles: list[str] = []
+    # BUI-267: which owned row each skip matched (series_name + release year),
+    # so a caller can catch a cross-era/variant false match instead of trusting
+    # a bare skip count.
+    skipped_already_owned_detail: list[dict[str, Any]] = []
     manual_variant_count = 0
     manual_series_count = 0
     metron_lookups_attempted = 0
@@ -2380,15 +2536,37 @@ def cmd_collection_record_win(
                 chunk_manual_series += 1
 
             # BUI-34: skip wins already owned in the cache (series + issue),
-            # before any variant lookup or row construction. Dedup is by issue
-            # identity and ignores variant, matching the reported duplicates
-            # (variant Spawn back-issues already owned).
-            if issue_num and (
+            # before any variant lookup or row construction.
+            #
+            # BUI-267: the bare (series, issue) key collides across unrelated
+            # volumes/eras (New Gods #7 1971 vs an owned Vol. 5 2024 #7) and
+            # across distinct print editions (a base win vs an owned Newsstand
+            # copy), so a key collision alone is no longer sufficient — each
+            # candidate owned row must also be era- and edition-compatible.
+            # Cosmetic cover variants (e.g. "Capullo Variant") stay ignored,
+            # matching the original BUI-34 behavior.
+            owned_candidates = owned_index.get((
                 _normalize_series_key(canonical_series),
                 normalize_issue_key(issue_num),
-            ) in owned_index:
+            ), []) if issue_num else []
+            matched_owned_row: Optional[dict[str, Any]] = None
+            if owned_candidates:
+                win_year = _year_of_date(year_raw)
+                for candidate_row in owned_candidates:
+                    candidate_suffix = _owned_row_variant_suffix(candidate_row.get("full_title") or "")
+                    if _dedup_era_compatible(win_year, candidate_row) and _dedup_variant_compatible(
+                        variant_text, candidate_suffix
+                    ):
+                        matched_owned_row = candidate_row
+                        break
+            if matched_owned_row is not None:
                 skipped_already_owned += 1
                 skipped_already_owned_titles.append(f"{canonical_series} #{issue_num}")
+                skipped_already_owned_detail.append({
+                    "win": f"{canonical_series} #{issue_num}",
+                    "matched_series_name": matched_owned_row.get("series_name"),
+                    "matched_release_date": matched_owned_row.get("release_date"),
+                })
                 continue
 
             # BUI-210: when the series resolved via series_name_index (the common
@@ -2479,10 +2657,34 @@ def cmd_collection_record_win(
             else:
                 full_title = base_title
 
-            # release_date: prefer store_date, fall back to cover_date
+            # release_date: prefer store_date, fall back to cover_date.
+            #
+            # BUI-268: same reprint guard as the BUI-210 date-only lookup below
+            # — this metron_data can come from the FIRST Metron call (the R36
+            # step-2 series-resolution path a few lines up, used when
+            # series_name_index has no entry), which has no year filter of its
+            # own. Left unguarded, a reprint/collected-edition store_date
+            # (observed: Infinity Gauntlet #1 stamped 2022-09-14 from a 2022
+            # reprint hit, despite series_name correctly resolving to "The
+            # Infinity Gauntlet (1991) (1991 - 1991)") got written onto an
+            # otherwise-correct 1991 row, so a later year-gated
+            # collection-check for the real 1991 issue found the row and
+            # rejected it as a mismatched era. Only accept the Metron date when
+            # its year matches year_raw; a mismatch is dropped (R66: a Metron
+            # hit that lacks a trustworthy date stays blank — the relaxed year
+            # gate then fail-opens on this row rather than falsely rejecting a
+            # genuinely-owned copy).
             release_date: Optional[str] = None
             if metron_data:
-                release_date = metron_data.get("store_date") or metron_data.get("cover_date")
+                candidate_date = metron_data.get("store_date") or metron_data.get("cover_date")
+                year_str = str(year_raw).strip() if year_raw is not None else ""
+                if (
+                    re.fullmatch(r"\d{4}", year_str)
+                    and candidate_date
+                    and not str(candidate_date).startswith(year_str)
+                ):
+                    candidate_date = None
+                release_date = candidate_date
 
             # BUI-105: when no Metron data backs this win (the series_name_index
             # path, or the bare-series manual fallback), there is no Metron date,
@@ -2551,6 +2753,7 @@ def cmd_collection_record_win(
         "chunks_committed": chunks_committed,
         "skipped_already_owned": skipped_already_owned,
         "skipped_already_owned_titles": skipped_already_owned_titles,
+        "skipped_already_owned_detail": skipped_already_owned_detail,
         "manual_variant_count": manual_variant_count,
         "manual_series_count": manual_series_count,
         "metron_lookups_attempted": metron_lookups_attempted,
