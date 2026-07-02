@@ -175,7 +175,7 @@ class MetronClient:
                 return None
 
             issues = session.issues_list(
-                {"series": best_series.id, "number": str(issue_number)}
+                {"series_id": best_series.id, "number": str(issue_number)}
             )
             if not issues:
                 return None
@@ -328,7 +328,7 @@ class MetronClient:
         Jr.'s Uncanny X-Men #175–211 AND his ~1993 #287/#300–311 second stint).
 
         Strategy:
-          1. ``issues_list({series, creator: creator_id})`` returns the candidate
+          1. ``issues_list({series_id, creator: creator_id})`` returns the candidate
              set — every issue where this creator (pinned by **id**, so JR vs Sr
              never collide) has *any* credit. This is what catches both stints.
           2. For each candidate, fetch the issue detail and confirm the creator
@@ -354,7 +354,7 @@ class MetronClient:
         try:
             session = self._get_session()
             candidates = session.issues_list(
-                {"series": series_id, "creator": creator_id}
+                {"series_id": series_id, "creator": creator_id}
             )
         except MetronCredentialError:
             raise

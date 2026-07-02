@@ -97,7 +97,7 @@ def test_lookup_issue_returns_expected_dict():
     assert result["series_id"] == 1
 
     session.series_list.assert_called_once_with({"name": "Fantastic Four"})
-    session.issues_list.assert_called_once_with({"series": 1, "number": "1"})
+    session.issues_list.assert_called_once_with({"series_id": 1, "number": "1"})
 
 
 def test_lookup_issue_with_store_date():
@@ -140,7 +140,7 @@ def test_lookup_issue_disambiguates_multiple_series_by_year():
     assert result is not None
     assert result["series_id"] == 1  # the 1963–1998 volume
     # The issue lookup must target the disambiguated series, not series_list[0]
-    session.issues_list.assert_called_once_with({"series": 1, "number": "151"})
+    session.issues_list.assert_called_once_with({"series_id": 1, "number": "151"})
 
 
 def test_lookup_issue_disambiguates_into_ongoing_series():
