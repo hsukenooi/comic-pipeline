@@ -217,7 +217,7 @@ def _parse_end_iso(end_iso: str | None) -> datetime | None:
         return None
 
 
-def _iso_to_relative(end_date_iso: str | None) -> str:
+def iso_to_relative(end_date_iso: str | None) -> str:
     if not end_date_iso:
         return "—"
     try:
@@ -1075,7 +1075,7 @@ def _serialize_snipe_row(item: dict) -> dict:
         "max_bid": f"{item['max_bid']:.2f} USD",
         "bid_offset": item["bid_offset"],
         "snipe_group": item["snipe_group"],
-        "time_to_end": _iso_to_relative(end_date_iso),
+        "time_to_end": iso_to_relative(end_date_iso),
         "end_date_iso": end_date_iso,
         "status": item["status"],
         "status_mirror": item.get("status_mirror"),

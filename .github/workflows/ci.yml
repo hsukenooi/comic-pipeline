@@ -32,7 +32,7 @@ jobs:
 
       - name: Smoke — overlay resolves gixen-cli via the workspace (no path hack)
         run: |
-          uv run python -c "import gixen_overlay.routes; from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task; from server.db import get_bid_by_item_id; print('overlay -> gixen-cli coupling OK')"
+          uv run python -c "import gixen_overlay.routes; from server.main import _ensure_fresh_sync, iso_to_relative, _spawn_fallback_task; from server.db import get_bid_by_item_id; print('overlay -> gixen-cli coupling OK')"
 
       - name: Check plugin structure
         run: |

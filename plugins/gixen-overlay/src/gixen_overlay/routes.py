@@ -40,7 +40,7 @@ from gixen_overlay.models import (
 )
 from gixen_overlay.title_parser import parse_title
 from server.db import get_bid_by_item_id, resolve_server_dir, TOMBSTONE_STATUSES_SQL
-from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task
+from server.main import _ensure_fresh_sync, iso_to_relative, _spawn_fallback_task
 
 # BUI-91/92: the overlay wraps locg-cli's existing collection + wish-list logic
 # (the accumulated matcher with its four documented bugfixes, plus the three
@@ -629,7 +629,7 @@ def _build_comics_row(row):
         "max_bid": f"{item['max_bid']:.2f} USD",
         "bid_offset": item["bid_offset"],
         "snipe_group": item["snipe_group"],
-        "time_to_end": _iso_to_relative(end_date_iso),
+        "time_to_end": iso_to_relative(end_date_iso),
         "end_date_iso": end_date_iso,
         "status": item["status"],
         "status_mirror": item.get("status_mirror"),
