@@ -2385,6 +2385,312 @@ def _resolve_price(raw: Any) -> Optional[float]:
         return None
 
 
+def _build_win_row(
+    win: dict[str, Any],
+    *,
+    series_name_index: dict[str, str],
+    volume_candidates: Any,
+    existing_titles: set[str],
+    owned_index: dict[tuple[str, str], list[dict[str, Any]]],
+    metron: Any,
+    metron_disabled: bool,
+) -> dict[str, Any]:
+    """Build one collection row for a single Gixen win.
+
+    This is the per-win body of cmd_collection_record_win's per-chunk loop,
+    lifted verbatim into a helper so the loop mutates outer counters/flags via
+    the returned dict instead of directly. See cmd_collection_record_win's
+    docstring for the overall R36/BUI-199/BUI-34/BUI-267/BUI-210/BUI-105
+    resolution chain this implements.
+
+    Returns a dict with:
+      - "skipped": bool — True if the win matched an already-owned row (BUI-34/BUI-267)
+      - "skip_detail": dict | None — present when skipped
+      - "row": dict | None — the built collection row, present when not skipped
+      - "metron_disabled": bool — updated metron_disabled flag to thread into the next call
+      - "metron_attempted" / "metron_succeeded" / "manual_series" / "manual_variant" /
+        "variant_detail_attempted" / "variant_matches": int deltas for this win
+    """
+    from locg.collection_cache import _next_seq, _utcnow_iso, base_full_title, resolve_series_for_win
+    from locg.metron import MetronCredentialError
+
+    metron_attempted = 0
+    metron_succeeded = 0
+    manual_series = 0
+    manual_variant = 0
+    variant_detail_attempted = 0
+    variant_matches = 0
+
+    identify = win.get("identify_data") or {}
+    series_raw = str(identify.get("series") or "").strip()
+    issue_num = str(identify.get("issue") or "").strip()
+    year_raw = identify.get("year")
+    variant_text = str(identify.get("variant_text") or "").strip().lower()
+    end_date = str(win.get("end_date_iso") or "").strip()
+    item_id = str(win.get("item_id") or "").strip()
+    price = _resolve_price(win.get("current_bid"))
+
+    # date_purchased: date portion of end_date_iso
+    date_purchased: Optional[str] = None
+    if end_date:
+        try:
+            dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            date_purchased = dt.date().isoformat()
+        except ValueError:
+            date_purchased = end_date[:10] if len(end_date) >= 10 else end_date
+
+    # R36: series resolution
+    norm_key = _normalize_series_key(series_raw)
+    canonical_series: Optional[str] = None
+    needs_manual_series = False
+    metron_data: Optional[dict[str, Any]] = None
+
+    # BUI-199: resolve the canonical series by issue-number boundary
+    # (the LOCG X-Men split) and by year/era (the right volume), not by
+    # blindly taking the single series_name_index entry.
+    resolved_series = resolve_series_for_win(
+        norm_key, issue_num, year_raw, series_name_index, volume_candidates
+    )
+    if resolved_series is not None:
+        canonical_series = resolved_series
+    elif not metron_disabled:
+        try:
+            metron_attempted += 1
+            metron_data = metron.lookup_issue(series_raw, issue_num, year_raw)
+            if metron_data:
+                metron_succeeded += 1
+                canonical_series = metron.format_series_name(metron_data)
+        except MetronCredentialError:
+            metron_disabled = True
+            logger.warning("Metron credentials not configured; falling back to manual series resolution.")
+        else:
+            metron_disabled = _check_metron_degraded(metron, metron_disabled)
+
+    if canonical_series is None:
+        canonical_series = series_raw
+        needs_manual_series = True
+        manual_series += 1
+
+    # BUI-34: skip wins already owned in the cache (series + issue),
+    # before any variant lookup or row construction.
+    #
+    # BUI-267: the bare (series, issue) key collides across unrelated
+    # volumes/eras (New Gods #7 1971 vs an owned Vol. 5 2024 #7) and
+    # across distinct print editions (a base win vs an owned Newsstand
+    # copy), so a key collision alone is no longer sufficient — each
+    # candidate owned row must also be era- and edition-compatible.
+    # Cosmetic cover variants (e.g. "Capullo Variant") stay ignored,
+    # matching the original BUI-34 behavior.
+    owned_candidates = owned_index.get((
+        _normalize_series_key(canonical_series),
+        normalize_issue_key(issue_num),
+    ), []) if issue_num else []
+    matched_owned_row: Optional[dict[str, Any]] = None
+    if owned_candidates:
+        win_year = _coerce_year(year_raw)
+        for candidate_row in owned_candidates:
+            candidate_suffix = _owned_row_variant_suffix(candidate_row.get("full_title") or "")
+            if _dedup_era_compatible(win_year, candidate_row) and _dedup_variant_compatible(
+                variant_text, candidate_suffix
+            ):
+                matched_owned_row = candidate_row
+                break
+    if matched_owned_row is not None:
+        return {
+            "skipped": True,
+            "skip_detail": {
+                "win": f"{canonical_series} #{issue_num}",
+                "matched_series_name": matched_owned_row.get("series_name"),
+                "matched_release_date": matched_owned_row.get("release_date"),
+            },
+            "row": None,
+            "metron_disabled": metron_disabled,
+            "metron_attempted": metron_attempted,
+            "metron_succeeded": metron_succeeded,
+            "manual_series": manual_series,
+            "manual_variant": manual_variant,
+            "variant_detail_attempted": variant_detail_attempted,
+            "variant_matches": variant_matches,
+        }
+
+    # BUI-210: when the series resolved via series_name_index (the common
+    # case — metron_data stays None), we still have no release_date, so
+    # the row would fall through to the {year}-01-01 placeholder, which
+    # the export blanks → the row ships dateless and an all-dateless
+    # batch hangs LOCG's importer. Do a Metron *issue* lookup purely to
+    # populate a real date; do NOT touch canonical_series (the
+    # index-resolved value is more reliable than Metron's
+    # format_series_name here). Runs after the BUI-34 dedup continue so
+    # we never spend a Metron call on a skipped already-owned win, and
+    # before the variant block so variant resolution can reuse metron_id.
+    #
+    # Reprint guard: a naive lookup_issue("The X-Men", "59", 1970) can
+    # return a collected-edition/reprint date (observed: 2005-03-09).
+    # Only accept the result if the returned store/cover date's YEAR
+    # matches the win's year_raw; otherwise reject it and keep the
+    # placeholder fallback below.
+    if metron_data is None and issue_num and not metron_disabled:
+        year_str = str(year_raw).strip() if year_raw is not None else ""
+        if re.fullmatch(r"\d{4}", year_str):
+            try:
+                metron_attempted += 1
+                looked_up = metron.lookup_issue(series_raw, issue_num, year_raw)
+                if looked_up:
+                    looked_date = (
+                        looked_up.get("store_date")
+                        or looked_up.get("cover_date")
+                    )
+                    if _date_matches_year(looked_date, year_raw):
+                        metron_succeeded += 1
+                        metron_data = looked_up
+            except MetronCredentialError:
+                metron_disabled = True
+                logger.warning(
+                    "Metron credentials not configured; falling back to placeholder release date."
+                )
+            else:
+                metron_disabled = _check_metron_degraded(metron, metron_disabled)
+
+    # R32: variant handling
+    needs_manual_variant = False
+    # BUI-199 Cause 1: full_title must use the BASE series name, not the
+    # decorated canonical_series. LOCG's full_title carries no
+    # "(Vol. N) (YYYY - YYYY)" decoration (e.g. "Fantastic Four #72",
+    # not "Fantastic Four (Vol. 3) (1997 - 2012) #72"), so a decorated
+    # full_title is unmatchable by LOCG Bulk Import. The stored
+    # series_name stays decorated/unchanged.
+    base_title = base_full_title(canonical_series, issue_num or None)
+    if variant_text:
+        suffix = VARIANT_SUFFIX_MAP.get(variant_text)
+        if suffix:
+            full_title = f"{base_title} {suffix}"
+        else:
+            # BUI-33: Metron variant resolution. The lightweight
+            # lookup_issue has no variants, so fetch issue detail and
+            # fuzzy-match the auction variant text against Metron's
+            # variant cover names. (LOCG title-search fallback is dead
+            # per the local-first pivot, ADR 0001 / BUI-25.)
+            matched_variant: Optional[str] = None
+            metron_id = metron_data.get("metron_id") if metron_data else None
+            if metron_id is not None and not metron_disabled:
+                try:
+                    variant_detail_attempted += 1
+                    detail = metron.lookup_issue_detail(metron_id)
+                    if detail:
+                        matched_variant = _fuzzy_variant_match(
+                            variant_text, detail.get("variants") or []
+                        )
+                except MetronCredentialError:
+                    metron_disabled = True
+                    logger.warning(
+                        "Metron credentials not configured; skipping variant resolution."
+                    )
+                else:
+                    metron_disabled = _check_metron_degraded(metron, metron_disabled)
+
+            if matched_variant:
+                full_title = f"{base_title} {matched_variant}"
+                variant_matches += 1
+            elif base_title in existing_titles:
+                # Base issue already owned — attach to the canonical entry.
+                full_title = base_title
+            else:
+                full_title = base_title
+                needs_manual_variant = True
+                manual_variant += 1
+    else:
+        full_title = base_title
+
+    # release_date: prefer store_date, fall back to cover_date.
+    #
+    # BUI-268: same reprint guard as the BUI-210 date-only lookup below
+    # — this metron_data can come from the FIRST Metron call (the R36
+    # step-2 series-resolution path a few lines up, used when
+    # series_name_index has no entry), which has no year filter of its
+    # own. Left unguarded, a reprint/collected-edition store_date
+    # (observed: Infinity Gauntlet #1 stamped 2022-09-14 from a 2022
+    # reprint hit, despite series_name correctly resolving to "The
+    # Infinity Gauntlet (1991) (1991 - 1991)") got written onto an
+    # otherwise-correct 1991 row, so a later year-gated
+    # collection-check for the real 1991 issue found the row and
+    # rejected it as a mismatched era. Only accept the Metron date when
+    # its year matches year_raw; a mismatch is dropped (R66: a Metron
+    # hit that lacks a trustworthy date stays blank — the relaxed year
+    # gate then fail-opens on this row rather than falsely rejecting a
+    # genuinely-owned copy).
+    release_date: Optional[str] = None
+    if metron_data:
+        candidate_date = metron_data.get("store_date") or metron_data.get("cover_date")
+        year_str = str(year_raw).strip() if year_raw is not None else ""
+        if (
+            re.fullmatch(r"\d{4}", year_str)
+            and candidate_date
+            and not _date_matches_year(candidate_date, year_raw)
+        ):
+            candidate_date = None
+        release_date = candidate_date
+
+    # BUI-105: when no Metron data backs this win (the series_name_index
+    # path, or the bare-series manual fallback), there is no Metron date,
+    # so the row would be written dateless and miss a year-gated
+    # collection-check. Stamp a best-effort release_date from the identify
+    # year (Jan 1 — year precision is all the year.startswith() gate in
+    # _match_owned_issue needs) so a just-won book reads as in-collection.
+    # A Metron hit that simply lacks dates stays blank (R66) — the relaxed
+    # year gate already lets that row match.
+    if release_date is None and metron_data is None and year_raw is not None:
+        year_str = str(year_raw).strip()
+        if re.fullmatch(r"\d{4}", year_str):
+            release_date = f"{year_str}-01-01"
+
+    row: dict[str, Any] = {
+        "publisher_name": None,
+        "series_name": canonical_series,
+        "full_title": full_title,
+        "release_date": release_date,
+        "in_collection": 1,
+        "in_wish_list": 0,
+        "marked_read": 0,
+        "my_rating": None,
+        "media_format": None,
+        "price_paid": price,
+        "date_purchased": date_purchased,
+        "condition": None,
+        "notes": None,
+        "tags": None,
+        "storage_box": None,
+        "owner": None,
+        "purchase_store": "eBay",
+        "signature": 0,
+        "slabbing": 0,
+        "grading": None,
+        "grading_company": None,
+        "local_added_at": _utcnow_iso(),
+        "local_added_seq": _next_seq(),
+        "pushed_to_locg_at": None,
+        "last_seen_in_export_at": None,
+        "source": "agent_win",
+        "needs_manual_variant": needs_manual_variant,
+        "needs_manual_series_canonical": needs_manual_series,
+        "metron_id": metron_data.get("metron_id") if metron_data else None,
+        "gixen_item_id": item_id or None,
+        "previous_full_title": None,
+    }
+
+    return {
+        "skipped": False,
+        "skip_detail": None,
+        "row": row,
+        "metron_disabled": metron_disabled,
+        "metron_attempted": metron_attempted,
+        "metron_succeeded": metron_succeeded,
+        "manual_series": manual_series,
+        "manual_variant": manual_variant,
+        "variant_detail_attempted": variant_detail_attempted,
+        "variant_matches": variant_matches,
+    }
+
+
 def cmd_collection_record_win(
     wins: list[dict[str, Any]],
     cache: Optional[Any] = None,
@@ -2495,254 +2801,30 @@ def cmd_collection_record_win(
         chunk_variant_matches = 0
 
         for win in chunk:
-            identify = win.get("identify_data") or {}
-            series_raw = str(identify.get("series") or "").strip()
-            issue_num = str(identify.get("issue") or "").strip()
-            year_raw = identify.get("year")
-            variant_text = str(identify.get("variant_text") or "").strip().lower()
-            end_date = str(win.get("end_date_iso") or "").strip()
-            item_id = str(win.get("item_id") or "").strip()
-            price = _resolve_price(win.get("current_bid"))
-
-            # date_purchased: date portion of end_date_iso
-            date_purchased: Optional[str] = None
-            if end_date:
-                try:
-                    dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                    date_purchased = dt.date().isoformat()
-                except ValueError:
-                    date_purchased = end_date[:10] if len(end_date) >= 10 else end_date
-
-            # R36: series resolution
-            norm_key = _normalize_series_key(series_raw)
-            canonical_series: Optional[str] = None
-            needs_manual_series = False
-            metron_data: Optional[dict[str, Any]] = None
-
-            # BUI-199: resolve the canonical series by issue-number boundary
-            # (the LOCG X-Men split) and by year/era (the right volume), not by
-            # blindly taking the single series_name_index entry.
-            resolved_series = resolve_series_for_win(
-                norm_key, issue_num, year_raw, series_name_index, volume_candidates
+            result = _build_win_row(
+                win,
+                series_name_index=series_name_index,
+                volume_candidates=volume_candidates,
+                existing_titles=existing_titles,
+                owned_index=owned_index,
+                metron=metron,
+                metron_disabled=metron_disabled,
             )
-            if resolved_series is not None:
-                canonical_series = resolved_series
-            elif not metron_disabled:
-                try:
-                    chunk_metron_attempted += 1
-                    metron_data = metron.lookup_issue(series_raw, issue_num, year_raw)
-                    if metron_data:
-                        chunk_metron_succeeded += 1
-                        canonical_series = metron.format_series_name(metron_data)
-                except MetronCredentialError:
-                    metron_disabled = True
-                    logger.warning("Metron credentials not configured; falling back to manual series resolution.")
-                else:
-                    metron_disabled = _check_metron_degraded(metron, metron_disabled)
+            metron_disabled = result["metron_disabled"]
+            chunk_metron_attempted += result["metron_attempted"]
+            chunk_metron_succeeded += result["metron_succeeded"]
+            chunk_manual_series += result["manual_series"]
+            chunk_manual_variant += result["manual_variant"]
+            chunk_variant_detail_attempted += result["variant_detail_attempted"]
+            chunk_variant_matches += result["variant_matches"]
 
-            if canonical_series is None:
-                canonical_series = series_raw
-                needs_manual_series = True
-                chunk_manual_series += 1
-
-            # BUI-34: skip wins already owned in the cache (series + issue),
-            # before any variant lookup or row construction.
-            #
-            # BUI-267: the bare (series, issue) key collides across unrelated
-            # volumes/eras (New Gods #7 1971 vs an owned Vol. 5 2024 #7) and
-            # across distinct print editions (a base win vs an owned Newsstand
-            # copy), so a key collision alone is no longer sufficient — each
-            # candidate owned row must also be era- and edition-compatible.
-            # Cosmetic cover variants (e.g. "Capullo Variant") stay ignored,
-            # matching the original BUI-34 behavior.
-            owned_candidates = owned_index.get((
-                _normalize_series_key(canonical_series),
-                normalize_issue_key(issue_num),
-            ), []) if issue_num else []
-            matched_owned_row: Optional[dict[str, Any]] = None
-            if owned_candidates:
-                win_year = _coerce_year(year_raw)
-                for candidate_row in owned_candidates:
-                    candidate_suffix = _owned_row_variant_suffix(candidate_row.get("full_title") or "")
-                    if _dedup_era_compatible(win_year, candidate_row) and _dedup_variant_compatible(
-                        variant_text, candidate_suffix
-                    ):
-                        matched_owned_row = candidate_row
-                        break
-            if matched_owned_row is not None:
+            if result["skipped"]:
                 skipped_already_owned += 1
-                skipped_already_owned_titles.append(f"{canonical_series} #{issue_num}")
-                skipped_already_owned_detail.append({
-                    "win": f"{canonical_series} #{issue_num}",
-                    "matched_series_name": matched_owned_row.get("series_name"),
-                    "matched_release_date": matched_owned_row.get("release_date"),
-                })
+                skipped_already_owned_titles.append(result["skip_detail"]["win"])
+                skipped_already_owned_detail.append(result["skip_detail"])
                 continue
 
-            # BUI-210: when the series resolved via series_name_index (the common
-            # case — metron_data stays None), we still have no release_date, so
-            # the row would fall through to the {year}-01-01 placeholder, which
-            # the export blanks → the row ships dateless and an all-dateless
-            # batch hangs LOCG's importer. Do a Metron *issue* lookup purely to
-            # populate a real date; do NOT touch canonical_series (the
-            # index-resolved value is more reliable than Metron's
-            # format_series_name here). Runs after the BUI-34 dedup continue so
-            # we never spend a Metron call on a skipped already-owned win, and
-            # before the variant block so variant resolution can reuse metron_id.
-            #
-            # Reprint guard: a naive lookup_issue("The X-Men", "59", 1970) can
-            # return a collected-edition/reprint date (observed: 2005-03-09).
-            # Only accept the result if the returned store/cover date's YEAR
-            # matches the win's year_raw; otherwise reject it and keep the
-            # placeholder fallback below.
-            if metron_data is None and issue_num and not metron_disabled:
-                year_str = str(year_raw).strip() if year_raw is not None else ""
-                if re.fullmatch(r"\d{4}", year_str):
-                    try:
-                        chunk_metron_attempted += 1
-                        looked_up = metron.lookup_issue(series_raw, issue_num, year_raw)
-                        if looked_up:
-                            looked_date = (
-                                looked_up.get("store_date")
-                                or looked_up.get("cover_date")
-                            )
-                            if _date_matches_year(looked_date, year_raw):
-                                chunk_metron_succeeded += 1
-                                metron_data = looked_up
-                    except MetronCredentialError:
-                        metron_disabled = True
-                        logger.warning(
-                            "Metron credentials not configured; falling back to placeholder release date."
-                        )
-                    else:
-                        metron_disabled = _check_metron_degraded(metron, metron_disabled)
-
-            # R32: variant handling
-            needs_manual_variant = False
-            # BUI-199 Cause 1: full_title must use the BASE series name, not the
-            # decorated canonical_series. LOCG's full_title carries no
-            # "(Vol. N) (YYYY - YYYY)" decoration (e.g. "Fantastic Four #72",
-            # not "Fantastic Four (Vol. 3) (1997 - 2012) #72"), so a decorated
-            # full_title is unmatchable by LOCG Bulk Import. The stored
-            # series_name stays decorated/unchanged.
-            base_title = base_full_title(canonical_series, issue_num or None)
-            if variant_text:
-                suffix = VARIANT_SUFFIX_MAP.get(variant_text)
-                if suffix:
-                    full_title = f"{base_title} {suffix}"
-                else:
-                    # BUI-33: Metron variant resolution. The lightweight
-                    # lookup_issue has no variants, so fetch issue detail and
-                    # fuzzy-match the auction variant text against Metron's
-                    # variant cover names. (LOCG title-search fallback is dead
-                    # per the local-first pivot, ADR 0001 / BUI-25.)
-                    matched_variant: Optional[str] = None
-                    metron_id = metron_data.get("metron_id") if metron_data else None
-                    if metron_id is not None and not metron_disabled:
-                        try:
-                            chunk_variant_detail_attempted += 1
-                            detail = metron.lookup_issue_detail(metron_id)
-                            if detail:
-                                matched_variant = _fuzzy_variant_match(
-                                    variant_text, detail.get("variants") or []
-                                )
-                        except MetronCredentialError:
-                            metron_disabled = True
-                            logger.warning(
-                                "Metron credentials not configured; skipping variant resolution."
-                            )
-                        else:
-                            metron_disabled = _check_metron_degraded(metron, metron_disabled)
-
-                    if matched_variant:
-                        full_title = f"{base_title} {matched_variant}"
-                        chunk_variant_matches += 1
-                    elif base_title in existing_titles:
-                        # Base issue already owned — attach to the canonical entry.
-                        full_title = base_title
-                    else:
-                        full_title = base_title
-                        needs_manual_variant = True
-                        chunk_manual_variant += 1
-            else:
-                full_title = base_title
-
-            # release_date: prefer store_date, fall back to cover_date.
-            #
-            # BUI-268: same reprint guard as the BUI-210 date-only lookup below
-            # — this metron_data can come from the FIRST Metron call (the R36
-            # step-2 series-resolution path a few lines up, used when
-            # series_name_index has no entry), which has no year filter of its
-            # own. Left unguarded, a reprint/collected-edition store_date
-            # (observed: Infinity Gauntlet #1 stamped 2022-09-14 from a 2022
-            # reprint hit, despite series_name correctly resolving to "The
-            # Infinity Gauntlet (1991) (1991 - 1991)") got written onto an
-            # otherwise-correct 1991 row, so a later year-gated
-            # collection-check for the real 1991 issue found the row and
-            # rejected it as a mismatched era. Only accept the Metron date when
-            # its year matches year_raw; a mismatch is dropped (R66: a Metron
-            # hit that lacks a trustworthy date stays blank — the relaxed year
-            # gate then fail-opens on this row rather than falsely rejecting a
-            # genuinely-owned copy).
-            release_date: Optional[str] = None
-            if metron_data:
-                candidate_date = metron_data.get("store_date") or metron_data.get("cover_date")
-                year_str = str(year_raw).strip() if year_raw is not None else ""
-                if (
-                    re.fullmatch(r"\d{4}", year_str)
-                    and candidate_date
-                    and not _date_matches_year(candidate_date, year_raw)
-                ):
-                    candidate_date = None
-                release_date = candidate_date
-
-            # BUI-105: when no Metron data backs this win (the series_name_index
-            # path, or the bare-series manual fallback), there is no Metron date,
-            # so the row would be written dateless and miss a year-gated
-            # collection-check. Stamp a best-effort release_date from the identify
-            # year (Jan 1 — year precision is all the year.startswith() gate in
-            # _match_owned_issue needs) so a just-won book reads as in-collection.
-            # A Metron hit that simply lacks dates stays blank (R66) — the relaxed
-            # year gate already lets that row match.
-            if release_date is None and metron_data is None and year_raw is not None:
-                year_str = str(year_raw).strip()
-                if re.fullmatch(r"\d{4}", year_str):
-                    release_date = f"{year_str}-01-01"
-
-            row: dict[str, Any] = {
-                "publisher_name": None,
-                "series_name": canonical_series,
-                "full_title": full_title,
-                "release_date": release_date,
-                "in_collection": 1,
-                "in_wish_list": 0,
-                "marked_read": 0,
-                "my_rating": None,
-                "media_format": None,
-                "price_paid": price,
-                "date_purchased": date_purchased,
-                "condition": None,
-                "notes": None,
-                "tags": None,
-                "storage_box": None,
-                "owner": None,
-                "purchase_store": "eBay",
-                "signature": 0,
-                "slabbing": 0,
-                "grading": None,
-                "grading_company": None,
-                "local_added_at": _utcnow_iso(),
-                "local_added_seq": _next_seq(),
-                "pushed_to_locg_at": None,
-                "last_seen_in_export_at": None,
-                "source": "agent_win",
-                "needs_manual_variant": needs_manual_variant,
-                "needs_manual_series_canonical": needs_manual_series,
-                "metron_id": metron_data.get("metron_id") if metron_data else None,
-                "gixen_item_id": item_id or None,
-                "previous_full_title": None,
-            }
-            built_rows.append(row)
+            built_rows.append(result["row"])
 
         try:
             cache.write_wins(built_rows, command="record-win")

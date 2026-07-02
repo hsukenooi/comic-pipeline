@@ -362,6 +362,331 @@ def migrate_wish_list_source() -> dict[str, Any]:
 # Main import orchestration
 # ---------------------------------------------------------------------------
 
+def _reconcile_phase(
+    comics: list[dict[str, Any]],
+    xlsx_rows: list[dict[str, Any]],
+    identity_to_idx: dict[tuple, int],
+    partial_to_idx: dict[tuple, int],
+    healed_drop: set[int],
+    audit_records: list[dict[str, Any]],
+    summary: dict[str, Any],
+    now: str,
+) -> None:
+    """Phase 1 of import_xlsx's do_merge: reconcile flagged/pending agent_win
+    rows against the incoming export via the relaxed heuristic
+    (_reconcile_score), rewriting identity in place and clearing manual flags.
+    See import_xlsx's docstring for the two-phase pipeline this implements.
+
+    Mutates `comics` row dicts, `identity_to_idx` / `partial_to_idx`,
+    `healed_drop`, `audit_records`, and `summary` in place (same containers
+    do_merge already builds/holds) — no return value, matching do_merge's
+    existing mutate-in-place style. Must run before _standard_merge_phase,
+    which relies on the identity rewrites and index updates made here.
+    """
+    # ----- Phase 1: Reconciliation ----------------------------------------
+    # Manually-flagged best-guess rows always get the relaxed (exact-year)
+    # heuristic. BUI-122: also run it for *unflagged* pending agent_win rows
+    # whose exact identity is absent from this export. LOCG silently rewrites
+    # a just-pushed row's Release Date to its own canonical value (see
+    # docs/solutions/integration-issues/locg-bulk-import-recipe-2026-05-22.md),
+    # which breaks the Phase-2 exact make_identity match; the row would then
+    # insert as a duplicate while the original stayed pending forever. The
+    # `make_identity(r) not in exact_ids` guard preserves Phase-2 exact-match
+    # primacy — a win whose date round-tripped unchanged is handled by the
+    # standard merge, not routed through year-tolerant scoring (which would
+    # mis-flag it ambiguous against a same-year variant).
+    exact_ids = {make_identity(xr) for xr in xlsx_rows}
+    flagged_indices = [
+        i for i, r in enumerate(comics)
+        if r.get("needs_manual_variant")
+        or r.get("needs_manual_series_canonical")
+        or (
+            r.get("source") == "agent_win"
+            and r.get("pushed_to_locg_at") is None
+            and make_identity(r) not in exact_ids
+        )
+    ]
+
+    for ci in flagged_indices:
+        cache_row = comics[ci]
+        candidates: list[tuple[int, int, dict]] = []
+
+        for xi, xr in enumerate(xlsx_rows):
+            score = _reconcile_score(cache_row, xr)
+            if score > 0:
+                candidates.append((score, xi, xr))
+
+        if not candidates:
+            continue
+
+        if len(candidates) > 1:
+            # Multi-match: leave all flagged, log ambiguous
+            audit_records.append({
+                "type": "ambiguous_reconciliation",
+                "ts": now,
+                "command": "import",
+                "details": {
+                    "full_title": cache_row.get("full_title"),
+                    "candidate_count": len(candidates),
+                },
+            })
+            summary["warnings"].append(
+                f"Ambiguous reconciliation for '{cache_row.get('full_title')}'"
+            )
+            continue
+
+        _score, _xi, xlsx_row = candidates[0]
+
+        # Collision guard (BUI-122): rewriting this row's identity to the
+        # matched export row's identity must not land on an identity another
+        # cache row already holds — that would create a duplicate-identity
+        # pair. This happens when the row is a win for a book already owned
+        # under LOCG's canonical identity (the agent_win row and the existing
+        # locg_export row are the same comic). Leave it pending and surface it
+        # rather than silently merging or duplicating (visible non-clear over
+        # silent wrong merge). The pre-existing duplicate-records condition is
+        # then resolved out-of-band (see the sync runbook's cleanup section).
+        target_identity = make_identity(xlsx_row)
+        collide = identity_to_idx.get(target_identity)
+        if collide is not None and collide != ci:
+            # BUI-211: auto-heal the safe case (folds in cleanup_duplicates.py
+            # class 1 — same-book/different-identity dup wins). If the collision
+            # target is an *established owned* row (locg_export or already
+            # pushed, AND in_collection) and THIS row is a pending agent_win,
+            # the two are the same owned book: the win is a redundant leftover
+            # that record-win's dedup missed (the owned copy was usually
+            # imported after the win was recorded). Drop the pending win, keep
+            # the established owned row — no "left pending" warning needed.
+            target_row = comics[collide]
+            target_established_owned = (
+                (
+                    target_row.get("source") == "locg_export"
+                    or bool(target_row.get("pushed_to_locg_at"))
+                )
+                and bool(target_row.get("in_collection"))
+            )
+            cache_row_pending_win = (
+                cache_row.get("source") == "agent_win"
+                and cache_row.get("pushed_to_locg_at") is None
+            )
+            if target_established_owned and cache_row_pending_win:
+                healed_drop.add(ci)
+                summary["auto_healed_duplicates"] += 1
+                audit_records.append({
+                    "type": "auto_healed_duplicate_win",
+                    "ts": now,
+                    "command": "import",
+                    "details": {
+                        "full_title": cache_row.get("full_title"),
+                        "kept_identity": list(target_identity),
+                    },
+                })
+                # Skip the rest of this iteration (like the leave-pending path):
+                # do NOT rewrite identity or touch indices for a dropped row.
+                continue
+
+            # Not an established-owned collision (e.g. two pending rows): keep
+            # the existing leave-pending behavior exactly.
+            audit_records.append({
+                "type": "ambiguous_reconciliation",
+                "ts": now,
+                "command": "import",
+                "details": {
+                    "full_title": cache_row.get("full_title"),
+                    "reason": "identity_collision_with_existing_row",
+                },
+            })
+            summary["warnings"].append(
+                f"Reconciliation collision for '{cache_row.get('full_title')}' "
+                "— a row with that identity already exists; left pending"
+            )
+            continue
+
+        old_identity = make_identity(cache_row)
+        old_partial = _partial_identity(cache_row)
+
+        cache_row["publisher_name"] = xlsx_row["publisher_name"]
+        cache_row["series_name"] = xlsx_row["series_name"]
+        cache_row["full_title"] = xlsx_row["full_title"]
+        cache_row["release_date"] = xlsx_row["release_date"]
+        cache_row["needs_manual_variant"] = False
+        cache_row["needs_manual_series_canonical"] = False
+        cache_row["source"] = "locg_export"
+        cache_row["last_seen_in_export_at"] = now
+        cache_row["pushed_to_locg_at"] = cache_row.get("pushed_to_locg_at") or now
+
+        # Update indices
+        if old_identity in identity_to_idx:
+            del identity_to_idx[old_identity]
+        if old_partial in partial_to_idx:
+            del partial_to_idx[old_partial]
+        identity_to_idx[make_identity(cache_row)] = ci
+        partial_to_idx[_partial_identity(cache_row)] = ci
+
+        summary["reconciled"] += 1
+        audit_records.append({
+            "type": "reconciliation",
+            "ts": now,
+            "command": "import",
+            "details": {
+                "old_identity": list(old_identity),
+                "new_identity": list(make_identity(cache_row)),
+            },
+        })
+
+
+def _standard_merge_phase(
+    comics: list[dict[str, Any]],
+    xlsx_rows: list[dict[str, Any]],
+    identity_to_idx: dict[tuple, int],
+    partial_to_idx: dict[tuple, int],
+    audit_records: list[dict[str, Any]],
+    summary: dict[str, Any],
+    now: str,
+) -> set[tuple]:
+    """Phase 2 of import_xlsx's do_merge: insert-or-update each export row by
+    identity tuple, detecting renames (R67) via partial-identity match against
+    pre-import rows only. See import_xlsx's docstring for the two-phase
+    pipeline this implements.
+
+    Mutates `comics`, `identity_to_idx` / `partial_to_idx`, `audit_records`,
+    and `summary` in place. Must run after _reconcile_phase (Phase 1), whose
+    identity rewrites this phase's identity_to_idx lookups depend on. Returns
+    the set of xlsx row identities seen, which the possibly-removed check
+    (run by do_merge after both phases) needs.
+    """
+    # ----- Phase 2: Standard merge ----------------------------------------
+    # Record how many comics existed BEFORE this import so we only check
+    # pre-import rows for rename detection — new insertions in this same
+    # loop must never trigger spurious renames.
+    pre_import_count = len(comics)
+    xlsx_identities: set[tuple] = set()
+
+    for xr in xlsx_rows:
+        row_identity = make_identity(xr)
+        xlsx_identities.add(row_identity)
+
+        if row_identity in identity_to_idx:
+            # Update existing row
+            ci = identity_to_idx[row_identity]
+            existing = comics[ci]
+
+            # Capture user-managed values BEFORE overwriting with xlsx data
+            pre_user_values = {col: existing.get(col) for col in USER_MANAGED_COLUMNS}
+            pre_checksum = _user_column_checksum(existing)
+
+            # Remove from partial_to_idx so it won't be found as a rename
+            # candidate by a later xlsx row with the same partial identity
+            old_partial = _partial_identity(existing)
+            if partial_to_idx.get(old_partial) == ci:
+                del partial_to_idx[old_partial]
+
+            _apply_locg_columns_held(existing, xr, now, audit_records, summary)
+            existing["last_seen_in_export_at"] = now
+            existing["source"] = "locg_export"
+            if existing.get("pushed_to_locg_at") is None:
+                existing["pushed_to_locg_at"] = now
+
+            post_checksum = _user_column_checksum(existing)
+            if pre_checksum != post_checksum:
+                changed = [
+                    col for col in USER_MANAGED_COLUMNS
+                    if pre_user_values.get(col) != xr.get(col)
+                ]
+                if changed:
+                    audit_records.append({
+                        "type": "behavioral_drift",
+                        "ts": now,
+                        "command": "import",
+                        "details": {
+                            "identity": list(row_identity),
+                            "columns_changed": changed,
+                        },
+                    })
+                    summary["behavioral_drift_count"] += 1
+
+            summary["updated"] += 1
+
+        else:
+            # Check for rename: same (publisher, series, release_date), different
+            # full_title (R67) — only against pre-import rows, never new inserts
+            row_partial = _partial_identity(xr)
+            if row_partial in partial_to_idx:
+                ci = partial_to_idx[row_partial]
+                if ci < pre_import_count:
+                    existing = comics[ci]
+                    old_title = existing.get("full_title") or ""
+                    new_title = xr.get("full_title") or ""
+                    if old_title and new_title and old_title != new_title:
+                        old_identity = make_identity(existing)
+                        existing["previous_full_title"] = old_title
+
+                        pre_checksum = _user_column_checksum(existing)
+                        _apply_locg_columns_held(
+                            existing, xr, now, audit_records, summary
+                        )
+                        existing["last_seen_in_export_at"] = now
+                        existing["source"] = "locg_export"
+                        if existing.get("pushed_to_locg_at") is None:
+                            existing["pushed_to_locg_at"] = now
+                        post_checksum = _user_column_checksum(existing)
+
+                        if old_identity in identity_to_idx:
+                            del identity_to_idx[old_identity]
+                        identity_to_idx[make_identity(existing)] = ci
+                        # Consume the partial slot so it won't match again
+                        del partial_to_idx[row_partial]
+
+                        if pre_checksum != post_checksum:
+                            changed = [
+                                col for col in USER_MANAGED_COLUMNS
+                                if existing.get(col) != xr.get(col)
+                            ]
+                            if changed:
+                                audit_records.append({
+                                    "type": "behavioral_drift",
+                                    "ts": now,
+                                    "command": "import",
+                                    "details": {
+                                        "identity": list(make_identity(existing)),
+                                        "columns_changed": changed,
+                                    },
+                                })
+                                summary["behavioral_drift_count"] += 1
+
+                        audit_records.append({
+                            "type": "renamed_full_title",
+                            "ts": now,
+                            "command": "import",
+                            "details": {
+                                "old_title": old_title,
+                                "new_title": new_title,
+                                "identity": list(make_identity(existing)),
+                            },
+                        })
+                        summary["updated"] += 1
+                        continue
+
+            # Genuine new row from LOCG — do NOT add to partial_to_idx to
+            # avoid triggering rename detection for subsequent xlsx rows
+            new_row: dict[str, Any] = dict(xr)
+            new_row["local_added_at"] = now
+            new_row["local_added_seq"] = _next_seq()
+            new_row["pushed_to_locg_at"] = now
+            new_row["last_seen_in_export_at"] = now
+            new_row["source"] = "locg_export"
+            new_row["needs_manual_variant"] = False
+            new_row["needs_manual_series_canonical"] = False
+            new_row["metron_id"] = None
+            new_row["gixen_item_id"] = None
+            new_row["previous_full_title"] = None
+            comics.append(new_row)
+            identity_to_idx[make_identity(new_row)] = len(comics) - 1
+            summary["added"] += 1
+
+    return xlsx_identities
+
+
 def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
     """Parse a LOCG Excel export and merge it into the cache.
 
@@ -417,285 +742,26 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
             identity_to_idx[make_identity(row)] = i
             partial_to_idx[_partial_identity(row)] = i
 
-        # ----- Phase 1: Reconciliation ----------------------------------------
-        # Manually-flagged best-guess rows always get the relaxed (exact-year)
-        # heuristic. BUI-122: also run it for *unflagged* pending agent_win rows
-        # whose exact identity is absent from this export. LOCG silently rewrites
-        # a just-pushed row's Release Date to its own canonical value (see
-        # docs/solutions/integration-issues/locg-bulk-import-recipe-2026-05-22.md),
-        # which breaks the Phase-2 exact make_identity match; the row would then
-        # insert as a duplicate while the original stayed pending forever. The
-        # `make_identity(r) not in exact_ids` guard preserves Phase-2 exact-match
-        # primacy — a win whose date round-tripped unchanged is handled by the
-        # standard merge, not routed through year-tolerant scoring (which would
-        # mis-flag it ambiguous against a same-year variant).
-        exact_ids = {make_identity(xr) for xr in xlsx_rows}
-        flagged_indices = [
-            i for i, r in enumerate(comics)
-            if r.get("needs_manual_variant")
-            or r.get("needs_manual_series_canonical")
-            or (
-                r.get("source") == "agent_win"
-                and r.get("pushed_to_locg_at") is None
-                and make_identity(r) not in exact_ids
-            )
-        ]
+        _reconcile_phase(
+            comics,
+            xlsx_rows,
+            identity_to_idx,
+            partial_to_idx,
+            healed_drop,
+            audit_records,
+            summary,
+            now,
+        )
 
-        for ci in flagged_indices:
-            cache_row = comics[ci]
-            candidates: list[tuple[int, int, dict]] = []
-
-            for xi, xr in enumerate(xlsx_rows):
-                score = _reconcile_score(cache_row, xr)
-                if score > 0:
-                    candidates.append((score, xi, xr))
-
-            if not candidates:
-                continue
-
-            if len(candidates) > 1:
-                # Multi-match: leave all flagged, log ambiguous
-                audit_records.append({
-                    "type": "ambiguous_reconciliation",
-                    "ts": now,
-                    "command": "import",
-                    "details": {
-                        "full_title": cache_row.get("full_title"),
-                        "candidate_count": len(candidates),
-                    },
-                })
-                summary["warnings"].append(
-                    f"Ambiguous reconciliation for '{cache_row.get('full_title')}'"
-                )
-                continue
-
-            _score, _xi, xlsx_row = candidates[0]
-
-            # Collision guard (BUI-122): rewriting this row's identity to the
-            # matched export row's identity must not land on an identity another
-            # cache row already holds — that would create a duplicate-identity
-            # pair. This happens when the row is a win for a book already owned
-            # under LOCG's canonical identity (the agent_win row and the existing
-            # locg_export row are the same comic). Leave it pending and surface it
-            # rather than silently merging or duplicating (visible non-clear over
-            # silent wrong merge). The pre-existing duplicate-records condition is
-            # then resolved out-of-band (see the sync runbook's cleanup section).
-            target_identity = make_identity(xlsx_row)
-            collide = identity_to_idx.get(target_identity)
-            if collide is not None and collide != ci:
-                # BUI-211: auto-heal the safe case (folds in cleanup_duplicates.py
-                # class 1 — same-book/different-identity dup wins). If the collision
-                # target is an *established owned* row (locg_export or already
-                # pushed, AND in_collection) and THIS row is a pending agent_win,
-                # the two are the same owned book: the win is a redundant leftover
-                # that record-win's dedup missed (the owned copy was usually
-                # imported after the win was recorded). Drop the pending win, keep
-                # the established owned row — no "left pending" warning needed.
-                target_row = comics[collide]
-                target_established_owned = (
-                    (
-                        target_row.get("source") == "locg_export"
-                        or bool(target_row.get("pushed_to_locg_at"))
-                    )
-                    and bool(target_row.get("in_collection"))
-                )
-                cache_row_pending_win = (
-                    cache_row.get("source") == "agent_win"
-                    and cache_row.get("pushed_to_locg_at") is None
-                )
-                if target_established_owned and cache_row_pending_win:
-                    healed_drop.add(ci)
-                    summary["auto_healed_duplicates"] += 1
-                    audit_records.append({
-                        "type": "auto_healed_duplicate_win",
-                        "ts": now,
-                        "command": "import",
-                        "details": {
-                            "full_title": cache_row.get("full_title"),
-                            "kept_identity": list(target_identity),
-                        },
-                    })
-                    # Skip the rest of this iteration (like the leave-pending path):
-                    # do NOT rewrite identity or touch indices for a dropped row.
-                    continue
-
-                # Not an established-owned collision (e.g. two pending rows): keep
-                # the existing leave-pending behavior exactly.
-                audit_records.append({
-                    "type": "ambiguous_reconciliation",
-                    "ts": now,
-                    "command": "import",
-                    "details": {
-                        "full_title": cache_row.get("full_title"),
-                        "reason": "identity_collision_with_existing_row",
-                    },
-                })
-                summary["warnings"].append(
-                    f"Reconciliation collision for '{cache_row.get('full_title')}' "
-                    "— a row with that identity already exists; left pending"
-                )
-                continue
-
-            old_identity = make_identity(cache_row)
-            old_partial = _partial_identity(cache_row)
-
-            cache_row["publisher_name"] = xlsx_row["publisher_name"]
-            cache_row["series_name"] = xlsx_row["series_name"]
-            cache_row["full_title"] = xlsx_row["full_title"]
-            cache_row["release_date"] = xlsx_row["release_date"]
-            cache_row["needs_manual_variant"] = False
-            cache_row["needs_manual_series_canonical"] = False
-            cache_row["source"] = "locg_export"
-            cache_row["last_seen_in_export_at"] = now
-            cache_row["pushed_to_locg_at"] = cache_row.get("pushed_to_locg_at") or now
-
-            # Update indices
-            if old_identity in identity_to_idx:
-                del identity_to_idx[old_identity]
-            if old_partial in partial_to_idx:
-                del partial_to_idx[old_partial]
-            identity_to_idx[make_identity(cache_row)] = ci
-            partial_to_idx[_partial_identity(cache_row)] = ci
-
-            summary["reconciled"] += 1
-            audit_records.append({
-                "type": "reconciliation",
-                "ts": now,
-                "command": "import",
-                "details": {
-                    "old_identity": list(old_identity),
-                    "new_identity": list(make_identity(cache_row)),
-                },
-            })
-
-        # ----- Phase 2: Standard merge ----------------------------------------
-        # Record how many comics existed BEFORE this import so we only check
-        # pre-import rows for rename detection — new insertions in this same
-        # loop must never trigger spurious renames.
-        pre_import_count = len(comics)
-        xlsx_identities: set[tuple] = set()
-
-        for xr in xlsx_rows:
-            row_identity = make_identity(xr)
-            xlsx_identities.add(row_identity)
-
-            if row_identity in identity_to_idx:
-                # Update existing row
-                ci = identity_to_idx[row_identity]
-                existing = comics[ci]
-
-                # Capture user-managed values BEFORE overwriting with xlsx data
-                pre_user_values = {col: existing.get(col) for col in USER_MANAGED_COLUMNS}
-                pre_checksum = _user_column_checksum(existing)
-
-                # Remove from partial_to_idx so it won't be found as a rename
-                # candidate by a later xlsx row with the same partial identity
-                old_partial = _partial_identity(existing)
-                if partial_to_idx.get(old_partial) == ci:
-                    del partial_to_idx[old_partial]
-
-                _apply_locg_columns_held(existing, xr, now, audit_records, summary)
-                existing["last_seen_in_export_at"] = now
-                existing["source"] = "locg_export"
-                if existing.get("pushed_to_locg_at") is None:
-                    existing["pushed_to_locg_at"] = now
-
-                post_checksum = _user_column_checksum(existing)
-                if pre_checksum != post_checksum:
-                    changed = [
-                        col for col in USER_MANAGED_COLUMNS
-                        if pre_user_values.get(col) != xr.get(col)
-                    ]
-                    if changed:
-                        audit_records.append({
-                            "type": "behavioral_drift",
-                            "ts": now,
-                            "command": "import",
-                            "details": {
-                                "identity": list(row_identity),
-                                "columns_changed": changed,
-                            },
-                        })
-                        summary["behavioral_drift_count"] += 1
-
-                summary["updated"] += 1
-
-            else:
-                # Check for rename: same (publisher, series, release_date), different
-                # full_title (R67) — only against pre-import rows, never new inserts
-                row_partial = _partial_identity(xr)
-                if row_partial in partial_to_idx:
-                    ci = partial_to_idx[row_partial]
-                    if ci < pre_import_count:
-                        existing = comics[ci]
-                        old_title = existing.get("full_title") or ""
-                        new_title = xr.get("full_title") or ""
-                        if old_title and new_title and old_title != new_title:
-                            old_identity = make_identity(existing)
-                            existing["previous_full_title"] = old_title
-
-                            pre_checksum = _user_column_checksum(existing)
-                            _apply_locg_columns_held(
-                                existing, xr, now, audit_records, summary
-                            )
-                            existing["last_seen_in_export_at"] = now
-                            existing["source"] = "locg_export"
-                            if existing.get("pushed_to_locg_at") is None:
-                                existing["pushed_to_locg_at"] = now
-                            post_checksum = _user_column_checksum(existing)
-
-                            if old_identity in identity_to_idx:
-                                del identity_to_idx[old_identity]
-                            identity_to_idx[make_identity(existing)] = ci
-                            # Consume the partial slot so it won't match again
-                            del partial_to_idx[row_partial]
-
-                            if pre_checksum != post_checksum:
-                                changed = [
-                                    col for col in USER_MANAGED_COLUMNS
-                                    if existing.get(col) != xr.get(col)
-                                ]
-                                if changed:
-                                    audit_records.append({
-                                        "type": "behavioral_drift",
-                                        "ts": now,
-                                        "command": "import",
-                                        "details": {
-                                            "identity": list(make_identity(existing)),
-                                            "columns_changed": changed,
-                                        },
-                                    })
-                                    summary["behavioral_drift_count"] += 1
-
-                            audit_records.append({
-                                "type": "renamed_full_title",
-                                "ts": now,
-                                "command": "import",
-                                "details": {
-                                    "old_title": old_title,
-                                    "new_title": new_title,
-                                    "identity": list(make_identity(existing)),
-                                },
-                            })
-                            summary["updated"] += 1
-                            continue
-
-                # Genuine new row from LOCG — do NOT add to partial_to_idx to
-                # avoid triggering rename detection for subsequent xlsx rows
-                new_row: dict[str, Any] = dict(xr)
-                new_row["local_added_at"] = now
-                new_row["local_added_seq"] = _next_seq()
-                new_row["pushed_to_locg_at"] = now
-                new_row["last_seen_in_export_at"] = now
-                new_row["source"] = "locg_export"
-                new_row["needs_manual_variant"] = False
-                new_row["needs_manual_series_canonical"] = False
-                new_row["metron_id"] = None
-                new_row["gixen_item_id"] = None
-                new_row["previous_full_title"] = None
-                comics.append(new_row)
-                identity_to_idx[make_identity(new_row)] = len(comics) - 1
-                summary["added"] += 1
+        xlsx_identities = _standard_merge_phase(
+            comics,
+            xlsx_rows,
+            identity_to_idx,
+            partial_to_idx,
+            audit_records,
+            summary,
+            now,
+        )
 
         # ----- Drop auto-healed duplicate wins (BUI-211) ----------------------
         # Filter the redundant pending agent_win rows now that all index-bearing

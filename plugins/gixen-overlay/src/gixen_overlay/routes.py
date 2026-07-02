@@ -776,6 +776,69 @@ async def api_seller_reliability(request: Request, seller: str):
     }
 
 
+def _link_issue_to_bid(
+    db,
+    *,
+    bid_id: int,
+    series: str,
+    issue: str,
+    year,
+    grade,
+    confidence,
+    locg_id,
+    locg_variant_id,
+    is_primary: bool,
+) -> bool:
+    """Upsert one comic/issue and link it to `bid_id` via fmv_id.
+
+    Lifted verbatim from the per-issue body of api_extract_comics's linking
+    loop. Returns True iff a bids -> bid_fmvs junction row was written for
+    this issue.
+    """
+    comic_id = upsert_comic(
+        db,
+        title=series,
+        issue=issue,
+        year=year,
+        locg_id=locg_id,
+        locg_variant_id=locg_variant_id,
+    )
+    if grade is not None:
+        # BUI-144/145: scope to the comic_id upsert_comic just
+        # returned, not a title/issue re-match. The old query
+        # ignored year AND variant, so a bid could link to a valued
+        # FMV of a DIFFERENT edition (e.g. ASM 1963 #1 priced at the
+        # 2018 reprint's FMV) — comic_id already encodes year+variant,
+        # so this is correct for free and mirrors the no-grade branch.
+        existing_valued = db.execute(
+            "SELECT f.id FROM fmv f "
+            "WHERE f.comic_id=? AND f.grade=? AND f.low IS NOT NULL "
+            "LIMIT 1",
+            (comic_id, grade),
+        ).fetchone()
+        if existing_valued:
+            fmv_id = existing_valued["id"]
+        else:
+            fmv_id = upsert_fmv(
+                db,
+                comic_id=comic_id,
+                grade=grade,
+                notes=f"auto-linked from eBay title (confidence={confidence})",
+            )
+        link_fmv_to_bid(db, bid_id, fmv_id, is_primary=is_primary)
+        return True
+    else:
+        # No parseable grade — link to any existing valued FMV for this comic.
+        any_valued = db.execute(
+            "SELECT f.id FROM fmv f WHERE f.comic_id=? AND f.low IS NOT NULL LIMIT 1",
+            (comic_id,),
+        ).fetchone()
+        if any_valued:
+            link_fmv_to_bid(db, bid_id, any_valued["id"], is_primary=is_primary)
+            return True
+    return False
+
+
 @router.post("/api/extract-comics")
 async def api_extract_comics(request: Request):
     """Parse cached eBay titles for unlinked bids and link them via fmv_id.
@@ -831,47 +894,19 @@ async def api_extract_comics(request: Request):
         try:
             wrote_junction = False
             for idx, issue in enumerate(issues):
-                comic_id = upsert_comic(
+                if _link_issue_to_bid(
                     db,
-                    title=parsed.series,
+                    bid_id=row["id"],
+                    series=parsed.series,
                     issue=issue,
                     year=year,
+                    grade=parsed.grade,
+                    confidence=parsed.confidence,
                     locg_id=primary_resolution.locg_id if (primary_resolution and idx == 0) else None,
                     locg_variant_id=primary_resolution.locg_variant_id if (primary_resolution and idx == 0) else None,
-                )
-                if parsed.grade is not None:
-                    # BUI-144/145: scope to the comic_id upsert_comic just
-                    # returned, not a title/issue re-match. The old query
-                    # ignored year AND variant, so a bid could link to a valued
-                    # FMV of a DIFFERENT edition (e.g. ASM 1963 #1 priced at the
-                    # 2018 reprint's FMV) — comic_id already encodes year+variant,
-                    # so this is correct for free and mirrors the no-grade branch.
-                    existing_valued = db.execute(
-                        "SELECT f.id FROM fmv f "
-                        "WHERE f.comic_id=? AND f.grade=? AND f.low IS NOT NULL "
-                        "LIMIT 1",
-                        (comic_id, parsed.grade),
-                    ).fetchone()
-                    if existing_valued:
-                        fmv_id = existing_valued["id"]
-                    else:
-                        fmv_id = upsert_fmv(
-                            db,
-                            comic_id=comic_id,
-                            grade=parsed.grade,
-                            notes=f"auto-linked from eBay title (confidence={parsed.confidence})",
-                        )
-                    link_fmv_to_bid(db, row["id"], fmv_id, is_primary=(idx == 0))
+                    is_primary=(idx == 0),
+                ):
                     wrote_junction = True
-                else:
-                    # No parseable grade — link to any existing valued FMV for this comic.
-                    any_valued = db.execute(
-                        "SELECT f.id FROM fmv f WHERE f.comic_id=? AND f.low IS NOT NULL LIMIT 1",
-                        (comic_id,),
-                    ).fetchone()
-                    if any_valued:
-                        link_fmv_to_bid(db, row["id"], any_valued["id"], is_primary=(idx == 0))
-                        wrote_junction = True
             if wrote_junction:
                 linked += 1
             else:
@@ -1308,6 +1343,23 @@ async def api_record_win(req: RecordWinRequest):
     return result
 
 
+def _is_pinned_collection_row(
+    row: dict[str, Any], full_title: str, release_date: str | None
+) -> bool:
+    """Pin predicate (BUI-254 S1): is `row` an owned row matching BOTH
+    `full_title` and `release_date`? See `_pinned_collection_rows` for the
+    full rationale. Shared by the dry-run preview, the pre-check, and the
+    locked `_mutate` closure in `api_collection_delete` so all three apply
+    the identical classification (lifted verbatim, unifying what were
+    previously separate copies of this same condition).
+    """
+    return (
+        row.get("in_collection")
+        and row.get("full_title") == full_title
+        and (row.get("release_date") or None) == release_date
+    )
+
+
 def _pinned_collection_rows(
     comics: list[dict[str, Any]], full_title: str, release_date: str | None
 ) -> list[dict[str, Any]]:
@@ -1322,12 +1374,7 @@ def _pinned_collection_rows(
     this endpoint touches is provably the SAME row `cmd_collection_check`
     reported as in_collection, not just "the first row with this title".
     """
-    return [
-        row for row in comics
-        if row.get("in_collection")
-        and row.get("full_title") == full_title
-        and (row.get("release_date") or None) == release_date
-    ]
+    return [row for row in comics if _is_pinned_collection_row(row, full_title, release_date)]
 
 
 @router.delete("/api/comics/collection")
@@ -1462,9 +1509,7 @@ async def api_collection_delete(
         comics = payload.get("comics", [])
         candidates = [
             i for i, row in enumerate(comics)
-            if row.get("in_collection")
-            and row.get("full_title") == full_title
-            and (row.get("release_date") or None) == matched_release_date
+            if _is_pinned_collection_row(row, full_title, matched_release_date)
         ]
         if len(candidates) > 1:
             ambiguous_count = len(candidates)

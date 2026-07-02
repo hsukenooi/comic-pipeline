@@ -245,6 +245,104 @@ def iso_to_relative(end_date_iso: str | None) -> str:
 # Gixen sync helper (used by api_purge and ended-bid resolution)
 # ---------------------------------------------------------------------------
 
+async def _resolve_vanished_null_end_bids(
+    db: sqlite3.Connection,
+    snipes: list,
+    gixen_item_ids: set,
+    now_dt: datetime,
+    now: str,
+) -> None:
+    # BUI-85: PENDING rows that vanished from Gixen but never had an end time
+    # captured (auction_end_at IS NULL) escape the vanished_ended query above —
+    # it requires a non-NULL end. These rows are ambiguous on their own ("the
+    # auction ended and Gixen dropped it" vs "the user removed the snipe via
+    # Gixen's web UI before any sync ran"), so they can't be blindly marked
+    # ENDED. eBay's listing end time is the external signal that disambiguates:
+    #   - end in the past  → the auction genuinely ended → ENDED (the eBay
+    #     fallback then fills winning_bid). Glitch-safe: a still-live snipe has
+    #     a future end, so it can never wrongly land here.
+    #   - end in the future → the auction is still live but the snipe is gone →
+    #     the user removed it → tombstone REMOVED (never ENDED/WON/LOST). Only
+    #     when Gixen returned a non-empty list this sync, so an empty-list
+    #     scrape glitch can't mass-cancel live snipes.
+    #   - no eBay data      → leave PENDING and retry a later sync.
+    # Gated by the eBay cooldown and capped per sync to bound rate-limited I/O.
+    if _ebay_fetch_bin() is not None and now_dt.timestamp() >= _ebay_cooldown_until:
+        vanished_null_end = db.execute(
+            "SELECT item_id FROM bids "
+            "WHERE status = 'PENDING' AND auction_end_at IS NULL"
+        ).fetchall()
+        checked = 0
+        for row in vanished_null_end:
+            iid = row["item_id"]
+            if iid in gixen_item_ids:
+                continue  # still live on Gixen; the time_to_end path sets end
+            if checked >= _VANISHED_NULL_END_MAX_PER_SYNC:
+                break
+            checked += 1
+            ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+            end_iso = (ebay or {}).get("end_date_iso")
+            end_dt = _parse_end_iso(end_iso)
+            if end_dt is None:
+                continue  # can't disambiguate yet — leave PENDING, retry later
+            set_auction_end_time(db, iid, end_iso)
+            if end_dt <= now_dt:
+                update_bid_status(db, iid, "ENDED", winning_bid=None, resolved_at=now)
+                logger.info(
+                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s is past → ENDED",
+                    iid, end_iso,
+                )
+            elif snipes:
+                update_bid_status(db, iid, "REMOVED", winning_bid=None, resolved_at=now)
+                logger.info(
+                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s still future "
+                    "→ removed from Gixen, tombstoned REMOVED", iid, end_iso,
+                )
+
+
+def _insert_web_added_bids(db: sqlite3.Connection, snipes: list) -> None:
+    # Insert any Gixen snipes not yet in the DB (e.g. added via web UI). Use
+    # the full bids table — not just PENDING — so a snipe we already
+    # transitioned to a terminal status earlier in this same sync run isn't
+    # re-inserted as a fresh PENDING duplicate.
+    existing_ids = {b["item_id"] for b in get_all_bids(db)}
+    for snipe in snipes:
+        snipe_terminal = _map_terminal_status(
+            snipe.get("status", ""), snipe.get("time_to_end", "")
+        )
+        if snipe["item_id"] not in existing_ids and snipe_terminal is None:
+            try:
+                max_bid = float(snipe.get("max_bid") or 0)
+            except (ValueError, TypeError):
+                max_bid = 0.0
+            try:
+                insert_bid(
+                    db, snipe["item_id"], max_bid,
+                    int(snipe.get("bid_offset", 6)),
+                    int(snipe.get("snipe_group", 0)),
+                    snipe.get("seller"),
+                )
+                logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
+            except sqlite3.IntegrityError:
+                # existing_ids was snapshotted before the list_snipes await; a
+                # concurrent api_add_bid can insert this PENDING row in that
+                # window. This loop runs unlocked (_sync_loop uses a separate
+                # client, no _api_lock), so the partial unique index is what
+                # actually prevents the duplicate — catch its violation and skip
+                # rather than aborting the whole sync run (BUI-67 U4/KTD6).
+                #
+                # rollback() scope: the only uncommitted statement here is this
+                # failed INSERT — the terminal/cache writes from the earlier loop
+                # were committed at the db.commit() above, and each insert_bid
+                # self-commits. So this discards just the failed insert, not any
+                # batched sibling work.
+                db.rollback()
+                logger.debug(
+                    "_sync_gixen: %s already present (concurrent add); skipping insert",
+                    snipe["item_id"],
+                )
+
+
 async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: bool = False) -> list:
     """Pull current Gixen state and update DB. Returns the snipes list.
 
@@ -347,95 +445,11 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
             iid,
         )
 
-    # BUI-85: PENDING rows that vanished from Gixen but never had an end time
-    # captured (auction_end_at IS NULL) escape the vanished_ended query above —
-    # it requires a non-NULL end. These rows are ambiguous on their own ("the
-    # auction ended and Gixen dropped it" vs "the user removed the snipe via
-    # Gixen's web UI before any sync ran"), so they can't be blindly marked
-    # ENDED. eBay's listing end time is the external signal that disambiguates:
-    #   - end in the past  → the auction genuinely ended → ENDED (the eBay
-    #     fallback then fills winning_bid). Glitch-safe: a still-live snipe has
-    #     a future end, so it can never wrongly land here.
-    #   - end in the future → the auction is still live but the snipe is gone →
-    #     the user removed it → tombstone REMOVED (never ENDED/WON/LOST). Only
-    #     when Gixen returned a non-empty list this sync, so an empty-list
-    #     scrape glitch can't mass-cancel live snipes.
-    #   - no eBay data      → leave PENDING and retry a later sync.
-    # Gated by the eBay cooldown and capped per sync to bound rate-limited I/O.
-    if _ebay_fetch_bin() is not None and now_dt.timestamp() >= _ebay_cooldown_until:
-        vanished_null_end = db.execute(
-            "SELECT item_id FROM bids "
-            "WHERE status = 'PENDING' AND auction_end_at IS NULL"
-        ).fetchall()
-        checked = 0
-        for row in vanished_null_end:
-            iid = row["item_id"]
-            if iid in gixen_item_ids:
-                continue  # still live on Gixen; the time_to_end path sets end
-            if checked >= _VANISHED_NULL_END_MAX_PER_SYNC:
-                break
-            checked += 1
-            ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
-            end_iso = (ebay or {}).get("end_date_iso")
-            end_dt = _parse_end_iso(end_iso)
-            if end_dt is None:
-                continue  # can't disambiguate yet — leave PENDING, retry later
-            set_auction_end_time(db, iid, end_iso)
-            if end_dt <= now_dt:
-                update_bid_status(db, iid, "ENDED", winning_bid=None, resolved_at=now)
-                logger.info(
-                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s is past → ENDED",
-                    iid, end_iso,
-                )
-            elif snipes:
-                update_bid_status(db, iid, "REMOVED", winning_bid=None, resolved_at=now)
-                logger.info(
-                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s still future "
-                    "→ removed from Gixen, tombstoned REMOVED", iid, end_iso,
-                )
+    await _resolve_vanished_null_end_bids(db, snipes, gixen_item_ids, now_dt, now)
 
     db.commit()
 
-    # Insert any Gixen snipes not yet in the DB (e.g. added via web UI). Use
-    # the full bids table — not just PENDING — so a snipe we already
-    # transitioned to a terminal status earlier in this same sync run isn't
-    # re-inserted as a fresh PENDING duplicate.
-    existing_ids = {b["item_id"] for b in get_all_bids(db)}
-    for snipe in snipes:
-        snipe_terminal = _map_terminal_status(
-            snipe.get("status", ""), snipe.get("time_to_end", "")
-        )
-        if snipe["item_id"] not in existing_ids and snipe_terminal is None:
-            try:
-                max_bid = float(snipe.get("max_bid") or 0)
-            except (ValueError, TypeError):
-                max_bid = 0.0
-            try:
-                insert_bid(
-                    db, snipe["item_id"], max_bid,
-                    int(snipe.get("bid_offset", 6)),
-                    int(snipe.get("snipe_group", 0)),
-                    snipe.get("seller"),
-                )
-                logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
-            except sqlite3.IntegrityError:
-                # existing_ids was snapshotted before the list_snipes await; a
-                # concurrent api_add_bid can insert this PENDING row in that
-                # window. This loop runs unlocked (_sync_loop uses a separate
-                # client, no _api_lock), so the partial unique index is what
-                # actually prevents the duplicate — catch its violation and skip
-                # rather than aborting the whole sync run (BUI-67 U4/KTD6).
-                #
-                # rollback() scope: the only uncommitted statement here is this
-                # failed INSERT — the terminal/cache writes from the earlier loop
-                # were committed at the db.commit() above, and each insert_bid
-                # self-commits. So this discards just the failed insert, not any
-                # batched sibling work.
-                db.rollback()
-                logger.debug(
-                    "_sync_gixen: %s already present (concurrent add); skipping insert",
-                    snipe["item_id"],
-                )
+    _insert_web_added_bids(db, snipes)
 
     return snipes
 
