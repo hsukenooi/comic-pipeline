@@ -22,6 +22,7 @@ wishlist-sellers = "wishlist_sellers:main"
 include = [
     "src/ebay_fetch.py",
     "src/sold_comps.py",
+    "src/comic_identity.py",
     "src/seller_scan.py",
     "src/ebay_search_cache.py",
     "src/wishlist_sellers.py",
