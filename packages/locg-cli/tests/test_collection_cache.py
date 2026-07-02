@@ -718,6 +718,29 @@ def test_resolve_xmen_modern_relaunch_not_classic():
     assert resolve_series_for_win("x-men", "1", 2019, {}, {"x-men": [modern]}) == modern
 
 
+def test_resolve_xmen_later_volume_not_collapsed_to_vol1():
+    """X-Men (Vol. 2) #7 (1991 Jim Lee) must resolve to Vol. 2, not the classic
+    split's Vol. 1 — the classic era's year window (1963-2011) overlaps the
+    later volume's own range, so an explicit candidate for that year must win
+    over the hardcoded split (BUI-265)."""
+    from locg.collection_cache import resolve_series_for_win
+    vol2 = "X-Men (Vol. 2) (1991 - 2001)"
+    candidates = {"x-men": [vol2]}
+    assert resolve_series_for_win("x-men", "7", 1991, {}, candidates) == vol2
+
+
+def test_resolve_xmen_genuine_vol1_still_splits():
+    """A genuine classic-era Vol. 1 issue still resolves correctly when an
+    explicit Vol. 1 candidate is present (BUI-265 regression: the later-volume
+    fix must not disturb the original BUI-197/BUI-199/BUI-200 split)."""
+    from locg.collection_cache import resolve_series_for_win
+    vol1 = "The X-Men (Vol. 1) (1963 - 1981)"
+    candidates = {"x-men": [vol1]}
+    assert resolve_series_for_win("x-men", "107", 1979, {}, candidates) == vol1
+    # And with no candidates at all, the hardcoded split still fires.
+    assert resolve_series_for_win("x-men", "107", 1979, {}, None) == vol1
+
+
 def test_resolve_unknown_key_returns_none():
     """An unknown normalized key returns None (Metron fallback fires)."""
     from locg.collection_cache import resolve_series_for_win

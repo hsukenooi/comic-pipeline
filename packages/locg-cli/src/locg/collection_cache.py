@@ -462,7 +462,11 @@ def resolve_series_for_win(
       most-specific (narrowest) first — deterministic regardless of order.
     * **The classic X-Men split** — ``The X-Men`` (#1–141) vs ``Uncanny X-Men``
       (#142+) by issue-number boundary, applied ONLY within the classic era so
-      a modern relaunch falls through to normal resolution / Metron.
+      a modern relaunch falls through to normal resolution / Metron. The
+      classic era's year window (1963–2011) overlaps later relaunch volumes
+      (e.g. X-Men (Vol. 2), 1991–2001), so before applying the split we check
+      ``volume_candidates`` for a volume whose OWN range contains ``year`` —
+      that later volume wins over the hardcoded split (BUI-265).
 
     ``volume_candidates`` (norm_key -> [decorated names]) is the multi-volume
     map from :func:`build_volume_candidates`; when omitted the resolver behaves
@@ -474,6 +478,18 @@ def resolve_series_for_win(
     # returns None here and falls through (then to Metron). The issue-number
     # boundary tie-breaks the two volumes' overlapping ranges (1980–1981).
     if norm_key in _XMEN_SPLIT_KEYS:
+        # BUI-265: a later volume (e.g. X-Men (Vol. 2) 1991 Jim Lee) can fall
+        # inside the classic split's broad year window (1963–2011) while
+        # being a genuinely different run. If an explicit candidate's own
+        # year range contains ``yr`` AND it isn't just one of the two classic
+        # split targets themselves, it's a real match — prefer it over the
+        # hardcoded split so a low issue number isn't collapsed into Vol. 1.
+        # (Excluding the split targets keeps the #141/#142 boundary tie-break
+        # working when the only local candidate IS one of those two volumes.)
+        if yr is not None and volume_candidates and norm_key in volume_candidates:
+            explicit = _best_volume_by_year(volume_candidates[norm_key], yr)
+            if explicit is not None and explicit not in (_XMEN_EARLY_SERIES, _XMEN_LATE_SERIES):
+                return explicit
         split = _xmen_classic_split(issue_num, year)
         if split is not None:
             return split
