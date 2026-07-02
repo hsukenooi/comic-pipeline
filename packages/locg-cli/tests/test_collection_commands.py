@@ -521,6 +521,150 @@ def test_check_year_minus_two_not_tolerated(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# cmd_collection_check year gate widened to a SYMMETRIC ±1 window (BUI-251)
+# ---------------------------------------------------------------------------
+
+def test_check_year_plus_one_avengers_false_negative_fixed(tmp_path, monkeypatch):
+    """BUI-251: reproduces the BUI-247 audit finding — Avengers #1 (2013),
+    confirmed owned, returned not_in_cache when queried WITH its year because
+    the stored release_date sits ONE YEAR LATER than the query year (the
+    opposite skew direction from BUI-214's year-minus-1 case — a late
+    solicitation whose actual on-sale slipped into the following January).
+    The asymmetric year-OR-year-minus-1 window missed this; the symmetric
+    ±1 window must catch it.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Avengers (Vol. 5) (2013 - 2015)",
+        full_title="Avengers #1",
+        release_date="2014-01-08",
+    )])
+
+    result = cmds.cmd_collection_check(series="Avengers", issue="1", year="2013")
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Avengers #1"
+
+
+def test_check_year_plus_one_thor_false_negative_fixed(tmp_path, monkeypatch):
+    """BUI-251: the second reproduced case — Thor #5 (2016), confirmed owned,
+    same year+1 skew as the Avengers case above."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 5) (2016 - 2018)",
+        full_title="Thor #5",
+        release_date="2017-02-01",
+    )])
+
+    result = cmds.cmd_collection_check(series="Thor", issue="5", year="2016")
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Thor #5"
+
+
+def test_check_year_plus_two_not_tolerated(tmp_path, monkeypatch):
+    """BUI-251: confirm the widened window is exactly ±1, not wider — mirrors
+    test_check_year_minus_two_not_tolerated on the other side. A query year of
+    1983 must NOT match a row stored as 1985-xx (year+2 is outside the window)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #238",
+        release_date="1985-03-01",
+    )])
+
+    too_far = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="238", year="1983"
+    )
+    assert too_far["match_status"] == "not_in_cache"
+
+
+def test_check_year_gate_two_year_gap_still_rejected(tmp_path, monkeypatch):
+    """BUI-251: the ±1 widening must not reopen cross-volume collisions — the
+    entire reason the year gate exists. A 1962 Vol. 1 #1 must NOT satisfy a
+    2021 Vol. 5 #1 query, and a 2021 Vol. 5 #1 must NOT satisfy a 1962 query,
+    even with the wider window (2021 vs 1962 is far outside ±1 either way)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Hulk (Vol. 1) (1962 - 1963)",
+        full_title="Hulk #1",
+        release_date="1962-05-01",
+        gixen_item_id="hulk-1962",
+    )])
+
+    assert cmds.cmd_collection_check(
+        series="Hulk", issue="1", year="2021"
+    )["match_status"] == "not_in_cache"
+
+    cache2 = make_cache(tmp_path / "vol5")
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache2)
+    _seed_cache(cache2, [_agent_win_row(
+        series="Hulk (Vol. 5) (2021 - Present)",
+        full_title="Hulk #1",
+        release_date="2021-06-01",
+        gixen_item_id="hulk-2021",
+    )])
+
+    assert cmds.cmd_collection_check(
+        series="Hulk", issue="1", year="1962"
+    )["match_status"] == "not_in_cache"
+
+
+def test_check_wish_row_year_plus_one_tolerated(tmp_path, monkeypatch):
+    """BUI-251: the widened ±1 window applies to the wish-list gate too
+    (_match_wishlisted_issue shares _year_gate_accepts with _match_owned_issue)
+    — a wishlisted row with the same year+1 skew as the Avengers/Thor cases
+    must flag in_wish_list."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    wishlisted = _agent_win_row(
+        series="Avengers (Vol. 5) (2013 - 2015)",
+        full_title="Avengers #1",
+        release_date="2014-01-08",
+    )
+    wishlisted["in_collection"] = 0
+    _seed_cache(cache, [wishlisted])
+
+    result = cmds.cmd_collection_check(series="Avengers", issue="1", year="2013")
+    assert result["match_status"] == "not_in_cache"
+    assert result["in_wish_list"] is True
+
+
+def test_check_wish_row_year_plus_two_not_tolerated(tmp_path, monkeypatch):
+    """BUI-251: the wish-list gate's window is also exactly ±1, not wider —
+    mirrors test_check_year_plus_two_not_tolerated for _match_wishlisted_issue."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    wishlisted = _agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #238",
+        release_date="1985-03-01",
+    )
+    wishlisted["in_collection"] = 0
+    _seed_cache(cache, [wishlisted])
+
+    result = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="238", year="1983"
+    )
+    assert result["match_status"] == "not_in_cache"
+    assert result["in_wish_list"] is False
+
+
+# ---------------------------------------------------------------------------
 # cmd_collection_series_names (BUI-129)
 # ---------------------------------------------------------------------------
 
@@ -678,6 +822,60 @@ def test_check_ignores_unowned_rows(tmp_path, monkeypatch):
     assert cmds.cmd_collection_check(series="Detective Comics", issue="27")["match_status"] == "in_collection"
 
 
+def test_check_distinguishes_untracked_wishlisted_and_owned(tmp_path, monkeypatch):
+    """BUI-250: not_in_cache used to conflate 'no row at all' with 'a row exists
+    but in_collection == 0' (on the wish list / pull / read, never owned) — the
+    BUI-247 audit found Hulk (Vol. 5) #9 in the latter state, indistinguishable
+    from a genuinely untracked issue like New Mutants #1. `in_wish_list` makes
+    the three states distinguishable: untracked (False), wishlisted-not-owned
+    (True, still not_in_cache), and owned (in_collection, in_wish_list False —
+    no separate wish-list-only row exists for the same issue)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    wishlisted = _agent_win_row(series="Hulk (Vol. 5) (2023 - Present)", full_title="Hulk #9")
+    wishlisted["in_collection"] = 0
+    owned = _agent_win_row(series="New Mutants (Vol. 1) (1983 - 1991)", full_title="New Mutants #98")
+    _seed_cache(cache, [wishlisted, owned])
+
+    untracked = cmds.cmd_collection_check(series="New Mutants", issue="1")
+    assert untracked["match_status"] == "not_in_cache"
+    assert untracked["in_wish_list"] is False
+
+    wish_only = cmds.cmd_collection_check(series="Hulk", issue="9")
+    assert wish_only["match_status"] == "not_in_cache"
+    assert wish_only["in_wish_list"] is True
+
+    owned_result = cmds.cmd_collection_check(series="New Mutants", issue="98")
+    assert owned_result["match_status"] == "in_collection"
+    assert owned_result["in_wish_list"] is False
+
+
+def test_check_wish_row_year_gate_prevents_wrong_era_flag(tmp_path, monkeypatch):
+    """BUI-250: in_wish_list applies the same accept-year-or-year-minus-1 gate
+    as ownership — a wish-list row from a different era must not flag a query
+    for a different volume's issue (mirrors the BUI-249 wrong-era concern)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    wishlisted_2008 = _agent_win_row(
+        series="Hulk (2008 - 2012)", full_title="Hulk #1", release_date="2008-03-01",
+    )
+    wishlisted_2008["in_collection"] = 0
+    _seed_cache(cache, [wishlisted_2008])
+
+    # Same masthead, different era — the 1962 Hulk #1 query must not be flagged.
+    result = cmds.cmd_collection_check(series="Hulk", issue="1", year="1962")
+    assert result["match_status"] == "not_in_cache"
+    assert result["in_wish_list"] is False
+
+    # The matching era does flag it.
+    result2 = cmds.cmd_collection_check(series="Hulk", issue="1", year="2008")
+    assert result2["in_wish_list"] is True
+
+
 def test_check_mighty_thor_masthead_alias(tmp_path, monkeypatch):
     """'The Mighty Thor #154' (cover title) resolves to the owned 'Thor #154'
     via the masthead alias (BUI-46, broadened in BUI-197).
@@ -703,15 +901,51 @@ def test_check_mighty_thor_masthead_alias(tmp_path, monkeypatch):
     )])
 
     # The catalog name works directly:
-    assert cmds.cmd_collection_check(series="Thor", issue="154")["match_status"] == "in_collection"
+    direct = cmds.cmd_collection_check(series="Thor", issue="154")
+    assert direct["match_status"] == "in_collection"
+    # BUI-249: a direct series-key match is "exact", never "alias".
+    assert direct["match_kind"] == "exact"
     # The cover/masthead name resolves via the alias, with a matching year:
     r = cmds.cmd_collection_check(series="The Mighty Thor", issue="154", year="1968")
     assert r["match_status"] == "in_collection"
     assert r["full_title_matched"] == "Thor #154"
+    # BUI-249: an alias-pass match is flagged so a caller can confirm volume.
+    assert r["match_kind"] == "alias"
+    assert r["matched_series_name"] == "Thor (Vol. 1) (1966 - 1996)"
+    assert r["matched_release_date"] == "1968-05-02"
     # BUI-197: the alias now also fires WITHOUT a year (audit/export path).
     r2 = cmds.cmd_collection_check(series="The Mighty Thor", issue="154")
     assert r2["match_status"] == "in_collection"
     assert r2["full_title_matched"] == "Thor #154"
+    assert r2["match_kind"] == "alias"
+
+
+def test_check_mighty_thor_alias_false_positive_wrong_volume(tmp_path, monkeypatch):
+    """BUI-249: the alias pass can land on an owned issue of the WRONG volume.
+
+    Owning 'Thor #5' (Vol.1, 1966) makes a no-year 'The Mighty Thor #5' query
+    (the intended Mighty Thor Vol.3, 2015) report in_collection via the
+    masthead alias — a silent false positive, since the Vol.3 book is not
+    actually owned. match_kind == "alias" (plus the matched row's decorated
+    series name / release date) is how a caller detects this instead of
+    trusting the bare in_collection verdict.
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 1) (1966 - 1996)",
+        full_title="Thor #5",
+        release_date="1966-08-01",
+    )])
+
+    r = cmds.cmd_collection_check(series="The Mighty Thor", issue="5")
+    assert r["match_status"] == "in_collection"
+    assert r["full_title_matched"] == "Thor #5"
+    assert r["match_kind"] == "alias"
+    assert r["matched_series_name"] == "Thor (Vol. 1) (1966 - 1996)"
+    assert r["matched_release_date"] == "1966-08-01"
 
 
 def test_check_masthead_alias_year_gate_prevents_collision(tmp_path, monkeypatch):
@@ -1847,6 +2081,73 @@ def test_record_win_metron_credential_error_disables_metron(tmp_path):
     assert result["rows_written"] == 2
     assert result["manual_series_count"] == 2
     assert metron.lookup_issue.call_count == 1
+
+
+# --- BUI-255: throttle/timeout trips the batch breaker like credential errors ---
+
+def test_record_win_metron_degraded_disables_metron(tmp_path):
+    """A throttled/unreachable Metron (MetronClient.degraded) trips the same
+    per-batch breaker as MetronCredentialError: after the first call reports
+    degraded, remaining rows fall back to manual and Metron is never called
+    again — instead of retrying (and sleeping) on every remaining row."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.degraded = False
+
+    def _throttled_lookup(*_args, **_kwargs):
+        # Simulates a real MetronClient after its BUI-260 rate-limit retry
+        # is exhausted: returns None (no exception) but flips .degraded True.
+        metron.degraded = True
+        return None
+
+    metron.lookup_issue.side_effect = _throttled_lookup
+
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", series="Ghost Rider", issue="1"),
+            _make_win(item_id="2", series="Ghost Rider", issue="2"),
+        ],
+        cache=cache,
+        metron=metron,
+    )
+
+    # Both rows still get written (the batch completes and commits); Metron
+    # is called exactly once — the breaker trips before row 2 ever asks it.
+    assert result["rows_written"] == 2
+    assert result["manual_series_count"] == 2
+    assert result["partial_failure"] is False
+    assert metron.lookup_issue.call_count == 1
+
+
+def test_record_win_metron_degraded_false_does_not_disable(tmp_path):
+    """A genuine, exception-free 'no match' (degraded stays False) must NOT
+    trip the breaker — every row still gets its own Metron attempt."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.degraded = False
+    metron.lookup_issue.return_value = None  # plain miss, not a throttle
+
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", series="Ghost Rider", issue="1"),
+            _make_win(item_id="2", series="Ghost Rider", issue="2"),
+        ],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["rows_written"] == 2
+    assert result["manual_series_count"] == 2
+    # Each row gets its own series-resolution attempt AND its own BUI-210
+    # date-backfill attempt (metron_data stays None both times) — 2 calls per
+    # row, 4 total — proving the breaker never tripped and skipped none of them.
+    assert metron.lookup_issue.call_count == 4
 
 
 def test_record_win_duplicate_gixen_id_updates_not_inserts(tmp_path):

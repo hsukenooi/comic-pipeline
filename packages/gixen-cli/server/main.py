@@ -751,6 +751,14 @@ async def lifespan(app: FastAPI):
     _invoke_register_routes(pm, app, logger=logger)
     app.state.dashboard_tabs = _collect_dashboard_tabs(pm, logger=logger)
 
+    # BUI-257 invariant: the only background tasks started here are the eBay
+    # fallback (fire-and-forget, spawned on demand via _spawn_fallback_task),
+    # this Gixen snipe-sync loop (_sync_loop, gated by GIXEN_SYNC_ENABLED), and
+    # the sniper loop below — all Gixen/eBay, never LOCG. There is intentionally
+    # NO automatic/background LOCG access anywhere in this server: LOCG is
+    # programmatically inaccessible, and the only path to it is the manual,
+    # user-invoked /comic:collection-sync skill (see locg-cli's client.py and
+    # collection_io.py).
     sync_task = None
     sniper_task = None
     if os.getenv("GIXEN_SYNC_ENABLED", "true") != "false":

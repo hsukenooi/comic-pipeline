@@ -1822,6 +1822,40 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
 # release-date filter), so no separate year-gated alias path is needed.
 
 
+def _year_gate_accepts(year: Optional[str], release_date: str) -> bool:
+    """Return True when `release_date`'s year is within the accepted window of
+    `year`, or when either is missing (no gating possible — fail open, same as
+    always). Shared by `_match_owned_issue` and `_match_wishlisted_issue` so the
+    two matchers can never drift on what "same era" means.
+
+    BUI-214 introduced a year-OR-year-minus-1 tolerance for the cover-vs-onsale
+    skew (`/comic:wishlist-add` passes Metron's `cover_date` year, but LOCG
+    stores the earlier on-sale `release_date` — a January-cover issue often
+    ships the previous December). BUI-251 widened this to a SYMMETRIC ±1 window
+    (`year-1`, `year`, `year+1`): the BUI-247 purchase-history audit found
+    confirmed-owned books (Avengers #1 2013, Thor #5 2016) whose stored
+    `release_date` sits ONE YEAR LATER than the query year — the opposite skew
+    direction, seen on late-in-year cover dates whose actual on-sale slipped
+    into the following January. The one-directional window covered only the
+    first skew, producing false `not_in_cache` negatives on stock that was
+    actually owned. ±1 (not wider) is deliberate: the gate's real job is
+    rejecting a DIFFERENT VOLUME published years apart (a 1962 Hulk #1 vs. a
+    2008 Hulk #1) — see test_check_year_gate_two_year_gap_still_rejected for
+    the boundary this must keep holding.
+    """
+    if not year or not release_date:
+        return True
+    year_str = str(year)
+    candidates = {year_str}
+    try:
+        year_int = int(year_str)
+        candidates.add(str(year_int - 1))
+        candidates.add(str(year_int + 1))
+    except (TypeError, ValueError):
+        pass
+    return any(release_date.startswith(candidate) for candidate in candidates)
+
+
 def _match_owned_issue(
     comics: list[dict[str, Any]],
     series_key: str,
@@ -1830,10 +1864,17 @@ def _match_owned_issue(
     variant: Optional[str],
     year: Optional[str],
     require_dated: bool = False,
-) -> Optional[str]:
-    """Return the full_title of an owned cache row matching the series key +
-    issue (+ optional variant/year), or None. Shared by the direct and the
-    alias-fallback passes of cmd_collection_check.
+) -> Optional[dict[str, Any]]:
+    """Return the owned cache ROW matching the series key + issue (+ optional
+    variant/year), or None. Shared by the direct and the alias-fallback passes
+    of cmd_collection_check.
+
+    BUI-249: returns the full row (not just its full_title) so the caller can
+    surface match provenance — the alias pass can land on an owned issue of
+    the WRONG volume/era (e.g. "The Mighty Thor #5" resolving to an owned
+    Thor Vol.1/Vol.4/Vol.6 row when the intended Mighty Thor Vol.3 #5 is not
+    owned), and `matched_series_name`/`matched_release_date` are how a caller
+    detects that.
 
     `variant` is a SOFT preference, not a hard filter (BUI-176): an owned row
     that matches series + issue (+ year) still counts as in-collection even when
@@ -1850,7 +1891,7 @@ def _match_owned_issue(
     pass keeps the BUI-105 fail-open behavior (``require_dated=False``): a
     dateless same-series record-win must still match.
     """
-    fallback: Optional[str] = None
+    fallback: Optional[dict[str, Any]] = None
     for row in comics:
         # in_collection is a copies-owned count (0 = wish-list / pull / read but
         # not owned). Only owned rows count as "in collection" (BUI-26 bug D).
@@ -1891,23 +1932,12 @@ def _match_owned_issue(
         release_date = row.get("release_date") or ""
         if year and not release_date and require_dated:
             continue
-        # BUI-214: tolerate the cover-vs-on-sale year skew. `/comic:wishlist-add`
-        # passes Metron's `cover_date` year, but LOCG stores the earlier *on-sale*
-        # `release_date`, so a cover-year-1983 book can be stored as 1982-xx. The
-        # skew is physically bounded (release_year ∈ {cover_year, cover_year−1}),
-        # so accept year OR year−1 — never year+1, which would widen the gate
-        # enough to collide adjacent eras (e.g. a 1963 run vs a 2018 relaunch).
-        if year and release_date:
-            year_str = str(year)
-            try:
-                prev_year_str = str(int(year_str) - 1)
-            except (TypeError, ValueError):
-                prev_year_str = None
-            if not (
-                release_date.startswith(year_str)
-                or (prev_year_str is not None and release_date.startswith(prev_year_str))
-            ):
-                continue
+        # BUI-214/BUI-251: tolerate the cover-vs-on-sale year skew (see
+        # _year_gate_accepts) — accept year−1, year, or year+1, not an exact
+        # match, so a genuine one-year skew in either direction doesn't read
+        # as a wrong-era row.
+        if not _year_gate_accepts(year, release_date):
+            continue
 
         # BUI-176: variant is a soft preference. With no variant requested, the
         # first series+issue match wins (unchanged behavior). With a variant
@@ -1915,13 +1945,70 @@ def _match_owned_issue(
         # base row is held as a fallback so ownership is still reported rather
         # than a false not_in_cache that triggers a duplicate buy.
         if not variant:
-            return full_title
+            return row
         if variant.lower() in full_title.lower():
-            return full_title
+            return row
         if fallback is None:
-            fallback = full_title
+            fallback = row
 
     return fallback
+
+
+def _match_wishlisted_issue(
+    comics: list[dict[str, Any]],
+    series_key: str,
+    issue_stripped: str,
+    issue: str,
+    year: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Return a TRACKED-BUT-NOT-OWNED cache row (``in_collection == 0``)
+    matching the series key + issue (+ optional year), or None.
+
+    BUI-250: `_match_owned_issue` skips these rows entirely (BUI-26 bug D — a
+    copies-owned count of 0 must never read as "owned"), which is correct for
+    ownership but means `cmd_collection_check` cannot tell "genuinely
+    untracked" from "catalogued on the wish list, just not owned yet" — both
+    collapsed into the same `not_in_cache` verdict. Confirmed via the BUI-247
+    audit: Hulk (Vol. 5) #9 has a real `in_collection=0` row, indistinguishable
+    from a never-added issue like New Mutants #1 before this function existed.
+
+    Deliberately narrower than `_match_owned_issue`: no variant preference (a
+    wish-list row has no meaningful variant qualifier to prefer between
+    candidates) and no masthead-alias fallback (`owned_match_keys`) — this is
+    an advisory signal, not a duplicate-buy gate, so it isn't worth stacking a
+    second kind of cross-masthead guessing on top of BUI-249's. The SAME year
+    gate as ownership applies when `year` is supplied (`_year_gate_accepts`):
+    without it, a same-masthead wish row from a different era (e.g. a
+    wishlisted 2008 "Hulk #1" flagging a query about the 1962 "Hulk #1") would
+    reproduce the exact wrong-era false-positive BUI-249 addressed for
+    ownership — so year-gating here mirrors the ownership pass exactly.
+    """
+    for row in comics:
+        if row.get("in_collection"):
+            continue  # owned rows are _match_owned_issue's job, not this one
+
+        full_title = row.get("full_title") or ""
+        title_series, title_issue = split_series_issue_for_ownership(full_title)
+        if _normalize_series_key(title_series) != series_key:
+            continue
+
+        if title_issue is not None:
+            norm_title_issue = title_issue.lstrip("0") or title_issue
+            if norm_title_issue.lower() != issue_stripped.lower():
+                continue
+        else:
+            if issue.strip().lower() not in full_title.lower():
+                continue
+
+        # Same _year_gate_accepts window as _match_owned_issue (BUI-214/BUI-251)
+        # — kept in one shared function so the two matchers can't drift.
+        release_date = row.get("release_date") or ""
+        if not _year_gate_accepts(year, release_date):
+            continue
+
+        return row
+
+    return None
 
 
 def cmd_collection_check(
@@ -1932,8 +2019,27 @@ def cmd_collection_check(
 ) -> dict[str, Any]:
     """Check whether a comic is in the local collection cache.
 
-    Returns {match_status, full_title_matched, cache_age_days}.
+    Returns {match_status, full_title_matched, matched_series_name,
+    matched_release_date, match_kind, in_wish_list, cache_age_days}.
     match_status: "in_collection" | "not_in_cache".
+
+    BUI-249: matched_series_name/matched_release_date/match_kind surface the
+    matched row's provenance so a caller can detect an alias match that landed
+    on the wrong volume/era (see _match_owned_issue). They are null whenever
+    match_status is "not_in_cache" (R11 — no verdict, no provenance to report).
+    match_kind is "exact" when series_key matched directly, "alias" when it
+    only matched via owned_match_keys' cross-masthead fallback — "alias" is
+    the signal a caller should treat as "confirm volume before trusting this".
+
+    BUI-250: `not_in_cache` was overloading two distinct states — a genuinely
+    untracked issue vs. a row that exists but is catalogued with
+    `in_collection == 0` (on the wish list / pull / read but never owned).
+    `in_wish_list` (always a bool, computed independently of match_status via
+    _match_wishlisted_issue) distinguishes them: false means no tracked row was
+    found at all, true means one was found. It's reported for every verdict —
+    including "in_collection" — rather than only for "not_in_cache", since a
+    duplicate row (one owned edition, one wish-list-only edition of the same
+    issue) is a real, if rare, possibility.
     """
     cache = CollectionCache()
     payload = cache.load()
@@ -1944,7 +2050,9 @@ def cmd_collection_check(
     # Strip leading zeros for the issue token comparison
     issue_stripped = str(issue).strip().lstrip("0") or str(issue).strip()
 
-    matched = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
+    matched_row = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
+    match_kind: Optional[str] = "exact" if matched_row is not None else None
+    in_wish_list = _match_wishlisted_issue(comics, series_key, issue_stripped, issue, year) is not None
 
     # BUI-200/BUI-197: an owned copy can be filed under a DIFFERENT series-name
     # variant for the same run — the classic X-Men issue-number split
@@ -1958,7 +2066,7 @@ def cmd_collection_check(
     # with no year (the conflicts audit) the alias keys still resolve so the
     # cross-masthead owned book is found and the export can't emit an
     # In Collection=0 row that deletes it (the 26-deleted-X-Men data-loss bug).
-    if matched is None:
+    if matched_row is None:
         for alt_key in owned_match_keys(series, issue):
             if alt_key == series_key:
                 continue
@@ -1967,23 +2075,32 @@ def cmd_collection_check(
             # dateless classic "Incredible Hulk #1" from falsely satisfying a
             # year-bearing "Hulk #1" 2021 relaunch query). With NO year the alias
             # over-matches (the safe over-exclusion direction for the audit/export).
-            matched = _match_owned_issue(
+            matched_row = _match_owned_issue(
                 comics, alt_key, issue_stripped, issue, variant, year,
                 require_dated=True,
             )
-            if matched is not None:
+            if matched_row is not None:
+                match_kind = "alias"
                 break
 
-    if matched is not None:
+    if matched_row is not None:
         return {
             "match_status": "in_collection",
-            "full_title_matched": matched,
+            "full_title_matched": matched_row.get("full_title") or "",
+            "matched_series_name": matched_row.get("series_name"),
+            "matched_release_date": matched_row.get("release_date"),
+            "match_kind": match_kind,
+            "in_wish_list": in_wish_list,
             "cache_age_days": cache_age,
         }
 
     return {
         "match_status": "not_in_cache",
         "full_title_matched": None,
+        "matched_series_name": None,
+        "matched_release_date": None,
+        "match_kind": None,
+        "in_wish_list": in_wish_list,
         "cache_age_days": cache_age,
     }
 
@@ -2063,6 +2180,36 @@ def _fuzzy_variant_match(variant_text: str, names: list[str]) -> Optional[str]:
 
 
 RECORD_WIN_CHUNK_SIZE = 25
+
+
+def _check_metron_degraded(metron: Any, metron_disabled: bool) -> bool:
+    """BUI-255: trip the per-batch Metron breaker on throttle/timeout.
+
+    ``metron.degraded`` is set by ``MetronClient``'s rate-limit-retry decorator
+    (BUI-260, exhausted a single capped 60s retry) or by a connection-error
+    ``ApiError`` — i.e. Metron itself signaling "this call failed because I'm
+    throttled/unreachable", never a genuine, exception-free "no match". Once
+    tripped, the caller stops calling Metron for the rest of the batch (same
+    fallback ``MetronCredentialError`` already uses) instead of repeating a
+    capped-but-still-real sleep on every remaining row — a 44-row batch could
+    otherwise stack dozens of 60s sleeps and wedge the single-worker server
+    that runs this synchronously (see BUI-247's record-win incident).
+
+    ``is True`` (identity, not truthiness) so an unconfigured ``MagicMock``
+    metron stub in a test — whose ``.degraded`` auto-vivifies as a truthy
+    ``Mock`` — never falsely trips this without the test explicitly setting
+    ``metron.degraded = True``.
+    """
+    if metron_disabled:
+        return True
+    if getattr(metron, "degraded", False) is True:
+        logger.warning(
+            "Metron rate-limited/unreachable; disabling for the rest of this "
+            "record-win batch (remaining rows fall back to "
+            "needs_manual_series_canonical)."
+        )
+        return True
+    return False
 
 
 def _resolve_price(raw: Any) -> Optional[float]:
@@ -2224,6 +2371,8 @@ def cmd_collection_record_win(
                 except MetronCredentialError:
                     metron_disabled = True
                     logger.warning("Metron credentials not configured; falling back to manual series resolution.")
+                else:
+                    metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
             if canonical_series is None:
                 canonical_series = series_raw
@@ -2277,6 +2426,8 @@ def cmd_collection_record_win(
                         logger.warning(
                             "Metron credentials not configured; falling back to placeholder release date."
                         )
+                    else:
+                        metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
             # R32: variant handling
             needs_manual_variant = False
@@ -2312,6 +2463,8 @@ def cmd_collection_record_win(
                             logger.warning(
                                 "Metron credentials not configured; skipping variant resolution."
                             )
+                        else:
+                            metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
                     if matched_variant:
                         full_title = f"{base_title} {matched_variant}"

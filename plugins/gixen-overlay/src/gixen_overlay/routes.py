@@ -1,11 +1,13 @@
 """Comic FastAPI routes for the gixen-overlay plugin."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,7 @@ from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_ta
 # write paths) behind /api/comics/* instead of porting any of it to SQL. These
 # imports prove the locg workspace dependency resolves (exercised by the
 # workspace-imports canary).
+from locg.collection_cache import CollectionCache
 from locg.collection_io import MAX_XLSX_BYTES
 from locg.commands import (
     _split_wish_list_name,
@@ -1197,10 +1200,22 @@ async def api_record_win(req: RecordWinRequest):
     Mirrors `locg collection record-win`; the Metron series resolution and
     BUI-34 already-owned dedup are unchanged (owned by locg-cli). Returns the
     same summary metrics the CLI does.
+
+    BUI-255: `cmd_collection_record_win` is synchronous and can block for a
+    while — each new series costs a Metron lookup, and a throttled Metron can
+    add a capped-but-real 60s sleep per call (BUI-260's rate-limit retry;
+    BUI-255's own batch breaker stops it from repeating that on every row,
+    but the FIRST throttled row still sleeps once). Calling it directly on
+    this coroutine would block the single-worker event loop for that whole
+    stretch — every other endpoint (e.g. GET .../status) would hang until the
+    batch finished, which is exactly what happened during the BUI-247 audit.
+    `asyncio.to_thread` runs it on a worker thread so the loop stays
+    responsive; this matches the pattern gixen-cli's own server/main.py
+    already uses for its blocking calls.
     """
     _ensure_collection_store()
     try:
-        result = cmd_collection_record_win(req.wins)
+        result = await asyncio.to_thread(cmd_collection_record_win, req.wins)
     except RuntimeError as exc:
         raise HTTPException(
             status_code=500, detail=f"collection store unavailable: {exc}"
@@ -1245,6 +1260,215 @@ async def api_record_win(req: RecordWinRequest):
             },
         )
     return result
+
+
+def _pinned_collection_rows(
+    comics: list[dict[str, Any]], full_title: str, release_date: str | None
+) -> list[dict[str, Any]]:
+    """Owned rows matching BOTH `full_title` and `release_date` (BUI-254 S1).
+
+    `full_title` alone is not a unique key: LOCG's `full_title` carries no year
+    (BUI-199 — "Hulk #1", not "Hulk (2008) #1"), so a collection owning both the
+    1962 and 2008 "Hulk #1" has TWO owned rows with an identical `full_title`.
+    `cmd_collection_check`'s year gate already resolved that ambiguity down to
+    ONE row (its `matched_release_date` is that exact row's `release_date`, or
+    `None` when the matched row is itself dateless) — pin on it too so the row
+    this endpoint touches is provably the SAME row `cmd_collection_check`
+    reported as in_collection, not just "the first row with this title".
+    """
+    return [
+        row for row in comics
+        if row.get("in_collection")
+        and row.get("full_title") == full_title
+        and (row.get("release_date") or None) == release_date
+    ]
+
+
+@router.delete("/api/comics/collection")
+async def api_collection_delete(
+    series: str,
+    issue: str,
+    year: str | None = None,
+    variant: str | None = None,
+    dry_run: bool = False,
+):
+    """Remove a single erroneous entry from the collection (BUI-254).
+
+    The collection's only write paths were `import` (bulk) and `record-win`
+    (append) — there was no way to undo one mistaken entry short of exporting it
+    with `In Collection=0` and letting LOCG delete it on sync, the exact
+    mechanism that caused the BUI-122 data-loss incident. This is a deliberate
+    HARD delete instead, not a tombstone: unlike the `bids` table (BUI-49),
+    where the tombstone protects against an *automated* sweep/live-cancel, this
+    endpoint is only ever invoked manually for a single confirmed mistake, so a
+    tombstone would just be dead weight the read paths have to keep filtering
+    (the BUI-50 lesson: an added filter is an added way to forget the filter).
+    The full removed record is returned AND logged to the import-history audit
+    log, so a mistaken removal can still be manually reversed via `record-win`
+    or a fresh import even with no live row to restore from.
+
+    Locates the row with the SAME matcher `cmd_collection_check` uses (masthead
+    aliases, the X-Men issue-number split, leading-zero/leading-article
+    normalization, the year gate) — not a reimplementation. The row is then
+    pinned by `full_title` AND `release_date` together (`_pinned_collection_rows`,
+    BUI-254 S1): `full_title` alone can collide across eras of the same issue
+    number (e.g. two owned "Hulk #1" rows, 1962 and 2008), so a bare
+    `full_title` match could silently touch the wrong one. If the pin still
+    matches more than one row (e.g. two genuinely dateless rows sharing a
+    title), that's an unresolvable ambiguity — refuse with 409 rather than
+    guess via first-match. `in_collection` is a copies-owned count
+    (BUI-249/250/251): a row with more than one copy is decremented, a
+    single-copy row is removed outright, so deleting one erroneous copy never
+    un-owns the others. Pass `dry_run=true` to preview the record that WOULD be
+    removed/decremented without mutating the store (the same dry-run-then-
+    confirm shape `/comic:wishlist-add` and `/comic:collection-sync` use) — the
+    preview and the real delete share the exact same pinning predicate, so what
+    you preview is what you'd delete.
+
+    404 when no owned row matches; 409 when the store was never imported (R11)
+    or when the pin is ambiguous.
+    """
+    series = series.strip()
+    issue = issue.strip()
+    if not series or not issue:
+        raise HTTPException(status_code=422, detail="series and issue must both be non-empty")
+
+    _ensure_collection_store()
+    _require_imported_collection()
+
+    try:
+        check = cmd_collection_check(series=series, issue=issue, variant=variant, year=year)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+    if check["match_status"] != "in_collection":
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{series} #{issue}' is not in the collection — nothing to remove",
+        )
+    full_title = check["full_title_matched"]
+    # Normalize "" to None here, once: cmd_collection_check sets
+    # matched_release_date straight from the matched row's release_date, which
+    # can be "" (not just missing) for an owned-but-dateless row — the year
+    # gate fail-opens on an empty date, so such a row still reports
+    # in_collection. _pinned_collection_rows folds the ROW side's
+    # release_date the same "" -> None way; if this side stayed unnormalized
+    # ("" != None), the pin would reject the very row cmd_collection_check
+    # just confirmed is owned, 404ing a legitimately deletable dateless row.
+    matched_release_date = check.get("matched_release_date") or None
+
+    cache = CollectionCache()
+
+    if dry_run:
+        # Read-only preview: no lock, no mutation, no audit entry. Re-reads
+        # rather than reusing the check above so the previewed record reflects
+        # the store at read time, not a snapshot from before this request.
+        payload = cache.load()
+        candidates = _pinned_collection_rows(payload.get("comics", []), full_title, matched_release_date)
+        if not candidates:
+            raise HTTPException(
+                status_code=404,
+                detail=f"'{series} #{issue}' is not in the collection — nothing to remove",
+            )
+        if len(candidates) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"ambiguous match: {len(candidates)} owned rows share full_title="
+                    f"{full_title!r} and release_date={matched_release_date!r} — "
+                    "refusing to guess which one to remove"
+                ),
+            )
+        row = candidates[0]
+        copies = row.get("in_collection") or 0
+        return {
+            "status": "preview",
+            "action": "would_decrement" if copies > 1 else "would_remove",
+            "would_remove": dict(row),
+            "remaining_copies": copies - 1 if copies > 1 else 0,
+        }
+
+    # Cheap no-lock pre-check: refuse an ambiguous pin BEFORE touching
+    # cache.apply(), so a refused (409) delete is a true no-op — it doesn't
+    # rotate the .bak ring or rewrite last_writer metadata for a delete that
+    # never actually happened. Repeated ambiguous calls would otherwise churn
+    # the backup ring and could evict older, distinct backups. The in-`_mutate`
+    # ambiguity guard below stays as the authoritative, race-safe backstop: if
+    # the store changes between this pre-check and the lock (e.g. a second
+    # copy of the same dateless row is imported in between), that guard still
+    # catches it before any row is touched.
+    if len(_pinned_collection_rows(cache.load().get("comics", []), full_title, matched_release_date)) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ambiguous match: multiple owned rows share full_title="
+                f"{full_title!r} and release_date={matched_release_date!r} — "
+                "refusing to guess which one to remove"
+            ),
+        )
+
+    removed: dict[str, Any] | None = None
+    action: str | None = None
+    remaining_copies = 0
+    ambiguous_count = 0
+
+    def _mutate(payload: dict[str, Any]) -> None:
+        nonlocal removed, action, remaining_copies, ambiguous_count
+        comics = payload.get("comics", [])
+        candidates = [
+            i for i, row in enumerate(comics)
+            if row.get("in_collection")
+            and row.get("full_title") == full_title
+            and (row.get("release_date") or None) == matched_release_date
+        ]
+        if len(candidates) > 1:
+            ambiguous_count = len(candidates)
+            return
+        if not candidates:
+            return
+        i = candidates[0]
+        row = comics[i]
+        removed = dict(row)
+        copies = row.get("in_collection") or 0
+        if copies > 1:
+            row["in_collection"] = copies - 1
+            action = "decremented"
+            remaining_copies = copies - 1
+        else:
+            del comics[i]
+            action = "removed"
+
+    cache.apply(_mutate, command="collection-delete")
+
+    if ambiguous_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ambiguous match: {ambiguous_count} owned rows share full_title="
+                f"{full_title!r} and release_date={matched_release_date!r} — "
+                "refusing to guess which one to remove"
+            ),
+        )
+
+    if removed is None:
+        # Lost a race with a concurrent write between the check above and the
+        # locked apply() call — the row was already gone by the time the lock
+        # was acquired.
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{series} #{issue}' is not in the collection — nothing to remove",
+        )
+
+    # Log the full removed record so a mistaken deletion can be manually
+    # reversed via record-win/re-import even though this is a hard delete with
+    # no tombstone row to restore from.
+    cache.append_audit({
+        "type": "collection_delete",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "command": "collection-delete",
+        "details": {"query": {"series": series, "issue": issue}, "action": action, "removed": removed},
+    })
+
+    return {"status": "ok", "action": action, "removed": removed, "remaining_copies": remaining_copies}
 
 
 @router.post("/api/comics/wish-list")

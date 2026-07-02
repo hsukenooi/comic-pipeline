@@ -30,6 +30,18 @@ set -a; . ~/.config/locg/.env 2>/dev/null; set +a
 > Metron credentials not found. Add `METRON_USERNAME` and `METRON_PASSWORD` to
 > `~/.config/locg/.env` and retry.
 
+Also source the shared Metron call convention (BUI-262,
+`docs/conventions/metron-api-best-practices.md`). Raw inline `curl` against
+metron.cloud has no retry, no backoff, and no rate-limit awareness — an agent
+following bare `curl` prose got throttled. `metron_curl`/`metron_paginate`
+handle Metron's documented rate limits (429 `Retry-After`, 5xx backoff,
+burst/sustained headers) so every Metron call in this skill routes through
+them instead of a hand-rolled `curl`:
+
+```bash
+source "$(git rev-parse --show-toplevel)/scripts/metron-curl.sh"
+```
+
 Also resolve and health-gate the comics server (the wish-list now lives there)
 through the shared comics-server convention (BUI-172,
 `docs/conventions/comics-server-call.md`). This actually **infers** the URL from
@@ -48,8 +60,7 @@ comics_health_gate     || exit 1
 ## Step 1: Look up the series on Metron
 
 ```bash
-curl -s -u "$METRON_USERNAME:$METRON_PASSWORD" \
-  "https://metron.cloud/api/series/?name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")"
+metron_curl "https://metron.cloud/api/series/?name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")"
 ```
 
 **Filter by start year server-side when you know it (BUI-204).** The bare `name`
@@ -60,8 +71,7 @@ supplied a year, or you otherwise know the run's start year, add Metron's
 of every same-named title:
 
 ```bash
-curl -s -u "$METRON_USERNAME:$METRON_PASSWORD" \
-  "https://metron.cloud/api/series/?name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")&year_began=<YEAR>"
+metron_curl "https://metron.cloud/api/series/?name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")&year_began=<YEAR>"
 ```
 
 Each result has `id`, `series` (display name incl. year, e.g.
@@ -85,16 +95,21 @@ Record `issue_count` and the chosen `series` display name.
 Fetch the series' issues from Metron so each carries its **cover date**. The
 per-issue cover year is what the BUI-184 ownership check needs (Step 3) and is
 the ONLY safe year to pass it — never `year_began` (BUI-129). Paginate
-`/api/issue/`:
+`/api/issue/` with `metron_paginate`, which walks `next` sequentially (never
+parallel, per Metron's best practices) and emits one result per line:
 
 ```bash
-curl -s -u "$METRON_USERNAME:$METRON_PASSWORD" \
-  "https://metron.cloud/api/issue/?series_id=<SERIES_ID>&page=<N>"
+metron_paginate "https://metron.cloud/api/issue/?series_id=<SERIES_ID>" | while IFS= read -r issue; do
+  number="$(printf '%s' "$issue" | jq -r '.number')"
+  cover_date="$(printf '%s' "$issue" | jq -r '.cover_date')"
+  # ... accumulate number -> cover_year into your map
+done
 ```
 
-Each result has `number` and `cover_date` (e.g. `"1968-07-01"`). Walk `next`
-until it is null; build a map `number → cover_year` (the 4-digit year of
-`cover_date`; leave it empty for an issue Metron has no `cover_date` for).
+Each result has `number` and `cover_date` (e.g. `"1968-07-01"`). Build a map
+`number → cover_year` (the 4-digit year of `cover_date`; leave it empty for an
+issue Metron has no `cover_date` for). `metron_paginate` itself stops once
+`next` is null — no manual loop-until-null logic needed.
 
 - No range given → every issue `number` Metron returned.
 - Range given → parse it (`1-4` → 1,2,3,4; `1,3,5` → those; `5-` → 5…last) and

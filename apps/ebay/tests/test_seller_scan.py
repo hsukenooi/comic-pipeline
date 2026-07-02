@@ -1188,6 +1188,202 @@ class TestHardRejectLot:
         assert not seller_scan.hard_reject(title, "X-Men", "1")
 
 
+# ─── BUI-261: _LOT_RE missed formats (live false-negatives) ──────────────────
+
+
+class TestLotReMissedFormats:
+    """BUI-247 audit dry-runs found real eBay lot titles that slipped past
+    _LOT_RE. Each format below is a real observed title shape; every one must
+    now be detected as a lot (and therefore hard-rejected)."""
+
+    def test_slash_list_rejected(self):
+        title = "STRANGE TALES 164/165/166/168"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "Strange Tales", "164")
+
+    def test_ampersand_pair_rejected(self):
+        title = "Dark Knight Returns # 1 & 3"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(
+            title, "Batman: The Dark Knight Returns", "1"
+        )
+
+    def test_comma_ampersand_mixed_list_rejected(self):
+        title = "ASM #64, #65 & #66"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "Amazing Spider-Man", "64")
+
+    def test_bare_comma_list_ending_in_lot_rejected(self):
+        title = "Avengers 33,45,50,53,63,81,86 Marvel Silver/Bronze Age Lot"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "The Avengers", "33")
+
+    def test_dash_separated_list_rejected(self):
+        title = "AVENGERS 92-93-94-95-96 Marvel Bronze Age Lot"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "The Avengers", "92")
+
+    def test_bare_hash_through_rejected(self):
+        # BUI-261: no "issues"/"books" word — the pre-existing through-branch
+        # required one; real titles often drop it.
+        title = "The Eternals #1 through 10"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "Eternals", "1")
+
+    def test_bare_no_hash_through_rejected(self):
+        title = "Eternals 1 through 10 Marvel"
+        assert seller_scan._LOT_RE.search(title)
+        assert seller_scan.hard_reject(title, "Eternals", "1")
+
+    # ── A 2-member ampersand pair is unambiguous on its own ───────────────────
+
+    def test_two_member_ampersand_pair_rejected(self):
+        assert seller_scan._LOT_RE.search("X-Men #94 & #95")
+
+    # ── PR review fix: "/" dropped from the 2-member branch ──────────────────
+    # "/" is overloaded with ratio/incentive-variant and half-issue notation in
+    # real listings — a bare 2-member slash pair must NOT be treated as a lot
+    # (hard_reject must never drop a genuine single-issue copy). A 2-member
+    # slash LOT ("STRANGE TALES 164/165") now falls through to Haiku instead —
+    # the safe under-reject direction; 3+ member slash chains are still caught
+    # by the generic list branch (see test_slash_list_rejected above).
+
+    def test_two_member_slash_pair_not_rejected(self):
+        assert not seller_scan._LOT_RE.search("Amazing Spider-Man #1/2")
+
+    def test_ratio_variant_1_of_100_not_rejected(self):
+        title = "Amazing Spider-Man #300 1/100 variant"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "Amazing Spider-Man", "300")
+
+    def test_ratio_variant_1_of_25_not_rejected(self):
+        title = "Batman #92 1/25 variant"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "Batman", "92")
+
+    def test_ratio_variant_1_of_50_not_rejected(self):
+        title = "X-Men #1 1/50 Skan variant"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "X-Men", "1")
+
+    def test_half_issue_slash_not_rejected(self):
+        # "Batman #1/2" — a Wizard-style half-issue, not a lot.
+        title = "Batman #1/2"
+        assert not seller_scan._LOT_RE.search(title)
+        assert not seller_scan.hard_reject(title, "Batman", "1")
+
+
+class TestLotCountMismatch:
+    """BUI-261: lot_count_mismatch() flags a stated 'Lot of N' count that
+    contradicts an explicit '#start-end' range in the same title — a parsing
+    red flag surfaced for a caller to act on (fail-open, not a rejection gate:
+    _LOT_RE already hard-rejects any 'lot of N' phrasing regardless)."""
+
+    def test_count_lower_than_range_flagged(self):
+        # "Lot of 11" claimed over a #1-10 range (only 10 issues) — BUI-261 example.
+        assert seller_scan.lot_count_mismatch(
+            "Lot of 11 Comics Amazing Spider-Man #1-10"
+        ) is True
+
+    def test_count_matches_range_not_flagged(self):
+        assert seller_scan.lot_count_mismatch(
+            "Lot of 10 Comics Amazing Spider-Man #1-10"
+        ) is False
+
+    def test_no_stated_count_fails_open(self):
+        assert seller_scan.lot_count_mismatch(
+            "Amazing Spider-Man #1-10 Marvel Lot"
+        ) is False
+
+    def test_no_explicit_range_fails_open(self):
+        assert seller_scan.lot_count_mismatch(
+            "Lot of 11 Amazing Spider-Man Comics"
+        ) is False
+
+    def test_malformed_range_end_before_start_fails_open(self):
+        assert seller_scan.lot_count_mismatch(
+            "Lot of 5 Comics Amazing Spider-Man #10-1"
+        ) is False
+
+    def test_empty_title_fails_open(self):
+        assert seller_scan.lot_count_mismatch("") is False
+
+
+class TestLotCountMismatchWiredIntoHardReject:
+    """PR review fix: lot_count_mismatch() was defined + tested but had no
+    non-test caller (dead code) — the BUI-261 AC wanted it "surfaced (logged/
+    flagged), not silently trusted". hard_reject's lot branch (rule 3) is the
+    single choke point both should_reject call sites already run through, so
+    it now calls lot_count_mismatch() and emits a stderr warning on a hit."""
+
+    def test_mismatch_prints_warning(self, capsys):
+        title = "Lot of 11 Comics Amazing Spider-Man #1-10"
+        assert seller_scan.hard_reject(title, "Amazing Spider-Man", "1") is True
+        err = capsys.readouterr().err
+        assert "lot count/range mismatch" in err
+        assert title in err
+
+    def test_matching_count_prints_no_warning(self, capsys):
+        title = "Lot of 10 Comics Amazing Spider-Man #1-10"
+        assert seller_scan.hard_reject(title, "Amazing Spider-Man", "1") is True
+        err = capsys.readouterr().err
+        assert "lot count/range mismatch" not in err
+
+    def test_non_lot_title_prints_no_warning(self, capsys):
+        title = "Amazing Spider-Man #300 NM Marvel 1988"
+        assert seller_scan.hard_reject(title, "Amazing Spider-Man", "300") is False
+        err = capsys.readouterr().err
+        assert "lot count/range mismatch" not in err
+
+
+class TestLotReBui243GuardsPreserved:
+    """BUI-261 regression: re-assert every BUI-243 false-reject carve-out
+    (year spans, SKU-adjacent digits) still passes after extending _LOT_RE
+    with the new generic numeric-list/through/bare-lot branches."""
+
+    def test_year_span_after_issue_number_still_not_lot(self):
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #4 1962-1963 Silver Age Marvel"
+        )
+
+    def test_year_span_after_first_issue_word_still_not_lot(self):
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #1 First Issue 1962-1963 Marvel"
+        )
+
+    def test_year_span_after_key_issue_word_still_not_lot(self):
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man #1 Key Issue 1962-1964 Marvel"
+        )
+
+    def test_bare_two_member_dash_range_still_not_lot(self):
+        # BUI-221 carve-out: a bare 2-member dash pair with no '#' anchor and
+        # no quantity word stays ambiguous (ended run years / price span).
+        assert not seller_scan._LOT_RE.search(
+            "Amazing Spider-Man 129-150 Bronze Age"
+        )
+
+    def test_series_run_year_range_in_parens_still_not_lot(self):
+        assert not seller_scan._LOT_RE.search(
+            "Uncanny X-Men #266 (1981-2011) 1st Gambit"
+        )
+
+    def test_decimal_grade_ratio_not_mistaken_for_slash_list(self):
+        # BUI-261: a decimal-grade comparison ("9.4/9.6") must not be misread
+        # as a 2-member slash list ("4/9") by the new generic detector.
+        assert not seller_scan._LOT_RE.search(
+            "CGC 9.4/9.6 slab pair Amazing Spider-Man #300"
+        )
+
+    def test_sku_letter_digit_token_not_mistaken_for_lot_member(self):
+        # BUI-261: a SKU token like "X6" must not be read as a lone lot member
+        # (no word boundary between a letter and an immediately-adjacent digit).
+        assert not seller_scan._LOT_RE.search("Moon Knight X6 Marvel 1982")
+
+    def test_sku_paren_code_not_mistaken_for_lot_member(self):
+        assert not seller_scan._LOT_RE.search("Fantastic Four (CZ) 48 VF")
+
+
 class TestHardRejectMissingIssue:
     def test_title_missing_issue_number_rejected(self):
         # Title has no "300" — obvious wrong listing.
@@ -2356,3 +2552,189 @@ class TestPublicationYearMismatch:
         aspects = {"Publication Year": "1964", "Era": "Modern Age (1992-Now)"}
         # release_year="2020" would normally be post-1992 (keep), but pub year wins
         assert seller_scan.publication_year_mismatch(aspects, self._ASM_1963, "2020") is False
+
+
+# ─── BUI-245: should_reject (shared deterministic gate chain) ────────────────
+
+
+class TestShouldReject:
+    """should_reject() is the single gate chain shared by seller_scan.main() and
+    wishlist_sellers.match_results_for_wish(). Each underlying gate already has
+    its own thorough test class (TestHardRejectCGC, TestReprintReject, etc.) —
+    these tests just confirm should_reject wires every one of them in, so a
+    True from any single gate propagates."""
+
+    _ASM_1963 = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+    def test_clean_match_not_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 VF Marvel", "Amazing Spider-Man", "15",
+        ) is False
+
+    def test_cgc_slab_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 CGC 9.4", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_edition_mismatch_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man Annual #15", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_lot_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 lot of 5", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_missing_issue_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #16 VF Marvel", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_era_mismatch_rejected(self):
+        """A parenthesized year outside the wish's release-year window rejects."""
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 (1999) VF", "Amazing Spider-Man",
+            "15", self._ASM_1963, "1964",
+        ) is True
+
+    def test_era_mismatch_fails_open_without_series_name(self):
+        """Same title, but no series_name passed → era gate can't fire."""
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 (1999) VF", "Amazing Spider-Man", "15",
+        ) is False
+
+    def test_reprint_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 Omnibus", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_digital_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 Digital Only", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_trading_card_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 Topps card", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_foreign_edition_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 La Prensa", "Amazing Spider-Man", "15",
+        ) is True
+
+    def test_second_print_rejected(self):
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 2nd Printing", "Amazing Spider-Man", "15",
+        ) is True
+
+
+# ─── BUI-245: seller_scan.main() candidate loop — deterministic gate + hint ──
+
+
+class TestMainCandidateLoopGateChain:
+    """Regression coverage for BUI-245: seller_scan.main()'s candidate loop must
+    run the same deterministic reject chain as wishlist_sellers.match_results_for_wish()
+    and must carry _series_name onto candidates so verify_with_claude's
+    "Correct series:" era hint activates.
+
+    Repro (BUI-245): "Spectacular Spider-Man #15" scores 0.67 against wish item
+    "The Amazing Spider-Man #15" (spider + man = 2/3 tokens) — high enough to
+    clear match_listing's 0.65 floor, so none of the deterministic gates catch
+    it (no edition/lot/reprint/digital/trading-card/foreign-edition marker, and
+    no parenthesized year for era_mismatch to compare). The fix relies on the
+    "Correct series:" hint reaching Haiku, which is exactly what these tests
+    verify is now wired through from the main() loop.
+    """
+
+    def _wish_items(self):
+        return seller_scan.prepare_wish_items([{
+            "id": "w1",
+            "name": "The Amazing Spider-Man #15",
+            "series_name": "The Amazing Spider-Man (Vol. 1) (1963 - 1998)",
+            "release_date": "1964-08-01",
+        }])
+
+    def _run_scan_loop_body(self, raw_titles, wish_items):
+        """Replicate the scan-loop body from seller_scan.main() (mirrors
+        TestNullTitleScanLoop's approach) so the fix can be exercised without
+        spinning up the full CLI."""
+        candidates = []
+        seen_ids = set()
+        for item_id, title in raw_titles:
+            if not title:
+                continue
+            if "cgc" in title.lower():
+                continue
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            wish, score = seller_scan.match_listing(title, wish_items)
+            if not wish:
+                continue
+            if seller_scan.should_reject(
+                title, wish["series"], wish["issue"],
+                wish.get("_series_name"), wish.get("_release_year"),
+            ):
+                continue
+            candidates.append({
+                "item_id": item_id,
+                "title": title,
+                "wish_id": wish["id"],
+                "wish_name": wish["name"],
+                "match_score": round(score, 2),
+                "_series_name": wish.get("_series_name"),
+                "_release_year": wish.get("_release_year"),
+            })
+        return candidates
+
+    def test_cross_series_candidate_not_deterministically_rejected(self):
+        """should_reject alone does not catch this pair — confirms the failure
+        mode described in BUI-245 (the case must reach Haiku, not be dropped
+        deterministically)."""
+        wish_items = self._wish_items()
+        candidates = self._run_scan_loop_body(
+            [("1", "Spectacular Spider-Man #15 VF Marvel 1979")], wish_items
+        )
+        assert len(candidates) == 1
+
+    def test_cross_series_candidate_carries_series_name_hint(self):
+        """The candidate dict built by the main()-loop replica carries
+        _series_name so verify_with_claude's era hint activates (BUI-245 fix)."""
+        wish_items = self._wish_items()
+        candidates = self._run_scan_loop_body(
+            [("1", "Spectacular Spider-Man #15 VF Marvel 1979")], wish_items
+        )
+        assert candidates[0]["_series_name"] == "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+    def test_cross_series_candidate_rejected_end_to_end_via_claude_hint(self, monkeypatch):
+        """End-to-end: the candidate built by main()'s loop is sent to
+        verify_with_claude with the "Correct series:" hint present in the
+        prompt, and a Claude response rejecting it (as the hint enables) drops
+        it from the final matches — the BUI-245 false positive is gone."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+        wish_items = self._wish_items()
+        candidates = self._run_scan_loop_body(
+            [("1", "Spectacular Spider-Man #15 VF Marvel 1979")], wish_items
+        )
+
+        prompts_seen = []
+
+        def fake_create(**kwargs):
+            prompts_seen.append(kwargs["messages"][0]["content"])
+            resp = MagicMock()
+            resp.content = [MagicMock(
+                text='[{"id":1,"reason":"Spectacular Spider-Man not Amazing Spider-Man"}]'
+            )]
+            return resp
+
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = fake_create
+        monkeypatch.setattr(seller_scan.anthropic, "Anthropic", lambda: fake_client)
+        monkeypatch.setattr(seller_scan, "_load_dotenv", lambda *a, **k: None)
+
+        kept = seller_scan.verify_with_claude(candidates)
+
+        assert "Correct series: The Amazing Spider-Man (Vol. 1) (1963 - 1998)" in prompts_seen[0]
+        assert kept == []

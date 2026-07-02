@@ -148,11 +148,27 @@ _EDITION_PATTERNS = [
     re.compile(r"\btreasury\b", re.IGNORECASE),
 ]
 
+# BUI-261: shared building block for the generic numeric-list branches below.
+# Matches one lot "member": an optional '#' + a 1-3 digit run, bounded so it
+# can never bind to part of a longer run (a 4-digit YEAR, or the "6" in a SKU
+# token like "X6" — \b requires a non-word char on both sides, and a letter
+# immediately touching a digit is NOT a boundary) and never bind to half of a
+# decimal grade ("9.4/9.6" — the lookaround pair excludes any digit run that
+# is directly preceded or followed by a '.').  This is what makes the generic
+# separator-chain branches below safe to add without regressing the BUI-243
+# guards (year-span carve-out, SKU tokens) or false-firing on grade ratios.
+_LOT_MEMBER = r"#?\s*(?<!\.)\b\d{1,3}\b(?!\.\d)"
+
 # Multi-comic-lot signals.  Any match → listing is a bundle, not a single issue.
 _LOT_RE = re.compile(
     r"\blot\s+of\b"           # "lot of"
     r"|\b\d+\s+lot\b"         # "5 lot", "10-comic lot"
     r"|\blot\s+\d+"           # "lot 5", "lot 10"
+    # BUI-261: bare "lot" catch-all. Comics titles essentially never use "lot"
+    # as anything but a bundle signal, so this alone subsumes the three
+    # narrower branches above — they're kept for documentation/history and
+    # because their tests assert the exact substrings.
+    r"|\blot\b"
     r"|\bcollection\b"         # "complete collection", "run collection"
     r"|\bcomplete\s+run\b"     # "complete run"
     r"|\bcomplete\s+set\b"     # BUI-243: "complete set" (full-run bundles)
@@ -171,9 +187,69 @@ _LOT_RE = re.compile(
     # direction there is a missed lot-reject, which is the safe side).
     r"|\b(?:books?|issues?)\s*\d{1,3}\s*-\s*#?\d{1,3}\b"
     # BUI-243: spelled-out range — "issues 1 through 6", "books 1 through 4"
-    r"|\b(?:books?|issues?)\s+\d{1,3}\s+through\s+\d{1,3}\b",
+    r"|\b(?:books?|issues?)\s+\d{1,3}\s+through\s+\d{1,3}\b"
+    # BUI-261: bare "#N through M" / "N through M" — the branch above requires
+    # a literal "issues"/"books" word; real titles often drop it entirely
+    # (e.g. "The Eternals #1 through 10").
+    r"|#\d{1,3}\s+through\s+\d{1,3}\b"
+    r"|\b\d{1,3}\s+through\s+\d{1,3}\b"
+    # BUI-261: generic numeric-list detector — 3+ members chained by any mix
+    # of comma/slash/ampersand/dash ("164/165/166/168", "33,45,50,53,63,81,86",
+    # "92-93-94-95-96", "#64, #65 & #66"). Requiring 2+ separators (3+ members)
+    # for a comma/dash-only chain preserves the BUI-221/BUI-243 carve-out for a
+    # bare 2-member dash pair ("129-150", "1962-1963") — those stay ambiguous
+    # (year span / price span) and are intentionally left alone.
+    rf"|{_LOT_MEMBER}(?:\s*[,/&-]\s*{_LOT_MEMBER}){{2,}}"
+    # BUI-261 (PR review fix): a 2-member AMPERSAND pair is unambiguous on its
+    # own — "&" is never used to write a single number or a year/price span
+    # ("Dark Knight Returns # 1 & 3"). "/" is deliberately EXCLUDED from this
+    # 2-member branch (unlike the 3+ member branch above): "/" is overloaded
+    # in real listings with ratio/incentive variants and half-issues — "ASM
+    # #300 1/100 variant", "Batman #92 1/25 variant", "Batman #1/2" (a Wizard
+    # half-issue) are all genuine SINGLE-issue titles, not lots, and hard_reject
+    # must never drop a genuine single-issue copy. A genuine 2-member slash
+    # LOT ("STRANGE TALES 164/165") falls through to Haiku instead — the safe
+    # under-reject direction; a 3+ member slash chain ("164/165/166") is still
+    # caught by the branch above.
+    rf"|{_LOT_MEMBER}\s*&\s*{_LOT_MEMBER}",
     re.IGNORECASE,
 )
+
+# ─── Lot count vs. parsed-range mismatch (BUI-261) ───────────────────────────
+
+_LOT_STATED_COUNT_RE = re.compile(r"\blot\s+of\s+(\d{1,3})\b", re.IGNORECASE)
+_LOT_ISSUE_RANGE_RE = re.compile(r"#\s*(\d{1,3})\s*-\s*#?\s*(\d{1,3})\b")
+
+
+def lot_count_mismatch(title: str) -> bool:
+    """Return True if a stated "Lot of N" count contradicts the size of an
+    explicit "#start-end" issue range also present in the title.
+
+    Example: "Lot of 11 Comics ... #1-10" claims 11 books over a range that
+    only spans 10 issues — a parsing red flag worth surfacing rather than
+    silently trusting either number.
+
+    FAIL-OPEN (BUI-261): this is a diagnostic flag for a caller to act on
+    (e.g. log a warning, or double-check before expanding a lot into
+    constituent issues) — not a rejection gate; _LOT_RE already hard-rejects
+    anything phrased as "lot of N" regardless of what this returns. Returns
+    False whenever the stated count or an explicit range is missing, or the
+    range is malformed (end < start) — ambiguous input is never reported as
+    a mismatch.
+    """
+    stated_m = _LOT_STATED_COUNT_RE.search(title or "")
+    if not stated_m:
+        return False
+    stated = int(stated_m.group(1))
+
+    range_m = _LOT_ISSUE_RANGE_RE.search(title)
+    if not range_m:
+        return False
+    start, end = int(range_m.group(1)), int(range_m.group(2))
+    if end < start:
+        return False
+    return (end - start + 1) != stated
+
 
 # BUI-135: numeric grade tokens (CGC/CBCS slab grades and raw grade shorthand)
 # look like "7.0", "8.5", "9.2", "9.4". _normalize() replaces the "." with a
@@ -327,6 +403,17 @@ def hard_reject(title, series, issue):
 
     # Rule 3: multi-comic lot
     if _LOT_RE.search(title):
+        # BUI-261 (PR review fix): surface a stated-count vs parsed-range
+        # contradiction instead of silently trusting either number — e.g.
+        # "Lot of 11 Comics ... #1-10" claims 11 books over a 10-issue range.
+        # hard_reject is the single choke point both should_reject call sites
+        # (seller_scan.main() and wishlist_sellers.match_results_for_wish)
+        # already run through, so this is the cheapest place to flag it live.
+        if lot_count_mismatch(title):
+            print(
+                f"Warning: lot count/range mismatch in title: {title!r}",
+                file=sys.stderr,
+            )
         return True
 
     # Rule 4: missing issue number (same logic as match_listing)
@@ -779,6 +866,53 @@ def _second_print_reject(title: str) -> bool:
     return bool(_LATER_PRINTING_RE.search(title or ""))
 
 
+# ─── Shared deterministic reject chain (BUI-245) ──────────────────────────────
+# Single source of truth for the deterministic gate chain, consulted by both
+# seller_scan.main() and wishlist_sellers.match_results_for_wish() so the two
+# candidate loops can never drift apart on what counts as an obvious non-match.
+
+
+def should_reject(
+    title: str,
+    series: str,
+    issue: "str | None",
+    series_name: "str | None" = None,
+    release_year: "str | None" = None,
+) -> bool:
+    """Return True if *title* is a deterministic non-match for this wish item.
+
+    Runs the full gate chain in order — the first gate to fire wins:
+      1. hard_reject       — CGC slab, edition mismatch, multi-comic lot,
+                              missing issue number.
+      2. era_mismatch      — parenthesized year or explicit volume clearly
+                              contradicts the wish series era (BUI-226/BUI-240).
+      3. _reprint_reject   — facsimile / omnibus / TPB / etc. (BUI-227).
+      4. _digital_reject   — digital-code / no-physical-comic offer (BUI-230).
+      5. _trading_card_reject — trading card / TCG product (BUI-232).
+      6. _foreign_edition_reject — foreign-language/-market reprint (BUI-239).
+      7. _second_print_reject   — later printing / non-first-print (BUI-244).
+
+    *series_name* and *release_year* are optional — pass them whenever the
+    caller has a decorated LOCG series name / per-issue release year so the
+    era-gate signals can fire; omitting them just fails those checks open.
+    """
+    if hard_reject(title, series, issue):
+        return True
+    if era_mismatch(title, series_name, release_year):
+        return True
+    if _reprint_reject(title):
+        return True
+    if _digital_reject(title):
+        return True
+    if _trading_card_reject(title):
+        return True
+    if _foreign_edition_reject(title):
+        return True
+    if _second_print_reject(title):
+        return True
+    return False
+
+
 # ─── Claude verification ──────────────────────────────────────────────────────
 
 def _load_dotenv(path):
@@ -862,8 +996,9 @@ def verify_with_claude(matches):
         chunk_label = f"{chunk_start + 1}–{chunk_start + len(chunk)}"
 
         # Build pairs text.  When the candidate carries a decorated series name
-        # (_series_name, stripped from output by _emit), include it as a
-        # "Correct series:" hint so Haiku knows the exact era the user wants.
+        # (_series_name, stripped from output before printing — see the
+        # underscore-key filter in main()), include it as a "Correct series:"
+        # hint so Haiku knows the exact era the user wants.
         pairs_parts = []
         for idx, cand in enumerate(chunk, 1):
             pair_text = (
@@ -1109,21 +1244,39 @@ def main(argv=None):
         # BUI-184: defense in depth — parse_item_summary already coerces null
         # titles to "" via `or ""`, but skip explicitly here too so that a
         # title-less listing never reaches .lower() or match_listing at all.
-        if not listing.get("title"):
+        title = listing.get("title")
+        if not title:
             continue
-        if "cgc" in listing["title"].lower():
+        if "cgc" in title.lower():
             continue
         if listing["item_id"] in seen_ids:
             continue
         seen_ids.add(listing["item_id"])
-        wish, score = match_listing(listing["title"], wish_items)
-        if wish:
-            candidates.append({
-                **listing,
-                "wish_id": wish["id"],
-                "wish_name": wish["name"],
-                "match_score": round(score, 2),
-            })
+        wish, score = match_listing(title, wish_items)
+        if not wish:
+            continue
+        # BUI-245: run the same deterministic reject chain wishlist_sellers uses
+        # (hard_reject, era_mismatch, reprint/digital/trading-card/foreign-edition/
+        # second-print) against the wish item match_listing resolved, so a
+        # cross-series false positive (e.g. "Spectacular Spider-Man #15" vs wish
+        # "The Amazing Spider-Man #15") is dropped here rather than reaching Haiku
+        # with no era hint.
+        if should_reject(
+            title, wish["series"], wish["issue"],
+            wish.get("_series_name"), wish.get("_release_year"),
+        ):
+            continue
+        candidates.append({
+            **listing,
+            "wish_id": wish["id"],
+            "wish_name": wish["name"],
+            "match_score": round(score, 2),
+            # Private fields (BUI-245): carry the decorated series name so
+            # verify_with_claude's "Correct series:" era hint activates for this
+            # candidate too. Stripped before output — see the json_output block.
+            "_series_name": wish.get("_series_name"),
+            "_release_year": wish.get("_release_year"),
+        })
 
     # BUI-113: drop matches already surfaced in a prior scan (default). --all
     # skips the filter (and its server fetch); the short-circuit on an empty
@@ -1145,6 +1298,11 @@ def main(argv=None):
     else:
         matches = []
     print(f"  {len(matches)} genuine match(es) found", file=sys.stderr)
+
+    # BUI-245: strip private pipeline fields (_series_name, _release_year) —
+    # they exist only to feed verify_with_claude's era hint and were never
+    # meant to reach the user-facing table/JSON output.
+    matches = [{k: v for k, v in m.items() if not k.startswith("_")} for m in matches]
 
     if args.json_output:
         print(json.dumps(matches, indent=2))
