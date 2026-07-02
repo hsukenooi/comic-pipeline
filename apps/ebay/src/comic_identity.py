@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """comic_identity: deterministic freeform-title → comic-identity logic.
 
-BUI-253 Step 1: this module consolidates the title-parsing / deterministic
-reject helpers that used to live in seller_scan.py (grown across BUI-135,
-BUI-221, BUI-226..245, BUI-261) so seller_scan.py, wishlist_sellers.py, and
+BUI-253 Step 1 consolidated the title-parsing / deterministic reject helpers
+that used to live in seller_scan.py (grown across BUI-135, BUI-221,
+BUI-226..245, BUI-261) so seller_scan.py, wishlist_sellers.py, and
 (eventually) a standalone comic-identify CLI + the LLM skills all share ONE
-implementation instead of re-deriving these rules. Step 1 is a pure move —
-every symbol below is unchanged from its seller_scan.py original and is
-re-exported from seller_scan.py so no caller (including the existing test
-suite) had to change. Genuinely new identity logic (identify_comic(), lot
-expansion, bare-year handling, etc.) lands in later BUI-253 steps.
+implementation instead of re-deriving these rules. Every symbol from Step 1
+is unchanged from its seller_scan.py original and is re-exported from
+seller_scan.py so no caller had to change.
+
+BUI-253 Step 2 adds the genuinely new title→identity logic on top of those
+helpers: identify_comic() (freeform title → ComicIdentity — series, issue,
+year, volume, edition, lot detection + expansion), and score_against_wish()
+(the fuzzy-match scorer extracted out of seller_scan.match_listing so the
+scoring math lives alongside the identity it scores against). See the
+docstrings on identify_comic and ComicIdentity for the extraction rules and
+confidence scale.
 
 Co-located with its two code consumers (seller_scan.py, wishlist_sellers.py)
 in apps/ebay/src — NOT a packages/ workspace package, since the overlay never
@@ -20,6 +26,7 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass, field
 
 # ─── Text normalization ────────────────────────────────────────────────────
 
@@ -732,3 +739,499 @@ def should_reject(
     if _second_print_reject(title):
         return True
     return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BUI-253 Step 2: standalone freeform-title → comic-identity extraction.
+#
+# Everything above this line is Step 1 (moved verbatim from seller_scan.py).
+# Everything below is genuinely new: nothing in this codebase previously
+# turned a bare eBay title into a structured identity without a KNOWN wish
+# item to score it against — match_listing/hard_reject/should_reject all
+# require a candidate wish (series, issue) to compare a title to. identify_comic
+# is the reverse direction: title alone in, best-effort structured guess out.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class ComicIdentity:
+    """Best-effort structured identity extracted from a freeform eBay title.
+
+    Fields:
+      title               — the original, unmodified input title. Kept on the
+                             object so score_against_wish() can score this
+                             identity against a wish item without needing the
+                             raw string passed around separately.
+      series              — extracted series name (literal substring of the
+                             title, NOT normalized against any canonical
+                             series list — see "X-Men vs Uncanny X-Men" below).
+                             None if extraction failed entirely.
+      issue               — the single extracted issue number as a string
+                             (matches the "#N"/"N" convention used throughout
+                             this module), or None for a lot (see is_lot) or
+                             an unparseable title.
+      year                — best-guess 4-digit publication year, or None.
+                             Parenthesized years are preferred (high
+                             precision); a bare/embedded year is used only
+                             when no parenthesized one is present.
+      volume              — explicit "Vol N"/"Volume N" number from the
+                             title, or None.
+      edition             — one of "single-issue" (default), "annual",
+                             "giant-size", "king-size", "treasury",
+                             "collected" (HC/TPB/Omnibus/Epic Collection —a
+                             single purchasable SKU, not a multi-issue lot),
+                             "facsimile", or "reprint" (later
+                             printing / promotional reprint). See
+                             _classify_edition_kind for the priority order.
+      is_lot              — True if the title matches the deterministic lot
+                             signals in _LOT_RE (BUI-243/BUI-261).
+      constituent_issues  — for a lot, the best-effort list of individual
+                             issue numbers the lot appears to bundle (see
+                             _expand_lot_issues). [] means "known bundle,
+                             contents not parseable" — NOT "not a lot".
+      reject_reasons      — human-readable notes on why a caller might not
+                             want this listing as a genuine single raw issue
+                             (CGC slab, lot, digital-only, trading card,
+                             foreign edition, collected edition, facsimile,
+                             later printing, lot count/range mismatch,
+                             ambiguous year, or failed extraction). Additive,
+                             never mutually exclusive with a populated series
+                             /issue — e.g. a facsimile still gets a normal
+                             series/issue extraction AND a reject_reasons note.
+      confidence          — float in [0.0, 1.0], confidence in the EXTRACTED
+                             FIELDS being correct (not a judgment about
+                             whether the listing is "wanted" — that's what
+                             reject_reasons is for). Tiers, highest to
+                             lowest:
+                               1.0  — explicit "#N" issue + non-empty series
+                                      + at most one distinct year mention.
+                               0.8  — same as 1.0 but multiple DISTINCT year
+                                      mentions in the title (ambiguous era —
+                                      e.g. a "(1962-1963)" run-year span).
+                               0.6  — a "collected" edition with no issue
+                                      number — expected/correct for a
+                                      HC/TPB/Omnibus, not a parse failure.
+                               0.5  — a lot whose constituent_issues WERE
+                                      parsed; or a single issue whose number
+                                      was only found via the bare-digit
+                                      fallback (no explicit "#").
+                               0.35 — a lot whose constituent_issues were
+                                      parsed BUT also flagged with a
+                                      count/range mismatch (contradictory
+                                      signals in the same title).
+                               0.3  — a lot whose constituent_issues could
+                                      NOT be parsed at all; or a non-lot
+                                      title with no resolvable issue number.
+                               0.0  — empty/blank title.
+
+    X-Men vs Uncanny X-Men: identify_comic never canonicalizes or reduces the
+    extracted series text — "X-Men #142" and "Uncanny X-Men #142" produce
+    series="X-Men" and series="Uncanny X-Men" respectively, because these are
+    two different LOCG series with different histories/volumes, not the same
+    series with an ignorable adjective. Any future fuzzy series-matching layer
+    must compare on the literal extracted text, not a "core" reduced form.
+    """
+
+    title: str
+    series: "str | None" = None
+    issue: "str | None" = None
+    year: "int | None" = None
+    volume: "int | None" = None
+    edition: str = "single-issue"
+    is_lot: bool = False
+    constituent_issues: "list[str]" = field(default_factory=list)
+    reject_reasons: "list[str]" = field(default_factory=list)
+    confidence: float = 0.0
+    # Internal cache — the grade-stripped + normalized title, computed once by
+    # identify_comic() so score_against_wish() never has to recompute it per
+    # wish item (match_listing scores ONE title against potentially hundreds
+    # of wish items). Not part of the public field contract above.
+    _title_norm: str = ""
+
+
+# ─── Edition classification (annual-nests-in-parent vs Giant-Size-own-series) ─
+# These duplicate the regex BODIES already in _EDITION_PATTERNS (kept generic
+# there for hard_reject's "does title contain any edition word" check) because
+# identify_comic needs to treat each edition word differently: Annual and
+# Treasury nest inside the PARENT series' full_title in LOCG's catalog (an
+# annual is "The Amazing Spider-Man" with issue "Annual N", not its own
+# series), so that word is stripped out of the extracted series text. Giant-
+# Size and King-Size are the opposite — LOCG catalogs them as their OWN
+# series (e.g. "Giant-Size X-Men" is a distinct series_name from "X-Men"), so
+# that word STAYS in the extracted series text. This is the sharp edge BUI-253
+# called out explicitly.
+_ANNUAL_RE = re.compile(r"\bannual\b", re.IGNORECASE)
+# Matches an optional trailing "Edition" too ("Treasury Edition") so
+# stripping it from the series text doesn't leave a dangling "Edition" word
+# behind (e.g. "Superman Treasury Edition #1" -> series "Superman", not
+# "Superman Edition").
+_TREASURY_RE = re.compile(r"\btreasury(?:\s+edition)?\b", re.IGNORECASE)
+_GIANT_SIZE_RE = re.compile(r"\bgiant[\s-]size\b", re.IGNORECASE)
+_KING_SIZE_RE = re.compile(r"\bking[\s-]size\b", re.IGNORECASE)
+
+# Collected-edition / reprint markers reused from the BUI-227 lexicon, split
+# out by kind so identify_comic can report WHICH kind of non-original-format
+# this is (edition="collected" for a HC/TPB/Omnibus single-SKU vs
+# edition="facsimile" vs edition="reprint" for a later-printing/promo
+# reprint) instead of _reprint_reject's single boolean.
+_COLLECTED_EDITION_MARKERS: frozenset[str] = frozenset({
+    "omnibus", "trade paperback", "tpb", "epic collection",
+})
+_FACSIMILE_MARKERS: frozenset[str] = frozenset({"facsimile"})
+_PROMO_REPRINT_MARKERS: frozenset[str] = frozenset({
+    "true believers", "marvel tales", "2nd printing", "second printing",
+})
+
+
+def _marker_hit(title: str, markers: "frozenset[str]") -> bool:
+    """Whole-word/phrase, case-insensitive membership check (same mechanism
+    as _reprint_reject et al.)."""
+    t = (title or "").lower()
+    return any(
+        re.search(r"(?<!\w)" + re.escape(m) + r"(?!\w)", t) for m in markers
+    )
+
+
+def _classify_edition_kind(title: str) -> str:
+    """Return the edition kind for *title* — checked against the WHOLE title
+    (these markers can appear anywhere, not just between series and issue).
+
+    Priority order (first match wins): facsimile > collected > later-printing
+    reprint > annual > giant-size > king-size > treasury > single-issue.
+    Facsimile/collected/reprint take priority over annual/giant-size/etc.
+    because a title can combine them (e.g. "X-Men Annual #1 Facsimile
+    Edition") and the printing-format distinction is the more actionable
+    reject signal.
+    """
+    if _marker_hit(title, _FACSIMILE_MARKERS):
+        return "facsimile"
+    if _marker_hit(title, _COLLECTED_EDITION_MARKERS):
+        return "collected"
+    if _marker_hit(title, _PROMO_REPRINT_MARKERS) or _second_print_reject(title):
+        return "reprint"
+    if _ANNUAL_RE.search(title):
+        return "annual"
+    if _GIANT_SIZE_RE.search(title):
+        return "giant-size"
+    if _KING_SIZE_RE.search(title):
+        return "king-size"
+    if _TREASURY_RE.search(title):
+        return "treasury"
+    return "single-issue"
+
+
+# ─── Issue-number extraction ──────────────────────────────────────────────
+
+# The primary, high-confidence issue signal: an explicit "#N" (optionally with
+# a trailing letter/suffix, e.g. "#1A") — same shape as _parse_wish_name's
+# issue group so the two conventions line up.
+_ISSUE_HASH_RE = re.compile(r"#\s*(\d+\w*)")
+
+# A parenthetical group that is PURELY a year or year range — "(2022)",
+# "(1963 - 1998)", "(2022 - Present)" — stripped out of the extracted series
+# text (the year itself is reported separately via ComicIdentity.year/
+# _all_title_years). Reuses _ERA_DASH_CLASS (the same dash-variant class
+# series_year_range uses) so en/em-dash decorated ranges are handled too.
+_PAREN_YEAR_ONLY_RE = re.compile(
+    rf"\(\s*\d{{4}}\s*(?:{_ERA_DASH_CLASS}\s*(?:\d{{4}}|Present)\s*)?\)",
+    re.IGNORECASE,
+)
+
+# A "Vol N"/"Volume N" mention must be masked out before the bare-digit
+# fallback scans for a plausible issue number, or the volume number gets
+# mistaken for the issue (e.g. "Amazing Spider-Man Vol 3 175" bare-issue
+# fallback must find "175", not the "3" from "Vol 3").
+_VOLUME_MASK_RE = re.compile(r"\bvol(?:ume)?\.?\s*\d+\b", re.IGNORECASE)
+
+
+def _bare_issue_match(stripped_title: str) -> "tuple[re.Match | None, str]":
+    """Best-effort issue-number fallback when no explicit "#N" is present.
+
+    Returns (match, masked_text) where match is the FIRST standalone 1-3
+    digit token in the (grade-stripped, volume-masked) title, or (None,
+    masked_text) if nothing plausible is found. A 4-digit token is never
+    returned — the codebase convention throughout (_LOT_MEMBER, the BUI-243
+    year-span guards) treats any 4-digit run as a year/noise signal, never a
+    plausible issue number. This is a LOW-CONFIDENCE guess (see
+    ComicIdentity.confidence); callers should never treat it with the same
+    certainty as an explicit "#N" match.
+
+    The masked text is also returned (not just the match) so the caller can
+    slice out the series text preceding match.start() from the SAME string
+    the match was found in — the volume-masking replaces "Vol N" with a
+    single space, which shifts positions relative to the original title, so
+    slicing the original stripped_title at match.start() would be wrong
+    (e.g. "Amazing Spider-Man Vol 3 175" — the series text must exclude
+    "Vol 3" entirely, not just stop before wherever "175" landed pre-mask).
+    """
+    masked = _VOLUME_MASK_RE.sub(" ", stripped_title)
+    for m in re.finditer(r"\b\d{1,4}\b", masked):
+        if len(m.group(0)) == 4:
+            continue
+        return m, masked
+    return None, masked
+
+
+# ─── Bare/embedded-year extraction ─────────────────────────────────────────
+
+_BARE_YEAR_RE = re.compile(r"\b(\d{4})\b")
+
+
+def _all_title_years(title: str) -> "list[int]":
+    """Every plausible year (1930-2035) mentioned in *title*, parenthesized
+    ones first (high precision, via _title_paren_years) followed by any bare/
+    embedded ones (lower precision — a run-year span like "1962-1963" or a
+    trailing "Marvel 1988" with no parens). Order is preference order, not
+    necessarily title order across the two groups.
+    """
+    paren_years = _title_paren_years(title)
+    no_parens = re.sub(r"\([^)]*\)", " ", title or "")
+    bare_years = []
+    for m in _BARE_YEAR_RE.finditer(no_parens):
+        yr = int(m.group(1))
+        if 1930 <= yr <= 2035:
+            bare_years.append(yr)
+    return paren_years + bare_years
+
+
+# ─── Lot expansion (BUI-261 formats → constituent issue numbers) ──────────
+
+# Explicit RANGES — a start/end pair meant to be expanded INCLUSIVELY into
+# every issue number in between. Order matters: whichever pattern matches
+# EARLIEST in the title wins (see _expand_lot_issues / _lot_series_text).
+_LOT_RANGE_PATTERNS = [
+    # "#1-#10" / "#1-10" (hash-anchored — mirrors _LOT_RE's own range branch)
+    re.compile(r"#\s*(\d{1,3})\s*-\s*#?\s*(\d{1,3})\b"),
+    # "Books 1-4" / "issues 2-4" / "issue 1-6" (quantity-word-prefixed range)
+    re.compile(r"\b(?:books?|issues?)\s*(\d{1,3})\s*-\s*#?\s*(\d{1,3})\b", re.IGNORECASE),
+    # "#1 through 10" / "1 through 10" (spelled-out range, hash optional)
+    re.compile(r"(?:#\s*)?(\d{1,3})\s+through\s+(\d{1,3})\b", re.IGNORECASE),
+]
+
+# Explicit LISTS — separator-delimited individual members that must NOT be
+# range-expanded: a real title can skip numbers ("164/165/166/168" omits
+# 167), so the literal listed members are returned as-is. Reuses _LOT_MEMBER
+# (the same bounded digit-token building block _LOT_RE uses) so this can
+# never misread a 4-digit year or a SKU-adjacent digit as a lot member.
+_LOT_LIST_RE = re.compile(
+    rf"{_LOT_MEMBER}(?:\s*[,/&-]\s*{_LOT_MEMBER})+", re.IGNORECASE
+)
+_LOT_LIST_MEMBER_RE = re.compile(r"\d{1,3}")
+
+# Boilerplate that precedes the real series name in a "Lot of N ..." title —
+# stripped from the extracted series text so e.g. "Lot of 11 Comics Amazing
+# Spider-Man #1-10" yields series="Amazing Spider-Man", not "Lot of 11
+# Comics Amazing Spider-Man". Anchored at the start of the (already-sliced)
+# candidate text.
+_LOT_BOILERPLATE_RE = re.compile(
+    r"^\s*(?:huge\s+)?lot\s+of\s+\d+\s*(?:comics?|books?|issues?)?\s*[:\-]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _expand_lot_issues(title: str) -> "list[str]":
+    """Best-effort parse of the individual issue numbers a lot title bundles.
+
+    Tries, in order:
+      1. An explicit range ("#1-#10", "Books 1-4", "#1 through 10") —
+         expanded to every issue number in [start, end] inclusive. A sanity
+         bound (span <= 500) guards against a garbage/inverted range.
+      2. An explicit separator-delimited list ("164/165/166/168",
+         "33,45,50,53,63,81,86", "#64, #65 & #66") — the literal listed
+         members, NOT range-expanded (see _LOT_LIST_RE docstring above).
+
+    Returns [] when nothing parseable is found (is_lot may still be True —
+    the title matched _LOT_RE on a signal word like "lot"/"collection" with
+    no extractable numbers, e.g. "Huge Spider-Man Comic Lot!!"). Callers must
+    treat an empty list as "known bundle, unknown contents", never as "not a
+    lot".
+    """
+    for pat in _LOT_RANGE_PATTERNS:
+        m = pat.search(title)
+        if m:
+            start, end = int(m.group(1)), int(m.group(2))
+            if 0 <= end - start <= 500:
+                return [str(n) for n in range(start, end + 1)]
+    m = _LOT_LIST_RE.search(title)
+    if m:
+        return [d.group(0) for d in _LOT_LIST_MEMBER_RE.finditer(m.group(0))]
+    return []
+
+
+def _lot_series_text(stripped_title: str) -> str:
+    """Best-effort series text for a lot title: everything before the
+    earliest numeric range/list signal, with leading "Lot of N ..."
+    boilerplate stripped. Falls back to the whole (stripped) title if no
+    range/list pattern is found at all (the bare-"lot"-word-only case)."""
+    earliest = None
+    for pat in (*_LOT_RANGE_PATTERNS, _LOT_LIST_RE):
+        m = pat.search(stripped_title)
+        if m and (earliest is None or m.start() < earliest):
+            earliest = m.start()
+    text = stripped_title[:earliest].strip() if earliest is not None else stripped_title.strip()
+    return _LOT_BOILERPLATE_RE.sub("", text).strip()
+
+
+# ─── identify_comic() ──────────────────────────────────────────────────────
+
+
+def identify_comic(title: "str | None") -> ComicIdentity:
+    """Extract a best-effort ComicIdentity from a freeform eBay listing title.
+
+    This is the "title alone in, structured guess out" direction — the
+    opposite of hard_reject/should_reject/score_against_wish, which all
+    require a KNOWN candidate wish item to compare a title against. Be
+    conservative: populate confidence/reject_reasons rather than guessing
+    wildly (BUI-253). See ComicIdentity's docstring for the field semantics
+    and the confidence tier table.
+    """
+    raw_title = title or ""
+    identity = ComicIdentity(title=raw_title)
+
+    if not raw_title.strip():
+        identity.reject_reasons.append("empty title")
+        return identity
+
+    stripped = _strip_grades(raw_title)
+    identity._title_norm = _normalize(stripped)
+
+    # --- deterministic reject signals (independent of series/issue) -------
+    if "cgc" in raw_title.lower():
+        identity.reject_reasons.append("CGC slab")
+    if _digital_reject(raw_title):
+        identity.reject_reasons.append("digital-only listing")
+    if _trading_card_reject(raw_title):
+        identity.reject_reasons.append("trading card / TCG product")
+    if _foreign_edition_reject(raw_title):
+        identity.reject_reasons.append("foreign-language/-market edition")
+
+    # --- lot detection + expansion (BUI-243/BUI-261) -----------------------
+    identity.is_lot = bool(_LOT_RE.search(raw_title))
+    count_mismatch = False
+    if identity.is_lot:
+        identity.constituent_issues = _expand_lot_issues(raw_title)
+        count_mismatch = lot_count_mismatch(raw_title)
+        if count_mismatch:
+            identity.reject_reasons.append(
+                "lot count/range mismatch: stated count disagrees with parsed range"
+            )
+        if not identity.constituent_issues:
+            identity.reject_reasons.append(
+                "lot detected but constituent issues could not be parsed"
+            )
+
+    # --- edition classification ---------------------------------------------
+    identity.edition = _classify_edition_kind(raw_title)
+    if identity.edition == "facsimile":
+        identity.reject_reasons.append("facsimile reprint, not an original")
+    elif identity.edition == "collected":
+        identity.reject_reasons.append(
+            "collected edition (HC/TPB/Omnibus), not a single floppy issue"
+        )
+    elif identity.edition == "reprint":
+        identity.reject_reasons.append(
+            "later printing / promotional reprint, not an original first print"
+        )
+    # annual/giant-size/king-size/treasury/single-issue are classification
+    # only, not inherently a reject signal (hard_reject already handles the
+    # "mismatches the WISHED series' own edition" case; identify_comic has no
+    # wish item to compare against here).
+
+    # --- series + issue extraction ------------------------------------------
+    hash_m = _ISSUE_HASH_RE.search(stripped)
+    bare_m = None
+    if not identity.is_lot and not hash_m:
+        bare_m, masked_for_bare = _bare_issue_match(stripped)
+
+    if identity.is_lot:
+        pre_issue_text = _lot_series_text(stripped)
+    elif hash_m:
+        pre_issue_text = stripped[: hash_m.start()]
+    elif bare_m:
+        pre_issue_text = masked_for_bare[: bare_m.start()]
+    else:
+        pre_issue_text = stripped
+
+    if identity.edition in ("annual", "treasury"):
+        pre_issue_text = _ANNUAL_RE.sub("", pre_issue_text) if identity.edition == "annual" \
+            else _TREASURY_RE.sub("", pre_issue_text)
+    # Strip a purely-parenthetical year or year-range from the series text —
+    # "Amazing Spider-Man (2022) #7" must yield series="Amazing Spider-Man"
+    # with year=2022 reported separately (below), not folded into the series
+    # string. A paren group with OTHER content (e.g. "(CGC 2024)") is left
+    # alone — it isn't unambiguously just an era marker.
+    pre_issue_text = _PAREN_YEAR_ONLY_RE.sub(" ", pre_issue_text)
+    series_text = re.sub(r"\s+", " ", pre_issue_text).strip()
+    identity.series = series_text or None
+
+    if not identity.is_lot:
+        if hash_m:
+            identity.issue = hash_m.group(1)
+        elif bare_m:
+            identity.issue = bare_m.group(0)
+
+    # --- year / volume --------------------------------------------------------
+    identity.volume = _title_volume(raw_title)
+    years = _all_title_years(raw_title)
+    identity.year = years[0] if years else None
+    ambiguous_year = len(set(years)) > 1
+
+    # --- confidence -------------------------------------------------------
+    if identity.is_lot:
+        if not identity.constituent_issues:
+            identity.confidence = 0.3
+        elif count_mismatch:
+            identity.confidence = 0.35
+        else:
+            identity.confidence = 0.5
+    elif identity.issue is not None and identity.series:
+        if hash_m:
+            identity.confidence = 0.8 if ambiguous_year else 1.0
+        else:
+            identity.confidence = 0.5  # bare-digit fallback, no explicit "#"
+    elif identity.issue is not None:
+        # Issue found but series text was empty (e.g. title == "#5 NM").
+        identity.confidence = 0.5
+        identity.reject_reasons.append("no series text before issue number")
+    elif identity.edition == "collected":
+        # Expected shape for a HC/TPB/Omnibus — not an extraction failure.
+        identity.confidence = 0.6
+    else:
+        identity.confidence = 0.3
+        identity.reject_reasons.append("no issue number found")
+
+    return identity
+
+
+# ─── score_against_wish() ──────────────────────────────────────────────────
+
+
+def score_against_wish(identity: "ComicIdentity", wish_item: dict) -> float:
+    """Return the fuzzy match score of *identity* against a single wish item.
+
+    Extracted out of seller_scan.match_listing's inner loop (BUI-253 Step 2)
+    so the scoring math lives next to the identity it scores — match_listing
+    now reads as identify_comic(title) -> score_against_wish(identity, wish)
+    per wish item. The math itself is UNCHANGED from the pre-Step-2
+    match_listing: same issue_pattern regex, same token-overlap ratio, same
+    0.0 return for a non-match (the 0.65 floor and best-of-all-wishes
+    selection stay in match_listing, same as before).
+
+    Uses identity._title_norm (computed once by identify_comic) rather than
+    recomputing _normalize(_strip_grades(...)) per call — match_listing calls
+    this once per wish item, so recomputing per call would be O(len(wish_items))
+    redundant string processing for what used to be O(1) shared work.
+    """
+    issue = wish_item["issue"]
+    issue_pattern = re.compile(
+        r"(?:#\s*" + re.escape(issue) + r"\b|\b" + re.escape(issue) + r"\b)"
+    )
+    if not issue_pattern.search(identity._title_norm):
+        return 0.0
+
+    tokens = wish_item["_tokens"]
+    if not tokens:
+        return 0.0
+    title_words = set(identity._title_norm.split())
+    matched = sum(1 for t in tokens if t in title_words)
+    return matched / len(tokens)

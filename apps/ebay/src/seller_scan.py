@@ -12,6 +12,7 @@ import anthropic
 import requests
 
 from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for callers
+    ComicIdentity,
     _digital_reject,
     _EDITION_PATTERNS,
     _foreign_edition_reject,
@@ -28,8 +29,10 @@ from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for c
     _trading_card_reject,
     era_mismatch,
     hard_reject,
+    identify_comic,
     lot_count_mismatch,
     publication_year_mismatch,
+    score_against_wish,
     series_volume,
     series_year_range,
     should_reject,
@@ -200,32 +203,24 @@ def match_listing(title, wish_items):
     Requires:
     - Issue number present in title as #N or as isolated digits
     - At least 50% of series tokens present in title
+
+    BUI-253 Step 2: the actual scoring math for a single (title, wish) pair
+    now lives in comic_identity.score_against_wish — this function is just
+    identify_comic(title) -> score_against_wish(identity, wish) per wish item,
+    picking the best-scoring wish above the 0.65 floor. identify_comic() runs
+    ONCE per title (not per wish item): it caches the grade-stripped/
+    normalized title on the identity (ComicIdentity._title_norm) so
+    score_against_wish never redoes that work per wish item, matching the
+    pre-refactor performance (O(1) shared string processing, not
+    O(len(wish_items))). See score_against_wish's docstring for why the
+    scoring behavior itself is unchanged.
     """
-    # BUI-135: strip decimal grade tokens before normalizing so a slab/raw grade
-    # like "7.0" or "9.4" can't orphan its integer into a fake issue-number match.
-    title_norm = _normalize(_strip_grades(title))
+    identity = identify_comic(title)
     best = None
     best_score = 0.0
 
     for wish in wish_items:
-        issue = wish["issue"]
-        # Issue number check: look for #N or space-bounded N.
-        # BUI-184: add a trailing \b to the #\s*N branch so that "#3" does not
-        # prefix-match "#300". In practice _normalize() strips "#" before this
-        # runs (so the first branch rarely fires on a normalized title), but the
-        # trailing boundary hardens it defensively against any future caller that
-        # passes un-normalized input. Both branches now have symmetric boundaries.
-        issue_pattern = re.compile(
-            r"(?:#\s*" + re.escape(issue) + r"\b|\b" + re.escape(issue) + r"\b)"
-        )
-        if not issue_pattern.search(title_norm):
-            continue
-
-        tokens = wish["_tokens"]
-        title_words = set(title_norm.split())
-        matched = sum(1 for t in tokens if t in title_words)
-        score = matched / len(tokens)
-
+        score = score_against_wish(identity, wish)
         if score > best_score:
             best_score = score
             best = wish
