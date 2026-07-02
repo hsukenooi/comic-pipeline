@@ -31,6 +31,15 @@ def resolve_server_dir() -> Path:
 
 DB_PATH = resolve_server_dir() / "db.sqlite"
 
+# Soft-delete tombstone status values (BUI-49 renamed PURGED -> REMOVED). Both
+# are tolerated in queries so gixen-cli and gixen-overlay stay correct across
+# package version skew (BUI-272: centralizes the ~13 hand-typed occurrences).
+# This is a bare SQL value list, not a parenthesized tuple, so callers compose
+# it into whatever IN/NOT IN clause shape they need, e.g.
+# f"status NOT IN ({TOMBSTONE_STATUSES_SQL})" or, alongside other values,
+# f"status NOT IN ('PENDING', {TOMBSTONE_STATUSES_SQL})".
+TOMBSTONE_STATUSES_SQL = "'PURGED', 'REMOVED'"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bids (
     id              INTEGER PRIMARY KEY,
@@ -302,7 +311,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE bids SET auction_end_at = resolved_at "
         "WHERE auction_end_at IS NULL AND resolved_at IS NOT NULL "
-        "AND status NOT IN ('PURGED', 'REMOVED')"
+        f"AND status NOT IN ({TOMBSTONE_STATUSES_SQL})"
     )
     conn.commit()
 
@@ -543,7 +552,7 @@ def update_bid_status(
         "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, "
         "auction_end_at=COALESCE(auction_end_at, ?), "
         "status_mirror=COALESCE(?, status_mirror) "
-        "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
+        f"WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL})",
         (status, winning_bid, resolved_at, resolved_at, status_mirror, item_id),
     )
 
@@ -576,7 +585,7 @@ def cache_gixen_data(
     if dbidid:
         conn.execute(
             "UPDATE bids SET dbidid=? "
-            "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
+            f"WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL})",
             (dbidid, item_id),
         )
 
@@ -596,7 +605,7 @@ def cache_gixen_data(
         "seller=COALESCE(seller, ?), "
         "cached_current_bid=COALESCE(?, cached_current_bid), "
         "cached_at=? "
-        "WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
+        f"WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL})",
         (title, seller, current_bid, now, item_id),
     )
 
@@ -606,7 +615,7 @@ def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     # Soft-delete tombstone. Renamed PURGED -> REMOVED in BUI-49; skip rows that
     # already carry either tombstone value so we don't re-stamp resolved_at.
     conn.execute(
-        "UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id=? AND status NOT IN ('PURGED', 'REMOVED')",
+        f"UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL})",
         (now, item_id),
     )
     conn.commit()
@@ -636,7 +645,7 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     conn.execute(
         f"UPDATE bids SET status='REMOVED', resolved_at=? "
         f"WHERE item_id IN ({placeholders}) "
-        f"AND status NOT IN ('PENDING', 'PURGED', 'REMOVED')",
+        f"AND status NOT IN ('PENDING', {TOMBSTONE_STATUSES_SQL})",
         [now, *item_ids],
     )
     conn.commit()

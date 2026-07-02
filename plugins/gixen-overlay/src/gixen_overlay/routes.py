@@ -39,7 +39,7 @@ from gixen_overlay.models import (
     CollectionCheckBatchRequest,
 )
 from gixen_overlay.title_parser import parse_title
-from server.db import get_bid_by_item_id, resolve_server_dir
+from server.db import get_bid_by_item_id, resolve_server_dir, TOMBSTONE_STATUSES_SQL
 from server.main import _ensure_fresh_sync, _iso_to_relative, _spawn_fallback_task
 
 # BUI-91/92: the overlay wraps locg-cli's existing collection + wish-list logic
@@ -686,7 +686,7 @@ async def api_comics_snipes(request: Request):
         -- resolved snipe with no auction_end_at from being pinned in Active when
         -- the front-end isEnded() heuristic can't detect the end (no end-date and
         -- a status string it doesn't treat as ended).
-        WHERE b.status NOT IN ('PURGED', 'REMOVED', 'WON', 'LOST', 'ENDED', 'FAILED')
+        WHERE b.status NOT IN ({TOMBSTONE_STATUSES_SQL}, 'WON', 'LOST', 'ENDED', 'FAILED')
         GROUP BY b.id
         ORDER BY b.added_at DESC
     """).fetchall()
@@ -715,7 +715,7 @@ async def api_comics_history(request: Request):
             -- legit LOST/WON row still shows even if a later same-item snipe was
             -- added then removed (higher id, tombstone). Mirrors
             -- api_comics_snipes' status filter.
-            WHERE status NOT IN ('PURGED', 'REMOVED')
+            WHERE status NOT IN ({TOMBSTONE_STATUSES_SQL})
             AND (
               (
                 auction_end_at IS NOT NULL
@@ -758,13 +758,13 @@ async def api_seller_reliability(request: Request, seller: str):
     key = seller.lower()
     db = request.app.state.db
     row = db.execute(
-        """
+        f"""
         SELECT AVG(seller_grade - photo_grade) AS avg_dev, COUNT(*) AS n
         FROM bids
         WHERE LOWER(seller) = ?
           AND seller_grade IS NOT NULL
           AND photo_grade IS NOT NULL
-          AND status NOT IN ('PURGED', 'REMOVED')
+          AND status NOT IN ({TOMBSTONE_STATUSES_SQL})
         """,
         (key,),
     ).fetchone()
@@ -785,13 +785,13 @@ async def api_extract_comics(request: Request):
     db = request.app.state.db
 
     rows = db.execute(
-        """
+        f"""
         SELECT id, item_id, ebay_title
         FROM bids
         WHERE fmv_id IS NULL
           AND ebay_title IS NOT NULL
           AND ebay_title != ''
-          AND status NOT IN ('PURGED', 'REMOVED')
+          AND status NOT IN ({TOMBSTONE_STATUSES_SQL})
         """
     ).fetchall()
 

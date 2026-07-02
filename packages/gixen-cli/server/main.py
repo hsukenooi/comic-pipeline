@@ -37,6 +37,7 @@ from server.db import (
     update_bid, update_bid_status, delete_bid, get_all_bids,
     mark_bids_purged, cache_gixen_data, DEDUP_TOMBSTONE_NOTE,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
+    TOMBSTONE_STATUSES_SQL,
 )
 import ebay_bidder
 
@@ -567,7 +568,7 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
     phantom winning_bid/WON stamp. The 'IS NOT' comparison keeps NULL-notes rows.
     """
     return db.execute(
-        """
+        f"""
         SELECT item_id, max_bid, local_snipe_result, 0 AS is_purged FROM bids
         WHERE status IN ('PENDING', 'ENDED')
           AND auction_end_at IS NOT NULL
@@ -575,7 +576,7 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
           AND winning_bid IS NULL
         UNION ALL
         SELECT item_id, max_bid, local_snipe_result, 1 AS is_purged FROM bids
-        WHERE status IN ('PURGED', 'REMOVED')
+        WHERE status IN ({TOMBSTONE_STATUSES_SQL})
           AND winning_bid IS NULL
           AND notes IS NOT ?
           AND datetime(COALESCE(auction_end_at, resolved_at)) >= datetime('now', '-7 days')
@@ -643,7 +644,7 @@ async def _run_ebay_fallback() -> None:
                 if is_purged:
                     if final_amount is not None and final_amount > 0:
                         db.execute(
-                            "UPDATE bids SET winning_bid = ? WHERE item_id = ? AND status IN ('PURGED', 'REMOVED')",
+                            f"UPDATE bids SET winning_bid = ? WHERE item_id = ? AND status IN ({TOMBSTONE_STATUSES_SQL})",
                             (final_amount, iid),
                         )
                         logger.info(
@@ -1098,9 +1099,9 @@ async def api_get_snipes():
 
     db = _get_db()
 
-    rows = db.execute("""
+    rows = db.execute(f"""
         SELECT * FROM bids
-        WHERE status NOT IN ('PURGED', 'REMOVED')
+        WHERE status NOT IN ({TOMBSTONE_STATUSES_SQL})
         ORDER BY added_at DESC
     """).fetchall()
 
