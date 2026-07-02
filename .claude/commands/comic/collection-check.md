@@ -172,9 +172,9 @@ curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
   --data-urlencode "year=1987"
 ```
 
-- A successful re-query with an alternate series key is a *valid* call — it does not
-  violate R11. R11 only forbids rendering "not owned" from a **failed** call. If this
-  re-query itself fails / can't reach the server → **STOP** (R11), don't proceed.
+- A successful re-query with an alternate series key is R11-safe (it's a new call,
+  not a fallback from a failed one). If the re-query itself fails / can't reach
+  the server → **STOP** (R11), don't proceed.
 - If the toggled query returns `in_collection`, surface **both** results and flag —
   do **not** silently flip the verdict:
   > ⚠️ owned under series key "The Incredible Hulk" — identify dropped/added a leading article; confirm before bidding
@@ -264,7 +264,7 @@ Remove skipped comics from the working list before passing to `/comic:fmv`.
 
 | Mistake | Fix |
 |---|---|
-| Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11). A silent miss buys a duplicate. |
+| Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11 — see the callout at the top of this skill) |
 | Passing the series start year (`year_began`) as `year` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`. Forwarding a series' first-published year (e.g. `1963` for *Uncanny X-Men*) filters out every owned issue and returns a false `not_in_cache` for the whole run (BUI-129). Pass `year` only with this issue's actual cover year; otherwise omit it |
 | Running checks before the `/health` gate passes | Health-gate first; a check against a down server is worthless and dangerous |
 | Treating a stale-cache `not_in_cache` as confident "not in collection" | Apply the stale-cache downgrade when `cache_age_days > 14` |

@@ -30,24 +30,18 @@ set -a; . ~/.config/locg/.env 2>/dev/null; set +a
 > Metron credentials not found. Add `METRON_USERNAME` and `METRON_PASSWORD` to
 > `~/.config/locg/.env` and retry.
 
-Also source the shared Metron call convention (BUI-262,
-`docs/conventions/metron-api-best-practices.md`). Raw inline `curl` against
-metron.cloud has no retry, no backoff, and no rate-limit awareness — an agent
-following bare `curl` prose got throttled. `metron_curl`/`metron_paginate`
-handle Metron's documented rate limits (429 `Retry-After`, 5xx backoff,
-burst/sustained headers) so every Metron call in this skill routes through
-them instead of a hand-rolled `curl`:
+Also source the shared Metron call convention
+(`docs/conventions/metron-api-best-practices.md`, BUI-262) — every Metron call
+in this skill routes through `metron_curl`/`metron_paginate` rather than a
+hand-rolled `curl` (that doc has the rate-limit/retry rationale):
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/metron-curl.sh"
 ```
 
 Also resolve and health-gate the comics server (the wish-list now lives there)
-through the shared comics-server convention (BUI-172,
-`docs/conventions/comics-server-call.md`). This actually **infers** the URL from
-the hostname when `COMICS_SERVER_URL` is unset — including the Mac Mini →
-`localhost` mapping the old comment-only block omitted (BUI-170), so the skill no
-longer aborts on the Mac Mini where the correct answer is `localhost:8080`:
+through the shared comics-server convention
+(`docs/conventions/comics-server-call.md`, BUI-172):
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
