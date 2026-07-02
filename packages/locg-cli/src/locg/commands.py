@@ -2260,6 +2260,17 @@ def _dedup_variant_compatible(variant_text: str, candidate_suffix: Optional[str]
     cover-artist variant like "Capullo Variant") can't be reliably normalized
     against a suffix, so it stays permissive — preserving the pre-existing
     BUI-34 behavior of deduping through cosmetic cover variants.
+
+    Known limitation (safe direction): recognition is by EXACT
+    :data:`VARIANT_SUFFIX_MAP` key, so a novel phrasing like
+    ``"newsstand variant"`` (not a map key) reads as ``None`` and stays
+    permissive — a newsstand win against an owned newsstand row then dedups
+    through, at worst producing a duplicate owned row (never hiding a new
+    win). The load-bearing direction — a *base* win must NOT dedup against an
+    owned Newsstand row — always holds, because the owned row's parsed
+    ``candidate_suffix`` ("Newsstand Edition") IS a map key. VARIANT_SUFFIX_MAP
+    isn't widened here on purpose: it also feeds the full_title builder
+    (see its other consumer), so new keys would change more than this check.
     """
     known_win_suffix = VARIANT_SUFFIX_MAP.get(variant_text) if variant_text else None
     known_candidate_suffix = (
@@ -2287,6 +2298,19 @@ def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]
     (2024 - 2025)" #7. Permissive when either side's year is unknown/
     unparseable, matching BUI-34's original bias toward never hiding a
     genuinely-new win behind an uncertain match.
+
+    Known tradeoff (deliberately unchanged — safe direction): a bare
+    single-year owned decoration like ``"The Amazing Spider-Man (1963)"``
+    parses to the degenerate range ``(1963, 1963)`` (a start-year, not a true
+    one-year series), so a later-issue win for that same title (e.g. year
+    1988) reads as era-INCOMPATIBLE and records a DUPLICATE owned row rather
+    than deduping. That is the safe direction (a dup, never hiding ownership —
+    BUI-34's bias), and it is why we do NOT collapse ``start == end`` to
+    "permissive": doing so would re-open the exact cross-era false-SKIP this
+    function exists to close (New Gods #7 1971 vs an owned 2024 Vol. 5 #7)
+    whenever the owned row happened to carry only a bare start-year. Genuine
+    cross-era matches we must catch carry full ``(YYYY - YYYY)`` ranges, so the
+    strict check still fires correctly for them.
     """
     if win_year is None:
         return True
