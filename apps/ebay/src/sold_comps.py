@@ -121,7 +121,7 @@ def build_query(title: str, issue: str, year: int | None = None,
     return " ".join(parts)
 
 
-def canonical_serpapi_url(nkw: str, api_key: str) -> str:
+def canonical_serpapi_url(nkw: str) -> str:
     """Build the SerpApi URL with deterministic param order (for cache key).
 
     Excludes api_key from the canonical form so we don't tie cache to a
@@ -150,7 +150,7 @@ class SerpApiError(Exception):
 def fetch(nkw: str, api_key: str, *, force: bool = False,
           ttl_sec: int = DEFAULT_CACHE_TTL_SEC) -> tuple[dict, bool]:
     """Fetch a SerpApi response with caching. Returns (data, cache_hit)."""
-    canonical = canonical_serpapi_url(nkw, api_key)
+    canonical = canonical_serpapi_url(nkw)
     path = _cache_path(canonical)
 
     if not force:

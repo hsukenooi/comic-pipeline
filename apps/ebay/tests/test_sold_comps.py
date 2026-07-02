@@ -226,14 +226,14 @@ class TestBuildQuery:
 
 class TestCanonicalUrl:
     def test_excludes_api_key(self):
-        url = sc.canonical_serpapi_url('"X-Men 1"', "secret-key")
+        url = sc.canonical_serpapi_url('"X-Men 1"')
         assert "secret-key" not in url
         assert "show_only=Sold" in url
         assert "engine=ebay" in url
 
     def test_deterministic(self):
-        url1 = sc.canonical_serpapi_url('"X-Men 1"', "k")
-        url2 = sc.canonical_serpapi_url('"X-Men 1"', "k")
+        url1 = sc.canonical_serpapi_url('"X-Men 1"')
+        url2 = sc.canonical_serpapi_url('"X-Men 1"')
         assert url1 == url2
 
 

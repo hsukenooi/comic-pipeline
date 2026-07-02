@@ -611,6 +611,32 @@ def _migrate_year_nullable(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _find_yearless_orphans(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Yearless comics rows that have a yeared sibling (same title/issue).
+
+    Shared SELECT for the one-time ALL-CAPS migration and the on-demand
+    orphan sweep; both merge these rows into their yeared sibling and delete
+    the yearless stub, but differ in dry-run/commit handling.
+    """
+    return conn.execute(
+        """
+        SELECT
+            c.id   AS yearless_id,
+            c.title,
+            c.issue,
+            (SELECT id FROM comics
+             WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
+             ORDER BY (locg_id IS NULL), id LIMIT 1) AS yeared_id
+        FROM comics c
+        WHERE c.year IS NULL
+          AND EXISTS (
+              SELECT 1 FROM comics
+              WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
+          )
+        """
+    ).fetchall()
+
+
 def _migrate_sweep_allcaps_orphans(conn: sqlite3.Connection) -> None:
     """Merge ALL-CAPS yearless orphan comics into their yeared siblings exactly once.
 
@@ -628,23 +654,7 @@ def _migrate_sweep_allcaps_orphans(conn: sqlite3.Connection) -> None:
     if row is not None:
         return
 
-    orphans = conn.execute(
-        """
-        SELECT
-            c.id   AS yearless_id,
-            c.title,
-            c.issue,
-            (SELECT id FROM comics
-             WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
-             ORDER BY (locg_id IS NULL), id LIMIT 1) AS yeared_id
-        FROM comics c
-        WHERE c.year IS NULL
-          AND EXISTS (
-              SELECT 1 FROM comics
-              WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
-          )
-        """
-    ).fetchall()
+    orphans = _find_yearless_orphans(conn)
 
     for orphan in orphans:
         _merge_yearless_into_yeared(conn, orphan["yearless_id"], orphan["yeared_id"])
@@ -927,23 +937,7 @@ def sweep_orphan_yearless_comics(
     When dry_run=True reports what would change without touching the DB.
     Returns a summary dict with 'merged' (or 'would_merge') count and details.
     """
-    orphans = conn.execute(
-        """
-        SELECT
-            c.id   AS yearless_id,
-            c.title,
-            c.issue,
-            (SELECT id FROM comics
-             WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
-             ORDER BY (locg_id IS NULL), id LIMIT 1) AS yeared_id
-        FROM comics c
-        WHERE c.year IS NULL
-          AND EXISTS (
-              SELECT 1 FROM comics
-              WHERE LOWER(title)=LOWER(c.title) AND issue=c.issue AND year IS NOT NULL
-          )
-        """
-    ).fetchall()
+    orphans = _find_yearless_orphans(conn)
 
     details = [
         {

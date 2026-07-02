@@ -57,6 +57,7 @@ from seller_scan import (
     _strip_grades,
     _title_paren_years,
     _title_volume,
+    _trunc,
     fetch_seen_item_ids,
     fetch_wish_list,
     hard_reject,
@@ -479,12 +480,6 @@ def apply_verdict_cache(matches: list, db_path: Path) -> tuple[list, list, list]
 
 
 # ─── Output helpers ───────────────────────────────────────────────────────────
-
-def _trunc(text: str, width: int) -> str:
-    if not text:
-        return ""
-    return text if len(text) <= width else text[: width - 1] + "…"
-
 
 def format_table(grouped: dict) -> str:
     """Format grouped seller results as a compact human-readable table."""

@@ -551,13 +551,6 @@ class GixenClient:
                 raise GixenLoginError(f"Account suspended (error {code})")
             raise GixenItemError(code, message)
 
-        # Also check for the "Could not add" message that follows some errors
-        match = re.search(
-            r'<font color="red">Could not add this item \((\d+)\)',
-            html, re.IGNORECASE,
-        )
-        # This is already caught by the Error pattern above; only here as fallback
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -587,6 +580,16 @@ class GixenClient:
             self.login()
             html = self._get_home_page(retry_on_expired=False)
             return self._parse_snipe_table(html)
+
+    def _verify_present(self, target: str) -> bool:
+        """True if `target` (an item_id) appears in the current snipe list.
+
+        Raises whatever list_snipes() raises (GixenParseError,
+        requests.HTTPError, GixenSessionExpiredError) — callers decide how to
+        log and chain the resulting GixenAddNotConfirmedError.
+        """
+        snipes = self.list_snipes()
+        return any(s["item_id"] == target for s in snipes)
 
     def add_snipe(
         self,
@@ -624,7 +627,7 @@ class GixenClient:
         # double-POSTing in that uncertain state risks duplicate snipes. Bail
         # with AddNotConfirmedError so the caller can investigate.
         try:
-            snipes = self.list_snipes()
+            present = self._verify_present(target)
         except (GixenParseError, requests.HTTPError, GixenSessionExpiredError) as e:
             logger.warning(
                 "add_snipe for item=%s: verify list_snipes failed (%s); "
@@ -633,7 +636,7 @@ class GixenClient:
             )
             raise GixenAddNotConfirmedError(item_id) from e
 
-        if any(s["item_id"] == target for s in snipes):
+        if present:
             logger.info("Added snipe: item=%s, max_bid=%s", item_id, max_bid)
             return True
 
@@ -656,10 +659,10 @@ class GixenClient:
         except GixenItemError as e:
             if e.code == 202:
                 try:
-                    snipes = self.list_snipes()
+                    present = self._verify_present(target)
                 except (GixenParseError, requests.HTTPError, GixenSessionExpiredError):
                     raise GixenAddNotConfirmedError(item_id) from e
-                if any(s["item_id"] == target for s in snipes):
+                if present:
                     logger.info(
                         "add_snipe for item=%s: first POST landed, retry hit "
                         "202; treating as success", item_id,
@@ -670,11 +673,11 @@ class GixenClient:
             raise
 
         try:
-            snipes = self.list_snipes()
+            present = self._verify_present(target)
         except (GixenParseError, requests.HTTPError, GixenSessionExpiredError) as e:
             raise GixenAddNotConfirmedError(item_id) from e
 
-        if any(s["item_id"] == target for s in snipes):
+        if present:
             logger.info("Added snipe on retry: item=%s, max_bid=%s", item_id, max_bid)
             return True
 

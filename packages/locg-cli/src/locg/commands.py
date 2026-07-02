@@ -19,6 +19,7 @@ from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
 from locg.collection_cache import (
     CollectionCache,
+    _coerce_year,
     _normalize_series_key,
     owned_match_keys,
     series_year_range,
@@ -2281,12 +2282,21 @@ def _dedup_variant_compatible(variant_text: str, candidate_suffix: Optional[str]
     return known_win_suffix == known_candidate_suffix
 
 
-def _year_of_date(date_str: Optional[str]) -> Optional[int]:
-    """Leading 4-digit year of a date-ish string, or None."""
-    if not date_str:
-        return None
-    m = re.match(r"(\d{4})", str(date_str))
-    return int(m.group(1)) if m else None
+def _date_matches_year(date: Optional[str], year_raw: Any) -> bool:
+    """True if ``date`` starts with the 4-digit year encoded in ``year_raw``.
+
+    Shared reprint-date check for the BUI-210/268 Metron guards, which only
+    accept a looked-up date when its year matches the win's identified year
+    (a naive lookup can otherwise return a reprint/collected-edition date).
+    False if ``date`` is falsy — callers still validate ``year_raw`` is a
+    clean 4-digit year themselves before relying on this, since each site
+    gates a different thing (attempting a lookup vs. rejecting a result) on
+    that validity.
+    """
+    if not date:
+        return False
+    year_str = str(year_raw).strip() if year_raw is not None else ""
+    return str(date).startswith(year_str)
 
 
 def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]) -> bool:
@@ -2317,7 +2327,7 @@ def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]
     rng = series_year_range(candidate_row.get("series_name") or "")
     if rng is not None:
         return rng[0] <= win_year <= rng[1]
-    candidate_year = _year_of_date(candidate_row.get("release_date"))
+    candidate_year = _coerce_year(candidate_row.get("release_date"))
     if candidate_year is not None:
         return candidate_year == win_year
     return True
@@ -2551,7 +2561,7 @@ def cmd_collection_record_win(
             ), []) if issue_num else []
             matched_owned_row: Optional[dict[str, Any]] = None
             if owned_candidates:
-                win_year = _year_of_date(year_raw)
+                win_year = _coerce_year(year_raw)
                 for candidate_row in owned_candidates:
                     candidate_suffix = _owned_row_variant_suffix(candidate_row.get("full_title") or "")
                     if _dedup_era_compatible(win_year, candidate_row) and _dedup_variant_compatible(
@@ -2596,7 +2606,7 @@ def cmd_collection_record_win(
                                 looked_up.get("store_date")
                                 or looked_up.get("cover_date")
                             )
-                            if looked_date and str(looked_date).startswith(year_str):
+                            if _date_matches_year(looked_date, year_raw):
                                 chunk_metron_succeeded += 1
                                 metron_data = looked_up
                     except MetronCredentialError:
@@ -2681,7 +2691,7 @@ def cmd_collection_record_win(
                 if (
                     re.fullmatch(r"\d{4}", year_str)
                     and candidate_date
-                    and not str(candidate_date).startswith(year_str)
+                    and not _date_matches_year(candidate_date, year_raw)
                 ):
                     candidate_date = None
                 release_date = candidate_date
