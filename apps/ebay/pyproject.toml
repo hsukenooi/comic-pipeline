@@ -17,12 +17,14 @@ ebay-fetch = "ebay_fetch:main"
 ebay-sold-comps = "sold_comps:main"
 seller-scan = "seller_scan:main"
 wishlist-sellers = "wishlist_sellers:main"
+comic-identify = "comic_identify:main"
 
 [tool.hatch.build.targets.wheel]
 include = [
     "src/ebay_fetch.py",
     "src/sold_comps.py",
     "src/comic_identity.py",
+    "src/comic_identify.py",
     "src/seller_scan.py",
     "src/ebay_search_cache.py",
     "src/wishlist_sellers.py",

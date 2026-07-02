@@ -1018,13 +1018,16 @@ _LOT_LIST_RE = re.compile(
 )
 _LOT_LIST_MEMBER_RE = re.compile(r"\d{1,3}")
 
-# Boilerplate that precedes the real series name in a "Lot of N ..." title —
-# stripped from the extracted series text so e.g. "Lot of 11 Comics Amazing
-# Spider-Man #1-10" yields series="Amazing Spider-Man", not "Lot of 11
-# Comics Amazing Spider-Man". Anchored at the start of the (already-sliced)
-# candidate text.
+# Boilerplate that surrounds the real series name in a "Lot of N ..." title —
+# stripped from the extracted series text wherever it appears (leading, e.g.
+# "Lot of 11 Comics Amazing Spider-Man #1-10", OR mid-string, e.g. "Avengers
+# Lot of 11 Comics #1-10") so either shape yields a clean series name instead
+# of one contaminated with the lot-count phrase. NOT anchored to the start —
+# a real series name is never going to coincidentally contain "lot of N
+# comics", so matching anywhere in the (already-sliced) candidate text is
+# safe.
 _LOT_BOILERPLATE_RE = re.compile(
-    r"^\s*(?:huge\s+)?lot\s+of\s+\d+\s*(?:comics?|books?|issues?)?\s*[:\-]?\s*",
+    r"\s*(?:huge\s+)?lot\s+of\s+\d+\s*(?:comics?|books?|issues?)?\s*[:\-]?\s*",
     re.IGNORECASE,
 )
 
@@ -1060,9 +1063,11 @@ def _expand_lot_issues(title: str) -> "list[str]":
 
 def _lot_series_text(stripped_title: str) -> str:
     """Best-effort series text for a lot title: everything before the
-    earliest numeric range/list signal, with leading "Lot of N ..."
-    boilerplate stripped. Falls back to the whole (stripped) title if no
-    range/list pattern is found at all (the bare-"lot"-word-only case)."""
+    earliest numeric range/list signal, with "Lot of N ..." boilerplate
+    stripped wherever it falls (leading, e.g. "Lot of 11 Comics Amazing
+    Spider-Man #1-10", or mid-string, e.g. "Avengers Lot of 11 Comics
+    #1-10"). Falls back to the whole (stripped) title if no range/list
+    pattern is found at all (the bare-"lot"-word-only case)."""
     earliest = None
     for pat in (*_LOT_RANGE_PATTERNS, _LOT_LIST_RE):
         m = pat.search(stripped_title)
@@ -1235,3 +1240,53 @@ def score_against_wish(identity: "ComicIdentity", wish_item: dict) -> float:
     title_words = set(identity._title_norm.split())
     matched = sum(1 for t in tokens if t in title_words)
     return matched / len(tokens)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BUI-253 Step 5: Haiku verify-prompt bullet rendering.
+#
+# seller_scan.verify_with_claude's reject-list previously hand-typed example
+# markers ("Mexican La Prensa", "2nd print") that already exist verbatim in
+# the deterministic lexicons above (_FOREIGN_EDITION_MARKERS, _REPRINT_MARKERS)
+# — two independent copies of the same words that could silently drift apart.
+# These helpers render the ACTUAL lexicon contents into prompt-ready text so
+# there is one source of truth; verify_with_claude just consumes the strings.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _joined_markers(markers: "frozenset[str]") -> str:
+    """Sorted, comma-joined marker list for embedding in an LLM prompt."""
+    return ", ".join(sorted(markers))
+
+
+# _EDITION_PATTERNS (Step 1, untouched — hard_reject rule 2) is a list of
+# compiled regexes, not a flat lexicon, so its words can't be safely
+# recovered by introspecting regex source. This tuple supplies the
+# human-readable labels for the SAME edition words and must be kept in sync
+# with _EDITION_PATTERNS by hand — the same convention series_year_range's
+# "ported from locg-cli, keep in sync" comment already uses elsewhere in this
+# file. A smaller, honest solution given _EDITION_PATTERNS itself can't move
+# or change (Step 1 byte-identity guarantee).
+EDITION_LABELS: "tuple[str, ...]" = ("Annual", "Giant-Size", "King-Size", "Treasury")
+
+
+def foreign_edition_examples() -> str:
+    """Comma-joined _FOREIGN_EDITION_MARKERS (BUI-239), for the Haiku prompt's
+    foreign-edition reject bullet. Deliberately narrower than the bullet's
+    full semantic scope — bare nationality adjectives like "Spanish"/
+    "French"/"German"/"Italian" are intentionally excluded from the
+    deterministic lexicon (BUI-239 design: too ambiguous to hard-reject) and
+    left to Haiku's judgment, so the caller should still name those broader
+    cases explicitly alongside these concrete markers.
+    """
+    return _joined_markers(_FOREIGN_EDITION_MARKERS)
+
+
+def later_printing_examples() -> str:
+    """The subset of _REPRINT_MARKERS (BUI-227) that describes a LATER
+    PRINTING specifically (not a facsimile/collected-edition format change,
+    which should_reject already gates deterministically pre-Haiku) — for the
+    Haiku prompt's "later printing / reprint" bullet.
+    """
+    later_printing = {m for m in _REPRINT_MARKERS if "printing" in m}
+    return _joined_markers(later_printing)

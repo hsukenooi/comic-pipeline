@@ -13,6 +13,7 @@ import requests
 
 from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for callers
     ComicIdentity,
+    EDITION_LABELS,
     _digital_reject,
     _EDITION_PATTERNS,
     _foreign_edition_reject,
@@ -28,8 +29,10 @@ from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for c
     _title_volume,
     _trading_card_reject,
     era_mismatch,
+    foreign_edition_examples,
     hard_reject,
     identify_comic,
+    later_printing_examples,
     lot_count_mismatch,
     publication_year_mismatch,
     score_against_wish,
@@ -307,6 +310,16 @@ def verify_with_claude(matches):
         sys.exit(1)
     client = anthropic.Anthropic()
 
+    # BUI-253 Step 5: render the reject-list bullets that duplicate a
+    # deterministic comic_identity lexicon FROM that lexicon, once per call —
+    # so the prompt and the code can't silently drift apart (e.g. this used
+    # to hand-type "Mexican La Prensa" as the only foreign-edition example,
+    # missing every other _FOREIGN_EDITION_MARKERS entry). Computed outside
+    # the chunk loop since it's the same text for every chunk.
+    _edition_words = ", ".join(EDITION_LABELS)
+    _foreign_examples = foreign_edition_examples()
+    _later_printing_examples = later_printing_examples()
+
     kept = []
     for chunk_start in range(0, len(matches), _VERIFY_CHUNK_SIZE):
         chunk = matches[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
@@ -331,15 +344,15 @@ def verify_with_claude(matches):
 
 Reject if:
 - Different series sharing words (Spider-Man Noir vs Amazing Spider-Man, X-Factor vs X-Men, Superior/Ultimate Spider-Man vs Amazing Spider-Man)
-- Annual, Giant-Size, or special edition matching a regular series issue (and vice versa)
+- {_edition_words}, or special edition matching a regular series issue (and vice versa)
 - Lot listing where the issue number appears in the lot size
 - Promotional reprint (Trick or Read, LCSD, Amazon promo, Undeluxe)
 - Modern renumbered issue matching an original issue number (e.g. #10 (811))
 - Series name only in a subtitle or story description, not the actual series
 - Different series VOLUME / relaunch: if the 'Correct series' line shows a specific era, reject listings where 'vol N' or a (YYYY) indicates a different era than the one shown
-- Foreign-language or foreign-market reprint/edition (e.g. Mexican La Prensa, Spanish/French/German/Italian edition) when the wish item is the original US edition
+- Foreign-language or foreign-market reprint/edition (e.g. {_foreign_examples}, or any Spanish/French/German/Italian-language edition) when the wish item is the original US edition
 - Numbered sequential run or complete multi-issue set (e.g. "Books 1-4", "Issues 1 through 6", "complete set", "full run") when the wish item is a single specific issue
-- Later printing / reprint of a key issue (e.g. "2nd print", "Second Printing", "Reprint") when the wish item means the original first print. Newsstand and Direct editions are NOT reprints — keep those
+- Later printing / reprint of a key issue (e.g. {_later_printing_examples}, or a bare "reprint") when the wish item means the original first print. Newsstand and Direct editions are NOT reprints — keep those
 
 Respond with a JSON array containing ONLY the ids you are REJECTING, each with a brief reason:
 [{{"id": 3, "reason": "X-Factor not X-Men"}}, {{"id": 7, "reason": "annual vs regular"}}]
