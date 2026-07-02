@@ -114,6 +114,18 @@ class TestHardExclude:
         "ASM #129 signed by Stan Lee",
         "WW Live Sale ASM result",
         "X-Men #1 restored copy",
+        # BUI-269: previously sold_comps-only markers, now unioned into
+        # comic_identity — pin that reconciling the two lexicons didn't drop
+        # coverage on the sold_comps side.
+        "ASM #300 9d variant UK",
+        "Fantastic Four #1 rare Brazil edition",
+        "Amazing Spider-Man #1 rare Mexico edition",
+        "Batman #1 Norway edition",
+        "Superman #1 Australia edition",
+        "ASM #1 Italian edition",
+        "ASM #1 Spain edition",
+        "ASM #1 Ebal edition",
+        "Spawn #1 Johnny Lightning promo",
     ])
     def test_excludes(self, title):
         assert sc.hard_exclude(title)
