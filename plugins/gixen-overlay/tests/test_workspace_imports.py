@@ -22,7 +22,7 @@ def test_overlay_routes_importable_via_workspace():
 def test_gixen_cli_private_helper_surface_resolves():
     """The exact private helpers the overlay depends on must be importable
     from gixen-cli. If any is renamed upstream, this is the canary."""
-    from server.db import get_bid_by_item_id
+    from server.db import TOMBSTONE_STATUSES_SQL, get_bid_by_item_id
     from server.main import (
         _ensure_fresh_sync,
         _spawn_fallback_task,
@@ -38,6 +38,10 @@ def test_gixen_cli_private_helper_surface_resolves():
             get_bid_by_item_id,
         )
     )
+    # BUI-272: routes.py also imports this tombstone-filter constant from
+    # server.db; pin its resolvability + the PURGED/REMOVED dual-tolerance (BUI-49).
+    assert "'PURGED'" in TOMBSTONE_STATUSES_SQL
+    assert "'REMOVED'" in TOMBSTONE_STATUSES_SQL
 
 
 def test_plugin_hook_entrypoint_importable():
