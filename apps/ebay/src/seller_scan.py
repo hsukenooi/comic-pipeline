@@ -5,10 +5,10 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
-import anthropic
 import requests
 
 from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for callers
@@ -235,80 +235,56 @@ def match_listing(title, wish_items):
 
 # ─── Claude verification ──────────────────────────────────────────────────────
 
-def _load_dotenv(path):
-    """Load key=value pairs from a .env file into os.environ (if not already set)."""
-    import os
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                key = key.strip()
-                if key and key not in os.environ:
-                    os.environ[key] = val.strip()
-    except FileNotFoundError:
-        pass
-
-
-# Maximum candidates per Claude API call.  At ~30–50 output tokens/verdict,
-# the 8 096-token cap limits a single call to ~150–270 candidates before
+# Maximum candidates per Claude CLI call.  At ~30–50 output tokens/verdict,
+# an 8 096-token cap limits a single call to ~150–270 candidates before
 # silent truncation; 100 keeps a comfortable margin and caps cost per call.
 _VERIFY_CHUNK_SIZE = 100
 
 
+def _verify_via_claude_cli(prompt: str) -> str:
+    """Run the verify prompt through the `claude` CLI (subscription auth, no
+    ANTHROPIC_API_KEY needed — BUI-270). The prompt goes via stdin (not argv)
+    to avoid ARG_MAX/escaping issues on a 100-candidate chunk.
+
+    Raises RuntimeError on any transport failure (nonzero exit, timeout, or
+    empty stdout) so the caller can fold it into the existing fail-closed
+    chunk-drop path — a CLI hiccup must never leak an unverified match.
+    """
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", "claude-haiku-4-5-20251001",
+             "--output-format", "text"],
+            input=prompt, capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"claude CLI timed out: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"claude CLI failed to start: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "claude CLI failed")
+    if not result.stdout.strip():
+        raise RuntimeError("claude CLI returned empty output")
+    return result.stdout
+
+
 def verify_with_claude(matches):
-    """Filter candidates to genuine matches using chunked Claude API calls.
+    """Filter candidates to genuine matches using chunked claude CLI calls.
 
     Candidates are processed in batches of at most _VERIFY_CHUNK_SIZE per call
     so that a large run never silently truncates the response.  Indices in each
     prompt are 1-based and local to the chunk so the correlation logic is
     identical to the single-call version.
 
-    Fail-closed: if a chunk's response cannot be parsed OR the number of
-    returned verdicts does not match the number of candidates sent, that chunk
-    is REJECTED entirely (those candidates are dropped) and a warning is
-    printed to stderr.  Better to miss a borderline listing than to surface
-    false positives unattended.  This replaces the previous fail-open fallback
-    that returned all candidates on a parse error.
+    Fail-closed: if a chunk's response cannot be parsed, the CLI call itself
+    fails (nonzero exit / timeout / empty output), OR the number of returned
+    verdicts does not match the number of candidates sent, that chunk is
+    REJECTED entirely (those candidates are dropped) and a warning is printed
+    to stderr.  Better to miss a borderline listing than to surface false
+    positives unattended.  This replaces the previous fail-open fallback that
+    returned all candidates on a parse error.
     """
     if not matches:
         return []
-
-    # BUI-241: try .env candidates in order until the key lands in the environment.
-    # (1) file-relative path — works under --editable install (primary, Option A fix)
-    # (2) $COMIC_PIPELINE_ENV — an explicit full path to a .env file, if set
-    # (3) stable user location — ~/.config/comic-pipeline/.env (Option B fallback)
-    _dotenv_candidates = [
-        Path(__file__).parent.parent / ".env",
-        *(
-            [Path(os.environ["COMIC_PIPELINE_ENV"])]
-            if os.environ.get("COMIC_PIPELINE_ENV")
-            else []
-        ),
-        Path.home() / ".config" / "comic-pipeline" / ".env",
-    ]
-    for _candidate in _dotenv_candidates:
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            break
-        _load_dotenv(_candidate)
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        _checked = ", ".join(str(p) for p in _dotenv_candidates)
-        _env_hint = (
-            " or set $COMIC_PIPELINE_ENV to a .env file path"
-            if not os.environ.get("COMIC_PIPELINE_ENV")
-            else ""
-        )
-        print(
-            f"Error: ANTHROPIC_API_KEY is not set (checked the environment and "
-            f"{_checked}). Claude verification cannot run — refusing to "
-            f"surface unverified matches. Export ANTHROPIC_API_KEY, add it to "
-            f"one of the files above{_env_hint}, then re-run.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    client = anthropic.Anthropic()
 
     # BUI-253 Step 5: render the reject-list bullets that duplicate a
     # deterministic comic_identity lexicon FROM that lexicon, once per call —
@@ -364,12 +340,16 @@ Any candidate id NOT present in your response is treated as genuine.
 Pairs:
 {pairs}"""
 
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=8096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text
+        try:
+            text = _verify_via_claude_cli(prompt)
+        except RuntimeError as exc:
+            print(
+                f"Warning: claude CLI verification failed for candidates "
+                f"{chunk_label} ({exc}); dropping chunk (fail-closed)",
+                file=sys.stderr,
+            )
+            continue
+
         json_match = re.search(r"\[.*\]", text, re.DOTALL)
         if not json_match:
             print(
