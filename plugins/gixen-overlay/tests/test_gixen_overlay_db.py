@@ -8,8 +8,6 @@ from gixen_overlay.db import (
     create_tables,
     upsert_comic,
     upsert_fmv,
-    set_bid_fmv,
-    get_fmv_for_bid,
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
@@ -440,7 +438,7 @@ def test_upsert_fmv_fresh_price_clears_prior_flag(db):
 
 
 # ---------------------------------------------------------------------------
-# link_fmv_to_bid / set_bid_fmv / get_fmv_for_bid
+# link_fmv_to_bid
 # ---------------------------------------------------------------------------
 
 
@@ -542,32 +540,6 @@ def test_link_fmv_to_bid_nonexistent_fmv_raises_fk(db):
     bid_id = _insert_bid(db)
     with pytest.raises(sqlite3.IntegrityError):
         link_fmv_to_bid(db, bid_id, 9999, is_primary=False)
-
-
-def test_set_bid_fmv_sets_and_clears(db):
-    bid_id = _insert_bid(db)
-    cid = _insert_comic(db)
-    fid = upsert_fmv(db, cid, 9.2, low=800.0)
-    set_bid_fmv(db, bid_id, fid)
-    assert db.execute("SELECT fmv_id FROM bids WHERE id=?", (bid_id,)).fetchone()["fmv_id"] == fid
-    set_bid_fmv(db, bid_id, None)
-    assert db.execute("SELECT fmv_id FROM bids WHERE id=?", (bid_id,)).fetchone()["fmv_id"] is None
-
-
-def test_get_fmv_for_bid_returns_fmv_row(db):
-    bid_id = _insert_bid(db)
-    cid = _insert_comic(db)
-    fid = upsert_fmv(db, cid, 9.2, low=800.0)
-    set_bid_fmv(db, bid_id, fid)
-    row = get_fmv_for_bid(db, bid_id)
-    assert row is not None
-    assert row["id"] == fid
-    assert row["low"] == 800.0
-
-
-def test_get_fmv_for_bid_returns_none_when_unlinked(db):
-    bid_id = _insert_bid(db)
-    assert get_fmv_for_bid(db, bid_id) is None
 
 
 def test_get_primary_fmv_for_bid_integration(db):

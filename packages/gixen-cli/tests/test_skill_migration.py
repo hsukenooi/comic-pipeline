@@ -17,6 +17,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SKILLS_DIR = REPO_ROOT / ".claude" / "commands" / "comic"
 EBAY_FETCH_SCRIPT = REPO_ROOT / "apps" / "ebay" / "src" / "ebay_fetch.py"
+# BUI-279: grade.md's inline downloader was extracted here — the credential
+# handling this test pins now lives in the script, not the doc.
+GRADE_PHOTOS_SCRIPT = REPO_ROOT / "apps" / "ebay" / "src" / "grade_photos.py"
 EZSHIP_CLI = REPO_ROOT / "apps" / "ezship" / "src" / "cli.ts"
 
 EXPECTED_SKILLS = [
@@ -83,25 +86,30 @@ def test_ezship_cli_exists():
     )
 
 
-# --- R5: Credential key alignment (grade.md vs ebay_fetch.py) ---
+# --- R5: Credential key alignment (grade_photos.py vs ebay_fetch.py) ---
 
 def test_ebay_fetch_uses_client_id_key():
     _require_skills_dir()
     content = EBAY_FETCH_SCRIPT.read_text()
     assert 'cfg.get("client_id")' in content or "client_id" in content, (
-        "ebay_fetch.py does not reference 'client_id' — grade.md credential alignment may be wrong"
+        "ebay_fetch.py does not reference 'client_id' — grade_photos.py credential alignment may be wrong"
     )
 
 
-def test_grade_md_reads_json_not_dotenv():
-    _require_skills_dir()
-    content = (SKILLS_DIR / "grade.md").read_text()
+def test_grade_photos_reads_json_not_dotenv():
+    # BUI-279: this credential-reading code lived inline in grade.md until it
+    # was extracted to apps/ebay/src/grade_photos.py — assert against the
+    # extracted script, same intent as before the move.
+    assert GRADE_PHOTOS_SCRIPT.is_file(), (
+        f"grade_photos.py not found at {GRADE_PHOTOS_SCRIPT}"
+    )
+    content = GRADE_PHOTOS_SCRIPT.read_text()
     assert "load_dotenv" not in content, (
-        "grade.md still uses load_dotenv() — should use json.load() for config.json"
+        "grade_photos.py still uses load_dotenv() — should use json.load() for config.json"
     )
     assert "json.load" in content, (
-        "grade.md does not use json.load() to read config.json"
+        "grade_photos.py does not use json.load() to read config.json"
     )
     assert "client_id" in content, (
-        "grade.md does not reference 'client_id' key — may be using old EBAY_APP_ID naming"
+        "grade_photos.py does not reference 'client_id' key — may be using old EBAY_APP_ID naming"
     )

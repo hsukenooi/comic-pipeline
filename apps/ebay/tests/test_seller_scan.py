@@ -396,26 +396,6 @@ class TestSeriesVolume:
         assert seller_scan.series_volume("") is None
 
 
-class TestTitleParenYear:
-    def test_year_in_parens(self):
-        assert seller_scan._title_paren_year("Amazing Spider-Man (2022) #7") == 2022
-
-    def test_early_year(self):
-        assert seller_scan._title_paren_year("Batman (1940) #100 NM") == 1940
-
-    def test_no_paren_year(self):
-        """Bare year without parens is not extracted."""
-        assert seller_scan._title_paren_year("Amazing Spider-Man #7 VF 1963") is None
-
-    def test_out_of_range_year_ignored(self):
-        """A parenthesized year outside [1930, 2035] is not returned."""
-        assert seller_scan._title_paren_year("Batman (1900) #1") is None
-        assert seller_scan._title_paren_year("Something (2100) #1") is None
-
-    def test_empty_returns_none(self):
-        assert seller_scan._title_paren_year("") is None
-
-
 class TestTitleVolume:
     def test_vol_n(self):
         assert seller_scan._title_volume("Amazing Spider-Man Vol 3 #7") == 3
@@ -1769,15 +1749,6 @@ class TestTitleParenYears:
         """Only in-range years survive when the group has multiple 4-digit numbers."""
         result = seller_scan._title_paren_years("Book (Marvel 2014 1900) #1")
         assert result == [2014]
-
-    # _title_paren_year backward compat (thin wrapper)
-    def test_paren_year_wrapper_returns_first(self):
-        assert seller_scan._title_paren_year(
-            "Some Book (1963) (CGC 2024)"
-        ) == 1963
-
-    def test_paren_year_wrapper_none_on_empty(self):
-        assert seller_scan._title_paren_year("") is None
 
 
 # ─── BUI-227: era_mismatch compound / multi-year cases ───────────────────────

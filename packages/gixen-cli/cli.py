@@ -203,7 +203,6 @@ def _format_bid(bid_str: str | float | None) -> str:
 def _get_ebay_bid_count(item_id: str) -> int | None:
     """Return current bid count for an eBay listing, or None if unavailable."""
     try:
-        import requests
         resp = requests.get(
             f"https://www.ebay.com/itm/{item_id}",
             headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},

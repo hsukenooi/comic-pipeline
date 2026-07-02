@@ -14,19 +14,24 @@ immediately — no git round-trip (R8). No Playwright, no live LOCG session need
 
 ## Step 0: Resolve the server + bootstrap guard
 
-Resolve `COMICS_SERVER_URL` (env var, with a hostname fallback — same as
-`/comic:fmv`) and confirm the server is up before writing:
+Resolve and health-gate the comics server through the **shared comics-server
+call convention** (BUI-172, `docs/conventions/comics-server-call.md`) — don't
+hand-roll URL resolution or the health check here:
 
 ```bash
-echo "${COMICS_SERVER_URL:-UNSET}"; hostname
-# unset → MacBook (Hsus-MacBook-Air.local): http://mac-mini.tail9b7fa5.ts.net:8080
-#         Mac Mini: http://localhost:8080 ; neither → stop
-curl -sf "$COMICS_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
-curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
+comics_health_gate     || exit 1   # the server must answer
 ```
 
-**If the health gate fails:** STOP — do not record wins against an unreachable
+**If either step fails:** STOP — do not record wins against an unreachable
 server.
+
+Then read collection status:
+
+```bash
+curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
+```
 
 **If `last_full_import` is null:** Stop immediately with:
 > Collection empty on the server — run a full LOCG import before recording wins.
@@ -68,7 +73,7 @@ Returns a JSON **array** of row objects. Filter to wins by **`status` only**:
 No `time_to_end` filter is needed for this source: the endpoint already returns
 only auctions that have **ended** in the past 7 days, and excludes the
 tombstone, so `status` contains `WON` is the complete filter. (Every history row
-actually carries `time_to_end == "ENDED"` — `_iso_to_relative` returns `"ENDED"`
+actually carries `time_to_end == "ENDED"` — `iso_to_relative` returns `"ENDED"`
 for any past auction, and the endpoint only surfaces past auctions — so adding
 that check would be redundant, not necessary. The relevant difference from the
 CLI source below is *scope*, not the `time_to_end` value.)
@@ -291,5 +296,5 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
 | Marking wins seen before the POST succeeds | Only mark seen after a successful record-win POST — a failed call means wins weren't recorded |
 | Confusing `oldest_pending_days` with "days since last sync" | `oldest_pending_days` = age of oldest uncleared item; use `last_full_import` from status for sync recency |
-| Assuming `/api/comics/history` needs the `time_to_end == "ENDED"` filter | It doesn't, and not for the reason you might think: every history row is *already* ended, so `time_to_end` is always `"ENDED"` there (`_iso_to_relative` returns `"ENDED"` for past auctions). The filter would be redundant, not harmful. Use `status` contains `WON` only. The `"ENDED"` check matters only for `gixen list --json`, which also dumps still-live PENDING snipes |
+| Assuming `/api/comics/history` needs the `time_to_end == "ENDED"` filter | It doesn't, and not for the reason you might think: every history row is *already* ended, so `time_to_end` is always `"ENDED"` there (`iso_to_relative` returns `"ENDED"` for past auctions). The filter would be redundant, not harmful. Use `status` contains `WON` only. The `"ENDED"` check matters only for `gixen list --json`, which also dumps still-live PENDING snipes |
 | Pulling from `/api/comics/history` when the needed window predates 7 days | The endpoint only returns snipes ended in the past 7 days. On a first run or after a >7-day gap (any time you can't confirm the last run was within 7 days), fall back to `gixen list --json` so older wins aren't missed |

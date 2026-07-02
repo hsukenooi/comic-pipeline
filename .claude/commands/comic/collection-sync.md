@@ -31,6 +31,10 @@ across name variants (BUI-200), but the procedure below adds defense in depth:
 **wins-only by default, wish push is a separate opted-in step, and every upload is
 previewed and aborted on any unexpected "Deleted from Collection."**
 
+Full incident post-mortem and the current sync architecture:
+`docs/solutions/integration-issues/locg-export-deletes-owned-wished-books.md`
+and `docs/solutions/integration-issues/locg-sync-unified-model-2026-06-22.md`.
+
 ## Step 0: Resolve the server + bootstrap guard
 
 Resolve and health-gate the server through the **shared comics-server call
@@ -41,15 +45,13 @@ hand-roll URL resolution or `curl` error handling here:
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
 comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
 comics_health_gate     || exit 1   # the process is up
-# BUI-157: route the status read through comics_curl too. /health is static, so
-# it passes even when the collection store is corrupt and /collection/status
-# 500s — comics_curl hard-fails on that 500 so it can't slip past the gate below.
 comics_curl "$COMICS_SERVER_URL/api/comics/collection/status" \
-  || { echo "status check failed"; exit 1; }
+  || { echo "status check failed"; exit 1; }   # BUI-157: /health alone doesn't prove the store is healthy
 ```
 
 **If the health gate or status call fails:** STOP — never sync against an
-unreachable or erroring server.
+unreachable or erroring server. (Why the status read needs its own hard-fail,
+not just `/health`: BUI-157 in `docs/audit/2026-06-15-seam-audit.md`.)
 
 **If `last_full_import` is absent or null:** STOP with:
 > Collection empty on the server — run a full LOCG import before syncing.
@@ -85,10 +87,7 @@ The export reads the **server** collection (read-only — it does not mark rows
 pushed) and returns the file contents; save them locally for the upload:
 
 ```bash
-# BUI-138: a FRESH temp file per run + a hard-fail BEFORE the parse. With the
-# old fixed temp path, a failed export (server down / 500) left the prior run's
-# file untouched and the next line happily built a CSV from STALE data.
-# comics_curl hard-fails on non-200, and mktemp guarantees no stale reuse.
+# BUI-138: fresh temp file per run + hard-fail before the parse (never reuse stale data)
 EXPORT_JSON="$(mktemp -t sync-export.XXXXXX)"
 comics_curl "$COMICS_SERVER_URL/api/comics/collection/export" -o "$EXPORT_JSON" \
   || { echo "export failed — not generating a CSV from stale data"; exit 1; }
@@ -100,15 +99,18 @@ python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \
   print('csv:', base+'.csv'); print('ready:', d['ready_count'], '| manual_series:', d['manual_series_count'], '| wish:', d['wish_list_count'])"
 ```
 
+(Why a fresh `mktemp` path and a hard-fail before parsing: BUI-138 in
+`docs/audit/2026-06-15-seam-audit.md` — the old fixed temp path let a failed
+export silently build a CSV from a prior run's stale data.)
+
 Surface `ready_count` (collection rows that will upload), `manual_series_count`
 (rows withheld from the CSV — they stay pending until you resolve them in
 `.notes.md`), and `wish_list_count`.
 
-**Owned-safe export — what is and is NOT guaranteed (BUI-122/BUI-200):** the
+**Owned-safe export coverage (BUI-122/BUI-200) — partial, not complete:** the
 CSV's wish rows are only local-only adds (derived wishes already on LOCG are
 dropped), and the export excludes a wish when it can match an owned copy on
-normalized *(series, issue)* rather than literal title. **Read these limits
-carefully — this is a delete-capable workflow and the guarantee is partial.**
+normalized *(series, issue)* rather than literal title.
 
 **Structurally owned-safe now** (the export will NOT emit `In Collection=0` for an
 owned copy in these cases):
@@ -195,32 +197,29 @@ Then also clean the
 wish-list itself so no owned-but-wished entry survives to be pushed in Step 3b:
 
 ```bash
-# Dry-run audit (BUI-130). Each conflict now carries the matched owned row's
-# provenance — `series_name` + `release_date` (BUI-249/BUI-266) — because this
-# audit is year/variant-blind by necessity (a wish-list name has no per-issue
-# year), so it can land on the WRONG volume/era of a same-numbered issue.
+# BUI-130: dry-run audit — conflicts carry matched-owned-row provenance (BUI-249/266)
 comics_curl "$COMICS_SERVER_URL/api/comics/wish-list/conflicts"
 ```
 
-**Review each conflict's provenance before removing anything (BUI-266).** For
+**Review each conflict's provenance before removing anything (BUI-266) — the
+audit is year/variant-blind by necessity (a wish-list name has no per-issue
+year), so it can land on the WRONG volume/era of a same-numbered issue.** For
 every conflict, compare the wished book's real era/edition against the matched
 owned row's `series_name`/`release_date`:
 
 - **Genuine conflict** — the owned row is the *same* book you wished (same
   volume/era, same print edition). Safe to drop the wish (you now own it).
 - **Decoy — do NOT remove** — a *different* comic that only shares a masthead +
-  issue number: a cross-era match (e.g. a wished 1968 *Avengers* #52 matched
-  against an owned UK-reprint `The Avengers (1973 - 1976)` #52) or the opposite
-  print edition (a base `Uncanny X-Men #201` wish matched against an owned
-  *Newsstand* copy). Removing these is the **BUI-259 114-item over-removal
-  bug** — leave them wishlisted.
+  issue number (a cross-era match, or the opposite print edition of the same
+  issue). Removing decoys caused a 114-item over-removal incident (BUI-259);
+  see `docs/solutions/integration-issues/wishlist-conflict-scoped-removal-2026-07-02.md`
+  for the worked examples. Leave decoys wishlisted.
 
 Then remove **only the reviewed genuine conflicts**, scoped by their exact
 `name` values from the audit:
 
 ```bash
-# Scoped removal (BUI-266). Each name is re-checked against a FRESH audit, so a
-# stale/non-conflict name errors out instead of removing the wrong book.
+# BUI-266: scoped removal, each name re-checked against a FRESH audit
 comics_curl -X POST "$COMICS_SERVER_URL/api/comics/wish-list/remove-conflicts" \
   -H 'Content-Type: application/json' \
   -d '{"names": ["<exact name from the audit>", "..."]}'
@@ -378,15 +377,9 @@ win-records cleanup in
 | Mistake | Fix |
 |---|---|
 | Trying to push wishes in the default sync | The export is wins-only (BUI-208 machine gate — it refuses to emit `In Collection=0`); wishes are a separate opt-in export (`?push_wishes=true`, Step 3b), gated on a clean conflicts audit. Wins can only add; wishes can delete |
-| Splitting the CSV in ≤20-row batches | No row limit — that was a misdiagnosis (the hangs were incomplete/dateless rows). Upload complete-and-exact rows at any size |
 | Pushing wishes without cleaning conflicts first | Step 3b is gated on Step 2b reporting **zero** wish-list conflicts. An owned-but-wished entry pushed as In Collection=0 deletes the owned copy |
-| Skipping the probe / not reading the import preview | Always probe ≤5 rows and read LOCG's per-row result first. **ABORT on any "Deleted from Collection."** — that is the data-loss signal |
-| Skipping the pre-sync data-quality audit | Run Step 2b. Decorated full_titles, Jan-1 placeholder dates, and volume mislabels (BUI-199) read as "Not Found"; an all-dateless batch hangs the importer |
-| Uploading partial/wrong rows | Rows must be complete and exact: publisher + canonical series + exact full_title (no `(Vol.)`/year decoration) + accurate release date — else LOCG returns "Not Found" |
-| Re-export → re-upload without the intervening re-import | Always finish Step 5. Export does not mark rows pushed, so skipping the re-import re-emits the same rows as duplicate uploads |
 | Syncing without a backup | Step 1 is mandatory and hard-stops on failure |
 | Seeing "Deleted from Collection" on upload | A win/wish row should never delete (BUI-122/BUI-200) — STOP, do not upload the rest, report it, restore from the Step 1 backup if a deletion landed |
 | "Error: timeout" at 0% on small batches | LOCG's import backend is degraded (a `queue_import_comic` XHR shows `(canceled)`); wait and retry later — not a file problem |
 | Claiming success when `added` is large | A large `added` means the re-import inserted duplicates instead of reconciling — STOP, investigate, restore from backup if needed |
 | Uploading the `.notes.md` rows | Only the `.csv` files go to LOCG; `.notes.md` lists rows withheld for manual resolution |
-| Running the LOCG web steps for the user | Steps 3, 3b and 4 are manual (Playwright login + web UI) — wait for the user to confirm |

@@ -46,7 +46,7 @@ Provides the `/comics` dashboard tab and comic-specific endpoints:
 
 ### Coupling to gixen-cli
 
-The plugin imports private helpers (`_ensure_fresh_sync`, `_spawn_fallback_task`, `_iso_to_relative`) from gixen-cli's `server.main`. Now that both live in this monorepo, the overlay declares `gixen-cli` as a workspace dependency and a rename of one of these + its caller land in the same commit and CI run — the canary `plugins/gixen-overlay/tests/test_workspace_imports.py` fails loudly if the surface drifts. See `plugins/gixen-overlay/src/gixen_overlay/routes.py`.
+The plugin imports gixen-cli's `server.main`: the private `_ensure_fresh_sync` and `_spawn_fallback_task`, and the public `iso_to_relative`. Now that both live in this monorepo, the overlay declares `gixen-cli` as a workspace dependency and a rename of one of these + its caller land in the same commit and CI run — the canary `plugins/gixen-overlay/tests/test_workspace_imports.py` fails loudly if the surface drifts. See `plugins/gixen-overlay/src/gixen_overlay/routes.py`.
 
 ## Status
 

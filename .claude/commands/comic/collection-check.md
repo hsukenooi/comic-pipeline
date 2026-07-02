@@ -21,29 +21,26 @@ from the `/comic:identify` output table or provided directly by the user.
 
 ## Step 0: Resolve the server + bootstrap guard
 
-Resolve `COMICS_SERVER_URL` (env var, with a hostname fallback) and confirm the
-server is up before any checks — same pattern as `/comic:fmv` and
-`/comic:snipe-add`:
+Resolve and health-gate the comics server through the **shared comics-server
+call convention** (BUI-172, `docs/conventions/comics-server-call.md`) — don't
+hand-roll URL resolution or the health check here:
 
 ```bash
-echo "${COMICS_SERVER_URL:-UNSET}"; hostname
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
+comics_health_gate     || exit 1   # the server must answer
 ```
 
-If `COMICS_SERVER_URL` is unset, infer it:
-- `Hsus-MacBook-Air.local` → `http://mac-mini.tail9b7fa5.ts.net:8080`
-- a Mac Mini hostname → `http://localhost:8080`
-- neither → **stop** ("machine is unrecognised — set COMICS_SERVER_URL").
+**If either step fails: STOP immediately** — the collection cannot be checked,
+so do not proceed to bidding. Do not report any comic as "not in collection".
 
-Health gate, then read collection status:
+Then read collection status:
 
 ```bash
-curl -sf "$COMICS_SERVER_URL/health" || { echo "server unreachable"; exit 1; }
 curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 ```
 
-**If the health gate or status call fails:** STOP immediately — the collection
-cannot be checked, so do not proceed to bidding. Do not report any comic as "not
-in collection".
+**If the status call fails:** STOP immediately — same rule as above.
 
 **If `last_full_import` is null:** Stop with:
 > Collection empty on the server — run a full LOCG import (`/comic:collection-add`
@@ -172,9 +169,9 @@ curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
   --data-urlencode "year=1987"
 ```
 
-- A successful re-query with an alternate series key is a *valid* call — it does not
-  violate R11. R11 only forbids rendering "not owned" from a **failed** call. If this
-  re-query itself fails / can't reach the server → **STOP** (R11), don't proceed.
+- A successful re-query with an alternate series key is R11-safe (it's a new call,
+  not a fallback from a failed one). If the re-query itself fails / can't reach
+  the server → **STOP** (R11), don't proceed.
 - If the toggled query returns `in_collection`, surface **both** results and flag —
   do **not** silently flip the verdict:
   > ⚠️ owned under series key "The Incredible Hulk" — identify dropped/added a leading article; confirm before bidding
@@ -264,12 +261,7 @@ Remove skipped comics from the working list before passing to `/comic:fmv`.
 
 | Mistake | Fix |
 |---|---|
-| Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11). A silent miss buys a duplicate. |
+| Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11 — see the callout at the top of this skill) |
 | Passing the series start year (`year_began`) as `year` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`. Forwarding a series' first-published year (e.g. `1963` for *Uncanny X-Men*) filters out every owned issue and returns a false `not_in_cache` for the whole run (BUI-129). Pass `year` only with this issue's actual cover year; otherwise omit it |
-| Running checks before the `/health` gate passes | Health-gate first; a check against a down server is worthless and dangerous |
-| Treating a stale-cache `not_in_cache` as confident "not in collection" | Apply the stale-cache downgrade when `cache_age_days > 14` |
-| Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — likely conflated with the base/annual series; flag and let the user confirm, don't silently skip |
-| Trusting a `not_in_cache` for a series with a leading article | Step 2.5 Pattern B — re-query with `The` toggled; a successful alternate-key call is R11-safe, a failed one is an R11 STOP |
-| Trusting an `in_collection` verdict with `match_kind: "alias"` without checking the volume | Step 2.5 Pattern D — the masthead alias has no notion of volume/era; read `matched_series_name`/`matched_release_date` and flag for the user to confirm (BUI-249) |
-| Rendering every `not_in_cache` result as plain "Not in collection" | Check `in_wish_list` first (BUI-250) — `true` means a row exists (wish list / pull / read) but isn't owned; render `📋 Wishlisted (not owned)`, not `❌ Not in collection` |
+| Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — a confirmed, repeating false-positive (Giant-Size Fantastic Four vs. an owned Fantastic Four Annual); flag and let the user confirm, don't silently skip |
 | Letting the disambiguator flip a verdict on its own | It's advisory — it flags ambiguity for the user, it never invents ownership or overrides the hard-fail (R11) |

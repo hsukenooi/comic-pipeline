@@ -57,6 +57,7 @@ from seller_scan import (
     _strip_grades,
     _title_paren_years,
     _title_volume,
+    _trunc,
     fetch_seen_item_ids,
     fetch_wish_list,
     hard_reject,
@@ -480,12 +481,6 @@ def apply_verdict_cache(matches: list, db_path: Path) -> tuple[list, list, list]
 
 # ─── Output helpers ───────────────────────────────────────────────────────────
 
-def _trunc(text: str, width: int) -> str:
-    if not text:
-        return ""
-    return text if len(text) <= width else text[: width - 1] + "…"
-
-
 def format_table(grouped: dict) -> str:
     """Format grouped seller results as a compact human-readable table."""
     lines: list[str] = []
@@ -539,6 +534,85 @@ def _emit(*, grouped: dict, json_output: bool) -> None:
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list]:
+    """Split verdict-cache-miss matches into pristine (deterministic) and
+    Claude-verified survivors, persisting new verdicts to the cache.
+
+    Dedups needs-verify candidates cross-seller by (title_key, wish_name),
+    calls verify_with_claude, fans the verified verdict back to every listing
+    sharing a key, and persists new verdicts via verdict_put. Returns
+    (pristine_direct, verified) — both empty lists when `uncached` is empty.
+    """
+    if not uncached:
+        return [], []
+
+    # BUI-224: deterministic shortcut — pristine score-1.0 listings skip Haiku.
+    # Split before cross-seller dedup so only ambiguous candidates go to verify.
+    # Evaluate is_pristine_match once per item (not twice) by partitioning in
+    # a single pass.
+    pristine_direct = []
+    needs_verify = []
+    for m in uncached:
+        if is_pristine_match(m):
+            pristine_direct.append(m)
+        else:
+            needs_verify.append(m)
+
+    if pristine_direct:
+        print(
+            f"  Deterministic shortcut: {len(pristine_direct)} pristine match(es) skipped Haiku",
+            file=sys.stderr,
+        )
+        # Persist as genuine by (title_key, wish_name) so re-runs hit the cache.
+        persisted_pristine: set[tuple] = set()
+        for m in pristine_direct:
+            key = (_title_key(m["title"]), m["wish_name"])
+            if key not in persisted_pristine:
+                verdict_put(key[0], m["wish_name"], True, db_path=db_path)
+                persisted_pristine.add(key)
+
+    if needs_verify:
+        # Cross-seller dedup: same normalized title + wish_name → one Haiku call.
+        # Build one representative per (title_key, wish_name) pair so the verify
+        # model receives each distinct comic exactly once across all sellers.
+        rep_map: dict[tuple, dict] = {}
+        for m in needs_verify:
+            key = (_title_key(m["title"]), m["wish_name"])
+            if key not in rep_map:
+                rep_map[key] = m
+        representatives = list(rep_map.values())
+        deduped_count = len(needs_verify) - len(representatives)
+        if deduped_count:
+            print(
+                f"  Cross-seller dedup: {len(needs_verify)} uncached → "
+                f"{len(representatives)} unique (title, wish) pair(s) to verify",
+                file=sys.stderr,
+            )
+        print(
+            f"  Verifying {len(representatives)} uncached candidate(s) with Claude Haiku...",
+            file=sys.stderr,
+        )
+        verified_reps = verify_with_claude(representatives)
+        # Keys that came back as genuine from verify
+        genuine_keys = {(_title_key(m["title"]), m["wish_name"]) for m in verified_reps}
+        # Fan the verdict back out to ALL needs_verify listings sharing each key
+        verified = [
+            m for m in needs_verify
+            if (_title_key(m["title"]), m["wish_name"]) in genuine_keys
+        ]
+        # Persist one verdict row per (title_key, wish_name) — not per listing
+        persisted: set[tuple] = set()
+        for m in needs_verify:
+            key = (_title_key(m["title"]), m["wish_name"])
+            if key not in persisted:
+                verdict_put(key[0], m["wish_name"], key in genuine_keys, db_path=db_path)
+                persisted.add(key)
+    else:
+        verified = []
+
+    return pristine_direct, verified
 
 
 def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
@@ -790,73 +864,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         file=sys.stderr,
     )
 
-    if uncached:
-        # BUI-224: deterministic shortcut — pristine score-1.0 listings skip Haiku.
-        # Split before cross-seller dedup so only ambiguous candidates go to verify.
-        # Evaluate is_pristine_match once per item (not twice) by partitioning in
-        # a single pass.
-        pristine_direct = []
-        needs_verify = []
-        for m in uncached:
-            if is_pristine_match(m):
-                pristine_direct.append(m)
-            else:
-                needs_verify.append(m)
-
-        if pristine_direct:
-            print(
-                f"  Deterministic shortcut: {len(pristine_direct)} pristine match(es) skipped Haiku",
-                file=sys.stderr,
-            )
-            # Persist as genuine by (title_key, wish_name) so re-runs hit the cache.
-            persisted_pristine: set[tuple] = set()
-            for m in pristine_direct:
-                key = (_title_key(m["title"]), m["wish_name"])
-                if key not in persisted_pristine:
-                    verdict_put(key[0], m["wish_name"], True, db_path=db_path)
-                    persisted_pristine.add(key)
-
-        if needs_verify:
-            # Cross-seller dedup: same normalized title + wish_name → one Haiku call.
-            # Build one representative per (title_key, wish_name) pair so the verify
-            # model receives each distinct comic exactly once across all sellers.
-            rep_map: dict[tuple, dict] = {}
-            for m in needs_verify:
-                key = (_title_key(m["title"]), m["wish_name"])
-                if key not in rep_map:
-                    rep_map[key] = m
-            representatives = list(rep_map.values())
-            deduped_count = len(needs_verify) - len(representatives)
-            if deduped_count:
-                print(
-                    f"  Cross-seller dedup: {len(needs_verify)} uncached → "
-                    f"{len(representatives)} unique (title, wish) pair(s) to verify",
-                    file=sys.stderr,
-                )
-            print(
-                f"  Verifying {len(representatives)} uncached candidate(s) with Claude Haiku...",
-                file=sys.stderr,
-            )
-            verified_reps = verify_with_claude(representatives)
-            # Keys that came back as genuine from verify
-            genuine_keys = {(_title_key(m["title"]), m["wish_name"]) for m in verified_reps}
-            # Fan the verdict back out to ALL needs_verify listings sharing each key
-            verified = [
-                m for m in needs_verify
-                if (_title_key(m["title"]), m["wish_name"]) in genuine_keys
-            ]
-            # Persist one verdict row per (title_key, wish_name) — not per listing
-            persisted: set[tuple] = set()
-            for m in needs_verify:
-                key = (_title_key(m["title"]), m["wish_name"])
-                if key not in persisted:
-                    verdict_put(key[0], m["wish_name"], key in genuine_keys, db_path=db_path)
-                    persisted.add(key)
-        else:
-            verified = []
-    else:
-        pristine_direct = []
-        verified = []
+    pristine_direct, verified = _verify_uncached_matches(uncached, db_path)
 
     survivors = cached_genuine + pristine_direct + verified
 

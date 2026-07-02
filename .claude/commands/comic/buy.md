@@ -93,7 +93,7 @@ Read `~/Projects/comic-pipeline/.claude/commands/comic/grade.md` and follow it f
 
 - Pass only the ungraded item IDs — already-graded comics skip this step
 - The skill downloads photos via the eBay Browse API and dispatches the **`comic-grader` subagent** by type per comic (value-gated: 1 grader for cheap/unambiguous lots, a 3-grader panel for high-value or boundary-ambiguous ones). The grader persona + OUTPUT FORMAT contract lives in `.claude/agents/comic-grader.md` (scoped `Read, Bash`); grade.md passes it only the dynamic per-comic inputs
-- **Decision-sensitivity gate (U8):** `/comic:buy` is the flow that *has* the current price and can compute FMV, so it can short-circuit grade.md's escalation. For any comic that would escalate to the 3-grader panel, first probe FMV at the **endpoints of the first grader's GRADE RANGE** (a 2-row `comic-fmv --batch` at range-low and range-high, same `grade_confidence` haircut) and compare the resulting bid caps. If both ends give the **same buy/no-buy call** against the current price and bid caps within `CAP_DECISION_TOLERANCE` (10%), the grade's imprecision can't move the bid — **keep the single grade, skip the panel**, and note it. Only escalate when the range straddles a decision boundary. This trades two cheap FMV probes for two vision-grader agents and skips grading precision that the bid never sees.
+- **Decision-sensitivity gate:** grade.md's Step 2 owns this rule (it's written to anticipate exactly this caller) — `/comic:buy` is the flow that *has* the current price and can compute FMV, so it can short-circuit grade.md's escalation to the 3-grader panel by probing FMV at the grade range's endpoints and comparing bid caps within `CAP_DECISION_TOLERANCE`. See grade.md Step 2 for the trigger conditions and constants.
 - Use the consensus grade output as the grade for Step 3 — and carry the **Confidence** column forward as `grade_confidence` (FMV uses it to haircut the bid cap when grade confidence is low)
 
 Present the photo-assessed grades to the user before proceeding:
@@ -105,7 +105,7 @@ Present the photo-assessed grades to the user before proceeding:
 | 2 | Fantastic Four #48 | ⚠️ not stated | 5.0 VG/FN | MEDIUM-LOW | photo assessed |
 ```
 
-Gate: user confirms the assessed grades (or overrides any) before FMV. Map the grade skill's confidence to `grade_confidence` for Step 3, preserving all four levels: HIGH → `high`, MEDIUM → `medium`, MEDIUM-LOW → `medium-low`, LOW → `low` (MEDIUM-LOW and LOW haircut differently — 0.70 vs 0.60 — so don't collapse them).
+Gate: user confirms the assessed grades (or overrides any) before FMV. Map the grade skill's confidence to `grade_confidence` for Step 3, preserving all four levels: HIGH → `high`, MEDIUM → `medium`, MEDIUM-LOW → `medium-low`, LOW → `low` — don't collapse MEDIUM-LOW into `low`; fmv.md owns the haircut each level applies.
 
 **Preserve the raw photo consensus.** Keep the grader's consensus point estimate as its own working-list field (`photo_grade`), distinct from the grade the user confirms/overrides for FMV (`grade`). Step 5 stores `photo_grade` for seller-deviation analytics — it must be the *raw* assessment, never the override.
 
@@ -121,7 +121,7 @@ Run `comic-fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetc
 comic-fmv --batch <working_list.json> --out <results.json>
 ```
 
-**Input:** Working list JSON: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Pass `publisher` for non-Marvel/DC titles and `variant` for non-base editions — both feed FMV accuracy (BUI-161). Include `grade_confidence` (`high`|`medium`|`medium-low`|`low` — all four levels; `medium-low` and `low` haircut differently, 0.70 vs 0.60) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
+**Input:** Working list JSON: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Pass `publisher` for non-Marvel/DC titles and `variant` for non-base editions — both feed FMV accuracy (BUI-161). Include `grade_confidence` (`high`|`medium`|`medium-low`|`low` — all four levels; fmv.md owns the haircut each applies) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
 
 **Output:** Human FMV table to stdout + structured JSON at `--out`. Carry the JSON forward to Step 4 **and Step 5**.
 
@@ -129,36 +129,15 @@ Each row in the output JSON includes the internal `comic_id` (and `fmv_id`) retu
 
 **Needs-manual rows (BUI-86):** a row whose `fmv.flag_reason` is set (`one_sided`, `too_wide`, or `too_sparse`) could not be honestly auto-priced — its `fmv_low`/`fmv_high`/`max_bid` are all `null`. It still has a real `comic_id` (the comic stub was written), so the `comic_id: null` check above will **not** catch it. Gate on `fmv.flag_reason` instead: surface these rows as **needs-manual** and do not auto-propose a max bid. The user either hand-prices them (via the `fmv.md` interpolation / CGC-proxy methods) or skips them — never bid the absent number.
 
-### The ID chain (why we capture `comic_id`)
+### Why Step 3 captures `comic_id`
 
-This is the chain that fixes the recurring "bids.comic_id and bids.fmv_id are NULL" bug (PER-140):
-
-```
-fmv_runner.py → result["comic_id"]
-              → /comic:buy carries it forward
-              → gixen add --comic-id <id> --grade <float>
-              → POST /api/bids/{item_id}/link-fmv {comic_id, grade}
-              → bids.comic_id + bids.fmv_id populated via bid_fmvs junction
-```
-
-If the `comic_id` is dropped at any step the snipe still records, but the dashboard loses condition and FMV data for that bid. Step 5 is where most past sessions broke the chain.
+Carrying `comic_id` forward from here through Step 5 is what fixes the recurring "bids.comic_id and bids.fmv_id are NULL" bug (PER-140) — snipe-add.md owns the full chain (its "Canonical post-FMV invocation" section) and the `--comic-id` vs `--catalog-id` distinction. If the `comic_id` is dropped at any step the snipe still records, but the dashboard loses condition and FMV data for that bid. Step 5 is where most past sessions broke the chain.
 
 Flags worth knowing:
 - `--max-age-days N` (default 7) — reuses FMVs already in the comics server's DB if `fmv_updated_at` is recent. **Note (BUI-153):** DB-FMV reuse only fires for books that carry a `locg_id`, but the orchestrated buy flow derives series/issue from the eBay title and never resolves one — so this cache-skip is effectively inert in `/comic:buy` and every run recomputes FMV from comps (the ebay-sold-comps SerpApi response cache still applies). `--max-age-days` engages on the standalone `comic-fmv` path when the batch carries explicit `locg_id`s.
 - `--force` — bypasses both SerpApi and DB caches; use only when you suspect a stale comp pool
 
-**Confidence rubric** (CLI returns these labels; surface them in your presentation):
-
-| n (trimmed pool) | CV | Confidence |
-|---|---|---|
-| ≥8 | <25% | HIGH |
-| ≥6 | <30% | HIGH |
-| ≥5 | <35% | MEDIUM-HIGH |
-| ≥4 | <45% | MEDIUM |
-| ≥3 | any | MEDIUM-LOW |
-| <3 | — | LOW |
-
-A pool built at a window wider than ±1.0 caps at MEDIUM regardless of n/CV (the CLI applies this; the row's `window` field shows the window used).
+**Confidence rubric:** fmv.md §8 owns the n/CV thresholds and the wide-window MEDIUM cap. The CLI returns these labels directly (the row's `window` field shows the window used) — surface them as-is in your presentation.
 
 **Flagging rules** (apply when presenting the table to the user):
 - `fmv.flag_reason` set → present as **needs-manual (`<reason>`)**, no max bid; user hand-prices or skips (see the needs-manual note in Step 3)
@@ -173,7 +152,7 @@ If the CLI fails, fall back to the manual procedure in `~/Projects/comic-pipelin
 
 ## Step 4: Compute Max Bids
 
-The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is the standard `0.80` **unless** a low `grade_confidence` (from a photo grade) or low comp confidence triggers a haircut (`0.70` at MEDIUM-LOW, `0.60` at LOW combined) — see Step 2.5. When a haircut applied, the row's Notes carry `bid_haircut=…`. Present the proposed bids:
+The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is `0.80` by default; fmv.md §6 owns the haircut logic that lowers it when grade or comp confidence is low (see Step 2.5 for where `grade_confidence` comes from). When a haircut applied, the row's Notes carry `bid_haircut=…`. Present the proposed bids:
 
 ```
 | # | Comic | Grade | FMV Range | Max Bid | Notes |

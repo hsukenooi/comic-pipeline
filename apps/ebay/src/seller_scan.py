@@ -24,7 +24,6 @@ from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for c
     _second_print_reject,
     _series_tokens,
     _strip_grades,
-    _title_paren_year,
     _title_paren_years,
     _title_volume,
     _trading_card_reject,
@@ -267,6 +266,116 @@ def _verify_via_claude_cli(prompt: str) -> str:
     return result.stdout
 
 
+def _build_verification_prompt(chunk, edition_words, foreign_examples, later_printing_examples):
+    """Build the Claude verification prompt text for one chunk of candidates.
+
+    Assembles the numbered listing/wish pairs (with an optional "Correct
+    series:" hint per candidate) into the verification prompt template.
+    """
+    pairs_parts = []
+    for idx, cand in enumerate(chunk, 1):
+        pair_text = (
+            f'{idx}. Listing: "{cand["title"]}"\n'
+            f'   Wish item: "{cand["wish_name"]}"'
+        )
+        sn = cand.get("_series_name")
+        if sn:
+            pair_text += f"\n   Correct series: {sn}"
+        pairs_parts.append(pair_text)
+    pairs = "\n".join(pairs_parts)
+    return f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
+
+Reject if:
+- Different series sharing words (Spider-Man Noir vs Amazing Spider-Man, X-Factor vs X-Men, Superior/Ultimate Spider-Man vs Amazing Spider-Man)
+- {edition_words}, or special edition matching a regular series issue (and vice versa)
+- Lot listing where the issue number appears in the lot size
+- Promotional reprint (Trick or Read, LCSD, Amazon promo, Undeluxe)
+- Modern renumbered issue matching an original issue number (e.g. #10 (811))
+- Series name only in a subtitle or story description, not the actual series
+- Different series VOLUME / relaunch: if the 'Correct series' line shows a specific era, reject listings where 'vol N' or a (YYYY) indicates a different era than the one shown
+- Foreign-language or foreign-market reprint/edition (e.g. {foreign_examples}, or any Spanish/French/German/Italian-language edition) when the wish item is the original US edition
+- Numbered sequential run or complete multi-issue set (e.g. "Books 1-4", "Issues 1 through 6", "complete set", "full run") when the wish item is a single specific issue
+- Later printing / reprint of a key issue (e.g. {later_printing_examples}, or a bare "reprint") when the wish item means the original first print. Newsstand and Direct editions are NOT reprints — keep those
+
+Respond with a JSON array containing ONLY the ids you are REJECTING, each with a brief reason:
+[{{"id": 3, "reason": "X-Factor not X-Men"}}, {{"id": 7, "reason": "annual vs regular"}}]
+
+If nothing is rejected, return [].
+
+Any candidate id NOT present in your response is treated as genuine.
+
+Pairs:
+{pairs}"""
+
+
+def _parse_verification_response(text, chunk, chunk_label):
+    """Parse one chunk's Claude verification response.
+
+    Returns the subset of `chunk` NOT rejected (the list to extend `kept`
+    with), or None if the response could not be parsed/validated.  None means
+    "drop this chunk" (fail-closed): catches json.JSONDecodeError plus
+    KeyError/ValueError/TypeError during id validation, emits the warning
+    messages, and prints the BUI-149 rejected-candidate stderr listing.
+    """
+    json_match = re.search(r"\[.*\]", text, re.DOTALL)
+    if not json_match:
+        print(
+            f"Warning: could not parse Claude response for candidates "
+            f"{chunk_label}; dropping chunk (fail-closed)",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        rejected_list = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        print(
+            f"Warning: invalid JSON in Claude response for candidates "
+            f"{chunk_label}; dropping chunk (fail-closed)",
+            file=sys.stderr,
+        )
+        return None
+
+    # Validate: every returned object must have an int id strictly within
+    # the chunk's 1-based range.  A missing key, non-int id, or out-of-range
+    # id indicates a malformed response → reject the whole chunk (fail-closed).
+    valid_ids = set(range(1, len(chunk) + 1))
+    try:
+        rejected_ids: dict[int, str] = {}
+        for v in rejected_list:
+            rid = v["id"]  # KeyError if missing
+            if not isinstance(rid, int):
+                raise ValueError(f"non-int id: {rid!r}")
+            if rid not in valid_ids:
+                raise ValueError(f"id {rid} out of range 1..{len(chunk)}")
+            rejected_ids[rid] = v.get("reason", "")
+    except (KeyError, ValueError, TypeError) as exc:
+        print(
+            f"Warning: invalid rejected-ids in Claude response for candidates "
+            f"{chunk_label} ({exc}); dropping chunk (fail-closed)",
+            file=sys.stderr,
+        )
+        return None
+
+    # BUI-149: surface each rejected candidate (with the model's reason) to
+    # stderr so the user can override if the verifier was wrong.
+    if rejected_ids:
+        print(
+            f"Filtered {len(rejected_ids)} likely false positive(s) "
+            f"(Claude verification):",
+            file=sys.stderr,
+        )
+        for idx, cand in enumerate(chunk, 1):
+            if idx in rejected_ids:
+                reason = rejected_ids[idx]
+                line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
+                if reason:
+                    line += f"  — {reason}"
+                print(line, file=sys.stderr)
+
+    return [cand for idx, cand in enumerate(chunk, 1) if idx not in rejected_ids]
+
+
 def verify_with_claude(matches):
     """Filter candidates to genuine matches using chunked claude CLI calls.
 
@@ -330,40 +439,9 @@ def verify_with_claude(matches):
         # (_series_name, stripped from output before printing — see the
         # underscore-key filter in main()), include it as a "Correct series:"
         # hint so Haiku knows the exact era the user wants.
-        pairs_parts = []
-        for idx, cand in enumerate(chunk, 1):
-            pair_text = (
-                f'{idx}. Listing: "{cand["title"]}"\n'
-                f'   Wish item: "{cand["wish_name"]}"'
-            )
-            sn = cand.get("_series_name")
-            if sn:
-                pair_text += f"\n   Correct series: {sn}"
-            pairs_parts.append(pair_text)
-        pairs = "\n".join(pairs_parts)
-        prompt = f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
-
-Reject if:
-- Different series sharing words (Spider-Man Noir vs Amazing Spider-Man, X-Factor vs X-Men, Superior/Ultimate Spider-Man vs Amazing Spider-Man)
-- {_edition_words}, or special edition matching a regular series issue (and vice versa)
-- Lot listing where the issue number appears in the lot size
-- Promotional reprint (Trick or Read, LCSD, Amazon promo, Undeluxe)
-- Modern renumbered issue matching an original issue number (e.g. #10 (811))
-- Series name only in a subtitle or story description, not the actual series
-- Different series VOLUME / relaunch: if the 'Correct series' line shows a specific era, reject listings where 'vol N' or a (YYYY) indicates a different era than the one shown
-- Foreign-language or foreign-market reprint/edition (e.g. {_foreign_examples}, or any Spanish/French/German/Italian-language edition) when the wish item is the original US edition
-- Numbered sequential run or complete multi-issue set (e.g. "Books 1-4", "Issues 1 through 6", "complete set", "full run") when the wish item is a single specific issue
-- Later printing / reprint of a key issue (e.g. {_later_printing_examples}, or a bare "reprint") when the wish item means the original first print. Newsstand and Direct editions are NOT reprints — keep those
-
-Respond with a JSON array containing ONLY the ids you are REJECTING, each with a brief reason:
-[{{"id": 3, "reason": "X-Factor not X-Men"}}, {{"id": 7, "reason": "annual vs regular"}}]
-
-If nothing is rejected, return [].
-
-Any candidate id NOT present in your response is treated as genuine.
-
-Pairs:
-{pairs}"""
+        prompt = _build_verification_prompt(
+            chunk, _edition_words, _foreign_examples, _later_printing_examples
+        )
 
         try:
             text = _verify_via_claude_cli(prompt)
@@ -376,65 +454,10 @@ Pairs:
             continue
         transport_ok += 1
 
-        json_match = re.search(r"\[.*\]", text, re.DOTALL)
-        if not json_match:
-            print(
-                f"Warning: could not parse Claude response for candidates "
-                f"{chunk_label}; dropping chunk (fail-closed)",
-                file=sys.stderr,
-            )
+        parsed = _parse_verification_response(text, chunk, chunk_label)
+        if parsed is None:
             continue
-
-        try:
-            rejected_list = json.loads(json_match.group())
-        except json.JSONDecodeError:
-            print(
-                f"Warning: invalid JSON in Claude response for candidates "
-                f"{chunk_label}; dropping chunk (fail-closed)",
-                file=sys.stderr,
-            )
-            continue
-
-        # Validate: every returned object must have an int id strictly within
-        # the chunk's 1-based range.  A missing key, non-int id, or out-of-range
-        # id indicates a malformed response → reject the whole chunk (fail-closed).
-        valid_ids = set(range(1, len(chunk) + 1))
-        try:
-            rejected_ids: dict[int, str] = {}
-            for v in rejected_list:
-                rid = v["id"]  # KeyError if missing
-                if not isinstance(rid, int):
-                    raise ValueError(f"non-int id: {rid!r}")
-                if rid not in valid_ids:
-                    raise ValueError(f"id {rid} out of range 1..{len(chunk)}")
-                rejected_ids[rid] = v.get("reason", "")
-        except (KeyError, ValueError, TypeError) as exc:
-            print(
-                f"Warning: invalid rejected-ids in Claude response for candidates "
-                f"{chunk_label} ({exc}); dropping chunk (fail-closed)",
-                file=sys.stderr,
-            )
-            continue
-
-        # BUI-149: surface each rejected candidate (with the model's reason) to
-        # stderr so the user can override if the verifier was wrong.
-        if rejected_ids:
-            print(
-                f"Filtered {len(rejected_ids)} likely false positive(s) "
-                f"(Claude verification):",
-                file=sys.stderr,
-            )
-            for idx, cand in enumerate(chunk, 1):
-                if idx in rejected_ids:
-                    reason = rejected_ids[idx]
-                    line = f"  - {cand.get('title', '?')}  ↮  {cand.get('wish_name', '?')}"
-                    if reason:
-                        line += f"  — {reason}"
-                    print(line, file=sys.stderr)
-
-        kept.extend(
-            cand for idx, cand in enumerate(chunk, 1) if idx not in rejected_ids
-        )
+        kept.extend(parsed)
 
     # BUI-270 safety net: at least one chunk existed (matches is non-empty) but
     # not a single transport call succeeded → the verifier is globally broken

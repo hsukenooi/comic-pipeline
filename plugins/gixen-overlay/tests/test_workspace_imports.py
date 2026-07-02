@@ -22,11 +22,11 @@ def test_overlay_routes_importable_via_workspace():
 def test_gixen_cli_private_helper_surface_resolves():
     """The exact private helpers the overlay depends on must be importable
     from gixen-cli. If any is renamed upstream, this is the canary."""
-    from server.db import get_bid_by_item_id
+    from server.db import TOMBSTONE_STATUSES_SQL, get_bid_by_item_id
     from server.main import (
         _ensure_fresh_sync,
-        _iso_to_relative,
         _spawn_fallback_task,
+        iso_to_relative,
     )
 
     assert all(
@@ -34,10 +34,14 @@ def test_gixen_cli_private_helper_surface_resolves():
         for fn in (
             _ensure_fresh_sync,
             _spawn_fallback_task,
-            _iso_to_relative,
+            iso_to_relative,
             get_bid_by_item_id,
         )
     )
+    # BUI-272: routes.py also imports this tombstone-filter constant from
+    # server.db; pin its resolvability + the PURGED/REMOVED dual-tolerance (BUI-49).
+    assert "'PURGED'" in TOMBSTONE_STATUSES_SQL
+    assert "'REMOVED'" in TOMBSTONE_STATUSES_SQL
 
 
 def test_plugin_hook_entrypoint_importable():
@@ -109,12 +113,12 @@ def test_gixen_cli_private_helper_signatures_pinned():
     from server.db import get_bid_by_item_id
     from server.main import (
         _ensure_fresh_sync,
-        _iso_to_relative,
         _spawn_fallback_task,
+        iso_to_relative,
     )
 
-    # routes.py:593 — `_iso_to_relative(end_date_iso)`: exactly one positional.
-    assert _required_positional_count(_iso_to_relative) == 1
+    # routes.py:593 — `iso_to_relative(end_date_iso)`: exactly one positional.
+    assert _required_positional_count(iso_to_relative) == 1
 
     # routes.py:189/297 — `get_bid_by_item_id(db, item_id)`: exactly two.
     assert _required_positional_count(get_bid_by_item_id) == 2
