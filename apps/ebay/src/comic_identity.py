@@ -280,26 +280,11 @@ def _title_paren_years(title: str) -> "list[int]":
     return years
 
 
-def _title_paren_year(title: str) -> "int | None":
-    """Extract the first parenthesized 4-digit year (1930–2035) from a title.
-
-    Thin wrapper around _title_paren_years for callers that only need the first
-    year.  Kept for backward compatibility.
-
-    Examples:
-      "Amazing Spider-Man (2022) #7"  → 2022
-      "Amazing Spider-Man #7 VF"      → None
-      "Batman (1940) #100 NM"         → 1940
-    """
-    yrs = _title_paren_years(title)
-    return yrs[0] if yrs else None
-
-
 def _title_volume(title: str) -> "int | None":
     """Extract an explicit volume number from a listing title, or None.
 
     Matches "vol N", "vol. N", "volume N" (case-insensitive, word-boundary).
-    Parenthesized years are handled separately by _title_paren_year.
+    Parenthesized years are handled separately by _title_paren_years.
 
     Examples:
       "Amazing Spider-Man Vol 3 #7"  → 3
@@ -474,11 +459,7 @@ def _reprint_reject(title: str) -> bool:
     Case-insensitive; each marker is matched as a whole word or phrase (not a
     substring of another word) using look-around assertions.
     """
-    t = (title or "").lower()
-    for marker in _REPRINT_MARKERS:
-        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
-            return True
-    return False
+    return _marker_hit(title, _REPRINT_MARKERS)
 
 
 # ─── Digital-code / no-physical-comic lexicon (BUI-230) ──────────────────────
@@ -502,11 +483,7 @@ def _digital_reject(title: str) -> bool:
     Conservative by design — see _DIGITAL_MARKERS: a title that merely says it
     "includes/with digital code" alongside a physical book is NOT rejected.
     """
-    t = (title or "").lower()
-    for marker in _DIGITAL_MARKERS:
-        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
-            return True
-    return False
+    return _marker_hit(title, _DIGITAL_MARKERS)
 
 
 # ─── Trading-card / TCG lexicon (BUI-232) ────────────────────────────────────
@@ -542,11 +519,7 @@ def _trading_card_reject(title: str) -> bool:
     and _digital_reject).  Only categorically trading-card/TCG terms are in the
     marker set — ambiguous terms are excluded.
     """
-    t = (title or "").lower()
-    for marker in _TRADING_CARD_MARKERS:
-        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
-            return True
-    return False
+    return _marker_hit(title, _TRADING_CARD_MARKERS)
 
 
 # ─── Foreign-edition / foreign-market reprint lexicon (BUI-239) ──────────────
@@ -598,11 +571,7 @@ def _foreign_edition_reject(title: str) -> bool:
     positives on story-arc titles or character descriptors.  Those bare-adjective
     cases are handled by the Haiku semantic layer.  BUI-239.
     """
-    t = (title or "").lower()
-    for marker in _FOREIGN_EDITION_MARKERS:
-        if re.search(r"(?<!\w)" + re.escape(marker) + r"(?!\w)", t):
-            return True
-    return False
+    return _marker_hit(title, _FOREIGN_EDITION_MARKERS)
 
 
 # ─── Later-printing / non-first-print reject (BUI-244) ────────────────────────

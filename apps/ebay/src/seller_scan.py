@@ -24,7 +24,6 @@ from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for c
     _second_print_reject,
     _series_tokens,
     _strip_grades,
-    _title_paren_year,
     _title_paren_years,
     _title_volume,
     _trading_card_reject,
