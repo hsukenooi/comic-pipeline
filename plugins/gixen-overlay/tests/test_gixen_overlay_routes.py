@@ -1461,13 +1461,17 @@ def test_comics_history_removed_does_not_shadow_legit_loss(api):
 
 
 def _create_comic_and_fmv(api, *, title, issue, year, grade, locg_id=None,
-                          locg_variant_id=None):
+                          locg_variant_id=None, fmv_low=None, fmv_high=None):
     """POST /api/comics to create a comic+fmv row, return (comic_id, fmv_id)."""
     body = {"title": title, "issue": issue, "year": year, "grade": grade}
     if locg_id is not None:
         body["locg_id"] = locg_id
     if locg_variant_id is not None:
         body["locg_variant_id"] = locg_variant_id
+    if fmv_low is not None:
+        body["fmv_low"] = fmv_low
+    if fmv_high is not None:
+        body["fmv_high"] = fmv_high
     row = api.post("/api/comics", json=body).json()
     return row["comic_id"], row["fmv_id"]
 
@@ -1674,6 +1678,204 @@ def test_comics_outcomes_resolves_by_title_issue_year_when_no_locg_id(api):
                    params={"title": "Incredible Hulk", "issue": "181",
                            "year": 1974, "grade": 9.0}).json()
     assert [r["price"] for r in rows] == [450.0]
+
+
+# --- /api/comics/calibration (BUI-288) ---------------------------------------
+
+
+def _add_resolved_bid(api, db_path, item_id, fmv_id, *, status, winning_bid,
+                       is_primary=True, days_ago=1):
+    """Create a bid, link it to fmv_id, and resolve it days_ago days in the
+    past. Shares the same fixture shape as the /api/comics/outcomes tests
+    above (POST /api/bids + _link_bid_to_fmv + a raw status/winning_bid/
+    auction_end_at UPDATE)."""
+    api.post("/api/bids", json={"item_id": item_id, "max_bid": winning_bid})
+    _link_bid_to_fmv(db_path, item_id, fmv_id, is_primary=is_primary)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status=?, winning_bid=?, "
+        "auction_end_at=datetime('now', ?) WHERE item_id=?",
+        (status, winning_bid, f"-{days_ago} days", item_id),
+    )
+    raw.commit()
+    raw.close()
+
+
+def test_calibration_empty_on_fresh_db(api):
+    r = api.get("/api/comics/calibration")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_calibration_ranks_by_overshoot_descending(api):
+    """Overshoot ranking: an issue whose losses cleared ~20-30% above
+    fmv_high ranks above one whose losses cleared only slightly above it."""
+    db_path = os.environ["DB_PATH"]
+    _, high_overshoot_fmv = _create_comic_and_fmv(
+        api, title="Giant-Size X-Men", issue="1", year=1975, grade=9.0,
+        fmv_high=100.0,
+    )
+    _, low_overshoot_fmv = _create_comic_and_fmv(
+        api, title="Iron Fist", issue="14", year=1977, grade=9.0,
+        fmv_high=100.0,
+    )
+    # ~25% overshoot.
+    for i, price in enumerate((120.0, 125.0, 130.0)):
+        _add_resolved_bid(api, db_path, f"400000{i}", high_overshoot_fmv,
+                           status="LOST", winning_bid=price)
+    # ~5% overshoot — still > fmv_high, but far less than the first book.
+    for i, price in enumerate((103.0, 104.0, 105.0)):
+        _add_resolved_bid(api, db_path, f"400001{i}", low_overshoot_fmv,
+                           status="LOST", winning_bid=price)
+
+    report = api.get("/api/comics/calibration").json()
+    comic_ids = [row["comic_id"] for row in report]
+    high_comic_id, low_comic_id = comic_ids[0], comic_ids[1]
+    titles_by_comic = {row["comic_id"]: row["title"] for row in report}
+    assert titles_by_comic[high_comic_id] == "Giant-Size X-Men"
+    assert titles_by_comic[low_comic_id] == "Iron Fist"
+    assert report[0]["overshoot"] > report[1]["overshoot"] > 1
+
+
+def test_calibration_above_fmv_loss_rate(api):
+    """3 of 4 losses above fmv_high -> 75%."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Amazing Spider-Man", issue="129", year=1973, grade=8.0,
+        fmv_high=100.0,
+    )
+    for i, price in enumerate((130.0, 125.0, 115.0, 90.0)):
+        _add_resolved_bid(api, db_path, f"40002{i}", fmv_id,
+                           status="LOST", winning_bid=price)
+
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 1
+    row = report[0]
+    assert row["loss_count"] == 4
+    assert row["above_fmv_loss_count"] == 3
+    assert row["above_fmv_loss_rate"] == 75.0
+
+
+def test_calibration_r4_guard_high_loss_count_below_fmv_not_flagged(api):
+    """R4 (critical): losing a LOT is not the signal. A book with many losses
+    that all cleared at/below fmv_high must not surface at all, however high
+    the loss count is."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Fantastic Four", issue="48", year=1966, grade=7.0,
+        fmv_high=100.0,
+    )
+    prices = (95.0, 90.0, 85.0, 80.0, 75.0, 70.0, 65.0, 60.0, 55.0, 50.0)
+    for i, price in enumerate(prices):
+        _add_resolved_bid(api, db_path, f"40003{i}", fmv_id,
+                           status="LOST", winning_bid=price)
+
+    report = api.get("/api/comics/calibration").json()
+    assert report == []
+
+
+def test_calibration_excludes_null_price_tombstone_and_unpriced_fmv(api):
+    """Consistent with get_first_party_outcomes: NULL winning_bid, the
+    REMOVED tombstone, and an unpriced (NULL fmv.high) book are all excluded
+    rather than erroring or dividing by zero."""
+    db_path = os.environ["DB_PATH"]
+    _, priced_fmv = _create_comic_and_fmv(
+        api, title="Detective Comics", issue="27", year=1939, grade=6.0,
+        fmv_high=1000.0,
+    )
+    _, unpriced_fmv = _create_comic_and_fmv(
+        api, title="Action Comics", issue="1", year=1938, grade=6.0,
+    )
+    assert unpriced_fmv is not None
+
+    # ENDED with NULL winning_bid (no trustworthy price).
+    _add_resolved_bid(api, db_path, "400040", priced_fmv,
+                       status="LOST", winning_bid=1200.0)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='ENDED', winning_bid=NULL WHERE item_id=?",
+        ("400040",),
+    )
+    raw.commit()
+    raw.close()
+
+    # REMOVED tombstone with a winning_bid present.
+    _add_resolved_bid(api, db_path, "400041", priced_fmv,
+                       status="LOST", winning_bid=1300.0)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='REMOVED' WHERE item_id=?", ("400041",),
+    )
+    raw.commit()
+    raw.close()
+
+    # A resolved loss above fmv_high, but fmv.high is NULL (unpriced/flagged).
+    _add_resolved_bid(api, db_path, "400042", unpriced_fmv,
+                       status="LOST", winning_bid=500.0)
+
+    # One genuine, trustworthy above-FMV loss so the priced book would
+    # otherwise surface if the exclusions above failed to apply.
+    report_before = api.get("/api/comics/calibration").json()
+    assert report_before == []
+
+    _add_resolved_bid(api, db_path, "400043", priced_fmv,
+                       status="LOST", winning_bid=1300.0)
+    report_after = api.get("/api/comics/calibration").json()
+    assert len(report_after) == 1
+    assert report_after[0]["title"] == "Detective Comics"
+    assert report_after[0]["loss_count"] == 1
+
+
+def test_calibration_win_context_not_ranked_and_win_only_book_excluded(api):
+    """A book won well below fmv_high is not reported as mispriced (no loss
+    -> no overshoot signal), and contested_win_margin is context only."""
+    db_path = os.environ["DB_PATH"]
+    _, win_only_fmv = _create_comic_and_fmv(
+        api, title="Batman", issue="1", year=1940, grade=9.0, fmv_high=500.0,
+    )
+    _add_resolved_bid(api, db_path, "400050", win_only_fmv,
+                       status="WON", winning_bid=200.0)
+
+    report = api.get("/api/comics/calibration").json()
+    assert report == []
+
+    # Now give the same book an above-FMV loss too, plus its below-FMV win.
+    # It should surface on the loss alone, with the win reported as context
+    # (and NOT affecting the overshoot ranking value, which is loss-only).
+    _add_resolved_bid(api, db_path, "400051", win_only_fmv,
+                       status="LOST", winning_bid=600.0)
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 1
+    row = report[0]
+    assert row["loss_count"] == 1
+    assert row["overshoot"] == 600.0 / 500.0
+    assert row["win_count"] == 1
+    assert row["contested_win_margin"] == 200.0 / 500.0
+
+
+def test_calibration_performs_no_write_to_fmv_table(api):
+    """R5: the report is diagnostic-only — running it must not mutate the
+    fmv table (no upsert/UPDATE fires)."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="X-Men", issue="1", year=1963, grade=8.5, fmv_high=200.0,
+    )
+    _add_resolved_bid(api, db_path, "400060", fmv_id,
+                       status="LOST", winning_bid=260.0)
+
+    def _dump_fmv_table():
+        raw = sqlite3.connect(db_path)
+        raw.row_factory = sqlite3.Row
+        rows = [dict(r) for r in raw.execute("SELECT * FROM fmv ORDER BY id")]
+        raw.close()
+        return rows
+
+    before = _dump_fmv_table()
+    report = api.get("/api/comics/calibration").json()
+    after = _dump_fmv_table()
+
+    assert report != []  # sanity: the report actually ran its aggregation
+    assert before == after
 
 
 # --- JS outcome() (v2-comics.html) -------------------------------------------

@@ -26,6 +26,7 @@ from gixen_overlay.db import (
     get_collection_wins_seen,
     mark_collection_wins_seen,
     get_first_party_outcomes,
+    calibration_report,
     DEFAULT_OUTCOME_GRADE_WINDOW,
     DEFAULT_OUTCOME_RECENCY_DAYS,
 )
@@ -187,6 +188,33 @@ async def api_comics_outcomes(
         days=days,
     )
     return [dict(r) for r in rows]
+
+
+@router.get("/api/comics/calibration")
+async def api_comics_calibration(
+    request: Request,
+    days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+):
+    """BUI-288 (Issue C): loss-vs-FMV calibration report — DIAGNOSTIC ONLY.
+
+    Ranks priced (comic, grade) books whose recent LOSSES are clearing above
+    `fmv.high`, so a human can decide which ones to recompute `comic-fmv` for.
+    This endpoint performs **no writes** — it is a read-only aggregate over
+    `get_first_party_outcomes`'s "a resolved auction" definition (see
+    `calibration_report` in `db.py`) plus each book's own `fmv.high`.
+
+    **The ranking key is overshoot vs `fmv.high`, never raw win/loss rate** —
+    losing is the intended outcome of the bid haircut, so a high loss count
+    alone is not surfaced; only *persistently clearing above fmv.high* is.
+    See `calibration_report`'s docstring for the full rationale (R4/R5 in the
+    auction-outcome-feedback plan) before changing this endpoint's shape.
+
+    Consumed by the `/comic:calibration-report` skill, which curls this
+    endpoint and renders the ranked table — mirroring how `wishlist-sellers`
+    and `seller-scan` are thin CLI/skill layers over server-owned aggregates.
+    """
+    db = request.app.state.db
+    return calibration_report(db, days=days)
 
 
 @router.post("/api/comics")

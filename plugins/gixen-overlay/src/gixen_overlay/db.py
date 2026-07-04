@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from statistics import median
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -1226,6 +1227,28 @@ DEFAULT_OUTCOME_RECENCY_DAYS = 180
 # Problem Frame in docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md.
 _OUTCOME_STATUSES_SQL = "'WON', 'LOST'"
 
+# Shared "a resolved auction" predicate fragments (BUI-286/BUI-288). Both
+# `get_first_party_outcomes` (Issue A, the comp-pool feed) and
+# `calibration_report` (Issue C, the loss-vs-FMV audit) build their WHERE
+# clause out of exactly these fragments plus `_OUTCOME_STATUSES_SQL` above —
+# there is deliberately no second, divergently-worded definition of "a
+# resolved auction" anywhere in this module.
+
+# A multi-comic lot's `winning_bid` prices the whole lot, not one book, so a
+# secondary lot member (`is_primary = 0`) is not a valid per-book comp.
+_PRIMARY_LINK_CLAUSE = "bf.is_primary = 1"
+
+# NULL-price `ENDED` rows carry no trustworthy comp/signal (R3).
+_WINNING_BID_NOT_NULL_CLAUSE = "b.winning_bid IS NOT NULL"
+
+# Recency is judged the same way /api/comics/history judges "when did this
+# resolve": COALESCE(auction_end_at, resolved_at), bounded to the last `days`.
+# SQLite's own datetime() normalizes both sides rather than comparing against
+# a Python-formatted ISO string — see the note on `get_first_party_outcomes`.
+_RESOLVED_RECENCY_CLAUSE = (
+    "datetime(COALESCE(b.auction_end_at, b.resolved_at)) >= datetime('now', ?)"
+)
+
 
 def get_first_party_outcomes(
     conn: sqlite3.Connection,
@@ -1271,7 +1294,7 @@ def get_first_party_outcomes(
     if not locg_id and not (title and issue):
         return []
 
-    clauses: list[str] = ["bf.is_primary = 1"]
+    clauses: list[str] = [_PRIMARY_LINK_CLAUSE]
     params: list[Any] = []
     if locg_id is not None:
         clauses.append("c.locg_id = ?")
@@ -1291,7 +1314,7 @@ def get_first_party_outcomes(
     clauses.append("f.grade BETWEEN ? AND ?")
     params.extend([grade - window, grade + window])
     clauses.append(f"b.status IN ({_OUTCOME_STATUSES_SQL})")
-    clauses.append("b.winning_bid IS NOT NULL")
+    clauses.append(_WINNING_BID_NOT_NULL_CLAUSE)
     clauses.append("COALESCE(b.auction_end_at, b.resolved_at) IS NOT NULL")
     # Normalize both sides through SQLite's own datetime() rather than
     # comparing against a Python-formatted ISO string: auction_end_at/
@@ -1300,9 +1323,7 @@ def get_first_party_outcomes(
     # against `datetime.isoformat()`'s "T"-separated, offset-suffixed output
     # (same convention already used by /api/comics/history's own recency
     # filter, a few lines up the file in routes.py).
-    clauses.append(
-        "datetime(COALESCE(b.auction_end_at, b.resolved_at)) >= datetime('now', ?)"
-    )
+    clauses.append(_RESOLVED_RECENCY_CLAUSE)
     params.append(f"-{days} days")
 
     where = " AND ".join(clauses)
@@ -1321,6 +1342,154 @@ def get_first_party_outcomes(
         """,
         params,
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Loss-vs-FMV calibration report (BUI-288)
+# ---------------------------------------------------------------------------
+
+
+def calibration_report(
+    conn: sqlite3.Connection,
+    *,
+    days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+) -> list[dict[str, Any]]:
+    """DIAGNOSTIC-ONLY audit: rank priced (comic, grade) books whose LOSSES are
+    clearing above `fmv.high` — the honest "learn from losing" loop (Issue C
+    in the auction-outcome-feedback plan). Issues **zero writes** — this
+    function contains no INSERT/UPDATE/upsert of any kind, only a single
+    SELECT plus in-memory aggregation; it never touches the `fmv` table.
+
+    **The ranking key is OVERSHOOT vs `fmv.high`, never raw win/loss rate.**
+    Losing is the *intended* outcome of the 80% (or 60%, on low confidence)
+    bid haircut — you are designed to lose most auctions by bargain-hunting
+    below fair value, so a high loss *count* or *rate* is not a mispricing
+    signal. A book that loses every auction it enters is working exactly as
+    designed as long as those losses clear at or below `fmv.high`. The only
+    sound signal is where the losing hammer price lands *relative to*
+    `fmv.high`: persistently clearing above it means `fmv.high` itself is set
+    too low. **Do not "also surface high loss-rate books" or add a win-rate
+    metric here** — that reintroduces the deflation/mispricing trap this
+    report exists to avoid (R4 in the plan; see the Problem Frame in
+    docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md).
+
+    Reuses the exact same "a resolved auction" predicate as
+    `get_first_party_outcomes` — `_OUTCOME_STATUSES_SQL`, `_PRIMARY_LINK_CLAUSE`,
+    `_WINNING_BID_NOT_NULL_CLAUSE`, and `_RESOLVED_RECENCY_CLAUSE` — rather
+    than forking a second definition. Unlike `get_first_party_outcomes` (which
+    grade-windows around a *target* grade for a fresh pricing run), this
+    report only considers a bid's own directly-linked `fmv` row
+    (`bid_fmvs.fmv_id = fmv.id`, no window): calibration measures each priced
+    (comic, grade) row against the auctions actually linked to it.
+
+    Excludes: NULL `winning_bid`, tombstoned/`ENDED` bids (never WON/LOST, so
+    the status filter alone excludes them), secondary lot members
+    (`is_primary = 0`), and any `fmv` row with a NULL (or non-positive)
+    `high` — an unpriced or flagged book has nothing to compare a hammer
+    price against, so it is excluded rather than dividing by zero/NULL.
+
+    A (comic, grade) with **zero losses** in-window is omitted entirely —
+    losing is required to compute overshoot; a book that has only won, or has
+    no resolved auctions at all, has no calibration signal to report.
+
+    A (comic, grade) whose losses' median `winning_bid / fmv_high` is `<= 1`
+    is **also** omitted — those losses cleared at or below `fmv_high`, which
+    is the haircut doing its job, however many losses there are (R4: never
+    surface on loss *count*). Because every ratio in that case is `<= 1`, its
+    `above_fmv_loss_rate` would read 0% anyway; the gate is written against
+    `overshoot`, not the rate, on purpose — so a future change to the rate
+    metric can't accidentally start surfacing these again.
+
+    Returns one dict per (comic, grade) that clears the overshoot gate above,
+    each with:
+      - `comic_id`, `title`, `issue`, `year`, `grade`, `fmv_high`
+      - `loss_count`, `above_fmv_loss_count`, `above_fmv_loss_rate` (0-100,
+        the % of losses where `winning_bid > fmv_high`)
+      - `overshoot` — `median(winning_bid / fmv_high)` over losses. The
+        ranking key; sorted descending (highest overshoot first — the ranked
+        re-price list).
+      - `win_count`, `contested_win_margin` — `median(winning_bid / fmv_high)`
+        over wins, or `None` if there were no wins. **Context only** (winning
+        far below `fmv_high` means a bargain, not a mispriced book) — never
+        used for ranking.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT f.id AS fmv_id,
+               c.id AS comic_id,
+               c.title AS title,
+               c.issue AS issue,
+               c.year AS year,
+               f.grade AS grade,
+               f.high AS fmv_high,
+               b.winning_bid AS winning_bid,
+               b.status AS status
+        FROM bids b
+        JOIN bid_fmvs bf ON bf.bid_id = b.id
+        JOIN fmv f       ON f.id = bf.fmv_id
+        JOIN comics c    ON c.id = f.comic_id
+        WHERE {_PRIMARY_LINK_CLAUSE}
+          AND b.status IN ({_OUTCOME_STATUSES_SQL})
+          AND {_WINNING_BID_NOT_NULL_CLAUSE}
+          AND f.high IS NOT NULL
+          AND {_RESOLVED_RECENCY_CLAUSE}
+        ORDER BY f.id
+        """,
+        (f"-{days} days",),
+    ).fetchall()
+
+    groups: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        fmv_high = row["fmv_high"]
+        if fmv_high is None or fmv_high <= 0:
+            # Guard against divide-by-zero / a nonsensical zero-or-negative
+            # fmv_high — belt-and-suspenders alongside the NOT NULL SQL filter.
+            continue
+        group = groups.setdefault(
+            row["fmv_id"],
+            {
+                "comic_id": row["comic_id"],
+                "title": row["title"],
+                "issue": row["issue"],
+                "year": row["year"],
+                "grade": row["grade"],
+                "fmv_high": fmv_high,
+                "_losses": [],
+                "_wins": [],
+            },
+        )
+        ratio = row["winning_bid"] / fmv_high
+        if row["status"] == "LOST":
+            group["_losses"].append(ratio)
+        elif row["status"] == "WON":
+            group["_wins"].append(ratio)
+
+    report: list[dict[str, Any]] = []
+    for group in groups.values():
+        losses = group.pop("_losses")
+        wins = group.pop("_wins")
+        if not losses:
+            continue  # no loss ⇒ no overshoot signal ⇒ nothing to report (R4)
+        overshoot = median(losses)
+        if overshoot <= 1:
+            # R4 guard: losses clearing at/below fmv_high are the haircut
+            # working as designed, however many of them there are — do NOT
+            # surface the book just because it has a high loss count. Note
+            # every ratio here is <= 1 in this branch, so above_fmv_loss_rate
+            # would read 0% anyway; gating on overshoot (not the rate) is
+            # what keeps this immune to a future "add win/loss rate" edit.
+            continue
+        above_fmv_loss_count = sum(1 for ratio in losses if ratio > 1)
+        group["loss_count"] = len(losses)
+        group["above_fmv_loss_count"] = above_fmv_loss_count
+        group["above_fmv_loss_rate"] = above_fmv_loss_count / len(losses) * 100
+        group["overshoot"] = overshoot
+        group["win_count"] = len(wins)
+        group["contested_win_margin"] = median(wins) if wins else None
+        report.append(group)
+
+    report.sort(key=lambda g: g["overshoot"], reverse=True)
+    return report
 
 
 # ---------------------------------------------------------------------------
