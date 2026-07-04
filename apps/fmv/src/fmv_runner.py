@@ -312,6 +312,80 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
                 pass
 
 
+# ─── Step 2b — First-party outcomes (BUI-286) ─────────────────────────────────
+
+# Recency window for pulling the user's own resolved auctions back in as
+# first-party comps. 180 days is a starting default (per the plan's KTD-2:
+# start unweighted, revisit once U2 lands time-decay) — long enough to catch
+# a slow-moving collector's last few relevant snipes, short enough that a
+# hammer price from years ago doesn't masquerade as "current."
+FIRST_PARTY_RECENCY_DAYS = 180
+
+
+def _fetch_first_party_outcomes(server_url: str, *, target_grade: float,
+                                locg_id: int | None = None,
+                                locg_variant_id: int | None = None,
+                                title: str | None = None,
+                                issue: str | None = None,
+                                year: int | None = None) -> list[dict]:
+    """Pull the user's own resolved auctions for this (comic, grade) window.
+
+    BUI-286 (Issue A) / KTD-1: this is the ONLY call site that reads
+    bids→bid_fmvs→fmv→comics for pricing purposes. It always asks the server
+    for WON-and-LOST rows together in one request (R2/KTD-3) — the server-side
+    query (`get_first_party_outcomes` in gixen-overlay) has no wins-only mode,
+    so there is no way for this function to accidentally request wins alone.
+
+    The server scans a generous grade band (matching fmv_math.MAX_GRADE_WINDOW,
+    passed explicitly here so the coupling is visible rather than silently
+    assumed); the *effective* grade window a first-party comp survives at is
+    whatever build_pool's own ±0.5→±2.0 progressive widening lands on once
+    these rows are merged into the comp pool (KTD-5) — this function does not
+    do its own narrower filtering.
+
+    Returns [] (never raises) on any lookup failure — same soft-fail posture
+    as `_db_lookup`: a book with no resolved auctions, or an unreachable
+    outcomes endpoint, must price identically to today, not error out.
+    """
+    if not locg_id and not (title and issue):
+        return []
+    params: dict = {
+        "grade": target_grade,
+        "window": fmv_math.MAX_GRADE_WINDOW,
+        "days": FIRST_PARTY_RECENCY_DAYS,
+    }
+    if locg_id is not None:
+        params["locg_id"] = locg_id
+        if locg_variant_id is not None:
+            params["locg_variant_id"] = locg_variant_id
+    else:
+        params["title"] = title
+        params["issue"] = str(issue)
+        if year is not None:
+            params["year"] = year
+    try:
+        resp = requests.get(f"{server_url}/api/comics/outcomes", params=params,
+                            timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        click.echo(
+            f"Warning: first-party outcomes lookup failed "
+            f"(locg_id={locg_id}, title={title!r} issue={issue!r}): {e}",
+            err=True,
+        )
+        return []
+    try:
+        rows = resp.json()
+    except ValueError:
+        return []
+    return [
+        {"price": r["price"], "grade": r["grade"],
+         "sold_date": r.get("sold_date", ""), "source": "first_party"}
+        for r in rows
+        if r.get("price") is not None and r.get("grade") is not None
+    ]
+
+
 # ─── Step 3 — Math + DB upsert ────────────────────────────────────────────────
 
 def _compute_and_upsert_one(result: dict, original_book: dict, *,
@@ -358,16 +432,35 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
         target_grade = coerced
         inp["grade"] = coerced
 
+    # BUI-286: merge the user's own resolved auctions in as first-party comps
+    # (KTD-1 — the merge happens at the pool stage, right before compute_fmv,
+    # never inside fmv_math's pure math). `comps` itself is left untouched so
+    # `comp_count_total` below still reflects the SerpApi/ebay-sold-comps pool
+    # only (BUI-143's fetch-error signal keys off that count); first-party rows
+    # are added only to the pool actually priced. A book with no resolved
+    # auctions gets `first_party == []`, so `pool_comps == comps` and pricing
+    # is byte-for-byte what it was before this feature existed.
+    first_party = _fetch_first_party_outcomes(
+        server_url, target_grade=target_grade,
+        locg_id=inp.get("locg_id"), locg_variant_id=inp.get("locg_variant_id"),
+        title=inp.get("title"), issue=inp.get("issue"), year=inp.get("year"),
+    )
+    pool_comps = comps + first_party
+
     # BUI-51: grade_confidence (photo-coverage confidence from /comic:grade)
     # rides the batch envelope and haircuts the bid cap when low. Absent → no
     # haircut (back-compat for manual / already-graded books).
     # grade_window is None when --grade-window is omitted; compute_fmv treats
     # None as "use the default ceiling", so it threads straight through.
     fmv = fmv_math.compute_fmv(
-        comps, target_grade=target_grade,
+        pool_comps, target_grade=target_grade,
         grade_confidence=inp.get("grade_confidence"),
         max_window=grade_window,
     )
+    # BUI-286: surface the first-party contribution on the returned dict so
+    # `_build_notes` can mention it — informational only, fmv_math's output
+    # shape is otherwise untouched.
+    fmv["first_party_count"] = len(first_party)
     # BUI-44: upsert unconditionally — even with n=0 comps (fmv_low/high None),
     # so the comics row + a stub fmv row are written and comic_id is returned.
     # This lets snipe-add thread --comic-id and verify report no_fmv_at_grade
@@ -465,6 +558,12 @@ def _build_notes(fmv: dict) -> str:
     span = fmv.get("grade_span")
     if span is not None:
         parts.append(f"span={span:g}")
+    # BUI-286: surface how many of the priced comps came from the user's own
+    # resolved auctions, so a visible FMV shift is traceable to first-party
+    # data rather than looking like an unexplained SerpApi swing.
+    fp_count = fmv.get("first_party_count") or 0
+    if fp_count:
+        parts.append(f"first_party={fp_count}")
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")

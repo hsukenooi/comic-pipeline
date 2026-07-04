@@ -19,6 +19,18 @@ def server_url():
     return "http://test-server:8080"
 
 
+@pytest.fixture(autouse=True)
+def _no_first_party_outcomes_by_default(monkeypatch):
+    """BUI-286: `_compute_and_upsert_one` now also calls out to
+    `_fetch_first_party_outcomes` (a real HTTP GET). None of the tests in this
+    file are about that feature — it's covered end-to-end in
+    test_first_party_comps.py — so default it to a no-op here rather than
+    editing every existing `_compute_and_upsert_one`/`run` call site to mock
+    yet another network call it was never testing."""
+    monkeypatch.setattr(fmv_runner, "_fetch_first_party_outcomes",
+                        lambda *a, **k: [])
+
+
 def _make_book(item_id, title, issue, year, grade, locg_id=None):
     book = {"item_id": item_id, "title": title, "issue": issue,
             "year": year, "grade": grade}

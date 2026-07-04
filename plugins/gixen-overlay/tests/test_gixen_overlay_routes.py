@@ -1457,6 +1457,225 @@ def test_comics_history_removed_does_not_shadow_legit_loss(api):
     assert matching[0]["status"] == "LOST"
 
 
+# --- /api/comics/outcomes (BUI-286) ------------------------------------------
+
+
+def _create_comic_and_fmv(api, *, title, issue, year, grade, locg_id=None,
+                          locg_variant_id=None):
+    """POST /api/comics to create a comic+fmv row, return (comic_id, fmv_id)."""
+    body = {"title": title, "issue": issue, "year": year, "grade": grade}
+    if locg_id is not None:
+        body["locg_id"] = locg_id
+    if locg_variant_id is not None:
+        body["locg_variant_id"] = locg_variant_id
+    row = api.post("/api/comics", json=body).json()
+    return row["comic_id"], row["fmv_id"]
+
+
+def _link_bid_to_fmv(db_path, item_id, fmv_id, *, is_primary=True):
+    """Insert a bid_fmvs junction row for an existing bid + fmv (mirrors the
+    linking half of `_link_comic` without recreating the comic/fmv rows)."""
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    try:
+        bid = raw.execute(
+            "SELECT id FROM bids WHERE item_id=?", (item_id,)
+        ).fetchone()
+        if is_primary:
+            raw.execute("UPDATE bid_fmvs SET is_primary=0 WHERE bid_id=?", (bid["id"],))
+            raw.execute("UPDATE bids SET fmv_id=? WHERE id=?", (fmv_id, bid["id"]))
+        raw.execute(
+            "INSERT OR REPLACE INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, ?)",
+            (bid["id"], fmv_id, 1 if is_primary else 0),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+
+def test_comics_outcomes_empty_on_fresh_db(api):
+    r = api.get("/api/comics/outcomes", params={"locg_id": 1, "grade": 9.0})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_comics_outcomes_requires_an_identity_filter(api):
+    """Neither locg_id nor title+issue given → [], not every outcome ever."""
+    r = api.get("/api/comics/outcomes", params={"grade": 9.0})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_comics_outcomes_returns_wins_and_losses_together(api):
+    """R2 invariant: a combined WON+LOST query, not a wins-only path."""
+    db_path = os.environ["DB_PATH"]
+    comic_id, fmv_id = _create_comic_and_fmv(
+        api, title="Amazing Fantasy", issue="15", year=1962, grade=9.0,
+        locg_id=9001,
+    )
+    api.post("/api/bids", json={"item_id": "300000001", "max_bid": 80.0})
+    api.post("/api/bids", json={"item_id": "300000002", "max_bid": 100.0})
+    _link_bid_to_fmv(db_path, "300000001", fmv_id)
+    _link_bid_to_fmv(db_path, "300000002", fmv_id)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='LOST', winning_bid=90.0, "
+        "auction_end_at=datetime('now', '-5 days') WHERE item_id=?",
+        ("300000001",),
+    )
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=100.0, "
+        "auction_end_at=datetime('now', '-3 days') WHERE item_id=?",
+        ("300000002",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/outcomes",
+                   params={"locg_id": 9001, "grade": 9.0}).json()
+    statuses = {r["status"] for r in rows}
+    prices = {r["price"] for r in rows}
+    assert statuses == {"LOST", "WON"}
+    assert prices == {90.0, 100.0}
+
+
+def test_comics_outcomes_excludes_null_price_ended_and_removed_tombstone(api):
+    db_path = os.environ["DB_PATH"]
+    comic_id, fmv_id = _create_comic_and_fmv(
+        api, title="Detective Comics", issue="27", year=1939, grade=6.0,
+        locg_id=9002,
+    )
+    for item_id in ("300000010", "300000011"):
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": 50.0})
+        _link_bid_to_fmv(db_path, item_id, fmv_id)
+    raw = sqlite3.connect(db_path)
+    # ENDED with NULL winning_bid (R3: no trustworthy price).
+    raw.execute(
+        "UPDATE bids SET status='ENDED', winning_bid=NULL, "
+        "auction_end_at=datetime('now', '-2 days') WHERE item_id=?",
+        ("300000010",),
+    )
+    # REMOVED tombstone with a winning_bid present.
+    raw.execute(
+        "UPDATE bids SET status='REMOVED', winning_bid=12.0, "
+        "auction_end_at=datetime('now', '-2 days') WHERE item_id=?",
+        ("300000011",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/outcomes",
+                   params={"locg_id": 9002, "grade": 6.0}).json()
+    assert rows == []
+
+
+def test_comics_outcomes_grade_window_filters_out_of_band_rows(api):
+    db_path = os.environ["DB_PATH"]
+    _, fmv_in = _create_comic_and_fmv(
+        api, title="Batman", issue="1", year=1940, grade=9.5, locg_id=9003,
+    )
+    _, fmv_out = _create_comic_and_fmv(
+        api, title="Batman", issue="1", year=1940, grade=10.0, locg_id=9003,
+    )
+    for item_id, fmv_id, price in (
+        ("300000020", fmv_in, 500.0), ("300000021", fmv_out, 600.0),
+    ):
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": price})
+        _link_bid_to_fmv(db_path, item_id, fmv_id)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=500.0, "
+        "auction_end_at=datetime('now', '-1 day') WHERE item_id=?",
+        ("300000020",),
+    )
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=600.0, "
+        "auction_end_at=datetime('now', '-1 day') WHERE item_id=?",
+        ("300000021",),
+    )
+    raw.commit()
+    raw.close()
+
+    # target 9.0, window 0.5 → grade 9.5 (diff 0.5) in, grade 10.0 (diff 1.0) out.
+    rows = api.get("/api/comics/outcomes",
+                   params={"locg_id": 9003, "grade": 9.0, "window": 0.5}).json()
+    assert [r["price"] for r in rows] == [500.0]
+
+
+def test_comics_outcomes_excludes_stale_beyond_recency_window(api):
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Action Comics", issue="1", year=1938, grade=8.0,
+        locg_id=9004,
+    )
+    for item_id in ("300000030", "300000031"):
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": 50.0})
+        _link_bid_to_fmv(db_path, item_id, fmv_id)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=200.0, "
+        "auction_end_at=datetime('now', '-10 days') WHERE item_id=?",
+        ("300000030",),
+    )
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=210.0, "
+        "auction_end_at=datetime('now', '-200 days') WHERE item_id=?",
+        ("300000031",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/outcomes",
+                   params={"locg_id": 9004, "grade": 8.0, "days": 180}).json()
+    assert [r["price"] for r in rows] == [200.0]
+
+
+def test_comics_outcomes_excludes_secondary_lot_member(api):
+    """A lot's winning_bid prices the whole lot, not one book — only the
+    primary-linked comic is a valid per-book comp."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Fantastic Four", issue="1", year=1961, grade=7.0,
+        locg_id=9005,
+    )
+    api.post("/api/bids", json={"item_id": "300000040", "max_bid": 300.0})
+    _link_bid_to_fmv(db_path, "300000040", fmv_id, is_primary=False)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=350.0, "
+        "auction_end_at=datetime('now', '-1 day') WHERE item_id=?",
+        ("300000040",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/outcomes",
+                   params={"locg_id": 9005, "grade": 7.0}).json()
+    assert rows == []
+
+
+def test_comics_outcomes_resolves_by_title_issue_year_when_no_locg_id(api):
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Incredible Hulk", issue="181", year=1974, grade=9.0,
+    )
+    api.post("/api/bids", json={"item_id": "300000050", "max_bid": 400.0})
+    _link_bid_to_fmv(db_path, "300000050", fmv_id)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='LOST', winning_bid=450.0, "
+        "auction_end_at=datetime('now', '-1 day') WHERE item_id=?",
+        ("300000050",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/outcomes",
+                   params={"title": "Incredible Hulk", "issue": "181",
+                           "year": 1974, "grade": 9.0}).json()
+    assert [r["price"] for r in rows] == [450.0]
+
+
 # --- JS outcome() (v2-comics.html) -------------------------------------------
 
 

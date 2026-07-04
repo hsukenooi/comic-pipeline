@@ -1201,6 +1201,129 @@ def list_comics(
 
 
 # ---------------------------------------------------------------------------
+# First-party auction outcomes (BUI-286)
+# ---------------------------------------------------------------------------
+
+# Default grade-window scanned for candidate outcomes. Deliberately generous
+# (matches apps/fmv's fmv_math.MAX_GRADE_WINDOW ceiling) — the caller merges
+# these rows into the same comp pool build_pool() progressively narrows with
+# its own ±0.5→±2.0 walk, so the *effective* grade window a first-party comp
+# survives at is whatever build_pool lands on, not this default. Kept as an
+# independent constant (not imported from apps/fmv) because gixen-overlay does
+# not depend on apps/fmv — apps/* are uv-tool-installed, not workspace members.
+DEFAULT_OUTCOME_GRADE_WINDOW = 2.0
+
+# Default recency window (days) for "resolved recently enough to be a current
+# comp". 180 days is a starting default (BUI-286); not yet tied to any decay
+# curve — that is U2's job.
+DEFAULT_OUTCOME_RECENCY_DAYS = 180
+
+# R2/KTD-3 (structural invariant): WON and LOST together, in one clause, with
+# no parameter to narrow it to wins alone. A caller wanting "wins only" would
+# reintroduce the truncated-from-above deflation spiral (a proxy-auction win's
+# winning_bid is the underbidder's max; the wins we see are the auctions we
+# *didn't* lose to a higher bidder, so a wins-only sample biases low). See the
+# Problem Frame in docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md.
+_OUTCOME_STATUSES_SQL = "'WON', 'LOST'"
+
+
+def get_first_party_outcomes(
+    conn: sqlite3.Connection,
+    *,
+    grade: float,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    locg_id: int | None = None,
+    locg_variant_id: int | None = None,
+    window: float = DEFAULT_OUTCOME_GRADE_WINDOW,
+    days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+) -> list[sqlite3.Row]:
+    """Return the user's own resolved auctions for a (comic, grade) window.
+
+    BUI-286 (Issue A in the auction-outcome-feedback plan): feeds apps/fmv's
+    first-party-comp merge via GET /api/comics/outcomes, and is designed to be
+    reused as-is (not forked) by the later loss-vs-FMV calibration report
+    (Issue C) — both need the identical definition of "a resolved auction".
+
+    Comic resolution mirrors `list_comics`: locg_id (+ optional
+    locg_variant_id) when given, else (title, issue[, year]) case-insensitive
+    on title. Returns [] (never raises) when neither identity is supplied, or
+    when nothing matches — a book with no resolved auctions must fall through
+    to pricing exactly as it does today, not error.
+
+    Trustworthiness filter (R3): `b.winning_bid IS NOT NULL` AND
+    `b.status IN ('WON','LOST')` — NULL-price ENDED rows and the
+    PURGED/REMOVED tombstones are excluded (tombstones are never WON/LOST, so
+    the status filter alone is sufficient; winning_bid IS NOT NULL is kept as
+    an explicit belt-and-suspenders check per R3's wording).
+
+    `bf.is_primary = 1` restricts to the bid's primary linked comic. A
+    multi-comic lot's `winning_bid` prices the whole lot, not one book, so a
+    secondary lot member (`is_primary = 0`) is not a valid per-book comp and
+    is excluded — the same reasoning `get_primary_fmv_for_bid` and the
+    dashboard aggregates already apply to represent "the" comic for a bid.
+
+    Recency is judged the same way /api/comics/history judges "when did this
+    resolve": `COALESCE(auction_end_at, resolved_at)`, bounded to the last
+    `days`.
+    """
+    if not locg_id and not (title and issue):
+        return []
+
+    clauses: list[str] = ["bf.is_primary = 1"]
+    params: list[Any] = []
+    if locg_id is not None:
+        clauses.append("c.locg_id = ?")
+        params.append(locg_id)
+        if locg_variant_id is not None:
+            clauses.append("c.locg_variant_id = ?")
+            params.append(locg_variant_id)
+    else:
+        clauses.append("LOWER(c.title) = LOWER(?)")
+        params.append(title)
+        clauses.append("c.issue = ?")
+        params.append(issue)
+        if year is not None:
+            clauses.append("c.year = ?")
+            params.append(year)
+
+    clauses.append("f.grade BETWEEN ? AND ?")
+    params.extend([grade - window, grade + window])
+    clauses.append(f"b.status IN ({_OUTCOME_STATUSES_SQL})")
+    clauses.append("b.winning_bid IS NOT NULL")
+    clauses.append("COALESCE(b.auction_end_at, b.resolved_at) IS NOT NULL")
+    # Normalize both sides through SQLite's own datetime() rather than
+    # comparing against a Python-formatted ISO string: auction_end_at/
+    # resolved_at are stored in SQLite's "YYYY-MM-DD HH:MM:SS" shape (space
+    # separator, no offset), which does not compare correctly byte-for-byte
+    # against `datetime.isoformat()`'s "T"-separated, offset-suffixed output
+    # (same convention already used by /api/comics/history's own recency
+    # filter, a few lines up the file in routes.py).
+    clauses.append(
+        "datetime(COALESCE(b.auction_end_at, b.resolved_at)) >= datetime('now', ?)"
+    )
+    params.append(f"-{days} days")
+
+    where = " AND ".join(clauses)
+    return conn.execute(
+        f"""
+        SELECT b.winning_bid AS price,
+               f.grade AS grade,
+               COALESCE(b.auction_end_at, b.resolved_at) AS sold_date,
+               b.status AS status
+        FROM bids b
+        JOIN bid_fmvs bf ON bf.bid_id = b.id
+        JOIN fmv f       ON f.id = bf.fmv_id
+        JOIN comics c    ON c.id = f.comic_id
+        WHERE {where}
+        ORDER BY sold_date DESC
+        """,
+        params,
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
 # Seller-scan seen-tracking (BUI-113)
 # ---------------------------------------------------------------------------
 

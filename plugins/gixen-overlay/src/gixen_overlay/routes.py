@@ -25,6 +25,9 @@ from gixen_overlay.db import (
     mark_items_seen,
     get_collection_wins_seen,
     mark_collection_wins_seen,
+    get_first_party_outcomes,
+    DEFAULT_OUTCOME_GRADE_WINDOW,
+    DEFAULT_OUTCOME_RECENCY_DAYS,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import (
@@ -139,6 +142,49 @@ async def api_list_comics(
         locg_id=locg_id,
         locg_variant_id=locg_variant_id,
         max_age_days=max_age_days,
+    )
+    return [dict(r) for r in rows]
+
+
+@router.get("/api/comics/outcomes")
+async def api_comics_outcomes(
+    request: Request,
+    grade: float,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    locg_id: int | None = None,
+    locg_variant_id: int | None = None,
+    window: float = DEFAULT_OUTCOME_GRADE_WINDOW,
+    days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+):
+    """BUI-286: the user's own resolved auctions for a (comic, grade) window.
+
+    Feeds `apps/fmv`'s first-party-comp merge (Issue A) — comic-fmv calls this
+    over HTTP (it has no direct DB access; the DB lives on the comics server)
+    the same way it already round-trips `/api/comics` for cache reuse and
+    upsert. Deliberately provider-neutral (never `/locg/*`) per the overlay's
+    endpoint convention, and deliberately reusable as-is by the later
+    loss-vs-FMV calibration report (Issue C) so "a resolved auction" is
+    defined exactly once.
+
+    Comic resolution: `locg_id` (+ optional `locg_variant_id`) when given,
+    else `title` + `issue` (+ optional `year`) — same as `/api/comics`.
+
+    Always both WON and LOST (R2/KTD-3) — see `get_first_party_outcomes` for
+    why there is no parameter to narrow this to wins alone.
+    """
+    db = request.app.state.db
+    rows = get_first_party_outcomes(
+        db,
+        grade=grade,
+        title=title,
+        issue=issue,
+        year=year,
+        locg_id=locg_id,
+        locg_variant_id=locg_variant_id,
+        window=window,
+        days=days,
     )
     return [dict(r) for r in rows]
 
