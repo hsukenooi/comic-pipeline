@@ -42,6 +42,15 @@ in this report — there is no loss to measure overshoot from. A book whose
 losses all cleared at or below `fmv_high` — however many losses it has — is
 likewise never surfaced (the server-side R4 guard).
 
+**A book must have lost at least `min_losses` times in-window to surface at
+all (default 2).** A single loss — however far above `fmv_high` it cleared —
+is one bidding-war outlier, not a persistent pattern; the report suppresses
+it as noise rather than ranking a book on one data point. Pass `min_losses`
+as a query param to change the floor (e.g. `min_losses=3` for a stricter
+gate); it can never be used to relax R4's loss-count-is-not-the-signal rule,
+only to raise or lower how many *qualifying* (above-`fmv_high`-median) losses
+are required before a row surfaces.
+
 ## Prerequisites
 
 **`COMICS_SERVER_URL` must be set.** Set it once in `~/.zshrc`:
@@ -82,6 +91,14 @@ Optional `days` query param (default 180 — matches the recency window
 
 ```bash
 comics_get "$COMICS_SERVER_URL/api/comics/calibration?days=90"
+```
+
+Optional `min_losses` query param (default 2 — a book must have lost at least
+this many times in-window to surface; see "The one rule that must never be
+'fixed'" above for why a single loss doesn't count):
+
+```bash
+comics_get "$COMICS_SERVER_URL/api/comics/calibration?min_losses=3"
 ```
 
 ## Response shape

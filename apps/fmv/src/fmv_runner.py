@@ -324,6 +324,11 @@ def _get_json_or_warn(url: str, *, params: dict, warn: str, default,
         click.echo(f"Warning: {warn}: {e}", err=True)
         return default
     except ValueError:
+        # A malformed (non-JSON) body from the comics server must not degrade
+        # silently into an indistinguishable cache-miss / no-outcomes result —
+        # warn so the operator can tell "nothing found" from "the server sent
+        # garbage" (matches this function's own docstring promise).
+        click.echo(f"Warning: {warn}: invalid JSON response", err=True)
         return default
 
 
@@ -384,6 +389,27 @@ def _fetch_first_party_outcomes(server_url: str, *, target_grade: float,
               f"(locg_id={locg_id}, title={title!r} issue={issue!r})"),
         default=[],
     )
+
+    # Adversarial-review fix (post-BUI-286): R2/KTD-3 make wins-and-losses a
+    # structural invariant at the QUERY level (the server has no wins-only
+    # entry point), but that is not the same as a per-book GUARANTEE. A
+    # (comic, grade) that has only ever WON, or whose losses aged past
+    # FIRST_PARTY_RECENCY_DAYS while a win stayed in-window, still yields a
+    # wins-only `rows` here even though the query itself asked for both. Merging
+    # that truncated-from-above set into the pool would drag FMV down over
+    # successive runs (the deflation spiral the plan's Problem Frame warns
+    # about) — so re-check the actual composition of what came back, not just
+    # how it was asked for, and drop the contribution entirely rather than
+    # merge a wins-only pool.
+    statuses = {r.get("status") for r in rows}
+    if "WON" in statuses and "LOST" not in statuses:
+        click.echo(
+            "Note: first-party outcomes skipped (wins-only, no in-window "
+            f"losses) for locg_id={locg_id}, title={title!r} issue={issue!r}",
+            err=True,
+        )
+        return []
+
     return [
         {"price": r["price"], "grade": r["grade"],
          "sold_date": r.get("sold_date", ""), "source": "first_party"}

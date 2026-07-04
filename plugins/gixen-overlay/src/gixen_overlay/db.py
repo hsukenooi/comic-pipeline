@@ -1353,10 +1353,14 @@ def get_first_party_outcomes(
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_CALIBRATION_MIN_LOSSES = 2
+
+
 def calibration_report(
     conn: sqlite3.Connection,
     *,
     days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+    min_losses: int = DEFAULT_CALIBRATION_MIN_LOSSES,
 ) -> list[dict[str, Any]]:
     """DIAGNOSTIC-ONLY audit: rank priced (comic, grade) books whose LOSSES are
     clearing above `fmv.high` — the honest "learn from losing" loop (Issue C
@@ -1392,17 +1396,27 @@ def calibration_report(
     `high` — an unpriced or flagged book has nothing to compare a hammer
     price against, so it is excluded rather than dividing by zero/NULL.
 
-    A (comic, grade) with **zero losses** in-window is omitted entirely —
-    losing is required to compute overshoot; a book that has only won, or has
-    no resolved auctions at all, has no calibration signal to report.
+    A (comic, grade) with **fewer than `min_losses` losses** (default
+    `DEFAULT_CALIBRATION_MIN_LOSSES` = 2) in-window is omitted entirely. A
+    single loss — however far above `fmv_high` it cleared — is indistinguishable
+    from a one-off bidding war; the report's "persistent" framing requires at
+    least `min_losses` independent losses before the overshoot is trusted as a
+    pattern rather than an outlier. (Losing at all is required to compute
+    overshoot in the first place; a book that has only won, or has no resolved
+    auctions at all, has no calibration signal to report.)
 
     A (comic, grade) whose losses' median `winning_bid / fmv_high` is `<= 1`
     is **also** omitted — those losses cleared at or below `fmv_high`, which
     is the haircut doing its job, however many losses there are (R4: never
-    surface on loss *count*). Because every ratio in that case is `<= 1`, its
-    `above_fmv_loss_rate` would read 0% anyway; the gate is written against
-    `overshoot`, not the rate, on purpose — so a future change to the rate
-    metric can't accidentally start surfacing these again.
+    surface on loss *count*). The gate drops a row when the MEDIAN loss ratio
+    is `<= 1` — a deliberately robust-to-outliers statistic (KTD-4): a single
+    high-ratio loss (a bidding war) does not by itself drag the median above
+    1, so it does not flag the book. This is NOT the same as every individual
+    ratio being `<= 1` — e.g. losses at ratios `[0.5, 0.6, 5.0]` have median
+    `0.6` (dropped by this gate) even though one ratio is `5.0`. The gate is
+    written against the median `overshoot`, not the rate, on purpose — so a
+    future change to the rate metric can't accidentally start surfacing these
+    again.
 
     Returns one dict per (comic, grade) that clears the overshoot gate above,
     each with:
@@ -1474,14 +1488,22 @@ def calibration_report(
         wins = group.pop("_wins")
         if not losses:
             continue  # no loss ⇒ no overshoot signal ⇒ nothing to report (R4)
+        if len(losses) < min_losses:
+            # FIX 3 (adversarial review): a single loss makes one bidding-war
+            # outlier rank #1, contradicting this report's "persistent"
+            # framing — require at least `min_losses` independent losses
+            # before an overshoot is trusted as a pattern, not noise.
+            continue
         overshoot = median(losses)
         if overshoot <= 1:
             # R4 guard: losses clearing at/below fmv_high are the haircut
             # working as designed, however many of them there are — do NOT
-            # surface the book just because it has a high loss count. Note
-            # every ratio here is <= 1 in this branch, so above_fmv_loss_rate
-            # would read 0% anyway; gating on overshoot (not the rate) is
-            # what keeps this immune to a future "add win/loss rate" edit.
+            # surface the book just because it has a high loss count. The
+            # gate is written against the MEDIAN overshoot, not the rate —
+            # note that does NOT mean every individual ratio here is <= 1
+            # (see the docstring for the [0.5, 0.6, 5.0] counter-example) —
+            # gating on the median is what keeps this immune to a future
+            # "add win/loss rate" edit.
             continue
         above_fmv_loss_count = sum(1 for ratio in losses if ratio > 1)
         group["loss_count"] = len(losses)

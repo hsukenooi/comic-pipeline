@@ -391,6 +391,39 @@ class TestWeightedQuantiles:
         weighted_q75 = fm.weighted_quartile(prices, weights, 0.75)
         assert weighted_q75 >= unweighted_q75
 
+    def test_weighted_median_exact_value_hand_computed(self):
+        """FIX 6 (test hardening): the directional tests above only assert
+        `weighted > unweighted` — a sign/fraction bug that still moves the
+        right way would sail through. Pin an exact value derived from
+        `weighted_quartile`'s OWN documented formula (read from fmv_math.py,
+        not guessed), so a wrong-but-monotonic implementation fails.
+
+        weighted_quartile's algorithm (unequal-weight branch):
+          1. sort (price, weight) pairs by price
+          2. cumulative weight `cum` after each pair; total = sum(weights)
+          3. each pair's "position" = (cum - weight/2) / total
+          4. linearly interpolate `q` between the two bracketing positions
+
+        Pool: prices=[10, 20, 30], weights=[1.0, 1.0, 0.5] (already sorted by
+        price; not all-equal, so this exercises the real weighted branch, not
+        the equal-weight passthrough to `quartile`/`statistics.median`).
+
+        Hand computation for q=0.5 (weighted_median):
+          total = 1.0 + 1.0 + 0.5 = 2.5
+          pair0 (10, 1.0):  cum=1.0  -> position = (1.0 - 1.0/2) / 2.5 = 0.5/2.5 = 0.20
+          pair1 (20, 1.0):  cum=2.0  -> position = (2.0 - 1.0/2) / 2.5 = 1.5/2.5 = 0.60
+          pair2 (30, 0.5):  cum=2.5  -> position = (2.5 - 0.5/2) / 2.5 = 2.25/2.5 = 0.90
+          q=0.5 falls between pair0's 0.20 and pair1's 0.60 (positions[1]=0.60
+          is the first >= q):
+            frac = (0.5 - 0.20) / (0.60 - 0.20) = 0.30 / 0.40 = 0.75
+            value = 10 + 0.75 * (20 - 10) = 10 + 7.5 = 17.5
+        """
+        prices = [10, 20, 30]
+        weights = [1.0, 1.0, 0.5]
+        assert not fm._weights_equal(weights)  # confirm this hits the real branch
+        assert fm.weighted_median(prices, weights) == pytest.approx(17.5, rel=1e-3)
+        assert fm.weighted_quartile(prices, weights, 0.5) == pytest.approx(17.5, rel=1e-3)
+
 
 class TestConfidenceReconciledToEffectiveN:
     def test_many_stale_comps_no_longer_earn_high_on_raw_count(self):

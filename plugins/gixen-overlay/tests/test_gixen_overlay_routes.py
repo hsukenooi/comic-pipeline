@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
+import statistics
 import subprocess
 from importlib.metadata import EntryPoint
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1818,12 +1821,18 @@ def test_calibration_excludes_null_price_tombstone_and_unpriced_fmv(api):
     report_before = api.get("/api/comics/calibration").json()
     assert report_before == []
 
+    # FIX 3 default min_losses=2: two genuine losses are needed to surface at
+    # all (a single loss is a bidding-war outlier, not a persistent pattern),
+    # so add a second one here — this test's intent (the exclusions above
+    # don't count toward the total) is unchanged.
     _add_resolved_bid(api, db_path, "400043", priced_fmv,
                        status="LOST", winning_bid=1300.0)
+    _add_resolved_bid(api, db_path, "400044", priced_fmv,
+                       status="LOST", winning_bid=1250.0)
     report_after = api.get("/api/comics/calibration").json()
     assert len(report_after) == 1
     assert report_after[0]["title"] == "Detective Comics"
-    assert report_after[0]["loss_count"] == 1
+    assert report_after[0]["loss_count"] == 2
 
 
 def test_calibration_win_context_not_ranked_and_win_only_book_excluded(api):
@@ -1839,18 +1848,79 @@ def test_calibration_win_context_not_ranked_and_win_only_book_excluded(api):
     report = api.get("/api/comics/calibration").json()
     assert report == []
 
-    # Now give the same book an above-FMV loss too, plus its below-FMV win.
-    # It should surface on the loss alone, with the win reported as context
-    # (and NOT affecting the overshoot ranking value, which is loss-only).
+    # Now give the same book two above-FMV losses (FIX 3 default min_losses=2
+    # requires at least two to surface — a single loss is a bidding-war
+    # outlier, not a persistent pattern) plus its below-FMV win. It should
+    # surface on the losses alone, with the win reported as context (and NOT
+    # affecting the overshoot ranking value, which is loss-only).
     _add_resolved_bid(api, db_path, "400051", win_only_fmv,
                        status="LOST", winning_bid=600.0)
+    _add_resolved_bid(api, db_path, "400052", win_only_fmv,
+                       status="LOST", winning_bid=650.0)
     report = api.get("/api/comics/calibration").json()
     assert len(report) == 1
     row = report[0]
-    assert row["loss_count"] == 1
-    assert row["overshoot"] == 600.0 / 500.0
+    assert row["loss_count"] == 2
+    assert row["overshoot"] == statistics.median([600.0 / 500.0, 650.0 / 500.0])
     assert row["win_count"] == 1
     assert row["contested_win_margin"] == 200.0 / 500.0
+
+
+def test_calibration_single_loss_below_min_losses_does_not_surface(api):
+    """FIX 3: a single loss — even at a huge overshoot — must not surface.
+    A lone bidding-war outlier is not a persistent pattern; min_losses (default
+    2) requires a second qualifying loss before the book is trusted as signal."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Detective Comics", issue="27", year=1939, grade=6.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400070", fmv_id,
+                       status="LOST", winning_bid=500.0)  # 5x overshoot
+
+    report = api.get("/api/comics/calibration").json()
+    assert report == []
+
+
+def test_calibration_two_losses_above_fmv_high_surfaces(api):
+    """FIX 3: once a second qualifying (above-fmv_high) loss lands, the book
+    clears both the min_losses gate and the overshoot gate and surfaces."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Detective Comics", issue="27", year=1939, grade=6.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400071", fmv_id,
+                       status="LOST", winning_bid=500.0)
+    _add_resolved_bid(api, db_path, "400072", fmv_id,
+                       status="LOST", winning_bid=520.0)
+
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 1
+    assert report[0]["loss_count"] == 2
+    assert report[0]["overshoot"] > 1
+
+
+def test_calibration_min_losses_query_param_overrides_default(api):
+    """FIX 3: min_losses is caller-tunable via the query param — a stricter
+    floor (e.g. 3) suppresses a book that clears the default gate of 2."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Detective Comics", issue="27", year=1939, grade=6.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400073", fmv_id,
+                       status="LOST", winning_bid=500.0)
+    _add_resolved_bid(api, db_path, "400074", fmv_id,
+                       status="LOST", winning_bid=520.0)
+
+    default_report = api.get("/api/comics/calibration").json()
+    assert len(default_report) == 1
+
+    stricter_report = api.get(
+        "/api/comics/calibration", params={"min_losses": 3}
+    ).json()
+    assert stricter_report == []
 
 
 def test_calibration_performs_no_write_to_fmv_table(api):
@@ -1860,8 +1930,11 @@ def test_calibration_performs_no_write_to_fmv_table(api):
     _, fmv_id = _create_comic_and_fmv(
         api, title="X-Men", issue="1", year=1963, grade=8.5, fmv_high=200.0,
     )
+    # FIX 3 default min_losses=2: two losses needed to surface at all.
     _add_resolved_bid(api, db_path, "400060", fmv_id,
                        status="LOST", winning_bid=260.0)
+    _add_resolved_bid(api, db_path, "400061", fmv_id,
+                       status="LOST", winning_bid=270.0)
 
     def _dump_fmv_table():
         raw = sqlite3.connect(db_path)
@@ -1876,6 +1949,46 @@ def test_calibration_performs_no_write_to_fmv_table(api):
 
     assert report != []  # sanity: the report actually ran its aggregation
     assert before == after
+
+
+def test_calibration_report_fields_match_skill_doc(api):
+    """FIX 8 (canary): the fields `.claude/commands/comic/calibration-report.md`
+    documents/parses in its "Response shape" example must match the keys
+    `calibration_report()` ACTUALLY returns. A future field rename on either
+    side (server or doc) fails this test instead of biting an agent reading
+    the skill at runtime — the same drift class test_skill_contracts.py's
+    other contract tests already guard against for other skills."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Amazing Spider-Man", issue="129", year=1973, grade=8.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400090", fmv_id,
+                       status="LOST", winning_bid=120.0)
+    _add_resolved_bid(api, db_path, "400091", fmv_id,
+                       status="LOST", winning_bid=125.0)
+    _add_resolved_bid(api, db_path, "400092", fmv_id,
+                       status="WON", winning_bid=40.0)
+
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 1
+    actual_fields = set(report[0].keys())
+
+    doc_path = (
+        Path(__file__).resolve().parents[3]
+        / ".claude" / "commands" / "comic" / "calibration-report.md"
+    )
+    doc_text = doc_path.read_text()
+    match = re.search(r"## Response shape.*?```json\s*(\{.*?\})\s*```",
+                      doc_text, re.DOTALL)
+    assert match, "calibration-report.md's Response shape JSON example is missing"
+    documented_fields = set(json.loads(match.group(1)).keys())
+
+    assert documented_fields == actual_fields, (
+        f"calibration-report.md documents {documented_fields} but "
+        f"calibration_report() actually returns {actual_fields} — a field "
+        "was renamed/added/removed on one side without the other"
+    )
 
 
 # --- JS outcome() (v2-comics.html) -------------------------------------------

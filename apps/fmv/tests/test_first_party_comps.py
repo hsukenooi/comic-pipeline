@@ -115,15 +115,81 @@ class TestFetchFirstPartyOutcomes:
         assert out[0]["price"] == 60.0
 
     def test_no_status_parameter_exists(self):
-        """R2/KTD-3 structural guard: there must be no way for a caller to ask
-        for wins only. Assert the function signature has no status/mode/
-        wins_only parameter a future edit could wire up to narrow the query."""
+        """R2/KTD-3 structural guard, as an ALLOWLIST rather than a denylist:
+        a denylist of specific forbidden names (status/mode/wins_only/...)
+        would sail right past a differently-named wins-only knob (e.g.
+        `won_only`, `outcome_type`). Assert the full parameter set equals the
+        known-good tuple exactly, so ANY new parameter — no matter what it's
+        called — forces a deliberate update of this test (and a human reading
+        this docstring) rather than silently reintroducing a way to request
+        wins alone."""
         sig = inspect.signature(fmv_runner._fetch_first_party_outcomes)
-        forbidden = {"status", "statuses", "wins_only", "mode"}
-        assert not (forbidden & set(sig.parameters)), (
-            "a status-narrowing parameter would let a caller request wins "
-            "alone, reintroducing the truncated-from-above deflation spiral"
+        known_good = {
+            "server_url", "target_grade", "locg_id", "locg_variant_id",
+            "title", "issue", "year",
+        }
+        assert set(sig.parameters) == known_good, (
+            "the parameter set of _fetch_first_party_outcomes changed — if you "
+            "added a legitimate new parameter, update `known_good` above "
+            "deliberately; if it narrows results by status/outcome (e.g. "
+            "wins-only), do NOT add it — that reintroduces the "
+            "truncated-from-above deflation spiral"
         )
+
+    # ─── FIX 1 (BUI-286 adversarial review): per-book wins-need-losses gate ───
+
+    def test_wins_only_in_window_yields_no_first_party_comps(self):
+        """A (comic, grade) that has WON every in-window auction (or whose
+        losses aged past the recency window) must contribute NOTHING to the
+        pool — merging a wins-only sample would deflate FMV over successive
+        runs (the query-level guard ensures the request always ASKS for both,
+        but does not guarantee the in-window RESULT has both)."""
+        rows = [_outcome_row(100.0, 9.0, "WON"), _outcome_row(110.0, 9.0, "WON")]
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = rows
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            out = fmv_runner._fetch_first_party_outcomes(
+                server_url(), target_grade=9.0, locg_id=1)
+        assert out == []
+
+    def test_mixed_wins_and_losses_are_merged(self):
+        """>= 1 LOST alongside wins restores the missing right tail — merge,
+        don't drop."""
+        rows = [_outcome_row(100.0, 9.0, "WON"), _outcome_row(150.0, 9.0, "LOST")]
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = rows
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            out = fmv_runner._fetch_first_party_outcomes(
+                server_url(), target_grade=9.0, locg_id=1)
+        assert {c["price"] for c in out} == {100.0, 150.0}
+
+    def test_losses_only_are_merged(self):
+        """A losses-only set needs no win to be trustworthy — it's already
+        the right-tail signal the guard exists to protect."""
+        rows = [_outcome_row(150.0, 9.0, "LOST"), _outcome_row(160.0, 9.0, "LOST")]
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = rows
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            out = fmv_runner._fetch_first_party_outcomes(
+                server_url(), target_grade=9.0, locg_id=1)
+        assert {c["price"] for c in out} == {150.0, 160.0}
+
+    def test_malformed_json_warns_and_returns_empty(self, capsys):
+        """FIX 2: _get_json_or_warn's ValueError branch must warn to stderr,
+        not silently degrade a malformed comics-server response into an
+        indistinguishable 'no first-party outcomes' result."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = ValueError("not json")
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            out = fmv_runner._fetch_first_party_outcomes(
+                server_url(), target_grade=9.0, locg_id=1)
+        assert out == []
+        err = capsys.readouterr().err
+        assert "Warning" in err and "invalid JSON" in err
 
 
 # ─── Merge into _compute_and_upsert_one ───────────────────────────────────────

@@ -29,6 +29,7 @@ from gixen_overlay.db import (
     calibration_report,
     DEFAULT_OUTCOME_GRADE_WINDOW,
     DEFAULT_OUTCOME_RECENCY_DAYS,
+    DEFAULT_CALIBRATION_MIN_LOSSES,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import (
@@ -194,6 +195,7 @@ async def api_comics_outcomes(
 async def api_comics_calibration(
     request: Request,
     days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+    min_losses: int = DEFAULT_CALIBRATION_MIN_LOSSES,
 ):
     """BUI-288 (Issue C): loss-vs-FMV calibration report — DIAGNOSTIC ONLY.
 
@@ -209,12 +211,16 @@ async def api_comics_calibration(
     See `calibration_report`'s docstring for the full rationale (R4/R5 in the
     auction-outcome-feedback plan) before changing this endpoint's shape.
 
+    `min_losses` (default 2, FIX 3) requires a (comic, grade) to have lost at
+    least this many times in-window before it can surface at all — a single
+    high-overshoot loss is a bidding-war outlier, not a persistent pattern.
+
     Consumed by the `/comic:calibration-report` skill, which curls this
     endpoint and renders the ranked table — mirroring how `wishlist-sellers`
     and `seller-scan` are thin CLI/skill layers over server-owned aggregates.
     """
     db = request.app.state.db
-    return calibration_report(db, days=days)
+    return calibration_report(db, days=days, min_losses=min_losses)
 
 
 @router.post("/api/comics")

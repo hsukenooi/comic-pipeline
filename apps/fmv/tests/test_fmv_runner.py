@@ -226,6 +226,20 @@ class TestDbLookup:
                                         max_age_days=7)
         assert row is None  # fail-soft so we still try to compute fresh
 
+    def test_malformed_json_warns_and_returns_none(self, server_url, capsys):
+        """_get_json_or_warn's docstring promises a non-JSON body warns to
+        stderr — a malformed comics-server response must be visible, not a
+        silent cache-miss."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = ValueError("not json")
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            row = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                        max_age_days=7)
+        assert row is None
+        err = capsys.readouterr().err
+        assert "Warning" in err and "invalid JSON" in err
+
 
 # ─── _compute_and_upsert_one ──────────────────────────────────────────────────
 
