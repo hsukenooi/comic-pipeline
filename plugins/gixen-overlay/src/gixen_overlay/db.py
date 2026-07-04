@@ -1225,7 +1225,12 @@ DEFAULT_OUTCOME_RECENCY_DAYS = 180
 # winning_bid is the underbidder's max; the wins we see are the auctions we
 # *didn't* lose to a higher bidder, so a wins-only sample biases low). See the
 # Problem Frame in docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md.
-_OUTCOME_STATUSES_SQL = "'WON', 'LOST'"
+_STATUS_WON = "WON"
+_STATUS_LOST = "LOST"
+# Single source of truth: the SQL IN-list is built from the same constants the
+# Python-side bucketing in `calibration_report` compares against, so the two
+# can't drift if the resolved-status set ever changes.
+_OUTCOME_STATUSES_SQL = f"'{_STATUS_WON}', '{_STATUS_LOST}'"
 
 # Shared "a resolved auction" predicate fragments (BUI-286/BUI-288). Both
 # `get_first_party_outcomes` (Issue A, the comp-pool feed) and
@@ -1315,7 +1320,6 @@ def get_first_party_outcomes(
     params.extend([grade - window, grade + window])
     clauses.append(f"b.status IN ({_OUTCOME_STATUSES_SQL})")
     clauses.append(_WINNING_BID_NOT_NULL_CLAUSE)
-    clauses.append("COALESCE(b.auction_end_at, b.resolved_at) IS NOT NULL")
     # Normalize both sides through SQLite's own datetime() rather than
     # comparing against a Python-formatted ISO string: auction_end_at/
     # resolved_at are stored in SQLite's "YYYY-MM-DD HH:MM:SS" shape (space
@@ -1459,9 +1463,9 @@ def calibration_report(
             },
         )
         ratio = row["winning_bid"] / fmv_high
-        if row["status"] == "LOST":
+        if row["status"] == _STATUS_LOST:
             group["_losses"].append(ratio)
-        elif row["status"] == "WON":
+        elif row["status"] == _STATUS_WON:
             group["_wins"].append(ratio)
 
     report: list[dict[str, Any]] = []

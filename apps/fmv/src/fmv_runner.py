@@ -203,18 +203,12 @@ def _db_lookup(server_url: str, *, locg_id: int, grade: float,
                     "max_age_days": max_age_days}
     if locg_variant_id is not None:
         params["locg_variant_id"] = locg_variant_id
-    try:
-        resp = requests.get(
-            f"{server_url}/api/comics",
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        click.echo(f"Warning: DB cache lookup failed (locg_id={locg_id}): {e}",
-                   err=True)
+    rows = _get_json_or_warn(
+        f"{server_url}/api/comics", params=params,
+        warn=f"DB cache lookup failed (locg_id={locg_id})", default=None,
+    )
+    if rows is None:
         return None
-    rows = resp.json()
     # A stub fmv row (null fmv_low, written by BUI-44 when n=0 comps) links the
     # comic but has no pricing to reuse — don't count it as a cache hit, so the
     # book falls through to a fresh fetch+compute instead of reusing the stub.
@@ -312,6 +306,27 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
                 pass
 
 
+def _get_json_or_warn(url: str, *, params: dict, warn: str, default,
+                      timeout: int = 15):
+    """GET `url` and return parsed JSON, or `default` on any failure.
+
+    The shared soft-fail HTTP shape for the comics-server read helpers
+    (`_db_lookup`, `_fetch_first_party_outcomes`): a transport/HTTP error or a
+    non-JSON body warns to stderr (`Warning: {warn}: {err}`) and returns
+    `default`, so the caller degrades gracefully (prices as if the lookup found
+    nothing) rather than raising.
+    """
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        click.echo(f"Warning: {warn}: {e}", err=True)
+        return default
+    except ValueError:
+        return default
+
+
 # ─── Step 2b — First-party outcomes (BUI-286) ─────────────────────────────────
 
 # Recency window for pulling the user's own resolved auctions back in as
@@ -363,21 +378,12 @@ def _fetch_first_party_outcomes(server_url: str, *, target_grade: float,
         params["issue"] = str(issue)
         if year is not None:
             params["year"] = year
-    try:
-        resp = requests.get(f"{server_url}/api/comics/outcomes", params=params,
-                            timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        click.echo(
-            f"Warning: first-party outcomes lookup failed "
-            f"(locg_id={locg_id}, title={title!r} issue={issue!r}): {e}",
-            err=True,
-        )
-        return []
-    try:
-        rows = resp.json()
-    except ValueError:
-        return []
+    rows = _get_json_or_warn(
+        f"{server_url}/api/comics/outcomes", params=params,
+        warn=(f"first-party outcomes lookup failed "
+              f"(locg_id={locg_id}, title={title!r} issue={issue!r})"),
+        default=[],
+    )
     return [
         {"price": r["price"], "grade": r["grade"],
          "sold_date": r.get("sold_date", ""), "source": "first_party"}

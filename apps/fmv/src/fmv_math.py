@@ -427,7 +427,6 @@ def compute_fmv(comps: list[dict], target_grade: float,
     else:
         lo_bound, hi_bound = bounds
         trimmed_comps = [c for c in pool if lo_bound <= c["price"] <= hi_bound]
-    trimmed_comps.sort(key=lambda c: c["price"])
 
     trimmed = [c["price"] for c in trimmed_comps]
     n = len(trimmed)
