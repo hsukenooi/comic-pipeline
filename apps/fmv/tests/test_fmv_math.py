@@ -1,5 +1,8 @@
 """Tests for fmv_math.py — pure functions, no I/O, no network."""
 
+import statistics
+from datetime import date, timedelta
+
 import pytest
 
 import fmv_math as fm
@@ -7,6 +10,10 @@ import fmv_math as fm
 
 def _comp(price, grade=None):
     return {"price": price, "grade": grade}
+
+
+def _dated_comp(price, grade, sold_date):
+    return {"price": price, "grade": grade, "sold_date": sold_date}
 
 
 # ─── build_pool ────────────────────────────────────────────────────────────────
@@ -301,6 +308,188 @@ class TestPriceabilityGuards:
         comps = [_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
         out = fm.compute_fmv(comps, target_grade=9.6, max_window=2.5)
         assert out["flag_reason"] == "one_sided"
+
+
+# ─── Recency weighting (BUI-287 U2) ───────────────────────────────────────────
+
+class TestParseSoldDate:
+    def test_serpapi_free_text(self):
+        assert fm._parse_sold_date("Sold Oct 12, 2026") == date(2026, 10, 12)
+
+    def test_iso_first_party(self):
+        assert fm._parse_sold_date("2026-06-01T12:34:56Z") == date(2026, 6, 1)
+
+    def test_iso_date_only(self):
+        assert fm._parse_sold_date("2026-06-01") == date(2026, 6, 1)
+
+    def test_missing_or_unparseable_is_none(self):
+        assert fm._parse_sold_date(None) is None
+        assert fm._parse_sold_date("") is None
+        assert fm._parse_sold_date("   ") is None
+        assert fm._parse_sold_date("garbage") is None
+        assert fm._parse_sold_date(12345) is None  # non-string envelope value
+
+
+class TestRecencyWeight:
+    def test_fresh_comp_is_full_weight(self):
+        ref = date(2026, 6, 1)
+        assert fm._recency_weight(ref, ref) == 1.0
+
+    def test_no_date_is_neutral_weight(self):
+        assert fm._recency_weight(None, date(2026, 6, 1)) == 1.0
+
+    def test_one_half_life_older_is_half_weight(self):
+        # KTD-7 test scenario: a comp exactly one half-life older contributes
+        # ~half the weight of an identical fresh comp.
+        ref = date(2026, 6, 1)
+        older = ref - timedelta(days=fm.RECENCY_HALF_LIFE_DAYS)
+        assert fm._recency_weight(older, ref) == pytest.approx(0.5, rel=1e-9)
+
+    def test_two_half_lives_older_is_quarter_weight(self):
+        ref = date(2026, 6, 1)
+        older = ref - timedelta(days=2 * fm.RECENCY_HALF_LIFE_DAYS)
+        assert fm._recency_weight(older, ref) == pytest.approx(0.25, rel=1e-9)
+
+    def test_future_date_relative_to_reference_is_not_penalized(self):
+        # Shouldn't happen (reference is the max date in the pool) but must
+        # not produce a weight > 1.0 on a rounding edge case.
+        ref = date(2026, 6, 1)
+        assert fm._recency_weight(ref + timedelta(days=1), ref) == 1.0
+
+
+class TestWeightedQuantiles:
+    def test_degenerate_no_weights_matches_quartile_exactly(self):
+        prices = [100, 110, 120, 130, 140, 150, 160, 170, 180]
+        weights = [1.0] * len(prices)
+        assert fm.weighted_quartile(prices, weights, 0.25) == fm.quartile(prices, 0.25)
+        assert fm.weighted_quartile(prices, weights, 0.75) == fm.quartile(prices, 0.75)
+
+    def test_degenerate_equal_nonunit_weights_matches_quartile_exactly(self):
+        # Equal but not literally 1.0 — still degenerate (all-same-date pool).
+        prices = [10, 20, 30, 40]
+        weights = [0.4, 0.4, 0.4, 0.4]
+        assert fm.weighted_quartile(prices, weights, 0.5) == fm.quartile(prices, 0.5)
+
+    def test_degenerate_median_matches_statistics_median_exactly(self):
+        prices = [10, 20, 30, 40]
+        weights = [1.0, 1.0, 1.0, 1.0]
+        assert fm.weighted_median(prices, weights) == statistics.median(prices)
+
+    def test_weighting_direction_recent_high_beats_unweighted_median(self):
+        # A recent high price and an old low price: the weighted median must
+        # sit ABOVE the unweighted median (the old low comp is discounted).
+        prices = [100, 200]
+        weights = [0.05, 1.0]  # 100 is stale, 200 is fresh
+        unweighted = statistics.median(prices)
+        weighted = fm.weighted_median(prices, weights)
+        assert weighted > unweighted
+
+    def test_weighting_direction_quartile(self):
+        prices = [100, 110, 120, 130, 140]
+        weights = [0.05, 0.05, 0.05, 1.0, 1.0]  # low prices stale, high prices fresh
+        unweighted_q75 = fm.quartile(prices, 0.75)
+        weighted_q75 = fm.weighted_quartile(prices, weights, 0.75)
+        assert weighted_q75 >= unweighted_q75
+
+    def test_weighted_median_exact_value_hand_computed(self):
+        """FIX 6 (test hardening): the directional tests above only assert
+        `weighted > unweighted` — a sign/fraction bug that still moves the
+        right way would sail through. Pin an exact value derived from
+        `weighted_quartile`'s OWN documented formula (read from fmv_math.py,
+        not guessed), so a wrong-but-monotonic implementation fails.
+
+        weighted_quartile's algorithm (unequal-weight branch):
+          1. sort (price, weight) pairs by price
+          2. cumulative weight `cum` after each pair; total = sum(weights)
+          3. each pair's "position" = (cum - weight/2) / total
+          4. linearly interpolate `q` between the two bracketing positions
+
+        Pool: prices=[10, 20, 30], weights=[1.0, 1.0, 0.5] (already sorted by
+        price; not all-equal, so this exercises the real weighted branch, not
+        the equal-weight passthrough to `quartile`/`statistics.median`).
+
+        Hand computation for q=0.5 (weighted_median):
+          total = 1.0 + 1.0 + 0.5 = 2.5
+          pair0 (10, 1.0):  cum=1.0  -> position = (1.0 - 1.0/2) / 2.5 = 0.5/2.5 = 0.20
+          pair1 (20, 1.0):  cum=2.0  -> position = (2.0 - 1.0/2) / 2.5 = 1.5/2.5 = 0.60
+          pair2 (30, 0.5):  cum=2.5  -> position = (2.5 - 0.5/2) / 2.5 = 2.25/2.5 = 0.90
+          q=0.5 falls between pair0's 0.20 and pair1's 0.60 (positions[1]=0.60
+          is the first >= q):
+            frac = (0.5 - 0.20) / (0.60 - 0.20) = 0.30 / 0.40 = 0.75
+            value = 10 + 0.75 * (20 - 10) = 10 + 7.5 = 17.5
+        """
+        prices = [10, 20, 30]
+        weights = [1.0, 1.0, 0.5]
+        assert not fm._weights_equal(weights)  # confirm this hits the real branch
+        assert fm.weighted_median(prices, weights) == pytest.approx(17.5, rel=1e-3)
+        assert fm.weighted_quartile(prices, weights, 0.5) == pytest.approx(17.5, rel=1e-3)
+
+
+class TestConfidenceReconciledToEffectiveN:
+    def test_many_stale_comps_no_longer_earn_high_on_raw_count(self):
+        # 8 near-identical, low-CV prices would earn HIGH under the old
+        # raw-count rubric (n>=8, cv<25%). Only one comp is recent; the
+        # other 7 are ~2.8 half-lives stale, so effective sample size
+        # collapses well below every confidence tier's floor.
+        recent = _dated_comp(100, 8.0, "2026-06-01")
+        stale = [_dated_comp(101 + i, 8.0, "2025-11-01") for i in range(7)]
+        comps = [recent] + stale
+        out = fm.compute_fmv(comps, target_grade=8.0)
+        assert out["n"] == 8                 # raw trimmed count unchanged
+        assert out["effective_n"] < 4        # far below even the MEDIUM floor
+        assert out["confidence"] != "HIGH"
+
+    def test_all_fresh_comps_unaffected(self):
+        # Sanity: when every comp is equally fresh (same date), effective_n
+        # equals raw n and the confidence rubric is untouched.
+        comps = [_dated_comp(100 + i, 8.0, "2026-06-01") for i in range(9)]
+        out = fm.compute_fmv(comps, target_grade=8.0)
+        assert out["effective_n"] == out["n"] == 9
+        assert out["confidence"] == "HIGH"
+
+
+class TestDegenerateBackCompat:
+    """R2-critical (BUI-287 U2): a no-date pool and an all-same-date pool
+    must each reduce EXACTLY to the pre-U2 unweighted result."""
+
+    _PRICES = [100, 110, 120, 130, 140, 150, 160, 170, 180]
+
+    def test_no_date_pool_matches_unweighted_math_exactly(self):
+        comps = [_comp(p, 8.0) for p in self._PRICES]
+        out = fm.compute_fmv(comps, target_grade=8.0)
+        assert out["effective_n"] == out["n"] == 9
+
+        trimmed = fm.iqr_trim(self._PRICES)
+        assert out["fmv_low"] == fm.clean_round(fm.quartile(trimmed, 0.25))
+        assert out["fmv_high"] == fm.clean_round(fm.quartile(trimmed, 0.75))
+        assert out["median"] == fm.clean_round(statistics.median(trimmed))
+
+    def test_all_same_date_pool_matches_no_date_pool_exactly(self):
+        dated_comps = [_dated_comp(p, 8.0, "2026-06-01") for p in self._PRICES]
+        undated_comps = [_comp(p, 8.0) for p in self._PRICES]
+
+        dated_out = fm.compute_fmv(dated_comps, target_grade=8.0)
+        undated_out = fm.compute_fmv(undated_comps, target_grade=8.0)
+
+        assert dated_out["effective_n"] == dated_out["n"] == 9
+        assert dated_out["fmv_low"] == undated_out["fmv_low"]
+        assert dated_out["fmv_high"] == undated_out["fmv_high"]
+        assert dated_out["median"] == undated_out["median"]
+        assert dated_out["confidence"] == undated_out["confidence"]
+        assert dated_out["max_bid"] == undated_out["max_bid"]
+
+
+class TestComputeFmvRecencyIntegration:
+    def test_recent_high_pulls_fmv_up_vs_unweighted(self):
+        old_low = _dated_comp(100, 8.0, "2025-01-01")
+        recent_high = _dated_comp(200, 8.0, "2026-06-01")
+        weighted_out = fm.compute_fmv([old_low, recent_high], target_grade=8.0)
+
+        unweighted_out = fm.compute_fmv(
+            [_comp(100, 8.0), _comp(200, 8.0)], target_grade=8.0
+        )
+        assert weighted_out["median"] > unweighted_out["median"]
+        assert weighted_out["fmv_high"] > unweighted_out["fmv_high"]
 
 
 # ─── bid_factor (BUI-51 confidence haircut) ───────────────────────────────────

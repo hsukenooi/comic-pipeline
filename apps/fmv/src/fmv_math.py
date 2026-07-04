@@ -13,7 +13,10 @@ QUARTILE.INC and behaves predictably on the 5-15 point pools we see.
 
 from __future__ import annotations
 
+import math
+import re
 import statistics
+from datetime import date, datetime
 from typing import Iterable
 
 
@@ -84,16 +87,24 @@ def _classify_pool(pool: list[dict], target_grade: float,
 
 # ─── IQR trim + quartiles (inclusive method) ──────────────────────────────────
 
-def iqr_trim(prices: list[float]) -> list[float]:
-    """Drop values outside Q1 - 1.5*IQR to Q3 + 1.5*IQR."""
+def _iqr_bounds(prices: list[float]) -> tuple[float, float] | None:
+    """Q1 - 1.5*IQR / Q3 + 1.5*IQR bounds, or None if too few points (n<3)."""
     if len(prices) < 3:
-        return list(prices)
+        return None
     s = sorted(prices)
     qs = statistics.quantiles(s, n=4, method="inclusive")
     q1, q3 = qs[0], qs[2]
     iqr = q3 - q1
-    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-    return [p for p in s if lo <= p <= hi]
+    return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+
+def iqr_trim(prices: list[float]) -> list[float]:
+    """Drop values outside Q1 - 1.5*IQR to Q3 + 1.5*IQR."""
+    bounds = _iqr_bounds(prices)
+    if bounds is None:
+        return list(prices)
+    lo, hi = bounds
+    return [p for p in sorted(prices) if lo <= p <= hi]
 
 
 def quartile(prices: list[float], q: float) -> float:
@@ -104,6 +115,156 @@ def quartile(prices: list[float], q: float) -> float:
     # qs has 99 cut points (between n=100 buckets); index i = (i+1)/100 quantile
     idx = max(0, min(98, round(q * 100) - 1))
     return qs[idx]
+
+
+# ─── Recency weighting (BUI-287 U2) ───────────────────────────────────────────
+#
+# fmv_math stays a pure, clock-free function: the reference date used to age
+# every comp is the NEWEST `sold_date` found *within the pool being priced*
+# (never datetime.now()/date.today()). The newest comp always gets weight 1.0;
+# older comps decay by exp(-ln2 * age_days / RECENCY_HALF_LIFE_DAYS). A comp
+# with a missing or unparseable `sold_date` gets NEUTRAL weight 1.0 — most
+# existing comps/tests carry no date at all, so an all-neutral-weight pool
+# must price byte-for-byte identically to the pre-U2 unweighted math.
+
+RECENCY_HALF_LIFE_DAYS = 75  # empirical starting point (60-90 day range)
+
+_SOLD_DATE_PREFIX_RE = re.compile(r"^\s*sold\s+", re.IGNORECASE)
+_SOLD_DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y")  # SerpApi free text, e.g. "Oct 12, 2026"
+
+
+def _parse_sold_date(value: object) -> date | None:
+    """Parse a comp's `sold_date` into a comparable date, or None.
+
+    Handles the two known shapes in this codebase: SerpApi's "Sold Mon DD,
+    YYYY" free text (apps/ebay/src/sold_comps.py `parse_comp`) and first-party
+    comps' ISO-8601 `resolved_at` timestamp (apps/fmv/src/fmv_runner.py).
+    Missing, blank, or unparseable values return None so the caller can fall
+    back to neutral weight rather than crash or guess.
+    """
+    if not isinstance(value, str):
+        return None
+    text = _SOLD_DATE_PREFIX_RE.sub("", value).strip()
+    if not text:
+        return None
+    iso_candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        return datetime.fromisoformat(iso_candidate).date()
+    except ValueError:
+        pass
+    for fmt in _SOLD_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _recency_weight(sold_date: date | None, reference: date) -> float:
+    """Exponential-decay weight for one comp relative to `reference`.
+
+    `reference` is the newest sold_date already found in the pool (see
+    `_recency_weights`) — never a live clock. A comp with no parseable date
+    gets weight 1.0 (neutral); a comp dated after `reference` (shouldn't
+    happen since reference is the max, but guards float/rounding edge cases)
+    also gets 1.0 rather than a weight > 1.0.
+    """
+    if sold_date is None:
+        return 1.0
+    age_days = (reference - sold_date).days
+    if age_days <= 0:
+        return 1.0
+    return math.exp(-math.log(2) * age_days / RECENCY_HALF_LIFE_DAYS)
+
+
+def _recency_weights(pool_comps: list[dict]) -> list[float]:
+    """Return one weight per comp in `pool_comps`, in the same order.
+
+    Reference date = newest parseable `sold_date` in THIS pool (fully
+    deterministic, no clock). If no comp in the pool has a parseable date,
+    every weight is the neutral 1.0 — the degenerate no-date case required
+    to reduce exactly to the pre-U2 unweighted result.
+    """
+    parsed = [_parse_sold_date(c.get("sold_date")) for c in pool_comps]
+    known = [d for d in parsed if d is not None]
+    if not known:
+        return [1.0] * len(pool_comps)
+    reference = max(known)
+    return [_recency_weight(d, reference) for d in parsed]
+
+
+def _weights_equal(weights: list[float]) -> bool:
+    """True if every weight is (approximately) the same value.
+
+    Covers both the no-date pool (all neutral 1.0) and an all-same-date pool
+    (all comps age-0 relative to the newest → all 1.0) — the two degenerate
+    cases that must reduce EXACTLY to the unweighted quantile functions.
+    """
+    if not weights:
+        return True
+    first = weights[0]
+    return all(abs(w - first) < 1e-9 for w in weights)
+
+
+def weighted_quartile(prices: list[float], weights: list[float], q: float) -> float:
+    """Weighted analog of `quartile`.
+
+    When every weight is equal (degenerate: no dates, or all-same-date pool),
+    delegates to the exact unweighted `quartile` — guaranteed byte-identical,
+    not just numerically close, which is what keeps the existing golden
+    fixture and no-date test suite green (BUI-287 U2).
+
+    Otherwise uses the standard "weighted percentile" midpoint interpolation:
+    for sorted (price, weight) pairs, comp i sits at cumulative-weight
+    fraction (S_i - w_i/2) / W, where S_i is the cumulative weight through i
+    and W is the total weight; `q` is linearly interpolated between the two
+    bracketing comps (flat-extrapolated past the first/last comp's position).
+    Unlike a knot placement anchored at exactly 0/1 (e.g. a naive weighted
+    generalization of the type-7 method used for the unweighted case), this
+    lets a 2-comp pool's weight *ratio* actually move the estimate — required
+    for the recency-weighting direction test (a fresher, higher-weighted comp
+    must pull the quantile toward it even with only two comps).
+    """
+    if len(prices) == 1:
+        return prices[0]
+    if _weights_equal(weights):
+        return quartile(prices, q)
+    pairs = sorted(zip(prices, weights), key=lambda pw: pw[0])
+    vals = [p for p, _ in pairs]
+    ws = [w for _, w in pairs]
+    n = len(vals)
+    total = sum(ws)
+    cum = 0.0
+    positions = []
+    for w in ws:
+        cum += w
+        positions.append((cum - w / 2) / total)
+    if q <= positions[0]:
+        return vals[0]
+    if q >= positions[-1]:
+        return vals[-1]
+    for i in range(1, n):
+        if positions[i] >= q:
+            p0, p1 = positions[i - 1], positions[i]
+            v0, v1 = vals[i - 1], vals[i]
+            frac = (q - p0) / (p1 - p0) if p1 > p0 else 0.0
+            return v0 + frac * (v1 - v0)
+    return vals[-1]
+
+
+def weighted_median(prices: list[float], weights: list[float]) -> float:
+    """Weighted analog of statistics.median.
+
+    Degenerates EXACTLY to `statistics.median` when every weight is equal
+    (mirrors why `compute_fmv` calls statistics.median directly rather than
+    `quartile(prices, 0.5)` for the unweighted case — quartile's 99-cutpoint
+    grid can disagree with the true median on small/even-n pools).
+    """
+    if len(prices) == 1:
+        return prices[0]
+    if _weights_equal(weights):
+        return statistics.median(prices)
+    return weighted_quartile(prices, weights, 0.5)
 
 
 def cv(prices: list[float]) -> float | None:
@@ -118,8 +279,15 @@ def cv(prices: list[float]) -> float | None:
 
 # ─── Confidence rubric ────────────────────────────────────────────────────────
 
-def confidence_label(n: int, cv_value: float | None) -> str:
-    """Per the rubric in /comic:fmv § 8."""
+def confidence_label(n: float, cv_value: float | None) -> str:
+    """Per the rubric in /comic:fmv § 8.
+
+    `n` is the EFFECTIVE sample size (sum of recency weights, BUI-287 U2),
+    not necessarily the raw trimmed-pool count — a pool of many stale comps
+    can no longer claim HIGH purely on raw count. When every comp carries
+    neutral weight 1.0 (no dates, or all-same-date), effective n equals the
+    raw count exactly, so every pre-U2 caller/test is unaffected.
+    """
     if cv_value is None:
         return "MEDIUM-LOW" if n >= 3 else "LOW"
     pct = cv_value * 100
@@ -223,13 +391,15 @@ def compute_fmv(comps: list[dict], target_grade: float,
 
     Output shape:
     {
-      "n": int,                        # trimmed pool size
+      "n": int,                        # trimmed pool size (raw count)
+      "effective_n": float,            # sum of recency weights (BUI-287 U2);
+                                        # == n when every comp has neutral weight
       "window": float,                 # window the pool was built at (≤ max_window)
       "flag_reason": str | None,       # one_sided | too_wide | too_sparse | None (BUI-86)
       "grade_span": float | None,      # max(grade) - min(grade) over the pool
-      "fmv_low": int | None,           # Q25, clean-rounded (None if flagged/no-comps)
-      "fmv_high": int | None,          # Q75, clean-rounded
-      "median": int | None,            # median, clean-rounded
+      "fmv_low": int | None,           # weighted Q25, clean-rounded (None if flagged/no-comps)
+      "fmv_high": int | None,          # weighted Q75, clean-rounded
+      "median": int | None,            # weighted median, clean-rounded
       "max_bid": int | None,           # bid_factor × fmv_high, clean-rounded
       "cv": float | None,              # raw CV (not %)
       "cv_pct": str,                   # human "27%" or "n/a"
@@ -247,9 +417,23 @@ def compute_fmv(comps: list[dict], target_grade: float,
     if max_window is None:
         max_window = MAX_GRADE_WINDOW
     pool, window = build_pool(comps, target_grade, max_window=max_window)
-    trimmed = iqr_trim([c["price"] for c in pool])
+
+    # IQR-trim by price but keep the surviving comps as dicts (not just a
+    # price list) so recency weighting (below) can still read their
+    # sold_date. Bounds are computed the same way iqr_trim() does internally.
+    bounds = _iqr_bounds([c["price"] for c in pool])
+    if bounds is None:
+        trimmed_comps = list(pool)
+    else:
+        lo_bound, hi_bound = bounds
+        trimmed_comps = [c for c in pool if lo_bound <= c["price"] <= hi_bound]
+
+    trimmed = [c["price"] for c in trimmed_comps]
     n = len(trimmed)
-    cv_val = cv(trimmed)
+    cv_val = cv(trimmed)  # dispersion stays unweighted — only the point/quartile
+                          # estimate and the confidence sample-size are recency-aware
+    weights = _recency_weights(trimmed_comps)
+    effective_n = sum(weights)
     flag_reason, grade_span = _classify_pool(pool, target_grade, n)
 
     # BUI-179: a 2-comp pool is never IQR-trimmed (len<3) and isn't too_sparse
@@ -261,7 +445,7 @@ def compute_fmv(comps: list[dict], target_grade: float,
         if lo <= 0 or hi / lo > SMALL_POOL_MAX_RATIO:
             flag_reason = "too_sparse"
 
-    label = confidence_label(n, cv_val)
+    label = confidence_label(effective_n, cv_val)
     if flag_reason is not None:
         label = "LOW"  # a needs_manual book never claims priceable confidence
     elif window > WIDE_GRADE_WINDOW and _rank(label) > _CONF_RANK["MEDIUM"]:
@@ -271,13 +455,14 @@ def compute_fmv(comps: list[dict], target_grade: float,
     if flag_reason is not None or n == 0:
         fmv_low = fmv_high = med = max_bid = None
     else:
-        fmv_low = clean_round(quartile(trimmed, 0.25))
-        fmv_high = clean_round(quartile(trimmed, 0.75))
-        med = clean_round(statistics.median(trimmed))
+        fmv_low = clean_round(weighted_quartile(trimmed, weights, 0.25))
+        fmv_high = clean_round(weighted_quartile(trimmed, weights, 0.75))
+        med = clean_round(weighted_median(trimmed, weights))
         max_bid = clean_round(fmv_high * factor)
 
     return {
         "n": n,
+        "effective_n": effective_n,
         "window": window,
         "flag_reason": flag_reason,
         "grade_span": grade_span,

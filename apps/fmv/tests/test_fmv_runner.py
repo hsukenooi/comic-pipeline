@@ -19,6 +19,18 @@ def server_url():
     return "http://test-server:8080"
 
 
+@pytest.fixture(autouse=True)
+def _no_first_party_outcomes_by_default(monkeypatch):
+    """BUI-286: `_compute_and_upsert_one` now also calls out to
+    `_fetch_first_party_outcomes` (a real HTTP GET). None of the tests in this
+    file are about that feature — it's covered end-to-end in
+    test_first_party_comps.py — so default it to a no-op here rather than
+    editing every existing `_compute_and_upsert_one`/`run` call site to mock
+    yet another network call it was never testing."""
+    monkeypatch.setattr(fmv_runner, "_fetch_first_party_outcomes",
+                        lambda *a, **k: [])
+
+
 def _make_book(item_id, title, issue, year, grade, locg_id=None):
     book = {"item_id": item_id, "title": title, "issue": issue,
             "year": year, "grade": grade}
@@ -213,6 +225,23 @@ class TestDbLookup:
             row = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
                                         max_age_days=7)
         assert row is None  # fail-soft so we still try to compute fresh
+
+    def test_malformed_json_warns_and_returns_none(self, server_url, capsys):
+        """_get_json_or_warn's docstring promises a non-JSON body warns to
+        stderr — a malformed comics-server response must be visible, not a
+        silent cache-miss."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        # Real requests raises requests.exceptions.JSONDecodeError (a subclass
+        # of both ValueError and RequestException), not a bare ValueError.
+        mock_resp.json.side_effect = fmv_runner.requests.exceptions.JSONDecodeError(
+            "Expecting value", "", 0)
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            row = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                        max_age_days=7)
+        assert row is None
+        err = capsys.readouterr().err
+        assert "Warning" in err and "invalid JSON" in err
 
 
 # ─── _compute_and_upsert_one ──────────────────────────────────────────────────

@@ -25,6 +25,11 @@ from gixen_overlay.db import (
     mark_items_seen,
     get_collection_wins_seen,
     mark_collection_wins_seen,
+    get_first_party_outcomes,
+    calibration_report,
+    DEFAULT_OUTCOME_GRADE_WINDOW,
+    DEFAULT_OUTCOME_RECENCY_DAYS,
+    DEFAULT_CALIBRATION_MIN_LOSSES,
 )
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import (
@@ -141,6 +146,81 @@ async def api_list_comics(
         max_age_days=max_age_days,
     )
     return [dict(r) for r in rows]
+
+
+@router.get("/api/comics/outcomes")
+async def api_comics_outcomes(
+    request: Request,
+    grade: float,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    locg_id: int | None = None,
+    locg_variant_id: int | None = None,
+    window: float = DEFAULT_OUTCOME_GRADE_WINDOW,
+    days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+):
+    """BUI-286: the user's own resolved auctions for a (comic, grade) window.
+
+    Feeds `apps/fmv`'s first-party-comp merge (Issue A) — comic-fmv calls this
+    over HTTP (it has no direct DB access; the DB lives on the comics server)
+    the same way it already round-trips `/api/comics` for cache reuse and
+    upsert. Deliberately provider-neutral (never `/locg/*`) per the overlay's
+    endpoint convention, and deliberately reusable as-is by the later
+    loss-vs-FMV calibration report (Issue C) so "a resolved auction" is
+    defined exactly once.
+
+    Comic resolution: `locg_id` (+ optional `locg_variant_id`) when given,
+    else `title` + `issue` (+ optional `year`) — same as `/api/comics`.
+
+    Always both WON and LOST (R2/KTD-3) — see `get_first_party_outcomes` for
+    why there is no parameter to narrow this to wins alone.
+    """
+    db = request.app.state.db
+    rows = get_first_party_outcomes(
+        db,
+        grade=grade,
+        title=title,
+        issue=issue,
+        year=year,
+        locg_id=locg_id,
+        locg_variant_id=locg_variant_id,
+        window=window,
+        days=days,
+    )
+    return [dict(r) for r in rows]
+
+
+@router.get("/api/comics/calibration")
+async def api_comics_calibration(
+    request: Request,
+    days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+    min_losses: int = DEFAULT_CALIBRATION_MIN_LOSSES,
+):
+    """BUI-288 (Issue C): loss-vs-FMV calibration report — DIAGNOSTIC ONLY.
+
+    Ranks priced (comic, grade) books whose recent LOSSES are clearing above
+    `fmv.high`, so a human can decide which ones to recompute `comic-fmv` for.
+    This endpoint performs **no writes** — it is a read-only aggregate over
+    `get_first_party_outcomes`'s "a resolved auction" definition (see
+    `calibration_report` in `db.py`) plus each book's own `fmv.high`.
+
+    **The ranking key is overshoot vs `fmv.high`, never raw win/loss rate** —
+    losing is the intended outcome of the bid haircut, so a high loss count
+    alone is not surfaced; only *persistently clearing above fmv.high* is.
+    See `calibration_report`'s docstring for the full rationale (R4/R5 in the
+    auction-outcome-feedback plan) before changing this endpoint's shape.
+
+    `min_losses` (default 2, FIX 3) requires a (comic, grade) to have lost at
+    least this many times in-window before it can surface at all — a single
+    high-overshoot loss is a bidding-war outlier, not a persistent pattern.
+
+    Consumed by the `/comic:calibration-report` skill, which curls this
+    endpoint and renders the ranked table — mirroring how `wishlist-sellers`
+    and `seller-scan` are thin CLI/skill layers over server-owned aggregates.
+    """
+    db = request.app.state.db
+    return calibration_report(db, days=days, min_losses=min_losses)
 
 
 @router.post("/api/comics")
