@@ -78,5 +78,5 @@ uvx mypy --ignore-missing-imports apps/fmv/src/fmv_runner.py plugins/gixen-overl
 ## Related
 
 - `docs/solutions/best-practices/fmv-self-referential-feedback-deflation-guard.md` — the sibling Python gotcha (`JSONDecodeError` subclassing both `ValueError` and `RequestException`) surfaced during the same FMV feedback-loop work.
-- `docs/solutions/developer-experience/apps-tests-require-uv-run-with-pytest.md` — the `apps/*` tests need `uv run --with pytest`; note that doc (and root `CLAUDE.md`) still claim "CI does not run the suites," which BUI-140 made stale — `ci.yml`'s `workspace` + `apps-python` jobs now run the pytest suites as the merge gate.
+- `docs/solutions/developer-experience/apps-tests-require-uv-run-with-pytest.md` — the `apps/*` tests need `uv run --with pytest` (the exact invocation the `apps-python` CI job uses). CI *does* run the pytest suites as the merge gate (BUI-140, `workspace` + `apps-python` jobs); `typecheck` is the non-required outlier described above.
 - BUI-290 (fix), surfaced via BUI-289 / PR #123; the `typecheck` job is BUI-188.

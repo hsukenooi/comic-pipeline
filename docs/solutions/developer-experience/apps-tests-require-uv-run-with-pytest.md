@@ -1,6 +1,7 @@
 ---
 title: "apps/* tests need `uv run --with pytest pytest` — plain `uv run pytest` silently no-ops"
 date: 2026-07-03
+last_updated: 2026-07-04
 category: docs/solutions/developer-experience
 module: apps/ebay
 problem_type: developer_experience
@@ -41,7 +42,7 @@ with a **non-zero exit** and **no `N passed` summary line**. Any "green" report 
 
 ## Why This Matters
 
-A false pass is worse than a loud failure: it lets a regression through the one gate meant to catch it. CI here does **not** run the suites (it only AST-parses `plugin.py` as a smoke check), so the local run is the real gate — and a silently-skipped app suite means nothing checked the change. Treat the presence of a genuine `N passed` line as the proof of a run, not the command's exit banner.
+A false pass is worse than a loud failure: a green that ran nothing hides the regression from *you*. CI does now run the app suites — the `apps-python` job runs `apps/ebay` + `apps/fmv` with exactly `uv run --with pytest pytest` (BUI-140), so a real break is still caught there. But don't lean on that: a locally-green-but-actually-skipped run means you pushed believing the change was tested, and you lose the fast local signal. (The fix is the same invocation CI uses — which is the tell that plain `uv run pytest` is the wrong local command.) Treat the presence of a genuine `N passed` line as the proof of a run, not the command's exit banner.
 
 ## When to Apply
 

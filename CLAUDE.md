@@ -39,7 +39,7 @@ npm run build       # tsc -> dist/
 npm run dev         # tsx src/cli.ts
 ```
 
-CI (`.github/workflows/ci.yml`) only AST-parses `plugin.py` as a smoke check — it does **not** run the test suites. Run the relevant package's tests locally before committing.
+CI (`.github/workflows/ci.yml`, BUI-140) runs the per-package test suites as the merge gate: the `workspace` job runs the `gixen-cli`/`locg-cli`/`gixen-overlay` pytest suites (plus a `plugin.py` AST smoke-parse), and `apps-python` runs `apps/ebay` + `apps/fmv` (each with `uv run --with pytest pytest`). Also on CI: `lint` (ruff exception-hygiene), `ezship` (tsc + vitest), and `typecheck` (BUI-188: non-strict mypy over `fmv_runner.py` + `routes.py`). Note `typecheck` is a **non-required** check — its failures don't block merges, so a type error can sit red on `main`; check `gh pr checks` rather than just mergeability. Still run the relevant package's tests locally before committing.
 
 ## Architecture
 
