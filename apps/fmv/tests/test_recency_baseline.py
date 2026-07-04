@@ -21,7 +21,7 @@ date.today()), so the fixture is reproducible whenever the suite runs —
 compute_fmv itself ages comps against the newest date *in the pool*, clock-free.
 
 Regenerate the baseline ONLY on an intended change:
-    python tests/test_recency_baseline.py --regen
+    uv run --with pytest python tests/test_recency_baseline.py --regen
 and review the JSON diff before committing.
 """
 from __future__ import annotations
@@ -146,7 +146,7 @@ def test_recent_high_pool_raises_fmv_vs_unweighted():
     # A pool whose recent sales are higher must not price BELOW the unweighted
     # pool on any of the three FMV points.
     assert w["fmv_high"] > u["fmv_high"]
-    assert w["median"] >= u["median"]
+    assert w["median"] > u["median"]
     assert w["max_bid"] > u["max_bid"]
 
 
@@ -155,7 +155,7 @@ def test_recent_low_pool_lowers_fmv_vs_unweighted():
     w = fmv_math.compute_fmv(comps, target_grade=grade)
     u = fmv_math.compute_fmv(_strip_dates(comps), target_grade=grade)
     assert w["fmv_high"] < u["fmv_high"]
-    assert w["median"] <= u["median"]
+    assert w["median"] < u["median"]
     assert w["max_bid"] < u["max_bid"]
 
 
