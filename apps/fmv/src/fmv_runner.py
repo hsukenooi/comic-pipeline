@@ -320,15 +320,17 @@ def _get_json_or_warn(url: str, *, params: dict, warn: str, default,
         resp = requests.get(url, params=params, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        # A malformed (non-JSON) body must not degrade silently into an
+        # indistinguishable cache-miss / no-outcomes result. `resp.json()`
+        # raises requests.exceptions.JSONDecodeError, which subclasses BOTH
+        # ValueError AND requests.RequestException — so this branch must come
+        # FIRST, before the generic RequestException handler below, or the
+        # decode case would be swallowed there with a less specific message.
+        click.echo(f"Warning: {warn}: invalid JSON response", err=True)
+        return default
     except requests.RequestException as e:
         click.echo(f"Warning: {warn}: {e}", err=True)
-        return default
-    except ValueError:
-        # A malformed (non-JSON) body from the comics server must not degrade
-        # silently into an indistinguishable cache-miss / no-outcomes result —
-        # warn so the operator can tell "nothing found" from "the server sent
-        # garbage" (matches this function's own docstring promise).
-        click.echo(f"Warning: {warn}: invalid JSON response", err=True)
         return default
 
 

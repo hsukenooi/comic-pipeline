@@ -1409,14 +1409,18 @@ def calibration_report(
     is **also** omitted — those losses cleared at or below `fmv_high`, which
     is the haircut doing its job, however many losses there are (R4: never
     surface on loss *count*). The gate drops a row when the MEDIAN loss ratio
-    is `<= 1` — a deliberately robust-to-outliers statistic (KTD-4): a single
-    high-ratio loss (a bidding war) does not by itself drag the median above
-    1, so it does not flag the book. This is NOT the same as every individual
-    ratio being `<= 1` — e.g. losses at ratios `[0.5, 0.6, 5.0]` have median
-    `0.6` (dropped by this gate) even though one ratio is `5.0`. The gate is
-    written against the median `overshoot`, not the rate, on purpose — so a
-    future change to the rate metric can't accidentally start surfacing these
-    again.
+    is `<= 1`. For n >= 3 the median is outlier-robust — a single high-ratio
+    loss (a bidding war) does not by itself drag it above 1 (e.g. ratios
+    `[0.5, 0.6, 5.0]` have median `0.6`, dropped, even though one ratio is
+    `5.0`; note this is NOT the same as every individual ratio being `<= 1`).
+    CAVEAT at the default `min_losses = 2`: median([a, b]) == (a + b) / 2, the
+    mean — so a single blowout is only half-tempered. A pair like `[1.02, 8.0]`
+    has median `4.51` and WILL surface at overshoot 4.51. The min_losses gate
+    suppresses lone single-loss noise but is NOT fully outlier-robust at n = 2;
+    the human reading the ranked list should weigh `loss_count` and the loss
+    spread, not `overshoot` alone. The gate is written against the median
+    `overshoot`, not the rate, on purpose — so a future change to the rate
+    metric can't accidentally start surfacing sub-1 medians again.
 
     Returns one dict per (comic, grade) that clears the overshoot gate above,
     each with:

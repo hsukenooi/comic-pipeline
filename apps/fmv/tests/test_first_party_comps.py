@@ -183,7 +183,10 @@ class TestFetchFirstPartyOutcomes:
         indistinguishable 'no first-party outcomes' result."""
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        mock_resp.json.side_effect = ValueError("not json")
+        # Real requests raises requests.exceptions.JSONDecodeError (a subclass
+        # of both ValueError and RequestException), not a bare ValueError.
+        mock_resp.json.side_effect = fmv_runner.requests.exceptions.JSONDecodeError(
+            "Expecting value", "", 0)
         with patch("fmv_runner.requests.get", return_value=mock_resp):
             out = fmv_runner._fetch_first_party_outcomes(
                 server_url(), target_grade=9.0, locg_id=1)
