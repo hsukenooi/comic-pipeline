@@ -1,0 +1,86 @@
+{
+  "degenerate_same_date": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM-HIGH",
+    "effective_n": 5.0,
+    "flag_reason": null,
+    "fmv_high": 130,
+    "fmv_low": 110,
+    "max_bid": 100,
+    "median": 120,
+    "n": 5,
+    "window": 0.5
+  },
+  "direction_down__recent_low_old_high": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM-LOW",
+    "effective_n": 3.062,
+    "flag_reason": null,
+    "fmv_high": 110,
+    "fmv_low": 100,
+    "max_bid": 90,
+    "median": 110,
+    "n": 6,
+    "window": 0.5
+  },
+  "direction_up__recent_high_old_low": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM-LOW",
+    "effective_n": 3.062,
+    "flag_reason": null,
+    "fmv_high": 140,
+    "fmv_low": 130,
+    "max_bid": 110,
+    "median": 130,
+    "n": 6,
+    "window": 0.5
+  },
+  "half_life__75d_old_half_weight": {
+    "bid_factor": 0.8,
+    "confidence": "LOW",
+    "effective_n": 1.5,
+    "flag_reason": null,
+    "fmv_high": 200,
+    "fmv_low": 120,
+    "max_bid": 160,
+    "median": 170,
+    "n": 2,
+    "window": 2.0
+  },
+  "stale_high_count__confidence": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM-HIGH",
+    "effective_n": 5.92,
+    "flag_reason": null,
+    "fmv_high": 110,
+    "fmv_low": 100,
+    "max_bid": 90,
+    "median": 110,
+    "n": 8,
+    "window": 0.5
+  },
+  "thick_mild_skew__typical": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM",
+    "effective_n": 4.545,
+    "flag_reason": null,
+    "fmv_high": 225,
+    "fmv_low": 225,
+    "max_bid": 180,
+    "median": 225,
+    "n": 8,
+    "window": 0.5
+  },
+  "thin_2comp_fresh_high__watch_item": {
+    "bid_factor": 0.8,
+    "confidence": "LOW",
+    "effective_n": 1.157,
+    "flag_reason": null,
+    "fmv_high": 120,
+    "fmv_low": 90,
+    "max_bid": 100,
+    "median": 110,
+    "n": 2,
+    "window": 2.0
+  }
+}
