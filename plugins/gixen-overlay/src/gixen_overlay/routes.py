@@ -1430,7 +1430,7 @@ def _is_pinned_collection_row(
     locked `_mutate` closure in `api_collection_delete` so all three apply
     the identical classification.
     """
-    return (
+    return bool(
         row.get("in_collection")
         and row.get("full_title") == full_title
         and (row.get("release_date") or None) == release_date
