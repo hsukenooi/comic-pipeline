@@ -48,3 +48,14 @@ The process of recording a won eBay auction into the Collection as a Win-Sourced
 The round-trip that mirrors the Collection up to LOCG and reconciles it back: export the pending entries to a bulk-import file, upload it to LOCG, re-export from LOCG, and re-import to clear pending.
 
 The export is **owned-safe**: it never instructs LOCG to un-collect a book you own. LOCG's bulk import treats an `In Collection=0` row as "remove from collection," so the export pushes only genuinely-new wishes you do not already own. The re-import is reconciliation-based: it matches a pending Win-Sourced Entry to its LOCG counterpart even when LOCG has canonicalized the publisher or release date, and never creates a duplicate-identity entry. As of BUI-208 the up-CSV is **wins-only by default** — the code refuses to emit any `In Collection=0` row unless an explicit owned-safe wish push is requested (a machine-enforced gate, on top of the human-reviewed LOCG import preview). There is **no row-count limit** on uploads; the importer hangs only on incomplete/dateless rows (the old "≤20 rows" advice was a misdiagnosis).
+
+## FMV & Pricing
+
+### First-Party Comp
+A sold-price comp sourced from **your own** resolved eBay auctions (`bids.winning_bid`), merged into the FMV comp pool alongside external eBay sold comps (BUI-286). Because a proxy-auction win's price is only ever *at or below* your max, a wins-only set is **truncated from above** and biases FMV down — so first-party comps are always pulled as wins **and** losses together, and a book whose in-window set is wins-only is dropped rather than merged (see the deflation-guard learning in `docs/solutions/best-practices/`).
+
+### Calibration Report
+A **diagnostic-only** audit (BUI-288, `/comic:calibration-report`, `GET /api/comics/calibration`) that ranks issues whose FMV is set too low, so you know which books to re-price. It never bids, snipes, or writes FMV. It keys on **Overshoot vs `fmv_high`**, never on raw win/loss rate — losing is the *intended* outcome of the 80% bid haircut, so a high loss count is not a mispricing signal.
+
+### Overshoot
+The Calibration Report's ranking metric: `median(winning_bid / fmv_high)` over a book's **losing** auctions. Persistently `> 1` means the market keeps clearing above your stated fair-value ceiling, i.e. FMV is too low. A minimum loss count gates single-loss noise out of the ranking.
