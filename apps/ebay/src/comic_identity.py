@@ -612,6 +612,41 @@ def _second_print_reject(title: str) -> bool:
     return bool(_LATER_PRINTING_RE.search(title or ""))
 
 
+# ─── Distribution-variant extraction (BUI-295) ───────────────────────────────
+# Surface the original-print *distribution* variant named in a listing title as
+# a short canonical label, so callers (comic-identify -> /comic:collection-add's
+# identify_data.variant_text) don't re-derive it with ad-hoc regex each run.
+# These are the same variants the _second_print_reject keep-list protects
+# (Newsstand / Direct — identical content, different market channel), plus
+# Whitman (the bagged direct-market variant). They are NOT reprints — those are
+# rejected upstream. First match wins in listed order; "" when none is present,
+# matching the identify_data.variant_text "omit or empty" contract.
+#
+# "direct" is bounded on both sides so "Director's Cut"/"directed" don't match.
+_VARIANT_PATTERNS = [
+    ("Newsstand", re.compile(r"(?<!\w)news\s?stand(?!\w)", re.IGNORECASE)),
+    (
+        "Direct Edition",
+        re.compile(r"(?<!\w)direct(?:\s+(?:edition|market))?(?!\w)", re.IGNORECASE),
+    ),
+    ("Whitman", re.compile(r"(?<!\w)whitman(?!\w)", re.IGNORECASE)),
+]
+
+
+def extract_variant_text(title: str) -> str:
+    """Return a short canonical distribution-variant label for a listing title.
+
+    Detects the original-print distribution variants collectors distinguish
+    (Newsstand / Direct / Whitman) and returns "" when none is present. First
+    match wins in listed order. Case-insensitive; word-bounded so substrings
+    like "director" do not trigger the "Direct" match.
+    """
+    for label, pat in _VARIANT_PATTERNS:
+        if pat.search(title or ""):
+            return label
+    return ""
+
+
 # ─── hard_reject / should_reject (BUI-221/245) ───────────────────────────────
 
 

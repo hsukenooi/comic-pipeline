@@ -77,3 +77,98 @@ class TestComicIdentifyToDict:
         assert "_title_norm" not in data
         assert data["series"] == "Batman"
         assert data["issue"] == "1"
+
+
+class TestComicIdentifyBatchMode:
+    """Batch mode (BUI-292): read newline-delimited titles from stdin, emit one
+    JSONL object per line, so /comic:collection-add identifies many wins in one
+    invocation instead of one process per title."""
+
+    def _run_batch(self, monkeypatch, capsys, stdin_text):
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+        rc = comic_identify.main(["--batch"])
+        out = capsys.readouterr().out
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        return rc, [json.loads(ln) for ln in lines]
+
+    def test_batch_emits_one_line_per_title_in_order(self, monkeypatch, capsys):
+        rc, rows = self._run_batch(
+            monkeypatch, capsys, "Batman #1\nThe Amazing Spider-Man #300 (1988)\nX-Men #94\n"
+        )
+        assert rc == 0
+        assert len(rows) == 3
+        assert [r["series"] for r in rows] == ["Batman", "The Amazing Spider-Man", "X-Men"]
+        assert [r["issue"] for r in rows] == ["1", "300", "94"]
+
+    def test_batch_skips_blank_lines(self, monkeypatch, capsys):
+        rc, rows = self._run_batch(
+            monkeypatch, capsys, "Batman #1\n\n   \nX-Men #94\n"
+        )
+        assert rc == 0
+        assert len(rows) == 2
+        assert [r["series"] for r in rows] == ["Batman", "X-Men"]
+
+    def test_batch_keeps_rejectable_title_and_does_not_drop_others(
+        self, monkeypatch, capsys
+    ):
+        """A rejectable title (CGC slab) still emits its own line with
+        reject_reasons — it must not swallow or abort the surrounding titles."""
+        rc, rows = self._run_batch(
+            monkeypatch,
+            capsys,
+            "Batman #1\nAmazing Spider-Man #300 CGC 9.8\nX-Men #94\n",
+        )
+        assert rc == 0
+        assert len(rows) == 3
+        assert "CGC slab" in rows[1]["reject_reasons"]
+        assert [r["series"] for r in rows] == ["Batman", "Amazing Spider-Man", "X-Men"]
+
+    def test_batch_output_is_jsonl_one_object_per_line(self, monkeypatch, capsys):
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO("Batman #1\nX-Men #94\n"))
+        comic_identify.main(["--batch"])
+        out = capsys.readouterr().out
+        # Exactly two non-empty lines, each independently parseable.
+        assert out.count("\n") == 2
+        for ln in out.splitlines():
+            json.loads(ln)
+
+
+class TestComicIdentifyVariantText:
+    """variant_text (BUI-295): a short canonical distribution-variant label
+    projected into the CLI output so collection-add reads it directly."""
+
+    def test_newsstand_variant_detected(self, capsys):
+        comic_identify.main(["Ghost Rider #1 Marvel 1973 Newsstand"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["variant_text"] == "Newsstand"
+
+    def test_direct_edition_variant_detected(self, capsys):
+        comic_identify.main(["Amazing Spider-Man #300 Direct Edition"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["variant_text"] == "Direct Edition"
+
+    def test_no_variant_yields_empty_string(self, capsys):
+        comic_identify.main(["Batman #1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["variant_text"] == ""
+
+    def test_director_substring_does_not_false_match_direct(self, capsys):
+        """'Director's Cut' must not be read as a Direct-edition variant."""
+        comic_identify.main(["Spawn #1 Director's Cut"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["variant_text"] == ""
+
+    def test_variant_text_present_in_batch_rows(self, monkeypatch, capsys):
+        import io
+
+        monkeypatch.setattr(
+            "sys.stdin", io.StringIO("Ghost Rider #1 Newsstand\nBatman #1\n")
+        )
+        comic_identify.main(["--batch"])
+        rows = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert rows[0]["variant_text"] == "Newsstand"
+        assert rows[1]["variant_text"] == ""

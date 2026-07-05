@@ -116,18 +116,26 @@ For each **new** won snipe, build one entry in this format:
 **Source priority for `identify_data`:**
 
 1. **In-session context** — if this skill is being called from `/comic:buy` and you already identified the comics in Step 1, use those identifications directly.
-2. **Parse from gixen title via `comic-identify` (BUI-253)** — run the canonical
-   title-parser on the snipe's `title` field instead of parsing it yourself:
+2. **Parse from gixen title via `comic-identify` (BUI-253/292)** — run the
+   canonical title-parser on the snipe titles instead of parsing them yourself.
+   **Identify all new wins in ONE `--batch` call**, not one process per title:
+   write the titles (one per line, in the order of your new-wins list) to a file
+   and pipe them through batch mode, which emits one JSONL result per line in the
+   same order:
 
    ```bash
-   comic-identify "Ghost Rider #1 Marvel 1973 Newsstand"
-   # {"series": "Ghost Rider", "issue": "1", "year": 1973, "edition": "single-issue",
-   #  "is_lot": false, "constituent_issues": [], "reject_reasons": [], "confidence": 1.0, ...}
+   # /tmp/titles.txt: one snipe title per line, in new-wins order
+   comic-identify --batch < /tmp/titles.txt > /tmp/identities.jsonl
+   # each line, e.g.:
+   # {"title": "Ghost Rider #1 ... Newsstand", "series": "Ghost Rider", "issue": "1",
+   #  "year": 1973, "is_lot": false, "constituent_issues": [], "confidence": 1.0,
+   #  "variant_text": "Newsstand", ...}
    ```
 
-   Map its output straight into `identify_data`: `series` → `series`, `issue` → `issue`,
-   `year` → `year` (omit if `null`). There's no direct `variant_text` field — infer it
-   from the title as before (Newsstand/Direct/etc. aren't part of ComicIdentity).
+   Map each result straight into `identify_data`: `series` → `series`, `issue` →
+   `issue`, `year` → `year` (omit if `null`), `variant_text` → `variant_text`
+   (already computed — Newsstand/Direct/Whitman, or `""`; no need to infer it
+   yourself).
 
    **For lots** (`"is_lot": true`): build one `identify_data` entry per issue number in
    `constituent_issues`, all sharing the extracted `series`. If `constituent_issues` is
