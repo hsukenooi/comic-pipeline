@@ -225,8 +225,10 @@ so future runs skip them. Best-effort — a failed mark is non-fatal (the
 already-owned dedup will catch a re-POST):
 
 ```bash
-# Build {"item_ids": ["111", "222", ...]} from the item_ids of the new wins
-python3 -c "import json; ids=[w['item_id'] for w in json.load(open('/tmp/wins.json'))['wins']]; print(json.dumps({'item_ids': ids}))" \
+# Build {"item_ids": ["111", "222", ...]} from the item_ids of the new wins.
+# dict.fromkeys dedups while preserving order — a lot that expanded into several
+# entries shares one item_id, so a plain comprehension would POST it N times.
+python3 -c "import json; ids=list(dict.fromkeys(w['item_id'] for w in json.load(open('/tmp/wins.json'))['wins'])); print(json.dumps({'item_ids': ids}))" \
   | curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win/seen" \
     -H 'content-type: application/json' \
     -d @- \
