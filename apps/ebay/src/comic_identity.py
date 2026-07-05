@@ -612,6 +612,48 @@ def _second_print_reject(title: str) -> bool:
     return bool(_LATER_PRINTING_RE.search(title or ""))
 
 
+# ─── Distribution-variant extraction (BUI-295) ───────────────────────────────
+# Surface the original-print *distribution* variant named in a listing title as
+# a short canonical label, so callers (comic-identify -> /comic:collection-add's
+# identify_data.variant_text) don't re-derive it with ad-hoc regex each run.
+# These are the same variants the _second_print_reject keep-list protects
+# (Newsstand / Direct — identical content, different market channel), plus
+# Whitman (the bagged direct-market variant). They are NOT reprints — those are
+# rejected upstream. First match wins in listed order; "" when none is present,
+# matching the identify_data.variant_text "omit or empty" contract.
+#
+# Newsstand: allow "newsstand", "news stand", "news-stand".
+# Direct: require an explicit qualifier (edition/market/sales). Bare "direct" is
+# common listing filler ("ships direct from estate", "buy direct") and a false
+# "Direct Edition" label corrupts the recorded collection — precision over
+# recall, so an unqualified "Direct" stays "". "director"/"directed" can't match
+# either way (a whitespace-bounded "direct" must be followed by the qualifier).
+_VARIANT_PATTERNS = [
+    ("Newsstand", re.compile(r"(?<!\w)news[\s-]?stand(?!\w)", re.IGNORECASE)),
+    (
+        "Direct Edition",
+        re.compile(r"(?<!\w)direct\s+(?:edition|market|sales)(?!\w)", re.IGNORECASE),
+    ),
+    ("Whitman", re.compile(r"(?<!\w)whitman(?!\w)", re.IGNORECASE)),
+]
+
+
+def extract_variant_text(title: str) -> str:
+    """Return a short canonical distribution-variant label for a listing title.
+
+    Detects the original-print distribution variants collectors distinguish
+    (Newsstand / Direct Edition / Whitman) and returns "" when none is present.
+    First match wins in listed order. Case-insensitive. "Direct" requires an
+    edition/market/sales qualifier so bare filler ("ships direct") does not
+    false-match; this is a precision-first extractor, not an exhaustive one —
+    non-distribution variants (price/cover/sketch) are left to the caller.
+    """
+    for label, pat in _VARIANT_PATTERNS:
+        if pat.search(title or ""):
+            return label
+    return ""
+
+
 # ─── hard_reject / should_reject (BUI-221/245) ───────────────────────────────
 
 
