@@ -622,12 +622,17 @@ def _second_print_reject(title: str) -> bool:
 # rejected upstream. First match wins in listed order; "" when none is present,
 # matching the identify_data.variant_text "omit or empty" contract.
 #
-# "direct" is bounded on both sides so "Director's Cut"/"directed" don't match.
+# Newsstand: allow "newsstand", "news stand", "news-stand".
+# Direct: require an explicit qualifier (edition/market/sales). Bare "direct" is
+# common listing filler ("ships direct from estate", "buy direct") and a false
+# "Direct Edition" label corrupts the recorded collection — precision over
+# recall, so an unqualified "Direct" stays "". "director"/"directed" can't match
+# either way (a whitespace-bounded "direct" must be followed by the qualifier).
 _VARIANT_PATTERNS = [
-    ("Newsstand", re.compile(r"(?<!\w)news\s?stand(?!\w)", re.IGNORECASE)),
+    ("Newsstand", re.compile(r"(?<!\w)news[\s-]?stand(?!\w)", re.IGNORECASE)),
     (
         "Direct Edition",
-        re.compile(r"(?<!\w)direct(?:\s+(?:edition|market))?(?!\w)", re.IGNORECASE),
+        re.compile(r"(?<!\w)direct\s+(?:edition|market|sales)(?!\w)", re.IGNORECASE),
     ),
     ("Whitman", re.compile(r"(?<!\w)whitman(?!\w)", re.IGNORECASE)),
 ]
@@ -637,9 +642,11 @@ def extract_variant_text(title: str) -> str:
     """Return a short canonical distribution-variant label for a listing title.
 
     Detects the original-print distribution variants collectors distinguish
-    (Newsstand / Direct / Whitman) and returns "" when none is present. First
-    match wins in listed order. Case-insensitive; word-bounded so substrings
-    like "director" do not trigger the "Direct" match.
+    (Newsstand / Direct Edition / Whitman) and returns "" when none is present.
+    First match wins in listed order. Case-insensitive. "Direct" requires an
+    edition/market/sales qualifier so bare filler ("ships direct") does not
+    false-match; this is a precision-first extractor, not an exhaustive one —
+    non-distribution variants (price/cover/sketch) are left to the caller.
     """
     for label, pat in _VARIANT_PATTERNS:
         if pat.search(title or ""):

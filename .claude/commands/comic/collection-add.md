@@ -133,9 +133,19 @@ For each **new** won snipe, build one entry in this format:
    ```
 
    Map each result straight into `identify_data`: `series` → `series`, `issue` →
-   `issue`, `year` → `year` (omit if `null`), `variant_text` → `variant_text`
-   (already computed — Newsstand/Direct/Whitman, or `""`; no need to infer it
-   yourself).
+   `issue`, `year` → `year` (omit if `null`). The batch also computes
+   `variant_text` for the common **distribution** variants (Newsstand / Direct
+   Edition / Whitman) — use it directly when non-empty. It is precision-first,
+   **not** exhaustive: if `variant_text` is `""` but the title names some *other*
+   variant (a price variant like `"35 Cent"` / `"Canadian Price Variant"`, or a
+   cover/sketch/incentive variant), set `variant_text` to that yourself — those
+   distinguish genuinely different books and must not be collapsed into the base
+   issue.
+
+   Results are 1:1 with your input lines (one JSONL row per title, in order), so
+   map them back positionally; a row with `series`/`issue` `null` (or an
+   `"error"` field) is a title the parser couldn't resolve — fall through to the
+   blank-`series`/`issue` guard below and ask the user rather than recording it.
 
    **For lots** (`"is_lot": true`): build one `identify_data` entry per issue number in
    `constituent_issues`, all sharing the extracted `series`. If `constituent_issues` is

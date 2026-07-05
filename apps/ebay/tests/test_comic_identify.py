@@ -102,19 +102,23 @@ class TestComicIdentifyBatchMode:
         assert [r["series"] for r in rows] == ["Batman", "The Amazing Spider-Man", "X-Men"]
         assert [r["issue"] for r in rows] == ["1", "300", "94"]
 
-    def test_batch_skips_blank_lines(self, monkeypatch, capsys):
+    def test_batch_emits_one_row_per_line_including_blanks(self, monkeypatch, capsys):
+        """1:1 line correspondence is the contract callers map on: a blank line
+        must NOT be dropped (that would shift every later row), it yields a
+        null-series row that keeps positions aligned."""
         rc, rows = self._run_batch(
             monkeypatch, capsys, "Batman #1\n\n   \nX-Men #94\n"
         )
         assert rc == 0
-        assert len(rows) == 2
-        assert [r["series"] for r in rows] == ["Batman", "X-Men"]
+        assert len(rows) == 4  # 4 input lines -> 4 output rows, positions preserved
+        assert rows[0]["series"] == "Batman"
+        assert rows[1]["series"] is None  # blank line -> null-series row, not dropped
+        assert rows[2]["series"] is None  # whitespace-only line, likewise
+        assert rows[3]["series"] == "X-Men"
 
-    def test_batch_keeps_rejectable_title_and_does_not_drop_others(
-        self, monkeypatch, capsys
-    ):
-        """A rejectable title (CGC slab) still emits its own line with
-        reject_reasons — it must not swallow or abort the surrounding titles."""
+    def test_batch_reject_row_carries_reject_reasons(self, monkeypatch, capsys):
+        """A rejectable title (CGC slab) is a normal return — it emits its own
+        row with reject_reasons populated, in position."""
         rc, rows = self._run_batch(
             monkeypatch,
             capsys,
@@ -124,6 +128,31 @@ class TestComicIdentifyBatchMode:
         assert len(rows) == 3
         assert "CGC slab" in rows[1]["reject_reasons"]
         assert [r["series"] for r in rows] == ["Batman", "Amazing Spider-Man", "X-Men"]
+
+    def test_batch_one_raising_title_does_not_abort_the_batch(
+        self, monkeypatch, capsys
+    ):
+        """The isolation contract: if identify_comic raises on one line, the
+        batch emits an error row for it and still processes the rest — it does
+        not abort mid-stream (which would silently drop every later win)."""
+        import comic_identify as ci
+
+        real = ci.identify_comic
+
+        def flaky(title):
+            if "BOOM" in title:
+                raise ValueError("synthetic parse failure")
+            return real(title)
+
+        monkeypatch.setattr(ci, "identify_comic", flaky)
+        rc, rows = self._run_batch(
+            monkeypatch, capsys, "Batman #1\nBOOM #99\nX-Men #94\n"
+        )
+        assert rc == 0
+        assert len(rows) == 3  # all three lines emitted despite the middle raise
+        assert rows[0]["series"] == "Batman"
+        assert rows[1]["series"] is None and "error" in rows[1]  # error row, aligned
+        assert rows[2]["series"] == "X-Men"  # line after the raise still processed
 
     def test_batch_output_is_jsonl_one_object_per_line(self, monkeypatch, capsys):
         import io
@@ -161,6 +190,31 @@ class TestComicIdentifyVariantText:
         comic_identify.main(["Spawn #1 Director's Cut"])
         data = json.loads(capsys.readouterr().out)
         assert data["variant_text"] == ""
+
+    def test_bare_direct_filler_is_not_a_variant(self, capsys):
+        """Bare 'direct' as listing filler ('ships direct', 'buy direct') must
+        NOT be labeled Direct Edition — a false variant label corrupts the
+        recorded collection. The qualifier (edition/market/sales) is required."""
+        for title in [
+            "Amazing Spider-Man #300 ships direct from estate",
+            "Amazing Spider-Man #300 buy direct",
+        ]:
+            comic_identify.main([title])
+            data = json.loads(capsys.readouterr().out)
+            assert data["variant_text"] == "", title
+
+    def test_direct_market_and_sales_qualifiers_detected(self, capsys):
+        for title in ["X-Men #1 Direct Market", "X-Men #1 Direct Sales"]:
+            comic_identify.main([title])
+            data = json.loads(capsys.readouterr().out)
+            assert data["variant_text"] == "Direct Edition", title
+
+    def test_newsstand_hyphenated_spelling_detected(self, capsys):
+        """'news-stand' (hyphenated) is a real listing spelling and must be
+        caught, same as 'newsstand' / 'news stand'."""
+        comic_identify.main(["Batman #1 news-stand copy"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["variant_text"] == "Newsstand"
 
     def test_variant_text_present_in_batch_rows(self, monkeypatch, capsys):
         import io

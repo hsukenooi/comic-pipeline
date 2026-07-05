@@ -56,21 +56,30 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--batch",
         action="store_true",
-        help="Batch mode: read newline-delimited titles from stdin and emit one "
-             "JSON object per line (JSONL), in input order. Blank lines are "
-             "skipped; each title is parsed independently so one bad title never "
-             "aborts the batch. Lets a caller identify many titles in one "
-             "invocation instead of one process per title.",
+        help="Batch mode: read newline-delimited titles from stdin and emit "
+             "EXACTLY one JSON object per input line (JSONL), in order. The 1:1 "
+             "line correspondence lets a caller map results back positionally — "
+             "a blank line yields a null-series row (never dropped, so alignment "
+             "holds), and a title that fails to parse yields an {\"error\": ...} "
+             "row rather than aborting the batch. Lets a caller identify many "
+             "titles in one invocation instead of one process per title.",
     )
     args = parser.parse_args(argv)
 
     if args.batch:
+        # Emit exactly one line per input line so a caller can map results
+        # positionally (see --batch help). Never skip and never abort mid-stream:
+        # a blank line becomes identify_comic("") (null series — the caller's
+        # own "series/issue blank -> ask" guard catches it), and an unexpected
+        # raise becomes an error row instead of killing the whole batch.
         for line in sys.stdin:
             title = line.strip()
-            if not title:
-                continue
-            identity = identify_comic(title)
-            print(json.dumps(identity_to_dict(identity)))
+            try:
+                identity = identify_comic(title)
+                print(json.dumps(identity_to_dict(identity)))
+            except Exception as exc:  # noqa: BLE001 — one bad title must not abort the batch
+                print(json.dumps({"title": title, "series": None, "issue": None,
+                                  "variant_text": "", "error": str(exc)}))
         return 0
 
     title = args.title
