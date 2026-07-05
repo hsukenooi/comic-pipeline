@@ -38,80 +38,32 @@ curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 
 ## Step 1: Pull won auctions
 
-There are **two pull sources**. They return the *same kind* of data (ended
-snipes) in **different shapes**, so the WON filter and field mapping differ —
-pick the source first, then apply the matching filter below.
-
-**Decision rule — which source to pull:**
-
-1. **PREFER `/api/comics/history`** (bounded ~7-day window, server-side enriched,
-   tiny payload). Use it whenever the window you need is covered — i.e. the last
-   successful collection-add run was within the past 7 days. The seen-set state
-   note (`last collection-add run` date in memory / the prior run's cutoff) is
-   the simplest signal: if you can establish the last run was ≤7 days ago, the
-   history endpoint covers every win since then.
-2. **FALL BACK to `gixen list --json`** (full history, ~310 items) **only** when
-   the needed window predates the endpoint's 7-day horizon — a first run, a run
-   after a long gap, or any case where you **cannot** establish that the last
-   run was within the past 7 days. When in doubt, use the CLI fallback: a
-   slightly larger pull is harmless (the seen-set in Step 1b still excludes
-   already-recorded wins), but a missed older win is the worse failure.
-
-Don't over-engineer the date math — this choice only affects **completeness** of
-the pull, not correctness. The seen-set (Step 1b) is what actually prevents
-double-recording; the window choice just decides how far back you can see.
-
-**Source A — history endpoint (preferred):**
-
-```bash
-curl -sf "$COMICS_SERVER_URL/api/comics/history"
-```
-
-Returns a JSON **array** of row objects. Filter to wins by **`status` only**:
-- `status` contains `WON` (case-insensitive)
-
-No `time_to_end` filter is needed for this source: the endpoint already returns
-only auctions that have **ended** in the past 7 days, and excludes the
-tombstone, so `status` contains `WON` is the complete filter. (Every history row
-actually carries `time_to_end == "ENDED"` — `iso_to_relative` returns `"ENDED"`
-for any past auction, and the endpoint only surfaces past auctions — so adding
-that check would be redundant, not necessary. The relevant difference from the
-CLI source below is *scope*, not the `time_to_end` value.)
-
-**Source B — CLI fallback (`gixen list --json`):**
+Pull the full snipe list from the Gixen CLI and filter it to genuine wins:
 
 ```bash
 gixen list --json 2>/dev/null
 ```
 
-This dumps the entire snipe list, **including still-live (PENDING) snipes** whose
-auctions haven't ended. So here you need **both** conditions — the
-`time_to_end == "ENDED"` check is what excludes the live snipes that the history
-endpoint never returns in the first place:
-- `time_to_end == "ENDED"`
+This dumps **every** snipe, including still-live (PENDING) ones whose auctions
+haven't ended. Filter to wins with **both** conditions:
+- `time_to_end == "ENDED"` (excludes the live snipes)
 - `status` contains `WON` (case-insensitive)
 
-**Then, for whichever source you used, deduplicate by `item_id`** (keep the first
-occurrence) before continuing. The history endpoint already dedups server-side,
-but the CLI fallback does not and the general contract requires it — so apply
-this normalization unconditionally.
-
+Then **deduplicate by `item_id`** (keep the first occurrence) before continuing.
 If no wins, print "No won auctions to add." and stop.
 
-### Field mapping (history row → record-win entry)
+Each snipe object exposes the fields Step 2 needs directly: `item_id`,
+`current_bid` (e.g. `"222.50 USD"`), `end_date_iso` (ISO timestamp), and `title`
+(the source for parsing `identify_data`).
 
-The history row shape **differs** from `gixen list --json`. When you pulled from
-the history endpoint, read these fields to build each Step 2 entry:
-
-| History row field | Used as | Notes |
-|---|---|---|
-| `item_id` | `item_id` | string |
-| `current_bid` | `current_bid` | e.g. `"222.50 USD"` — maps directly |
-| `end_date_iso` | `end_date_iso` | ISO timestamp — maps directly |
-| `title` | source for parsing `identify_data` | series/issue/year/variant, same as the CLI path |
-
-(`gixen list --json` exposes the same logical fields under its own shape; the
-`title`-parsing and JSON-build steps below apply to both.)
+> **Optional fast-path (bandwidth only):** if you can establish the last
+> collection-add run was ≤7 days ago, `GET /api/comics/history` returns the same
+> wins in a smaller, server-enriched payload — already ended, already deduped,
+> tombstone excluded — so you'd filter by `status` contains `WON` alone (no
+> `time_to_end` check needed there). This is purely an optimization: the Step 1b
+> seen-set is what prevents double-recording regardless of source, and a missed
+> older win is the worse failure, so when the window is uncertain just use the
+> CLI above.
 
 ## Step 1b: Fetch already-processed wins (BUI-121)
 
@@ -125,15 +77,12 @@ SEEN_IDS=$(curl -sf "$COMICS_SERVER_URL/api/comics/collection/record-win/seen" \
   2>/dev/null || echo "")
 ```
 
-From the filtered, deduped WON snipes in Step 1 (whichever pull source you used),
-exclude any whose `item_id` appears in `SEEN_IDS`. Call the remaining wins
-**new wins**.
+From the filtered, deduped WON snipes in Step 1, exclude any whose `item_id`
+appears in `SEEN_IDS`. Call the remaining wins **new wins**.
 
-**The two mechanisms compose.** Step 1's source choice *narrows the pull* (how
-far back you can see — 7 days via the endpoint, or all of history via the CLI);
-the seen-set here *excludes already-recorded wins*. The seen-set remains the
-**primary dedup mechanism** and runs identically regardless of pull source — so a
-larger CLI-fallback pull never re-records anything the seen-set already covers.
+The seen-set is the **primary dedup mechanism**: it excludes already-recorded
+wins, so pulling the full `gixen list` (rather than a narrower window) never
+re-records anything a prior run already committed.
 
 If there are no new wins, print:
 > All won auctions already processed. Nothing new to record.
@@ -192,31 +141,72 @@ snipe rather than guessing.
 ## Step 3: Record wins
 
 Wrap the entries array as `{"wins": [...]}`, write it to a temp file, and POST it
-to the server's record-win endpoint (`curl -sf` so a non-200 fails loudly):
+to the server's record-win endpoint. **Capture the response body to a file and
+read only the summary scalars into context** — the full response also carries
+`skipped_already_owned_titles` and `skipped_already_owned_detail` (one object per
+already-owned win), which on a large batch is thousands of tokens of detail you
+don't need in the loop. Keep it on disk; surface the scalars:
 
 ```bash
 # /tmp/wins.json contains: {"wins": [ {entry}, {entry}, ... ]}
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win" \
+# rm the response file FIRST: on a connection failure curl leaves any prior
+# run's file in place (it only truncates -o once bytes arrive), and reading a
+# stale body would fabricate a "committed before failure" count for a request
+# that never left the machine.
+rm -f /tmp/record_win_response.json
+# Capture body + status separately (not `curl -f`, which discards the error
+# body): on a partial_failure we still need rows_written out of the 500 body.
+# curl still prints %{http_code} == 000 when it never connects.
+code=$(curl -sS -o /tmp/record_win_response.json -w '%{http_code}' \
+  -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win" \
   -H 'content-type: application/json' \
-  -d @/tmp/wins.json
+  -d @/tmp/wins.json)
+
+if [ "${code:-000}" -ge 200 ] && [ "${code:-000}" -lt 300 ]; then
+  # Success — pull only the summary scalars into context (drops the big
+  # skipped_already_owned_* arrays, which stay in /tmp/record_win_response.json).
+  # A 200 with an unparseable/truncated body is NOT success — exit non-zero so
+  # the run stops rather than silently proceeding to mark-seen.
+  python3 -c "import json; d=json.load(open('/tmp/record_win_response.json')); \
+    print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded']}))" \
+    || { echo "record-win returned HTTP $code but the body could not be parsed — see /tmp/record_win_response.json; do NOT assume success or mark wins seen."; exit 1; }
+else
+  # Failure — STOP with a NON-ZERO exit (this replaces the hard-fail that
+  # `curl -sf` used to give and that BUI-137's 500 relies on). The exit 1 is
+  # load-bearing: without it, anything keying off this block's exit status would
+  # treat the failure as success and run Step 3b, permanently marking uncommitted
+  # wins seen. Surface rows_written from the partial_failure detail so the user
+  # knows which wins DID commit before continuing.
+  echo "record-win FAILED (HTTP $code) — STOP. Do not mark wins seen."
+  python3 -c "import json; d=json.load(open('/tmp/record_win_response.json')); det=d.get('detail', d); \
+    print('error:', det.get('error'), '| rows_written (committed before failure):', det.get('rows_written'))" 2>/dev/null \
+    || echo "(no parseable response body — the request likely never reached the server)"
+  exit 1
+fi
 ```
 
 The server commits in batches of 25 using the same locg-cli logic (Metron series
-resolution + BUI-34 already-owned dedup). On success it returns:
+resolution + BUI-34 already-owned dedup). On a 2xx the scalar extraction above
+prints just:
 
 ```json
 {
   "rows_written": 3,
+  "skipped_already_owned": 0,
   "manual_variant_count": 0,
   "manual_series_count": 1,
-  "metron_lookups_succeeded": 2,
-  "skipped_already_owned": 0
+  "metron_lookups_succeeded": 2
 }
 ```
 
-`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails, STOP** — do not report success and do not mark the item IDs seen.
+The full response — including the `skipped_already_owned_titles` /
+`skipped_already_owned_detail` arrays — is preserved at
+`/tmp/record_win_response.json` if the user wants to inspect which owned titles
+were skipped.
 
-**Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200. Because Step 3 uses `curl -sf`, this halts the skill automatically — never report success on a partial_failure, and surface the `rows_written` so the user knows which wins still need recording.
+`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails (non-2xx), STOP** — do not report success and do not mark the item IDs seen.
+
+**Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200. The status-code check above routes this to the failure branch, which surfaces `rows_written` so the user knows which wins still need recording — never report success on a partial_failure.
 
 ## Step 3b: Mark new wins seen (BUI-121)
 
@@ -225,8 +215,10 @@ so future runs skip them. Best-effort — a failed mark is non-fatal (the
 already-owned dedup will catch a re-POST):
 
 ```bash
-# Build {"item_ids": ["111", "222", ...]} from the item_ids of the new wins
-python3 -c "import json; ids=[w['item_id'] for w in json.load(open('/tmp/wins.json'))['wins']]; print(json.dumps({'item_ids': ids}))" \
+# Build {"item_ids": ["111", "222", ...]} from the item_ids of the new wins.
+# dict.fromkeys dedups while preserving order — a lot that expanded into several
+# entries shares one item_id, so a plain comprehension would POST it N times.
+python3 -c "import json; ids=list(dict.fromkeys(w['item_id'] for w in json.load(open('/tmp/wins.json'))['wins'])); print(json.dumps({'item_ids': ids}))" \
   | curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win/seen" \
     -H 'content-type: application/json' \
     -d @- \
@@ -296,5 +288,4 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
 | Marking wins seen before the POST succeeds | Only mark seen after a successful record-win POST — a failed call means wins weren't recorded |
 | Confusing `oldest_pending_days` with "days since last sync" | `oldest_pending_days` = age of oldest uncleared item; use `last_full_import` from status for sync recency |
-| Assuming `/api/comics/history` needs the `time_to_end == "ENDED"` filter | It doesn't, and not for the reason you might think: every history row is *already* ended, so `time_to_end` is always `"ENDED"` there (`iso_to_relative` returns `"ENDED"` for past auctions). The filter would be redundant, not harmful. Use `status` contains `WON` only. The `"ENDED"` check matters only for `gixen list --json`, which also dumps still-live PENDING snipes |
-| Pulling from `/api/comics/history` when the needed window predates 7 days | The endpoint only returns snipes ended in the past 7 days. On a first run or after a >7-day gap (any time you can't confirm the last run was within 7 days), fall back to `gixen list --json` so older wins aren't missed |
+| Forgetting the `time_to_end == "ENDED"` filter on the `gixen list --json` pull | `gixen list` also dumps still-live PENDING snipes; filter on **both** `time_to_end == "ENDED"` and `status` contains `WON`, or you'll try to record auctions that haven't ended |
