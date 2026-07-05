@@ -149,25 +149,39 @@ don't need in the loop. Keep it on disk; surface the scalars:
 
 ```bash
 # /tmp/wins.json contains: {"wins": [ {entry}, {entry}, ... ]}
+# rm the response file FIRST: on a connection failure curl leaves any prior
+# run's file in place (it only truncates -o once bytes arrive), and reading a
+# stale body would fabricate a "committed before failure" count for a request
+# that never left the machine.
+rm -f /tmp/record_win_response.json
 # Capture body + status separately (not `curl -f`, which discards the error
 # body): on a partial_failure we still need rows_written out of the 500 body.
+# curl still prints %{http_code} == 000 when it never connects.
 code=$(curl -sS -o /tmp/record_win_response.json -w '%{http_code}' \
   -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win" \
   -H 'content-type: application/json' \
   -d @/tmp/wins.json)
 
-if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+if [ "${code:-000}" -ge 200 ] && [ "${code:-000}" -lt 300 ]; then
   # Success — pull only the summary scalars into context (drops the big
   # skipped_already_owned_* arrays, which stay in /tmp/record_win_response.json).
+  # A 200 with an unparseable/truncated body is NOT success — exit non-zero so
+  # the run stops rather than silently proceeding to mark-seen.
   python3 -c "import json; d=json.load(open('/tmp/record_win_response.json')); \
-    print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded']}))"
+    print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded']}))" \
+    || { echo "record-win returned HTTP $code but the body could not be parsed — see /tmp/record_win_response.json; do NOT assume success or mark wins seen."; exit 1; }
 else
-  # Failure — STOP. Surface rows_written from the partial_failure detail so the
-  # user knows which wins DID commit; do NOT proceed to Step 3b (mark-seen).
+  # Failure — STOP with a NON-ZERO exit (this replaces the hard-fail that
+  # `curl -sf` used to give and that BUI-137's 500 relies on). The exit 1 is
+  # load-bearing: without it, anything keying off this block's exit status would
+  # treat the failure as success and run Step 3b, permanently marking uncommitted
+  # wins seen. Surface rows_written from the partial_failure detail so the user
+  # knows which wins DID commit before continuing.
   echo "record-win FAILED (HTTP $code) — STOP. Do not mark wins seen."
   python3 -c "import json; d=json.load(open('/tmp/record_win_response.json')); det=d.get('detail', d); \
     print('error:', det.get('error'), '| rows_written (committed before failure):', det.get('rows_written'))" 2>/dev/null \
-    || echo "(could not parse failure body — see /tmp/record_win_response.json)"
+    || echo "(no parseable response body — the request likely never reached the server)"
+  exit 1
 fi
 ```
 
