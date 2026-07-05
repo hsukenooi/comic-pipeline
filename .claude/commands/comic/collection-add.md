@@ -192,31 +192,58 @@ snipe rather than guessing.
 ## Step 3: Record wins
 
 Wrap the entries array as `{"wins": [...]}`, write it to a temp file, and POST it
-to the server's record-win endpoint (`curl -sf` so a non-200 fails loudly):
+to the server's record-win endpoint. **Capture the response body to a file and
+read only the summary scalars into context** — the full response also carries
+`skipped_already_owned_titles` and `skipped_already_owned_detail` (one object per
+already-owned win), which on a large batch is thousands of tokens of detail you
+don't need in the loop. Keep it on disk; surface the scalars:
 
 ```bash
 # /tmp/wins.json contains: {"wins": [ {entry}, {entry}, ... ]}
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win" \
+# Capture body + status separately (not `curl -f`, which discards the error
+# body): on a partial_failure we still need rows_written out of the 500 body.
+code=$(curl -sS -o /tmp/record_win_response.json -w '%{http_code}' \
+  -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win" \
   -H 'content-type: application/json' \
-  -d @/tmp/wins.json
+  -d @/tmp/wins.json)
+
+if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+  # Success — pull only the summary scalars into context (drops the big
+  # skipped_already_owned_* arrays, which stay in /tmp/record_win_response.json).
+  python3 -c "import json; d=json.load(open('/tmp/record_win_response.json')); \
+    print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded']}))"
+else
+  # Failure — STOP. Surface rows_written from the partial_failure detail so the
+  # user knows which wins DID commit; do NOT proceed to Step 3b (mark-seen).
+  echo "record-win FAILED (HTTP $code) — STOP. Do not mark wins seen."
+  python3 -c "import json; d=json.load(open('/tmp/record_win_response.json')); det=d.get('detail', d); \
+    print('error:', det.get('error'), '| rows_written (committed before failure):', det.get('rows_written'))" 2>/dev/null \
+    || echo "(could not parse failure body — see /tmp/record_win_response.json)"
+fi
 ```
 
 The server commits in batches of 25 using the same locg-cli logic (Metron series
-resolution + BUI-34 already-owned dedup). On success it returns:
+resolution + BUI-34 already-owned dedup). On a 2xx the scalar extraction above
+prints just:
 
 ```json
 {
   "rows_written": 3,
+  "skipped_already_owned": 0,
   "manual_variant_count": 0,
   "manual_series_count": 1,
-  "metron_lookups_succeeded": 2,
-  "skipped_already_owned": 0
+  "metron_lookups_succeeded": 2
 }
 ```
 
-`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails, STOP** — do not report success and do not mark the item IDs seen.
+The full response — including the `skipped_already_owned_titles` /
+`skipped_already_owned_detail` arrays — is preserved at
+`/tmp/record_win_response.json` if the user wants to inspect which owned titles
+were skipped.
 
-**Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200. Because Step 3 uses `curl -sf`, this halts the skill automatically — never report success on a partial_failure, and surface the `rows_written` so the user knows which wins still need recording.
+`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails (non-2xx), STOP** — do not report success and do not mark the item IDs seen.
+
+**Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200. The status-code check above routes this to the failure branch, which surfaces `rows_written` so the user knows which wins still need recording — never report success on a partial_failure.
 
 ## Step 3b: Mark new wins seen (BUI-121)
 
