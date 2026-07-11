@@ -37,15 +37,37 @@ line per item:
 """
 
 import argparse
+import shutil
 import sys
-import urllib.request
 from pathlib import Path
 
+import requests
+
 from ebay_fetch import fetch_item, get_token, load_config
+
+# BUI-300: a hung image host must not stall the sequential batch indefinitely.
+# 15s per image is generous for a single comic-cover-sized JPEG while still
+# bounding the worst case. Uses `requests` (not urllib.request.urlretrieve,
+# which takes no timeout) — matching the timeout idiom every other network
+# call in this package already uses (ebay_fetch.py, seller_scan.py, etc.).
+_DOWNLOAD_TIMEOUT_SECONDS = 15
+
+
+def _download_image(url, dest, timeout=_DOWNLOAD_TIMEOUT_SECONDS):
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    dest.write_bytes(resp.content)
 
 
 def download_listing(token, item_id, outdir, base_url):
     outdir = Path(outdir)
+    # BUI-300: a re-run of this label (e.g. a listing that now has fewer
+    # images than a prior attempt) must not leave higher-numbered
+    # img-NN.jpg files behind — mkdir(exist_ok=True) alone never clears an
+    # existing dir, so a stale image from a previous listing could leak
+    # into the grade. Wipe it before writing this listing's images.
+    if outdir.exists():
+        shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     # BUI-283: fetch_item() returns None on failure (already logged detail to
     # stderr) rather than raising. Adapt that back to a raised RuntimeError so
@@ -56,13 +78,26 @@ def download_listing(token, item_id, outdir, base_url):
     data = fetch_item(item_id, token, base_url)
     if data is None:
         raise RuntimeError(f"item {item_id}: fetch failed (see stderr for detail)")
-    imgs = []
-    if "image" in data:
-        imgs.append(data["image"]["imageUrl"])
-    for ai in data.get("additionalImages", []):
-        imgs.append(ai["imageUrl"])
+    # BUI-300: a malformed Browse-API response (e.g. missing imageUrl) must
+    # fail only this item via the same FETCH FAILED contract as a None
+    # fetch_item() result above — not raise a bare KeyError that aborts the
+    # whole batch.
+    try:
+        imgs = []
+        if "image" in data:
+            imgs.append(data["image"]["imageUrl"])
+        for ai in data.get("additionalImages", []):
+            imgs.append(ai["imageUrl"])
+    except KeyError as e:
+        raise RuntimeError(f"item {item_id}: malformed image data (missing {e})") from e
     for i, url in enumerate(imgs, 1):
-        urllib.request.urlretrieve(url, outdir / f"img-{i:02d}.jpg")
+        try:
+            _download_image(url, outdir / f"img-{i:02d}.jpg")
+        except requests.exceptions.RequestException as e:
+            # Covers connection errors, HTTP error status, and a timed-out
+            # host — a hung image host must fail only this item, not stall
+            # the whole sequential batch.
+            raise RuntimeError(f"item {item_id}: image download failed ({e})") from e
     # Auction value signal for the value gate (Step 2): currentBidPrice/bidCount are
     # already in the Browse API response — capture them, no extra request needed.
     # BUI-165: for a fixed-price (BIN) listing currentBidPrice is absent, so this
@@ -98,6 +133,13 @@ def main(argv=None):
     client_id, client_secret, base_url = load_config()
     # BUI-283: reuse ebay_fetch's cached get_token() (writes token_cache_{env}.json,
     # 5-min buffer) instead of a fresh OAuth call every run — see module docstring.
+    # BUI-300 residual: no refresh-on-401 mid-batch. fetch_item() collapses every
+    # non-200/404/429 response (including 401) to a bare `return None` without
+    # surfacing the status code, so this loop cannot distinguish "token expired"
+    # from any other failure without changing ebay_fetch.py — out of scope here
+    # (see BUI-299, which is concurrently touching that file's network handling).
+    # A token outliving a long batch would currently show up as FETCH FAILED for
+    # the remaining items rather than self-healing.
     token = get_token(client_id, client_secret, base_url)
     for label, item_id in items:
         try:
