@@ -72,7 +72,7 @@ class TestDownloadListing:
         return data
 
     def test_happy_path_title_images_price_bids(self, tmp_path):
-        with patch("grade_photos.fetch_item", return_value=self._fake_item()):
+        with patch("grade_photos.fetch_item_with_status", return_value=(self._fake_item(), 200)):
             with patch("grade_photos._download_image"):
                 result = grade_photos.download_listing(
                     "fake-token", "123", tmp_path / "comic-1", ebay_fetch.PRODUCTION_BASE,
@@ -84,7 +84,7 @@ class TestDownloadListing:
 
     def test_multi_image_download_calls_download_image_per_image(self, tmp_path):
         outdir = tmp_path / "comic-1"
-        with patch("grade_photos.fetch_item", return_value=self._fake_item()):
+        with patch("grade_photos.fetch_item_with_status", return_value=(self._fake_item(), 200)):
             with patch("grade_photos._download_image") as mock_download:
                 grade_photos.download_listing(
                     "fake-token", "123", outdir, ebay_fetch.PRODUCTION_BASE,
@@ -104,7 +104,7 @@ class TestDownloadListing:
         )
         # currentBidPrice absent entirely (not just falsy) mirrors the real API shape.
         del item["currentBidPrice"]
-        with patch("grade_photos.fetch_item", return_value=item):
+        with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
             with patch("grade_photos._download_image"):
                 result = grade_photos.download_listing(
                     "fake-token", "123", tmp_path / "comic-1", ebay_fetch.PRODUCTION_BASE,
@@ -115,7 +115,7 @@ class TestDownloadListing:
     def test_no_price_field_at_all_is_none(self, tmp_path):
         item = self._fake_item()
         del item["currentBidPrice"]
-        with patch("grade_photos.fetch_item", return_value=item):
+        with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
             with patch("grade_photos._download_image"):
                 result = grade_photos.download_listing(
                     "fake-token", "123", tmp_path / "comic-1", ebay_fetch.PRODUCTION_BASE,
@@ -123,10 +123,11 @@ class TestDownloadListing:
         assert result["current_price"] is None
 
     def test_fetch_item_none_raises_runtime_error(self, tmp_path):
-        """BUI-283 adapter: fetch_item() returning None (its failure contract)
-        must surface as a raised RuntimeError so main() emits FETCH FAILED —
-        never silently falling through to an image_count=0 result (BUI-147)."""
-        with patch("grade_photos.fetch_item", return_value=None):
+        """BUI-283 adapter: fetch_item_with_status() returning (None, status)
+        for a non-401 failure must surface as a raised RuntimeError so main()
+        emits FETCH FAILED — never silently falling through to an
+        image_count=0 result (BUI-147)."""
+        with patch("grade_photos.fetch_item_with_status", return_value=(None, 500)):
             try:
                 grade_photos.download_listing(
                     "fake-token", "999", tmp_path / "comic-1", ebay_fetch.PRODUCTION_BASE,
@@ -134,6 +135,20 @@ class TestDownloadListing:
                 assert False, "expected RuntimeError"
             except RuntimeError as e:
                 assert "999" in str(e)
+
+    def test_fetch_item_401_raises_token_expired_error(self, tmp_path):
+        """BUI-310: a 401 must raise the more specific TokenExpiredError (a
+        RuntimeError subclass) so main() can refresh the token and retry —
+        distinct from the generic fetch-failure RuntimeError above."""
+        with patch("grade_photos.fetch_item_with_status", return_value=(None, 401)):
+            try:
+                grade_photos.download_listing(
+                    "fake-token", "999", tmp_path / "comic-1", ebay_fetch.PRODUCTION_BASE,
+                )
+                assert False, "expected TokenExpiredError"
+            except grade_photos.TokenExpiredError as e:
+                assert "999" in str(e)
+                assert isinstance(e, RuntimeError)
 
 
 # ============================================================
@@ -153,7 +168,7 @@ class TestMalformedImageData:
             "currentBidPrice": {"value": "1.00"},
             "bidCount": 1,
         }
-        with patch("grade_photos.fetch_item", return_value=item):
+        with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
             try:
                 grade_photos.download_listing(
                     "fake-token", "555", tmp_path / "comic-1", ebay_fetch.PRODUCTION_BASE,
@@ -171,7 +186,7 @@ class TestMalformedImageData:
             "currentBidPrice": {"value": "1.00"},
             "bidCount": 1,
         }
-        with patch("grade_photos.fetch_item", return_value=item):
+        with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
             with patch("grade_photos._download_image"):
                 try:
                     grade_photos.download_listing(
@@ -194,7 +209,10 @@ class TestMalformedImageData:
         bad_item = {"title": "Broken", "image": {}}
         with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
             with patch("grade_photos.get_token", return_value="fake-token"):
-                with patch("grade_photos.fetch_item", side_effect=[good_item, bad_item, good_item]):
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[(good_item, 200), (bad_item, 200), (good_item, 200)],
+                ):
                     with patch("grade_photos._download_image"):
                         grade_photos.main(["111", "222", "333", "--workdir", str(tmp_path)])
         lines = capsys.readouterr().out.strip().splitlines()
@@ -212,7 +230,7 @@ class TestDownloadTimeout:
     def test_download_uses_bounded_timeout(self, tmp_path):
         """Every image download must pass a bounded timeout to requests.get —
         a hung image host must not stall the sequential batch indefinitely."""
-        with patch("grade_photos.fetch_item", return_value=self._single_image_item()):
+        with patch("grade_photos.fetch_item_with_status", return_value=(self._single_image_item(), 200)):
             with patch("grade_photos.requests.get", return_value=_ok_response()) as mock_get:
                 grade_photos.download_listing(
                     "fake-token", "123", tmp_path / "comic-1", ebay_fetch.PRODUCTION_BASE,
@@ -223,7 +241,7 @@ class TestDownloadTimeout:
         """A download that times out (requests.exceptions.Timeout) must fail
         only this item via RuntimeError/FETCH FAILED — not stall or crash the
         whole sequential batch."""
-        with patch("grade_photos.fetch_item", return_value=self._single_image_item()):
+        with patch("grade_photos.fetch_item_with_status", return_value=(self._single_image_item(), 200)):
             with patch("grade_photos.requests.get", side_effect=requests.exceptions.Timeout("timed out")):
                 try:
                     grade_photos.download_listing(
@@ -238,7 +256,7 @@ class TestDownloadTimeout:
         on the image URL itself) must also fail only this item."""
         error_response = MagicMock()
         error_response.raise_for_status.side_effect = requests.exceptions.HTTPError("404 Client Error")
-        with patch("grade_photos.fetch_item", return_value=self._single_image_item()):
+        with patch("grade_photos.fetch_item_with_status", return_value=(self._single_image_item(), 200)):
             with patch("grade_photos.requests.get", return_value=error_response):
                 try:
                     grade_photos.download_listing(
@@ -252,7 +270,7 @@ class TestDownloadTimeout:
         good_item = self._single_image_item()
         with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
             with patch("grade_photos.get_token", return_value="fake-token"):
-                with patch("grade_photos.fetch_item", return_value=good_item):
+                with patch("grade_photos.fetch_item_with_status", return_value=(good_item, 200)):
                     with patch(
                         "grade_photos.requests.get",
                         side_effect=[requests.exceptions.Timeout("timed out"), _ok_response()],
@@ -298,7 +316,7 @@ class TestStaleFileCleanup:
             "bidCount": 1,
         }
 
-        with patch("grade_photos.fetch_item", return_value=one_image_item):
+        with patch("grade_photos.fetch_item_with_status", return_value=(one_image_item, 200)):
             with patch("grade_photos.requests.get", return_value=_ok_response(b"new-1")):
                 result = grade_photos.download_listing(
                     "fake-token", "123", outdir, ebay_fetch.PRODUCTION_BASE,
@@ -316,7 +334,7 @@ class TestStaleFileCleanup:
         outdir.mkdir(parents=True)
         (outdir / "img-01.jpg").write_bytes(b"stale-cover")
 
-        with patch("grade_photos.fetch_item", return_value=None):
+        with patch("grade_photos.fetch_item_with_status", return_value=(None, 500)):
             try:
                 grade_photos.download_listing(
                     "fake-token", "999", outdir, ebay_fetch.PRODUCTION_BASE,
@@ -346,7 +364,7 @@ class TestMainStdoutContract:
     def test_happy_path_line_format(self, tmp_path, capsys):
         with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
             with patch("grade_photos.get_token", return_value="fake-token"):
-                with patch("grade_photos.fetch_item", return_value=self._fake_item()):
+                with patch("grade_photos.fetch_item_with_status", return_value=(self._fake_item(), 200)):
                     with patch("grade_photos._download_image"):
                         grade_photos.main(["123", "--workdir", str(tmp_path)])
         out = capsys.readouterr().out
@@ -357,7 +375,7 @@ class TestMainStdoutContract:
         0-images success line."""
         with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
             with patch("grade_photos.get_token", return_value="fake-token"):
-                with patch("grade_photos.fetch_item", return_value=None):
+                with patch("grade_photos.fetch_item_with_status", return_value=(None, 500)):
                     grade_photos.main(["999", "--workdir", str(tmp_path)])
         out = capsys.readouterr().out.strip()
         assert out.startswith("comic-1: FETCH FAILED — ")
@@ -366,7 +384,10 @@ class TestMainStdoutContract:
     def test_comic_n_label_numbering_multiple_items(self, tmp_path, capsys):
         with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
             with patch("grade_photos.get_token", return_value="fake-token"):
-                with patch("grade_photos.fetch_item", side_effect=[self._fake_item(), None, self._fake_item()]):
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[(self._fake_item(), 200), (None, 500), (self._fake_item(), 200)],
+                ):
                     with patch("grade_photos._download_image"):
                         grade_photos.main(["111", "222", "333", "--workdir", str(tmp_path)])
         lines = capsys.readouterr().out.strip().splitlines()
@@ -379,10 +400,125 @@ class TestMainStdoutContract:
         per-item OAuth call this module used to make is gone."""
         with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
             with patch("grade_photos.get_token", return_value="fake-token") as mock_get_token:
-                with patch("grade_photos.fetch_item", return_value=self._fake_item()):
+                with patch("grade_photos.fetch_item_with_status", return_value=(self._fake_item(), 200)):
                     with patch("grade_photos._download_image"):
                         grade_photos.main(["111", "222", "--workdir", str(tmp_path)])
         assert mock_get_token.call_count == 1
+
+
+# ============================================================
+# BUI-310: refresh-on-401 mid-batch (closes the BUI-300 residual)
+# ============================================================
+
+
+class TestRefreshOn401:
+    def _fake_item(self, title="Fantastic Four #52"):
+        return {
+            "title": title,
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "currentBidPrice": {"value": "5.00"},
+            "bidCount": 1,
+        }
+
+    def test_401_mid_batch_refreshes_token_and_retries_once_then_succeeds(self, tmp_path, capsys):
+        """A 401 on one item must trigger exactly one get_token() refresh and
+        one retry of that same item — self-healing rather than FETCH FAILED —
+        and the refreshed token must be reused for the rest of the batch."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", side_effect=["stale-token", "fresh-token"]) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (self._fake_item("First"), 200),
+                        (None, 401),  # comic-2 with the stale token
+                        (self._fake_item("Second-retried"), 200),  # comic-2 retried with fresh token
+                        (self._fake_item("Third"), 200),  # comic-3 reuses the fresh token, no more 401s
+                    ],
+                ):
+                    with patch("grade_photos._download_image"):
+                        grade_photos.main(["111", "222", "333", "--workdir", str(tmp_path)])
+        assert mock_get_token.call_count == 2
+        # BUI-310: the refresh call must force a genuinely new token rather
+        # than trust the cache, which could still hand back the just-rejected
+        # one (see TestFetchItemWithStatus/get_token's force_refresh test).
+        assert mock_get_token.call_args_list[1].kwargs.get("force_refresh") is True
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert lines[0].startswith("comic-1: First")
+        assert lines[1].startswith("comic-2: Second-retried")
+        assert lines[2].startswith("comic-3: Third")
+        assert "FETCH FAILED" not in "\n".join(lines)
+
+    def test_refreshed_token_is_actually_forwarded_to_later_items(self, tmp_path, capsys):
+        """Directly pins token propagation: the stale token is passed to
+        comic-1 and comic-2's first (401) attempt, then the fresh token to
+        comic-2's retry AND comic-3 — asserting on the actual token argument
+        forwarded to fetch_item_with_status, not just inferring from the mock's
+        positional return order."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", side_effect=["stale-token", "fresh-token"]):
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (self._fake_item("First"), 200),  # comic-1, stale token
+                        (None, 401),                       # comic-2, stale token → 401
+                        (self._fake_item("Second"), 200),  # comic-2 retry, fresh token
+                        (self._fake_item("Third"), 200),   # comic-3, fresh token
+                    ],
+                ) as mock_fetch:
+                    with patch("grade_photos._download_image"):
+                        grade_photos.main(["111", "222", "333", "--workdir", str(tmp_path)])
+        # token is the second positional arg to fetch_item_with_status(item_id, token, base_url)
+        tokens_used = [c.args[1] for c in mock_fetch.call_args_list]
+        assert tokens_used == ["stale-token", "stale-token", "fresh-token", "fresh-token"]
+
+    def test_get_token_systemexit_during_refresh_degrades_to_fetch_failed(self, tmp_path, capsys):
+        """BUI-310 hardening: get_token() calls sys.exit(1) on a hard auth
+        failure. That SystemExit (a BaseException) must NOT escape main()'s
+        loop and abort the whole batch — it must degrade to this item's FETCH
+        FAILED and let the remaining items run (BUI-147/BUI-300 invariant)."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            # Initial token OK; the mid-batch force-refresh sys.exit(1)s.
+            with patch("grade_photos.get_token", side_effect=["good-token", SystemExit(1)]) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[(None, 401), (self._fake_item("Recovered"), 200)],
+                ):
+                    with patch("grade_photos._download_image"):
+                        rc = grade_photos.main(["111", "222", "--workdir", str(tmp_path)])
+        assert rc == 0  # batch completed, did not crash out via SystemExit
+        assert mock_get_token.call_count == 2
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert lines[0].startswith("comic-1: FETCH FAILED — ")
+        # comic-2 still ran despite comic-1's refresh blowing up.
+        assert lines[1].startswith("comic-2: Recovered")
+
+    def test_401_persists_after_refresh_still_fetch_failed(self, tmp_path, capsys):
+        """If the retry with a freshly fetched token ALSO 401s, that's a
+        genuine failure — the FETCH FAILED contract must still hold, and the
+        batch must not retry a second time."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", side_effect=["stale-token", "still-bad-token"]) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[(None, 401), (None, 401)],
+                ):
+                    grade_photos.main(["111", "--workdir", str(tmp_path)])
+        assert mock_get_token.call_count == 2
+        out = capsys.readouterr().out.strip()
+        assert out.startswith("comic-1: FETCH FAILED — ")
+
+    def test_non_401_failure_is_fetch_failed_without_refresh(self, tmp_path, capsys):
+        """A non-401 failure (e.g. 500, 404) must NOT trigger a token refresh
+        — only a 401 does. The FETCH FAILED contract stays intact unchanged."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", return_value="fake-token") as mock_get_token:
+                with patch("grade_photos.fetch_item_with_status", return_value=(None, 500)):
+                    grade_photos.main(["111", "--workdir", str(tmp_path)])
+        # Only the initial get_token() call before the loop — no refresh.
+        assert mock_get_token.call_count == 1
+        out = capsys.readouterr().out.strip()
+        assert out.startswith("comic-1: FETCH FAILED — ")
 
 
 # ============================================================

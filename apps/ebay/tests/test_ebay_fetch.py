@@ -516,6 +516,111 @@ class TestFetchItem:
         assert "Malformed response" in capsys.readouterr().err
 
 
+class TestFetchItemWithStatus:
+    """BUI-310: fetch_item_with_status() surfaces the HTTP status alongside
+    the data, so callers can distinguish 401 (token expired) from other
+    failures. fetch_item() must keep returning bare data-or-None on top of it."""
+
+    def test_success_returns_data_and_200(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"itemId": "v1|123|0", "title": "Test"}
+
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            data, status = ebay_fetch.fetch_item_with_status("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert data["title"] == "Test"
+        assert status == 200
+
+    def test_401_returns_none_and_401(self, capsys):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.text = "Unauthorized"
+
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            data, status = ebay_fetch.fetch_item_with_status("999", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert data is None
+        assert status == 401
+
+    def test_404_returns_none_and_404(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            data, status = ebay_fetch.fetch_item_with_status("999", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert data is None
+        assert status == 404
+
+    def test_other_4xx_returns_none_and_that_status(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        mock_resp.text = "Forbidden"
+
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            data, status = ebay_fetch.fetch_item_with_status("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert data is None
+        assert status == 403
+
+    def test_server_error_returns_none_and_status(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal Server Error"
+
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            data, status = ebay_fetch.fetch_item_with_status("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert data is None
+        assert status == 500
+
+    def test_network_error_returns_none_and_none_status(self):
+        """No HTTP response at all → status is None, distinguishing it from
+        any real HTTP status code."""
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=requests.exceptions.ConnectionError("no route to host"),
+        ):
+            data, status = ebay_fetch.fetch_item_with_status("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert data is None
+        assert status is None
+
+    def test_malformed_200_body_returns_none_and_200(self):
+        """A 200 with a non-JSON body reports status 200 (the response WAS a
+        200) with data None — the status half must not be swallowed."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1")
+
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            data, status = ebay_fetch.fetch_item_with_status("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert data is None
+        assert status == 200
+
+    def test_exhausted_429_retries_returns_none_and_429(self):
+        """When every attempt is rate-limited, the retries-exhausted fallthrough
+        must report status 429 (not None or 200) so a caller can tell a
+        rate-limit exhaustion apart from a network error or a success."""
+        rate_limited = MagicMock()
+        rate_limited.status_code = 429
+
+        with patch("ebay_fetch.requests.get", return_value=rate_limited):
+            with patch("ebay_fetch.time.sleep"):  # skip real backoff
+                data, status = ebay_fetch.fetch_item_with_status(
+                    "123", "fake-token", ebay_fetch.PRODUCTION_BASE, retries=2,
+                )
+        assert data is None
+        assert status == 429
+
+    def test_fetch_item_wrapper_discards_status_on_401(self):
+        """fetch_item() must keep its historical None-on-failure contract even
+        for a 401 — existing callers that only check `if data is None` must
+        keep working unchanged."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.text = "Unauthorized"
+
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert result is None
+
+
 class TestGetToken:
     def test_uses_cached_token(self, tmp_path, monkeypatch):
         cache_file = tmp_path / "token_cache_production.json"
@@ -542,6 +647,26 @@ class TestGetToken:
         with patch("ebay_fetch.requests.post", return_value=mock_resp):
             token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
         assert token == "new-token"
+
+    def test_force_refresh_bypasses_a_still_valid_cache(self, tmp_path, monkeypatch):
+        """BUI-310: force_refresh=True must fetch a new token even when the
+        cached one is nowhere near its TTL — used by grade_photos.py's
+        401-retry, which can't assume a 401 is caused by natural cache
+        expiry (server-side revocation, clock skew)."""
+        cache_file = tmp_path / "token_cache_production.json"
+        cache_file.write_text(json.dumps({
+            "access_token": "still-cached-but-rejected-token",
+            "expires_at": time.time() + 3600,  # far from expiry
+        }))
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "genuinely-new-token", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE, force_refresh=True)
+        assert token == "genuinely-new-token"
 
     def test_auth_failure_exits(self, tmp_path, monkeypatch):
         monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
