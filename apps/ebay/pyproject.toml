@@ -20,16 +20,12 @@ comic-identify = "comic_identify:main"
 grade-photos = "grade_photos:main"
 
 [tool.hatch.build.targets.wheel]
+# BUI-332: glob-based include so every src/*.py is shipped automatically —
+# no per-file entry to forget on a new module (the old explicit list let a
+# missing entry pass `uv run pytest`, which uses pythonpath=["src"] and never
+# exercises this list, and only break at `uv tool install` runtime).
 include = [
-    "src/ebay_fetch.py",
-    "src/sold_comps.py",
-    "src/comic_identity.py",
-    "src/comic_identity_year.py",
-    "src/comic_identify.py",
-    "src/grade_photos.py",
-    "src/seller_scan.py",
-    "src/ebay_search_cache.py",
-    "src/wishlist_sellers.py",
+    "src/*.py",
     "src/seller_aliases.json",
 ]
 sources = ["src"]
