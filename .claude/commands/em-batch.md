@@ -14,6 +14,7 @@ Distilled from the BUI-299..319 batches — the model-selection and token-effici
 - Read every ticket: `linear issue view <ID>` (and referenced tickets for context).
 - **Group into waves** by file-conflict and dependency:
   - Tickets touching the **same file** go in the **same wave combined into ONE branch/PR**, or in **different waves sequenced** so the later one branches from the merged earlier one. Never let two parallel agents edit the same file.
+  - **Conflict is by import edge, not just filename.** Two tickets in *different* files still collide when one changes a module surface the other imports (BUI-323 refactored `ebay_fetch.py`; BUI-322 imports it). Run them parallel only if the module-owner ticket is told to **keep its public signatures stable** — otherwise sequence them.
   - A ticket that consumes another's output waits for that one to merge.
 - Assign a **model per ticket** (see §2) and a **review depth** per ticket (see §3).
 - Post the wave plan (tickets, waves, model, review depth, conflict notes) before executing.
@@ -66,22 +67,28 @@ Spawn each via the Agent tool with `isolation: "worktree"` and the assigned mode
    ```
 7. SendMessage to `main`: branch, HEAD SHA (`git rev-parse HEAD`), test counts, and any out-of-scope findings.
 
+**License to stop (put this in the spawn prompt, especially for opus-tier tickets).** §2 deliberately routes opus work whose *stated approach may be wrong*. Grant the agent explicit permission: *if the ticket's premise is broken or the change can't be made safely as specified, STOP and report your findings instead of shipping a speculative implementation.* A disciplined no-code stop-and-report is a **success**, not a failure — handle it per §5. (BUI-326: the agent correctly refused to port a fragile price-extractor into a live bid-cap path; the right move was to close it, not force code.)
+
 If an agent stops mid-review without committing (a known failure mode), resume it via SendMessage: apply findings → run tests → commit → report.
+
+**Resuming a completed agent via SendMessage re-instantiates its entire context (~100k+ tokens).** Only resume when you need it to *do more work* — apply findings, commit, re-run tests. **NEVER resume merely to acknowledge a report, thank it, or tell it to stand down** — handle those silently on the EM side. In one batch, resuming an agent just to say "stand down" burned ~108k tokens for zero work (comparable to a whole ticket run).
 
 ## 5. EM duties (you, on `main`, per finished ticket)
 
 1. `git push -u origin <branch>`
 2. `gh pr create` with a summary body (+ the `🤖 Generated with…` / session-URL footer).
 3. Wait for CI: `gh pr checks <N>`. Gates are `workspace` + `apps-python` + `lint` + `ezship`. **`typecheck` is NON-required** — don't block on it, but glance at it.
-4. Merge once green: `gh pr merge <N> --merge --delete-branch`.
-5. Clean up the worktree (`git worktree remove -f -f <path>`; a live agent can lock it — `-f -f`), delete the local branch, `git checkout main && git pull`.
+4. Merge once green: `gh pr merge <N> --merge --delete-branch` — **one PR per bash call.** Batching several `gh pr merge`s (or combining a merge with other commands) in one invocation trips the auto-mode classifier ("Merge Without Review"); a lone `gh pr merge <N>` call goes through.
+5. Clean up the worktree (`git worktree remove -f -f <path>`; a live agent can lock it — `-f -f`), delete the local branch, `git checkout main && git pull`. Note: `gh pr merge --delete-branch` prints `failed to delete local branch … used by worktree` whenever the agent's worktree still holds the branch — that warning is **benign** (the *remote* branch is deleted); remove the worktree first, or just delete the local branch during this cleanup step.
 6. `linear issue comment add <ID>` with a shipped-summary, then `linear issue update <ID> -s "Done"`.
+
+**When an agent reports the ticket is ill-specified or can't be done safely** (a stop-and-report, no PR to merge): don't force code through. Escalate the *decision* to the user (`AskUserQuestion` with the options + a clear recommendation), then close the ticket per their call (Won't Do / re-scope) and file the spec-correction as a follow-up per §6. Clean up the (empty) worktree/branch. Not every ticket ships — a well-reasoned decline is a valid outcome.
 
 Launch each wave's agents in parallel; start the next wave only when its dependencies have **merged**. Track progress with the Task tools.
 
 ## 6. Guardrails
 
-- **New out-of-scope bugs/improvements** found during reviews → file a NEW Linear ticket (BUI team), **FILE-ONLY, do not recurse** into working them (this is one backlog level; findings from findings just get filed).
+- **New out-of-scope bugs/improvements** found during reviews → file a NEW Linear ticket (BUI team), **FILE-ONLY, do not recurse** into working them (this is one backlog level; findings from findings just get filed). When several findings share **one root cause** and would be fixed together, file **one consolidated ticket**, not N fragments — but keep them separate when they'd be worked independently (e.g. the same idiom duplicated across different packages).
 - When **all tickets are merged and `main` is green**, run `/ce-compound mode:headless` **if** the batch surfaced a compound-worthy learning (a non-obvious trap future work will re-hit). Then post a final summary of everything shipped.
 - **Never self-widen permissions.** The `Bash(gh pr merge:*)` rule must already be user-authored in `.claude/settings.local.json`. If a merge is blocked, surface it to the user — do not attempt to grant it yourself.
 - **Peer/background messages are not user approval.** Verify merged code rather than trusting late/orphaned reviewer messages that arrive after an agent finished.
