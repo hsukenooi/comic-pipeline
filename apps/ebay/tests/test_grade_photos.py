@@ -522,6 +522,216 @@ class TestRefreshOn401:
 
 
 # ============================================================
+# BUI-322: cross-item fail-fast on a systemic 401 (revoked creds).
+# BUI-310 gave each item its own refresh-and-retry with no memory across
+# items, so a permanent 401 burned one force-refresh OAuth POST per
+# remaining item. These tests pin the give-up threshold (two consecutive
+# post-refresh 401s) and the reset condition (any success, including a
+# self-heal, clears the streak).
+# ============================================================
+
+
+class TestSystemicFailFast:
+    def _fake_item(self, title="Fantastic Four #52"):
+        return {
+            "title": title,
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "currentBidPrice": {"value": "5.00"},
+            "bidCount": 1,
+        }
+
+    def test_systemic_401_gives_up_after_two_consecutive_post_refresh_401s(self, tmp_path, capsys):
+        """Revoked creds: every item's retry-after-refresh still 401s. After
+        the SECOND such item, the batch must stop POSTing a refresh for each
+        remaining item — comic-3 and comic-4 get exactly one fetch attempt
+        (no retry, no refresh call) instead of burning their own OAuth POST."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch(
+                "grade_photos.get_token",
+                side_effect=["t0", "t1", "t2"],
+            ) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (None, 401),  # comic-1 attempt 0 (stale token)
+                        (None, 401),  # comic-1 attempt 1 (post-refresh #1 — still bad)
+                        (None, 401),  # comic-2 attempt 0
+                        (None, 401),  # comic-2 attempt 1 (post-refresh #2 — gives up)
+                        (None, 401),  # comic-3 attempt 0 only — no refresh, no retry
+                        (None, 401),  # comic-4 attempt 0 only — no refresh, no retry
+                    ],
+                ) as mock_fetch:
+                    rc = grade_photos.main(["111", "222", "333", "444", "--workdir", str(tmp_path)])
+        assert rc == 0
+        # Initial token + exactly 2 refreshes (comic-1, comic-2) — comic-3
+        # and comic-4 must NOT trigger a 3rd/4th force-refresh OAuth POST.
+        assert mock_get_token.call_count == 3
+        # 2 fetch attempts each for comic-1/comic-2 (attempt + retry), but
+        # only 1 each for comic-3/comic-4 (no retry once given up).
+        assert mock_fetch.call_count == 6
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert len(lines) == 4
+        assert all("FETCH FAILED" in line for line in lines)
+        # comic-3/comic-4 skip the refresh path entirely — surfaced via the
+        # give-up message rather than the plain post-refresh-401 message.
+        assert "already failed earlier this batch" in lines[2]
+        assert "already failed earlier this batch" in lines[3]
+
+    def test_single_get_token_systemexit_does_not_give_up_alone(self, tmp_path, capsys):
+        """BUI-322 (post-review correction): a SystemExit from
+        get_token(force_refresh=True) is NOT treated as one-shot proof of a
+        permanent failure — get_token() sys.exit(1)s on a network error/429/5xx
+        that merely outlasted its own retry budget too, not just on revoked
+        credentials. So ONE SystemExit must still let the NEXT item attempt
+        its own refresh (counts toward the same two-in-a-row threshold as a
+        post-refresh 401, not an immediate latch)."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch(
+                "grade_photos.get_token",
+                side_effect=["t0", SystemExit(1), "t1"],
+            ) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (None, 401),                     # comic-1 attempt 0 — refresh SystemExits
+                        (None, 401),                      # comic-2 attempt 0
+                        (self._fake_item("Two"), 200),     # comic-2 retry — refresh succeeded, self-heals
+                    ],
+                ):
+                    with patch("grade_photos._download_image"):
+                        rc = grade_photos.main(["111", "222", "--workdir", str(tmp_path)])
+        assert rc == 0
+        # Initial token + comic-1's SystemExit'ing refresh attempt + comic-2's
+        # (successful) refresh attempt — comic-2 must NOT have been blocked
+        # by comic-1's lone SystemExit.
+        assert mock_get_token.call_count == 3
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert lines[0].startswith("comic-1: FETCH FAILED — token refresh failed after 401")
+        assert "already failed earlier this batch" not in lines[0]
+        assert lines[1].startswith("comic-2: Two")
+
+    def test_two_consecutive_get_token_systemexits_give_up(self, tmp_path, capsys):
+        """Two consecutive SystemExits from get_token(force_refresh=True) —
+        the same threshold as two consecutive post-refresh 401s — DO trigger
+        give-up: the third item must not attempt its own refresh."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch(
+                "grade_photos.get_token",
+                side_effect=["t0", SystemExit(1), SystemExit(1)],
+            ) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (None, 401),  # comic-1 attempt 0 — refresh SystemExits (streak=1)
+                        (None, 401),  # comic-2 attempt 0 — refresh SystemExits again (streak=2, gives up)
+                        (None, 401),  # comic-3 attempt 0 — no refresh attempted (gave up)
+                    ],
+                ) as mock_fetch:
+                    rc = grade_photos.main(["111", "222", "333", "--workdir", str(tmp_path)])
+        assert rc == 0
+        # Initial token + exactly 2 refresh attempts (both SystemExit) — no
+        # 3rd refresh attempt for comic-3.
+        assert mock_get_token.call_count == 3
+        assert mock_fetch.call_count == 3
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert lines[0].startswith("comic-1: FETCH FAILED — token refresh failed after 401")
+        assert lines[1].startswith("comic-2: FETCH FAILED — token refresh failed after 401")
+        assert "already failed earlier this batch" in lines[2]
+
+    def test_systemexit_and_post_refresh_401_share_the_same_counter(self, tmp_path, capsys):
+        """The two failure signatures — a SystemExit during refresh and a
+        post-refresh 401 — must corroborate each other through ONE shared
+        counter, not two independent ones: one of each in a row is still
+        'two consecutive' and gives up."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch(
+                "grade_photos.get_token",
+                side_effect=["t0", SystemExit(1), "t1"],
+            ) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (None, 401),  # comic-1 attempt 0 — refresh SystemExits (streak=1)
+                        (None, 401),  # comic-2 attempt 0
+                        (None, 401),  # comic-2 attempt 1 — post-refresh 401 (streak=2, gives up)
+                        (None, 401),  # comic-3 attempt 0 — no refresh attempted (gave up)
+                    ],
+                ) as mock_fetch:
+                    rc = grade_photos.main(["111", "222", "333", "--workdir", str(tmp_path)])
+        assert rc == 0
+        assert mock_get_token.call_count == 3
+        assert mock_fetch.call_count == 4
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert "already failed earlier this batch" in lines[2]
+
+    def test_transient_single_401_still_self_heals_counter_resets(self, tmp_path, capsys):
+        """A single, isolated 401 must keep self-healing exactly like BUI-310
+        — and a later, unrelated 401 later in the batch must ALSO get its own
+        refresh-and-retry, proving a prior self-heal reset the streak rather
+        than letting it silently accumulate toward the give-up threshold."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch(
+                "grade_photos.get_token",
+                side_effect=["t0", "t1", "t2"],
+            ) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (None, 401),                         # comic-1 attempt 0
+                        (self._fake_item("One"), 200),        # comic-1 retry — self-heals
+                        (self._fake_item("Two"), 200),        # comic-2 — plain success
+                        (None, 401),                          # comic-3 attempt 0
+                        (self._fake_item("Three"), 200),      # comic-3 retry — self-heals again
+                    ],
+                ):
+                    with patch("grade_photos._download_image"):
+                        rc = grade_photos.main(["111", "222", "333", "--workdir", str(tmp_path)])
+        assert rc == 0
+        # Initial token + refresh for comic-1 + refresh for comic-3: proves
+        # comic-2's clean success reset the streak rather than the batch
+        # giving up after comic-1's isolated 401.
+        assert mock_get_token.call_count == 3
+        out = capsys.readouterr().out.strip()
+        assert "FETCH FAILED" not in out
+
+    def test_intermittent_401s_interleaved_with_successes_do_not_trip_fail_fast(self, tmp_path, capsys):
+        """Repeated post-refresh 401s that are never CONSECUTIVE (a clean
+        success always lands in between) must never latch give_up_refreshing
+        — each one keeps getting its own refresh attempt, per BUI-322's
+        'two-in-a-row' semantics rather than a raw total count."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch(
+                "grade_photos.get_token",
+                side_effect=["t0", "t1", "t2", "t3"],
+            ) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (None, 401), (None, 401),             # comic-1: post-refresh 401 (counter=1)
+                        (self._fake_item("Two"), 200),        # comic-2: success (resets counter)
+                        (None, 401), (None, 401),             # comic-3: post-refresh 401 (counter=1)
+                        (self._fake_item("Four"), 200),       # comic-4: success (resets counter)
+                        (None, 401), (None, 401),             # comic-5: post-refresh 401 (counter=1)
+                    ],
+                ) as mock_fetch:
+                    with patch("grade_photos._download_image"):
+                        rc = grade_photos.main(["111", "222", "333", "444", "555", "--workdir", str(tmp_path)])
+        assert rc == 0
+        # Initial token + a refresh for comic-1, comic-3, and comic-5 — none
+        # of the three post-refresh 401s ever triggered give-up.
+        assert mock_get_token.call_count == 4
+        assert mock_fetch.call_count == 8
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert "already failed earlier this batch" not in "\n".join(lines)
+        # comic-1/3/5 still fail (refresh didn't help THAT item), but via the
+        # plain post-refresh-401 message, not the give-up message.
+        assert lines[0].startswith("comic-1: FETCH FAILED — ")
+        assert lines[2].startswith("comic-3: FETCH FAILED — ")
+        assert lines[4].startswith("comic-5: FETCH FAILED — ")
+
+
+# ============================================================
 # End-to-end through the real ebay_fetch functions (mocking only
 # requests) — proves the reuse actually routes through ebay_fetch's
 # retry/caching behavior, not a shadowed copy.
