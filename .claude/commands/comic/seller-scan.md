@@ -150,7 +150,8 @@ seller_scan.py <seller> 2>/dev/null
       "filtered": [ { "item_id": "...", "title": "...", "wish_name": "...", "reason": "..." } ],
       "skipped_cached_candidates": 0,
       "incomplete": false,
-      "error": null
+      "error": null,
+      "crashed": false
     }
   ]
 }
@@ -170,12 +171,14 @@ is passed, since `--all` bypasses the cache and force-re-verifies everything.
 |---|---|---|
 | `0` | Every seller scanned cleanly | Read `sellers[*].matches` as usual |
 | `1` | **Global verifier failure** — the `claude` CLI is missing/unauthenticated, or every chunk failed transport. The run is truncated: the failing seller's slot has `error: "claude verifier globally unavailable ..."`, sellers after it were not attempted | Fix the `claude` CLI/auth and re-run the whole batch |
-| `2` | At least one seller couldn't be resolved/fetched **or crashed mid-scan** (BUI-319), but none was incomplete | Check each `sellers[*].error` — sellers with `error: null` still have usable `matches`. A `seller scan crashed: ...` error (with the exception repr) means an unexpected bug isolated to that seller — the rest of the batch still ran; the others' results are intact and worth acting on |
+| `2` | At least one seller couldn't be resolved/fetched (unknown seller name, listing-fetch transport error), but none was incomplete or crashed | Check each `sellers[*].error` — sellers with `error: null` still have usable `matches`. This is a normal, expected failure (stale alias, transient eBay hiccup), not a bug |
 | `3` | At least one seller was **incomplete** (`sellers[*].incomplete: true`, top-level `incomplete: true`) — some candidates for that seller were NEVER verified | Surface the `INCOMPLETE` stderr banner; re-run to pick up the never-verified candidates (they were NOT marked seen, so they'll resurface) |
+| `4` | At least one seller's **worker crashed mid-scan** (BUI-324; `sellers[*].crashed: true`, `error` starts with `"seller scan crashed: ..."` and carries the exception repr) — the batch still completed for every other seller | This is an unexpected bug isolated to that seller, not a resolvable input problem — worth filing/investigating. The rest of the batch's results are intact and still worth acting on |
 | `2` (usage) | An **argparse usage error** (e.g. `--username`/`--add-alias` with 2+ sellers) — the message goes to **stderr** and **no JSON is emitted** | Fix the invocation and re-run |
 
-Priority when a batch hits several conditions: **1 > 3 > 2 > 0** (verifier-down
-is most severe; incomplete beats a bare seller error).
+Priority when a batch hits several conditions: **1 > 3 > 4 > 2 > 0** (verifier-down
+is most severe; incomplete beats a crash, which beats a bare resolvable seller
+error).
 
 **Exit `2` is overloaded** — a per-seller resolve/fetch error emits the full
 `--json` object (with that seller's `error` populated), whereas an argparse
@@ -213,7 +216,7 @@ Copy the eBay URLs from the URL column (MATCH rows, plus any UNCERTAIN rows the 
 
 | Issue | Fix |
 |---|---|
-| `unknown seller '<name>'` | The store name isn't in your alias map. Find the username (`_ssn=` in the seller's "See other items" URL) and re-run with `--add-alias <username>`. In a multi-seller batch this does NOT abort the other sellers — that seller's slot gets `error: "unknown seller '<name>'"` and the batch exits 2 (or 3 if another seller was also incomplete) |
+| `unknown seller '<name>'` | The store name isn't in your alias map. Find the username (`_ssn=` in the seller's "See other items" URL) and re-run with `--add-alias <username>`. In a multi-seller batch this does NOT abort the other sellers — that seller's slot gets `error: "unknown seller '<name>'"` and the batch exits 2 (or 3/4 if another seller was incomplete/crashed) |
 | `--username`/`--add-alias apply to exactly one seller` (exit 2) | You passed `--username` or `--add-alias` alongside 2+ sellers — re-run with a single seller when using either flag |
 | eBay rejected the seller filter | The resolved username isn't a valid eBay login username — re-check the `_ssn=` value and update the alias |
 | `Dropped N listing(s) from other sellers` | Safety net fired: eBay returned foreign sellers and they were filtered out. Usually means the alias points at the wrong/stale username |

@@ -2572,12 +2572,18 @@ class TestMainDroppedCandidatesExit:
         code = seller_scan.main(["badseller", "goodseller", "--json"])
 
         # No seller was incomplete, but one had a resolution error → exit 2.
-        assert code == 2
+        # BUI-324 regression guard: an unresolvable seller is a normal,
+        # resolvable failure — not a worker crash — so this must stay on the
+        # original _EXIT_SELLER_ERROR (2), never the new _EXIT_SELLER_CRASHED
+        # (4) added for the worker-crash case.
+        assert code == seller_scan._EXIT_SELLER_ERROR
+        assert code != seller_scan._EXIT_SELLER_CRASHED
         payload = json.loads(capsys.readouterr().out)
         by_seller = {s["seller"]: s for s in payload["sellers"]}
         assert by_seller["badseller"]["error"] == "unknown seller 'badseller'"
         assert by_seller["badseller"]["username"] is None
         assert by_seller["badseller"]["incomplete"] is False
+        assert by_seller["badseller"]["crashed"] is False
         assert by_seller["goodseller"]["error"] is None
         assert {row["item_id"] for row in by_seller["goodseller"]["matches"]} == {
             "goodseller-A1", "goodseller-A2",
@@ -3321,11 +3327,19 @@ class TestWorkerCrashIsolation:
         assert by_seller["sellerCrash"]["error"] is not None
         assert "crashed" in by_seller["sellerCrash"]["error"]
         assert "KeyError" in by_seller["sellerCrash"]["error"]
+        # BUI-324: the crashed slot is also flagged structurally (not just via
+        # its error string), and a healthy seller's slot is not.
+        assert by_seller["sellerCrash"]["crashed"] is True
+        assert by_seller["sellerOk"]["crashed"] is False
         # A crashed seller has error set but incomplete=False (dropped=[]), so
         # per main()'s documented exit priority (verifier-down 1 > incomplete 3
-        # > seller-error 2 > 0) the batch exits EXACTLY 2 — pin the precise code
-        # so a regression to 3 (incomplete) or any other value is caught.
-        assert code == seller_scan._EXIT_SELLER_ERROR
+        # > crashed 4 > seller-error 2 > 0) the batch exits EXACTLY 4 (BUI-324)
+        # — distinct from _EXIT_SELLER_ERROR (2), which is reserved for a
+        # normal, resolvable per-seller failure (unknown seller / listing
+        # fetch), not an unexpected worker crash. Pin the precise code so a
+        # regression to 2, 3, or any other value is caught.
+        assert code == seller_scan._EXIT_SELLER_CRASHED
+        assert code != seller_scan._EXIT_SELLER_ERROR
 
 
 # ─── BUI-227: _title_paren_years ─────────────────────────────────────────────
