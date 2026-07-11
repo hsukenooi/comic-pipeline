@@ -94,12 +94,20 @@ def _token_cache_file(base_url):
     return CONFIG_DIR / f"token_cache_{env}.json"
 
 
-def get_token(client_id, client_secret, base_url):
-    """Get a valid OAuth app token, using cache if available."""
+def get_token(client_id, client_secret, base_url, *, force_refresh=False):
+    """Get a valid OAuth app token, using cache if available.
+
+    force_refresh=True skips the cache-freshness check and always requests a
+    new token from eBay. BUI-310: a 401 mid-batch isn't provably caused by the
+    cache's own TTL running out (server-side revocation, clock skew) — a
+    caller retrying after a 401 needs a token guaranteed to differ from the
+    one that was just rejected, not "whatever the cache currently says is
+    still valid."
+    """
     cache_file = _token_cache_file(base_url)
 
     # Check cache
-    if cache_file.exists():
+    if not force_refresh and cache_file.exists():
         try:
             with open(cache_file) as f:
                 cache = json.load(f)
@@ -213,8 +221,23 @@ def extract_item_id(arg):
     return None
 
 
-def fetch_item(item_id, token, base_url, retries=3):
-    """Fetch a single item from the Browse API."""
+def fetch_item_with_status(item_id, token, base_url, retries=3):
+    """Fetch a single item from the Browse API, also returning the HTTP status.
+
+    Returns (data, status_code):
+    - data: the parsed JSON dict on success, else None.
+    - status_code: the HTTP status of the terminal response (e.g. 401, 404,
+      429), or None when the failure was a network error with no response at
+      all. On success (data is not None), status_code is always 200.
+
+    BUI-310: fetch_item() collapsed every non-200/404/429 response (including
+    401) to a bare `return None`, so a caller couldn't tell "token expired"
+    apart from any other failure. This is the status-aware version; fetch_item()
+    is now a thin wrapper that keeps the historical None-on-failure contract for
+    its two existing callers (this module's own CLI, grade_photos.py). Callers
+    that need to react to the status — e.g. refreshing an OAuth token on a 401
+    mid-batch — should call this directly instead.
+    """
     url = f"{base_url}/buy/browse/v1/item/get_item_by_legacy_id"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -227,17 +250,17 @@ def fetch_item(item_id, token, base_url, retries=3):
             resp = requests.get(url, headers=headers, params=params, timeout=10)
         except requests.exceptions.RequestException as exc:
             print(f"Network error fetching item {item_id}: {exc}", file=sys.stderr)
-            return None
+            return None, None
 
         if resp.status_code == 200:
             try:
-                return resp.json()
+                return resp.json(), 200
             except ValueError as exc:
                 print(f"Error: Malformed response for item {item_id}: {exc}", file=sys.stderr)
-                return None
+                return None, 200
         elif resp.status_code == 404:
             print(f"Error: Item {item_id} not found (404).", file=sys.stderr)
-            return None
+            return None, 404
         elif resp.status_code == 429:
             if attempt < retries - 1:
                 wait = 2 ** attempt
@@ -248,10 +271,22 @@ def fetch_item(item_id, token, base_url, retries=3):
                 f"Error fetching item {item_id}: HTTP {resp.status_code}: {resp.text[:200]}",
                 file=sys.stderr,
             )
-            return None
+            return None, resp.status_code
 
     print(f"Error: Failed to fetch item {item_id} after {retries} retries.", file=sys.stderr)
-    return None
+    return None, 429
+
+
+def fetch_item(item_id, token, base_url, retries=3):
+    """Fetch a single item from the Browse API. Returns None on any failure.
+
+    Thin wrapper over fetch_item_with_status() that discards the status code,
+    preserving the original contract for existing callers. Use
+    fetch_item_with_status() directly to distinguish failure modes (e.g. a 401
+    from any other error).
+    """
+    data, _status = fetch_item_with_status(item_id, token, base_url, retries=retries)
+    return data
 
 
 def _grade_from_text(text):
