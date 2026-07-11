@@ -733,16 +733,27 @@ class TestSystemicFailFast:
     def test_proof_of_200_failure_between_two_post_refresh_401s_resets_counter(self, tmp_path, capsys):
         """BUI-331: the exact scenario the ticket names — a post-refresh 401,
         then a non-auth failure that occurred AFTER a proven HTTP-200 (a
-        malformed item body), then another post-refresh 401. The middle item
-        got a 200, so the token demonstrably worked — that resets the streak,
-        making the two 401s NOT 'consecutive'. The batch must therefore NOT
-        give up: comic-3 still gets its own force-refresh, and no item prints
-        the give-up message."""
+        malformed item body), then more post-refresh 401s. The middle item got
+        a 200, so the token demonstrably worked — that resets the streak,
+        making the surrounding 401s NOT 'consecutive'. The batch must therefore
+        NOT give up.
+
+        FOUR items are required to observe this (BUI-331 code review): the
+        give-up latch only changes a *subsequent* item's behavior, so a 3-item
+        version (401 / proof-200 / 401) passes even against pre-BUI-331 code —
+        the second 401 pair is the last item and its refresh happens either
+        way. comic-4 is the observation point: with the reset, comic-1's and
+        comic-3's 401s are NOT consecutive, give-up never latches, and comic-4
+        still earns its own force-refresh. Without the reset (the old bug),
+        comic-3 would be the 2nd consecutive post-refresh 401, give-up would
+        latch, and comic-4 would be denied a refresh and print the give-up
+        message. The get_token==4 / no-give-up-message assertions below fail
+        against pre-BUI-331 code."""
         malformed = {"title": "Broken", "image": {}}  # 200 body, missing imageUrl → ListingContentError
         with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
             with patch(
                 "grade_photos.get_token",
-                side_effect=["t0", "t1", "t2"],
+                side_effect=["t0", "t1", "t2", "t3"],
             ) as mock_get_token:
                 with patch(
                     "grade_photos.fetch_item_with_status",
@@ -752,17 +763,53 @@ class TestSystemicFailFast:
                         (malformed, 200),   # comic-2 — proof-of-200 then malformed → resets counter to 0
                         (None, 401),        # comic-3 attempt 0
                         (None, 401),        # comic-3 attempt 1 — post-refresh 401 (counter=1, NOT 2)
+                        (None, 401),        # comic-4 attempt 0
+                        (None, 401),        # comic-4 attempt 1 — post-refresh 401 (counter=2; latches only now)
                     ],
                 ) as mock_fetch:
                     with patch("grade_photos._download_image"):
-                        rc = grade_photos.main(["111", "222", "333", "--workdir", str(tmp_path)])
+                        rc = grade_photos.main(["111", "222", "333", "444", "--workdir", str(tmp_path)])
         assert rc == 0
-        # Initial token + a refresh for comic-1 AND comic-3 — comic-3 getting
-        # its own refresh proves comic-2's proven-200 reset the streak (without
-        # the reset, comic-1+comic-3's 401s would be the 2nd consecutive and
-        # comic-3 would have skipped the refresh via give-up).
-        assert mock_get_token.call_count == 3
-        assert mock_fetch.call_count == 5
+        # Initial token + a refresh for comic-1, comic-3 AND comic-4 — comic-4
+        # earning its own refresh proves comic-2's proven-200 reset the streak
+        # (without the reset comic-3 would be the 2nd consecutive 401, give-up
+        # would latch, and comic-4 would be refused a refresh: get_token==3).
+        assert mock_get_token.call_count == 4
+        assert mock_fetch.call_count == 7
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert "already failed earlier this batch" not in "\n".join(lines)
+        assert all("FETCH FAILED" in line for line in lines)
+
+    def test_unparseable_200_body_is_proof_of_200_and_resets_counter(self, tmp_path, capsys):
+        """BUI-331 (code-review follow-up): a 200 whose body does not parse —
+        fetch_item_with_status returns (None, 200), the WAF-interstitial /
+        truncated-proxy case — is ALSO proof the token worked (eBay returned
+        200), so it must reset the give-up counter just like a malformed parsed
+        body. Guards against the reset keying on 'non-None body' rather than on
+        'observed 200': same 4-item shape as the test above but comic-2 is a
+        (None, 200) instead of a parsed-malformed dict. comic-4 still earns its
+        refresh and no give-up message prints."""
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch(
+                "grade_photos.get_token",
+                side_effect=["t0", "t1", "t2", "t3"],
+            ) as mock_get_token:
+                with patch(
+                    "grade_photos.fetch_item_with_status",
+                    side_effect=[
+                        (None, 401),   # comic-1 attempt 0
+                        (None, 401),   # comic-1 attempt 1 — post-refresh 401 (counter=1)
+                        (None, 200),   # comic-2 — unparseable 200 body → ListingContentError → resets counter
+                        (None, 401),   # comic-3 attempt 0
+                        (None, 401),   # comic-3 attempt 1 — post-refresh 401 (counter=1, NOT 2)
+                        (None, 401),   # comic-4 attempt 0
+                        (None, 401),   # comic-4 attempt 1 — post-refresh 401 (counter=2; latches only now)
+                    ],
+                ) as mock_get_fetch:
+                    rc = grade_photos.main(["111", "222", "333", "444", "--workdir", str(tmp_path)])
+        assert rc == 0
+        assert mock_get_token.call_count == 4
+        assert mock_get_fetch.call_count == 7
         lines = capsys.readouterr().out.strip().splitlines()
         assert "already failed earlier this batch" not in "\n".join(lines)
         assert all("FETCH FAILED" in line for line in lines)
