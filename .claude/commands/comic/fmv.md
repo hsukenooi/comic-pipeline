@@ -32,8 +32,11 @@ comic-fmv --batch <working_list.json> --out <results.json>
 Flags:
 - `--max-age-days N` (default 7): reuse FMVs already in the comics server's DB if `fmv_updated_at` is within N days
 - `--force`: bypass both the SerpApi cache and the DB cache and recompute everything
+- `--version`: print the installed version plus the git SHA/date the binary was built from, then exit
 
 The CLI prints a human-readable table to stdout and writes the full structured result to `--out`. Present the table to the user and carry the JSON forward to Step 4 of `/comic:buy`.
+
+**Stale install risk (BUI-305):** `apps/fmv` is `uv tool install`-managed, not a workspace member kept current by `uv sync` — same category of risk as the eBay tools' stale-wrapper issue (BUI-27, documented in `scripts/install.sh` and `CLAUDE.md`). A `comic-fmv` binary that's behind the repo silently runs old pricing logic (missing safety guards, bugfixes, etc.) with no error to signal it. If pricing looks off, or after pulling changes to `apps/fmv/src/`, run `comic-fmv --version` and compare the git SHA/date to `git log -1 --format='%h %cd' --date=short` (the build hook stamps whole-repo HEAD, not just `apps/fmv/`, so compare against unfiltered HEAD — a path-scoped `-- apps/fmv/src` comparison will false-positive on every unrelated commit elsewhere in the monorepo); if they don't match, re-run `./scripts/install.sh`.
 
 **`fetch-err` ≠ `n/a` (BUI-143):** a row whose FMV column reads `fetch-err` (and the loud post-table warning) means the **SerpApi fetch failed** for that book — quota exhausted or an outage — **not** that the book has no comps. Treat a `fetch-err` row (or a whole batch that comes back all `fetch-err`/`n/a`) as a SerpApi failure: check the `SERPAPI_KEY`/quota and re-run. Never tell the user these books are illiquid or bid on them as if priced.
 

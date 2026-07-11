@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import os
 import sys
 
@@ -10,7 +11,38 @@ import click
 import fmv_runner
 
 
+def _version_string() -> str:
+    """BUI-305: staleness signal for a `uv tool install`ed binary.
+
+    `_fmv_build_stamp` is generated at build time by hatch_build.py from the
+    git HEAD of the source tree the wheel was built from; it's absent when
+    running from an unbuilt checkout (e.g. `uv run` here in tests), so fall
+    back to "unknown" rather than failing.
+    """
+    try:
+        pkg_version = importlib.metadata.version("comic-fmv")
+    except importlib.metadata.PackageNotFoundError:
+        pkg_version = "unknown"
+    try:
+        from _fmv_build_stamp import GIT_DATE, GIT_SHA
+    except ImportError:
+        GIT_SHA, GIT_DATE = "unknown", "unknown"
+    return f"comic-fmv {pkg_version} (git {GIT_SHA}, {GIT_DATE})"
+
+
+def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+    click.echo(_version_string())
+    ctx.exit()
+
+
 @click.command("comic-fmv")
+@click.option("--version", is_flag=True, expose_value=False, is_eager=True,
+              callback=_print_version,
+              help="Print the installed version and the git SHA/date it was built "
+                   "from, then exit. Use this to check for a stale `uv tool install` "
+                   "(see scripts/install.sh).")
 @click.option("--batch", "batch_path", type=click.Path(exists=True),
               help="Path to JSON batch of books to value (or '-' for stdin).")
 @click.option("--out", "out_path", type=click.Path(),
