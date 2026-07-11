@@ -313,6 +313,27 @@ class TestParseItem:
         assert result["item_specifics"]["Series Title"] == "Amazing Spider-Man"
         assert result["item_specifics"]["Issue Number"] == "300"
 
+    def test_cover_year_emitted_when_signals_agree(self):
+        """BUI-316: cover_year is wired through parse_item — emitted when the
+        title paren year and item-specifics Publication Year corroborate."""
+        data = {
+            "itemId": "v1|111|0",
+            "title": "Fantastic Four #18 (1963) Kirby",
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "10.00", "currency": "USD"},
+            "price": {"value": "10.00", "currency": "USD"},
+            "bidCount": 1,
+            "itemEndDate": "2026-04-20T00:00:00.000Z",
+            "condition": "Good",
+            "localizedAspects": [{"name": "Publication Year", "value": "1963"}],
+            "itemWebUrl": "https://www.ebay.com/itm/111",
+        }
+        assert ebay_fetch.parse_item(data)["cover_year"] == 1963
+
+    def test_cover_year_none_when_signals_missing(self, auction_response):
+        # auction_response has no Publication Year and no title paren year.
+        assert ebay_fetch.parse_item(auction_response)["cover_year"] is None
+
     def test_description_truncation(self, auction_response):
         auction_response["shortDescription"] = "A" * 600
         result = ebay_fetch.parse_item(auction_response)

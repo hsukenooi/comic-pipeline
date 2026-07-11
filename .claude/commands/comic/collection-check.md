@@ -19,6 +19,17 @@ Mini see the same answer.
 A list of identified comics (series + issue, optionally variant and year). Either
 from the `/comic:identify` output table or provided directly by the user.
 
+**The `/comic:identify` table's Year column is a confidence-gated per-issue cover
+year (BUI-316):** it's populated only when the listing title's parenthesized year and
+eBay's item-specifics `Publication Year` corroborate each other within ±1 (and the
+listing isn't a facsimile/reprint). When that Year is present, **forward it as `year=`
+in Step 1** — it's a trustworthy per-issue cover year, so it safely disambiguates
+volumes (the whole point of BUI-316: it lets the matcher's year gate reject a match
+against the wrong volume of a rebootable masthead). When the Year column is blank,
+**omit `year`** — a blank means the identify step was *not* confident, so forwarding a
+guessed year would risk the BUI-129 false-negative. Never fabricate a year to fill a
+blank; the blank is the safe, year-agnostic default.
+
 ## Step 0: Resolve the server + bootstrap guard
 
 Resolve and health-gate the comics server through the **shared comics-server
@@ -224,23 +235,29 @@ list and re-check WITH the listing's per-issue cover `year`
 Never resolve an `ambiguous_cross_volume` verdict yourself by picking a volume —
 supply the year and let the matcher decide.
 
-**Pattern D3 — single-owned-wrong-volume, no year (unresolvable residual, BUI-308).**
-The one case D/D2 cannot catch: when a masthead has multiple volumes but you own
-the queried issue in only **one** of them, a no-`year` query returns a confident
-`in_collection` with `match_kind == "exact"` — even when that single owned volume
-is the *wrong* one (e.g. you own *Fantastic Four* (Vol. 7) #18 but meant Kirby's
-Vol. 1 #18, and supplied no year). Only one owned row matches, so there is no
-detectable ambiguity (unlike D2), and the year gate fails open with no year. This
-is **not mechanized** — it is an accepted residual (BUI-146-style). Direction is
-dangerous: it reports owned when you don't own the volume you meant → a **missed
-purchase** (not a BUI-122 data-loss). Mitigation is operator vigilance: for
-long-running rebootable mastheads (Fantastic Four, Amazing/Uncanny X-Men,
-Avengers, Thor, Iron Man, Hulk, Captain America, Batman, Superman, Wonder Woman,
-…), do **not** trust a no-year `in_collection`/`exact` blindly — eyeball the
-**Matched Volume** column against the era/volume the listing is for, and re-check
-with the listing's cover `year` (`?year=<YYYY>`) if they might differ. The proper
-fix (forwarding a confidence-gated per-issue cover year from the identify step) is
-tracked in BUI-316.
+**Pattern D3 — single-owned-wrong-volume (false positive, BUI-308 → fixed by BUI-316).**
+The one case D/D2 cannot catch at the key level: when a masthead has multiple volumes
+but you own the queried issue in only **one** of them, a no-`year` query returns a
+confident `in_collection` with `match_kind == "exact"` — even when that single owned
+volume is the *wrong* one (e.g. you own *Fantastic Four* (Vol. 7) #18 but meant
+Kirby's Vol. 1 #18). Only one owned row matches, so there is no detectable ambiguity
+(unlike D2), and the year gate fails open with no year. Direction is dangerous: it
+reports owned when you don't own the volume you meant → a **missed purchase**.
+
+**The real fix is upstream (BUI-316), not a manual re-check here:** when `/comic:identify`
+is confident of the per-issue cover year, its Year column is populated and you forward
+it as `year=` (see Input + Step 1). That per-issue year is exactly what the matcher's
+year gate needs to reject the wrong volume, so this false positive never reaches the
+table. **So the primary defense is simply: always forward the identify Year when it's
+present.** The residual is now narrow — it only survives when the Year column is
+*blank* (the identify confidence gate didn't fire, e.g. the title had no parenthesized
+year to corroborate the Publication Year). For that blank-year case only, keep the old
+operator vigilance for long-running rebootable mastheads (Fantastic Four,
+Amazing/Uncanny X-Men, Avengers, Thor, Iron Man, Hulk, Captain America, Batman,
+Superman, Wonder Woman, …): do **not** trust a no-year `in_collection`/`exact`
+blindly — eyeball the **Matched Volume** column against the era/volume the listing is
+for, and re-check with the listing's cover `year` (`?year=<YYYY>`) if you can source
+one and they might differ.
 
 Carry every flag into the Notes column of the Step 3 table and surface flagged rows
 separately at the Step 4 decision gate. The user decides; the disambiguator only

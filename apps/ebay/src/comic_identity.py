@@ -254,6 +254,19 @@ def series_volume(series_name: str) -> "int | None":
     return int(m.group(1)) if m else None
 
 
+# Plausible cover-year window: a 4-digit token outside this range is noise (a
+# SKU, a price, a garbage OCR number), not a real comic year. Defined once so
+# the three validators below — _title_paren_years, _all_title_years, and
+# _coerce_publication_year (BUI-316) — can never drift out of sync.
+_MIN_PLAUSIBLE_YEAR = 1930
+_MAX_PLAUSIBLE_YEAR = 2035
+
+
+def _is_plausible_year(year: int) -> bool:
+    """True if *year* falls in the plausible comic cover-year window."""
+    return _MIN_PLAUSIBLE_YEAR <= year <= _MAX_PLAUSIBLE_YEAR
+
+
 def _title_paren_years(title: str) -> "list[int]":
     """Extract every 4-digit year (1930–2035) from every parenthetical group in a title.
 
@@ -275,7 +288,7 @@ def _title_paren_years(title: str) -> "list[int]":
     for group in re.findall(r"\([^)]*\)", title or ""):
         for m in re.finditer(r"\b(\d{4})\b", group):
             yr = int(m.group(1))
-            if 1930 <= yr <= 2035:
+            if _is_plausible_year(yr):
                 years.append(yr)
     return years
 
@@ -1125,7 +1138,7 @@ def _all_title_years(title: str) -> "list[int]":
     bare_years = []
     for m in _BARE_YEAR_RE.finditer(no_parens):
         yr = int(m.group(1))
-        if 1930 <= yr <= 2035:
+        if _is_plausible_year(yr):
             bare_years.append(yr)
     return paren_years + bare_years
 
@@ -1384,6 +1397,94 @@ def identify_comic(title: "str | None") -> ComicIdentity:
         identity.reject_reasons.append("no issue number found")
 
     return identity
+
+
+# ─── Confidence-gated per-issue cover year (BUI-316) ────────────────────────
+# The proper fix for BUI-308's single-owned-wrong-volume false positive: a
+# no-year /comic:collection-check query for a rebootable masthead (Fantastic
+# Four, ASM, X-Men, …) can return a confident `in_collection` against the WRONG
+# volume, because the matcher's year gate fails open with no year. Forwarding
+# the CORRECT per-issue cover year lets that gate (locg _year_gate_accepts,
+# release_date.startswith within ±1) reject the wrong-volume row.
+#
+# The hazard being avoided is BUI-129: forwarding the WRONG year — a series
+# `year_began` — filtered out every owned mid-run issue and returned a false
+# `not_in_cache` for the whole run. The key reframing (BUI-308 design): BUI-129
+# came from the wrong year, NOT from supplying a year at all. So a year we are
+# confident is the issue's ACTUAL cover year is Pareto-better — it can only
+# ever help — while an uncertain one must never be forwarded (the check then
+# behaves exactly as today, year-agnostic).
+
+
+def _coerce_publication_year(item_specifics: "dict | None") -> "int | None":
+    """Parse item-specifics ``Publication Year`` to a plausible 4-digit int, or None.
+
+    Reuses the same 1930–2035 plausibility window as _title_paren_years so the
+    two signals are compared on the same footing. Fails open (None) on any
+    missing/unparseable/out-of-range value.
+    """
+    if not item_specifics:
+        return None
+    raw = item_specifics.get("Publication Year")
+    if raw is None:
+        return None
+    try:
+        year = int(str(raw).strip())
+    except (ValueError, TypeError):
+        return None
+    return year if _is_plausible_year(year) else None
+
+
+def confident_cover_year(
+    title: "str | None",
+    item_specifics: "dict | None",
+) -> "int | None":
+    """Return a per-issue cover year to forward to /comic:collection-check ONLY
+    when two independent signals corroborate it — else None (year-agnostic).
+
+    STRICT confidence gate (BUI-316). A year is emitted only when BOTH:
+      1. eBay's item-specifics ``Publication Year`` parses to a plausible year, and
+      2. a parenthesized year in the listing title (_title_paren_years) agrees
+         with it within ±1 — the same cover-vs-onsale tolerance the matcher's
+         own year gate uses (BUI-214/251).
+
+    The Publication Year is the authoritative per-issue cover year and is what
+    we return; the title's parenthesized year is the corroborating check. This
+    corroboration is what makes a WRONG year overwhelmingly unlikely: for a
+    long-running series whose title paren carries a VOLUME start year (e.g.
+    "Amazing Spider-Man (1963) #238", an issue that shipped 1983 with
+    Publication Year 1983), the two signals DISAGREE by 20 years, so nothing is
+    emitted and the check stays year-agnostic.
+
+    NEVER emit for a facsimile / reprint edition: its Publication Year is the
+    ORIGINAL issue's year while the physical book is a modern reprint, so the
+    year would falsely match — and thereby confirm ownership of — the original
+    volume the buyer does not actually own.
+
+    Accepted residual (BUI-316 design, matcher-softening rejected): the two
+    signals are both seller-entered, so they are only *usually* independent. In
+    the rare case where a seller stamps the SAME volume-start year in both the
+    title paren AND the Publication Year aspect for a mid-run issue (e.g. both
+    "1963" for ASM #238), the gate fires and forwards the wrong year — the
+    residual this cannot detect at the listing level. That is strictly narrower
+    than BUI-129 (which forwarded year_began for the WHOLE run unconditionally),
+    it needs a genuine double-mis-tag rather than the normal volume-decoration
+    convention, and the direction is a missed match (duplicate-buy risk), not
+    silent data loss. See test_correlated_wrong_year_is_the_accepted_residual.
+    """
+    # A reprint format's Publication Year is the original issue's year, not the
+    # copy the buyer is holding — forwarding it would falsely match the owned
+    # original. Refuse outright, before any corroboration.
+    if _classify_edition_kind(title or "") in ("facsimile", "reprint"):
+        return None
+
+    pub_year = _coerce_publication_year(item_specifics)
+    if pub_year is None:
+        return None
+
+    if any(abs(py - pub_year) <= 1 for py in _title_paren_years(title or "")):
+        return pub_year
+    return None
 
 
 # ─── score_against_wish() ──────────────────────────────────────────────────

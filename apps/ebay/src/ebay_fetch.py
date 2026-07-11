@@ -14,6 +14,8 @@ from pathlib import Path
 import requests
 from urllib.parse import quote
 
+from comic_identity import confident_cover_year
+
 # --- Configuration ---
 
 CONFIG_DIR = Path.home() / ".config" / "ebay-fetch"
@@ -405,6 +407,12 @@ def parse_item(data):
         "grade_source": grade_source,
         "grade_from_description": grade_from_description,
         "variant": variant,
+        # BUI-316: a per-issue cover year to forward to /comic:collection-check,
+        # but ONLY when the title's parenthesized year and item-specifics
+        # Publication Year corroborate it (and it's not a facsimile/reprint).
+        # None when not confident — the check then stays year-agnostic (never
+        # forwards a wrong year, so it can't reintroduce BUI-129).
+        "cover_year": confident_cover_year(title, item_specifics),
         "item_specifics": item_specifics,
         "description_snippet": description_snippet,
         "listing_url": listing_url,
