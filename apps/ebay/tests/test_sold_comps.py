@@ -277,6 +277,67 @@ class TestBuildQuery:
         assert sc._publisher_qualifier("DC Comics") is None
         assert sc._publisher_qualifier("Dark Horse") == "Dark Horse"
 
+    # ── BUI-321: DC/Marvel imprints map to their parent's gate ──
+    def test_marvel_imprints_map_to_marvel_gate(self):
+        # Marvel imprints must get the Marvel qualifier, not fall through to the
+        # indie branch and append the imprint name as a recall-noise keyword.
+        for pub in ("Epic", "Epic Comics", "Icon", "MAX", "Marvel Knights",
+                    "Star Comics", "Timely"):
+            assert sc._publisher_qualifier(pub) == "marvel comics", pub
+            q = sc.build_query("Moon Knight", "1", publisher=pub)
+            assert "marvel comics" in q
+            assert pub not in q  # imprint name is NOT appended as a keyword
+
+    def test_malibu_is_not_gated_to_marvel(self):
+        # BUI-321: Malibu published independently (1986–1994) before Marvel
+        # acquired it, so it must NOT get the year-less "marvel comics"
+        # qualifier — that over-narrows pre-acquisition titles. It passes
+        # through as a genuine indie publisher instead.
+        for pub in ("Malibu", "Malibu Comics"):
+            assert sc._publisher_qualifier(pub) == pub, pub
+
+    def test_every_imprint_table_entry_maps_to_its_declared_gate(self):
+        # BUI-321: exhaustively lock every _IMPRINT_PARENT_GATE row so a
+        # wrong-gate typo in any variant spelling fails loudly, not silently.
+        for key, gate in sc._IMPRINT_PARENT_GATE.items():
+            result = sc._publisher_qualifier(key)
+            if gate == "marvel":
+                assert result == "marvel comics", key
+            elif gate == "dc":
+                assert result is None, key
+            else:  # pragma: no cover - guards against an unknown gate value
+                raise AssertionError(f"unexpected gate {gate!r} for {key!r}")
+
+    def test_dc_imprints_map_to_dc_gate_no_qualifier(self):
+        # DC imprints must be gated to NO qualifier (Marvel-only, BUI-315) —
+        # byte-for-byte identical to omitting the publisher, and the imprint
+        # name is never appended as a keyword.
+        base = sc.build_query("Sandman", "1")
+        for pub in ("Vertigo", "Wildstorm", "Black Label", "DC Black Label",
+                    "Milestone", "Paradox Press", "Minx", "Helix", "Homage",
+                    "Zuda"):
+            assert sc._publisher_qualifier(pub) is None, pub
+            q = sc.build_query("Sandman", "1", publisher=pub)
+            assert q == base
+            assert pub.lower() not in q.lower()  # imprint not appended
+
+    # ── BUI-321: "D.C." punctuation tolerated → gated, not appended ──
+    def test_dc_with_periods_is_gated_not_appended(self):
+        base = sc.build_query("Detective Comics", "27")
+        for pub in ("D.C.", "D.C", "D.C. Comics"):
+            assert sc._publisher_qualifier(pub) is None, pub
+            q = sc.build_query("Detective Comics", "27", publisher=pub)
+            assert q == base
+            assert "d.c" not in q.lower()  # "D.C." not appended as a keyword
+
+    def test_genuine_indie_still_passes_through_unchanged(self):
+        # Regression guard: a non-imprint indie publisher must still pass
+        # through verbatim (unaffected by the BUI-321 imprint table).
+        for pub in ("Image Comics", "Dark Horse", "Valiant", "Boom Studios",
+                    "IDW"):
+            assert sc._publisher_qualifier(pub) == pub, pub
+            assert pub in sc.build_query("Saga", "1", publisher=pub)
+
 
 class TestCanonicalUrl:
     def test_excludes_api_key(self):

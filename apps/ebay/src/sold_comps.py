@@ -125,6 +125,64 @@ def _cache_put(path: Path, data: dict) -> None:
 
 # ─── Query construction ──────────────────────────────────────────────────────
 
+_MARVEL_QUALIFIER = "marvel comics"
+
+# BUI-321: known DC/Marvel imprints → their PARENT publisher's gate. Without
+# this table these imprints don't match \bmarvel\b/\bdc\b, so they fall through
+# to the indie raw-passthrough branch and append the imprint name (e.g.
+# "Vertigo", "Epic") as a query keyword — recall noise, since eBay comic
+# listings title the parent publisher, not the imprint. Keys are the
+# punctuation-stripped, lowercased, whitespace-collapsed publisher string (see
+# _normalize_publisher_key). Values are the parent gate: "marvel" → the Marvel
+# qualifier, "dc" → no qualifier (Marvel-only gate, BUI-315).
+_IMPRINT_PARENT_GATE = {
+    # ── Marvel imprints ──
+    "epic": "marvel",
+    "epic comics": "marvel",
+    "icon": "marvel",
+    "icon comics": "marvel",
+    "max": "marvel",
+    "max comics": "marvel",
+    "marvel knights": "marvel",
+    "star comics": "marvel",
+    "timely": "marvel",
+    "timely comics": "marvel",
+    # NOTE: Malibu is deliberately NOT mapped — it published independently
+    # (1986–1994) before Marvel acquired it, so a year-less "marvel comics"
+    # qualifier would over-narrow pre-acquisition titles (Ultraverse, Men in
+    # Black). It falls to indie passthrough, appending "Malibu" — correct for
+    # both eras, since those listings say "Malibu", not "Marvel". (BUI-321)
+    # ── DC imprints ──
+    "vertigo": "dc",
+    "dc vertigo": "dc",
+    "wildstorm": "dc",
+    "black label": "dc",
+    "dc black label": "dc",
+    "milestone": "dc",
+    "milestone media": "dc",
+    "milestone comics": "dc",
+    "paradox press": "dc",
+    "minx": "dc",
+    "helix": "dc",
+    "homage": "dc",
+    "homage comics": "dc",
+    "zuda": "dc",
+    "zuda comics": "dc",
+}
+
+
+def _normalize_publisher_key(publisher: str) -> str:
+    r"""Lowercase, drop periods, collapse whitespace — a match key.
+
+    Dropping periods is what lets "D.C." reach the \bdc\b gate (BUI-321): the
+    raw string "D.C." has no "dc" whole-word token, so it previously missed the
+    gate and got appended as a raw "D.C." keyword. Periods are removed (not
+    spaced) so "D.C." collapses to "dc", not "d c".
+    """
+    key = publisher.replace(".", "")
+    return re.sub(r"\s+", " ", key).strip().lower()
+
+
 def _publisher_qualifier(publisher: str | None) -> str | None:
     """Normalize a publisher into the query qualifier keyword to append.
 
@@ -142,6 +200,10 @@ def _publisher_qualifier(publisher: str | None) -> str | None:
     "DC Comics" raw passthrough would reintroduce the same two-token narrowing,
     so DC must short-circuit to None, not fall to the indie branch.
 
+    BUI-321: known DC/Marvel imprints (Vertigo, Wildstorm, Epic, …) map to their
+    parent's gate via _IMPRINT_PARENT_GATE instead of falling to indie
+    passthrough, and punctuation is tolerated so "D.C." is gated (not appended).
+
     Indie publishers pass through unchanged — the caller already supplies the
     noise-filtering name ("image comics", "dark horse"), which is the primary
     indie noise filter (BUI-161). Returns None for an absent/blank publisher so
@@ -150,9 +212,13 @@ def _publisher_qualifier(publisher: str | None) -> str | None:
     if not publisher or not publisher.strip():
         return None
     p = publisher.strip()
-    if re.search(r"\bmarvel\b", p, re.IGNORECASE):
-        return "marvel comics"
-    if re.search(r"\bdc\b", p, re.IGNORECASE):
+    key = _normalize_publisher_key(p)
+    # BUI-321: resolve a known imprint to its parent gate first; else match the
+    # parent name directly on the punctuation-normalized key ("D.C." → "dc").
+    gate = _IMPRINT_PARENT_GATE.get(key)
+    if gate == "marvel" or re.search(r"\bmarvel\b", key):
+        return _MARVEL_QUALIFIER
+    if gate == "dc" or re.search(r"\bdc\b", key):
         return None  # BUI-315: DC qualifier regresses recall — no qualifier
     return p
 
