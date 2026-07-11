@@ -757,6 +757,52 @@ class TestGetToken:
         assert token == "live-token"
         assert "could not write token cache" in capsys.readouterr().err
 
+    # ── BUI-312: token-cache write is atomic (tmp + replace) ─────────────────
+
+    def test_cache_write_is_atomic_tmp_then_replace(self, tmp_path, monkeypatch):
+        """The cache write must go through a tmp file + atomic replace (mirrors
+        _aspects_cache_put's tmp→rename idiom), not an in-place truncating
+        write: the final file holds the new token and no tmp file is left
+        behind after a clean write."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+        cache_file = tmp_path / "token_cache_production.json"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "atomic-token", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "atomic-token"
+        assert json.loads(cache_file.read_text())["access_token"] == "atomic-token"
+        assert not cache_file.with_suffix(".tmp").exists()
+
+    def test_crash_before_replace_leaves_old_cache_intact(self, tmp_path, monkeypatch, capsys):
+        """If the process is interrupted after the tmp file is written but
+        before the atomic replace lands (simulated by making Path.replace
+        raise), the previously-cached token on disk must be untouched — not a
+        half-written new file — while the live token from this call is still
+        returned (best-effort write, BUI-299)."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+        cache_file = tmp_path / "token_cache_production.json"
+        cache_file.write_text(json.dumps({
+            "access_token": "old-cached-token",
+            "expires_at": time.time() - 100,  # expired -> forces the refresh path
+        }))
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "new-live-token", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("crash before rename")):
+                token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "new-live-token"
+        assert json.loads(cache_file.read_text())["access_token"] == "old-cached-token"
+        assert "could not write token cache" in capsys.readouterr().err
+
     # ── BUI-184 Item 2: null title in parse_item_summary ─────────────────────
 
     def test_null_title_becomes_empty_string(self):
