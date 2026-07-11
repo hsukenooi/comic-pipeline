@@ -103,6 +103,10 @@ machine won't re-surface the same matches.
   run, not every listing).
 - `--all` shows every match again, including already-seen ones. It still records
   newly-surfaced matches — `--all` means "show me everything," not "forget."
+  BUI-317: it also force-re-verifies every candidate by bypassing the
+  rejected-candidate cache below (a normal run skips re-verifying a
+  (listing, wish) pair Claude already rejected within the last 14 days) —
+  use it to recheck a seller when you think a past rejection was wrong.
 
 ```bash
 .venv/bin/python src/seller_scan.py <seller>          # only new matches
@@ -144,6 +148,7 @@ seller_scan.py <seller> 2>/dev/null
       "matches": [ { "title": "...", "wish_name": "...", "item_id": "...", "...": "..." } ],
       "dropped_candidates": [],
       "filtered": [ { "item_id": "...", "title": "...", "wish_name": "...", "reason": "..." } ],
+      "skipped_cached_candidates": 0,
       "incomplete": false,
       "error": null
     }
@@ -151,13 +156,21 @@ seller_scan.py <seller> 2>/dev/null
 }
 ```
 
+`sellers[*].skipped_cached_candidates` (BUI-317) is how many candidates were
+skipped entirely — no Claude CLI call — because that exact (listing, wish)
+pair was already rejected within the last 14 days (the BUI-301 cache). It's
+lower stakes than `dropped_candidates` (those were never verified at all);
+this is coverage info for unattended monitoring, and a nonzero count is
+expected/healthy on a repeat scan of the same seller. Always `0` when `--all`
+is passed, since `--all` bypasses the cache and force-re-verifies everything.
+
 **Parse exit-code-first, then drill in:**
 
 | Exit code | Meaning | What to do |
 |---|---|---|
 | `0` | Every seller scanned cleanly | Read `sellers[*].matches` as usual |
 | `1` | **Global verifier failure** — the `claude` CLI is missing/unauthenticated, or every chunk failed transport. The run is truncated: the failing seller's slot has `error: "claude verifier globally unavailable ..."`, sellers after it were not attempted | Fix the `claude` CLI/auth and re-run the whole batch |
-| `2` | At least one seller couldn't be resolved/fetched, but none was incomplete | Check each `sellers[*].error` — sellers with `error: null` still have usable `matches` |
+| `2` | At least one seller couldn't be resolved/fetched **or crashed mid-scan** (BUI-319), but none was incomplete | Check each `sellers[*].error` — sellers with `error: null` still have usable `matches`. A `seller scan crashed: ...` error (with the exception repr) means an unexpected bug isolated to that seller — the rest of the batch still ran; the others' results are intact and worth acting on |
 | `3` | At least one seller was **incomplete** (`sellers[*].incomplete: true`, top-level `incomplete: true`) — some candidates for that seller were NEVER verified | Surface the `INCOMPLETE` stderr banner; re-run to pick up the never-verified candidates (they were NOT marked seen, so they'll resurface) |
 | `2` (usage) | An **argparse usage error** (e.g. `--username`/`--add-alias` with 2+ sellers) — the message goes to **stderr** and **no JSON is emitted** | Fix the invocation and re-run |
 
