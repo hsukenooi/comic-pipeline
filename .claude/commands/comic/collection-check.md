@@ -206,8 +206,9 @@ needed — read the volume/year straight off the response and flag:
 If `matched_release_date`'s year is clearly the wrong era for the listing (e.g.
 a 1966 match against a 2015-era query), treat the flag as a likely false
 positive; if the era is ambiguous, still flag for the user rather than guessing.
-A `match_kind == "exact"` row needs no such flag — the series key matched
-directly.
+A `match_kind == "exact"` row needs no such *alias* flag — the series key
+matched directly (but a no-year exact match can still be the wrong volume — see
+Pattern D3).
 
 **Pattern D2 — cross-volume ambiguity, no year given (false-positive guard, BUI-284).**
 Also mechanized: when `match_status == "ambiguous_cross_volume"` (equivalently
@@ -222,6 +223,24 @@ list and re-check WITH the listing's per-issue cover `year`
 
 Never resolve an `ambiguous_cross_volume` verdict yourself by picking a volume —
 supply the year and let the matcher decide.
+
+**Pattern D3 — single-owned-wrong-volume, no year (unresolvable residual, BUI-308).**
+The one case D/D2 cannot catch: when a masthead has multiple volumes but you own
+the queried issue in only **one** of them, a no-`year` query returns a confident
+`in_collection` with `match_kind == "exact"` — even when that single owned volume
+is the *wrong* one (e.g. you own *Fantastic Four* (Vol. 7) #18 but meant Kirby's
+Vol. 1 #18, and supplied no year). Only one owned row matches, so there is no
+detectable ambiguity (unlike D2), and the year gate fails open with no year. This
+is **not mechanized** — it is an accepted residual (BUI-146-style). Direction is
+dangerous: it reports owned when you don't own the volume you meant → a **missed
+purchase** (not a BUI-122 data-loss). Mitigation is operator vigilance: for
+long-running rebootable mastheads (Fantastic Four, Amazing/Uncanny X-Men,
+Avengers, Thor, Iron Man, Hulk, Captain America, Batman, Superman, Wonder Woman,
+…), do **not** trust a no-year `in_collection`/`exact` blindly — eyeball the
+**Matched Volume** column against the era/volume the listing is for, and re-check
+with the listing's cover `year` (`?year=<YYYY>`) if they might differ. The proper
+fix (forwarding a confidence-gated per-issue cover year from the identify step) is
+tracked in BUI-316.
 
 Carry every flag into the Notes column of the Step 3 table and surface flagged rows
 separately at the Step 4 decision gate. The user decides; the disambiguator only
