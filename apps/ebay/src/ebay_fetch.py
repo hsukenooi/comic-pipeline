@@ -106,8 +106,8 @@ def get_token(client_id, client_secret, base_url):
             expires_at = cache.get("expires_at", 0)
             if time.time() < expires_at - 300:  # 5-minute buffer
                 return cache["access_token"]
-        except (json.JSONDecodeError, KeyError):
-            pass  # Treat corrupted cache as a cache miss
+        except Exception:  # noqa: BLE001  # malformed/wrong-shape cache → cache miss
+            pass  # e.g. non-dict JSON, non-numeric expires_at, missing access_token
 
     # Request new token — bounded retry loop mirrors the pattern in fetch_item().
     # 429 (rate-limited) and 5xx (transient server errors) are retried with
@@ -117,18 +117,34 @@ def get_token(client_id, client_secret, base_url):
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     retries = 3
     for attempt in range(retries):
-        resp = requests.post(
-            f"{base_url}/identity/v1/oauth2/token",
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Authorization": f"Basic {credentials}",
-            },
-            data={
-                "grant_type": "client_credentials",
-                "scope": "https://api.ebay.com/oauth/api_scope",
-            },
-            timeout=10,
-        )
+        try:
+            resp = requests.post(
+                f"{base_url}/identity/v1/oauth2/token",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {credentials}",
+                },
+                data={
+                    "grant_type": "client_credentials",
+                    "scope": "https://api.ebay.com/oauth/api_scope",
+                },
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as exc:
+            # Transient network error — same retry/backoff budget as 429/5xx below.
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(
+                    f"Network error requesting token: {exc}, retrying in {wait}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            print(
+                f"Error: Authentication failed (network error after {retries} attempts): {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
         if resp.status_code == 200:
             break
@@ -152,18 +168,30 @@ def get_token(client_id, client_secret, base_url):
             print(f"Error: Authentication failed ({resp.status_code})", file=sys.stderr)
             sys.exit(1)
 
-    token_data = resp.json()
-    access_token = token_data["access_token"]
+    # eBay can return 200 with a malformed body (truncated proxy response, a WAF
+    # interstitial served with a 200 status) — guard the same way get_item_aspects()
+    # guards resp.json() below.
+    try:
+        token_data = resp.json()
+        access_token = token_data["access_token"]
+    except (ValueError, KeyError) as exc:
+        print(f"Error: Malformed token response from eBay: {exc}", file=sys.stderr)
+        sys.exit(1)
     expires_in = token_data.get("expires_in", 7200)
 
-    # Cache token with restrictive permissions
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(cache_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(
-            {"access_token": access_token, "expires_at": time.time() + expires_in},
-            f,
-        )
+    # Cache token with restrictive permissions. Best-effort: an OSError here
+    # (e.g. disk full, permission denied) must not discard the token we already
+    # got from eBay — log and fall through, still returning the live token.
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(cache_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(
+                {"access_token": access_token, "expires_at": time.time() + expires_in},
+                f,
+            )
+    except OSError as exc:
+        print(f"Warning: could not write token cache: {exc}", file=sys.stderr)
 
     return access_token
 
@@ -191,10 +219,18 @@ def fetch_item(item_id, token, base_url, retries=3):
     params = {"legacy_item_id": item_id}
 
     for attempt in range(retries):
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+        except requests.exceptions.RequestException as exc:
+            print(f"Network error fetching item {item_id}: {exc}", file=sys.stderr)
+            return None
 
         if resp.status_code == 200:
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError as exc:
+                print(f"Error: Malformed response for item {item_id}: {exc}", file=sys.stderr)
+                return None
         elif resp.status_code == 404:
             print(f"Error: Item {item_id} not found (404).", file=sys.stderr)
             return None

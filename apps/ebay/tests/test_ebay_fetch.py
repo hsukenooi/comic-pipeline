@@ -458,6 +458,42 @@ class TestFetchItem:
             result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
         assert result is None
 
+    # ── BUI-299: network-exception guard ──────────────────────────────────
+
+    def test_network_error_returns_none(self, capsys):
+        """A transient ConnectionError must fail this single item, not crash
+        the whole run — mirrors search_by_keyword's RequestException handling."""
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=requests.exceptions.ConnectionError("no route to host"),
+        ):
+            result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert result is None
+        assert "Network error" in capsys.readouterr().err
+
+    def test_timeout_returns_none(self, capsys):
+        """A Timeout is also a RequestException subclass and must be caught too."""
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=requests.exceptions.Timeout("read timed out"),
+        ):
+            result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert result is None
+        assert "Network error" in capsys.readouterr().err
+
+    def test_malformed_200_body_returns_none(self, capsys):
+        """A 200 response with a non-JSON body (truncated proxy response, WAF
+        interstitial served with 200) must fail this item, not crash the run —
+        mirrors get_item_aspects()'s existing resp.json() guard."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1")
+
+        with patch("ebay_fetch.requests.get", return_value=mock_resp):
+            result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert result is None
+        assert "Malformed response" in capsys.readouterr().err
+
 
 class TestGetToken:
     def test_uses_cached_token(self, tmp_path, monkeypatch):
@@ -564,6 +600,162 @@ class TestGetToken:
         # Called once only — no retry on non-retryable 4xx
         assert mock_post.call_count == 1
         mock_sleep.assert_not_called()
+
+    # ── BUI-299: network-exception guard on the token POST ───────────────────
+
+    def test_network_error_retries_then_succeeds(self, tmp_path, monkeypatch):
+        """A transient ConnectionError on the token POST must be retried with
+        backoff, not crash the run — same budget as the 429/5xx branches."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"access_token": "network-recovered-token", "expires_in": 7200}
+
+        with patch(
+            "ebay_fetch.requests.post",
+            side_effect=[requests.exceptions.ConnectionError("timeout"), ok],
+        ):
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "network-recovered-token"
+        mock_sleep.assert_called_once_with(1)
+
+    def test_network_error_exhausted_retries_exits(self, tmp_path, monkeypatch, capsys):
+        """If every attempt hits a network error, exit cleanly (sys.exit) instead
+        of propagating an unhandled RequestException."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        with patch(
+            "ebay_fetch.requests.post",
+            side_effect=requests.exceptions.ConnectionError("no route to host"),
+        ):
+            with patch("ebay_fetch.time.sleep"):
+                with pytest.raises(SystemExit):
+                    ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert "Network error" in capsys.readouterr().err
+
+    # ── BUI-299: malformed token cache treated as a cache miss ───────────────
+
+    def test_invalid_json_cache_is_cache_miss(self, tmp_path, monkeypatch):
+        """Syntactically invalid JSON (the original JSONDecodeError case the
+        narrower except used to cover) must still be treated as a cache miss
+        after broadening to a bare `except Exception`."""
+        cache_file = tmp_path / "token_cache_production.json"
+        cache_file.write_text("{not valid json")
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "recovered-token", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "recovered-token"
+
+    def test_cache_missing_access_token_key_is_cache_miss(self, tmp_path, monkeypatch):
+        """A fresh (unexpired) cache dict missing 'access_token' (the original
+        KeyError case) must still be treated as a cache miss."""
+        cache_file = tmp_path / "token_cache_production.json"
+        cache_file.write_text(json.dumps({"expires_at": time.time() + 3600}))
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "recovered-token-2", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "recovered-token-2"
+
+    def test_malformed_cache_non_numeric_expires_at_is_cache_miss(self, tmp_path, monkeypatch):
+        """Valid JSON but wrong shape (expires_at not a number) previously raised
+        TypeError comparing it to time.time(); must now be treated as a miss."""
+        cache_file = tmp_path / "token_cache_production.json"
+        cache_file.write_text(json.dumps({
+            "access_token": "stale-token",
+            "expires_at": "not-a-number",
+        }))
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "fresh-token", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "fresh-token"
+
+    def test_malformed_cache_non_dict_json_is_cache_miss(self, tmp_path, monkeypatch):
+        """Valid JSON that isn't an object (e.g. a list) previously raised
+        AttributeError on cache.get(); must now be treated as a miss."""
+        cache_file = tmp_path / "token_cache_production.json"
+        cache_file.write_text(json.dumps(["not", "a", "dict"]))
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "fresh-token-2", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "fresh-token-2"
+
+    # ── BUI-299: malformed 200 token response body ────────────────────────────
+
+    def test_malformed_200_body_exits_cleanly(self, tmp_path, monkeypatch, capsys):
+        """A 200 response with a non-JSON body must exit cleanly (sys.exit),
+        not propagate an unhandled JSONDecodeError and kill the whole run."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.side_effect = ValueError("Expecting value: line 1 column 1")
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            with pytest.raises(SystemExit):
+                ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert "Malformed token response" in capsys.readouterr().err
+
+    def test_200_body_missing_access_token_exits_cleanly(self, tmp_path, monkeypatch, capsys):
+        """A 200 response whose JSON body is missing 'access_token' must exit
+        cleanly instead of propagating an unhandled KeyError."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"expires_in": 7200}  # no access_token
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            with pytest.raises(SystemExit):
+                ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert "Malformed token response" in capsys.readouterr().err
+
+    # ── BUI-299: cache-write failure must not discard a live token ───────────
+
+    def test_cache_write_failure_does_not_lose_token(self, tmp_path, monkeypatch, capsys):
+        """An OSError writing the token cache (disk full, permission denied, ...)
+        must not discard a token already obtained from eBay — best-effort write."""
+        monkeypatch.setattr(ebay_fetch, "CONFIG_DIR", tmp_path)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "live-token", "expires_in": 7200}
+
+        with patch("ebay_fetch.requests.post", return_value=mock_resp):
+            with patch("ebay_fetch.os.open", side_effect=OSError("disk full")):
+                token = ebay_fetch.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
+
+        assert token == "live-token"
+        assert "could not write token cache" in capsys.readouterr().err
 
     # ── BUI-184 Item 2: null title in parse_item_summary ─────────────────────
 
