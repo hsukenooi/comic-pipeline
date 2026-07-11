@@ -602,7 +602,7 @@ class TestMatchListing:
         assert wish is not None
 
 
-# ─── BUI-88: wish-list fetched over HTTP from the gixen server API ────────────
+# ─── BUI-88: wish-list fetched over HTTP from the comics server API ────────────
 
 
 class TestFetchWishList:
