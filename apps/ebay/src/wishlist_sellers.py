@@ -554,6 +554,13 @@ def _emit(*, grouped: dict, dropped_candidates: list, json_output: bool) -> None
     if json_output:
         # Strip private pipeline fields only on the path that consumes them —
         # the table branch renders from `grouped`/`dropped_candidates` directly.
+        # Only the top-level envelope (`incomplete` + object-not-array + exit
+        # code) is shared with seller_scan.py's BUI-298 shape. Here
+        # `dropped_candidates` is a single FLAT global list (not nested
+        # per-seller as in seller_scan) — a fully-dropped seller has no
+        # `sellers[]` slot to nest under, and each dropped dict carries its own
+        # `seller` key for attribution. Per-seller entries are `{seller,
+        # matches}` only.
         stripped_sellers = [
             {"seller": seller, "matches": _strip_private(matches)}
             for seller, matches in sorted(grouped.items(), key=lambda kv: -len(kv[1]))
@@ -628,7 +635,7 @@ def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list,
         # Persist as genuine by (title_key, wish_name) so re-runs hit the cache.
         persisted_pristine: set[tuple] = set()
         for m in pristine_direct:
-            key = (_title_key(m["title"]), m["wish_name"])
+            key = _verdict_key(m)
             if key not in persisted_pristine:
                 verdict_put(key[0], m["wish_name"], True, db_path=db_path)
                 persisted_pristine.add(key)
@@ -639,7 +646,7 @@ def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list,
         # model receives each distinct comic exactly once across all sellers.
         rep_map: dict[tuple, dict] = {}
         for m in needs_verify:
-            key = (_title_key(m["title"]), m["wish_name"])
+            key = _verdict_key(m)
             if key not in rep_map:
                 rep_map[key] = m
         representatives = list(rep_map.values())
@@ -686,11 +693,15 @@ def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list,
             if key not in persisted:
                 verdict_put(key[0], m["wish_name"], key in genuine_keys, db_path=db_path)
                 persisted.add(key)
-        if dropped_reps:
+        if dropped:
             # Loud signal: unattended scheduled runs must not silently lose a
             # never-verified wish-list match (the BUI-297 data-loss class).
+            # Count the fanned-out LISTINGS (`dropped`), not the deduped
+            # representatives (`dropped_reps`), so this matches the count in
+            # _emit's stdout INCOMPLETE banner and the --json `dropped_candidates`
+            # length — one never-verified key can cover several listings.
             print(
-                f"  WARNING: {len(dropped_reps)} candidate(s) never verified "
+                f"  WARNING: {len(dropped)} candidate(s) never verified "
                 f"(claude CLI timeout/transport failure) — NOT cached and NOT "
                 f"recorded as seen; will resurface next scheduled run.",
                 file=sys.stderr,
@@ -714,7 +725,10 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         "--json",
         action="store_true",
         dest="json_output",
-        help="Emit compact JSON instead of a human table",
+        help="Emit JSON instead of a human table (BUI-309: always a top-level "
+             "object — never a bare array — with `incomplete`, `sellers`, and "
+             "`dropped_candidates`; the process exits 3 when any candidate was "
+             "never verified. See main()'s docstring / the skill doc for the shape)",
     )
     parser.add_argument(
         "--env",

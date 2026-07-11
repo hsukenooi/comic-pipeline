@@ -892,6 +892,106 @@ class TestBui309ObservabilityContract:
             ws._title_key(mB2["title"]), mB2["wish_name"], db_path=db_path
         ) is None
 
+    @staticmethod
+    def _three_wish_items():
+        wish_list = [
+            {"id": "w1", "name": "Amazing Spider-Man #129"},
+            {"id": "w2", "name": "X-Men #94"},
+            {"id": "w3", "name": "Fantastic Four #48"},
+        ]
+        wish_items = [
+            {"id": "w1", "name": "Amazing Spider-Man #129",
+             "series": "Amazing Spider-Man", "issue": "129",
+             "_tokens": ["amazing", "spider", "man"]},
+            {"id": "w2", "name": "X-Men #94", "series": "X-Men", "issue": "94",
+             "_tokens": ["xmen"]},
+            {"id": "w3", "name": "Fantastic Four #48",
+             "series": "Fantastic Four", "issue": "48",
+             "_tokens": ["fantastic", "four"]},
+        ]
+        return wish_list, wish_items
+
+    def test_seller_survives_while_contributing_a_dropped_candidate(self, tmp_path):
+        """A 3-book seller loses ONE candidate to the never-verified path but
+        still clears the >=2 gate — so `sellers` is non-empty AND contains that
+        seller, while `dropped_candidates` also references it. Exit is still 3.
+        (The other BUI-309 tests only cover a drop pushing the seller below the
+        gate; this pins the seller-survives-with-a-drop composition.)"""
+        db_path = tmp_path / "v.db"
+        wish_list, wish_items = self._three_wish_items()
+        m1 = make_match(seller="big", item_id="1", wish_name="Amazing Spider-Man #129",
+                        title="Amazing Spider-Man #129 VF")
+        m2 = make_match(seller="big", item_id="2", wish_name="X-Men #94",
+                        title="X-Men #94 VF")
+        m3 = make_match(seller="big", item_id="3", wish_name="Fantastic Four #48",
+                        title="Fantastic Four #48 VF")
+
+        output, exit_code, _, mock_record = _run_main(
+            [[m1], [m2], [m3]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],   # 2 kept -> seller stays above the gate
+            dropped_return=[m3],      # 1 never verified
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        assert data["incomplete"] is True
+        assert exit_code == ws._EXIT_INCOMPLETE
+        # Seller survives (>=2 verified) AND appears in the output...
+        assert {s["seller"] for s in data["sellers"]} == {"big"}
+        # ...while its dropped book is reported separately, attributable via its
+        # own `seller` key (the flat dropped_candidates has no per-seller nesting).
+        assert len(data["dropped_candidates"]) == 1
+        assert data["dropped_candidates"][0]["item_id"] == "3"
+        assert data["dropped_candidates"][0]["seller"] == "big"
+        # The dropped book (item 3) is never recorded as seen; the kept ones are.
+        recorded_ids = [i for call in mock_record.call_args_list for i in call.args[0]]
+        assert "3" not in recorded_ids
+        assert {"1", "2"} <= set(recorded_ids)
+
+    def test_one_dropped_key_fans_out_to_every_sharing_listing(self, tmp_path):
+        """The whole reason `dropped` is fanned out (not one representative per
+        key): two sellers list the SAME book (same title + wish_name -> one
+        verdict key). verify_with_claude sees ONE representative and drops it;
+        BOTH listings must land in dropped_candidates (BUI-309), not just the
+        representative. All other BUI-309 tests use distinct titles so the key
+        never collapses and dropped_candidates length is always 1."""
+        db_path = tmp_path / "v.db"
+        wish_list, wish_items = self._three_wish_items()
+        # Two sellers, identical ASM #129 listing -> same (title_key, wish_name).
+        asm_s1 = make_match(seller="s1", item_id="a1",
+                            wish_name="Amazing Spider-Man #129",
+                            title="Amazing Spider-Man #129 VF")
+        asm_s2 = make_match(seller="s2", item_id="a2",
+                            wish_name="Amazing Spider-Man #129",
+                            title="Amazing Spider-Man #129 VF")
+        # A distinct 2nd book per seller so each clears the pre-verify >=2 gate.
+        xmen_s1 = make_match(seller="s1", item_id="x1", wish_name="X-Men #94",
+                             title="X-Men #94 VF")
+        ff_s2 = make_match(seller="s2", item_id="f2", wish_name="Fantastic Four #48",
+                           title="Fantastic Four #48 VF")
+
+        output, exit_code, _, _ = _run_main(
+            [[asm_s1, asm_s2], [xmen_s1], [ff_s2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            # verify sees one representative per key: keep the X-Men + FF reps,
+            # drop the shared ASM representative.
+            verify_return=[xmen_s1, ff_s2],
+            dropped_return=[asm_s1],
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        assert data["incomplete"] is True
+        assert exit_code == ws._EXIT_INCOMPLETE
+        # The single dropped KEY fans out to BOTH listings that share it.
+        dropped_ids = {d["item_id"] for d in data["dropped_candidates"]}
+        assert dropped_ids == {"a1", "a2"}
+
 
 # ─── Post-verify re-gate ──────────────────────────────────────────────────────
 
