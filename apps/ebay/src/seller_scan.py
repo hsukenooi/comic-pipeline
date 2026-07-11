@@ -8,7 +8,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -285,6 +287,23 @@ _EXIT_SELLER_ERROR = 2
 _EXIT_VERIFIER_DOWN = 1
 
 
+# BUI-307: seller-level parallelism. The multi-seller loop (BUI-298) ran each
+# seller's listing-fetch + chunked Claude verification fully SEQUENTIALLY, so
+# wall-clock scaled linearly with sellers × chunks and a single stuck 180s
+# verify timeout blocked every seller queued behind it. `claude -p` calls are
+# stateless, so scanning sellers in a bounded thread pool is safe.
+#
+# Capped at 3 deliberately: each worker's per-seller listing fetch hits the eBay
+# Browse API, and 2–3 concurrent workers is the safe ceiling that parallelizes
+# the common small batches without risking Browse rate limits — do NOT raise
+# this without re-checking eBay's Browse quota. Chunks WITHIN a seller still run
+# sequentially (verify_with_claude is unchanged), so BUI-297's per-chunk circuit
+# breaker keeps its sequential-chunk assumption; and the breaker state
+# (transport_ok) is a local of each verify_with_claude call, so it stays
+# per-seller — never shared or mutated across the concurrent sellers.
+_SELLER_SCAN_MAX_WORKERS = 3
+
+
 # ─── Rejected-candidate cache (BUI-301) ────────────────────────────────────────
 # BUI-149: a model-REJECTED candidate is correctly never marked "seen" (it's
 # not a genuine match) — but that means every scan re-fetches and re-verifies
@@ -388,6 +407,42 @@ def _save_rejected_cache(cache: dict[str, str]) -> None:
             f"Warning: could not persist rejected-candidate cache ({e})",
             file=sys.stderr,
         )
+
+
+# BUI-307: serialize the rejected-cache read-modify-write across the seller-level
+# worker threads of THIS process. _save_rejected_cache's atomic tmp→rename makes
+# a *single* write safe, but under seller parallelism two workers could each load
+# {X}, add a different entry, and write — a plain last-writer-wins overwrite would
+# silently DROP the other worker's rejection (and, because both write the same
+# `.tmp` path, could interleave into a corrupt file mid-write). This lock makes
+# the save a locked re-read → merge → write so no rejection is lost and only one
+# thread IN THIS PROCESS touches the `.tmp` file at a time. Reads at the START of
+# verify_with_claude stay lock-free on purpose: a stale skip-decision only costs
+# a redundant re-verify (safe, fail-open), and the atomic rename means a lock-
+# free reader never observes a partially-written file.
+#
+# Scope: intra-process only. Two *separate* seller-scan processes racing the same
+# file is a pre-existing condition (unchanged by BUI-307) — atomic rename keeps
+# it from corrupting readers, and the worst case is a lost cache entry (a
+# redundant re-verify next run), never a wrong buy. That's out of scope here.
+_REJECTED_CACHE_LOCK = threading.Lock()
+
+
+def _record_rejections(new_entries: dict[str, str]) -> None:
+    """Merge freshly model-rejected ``{pair_key: iso_ts}`` entries into the
+    on-disk rejected cache under _REJECTED_CACHE_LOCK (BUI-307).
+
+    Re-reads the current on-disk cache *inside* the lock before merging, so a
+    concurrent seller-scan worker's entries are preserved rather than clobbered
+    by a last-writer-wins overwrite. Best-effort: inherits _save_rejected_cache's
+    fail-open OSError handling (a persist failure warns, never raises).
+    """
+    if not new_entries:
+        return
+    with _REJECTED_CACHE_LOCK:
+        cache = _load_rejected_cache()
+        cache.update(new_entries)
+        _save_rejected_cache(cache)
 
 
 class _VerifyTimeout(RuntimeError):
@@ -800,15 +855,17 @@ def verify_with_claude(matches, *, use_rejected_cache=False):
     # those must resurface on the very next run, not be treated as a rejection.
     if use_rejected_cache and filtered:
         now_iso = datetime.now(timezone.utc).isoformat()
-        wrote = False
+        new_entries: dict[str, str] = {}
         for f in filtered:
             item_id = f.get("item_id")
             wish_name = f.get("wish_name")
             if item_id is not None and wish_name is not None:
-                rejected_cache[_rejected_cache_key(item_id, wish_name)] = now_iso
-                wrote = True
-        if wrote:
-            _save_rejected_cache(rejected_cache)
+                new_entries[_rejected_cache_key(item_id, wish_name)] = now_iso
+        # BUI-307: merge under the lock (re-reading on-disk state) instead of
+        # writing back this call's start-of-run `rejected_cache` snapshot — a
+        # concurrent worker may have added entries since we loaded, and a plain
+        # overwrite of the whole snapshot would drop them.
+        _record_rejections(new_entries)
 
     return kept, dropped, filtered
 
@@ -1119,24 +1176,23 @@ def main(argv=None):
     wish_items = prepare_wish_items(wish_list)
     print(f"  {len(wish_items)} matchable wish list items", file=sys.stderr)
 
-    results = []
-    # BUI-298 reliability: a GLOBAL verifier failure (missing claude CLI /
-    # every chunk failed transport) makes verify_with_claude sys.exit(1). In a
-    # multi-seller batch that must not silently discard the results of sellers
-    # already scanned this run — they were recorded seen but, since main()
-    # only prints after the loop, would never be shown (the BUI-297 lost-match
-    # failure class re-entering via crash-before-print). Catch it, record the
-    # failing seller's slot, and stop — a global failure hits every remaining
-    # seller identically, and the _EXIT_VERIFIER_DOWN signal tells the caller
-    # to re-run the whole batch once the verifier is reachable.
-    verifier_down = False
-    for seller_arg in args.sellers:
-        # Resolve the store name to an eBay login username before anything
-        # else — a store name is NOT a username and would silently scan
-        # every seller (BUI-68). BUI-298: an unresolvable seller does NOT
-        # abort the batch — its slot records the error and the loop continues.
-        # (Any --add-alias was already persisted + folded into `aliases`
-        # above, before the map was loaded — single-seller only.)
+    # BUI-307: aggregate into per-seller slots indexed by input position, so the
+    # final `results` list is in args.sellers order REGARDLESS of the (now
+    # concurrent) completion order — output stays deterministic and identical to
+    # the old sequential loop's ordering. A slot left None (a seller that was
+    # never collected — e.g. cancelled after a global verifier failure) is
+    # dropped from `results` at the end.
+    slots: list = [None] * len(args.sellers)
+
+    # Resolve every seller FIRST (cheap, local alias-map lookup — no API), in
+    # the main thread. An unresolvable seller fills its slot immediately and is
+    # never submitted to the pool. A store name is NOT a username and would
+    # silently scan every seller (BUI-68); BUI-298: an unresolvable seller does
+    # NOT abort the batch — its slot records the error and the batch continues.
+    # (Any --add-alias was already persisted + folded into `aliases` above,
+    # before the map was loaded — single-seller only.)
+    resolvable = []  # (idx, seller_arg, username)
+    for idx, seller_arg in enumerate(args.sellers):
         try:
             username = resolve_seller_username(
                 seller_arg, aliases, username_override=args.username
@@ -1152,26 +1208,68 @@ def main(argv=None):
                 f"    seller-scan {e.store} --username <username>     (one-off)",
                 file=sys.stderr,
             )
-            results.append(_seller_result(
+            slots[idx] = _seller_result(
                 seller_arg, None, error=f"unknown seller '{e.store}'"
-            ))
+            )
             continue
+        resolvable.append((idx, seller_arg, username))
 
-        try:
-            results.append(_scan_one_seller(
-                seller_arg, username, token, base_url, wish_items,
-                args.max_results, args.show_all,
-            ))
-        except SystemExit as e:
-            # verify_with_claude's global-failure guard (the ONLY sys.exit in
-            # this call path) fired — the verifier is down for every seller.
-            verifier_down = True
-            results.append(_seller_result(
-                seller_arg, username,
-                error=f"claude verifier globally unavailable (exit {e.code}) — "
-                      "re-run the batch once it is reachable",
-            ))
-            break
+    # BUI-307: scan resolvable sellers CONCURRENTLY, bounded to
+    # _SELLER_SCAN_MAX_WORKERS. The old loop ran sellers strictly sequentially,
+    # so one stuck 180s verify timeout blocked every seller behind it; a bounded
+    # pool lets healthy sellers finish while one hangs, and caps eBay Browse API
+    # concurrency at the worker count. Each seller's chunked verification still
+    # runs sequentially inside its own _scan_one_seller (BUI-297 breaker intact).
+    #
+    # BUI-298 reliability, preserved under BUI-307 concurrency: a GLOBAL verifier
+    # failure (missing claude CLI / every chunk failed transport) makes
+    # verify_with_claude sys.exit(1), which a worker thread turns into the
+    # future's exception, re-raised here by future.result(). On the first such
+    # failure we record that seller's error slot and CANCEL the not-yet-started
+    # tail (a global failure hits every remaining seller identically, so there's
+    # no point fanning it out) — but we do NOT stop draining `as_completed`.
+    #
+    # This is load-bearing: a seller that already finished (or is mid-flight)
+    # recorded its genuine matches as *seen* (record_items_seen) before returning.
+    # If we broke out here without collecting its slot, main() would print
+    # nothing for it, yet the re-run that _EXIT_VERIFIER_DOWN prompts would find
+    # those item_ids already seen and hide them — silently losing a real
+    # wish-list match (the exact BUI-297 lost-match class). So we keep collecting
+    # every future that actually ran; only the cancelled (never-started) tail is
+    # skipped — those recorded nothing, so their empty slots drop out cleanly.
+    verifier_down = False
+    with ThreadPoolExecutor(max_workers=_SELLER_SCAN_MAX_WORKERS) as executor:
+        future_to_meta = {
+            executor.submit(
+                _scan_one_seller, seller_arg, username, token, base_url,
+                wish_items, args.max_results, args.show_all,
+            ): (idx, seller_arg, username)
+            for idx, seller_arg, username in resolvable
+        }
+        for future in as_completed(future_to_meta):
+            idx, seller_arg, username = future_to_meta[future]
+            try:
+                slots[idx] = future.result()
+            except CancelledError:
+                # A not-yet-started seller we cancelled after a global verifier
+                # failure below — it was never scanned and recorded nothing, so
+                # leave its slot None (dropped from `results`).
+                continue
+            except SystemExit as e:
+                # verify_with_claude's global-failure guard (the ONLY sys.exit in
+                # this call path) fired — the verifier is down for every seller.
+                verifier_down = True
+                slots[idx] = _seller_result(
+                    seller_arg, username,
+                    error=f"claude verifier globally unavailable (exit {e.code}) — "
+                          "re-run the batch once it is reachable",
+                )
+                # Cancel only the not-yet-started sellers; already-running ones
+                # keep going and are still collected on later as_completed turns.
+                for f in future_to_meta:
+                    f.cancel()
+
+    results = [s for s in slots if s is not None]
 
     any_incomplete = any(r["incomplete"] for r in results)
     any_error = any(r["error"] for r in results)
