@@ -223,6 +223,51 @@ class TestBuildQuery:
         q = sc.build_query("Batman", "224", year=1970, grade_label="FN")
         assert " FN " in q or q.endswith(" FN") or " FN -" in q
 
+    # ── BUI-304 (issue 1): variant appended as a query keyword ──────────────
+    def test_variant_appended_when_present(self):
+        q = sc.build_query("X-Men", "123", variant="Newsstand")
+        assert "Newsstand" in q
+
+    def test_base_unchanged_when_variant_absent(self):
+        # Guard: absent/None/empty variant must leave the base query byte-for-byte
+        # identical to the pre-BUI-304 output.
+        base = sc.build_query("X-Men", "123")
+        assert sc.build_query("X-Men", "123", variant=None) == base
+        assert sc.build_query("X-Men", "123", variant="") == base
+        assert sc.build_query("X-Men", "123", variant="   ") == base
+        assert "Newsstand" not in base
+
+    def test_variant_and_publisher_both_appended(self):
+        q = sc.build_query("Invincible", "1", publisher="image comics",
+                           variant="Direct")
+        assert "Direct" in q
+        assert "image comics" in q
+
+    # ── BUI-304 (issue 2): Marvel/DC publisher normalized to "<pub> comics" ──
+    def test_marvel_publisher_qualifier(self):
+        for pub in ("Marvel", "marvel", "Marvel Comics"):
+            q = sc.build_query("Amazing Spider-Man", "300", publisher=pub)
+            assert "marvel comics" in q
+
+    def test_dc_publisher_qualifier(self):
+        for pub in ("DC", "dc", "DC Comics"):
+            q = sc.build_query("Detective Comics", "27", publisher=pub)
+            assert "dc comics" in q
+
+    def test_indie_publisher_passes_through_unchanged(self):
+        # The pre-existing indie mechanism must keep working verbatim.
+        for pub in ("image comics", "dark horse", "Valiant"):
+            q = sc.build_query("Spawn", "1", publisher=pub)
+            assert pub in q
+
+    def test_publisher_qualifier_helper(self):
+        assert sc._publisher_qualifier(None) is None
+        assert sc._publisher_qualifier("") is None
+        assert sc._publisher_qualifier("   ") is None
+        assert sc._publisher_qualifier("Marvel") == "marvel comics"
+        assert sc._publisher_qualifier("DC Comics") == "dc comics"
+        assert sc._publisher_qualifier("Dark Horse") == "Dark Horse"
+
 
 class TestCanonicalUrl:
     def test_excludes_api_key(self):
@@ -451,6 +496,25 @@ class TestTieredStrategy:
             {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
         )
         assert "_req_id" not in out["input"]
+
+    def test_variant_threaded_into_every_tier(self, tmp_path, monkeypatch):
+        """BUI-304: a book's `variant` must reach the actual eBay search on ALL
+        three tiers (base, broader, grade-targeted) — not just build_query in
+        isolation. Force all tiers to fire (thin base, few grade-tagged) and
+        assert the variant keyword lands in every query the pipeline runs."""
+        results = [
+            [self._comp(str(i)) for i in range(2)],          # thin base → broaden
+            [self._comp(str(100 + i)) for i in range(3)],    # broader (still ungraded)
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        sc.fetch_book_comps(
+            {"title": "X-Men", "issue": "123", "year": 1991, "grade": 6.5,
+             "variant": "Newsstand"},
+            "key",
+        )
+        # base + broader + grade-targeted all fired, each carrying the variant.
+        assert len(calls) == 3
+        assert all("Newsstand" in nkw for nkw in calls)
 
 
 # ─── End-to-end-ish: batch driver ────────────────────────────────────────────
