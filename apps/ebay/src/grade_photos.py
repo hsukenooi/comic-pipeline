@@ -8,6 +8,23 @@ Browse API calls (get_item_by_legacy_id), same image-download logic, same
 stdout contract the grader depends on — only the item IDs move from a
 hardcoded list to argv.
 
+BUI-283: OAuth + Browse-API fetch now reuse ebay_fetch.py's load_config() /
+get_token() / fetch_item() instead of a second copy of that logic. Two
+deliberate behavior changes from the pre-BUI-283 version:
+
+- Token caching is ADOPTED: ebay_fetch.get_token() writes/reads
+  token_cache_{env}.json (5-min expiry buffer) instead of doing a fresh
+  OAuth call on every run. This matches seller_scan.py and
+  wishlist_sellers.py (the existing reuse idiom in this package) and drops
+  a redundant OAuth round-trip per grade run. grade.md's Step 1 contract
+  depends only on the per-line stdout format below, not on a fresh token
+  each run, so this is safe to adopt.
+- Credential loading goes through ebay_fetch.load_config(), which is
+  env-var-first with the config file as a fallback — fixing a latent bug
+  where this module used to open ~/.config/ebay-fetch/config.json
+  unconditionally at import time, raising FileNotFoundError at import on
+  any machine that only sets EBAY_CLIENT_ID/EBAY_CLIENT_SECRET env vars.
+
 Usage:
     python src/grade_photos.py ITEM_ID [ITEM_ID ...] [--workdir DIR]
 
@@ -20,61 +37,25 @@ line per item:
 """
 
 import argparse
-import base64
-import json
-import os
 import sys
-import time
 import urllib.request
 from pathlib import Path
 
-import requests
-
-with open(Path("~/.config/ebay-fetch/config.json").expanduser()) as _f:
-    _cfg = json.load(_f)
-APP_ID = os.environ.get("EBAY_CLIENT_ID") or _cfg.get("client_id")
-CERT_ID = os.environ.get("EBAY_CLIENT_SECRET") or _cfg.get("client_secret")
-BASE_URL = "https://api.ebay.com"
+from ebay_fetch import fetch_item, get_token, load_config
 
 
-def _request_json(method, url, *, headers=None, params=None, data=None, what="request"):
-    # BUI-147: mirror ebay_fetch.py's contract — retry 429 with backoff and
-    # abort LOUDLY on a persistent non-200. Without this, a down/429/404 API
-    # returns an error body, .json() yields no image keys, and the listing is
-    # reported with image_count=0 — indistinguishable from a genuinely
-    # photo-less listing, so the Step 1.5 triage silently DROPs a real book.
-    for attempt in range(4):
-        resp = requests.request(method, url, headers=headers, params=params, data=data, timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
-        if resp.status_code == 429:
-            time.sleep(2 ** attempt)
-            continue
-        raise RuntimeError(f"{what}: HTTP {resp.status_code} {resp.text[:200]}")
-    raise RuntimeError(f"{what}: still rate-limited (429) after retries")
-
-
-def get_token():
-    creds = base64.b64encode(f"{APP_ID}:{CERT_ID}".encode()).decode()
-    tok = _request_json(
-        "POST", f"{BASE_URL}/identity/v1/oauth2/token",
-        headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
-        data={"grant_type": "client_credentials", "scope": "https://api.ebay.com/oauth/api_scope"},
-        what="oauth token",
-    )
-    if "access_token" not in tok:  # guard: don't KeyError on a malformed body
-        raise RuntimeError(f"oauth token response missing access_token: {tok}")
-    return tok["access_token"]
-
-
-def download_listing(token, item_id, outdir):
+def download_listing(token, item_id, outdir, base_url):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    headers = {"Authorization": f"Bearer {token}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"}
-    data = _request_json(
-        "GET", f"{BASE_URL}/buy/browse/v1/item/get_item_by_legacy_id",
-        headers=headers, params={"legacy_item_id": item_id}, what=f"item {item_id}",
-    )
+    # BUI-283: fetch_item() returns None on failure (already logged detail to
+    # stderr) rather than raising. Adapt that back to a raised RuntimeError so
+    # the FETCH FAILED contract below (BUI-147: a fetch failure is NOT zero
+    # images) stays intact — without this, a None result would need its own
+    # empty-image handling and would be indistinguishable from a genuinely
+    # photo-less listing.
+    data = fetch_item(item_id, token, base_url)
+    if data is None:
+        raise RuntimeError(f"item {item_id}: fetch failed (see stderr for detail)")
     imgs = []
     if "image" in data:
         imgs.append(data["image"]["imageUrl"])
@@ -114,10 +95,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     items = [(f"comic-{i}", item_id) for i, item_id in enumerate(args.item_ids, 1)]
-    token = get_token()
+    client_id, client_secret, base_url = load_config()
+    # BUI-283: reuse ebay_fetch's cached get_token() (writes token_cache_{env}.json,
+    # 5-min buffer) instead of a fresh OAuth call every run — see module docstring.
+    token = get_token(client_id, client_secret, base_url)
     for label, item_id in items:
         try:
-            result = download_listing(token, item_id, f"{args.workdir}/{label}")
+            result = download_listing(token, item_id, f"{args.workdir}/{label}", base_url)
         except RuntimeError as e:
             # BUI-147: a fetch failure is NOT zero images. Surface it loudly so the
             # Step 1.5 triage doesn't DROP a real book as "un-gradeable".
