@@ -73,3 +73,9 @@ The Calibration Report's ranking metric: `median(winning_bid / fmv_high)` over a
 
 ### Grade-Curve Interpolation
 Estimating an FMV for a comic at a grade with no direct sold comps by reading a price off the curve implied by comps at neighbouring grades. It is a **fallback only when the target grade's bucket is empty** — never used when real comps exist at the target grade — requires a minimum number of supporting comps, and its output is marked as interpolated at **low confidence** (including through cache reuse) so it is never conflated with a direct-comp price (see the over-bid-guards learning in `docs/solutions/best-practices/`).
+
+### needs_manual
+The FMV verdict emitted when even the fallbacks can't defensibly price a book (raw sold comps too thin, target grade's bucket empty and interpolation unsupported). It is a deliberate **punt to a human/LLM**, not a failure — the book gets hand-priced with judgment inside the `/comic:fmv` skill rather than auto-bid on a shaky estimate. Automating away a `needs_manual` on a high-value key removes the human check exactly where a mistake costs the most.
+
+### CGC-Proxy Fallback (§7a)
+The fmv.md §7a step for pricing a thin-comp book off CGC census/graded realized prices (Google/Heritage/GoCollect) instead of raw eBay sold comps. It is **human/LLM-gated by design and deliberately not automated** — its inputs are unstructured prose (no `price.extracted` field like `engine=ebay` has), its ">$200 value" trigger is circular (no value estimate exists precisely when comps are too thin to price), and a mis-read number would be an unbounded over-bid in the bid-cap path. A future ask to automate it should stop here (see the not-safely-automatable learning in `docs/solutions/best-practices/`; BUI-326 Won't Do).
