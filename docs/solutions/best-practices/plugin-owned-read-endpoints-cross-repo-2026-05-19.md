@@ -386,6 +386,7 @@ The JS `isEnded(r)` helper handles the active/ended split on every render.
 
 ## Related
 
+- General case of §(b)'s import-time smoke test: [docs/solutions/developer-experience/cross-package-regressions-escape-per-package-test-runs.md](../developer-experience/cross-package-regressions-escape-per-package-test-runs.md) — the repo-wide version of "a host-side contract change should fail on the consumer's side in CI, not in production": grep all consumers on a signature change, keep mocks mirroring the real return shape, grep source-text guard tests before relocating, and gate on the full CI matrix.
 - Brainstorm: [docs/brainstorms/2026-05-19-comics-dashboard-requirements.md](../../brainstorms/2026-05-19-comics-dashboard-requirements.md)
 - Plan: [docs/plans/2026-05-19-002-feat-comics-dashboard-plan.md](../../plans/2026-05-19-002-feat-comics-dashboard-plan.md)
 - Sibling SQLite gotcha (DDL/migration scope, not DQL): [docs/solutions/database-issues/sqlite-fk-rename-savepoint-pragma-2026-05-19.md](../database-issues/sqlite-fk-rename-savepoint-pragma-2026-05-19.md)
