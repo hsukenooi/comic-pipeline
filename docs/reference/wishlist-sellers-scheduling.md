@@ -5,8 +5,9 @@ of the skill body (BUI-282) because it's setup-time reference, not something a
 runtime invocation needs to read.
 
 `/comic:wishlist-sellers` is designed to run on a **recurring schedule** —
-daily or weekly — and notify you only when new multi-match sellers are found.
-An empty result is always silent.
+daily or weekly — and notify you when new multi-match sellers are found, or
+when a run is partial (exit 3 — some candidates were never verified; see the
+exit-code table below). A clean empty result (exit 0, no sellers) is silent.
 
 ## Why re-runs are cheap
 
@@ -49,34 +50,62 @@ Run /comic:wishlist-sellers every Sunday at 9 AM. Notify me only if sellers are 
 
 The cloud agent runs `wishlist-sellers` on the Mac Mini (where
 `COMICS_SERVER_URL=http://localhost:8080` is already set), captures the
-output, and delivers a completion notification when the run finishes. An empty
-result (no sellers with ≥2 matches) is silent; a non-empty result surfaces the
-full per-seller table in the notification.
+output, and delivers a completion notification when the run finishes. A clean
+empty result (no sellers with ≥2 matches, exit 0) is silent; a non-empty
+result surfaces the full per-seller table in the notification. **A partial run
+(exit 3 — see the exit-code table below) should also notify** even with zero
+sellers, because it means some candidates were never verified and the run
+should be re-triggered.
 
 **Option B — local cron** (if you prefer a local trigger):
 
 ```bash
-# Run every Sunday at 9 AM; notify via terminal-notifier on non-empty output
-0 9 * * 0 COMICS_SERVER_URL=http://localhost:8080 wishlist-sellers 2>/dev/null \
-  | tee /tmp/wishlist-sellers-last.txt \
-  | grep -q "Seller:" && terminal-notifier -title "Wish List Sellers" \
-      -message "$(wc -l < /tmp/wishlist-sellers-last.txt) lines — check terminal"
+# Run every Sunday at 9 AM; notify on new sellers OR a partial (exit-3) run.
+# Capture wishlist-sellers' OWN exit code — a bare pipe would report grep's
+# instead, hiding exit 3 (BUI-309). Notify when sellers were found (grep) or
+# the run was incomplete (exit 3 = some candidates never verified).
+0 9 * * 0 COMICS_SERVER_URL=http://localhost:8080 bash -c '\
+  wishlist-sellers > /tmp/wishlist-sellers-last.txt 2>/dev/null; ec=$?; \
+  if grep -q "Seller:" /tmp/wishlist-sellers-last.txt || [ $ec -eq 3 ]; then \
+    terminal-notifier -title "Wish List Sellers" \
+      -message "exit $ec — check /tmp/wishlist-sellers-last.txt"; \
+  fi'
 ```
 
 Adjust the URL and notification command to match your machine and preferred
 alerting tool.
 
+## Exit codes (BUI-309)
+
+`wishlist-sellers` mirrors `seller-scan`'s exit-code-first contract so an
+unattended scheduler can branch on the exit code before parsing output:
+
+| Exit | Meaning | Scheduler action |
+|------|---------|------------------|
+| `0` | Clean run (any sellers found are in the output) | Notify only if sellers were found |
+| `3` | Partial run — one or more candidates were NEVER verified (claude CLI timeout / transport failure). They stay uncached + unseen and resurface next run | Notify; re-run is safe and cheap (caches warm) |
+| `1` | Verifier globally down (missing/broken `claude` CLI) — nothing could be verified | Alert; a re-run won't help until `claude` auth is fixed |
+
+Run with `--json` for a machine-readable payload: a top-level object
+`{"incomplete": bool, "sellers": [...], "dropped_candidates": [...]}`.
+`incomplete` is `true` exactly when the exit code is `3`; `dropped_candidates`
+lists the never-verified listings.
+
 ## Notification behavior
 
-- **Non-empty result** → notify. The per-seller table is the notification
-  payload when run via a cloud agent; route it to whatever channel reaches
-  you (Slack, push notification, email).
-- **Empty result** → silent. No sellers with ≥2 matches means nothing
-  actionable; the run exits 0 with no output.
+- **Sellers found (exit 0, non-empty)** → notify. The per-seller table is the
+  notification payload when run via a cloud agent; route it to whatever channel
+  reaches you (Slack, push notification, email).
+- **Partial run (exit 3)** → notify. Some candidates were never verified; the
+  run is worth re-triggering (they resurface next run by design). The stdout
+  `INCOMPLETE:` banner (or `--json` `dropped_candidates`) names how many.
+- **Clean empty result (exit 0, no sellers)** → silent. No sellers with ≥2
+  matches and nothing left unverified means nothing actionable.
 
 The script itself does not push notifications — it only writes to
-stdout/stderr. The scheduling layer (cloud agent or cron wrapper) is
-responsible for detecting non-empty output and routing it.
+stdout/stderr and sets the exit code. The scheduling layer (cloud agent or
+cron wrapper) is responsible for detecting a non-empty result or a non-zero
+exit and routing it.
 
 ---
 

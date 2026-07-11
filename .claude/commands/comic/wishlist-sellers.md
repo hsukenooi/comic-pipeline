@@ -121,11 +121,34 @@ Seller: m9zr3pq1y... (2 matches)
 
 Progress counts (wish-list size, cache hits/misses, match counts before/after each filter stage, Haiku verify count, final seller count) all go to stderr so the stdout table stays clean for piping.
 
+### `--json` output and exit codes (BUI-309)
+
+For programmatic use, `--json` emits a single top-level **object** (never a bare array), mirroring `/comic:seller-scan`'s contract:
+
+```json
+{
+  "incomplete": false,
+  "sellers": [{"seller": "a4k92xbp7...", "matches": [{"wish_name": "...", "title": "...", "price": "...", "listing_url": "..."}]}],
+  "dropped_candidates": []
+}
+```
+
+- `incomplete` is `true` exactly when the run was **partial** — one or more candidates were never verified (claude CLI timeout / transport failure). Those listings appear in `dropped_candidates` (each carries its own `seller` key). They are deliberately **not** recorded as seen and **not** cached, so they resurface on the next run.
+- The process **exit code** signals the same thing without parsing stdout:
+
+| Exit | Meaning |
+|---|---|
+| `0` | Clean run |
+| `3` | Partial run — some candidates never verified (`incomplete: true`) |
+| `1` | Verifier globally down (missing/broken `claude` CLI) |
+
+When run as a skill on a schedule, check the exit code: on **3**, tell the user the run was partial and the unverified books will be retried next run (no action needed — they self-heal); on **1**, the `claude` CLI needs attention before a re-run helps. See `docs/reference/wishlist-sellers-scheduling.md` for the cron/cloud-agent wiring.
+
 When run as a skill, present the per-seller blocks clearly so the user can decide which seller to pursue for a combined purchase. Note the ending times so they can prioritize sellers whose auctions close soonest.
 
 ## Scheduling and recurring runs
 
-`/comic:wishlist-sellers` is designed to run on a **recurring schedule** — daily or weekly — and notify you only when new multi-match sellers are found. An empty result is always silent (three cache layers make steady-state runs near-free — search cache, verdict cache, seen-item filter). For setup instructions (`/schedule` cloud agent vs local cron) and the cache-cost breakdown, see `docs/reference/wishlist-sellers-scheduling.md`.
+`/comic:wishlist-sellers` is designed to run on a **recurring schedule** — daily or weekly — and notify you when new multi-match sellers are found, or when a run is partial (exit 3 — some candidates never verified; see the exit-code table above). A clean empty result (exit 0, no sellers) is silent (three cache layers make steady-state runs near-free — search cache, verdict cache, seen-item filter). For setup instructions (`/schedule` cloud agent vs local cron) and the cache-cost breakdown, see `docs/reference/wishlist-sellers-scheduling.md`.
 
 ## After you find a seller
 

@@ -82,13 +82,18 @@ def _run_main(
     dropped_return: list | None = None,
     json_output: bool = False,
     extra_args: list | None = None,
-) -> tuple[str, MagicMock, MagicMock]:
-    """Run main() with standard mocks; return (stdout, mock_verify, mock_record).
+) -> tuple[str, int, MagicMock, MagicMock]:
+    """Run main() with standard mocks; return (stdout, exit_code, mock_verify,
+    mock_record).
 
     BUI-297/BUI-298: verify_with_claude returns (kept, dropped, filtered).
     `verify_return` is the KEPT list; `dropped_return` (default []) is the
     never-verified list; the third element (model-rejected `filtered`, which
     wishlist-sellers ignores) is always [] here.
+
+    BUI-309: `exit_code` is main()'s return value — non-zero (_EXIT_INCOMPLETE)
+    when `dropped_return` produced any never-verified candidates in the final
+    survivors set, 0 on a clean run.
     """
     if wish_list is None or wish_items is None:
         wish_list, wish_items = _two_wish_items()
@@ -125,8 +130,8 @@ def _run_main(
         if extra_args:
             argv = argv + extra_args
         with redirect_stdout(buf):
-            ws.main(argv)
-        return buf.getvalue(), mock_verify, mock_record
+            exit_code = ws.main(argv)
+        return buf.getvalue(), exit_code, mock_verify, mock_record
 
 
 # ─── dedup_matches ────────────────────────────────────────────────────────────
@@ -665,11 +670,14 @@ class TestVerifyDroppedCandidates:
                 return_value=([m_genuine], [m_dropped], []),  # m_rejected: neither
             ),
         ):
-            pristine_direct, verified = ws._verify_uncached_matches(uncached, db_path)
+            pristine_direct, verified, dropped = ws._verify_uncached_matches(uncached, db_path)
 
-        # Dropped candidate is never returned as a survivor.
+        # Dropped candidate is never returned as a survivor, but IS reported
+        # separately (BUI-309) so the caller can surface it in --json /
+        # exit code without treating it as genuine.
         assert pristine_direct == []
         assert verified == [m_genuine]
+        assert dropped == [m_dropped]
 
         gk = ws._title_key(m_genuine["title"])
         rk = ws._title_key(m_rejected["title"])
@@ -693,7 +701,7 @@ class TestVerifyDroppedCandidates:
         m2 = make_match(seller="sellerZ", item_id="2", wish_name="X-Men #94")
         wish_list, wish_items = _two_wish_items()
 
-        _, _, mock_record = _run_main(
+        _, _exit, _, mock_record = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -706,6 +714,283 @@ class TestVerifyDroppedCandidates:
         # m1, so nothing is recorded at all — and critically not item_id "2".
         recorded_ids = [i for call in mock_record.call_args_list for i in call.args[0]]
         assert "2" not in recorded_ids
+
+
+# ─── BUI-309: observability contract (--json object + non-zero exit) ────────
+
+class TestBui309ObservabilityContract:
+    """wishlist-sellers runs UNATTENDED on a schedule, so a stderr WARNING
+    for never-verified ('dropped') candidates is too weak a signal. BUI-309
+    mirrors seller_scan.py's BUI-298 contract: `--json` is always a top-level
+    OBJECT (never a bare array) carrying a `dropped_candidates` field, and the
+    process exits non-zero (_EXIT_INCOMPLETE, reused from seller_scan.py) when
+    any candidate was never verified — 0 on a clean run either way."""
+
+    @staticmethod
+    def _two_seller_setup():
+        """sellerA and sellerB each have 2 raw candidates (one per wish item),
+        so both clear the pre-verify ≥2 gate. mB2 is the one BUI-309 tests
+        drop (never verify). Titles are all distinct so the cross-seller
+        (title_key, wish_name) dedup in _verify_uncached_matches never
+        collapses two of these into the same representative — each match
+        must get its own, independently mockable verify verdict."""
+        mA1 = make_match(seller="sellerA", item_id="a1",
+                        wish_name="Amazing Spider-Man #129",
+                        title="Amazing Spider-Man #129 VF (seller A copy)")
+        mA2 = make_match(seller="sellerA", item_id="a2", wish_name="X-Men #94",
+                        title="X-Men #94 VF (seller A copy)")
+        mB1 = make_match(seller="sellerB", item_id="b1",
+                        wish_name="Amazing Spider-Man #129",
+                        title="Amazing Spider-Man #129 NM (seller B copy)")
+        mB2 = make_match(seller="sellerB", item_id="b2", wish_name="X-Men #94",
+                        title="X-Men #94 NM (seller B copy)")
+        return mA1, mA2, mB1, mB2
+
+    def test_exit_code_nonzero_when_candidates_dropped(self, tmp_path):
+        db_path = tmp_path / "v.db"
+        mA1, mA2, mB1, mB2 = self._two_seller_setup()
+        wish_list, wish_items = _two_wish_items()
+
+        _, exit_code, _, _ = _run_main(
+            [[mA1, mB1], [mA2, mB2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[mA1, mA2, mB1],
+            dropped_return=[mB2],
+        )
+
+        assert exit_code == ws._EXIT_INCOMPLETE
+        assert exit_code == 3, "exit 3 mirrors seller_scan.py's BUI-298 drop signal"
+
+    def test_exit_code_zero_on_clean_run(self, tmp_path):
+        db_path = tmp_path / "v.db"
+        mA1, mA2, mB1, mB2 = self._two_seller_setup()
+        wish_list, wish_items = _two_wish_items()
+
+        _, exit_code, _, _ = _run_main(
+            [[mA1, mB1], [mA2, mB2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[mA1, mA2, mB1, mB2],
+            dropped_return=[],
+        )
+
+        assert exit_code == 0
+
+    def test_json_is_object_with_dropped_candidates(self, tmp_path):
+        db_path = tmp_path / "v.db"
+        mA1, mA2, mB1, mB2 = self._two_seller_setup()
+        wish_list, wish_items = _two_wish_items()
+
+        output, exit_code, _, _ = _run_main(
+            [[mA1, mB1], [mA2, mB2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[mA1, mA2, mB1],
+            dropped_return=[mB2],
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        assert isinstance(data, dict), "BUI-309: --json is always an object, never a bare array"
+        assert data["incomplete"] is True
+        assert len(data["dropped_candidates"]) == 1
+        dropped = data["dropped_candidates"][0]
+        assert dropped["item_id"] == "b2"
+        assert "_series" not in dropped
+        assert "_issue" not in dropped
+        # sellerB's second candidate never verified → falls below the ≥2 gate
+        # post-verify and drops out of `sellers`; sellerA is unaffected.
+        seller_names = {s["seller"] for s in data["sellers"]}
+        assert seller_names == {"sellerA"}
+        assert exit_code == ws._EXIT_INCOMPLETE
+
+    def test_json_dropped_candidates_empty_on_clean_run(self, tmp_path):
+        """`sellers`/kept-match behavior is unchanged under the new object
+        envelope — only the top-level shape changed (array → object)."""
+        db_path = tmp_path / "v.db"
+        mA1, mA2, mB1, mB2 = self._two_seller_setup()
+        wish_list, wish_items = _two_wish_items()
+
+        output, exit_code, _, _ = _run_main(
+            [[mA1, mB1], [mA2, mB2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[mA1, mA2, mB1, mB2],
+            dropped_return=[],
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        assert data["incomplete"] is False
+        assert data["dropped_candidates"] == []
+        seller_names = {s["seller"] for s in data["sellers"]}
+        assert seller_names == {"sellerA", "sellerB"}
+        assert exit_code == 0
+
+    def test_human_readable_output_signals_partial_run(self, tmp_path):
+        """The non-JSON table path also signals an incomplete run — not just
+        the stderr WARNING already printed during verification."""
+        db_path = tmp_path / "v.db"
+        mA1, mA2, mB1, mB2 = self._two_seller_setup()
+        wish_list, wish_items = _two_wish_items()
+
+        output, exit_code, _, _ = _run_main(
+            [[mA1, mB1], [mA2, mB2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[mA1, mA2, mB1],
+            dropped_return=[mB2],
+        )
+
+        assert "INCOMPLETE" in output
+        assert "never verified" in output.lower()
+        assert exit_code == ws._EXIT_INCOMPLETE
+
+    def test_human_readable_output_silent_on_clean_run(self, tmp_path):
+        db_path = tmp_path / "v.db"
+        mA1, mA2, mB1, mB2 = self._two_seller_setup()
+        wish_list, wish_items = _two_wish_items()
+
+        output, exit_code, _, _ = _run_main(
+            [[mA1, mB1], [mA2, mB2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[mA1, mA2, mB1, mB2],
+            dropped_return=[],
+        )
+
+        assert "INCOMPLETE" not in output
+        assert exit_code == 0
+
+    def test_dropped_candidate_stays_uncached_and_unseen(self, tmp_path):
+        """Data-safety invariant (BUI-297) is unchanged by BUI-309's
+        observability upgrade: a dropped candidate is never cached as a
+        verdict and never recorded as seen, so it resurfaces next run."""
+        db_path = tmp_path / "v.db"
+        mA1, mA2, mB1, mB2 = self._two_seller_setup()
+        wish_list, wish_items = _two_wish_items()
+
+        _, _exit, _, mock_record = _run_main(
+            [[mA1, mB1], [mA2, mB2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[mA1, mA2, mB1],
+            dropped_return=[mB2],
+        )
+
+        recorded_ids = [i for call in mock_record.call_args_list for i in call.args[0]]
+        assert "b2" not in recorded_ids
+        assert ws.verdict_get(
+            ws._title_key(mB2["title"]), mB2["wish_name"], db_path=db_path
+        ) is None
+
+    @staticmethod
+    def _three_wish_items():
+        wish_list = [
+            {"id": "w1", "name": "Amazing Spider-Man #129"},
+            {"id": "w2", "name": "X-Men #94"},
+            {"id": "w3", "name": "Fantastic Four #48"},
+        ]
+        wish_items = [
+            {"id": "w1", "name": "Amazing Spider-Man #129",
+             "series": "Amazing Spider-Man", "issue": "129",
+             "_tokens": ["amazing", "spider", "man"]},
+            {"id": "w2", "name": "X-Men #94", "series": "X-Men", "issue": "94",
+             "_tokens": ["xmen"]},
+            {"id": "w3", "name": "Fantastic Four #48",
+             "series": "Fantastic Four", "issue": "48",
+             "_tokens": ["fantastic", "four"]},
+        ]
+        return wish_list, wish_items
+
+    def test_seller_survives_while_contributing_a_dropped_candidate(self, tmp_path):
+        """A 3-book seller loses ONE candidate to the never-verified path but
+        still clears the >=2 gate — so `sellers` is non-empty AND contains that
+        seller, while `dropped_candidates` also references it. Exit is still 3.
+        (The other BUI-309 tests only cover a drop pushing the seller below the
+        gate; this pins the seller-survives-with-a-drop composition.)"""
+        db_path = tmp_path / "v.db"
+        wish_list, wish_items = self._three_wish_items()
+        m1 = make_match(seller="big", item_id="1", wish_name="Amazing Spider-Man #129",
+                        title="Amazing Spider-Man #129 VF")
+        m2 = make_match(seller="big", item_id="2", wish_name="X-Men #94",
+                        title="X-Men #94 VF")
+        m3 = make_match(seller="big", item_id="3", wish_name="Fantastic Four #48",
+                        title="Fantastic Four #48 VF")
+
+        output, exit_code, _, mock_record = _run_main(
+            [[m1], [m2], [m3]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],   # 2 kept -> seller stays above the gate
+            dropped_return=[m3],      # 1 never verified
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        assert data["incomplete"] is True
+        assert exit_code == ws._EXIT_INCOMPLETE
+        # Seller survives (>=2 verified) AND appears in the output...
+        assert {s["seller"] for s in data["sellers"]} == {"big"}
+        # ...while its dropped book is reported separately, attributable via its
+        # own `seller` key (the flat dropped_candidates has no per-seller nesting).
+        assert len(data["dropped_candidates"]) == 1
+        assert data["dropped_candidates"][0]["item_id"] == "3"
+        assert data["dropped_candidates"][0]["seller"] == "big"
+        # The dropped book (item 3) is never recorded as seen; the kept ones are.
+        recorded_ids = [i for call in mock_record.call_args_list for i in call.args[0]]
+        assert "3" not in recorded_ids
+        assert {"1", "2"} <= set(recorded_ids)
+
+    def test_one_dropped_key_fans_out_to_every_sharing_listing(self, tmp_path):
+        """The whole reason `dropped` is fanned out (not one representative per
+        key): two sellers list the SAME book (same title + wish_name -> one
+        verdict key). verify_with_claude sees ONE representative and drops it;
+        BOTH listings must land in dropped_candidates (BUI-309), not just the
+        representative. All other BUI-309 tests use distinct titles so the key
+        never collapses and dropped_candidates length is always 1."""
+        db_path = tmp_path / "v.db"
+        wish_list, wish_items = self._three_wish_items()
+        # Two sellers, identical ASM #129 listing -> same (title_key, wish_name).
+        asm_s1 = make_match(seller="s1", item_id="a1",
+                            wish_name="Amazing Spider-Man #129",
+                            title="Amazing Spider-Man #129 VF")
+        asm_s2 = make_match(seller="s2", item_id="a2",
+                            wish_name="Amazing Spider-Man #129",
+                            title="Amazing Spider-Man #129 VF")
+        # A distinct 2nd book per seller so each clears the pre-verify >=2 gate.
+        xmen_s1 = make_match(seller="s1", item_id="x1", wish_name="X-Men #94",
+                             title="X-Men #94 VF")
+        ff_s2 = make_match(seller="s2", item_id="f2", wish_name="Fantastic Four #48",
+                           title="Fantastic Four #48 VF")
+
+        output, exit_code, _, _ = _run_main(
+            [[asm_s1, asm_s2], [xmen_s1], [ff_s2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            # verify sees one representative per key: keep the X-Men + FF reps,
+            # drop the shared ASM representative.
+            verify_return=[xmen_s1, ff_s2],
+            dropped_return=[asm_s1],
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        assert data["incomplete"] is True
+        assert exit_code == ws._EXIT_INCOMPLETE
+        # The single dropped KEY fans out to BOTH listings that share it.
+        dropped_ids = {d["item_id"] for d in data["dropped_candidates"]}
+        assert dropped_ids == {"a1", "a2"}
 
 
 # ─── Post-verify re-gate ──────────────────────────────────────────────────────
@@ -762,7 +1047,7 @@ class TestEndToEndHappyPath:
                         wish_name="X-Men #94", price="$80.00")
         wish_list, wish_items = _two_wish_items()
 
-        output, _, mock_record = _run_main(
+        output, _exit, _, mock_record = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -775,14 +1060,15 @@ class TestEndToEndHappyPath:
         assert "X-Men #94" in output
 
     def test_json_output_valid_and_no_private_fields(self, tmp_path):
-        """--json emits valid JSON; private keys _series/_issue are stripped."""
+        """--json emits a top-level OBJECT (BUI-309) with a `sellers` array;
+        private keys _series/_issue are stripped from each match."""
         db_path = tmp_path / "v.db"
         m1 = make_match(seller="comicseller1", item_id="200",
                         wish_name="Amazing Spider-Man #129")
         m2 = make_match(seller="comicseller1", item_id="201", wish_name="X-Men #94")
         wish_list, wish_items = _two_wish_items()
 
-        output, _, _ = _run_main(
+        output, exit_code, _, _ = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -792,12 +1078,16 @@ class TestEndToEndHappyPath:
         )
 
         data = json.loads(output)
-        assert len(data) == 1
-        assert data[0]["seller"] == "comicseller1"
-        assert len(data[0]["matches"]) == 2
-        for match in data[0]["matches"]:
+        assert isinstance(data, dict), "BUI-309: --json is always an object, never a bare array"
+        assert data["incomplete"] is False
+        assert data["dropped_candidates"] == []
+        assert len(data["sellers"]) == 1
+        assert data["sellers"][0]["seller"] == "comicseller1"
+        assert len(data["sellers"][0]["matches"]) == 2
+        for match in data["sellers"][0]["matches"]:
             assert "_series" not in match
             assert "_issue" not in match
+        assert exit_code == 0
 
     def test_seen_items_dropped_before_output(self, tmp_path):
         """Items already in the global seen set are hidden from the report."""
@@ -806,7 +1096,7 @@ class TestEndToEndHappyPath:
         m2 = make_match(seller="S", item_id="301", wish_name="X-Men #94")
         wish_list, wish_items = _two_wish_items()
 
-        output, _, _ = _run_main(
+        output, _exit, _, _ = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -824,7 +1114,7 @@ class TestEndToEndHappyPath:
         m2 = make_match(seller="S", item_id="401", wish_name="X-Men #94")
         wish_list, wish_items = _two_wish_items()
 
-        _, _, mock_record = _run_main(
+        _, _exit, _, mock_record = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -848,7 +1138,7 @@ class TestRunFlags:
         m1 = make_match(seller="s1", item_id="100", wish_name="Amazing Spider-Man #129")
         m2 = make_match(seller="s1", item_id="101", wish_name="X-Men #94")
 
-        output, _, mock_record = _run_main(
+        output, _exit, _, mock_record = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             verify_return=[m1, m2],
@@ -864,7 +1154,7 @@ class TestRunFlags:
         m1 = make_match(seller="s1", item_id="100", wish_name="Amazing Spider-Man #129")
         m2 = make_match(seller="s1", item_id="101", wish_name="X-Men #94")
 
-        _, _, mock_record = _run_main(
+        _, _exit, _, mock_record = _run_main(
             [[m1], [m2]], db_path=db_path, verify_return=[m1, m2],
         )
 
@@ -877,7 +1167,7 @@ class TestRunFlags:
         m1 = make_match(seller="s1", item_id="100", wish_name="Amazing Spider-Man #129")
         m2 = make_match(seller="s1", item_id="101", wish_name="X-Men #94")
 
-        output, _, _ = _run_main(
+        output, _exit, _, _ = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             verify_return=[m1, m2],
@@ -1014,7 +1304,7 @@ class TestFanoutGuards:
         wl = [{"id": "d", "name": "300 #1"}]
         wi = [{"id": "d", "name": "300 #1", "series": "300", "issue": "1",
                "_tokens": ["300"]}]
-        output, _, _ = _run_main([], db_path=db_path, wish_list=wl, wish_items=wi)
+        output, _exit, _, _ = _run_main([], db_path=db_path, wish_list=wl, wish_items=wi)
         assert "No sellers" in output
 
     def test_variant_saturation_is_not_a_combine_signal(self, tmp_path):
@@ -1026,7 +1316,7 @@ class TestFanoutGuards:
         variants = [make_match(seller="s1", item_id=str(3000 + i),
                                wish_name="Amazing Spider-Man #129",
                                price=f"${10 + i}.00") for i in range(50)]
-        output, _, _ = _run_main([variants, []], db_path=db_path,
+        output, _exit, _, _ = _run_main([variants, []], db_path=db_path,
                                  wish_list=wl, wish_items=wi,
                                  verify_return=variants)
         # 50 variants collapse to 1 distinct book → below the ≥2 gate.
@@ -1166,7 +1456,7 @@ class TestCrossSellerDedup:
                           title="X-Men #94 NM")
         wish_list, wish_items = _two_wish_items()
 
-        output, _, _ = _run_main(
+        output, _exit, _, _ = _run_main(
             [[m_a, m_b], [m_a2, m_b2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -1363,7 +1653,7 @@ class TestPristineMatchFunnel:
         wish_list, wish_items = _two_wish_items()
 
         # verify_with_claude returns m2 as genuine (m1 never reaches it)
-        output, mock_verify, _ = _run_main(
+        output, _exit, mock_verify, _ = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -1399,7 +1689,7 @@ class TestPristineMatchFunnel:
         )
         wish_list, wish_items = _two_wish_items()
 
-        _, mock_verify, _ = _run_main(
+        _, _exit, mock_verify, _ = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -1428,7 +1718,7 @@ class TestPristineMatchFunnel:
         ws.verdict_put(ws._title_key(m2["title"]), "X-Men #94", True, db_path=db_path)
         wish_list, wish_items = _two_wish_items()
 
-        _, mock_verify, _ = _run_main(
+        _, _exit, mock_verify, _ = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -1639,7 +1929,7 @@ class TestMatchResultsForWishBui227:
         m2["_series_name"] = None
         wish_list, wish_items = _two_wish_items()
 
-        output, _, _ = _run_main(
+        output, _exit, _, _ = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
@@ -1648,7 +1938,7 @@ class TestMatchResultsForWishBui227:
             json_output=True,
         )
         data = json.loads(output)
-        for match in data[0]["matches"]:
+        for match in data["sellers"][0]["matches"]:
             assert "_series_name" not in match
 
 
@@ -2124,7 +2414,7 @@ class TestItemSpecificsGate:
         wish_list, wish_items = _two_wish_items()
         mock_verify = MagicMock(return_value=([m1, m2], [], []))
 
-        output, _, _ = _run_main(
+        output, _exit, _, _ = _run_main(
             [[m1], [m2]],
             db_path=db_path,
             wish_list=wish_list,
