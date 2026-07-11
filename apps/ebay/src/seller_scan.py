@@ -47,6 +47,7 @@ from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for c
 )
 from ebay_fetch import (
     UnknownSellerError,
+    _atomic_write_json,
     get_token,
     load_config,
     load_seller_aliases,
@@ -338,10 +339,11 @@ _SELLER_SCAN_MAX_WORKERS = 3
 # invariant this feature must not break. The wish_name is part of the key so a
 # rejection only suppresses the pair the model actually judged.
 #
-# Stored as a single JSON file ({pair_key: iso_timestamp}), mirroring the
-# tmp→rename atomic-write idiom used by ebay_search_cache.py / ebay_fetch.py's
-# aspects cache, but keyed by a timestamp *inside* the file (not file mtime)
-# since many pairs share one file.
+# Stored as a single JSON file ({pair_key: iso_timestamp}), written through
+# ebay_fetch._atomic_write_json() (BUI-333: was a hand-rolled copy of the same
+# tmp→rename idiom ebay_search_cache.py / ebay_fetch.py's aspects cache use),
+# but keyed by a timestamp *inside* the file (not file mtime) since many pairs
+# share one file.
 _REJECTED_CACHE_PATH: Path = Path.home() / ".cache" / "seller-scan" / "rejected.json"
 _REJECTED_CACHE_TTL_SEC: int = 14 * 24 * 3600  # 14 days
 
@@ -403,7 +405,8 @@ def _load_rejected_cache() -> dict[str, str]:
 
 
 def _save_rejected_cache(cache: dict[str, str]) -> None:
-    """Persist the rejected-candidate cache (atomic tmp→rename write).
+    """Persist the rejected-candidate cache via the shared atomic tmp→rename
+    write (ebay_fetch._atomic_write_json(), BUI-333 — was a hand-rolled copy).
 
     Best-effort: an OSError (disk full, read-only FS, permission) is warned and
     swallowed, never raised. The cache is a cost optimization — a failed write
@@ -412,10 +415,7 @@ def _save_rejected_cache(cache: dict[str, str]) -> None:
     record_items_seen's best-effort contract.
     """
     try:
-        _REJECTED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _REJECTED_CACHE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cache))
-        tmp.replace(_REJECTED_CACHE_PATH)
+        _atomic_write_json(_REJECTED_CACHE_PATH, cache)
     except OSError as e:
         print(
             f"Warning: could not persist rejected-candidate cache ({e})",

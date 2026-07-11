@@ -2000,6 +2000,18 @@ class TestRejectedCandidateCache:
 
         err = capsys.readouterr().err
         assert "could not persist rejected-candidate cache" in err
+        # BUI-333: the shared _atomic_write_json() helper cleans up its .tmp
+        # file on a failed write — no orphan left behind for the next save.
+        assert not self.cache_path.with_suffix(".tmp").exists()
+
+    def test_save_helper_writes_via_shared_atomic_write_json(self, monkeypatch):
+        """BUI-333: _save_rejected_cache() routes through the shared
+        ebay_fetch._atomic_write_json() rather than a hand-rolled tmp→rename
+        copy — a genuine save leaves no .tmp file and the data round-trips."""
+        entries = {self._key("111"): "2026-07-11T00:00:00+00:00"}
+        seller_scan._save_rejected_cache(entries)
+        assert json.loads(self.cache_path.read_text()) == entries
+        assert not self.cache_path.with_suffix(".tmp").exists()
 
     def test_save_failure_does_not_crash_verify(self, monkeypatch):
         """End-to-end: an OSError persisting a fresh rejection must not abort
