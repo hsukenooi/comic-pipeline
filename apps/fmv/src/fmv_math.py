@@ -30,6 +30,10 @@ MIN_NARROW_POOL = 5          # widen-stop target: keep widening until this many 
 MIN_PRICEABLE_POOL = 2       # sparse-flag floor: fewer trimmed comps → flag too_sparse
 MAX_GRADE_SPAN = 2.0         # too-wide guard: pool grade-span above this → flag
 SMALL_POOL_MAX_RATIO = 3.0   # 2-comp dispersion guard: hi/lo above this → flag (BUI-179)
+MIN_BRACKET_COMPS = 2        # §7 thin-bracket guard: a bracket bucket with fewer
+                             #   than this many comps is too thin to anchor an
+                             #   interpolation (a lone mistagged comp → wild
+                             #   over-bid), so it can't serve as an anchor (BUI-318)
 
 
 def build_pool(comps: Iterable[dict], target_grade: float,
@@ -105,6 +109,25 @@ def bucket_medians(comps: Iterable[dict]) -> dict[float, float]:
     return {g: statistics.median(ps) for g, ps in buckets.items()}
 
 
+def bucket_counts(comps: Iterable[dict]) -> dict[float, int]:
+    """Grade → number of comps in that bucket (companion to bucket_medians).
+
+    A bucket's comp count gates whether it may anchor a §7 interpolation: a
+    single-comp bucket is one mistagged listing away from an entire bracket end
+    (the BUI-318 wild-over-bid path), so interpolate_grade_curve refuses to
+    bracket off buckets thinner than MIN_BRACKET_COMPS. Counts the same comps
+    bucket_medians does (grade + price both present) so the two dicts share keys.
+    """
+    counts: dict[float, int] = {}
+    for c in comps:
+        g = c.get("grade")
+        p = c.get("price")
+        if g is None or p is None:
+            continue
+        counts[float(g)] = counts.get(float(g), 0) + 1
+    return counts
+
+
 def monotonicity_violations(
     medians: dict[float, float],
 ) -> list[tuple[float, float]]:
@@ -127,6 +150,8 @@ def monotonicity_violations(
 
 def interpolate_grade_curve(
     medians: dict[float, float], target_grade: float,
+    counts: dict[float, int] | None = None,
+    min_bucket_n: int = MIN_BRACKET_COMPS,
 ) -> dict | None:
     """§7 linear interpolation between the nearest BRACKETING bucket medians.
 
@@ -145,13 +170,29 @@ def interpolate_grade_curve(
             + (target_grade - grade_below) / (grade_above - grade_below)
               * (median_above - median_below)
 
+    ``counts`` (BUI-318 thin-bracket money guard): when supplied (grade → comp
+    count, e.g. from ``bucket_counts``), only buckets holding at least
+    ``min_bucket_n`` comps are eligible to serve as a bracketing anchor. A
+    single-comp bucket is one mistagged listing away from being an entire
+    bracket end, which can smear a wild over-bid across the target; such a
+    bucket is skipped, and if that leaves no eligible bracket on a side the
+    whole interpolation is suppressed (returns None → the pool stays
+    needs_manual). ``counts=None`` disables the guard entirely — the back-compat
+    path for callers that pass raw medians without a matching count map.
+
     Returns the interpolation inputs alongside ``target_price`` so the caller
     can state EXPLICITLY which buckets were used (§7's state-explicitly rule).
     """
     if target_grade in medians:
         return None
-    below = [g for g in medians if g < target_grade]
-    above = [g for g in medians if g > target_grade]
+
+    def _eligible(g: float) -> bool:
+        # Thin-bracket money guard: a bucket below the comp floor is too thin
+        # to trust as an anchor. counts=None → guard disabled (back-compat).
+        return counts is None or counts.get(g, 0) >= min_bucket_n
+
+    below = [g for g in medians if g < target_grade and _eligible(g)]
+    above = [g for g in medians if g > target_grade and _eligible(g)]
     if not below or not above:
         return None
     grade_below = max(below)
@@ -394,6 +435,14 @@ def confidence_label(n: float, cv_value: float | None) -> str:
 # ─── Bid-cap factor (confidence haircut) ──────────────────────────────────────
 
 BASE_BID_FACTOR = 0.80  # standard: max_bid = 80% × fmv_high
+# BUI-318 interpolated-LOW haircut: a §7 interpolated price is a single point
+# estimate off a bracket (never a real direct comp) and is always carried at LOW
+# fmv-confidence, but fmv-confidence alone never haircuts the bid (BUI-51: only a
+# photo grade_confidence does). So absent a grade_confidence an interpolated book
+# would still bid at 0.80× — the residual over-bid path flagged in BUI-318. Cap
+# the factor for interpolated books at this LOW-tier value (== bid_factor's LOW
+# rung) so a thin interpolated estimate never sets a full-confidence bid cap.
+INTERPOLATED_BID_FACTOR = 0.60
 
 # Ordinal ranking of confidence labels, lowest = least confident.
 _CONF_RANK = {
@@ -511,7 +560,16 @@ def compute_fmv(comps: list[dict], target_grade: float,
     (the book now emits a bid-able number, so the upsert must not wipe it as
     needs_manual), fmv_low == fmv_high == median == the interpolated point
     (a single estimate, no dispersion), and confidence is forced to LOW (§7:
-    "confidence is reduced"). `suspect_buckets` (§5) lists any adjacent
+    "confidence is reduced").
+
+    BUI-318 money-safety hardening of §7: (a) a bracket may only be anchored on
+    a bucket holding ≥ MIN_BRACKET_COMPS comps — a single-comp bracket is one
+    mistagged listing away from a wild over-bid, so a pool that can't muster a
+    ≥2-comp bracket on BOTH sides stays needs_manual instead of emitting a
+    trusted interpolated value; (b) the interpolated bid factor is capped at
+    INTERPOLATED_BID_FACTOR (the interpolated-LOW haircut) so a thin
+    single-point estimate never sets a full-0.80× bid cap even when no photo
+    grade_confidence is present. `suspect_buckets` (§5) lists any adjacent
     grade-bucket median inversions so a monotonicity violation is flagged
     rather than silently blended — this is informational and never changes the
     priced number for a monotonic pool.
@@ -552,6 +610,7 @@ def compute_fmv(comps: list[dict], target_grade: float,
     # alter the priced number for a monotonic pool — a non-monotonic pool keeps
     # its today-behavior price and just gains a warning.
     curve = bucket_medians(pool)
+    counts = bucket_counts(pool)
     suspect_buckets = monotonicity_violations(curve)
 
     # BUI-306 §7: a one_sided/too_wide pool that still brackets the target with
@@ -567,9 +626,12 @@ def compute_fmv(comps: list[dict], target_grade: float,
     # BUI-179 wild-ratio guard can fire, so without this floor such a pool would
     # interpolate a wild cap ($2k+ off two points). Too thin to vet → stays
     # manual, consistent with the module's "<3 comps is not a reliable price".
+    # BUI-318 thin-bracket guard: pass per-bucket comp counts so a bracket
+    # anchored on a lone comp is suppressed (returns None → stays needs_manual)
+    # rather than smearing a wild over-bid across the target.
     interpolation = None
     if flag_reason in ("one_sided", "too_wide") and n >= 3:
-        interpolation = interpolate_grade_curve(curve, target_grade)
+        interpolation = interpolate_grade_curve(curve, target_grade, counts=counts)
 
     label = confidence_label(effective_n, cv_val)
     if interpolation is not None:
@@ -579,6 +641,12 @@ def compute_fmv(comps: list[dict], target_grade: float,
     elif window > WIDE_GRADE_WINDOW and _rank(label) > _CONF_RANK["MEDIUM"]:
         label = "MEDIUM"  # wide-window pools can't claim HIGH/MEDIUM-HIGH (BUI-86 R7)
     factor = bid_factor(label, grade_confidence)
+    if interpolation is not None:
+        # BUI-318 interpolated-LOW haircut: a thin interpolated estimate never
+        # sets a full-confidence bid cap. Take the MORE conservative of the
+        # normal factor and the interpolated cap (min, so a present-and-lower
+        # grade_confidence haircut still wins).
+        factor = min(factor, INTERPOLATED_BID_FACTOR)
 
     # Declared Optional up front so mypy keeps all three pricing branches
     # consistent (the interpolation branch assigns non-None clean_round ints

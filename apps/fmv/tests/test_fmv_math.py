@@ -237,16 +237,18 @@ class TestPriceabilityGuards:
     def test_too_wide_bracketed_pool_interpolates(self):
         # BUI-306 §7: Iron Man #124 shape — target 7.0, pool brackets but spans
         # 4 grade points. It used to flag too_wide (no price); now it is priced
-        # by interpolation between the 5.0 bucket ($50) and the 9.0 bucket
-        # (median $310): 50 + (7-5)/(9-5)*(310-50) = $180.
-        comps = [_comp(50, 5.0), _comp(300, 9.0), _comp(320, 9.0)]
+        # by interpolation between the 5.0 bucket (median $50) and the 9.0 bucket
+        # (median $310): 50 + (7-5)/(9-5)*(310-50) = $180. BUI-318: BOTH brackets
+        # carry ≥2 comps (a lone-comp bracket now suppresses), and the max_bid is
+        # the interpolated-LOW haircut clean_round(180 × 0.60) = 110, not 0.80×.
+        comps = [_comp(40, 5.0), _comp(60, 5.0), _comp(300, 9.0), _comp(320, 9.0)]
         out = fm.compute_fmv(comps, target_grade=7.0)
         assert out["interpolated"] is True
         assert out["flag_reason"] is None      # cleared: now emits a bid-able number
         assert out["grade_span"] == 4.0
         assert out["fmv_low"] == 180 and out["fmv_high"] == 180
         assert out["median"] == 180
-        assert out["max_bid"] == 140           # clean_round(180 * 0.80)
+        assert out["max_bid"] == 110           # clean_round(180 * 0.60) haircut
         assert out["confidence"] == "LOW"      # §7: confidence reduced
 
     def test_too_sparse_flags_single_comp(self):
@@ -622,6 +624,17 @@ class TestBucketMedians:
         assert fm.bucket_medians(comps) == {7.0: 100.0}
 
 
+class TestBucketCounts:
+    def test_counts_per_grade(self):
+        comps = [_comp(100, 7.0), _comp(120, 7.0), _comp(300, 9.0)]
+        assert fm.bucket_counts(comps) == {7.0: 2, 9.0: 1}
+
+    def test_ignores_gradeless_and_priceless(self):
+        # Same drop rule as bucket_medians so the two dicts share keys.
+        comps = [_comp(100, 7.0), _comp(None, 7.0), {"grade": 8.0}]
+        assert fm.bucket_counts(comps) == {7.0: 1}
+
+
 class TestMonotonicityViolations:
     def test_rising_curve_has_no_violation(self):
         assert fm.monotonicity_violations({4.0: 50, 6.0: 80, 9.0: 300}) == []
@@ -661,18 +674,59 @@ class TestInterpolateGradeCurve:
         assert fm.interpolate_grade_curve(
             {5.0: 400.0, 7.0: 105.0, 9.0: 900.0}, 7.0) is None
 
+    # ─── BUI-318 thin-bracket (≥2 comps per bracket) guard ────────────────────
+
+    def test_counts_none_disables_guard(self):
+        # Back-compat: no counts map → no thin-bracket filtering (BUI-306 shape).
+        got = fm.interpolate_grade_curve({4.0: 100.0, 8.0: 200.0}, 6.0)
+        assert got is not None and got["target_price"] == pytest.approx(150.0)
+
+    def test_thin_below_bracket_suppressed(self):
+        # 4.0 bracket has a single comp → too thin to anchor → suppress entirely.
+        got = fm.interpolate_grade_curve(
+            {4.0: 100.0, 8.0: 200.0}, 6.0, counts={4.0: 1, 8.0: 3})
+        assert got is None
+
+    def test_thin_above_bracket_suppressed(self):
+        got = fm.interpolate_grade_curve(
+            {4.0: 100.0, 8.0: 200.0}, 6.0, counts={4.0: 3, 8.0: 1})
+        assert got is None
+
+    def test_both_brackets_thick_interpolates(self):
+        got = fm.interpolate_grade_curve(
+            {4.0: 100.0, 8.0: 200.0}, 6.0, counts={4.0: 2, 8.0: 2})
+        assert got is not None and got["target_price"] == pytest.approx(150.0)
+
+    def test_skips_thin_bucket_for_next_eligible(self):
+        # Nearest below (6.0) is thin; a thicker 4.0 bucket sits further below.
+        # The guard skips the thin bucket and anchors off the eligible 4.0.
+        got = fm.interpolate_grade_curve(
+            {4.0: 100.0, 6.0: 140.0, 9.0: 300.0}, 7.0,
+            counts={4.0: 3, 6.0: 1, 9.0: 3})
+        assert got is not None
+        assert got["grade_below"] == 4.0 and got["grade_above"] == 9.0
+
+    def test_custom_min_bucket_n_threshold(self):
+        got = fm.interpolate_grade_curve(
+            {4.0: 100.0, 8.0: 200.0}, 6.0, counts={4.0: 2, 8.0: 2},
+            min_bucket_n=3)
+        assert got is None
+
 
 class TestInterpolationInComputeFmv:
     def test_too_wide_bracketed_interpolates_with_exact_value(self):
-        # target 6.0, grades 4.0($100) & 8.0(median $200): span 4.0 → too_wide,
-        # but bracketed → 100 + (6-4)/(8-4)*(200-100) = $150; max_bid 0.80×150=120.
-        comps = [_comp(100, 4.0), _comp(190, 8.0), _comp(210, 8.0)]
+        # target 6.0, grades 4.0(median $100) & 8.0(median $200): span 4.0 →
+        # too_wide, but bracketed → 100 + (6-4)/(8-4)*(200-100) = $150. Both
+        # brackets carry ≥2 comps (BUI-318), so it interpolates. max_bid is the
+        # interpolated-LOW haircut: clean_round(0.60×150) = 90 (not 0.80×=120).
+        comps = [_comp(90, 4.0), _comp(110, 4.0), _comp(190, 8.0), _comp(210, 8.0)]
         out = fm.compute_fmv(comps, target_grade=6.0)
         assert out["interpolated"] is True
         assert out["flag_reason"] is None
         assert out["fmv_low"] == 150 and out["fmv_high"] == 150
         assert out["median"] == 150
-        assert out["max_bid"] == 120
+        assert out["bid_factor"] == fm.INTERPOLATED_BID_FACTOR
+        assert out["max_bid"] == 90
         assert out["confidence"] == "LOW"
         assert out["interpolation"]["grade_below"] == 4.0
         assert out["interpolation"]["grade_above"] == 8.0
@@ -692,7 +746,7 @@ class TestInterpolationInComputeFmv:
     def test_interpolation_marked_in_output(self):
         # A downstream JSON reader must be able to tell an interpolated value
         # from a real direct comp: the flag + provenance ride the output dict.
-        comps = [_comp(100, 4.0), _comp(200, 8.0), _comp(200, 8.0)]
+        comps = [_comp(90, 4.0), _comp(110, 4.0), _comp(200, 8.0), _comp(200, 8.0)]
         out = fm.compute_fmv(comps, target_grade=6.0)
         assert out["interpolated"] is True
         assert set(out["interpolation"]) == {
@@ -745,3 +799,47 @@ class TestInterpolationInComputeFmv:
         # price is the blended trimmed-pool quartile, unchanged by the §5 check
         assert out["fmv_low"] is not None and out["fmv_high"] is not None
         assert out["n"] == 6
+
+    # ─── BUI-318 money-safety: thin-bracket suppression + interpolated haircut ──
+
+    def test_single_comp_bracket_suppressed_stays_manual(self):
+        # MONEY-SAFETY (BUI-318): a too_wide pool with n>=3 that brackets the
+        # target, but whose BELOW bracket is a lone comp ($100 @4.0), must NOT
+        # interpolate — a single mistagged comp forming a bracket end is the
+        # wild-over-bid path. It stays needs_manual instead of emitting a
+        # trusted interpolated value. (The above bucket is thick, so the n>=3
+        # floor is satisfied — suppression here is the ≥2-per-bracket rule.)
+        comps = [_comp(100, 4.0)] + [_comp(p, 8.0) for p in [190, 200, 210]]
+        out = fm.compute_fmv(comps, target_grade=6.0)
+        assert out["interpolated"] is False
+        assert out["interpolation"] is None
+        assert out["flag_reason"] == "too_wide"
+        assert out["fmv_high"] is None and out["max_bid"] is None
+
+    def test_thick_brackets_interpolate_and_haircut_without_grade_conf(self):
+        # MONEY-SAFETY (BUI-318 residual 1): both brackets carry ≥2 comps so the
+        # book interpolates ($150) and is marked LOW/interpolated — and even with
+        # NO photo grade_confidence the bid factor is the interpolated-LOW
+        # haircut (0.60), not the full 0.80×. A thin single-point estimate never
+        # sets a full-confidence bid cap.
+        comps = [_comp(90, 4.0), _comp(110, 4.0), _comp(190, 8.0), _comp(210, 8.0)]
+        out = fm.compute_fmv(comps, target_grade=6.0, grade_confidence=None)
+        assert out["interpolated"] is True
+        assert out["confidence"] == "LOW"
+        assert out["bid_factor"] == fm.INTERPOLATED_BID_FACTOR
+        assert out["bid_factor"] < fm.BASE_BID_FACTOR
+        assert out["max_bid"] == fm.clean_round(150 * fm.INTERPOLATED_BID_FACTOR)
+
+    def test_haircut_is_interpolation_specific_not_generic_low(self):
+        # Contrast to the above: a NON-interpolated LOW-confidence book with no
+        # grade_confidence still bids at the full BASE factor (BUI-51 semantics —
+        # fmv-confidence alone never haircuts). This proves the BUI-318 haircut
+        # is scoped to interpolated books, not all LOW pools. A tight 2-comp pool
+        # (ratio < SMALL_POOL_MAX_RATIO so it isn't flagged) prices at LOW (n<3)
+        # yet keeps the 0.80× base factor.
+        comps = [_comp(100, 9.0), _comp(120, 9.0)]
+        out = fm.compute_fmv(comps, target_grade=9.0, grade_confidence=None)
+        assert out["interpolated"] is False
+        assert out["flag_reason"] is None          # priced, not needs_manual
+        assert out["confidence"] == "LOW"          # n=2, cv defined → LOW rung
+        assert out["bid_factor"] == fm.BASE_BID_FACTOR

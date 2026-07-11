@@ -9,6 +9,7 @@ import json
 from unittest.mock import MagicMock, patch
 import pytest
 
+import fmv_math
 import fmv_runner
 
 
@@ -480,7 +481,10 @@ class TestComputeOne:
         # BUI-306: a too_wide pool that interpolates must POST a real fmv_high
         # with fmv_flag_reason=None — a non-null flag makes the server wipe the
         # price as needs_manual. The interpolation provenance rides fmv_notes.
-        comps = [_make_comp(50, 5.0), _make_comp(300, 9.0), _make_comp(320, 9.0)]
+        # Both brackets carry ≥2 comps (BUI-318): 5.0 median $50, 9.0 median
+        # $310 → target 7.0 interpolates to $180.
+        comps = [_make_comp(40, 5.0), _make_comp(60, 5.0),
+                 _make_comp(300, 9.0), _make_comp(320, 9.0)]
         result = {
             "input": {"title": "X-Men", "issue": "96", "year": 1975, "grade": 7.0},
             "comps": comps,
@@ -750,6 +754,22 @@ class TestFlaggedPresentation:
         out = fmv_runner._fmv_from_db_row(row)
         assert out["interpolated"] is False
 
+    def test_cached_interpolated_row_applies_haircut(self):
+        # BUI-318: a cached interpolated row persists a plain "low" confidence, so
+        # bid_factor("LOW", None) would return the full 0.80× and silently undo
+        # the interpolated-LOW haircut on reuse. The reuse path must re-apply the
+        # cap so a cached interpolated book bids at 0.60×, matching a fresh
+        # recompute (no photo grade_confidence supplied).
+        row = {"fmv_low": 180, "fmv_high": 180, "fmv_comps": 4,
+               "fmv_confidence": "low",
+               "fmv_notes": "window=±2.0 | interpolated=grade 5→9 "
+                            "(median $50→$310); confidence reduced"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["interpolated"] is True
+        assert out["bid_factor"] == fmv_math.INTERPOLATED_BID_FACTOR
+        assert out["max_bid"] == fmv_math.clean_round(
+            180 * fmv_math.INTERPOLATED_BID_FACTOR)
+
     def test_fmv_from_db_row_has_new_keys(self):
         row = {"fmv_low": 50, "fmv_high": 100, "fmv_comps": 8,
                "fmv_confidence": "high"}
@@ -863,7 +883,8 @@ class TestRunEndToEnd:
         fake_result = [{
             "input": {"_req_id": 0, "title": "X-Men", "issue": "96",
                       "year": 1975, "grade": 7.0, "item_id": "1"},
-            "comps": [_make_comp(50, 5.0), _make_comp(300, 9.0), _make_comp(320, 9.0)],
+            "comps": [_make_comp(40, 5.0), _make_comp(60, 5.0),
+                      _make_comp(300, 9.0), _make_comp(320, 9.0)],
             "queries_used": [{"tier": "base", "cached": False}],
         }]
         with patch("fmv_runner._fetch_comps", return_value=fake_result), \
