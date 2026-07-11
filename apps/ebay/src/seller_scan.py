@@ -8,6 +8,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -282,6 +285,111 @@ _EXIT_SELLER_ERROR = 2
 _EXIT_VERIFIER_DOWN = 1
 
 
+# ─── Rejected-candidate cache (BUI-301) ────────────────────────────────────────
+# BUI-149: a model-REJECTED candidate is correctly never marked "seen" (it's
+# not a genuine match) — but that means every scan re-fetches and re-verifies
+# it, paying the Claude CLI verification cost on the same rejected candidate
+# forever. This cache is deliberately SEPARATE from the genuine-match seen-set
+# (fetch_seen_item_ids/record_items_seen above, server-side): it never marks
+# anything as a real match, it only remembers "the model already rejected this
+# (listing, wish) pair recently" so a repeat scan can skip re-verifying it. An
+# entry expires after _REJECTED_CACHE_TTL_SEC, so a candidate is always
+# eventually re-checked — a transient misjudgement or an edited listing gets
+# another chance rather than being suppressed forever.
+#
+# Keyed by the (item_id, wish_name) PAIR, not item_id alone: match_listing
+# picks the single best-scoring wish per listing, so the same listing can pair
+# to a different wish on a later run (a false-positive wish was bought/removed,
+# leaving a genuine one). Keying on item_id alone would then skip the genuine
+# re-pairing for the whole TTL — the exact "never suppress a real match"
+# invariant this feature must not break. The wish_name is part of the key so a
+# rejection only suppresses the pair the model actually judged.
+#
+# Stored as a single JSON file ({pair_key: iso_timestamp}), mirroring the
+# tmp→rename atomic-write idiom used by ebay_search_cache.py / ebay_fetch.py's
+# aspects cache, but keyed by a timestamp *inside* the file (not file mtime)
+# since many pairs share one file.
+_REJECTED_CACHE_PATH: Path = Path.home() / ".cache" / "seller-scan" / "rejected.json"
+_REJECTED_CACHE_TTL_SEC: int = 14 * 24 * 3600  # 14 days
+
+# Separator joining (item_id, wish_name) into one JSON-string key. \x1f (ASCII
+# unit separator) never appears in an eBay item_id or a comic wish name, so it
+# can't collide with either field's content.
+_REJECTED_CACHE_KEY_SEP = "\x1f"
+
+
+def _rejected_cache_key(item_id: str, wish_name: str) -> str:
+    """Compose the (item_id, wish_name) pair key for the rejected cache."""
+    return f"{item_id}{_REJECTED_CACHE_KEY_SEP}{wish_name}"
+
+
+def _rejected_cache_entry_age_sec(iso_ts: str, now: float) -> float:
+    """Return the age in seconds of an ISO-8601 timestamp relative to *now*
+    (epoch seconds).
+
+    An unparseable timestamp is treated as infinitely old, and a future-dated
+    one (negative age, e.g. from clock skew or a hand-edited file) as expired,
+    so a corrupt or bogus entry can't wedge a candidate out of re-verification
+    forever — the caller drops any entry this reports as expired.
+    """
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return float("inf")
+    age = now - dt.timestamp()
+    # Future-dated (age < 0) → treat as expired: a legitimate entry is only ever
+    # read by a later process, so a negative age means a bad clock/edit, not a
+    # fresh entry. Reads never happen in the same process that wrote the entry.
+    return age if age >= 0 else float("inf")
+
+
+def _load_rejected_cache() -> dict[str, str]:
+    """Return {pair_key: iso_timestamp} of recently model-rejected candidates.
+
+    A missing or corrupt file returns {} (never raises). Entries older than
+    _REJECTED_CACHE_TTL_SEC (or future-dated — see _rejected_cache_entry_age_sec)
+    are dropped here so the cache stays bounded and every rejection is
+    eventually re-checked, rather than growing forever.
+    """
+    if not _REJECTED_CACHE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(_REJECTED_CACHE_PATH.read_text())
+        if not isinstance(data, dict):
+            return {}
+    except Exception:  # noqa: BLE001 — corrupt/partial file → empty cache
+        return {}
+    now = time.time()
+    return {
+        key: ts
+        for key, ts in data.items()
+        if _rejected_cache_entry_age_sec(ts, now) <= _REJECTED_CACHE_TTL_SEC
+    }
+
+
+def _save_rejected_cache(cache: dict[str, str]) -> None:
+    """Persist the rejected-candidate cache (atomic tmp→rename write).
+
+    Best-effort: an OSError (disk full, read-only FS, permission) is warned and
+    swallowed, never raised. The cache is a cost optimization — a failed write
+    must fall open to normal re-verification, not abort the scan (and, in a
+    multi-seller batch, crash before any seller's results are printed). Mirrors
+    record_items_seen's best-effort contract.
+    """
+    try:
+        _REJECTED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _REJECTED_CACHE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache))
+        tmp.replace(_REJECTED_CACHE_PATH)
+    except OSError as e:
+        print(
+            f"Warning: could not persist rejected-candidate cache ({e})",
+            file=sys.stderr,
+        )
+
+
 class _VerifyTimeout(RuntimeError):
     """A `claude` CLI verification call that timed out.
 
@@ -546,7 +654,7 @@ def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
     return kept, [], filtered_info, 1
 
 
-def verify_with_claude(matches):
+def verify_with_claude(matches, *, use_rejected_cache=False):
     """Split candidates into genuine matches (`kept`), never-verified ones
     (`dropped`), and model-rejected ones with their reasons (`filtered`),
     using chunked claude CLI calls.  Returns ``(kept, dropped, filtered)``.
@@ -574,6 +682,17 @@ def verify_with_claude(matches):
       all-chunks-transport-failed safety net (broken auth / every call timing
       out) both sys.exit(1) rather than return an empty `kept` that reads as
       "this seller has no matching books".
+
+    BUI-301 (`use_rejected_cache`, opt-in): when true, candidates whose
+    (item_id, wish_name) pair was model-rejected within the last
+    _REJECTED_CACHE_TTL_SEC (see the rejected-candidate cache above) are
+    skipped entirely — no CLI call, no chunk, no entry in `kept`/`dropped`/
+    `filtered` — so a scan doesn't keep paying Claude CLI cost to re-reject the
+    same pair every run. They resurface for verification once the cache entry
+    expires. `dropped` (never-verified) candidates are never written to this
+    cache, only genuine model rejections. Default OFF so this shared verifier's
+    other caller (wishlist_sellers, which has its own permanent title-keyed
+    verdict cache) is unaffected — only seller-scan opts in.
     """
     if not matches:
         return [], [], []
@@ -589,6 +708,39 @@ def verify_with_claude(matches):
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # BUI-301: skip (listing, wish) pairs the model already rejected recently —
+    # see the rejected-candidate cache section above for why this is a separate
+    # cache from the genuine-match seen-set, and why the key is the pair, not
+    # item_id alone.
+    rejected_cache = _load_rejected_cache() if use_rejected_cache else {}
+    to_verify = []
+    skipped = 0
+    for cand in matches:
+        item_id = cand.get("item_id")
+        wish_name = cand.get("wish_name")
+        if (
+            item_id is not None
+            and wish_name is not None
+            and _rejected_cache_key(item_id, wish_name) in rejected_cache
+        ):
+            skipped += 1
+            continue
+        to_verify.append(cand)
+    if skipped:
+        print(
+            f"  {skipped} candidate(s) skipped (rejected by Claude within the "
+            f"last {_REJECTED_CACHE_TTL_SEC // 86400} days; cached — use a "
+            f"fresh listing edit or wait for the cache to expire to force "
+            f"re-verification)",
+            file=sys.stderr,
+        )
+    if not to_verify:
+        # Load-bearing, NOT redundant with the `if not matches` guard above:
+        # a run where every candidate was skipped by the rejected cache would
+        # otherwise fall through with transport_ok == 0 and wrongly trip the
+        # BUI-270 "verifier globally broken" sys.exit(1) safety net below.
+        return [], [], []
 
     # BUI-253 Step 5: render the reject-list bullets that duplicate a
     # deterministic comic_identity lexicon FROM that lexicon, once per call —
@@ -612,8 +764,8 @@ def verify_with_claude(matches):
     # failure, not a genuine "everything rejected" — so we hard-fail below
     # rather than return an empty list that looks like no-match.
     transport_ok = 0
-    for chunk_start in range(0, len(matches), _VERIFY_CHUNK_SIZE):
-        chunk = matches[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
+    for chunk_start in range(0, len(to_verify), _VERIFY_CHUNK_SIZE):
+        chunk = to_verify[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
         k, d, f, ok = _verify_chunk(chunk, chunk_start, prompt_ctx)
         kept.extend(k)
         dropped.extend(d)
@@ -641,6 +793,22 @@ def verify_with_claude(matches):
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # BUI-301: remember this run's genuine model rejections (by (item_id,
+    # wish_name) pair) so the next scan can skip re-verifying them until the TTL
+    # expires. `dropped` (never-verified candidates) is deliberately excluded —
+    # those must resurface on the very next run, not be treated as a rejection.
+    if use_rejected_cache and filtered:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        wrote = False
+        for f in filtered:
+            item_id = f.get("item_id")
+            wish_name = f.get("wish_name")
+            if item_id is not None and wish_name is not None:
+                rejected_cache[_rejected_cache_key(item_id, wish_name)] = now_iso
+                wrote = True
+        if wrote:
+            _save_rejected_cache(rejected_cache)
 
     return kept, dropped, filtered
 
@@ -810,7 +978,12 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
 
     if candidates:
         print(f"  {len(candidates)} candidate(s) — verifying with Claude...", file=sys.stderr)
-        matches, dropped, filtered = verify_with_claude(candidates)
+        # BUI-301: seller-scan opts into the rejected-candidate cache so a
+        # (listing, wish) pair Claude already rejected isn't re-verified (re-
+        # paying CLI cost) every run until the TTL expires.
+        matches, dropped, filtered = verify_with_claude(
+            candidates, use_rejected_cache=True
+        )
     else:
         matches, dropped, filtered = [], [], []
 
