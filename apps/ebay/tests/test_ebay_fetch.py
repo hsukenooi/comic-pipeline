@@ -436,6 +436,209 @@ class TestLoadConfig:
             ebay_fetch.load_config()
 
 
+class TestRetryRequestHelper:
+    """BUI-323: _retry_request() is the shared retry/backoff loop that
+    get_token(), fetch_item_with_status(), search_seller_listings(),
+    search_by_keyword(), and get_item_aspects() all now call. These tests
+    cover the helper directly (success, retry-then-success, exhausted-
+    retries) so the mechanics are proven once rather than five times over."""
+
+    def test_success_on_first_attempt_returns_immediately(self):
+        ok = MagicMock(status_code=200)
+        make_request = MagicMock(return_value=ok)
+
+        resp = ebay_fetch._retry_request(
+            make_request,
+            retries=3,
+            is_retryable_status=lambda code: code == 429,
+            retry_network_errors=False,
+        )
+        assert resp is ok
+        assert make_request.call_count == 1
+
+    def test_retryable_status_then_success(self):
+        rate_limited = MagicMock(status_code=429)
+        ok = MagicMock(status_code=200)
+        make_request = MagicMock(side_effect=[rate_limited, ok])
+
+        with patch("ebay_fetch.time.sleep") as mock_sleep:
+            resp = ebay_fetch._retry_request(
+                make_request,
+                retries=3,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=False,
+            )
+        assert resp is ok
+        assert make_request.call_count == 2
+        mock_sleep.assert_called_once_with(1)
+
+    def test_retryable_status_exhausted_raises_with_response(self):
+        rate_limited = MagicMock(status_code=429)
+        make_request = MagicMock(return_value=rate_limited)
+
+        with patch("ebay_fetch.time.sleep"):
+            with pytest.raises(ebay_fetch._RetryExhausted) as excinfo:
+                ebay_fetch._retry_request(
+                    make_request,
+                    retries=3,
+                    is_retryable_status=lambda code: code == 429,
+                    retry_network_errors=False,
+                )
+        assert excinfo.value.response is rate_limited
+        assert excinfo.value.network_error is None
+        assert make_request.call_count == 3
+
+    def test_network_error_retried_when_enabled_then_succeeds(self):
+        ok = MagicMock(status_code=200)
+        make_request = MagicMock(
+            side_effect=[requests.exceptions.ConnectionError("timeout"), ok]
+        )
+
+        with patch("ebay_fetch.time.sleep") as mock_sleep:
+            resp = ebay_fetch._retry_request(
+                make_request,
+                retries=3,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=True,
+            )
+        assert resp is ok
+        assert make_request.call_count == 2
+        mock_sleep.assert_called_once_with(1)
+
+    def test_network_error_exhausted_raises_with_network_error(self):
+        exc = requests.exceptions.ConnectionError("no route to host")
+        make_request = MagicMock(side_effect=exc)
+
+        with patch("ebay_fetch.time.sleep"):
+            with pytest.raises(ebay_fetch._RetryExhausted) as excinfo:
+                ebay_fetch._retry_request(
+                    make_request,
+                    retries=3,
+                    is_retryable_status=lambda code: code == 429,
+                    retry_network_errors=True,
+                )
+        assert excinfo.value.network_error is exc
+        assert excinfo.value.response is None
+        assert make_request.call_count == 3
+
+    def test_network_error_not_retried_when_disabled_reraises_immediately(self):
+        """The fail-fast shape used by search_seller_listings/search_by_keyword/
+        get_item_aspects: a network error propagates on the very first
+        occurrence, spending none of the retry budget."""
+        exc = requests.exceptions.ConnectionError("down")
+        make_request = MagicMock(side_effect=exc)
+
+        with patch("ebay_fetch.time.sleep") as mock_sleep:
+            with pytest.raises(requests.exceptions.ConnectionError):
+                ebay_fetch._retry_request(
+                    make_request,
+                    retries=3,
+                    is_retryable_status=lambda code: code == 429,
+                    retry_network_errors=False,
+                )
+        assert make_request.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_non_retryable_status_returned_without_retry(self):
+        """A status the caller didn't mark retryable (e.g. a 401) comes back
+        immediately for the caller to inspect — no backoff spent on it."""
+        unauthorized = MagicMock(status_code=401)
+        make_request = MagicMock(return_value=unauthorized)
+
+        with patch("ebay_fetch.time.sleep") as mock_sleep:
+            resp = ebay_fetch._retry_request(
+                make_request,
+                retries=3,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=False,
+            )
+        assert resp is unauthorized
+        assert make_request.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_status_retry_message_none_retries_silently(self):
+        """get_item_aspects() passes no status_retry_message — a retryable
+        429 must still back off and retry without printing anything."""
+        rate_limited = MagicMock(status_code=429)
+        ok = MagicMock(status_code=200)
+        make_request = MagicMock(side_effect=[rate_limited, ok])
+
+        with patch("ebay_fetch.time.sleep"):
+            import io
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                resp = ebay_fetch._retry_request(
+                    make_request,
+                    retries=3,
+                    is_retryable_status=lambda code: code == 429,
+                    retry_network_errors=False,
+                )
+        assert resp is ok
+        assert buf.getvalue() == ""
+
+    def test_retries_of_one_exhausts_on_first_retryable_status_without_backoff(self):
+        """retries=1 means exactly one attempt and no room for backoff — the
+        loop's last-attempt branch must fire on attempt 0, not sleep first."""
+        rate_limited = MagicMock(status_code=429)
+        make_request = MagicMock(return_value=rate_limited)
+
+        with patch("ebay_fetch.time.sleep") as mock_sleep:
+            with pytest.raises(ebay_fetch._RetryExhausted) as excinfo:
+                ebay_fetch._retry_request(
+                    make_request,
+                    retries=1,
+                    is_retryable_status=lambda code: code == 429,
+                    retry_network_errors=False,
+                )
+        assert excinfo.value.response is rate_limited
+        assert make_request.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_retries_less_than_one_raises_value_error(self):
+        """retries=0 (or negative) is a caller bug, not a network outcome —
+        must raise ValueError immediately rather than silently returning a
+        misleading result (e.g. a status the loop never actually observed)
+        or an AssertionError that `python -O` would strip."""
+        with pytest.raises(ValueError):
+            ebay_fetch._retry_request(
+                MagicMock(),
+                retries=0,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=False,
+            )
+
+
+class TestAtomicWriteJsonHelper:
+    """BUI-323: _atomic_write_json() is the shared tmp→Path.replace() write
+    helper get_token()'s token cache and _aspects_cache_put() both call."""
+
+    def test_writes_json_and_leaves_no_tmp_file(self, tmp_path):
+        path = tmp_path / "cache.json"
+        ebay_fetch._atomic_write_json(path, {"a": 1})
+        assert json.loads(path.read_text()) == {"a": 1}
+        assert not path.with_suffix(".tmp").exists()
+
+    def test_creates_parent_directory(self, tmp_path):
+        path = tmp_path / "nested" / "dir" / "cache.json"
+        ebay_fetch._atomic_write_json(path, {"b": 2})
+        assert json.loads(path.read_text()) == {"b": 2}
+
+    def test_mode_restricts_permissions(self, tmp_path):
+        path = tmp_path / "secret.json"
+        ebay_fetch._atomic_write_json(path, {"token": "x"}, mode=0o600)
+        assert json.loads(path.read_text()) == {"token": "x"}
+        assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_replace_failure_leaves_old_file_intact_and_raises(self, tmp_path):
+        path = tmp_path / "cache.json"
+        path.write_text(json.dumps({"old": True}))
+        with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")):
+            with pytest.raises(OSError):
+                ebay_fetch._atomic_write_json(path, {"new": True})
+        assert json.loads(path.read_text()) == {"old": True}
+
+
 class TestFetchItem:
     """Test fetch_item with mocked HTTP responses."""
 
@@ -483,12 +686,18 @@ class TestFetchItem:
 
     def test_network_error_returns_none(self, capsys):
         """A transient ConnectionError must fail this single item, not crash
-        the whole run — mirrors search_by_keyword's RequestException handling."""
+        the whole run — mirrors search_by_keyword's RequestException handling.
+
+        BUI-323: the network-exception branch now retries with backoff (see
+        TestFetchItemWithStatus for the dedicated retry-budget assertions),
+        so every attempt here raises the same ConnectionError and time.sleep
+        must be mocked or this test would really sleep ~3s."""
         with patch(
             "ebay_fetch.requests.get",
             side_effect=requests.exceptions.ConnectionError("no route to host"),
         ):
-            result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+            with patch("ebay_fetch.time.sleep"):
+                result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
         assert result is None
         assert "Network error" in capsys.readouterr().err
 
@@ -498,7 +707,8 @@ class TestFetchItem:
             "ebay_fetch.requests.get",
             side_effect=requests.exceptions.Timeout("read timed out"),
         ):
-            result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+            with patch("ebay_fetch.time.sleep"):
+                result = ebay_fetch.fetch_item("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
         assert result is None
         assert "Network error" in capsys.readouterr().err
 
@@ -577,9 +787,58 @@ class TestFetchItemWithStatus:
             "ebay_fetch.requests.get",
             side_effect=requests.exceptions.ConnectionError("no route to host"),
         ):
-            data, status = ebay_fetch.fetch_item_with_status("123", "fake-token", ebay_fetch.PRODUCTION_BASE)
+            with patch("ebay_fetch.time.sleep"):
+                data, status = ebay_fetch.fetch_item_with_status(
+                    "123", "fake-token", ebay_fetch.PRODUCTION_BASE
+                )
         assert data is None
         assert status is None
+
+    # ── BUI-323: network errors now honor the retries budget with backoff ────
+
+    def test_network_error_retries_with_backoff_before_succeeding(self):
+        """BUI-310 fixed this branch to `return None, None` immediately on the
+        very first RequestException — spending none of the retry budget a 429
+        gets. BUI-323 fixes that drift: a network error must now be retried
+        with the same exponential backoff as get_token(), not returned
+        immediately. Proven here by recovering on the second attempt."""
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"itemId": "v1|123|0", "title": "Recovered"}
+
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=[requests.exceptions.ConnectionError("timeout"), ok],
+        ) as mock_get:
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                data, status = ebay_fetch.fetch_item_with_status(
+                    "123", "fake-token", ebay_fetch.PRODUCTION_BASE
+                )
+        assert data["title"] == "Recovered"
+        assert status == 200
+        assert mock_get.call_count == 2
+        # Must have slept before retrying (exponential backoff: 2^0 = 1s) —
+        # proof the retry budget was actually spent, not skipped.
+        mock_sleep.assert_called_once_with(1)
+
+    def test_network_error_exhausts_full_retry_budget(self):
+        """Every attempt raising a network error must consume the full
+        `retries` budget (with backoff between each) before giving up —
+        not return on the first exception as the pre-BUI-323 code did."""
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=requests.exceptions.ConnectionError("no route to host"),
+        ) as mock_get:
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                data, status = ebay_fetch.fetch_item_with_status(
+                    "123", "fake-token", ebay_fetch.PRODUCTION_BASE, retries=3,
+                )
+        assert data is None
+        assert status is None
+        assert mock_get.call_count == 3
+        # 2 backoff sleeps between 3 attempts (1s, 2s) — the same shape as
+        # get_token's network-error retry.
+        assert mock_sleep.call_args_list == [((1,),), ((2,),)]
 
     def test_malformed_200_body_returns_none_and_200(self):
         """A 200 with a non-JSON body reports status 200 (the response WAS a
@@ -1398,12 +1657,27 @@ class TestGetItemAspects:
         assert result is None
 
     def test_returns_none_on_network_error(self, tmp_path, monkeypatch):
-        """Network error (ConnectionError) → None (fail-open)."""
+        """Network error (ConnectionError) → None (fail-open).
+
+        BUI-323: get_item_aspects() passes retry_network_errors=False, so a
+        network error must fail on the very first attempt — spending none of
+        the retry budget — matching search_by_keyword()'s fail-fast shape.
+        Asserting call_count == 1 and that time.sleep was never invoked is
+        what would actually catch a future regression that flipped this
+        call site to retry_network_errors=True; get_item_aspects()'s single
+        `except (RequestException, _RetryExhausted): return None` collapses
+        both outcomes to the same return value, so `result is None` alone
+        can't distinguish "failed fast" from "retried, then gave up"."""
         import requests as req
         monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
-        with patch("requests.get", side_effect=req.exceptions.ConnectionError("down")):
-            result = ebay_fetch.get_item_aspects("999", "tok", "https://api.ebay.com")
+        with patch(
+            "requests.get", side_effect=req.exceptions.ConnectionError("down")
+        ) as mock_get:
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                result = ebay_fetch.get_item_aspects("999", "tok", "https://api.ebay.com")
         assert result is None
+        assert mock_get.call_count == 1
+        mock_sleep.assert_not_called()
 
     def test_returns_none_when_no_localized_aspects(self, tmp_path, monkeypatch):
         """200 response without a localizedAspects key → None (fail-open)."""

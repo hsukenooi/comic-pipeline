@@ -116,6 +116,143 @@ def _token_cache_file(base_url):
     return CONFIG_DIR / f"token_cache_{env}.json"
 
 
+# ─── Shared network retry/backoff + atomic write helpers (BUI-323) ──────────
+# get_token(), fetch_item_with_status(), search_seller_listings(),
+# search_by_keyword(), and get_item_aspects() each drove their own
+# hand-rolled "for attempt in range(retries): try/except RequestException,
+# check status, backoff, retry" loop. BUI-299/300/310/311/312 kept hardening
+# them one function at a time by copying whichever sibling already handled a
+# given failure mode best (see docs/solutions/design-patterns/
+# oauth-token-refresh-retry-pattern.md, pattern 4) — which worked, but left
+# five hand-copied variants that could drift again (and one did: see
+# fetch_item_with_status()'s network-error branch below). _retry_request() is
+# now the single place the retry/backoff shape lives; _atomic_write_json() is
+# the equivalent consolidation of the tmp-file-then-.replace() write idiom
+# used by the OAuth token cache and the item-aspects disk cache.
+
+
+class _RetryExhausted(Exception):
+    """Raised by _retry_request() when the retry budget runs out.
+
+    Exactly one of the two attributes is set, mirroring the two ways a call
+    can keep failing:
+    - `response`: the last response with a retryable status code (e.g. a
+      429 that never let up).
+    - `network_error`: the last requests.exceptions.RequestException (only
+      possible when retry_network_errors=True was passed in).
+
+    Callers catch this and choose their own fallback (sys.exit, None, a
+    status-tagged return, partial results...) — that terminal reaction is
+    exactly the part that differs enough between callers that unifying it
+    would just relocate the drift, not remove it.
+    """
+
+    def __init__(self, *, response=None, network_error=None):
+        self.response = response
+        self.network_error = network_error
+        super().__init__("retry budget exhausted")
+
+
+def _retry_request(
+    make_request,
+    *,
+    retries,
+    is_retryable_status,
+    retry_network_errors,
+    network_error_context=None,
+    status_retry_message=None,
+):
+    """Drive the exponential-backoff retry loop shared by every network call
+    in this module.
+
+    make_request() performs one HTTP call and returns a requests.Response; it
+    may raise requests.exceptions.RequestException. Returns the first response
+    whose status code is NOT retryable per is_retryable_status(status_code)
+    (including an immediate 200) — callers branch on resp.status_code
+    themselves (200 vs 404 vs 401 vs ...) since that per-status reaction is
+    where callers genuinely differ.
+
+    A retryable status backs off `2 ** attempt` seconds between attempts,
+    printing f"{status_retry_message(status)}, retrying in {wait}s..." when
+    status_retry_message is given (pass None to retry silently, as
+    get_item_aspects() has always done). Once `retries` is exhausted, raises
+    _RetryExhausted(response=<last response>).
+
+    A RequestException is handled one of two ways, matching the two shapes
+    that existed independently before this helper:
+    - retry_network_errors=True (get_token(), fetch_item_with_status()):
+      retried with the same backoff — printing
+      f"Network error {network_error_context}: {exc}, retrying in {wait}s..."
+      when network_error_context is given — raising
+      _RetryExhausted(network_error=<last exc>) once exhausted.
+    - retry_network_errors=False (search_seller_listings(),
+      search_by_keyword(), get_item_aspects()): re-raised immediately on the
+      first occurrence. These callers have always failed fast on a network
+      error rather than spending the retry budget on it; BUI-323 preserves
+      that existing drift as-is rather than changing behavior beyond its one
+      intended fix (fetch_item_with_status(), below).
+    """
+    if retries < 1:
+        raise ValueError("retries must allow at least one attempt")
+    resp = None
+    for attempt in range(retries):
+        try:
+            resp = make_request()
+        except requests.exceptions.RequestException as exc:
+            if not retry_network_errors:
+                raise
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                if network_error_context:
+                    print(
+                        f"Network error {network_error_context}: {exc}, "
+                        f"retrying in {wait}s...",
+                        file=sys.stderr,
+                    )
+                time.sleep(wait)
+                continue
+            raise _RetryExhausted(network_error=exc) from exc
+
+        if not is_retryable_status(resp.status_code):
+            return resp
+
+        if attempt < retries - 1:
+            wait = 2 ** attempt
+            if status_retry_message:
+                print(
+                    f"{status_retry_message(resp.status_code)}, retrying in {wait}s...",
+                    file=sys.stderr,
+                )
+            time.sleep(wait)
+        else:
+            raise _RetryExhausted(response=resp)
+
+    raise _RetryExhausted(response=resp)  # pragma: no cover — unreachable for retries >= 1
+
+
+def _atomic_write_json(path, data, *, mode=None):
+    """Write `data` as JSON to `path` atomically (tmp file + Path.replace()),
+    so a crash mid-write never leaves a partial/corrupted file for a
+    concurrent reader — the pattern _aspects_cache_put() established first and
+    get_token()'s token-cache write later copied by hand.
+
+    When `mode` is given, the tmp file is created with exactly those
+    permissions from the start via os.open(O_CREAT, mode) instead of the
+    process umask — used for the OAuth token cache, which holds a credential.
+    Raises OSError on failure (disk full, permission denied, an interrupted
+    rename...); callers decide whether that's fatal or best-effort.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    if mode is not None:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+    else:
+        tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
 def get_token(client_id, client_secret, base_url, *, force_refresh=False):
     """Get a valid OAuth app token, using cache if available.
 
@@ -139,16 +276,18 @@ def get_token(client_id, client_secret, base_url, *, force_refresh=False):
         except Exception:  # noqa: BLE001  # malformed/wrong-shape cache → cache miss
             pass  # e.g. non-dict JSON, non-numeric expires_at, missing access_token
 
-    # Request new token — bounded retry loop mirrors the pattern in fetch_item().
-    # 429 (rate-limited) and 5xx (transient server errors) are retried with
-    # exponential backoff. Non-retryable 4xx errors (e.g. 401 bad credentials)
-    # exit immediately. BUI-184: a one-shot sys.exit on the first non-200 killed
-    # the whole run on a transient auth hiccup.
+    # Request new token via the shared _retry_request() helper (BUI-323) —
+    # the same one fetch_item_with_status() uses below, so a network error is
+    # now retried with backoff exactly like a 429/5xx on both. Non-retryable
+    # 4xx errors (e.g. 401 bad credentials) exit immediately. BUI-184: a
+    # one-shot sys.exit on the first non-200 killed the whole run on a
+    # transient auth hiccup.
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     retries = 3
-    for attempt in range(retries):
-        try:
-            resp = requests.post(
+
+    try:
+        resp = _retry_request(
+            lambda: requests.post(
                 f"{base_url}/identity/v1/oauth2/token",
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
@@ -159,44 +298,30 @@ def get_token(client_id, client_secret, base_url, *, force_refresh=False):
                     "scope": "https://api.ebay.com/oauth/api_scope",
                 },
                 timeout=10,
-            )
-        except requests.exceptions.RequestException as exc:
-            # Transient network error — same retry/backoff budget as 429/5xx below.
-            if attempt < retries - 1:
-                wait = 2 ** attempt
-                print(
-                    f"Network error requesting token: {exc}, retrying in {wait}s...",
-                    file=sys.stderr,
-                )
-                time.sleep(wait)
-                continue
+            ),
+            retries=retries,
+            is_retryable_status=lambda code: code == 429 or code >= 500,
+            retry_network_errors=True,
+            network_error_context="requesting token",
+            status_retry_message=lambda code: f"Token request failed ({code})",
+        )
+    except _RetryExhausted as exc:
+        if exc.network_error is not None:
             print(
-                f"Error: Authentication failed (network error after {retries} attempts): {exc}",
+                f"Error: Authentication failed (network error after {retries} attempts): {exc.network_error}",
                 file=sys.stderr,
             )
-            sys.exit(1)
-
-        if resp.status_code == 200:
-            break
-        elif resp.status_code == 429 or resp.status_code >= 500:
-            # Transient — back off and retry if budget remains.
-            if attempt < retries - 1:
-                wait = 2 ** attempt
-                print(
-                    f"Token request failed ({resp.status_code}), retrying in {wait}s...",
-                    file=sys.stderr,
-                )
-                time.sleep(wait)
-            else:
-                print(
-                    f"Error: Authentication failed ({resp.status_code}) after {retries} attempts",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
         else:
-            # Non-retryable 4xx (bad credentials, etc.) — exit immediately.
-            print(f"Error: Authentication failed ({resp.status_code})", file=sys.stderr)
-            sys.exit(1)
+            print(
+                f"Error: Authentication failed ({exc.response.status_code}) after {retries} attempts",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        # Non-retryable 4xx (bad credentials, etc.) — exit immediately.
+        print(f"Error: Authentication failed ({resp.status_code})", file=sys.stderr)
+        sys.exit(1)
 
     # eBay can return 200 with a malformed body (truncated proxy response, a WAF
     # interstitial served with a 200 status) — guard the same way get_item_aspects()
@@ -209,21 +334,17 @@ def get_token(client_id, client_secret, base_url, *, force_refresh=False):
         sys.exit(1)
     expires_in = token_data.get("expires_in", 7200)
 
-    # Cache token with restrictive permissions, atomically (tmp→rename, mirrors
-    # _aspects_cache_put) so a crash mid-write never leaves a partial cache file.
-    # Best-effort: an OSError here (e.g. disk full, permission denied) must not
-    # discard the token we already got from eBay — log and fall through, still
-    # returning the live token.
+    # Cache token with restrictive permissions, atomically (tmp→rename via the
+    # shared _atomic_write_json(), BUI-323) so a crash mid-write never leaves
+    # a partial cache file. Best-effort: an OSError here (e.g. disk full,
+    # permission denied) must not discard the token we already got from
+    # eBay — log and fall through, still returning the live token.
     try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = cache_file.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(
-                {"access_token": access_token, "expires_at": time.time() + expires_in},
-                f,
-            )
-        tmp.replace(cache_file)
+        _atomic_write_json(
+            cache_file,
+            {"access_token": access_token, "expires_at": time.time() + expires_in},
+            mode=0o600,
+        )
     except OSError as exc:
         print(f"Warning: could not write token cache: {exc}", file=sys.stderr)
 
@@ -259,6 +380,11 @@ def fetch_item_with_status(item_id, token, base_url, retries=3):
     its two existing callers (this module's own CLI, grade_photos.py). Callers
     that need to react to the status — e.g. refreshing an OAuth token on a 401
     mid-batch — should call this directly instead.
+
+    BUI-323: a network error now consumes the retries budget with backoff via
+    the shared _retry_request() helper, the same as get_token() — it used to
+    return (None, None) on the very first RequestException, spending none of
+    the retry budget a 429 gets (a real drift this fix removes).
     """
     url = f"{base_url}/buy/browse/v1/item/get_item_by_legacy_id"
     headers = {
@@ -267,36 +393,41 @@ def fetch_item_with_status(item_id, token, base_url, retries=3):
     }
     params = {"legacy_item_id": item_id}
 
-    for attempt in range(retries):
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=10)
-        except requests.exceptions.RequestException as exc:
-            print(f"Network error fetching item {item_id}: {exc}", file=sys.stderr)
-            return None, None
-
-        if resp.status_code == 200:
-            try:
-                return resp.json(), 200
-            except ValueError as exc:
-                print(f"Error: Malformed response for item {item_id}: {exc}", file=sys.stderr)
-                return None, 200
-        elif resp.status_code == 404:
-            print(f"Error: Item {item_id} not found (404).", file=sys.stderr)
-            return None, 404
-        elif resp.status_code == 429:
-            if attempt < retries - 1:
-                wait = 2 ** attempt
-                print(f"Rate limited, retrying in {wait}s...", file=sys.stderr)
-                time.sleep(wait)
-        else:
+    try:
+        resp = _retry_request(
+            lambda: requests.get(url, headers=headers, params=params, timeout=10),
+            retries=retries,
+            is_retryable_status=lambda code: code == 429,
+            retry_network_errors=True,
+            network_error_context=f"fetching item {item_id}",
+            status_retry_message=lambda code: "Rate limited",
+        )
+    except _RetryExhausted as exc:
+        if exc.network_error is not None:
             print(
-                f"Error fetching item {item_id}: HTTP {resp.status_code}: {resp.text[:200]}",
+                f"Network error fetching item {item_id}: {exc.network_error}, "
+                f"giving up after {retries} attempts.",
                 file=sys.stderr,
             )
-            return None, resp.status_code
+            return None, None
+        print(f"Error: Failed to fetch item {item_id} after {retries} retries.", file=sys.stderr)
+        return None, 429
 
-    print(f"Error: Failed to fetch item {item_id} after {retries} retries.", file=sys.stderr)
-    return None, 429
+    if resp.status_code == 200:
+        try:
+            return resp.json(), 200
+        except ValueError as exc:
+            print(f"Error: Malformed response for item {item_id}: {exc}", file=sys.stderr)
+            return None, 200
+    elif resp.status_code == 404:
+        print(f"Error: Item {item_id} not found (404).", file=sys.stderr)
+        return None, 404
+    else:
+        print(
+            f"Error fetching item {item_id}: HTTP {resp.status_code}: {resp.text[:200]}",
+            file=sys.stderr,
+        )
+        return None, resp.status_code
 
 
 def fetch_item(item_id, token, base_url, retries=3):
@@ -682,27 +813,29 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
         filter_val = f"sellers:{{{safe_user}}},buyingOptions:{{AUCTION}}"
         query = f"q=comic&filter={filter_val}&limit={page_size}&offset={offset}"
 
-        for attempt in range(retries):
-            try:
-                resp = requests.get(url, headers=headers, params=query, timeout=15)
-            except requests.exceptions.RequestException as exc:
-                print(
-                    f"Network error fetching seller listings for '{username}': {exc}",
-                    file=sys.stderr,
-                )
-                return _filter_by_seller(all_items, username)
-            if resp.status_code == 200:
-                break
-            if resp.status_code == 429 and attempt < retries - 1:
-                wait = 2 ** attempt
-                print(f"Rate limited, retrying in {wait}s...", file=sys.stderr)
-                time.sleep(wait)
-            else:
-                print(
-                    f"Error fetching seller listings: HTTP {resp.status_code}: {resp.text[:200]}",
-                    file=sys.stderr,
-                )
-                return _filter_by_seller(all_items, username)
+        try:
+            resp = _retry_request(
+                lambda: requests.get(url, headers=headers, params=query, timeout=15),
+                retries=retries,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=False,
+                status_retry_message=lambda code: "Rate limited",
+            )
+        except requests.exceptions.RequestException as exc:
+            print(
+                f"Network error fetching seller listings for '{username}': {exc}",
+                file=sys.stderr,
+            )
+            return _filter_by_seller(all_items, username)
+        except _RetryExhausted as exc:
+            resp = exc.response
+
+        if resp.status_code != 200:
+            print(
+                f"Error fetching seller listings: HTTP {resp.status_code}: {resp.text[:200]}",
+                file=sys.stderr,
+            )
+            return _filter_by_seller(all_items, username)
 
         data = resp.json()
         if _seller_filter_rejected(data):
@@ -770,27 +903,29 @@ def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_optio
         filter_val = f"buyingOptions:{{{buying_options}}}"
         query = f"q={safe_kw}&filter={filter_val}&limit={page_size}&offset={offset}"
 
-        for attempt in range(retries):
-            try:
-                resp = requests.get(url, headers=headers, params=query, timeout=15)
-            except requests.exceptions.RequestException as exc:
-                print(
-                    f"Network error searching by keyword '{keyword}': {exc}",
-                    file=sys.stderr,
-                )
-                return all_items[:max_results]
-            if resp.status_code == 200:
-                break
-            if resp.status_code == 429 and attempt < retries - 1:
-                wait = 2 ** attempt
-                print(f"Rate limited, retrying in {wait}s...", file=sys.stderr)
-                time.sleep(wait)
-            else:
-                print(
-                    f"Error searching by keyword: HTTP {resp.status_code}: {resp.text[:200]}",
-                    file=sys.stderr,
-                )
-                return all_items[:max_results]
+        try:
+            resp = _retry_request(
+                lambda: requests.get(url, headers=headers, params=query, timeout=15),
+                retries=retries,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=False,
+                status_retry_message=lambda code: "Rate limited",
+            )
+        except requests.exceptions.RequestException as exc:
+            print(
+                f"Network error searching by keyword '{keyword}': {exc}",
+                file=sys.stderr,
+            )
+            return all_items[:max_results]
+        except _RetryExhausted as exc:
+            resp = exc.response
+
+        if resp.status_code != 200:
+            print(
+                f"Error searching by keyword: HTTP {resp.status_code}: {resp.text[:200]}",
+                file=sys.stderr,
+            )
+            return all_items[:max_results]
 
         data = resp.json()
         page_items = data.get("itemSummaries", [])
@@ -836,12 +971,9 @@ def _aspects_cache_get(item_id: str) -> "dict | None":
 
 
 def _aspects_cache_put(item_id: str, aspects: dict) -> None:
-    """Write aspects dict to the item-level disk cache (atomic tmp→rename)."""
-    path = _aspects_cache_path(item_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(aspects))
-    tmp.replace(path)
+    """Write aspects dict to the item-level disk cache (atomic tmp→rename via
+    the shared _atomic_write_json(), BUI-323)."""
+    _atomic_write_json(_aspects_cache_path(item_id), aspects)
 
 
 def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries: int = 3) -> "dict | None":
@@ -855,7 +987,9 @@ def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries:
     swallowed — the aspects gate is advisory, not load-bearing.  The caller treats
     None as "no signal" and keeps the listing.
 
-    Request/retry/pacing style mirrors search_by_keyword.
+    Request/retry style shares the module's _retry_request() helper (BUI-323),
+    matching search_by_keyword's fail-fast-on-network-error / retry-silently-
+    on-429 shape.
     """
     cached = _aspects_cache_get(legacy_item_id)
     if cached is not None:
@@ -868,17 +1002,18 @@ def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries:
     }
     params = {"legacy_item_id": legacy_item_id}
 
-    for attempt in range(retries):
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=10)
-        except requests.exceptions.RequestException:
-            return None  # network error → fail-open
-        if resp.status_code == 200:
-            break
-        if resp.status_code == 429 and attempt < retries - 1:
-            time.sleep(2 ** attempt)
-            continue
-        return None  # non-retryable or last retry → fail-open
+    try:
+        resp = _retry_request(
+            lambda: requests.get(url, headers=headers, params=params, timeout=10),
+            retries=retries,
+            is_retryable_status=lambda code: code == 429,
+            retry_network_errors=False,
+        )
+    except (requests.exceptions.RequestException, _RetryExhausted):
+        return None  # network error or retry-exhausted → fail-open
+
+    if resp.status_code != 200:
+        return None  # non-retryable status → fail-open
 
     try:
         data = resp.json()
