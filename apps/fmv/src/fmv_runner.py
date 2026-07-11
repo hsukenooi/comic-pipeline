@@ -601,6 +601,21 @@ def _build_notes(fmv: dict) -> str:
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")
+    # BUI-306 §7: state EXPLICITLY that the price was interpolated (not a direct
+    # comp) and that confidence is reduced, naming the bracketing buckets used.
+    interp = fmv.get("interpolation")
+    if fmv.get("interpolated") and interp:
+        parts.append(
+            f"interpolated=grade {interp['grade_below']:g}→{interp['grade_above']:g} "
+            f"(median ${interp['median_below']:g}→${interp['median_above']:g}); "
+            "confidence reduced"
+        )
+    # BUI-306 §5: surface any grade-curve monotonicity violation so a suspect
+    # bucket is flagged for review rather than silently blended into the pool.
+    suspect = fmv.get("suspect_buckets")
+    if suspect:
+        pairs = ", ".join(f"{lo:g}>{hi:g}" for lo, hi in suspect)
+        parts.append(f"suspect_grade_curve={pairs}")
     # BUI-51: surface the bid haircut so the lowered max bid is explained. Skip
     # it for a flagged book — it has no max bid, so a haircut token would be
     # misleading (its LOW label is forced by the flag, not a real haircut).
@@ -652,6 +667,16 @@ def _input_summary(book: dict) -> dict:
 
 
 _WINDOW_RE = re.compile(r"window=±\s*([0-9.]+)")
+
+
+def _interpolated_from_notes(notes: str | None) -> bool:
+    """Recover whether a cached FMV was priced by §7 interpolation (BUI-306).
+
+    `_build_notes` writes an `interpolated=grade …` token for an interpolated
+    book, so the cached path can re-mark it without a structured column. Used to
+    keep a cache-reuse row's `interpolated` flag honest for the table + JSON.
+    """
+    return bool(notes) and "interpolated=" in notes
 
 
 def _window_from_notes(notes: str | None) -> float | None:
@@ -717,6 +742,15 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "grade_confidence": grade_confidence,
         "bid_factor": factor,
         "trimmed_pool": [],
+        # BUI-306: shape parity with compute_fmv. An interpolated book persists
+        # a real number (flag cleared) so it IS cache-reusable — recover the
+        # interpolated marker from fmv_notes so a re-displayed / re-served row
+        # still tells a downstream consumer it's interpolated, not a direct comp
+        # (§7 "state explicitly"). The full interpolation detail dict isn't
+        # reconstructed (same lossy projection as median/cv/trimmed_pool).
+        "interpolated": _interpolated_from_notes(row.get("fmv_notes")),
+        "interpolation": None,
+        "suspect_buckets": [],
     }
 
 
@@ -768,6 +802,12 @@ def _print_table(rows: list[dict]) -> None:
             fmv_str = f"manual:{fmv['flag_reason']}"
             med_str = "—"
             mb_str = "manual"
+        elif fmv.get("interpolated"):
+            # BUI-306 §7: interpolated point estimate (fmv_low == fmv_high) — mark
+            # it so it's never conflated with a real direct-comp range.
+            fmv_str = f"${fmv['fmv_high']} interp"
+            med_str = f"${fmv.get('median') or '?'}"
+            mb_str = f"${fmv.get('max_bid') or '?'}"
         elif fmv.get("fmv_low") is not None:
             fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']}"
             med_str = f"${fmv.get('median') or '?'}"

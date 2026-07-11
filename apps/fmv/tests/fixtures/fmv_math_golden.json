@@ -62,12 +62,12 @@
   "too_wide_flag": {
     "bid_factor": 0.8,
     "confidence": "LOW",
-    "flag_reason": "too_wide",
-    "fmv_high": null,
-    "fmv_low": null,
+    "flag_reason": null,
+    "fmv_high": 180,
+    "fmv_low": 180,
     "grade_span": 4.0,
-    "max_bid": null,
-    "median": null,
+    "max_bid": 140,
+    "median": 180,
     "n": 3,
     "window": 2.0
   },
