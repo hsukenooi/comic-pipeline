@@ -382,6 +382,7 @@ class TestFetch:
     def _mock_response(self, organic_results=None, ebay_url=None, error=None):
         m = MagicMock()
         m.raise_for_status = MagicMock()
+        m.status_code = 200  # BUI-333: _retry_request() reads status_code directly
         body = {}
         if error:
             body["error"] = error
@@ -709,6 +710,53 @@ class TestFetchRetry:
                    side_effect=requests.ConnectionError("no route to host")):
             with pytest.raises(requests.ConnectionError):
                 sc.fetch("test", "key")
+
+    def test_exhausted_retryable_status_reraises_http_error(self, tmp_path, monkeypatch):
+        """BUI-333: a persistent 503 across every retry attempt exercises the
+        _RetryExhausted(response=...) branch — fetch() must still raise an
+        HTTPError carrying the original status code, and requests.get must be
+        called exactly FETCH_MAX_RETRIES times (no over/under-retrying)."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        def make_bad():
+            bad = MagicMock()
+            bad.status_code = 503
+            bad.raise_for_status = MagicMock(side_effect=requests.HTTPError(response=bad))
+            return bad
+
+        with patch("sold_comps.requests.get", side_effect=lambda *a, **k: make_bad()) as mock_get:
+            with pytest.raises(requests.HTTPError) as excinfo:
+                sc.fetch("test", "key")
+            assert excinfo.value.response.status_code == 503
+            assert mock_get.call_count == sc.FETCH_MAX_RETRIES
+
+    def test_retry_then_succeed_other_request_exception_type(self, tmp_path, monkeypatch):
+        """BUI-333: the shared _retry_request() helper widens the retryable
+        network-error catch from (Timeout, ConnectionError) to any
+        requests.exceptions.RequestException. Confirm a different subtype
+        (ChunkedEncodingError) is now retried rather than propagating
+        immediately — the old hand-rolled loop would NOT have caught this."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        good_response = self._mock_response(
+            ebay_url="https://www.ebay.com/?LH_Sold=1",
+            organic_results=[{"product_id": "99"}],
+        )
+        call_count = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise requests.exceptions.ChunkedEncodingError("connection broken")
+            return good_response
+
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            data, cache_hit = sc.fetch("test", "key")
+
+        assert data["organic_results"] == [{"product_id": "99"}]
+        assert call_count["n"] == 2
 
     def test_non_retryable_4xx_not_retried(self, tmp_path, monkeypatch):
         """A 404 is NOT retried — requests.get is called exactly once."""

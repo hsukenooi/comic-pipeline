@@ -638,6 +638,45 @@ class TestAtomicWriteJsonHelper:
                 ebay_fetch._atomic_write_json(path, {"new": True})
         assert json.loads(path.read_text()) == {"old": True}
 
+    def test_replace_failure_cleans_up_tmp_file(self, tmp_path):
+        """BUI-333 (BUI-323 finding d): a failed os.replace() must not leave a
+        stray .tmp file behind for the next writer to trip over."""
+        path = tmp_path / "cache.json"
+        with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")):
+            with pytest.raises(OSError):
+                ebay_fetch._atomic_write_json(path, {"new": True})
+        assert not path.with_suffix(".tmp").exists()
+
+    def test_write_failure_cleans_up_tmp_file(self, tmp_path):
+        """Same cleanup guarantee when the write itself (not just the replace)
+        fails partway — e.g. disk full mid-write."""
+        path = tmp_path / "cache.json"
+        with patch.object(ebay_fetch.Path, "write_text", side_effect=OSError("disk full")):
+            with pytest.raises(OSError):
+                ebay_fetch._atomic_write_json(path, {"new": True})
+        assert not path.with_suffix(".tmp").exists()
+        assert not path.exists()
+
+    def test_write_failure_with_mode_cleans_up_tmp_file(self, tmp_path):
+        """The mode!=None branch (os.open/os.fdopen) gets the same cleanup on
+        a write failure as the plain tmp.write_text() branch."""
+        path = tmp_path / "secret.json"
+        with patch("ebay_fetch.json.dump", side_effect=OSError("disk full")):
+            with pytest.raises(OSError):
+                ebay_fetch._atomic_write_json(path, {"token": "x"}, mode=0o600)
+        assert not path.with_suffix(".tmp").exists()
+        assert not path.exists()
+
+    def test_replace_failure_cleanup_error_does_not_mask_original_exception(self, tmp_path):
+        """If the best-effort tmp.unlink() cleanup itself fails, the original
+        write/replace OSError must still propagate — not be swallowed or
+        replaced by the cleanup failure."""
+        path = tmp_path / "cache.json"
+        with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")), \
+                patch.object(ebay_fetch.Path, "unlink", side_effect=OSError("cleanup also failed")):
+            with pytest.raises(OSError, match="boom"):
+                ebay_fetch._atomic_write_json(path, {"new": True})
+
 
 class TestFetchItem:
     """Test fetch_item with mocked HTTP responses."""

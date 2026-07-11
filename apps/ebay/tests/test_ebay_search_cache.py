@@ -115,6 +115,16 @@ def test_get_returns_none_on_cache_miss():
     assert cache.get("Fantastic Four #1") is None
 
 
+def test_put_writes_atomically_and_leaves_no_tmp_file():
+    """BUI-333: put() routes through the shared ebay_fetch._atomic_write_json()
+    helper rather than a hand-rolled tmp→rename copy."""
+    keyword = "Amazing Spider-Man #300"
+    cache.put(keyword, [{"title": "ASM #300"}])
+    path = cache.cache_path(keyword)
+    assert path.exists()
+    assert not path.with_suffix(".tmp").exists()
+
+
 def test_get_returns_none_when_expired(tmp_path):
     """get returns None when the cached file is older than ttl_sec."""
     keyword = "Daredevil #1"

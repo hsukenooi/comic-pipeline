@@ -129,6 +129,16 @@ def _token_cache_file(base_url):
 # now the single place the retry/backoff shape lives; _atomic_write_json() is
 # the equivalent consolidation of the tmp-file-then-.replace() write idiom
 # used by the OAuth token cache and the item-aspects disk cache.
+#
+# BUI-333: a reuse review after BUI-323 found the same two idioms hand-copied
+# elsewhere in apps/ebay/src/ — sold_comps.py's SerpApi retry loop + JSON
+# cache write, ebay_search_cache.py's JSON cache write, and seller_scan.py's
+# rejected-candidate cache write. Those now call _retry_request()/
+# _atomic_write_json() too, so apps/ebay has one retry/backoff and one
+# atomic-write implementation. (seller_scan.py's Claude-CLI verification
+# bisection retry and its single-shot `requests` calls without a retry budget
+# were left alone — neither matches this helper's shape; see that module for
+# why.)
 
 
 class _RetryExhausted(Exception):
@@ -241,16 +251,32 @@ def _atomic_write_json(path, data, *, mode=None):
     process umask — used for the OAuth token cache, which holds a credential.
     Raises OSError on failure (disk full, permission denied, an interrupted
     rename...); callers decide whether that's fatal or best-effort.
+
+    BUI-333: if the write or the replace fails partway, the .tmp file is
+    best-effort unlinked before the exception propagates — a pre-existing gap
+    (BUI-323 finding d) where a failed write used to leave an orphaned .tmp
+    file behind for the next writer to trip over. The cleanup itself never
+    masks the original failure: an unlink error is swallowed, and the
+    triggering exception always re-raises unchanged.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    if mode is not None:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-    else:
-        tmp.write_text(json.dumps(data))
-    tmp.replace(path)
+    wrote = False
+    try:
+        if mode is not None:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+        else:
+            tmp.write_text(json.dumps(data))
+        tmp.replace(path)
+        wrote = True
+    finally:
+        if not wrote:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def get_token(client_id, client_secret, base_url, *, force_refresh=False):
