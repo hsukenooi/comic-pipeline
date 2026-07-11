@@ -263,6 +263,24 @@ _VERIFY_MAX_BISECT_DEPTH = 3
 # clean "0 matches" scan (exit 0) and knows to re-run.
 _EXIT_INCOMPLETE = 3
 
+# BUI-298: exit code for a batch where at least one seller couldn't be
+# resolved/fetched (its slot carries an `error`) but NO seller was incomplete.
+# Kept distinct from _EXIT_INCOMPLETE=3 so a caller can tell "some seller
+# couldn't even be scanned" apart from "every requested seller was scanned but
+# verification didn't fully complete for at least one."
+_EXIT_SELLER_ERROR = 2
+
+# BUI-270/BUI-297: the `claude` verifier is globally unavailable (CLI missing,
+# broken auth, or every chunk failed transport). verify_with_claude sys.exit(1)s
+# on this. It's the MOST severe outcome — nothing could be verified and the run
+# is truncated — so it takes priority over incomplete/seller-error/clean.
+# Multi-seller exit-code priority (main()):
+#   1 (_EXIT_VERIFIER_DOWN) — verifier globally down, run truncated
+#   3 (_EXIT_INCOMPLETE)    — verifier worked but some candidates never verified
+#   2 (_EXIT_SELLER_ERROR)  — a seller couldn't be resolved/fetched
+#   0                       — clean
+_EXIT_VERIFIER_DOWN = 1
+
 
 class _VerifyTimeout(RuntimeError):
     """A `claude` CLI verification call that timed out.
@@ -348,8 +366,13 @@ Pairs:
 def _parse_verification_response(text, chunk, chunk_label):
     """Parse one chunk's Claude verification response.
 
-    Returns the subset of `chunk` NOT rejected (the list to extend `kept`
-    with), or None if the response could not be parsed/validated.  None means
+    Returns `(kept, filtered_info)` — `kept` is the subset of `chunk` NOT
+    rejected; `filtered_info` is a list of `{item_id, title, wish_name,
+    reason}` dicts, one per model-rejected candidate (BUI-298: threaded back
+    as data, not just printed to stderr, so `--json` output can carry the
+    "Filtered N false positive(s)" reasons inline — see requirement #2).
+
+    Returns None if the response could not be parsed/validated.  None means
     "drop this chunk" (fail-closed): catches json.JSONDecodeError plus
     KeyError/ValueError/TypeError during id validation, emits the warning
     messages, and prints the BUI-149 rejected-candidate stderr listing.
@@ -395,7 +418,11 @@ def _parse_verification_response(text, chunk, chunk_label):
         return None
 
     # BUI-149: surface each rejected candidate (with the model's reason) to
-    # stderr so the user can override if the verifier was wrong.
+    # stderr so the user can override if the verifier was wrong.  BUI-298:
+    # also collect the same info as data (`filtered_info`) so `--json` output
+    # can carry it inline, not just print it — the stderr printing stays for
+    # anyone watching the terminal.
+    filtered_info = []
     if rejected_ids:
         print(
             f"Filtered {len(rejected_ids)} likely false positive(s) "
@@ -409,28 +436,38 @@ def _parse_verification_response(text, chunk, chunk_label):
                 if reason:
                     line += f"  — {reason}"
                 print(line, file=sys.stderr)
+                filtered_info.append({
+                    "item_id": cand.get("item_id"),
+                    "title": cand.get("title"),
+                    "wish_name": cand.get("wish_name"),
+                    "reason": reason,
+                })
 
-    return [cand for idx, cand in enumerate(chunk, 1) if idx not in rejected_ids]
+    kept = [cand for idx, cand in enumerate(chunk, 1) if idx not in rejected_ids]
+    return kept, filtered_info
 
 
 def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
-    """Verify one chunk. Returns ``(kept, dropped, transport_ok)``.
+    """Verify one chunk. Returns ``(kept, dropped, filtered, transport_ok)``.
 
     `base_index` is the 0-based global offset of this chunk within `matches`,
     used only to render the human-readable 1-based candidate range in warnings
     (so a bisected sub-chunk still reports its true global position).  `depth`
     is the bisection recursion depth, capped at `_VERIFY_MAX_BISECT_DEPTH`.
 
-    The three return components map to the three per-candidate outcomes
-    (BUI-297 — the crux of this ticket):
+    The per-candidate outcomes map onto the return components (BUI-297 — the
+    crux of that ticket; `filtered` added in BUI-298):
 
     - **kept**: a successfully-parsed model response did NOT reject it.
-    - **model-rejected** (silent, safe — the existing BUI-149 behavior): a
-      successfully-parsed response explicitly rejected it, with the reason
-      surfaced to stderr.  These land in neither return list beyond being
+    - **model-rejected** → **filtered** (BUI-298: this used to only print to
+      stderr; now also returned as `{item_id, title, wish_name, reason}`
+      data so `--json` output can carry it inline): a successfully-parsed
+      response explicitly rejected it, with the reason surfaced to stderr
+      AND returned here.  This is still a safe, silent-from-the-table drop —
       excluded from `kept` — the model made a real judgement, so re-surfacing
-      them on the next run would be noise.
-    - **dropped** (loud — the never-verified case this ticket exists to fix): a
+      it as a *candidate* on the next run would be noise (it's just also
+      reported as data now, not re-verified).
+    - **dropped** (loud — the never-verified case BUI-297 exists to fix): a
       candidate that never received a usable verdict, because the transport
       failed (timeout / nonzero exit / empty output, even after bisection down
       to the floor) or the response was unparseable.  These MUST be reported
@@ -466,13 +503,13 @@ def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
                 file=sys.stderr,
             )
             mid = len(chunk) // 2
-            lk, ld, lok = _verify_chunk(
+            lk, ld, lf, lok = _verify_chunk(
                 chunk[:mid], base_index, prompt_ctx, depth + 1
             )
-            rk, rd, rok = _verify_chunk(
+            rk, rd, rf, rok = _verify_chunk(
                 chunk[mid:], base_index + mid, prompt_ctx, depth + 1
             )
-            return lk + rk, ld + rd, lok + rok
+            return lk + rk, ld + rd, lf + rf, lok + rok
         # Floor / max depth reached and it still times out.  These are "never
         # verified" candidates, NOT model rejections — count them as dropped so
         # the caller fails loudly and never marks them seen.
@@ -482,7 +519,7 @@ def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
             f"marked seen — will resurface on re-run)",
             file=sys.stderr,
         )
-        return [], list(chunk), 0
+        return [], list(chunk), [], 0
     except RuntimeError as exc:
         # Non-timeout transport failure (nonzero exit / empty output / exec
         # error).  BUI-297: bisection can't fix these — retrying smaller chunks
@@ -495,7 +532,7 @@ def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
             f"marked seen — will resurface on re-run)",
             file=sys.stderr,
         )
-        return [], list(chunk), 0
+        return [], list(chunk), [], 0
 
     parsed = _parse_verification_response(text, chunk, chunk_label)
     if parsed is None:
@@ -503,25 +540,30 @@ def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
         # usable verdict, so these candidates were never actually verified.
         # BUI-297: this is a loud DROP, not a silent fail-closed discard, and
         # is distinct from a genuine model rejection (which _parse_verification_
-        # response returns as the kept subset, not None).
-        return [], list(chunk), 1
-    return parsed, [], 1
+        # response returns as (kept, filtered_info), not None).
+        return [], list(chunk), [], 1
+    kept, filtered_info = parsed
+    return kept, [], filtered_info, 1
 
 
 def verify_with_claude(matches):
-    """Split candidates into genuine matches (`kept`) and never-verified ones
-    (`dropped`), using chunked claude CLI calls.  Returns ``(kept, dropped)``.
+    """Split candidates into genuine matches (`kept`), never-verified ones
+    (`dropped`), and model-rejected ones with their reasons (`filtered`),
+    using chunked claude CLI calls.  Returns ``(kept, dropped, filtered)``.
 
     Candidates are processed in batches of at most _VERIFY_CHUNK_SIZE per call
     so that a large run never silently truncates the response.  Indices in each
     prompt are 1-based and local to the chunk so the correlation logic is
     identical to the single-call version.
 
-    Failure handling (BUI-270 + BUI-297):
+    Failure handling (BUI-270 + BUI-297 + BUI-298):
 
     - A genuine **model rejection** (parsed response explicitly rejects a
-      candidate) is a safe silent drop — surfaced to stderr, excluded from the
-      output, and NOT counted as dropped (existing BUI-149 behavior).
+      candidate) is a safe silent-from-the-table drop — surfaced to stderr AND
+      returned as `{item_id, title, wish_name, reason}` data in `filtered`
+      (BUI-298, so `--json` output can carry it inline), but NOT counted as
+      `dropped` (existing BUI-149 behavior: it's a real judgement, not a
+      never-verified candidate).
     - A **never-verified** candidate (chunk transport failure that survives
       bisection, or an unparseable response) is returned in `dropped`.  BUI-297:
       the caller must fail loudly and must never mark these seen — folding them
@@ -534,7 +576,7 @@ def verify_with_claude(matches):
       "this seller has no matching books".
     """
     if not matches:
-        return [], []
+        return [], [], []
 
     # BUI-270 preflight: a missing `claude` binary is a global failure — every
     # chunk would fail and the caller would render an empty table that looks
@@ -562,6 +604,7 @@ def verify_with_claude(matches):
 
     kept: list = []
     dropped: list = []
+    filtered: list = []
     # BUI-270 safety-net counter: a successful transport call (model actually
     # returned text, regardless of whether we could parse it) proves the
     # verifier is reachable.  If EVERY call fails at the transport layer, the
@@ -571,9 +614,10 @@ def verify_with_claude(matches):
     transport_ok = 0
     for chunk_start in range(0, len(matches), _VERIFY_CHUNK_SIZE):
         chunk = matches[chunk_start : chunk_start + _VERIFY_CHUNK_SIZE]
-        k, d, ok = _verify_chunk(chunk, chunk_start, prompt_ctx)
+        k, d, f, ok = _verify_chunk(chunk, chunk_start, prompt_ctx)
         kept.extend(k)
         dropped.extend(d)
+        filtered.extend(f)
         transport_ok += ok
         # BUI-297 circuit breaker: if an entire chunk — including every bisected
         # retry — produced zero successful model calls, the verifier is globally
@@ -598,10 +642,20 @@ def verify_with_claude(matches):
         )
         sys.exit(1)
 
-    return kept, dropped
+    return kept, dropped, filtered
 
 
 # ─── Output ───────────────────────────────────────────────────────────────────
+
+def _strip_private(rows):
+    """Strip private pipeline fields (keys starting with `_`, e.g.
+    `_series_name`/`_release_year` — BUI-245) from a list of candidate dicts.
+
+    Those fields exist only to feed verify_with_claude's "Correct series:"
+    era hint and were never meant to reach the user-facing table/JSON output.
+    """
+    return [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+
 
 def _trunc(text, width):
     if not text:
@@ -609,8 +663,14 @@ def _trunc(text, width):
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def print_matches(matches):
-    """Print match results as a human-readable table."""
+def print_matches(matches, seller_label=None):
+    """Print match results as a human-readable table.
+
+    `seller_label`, when given, prints a `=== <label> ===` header first
+    (BUI-298: distinguishes sellers in a multi-seller run's output).
+    """
+    if seller_label is not None:
+        print(f"\n=== {seller_label} ===")
     if not matches:
         print("No matches found.")
         return
@@ -637,101 +697,58 @@ def print_matches(matches):
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        prog="seller-scan",
-        description="Match an eBay seller's listings against your LOCG wish list.",
-    )
-    parser.add_argument(
-        "seller",
-        help="eBay store name (resolved via your alias map), a /usr/ or _ssn= URL, "
-             "or use --username for a raw login username",
-    )
-    parser.add_argument(
-        "--username",
-        default=None,
-        help="eBay login username to scan directly, bypassing the alias map "
-             "(for a one-off seller not yet in your aliases)",
-    )
-    parser.add_argument(
-        "--add-alias",
-        default=None,
-        metavar="USERNAME",
-        help="Register the given login USERNAME for the store name in the "
-             "positional arg, persist it, then scan",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        help="Output matches as JSON array",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        dest="show_all",
-        help="Show every wish-list match, including ones surfaced in a prior "
-             "scan. By default (BUI-113) already-seen matches are hidden. "
-             "Newly-surfaced matches are recorded as seen either way.",
-    )
-    parser.add_argument(
-        "--max-results",
-        type=int,
-        default=1000,
-        help="Maximum listings to fetch from seller (default: 1000)",
-    )
-    parser.add_argument(
-        "--env",
-        choices=["production", "sandbox"],
-        default=None,
-        help="eBay environment (overrides config)",
-    )
-    args = parser.parse_args(argv)
+def _seller_result(seller, username, *, matches=None, dropped=None,
+                   filtered=None, error=None):
+    """Build one seller's result slot for the --json `sellers` array.
 
-    # Resolve the store name to an eBay login username before anything else —
-    # a store name is NOT a username and would silently scan every seller (BUI-68).
-    if args.add_alias:
-        save_seller_alias(args.seller, args.add_alias)
-        print(
-            f"Registered alias '{args.seller.strip().lower()}' → '{args.add_alias.strip()}'",
-            file=sys.stderr,
-        )
-    aliases = load_seller_aliases()
-    try:
-        username = resolve_seller_username(
-            args.seller, aliases, username_override=args.username
-        )
-    except UnknownSellerError as e:
-        print(
-            f"Error: unknown seller '{e.store}'. A store name is not an eBay "
-            "login username, so the scan can't run safely.\n"
-            "  Find the username: open one of the seller's listings, click "
-            "'See other items', and copy the _ssn= value from the URL.\n"
-            f"  Then either:\n"
-            f"    seller-scan {e.store} --add-alias <username>   (saves it for next time)\n"
-            f"    seller-scan {e.store} --username <username>     (one-off)",
-            file=sys.stderr,
-        )
-        return 2
+    BUI-298: a single factory for the per-seller shape so its keys are defined
+    in one place — the fetch-error, unknown-seller, and success paths all go
+    through here rather than hand-building three drift-prone literals.
+    `incomplete` is derived (true iff there are dropped/never-verified
+    candidates); `matches`/`dropped`/`filtered` already have their private
+    pipeline fields stripped by the caller.
+    """
+    dropped = dropped or []
+    return {
+        "seller": seller,
+        "username": username,
+        "matches": matches or [],
+        "dropped_candidates": dropped,
+        "filtered": filtered or [],
+        "incomplete": bool(dropped),
+        "error": error,
+    }
 
-    # Auth
-    client_id, client_secret, base_url = load_config()
-    if args.env:
-        from ebay_fetch import PRODUCTION_BASE, SANDBOX_BASE
-        base_url = PRODUCTION_BASE if args.env == "production" else SANDBOX_BASE
-    token = get_token(client_id, client_secret, base_url)
 
-    # Fetch wish list
-    print("Fetching LOCG wish list...", file=sys.stderr)
-    wish_list = fetch_wish_list()
-    wish_items = prepare_wish_items(wish_list)
-    print(f"  {len(wish_items)} matchable wish list items", file=sys.stderr)
+def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
+                    max_results, show_all):
+    """Scan one seller's active listings against the (already-fetched) wish
+    list and verify candidates with Claude. Returns a per-seller result dict:
 
-    # Fetch seller listings
+        {"seller", "username", "matches", "dropped_candidates", "filtered",
+         "incomplete", "error"}
+
+    BUI-298: this is the per-seller body of what used to be all of main() —
+    extracted so main() can fetch the wish list + OAuth token ONCE and loop
+    this function over N sellers. A listing-fetch transport failure for THIS
+    seller is caught here (not left to propagate) so one bad seller in a
+    multi-seller batch can't abort the rest — it's recorded in `error` and
+    the batch continues. Alias resolution happens in the caller (main), since
+    an unresolvable seller never has a `username` to reach this function with.
+    """
     print(f"Fetching listings for seller '{username}'...", file=sys.stderr)
-    raw_listings = search_seller_listings(
-        username, token, base_url, max_results=args.max_results
-    )
+    try:
+        raw_listings = search_seller_listings(
+            username, token, base_url, max_results=max_results
+        )
+    except requests.exceptions.RequestException as e:
+        print(
+            f"Error fetching listings for seller '{username}': {e}",
+            file=sys.stderr,
+        )
+        return _seller_result(
+            seller_arg, username, error=f"listing fetch failed: {e}"
+        )
     print(f"  {len(raw_listings)} listings fetched", file=sys.stderr)
 
     # Match
@@ -771,15 +788,16 @@ def main(argv=None):
             "match_score": round(score, 2),
             # Private fields (BUI-245): carry the decorated series name so
             # verify_with_claude's "Correct series:" era hint activates for this
-            # candidate too. Stripped before output — see the json_output block.
+            # candidate too. Stripped before output — see _strip_private below.
             "_series_name": wish.get("_series_name"),
             "_release_year": wish.get("_release_year"),
         })
 
     # BUI-113: drop matches already surfaced in a prior scan (default). --all
     # skips the filter (and its server fetch); the short-circuit on an empty
-    # candidate list skips the fetch/Claude/record entirely.
-    if candidates and not args.show_all:
+    # candidate list skips the fetch/Claude/record entirely. Seen-tracking is
+    # keyed by THIS seller's username — never merged across sellers in a batch.
+    if candidates and not show_all:
         seen = fetch_seen_item_ids(username)
         before = len(candidates)
         candidates = [c for c in candidates if c["item_id"] not in seen]
@@ -792,9 +810,9 @@ def main(argv=None):
 
     if candidates:
         print(f"  {len(candidates)} candidate(s) — verifying with Claude...", file=sys.stderr)
-        matches, dropped = verify_with_claude(candidates)
+        matches, dropped, filtered = verify_with_claude(candidates)
     else:
-        matches, dropped = [], []
+        matches, dropped, filtered = [], [], []
 
     # BUI-297: `dropped` are candidates the verifier never reached a verdict on
     # (timeout / transport failure surviving bisection, or an unparseable
@@ -803,51 +821,222 @@ def main(argv=None):
     # below distinguishes a clean verified-empty result from an INCOMPLETE run.
     if dropped:
         print(
-            f"  INCOMPLETE: {len(dropped)} candidate(s) were NEVER verified "
-            f"(claude CLI timeout/transport failure). They are NOT recorded as "
-            f"seen and WILL resurface on re-run — re-run to verify them.",
+            f"  INCOMPLETE: {len(dropped)} candidate(s) for '{username}' were "
+            f"NEVER verified (claude CLI timeout/transport failure). They are "
+            f"NOT recorded as seen and WILL resurface on re-run — re-run to "
+            f"verify them.",
             file=sys.stderr,
         )
     print(f"  {len(matches)} genuine match(es) verified", file=sys.stderr)
 
-    # BUI-245: strip private pipeline fields (_series_name, _release_year) —
-    # they exist only to feed verify_with_claude's era hint and were never
-    # meant to reach the user-facing table/JSON output.
-    def _strip_private(rows):
-        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-
-    matches = _strip_private(matches)
-    dropped = _strip_private(dropped)
-
-    if args.json_output:
-        # BUI-297: the historical --json shape is a bare array of matches, and
-        # the /comic:seller-scan skill parses it as such — so keep that shape
-        # on a clean run for backward compatibility.  Only when candidates were
-        # dropped (the loud, exceptional path, which also exits non-zero) do we
-        # switch to an object carrying the `dropped_candidates` field, so a
-        # consumer can see exactly what still needs verifying.
-        if dropped:
-            print(json.dumps(
-                {"matches": matches, "dropped_candidates": dropped}, indent=2
-            ))
-        else:
-            print(json.dumps(matches, indent=2))
-    else:
-        print_matches(matches)
-
-    # BUI-113 / BUI-297 INVARIANT: only *kept* (genuinely verified) matches are
-    # ever recorded as seen.  `dropped` candidates (never verified) are
-    # deliberately NOT passed here — marking them seen would suppress them on
-    # the next scan and silently lose a real wish-list match (the BUI-297 bug).
-    # Do not add `dropped` to this call.
+    # BUI-113 / BUI-297 / BUI-298 INVARIANT: only *kept* matches for THIS
+    # seller are ever recorded as seen, keyed by THIS seller's username.
+    # `dropped` (never-verified) candidates are deliberately NEVER passed here
+    # — marking them seen would suppress them on the next scan and silently
+    # lose a real wish-list match (the BUI-297 bug). This must also never be
+    # merged across sellers in a batch — each seller's seen-set is independent.
     # Runs under --all too — --all means "show me everything again", not "forget".
     if matches:
         record_items_seen([m["item_id"] for m in matches], username)
 
-    # BUI-297: a distinct non-zero exit code signals an incomplete verification
-    # run (never-verified candidates dropped) so callers/skills can tell it
-    # apart from a clean "0 matches" scan (exit 0).
-    return _EXIT_INCOMPLETE if dropped else 0
+    return _seller_result(
+        seller_arg, username,
+        matches=_strip_private(matches),
+        dropped=_strip_private(dropped),
+        filtered=filtered,
+    )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="seller-scan",
+        description="Match one or more eBay sellers' listings against your LOCG wish list.",
+    )
+    parser.add_argument(
+        "sellers",
+        nargs="+",
+        help="One or more eBay store names (resolved via your alias map), "
+             "/usr/ or _ssn= URLs, or raw login usernames (with --username). "
+             "BUI-298: passing multiple sellers fetches the wish list + OAuth "
+             "token ONCE and scans them in a single internal loop — always "
+             "prefer this over invoking seller-scan once per seller.",
+    )
+    parser.add_argument(
+        "--username",
+        default=None,
+        help="eBay login username to scan directly, bypassing the alias map "
+             "(for a one-off seller not yet in your aliases). Single-seller only.",
+    )
+    parser.add_argument(
+        "--add-alias",
+        default=None,
+        metavar="USERNAME",
+        help="Register the given login USERNAME for the store name in the "
+             "positional arg, persist it, then scan. Single-seller only.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output results as a single JSON object (BUI-298: always an "
+             "object — never a bare array — with a per-seller breakdown; "
+             "see main()'s docstring / the skill doc for the shape)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        dest="show_all",
+        help="Show every wish-list match, including ones surfaced in a prior "
+             "scan. By default (BUI-113) already-seen matches are hidden. "
+             "Newly-surfaced matches are recorded as seen either way.",
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=1000,
+        help="Maximum listings to fetch per seller (default: 1000)",
+    )
+    parser.add_argument(
+        "--env",
+        choices=["production", "sandbox"],
+        default=None,
+        help="eBay environment (overrides config)",
+    )
+    args = parser.parse_args(argv)
+
+    # BUI-298: --username/--add-alias are single-seller conveniences (override
+    # or register ONE alias) — ambiguous across a multi-seller batch, so
+    # refuse rather than silently applying either to only the first seller.
+    if (args.username or args.add_alias) and len(args.sellers) > 1:
+        parser.error(
+            "--username/--add-alias apply to exactly one seller (applying "
+            "them across a multi-seller batch would be ambiguous) — pass a "
+            "single seller when using them"
+        )
+
+    # BUI-298: persist a new --add-alias BEFORE loading the alias map, so the
+    # map read below already contains it and resolve_seller_username finds it
+    # (guaranteed single-seller by the guard above — args.sellers[0] is the
+    # only seller). Regression guard: BUI-298 hoisted load_seller_aliases()
+    # out of the per-seller loop; if the save stayed inside the loop, resolve
+    # would run against the stale pre-save map and false-fail as "unknown
+    # seller" even though the alias was written to disk.
+    if args.add_alias:
+        save_seller_alias(args.sellers[0], args.add_alias)
+        print(
+            f"Registered alias '{args.sellers[0].strip().lower()}' → '{args.add_alias.strip()}'",
+            file=sys.stderr,
+        )
+
+    aliases = load_seller_aliases()
+
+    # Auth — fetched ONCE for the whole batch (BUI-298; previously each
+    # single-seller invocation re-fetched its own token).
+    client_id, client_secret, base_url = load_config()
+    if args.env:
+        from ebay_fetch import PRODUCTION_BASE, SANDBOX_BASE
+        base_url = PRODUCTION_BASE if args.env == "production" else SANDBOX_BASE
+    token = get_token(client_id, client_secret, base_url)
+
+    # Wish list — fetched + prepped ONCE for the whole batch (BUI-298;
+    # previously each single-seller invocation re-fetched the full ~815-item
+    # wish list — 9x redundant HTTP for a 9-seller scan).
+    print("Fetching LOCG wish list...", file=sys.stderr)
+    wish_list = fetch_wish_list()
+    wish_items = prepare_wish_items(wish_list)
+    print(f"  {len(wish_items)} matchable wish list items", file=sys.stderr)
+
+    results = []
+    # BUI-298 reliability: a GLOBAL verifier failure (missing claude CLI /
+    # every chunk failed transport) makes verify_with_claude sys.exit(1). In a
+    # multi-seller batch that must not silently discard the results of sellers
+    # already scanned this run — they were recorded seen but, since main()
+    # only prints after the loop, would never be shown (the BUI-297 lost-match
+    # failure class re-entering via crash-before-print). Catch it, record the
+    # failing seller's slot, and stop — a global failure hits every remaining
+    # seller identically, and the _EXIT_VERIFIER_DOWN signal tells the caller
+    # to re-run the whole batch once the verifier is reachable.
+    verifier_down = False
+    for seller_arg in args.sellers:
+        # Resolve the store name to an eBay login username before anything
+        # else — a store name is NOT a username and would silently scan
+        # every seller (BUI-68). BUI-298: an unresolvable seller does NOT
+        # abort the batch — its slot records the error and the loop continues.
+        # (Any --add-alias was already persisted + folded into `aliases`
+        # above, before the map was loaded — single-seller only.)
+        try:
+            username = resolve_seller_username(
+                seller_arg, aliases, username_override=args.username
+            )
+        except UnknownSellerError as e:
+            print(
+                f"Error: unknown seller '{e.store}'. A store name is not an eBay "
+                "login username, so the scan can't run safely.\n"
+                "  Find the username: open one of the seller's listings, click "
+                "'See other items', and copy the _ssn= value from the URL.\n"
+                f"  Then either:\n"
+                f"    seller-scan {e.store} --add-alias <username>   (saves it for next time)\n"
+                f"    seller-scan {e.store} --username <username>     (one-off)",
+                file=sys.stderr,
+            )
+            results.append(_seller_result(
+                seller_arg, None, error=f"unknown seller '{e.store}'"
+            ))
+            continue
+
+        try:
+            results.append(_scan_one_seller(
+                seller_arg, username, token, base_url, wish_items,
+                args.max_results, args.show_all,
+            ))
+        except SystemExit as e:
+            # verify_with_claude's global-failure guard (the ONLY sys.exit in
+            # this call path) fired — the verifier is down for every seller.
+            verifier_down = True
+            results.append(_seller_result(
+                seller_arg, username,
+                error=f"claude verifier globally unavailable (exit {e.code}) — "
+                      "re-run the batch once it is reachable",
+            ))
+            break
+
+    any_incomplete = any(r["incomplete"] for r in results)
+    any_error = any(r["error"] for r in results)
+
+    if args.json_output:
+        # BUI-298 (fold-in A): --json is ALWAYS a top-level object — never a
+        # bare array — so a caller can branch exit-code-first and then drill
+        # into a stable shape regardless of clean/dirty run. This replaces the
+        # BUI-297 polymorphic shape (bare array on clean, object only when
+        # something was dropped), which existed only because that PR couldn't
+        # also update the skill's parser — BUI-298 does, so the ambiguity is
+        # gone. `incomplete` is true iff ANY seller's slot is incomplete.
+        print(json.dumps({
+            "incomplete": any_incomplete,
+            "sellers": results,
+        }, indent=2))
+    else:
+        multi = len(results) > 1
+        for r in results:
+            if r["error"]:
+                if multi:
+                    print(f"\n=== {r['seller']} ===")
+                print(f"Error: {r['error']}")
+                continue
+            print_matches(
+                r["matches"],
+                seller_label=(f"{r['seller']} ({r['username']})" if multi else None),
+            )
+
+    # BUI-298 exit-code priority (see the exit-constant comments above):
+    # verifier-down (1) > incomplete (3) > seller-error (2) > clean (0).
+    if verifier_down:
+        return _EXIT_VERIFIER_DOWN
+    if any_incomplete:
+        return _EXIT_INCOMPLETE
+    if any_error:
+        return _EXIT_SELLER_ERROR
+    return 0
 
 
 if __name__ == "__main__":
