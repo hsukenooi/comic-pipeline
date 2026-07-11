@@ -1439,7 +1439,7 @@ class TestVerifyWithClaudeChunking:
 
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         assert len(calls) == 9  # ceil(250 / 30)
         assert len(kept) == 250
@@ -1459,7 +1459,7 @@ class TestVerifyWithClaudeChunking:
             seller_scan, "_verify_via_claude_cli", lambda prompt: next(responses)
         )
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         # 30 from chunk 1 + 1 from chunk 2 = 31
         assert len(kept) == 31
@@ -1478,7 +1478,7 @@ class TestVerifyWithClaudeChunking:
             lambda prompt: "I cannot help with that request.",
         )
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         assert kept == []
         assert len(dropped) == 3
@@ -1495,7 +1495,7 @@ class TestVerifyWithClaudeChunking:
             seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
         )
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         assert kept == []
         assert len(dropped) == 5
@@ -1511,7 +1511,7 @@ class TestVerifyWithClaudeChunking:
             seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
         )
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         assert kept == []
         assert len(dropped) == 5
@@ -1527,7 +1527,7 @@ class TestVerifyWithClaudeChunking:
             seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
         )
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         assert kept == []
         assert len(dropped) == 5
@@ -1539,7 +1539,7 @@ class TestVerifyWithClaudeChunking:
         matches = self._make_matches(5)
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", lambda prompt: "[]")
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         assert len(kept) == 5
         assert dropped == []
@@ -1553,7 +1553,7 @@ class TestVerifyWithClaudeChunking:
             seller_scan, "_verify_via_claude_cli", lambda prompt: next(responses)
         )
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         # First 30 dropped (bad chunk); last 30 kept.
         assert len(kept) == 30
@@ -1701,7 +1701,7 @@ class TestVerifyWithClaudeNoSilentDrop:
             seller_scan, "_verify_via_claude_cli", lambda prompt: verdict_json
         )
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         # Only the genuine match is returned (unchanged behaviour).
         assert [m["title"] for m in kept] == ["Amazing Spider-Man #300 NM Marvel 1988"]
@@ -1750,7 +1750,7 @@ class TestVerifyBisectionAndDrops:
 
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         assert len(kept) == 30
         assert dropped == []
@@ -1776,7 +1776,7 @@ class TestVerifyBisectionAndDrops:
 
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         # The poison candidate is isolated into the dropped group; the rest keep.
         assert any(c["title"] == "Comic Series #1" for c in dropped)
@@ -1803,7 +1803,7 @@ class TestVerifyBisectionAndDrops:
 
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         # Chunk 1 fully kept; chunk 2 entirely dropped (never verified).
         assert len(kept) == 30
@@ -1896,7 +1896,7 @@ class TestVerifyBisectionAndDrops:
 
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
 
         # Chunk 1: 30 - 1 rejected = 29 kept, and the rejected one is NOT dropped.
         assert len(kept) == 29
@@ -1908,56 +1908,86 @@ class TestVerifyBisectionAndDrops:
 
 
 class TestMainDroppedCandidatesExit:
-    """BUI-297 end-to-end through main(): a run with never-verified candidates
-    exits non-zero, emits the dropped_candidates JSON field, and records ONLY
-    the kept matches as seen."""
+    """BUI-297/BUI-298 end-to-end through main(): a run with never-verified
+    candidates exits non-zero and reports incompleteness per-seller inside
+    the always-object --json shape; only kept matches are ever recorded seen.
+    """
 
-    def _wire_main(self, monkeypatch, verify_return, record_sink):
+    def _wire_main(
+        self, monkeypatch, verify_return_by_username, record_sink,
+        wish_fetch_calls=None, token_calls=None,
+    ):
         """Stub out every external seam so main() reaches verify_with_claude
-        with two candidates, then returns `verify_return` from it."""
+        for each seller with two per-seller candidates (item_ids
+        "<username>-A1"/"<username>-A2"), then returns
+        `verify_return_by_username[username](cands)` from verify_with_claude.
+
+        `wish_fetch_calls`/`token_calls`, if given, are lists appended to on
+        each fetch_wish_list()/get_token() call — used to assert single-fetch
+        behavior across a multi-seller batch (BUI-298 requirement #1).
+        """
         monkeypatch.setattr(seller_scan, "load_seller_aliases", lambda: {})
+        # BUI-298: echo the seller arg back as the "resolved" username so a
+        # multi-seller test can address each seller's stubbed listings/verify
+        # behavior by name.
         monkeypatch.setattr(
-            seller_scan, "resolve_seller_username", lambda *a, **k: "seller1"
+            seller_scan,
+            "resolve_seller_username",
+            lambda seller, aliases, username_override=None: seller,
         )
         monkeypatch.setattr(
             seller_scan, "load_config", lambda: ("id", "secret", "http://x")
         )
-        monkeypatch.setattr(seller_scan, "get_token", lambda *a, **k: "tok")
-        monkeypatch.setattr(
-            seller_scan,
-            "fetch_wish_list",
-            lambda: [{"id": 1, "name": "Amazing Spider-Man #300"}],
-        )
-        raw_listings = [
-            {"item_id": "A1", "title": "Amazing Spider-Man #300 one"},
-            {"item_id": "A2", "title": "Amazing Spider-Man #300 two"},
-        ]
-        monkeypatch.setattr(
-            seller_scan, "search_seller_listings", lambda *a, **k: raw_listings
-        )
+
+        def fake_get_token(*a, **k):
+            if token_calls is not None:
+                token_calls.append(1)
+            return "tok"
+
+        monkeypatch.setattr(seller_scan, "get_token", fake_get_token)
+
+        def fake_fetch_wish_list():
+            if wish_fetch_calls is not None:
+                wish_fetch_calls.append(1)
+            return [{"id": 1, "name": "Amazing Spider-Man #300"}]
+
+        monkeypatch.setattr(seller_scan, "fetch_wish_list", fake_fetch_wish_list)
+
+        def fake_search(username, token, base_url, max_results=1000):
+            return [
+                {"item_id": f"{username}-A1", "title": "Amazing Spider-Man #300 one"},
+                {"item_id": f"{username}-A2", "title": "Amazing Spider-Man #300 two"},
+            ]
+
+        monkeypatch.setattr(seller_scan, "search_seller_listings", fake_search)
         monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
         monkeypatch.setattr(
             seller_scan, "match_listing", lambda title, wish_items: (wish_items[0], 0.9)
         )
         monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
         monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
-        monkeypatch.setattr(
-            seller_scan, "verify_with_claude", lambda cands: verify_return(cands)
-        )
+
+        def fake_verify(cands):
+            username = cands[0]["item_id"].rsplit("-", 1)[0]
+            return verify_return_by_username[username](cands)
+
+        monkeypatch.setattr(seller_scan, "verify_with_claude", fake_verify)
         monkeypatch.setattr(
             seller_scan,
             "record_items_seen",
-            lambda ids, seller: record_sink.extend(ids),
+            lambda ids, seller: record_sink.setdefault(seller, []).extend(ids),
         )
 
-    def test_dropped_run_exits_3_json_field_and_seen_invariant(
+    def test_dropped_run_exits_3_object_json_and_seen_invariant(
         self, monkeypatch, capsys
     ):
-        recorded = []
+        recorded = {}
         # First candidate kept (verified), second dropped (never verified).
         self._wire_main(
             monkeypatch,
-            verify_return=lambda cands: (cands[:1], cands[1:]),
+            verify_return_by_username={
+                "seller1": lambda cands: (cands[:1], cands[1:], [])
+            },
             record_sink=recorded,
         )
 
@@ -1968,31 +1998,40 @@ class TestMainDroppedCandidatesExit:
 
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
-        # AC #2: --json carries a dropped_candidates field on the loud path.
-        assert "dropped_candidates" in payload
-        assert len(payload["matches"]) == 1
-        assert len(payload["dropped_candidates"]) == 1
-        assert payload["matches"][0]["item_id"] == "A1"
-        assert payload["dropped_candidates"][0]["item_id"] == "A2"
+        # BUI-298 fold-in A: --json is ALWAYS a top-level object.
+        assert isinstance(payload, dict)
+        assert payload["incomplete"] is True
+        assert len(payload["sellers"]) == 1
+        seller_result = payload["sellers"][0]
+        assert seller_result["seller"] == "seller1"
+        assert seller_result["username"] == "seller1"
+        assert seller_result["incomplete"] is True
+        assert seller_result["error"] is None
+        assert len(seller_result["matches"]) == 1
+        assert len(seller_result["dropped_candidates"]) == 1
+        assert seller_result["matches"][0]["item_id"] == "seller1-A1"
+        assert seller_result["dropped_candidates"][0]["item_id"] == "seller1-A2"
         # Private pipeline fields are stripped from the dropped side too.
         assert not any(
-            k.startswith("_") for k in payload["dropped_candidates"][0]
+            k.startswith("_") for k in seller_result["dropped_candidates"][0]
         )
 
         # AC #2: the loud INCOMPLETE banner tells the operator to re-run.
         assert "INCOMPLETE" in captured.err
         assert "resurface on re-run" in captured.err
 
-        # AC #5: only the kept match is recorded as seen — the dropped one is
-        # never marked, so it resurfaces on re-run.
-        assert recorded == ["A1"]
+        # AC #5 / BUI-298: only the kept match is recorded as seen — the
+        # dropped one is never marked, so it resurfaces on re-run.
+        assert recorded == {"seller1": ["seller1-A1"]}
 
-    def test_clean_run_exits_0_with_bare_array_json(self, monkeypatch, capsys):
-        recorded = []
+    def test_clean_run_exits_0_with_object_json(self, monkeypatch, capsys):
+        recorded = {}
         # Both candidates kept, none dropped.
         self._wire_main(
             monkeypatch,
-            verify_return=lambda cands: (list(cands), []),
+            verify_return_by_username={
+                "seller1": lambda cands: (list(cands), [], [])
+            },
             record_sink=recorded,
         )
 
@@ -2001,10 +2040,371 @@ class TestMainDroppedCandidatesExit:
         assert code == 0
         out = capsys.readouterr().out
         payload = json.loads(out)
-        # Backward-compatible bare-array shape when nothing was dropped.
-        assert isinstance(payload, list)
-        assert {row["item_id"] for row in payload} == {"A1", "A2"}
-        assert recorded == ["A1", "A2"]
+        # BUI-298: always an object, even on a fully clean run (no more
+        # backward-compat bare-array shape).
+        assert isinstance(payload, dict)
+        assert payload["incomplete"] is False
+        assert len(payload["sellers"]) == 1
+        seller_result = payload["sellers"][0]
+        assert seller_result["incomplete"] is False
+        assert {row["item_id"] for row in seller_result["matches"]} == {
+            "seller1-A1", "seller1-A2",
+        }
+        assert recorded == {"seller1": ["seller1-A1", "seller1-A2"]}
+
+    def test_filtered_reasons_included_inline_in_json(self, monkeypatch, capsys):
+        """BUI-298 requirement #2: the "Filtered N false positive(s)" reasons
+        (model-rejected candidates) are available in --json output, not just
+        stderr."""
+        recorded = {}
+        filtered_info = [{
+            "item_id": "seller1-A2", "title": "Daredevil Annual #1",
+            "wish_name": "Daredevil #1", "reason": "annual, not regular series",
+        }]
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "seller1": lambda cands: (cands[:1], [], filtered_info)
+            },
+            record_sink=recorded,
+        )
+
+        code = seller_scan.main(["seller1", "--json"])
+        assert code == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        seller_result = payload["sellers"][0]
+        assert seller_result["filtered"] == filtered_info
+
+    def test_multi_seller_fetches_wish_list_and_token_exactly_once(
+        self, monkeypatch, capsys
+    ):
+        """BUI-298 requirement #1: a batch of 3 sellers fetches the wish list
+        + OAuth token ONCE, not once per seller."""
+        recorded = {}
+        wish_fetch_calls = []
+        token_calls = []
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "sellerA": lambda cands: (list(cands), [], []),
+                "sellerB": lambda cands: (list(cands), [], []),
+                "sellerC": lambda cands: (list(cands), [], []),
+            },
+            record_sink=recorded,
+            wish_fetch_calls=wish_fetch_calls,
+            token_calls=token_calls,
+        )
+
+        code = seller_scan.main(["sellerA", "sellerB", "sellerC", "--json"])
+
+        assert code == 0
+        assert len(wish_fetch_calls) == 1
+        assert len(token_calls) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert [s["seller"] for s in payload["sellers"]] == [
+            "sellerA", "sellerB", "sellerC",
+        ]
+        # Each seller's seen-recording stays independent — never merged.
+        assert set(recorded.keys()) == {"sellerA", "sellerB", "sellerC"}
+
+    def test_per_seller_incomplete_propagation_overall_exit_3(
+        self, monkeypatch, capsys
+    ):
+        """BUI-298 fold-in B: one seller in a batch is incomplete (dropped
+        candidates) while another is clean — that seller's slot is flagged,
+        the other stays clean, and the OVERALL exit code is still 3."""
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "sellerClean": lambda cands: (list(cands), [], []),
+                "sellerBad": lambda cands: (cands[:1], cands[1:], []),
+            },
+            record_sink=recorded,
+        )
+
+        code = seller_scan.main(["sellerClean", "sellerBad", "--json"])
+
+        assert code == 3
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["incomplete"] is True
+        by_seller = {s["seller"]: s for s in payload["sellers"]}
+        assert by_seller["sellerClean"]["incomplete"] is False
+        assert by_seller["sellerClean"]["dropped_candidates"] == []
+        assert by_seller["sellerBad"]["incomplete"] is True
+        assert len(by_seller["sellerBad"]["dropped_candidates"]) == 1
+        # Seen-invariant preserved per-seller: sellerBad's dropped candidate
+        # never recorded seen; sellerClean unaffected by sellerBad's drop.
+        assert recorded["sellerClean"] == ["sellerClean-A1", "sellerClean-A2"]
+        assert recorded["sellerBad"] == ["sellerBad-A1"]
+
+    def test_unknown_seller_in_batch_records_error_and_continues(
+        self, monkeypatch, capsys
+    ):
+        """BUI-298: one seller failing alias resolution does not abort the
+        rest of the batch."""
+        recorded = {}
+        wish_fetch_calls = []
+
+        def resolve(seller, aliases, username_override=None):
+            if seller == "badseller":
+                raise ebay_fetch.UnknownSellerError("badseller")
+            return seller
+
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "goodseller": lambda cands: (list(cands), [], []),
+            },
+            record_sink=recorded,
+            wish_fetch_calls=wish_fetch_calls,
+        )
+        monkeypatch.setattr(seller_scan, "resolve_seller_username", resolve)
+
+        code = seller_scan.main(["badseller", "goodseller", "--json"])
+
+        # No seller was incomplete, but one had a resolution error → exit 2.
+        assert code == 2
+        payload = json.loads(capsys.readouterr().out)
+        by_seller = {s["seller"]: s for s in payload["sellers"]}
+        assert by_seller["badseller"]["error"] == "unknown seller 'badseller'"
+        assert by_seller["badseller"]["username"] is None
+        assert by_seller["badseller"]["incomplete"] is False
+        assert by_seller["goodseller"]["error"] is None
+        assert {row["item_id"] for row in by_seller["goodseller"]["matches"]} == {
+            "goodseller-A1", "goodseller-A2",
+        }
+        # The wish list is still fetched once even though one seller errored.
+        assert len(wish_fetch_calls) == 1
+
+    def test_listing_fetch_error_in_batch_records_error_and_continues(
+        self, monkeypatch, capsys
+    ):
+        """BUI-298: a per-seller listing-fetch RequestException isolates to that
+        seller's slot (error recorded) and does NOT abort the batch."""
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "goodseller": lambda cands: (list(cands), [], []),
+            },
+            record_sink=recorded,
+        )
+
+        def fake_search(username, token, base_url, max_results=1000):
+            if username == "badfetch":
+                raise seller_scan.requests.exceptions.ConnectionError("eBay down")
+            return [
+                {"item_id": f"{username}-A1", "title": "Amazing Spider-Man #300 one"},
+            ]
+
+        monkeypatch.setattr(seller_scan, "search_seller_listings", fake_search)
+
+        code = seller_scan.main(["badfetch", "goodseller", "--json"])
+
+        # A fetch failure is a seller error (exit 2), not incomplete.
+        assert code == 2
+        payload = json.loads(capsys.readouterr().out)
+        by_seller = {s["seller"]: s for s in payload["sellers"]}
+        assert "listing fetch failed" in by_seller["badfetch"]["error"]
+        assert by_seller["badfetch"]["matches"] == []
+        # The good seller after it still ran.
+        assert by_seller["goodseller"]["error"] is None
+        assert len(by_seller["goodseller"]["matches"]) == 1
+
+    def test_multi_seller_non_json_output_has_per_seller_sections(
+        self, monkeypatch, capsys
+    ):
+        """BUI-298: multi-seller non-JSON output prints a per-seller header for
+        each seller and an `Error:` line for an erroring seller."""
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "goodseller": lambda cands: (list(cands), [], []),
+            },
+            record_sink=recorded,
+        )
+
+        def resolve(seller, aliases, username_override=None):
+            if seller == "badseller":
+                raise ebay_fetch.UnknownSellerError("badseller")
+            return seller
+
+        monkeypatch.setattr(seller_scan, "resolve_seller_username", resolve)
+
+        seller_scan.main(["goodseller", "badseller"])  # no --json
+
+        out = capsys.readouterr().out
+        # Per-seller headers distinguish the two sellers' sections.
+        assert "=== goodseller (goodseller) ===" in out
+        assert "=== badseller ===" in out
+        assert "Error: unknown seller 'badseller'" in out
+        # The good seller's match table rendered (wish_name is a printed column).
+        assert "Amazing Spider-Man #300" in out
+
+    def test_incomplete_wins_over_error_when_batch_has_both(
+        self, monkeypatch, capsys
+    ):
+        """BUI-298 exit-code priority: a batch with BOTH an unresolved seller
+        (would be exit 2) AND an incomplete seller (exit 3) exits 3 — the
+        documented precedence."""
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                # sellerBad is incomplete (one dropped candidate).
+                "sellerBad": lambda cands: (cands[:1], cands[1:], []),
+            },
+            record_sink=recorded,
+        )
+
+        def resolve(seller, aliases, username_override=None):
+            if seller == "unresolvable":
+                raise ebay_fetch.UnknownSellerError("unresolvable")
+            return seller
+
+        monkeypatch.setattr(seller_scan, "resolve_seller_username", resolve)
+
+        code = seller_scan.main(["unresolvable", "sellerBad", "--json"])
+
+        # Both an error slot AND an incomplete slot exist; exit 3 wins.
+        assert code == 3
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["incomplete"] is True
+        by_seller = {s["seller"]: s for s in payload["sellers"]}
+        assert by_seller["unresolvable"]["error"] is not None
+        assert by_seller["sellerBad"]["incomplete"] is True
+
+    def test_global_verifier_failure_mid_batch_still_prints_prior_sellers(
+        self, monkeypatch, capsys
+    ):
+        """BUI-298 reliability: a GLOBAL verifier failure (verify_with_claude
+        sys.exit(1)) on seller 2 must NOT discard seller 1's already-scanned
+        result — the batch prints what it has and exits 1 (verifier-down), the
+        most severe code."""
+        recorded = {}
+
+        def verify(cands):
+            username = cands[0]["item_id"].rsplit("-", 1)[0]
+            if username == "sellerDead":
+                # Simulate verify_with_claude's global-failure hard-exit.
+                raise SystemExit(1)
+            return (list(cands), [], [])
+
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={},  # unused; we override verify below
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(seller_scan, "verify_with_claude", verify)
+
+        code = seller_scan.main(["sellerOk", "sellerDead", "sellerNever", "--json"])
+
+        # Verifier-down is the most severe exit.
+        assert code == 1
+        payload = json.loads(capsys.readouterr().out)
+        by_seller = {s["seller"]: s for s in payload["sellers"]}
+        # Seller 1's result was NOT discarded — it printed with its matches.
+        assert by_seller["sellerOk"]["error"] is None
+        assert len(by_seller["sellerOk"]["matches"]) == 2
+        # The dead seller carries the global-failure error.
+        assert "globally unavailable" in by_seller["sellerDead"]["error"]
+        # The loop broke — seller 3 was never attempted (global failure hits all).
+        assert "sellerNever" not in by_seller
+        # Seller 1's matches WERE recorded seen (they were genuinely verified);
+        # the reliability fix ensures they're also shown, not silently lost.
+        assert recorded["sellerOk"] == ["sellerOk-A1", "sellerOk-A2"]
+
+    def test_username_and_add_alias_reject_multi_seller(self, monkeypatch, capsys):
+        """BUI-298: --username/--add-alias are single-seller conveniences —
+        passing them with 2+ sellers is a usage error, not a silent
+        first-seller-only application."""
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.main(["seller1", "seller2", "--username", "realuser"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "single seller" in err.lower() or "--username" in err
+
+    def test_single_seller_non_json_output_still_prints_table(
+        self, monkeypatch, capsys
+    ):
+        """Backward-compat: a single-seller, non-JSON invocation still prints
+        the plain table (no forced seller header for N=1)."""
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "seller1": lambda cands: (list(cands), [], []),
+            },
+            record_sink=recorded,
+        )
+
+        code = seller_scan.main(["seller1"])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "=== seller1" not in out
+        assert "seller1-A1" not in out  # item_id isn't a printed column...
+        assert "Amazing Spider-Man #300" in out  # ...but the wish_name is
+
+    def test_add_alias_register_then_scan_uses_fresh_alias(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """BUI-298 regression: `--add-alias` must persist AND be honored in the
+        same invocation. The batching refactor hoisted load_seller_aliases()
+        out of the per-seller loop; if the save stayed inside the loop, the
+        alias map read for resolution would be stale and the run would
+        false-fail as "unknown seller" despite writing the alias to disk.
+
+        Uses the REAL save/load/resolve alias path (only network seams are
+        mocked) so it exercises the exact code the earlier main() tests mock
+        away.
+        """
+        monkeypatch.setattr(
+            ebay_fetch, "SELLER_ALIASES_FILE", tmp_path / "aliases.json"
+        )
+        monkeypatch.setattr(
+            seller_scan, "load_config", lambda: ("id", "secret", "http://x")
+        )
+        monkeypatch.setattr(seller_scan, "get_token", lambda *a, **k: "tok")
+        monkeypatch.setattr(
+            seller_scan, "fetch_wish_list",
+            lambda: [{"id": 1, "name": "Amazing Spider-Man #300"}],
+        )
+        searched = {}
+
+        def fake_search(username, token, base_url, max_results=1000):
+            searched["username"] = username
+            return [{"item_id": "X1", "title": "Amazing Spider-Man #300"}]
+
+        monkeypatch.setattr(seller_scan, "search_seller_listings", fake_search)
+        monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
+        monkeypatch.setattr(
+            seller_scan, "match_listing", lambda title, wish_items: (wish_items[0], 0.9)
+        )
+        monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
+        monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
+        monkeypatch.setattr(
+            seller_scan, "verify_with_claude", lambda cands: (list(cands), [], [])
+        )
+        monkeypatch.setattr(seller_scan, "record_items_seen", lambda ids, seller: None)
+
+        # A brand-new store name, registered in the SAME call via --add-alias.
+        code = seller_scan.main(
+            ["newstore", "--add-alias", "newstore_login", "--json"]
+        )
+
+        # It resolved to the freshly-saved username and actually scanned —
+        # NOT a false "unknown seller" / exit 2.
+        assert code == 0
+        assert searched["username"] == "newstore_login"
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["sellers"][0]["error"] is None
+        assert payload["sellers"][0]["username"] == "newstore_login"
+        # The alias was persisted for next time.
+        assert ebay_fetch.load_seller_aliases()["newstore"] == "newstore_login"
 
 
 # ─── BUI-227: _title_paren_years ─────────────────────────────────────────────
@@ -2658,7 +3058,7 @@ class TestVerifyWithClaudePromptEnrichment:
             lambda prompt: '[{"id":2,"reason":"annual vs regular"}]',
         )
 
-        kept, dropped = seller_scan.verify_with_claude(matches)
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
         assert len(kept) == 1
         assert kept[0]["title"] == "Amazing Spider-Man #7"
         assert dropped == []
@@ -3086,7 +3486,7 @@ class TestMainCandidateLoopGateChain:
         )
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
-        kept, dropped = seller_scan.verify_with_claude(candidates)
+        kept, dropped, filtered = seller_scan.verify_with_claude(candidates)
 
         assert "Correct series: The Amazing Spider-Man (Vol. 1) (1963 - 1998)" in prompts_seen[0]
         assert kept == []

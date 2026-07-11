@@ -594,14 +594,19 @@ def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list]
             f"  Verifying {len(representatives)} uncached candidate(s) with Claude Haiku...",
             file=sys.stderr,
         )
-        # BUI-297: verify_with_claude returns (kept, dropped). `dropped` are
-        # candidates the verifier NEVER reached a verdict on (claude CLI
-        # timeout / transport failure surviving bisection) — semantically NOT a
-        # rejection. They must be treated as never-verified: NOT cached as a
-        # verdict (caching False would make a never-verified book a permanent
-        # silent rejection that never resurfaces) and NOT recorded as seen, so
-        # they resurface and re-verify on the next scheduled run.
-        verified_reps, dropped_reps = verify_with_claude(representatives)
+        # BUI-297/BUI-298: verify_with_claude returns (kept, dropped, filtered).
+        # `dropped` are candidates the verifier NEVER reached a verdict on
+        # (claude CLI timeout / transport failure surviving bisection) —
+        # semantically NOT a rejection. They must be treated as never-verified:
+        # NOT cached as a verdict (caching False would make a never-verified
+        # book a permanent silent rejection that never resurfaces) and NOT
+        # recorded as seen, so they resurface and re-verify on the next
+        # scheduled run. `filtered` (BUI-298: model-rejected candidates with
+        # reasons) is a safe silent drop — the model made a real judgement, so
+        # it's cached as a rejection via the genuine_keys logic below just like
+        # before; wishlist-sellers has no use for the inline reasons, so it's
+        # ignored here (the stderr "Filtered N …" line still prints).
+        verified_reps, dropped_reps, _filtered_reps = verify_with_claude(representatives)
         # Keys that came back as genuine from verify
         genuine_keys = {(_title_key(m["title"]), m["wish_name"]) for m in verified_reps}
         dropped_keys = {(_title_key(m["title"]), m["wish_name"]) for m in dropped_reps}
