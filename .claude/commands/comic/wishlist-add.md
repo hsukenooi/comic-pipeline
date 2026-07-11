@@ -170,6 +170,13 @@ full_title_matched, cache_age_days}, ...]}` — one entry per input item, echoin
 its `series`/`issue` so you can correlate by key (don't rely on order). Per item:
 
 - `{"match_status": "in_collection"}` → **owned, skip it** (don't wish-list).
+- `{"match_status": "ambiguous_cross_volume"}` → **owned, skip it** (don't
+  wish-list) — same as `in_collection` (BUI-284: owned under >1 volume, no year
+  to disambiguate — still an ownership signal). This is backstopped by the
+  per-issue `POST /api/comics/wish-list` owned-guard, which also treats it as
+  owned and 409s (so a slip-through here isn't a data-loss risk, just a wasted
+  round-trip) — but skip it client-side anyway (BUI-302) so it never reaches
+  the to-add list in the first place.
 - `{"match_status": "not_in_cache"}` → not owned, keep it.
 
 The batch call's HTTP status is the whole-batch signal:

@@ -450,7 +450,11 @@ def batch_check_owned(wish_pairs: list[tuple[str, str]], base: str) -> set:
         sys.exit(1)
     owned: set[tuple[str, str]] = set()
     for r in data.get("results", []):
-        if r.get("match_status") == "in_collection":
+        # BUI-302: ambiguous_cross_volume (BUI-284) is owned under >1 volume
+        # with no year to disambiguate — still an ownership signal. Treat it
+        # as owned here too: skipping a possibly-owned book as a buy candidate
+        # is the safe direction (a human still reviews at buy time).
+        if r.get("match_status") in ("in_collection", "ambiguous_cross_volume"):
             owned.add((r.get("series", ""), r.get("issue", "")))
     return owned
 
