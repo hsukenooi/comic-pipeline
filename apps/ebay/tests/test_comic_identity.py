@@ -689,3 +689,151 @@ class TestMatchListingDelegatesCorrectly:
         wish, score = seller_scan.match_listing("", items)
         assert wish is None
         assert score == 0.0
+
+
+# ─── confident_cover_year() — the BUI-316 strict gate ──────────────────────
+# The proper fix for BUI-308's single-owned-wrong-volume false positive: only
+# forward a per-issue cover year to /comic:collection-check when the title's
+# parenthesized year AND item-specifics Publication Year corroborate it within
+# ±1, and never for a facsimile/reprint. A correct year is Pareto-better (it
+# lets the matcher's year gate reject the wrong volume); a wrong/uncertain one
+# is never emitted, so it cannot reintroduce BUI-129.
+
+
+class TestConfidentCoverYear:
+    def test_agreeing_signals_emit_the_pub_year(self):
+        # Title paren year and Publication Year agree exactly → emit.
+        assert (
+            ci.confident_cover_year(
+                "Fantastic Four #18 (1963) Kirby", {"Publication Year": "1963"}
+            )
+            == 1963
+        )
+
+    def test_agreement_within_plus_or_minus_one_still_emits(self):
+        # ±1 cover-vs-onsale skew tolerance (BUI-214/251): paren 2015 vs
+        # Publication Year 2016 still corroborate; the Publication Year is
+        # returned as the authoritative cover year.
+        assert (
+            ci.confident_cover_year("Thor #5 (2015)", {"Publication Year": "2016"})
+            == 2016
+        )
+        assert (
+            ci.confident_cover_year("Thor #5 (2015)", {"Publication Year": "2014"})
+            == 2014
+        )
+
+    def test_disagreeing_signals_suppress_volume_start_year_trap(self):
+        # The BUI-129 trap: the title paren carries the VOLUME start year (1963)
+        # while the issue actually shipped 1983 (Publication Year 1983). The two
+        # disagree by 20 years → emit NOTHING, so the check stays year-agnostic
+        # (never forwards the wrong 1963 that would hide every owned mid-run issue).
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man (1963) #238", {"Publication Year": "1983"}
+            )
+            is None
+        )
+
+    def test_two_year_gap_suppresses(self):
+        # A 2-year gap is outside the ±1 window → suppress.
+        assert (
+            ci.confident_cover_year("Thor #5 (2015)", {"Publication Year": "2017"})
+            is None
+        )
+
+    def test_facsimile_never_emits_even_when_signals_agree(self):
+        # A facsimile's Publication Year is the ORIGINAL issue's year; forwarding
+        # it would falsely match the owned original volume. Refuse outright even
+        # though both signals say 1963.
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man #1 (1963) Facsimile Edition",
+                {"Publication Year": "1963"},
+            )
+            is None
+        )
+
+    def test_reprint_never_emits_even_when_signals_agree(self):
+        # Same hazard for a later printing (2nd/3rd print, true believers, etc.).
+        assert (
+            ci.confident_cover_year(
+                "Batman #1 (1940) 2nd Printing", {"Publication Year": "1940"}
+            )
+            is None
+        )
+
+    def test_no_paren_year_in_title_suppresses(self):
+        # Only one signal (Publication Year) → no corroboration → suppress.
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man #300 Marvel", {"Publication Year": "1988"}
+            )
+            is None
+        )
+
+    def test_no_publication_year_suppresses(self):
+        # Only one signal (title paren) → no corroboration → suppress.
+        assert ci.confident_cover_year("Amazing Spider-Man #300 (1988)", {}) is None
+        assert (
+            ci.confident_cover_year("Amazing Spider-Man #300 (1988)", None) is None
+        )
+
+    def test_unparseable_or_implausible_publication_year_suppresses(self):
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man #300 (1988)", {"Publication Year": "n/a"}
+            )
+            is None
+        )
+        # Out of the 1930–2035 plausibility window.
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man #300 (1899)", {"Publication Year": "1899"}
+            )
+            is None
+        )
+
+    def test_integer_publication_year_value_accepted(self):
+        # item_specifics values are normally strings, but tolerate an int too.
+        assert (
+            ci.confident_cover_year(
+                "Fantastic Four #1 (1961)", {"Publication Year": 1961}
+            )
+            == 1961
+        )
+
+    def test_empty_or_none_title_suppresses(self):
+        assert ci.confident_cover_year(None, {"Publication Year": "1988"}) is None
+        assert ci.confident_cover_year("", {"Publication Year": "1988"}) is None
+
+    def test_multiple_paren_years_one_corroborates_emits(self):
+        # A title can carry two parenthetical groups (a volume year + a
+        # grading/cert year, e.g. "(2018) (CGC 2024)"). Corroboration is
+        # satisfied if ANY of them is within ±1 of the Publication Year — here
+        # 2018 does, so the true cover year is emitted.
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man #798 (2018) (CGC 2024)",
+                {"Publication Year": "2018"},
+            )
+            == 2018
+        )
+
+    def test_correlated_wrong_year_is_the_accepted_residual(self):
+        # ACCEPTED RESIDUAL (BUI-316 design): the two signals are both
+        # seller-entered, so a seller who stamps the SAME volume-start year in
+        # BOTH the title paren and the Publication Year aspect for a mid-run
+        # issue defeats the corroboration — the gate cannot tell this apart from
+        # a genuine agreement and forwards the (wrong) year. This is a conscious
+        # tradeoff (matcher softening was rejected); the test PINS the behavior
+        # so any future hardening that changes it is a visible, deliberate
+        # change, not an accidental one. Contrast with
+        # test_disagreeing_signals_suppress_volume_start_year_trap, the common
+        # case the gate DOES catch (Publication Year carries the true 1983).
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man (1963) #238", {"Publication Year": "1963"}
+            )
+            == 1963
+        )

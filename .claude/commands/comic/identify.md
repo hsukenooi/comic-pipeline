@@ -25,21 +25,29 @@ this context.
 The subagent returns the identification table directly. Present it to the user:
 
 ```
-| # | Comic | Issue | Grade | Variant | Type | Seller | Ends | Notes |
-|---|---|---|---|---|---|---|---|---|
-| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | NM- | — | Auction | beatlebluecat | 2d | — |
-| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | Newsstand | Auction | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
-| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | VF | — | BIN | someseller | — | ⚠️ Buy It Now |
+| # | Comic | Issue | Year | Grade | Variant | Type | Seller | Ends | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | beatlebluecat | 2d | — |
+| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
+| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | someseller | — | ⚠️ Buy It Now |
 ```
 
 - The `#` column links directly to the eBay listing (`https://www.ebay.com/itm/{item_id}`).
   No separate Item ID column.
+- **Year** is the confidence-gated per-issue cover year (BUI-316). It's populated only
+  when the title's parenthesized year and eBay's item-specifics `Publication Year`
+  corroborate each other (and the listing isn't a facsimile/reprint) — otherwise `—`.
+  A blank is the common, safe case. `/comic:collection-check` forwards this exact value
+  as the per-issue `year` to disambiguate rebootable-masthead volumes (e.g. Fantastic
+  Four Vol. 1 vs. Vol. 7); a wrong/uncertain year is deliberately never emitted, so the
+  check simply stays year-agnostic when it's blank.
 - **Ends** shows time remaining, not the end date: `<60 min → "47m"`, `<24h → "18h"`,
   `≥1 day → "2d"`. Mark with ⚠️ in the Ends cell if under 24h.
 - Flag Buy It Now listings — they're skipped at the Gixen step.
-- Carry the `seller` username and the stated `grade` forward — `/comic:buy` uses
-  the seller for its reliability advisory (Step 1) and stores both the seller
-  grade and (if graded) the photo grade on the snipe.
+- Carry the `seller` username, the stated `grade`, and the **Year** forward —
+  `/comic:buy` uses the seller for its reliability advisory (Step 1) and stores both
+  the seller grade and (if graded) the photo grade on the snipe; the Year flows into
+  `/comic:collection-check` as the per-issue cover year (BUI-316).
 
 **Ask user to confirm identifications are correct.**
 

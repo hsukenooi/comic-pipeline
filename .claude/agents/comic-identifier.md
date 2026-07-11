@@ -59,6 +59,7 @@ Fields to use from each object:
 | `grade_source` | `"item_specifics"`, `"title"`, or `"missing"` |
 | `grade_from_description` | Grade found only in the body description (not title/specifics). Populated when `grade_source` is `"missing"` but the description still states a grade. Null when absent. |
 | `variant` | Newsstand, Direct, Whitman, etc. Null if not found |
+| `cover_year` | Confidence-gated per-issue cover year for the **Year** column (BUI-316). A 4-digit int **only** when the title's parenthesized year and item-specifics `Publication Year` corroborate each other within ±1 (and it's not a facsimile/reprint); `null` otherwise. Emit it verbatim — do **not** substitute `comic-identify`'s own best-guess `year`, which is not confidence-gated. |
 | `item_specifics` | Full key-value pairs from the listing |
 | `seller` | eBay seller username (not the store display name) |
 
@@ -103,16 +104,22 @@ dropped items). Do not include raw JSON, intermediate reasoning, or parsing note
 caller's context receives only this output.
 
 ```
-| # | Comic | Issue | Grade | Variant | Type | Seller | Ends | Notes |
-|---|---|---|---|---|---|---|---|---|
-| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | NM- | — | Auction | beatlebluecat | 2d | — |
-| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | Newsstand | Auction | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
-| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | VF | — | BIN | someseller | — | ⚠️ Buy It Now |
+| # | Comic | Issue | Year | Grade | Variant | Type | Seller | Ends | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | beatlebluecat | 2d | — |
+| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
+| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | someseller | — | ⚠️ Buy It Now |
 ```
 
 Rules:
 - The `#` column links directly to the eBay listing (`https://www.ebay.com/itm/{item_id}`).
   No separate Item ID column.
+- **Year** is the `cover_year` field verbatim — the confidence-gated per-issue cover
+  year (BUI-316). Render `—` when it's `null` (the common case: the gate only fires
+  when the title paren year and item-specifics `Publication Year` agree). This column
+  is the value `/comic:collection-check` forwards as `?year=` to disambiguate volumes;
+  a blank is correct and safe (the check stays year-agnostic), so never backfill it
+  with a guessed year.
 - Flag any listing where `grade_source` is `"missing"` **and** `grade_from_description` is
   null (a true no-grade listing); if `grade_from_description` is present, show it as a weak
   description-sourced grade instead.
