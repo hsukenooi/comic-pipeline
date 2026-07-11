@@ -1848,6 +1848,84 @@ class TestRejectedCandidateCache:
         assert "Comic Series #2" in prompts[0]
         assert "Comic Series #1" not in prompts[0]
 
+    def test_stats_out_param_reports_skipped_count(self, monkeypatch):
+        """BUI-317: when a `stats` dict is passed, verify_with_claude sets
+        stats["skipped"] to the number of candidates the rejected cache
+        skipped — the count a --json caller needs for coverage visibility.
+        """
+        now = datetime.now(timezone.utc)
+        self._write_cache({self._key("111", n=1): now.isoformat()})
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", lambda prompt: "[]")
+
+        stats = {}
+        kept, dropped, filtered = seller_scan.verify_with_claude(
+            [self._make_match("111", n=1), self._make_match("222", n=2)],
+            use_rejected_cache=True,
+            stats=stats,
+        )
+
+        assert stats["skipped"] == 1
+        assert [c["item_id"] for c in kept] == ["222"]
+
+    def test_stats_out_param_on_all_cached_early_return(self, monkeypatch):
+        """BUI-317: when EVERY candidate is cache-skipped, verify_with_claude
+        takes the `if not to_verify: return [], [], []` early return — a
+        distinct path from the empty-`matches` one. stats["skipped"] must
+        still carry the real count there (a reordering that set it after the
+        early return would silently report 0 for a fully-cached seller)."""
+        now = datetime.now(timezone.utc)
+        self._write_cache({
+            self._key("111", n=1): now.isoformat(),
+            self._key("222", n=2): now.isoformat(),
+        })
+
+        calls = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: calls.append(prompt) or "[]",
+        )
+
+        stats = {}
+        result = seller_scan.verify_with_claude(
+            [self._make_match("111", n=1), self._make_match("222", n=2)],
+            use_rejected_cache=True,
+            stats=stats,
+        )
+
+        assert calls == []  # every candidate skipped → no CLI call
+        assert result == ([], [], [])
+        assert stats["skipped"] == 2
+
+    def test_stats_out_param_zero_when_nothing_cached(self, monkeypatch):
+        """No cache hits → stats["skipped"] is 0, not omitted — a caller must
+        always find a value, including the common healthy-scan case."""
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", lambda prompt: "[]")
+
+        stats = {}
+        seller_scan.verify_with_claude(
+            [self._make_match("222")], use_rejected_cache=True, stats=stats
+        )
+
+        assert stats["skipped"] == 0
+
+    def test_stats_out_param_zero_on_empty_matches(self):
+        """The `if not matches` early return also populates stats["skipped"]
+        rather than leaving the dict unset."""
+        stats = {}
+        result = seller_scan.verify_with_claude([], use_rejected_cache=True, stats=stats)
+
+        assert result == ([], [], [])
+        assert stats["skipped"] == 0
+
+    def test_stats_out_param_defaults_to_none_no_error(self, monkeypatch):
+        """Omitting `stats` (the default, and every pre-BUI-317 call site)
+        must not raise — it's a pure opt-in out-parameter."""
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", lambda prompt: "[]")
+        kept, dropped, filtered = self._verify([self._make_match("222")])
+        assert len(kept) == 1
+
     def test_disabled_by_default_does_not_read_or_write_cache(self, monkeypatch):
         """use_rejected_cache defaults False (the wishlist_sellers path): a
         pre-existing rejection must NOT skip, and a fresh rejection must NOT be
@@ -2739,6 +2817,128 @@ class TestMainDroppedCandidatesExit:
         assert ebay_fetch.load_seller_aliases()["newstore"] == "newstore_login"
 
 
+class TestSkippedCountAndForceReverify:
+    """BUI-317: the rejected-cache 'skipped' count is surfaced in --json
+    output, and --all force-re-verifies by bypassing that cache. Reuses
+    TestMainDroppedCandidatesExit's `_wire_main` stubbing helper via
+    composition (an instance, not a base class) so this class contributes
+    only its own tests — subclassing would also re-collect and re-run every
+    unrelated test already covered there.
+    """
+
+    def _wire_main(self, *args, **kwargs):
+        return TestMainDroppedCandidatesExit()._wire_main(*args, **kwargs)
+
+    def test_json_reports_skipped_cached_candidates_count(self, monkeypatch, capsys):
+        """--json surfaces sellers[*].skipped_cached_candidates (BUI-317) —
+        the count verify_with_claude reports via its `stats` out-param."""
+        recorded = {}
+
+        def fake_verify(cands, **kwargs):
+            stats = kwargs.get("stats")
+            if stats is not None:
+                stats["skipped"] = 1
+            # One candidate cache-skipped, one verified+kept.
+            return cands[:1], [], []
+
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={},  # unused; fake_verify below is used directly
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(seller_scan, "verify_with_claude", fake_verify)
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["sellers"][0]["skipped_cached_candidates"] == 1
+
+    def test_json_skipped_count_zero_when_nothing_cached(self, monkeypatch, capsys):
+        """The common case: no rejected-cache hits → the field is present and
+        0, not omitted."""
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "seller1": lambda cands: (list(cands), [], [])
+            },
+            record_sink=recorded,
+        )
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["sellers"][0]["skipped_cached_candidates"] == 0
+
+    def test_skipped_count_zero_when_no_candidates_match(self, monkeypatch, capsys):
+        """A seller whose listings match nothing exercises
+        _scan_one_seller_impl's empty-candidates branch (verify is never
+        called): skipped_cached_candidates is still present and 0, not omitted."""
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={},  # verify must never be reached
+            record_sink=recorded,
+        )
+        # Override the always-match stub so no candidate survives matching.
+        monkeypatch.setattr(
+            seller_scan, "match_listing", lambda title, wish_items: (None, 0.0)
+        )
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["sellers"][0]["matches"] == []
+        assert payload["sellers"][0]["skipped_cached_candidates"] == 0
+
+    def test_all_flag_passes_use_rejected_cache_false(self, monkeypatch, capsys):
+        """BUI-317: --all bypasses the BUI-301 rejected cache (force-re-verify),
+        in addition to its existing BUI-113 already-seen-match behavior."""
+        recorded = {}
+        seen_kwargs = {}
+
+        def fake_verify(cands, **kwargs):
+            seen_kwargs.update(kwargs)
+            return list(cands), [], []
+
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={},
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(seller_scan, "verify_with_claude", fake_verify)
+
+        code = seller_scan.main(["seller1", "--all", "--json"])
+
+        assert code == 0
+        assert seen_kwargs["use_rejected_cache"] is False
+
+    def test_without_all_flag_use_rejected_cache_stays_true(self, monkeypatch, capsys):
+        """Baseline (no --all): the rejected cache stays opt-in-active, as
+        before BUI-317 — only --all changes this."""
+        recorded = {}
+        seen_kwargs = {}
+
+        def fake_verify(cands, **kwargs):
+            seen_kwargs.update(kwargs)
+            return list(cands), [], []
+
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={},
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(seller_scan, "verify_with_claude", fake_verify)
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        assert code == 0
+        assert seen_kwargs["use_rejected_cache"] is True
+
+
 class TestSellerLevelParallelism:
     """BUI-307: sellers are scanned in a bounded ThreadPoolExecutor instead of a
     sequential loop. These tests prove the parallelism is:
@@ -2981,6 +3181,151 @@ class TestSellerLevelParallelism:
         }
         # The dead seller carries the global-failure error.
         assert "globally unavailable" in by_seller["sellerDead"]["error"]
+
+
+class TestWorkerCrashIsolation:
+    """BUI-319: an unexpected (non-SystemExit) exception inside a
+    _scan_one_seller worker must not propagate out of main() and abort the
+    whole multi-seller batch — it's isolated as an ordinary per-seller error.
+    Reuses TestSellerLevelParallelism's `_wire` stubbing helper via
+    composition (an instance, not a base class) so this class contributes
+    only its own tests — subclassing would also re-collect and re-run every
+    unrelated test already covered there.
+    """
+
+    def _wire(self, *args, **kwargs):
+        return TestSellerLevelParallelism()._wire(*args, **kwargs)
+
+    def test_scan_one_seller_isolates_unexpected_exception(self, monkeypatch):
+        """A crash anywhere in the scan body (simulated via
+        search_seller_listings raising a plain ValueError — not the
+        requests.exceptions.RequestException the impl already handles
+        inline) returns an ordinary error result instead of propagating."""
+        def boom(*a, **k):
+            raise ValueError("simulated crash")
+
+        monkeypatch.setattr(seller_scan, "search_seller_listings", boom)
+
+        result = seller_scan._scan_one_seller(
+            "seller1", "seller1", "tok", "http://x", [], 1000, False
+        )
+
+        assert result["error"] is not None
+        assert "crashed" in result["error"]
+        assert "simulated crash" in result["error"]
+        assert result["matches"] == []
+        assert result["seller"] == "seller1"
+        assert result["username"] == "seller1"
+
+    def test_scan_one_seller_reraises_systemexit(self, monkeypatch):
+        """SystemExit (verify_with_claude's global-verifier-down signal) must
+        NOT be swallowed by the crash-isolation wrapper — main()'s
+        as_completed loop depends on it propagating to trigger the BUI-307
+        drain-then-cancel-the-tail path, not being masked as an ordinary
+        per-seller error."""
+        def raise_system_exit(*a, **k):
+            raise SystemExit(1)
+
+        monkeypatch.setattr(seller_scan, "search_seller_listings", raise_system_exit)
+
+        with pytest.raises(SystemExit):
+            seller_scan._scan_one_seller(
+                "seller1", "seller1", "tok", "http://x", [], 1000, False
+            )
+
+    def test_crash_while_building_result_does_not_poison_seen_set(
+        self, monkeypatch
+    ):
+        """BUI-319 (adversarial): a crash while BUILDING the result must not
+        leave the seen-set committed with the matches dropped (the BUI-297
+        lost-match class). The impl records seen AFTER constructing the result,
+        so a crash in result-building happens BEFORE record_items_seen — this
+        pins that ordering: if _strip_private blows up, record_items_seen is
+        never reached, and the wrapper isolates the crash as an error slot.
+        """
+        recorded = []
+        monkeypatch.setattr(
+            seller_scan, "search_seller_listings",
+            lambda username, token, base_url, max_results=1000: [
+                {"item_id": "X1", "title": "Amazing Spider-Man #300"}
+            ],
+        )
+        monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
+        monkeypatch.setattr(
+            seller_scan, "match_listing",
+            lambda title, wish_items: (wish_items[0], 0.9),
+        )
+        monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
+        monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
+        monkeypatch.setattr(
+            seller_scan, "verify_with_claude",
+            lambda cands, **kwargs: (list(cands), [], []),
+        )
+        monkeypatch.setattr(
+            seller_scan, "record_items_seen",
+            lambda ids, seller: recorded.append((seller, list(ids))),
+        )
+        # Blow up during result construction — AFTER matching/verify, but the
+        # impl builds the result before recording seen, so this precedes record.
+        def boom(rows):
+            raise RuntimeError("result build exploded")
+
+        monkeypatch.setattr(seller_scan, "_strip_private", boom)
+
+        wish = [{
+            "id": 1, "name": "Amazing Spider-Man #300",
+            "series": "Amazing Spider-Man", "issue": "300",
+            "_tokens": ["amazing", "spider", "man"],
+            "_series_name": None, "_release_year": None,
+        }]
+        result = seller_scan._scan_one_seller(
+            "seller1", "seller1", "tok", "http://x", wish, 1000, False
+        )
+
+        # The crash was isolated as an error slot...
+        assert result["error"] is not None
+        assert "crashed" in result["error"]
+        # ...and critically, the seen-set was NEVER written — no poisoned
+        # seen-then-dropped window.
+        assert recorded == []
+
+    def test_one_seller_crash_does_not_abort_the_batch(self, monkeypatch, capsys):
+        """End-to-end through main(): one seller's verify_with_claude call
+        raises an unexpected (non-SystemExit) exception simulating a bug —
+        the batch still completes, that seller's slot carries an error, and
+        the OTHER seller's genuine matches are intact. Before BUI-319 this
+        exception would propagate out of main() uncaught and lose every
+        seller's output, not just the crashed one.
+        """
+        def verify(cands, **kwargs):
+            username = cands[0]["item_id"].rsplit("-", 1)[0]
+            if username == "sellerCrash":
+                raise KeyError("simulated bug, not a global verifier failure")
+            return (list(cands), [], [])
+
+        self._wire(monkeypatch, verify)
+        monkeypatch.setattr(seller_scan, "_SELLER_SCAN_MAX_WORKERS", 2)
+
+        code = seller_scan.main(["sellerOk", "sellerCrash", "--json"])
+
+        payload = json.loads(capsys.readouterr().out)
+        by_seller = {s["seller"]: s for s in payload["sellers"]}
+        # The healthy seller's matches are untouched by the other's crash.
+        assert by_seller["sellerOk"]["error"] is None
+        assert {row["item_id"] for row in by_seller["sellerOk"]["matches"]} == {
+            "sellerOk-A1", "sellerOk-A2",
+        }
+        # The crashed seller carries an error, not a hard batch abort. The
+        # error carries the exception repr (BUI-319 `{e!r}`) so an unattended
+        # caller can triage the crash TYPE, not just a generic message.
+        assert by_seller["sellerCrash"]["error"] is not None
+        assert "crashed" in by_seller["sellerCrash"]["error"]
+        assert "KeyError" in by_seller["sellerCrash"]["error"]
+        # A crashed seller has error set but incomplete=False (dropped=[]), so
+        # per main()'s documented exit priority (verifier-down 1 > incomplete 3
+        # > seller-error 2 > 0) the batch exits EXACTLY 2 — pin the precise code
+        # so a regression to 3 (incomplete) or any other value is caught.
+        assert code == seller_scan._EXIT_SELLER_ERROR
 
 
 # ─── BUI-227: _title_paren_years ─────────────────────────────────────────────

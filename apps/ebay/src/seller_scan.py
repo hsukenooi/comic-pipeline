@@ -709,10 +709,20 @@ def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
     return kept, [], filtered_info, 1
 
 
-def verify_with_claude(matches, *, use_rejected_cache=False):
+def verify_with_claude(matches, *, use_rejected_cache=False, stats=None):
     """Split candidates into genuine matches (`kept`), never-verified ones
     (`dropped`), and model-rejected ones with their reasons (`filtered`),
     using chunked claude CLI calls.  Returns ``(kept, dropped, filtered)``.
+
+    BUI-317: when `stats` is given a dict, it is populated with
+    ``{"skipped": N}`` — the count of candidates skipped via the BUI-301
+    rejected cache (0 when `use_rejected_cache` is False, or when nothing in
+    `matches` happened to be cached). This is an out-parameter rather than a
+    4th return value on purpose: `verify_with_claude` has two existing
+    callers (`_scan_one_seller` here and `wishlist_sellers.py`, plus dozens
+    of tests that unpack the 3-tuple) that don't care about this count —
+    widening the tuple would force every one of them to change. `stats`
+    defaults to None (opt-in, no-op) so none of that is disturbed.
 
     Candidates are processed in batches of at most _VERIFY_CHUNK_SIZE per call
     so that a large run never silently truncates the response.  Indices in each
@@ -749,6 +759,13 @@ def verify_with_claude(matches, *, use_rejected_cache=False):
     other caller (wishlist_sellers, which has its own permanent title-keyed
     verdict cache) is unaffected — only seller-scan opts in.
     """
+    # BUI-317: initialize the out-param once up front so every early-return
+    # path below (empty matches, all-skipped) leaves it populated without a
+    # per-branch guard; the post-partition assignment overwrites it with the
+    # real count on the normal path.
+    if stats is not None:
+        stats["skipped"] = 0
+
     if not matches:
         return [], [], []
 
@@ -782,6 +799,11 @@ def verify_with_claude(matches, *, use_rejected_cache=False):
             skipped += 1
             continue
         to_verify.append(cand)
+    if stats is not None:
+        # BUI-317: set unconditionally (not just `if skipped`) so a caller
+        # reading `stats["skipped"]` after the call always finds a value,
+        # including the common zero case.
+        stats["skipped"] = skipped
     if skipped:
         print(
             f"  {skipped} candidate(s) skipped (rejected by Claude within the "
@@ -923,7 +945,7 @@ def print_matches(matches, seller_label=None):
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def _seller_result(seller, username, *, matches=None, dropped=None,
-                   filtered=None, error=None):
+                   filtered=None, skipped=0, error=None):
     """Build one seller's result slot for the --json `sellers` array.
 
     BUI-298: a single factory for the per-seller shape so its keys are defined
@@ -932,6 +954,11 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
     `incomplete` is derived (true iff there are dropped/never-verified
     candidates); `matches`/`dropped`/`filtered` already have their private
     pipeline fields stripped by the caller.
+
+    BUI-317: `skipped` is the count of candidates the BUI-301 rejected cache
+    skipped entirely (no CLI call) — surfaced as `skipped_cached_candidates`
+    so an unattended caller can see cache coverage (how much verification
+    cost this scan avoided) without scraping stderr.
     """
     dropped = dropped or []
     return {
@@ -940,6 +967,7 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
         "matches": matches or [],
         "dropped_candidates": dropped,
         "filtered": filtered or [],
+        "skipped_cached_candidates": skipped,
         "incomplete": bool(dropped),
         "error": error,
     }
@@ -947,11 +975,54 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
 
 def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
                     max_results, show_all):
+    """Scan one seller — crash-isolating wrapper around `_scan_one_seller_impl`.
+
+    BUI-319: this runs as a ThreadPoolExecutor worker (see main()). Before
+    this wrapper existed, any non-SystemExit exception raised inside the
+    impl (a bug in matching, a malformed listing, anything unanticipated)
+    propagated through `future.result()` in main()'s as_completed loop
+    uncaught, crashing the entire multi-seller batch after
+    `shutdown(wait=True)` — the sequential loop had the same crash-before-
+    print gap (not a regression), but concurrency widens the blast radius
+    from "this seller" to "every seller in the batch". Catching Exception
+    here turns a crash into an ordinary per-seller `error` result instead,
+    matching how a listing-fetch failure is already handled inside the impl.
+
+    SystemExit is deliberately NOT caught (it isn't an Exception subclass) —
+    verify_with_claude's global-verifier-down guard relies on it propagating
+    so main()'s `except SystemExit` branch can trip the drain-then-cancel-
+    the-tail path (BUI-307) rather than being masked as an ordinary
+    per-seller error.
+    """
+    try:
+        return _scan_one_seller_impl(
+            seller_arg, username, token, base_url, wish_items,
+            max_results, show_all,
+        )
+    except Exception as e:  # noqa: BLE001 — BUI-319: isolate a per-seller crash
+        print(
+            f"Error: seller '{username}' crashed during scan ({e!r}); "
+            "isolating it — the rest of this batch continues",
+            file=sys.stderr,
+        )
+        # BUI-319: use repr (`{e!r}`) not str for the structured `error` field —
+        # an unexpected crash's exception TYPE (e.g. KeyError vs ValueError) is
+        # load-bearing triage signal for an unattended --json caller deciding
+        # whether to retry or file a bug, and str() drops it. This deliberately
+        # differs from the listing-fetch branch's `{e}` (a known RequestException
+        # where the type adds nothing) — here the type is the whole point.
+        return _seller_result(
+            seller_arg, username, error=f"seller scan crashed: {e!r}"
+        )
+
+
+def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
+                    max_results, show_all):
     """Scan one seller's active listings against the (already-fetched) wish
     list and verify candidates with Claude. Returns a per-seller result dict:
 
         {"seller", "username", "matches", "dropped_candidates", "filtered",
-         "incomplete", "error"}
+         "skipped_cached_candidates", "incomplete", "error"}
 
     BUI-298: this is the per-seller body of what used to be all of main() —
     extracted so main() can fetch the wish list + OAuth token ONCE and loop
@@ -960,6 +1031,13 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
     multi-seller batch can't abort the rest — it's recorded in `error` and
     the batch continues. Alias resolution happens in the caller (main), since
     an unresolvable seller never has a `username` to reach this function with.
+
+    BUI-319: any OTHER exception raised in this body (not just the listing-
+    fetch RequestException handled below) is caught one level up, by the
+    `_scan_one_seller` wrapper — this function itself stays free of a
+    catch-all so its existing, more specific error handling (e.g. the
+    listing-fetch branch immediately below) still produces the most useful
+    message before the generic safety net would ever see it.
     """
     print(f"Fetching listings for seller '{username}'...", file=sys.stderr)
     try:
@@ -1037,12 +1115,19 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
         print(f"  {len(candidates)} candidate(s) — verifying with Claude...", file=sys.stderr)
         # BUI-301: seller-scan opts into the rejected-candidate cache so a
         # (listing, wish) pair Claude already rejected isn't re-verified (re-
-        # paying CLI cost) every run until the TTL expires.
+        # paying CLI cost) every run until the TTL expires. BUI-317: --all
+        # ("show me everything again") also bypasses this cache — a full
+        # force-re-verify for "recheck this seller, I think that rejection
+        # was wrong" — rather than leaving no way to override a stale/bad
+        # rejection short of waiting out the 14-day TTL.
+        verify_stats = {}
         matches, dropped, filtered = verify_with_claude(
-            candidates, use_rejected_cache=True
+            candidates, use_rejected_cache=not show_all, stats=verify_stats
         )
+        skipped = verify_stats.get("skipped", 0)
     else:
         matches, dropped, filtered = [], [], []
+        skipped = 0
 
     # BUI-297: `dropped` are candidates the verifier never reached a verdict on
     # (timeout / transport failure surviving bisection, or an unparseable
@@ -1059,6 +1144,23 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
         )
     print(f"  {len(matches)} genuine match(es) verified", file=sys.stderr)
 
+    # BUI-319: build the result slot BEFORE recording the seen-set, then return
+    # the already-built object after. record_items_seen commits an irreversible
+    # server-side "these item_ids were surfaced" mark; if the result-building
+    # (_strip_private / _seller_result) ran AFTER it and crashed, the crash-
+    # isolation wrapper would convert that into an error slot with matches=[]
+    # while the seen-set stayed committed — the item_ids would be hidden on the
+    # re-run, silently losing a genuine match (the BUI-297 lost-match class).
+    # Constructing the result first means nothing crashable runs after the seen
+    # write, so a poisoned-seen-but-dropped-matches window can't exist.
+    result = _seller_result(
+        seller_arg, username,
+        matches=_strip_private(matches),
+        dropped=_strip_private(dropped),
+        filtered=filtered,
+        skipped=skipped,
+    )
+
     # BUI-113 / BUI-297 / BUI-298 INVARIANT: only *kept* matches for THIS
     # seller are ever recorded as seen, keyed by THIS seller's username.
     # `dropped` (never-verified) candidates are deliberately NEVER passed here
@@ -1069,12 +1171,7 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
     if matches:
         record_items_seen([m["item_id"] for m in matches], username)
 
-    return _seller_result(
-        seller_arg, username,
-        matches=_strip_private(matches),
-        dropped=_strip_private(dropped),
-        filtered=filtered,
-    )
+    return result
 
 
 def main(argv=None):
@@ -1118,7 +1215,11 @@ def main(argv=None):
         dest="show_all",
         help="Show every wish-list match, including ones surfaced in a prior "
              "scan. By default (BUI-113) already-seen matches are hidden. "
-             "Newly-surfaced matches are recorded as seen either way.",
+             "Newly-surfaced matches are recorded as seen either way. BUI-317: "
+             "also force-re-verifies every candidate by bypassing the BUI-301 "
+             "rejected-candidate cache, for 'recheck this seller, I think "
+             "that rejection was wrong' — normal runs skip re-verifying a "
+             "pair Claude already rejected within the last 14 days.",
     )
     parser.add_argument(
         "--max-results",
