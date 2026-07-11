@@ -54,7 +54,6 @@ from server.main import _ensure_fresh_sync, iso_to_relative, _spawn_fallback_tas
 # workspace-imports canary).
 from locg.collection_cache import CollectionCache
 from locg.collection_io import MAX_XLSX_BYTES
-from locg.parsing import normalize_issue_key
 from locg.commands import (
     _split_wish_list_name,
     cmd_collection_check,
@@ -1650,44 +1649,6 @@ async def api_collection_delete(
     return {"status": "ok", "action": action, "removed": removed, "remaining_copies": remaining_copies}
 
 
-def _find_existing_wish_entry(title: str) -> dict[str, Any] | None:
-    """Return the existing wish-list cache entry that duplicates ``title``, or
-    None (BUI-285 idempotency).
-
-    Dedup key is the DECORATED series portion + issue token of the entry name,
-    compared case-insensitively with leading zeros stripped — NEVER
-    ``_normalize_series_key``, which collapses ``(Vol. N)``/year decoration and
-    would merge genuinely different volumes of the same masthead (the BUI-284
-    trap). A volume-decorated name (``"Fantastic Four (Vol. 7) #18"``) is a
-    distinct entry from a bare ``"Fantastic Four #18"``. ``year`` does not
-    participate: wish entries store only a name (no cover year), and two
-    identical names ARE duplicates for the LOCG export regardless of the volume
-    the caller had in mind — the export keys on the name too.
-
-    An unparseable ``title`` (no ``#`` token) can't be compared, so it is treated
-    as non-duplicate and appended as before. A missing/corrupt cache means there
-    is nothing to duplicate.
-    """
-    parsed = _split_wish_list_name(title)
-    if parsed is None:
-        return None
-    series, issue = parsed
-    series_cmp = series.strip().lower()
-    issue_cmp = normalize_issue_key(issue)
-    try:
-        items = cmd_wish_list_from_cache()
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-    for item in items:
-        item_parsed = _split_wish_list_name(item.get("name") or "")
-        if item_parsed is None:
-            continue
-        item_series, item_issue = item_parsed
-        if item_series.strip().lower() == series_cmp and normalize_issue_key(item_issue) == issue_cmp:
-            return item
-    return None
-
-
 @router.post("/api/comics/wish-list")
 async def api_wish_list_add(req: WishListAddRequest):
     """Append an issue to the wish-list on the server (R7).
@@ -1746,23 +1707,16 @@ async def api_wish_list_add(req: WishListAddRequest):
                     ),
                 )
 
-        # BUI-285: idempotency — a series+issue already on the wish-list is a
-        # no-op, not a second appended row (which would double-push to LOCG and
-        # defeat the BUI-266 scoped conflict-removal). Inside the `not force`
-        # block AFTER the owned-guard: an owned book is still 409'd, and
-        # force=true bypasses the dedup too — the documented escape hatch for a
-        # genuinely distinct printing/variant that shares series + issue.
-        existing = _find_existing_wish_entry(req.title)
-        if existing is not None:
-            # Superset of the add response's informative fields, so a caller that
-            # reads `items` off a normal add still finds it on the no-op.
-            return {
-                "status": "exists",
-                "existing": existing,
-                "items": len(cmd_wish_list_from_cache()),
-            }
-
-    result = cmd_wish_list_add(req.title)
+    # BUI-285/BUI-313: idempotency now lives entirely in cmd_wish_list_add's
+    # shared _find_duplicate_wish_entry dedup — a series+issue already on the
+    # wish-list returns a 200 {status: "exists", ...} no-op instead of a second
+    # appended row (which would double-push to LOCG and defeat the BUI-266 scoped
+    # conflict-removal). force=req.force threads through so a force=true request
+    # bypasses that dedup too — the escape hatch for a genuinely distinct
+    # printing/variant that shares series + issue (mirrors the owned-guard's own
+    # force bypass above). Passing it is load-bearing: without it, a force add
+    # would still be silently no-op'd by the callee's dedup.
+    result = cmd_wish_list_add(req.title, force=req.force)
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
     return result

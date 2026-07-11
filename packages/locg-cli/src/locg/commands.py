@@ -628,7 +628,7 @@ def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]
     return items
 
 
-def cmd_wish_list_add(title: str) -> dict[str, Any]:
+def cmd_wish_list_add(title: str, force: bool = False) -> dict[str, Any]:
     """Append a manual entry to the local wish-list cache.
 
     Writes ``{"name": title, "id": None, "source": "local"}`` to
@@ -641,6 +641,16 @@ def cmd_wish_list_add(title: str) -> dict[str, Any]:
     durable across a ``locg collection import``. There is no wish-list push path
     (cf. the collection's record-win round-trip), so a local entry persists
     until it is removed.
+
+    BUI-313: dedups against the existing cache via :func:`_find_duplicate_wish_entry`
+    — the same series+issue-token comparison the ``/api/comics/wish-list``
+    endpoint (BUI-285) and ``cmd_wish_list_add_creator_run`` (BUI-303) use, so
+    "already wishlisted" means the same thing regardless of entry point. A
+    duplicate is a 200 no-op (``{"status": "exists", "existing": ..., "items": ...}``)
+    rather than a second appended row — this CLI path previously had no dedup
+    guard at all. Pass ``force=True`` to bypass the dedup and append anyway (the
+    escape hatch the endpoint exposes via ``WishListAddRequest.force`` for a
+    genuinely distinct printing/variant that shares series + issue).
     """
     title = (title or "").strip()
     if not title:
@@ -655,6 +665,11 @@ def cmd_wish_list_add(title: str) -> dict[str, Any]:
         items: list[dict[str, Any]] = payload.get("items") or []
     else:
         items = []
+
+    if not force:
+        duplicate = _find_duplicate_wish_entry(title, items)
+        if duplicate is not None:
+            return {"status": "exists", "existing": duplicate, "items": len(items)}
 
     entry = {"name": title, "id": None, "source": "local"}
     items.append(entry)
@@ -781,10 +796,13 @@ def cmd_wish_list_add_creator_run(
     run_issues = run["issues"]
     warnings = run["warnings"]
 
-    # Load existing wish-list items once for already-wishlisted dedup.
+    # Load existing wish-list items once for already-wishlisted dedup. A missing
+    # OR corrupt cache degrades to an empty list (BUI-313: same tolerance the
+    # overlay's wish-list reads apply — a bad cache shouldn't crash the run, and
+    # dedup against "nothing" is safe; the owned-guard is the real safety net).
     try:
         existing = cmd_wish_list_from_cache()
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         existing = []
 
     to_add: list[dict[str, Any]] = []
@@ -813,6 +831,13 @@ def cmd_wish_list_add_creator_run(
             continue
 
         to_add.append({"title": title, "number": number})
+        # BUI-313: track this queued title in `existing` too, not just the
+        # on-disk cache — two run issues that normalize to the SAME
+        # series+issue token (e.g. Metron reporting both "1" and "001") would
+        # otherwise both pass this loop's dedup check, since `existing` is
+        # loaded once up front and neither is written to disk until the write
+        # loop below runs.
+        existing.append({"name": title})
 
     added: list[str] = []
     errors: list[dict[str, Any]] = []
@@ -820,6 +845,11 @@ def cmd_wish_list_add_creator_run(
         result = cmd_wish_list_add(item["title"])
         if "error" in result:
             errors.append({"title": item["title"], "error": result["error"]})
+        elif result.get("status") == "exists":
+            # Defense in depth: the intra-run tracking above already prevents
+            # this in practice, but report it accurately rather than double-
+            # counting as newly added if it ever slips through.
+            already_wishlisted.append(item["title"])
         else:
             added.append(item["title"])
 
@@ -950,12 +980,15 @@ def _find_duplicate_wish_entry(title: str, items: list[dict[str, Any]]) -> Optio
     which collapses ``(Vol. N)``/year decoration and would merge genuinely
     different volumes of the same masthead (the BUI-284 trap).
 
-    Mirrors ``gixen_overlay.routes._find_existing_wish_entry`` (BUI-285) so a
-    wish-list add is deduped the same way regardless of entry point — the
-    server endpoint or this CLI's creator-run (BUI-303). Only the cache lookup
-    differs: the endpoint re-reads the cache itself, while this takes the
-    caller's already-loaded ``items`` so a creator-run checking many issues in
-    one call doesn't re-read the cache per issue.
+    BUI-313: this is the SINGLE shared dedup implementation. Both local
+    wish-list-add entry points call it — ``cmd_wish_list_add`` (plain CLI/local
+    add) and ``cmd_wish_list_add_creator_run`` (BUI-303/BUI-134) — and the
+    ``POST /api/comics/wish-list`` endpoint (BUI-285) converges by calling
+    ``cmd_wish_list_add`` rather than re-running the dedup itself, so it inherits
+    this exact comparison. "Already wishlisted" therefore means the same thing at
+    every entry point. It takes the caller's already-loaded ``items`` rather than
+    reading the cache itself, so a caller checking many titles in one call (the
+    creator-run) isn't forced into one cache read per title.
 
     An unparseable ``title`` (no ``#`` token) can't be compared, so it is
     treated as non-duplicate.
