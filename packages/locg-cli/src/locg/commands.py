@@ -945,8 +945,9 @@ def cmd_wish_list_add_creator_run(
 def cmd_wish_list_remove(title: str) -> dict[str, Any]:
     """Remove the first matching entry from the local wish-list cache.
 
-    Matches on exact ``name`` field.  Uses the same atomic write pattern as
-    :func:`cmd_wish_list_add` (tempfile + os.replace + chmod 600).
+    Matches on exact ``name`` field. Writes via the shared atomic writer
+    :func:`_write_wish_list_cache` (tempfile + os.replace + chmod 600), the
+    same one every other wish-list write path uses (BUI-329).
     """
     title = (title or "").strip()
     if not title:
@@ -971,32 +972,13 @@ def cmd_wish_list_remove(title: str) -> dict[str, Any]:
     if removed is None:
         return {"error": f"wish-list remove: '{title}' not found in cache"}
 
-    new_payload = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "items": new_items,
-    }
-
-    fd, tmp = tempfile.mkstemp(
-        prefix=".wish-list-", suffix=".json.tmp", dir=path.parent
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(new_payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
-    except Exception:
-        if os.path.exists(tmp):
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        raise
+    written_path = _write_wish_list_cache(new_items)
 
     return {
         "status": "ok",
         "removed": removed,
         "items": len(new_items),
-        "path": str(path),
+        "path": str(written_path),
     }
 
 
