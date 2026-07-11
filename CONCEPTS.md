@@ -39,6 +39,17 @@ A Collection entry that originated from — or has round-tripped through — a L
 ### Pending Push
 A Collection entry that has been recorded locally but not yet confirmed present on LOCG. Clearing pending entries is the goal of a Collection Sync; an entry stays pending until it reappears in a LOCG export and reconciles.
 
+## Matching & Volumes
+
+### Masthead
+A long-running comic title (Amazing Spider-Man, X-Men, Fantastic Four, Batman) that has been relaunched as multiple numbered **volumes** over its history. Because the same issue number recurs across a masthead's volumes, ownership and pricing must disambiguate *which* volume, not just the series name and issue number — the mastheads you collect most heavily are exactly where volume collisions bite.
+
+### Cross-Volume Ambiguity
+The ownership-matcher state where a queried issue number is owned under more than one volume of the same Masthead and no Cover Year was supplied to disambiguate — a verdict that is **neither owned nor not-owned**. *Known in code and tickets as:* `ambiguous_cross_volume` / `match_kind == "cross_volume"`. Resolved by re-checking with the listing's Cover Year; the matcher must never guess a volume on its own. Its harder-to-detect sibling is the **single-owned-wrong-volume** residual — when only one volume is owned there is no detectable ambiguity, yet that single owned volume may still be the wrong one, so a no-year match can confidently report owned against a volume you did not mean.
+
+### Cover Year
+The publication year printed on an issue's cover, used as the **per-issue** key the matcher's year gate compares against a stored release date (within a small tolerance for cover-vs-onsale skew). Distinct from a series' **start year** (`year_began`): feeding a series start year into the per-issue gate is the wrong-year error that hides owned books, whereas the correct per-issue Cover Year disambiguates volumes without that risk.
+
 ## Sync Processes
 
 ### Record-Win
@@ -59,3 +70,6 @@ A **diagnostic-only** audit (BUI-288, `/comic:calibration-report`, `GET /api/com
 
 ### Overshoot
 The Calibration Report's ranking metric: `median(winning_bid / fmv_high)` over a book's **losing** auctions. Persistently `> 1` means the market keeps clearing above your stated fair-value ceiling, i.e. FMV is too low. A minimum loss count gates single-loss noise out of the ranking.
+
+### Grade-Curve Interpolation
+Estimating an FMV for a comic at a grade with no direct sold comps by reading a price off the curve implied by comps at neighbouring grades. It is a **fallback only when the target grade's bucket is empty** — never used when real comps exist at the target grade — requires a minimum number of supporting comps, and its output is marked as interpolated at **low confidence** (including through cache reuse) so it is never conflated with a direct-comp price (see the over-bid-guards learning in `docs/solutions/best-practices/`).
