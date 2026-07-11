@@ -580,6 +580,14 @@ def compute_fmv(comps: list[dict], target_grade: float,
         label = "MEDIUM"  # wide-window pools can't claim HIGH/MEDIUM-HIGH (BUI-86 R7)
     factor = bid_factor(label, grade_confidence)
 
+    # Declared Optional up front so mypy keeps all three pricing branches
+    # consistent (the interpolation branch assigns non-None clean_round ints
+    # first, which would otherwise pin these as non-Optional). clean_round
+    # returns int; a flagged/no-comps book punts to None.
+    fmv_low: int | None
+    fmv_high: int | None
+    med: int | None
+    max_bid: int | None
     if interpolation is not None:
         # Priced by §7 interpolation: a single point estimate (no dispersion),
         # so fmv_low == fmv_high == median. Clearing flag_reason is REQUIRED —

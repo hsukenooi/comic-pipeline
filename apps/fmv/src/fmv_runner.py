@@ -676,7 +676,7 @@ def _interpolated_from_notes(notes: str | None) -> bool:
     book, so the cached path can re-mark it without a structured column. Used to
     keep a cache-reuse row's `interpolated` flag honest for the table + JSON.
     """
-    return bool(notes) and "interpolated=" in notes
+    return notes is not None and "interpolated=" in notes
 
 
 def _window_from_notes(notes: str | None) -> float | None:
