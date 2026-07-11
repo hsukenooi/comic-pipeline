@@ -92,7 +92,7 @@ for attempt in range(2):
 
 The fix is the explicit `except SystemExit:` block in the loop above, which degrades a hard refresh failure to that one item's `FETCH FAILED` line and lets the batch continue. **Two independent reviewers flagged this on BUI-310** — it is easy to miss precisely because `except Exception` *looks* like it covers everything.
 
-### 4. Mirror-the-most-defensive-sibling idiom (and the standing shared-helper refactor)
+### 4. Mirror-the-most-defensive-sibling idiom (now centralized via shared helpers)
 
 Rather than inventing new error handling per function, each hardening pass copied the shape of whichever sibling already handled that failure mode best. The `RequestException` guard in `fetch_item_with_status()` —
 
@@ -107,7 +107,7 @@ for attempt in range(retries):
 
 — has the same shape as the guards in `get_token()`, `search_seller_listings()`, and `search_by_keyword()`. Likewise the atomic tmp→`.replace()` cache write in `get_token()`'s token-cache write (commented "mirrors `_aspects_cache_put`") copies the pattern already established by `_aspects_cache_put()`.
 
-This is a real but **informal** idiom today — each site independently duplicates the try/retry/backoff shape and the tmp→replace write instead of sharing one helper. The consolidation (a shared retry/backoff + atomic-write helper) is **not yet done**; it is filed as a standing follow-up, **BUI-323**. Until then, the rule is: when you touch one of these functions, make it look like its most-defensive sibling.
+This was a **temporary** idiom before BUI-323. The consolidation (a shared retry/backoff + atomic-write helper) shipped in BUI-323 (PR #160): see `_retry_request()` and `_atomic_write_json()` in `apps/ebay/src/ebay_fetch.py`. These helpers are now the canonical implementations; when adding new network calls or cache writes to `ebay_fetch.py`, use them rather than hand-duplicating the pattern.
 
 ## Why This Matters
 
@@ -170,4 +170,4 @@ except TokenExpiredError as e:
 
 - `docs/solutions/developer-experience/cross-package-regressions-escape-per-package-test-runs.md` — background on the `ebay_fetch.py`↔`grade_photos.py` coupling (its BUI-283 section describes the *move* of retry/OAuth logic into `ebay_fetch.py`; this doc describes that logic's current defensive shape).
 - `docs/solutions/best-practices/mypy-bool-return-type-and-non-required-typecheck-ci.md` and `docs/solutions/best-practices/fmv-self-referential-feedback-deflation-guard.md` — a related `requests.exceptions.JSONDecodeError`-subclasses-both-`ValueError`-and-`RequestException` exception-ordering gotcha, in `apps/fmv` (same theme, different primitive).
-- **BUI-323** (filed follow-up) — extract the shared retry/backoff + atomic-write helper that pattern 4 currently duplicates by hand.
+- **BUI-323** (shipped, PR #160) — extracted `_retry_request()` and `_atomic_write_json()` into `apps/ebay/src/ebay_fetch.py` to consolidate the retry/backoff and atomic-write patterns from pattern 4.
