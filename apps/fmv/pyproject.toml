@@ -4,7 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "comic-fmv"
-version = "0.1.0"
+# BUI-305: bump this on any meaningful change to src/ so `uv tool list`
+# alone signals staleness (a stale `uv tool install` was previously
+# indistinguishable from a current one — see `comic-fmv --version` below
+# for the finer-grained git-SHA signal).
+version = "0.2.0"
 description = "Compute fair market value for comics from eBay sold comps"
 requires-python = ">=3.11"
 dependencies = [
@@ -22,6 +26,9 @@ include = [
     "src/fmv_runner.py",
 ]
 sources = ["src"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
