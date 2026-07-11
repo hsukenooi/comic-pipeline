@@ -54,6 +54,7 @@ from server.main import _ensure_fresh_sync, iso_to_relative, _spawn_fallback_tas
 # workspace-imports canary).
 from locg.collection_cache import CollectionCache
 from locg.collection_io import MAX_XLSX_BYTES
+from locg.parsing import normalize_issue_key
 from locg.commands import (
     _split_wish_list_name,
     cmd_collection_check,
@@ -1649,6 +1650,44 @@ async def api_collection_delete(
     return {"status": "ok", "action": action, "removed": removed, "remaining_copies": remaining_copies}
 
 
+def _find_existing_wish_entry(title: str) -> dict[str, Any] | None:
+    """Return the existing wish-list cache entry that duplicates ``title``, or
+    None (BUI-285 idempotency).
+
+    Dedup key is the DECORATED series portion + issue token of the entry name,
+    compared case-insensitively with leading zeros stripped — NEVER
+    ``_normalize_series_key``, which collapses ``(Vol. N)``/year decoration and
+    would merge genuinely different volumes of the same masthead (the BUI-284
+    trap). A volume-decorated name (``"Fantastic Four (Vol. 7) #18"``) is a
+    distinct entry from a bare ``"Fantastic Four #18"``. ``year`` does not
+    participate: wish entries store only a name (no cover year), and two
+    identical names ARE duplicates for the LOCG export regardless of the volume
+    the caller had in mind — the export keys on the name too.
+
+    An unparseable ``title`` (no ``#`` token) can't be compared, so it is treated
+    as non-duplicate and appended as before. A missing/corrupt cache means there
+    is nothing to duplicate.
+    """
+    parsed = _split_wish_list_name(title)
+    if parsed is None:
+        return None
+    series, issue = parsed
+    series_cmp = series.strip().lower()
+    issue_cmp = normalize_issue_key(issue)
+    try:
+        items = cmd_wish_list_from_cache()
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    for item in items:
+        item_parsed = _split_wish_list_name(item.get("name") or "")
+        if item_parsed is None:
+            continue
+        item_series, item_issue = item_parsed
+        if item_series.strip().lower() == series_cmp and normalize_issue_key(item_issue) == issue_cmp:
+            return item
+    return None
+
+
 @router.post("/api/comics/wish-list")
 async def api_wish_list_add(req: WishListAddRequest):
     """Append an issue to the wish-list on the server (R7).
@@ -1662,6 +1701,15 @@ async def api_wish_list_add(req: WishListAddRequest):
     failures and stores that can't verify ownership fail open (the export-side
     BUI-122 fix is the real safety net); pass ``force=true`` to override
     intentionally (a different printing/variant).
+
+    BUI-285: idempotent. After the owned-guard, an add whose series + issue token
+    already exists in the wish-list is a no-op — it returns ``{status: "exists",
+    existing, items}`` with 200 instead of appending a duplicate row. A duplicate
+    would be double-pushed to LOCG (``wish_rows_for_export``) and would defeat the
+    BUI-266 scoped conflict-removal (its name-keyed dict collapses a dup pair,
+    leaving one behind). The dedup is name-based (decorated series + issue), so a
+    distinct volume of the same masthead still appends, and ``force=true`` bypasses
+    it (the escape hatch for a genuinely distinct printing/variant).
     """
     _ensure_collection_store()
     if not req.force:
@@ -1697,6 +1745,23 @@ async def api_wish_list_add(req: WishListAddRequest):
                         "to override."
                     ),
                 )
+
+        # BUI-285: idempotency — a series+issue already on the wish-list is a
+        # no-op, not a second appended row (which would double-push to LOCG and
+        # defeat the BUI-266 scoped conflict-removal). Inside the `not force`
+        # block AFTER the owned-guard: an owned book is still 409'd, and
+        # force=true bypasses the dedup too — the documented escape hatch for a
+        # genuinely distinct printing/variant that shares series + issue.
+        existing = _find_existing_wish_entry(req.title)
+        if existing is not None:
+            # Superset of the add response's informative fields, so a caller that
+            # reads `items` off a normal add still finds it on the no-op.
+            return {
+                "status": "exists",
+                "existing": existing,
+                "items": len(cmd_wish_list_from_cache()),
+            }
+
     result = cmd_wish_list_add(req.title)
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
