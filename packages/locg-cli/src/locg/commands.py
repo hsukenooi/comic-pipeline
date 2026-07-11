@@ -11,6 +11,7 @@ import stat
 import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from bs4 import BeautifulSoup
@@ -628,43 +629,23 @@ def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]
     return items
 
 
-def cmd_wish_list_add(title: str, force: bool = False) -> dict[str, Any]:
-    """Append a manual entry to the local wish-list cache.
+def _wish_list_add_to_items(
+    title: str, items: list[dict[str, Any]], force: bool = False
+) -> dict[str, Any]:
+    """In-memory core of a single wish-list add: dedup-check + append, no I/O.
 
-    Writes ``{"name": title, "id": None, "source": "local"}`` to
-    ``data/locg/wish-list.json`` using the same atomic write pattern as the rest
-    of the wish-list cache writers (tempfile + os.replace + chmod 600).
-
-    Manual adds carry ``source: "local"`` (BUI-208), which marks them as the
-    local diff LOCG doesn't have yet. Since the LOCG import no longer rewrites
-    ``wish-list.json`` (BUI-208), a local add — or a server-side removal — is
-    durable across a ``locg collection import``. There is no wish-list push path
-    (cf. the collection's record-win round-trip), so a local entry persists
-    until it is removed.
-
-    BUI-313: dedups against the existing cache via :func:`_find_duplicate_wish_entry`
-    — the same series+issue-token comparison the ``/api/comics/wish-list``
-    endpoint (BUI-285) and ``cmd_wish_list_add_creator_run`` (BUI-303) use, so
-    "already wishlisted" means the same thing regardless of entry point. A
-    duplicate is a 200 no-op (``{"status": "exists", "existing": ..., "items": ...}``)
-    rather than a second appended row — this CLI path previously had no dedup
-    guard at all. Pass ``force=True`` to bypass the dedup and append anyway (the
-    escape hatch the endpoint exposes via ``WishListAddRequest.force`` for a
-    genuinely distinct printing/variant that shares series + issue).
+    Extracted from :func:`cmd_wish_list_add` (BUI-325) so a caller resolving
+    MANY titles against the SAME in-memory ``items`` list — the creator-run
+    batch write — can do so without a disk read+write per title. Mutates
+    ``items`` in place (appends) when ``title`` is not a duplicate (or when
+    ``force=True``); returns the same per-title result shape
+    ``cmd_wish_list_add`` returns for its dedup/append branches, minus the
+    ``path`` key (no write happened here — the caller writes once, after
+    resolving every title).
     """
     title = (title or "").strip()
     if not title:
         return {"error": "wish-list add: title must be non-empty"}
-
-    path = wish_list_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if path.exists():
-        with open(path) as f:
-            payload = json.load(f)
-        items: list[dict[str, Any]] = payload.get("items") or []
-    else:
-        items = []
 
     if not force:
         duplicate = _find_duplicate_wish_entry(title, items)
@@ -673,6 +654,46 @@ def cmd_wish_list_add(title: str, force: bool = False) -> dict[str, Any]:
 
     entry = {"name": title, "id": None, "source": "local"}
     items.append(entry)
+    return {"status": "ok", "added": entry, "items": len(items)}
+
+
+def _read_wish_list_cache_items() -> list[dict[str, Any]]:
+    """Read the wish-list cache's ``items`` list from disk, or ``[]`` if the
+    cache file does not exist yet.
+
+    The read half of the tempfile+os.replace atomic pair :func:`_write_wish_list_cache`
+    writes. Shared by :func:`cmd_wish_list_add` and the batch write in
+    :func:`cmd_wish_list_add_creator_run` (BUI-325), so both go through the
+    same read logic rather than each hand-rolling the ``path.exists()`` +
+    ``json.load`` dance.
+
+    Deliberately does NOT catch ``json.JSONDecodeError``: this is the
+    pre-write read, so a corrupt cache must fail loudly here rather than be
+    silently treated as empty — degrading to ``[]`` and then writing would
+    permanently erase whatever survived the corruption. Contrast
+    :func:`cmd_wish_list_from_cache`'s read-only dedup callers, which DO
+    tolerate a corrupt cache (BUI-313): degrading to "dedup against nothing"
+    is safe there because nothing on disk gets overwritten as a result.
+    """
+    path = wish_list_cache_path()
+    if not path.exists():
+        return []
+    with open(path) as f:
+        payload = json.load(f)
+    return payload.get("items") or []
+
+
+def _write_wish_list_cache(items: list[dict[str, Any]]) -> Path:
+    """Atomically write ``items`` as the wish-list cache.
+
+    Tempfile + os.replace + chmod 600 — the same atomic write pattern used by
+    every wish-list cache writer. Shared by :func:`cmd_wish_list_add` (one
+    entry) and :func:`cmd_wish_list_add_creator_run` (BUI-325: the whole
+    run's entries in one call), so there is exactly one atomic write per
+    call site rather than a bespoke copy of the tempfile dance at each.
+    """
+    path = wish_list_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     new_payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -695,12 +716,43 @@ def cmd_wish_list_add(title: str, force: bool = False) -> dict[str, Any]:
                 pass
         raise
 
-    return {
-        "status": "ok",
-        "added": entry,
-        "items": len(items),
-        "path": str(path),
-    }
+    return path
+
+
+def cmd_wish_list_add(title: str, force: bool = False) -> dict[str, Any]:
+    """Append a manual entry to the local wish-list cache.
+
+    Writes ``{"name": title, "id": None, "source": "local"}`` to
+    ``data/locg/wish-list.json`` using the same atomic write pattern as the rest
+    of the wish-list cache writers (tempfile + os.replace + chmod 600, via
+    :func:`_write_wish_list_cache`).
+
+    Manual adds carry ``source: "local"`` (BUI-208), which marks them as the
+    local diff LOCG doesn't have yet. Since the LOCG import no longer rewrites
+    ``wish-list.json`` (BUI-208), a local add — or a server-side removal — is
+    durable across a ``locg collection import``. There is no wish-list push path
+    (cf. the collection's record-win round-trip), so a local entry persists
+    until it is removed.
+
+    BUI-313: dedups against the existing cache via :func:`_find_duplicate_wish_entry`
+    — the same series+issue-token comparison the ``/api/comics/wish-list``
+    endpoint (BUI-285) and ``cmd_wish_list_add_creator_run`` (BUI-303) use, so
+    "already wishlisted" means the same thing regardless of entry point. A
+    duplicate is a 200 no-op (``{"status": "exists", "existing": ..., "items": ...}``)
+    rather than a second appended row — this CLI path previously had no dedup
+    guard at all. Pass ``force=True`` to bypass the dedup and append anyway (the
+    escape hatch the endpoint exposes via ``WishListAddRequest.force`` for a
+    genuinely distinct printing/variant that shares series + issue).
+    """
+    items = _read_wish_list_cache_items()
+
+    result = _wish_list_add_to_items(title, items, force=force)
+    if "error" in result or result.get("status") == "exists":
+        return result
+
+    written_path = _write_wish_list_cache(items)
+    result["path"] = str(written_path)
+    return result
 
 
 def cmd_wish_list_add_creator_run(
@@ -841,17 +893,37 @@ def cmd_wish_list_add_creator_run(
 
     added: list[str] = []
     errors: list[dict[str, Any]] = []
-    for item in to_add:
-        result = cmd_wish_list_add(item["title"])
-        if "error" in result:
-            errors.append({"title": item["title"], "error": result["error"]})
-        elif result.get("status") == "exists":
-            # Defense in depth: the intra-run tracking above already prevents
-            # this in practice, but report it accurately rather than double-
-            # counting as newly added if it ever slips through.
-            already_wishlisted.append(item["title"])
-        else:
-            added.append(item["title"])
+
+    if to_add:
+        # BUI-325: ONE batched read + append + write for the whole run,
+        # instead of the N reads/scans/writes that resulted from calling
+        # cmd_wish_list_add once per issue. This is a fresh read of the
+        # on-disk cache (not a reuse of the `existing` snapshot loaded before
+        # the owned/dedup loop above) — defense in depth in case the cache
+        # changed between that pass and this write, same posture as the
+        # "exists" branch below. `_wish_list_add_to_items` mutates
+        # `write_items` in place and is the SAME dedup+append helper
+        # `cmd_wish_list_add` uses, so per-issue added/skipped accounting
+        # matches the serial path exactly. The atomic tempfile+os.replace
+        # write happens exactly once, at the end, via `_write_wish_list_cache`
+        # — never a partial/torn file, and never once per issue.
+        write_items = _read_wish_list_cache_items()
+
+        for item in to_add:
+            result = _wish_list_add_to_items(item["title"], write_items)
+            if "error" in result:
+                errors.append({"title": item["title"], "error": result["error"]})
+            elif result.get("status") == "exists":
+                # Defense in depth: the intra-run tracking above already
+                # prevents this in practice, but report it accurately rather
+                # than double-counting as newly added if it ever slips
+                # through.
+                already_wishlisted.append(item["title"])
+            else:
+                added.append(item["title"])
+
+        if added:
+            _write_wish_list_cache(write_items)
 
     return {
         "status": "ok" if not errors else "partial",
