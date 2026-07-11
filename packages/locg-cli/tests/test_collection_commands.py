@@ -3173,3 +3173,232 @@ def test_record_win_dedup_does_not_collapse_annual_into_base(tmp_path):
 
     assert result["skipped_already_owned"] == 0
     assert result["rows_written"] == 1
+
+
+# ---------------------------------------------------------------------------
+# cmd_collection_check cross-volume ambiguity (BUI-284)
+# ---------------------------------------------------------------------------
+
+def test_check_no_year_cross_volume_returns_ambiguous(tmp_path, monkeypatch):
+    """BUI-284: with no `year`, the same issue number owned under two distinct
+    volumes of the same masthead must surface `ambiguous_cross_volume`, not a
+    silent (arbitrary-volume) `in_collection`.
+
+    Fantastic Four #18 exists in both the 1961 Vol. 1 and the 2022 Vol. 7. The
+    normalized series key collapses the volume decoration, so with no year the
+    matcher can't tell which one the caller meant — guessing the first row is a
+    dangerous false positive (tells the caller they own a book they may not).
+    """
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Fantastic Four (Vol. 7) (2022 - 2025)",
+            full_title="Fantastic Four #18",
+            release_date="2024-02-14",
+        ),
+        _agent_win_row(
+            series="Fantastic Four (Vol. 1) (1961 - 1996)",
+            full_title="Fantastic Four #18",
+            release_date="1963-09-01",
+        ),
+    ])
+
+    result = cmds.cmd_collection_check(series="Fantastic Four", issue="18")
+    assert result["match_status"] == "ambiguous_cross_volume"
+    assert result["match_kind"] == "cross_volume"
+    # Both colliding volumes are surfaced for the caller to disambiguate.
+    names = {c["series_name"] for c in result["candidates"]}
+    assert names == {
+        "Fantastic Four (Vol. 7) (2022 - 2025)",
+        "Fantastic Four (Vol. 1) (1961 - 1996)",
+    }
+
+
+def test_check_no_year_single_era_still_in_collection(tmp_path, monkeypatch):
+    """BUI-284 no-regression: a single owned era with no year still resolves to
+    `in_collection` (the guard only fires when >1 distinct volume/era matches)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Fantastic Four (Vol. 1) (1961 - 1996)",
+        full_title="Fantastic Four #18",
+        release_date="1963-09-01",
+    )])
+
+    result = cmds.cmd_collection_check(series="Fantastic Four", issue="18")
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Fantastic Four #18"
+    assert "candidates" not in result
+
+
+def test_check_year_supplied_resolves_cross_volume(tmp_path, monkeypatch):
+    """BUI-284: supplying the per-issue cover year resolves the collision via the
+    release-date gate — the year-supplied path is unchanged (no ambiguity)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Fantastic Four (Vol. 7) (2022 - 2025)",
+            full_title="Fantastic Four #18",
+            release_date="2024-02-14",
+        ),
+        _agent_win_row(
+            series="Fantastic Four (Vol. 1) (1961 - 1996)",
+            full_title="Fantastic Four #18",
+            release_date="1963-09-01",
+        ),
+    ])
+
+    # The 1963 volume is owned → year resolves to that specific row.
+    result = cmds.cmd_collection_check(
+        series="Fantastic Four", issue="18", year="1963"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["matched_series_name"] == "Fantastic Four (Vol. 1) (1961 - 1996)"
+
+
+def test_check_no_year_undecorated_two_eras_ambiguous_by_release_year(tmp_path, monkeypatch):
+    """BUI-284: even when two eras share a bare (undecorated) series_name, a
+    difference in release_date year alone trips the ambiguity guard."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Fantastic Four",
+            full_title="Fantastic Four #1",
+            release_date="1961-11-08",
+        ),
+        _agent_win_row(
+            series="Fantastic Four",
+            full_title="Fantastic Four #1",
+            release_date="1998-01-14",
+        ),
+    ])
+
+    result = cmds.cmd_collection_check(series="Fantastic Four", issue="1")
+    assert result["match_status"] == "ambiguous_cross_volume"
+
+
+def test_check_no_year_same_volume_dated_and_dateless_not_ambiguous(tmp_path, monkeypatch):
+    """BUI-284 no-regression: a dateless record-win row (BUI-105) sharing a
+    volume with a dated row is NOT ambiguous — an empty release_date/series_name
+    is not counted as a distinct era, so this still resolves to `in_collection`."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Amazing Spider-Man (1963 - 1998)",
+            full_title="Amazing Spider-Man #300",
+            release_date="1988-05-10",
+        ),
+        # Same volume, second copy written before its date was stamped.
+        _agent_win_row(
+            series="Amazing Spider-Man (1963 - 1998)",
+            full_title="Amazing Spider-Man #300",
+            release_date="",
+        ),
+    ])
+
+    result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="300")
+    assert result["match_status"] == "in_collection"
+
+
+def test_check_no_year_two_copies_same_row_not_ambiguous(tmp_path, monkeypatch):
+    """BUI-284 no-regression: two identical owned rows (same volume, same date)
+    are a single era — not cross-volume ambiguity."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Amazing Spider-Man (1963 - 1998)",
+            full_title="Amazing Spider-Man #300",
+            release_date="1988-05-10",
+        ),
+        _agent_win_row(
+            series="Amazing Spider-Man (1963 - 1998)",
+            full_title="Amazing Spider-Man #300",
+            release_date="1988-05-10",
+        ),
+    ])
+
+    result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="300")
+    assert result["match_status"] == "in_collection"
+
+
+def test_check_no_year_same_volume_year_skew_not_ambiguous(tmp_path, monkeypatch):
+    """BUI-284 no-regression: two owned rows sharing one (undecorated) volume
+    whose release years differ only by the ±1 cover-vs-on-sale skew are NOT
+    misread as two eras — the release-year branch requires a gap wider than 1."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Amazing Spider-Man",
+            full_title="Amazing Spider-Man #238",
+            release_date="1982-11-01",
+        ),
+        _agent_win_row(
+            series="Amazing Spider-Man",
+            full_title="Amazing Spider-Man #238",
+            release_date="1983-01-01",  # one-year cover-vs-onsale skew
+        ),
+    ])
+
+    result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="238")
+    assert result["match_status"] == "in_collection"
+
+
+def test_wish_list_conflicts_flags_cross_volume_owned(tmp_path, monkeypatch):
+    """BUI-284/BUI-130: a wish-listed book owned under >1 volume must still be
+    flagged as a conflict. The audit is year-free, so the owned book returns
+    `ambiguous_cross_volume`; treating that as not-owned would let the owned copy
+    be exported In Collection=0 and deleted (BUI-122)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Fantastic Four (Vol. 1) (1961 - 1996)",
+            full_title="Fantastic Four #18",
+            release_date="1963-09-01",
+        ),
+        _agent_win_row(
+            series="Fantastic Four (Vol. 7) (2022 - 2025)",
+            full_title="Fantastic Four #18",
+            release_date="2024-02-14",
+        ),
+    ])
+    # Wish-list contains the same issue (owned under two volumes).
+    _seed_wish_list([{"name": "Fantastic Four #18", "id": None, "source": "local"}])
+
+    audit = cmds.cmd_wish_list_conflicts()
+    assert audit["checked"] == 1
+    assert len(audit["conflicts"]) == 1
+    assert audit["conflicts"][0]["name"] == "Fantastic Four #18"
+
+
+def test_collection_check_reports_owned_helper():
+    """BUI-284: the owned-guard helper treats in_collection AND
+    ambiguous_cross_volume as owned, but not not_in_cache."""
+    import locg.commands as cmds
+
+    assert cmds.collection_check_reports_owned({"match_status": "in_collection"})
+    assert cmds.collection_check_reports_owned({"match_status": "ambiguous_cross_volume"})
+    assert not cmds.collection_check_reports_owned({"match_status": "not_in_cache"})
+    assert not cmds.collection_check_reports_owned({})

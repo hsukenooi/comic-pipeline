@@ -802,7 +802,10 @@ def cmd_wish_list_add_creator_run(
         cover_year = cover[:4] if cover else None
 
         owned = cmd_collection_check(series=series, issue=str(number), year=cover_year)
-        if owned["match_status"] == "in_collection":
+        # BUI-284: ambiguous_cross_volume (owned under >1 volume, no year to
+        # disambiguate) counts as owned — skip it rather than wish-list an owned
+        # book (BUI-122). cover_year is None when Metron has no cover date.
+        if collection_check_reports_owned(owned):
             already_owned.append(title)
             continue
 
@@ -977,7 +980,11 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
         series, issue = parsed
         checked += 1
         result = cmd_collection_check(series=series, issue=issue)
-        if result["match_status"] == "in_collection":
+        # BUI-284: ambiguous_cross_volume counts as owned here — this audit is
+        # always year-free (a wish name has no cover date), so an owned-under-
+        # multiple-volumes book returns ambiguous, and missing it would let the
+        # owned copy get exported In Collection=0 and deleted (BUI-122).
+        if collection_check_reports_owned(result):
             conflicts.append({
                 "name": name,
                 "series": series,
@@ -1918,6 +1925,120 @@ def _year_gate_accepts(year: Optional[str], release_date: str) -> bool:
     return any(release_date.startswith(candidate) for candidate in candidates)
 
 
+def _row_matches_series_issue(
+    row: dict[str, Any],
+    series_key: str,
+    issue_stripped: str,
+    issue: str,
+) -> bool:
+    """Return True when ``row``'s series key + issue token match the query,
+    ignoring ownership/variant/year.
+
+    The single series+issue matching core, shared by BOTH the owned matcher
+    (``_owned_row_matches_series_issue``) and the wish-list matcher
+    (``_match_wishlisted_issue``) so they can never drift on what "same
+    series + issue" means. Encodes BUI-26 bugs B/C:
+
+    * C — series identity comes from the ``full_title`` prefix (via the shared
+      ownership split), so "Fantastic Four Annual" does not satisfy a plain
+      "Fantastic Four" query.
+    * B — exact issue-token equality (leading zeros ignored), no substring
+      fallback, so issue "2" no longer matches "#32". A dateless/no-``#N`` row
+      (TPB/OGN) still requires the issue token to appear verbatim.
+    """
+    full_title = row.get("full_title") or ""
+    # BUI-197: permissive ownership split so an owned row with a non-digit-led
+    # token ("Thor Annual #A1") parses to (series, issue) instead of (whole
+    # title, None) — otherwise its series key carries the "#A1" and never
+    # matches, so the audit silently misses an owned book under an alias name.
+    title_series, title_issue = split_series_issue_for_ownership(full_title)
+    if _normalize_series_key(title_series) != series_key:
+        return False
+
+    if title_issue is not None:
+        norm_title_issue = title_issue.lstrip("0") or title_issue
+        return norm_title_issue.lower() == issue_stripped.lower()
+    # Title carries no "#N" (TPB / OGN / special): require the issue token to
+    # appear verbatim.
+    return issue.strip().lower() in full_title.lower()
+
+
+def _owned_row_matches_series_issue(
+    row: dict[str, Any],
+    series_key: str,
+    issue_stripped: str,
+    issue: str,
+) -> bool:
+    """Return True when ``row`` is an OWNED cache row whose series key + issue
+    token match the query (BUI-26 bug D layered on the shared series+issue core).
+
+    ``in_collection`` is a copies-owned count (0 = wish/pull/read, not owned);
+    only a truthy count is "owned". Used by ``_match_owned_issue`` (which adds
+    variant preference + the year gate) and the BUI-284 cross-volume ambiguity
+    probe (``_owned_series_issue_candidates``).
+    """
+    if not row.get("in_collection"):
+        return False
+    return _row_matches_series_issue(row, series_key, issue_stripped, issue)
+
+
+def _owned_series_issue_candidates(
+    comics: list[dict[str, Any]],
+    series_key: str,
+    issue_stripped: str,
+    issue: str,
+) -> list[dict[str, Any]]:
+    """All owned rows matching the series key + issue token (no variant/year
+    gate). Used by the BUI-284 cross-volume ambiguity probe."""
+    return [
+        row
+        for row in comics
+        if _owned_row_matches_series_issue(row, series_key, issue_stripped, issue)
+    ]
+
+
+def _has_cross_volume_ambiguity(candidates: list[dict[str, Any]]) -> bool:
+    """Return True when owned ``candidates`` (all sharing a normalized series
+    key + issue token) span more than one distinct volume/era (BUI-284).
+
+    The normalized series key deliberately collapses ``(Vol. N)`` /
+    ``(YYYY - YYYY)`` decoration, so two genuinely-different volumes of the same
+    masthead (e.g. ``Fantastic Four (Vol. 1) (1961 - 1996)`` vs.
+    ``Fantastic Four (Vol. 7) (2022 - 2025)``) share a key and can't be told
+    apart without a ``year``. When a caller supplies NO year and owns the same
+    issue number under two such rows, silently returning the first is a
+    dangerous false positive (reports a book owned that the caller doesn't have
+    in the volume they meant). We detect that here by looking for either:
+
+    * more than one distinct **decorated** ``series_name`` (the usual signal —
+      different LOCG volumes carry different ``(Vol. N)``/year decoration), or
+    * more than one distinct **present** ``release_date`` year (covers the rare
+      undecorated case where two eras are both stored as a bare masthead name).
+
+    Empty ``series_name`` and empty ``release_date`` are ignored rather than
+    counted as their own "era", so a dateless record-win row (BUI-105) sharing a
+    volume with a dated row does NOT read as ambiguous — only genuinely
+    distinct, populated eras trip the guard.
+    """
+    series_names = {
+        (row.get("series_name") or "").strip()
+        for row in candidates
+    }
+    series_names.discard("")
+    if len(series_names) > 1:
+        return True
+    release_years = {
+        year for year in (_coerce_year(row.get("release_date")) for row in candidates)
+        if year is not None
+    }
+    # Require a gap WIDER than the ±1 cover-vs-on-sale skew that _year_gate_accepts
+    # tolerates, so two copies of ONE volume that differ only by that skew (a
+    # January-cover issue that shipped the prior December, BUI-214/251) aren't
+    # misread as two eras. Genuinely different volumes sharing an undecorated
+    # masthead name are years apart, so real cross-volume detection is preserved.
+    return bool(release_years) and (max(release_years) - min(release_years) > 1)
+
+
 def _match_owned_issue(
     comics: list[dict[str, Any]],
     series_key: str,
@@ -1955,34 +2076,12 @@ def _match_owned_issue(
     """
     fallback: Optional[dict[str, Any]] = None
     for row in comics:
-        # in_collection is a copies-owned count (0 = wish-list / pull / read but
-        # not owned). Only owned rows count as "in collection" (BUI-26 bug D).
-        if not row.get("in_collection"):
+        # Series-key + issue-token core (BUI-26 bugs B/C/D), shared with the
+        # cross-volume ambiguity probe via _owned_row_matches_series_issue.
+        if not _owned_row_matches_series_issue(row, series_key, issue_stripped, issue):
             continue
 
         full_title = row.get("full_title") or ""
-        # BUI-197: permissive ownership split so an owned row with a non-digit-led
-        # token ("Thor Annual #A1") parses to (series, issue) instead of (whole
-        # title, None) — otherwise its series key carries the "#A1" and never
-        # matches, so the audit silently misses an owned book under an alias name.
-        title_series, title_issue = split_series_issue_for_ownership(full_title)
-
-        # Series identity comes from the title prefix, so "Fantastic Four Annual"
-        # does not satisfy a plain "Fantastic Four" query (BUI-26 bug C).
-        if _normalize_series_key(title_series) != series_key:
-            continue
-
-        if title_issue is not None:
-            # Exact issue-token equality (leading zeros ignored). No substring
-            # fallback, so issue "2" no longer matches "#32" (BUI-26 bug B).
-            norm_title_issue = title_issue.lstrip("0") or title_issue
-            if norm_title_issue.lower() != issue_stripped.lower():
-                continue
-        else:
-            # Title carries no "#N" (TPB / OGN / special): require the issue
-            # token to appear verbatim.
-            if issue.strip().lower() not in full_title.lower():
-                continue
 
         # BUI-105: only reject on a year mismatch when the row actually carries a
         # release_date. A dateless owned row (e.g. an index-resolved record-win
@@ -2049,18 +2148,10 @@ def _match_wishlisted_issue(
         if row.get("in_collection"):
             continue  # owned rows are _match_owned_issue's job, not this one
 
-        full_title = row.get("full_title") or ""
-        title_series, title_issue = split_series_issue_for_ownership(full_title)
-        if _normalize_series_key(title_series) != series_key:
+        # Same series+issue core as the owned matcher (BUI-26 bugs B/C), shared
+        # via _row_matches_series_issue so the two matchers can't drift.
+        if not _row_matches_series_issue(row, series_key, issue_stripped, issue):
             continue
-
-        if title_issue is not None:
-            norm_title_issue = title_issue.lstrip("0") or title_issue
-            if norm_title_issue.lower() != issue_stripped.lower():
-                continue
-        else:
-            if issue.strip().lower() not in full_title.lower():
-                continue
 
         # Same _year_gate_accepts window as _match_owned_issue (BUI-214/BUI-251)
         # — kept in one shared function so the two matchers can't drift.
@@ -2083,7 +2174,15 @@ def cmd_collection_check(
 
     Returns {match_status, full_title_matched, matched_series_name,
     matched_release_date, match_kind, in_wish_list, cache_age_days}.
-    match_status: "in_collection" | "not_in_cache".
+    match_status: "in_collection" | "not_in_cache" | "ambiguous_cross_volume".
+
+    BUI-284: "ambiguous_cross_volume" is returned when NO year was supplied and
+    the same issue number is owned under more than one distinct volume/era of
+    the same masthead (the normalized series key can't tell them apart). It is
+    NEITHER "owned" nor "not owned" — the caller must re-check WITH a per-issue
+    cover year to resolve it, and must never treat it as "owned" (skip) or "not
+    owned" (buy). The verdict adds a `candidates` list of the colliding volumes
+    ({full_title, series_name, release_date}) and sets match_kind="cross_volume".
 
     BUI-249: matched_series_name/matched_release_date/match_kind surface the
     matched row's provenance so a caller can detect an alias match that landed
@@ -2115,6 +2214,38 @@ def cmd_collection_check(
     matched_row = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
     match_kind: Optional[str] = "exact" if matched_row is not None else None
     in_wish_list = _match_wishlisted_issue(comics, series_key, issue_stripped, issue, year) is not None
+
+    # BUI-284: cross-volume ambiguity guard (exact-key pass, no year). With no
+    # `year`, the normalized series key can't distinguish two owned volumes of
+    # the same masthead that share this issue number (e.g. Fantastic Four #18 in
+    # both the 1961 Vol. 1 and the 2022 Vol. 7). _match_owned_issue would return
+    # an ARBITRARY one and report `in_collection` — a dangerous false positive
+    # that tells the caller to skip a book they may not own in the volume they
+    # meant. Instead surface an explicit `ambiguous_cross_volume` verdict listing
+    # the colliding volumes so the caller (skill/human) can re-check WITH a year.
+    # Only fires when a year was NOT supplied (a year resolves the collision via
+    # the release-date gate) and the exact-key pass hit (the alias pass is
+    # already flagged as match_kind="alias"); a single owned era is unaffected.
+    if matched_row is not None and not year:
+        candidates = _owned_series_issue_candidates(comics, series_key, issue_stripped, issue)
+        if _has_cross_volume_ambiguity(candidates):
+            return {
+                "match_status": "ambiguous_cross_volume",
+                "full_title_matched": matched_row.get("full_title") or "",
+                "matched_series_name": matched_row.get("series_name"),
+                "matched_release_date": matched_row.get("release_date"),
+                "match_kind": "cross_volume",
+                "in_wish_list": in_wish_list,
+                "cache_age_days": cache_age,
+                "candidates": [
+                    {
+                        "full_title": row.get("full_title") or "",
+                        "series_name": row.get("series_name"),
+                        "release_date": row.get("release_date"),
+                    }
+                    for row in candidates
+                ],
+            }
 
     # BUI-200/BUI-197: an owned copy can be filed under a DIFFERENT series-name
     # variant for the same run — the classic X-Men issue-number split
@@ -2165,6 +2296,25 @@ def cmd_collection_check(
         "in_wish_list": in_wish_list,
         "cache_age_days": cache_age,
     }
+
+
+# BUI-284: match statuses that mean "owned in at least one volume". The
+# ambiguous_cross_volume verdict IS an ownership signal (the book is owned, just
+# under an undetermined volume because no year was supplied) — it is only the
+# BUY path (the collection-check skill) that must treat it as "flag, don't skip".
+# Every OWNED-GUARD consumer (the wish-list-add 409, the conflicts audit, the
+# record-win/creator-run skip) must count it as owned; treating it as not-owned
+# would fail those guards open and re-open the BUI-122 data-loss path (an owned
+# book wish-listed → exported In Collection=0 → deleted from LOCG).
+_OWNED_MATCH_STATUSES = frozenset({"in_collection", "ambiguous_cross_volume"})
+
+
+def collection_check_reports_owned(result: dict[str, Any]) -> bool:
+    """True when a :func:`cmd_collection_check` result indicates the book is
+    owned in at least one volume — ``in_collection`` OR the year-unresolvable
+    ``ambiguous_cross_volume`` (BUI-284). The owned-guards use this so the new
+    ambiguous verdict can never silently fail them open (BUI-122)."""
+    return result.get("match_status") in _OWNED_MATCH_STATUSES
 
 
 def cmd_collection_series_names() -> dict[str, Any]:

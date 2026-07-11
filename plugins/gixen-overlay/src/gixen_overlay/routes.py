@@ -57,6 +57,7 @@ from locg.collection_io import MAX_XLSX_BYTES
 from locg.commands import (
     _split_wish_list_name,
     cmd_collection_check,
+    collection_check_reports_owned,
     cmd_collection_export,
     cmd_collection_import,
     cmd_collection_record_win,
@@ -1038,6 +1039,11 @@ async def api_collection_check(
     surface it as HTTP 500 rather than letting it 500 unhandled. The consumer
     MUST treat any non-200 (or an unreachable server) as a hard error and never
     render "not owned" from it (R11) — a silent miss buys a duplicate.
+
+    BUI-284: with no ``year``, ``match_status`` may be ``ambiguous_cross_volume``
+    (the issue is owned under more than one masthead volume and can't be
+    disambiguated without a cover year). It passes through as a 200 — the caller
+    must flag it and re-check WITH a year, never read it as owned or not-owned.
     """
     _ensure_collection_store()
     try:
@@ -1080,6 +1086,10 @@ async def api_collection_check_batch(req: CollectionCheckBatchRequest):
     confident-looking "not owned" verdicts we 409 the entire call (the same
     refusal the single-item endpoint makes, lifted to the batch boundary). A
     corrupt/crashed store surfaces as 500. An empty ``items`` list is a 422.
+
+    BUI-284: a per-item verdict may be ``ambiguous_cross_volume`` (owned under
+    more than one masthead volume, no year to disambiguate) — same passthrough
+    semantics as the single-item endpoint; the caller flags and re-checks it.
     """
     if not req.items:
         raise HTTPException(status_code=422, detail="items must be a non-empty list")
@@ -1673,7 +1683,11 @@ async def api_wish_list_add(req: WishListAddRequest):
                 check = cmd_collection_check(series=series, issue=issue, year=req.year)
             except RuntimeError:
                 check = None  # store unavailable → fail open, don't block the add
-            if check is not None and check["match_status"] == "in_collection":
+            # BUI-284: ambiguous_cross_volume counts as owned — with no year
+            # (req.year is often None) an owned-under-multiple-volumes book returns
+            # ambiguous, and treating it as not-owned would fail this guard open
+            # and re-open the BUI-122 data-loss path.
+            if check is not None and collection_check_reports_owned(check):
                 raise HTTPException(
                     status_code=409,
                     detail=(
