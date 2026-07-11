@@ -1427,8 +1427,9 @@ class TestVerifyWithClaudeChunking:
             for i in range(1, n + 1)
         ]
 
-    def test_250_candidates_produce_3_cli_calls(self, monkeypatch):
-        """250 candidates → 3 chunks: [100, 100, 50] → 3 CLI calls."""
+    def test_candidates_chunked_at_30(self, monkeypatch):
+        """BUI-297: chunk size is 30 → 250 candidates split into 9 CLI calls
+        ([30]*8 + [10]), and every candidate survives a clean run."""
         matches = self._make_matches(250)
         calls = []
 
@@ -1438,34 +1439,38 @@ class TestVerifyWithClaudeChunking:
 
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
-        result = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
-        assert len(calls) == 3
-        assert len(result) == 250
+        assert len(calls) == 9  # ceil(250 / 30)
+        assert len(kept) == 250
+        assert dropped == []
 
     def test_chunk_indices_are_local_not_global(self, monkeypatch):
         """Each chunk's prompt uses 1-based indices local to that chunk, not
         global position, so verdicts correlate correctly across chunk boundaries."""
-        matches = self._make_matches(150)  # 2 chunks: [100, 50]
+        matches = self._make_matches(60)  # 2 chunks: [30, 30]
 
-        # Chunk 2: reject ids 2-50 (local), keep only id=1 (local) →
-        # corresponds to global match #101.
-        rejected_chunk2 = [{"id": i, "reason": "test"} for i in range(2, 51)]
+        # Chunk 2: reject ids 2-30 (local), keep only id=1 (local) →
+        # corresponds to global match #31.
+        rejected_chunk2 = [{"id": i, "reason": "test"} for i in range(2, 31)]
         responses = iter(["[]", json.dumps(rejected_chunk2)])
 
         monkeypatch.setattr(
             seller_scan, "_verify_via_claude_cli", lambda prompt: next(responses)
         )
 
-        result = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
-        # 100 from chunk 1 + 1 from chunk 2 = 101
-        assert len(result) == 101
-        # The surviving item from chunk 2 is global index 101 (title "Comic Series #101")
-        assert result[-1]["title"] == "Comic Series #101"
+        # 30 from chunk 1 + 1 from chunk 2 = 31
+        assert len(kept) == 31
+        # The surviving item from chunk 2 is global index 31 (title "Comic Series #31")
+        assert kept[-1]["title"] == "Comic Series #31"
+        assert dropped == []
 
-    def test_unparseable_chunk_fails_closed(self, monkeypatch, capsys):
-        """A chunk whose response contains no JSON array is dropped entirely."""
+    def test_unparseable_chunk_is_dropped_loudly(self, monkeypatch, capsys):
+        """BUI-297: a chunk whose response contains no JSON array yielded no
+        usable verdict — its candidates are NEVER-VERIFIED, so they go to
+        `dropped` (loud), not silently discarded."""
         matches = self._make_matches(3)
         monkeypatch.setattr(
             seller_scan,
@@ -1473,14 +1478,16 @@ class TestVerifyWithClaudeChunking:
             lambda prompt: "I cannot help with that request.",
         )
 
-        result = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
-        assert result == []
+        assert kept == []
+        assert len(dropped) == 3
         err = capsys.readouterr().err
         assert "fail-closed" in err
 
-    def test_out_of_range_id_fails_closed(self, monkeypatch, capsys):
-        """A rejected-id outside 1..len(chunk) causes the whole chunk to drop."""
+    def test_out_of_range_id_is_dropped_loudly(self, monkeypatch, capsys):
+        """A rejected-id outside 1..len(chunk) is an unparseable/invalid verdict
+        → the whole chunk is dropped (never verified), not silently discarded."""
         matches = self._make_matches(5)
         # id=6 is out of range for a 5-candidate chunk.
         rejected = [{"id": 6, "reason": "phantom id"}]
@@ -1488,96 +1495,72 @@ class TestVerifyWithClaudeChunking:
             seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
         )
 
-        result = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
-        assert result == []
+        assert kept == []
+        assert len(dropped) == 5
         err = capsys.readouterr().err
         assert "fail-closed" in err
 
-    def test_non_int_id_fails_closed(self, monkeypatch, capsys):
-        """A rejected-id that is not an integer causes the whole chunk to drop."""
+    def test_non_int_id_is_dropped_loudly(self, monkeypatch, capsys):
+        """A rejected-id that is not an integer is an invalid verdict → the
+        whole chunk is dropped (never verified)."""
         matches = self._make_matches(5)
         rejected = [{"id": "two", "reason": "string id"}]
         monkeypatch.setattr(
             seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
         )
 
-        result = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
-        assert result == []
+        assert kept == []
+        assert len(dropped) == 5
         err = capsys.readouterr().err
         assert "fail-closed" in err
 
-    def test_missing_id_key_fails_closed(self, monkeypatch, capsys):
-        """A rejected object with no 'id' key causes the whole chunk to drop."""
+    def test_missing_id_key_is_dropped_loudly(self, monkeypatch, capsys):
+        """A rejected object with no 'id' key is an invalid verdict → the whole
+        chunk is dropped (never verified)."""
         matches = self._make_matches(5)
         rejected = [{"reason": "forgot the id"}]
         monkeypatch.setattr(
             seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
         )
 
-        result = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
-        assert result == []
+        assert kept == []
+        assert len(dropped) == 5
         err = capsys.readouterr().err
         assert "fail-closed" in err
 
     def test_empty_array_keeps_all_candidates(self, monkeypatch):
-        """[] response means nothing rejected — all candidates returned."""
+        """[] response means nothing rejected — all candidates kept, none dropped."""
         matches = self._make_matches(5)
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", lambda prompt: "[]")
 
-        result = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
-        assert len(result) == 5
+        assert len(kept) == 5
+        assert dropped == []
 
     def test_good_chunk_after_bad_chunk_still_kept(self, monkeypatch, capsys):
         """A bad first chunk drops its candidates but a good second chunk is kept."""
-        matches = self._make_matches(150)  # 2 chunks: [100, 50]
-        responses = iter(["no json here", "[]"])  # 2nd chunk: nothing rejected → all 50 kept
+        matches = self._make_matches(60)  # 2 chunks: [30, 30]
+        responses = iter(["no json here", "[]"])  # 2nd chunk: nothing rejected → all 30 kept
 
         monkeypatch.setattr(
             seller_scan, "_verify_via_claude_cli", lambda prompt: next(responses)
         )
 
-        result = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
-        # First 100 dropped (bad chunk); last 50 kept.
-        assert len(result) == 50
-        assert result[0]["title"] == "Comic Series #101"
+        # First 30 dropped (bad chunk); last 30 kept.
+        assert len(kept) == 30
+        assert kept[0]["title"] == "Comic Series #31"
+        assert len(dropped) == 30
         err = capsys.readouterr().err
         assert "fail-closed" in err
-
-    def test_transient_cli_error_folds_into_fail_closed_drop(self, monkeypatch, capsys):
-        """BUI-270: a *transient* claude CLI transport failure (nonzero exit /
-        timeout / empty output — surfaced by _verify_via_claude_cli as a
-        RuntimeError) on ONE chunk, while another chunk succeeds, folds into the
-        same fail-closed chunk-drop as a parse failure — the failed chunk's
-        candidates are dropped, the good chunk's kept, and no SystemExit (the
-        verifier is reachable, so this isn't a global failure)."""
-        matches = self._make_matches(150)  # 2 chunks: [100, 50]
-
-        def responses():
-            yield "raise"       # chunk 1 → transport failure
-            yield "[]"          # chunk 2 → success, nothing rejected
-        gen = responses()
-
-        def fake_verify(prompt):
-            val = next(gen)
-            if val == "raise":
-                raise RuntimeError("claude CLI failed: some stderr text")
-            return val
-
-        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
-
-        result = seller_scan.verify_with_claude(matches)
-
-        # Chunk 1's 100 dropped (transport failed); chunk 2's 50 kept.
-        assert len(result) == 50
-        assert result[0]["title"] == "Comic Series #101"
-        err = capsys.readouterr().err
-        assert "fail-closed" in err
-        assert "claude CLI failed" in err
 
     def test_all_chunks_transport_fail_hard_exits(self, monkeypatch, capsys):
         """BUI-270 safety net: if EVERY chunk fails at the transport layer (zero
@@ -1663,14 +1646,28 @@ class TestVerifyViaClaudeCli:
         with pytest.raises(RuntimeError, match="not logged in"):
             seller_scan._verify_via_claude_cli("some prompt")
 
-    def test_timeout_raises_runtime_error(self, monkeypatch):
+    def test_timeout_raises_verify_timeout(self, monkeypatch):
+        """BUI-297: a timeout raises the _VerifyTimeout subclass (still a
+        RuntimeError) so the caller can bisect-retry only on timeouts."""
         def fake_run(cmd, input, capture_output, text, timeout):
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
 
         monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
 
-        with pytest.raises(RuntimeError, match="timed out"):
+        with pytest.raises(seller_scan._VerifyTimeout, match="timed out"):
             seller_scan._verify_via_claude_cli("some prompt")
+
+    def test_nonzero_exit_is_not_a_verify_timeout(self, monkeypatch):
+        """BUI-297: a nonzero exit raises a plain RuntimeError, NOT _VerifyTimeout
+        — so it is dropped without a (useless, load-amplifying) bisection retry."""
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError) as exc:
+            seller_scan._verify_via_claude_cli("some prompt")
+        assert not isinstance(exc.value, seller_scan._VerifyTimeout)
 
     def test_empty_stdout_raises_runtime_error(self, monkeypatch):
         def fake_run(cmd, input, capture_output, text, timeout):
@@ -1704,15 +1701,310 @@ class TestVerifyWithClaudeNoSilentDrop:
             seller_scan, "_verify_via_claude_cli", lambda prompt: verdict_json
         )
 
-        kept = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
 
         # Only the genuine match is returned (unchanged behaviour).
         assert [m["title"] for m in kept] == ["Amazing Spider-Man #300 NM Marvel 1988"]
+        # BUI-297: a genuine model rejection is NOT a dropped/never-verified
+        # candidate — it stays a safe silent drop and never resurfaces.
+        assert dropped == []
         # The rejected one is surfaced to stderr with its reason.
         err = capsys.readouterr().err
         assert "Filtered 1 likely false positive" in err
         assert "Daredevil Annual #1" in err
         assert "Annual, not the regular series" in err
+
+
+# ─── BUI-297: bisection retry + dropped (never-verified) candidates ──────────
+
+
+class TestVerifyBisectionAndDrops:
+    """BUI-297: a chunk-level transport timeout must (a) bisect-retry before
+    giving up and (b) surface any candidate it still can't verify as `dropped`
+    (loud), distinct from a genuine model rejection (silent, safe)."""
+
+    @pytest.fixture(autouse=True)
+    def _claude_on_path(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
+
+    def _make_matches(self, n):
+        return [
+            {"title": f"Comic Series #{i}", "wish_name": f"Comic Series #{i}"}
+            for i in range(1, n + 1)
+        ]
+
+    def test_bisection_recovers_a_chunk_that_times_out_whole(self, monkeypatch, capsys):
+        """A single 30-candidate chunk times out as a whole, but both halves
+        succeed on retry → all 30 kept, none dropped, no SystemExit."""
+        matches = self._make_matches(30)  # 1 chunk
+        state = {"first": True}
+
+        def fake_verify(prompt):
+            # Fail only the very first (full-chunk) call; the two halves succeed.
+            if state["first"]:
+                state["first"] = False
+                raise seller_scan._VerifyTimeout("claude CLI timed out: chunk too big")
+            return "[]"
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        kept, dropped = seller_scan.verify_with_claude(matches)
+
+        assert len(kept) == 30
+        assert dropped == []
+        err = capsys.readouterr().err
+        assert "bisecting and retrying each half" in err
+
+    def test_bisection_isolates_a_poison_candidate_and_keeps_the_rest(
+        self, monkeypatch
+    ):
+        """BUI-297 headline feature: when only part of a chunk keeps timing out,
+        bisection isolates the failing region and KEEPS the rest of the chunk —
+        it does not drop all 30.  Here candidate #1 is a 'poison pill' that times
+        out at every size; bisection narrows the drop to a small group bounded by
+        the recursion-depth cap, and the other ~27 candidates survive."""
+        matches = self._make_matches(30)  # 1 chunk
+
+        def fake_verify(prompt):
+            # Any (sub-)chunk still containing candidate #1 times out; every
+            # other sub-chunk verifies fine.
+            if 'Comic Series #1"' in prompt:
+                raise seller_scan._VerifyTimeout("claude CLI timed out: poison #1")
+            return "[]"
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        kept, dropped = seller_scan.verify_with_claude(matches)
+
+        # The poison candidate is isolated into the dropped group; the rest keep.
+        assert any(c["title"] == "Comic Series #1" for c in dropped)
+        kept_titles = {c["title"] for c in kept}
+        assert "Comic Series #4" in kept_titles
+        # Depth-bounded isolation: the drop is a small group, not the whole chunk.
+        assert len(dropped) <= 4
+        assert len(kept) + len(dropped) == 30
+
+    def test_persistent_timeout_bisects_to_floor_then_drops(self, monkeypatch, capsys):
+        """A chunk that times out at EVERY size bisects down to the depth cap and
+        counts each candidate as dropped (never verified). Because another
+        chunk succeeds (transport reachable), there is no global SystemExit."""
+        matches = self._make_matches(60)  # 2 chunks of 30
+
+        call_count = {"n": 0}
+
+        def fake_verify(prompt):
+            call_count["n"] += 1
+            # Chunk 1 (first full-size call) succeeds; chunk 2 always times out.
+            if call_count["n"] == 1:
+                return "[]"
+            raise seller_scan._VerifyTimeout("claude CLI timed out")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        kept, dropped = seller_scan.verify_with_claude(matches)
+
+        # Chunk 1 fully kept; chunk 2 entirely dropped (never verified).
+        assert len(kept) == 30
+        assert len(dropped) == 30
+        # Dropped candidates are exactly the second chunk's global range.
+        assert {c["title"] for c in dropped} == {
+            f"Comic Series #{i}" for i in range(31, 61)
+        }
+        err = capsys.readouterr().err
+        assert "counting as DROPPED" in err
+
+    def test_non_timeout_transport_error_is_not_bisected(self, monkeypatch, capsys):
+        """BUI-297 reliability: a non-timeout transport failure (nonzero exit /
+        auth / rate-limit, surfaced as a plain RuntimeError) is dropped WITHOUT
+        bisection — retrying smaller chunks can't help and only amplifies load.
+        The single 30-candidate chunk makes exactly ONE CLI call, then drops."""
+        matches = self._make_matches(30)  # 1 chunk
+        calls = []
+
+        def fake_verify(prompt):
+            calls.append(prompt)
+            raise RuntimeError("claude CLI failed: not logged in")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        with pytest.raises(SystemExit) as exc:  # all-failed → global safety net
+            seller_scan.verify_with_claude(matches)
+        assert exc.value.code == 1
+        # No bisection: exactly one attempt for the whole chunk.
+        assert len(calls) == 1
+
+    def test_circuit_breaker_skips_remaining_chunks_when_transport_dead(
+        self, monkeypatch
+    ):
+        """BUI-297 efficiency guard: once a whole chunk yields zero successful
+        calls, the verifier is globally broken — remaining chunks are NOT
+        attempted, and the run hard-exits.  Without the breaker a dead transport
+        would repeat the per-chunk fan-out across every chunk."""
+        matches = self._make_matches(90)  # 3 chunks of 30
+        prompts = []
+
+        def fake_verify(prompt):
+            prompts.append(prompt)
+            raise seller_scan._VerifyTimeout("claude CLI timed out")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.verify_with_claude(matches)
+        assert exc.value.code == 1
+
+        # Only chunk 1 (candidates #1–#30) was ever attempted; chunks 2 and 3
+        # (which contain "#61") were skipped by the circuit breaker.
+        assert not any("Comic Series #61" in p for p in prompts)
+
+    def test_bisection_fan_out_is_depth_bounded(self, monkeypatch):
+        """BUI-297 reliability: a verifier that times out on EVERY call cannot
+        fan out unbounded — the recursion-depth cap limits a single 30-candidate
+        chunk to at most 2^(depth+1)-1 = 15 CLI calls before dropping the rest."""
+        matches = self._make_matches(30)  # 1 chunk
+        calls = []
+
+        def fake_verify(prompt):
+            calls.append(prompt)
+            raise seller_scan._VerifyTimeout("claude CLI timed out")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        with pytest.raises(SystemExit):  # all-failed → global safety net
+            seller_scan.verify_with_claude(matches)
+        # Depth cap 3 → at most 1 + 2 + 4 + 8 = 15 calls for the one chunk.
+        assert len(calls) <= 15
+
+    def test_model_rejection_and_drop_tracked_separately(self, monkeypatch, capsys):
+        """AC #1: in one run, a genuine model rejection (silent) and a
+        never-verified timeout (loud drop) are tracked separately — the reject
+        reduces `kept` but stays out of `dropped`; the timeout populates
+        `dropped` only."""
+        matches = self._make_matches(60)  # 2 chunks of 30
+
+        call_count = {"n": 0}
+
+        def fake_verify(prompt):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Chunk 1: model rejects local id 5 (a real judgement) → silent.
+                return '[{"id": 5, "reason": "wrong series"}]'
+            # Chunk 2 (and its bisected retries): always times out.
+            raise seller_scan._VerifyTimeout("claude CLI timed out")
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        kept, dropped = seller_scan.verify_with_claude(matches)
+
+        # Chunk 1: 30 - 1 rejected = 29 kept, and the rejected one is NOT dropped.
+        assert len(kept) == 29
+        # Chunk 2: all 30 never verified → dropped.
+        assert len(dropped) == 30
+        err = capsys.readouterr().err
+        assert "Filtered 1 likely false positive" in err  # silent model reject
+        assert "counting as DROPPED" in err                # loud never-verified
+
+
+class TestMainDroppedCandidatesExit:
+    """BUI-297 end-to-end through main(): a run with never-verified candidates
+    exits non-zero, emits the dropped_candidates JSON field, and records ONLY
+    the kept matches as seen."""
+
+    def _wire_main(self, monkeypatch, verify_return, record_sink):
+        """Stub out every external seam so main() reaches verify_with_claude
+        with two candidates, then returns `verify_return` from it."""
+        monkeypatch.setattr(seller_scan, "load_seller_aliases", lambda: {})
+        monkeypatch.setattr(
+            seller_scan, "resolve_seller_username", lambda *a, **k: "seller1"
+        )
+        monkeypatch.setattr(
+            seller_scan, "load_config", lambda: ("id", "secret", "http://x")
+        )
+        monkeypatch.setattr(seller_scan, "get_token", lambda *a, **k: "tok")
+        monkeypatch.setattr(
+            seller_scan,
+            "fetch_wish_list",
+            lambda: [{"id": 1, "name": "Amazing Spider-Man #300"}],
+        )
+        raw_listings = [
+            {"item_id": "A1", "title": "Amazing Spider-Man #300 one"},
+            {"item_id": "A2", "title": "Amazing Spider-Man #300 two"},
+        ]
+        monkeypatch.setattr(
+            seller_scan, "search_seller_listings", lambda *a, **k: raw_listings
+        )
+        monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
+        monkeypatch.setattr(
+            seller_scan, "match_listing", lambda title, wish_items: (wish_items[0], 0.9)
+        )
+        monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
+        monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
+        monkeypatch.setattr(
+            seller_scan, "verify_with_claude", lambda cands: verify_return(cands)
+        )
+        monkeypatch.setattr(
+            seller_scan,
+            "record_items_seen",
+            lambda ids, seller: record_sink.extend(ids),
+        )
+
+    def test_dropped_run_exits_3_json_field_and_seen_invariant(
+        self, monkeypatch, capsys
+    ):
+        recorded = []
+        # First candidate kept (verified), second dropped (never verified).
+        self._wire_main(
+            monkeypatch,
+            verify_return=lambda cands: (cands[:1], cands[1:]),
+            record_sink=recorded,
+        )
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        # AC #2: a distinct non-zero exit code.
+        assert code == 3
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        # AC #2: --json carries a dropped_candidates field on the loud path.
+        assert "dropped_candidates" in payload
+        assert len(payload["matches"]) == 1
+        assert len(payload["dropped_candidates"]) == 1
+        assert payload["matches"][0]["item_id"] == "A1"
+        assert payload["dropped_candidates"][0]["item_id"] == "A2"
+        # Private pipeline fields are stripped from the dropped side too.
+        assert not any(
+            k.startswith("_") for k in payload["dropped_candidates"][0]
+        )
+
+        # AC #2: the loud INCOMPLETE banner tells the operator to re-run.
+        assert "INCOMPLETE" in captured.err
+        assert "resurface on re-run" in captured.err
+
+        # AC #5: only the kept match is recorded as seen — the dropped one is
+        # never marked, so it resurfaces on re-run.
+        assert recorded == ["A1"]
+
+    def test_clean_run_exits_0_with_bare_array_json(self, monkeypatch, capsys):
+        recorded = []
+        # Both candidates kept, none dropped.
+        self._wire_main(
+            monkeypatch,
+            verify_return=lambda cands: (list(cands), []),
+            record_sink=recorded,
+        )
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        # Backward-compatible bare-array shape when nothing was dropped.
+        assert isinstance(payload, list)
+        assert {row["item_id"] for row in payload} == {"A1", "A2"}
+        assert recorded == ["A1", "A2"]
 
 
 # ─── BUI-227: _title_paren_years ─────────────────────────────────────────────
@@ -2366,9 +2658,10 @@ class TestVerifyWithClaudePromptEnrichment:
             lambda prompt: '[{"id":2,"reason":"annual vs regular"}]',
         )
 
-        kept = seller_scan.verify_with_claude(matches)
+        kept, dropped = seller_scan.verify_with_claude(matches)
         assert len(kept) == 1
         assert kept[0]["title"] == "Amazing Spider-Man #7"
+        assert dropped == []
 
     def test_foreign_edition_bullet_in_prompt(self, monkeypatch):
         """BUI-239: the foreign-edition reject bullet is present in the Haiku prompt.
@@ -2793,7 +3086,8 @@ class TestMainCandidateLoopGateChain:
         )
         monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
 
-        kept = seller_scan.verify_with_claude(candidates)
+        kept, dropped = seller_scan.verify_with_claude(candidates)
 
         assert "Correct series: The Amazing Spider-Man (Vol. 1) (1963 - 1998)" in prompts_seen[0]
         assert kept == []
+        assert dropped == []

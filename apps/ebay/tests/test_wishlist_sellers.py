@@ -79,10 +79,15 @@ def _run_main(
     seen: set | None = None,
     server_base: str = "",
     verify_return: list | None = None,
+    dropped_return: list | None = None,
     json_output: bool = False,
     extra_args: list | None = None,
 ) -> tuple[str, MagicMock, MagicMock]:
-    """Run main() with standard mocks; return (stdout, mock_verify, mock_record)."""
+    """Run main() with standard mocks; return (stdout, mock_verify, mock_record).
+
+    BUI-297: verify_with_claude returns (kept, dropped). `verify_return` is the
+    KEPT list; `dropped_return` (default []) is the never-verified list.
+    """
     if wish_list is None or wish_items is None:
         wish_list, wish_items = _two_wish_items()
     if seen is None:
@@ -90,8 +95,10 @@ def _run_main(
     if verify_return is None:
         # By default verify passes everything through
         verify_return = [m for ms in matches_by_wish for m in ms]
+    if dropped_return is None:
+        dropped_return = []
 
-    mock_verify = MagicMock(return_value=verify_return)
+    mock_verify = MagicMock(return_value=(verify_return, dropped_return))
     mock_record = MagicMock()
 
     with (
@@ -419,7 +426,7 @@ class TestOwnedFilter:
              "match_status": "not_in_cache", "full_title_matched": False, "cache_age_days": 0},
         ]}
 
-        mock_verify = MagicMock(return_value=[m2])
+        mock_verify = MagicMock(return_value=([m2], []))
         mock_record = MagicMock()
         wish_list, wish_items = _two_wish_items()
 
@@ -517,7 +524,7 @@ class TestVerdictCachePipeline:
              "series": "Amazing Spider-Man", "issue": "129", "_tokens": ["amazing"]},
         ]
 
-        mock_verify = MagicMock(return_value=[m1, m2])
+        mock_verify = MagicMock(return_value=([m1, m2], []))
         mock_record = MagicMock()
 
         with (
@@ -552,7 +559,7 @@ class TestVerdictCachePipeline:
         m1 = make_match(seller="S", item_id="10", wish_name="Amazing Spider-Man #129")
         m2 = make_match(seller="S", item_id="11", wish_name="X-Men #94")
 
-        mock_verify = MagicMock(return_value=[m1, m2])
+        mock_verify = MagicMock(return_value=([m1, m2], []))
         wish_list, wish_items = _two_wish_items()
 
         with (
@@ -590,7 +597,7 @@ class TestVerdictCachePipeline:
         ws.verdict_put(tk, "X-Men #94", True, db_path=db_path)
 
         wish_list, wish_items = _two_wish_items()
-        mock_verify = MagicMock()
+        mock_verify = MagicMock(return_value=([], []))
 
         with (
             patch.object(ws, "fetch_wish_list", return_value=wish_list),
@@ -611,6 +618,76 @@ class TestVerdictCachePipeline:
             ws.main([])
 
         mock_verify.assert_not_called()
+
+
+# ─── BUI-297: never-verified (dropped) candidates ────────────────────────────
+
+class TestVerifyDroppedCandidates:
+    """verify_with_claude returns (kept, dropped). A `dropped` candidate was
+    NEVER verified (claude CLI timeout/transport failure) — it must NOT be
+    cached as a verdict (a False cache would make it a permanent silent
+    rejection) and must NOT flow into the survivors that get recorded as seen,
+    so it resurfaces and re-verifies on the next scheduled run."""
+
+    def test_dropped_is_not_cached_not_returned_and_warned(self, tmp_path, capsys):
+        db_path = tmp_path / "v.db"
+        ws.verdict_init_db(db_path)
+
+        m_genuine = make_match(
+            wish_name="Amazing Spider-Man #129", title="Amazing Spider-Man #129 VF"
+        )
+        m_dropped = make_match(wish_name="X-Men #94", title="X-Men #94 NM")
+        m_rejected = make_match(wish_name="Daredevil #1", title="Daredevil #1 VG")
+        uncached = [m_genuine, m_dropped, m_rejected]
+
+        with (
+            patch.object(ws, "is_pristine_match", return_value=False),
+            patch.object(
+                ws, "verify_with_claude",
+                return_value=([m_genuine], [m_dropped]),  # m_rejected: neither
+            ),
+        ):
+            pristine_direct, verified = ws._verify_uncached_matches(uncached, db_path)
+
+        # Dropped candidate is never returned as a survivor.
+        assert pristine_direct == []
+        assert verified == [m_genuine]
+
+        gk = ws._title_key(m_genuine["title"])
+        rk = ws._title_key(m_rejected["title"])
+        dk = ws._title_key(m_dropped["title"])
+        # Genuine cached True, rejected cached False, dropped NOT cached at all.
+        assert ws.verdict_get(gk, "Amazing Spider-Man #129", db_path=db_path) is True
+        assert ws.verdict_get(rk, "Daredevil #1", db_path=db_path) is False
+        assert ws.verdict_get(dk, "X-Men #94", db_path=db_path) is None
+
+        # Loud stderr warning so an unattended scheduled run isn't silent.
+        err = capsys.readouterr().err
+        assert "never verified" in err
+        assert "resurface" in err
+
+    def test_dropped_survivor_not_recorded_as_seen(self, tmp_path):
+        """End-to-end: a seller's second book is dropped (never verified) →
+        seller falls below the ≥2 gate and NONE of its item_ids are recorded as
+        seen, so the dropped book resurfaces next run."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="sellerZ", item_id="1", wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="sellerZ", item_id="2", wish_name="X-Men #94")
+        wish_list, wish_items = _two_wish_items()
+
+        _, _, mock_record = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1],       # only m1 verified genuine
+            dropped_return=[m2],      # m2 never verified
+        )
+
+        # m2 (dropped) must never be marked seen. sellerZ falls below 2 with only
+        # m1, so nothing is recorded at all — and critically not item_id "2".
+        recorded_ids = [i for call in mock_record.call_args_list for i in call.args[0]]
+        assert "2" not in recorded_ids
 
 
 # ─── Post-verify re-gate ──────────────────────────────────────────────────────
@@ -643,7 +720,7 @@ class TestPostVerifyReGate:
             patch.object(ws, "fetch_seen_item_ids", return_value=set()),
             patch.object(ws, "_server_base", return_value=""),
             patch.object(ws, "verdict_db_path", return_value=db_path),
-            patch.object(ws, "verify_with_claude", return_value=[m1]),  # only m1 kept
+            patch.object(ws, "verify_with_claude", return_value=([m1], [])),  # only m1 kept
             patch.object(ws, "record_items_seen"),
         ):
             with redirect_stdout(buf):
@@ -832,7 +909,7 @@ class TestBuyingOptionsFlag:
             patch.object(ws, "fetch_seen_item_ids", return_value=set()),
             patch.object(ws, "_server_base", return_value=""),
             patch.object(ws, "verdict_db_path", return_value=tmp_path / "v.db"),
-            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "verify_with_claude", return_value=([], [])),
             patch.object(ws, "record_items_seen"),
         ):
             buf = io.StringIO()
@@ -1028,7 +1105,7 @@ class TestCrossSellerDedup:
                           title="X-Men #94 NM")
         wish_list, wish_items = _two_wish_items()
 
-        mock_verify = MagicMock(side_effect=lambda reps: reps)
+        mock_verify = MagicMock(side_effect=lambda reps: (reps, []))
 
         with (
             patch.object(ws, "fetch_wish_list", return_value=wish_list),
@@ -1094,7 +1171,7 @@ class TestCrossSellerDedup:
         ws.verdict_put(ws._title_key(m1["title"]), "Amazing Spider-Man #129", True, db_path=db_path)
         ws.verdict_put(ws._title_key(m2["title"]), "X-Men #94", True, db_path=db_path)
         wish_list, wish_items = _two_wish_items()
-        mock_verify = MagicMock()
+        mock_verify = MagicMock(return_value=([], []))
 
         with (
             patch.object(ws, "fetch_wish_list", return_value=wish_list),
@@ -1861,7 +1938,7 @@ class TestItemSpecificsGate:
                 else {"Publication Year": "1977"}  # in-era for X-Men 1963-1981
             )
         )
-        mock_verify = MagicMock(return_value=[m2])
+        mock_verify = MagicMock(return_value=([m2], []))
         wish_list, wish_items = _two_wish_items()
 
         with (
@@ -1910,7 +1987,7 @@ class TestItemSpecificsGate:
                 else {"Publication Year": "1977"}
             )
         )
-        mock_verify = MagicMock(return_value=[m1, m2])
+        mock_verify = MagicMock(return_value=([m1, m2], []))
         wish_list, wish_items = _two_wish_items()
 
         with (
@@ -1954,7 +2031,7 @@ class TestItemSpecificsGate:
         m2["_series_name"] = None
         wish_list, wish_items = _two_wish_items()
         mock_aspects = MagicMock()
-        mock_verify = MagicMock(return_value=[m1, m2])
+        mock_verify = MagicMock(return_value=([m1, m2], []))
 
         with (
             patch.object(ws, "fetch_wish_list", return_value=wish_list),
@@ -1992,7 +2069,7 @@ class TestItemSpecificsGate:
         )
         wish_list, wish_items = _two_wish_items()
         mock_aspects = MagicMock()
-        mock_verify = MagicMock(return_value=[m1, m2])
+        mock_verify = MagicMock(return_value=([m1, m2], []))
 
         with (
             patch.object(ws, "fetch_wish_list", return_value=wish_list),
@@ -2027,7 +2104,7 @@ class TestItemSpecificsGate:
             series_name="X-Men (Vol. 1) (1963 - 1981)",
         )
         wish_list, wish_items = _two_wish_items()
-        mock_verify = MagicMock(return_value=[m1, m2])
+        mock_verify = MagicMock(return_value=([m1, m2], []))
 
         output, _, _ = _run_main(
             [[m1], [m2]],
@@ -2061,7 +2138,7 @@ class TestItemSpecificsGate:
         wish_list, wish_items = _two_wish_items()
         # in-era pub year for both sellerA matches so they survive the gate
         mock_aspects = MagicMock(return_value={"Publication Year": "1964"})
-        mock_verify = MagicMock(return_value=[m1, m2])
+        mock_verify = MagicMock(return_value=([m1, m2], []))
 
         with (
             patch.object(ws, "fetch_wish_list", return_value=wish_list),
@@ -2186,7 +2263,7 @@ class TestItemSpecificsEraFallbackByIssueYear:
             patch.object(ws, "fetch_seen_item_ids", return_value=set()),
             patch.object(ws, "_server_base", return_value=""),
             patch.object(ws, "verdict_db_path", return_value=db_path),
-            patch.object(ws, "verify_with_claude", MagicMock(return_value=[])),
+            patch.object(ws, "verify_with_claude", MagicMock(return_value=([], []))),
             patch.object(ws, "record_items_seen"),
         ):
             buf = io.StringIO()
@@ -2266,7 +2343,7 @@ class TestKeywordDedup:
             patch.object(ws, "fetch_seen_item_ids", return_value=set()),
             patch.object(ws, "_server_base", return_value=""),
             patch.object(ws, "verdict_db_path", return_value=db_path),
-            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "verify_with_claude", return_value=([], [])),
             patch.object(ws, "record_items_seen"),
         ):
             ws.main([])
@@ -2306,7 +2383,7 @@ class TestKeywordDedup:
             patch.object(ws, "fetch_seen_item_ids", return_value=set()),
             patch.object(ws, "_server_base", return_value=""),
             patch.object(ws, "verdict_db_path", return_value=db_path),
-            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "verify_with_claude", return_value=([], [])),
             patch.object(ws, "record_items_seen"),
         ):
             ws.main([])
@@ -2346,7 +2423,7 @@ class TestKeywordDedup:
             patch.object(ws, "fetch_seen_item_ids", return_value=set()),
             patch.object(ws, "_server_base", return_value=""),
             patch.object(ws, "verdict_db_path", return_value=db_path),
-            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "verify_with_claude", return_value=([], [])),
             patch.object(ws, "record_items_seen"),
         ):
             ws.main([])
@@ -2398,7 +2475,7 @@ class TestKeywordDedup:
             patch.object(ws, "fetch_seen_item_ids", return_value=set()),
             patch.object(ws, "_server_base", return_value=""),
             patch.object(ws, "verdict_db_path", return_value=db_path),
-            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "verify_with_claude", return_value=([], [])),
             patch.object(ws, "record_items_seen"),
         ):
             ws.main(["--limit", "2"])
@@ -2438,7 +2515,7 @@ class TestKeywordDedup:
             patch.object(ws, "fetch_seen_item_ids", return_value=set()),
             patch.object(ws, "_server_base", return_value=""),
             patch.object(ws, "verdict_db_path", return_value=db_path),
-            patch.object(ws, "verify_with_claude", return_value=[]),
+            patch.object(ws, "verify_with_claude", return_value=([], [])),
             patch.object(ws, "record_items_seen"),
         ):
             ws.main(["--limit", "1"])

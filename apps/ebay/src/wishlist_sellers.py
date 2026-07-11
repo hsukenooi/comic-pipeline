@@ -594,21 +594,41 @@ def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list]
             f"  Verifying {len(representatives)} uncached candidate(s) with Claude Haiku...",
             file=sys.stderr,
         )
-        verified_reps = verify_with_claude(representatives)
+        # BUI-297: verify_with_claude returns (kept, dropped). `dropped` are
+        # candidates the verifier NEVER reached a verdict on (claude CLI
+        # timeout / transport failure surviving bisection) — semantically NOT a
+        # rejection. They must be treated as never-verified: NOT cached as a
+        # verdict (caching False would make a never-verified book a permanent
+        # silent rejection that never resurfaces) and NOT recorded as seen, so
+        # they resurface and re-verify on the next scheduled run.
+        verified_reps, dropped_reps = verify_with_claude(representatives)
         # Keys that came back as genuine from verify
         genuine_keys = {(_title_key(m["title"]), m["wish_name"]) for m in verified_reps}
+        dropped_keys = {(_title_key(m["title"]), m["wish_name"]) for m in dropped_reps}
         # Fan the verdict back out to ALL needs_verify listings sharing each key
         verified = [
             m for m in needs_verify
             if (_title_key(m["title"]), m["wish_name"]) in genuine_keys
         ]
-        # Persist one verdict row per (title_key, wish_name) — not per listing
+        # Persist one verdict row per (title_key, wish_name) — not per listing —
+        # but skip never-verified keys entirely so they stay uncached (BUI-297).
         persisted: set[tuple] = set()
         for m in needs_verify:
             key = (_title_key(m["title"]), m["wish_name"])
+            if key in dropped_keys:
+                continue
             if key not in persisted:
                 verdict_put(key[0], m["wish_name"], key in genuine_keys, db_path=db_path)
                 persisted.add(key)
+        if dropped_reps:
+            # Loud signal: unattended scheduled runs must not silently lose a
+            # never-verified wish-list match (the BUI-297 data-loss class).
+            print(
+                f"  WARNING: {len(dropped_reps)} candidate(s) never verified "
+                f"(claude CLI timeout/transport failure) — NOT cached and NOT "
+                f"recorded as seen; will resurface next scheduled run.",
+                file=sys.stderr,
+            )
     else:
         verified = []
 
