@@ -179,17 +179,21 @@ def get_token(client_id, client_secret, base_url):
         sys.exit(1)
     expires_in = token_data.get("expires_in", 7200)
 
-    # Cache token with restrictive permissions. Best-effort: an OSError here
-    # (e.g. disk full, permission denied) must not discard the token we already
-    # got from eBay — log and fall through, still returning the live token.
+    # Cache token with restrictive permissions, atomically (tmp→rename, mirrors
+    # _aspects_cache_put) so a crash mid-write never leaves a partial cache file.
+    # Best-effort: an OSError here (e.g. disk full, permission denied) must not
+    # discard the token we already got from eBay — log and fall through, still
+    # returning the live token.
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        fd = os.open(cache_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp = cache_file.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump(
                 {"access_token": access_token, "expires_at": time.time() + expires_in},
                 f,
             )
+        tmp.replace(cache_file)
     except OSError as exc:
         print(f"Warning: could not write token cache: {exc}", file=sys.stderr)
 
@@ -616,7 +620,14 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
         query = f"q=comic&filter={filter_val}&limit={page_size}&offset={offset}"
 
         for attempt in range(retries):
-            resp = requests.get(url, headers=headers, params=query, timeout=15)
+            try:
+                resp = requests.get(url, headers=headers, params=query, timeout=15)
+            except requests.exceptions.RequestException as exc:
+                print(
+                    f"Network error fetching seller listings for '{username}': {exc}",
+                    file=sys.stderr,
+                )
+                return _filter_by_seller(all_items, username)
             if resp.status_code == 200:
                 break
             if resp.status_code == 429 and attempt < retries - 1:

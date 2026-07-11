@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 import ebay_fetch
 import seller_scan
@@ -258,6 +259,28 @@ class TestSearchSellerListings:
         result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
         assert result == []
         assert mock_get.call_count == 1
+
+    # ── BUI-311: network-exception guard ────────────────────────────────────
+
+    @patch("ebay_fetch.requests.get")
+    def test_network_error_on_second_page_returns_first_page(self, mock_get, capsys):
+        """A ConnectionError mid-pagination must degrade gracefully — return
+        the (seller-filtered) items collected so far rather than raising,
+        mirroring search_by_keyword's RequestException handling."""
+        page1 = self._mock_page([self._item(i) for i in range(200)], 400)
+        mock_get.side_effect = [page1, requests.exceptions.ConnectionError("no route to host")]
+        result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
+        assert len(result) == 200
+        assert "Network error" in capsys.readouterr().err
+
+    @patch("ebay_fetch.requests.get")
+    def test_network_error_on_first_page_returns_empty(self, mock_get, capsys):
+        """A ConnectionError on the very first request must fail this seller
+        scan, not crash the run — same contract as an HTTP error response."""
+        mock_get.side_effect = requests.exceptions.ConnectionError("no route to host")
+        result = ebay_fetch.search_seller_listings("seller", "tok", "https://api.ebay.com")
+        assert result == []
+        assert "Network error" in capsys.readouterr().err
 
 
 # ─── seller_scan matching ─────────────────────────────────────────────────────
