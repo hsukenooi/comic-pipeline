@@ -247,6 +247,8 @@ State explicitly that interpolation was used and confidence is reduced.
 
 Below $200 the two markets diverge too much (certification cost is proportionally too large, raw buyers discount heavily). Above $200 the cost of CGC submission (~$50–150) is small relative to value, so rational buyers pay near-CGC prices for clean raw copies — making CGC realized prices a reliable anchor.
 
+**Note on automation:** The >$200 value gate is meaningful only in the human/LLM skill path, which has context-based judgment to estimate value without FMV comps. In an automated code path where this §7a trigger fires (raw comps too thin to price), there is no pre-computed value estimate to gate on — that value is precisely what you're trying to solve for, creating a circular dependency. Any code-based automation of §7a would need to either (a) receive an explicit external value estimate as input, or (b) skip the value gate and apply the raw-discount formula unconditionally.
+
 **Why this beats grade-curve interpolation for keys:**
 Raw eBay comps for keys are sparse and noisy (sellers misgrade, titles lack condition info). CGC Heritage/GoCollect sales are grade-certain and drawn from the same buyer pool. For high-value keys, CGC data is more representative of true demand than a handful of raw eBay listings.
 
@@ -266,6 +268,8 @@ curl -s "https://serpapi.com/search.json?engine=google&q={title}+{issue}+{year}+
 ```
 
 Extract realized prices from snippets. Target the grade nearest your raw target (within ±0.5) and bracket grades above and below for interpolation if needed.
+
+**Automation note:** Automating this step requires `engine=google` SerpApi queries. The current `ebay-sold-comps` subprocess only implements `engine=ebay` for raw-copy pricing. Adding §7a automation would require extending `apps/ebay/src/sold_comps.py` to support Google queries — this cannot reuse existing `apps/fmv` plumbing, which only makes `requests` against the comics server.
 
 **Step 2 — Apply raw discount**
 
