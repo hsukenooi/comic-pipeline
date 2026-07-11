@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1417,6 +1418,8 @@ class TestVerifyWithClaudeChunking:
     def _claude_on_path(self, monkeypatch):
         # BUI-270: verify_with_claude preflights shutil.which("claude"); stub it
         # truthy so the chunking tests exercise the loop, not the preflight.
+        # (BUI-301's rejected-candidate cache is redirected globally by the
+        # conftest.py autouse fixture.)
         monkeypatch.setattr(
             seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
         )
@@ -1614,6 +1617,306 @@ class TestVerifyWithClaudeChunking:
         assert "`claude` CLI was not found on PATH" in err
         # Preflight fires before the loop — the transport is never called.
         assert called == []
+
+
+# ─── Rejected-candidate cache (BUI-301) ────────────────────────────────────────
+
+
+class TestRejectedCandidateCache:
+    """BUI-301: a model-REJECTED (listing, wish) pair is cached so a repeat
+    scan skips re-verifying it until the cache entry's TTL expires. Separate
+    concerns from the genuine seen-set: a genuine match must never be cached
+    here, and a never-verified (dropped) candidate must never be cached either
+    — it has to resurface for verification on the very next run. The cache is
+    opt-in (use_rejected_cache=True); seller-scan opts in.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _claude_on_path(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
+        # The conftest.py autouse fixture already redirected the rejected-cache
+        # to a per-test tmp path; capture that path for this class's direct
+        # cache writes rather than patching it a second time.
+        self.cache_path = seller_scan._REJECTED_CACHE_PATH
+
+    def _make_match(self, item_id, n=1, wish_name=None):
+        return {
+            "item_id": item_id,
+            "title": f"Comic Series #{n}",
+            "wish_name": wish_name if wish_name is not None else f"Comic Series #{n}",
+        }
+
+    def _key(self, item_id, n=1, wish_name=None):
+        return seller_scan._rejected_cache_key(
+            item_id, wish_name if wish_name is not None else f"Comic Series #{n}"
+        )
+
+    def _write_cache(self, entries):
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_path.write_text(json.dumps(entries))
+
+    def _verify(self, matches):
+        return seller_scan.verify_with_claude(matches, use_rejected_cache=True)
+
+    def test_rejected_candidate_within_ttl_is_skipped(self, monkeypatch):
+        """A pair cached as rejected less than the TTL ago is skipped entirely
+        — no CLI call, and it appears in none of kept/dropped/filtered."""
+        now = datetime.now(timezone.utc)
+        self._write_cache({self._key("111"): now.isoformat()})
+
+        calls = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: calls.append(prompt) or "[]",
+        )
+
+        kept, dropped, filtered = self._verify([self._make_match("111")])
+
+        assert calls == []
+        assert kept == []
+        assert dropped == []
+        assert filtered == []
+
+    def test_rejected_candidate_just_under_ttl_is_skipped(self, monkeypatch):
+        """TTL boundary (just-under side): an entry aged 1h short of the TTL is
+        still within window and skipped — guards the `<=` prune against a
+        `<`/`<=` off-by-one that the far-over-TTL test alone wouldn't catch."""
+        fresh = datetime.now(timezone.utc) - timedelta(
+            seconds=seller_scan._REJECTED_CACHE_TTL_SEC - 3600
+        )
+        self._write_cache({self._key("111"): fresh.isoformat()})
+
+        calls = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: calls.append(prompt) or "[]",
+        )
+
+        kept, dropped, filtered = self._verify([self._make_match("111")])
+
+        assert calls == []
+        assert kept == []
+
+    def test_rejected_candidate_past_ttl_is_reverified(self, monkeypatch):
+        """A cache entry older than _REJECTED_CACHE_TTL_SEC no longer
+        suppresses verification — the candidate is sent to the CLI again,
+        giving a transiently-misjudged or since-edited listing another chance."""
+        stale = datetime.now(timezone.utc) - timedelta(
+            seconds=seller_scan._REJECTED_CACHE_TTL_SEC + 3600
+        )
+        self._write_cache({self._key("111"): stale.isoformat()})
+
+        calls = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: calls.append(prompt) or "[]",
+        )
+
+        kept, dropped, filtered = self._verify([self._make_match("111")])
+
+        assert len(calls) == 1
+        assert len(kept) == 1
+        assert kept[0]["item_id"] == "111"
+        assert dropped == []
+        assert filtered == []
+
+    def test_future_dated_entry_is_evicted_not_wedged(self, monkeypatch):
+        """A future-dated timestamp (clock skew / hand-edit) has a negative age;
+        it must be treated as expired and re-verified, never suppress a
+        candidate forever (adversarial: no lower age bound would wedge it)."""
+        future = datetime.now(timezone.utc) + timedelta(days=365)
+        self._write_cache({self._key("111"): future.isoformat()})
+
+        calls = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: calls.append(prompt) or "[]",
+        )
+
+        kept, dropped, filtered = self._verify([self._make_match("111")])
+
+        assert len(calls) == 1
+        assert len(kept) == 1
+
+    def test_rejection_of_one_wish_does_not_suppress_a_different_wish(
+        self, monkeypatch
+    ):
+        """Cross-pairing invariant (correctness + adversarial): a listing
+        rejected against wish A must NOT be suppressed when a later run re-pairs
+        the SAME item_id to a genuine wish B — the cache key is the (item_id,
+        wish_name) pair, not item_id alone."""
+        now = datetime.now(timezone.utc)
+        # item 111 was rejected against wish "Wrong Series #5" last run.
+        self._write_cache(
+            {self._key("111", wish_name="Wrong Series #5"): now.isoformat()}
+        )
+
+        calls = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: calls.append(prompt) or "[]",
+        )
+
+        # This run, the same listing best-matches a DIFFERENT (genuine) wish.
+        kept, dropped, filtered = self._verify(
+            [self._make_match("111", wish_name="Right Series #5")]
+        )
+
+        assert len(calls) == 1  # re-verified, not skipped
+        assert len(kept) == 1
+        assert kept[0]["item_id"] == "111"
+
+    def test_genuine_match_is_unaffected(self, monkeypatch):
+        """A candidate with no rejected-cache entry is verified normally, and a
+        kept genuine match must never be written into the rejected cache."""
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", lambda prompt: "[]")
+
+        kept, dropped, filtered = self._verify([self._make_match("222")])
+
+        assert len(kept) == 1
+        assert dropped == []
+        assert filtered == []
+        assert seller_scan._load_rejected_cache() == {}
+
+    def test_model_rejection_is_cached_for_next_run(self, monkeypatch):
+        """A candidate the model explicitly rejects this run is written to the
+        rejected cache (keyed by the (item_id, wish_name) pair) so a subsequent
+        scan can skip it."""
+        rejected = [{"id": 1, "reason": "wrong series"}]
+        monkeypatch.setattr(
+            seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
+        )
+
+        kept, dropped, filtered = self._verify([self._make_match("333")])
+
+        assert kept == []
+        assert dropped == []
+        assert len(filtered) == 1
+        assert self._key("333") in seller_scan._load_rejected_cache()
+
+    def test_partial_cache_skips_only_the_cached_pair(self, monkeypatch):
+        """A mixed batch: one pair is cache-skipped while the other is verified
+        — exercises the skip/verify partition loop with a real split."""
+        now = datetime.now(timezone.utc)
+        self._write_cache({self._key("111", n=1): now.isoformat()})
+
+        prompts = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: prompts.append(prompt) or "[]",
+        )
+
+        kept, dropped, filtered = self._verify(
+            [self._make_match("111", n=1), self._make_match("222", n=2)]
+        )
+
+        # Only the uncached candidate reaches the CLI and is kept.
+        assert len(prompts) == 1
+        assert [c["item_id"] for c in kept] == ["222"]
+        assert "Comic Series #2" in prompts[0]
+        assert "Comic Series #1" not in prompts[0]
+
+    def test_disabled_by_default_does_not_read_or_write_cache(self, monkeypatch):
+        """use_rejected_cache defaults False (the wishlist_sellers path): a
+        pre-existing rejection must NOT skip, and a fresh rejection must NOT be
+        persisted — the shared verifier's other caller is unaffected."""
+        now = datetime.now(timezone.utc)
+        self._write_cache({self._key("111"): now.isoformat()})
+
+        rejected = [{"id": 1, "reason": "wrong series"}]
+        calls = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: calls.append(prompt) or json.dumps(rejected),
+        )
+
+        # Default call (no use_rejected_cache) — item 111 is NOT skipped despite
+        # the cache entry, and the new rejection does NOT overwrite the cache.
+        kept, dropped, filtered = seller_scan.verify_with_claude(
+            [self._make_match("111")]
+        )
+
+        assert len(calls) == 1  # verified despite the cached rejection
+        assert len(filtered) == 1
+        # Cache file untouched: still only the original entry, no new write.
+        assert seller_scan._load_rejected_cache() == {
+            self._key("111"): now.isoformat()
+        }
+
+    def test_corrupt_cache_file_is_treated_as_empty(self, monkeypatch):
+        """A corrupt / non-JSON cache file degrades to {} (never raises) so
+        verification proceeds normally."""
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_path.write_text("{ this is not valid json")
+
+        calls = []
+        monkeypatch.setattr(
+            seller_scan,
+            "_verify_via_claude_cli",
+            lambda prompt: calls.append(prompt) or "[]",
+        )
+
+        kept, dropped, filtered = self._verify([self._make_match("111")])
+
+        assert seller_scan._load_rejected_cache() == {}
+        assert len(calls) == 1  # not skipped — corrupt cache = empty
+        assert len(kept) == 1
+
+    def test_non_dict_cache_file_is_treated_as_empty(self):
+        """A JSON file that parses to a non-dict (e.g. a list) is ignored."""
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_path.write_text(json.dumps(["not", "a", "dict"]))
+        assert seller_scan._load_rejected_cache() == {}
+
+    def test_unparseable_timestamp_is_evicted(self):
+        """An entry with a non-ISO timestamp is treated as infinitely old and
+        dropped on load — a corrupt entry can't wedge a pair out of
+        re-verification forever."""
+        self._write_cache({self._key("111"): "not-a-timestamp"})
+        assert seller_scan._load_rejected_cache() == {}
+
+    def test_save_helper_swallows_oserror(self, monkeypatch, capsys):
+        """_save_rejected_cache warns and returns on an OSError (disk full,
+        read-only FS, permission) — never propagates. The cache is a cost
+        optimization; a failed write must fall open to normal re-verification."""
+        def raise_oserror(*a, **k):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(seller_scan.Path, "write_text", raise_oserror)
+
+        # Must not raise.
+        seller_scan._save_rejected_cache({self._key("111"): "2026-07-11T00:00:00+00:00"})
+
+        err = capsys.readouterr().err
+        assert "could not persist rejected-candidate cache" in err
+
+    def test_save_failure_does_not_crash_verify(self, monkeypatch):
+        """End-to-end: an OSError persisting a fresh rejection must not abort
+        verify_with_claude — the rejection is still returned in `filtered`, the
+        scan continues (a multi-seller batch must not crash before printing)."""
+        rejected = [{"id": 1, "reason": "wrong series"}]
+        monkeypatch.setattr(
+            seller_scan, "_verify_via_claude_cli", lambda prompt: json.dumps(rejected)
+        )
+        monkeypatch.setattr(
+            seller_scan.Path,
+            "write_text",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        kept, dropped, filtered = self._verify([self._make_match("444")])
+
+        assert kept == []
+        assert len(filtered) == 1
 
 
 class TestVerifyViaClaudeCli:
@@ -1967,7 +2270,9 @@ class TestMainDroppedCandidatesExit:
         monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
         monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
 
-        def fake_verify(cands):
+        def fake_verify(cands, **kwargs):
+            # BUI-301: _scan_one_seller passes use_rejected_cache=True; accept
+            # and ignore it here (the cache is unit-tested separately).
             username = cands[0]["item_id"].rsplit("-", 1)[0]
             return verify_return_by_username[username](cands)
 
@@ -2286,7 +2591,7 @@ class TestMainDroppedCandidatesExit:
         most severe code."""
         recorded = {}
 
-        def verify(cands):
+        def verify(cands, **kwargs):
             username = cands[0]["item_id"].rsplit("-", 1)[0]
             if username == "sellerDead":
                 # Simulate verify_with_claude's global-failure hard-exit.
@@ -2387,7 +2692,7 @@ class TestMainDroppedCandidatesExit:
         monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
         monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
         monkeypatch.setattr(
-            seller_scan, "verify_with_claude", lambda cands: (list(cands), [], [])
+            seller_scan, "verify_with_claude", lambda cands, **kwargs: (list(cands), [], [])
         )
         monkeypatch.setattr(seller_scan, "record_items_seen", lambda ids, seller: None)
 
