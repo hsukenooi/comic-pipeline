@@ -781,12 +781,11 @@ def cmd_wish_list_add_creator_run(
     run_issues = run["issues"]
     warnings = run["warnings"]
 
-    # Load existing wish-list names once for already-wishlisted dedup.
+    # Load existing wish-list items once for already-wishlisted dedup.
     try:
         existing = cmd_wish_list_from_cache()
     except FileNotFoundError:
         existing = []
-    wished_names = {(it.get("name") or "").strip().lower() for it in existing}
 
     to_add: list[dict[str, Any]] = []
     already_owned: list[str] = []
@@ -809,7 +808,7 @@ def cmd_wish_list_add_creator_run(
             already_owned.append(title)
             continue
 
-        if title.strip().lower() in wished_names:
+        if _find_duplicate_wish_entry(title, existing) is not None:
             already_wishlisted.append(title)
             continue
 
@@ -940,6 +939,41 @@ def _split_wish_list_name(name: str) -> Optional[tuple[str, str]]:
     if not series or not issue:
         return None
     return series, issue
+
+
+def _find_duplicate_wish_entry(title: str, items: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Return the wish-list item among ``items`` that duplicates ``title``.
+
+    Dedup key is the DECORATED series portion + issue token (via
+    :func:`_split_wish_list_name`), compared case-insensitively with leading
+    zeros stripped (:func:`normalize_issue_key`) — never ``_normalize_series_key``,
+    which collapses ``(Vol. N)``/year decoration and would merge genuinely
+    different volumes of the same masthead (the BUI-284 trap).
+
+    Mirrors ``gixen_overlay.routes._find_existing_wish_entry`` (BUI-285) so a
+    wish-list add is deduped the same way regardless of entry point — the
+    server endpoint or this CLI's creator-run (BUI-303). Only the cache lookup
+    differs: the endpoint re-reads the cache itself, while this takes the
+    caller's already-loaded ``items`` so a creator-run checking many issues in
+    one call doesn't re-read the cache per issue.
+
+    An unparseable ``title`` (no ``#`` token) can't be compared, so it is
+    treated as non-duplicate.
+    """
+    parsed = _split_wish_list_name(title)
+    if parsed is None:
+        return None
+    series, issue = parsed
+    series_cmp = series.strip().lower()
+    issue_cmp = normalize_issue_key(issue)
+    for item in items:
+        item_parsed = _split_wish_list_name(item.get("name") or "")
+        if item_parsed is None:
+            continue
+        item_series, item_issue = item_parsed
+        if item_series.strip().lower() == series_cmp and normalize_issue_key(item_issue) == issue_cmp:
+            return item
+    return None
 
 
 def cmd_wish_list_conflicts() -> dict[str, Any]:
