@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import importlib.metadata
 import json
 import os
 import re
@@ -15,6 +16,25 @@ import requests
 from urllib.parse import quote
 
 from comic_identity import confident_cover_year
+
+
+def _version_string() -> str:
+    """BUI-314: staleness signal for a `uv tool install`ed binary.
+
+    `_ebay_build_stamp` is generated at build time by hatch_build.py from the
+    git HEAD of the source tree the wheel was built from; it's absent when
+    running from an unbuilt checkout (e.g. `uv run` here in tests), so fall
+    back to "unknown" rather than failing.
+    """
+    try:
+        pkg_version = importlib.metadata.version("ebay-tools")
+    except importlib.metadata.PackageNotFoundError:
+        pkg_version = "unknown"
+    try:
+        from _ebay_build_stamp import GIT_DATE, GIT_SHA
+    except ImportError:
+        GIT_SHA, GIT_DATE = "unknown", "unknown"
+    return f"ebay-fetch {pkg_version} (git {GIT_SHA}, {GIT_DATE})"
 
 # --- Configuration ---
 
@@ -940,10 +960,18 @@ def print_table(items, fields=None):
         print(line)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Fetch structured listing data from eBay.",
         prog="ebay-fetch",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=_version_string(),
+        help="Print the installed version and the git SHA/date it was built "
+             "from, then exit. Use this to check for a stale `uv tool install` "
+             "(see scripts/install.sh).",
     )
     parser.add_argument(
         "items",
@@ -969,7 +997,7 @@ def main():
         help="eBay environment (overrides config)",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Collect item args from CLI and stdin
     raw_items = list(args.items) if args.items else []

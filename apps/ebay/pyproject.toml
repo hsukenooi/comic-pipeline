@@ -17,6 +17,7 @@ ebay-sold-comps = "sold_comps:main"
 seller-scan = "seller_scan:main"
 wishlist-sellers = "wishlist_sellers:main"
 comic-identify = "comic_identify:main"
+grade-photos = "grade_photos:main"
 
 [tool.hatch.build.targets.wheel]
 include = [
@@ -24,12 +25,16 @@ include = [
     "src/sold_comps.py",
     "src/comic_identity.py",
     "src/comic_identify.py",
+    "src/grade_photos.py",
     "src/seller_scan.py",
     "src/ebay_search_cache.py",
     "src/wishlist_sellers.py",
     "src/seller_aliases.json",
 ]
 sources = ["src"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

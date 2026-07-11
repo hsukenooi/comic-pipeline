@@ -35,6 +35,7 @@ set with per-seller scans — a listing shown by either tool won't re-surface.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import re
@@ -72,6 +73,25 @@ from seller_scan import (
     should_reject,  # BUI-245: shared deterministic reject chain
     verify_with_claude,
 )
+
+
+def _version_string() -> str:
+    """BUI-314: staleness signal for a `uv tool install`ed binary.
+
+    `_ebay_build_stamp` is generated at build time by hatch_build.py from the
+    git HEAD of the source tree the wheel was built from; it's absent when
+    running from an unbuilt checkout (e.g. `uv run` here in tests), so fall
+    back to "unknown" rather than failing.
+    """
+    try:
+        pkg_version = importlib.metadata.version("ebay-tools")
+    except importlib.metadata.PackageNotFoundError:
+        pkg_version = "unknown"
+    try:
+        from _ebay_build_stamp import GIT_DATE, GIT_SHA
+    except ImportError:
+        GIT_SHA, GIT_DATE = "unknown", "unknown"
+    return f"wishlist-sellers {pkg_version} (git {GIT_SHA}, {GIT_DATE})"
 
 # ─── Score floor ──────────────────────────────────────────────────────────────
 # Mirror seller_scan.match_listing's internal 0.65 threshold; match_listing
@@ -720,6 +740,14 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
             "Discover eBay sellers holding ≥2 wish-list books "
             "(combine-shipping candidates)."
         ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=_version_string(),
+        help="Print the installed version and the git SHA/date it was built "
+             "from, then exit. Use this to check for a stale `uv tool install` "
+             "(see scripts/install.sh).",
     )
     parser.add_argument(
         "--json",

@@ -2,6 +2,7 @@
 """seller-scan: Match an eBay seller's active listings against your LOCG wish list."""
 
 import argparse
+import importlib.metadata
 import json
 import os
 import re
@@ -1174,10 +1175,37 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
     return result
 
 
+def _version_string() -> str:
+    """BUI-314: staleness signal for a `uv tool install`ed binary.
+
+    `_ebay_build_stamp` is generated at build time by hatch_build.py from the
+    git HEAD of the source tree the wheel was built from; it's absent when
+    running from an unbuilt checkout (e.g. `uv run` here in tests), so fall
+    back to "unknown" rather than failing.
+    """
+    try:
+        pkg_version = importlib.metadata.version("ebay-tools")
+    except importlib.metadata.PackageNotFoundError:
+        pkg_version = "unknown"
+    try:
+        from _ebay_build_stamp import GIT_DATE, GIT_SHA
+    except ImportError:
+        GIT_SHA, GIT_DATE = "unknown", "unknown"
+    return f"seller-scan {pkg_version} (git {GIT_SHA}, {GIT_DATE})"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="seller-scan",
         description="Match one or more eBay sellers' listings against your LOCG wish list.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=_version_string(),
+        help="Print the installed version and the git SHA/date it was built "
+             "from, then exit. Use this to check for a stale `uv tool install` "
+             "(see scripts/install.sh).",
     )
     parser.add_argument(
         "sellers",
