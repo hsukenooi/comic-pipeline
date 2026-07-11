@@ -1998,6 +1998,51 @@ def test_cmd_wish_list_add_rejects_empty_title(tmp_path):
     assert not wish_list_cache_path().exists()
 
 
+def test_cmd_wish_list_add_dedups_against_existing_entry(tmp_path):
+    """BUI-313: the plain CLI add path (previously unguarded) now dedups
+    through the same shared ``_find_duplicate_wish_entry`` as the endpoint
+    (BUI-285) and the creator-run (BUI-303) — a duplicate is a no-op, not a
+    second appended row."""
+    from locg.commands import cmd_wish_list_add, cmd_wish_list_from_cache
+
+    seeded = _make_wish_list_cache(tmp_path)  # includes "X-Men #1"
+    result = cmd_wish_list_add("X-Men #1")
+
+    assert result["status"] == "exists"
+    assert result["existing"]["name"] == "X-Men #1"
+    items = cmd_wish_list_from_cache()
+    assert len(items) == len(seeded)  # no duplicate row appended
+
+
+def test_cmd_wish_list_add_dedup_normalizes_issue_and_case(tmp_path):
+    """BUI-313: dedup keys on the normalized issue token (leading zeros
+    stripped) and is case-insensitive on the series, same as the endpoint's
+    contract (BUI-285) — 'x-men #001' duplicates the seeded 'X-Men #1'."""
+    from locg.commands import cmd_wish_list_add, cmd_wish_list_from_cache
+
+    seeded = _make_wish_list_cache(tmp_path)
+    result = cmd_wish_list_add("x-men #001")
+
+    assert result["status"] == "exists"
+    names = [it["name"] for it in cmd_wish_list_from_cache()]
+    assert len(names) == len(seeded)
+    assert "x-men #001" not in names
+
+
+def test_cmd_wish_list_add_distinct_volume_still_appends(tmp_path):
+    """BUI-313/BUI-284: a volume-decorated name is a distinct entry from a bare
+    masthead of the same issue — dedup must not collapse it."""
+    from locg.commands import cmd_wish_list_add, cmd_wish_list_from_cache
+
+    _make_wish_list_cache(tmp_path)  # includes bare "X-Men #1"
+    result = cmd_wish_list_add("X-Men (Vol. 2) #1")
+
+    assert result["status"] == "ok"
+    names = {it["name"] for it in cmd_wish_list_from_cache()}
+    assert "X-Men (Vol. 2) #1" in names
+    assert "X-Men #1" in names
+
+
 # ---------------------------------------------------------------------------
 # cmd_wish_list_add_creator_run (BUI-134)
 # ---------------------------------------------------------------------------
@@ -2110,8 +2155,9 @@ def test_creator_run_adds_gap_issues_filtering_owned_and_wishlisted(tmp_path, mo
 
 def test_creator_run_dedup_catches_leading_zero_that_exact_string_match_would_miss(tmp_path, monkeypatch):
     """BUI-303: creator-run dedup goes through the same series+issue-token
-    comparison as the /api/comics/wish-list endpoint's ``_find_existing_wish_entry``
-    (BUI-285), not the old exact-lowercased-string match.
+    comparison as the /api/comics/wish-list endpoint (BUI-285, now also backed
+    by the shared ``_find_duplicate_wish_entry`` per BUI-313), not the old
+    exact-lowercased-string match.
 
     The cache already has "Uncanny X-Men #001" (zero-padded); Metron reports the
     same issue as plain "1". The old inline dedup compared
@@ -2208,6 +2254,38 @@ def test_creator_run_dedup_skips_unparseable_cache_entries(tmp_path, monkeypatch
     assert result["already_wishlisted"] == ["Uncanny X-Men #1"]
     names = [it["name"] for it in cmd_wish_list_from_cache()]
     assert names.count("Uncanny X-Men #1") == 1  # no duplicate row appended
+
+
+def test_creator_run_dedups_two_run_issues_normalizing_to_same_token(tmp_path, monkeypatch):
+    """BUI-313: two issues within the SAME creator run that normalize to the
+    same series+issue token (Metron reporting both "1" and "001") must not
+    both pass the dedup check and both get written — the second is caught as
+    already-wishlisted even though neither was on the wish-list when the run
+    started (the `existing` list loaded once up front is stale otherwise)."""
+    from locg.commands import cmd_wish_list_add_creator_run, cmd_wish_list_from_cache
+
+    _mark_collection_imported(tmp_path)
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [
+                {"number": "1", "metron_id": 1, "cover_date": "1983-11-01"},
+                {"number": "001", "metron_id": 2, "cover_date": "1983-11-01"},
+            ],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+
+    assert result["added"] == ["Uncanny X-Men #1"]
+    assert result["already_wishlisted"] == ["Uncanny X-Men #001"]
+    names = [it["name"] for it in cmd_wish_list_from_cache()]
+    assert names.count("Uncanny X-Men #1") == 1  # only one row written, not two
 
 
 def test_creator_run_surfaces_warnings(tmp_path, monkeypatch):
