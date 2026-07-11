@@ -2108,6 +2108,108 @@ def test_creator_run_adds_gap_issues_filtering_owned_and_wishlisted(tmp_path, mo
     assert "Uncanny X-Men #176" not in names  # owned never written
 
 
+def test_creator_run_dedup_catches_leading_zero_that_exact_string_match_would_miss(tmp_path, monkeypatch):
+    """BUI-303: creator-run dedup goes through the same series+issue-token
+    comparison as the /api/comics/wish-list endpoint's ``_find_existing_wish_entry``
+    (BUI-285), not the old exact-lowercased-string match.
+
+    The cache already has "Uncanny X-Men #001" (zero-padded); Metron reports the
+    same issue as plain "1". The old inline dedup compared
+    ``"uncanny x-men #1" == "uncanny x-men #001"`` — false, so it would have
+    wish-listed a duplicate. The shared token dedup normalizes both issue tokens
+    via ``normalize_issue_key`` (leading zeros stripped) and correctly treats
+    them as the same issue.
+    """
+    from locg.commands import cmd_wish_list_add_creator_run, cmd_wish_list_from_cache
+
+    _mark_collection_imported(tmp_path)
+    _make_wish_list_cache(tmp_path, items=[
+        {"name": "Uncanny X-Men #001", "id": None, "series_name": "Uncanny X-Men"},
+    ])
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "1", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+
+    assert result["added"] == []
+    assert result["already_wishlisted"] == ["Uncanny X-Men #1"]
+    names = {it["name"] for it in cmd_wish_list_from_cache()}
+    assert "Uncanny X-Men #1" not in names  # no duplicate row written
+
+
+def test_creator_run_dedup_does_not_collapse_distinct_volumes(tmp_path, monkeypatch):
+    """The token dedup keys on the DECORATED series text, not the bare masthead
+    (BUI-284 trap) — so it stays exactly as strict as the old exact-string match
+    when the series text genuinely differs (a volume-decorated cache entry vs.
+    a bare-masthead run title), and the issue is still added.
+    """
+    from locg.commands import cmd_wish_list_add_creator_run, cmd_wish_list_from_cache
+
+    _mark_collection_imported(tmp_path)
+    _make_wish_list_cache(tmp_path, items=[
+        {"name": "Uncanny X-Men (Vol. 2) #1", "id": None, "series_name": "Uncanny X-Men (Vol. 2)"},
+    ])
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "1", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+
+    assert result["already_wishlisted"] == []
+    assert result["added"] == ["Uncanny X-Men #1"]
+    names = {it["name"] for it in cmd_wish_list_from_cache()}
+    assert "Uncanny X-Men #1" in names
+
+
+def test_creator_run_dedup_skips_unparseable_cache_entries(tmp_path, monkeypatch):
+    """A cache entry with no '#' issue token (e.g. a TPB/OGN title) can't be
+    compared and must not blow up or falsely match — the dedup just skips it
+    and still catches the real duplicate alongside it.
+    """
+    from locg.commands import cmd_wish_list_add_creator_run, cmd_wish_list_from_cache
+
+    _mark_collection_imported(tmp_path)
+    _make_wish_list_cache(tmp_path, items=[
+        {"name": "Uncanny X-Men Omnibus", "id": None, "series_name": "Uncanny X-Men"},
+        {"name": "Uncanny X-Men #1", "id": None, "series_name": "Uncanny X-Men"},
+    ])
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "1", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+
+    assert result["added"] == []
+    assert result["already_wishlisted"] == ["Uncanny X-Men #1"]
+    names = [it["name"] for it in cmd_wish_list_from_cache()]
+    assert names.count("Uncanny X-Men #1") == 1  # no duplicate row appended
+
+
 def test_creator_run_surfaces_warnings(tmp_path, monkeypatch):
     """No-credit warnings from the resolver are passed through to the caller."""
     from locg.commands import cmd_wish_list_add_creator_run
