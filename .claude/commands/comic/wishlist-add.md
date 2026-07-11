@@ -189,11 +189,13 @@ Carry forward two lists: **to-add** (not owned) and **already-owned** (skipped).
 
 ## Step 3b: Skip issues already on the wish-list (single in-memory scan)
 
-The wish-list endpoint does **not** dedupe (Step 5), so re-adding a title already
-wished creates a duplicate. Filter those out up front — but fetch the wish-list
-**once** and scan it **in memory** (BUI-204), not re-fetched or re-grepped per
-issue. A real wish-list is large (685 items in the motivating run); a per-issue
-grep over that payload is the redundant work this step removes.
+The wish-list endpoint is idempotent as of BUI-285 (a re-added series+issue is a
+200 no-op returning `{"status": "exists", ...}`, not a duplicate row), but still
+filter duplicates out up front — the client-side scan avoids N redundant POSTs
+and keeps the "already wished" list accurate for the Step 6 report. Fetch the
+wish-list **once** and scan it **in memory** (BUI-204), not re-fetched or
+re-grepped per issue. A real wish-list is large (685 items in the motivating
+run); a per-issue grep over that payload is the redundant work this step removes.
 
 ```bash
 comics_curl "$COMICS_SERVER_URL/api/comics/wish-list" || exit 1
@@ -241,9 +243,9 @@ curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list" \
 ```
 
 Each call appends `{name: "<title>", id: null}` to the server wish-list and
-returns `{"status": "ok", ...}`. It is not deduped, so don't re-run a title that
-already succeeded (it would create a duplicate). Stop and report if any call
-returns a non-200.
+returns `{"status": "ok", ...}`. As of BUI-285 the endpoint is idempotent: a
+re-added series+issue returns `{"status": "exists", ...}` with 200 (no duplicate
+row), so a retried title is safe. Stop and report if any call returns a non-200.
 
 **Owned-title guard (BUI-130/BUI-184):** `POST /api/comics/wish-list` rejects an
 already-owned title with **409** at the API boundary (defense in depth behind
@@ -337,7 +339,7 @@ is treated as final, same as the numeric-range path.
 
 | Mistake | Fix |
 |---|---|
-| Re-running the whole range after a partial failure | Re-add only the issues that didn't succeed; the wish-list endpoint does not dedupe |
+| Re-running the whole range after a partial failure | Safe to re-add — the wish-list endpoint is idempotent (BUI-285): a duplicate series+issue is a 200 no-op (`{"status": "exists"}`), not a second row |
 | Writing to `data/locg/wish-list.json` directly | Adds go to the server via `POST /api/comics/wish-list` — the repo file is no longer the source of truth (BUI-93) |
 | Wish-listing issues you already own | Collection-check each issue first (Step 3) and skip owned ones — wishing an owned book is what deleted collection rows in BUI-122 |
 | Passing `year` (Metron's `year_began`) to `collection/check` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`, not a series disambiguator. Forwarding a series start-year filters out every owned mid-run issue and returns a false `not_in_cache`, so an owned book gets wish-listed (BUI-129/BUI-131). Check by series + issue only |

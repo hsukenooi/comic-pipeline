@@ -912,6 +912,74 @@ def test_wish_list_add_allows_unowned_title(client):
     assert r.status_code == 200, r.text
 
 
+def test_wish_list_add_duplicate_is_noop(client):
+    """BUI-285: adding a series+issue already on the wish-list is a 200 no-op —
+    it returns the existing entry and does NOT append a duplicate row (a dup
+    would be double-pushed to LOCG and defeat the BUI-266 scoped removal).
+    'X-Men #1' is already in the seeded wish-list."""
+    before = client.get("/api/comics/wish-list").json()
+    r = client.post("/api/comics/wish-list", json={"title": "X-Men #1"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "exists"
+    assert body["existing"]["name"] == "X-Men #1"
+    assert body["items"] == len(before)  # superset field, unchanged count
+    after = client.get("/api/comics/wish-list").json()
+    assert len(after) == len(before)  # no new row appended
+    assert sum(1 for i in after if i["name"] == "X-Men #1") == 1
+
+
+def test_wish_list_add_force_appends_duplicate(client):
+    """BUI-285: force=true bypasses the idempotency dedup (as it bypasses the
+    owned-guard) — the escape hatch for a genuinely distinct printing that
+    happens to share series + issue."""
+    r = client.post("/api/comics/wish-list", json={"title": "X-Men #1", "force": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok"
+    names = [i["name"] for i in client.get("/api/comics/wish-list").json()]
+    assert names.count("X-Men #1") == 2  # duplicate appended under force
+
+
+def test_wish_list_add_unparseable_title_appends(client):
+    """BUI-285: a title with no issue token can't be dedup-compared, so it
+    appends as before rather than erroring."""
+    r = client.post("/api/comics/wish-list", json={"title": "Some Graphic Novel"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok"
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Some Graphic Novel" in names
+
+
+def test_wish_list_add_dedup_normalizes_issue_and_case(client):
+    """BUI-285: dedup keys on the normalized issue token (leading zeros stripped)
+    and is case-insensitive on the series — 'x-men #001' duplicates 'X-Men #1'."""
+    r = client.post("/api/comics/wish-list", json={"title": "x-men #001"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "exists"
+    names = [i["name"] for i in client.get("/api/comics/wish-list").json()]
+    assert names.count("X-Men #1") == 1
+    assert "x-men #001" not in names
+
+
+def test_wish_list_add_distinct_volume_still_appends(client):
+    """BUI-285/BUI-284: a volume-decorated name is a DISTINCT entry from a bare
+    masthead of the same issue — dedup must not collapse it (never uses the
+    normalized key). 'X-Men (Vol. 2) #1' appends alongside 'X-Men #1'."""
+    r = client.post("/api/comics/wish-list", json={"title": "X-Men (Vol. 2) #1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok"
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "X-Men (Vol. 2) #1" in names
+    assert "X-Men #1" in names  # original untouched
+
+
+def test_wish_list_add_owned_guard_precedes_dedup(client):
+    """BUI-285: the owned-guard still runs BEFORE the idempotency check — an owned
+    book is 409'd, not silently reported as an existing wish."""
+    r = client.post("/api/comics/wish-list", json={"title": "Amazing Spider-Man #300"})
+    assert r.status_code == 409, r.text
+
+
 def test_wish_list_add_year_catches_masthead_owned_book(client):
     """BUI-184/BUI-197: the owned-guard catches a book stored under its base
     masthead. BUI-197 routed the masthead alias through owned_match_keys, so the
