@@ -234,13 +234,20 @@ class TestPriceabilityGuards:
         assert out["fmv_low"] is None and out["fmv_high"] is None
         assert out["max_bid"] is None
 
-    def test_too_wide_flags(self):
-        # Iron Man #124 shape: target 7.0, pool brackets but spans 4 grade points
+    def test_too_wide_bracketed_pool_interpolates(self):
+        # BUI-306 §7: Iron Man #124 shape — target 7.0, pool brackets but spans
+        # 4 grade points. It used to flag too_wide (no price); now it is priced
+        # by interpolation between the 5.0 bucket ($50) and the 9.0 bucket
+        # (median $310): 50 + (7-5)/(9-5)*(310-50) = $180.
         comps = [_comp(50, 5.0), _comp(300, 9.0), _comp(320, 9.0)]
         out = fm.compute_fmv(comps, target_grade=7.0)
-        assert out["flag_reason"] == "too_wide"
+        assert out["interpolated"] is True
+        assert out["flag_reason"] is None      # cleared: now emits a bid-able number
         assert out["grade_span"] == 4.0
-        assert out["fmv_low"] is None
+        assert out["fmv_low"] == 180 and out["fmv_high"] == 180
+        assert out["median"] == 180
+        assert out["max_bid"] == 140           # clean_round(180 * 0.80)
+        assert out["confidence"] == "LOW"      # §7: confidence reduced
 
     def test_too_sparse_flags_single_comp(self):
         # A lone comp no longer emits a point estimate — it flags
@@ -601,3 +608,140 @@ class TestComputeFmvGradeConfidence:
                              grade_confidence="medium-low")
         assert out["bid_factor"] == 0.70
         assert out["max_bid"] == fm.clean_round(out["fmv_high"] * 0.70)
+
+
+# ─── Grade-curve interpolation + monotonicity (BUI-306, fmv.md §5/§7) ─────────
+
+class TestBucketMedians:
+    def test_one_median_per_grade(self):
+        comps = [_comp(100, 7.0), _comp(120, 7.0), _comp(300, 9.0)]
+        assert fm.bucket_medians(comps) == {7.0: 110.0, 9.0: 300.0}
+
+    def test_ignores_gradeless_and_priceless(self):
+        comps = [_comp(100, 7.0), _comp(None, 7.0), {"grade": 8.0}]
+        assert fm.bucket_medians(comps) == {7.0: 100.0}
+
+
+class TestMonotonicityViolations:
+    def test_rising_curve_has_no_violation(self):
+        assert fm.monotonicity_violations({4.0: 50, 6.0: 80, 9.0: 300}) == []
+
+    def test_single_bucket_never_violates(self):
+        assert fm.monotonicity_violations({7.0: 100}) == []
+
+    def test_inversion_is_flagged(self):
+        # 7.0 median exceeds 8.5 median — the Nick Fury #17 shape.
+        assert fm.monotonicity_violations({7.0: 300, 8.5: 200}) == [(7.0, 8.5)]
+
+
+class TestInterpolateGradeCurve:
+    def test_exact_linear_interpolation(self):
+        # midpoint bracket: 100 + (6-4)/(8-4)*(200-100) = 150 exactly
+        got = fm.interpolate_grade_curve({4.0: 100.0, 8.0: 200.0}, 6.0)
+        assert got is not None
+        assert got["target_price"] == pytest.approx(150.0)
+        assert got["grade_below"] == 4.0 and got["grade_above"] == 8.0
+
+    def test_uses_nearest_bracketing_buckets(self):
+        # target 7.0 must interpolate off 6.0→9.0 (the nearest bracket), not 4.0.
+        got = fm.interpolate_grade_curve({4.0: 100.0, 6.0: 140.0, 9.0: 300.0}, 7.0)
+        assert got["grade_below"] == 6.0 and got["grade_above"] == 9.0
+        assert got["target_price"] == pytest.approx(140.0 + (1 / 3) * 160.0)
+
+    def test_no_bracket_below_returns_none(self):
+        # all buckets above target → extrapolation, not allowed
+        assert fm.interpolate_grade_curve({8.0: 100.0, 9.0: 200.0}, 7.0) is None
+
+    def test_no_bracket_above_returns_none(self):
+        assert fm.interpolate_grade_curve({5.0: 100.0, 6.0: 200.0}, 7.0) is None
+
+    def test_direct_target_bucket_returns_none(self):
+        # A bucket exactly AT the target must not be interpolated across —
+        # direct comps beat a smeared bracket (guards the 6× over-bid).
+        assert fm.interpolate_grade_curve(
+            {5.0: 400.0, 7.0: 105.0, 9.0: 900.0}, 7.0) is None
+
+
+class TestInterpolationInComputeFmv:
+    def test_too_wide_bracketed_interpolates_with_exact_value(self):
+        # target 6.0, grades 4.0($100) & 8.0(median $200): span 4.0 → too_wide,
+        # but bracketed → 100 + (6-4)/(8-4)*(200-100) = $150; max_bid 0.80×150=120.
+        comps = [_comp(100, 4.0), _comp(190, 8.0), _comp(210, 8.0)]
+        out = fm.compute_fmv(comps, target_grade=6.0)
+        assert out["interpolated"] is True
+        assert out["flag_reason"] is None
+        assert out["fmv_low"] == 150 and out["fmv_high"] == 150
+        assert out["median"] == 150
+        assert out["max_bid"] == 120
+        assert out["confidence"] == "LOW"
+        assert out["interpolation"]["grade_below"] == 4.0
+        assert out["interpolation"]["grade_above"] == 8.0
+        assert out["interpolation"]["target_price"] == pytest.approx(150.0)
+
+    def test_one_sided_pool_stays_needs_manual(self):
+        # FF #63 shape: target 9.6, all comps at 9.0 — no bucket above target,
+        # so interpolation is impossible and it must stay needs_manual (§7 is
+        # never allowed to extrapolate off a one-sided pool).
+        comps = [_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        out = fm.compute_fmv(comps, target_grade=9.6)
+        assert out["interpolated"] is False
+        assert out["interpolation"] is None
+        assert out["flag_reason"] == "one_sided"
+        assert out["fmv_low"] is None and out["max_bid"] is None
+
+    def test_interpolation_marked_in_output(self):
+        # A downstream JSON reader must be able to tell an interpolated value
+        # from a real direct comp: the flag + provenance ride the output dict.
+        comps = [_comp(100, 4.0), _comp(200, 8.0), _comp(200, 8.0)]
+        out = fm.compute_fmv(comps, target_grade=6.0)
+        assert out["interpolated"] is True
+        assert set(out["interpolation"]) == {
+            "grade_below", "grade_above", "median_below", "median_above",
+            "target_price",
+        }
+
+    def test_monotonic_priced_pool_has_no_suspect_and_prices(self):
+        # Rising two-bucket curve within span 2.0 → auto-prices normally, no
+        # interpolation, no suspect flag (byte-identical behavior to pre-BUI-306).
+        comps = ([_comp(p, 7.5) for p in [100, 105, 110]]
+                 + [_comp(p, 8.0) for p in [120, 125, 130]])
+        out = fm.compute_fmv(comps, target_grade=8.0)
+        assert out["interpolated"] is False
+        assert out["suspect_buckets"] == []
+        assert out["flag_reason"] is None
+        assert out["fmv_low"] is not None
+
+    def test_too_wide_with_direct_target_comps_stays_manual(self):
+        # MONEY-SAFETY: a too_wide pool that HAS direct comps at the target grade
+        # ($100/$110 @7.0) must NOT be re-priced off the distant 5.0/9.0 bracket
+        # (that produced a 6× over-bid). It stays needs_manual for the direct /
+        # manual path.
+        comps = [_comp(400, 5.0), _comp(100, 7.0), _comp(110, 7.0), _comp(900, 9.0)]
+        out = fm.compute_fmv(comps, target_grade=7.0)
+        assert out["interpolated"] is False
+        assert out["flag_reason"] == "too_wide"
+        assert out["fmv_high"] is None and out["max_bid"] is None
+
+    def test_two_comp_too_wide_pool_does_not_interpolate(self):
+        # MONEY-SAFETY: a 2-comp too_wide pool ([$50@5.0, $5000@9.0]) is never
+        # IQR-vetted and its points may be mistagged — interpolating it produced
+        # a $2k+ wild cap. The n>=3 floor keeps it manual (BUI-179 parity).
+        comps = [_comp(50, 5.0), _comp(5000, 9.0)]
+        out = fm.compute_fmv(comps, target_grade=7.0)
+        assert out["interpolated"] is False
+        assert out["flag_reason"] == "too_wide"
+        assert out["fmv_high"] is None and out["max_bid"] is None
+
+    def test_monotonicity_violation_flags_suspect_without_dropping(self):
+        # Nick Fury #17 shape: a 7.0 bucket priced ABOVE the 8.5 bucket. The pool
+        # still auto-prices (span 1.5, bracketed) — the suspect bucket is FLAGGED,
+        # not silently dropped, and the priced number is unaffected by the check.
+        comps = ([_comp(p, 7.0) for p in [290, 300, 310]]
+                 + [_comp(p, 8.5) for p in [190, 200, 210]])
+        out = fm.compute_fmv(comps, target_grade=8.0)
+        assert out["suspect_buckets"] == [(7.0, 8.5)]
+        assert out["flag_reason"] is None
+        assert out["interpolated"] is False
+        # price is the blended trimmed-pool quartile, unchanged by the §5 check
+        assert out["fmv_low"] is not None and out["fmv_high"] is not None
+        assert out["n"] == 6

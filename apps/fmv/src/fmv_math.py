@@ -85,6 +85,93 @@ def _classify_pool(pool: list[dict], target_grade: float,
     return None, grade_span
 
 
+# ─── Grade buckets + grade-curve checks (§2, §5, §7 — BUI-306) ────────────────
+
+def bucket_medians(comps: Iterable[dict]) -> dict[float, float]:
+    """Grade → median price, one bucket per distinct parsed grade (fmv.md §2).
+
+    The bucket value is the plain median of that grade's prices — median is
+    outlier-robust, so no per-bucket IQR trim (matching §2's "compute median
+    per bucket"). Comps with no parsed grade or price are ignored. Used by both
+    the §5 monotonicity check and the §7 interpolation below.
+    """
+    buckets: dict[float, list[float]] = {}
+    for c in comps:
+        g = c.get("grade")
+        p = c.get("price")
+        if g is None or p is None:
+            continue
+        buckets.setdefault(float(g), []).append(float(p))
+    return {g: statistics.median(ps) for g, ps in buckets.items()}
+
+
+def monotonicity_violations(
+    medians: dict[float, float],
+) -> list[tuple[float, float]]:
+    """Adjacent (lower_grade, higher_grade) pairs whose medians invert (§5).
+
+    Bucket medians should rise monotonically with grade. An adjacent pair where
+    the lower-grade median EXCEEDS the higher-grade one signals a suspect comp
+    (a damaged low-grade copy priced high, or a mis-graded high-grade copy
+    priced low — the Nick Fury #17 7×-for-2-grades outlier). Returned so the
+    caller can flag those buckets as SUSPECT instead of silently blending them.
+    A single-bucket (or empty) curve has no adjacent pair and never violates.
+    """
+    grades = sorted(medians)
+    return [
+        (grades[i], grades[i + 1])
+        for i in range(len(grades) - 1)
+        if medians[grades[i]] > medians[grades[i + 1]]
+    ]
+
+
+def interpolate_grade_curve(
+    medians: dict[float, float], target_grade: float,
+) -> dict | None:
+    """§7 linear interpolation between the nearest BRACKETING bucket medians.
+
+    Returns None unless there is at least one bucket strictly BELOW and one
+    strictly ABOVE ``target_grade`` — a genuine bracket, never extrapolation
+    (so a one-sided pool, whose comps all sit on one side of the target, yields
+    None and stays needs_manual). Also returns None when a bucket exists exactly
+    AT ``target_grade``: direct comps at the target are strictly better evidence
+    than a bracket smeared across it, so a pool holding them must NOT be
+    silently re-priced off distant grades (that mispriced X-Men #96 6× high in
+    testing) — it stays flagged for the direct-comp / manual path instead. Uses
+    the nearest bracketing bucket on each side and applies the exact formula
+    from fmv.md §7:
+
+        target_price = median_below
+            + (target_grade - grade_below) / (grade_above - grade_below)
+              * (median_above - median_below)
+
+    Returns the interpolation inputs alongside ``target_price`` so the caller
+    can state EXPLICITLY which buckets were used (§7's state-explicitly rule).
+    """
+    if target_grade in medians:
+        return None
+    below = [g for g in medians if g < target_grade]
+    above = [g for g in medians if g > target_grade]
+    if not below or not above:
+        return None
+    grade_below = max(below)
+    grade_above = min(above)
+    median_below = medians[grade_below]
+    median_above = medians[grade_above]
+    target_price = (
+        median_below
+        + (target_grade - grade_below) / (grade_above - grade_below)
+        * (median_above - median_below)
+    )
+    return {
+        "grade_below": grade_below,
+        "grade_above": grade_above,
+        "median_below": median_below,
+        "median_above": median_above,
+        "target_price": target_price,
+    }
+
+
 # ─── IQR trim + quartiles (inclusive method) ──────────────────────────────────
 
 def _iqr_bounds(prices: list[float]) -> tuple[float, float] | None:
@@ -407,12 +494,27 @@ def compute_fmv(comps: list[dict], target_grade: float,
       "grade_confidence": str | None,  # echoed back for traceability
       "bid_factor": float,             # the multiplier actually applied
       "trimmed_pool": list[float],     # for debugging / display
+      "interpolated": bool,            # §7 grade-curve interp was applied (BUI-306)
+      "interpolation": dict | None,    # {grade/median_below, _above, target_price}
+      "suspect_buckets": list,         # §5 monotonicity violations [[lo,hi],...]
     }
 
     A `flag_reason` book is "needs manual pricing" (BUI-86): it emits no
     bid-able number and its confidence is forced to LOW so the persisted
     fmv_confidence stays `low`. Priceability is derived downstream from
     `flag_reason is not None` — there is no separate `priceable` field.
+
+    BUI-306 (fmv.md §7): a `one_sided`/`too_wide` pool that still has real
+    grade buckets bracketing the target is priced by LINEAR INTERPOLATION
+    between the nearest bracketing bucket medians instead of being punted to
+    manual. When that happens `interpolated` is True, `flag_reason` is CLEARED
+    (the book now emits a bid-able number, so the upsert must not wipe it as
+    needs_manual), fmv_low == fmv_high == median == the interpolated point
+    (a single estimate, no dispersion), and confidence is forced to LOW (§7:
+    "confidence is reduced"). `suspect_buckets` (§5) lists any adjacent
+    grade-bucket median inversions so a monotonicity violation is flagged
+    rather than silently blended — this is informational and never changes the
+    priced number for a monotonic pool.
     """
     if max_window is None:
         max_window = MAX_GRADE_WINDOW
@@ -445,14 +547,56 @@ def compute_fmv(comps: list[dict], target_grade: float,
         if lo <= 0 or hi / lo > SMALL_POOL_MAX_RATIO:
             flag_reason = "too_sparse"
 
+    # BUI-306 §5: check the grade-bucket median curve for monotonicity on the
+    # widened grade-bearing pool. Violations are surfaced (SUSPECT) but never
+    # alter the priced number for a monotonic pool — a non-monotonic pool keeps
+    # its today-behavior price and just gains a warning.
+    curve = bucket_medians(pool)
+    suspect_buckets = monotonicity_violations(curve)
+
+    # BUI-306 §7: a one_sided/too_wide pool that still brackets the target with
+    # real grade buckets gets a bid-able number via linear interpolation between
+    # the nearest bracketing bucket medians, instead of always going manual. A
+    # genuinely one-sided pool has no bracket → interpolate_grade_curve returns
+    # None → it stays needs_manual. too_sparse is never interpolated (§7 needs a
+    # bracket, which a lone-comp/1-grade pool cannot supply).
+    #
+    # The n>=3 floor is a money-safety guard mirroring BUI-179: a 2-comp pool is
+    # never IQR-trimmable (len<3) and its two points may be wildly mistagged
+    # (the [$50 @5.0, $5000 @9.0] shape). too_wide is classified before the
+    # BUI-179 wild-ratio guard can fire, so without this floor such a pool would
+    # interpolate a wild cap ($2k+ off two points). Too thin to vet → stays
+    # manual, consistent with the module's "<3 comps is not a reliable price".
+    interpolation = None
+    if flag_reason in ("one_sided", "too_wide") and n >= 3:
+        interpolation = interpolate_grade_curve(curve, target_grade)
+
     label = confidence_label(effective_n, cv_val)
-    if flag_reason is not None:
+    if interpolation is not None:
+        label = "LOW"  # §7: interpolation reduces confidence
+    elif flag_reason is not None:
         label = "LOW"  # a needs_manual book never claims priceable confidence
     elif window > WIDE_GRADE_WINDOW and _rank(label) > _CONF_RANK["MEDIUM"]:
         label = "MEDIUM"  # wide-window pools can't claim HIGH/MEDIUM-HIGH (BUI-86 R7)
     factor = bid_factor(label, grade_confidence)
 
-    if flag_reason is not None or n == 0:
+    # Declared Optional up front so mypy keeps all three pricing branches
+    # consistent (the interpolation branch assigns non-None clean_round ints
+    # first, which would otherwise pin these as non-Optional). clean_round
+    # returns int; a flagged/no-comps book punts to None.
+    fmv_low: int | None
+    fmv_high: int | None
+    med: int | None
+    max_bid: int | None
+    if interpolation is not None:
+        # Priced by §7 interpolation: a single point estimate (no dispersion),
+        # so fmv_low == fmv_high == median. Clearing flag_reason is REQUIRED —
+        # a non-null flag makes the upsert wipe this price as needs_manual.
+        price = clean_round(interpolation["target_price"])
+        fmv_low = fmv_high = med = price
+        max_bid = clean_round(price * factor)
+        flag_reason = None
+    elif flag_reason is not None or n == 0:
         fmv_low = fmv_high = med = max_bid = None
     else:
         fmv_low = clean_round(weighted_quartile(trimmed, weights, 0.25))
@@ -476,4 +620,10 @@ def compute_fmv(comps: list[dict], target_grade: float,
         "grade_confidence": grade_confidence,
         "bid_factor": factor,
         "trimmed_pool": sorted(trimmed),
+        # BUI-306 §7/§5: interpolation + monotonicity, marked so a downstream
+        # consumer can tell an interpolated value from a real direct comp and
+        # spot a suspect grade bucket.
+        "interpolated": interpolation is not None,
+        "interpolation": interpolation,
+        "suspect_buckets": suspect_buckets,
     }

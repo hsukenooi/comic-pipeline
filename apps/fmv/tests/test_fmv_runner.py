@@ -476,6 +476,30 @@ class TestComputeOne:
         assert out["fmv"]["flag_reason"] == "one_sided"
         assert out["comic_id"] == 11
 
+    def test_interpolated_book_upserts_priced_row_with_flag_cleared(self, server_url):
+        # BUI-306: a too_wide pool that interpolates must POST a real fmv_high
+        # with fmv_flag_reason=None — a non-null flag makes the server wipe the
+        # price as needs_manual. The interpolation provenance rides fmv_notes.
+        comps = [_make_comp(50, 5.0), _make_comp(300, 9.0), _make_comp(320, 9.0)]
+        result = {
+            "input": {"title": "X-Men", "issue": "96", "year": 1975, "grade": 7.0},
+            "comps": comps,
+        }
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"comic_id": 9, "fmv_id": 3, "id": 9}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X-Men", "issue": "96", "grade": 7.0},
+                server_url=server_url)
+
+        body = post_mock.call_args.kwargs["json"]
+        assert body["fmv_flag_reason"] is None       # cleared → server keeps price
+        assert body["fmv_high"] == 180 and body["fmv_low"] == 180
+        assert body["fmv_confidence"] == "low"       # §7: confidence reduced
+        assert "interpolated=grade 5→9" in body["fmv_notes"]
+        assert out["fmv"]["interpolated"] is True
+
     def test_unrecognized_grade_string_errors(self, server_url):
         """If the grade string can't be coerced, log and return an error
         row rather than silently passing it to fmv_math."""
@@ -669,6 +693,63 @@ class TestFlaggedPresentation:
         # The flagged and no-comps rows must NOT render identically
         assert out.count("manual:one_sided") == 1
 
+    # ─── BUI-306: interpolation + monotonicity presentation ──────────────────
+
+    def test_build_notes_states_interpolation_explicitly(self):
+        # §7: notes must state the price was interpolated (naming the buckets)
+        # and that confidence is reduced — so an interpolated value is never
+        # read as a direct comp.
+        fmv = {"window": 2.0, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": None, "grade_span": 4.0, "bid_factor": 0.80,
+               "grade_confidence": None, "interpolated": True,
+               "interpolation": {"grade_below": 5.0, "grade_above": 9.0,
+                                 "median_below": 50.0, "median_above": 310.0,
+                                 "target_price": 180.0},
+               "suspect_buckets": []}
+        notes = fmv_runner._build_notes(fmv)
+        assert "interpolated=grade 5→9" in notes
+        assert "confidence reduced" in notes
+        assert "manual_review" not in notes  # cleared once priced
+
+    def test_build_notes_flags_suspect_grade_curve(self):
+        # §5: a monotonicity violation is surfaced, not silently blended.
+        fmv = {"window": 1.0, "cv_pct": "20%", "confidence": "MEDIUM",
+               "flag_reason": None, "grade_span": 1.5, "bid_factor": 0.80,
+               "interpolated": False, "interpolation": None,
+               "suspect_buckets": [(7.0, 8.5)]}
+        notes = fmv_runner._build_notes(fmv)
+        assert "suspect_grade_curve=7>8.5" in notes
+
+    def test_print_table_marks_interpolated_value(self, capsys):
+        rows = [
+            {"input": {"title": "Interp", "issue": "1", "grade": 7.0},
+             "fmv": {"flag_reason": None, "interpolated": True,
+                     "fmv_low": 180, "fmv_high": 180, "median": 180,
+                     "max_bid": 140, "n": 3, "cv_pct": "n/a",
+                     "confidence": "LOW"}, "source": "fresh"},
+        ]
+        fmv_runner._print_table(rows)
+        out = capsys.readouterr().out
+        assert "interp" in out           # marked, not a bare range
+        assert "$180–$180" not in out    # never rendered as a real comp range
+
+    def test_cached_interpolated_row_keeps_interp_marker(self):
+        # BUI-306: an interpolated book persists a real number (flag cleared) and
+        # is cache-reusable. On reuse it must still report interpolated=True from
+        # the persisted notes, so it renders "$X interp" not "$X–$X".
+        row = {"fmv_low": 180, "fmv_high": 180, "fmv_comps": 3,
+               "fmv_confidence": "low",
+               "fmv_notes": "window=±2.0 | interpolated=grade 5→9 "
+                            "(median $50→$310); confidence reduced"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["interpolated"] is True
+
+    def test_cached_priced_row_not_marked_interpolated(self):
+        row = {"fmv_low": 100, "fmv_high": 150, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5 | cv=20%"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["interpolated"] is False
+
     def test_fmv_from_db_row_has_new_keys(self):
         row = {"fmv_low": 50, "fmv_high": 100, "fmv_comps": 8,
                "fmv_confidence": "high"}
@@ -769,6 +850,32 @@ class TestRunEndToEnd:
         out = json.loads(out_path.read_text())
         assert out[0]["source"] == "fresh"
         assert out[0]["fmv"]["n"] == 5
+
+    def test_interpolated_book_marked_in_json_output(self, tmp_path, server_url):
+        # BUI-306 acceptance: end-to-end, an interpolated book's JSON output must
+        # let a downstream consumer tell it from a real direct comp.
+        batch = [{"item_id": "1", "title": "X-Men", "issue": "96", "year": 1975,
+                  "grade": 7.0}]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out.json"
+
+        fake_result = [{
+            "input": {"_req_id": 0, "title": "X-Men", "issue": "96",
+                      "year": 1975, "grade": 7.0, "item_id": "1"},
+            "comps": [_make_comp(50, 5.0), _make_comp(300, 9.0), _make_comp(320, 9.0)],
+            "queries_used": [{"tier": "base", "cached": False}],
+        }]
+        with patch("fmv_runner._fetch_comps", return_value=fake_result), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 9}):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        fmv = json.loads(out_path.read_text())[0]["fmv"]
+        assert fmv["interpolated"] is True
+        assert fmv["interpolation"]["target_price"] == 180.0
+        assert fmv["fmv_high"] == 180 and fmv["flag_reason"] is None
 
     def test_no_server_url_fails(self, tmp_path):
         batch_path = tmp_path / "b.json"
