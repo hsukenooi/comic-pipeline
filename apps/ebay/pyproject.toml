@@ -24,6 +24,7 @@ include = [
     "src/ebay_fetch.py",
     "src/sold_comps.py",
     "src/comic_identity.py",
+    "src/comic_identity_year.py",
     "src/comic_identify.py",
     "src/grade_photos.py",
     "src/seller_scan.py",
