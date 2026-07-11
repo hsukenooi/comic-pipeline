@@ -209,6 +209,20 @@ positive; if the era is ambiguous, still flag for the user rather than guessing.
 A `match_kind == "exact"` row needs no such flag — the series key matched
 directly.
 
+**Pattern D2 — cross-volume ambiguity, no year given (false-positive guard, BUI-284).**
+Also mechanized: when `match_status == "ambiguous_cross_volume"` (equivalently
+`match_kind == "cross_volume"`), the same issue number is owned under **more than
+one volume of the same masthead** (e.g. Fantastic Four #18 in both the 1961
+Vol. 1 and the 2022 Vol. 7) and no `year` was supplied, so the matcher refused to
+guess which volume you meant. This is NEITHER owned nor not-owned — do **not**
+skip and do **not** buy on it. Read the colliding volumes off the `candidates`
+list and re-check WITH the listing's per-issue cover `year`
+(`?year=<YYYY>`), which resolves the collision via the release-date gate:
+> ⚠️ cross-volume ambiguity — "{series} #{issue}" is owned in multiple volumes ({candidate series_names}); re-check with the listing's cover year before deciding
+
+Never resolve an `ambiguous_cross_volume` verdict yourself by picking a volume —
+supply the year and let the matcher decide.
+
 Carry every flag into the Notes column of the Step 3 table and surface flagged rows
 separately at the Step 4 decision gate. The user decides; the disambiguator only
 makes the ambiguity visible.
@@ -230,12 +244,14 @@ makes the ambiguity visible.
 — it's the decorated catalog name (carries volume + year), so a Pattern D flag is
 visible right in the table without opening the raw response.
 
-**In Cache?** has three renderings, not two (BUI-250): `✅ In collection` for
-`match_status: "in_collection"`, `📋 Wishlisted (not owned)` for
-`match_status: "not_in_cache"` with `in_wish_list: true`, and `❌ Not in
-collection` for `match_status: "not_in_cache"` with `in_wish_list: false`. Row 6
-is untracked at Full Title Matched / Matched Volume regardless — those columns
-only ever come from an `in_collection` match.
+**In Cache?** has four renderings, not two (BUI-250, BUI-284): `✅ In collection`
+for `match_status: "in_collection"`, `📋 Wishlisted (not owned)` for
+`match_status: "not_in_cache"` with `in_wish_list: true`, `❌ Not in
+collection` for `match_status: "not_in_cache"` with `in_wish_list: false`, and
+`⚠️ Ambiguous (cross-volume)` for `match_status: "ambiguous_cross_volume"` — the
+issue is owned under more than one volume and no year was given (Step 2.5 Pattern
+D2). Row 6 is untracked at Full Title Matched / Matched Volume regardless — those
+columns only ever come from an `in_collection` match.
 
 Cache age is the same value for every row (it's a property of the import date,
 not the comic).

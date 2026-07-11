@@ -355,6 +355,72 @@ def test_check_batch_alias_match_flags_wrong_volume(client):
     assert result["matched_series_name"] == "Thor (Vol. 1) (1966 - 1996)"
 
 
+_CROSS_VOLUME_FF18 = [
+    {
+        "full_title": "Fantastic Four #18",
+        "series_name": "Fantastic Four (Vol. 1) (1961 - 1996)",
+        "publisher_name": "Marvel Comics",
+        "release_date": "1963-09-01",
+        "in_collection": 1,
+    },
+    {
+        "full_title": "Fantastic Four #18",
+        "series_name": "Fantastic Four (Vol. 7) (2022 - 2025)",
+        "publisher_name": "Marvel Comics",
+        "release_date": "2024-02-14",
+        "in_collection": 1,
+    },
+]
+
+
+def test_check_no_year_cross_volume_returns_ambiguous(client):
+    """BUI-284: the same issue owned under two masthead volumes, checked with no
+    year, comes back as `ambiguous_cross_volume` (a 200 passthrough) rather than
+    a silent in_collection. The endpoint surfaces the colliding volumes so the
+    caller can re-check WITH the cover year."""
+    _seed_collection(client.store, _CROSS_VOLUME_FF18)
+    r = client.get(
+        "/api/comics/collection/check",
+        params={"series": "Fantastic Four", "issue": "18"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["match_status"] == "ambiguous_cross_volume"
+    assert body["match_kind"] == "cross_volume"
+    names = {c["series_name"] for c in body["candidates"]}
+    assert names == {
+        "Fantastic Four (Vol. 1) (1961 - 1996)",
+        "Fantastic Four (Vol. 7) (2022 - 2025)",
+    }
+
+
+def test_check_year_resolves_cross_volume(client):
+    """BUI-284: supplying the cover year resolves the collision to one volume —
+    unchanged in_collection behavior on the year-supplied path."""
+    _seed_collection(client.store, _CROSS_VOLUME_FF18)
+    r = client.get(
+        "/api/comics/collection/check",
+        params={"series": "Fantastic Four", "issue": "18", "year": "1963"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["match_status"] == "in_collection"
+    assert body["matched_series_name"] == "Fantastic Four (Vol. 1) (1961 - 1996)"
+
+
+def test_check_batch_cross_volume_returns_ambiguous(client):
+    """BUI-284: the batch endpoint carries the ambiguous verdict per-item too."""
+    _seed_collection(client.store, _CROSS_VOLUME_FF18)
+    r = client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [{"series": "Fantastic Four", "issue": "18"}]},
+    )
+    assert r.status_code == 200, r.text
+    result = r.json()["results"][0]
+    assert result["match_status"] == "ambiguous_cross_volume"
+    assert result["match_kind"] == "cross_volume"
+
+
 # --- wish-list -------------------------------------------------------------
 
 def test_wish_list_returns_items(client):
@@ -817,6 +883,18 @@ def test_wish_list_add_rejects_owned_title(client):
     # The owned title was not appended.
     names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
     assert "Amazing Spider-Man #300" not in names
+
+
+def test_wish_list_add_409_when_cross_volume_owned_no_year(client):
+    """BUI-284: the owned-guard must still 409 a book owned under >1 volume even
+    with no year — cmd_collection_check returns `ambiguous_cross_volume`, which
+    counts as owned. Treating it as not-owned would let an owned book onto the
+    wish-list and be exported In Collection=0 → deleted (BUI-122)."""
+    _seed_collection(client.store, _CROSS_VOLUME_FF18)
+    r = client.post("/api/comics/wish-list", json={"title": "Fantastic Four #18"})
+    assert r.status_code == 409, r.text
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Fantastic Four #18" not in names
 
 
 def test_wish_list_add_force_overrides_owned(client):
