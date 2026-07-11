@@ -239,6 +239,11 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
     # Strip the orchestrator's _idx but thread a stable correlation id (_req_id,
     # = the original input index) the subprocess echoes back, so run() can map
     # results to inputs by identity instead of fragile list position (BUI-174/187).
+    #
+    # BUI-315: the passthrough forwards every book field except _idx — crucially
+    # `publisher` — so ebay-sold-comps' build_query can activate the Marvel
+    # "marvel comics" qualifier (DC/indie handled by _publisher_qualifier). Keep
+    # publisher in the payload; dropping it silently disables the qualifier.
     payload = [
         {**{k: v for k, v in b.items() if k != "_idx"}, "_req_id": b["_idx"]}
         for b in books

@@ -243,16 +243,22 @@ class TestBuildQuery:
         assert "Direct" in q
         assert "image comics" in q
 
-    # ── BUI-304 (issue 2): Marvel/DC publisher normalized to "<pub> comics" ──
+    # ── BUI-304 (issue 2): Marvel publisher normalized to "marvel comics" ──
     def test_marvel_publisher_qualifier(self):
         for pub in ("Marvel", "marvel", "Marvel Comics"):
             q = sc.build_query("Amazing Spider-Man", "300", publisher=pub)
             assert "marvel comics" in q
 
-    def test_dc_publisher_qualifier(self):
+    # ── BUI-315: DC is Marvel-only gated — DC gets NO qualifier appended ──
+    def test_dc_publisher_gets_no_qualifier(self):
+        # The DC "dc comics" two-token qualifier regressed recall in BUI-304's
+        # live spot-check, so a DC publisher must leave the query untouched —
+        # byte-for-byte identical to omitting the publisher entirely.
+        base = sc.build_query("Detective Comics", "27")
         for pub in ("DC", "dc", "DC Comics"):
             q = sc.build_query("Detective Comics", "27", publisher=pub)
-            assert "dc comics" in q
+            assert q == base
+            assert "dc comics" not in q.lower()
 
     def test_indie_publisher_passes_through_unchanged(self):
         # The pre-existing indie mechanism must keep working verbatim.
@@ -265,7 +271,10 @@ class TestBuildQuery:
         assert sc._publisher_qualifier("") is None
         assert sc._publisher_qualifier("   ") is None
         assert sc._publisher_qualifier("Marvel") == "marvel comics"
-        assert sc._publisher_qualifier("DC Comics") == "dc comics"
+        # BUI-315: DC recognized publishers get no qualifier (Marvel-only).
+        assert sc._publisher_qualifier("DC") is None
+        assert sc._publisher_qualifier("dc") is None
+        assert sc._publisher_qualifier("DC Comics") is None
         assert sc._publisher_qualifier("Dark Horse") == "Dark Horse"
 
 

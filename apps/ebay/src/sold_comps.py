@@ -108,15 +108,24 @@ def _cache_put(path: Path, data: dict) -> None:
 def _publisher_qualifier(publisher: str | None) -> str | None:
     """Normalize a publisher into the query qualifier keyword to append.
 
-    BUI-304 (issue 2): for the "big two" we emit the canonical "marvel comics"
-    / "dc comics" — a cheap disambiguator that keeps the *year-less* base query
-    (per /comic:buy's convention of omitting year to dodge the BUI-129
-    collection-check false-negative) from colliding with modern media that
-    reuses the issue number: e.g. "X-Men 97" vs the 2024 "X-Men '97" show's
-    merchandise. Indie publishers pass through unchanged — the caller already
-    supplies the noise-filtering name ("image comics", "dark horse"), which is
-    the primary indie noise filter (BUI-161). Returns None for an absent/blank
-    publisher so the base query is untouched.
+    BUI-304 (issue 2): for Marvel we emit the canonical "marvel comics" — a
+    cheap disambiguator that keeps the *year-less* base query (per /comic:buy's
+    convention of omitting year to dodge the BUI-129 collection-check
+    false-negative) from colliding with modern media that reuses the issue
+    number: e.g. "X-Men 97" vs the 2024 "X-Men '97" show's merchandise.
+
+    BUI-315 — Marvel ONLY: a live SerpApi spot-check (BUI-304) showed the Marvel
+    qualifier is neutral-to-positive (ASM 300 46→50, X-Men 97 44→49) but the DC
+    "dc comics" two-token qualifier MATERIALLY narrows recall (Batman 232 34→12,
+    Detective 400 38→21). So DC recognized publishers get NO qualifier (return
+    None) — the base query passes through untouched rather than regressing. Any
+    "DC Comics" raw passthrough would reintroduce the same two-token narrowing,
+    so DC must short-circuit to None, not fall to the indie branch.
+
+    Indie publishers pass through unchanged — the caller already supplies the
+    noise-filtering name ("image comics", "dark horse"), which is the primary
+    indie noise filter (BUI-161). Returns None for an absent/blank publisher so
+    the base query is untouched.
     """
     if not publisher or not publisher.strip():
         return None
@@ -124,7 +133,7 @@ def _publisher_qualifier(publisher: str | None) -> str | None:
     if re.search(r"\bmarvel\b", p, re.IGNORECASE):
         return "marvel comics"
     if re.search(r"\bdc\b", p, re.IGNORECASE):
-        return "dc comics"
+        return None  # BUI-315: DC qualifier regresses recall — no qualifier
     return p
 
 
@@ -146,8 +155,9 @@ def build_query(title: str, issue: str, year: int | None = None,
     variant = variant.strip() if variant else ""
     if variant:
         parts.append(variant)
-    # BUI-304 (issue 2): the publisher qualifier — indie passes through, Marvel/
-    # DC normalize to "marvel comics"/"dc comics" (see _publisher_qualifier).
+    # BUI-304 (issue 2): the publisher qualifier — indie passes through, Marvel
+    # normalizes to "marvel comics"; DC gets none (BUI-315). See
+    # _publisher_qualifier.
     qualifier = _publisher_qualifier(publisher)
     if qualifier:
         parts.append(qualifier)
