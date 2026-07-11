@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -2585,10 +2586,12 @@ class TestMainDroppedCandidatesExit:
     def test_global_verifier_failure_mid_batch_still_prints_prior_sellers(
         self, monkeypatch, capsys
     ):
-        """BUI-298 reliability: a GLOBAL verifier failure (verify_with_claude
-        sys.exit(1)) on seller 2 must NOT discard seller 1's already-scanned
-        result — the batch prints what it has and exits 1 (verifier-down), the
-        most severe code."""
+        """BUI-298 reliability (preserved under BUI-307 concurrency): a GLOBAL
+        verifier failure (verify_with_claude sys.exit(1)) on one seller must NOT
+        discard another seller's already-scanned, already-recorded-seen result —
+        the batch prints what it has and exits 1 (verifier-down), the most
+        severe code. BUI-307: the fix drains every future that actually ran
+        (never break-and-discard), so a completed seller is always shown."""
         recorded = {}
 
         def verify(cands, **kwargs):
@@ -2604,6 +2607,9 @@ class TestMainDroppedCandidatesExit:
             record_sink=recorded,
         )
         monkeypatch.setattr(seller_scan, "verify_with_claude", verify)
+        # BUI-307: pin ONE worker so completion order is deterministic
+        # (sellerOk completes and is recorded seen before sellerDead's failure).
+        monkeypatch.setattr(seller_scan, "_SELLER_SCAN_MAX_WORKERS", 1)
 
         code = seller_scan.main(["sellerOk", "sellerDead", "sellerNever", "--json"])
 
@@ -2611,16 +2617,14 @@ class TestMainDroppedCandidatesExit:
         assert code == 1
         payload = json.loads(capsys.readouterr().out)
         by_seller = {s["seller"]: s for s in payload["sellers"]}
-        # Seller 1's result was NOT discarded — it printed with its matches.
+        # The seller that completed before the failure was NOT discarded — it
+        # printed with its matches (the reliability invariant: a seller that
+        # recorded its matches seen is always shown, never silently lost).
         assert by_seller["sellerOk"]["error"] is None
         assert len(by_seller["sellerOk"]["matches"]) == 2
+        assert recorded["sellerOk"] == ["sellerOk-A1", "sellerOk-A2"]
         # The dead seller carries the global-failure error.
         assert "globally unavailable" in by_seller["sellerDead"]["error"]
-        # The loop broke — seller 3 was never attempted (global failure hits all).
-        assert "sellerNever" not in by_seller
-        # Seller 1's matches WERE recorded seen (they were genuinely verified);
-        # the reliability fix ensures they're also shown, not silently lost.
-        assert recorded["sellerOk"] == ["sellerOk-A1", "sellerOk-A2"]
 
     def test_username_and_add_alias_reject_multi_seller(self, monkeypatch, capsys):
         """BUI-298: --username/--add-alias are single-seller conveniences —
@@ -2710,6 +2714,250 @@ class TestMainDroppedCandidatesExit:
         assert payload["sellers"][0]["username"] == "newstore_login"
         # The alias was persisted for next time.
         assert ebay_fetch.load_seller_aliases()["newstore"] == "newstore_login"
+
+
+class TestSellerLevelParallelism:
+    """BUI-307: sellers are scanned in a bounded ThreadPoolExecutor instead of a
+    sequential loop. These tests prove the parallelism is:
+
+    - deterministic + byte-for-byte identical to sequential aggregation
+      (output ordering follows input order, not completion order),
+    - genuinely concurrent (a slow/stuck seller can't serialize the rest),
+    - bounded to _SELLER_SCAN_MAX_WORKERS,
+    - keeps BUI-297's circuit-breaker state per-invocation (not a shared global
+      that concurrent sellers could corrupt),
+    - keeps BUI-301's rejected cache consistent under concurrent writers.
+    """
+
+    def _wire(self, monkeypatch, verify):
+        """Stub every external seam so main() reaches `verify` (the injected
+        verify_with_claude) once per seller with two candidates
+        (``<username>-A1``/``-A2``). The seller arg is echoed back as the
+        resolved username so a test can address each seller by name.
+        """
+        monkeypatch.setattr(seller_scan, "load_seller_aliases", lambda: {})
+        monkeypatch.setattr(
+            seller_scan, "resolve_seller_username",
+            lambda seller, aliases, username_override=None: seller,
+        )
+        monkeypatch.setattr(
+            seller_scan, "load_config", lambda: ("id", "secret", "http://x")
+        )
+        monkeypatch.setattr(seller_scan, "get_token", lambda *a, **k: "tok")
+        monkeypatch.setattr(
+            seller_scan, "fetch_wish_list",
+            lambda: [{"id": 1, "name": "Amazing Spider-Man #300"}],
+        )
+
+        def fake_search(username, token, base_url, max_results=1000):
+            return [
+                {"item_id": f"{username}-A1", "title": "Amazing Spider-Man #300 one"},
+                {"item_id": f"{username}-A2", "title": "Amazing Spider-Man #300 two"},
+            ]
+
+        monkeypatch.setattr(seller_scan, "search_seller_listings", fake_search)
+        monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
+        monkeypatch.setattr(
+            seller_scan, "match_listing", lambda title, wish_items: (wish_items[0], 0.9)
+        )
+        monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
+        monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
+        monkeypatch.setattr(seller_scan, "verify_with_claude", verify)
+        # record_items_seen runs on worker threads; a no-op stub keeps it off the
+        # real server (tests here assert on main()'s payload, not the seen-set).
+        monkeypatch.setattr(seller_scan, "record_items_seen", lambda ids, seller: None)
+
+    def test_output_deterministic_and_identical_to_sequential(
+        self, monkeypatch, capsys
+    ):
+        """The concurrent aggregate is ordered by INPUT position (not completion
+        order) and is byte-for-byte identical to a single-worker sequential run.
+        """
+        def verify(cands, **kwargs):
+            return (list(cands), [], [])
+
+        # Concurrent (default _SELLER_SCAN_MAX_WORKERS).
+        self._wire(monkeypatch, verify)
+        code_par = seller_scan.main(["sB", "sA", "sC", "--json"])
+        payload_par = json.loads(capsys.readouterr().out)
+
+        # Sequential (1 worker) — same inputs.
+        self._wire(monkeypatch, verify)
+        monkeypatch.setattr(seller_scan, "_SELLER_SCAN_MAX_WORKERS", 1)
+        code_seq = seller_scan.main(["sB", "sA", "sC", "--json"])
+        payload_seq = json.loads(capsys.readouterr().out)
+
+        assert code_par == code_seq == 0
+        # Ordering follows the CLI arg order regardless of which seller's verify
+        # finished first — never nondeterministic completion order.
+        assert [s["seller"] for s in payload_par["sellers"]] == ["sB", "sA", "sC"]
+        # Concurrency changes only the EXECUTION, never the aggregated result.
+        assert payload_par == payload_seq
+
+    def test_sellers_run_concurrently_not_serialized(self, monkeypatch, capsys):
+        """A Barrier sized to the worker count only releases when all sellers'
+        verify calls are in flight AT ONCE. Under the old sequential loop the
+        first seller would block here forever (the others never start) and the
+        5s timeout would raise BrokenBarrierError out of main(); passing proves
+        the verifications overlap — a slow/stuck seller can't serialize the rest.
+        """
+        n = seller_scan._SELLER_SCAN_MAX_WORKERS
+        barrier = threading.Barrier(n, timeout=5)
+
+        def verify(cands, **kwargs):
+            barrier.wait()
+            return (list(cands), [], [])
+
+        self._wire(monkeypatch, verify)
+        sellers = [f"s{i}" for i in range(n)]
+        code = seller_scan.main(sellers + ["--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert {s["seller"] for s in payload["sellers"]} == set(sellers)
+        assert all(len(s["matches"]) == 2 for s in payload["sellers"])
+
+    def test_worker_count_is_bounded(self, monkeypatch, capsys):
+        """With more sellers than workers, observed peak concurrency equals the
+        cap and never exceeds it. A Barrier sized to the cap forces each wave to
+        reach exactly the cap at once; the pool guarantees it never goes higher.
+        """
+        cap = seller_scan._SELLER_SCAN_MAX_WORKERS
+        barrier = threading.Barrier(cap, timeout=5)
+        lock = threading.Lock()
+        state = {"active": 0, "peak": 0}
+
+        def verify(cands, **kwargs):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            barrier.wait()  # hold exactly `cap` workers here simultaneously
+            with lock:
+                state["active"] -= 1
+            return (list(cands), [], [])
+
+        self._wire(monkeypatch, verify)
+        sellers = [f"s{i}" for i in range(cap * 2)]  # two clean waves
+        code = seller_scan.main(sellers + ["--json"])
+
+        assert code == 0
+        # Reached the cap (real parallelism) and never exceeded it (bounded).
+        assert state["peak"] == cap
+
+    def test_circuit_breaker_state_is_per_invocation_not_shared(self, monkeypatch):
+        """Two verify_with_claude invocations run CONCURRENTLY: one whose every
+        CLI call transport-fails (breaker trips → the global-failure safety net
+        sys.exit(1)s) and one whose every call succeeds. Because transport_ok is
+        a LOCAL of each verify_with_claude call — not a shared module global —
+        the healthy invocation returns its match and the broken one exits, with
+        no cross-talk. If the breaker state were shared, concurrent mutation
+        would let one invocation mask the other.
+        """
+        monkeypatch.setattr(
+            seller_scan.shutil, "which", lambda name: "/usr/bin/claude"
+        )
+
+        def fake_cli(prompt):
+            if "ZZDEADZZ" in prompt:
+                raise RuntimeError("transport boom")
+            return "[]"  # reject nothing → all candidates kept
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_cli)
+
+        healthy = [{"item_id": "ok-1", "title": "OK Book #1", "wish_name": "OK #1"}]
+        broken = [
+            {"item_id": "dead-1", "title": "ZZDEADZZ Book #1", "wish_name": "DEAD #1"}
+        ]
+        results = {}
+        barrier = threading.Barrier(2, timeout=5)
+
+        def run(key, cands):
+            barrier.wait()  # ensure the two invocations genuinely overlap
+            try:
+                results[key] = ("ok", seller_scan.verify_with_claude(cands))
+            except SystemExit as e:
+                results[key] = ("exit", e.code)
+
+        t1 = threading.Thread(target=run, args=("healthy", healthy))
+        t2 = threading.Thread(target=run, args=("broken", broken))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert results["healthy"][0] == "ok"
+        kept, dropped, filtered = results["healthy"][1]
+        assert [c["item_id"] for c in kept] == ["ok-1"]
+        assert dropped == []
+        # The broken invocation tripped its OWN breaker + safety net.
+        assert results["broken"] == ("exit", 1)
+
+    def test_rejected_cache_no_lost_entries_under_concurrent_writers(
+        self, monkeypatch
+    ):
+        """Many threads each record a DISTINCT rejection concurrently. A plain
+        last-writer-wins overwrite (load {X}; add mine; write whole dict) would
+        drop entries; _record_rejections re-reads and merges under a lock, so
+        every entry survives. (The autouse conftest fixture points the cache at
+        a per-test tmp path, so this never touches the real ~/.cache.)
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        n = 25
+        barrier = threading.Barrier(n, timeout=5)
+
+        def writer(i):
+            barrier.wait()  # maximize contention on the critical section
+            seller_scan._record_rejections({f"pair-{i}": now_iso})
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        cache = seller_scan._load_rejected_cache()
+        assert set(cache) == {f"pair-{i}" for i in range(n)}
+
+    def test_concurrent_completed_seller_shown_despite_global_verifier_failure(
+        self, monkeypatch, capsys
+    ):
+        """BUI-307 regression (found in review): when one seller trips the global
+        verifier failure (SystemExit) while another seller is running CONCURRENTLY
+        and verifies a real match, the completed seller MUST still be shown — it
+        already recorded its matches as seen, so dropping it would hide a genuine
+        wish-list match on the seen-filtered re-run (the BUI-297 lost-match class).
+
+        A Barrier(2) forces both sellers in-flight at once; the loop must keep
+        draining after the SystemExit rather than break-and-discard.
+        """
+        barrier = threading.Barrier(2, timeout=5)
+
+        def verify(cands, **kwargs):
+            username = cands[0]["item_id"].rsplit("-", 1)[0]
+            barrier.wait()  # both sellers reach verify concurrently
+            if username == "sellerDead":
+                raise SystemExit(1)  # verify_with_claude's global-failure exit
+            return (list(cands), [], [])
+
+        self._wire(monkeypatch, verify)
+        # Pin 2 workers so both sellers are genuinely in-flight together (the
+        # Barrier would otherwise deadlock under a single worker).
+        monkeypatch.setattr(seller_scan, "_SELLER_SCAN_MAX_WORKERS", 2)
+
+        code = seller_scan.main(["sellerOk", "sellerDead", "--json"])
+
+        # Verifier-down is the most severe exit.
+        assert code == 1
+        payload = json.loads(capsys.readouterr().out)
+        by_seller = {s["seller"]: s for s in payload["sellers"]}
+        # The concurrently-completed seller was NOT discarded — its real matches
+        # are shown (the fix: drain in-flight futures instead of breaking).
+        assert by_seller["sellerOk"]["error"] is None
+        assert {row["item_id"] for row in by_seller["sellerOk"]["matches"]} == {
+            "sellerOk-A1", "sellerOk-A2",
+        }
+        # The dead seller carries the global-failure error.
+        assert "globally unavailable" in by_seller["sellerDead"]["error"]
 
 
 # ─── BUI-227: _title_paren_years ─────────────────────────────────────────────
