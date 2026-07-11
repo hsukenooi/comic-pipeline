@@ -255,6 +255,22 @@ class TestBatchCheckOwned:
             owned = ws.batch_check_owned([("X-Men", "94")], "http://server")
         assert owned == set()
 
+    def test_ambiguous_cross_volume_returned_as_owned(self):
+        """BUI-302: ambiguous_cross_volume (BUI-284) is owned under >1 volume
+        with no year to disambiguate — must be skipped, not surfaced as a buy
+        candidate."""
+        payload = {"count": 1, "results": [
+            {"series": "X-Men", "issue": "94", "match_status": "ambiguous_cross_volume",
+             "full_title_matched": True, "cache_age_days": 1},
+        ]}
+        with patch("requests.post") as mock_post:
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=MagicMock(return_value=payload),
+            )
+            owned = ws.batch_check_owned([("X-Men", "94")], "http://server")
+        assert ("X-Men", "94") in owned
+
     def test_409_causes_sys_exit(self):
         """409 from server = collection not imported → hard-fail (plan R10/R11)."""
         with patch("requests.post") as mock_post:
