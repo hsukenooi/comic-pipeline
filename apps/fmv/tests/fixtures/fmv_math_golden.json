@@ -23,6 +23,18 @@
     "n": 8,
     "window": 0.5
   },
+  "interpolated_thick_brackets": {
+    "bid_factor": 0.6,
+    "confidence": "LOW",
+    "flag_reason": null,
+    "fmv_high": 180,
+    "fmv_low": 180,
+    "grade_span": 4.0,
+    "max_bid": 110,
+    "median": 180,
+    "n": 4,
+    "window": 2.0
+  },
   "narrow_high": {
     "bid_factor": 0.8,
     "confidence": "HIGH",
@@ -62,12 +74,12 @@
   "too_wide_flag": {
     "bid_factor": 0.8,
     "confidence": "LOW",
-    "flag_reason": null,
-    "fmv_high": 180,
-    "fmv_low": 180,
+    "flag_reason": "too_wide",
+    "fmv_high": null,
+    "fmv_low": null,
     "grade_span": 4.0,
-    "max_bid": 140,
-    "median": 180,
+    "max_bid": null,
+    "median": null,
     "n": 3,
     "window": 2.0
   },

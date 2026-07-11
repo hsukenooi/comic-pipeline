@@ -626,9 +626,12 @@ def _build_notes(fmv: dict) -> str:
     # misleading (its LOW label is forced by the flag, not a real haircut).
     factor = fmv.get("bid_factor")
     if not flag and factor is not None and factor < fmv_math.BASE_BID_FACTOR:
-        parts.append(
-            f"bid_haircut={factor:.2f} (grade_conf={fmv.get('grade_confidence')})"
-        )
+        # BUI-318: attribute the haircut to its cause. An interpolated book's
+        # cap comes from the interpolated-LOW haircut (not grade_conf, which is
+        # typically absent here), so naming grade_conf=None would misread.
+        cause = ("interpolated" if fmv.get("interpolated")
+                 else f"grade_conf={fmv.get('grade_confidence')}")
+        parts.append(f"bid_haircut={factor:.2f} ({cause})")
     return " | ".join(parts)
 
 
@@ -725,6 +728,14 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
             and fmv_math._rank(fmv_conf) > fmv_math._CONF_RANK["MEDIUM"]):
         fmv_conf = "MEDIUM"
     factor = fmv_math.bid_factor(fmv_conf, grade_confidence)
+    # BUI-318: an interpolated book is cache-reusable, but its persisted
+    # fmv_confidence is a plain "low" — bid_factor("LOW", None) would return the
+    # full 0.80×, silently undoing the interpolated-LOW haircut on reuse. Recover
+    # the interpolated marker from notes and re-apply the cap so a cached
+    # interpolated row bids at the same haircut a fresh recompute would.
+    interpolated = _interpolated_from_notes(row.get("fmv_notes"))
+    if interpolated:
+        factor = min(factor, fmv_math.INTERPOLATED_BID_FACTOR)
     return {
         "n": row.get("fmv_comps") or 0,
         "window": window,
@@ -753,7 +764,7 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         # still tells a downstream consumer it's interpolated, not a direct comp
         # (§7 "state explicitly"). The full interpolation detail dict isn't
         # reconstructed (same lossy projection as median/cv/trimmed_pool).
-        "interpolated": _interpolated_from_notes(row.get("fmv_notes")),
+        "interpolated": interpolated,
         "interpolation": None,
         "suspect_buckets": [],
     }
