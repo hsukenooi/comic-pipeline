@@ -56,6 +56,17 @@ otherwise-healthy batch). Any successful fetch — including a 401 that DOES
 self-heal after refresh — resets the counter to 0, so an isolated/transient
 expiry still self-heals exactly as BUI-310 intended.
 
+BUI-331: the give-up counter's reset is now "since last confirmed-healthy
+auth", not strictly "since last full success". A failure that lands AFTER a
+proven HTTP-200 fetch — a malformed response body or an image-CDN download
+error — raises `ListingContentError` (a RuntimeError subclass), and main()
+resets `consecutive_post_refresh_401s` on it: the token demonstrably worked,
+so two post-refresh 401s separated by such a failure are not "consecutive".
+Crucially the `data is None` non-401 fetch failure (a plain 500/404/network
+exhaustion) is NOT proof of 200 and does NOT reset — so a genuine revoked-creds
+streak still counts toward give-up and can't be kept alive forever by an
+unrelated non-auth failure defeating the circuit breaker.
+
 Usage:
     python src/grade_photos.py ITEM_ID [ITEM_ID ...] [--workdir DIR]
 
@@ -115,6 +126,28 @@ class TokenExpiredError(RuntimeError):
     """
 
 
+class ListingContentError(RuntimeError):
+    """Raised by download_listing() for a failure that occurred *after* a
+    proven HTTP-200 Browse-API fetch — a malformed response body or an image
+    download failing on the CDN.
+
+    BUI-331: the systemic-401 give-up counter in main() must reset on any
+    confirmed-healthy auth, not only on a full item success. `download_listing`
+    reaches its malformed-data / image-download error paths ONLY after
+    `fetch_item_with_status()` returned a non-None body, which its contract
+    guarantees means the request was a 200 — i.e. the token demonstrably
+    worked. A subclass of RuntimeError (like TokenExpiredError) so the existing
+    `except RuntimeError` FETCH FAILED contract still catches it; main() adds a
+    more specific `except ListingContentError` first that resets the counter.
+
+    Deliberately NOT raised on the `data is None` / non-401 fetch failure (a
+    plain 500, 404, or network-budget exhaustion): that path has no proof the
+    auth layer is healthy, so it must NOT reset a genuine systemic-401 streak —
+    resetting there is exactly the over-eager reset that would let a
+    truly-broken-auth batch keep hammering the OAuth endpoint forever.
+    """
+
+
 def _download_image(url, dest, timeout=_DOWNLOAD_TIMEOUT_SECONDS):
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
@@ -155,7 +188,8 @@ def download_listing(token, item_id, outdir, base_url):
         for ai in data.get("additionalImages", []):
             imgs.append(ai["imageUrl"])
     except KeyError as e:
-        raise RuntimeError(f"item {item_id}: malformed image data (missing {e})") from e
+        # BUI-331: proof-of-200 failure (body already fetched) — ListingContentError.
+        raise ListingContentError(f"item {item_id}: malformed image data (missing {e})") from e
     for i, url in enumerate(imgs, 1):
         try:
             _download_image(url, outdir / f"img-{i:02d}.jpg")
@@ -163,7 +197,9 @@ def download_listing(token, item_id, outdir, base_url):
             # Covers connection errors, HTTP error status, and a timed-out
             # host — a hung image host must fail only this item, not stall
             # the whole sequential batch.
-            raise RuntimeError(f"item {item_id}: image download failed ({e})") from e
+            # BUI-331: proof-of-200 failure (item body already fetched over a
+            # successful 200; only the image CDN failed) — ListingContentError.
+            raise ListingContentError(f"item {item_id}: image download failed ({e})") from e
     # Auction value signal for the value gate (Step 2): currentBidPrice/bidCount are
     # already in the Browse API response — capture them, no extra request needed.
     # BUI-165: for a fixed-price (BIN) listing currentBidPrice is absent, so this
@@ -276,6 +312,22 @@ def main(argv=None):
                 consecutive_post_refresh_401s += 1
                 if consecutive_post_refresh_401s >= 2:
                     give_up_refreshing = True
+                print(f"{label}: FETCH FAILED — {e}")
+                break
+            except ListingContentError as e:
+                # BUI-331: this item's fetch reached a proven HTTP-200 (the
+                # body was returned) and only then failed on malformed data or
+                # an image-CDN error — the auth token demonstrably worked. That
+                # is the same quality of evidence as a full success, so reset
+                # the systemic-401 streak: two post-refresh 401s separated by
+                # one of these are NOT "consecutive" (the give-up counter's
+                # semantics are 'since last confirmed-healthy auth', which this
+                # is). A `data is None` fetch failure (plain RuntimeError below)
+                # is NOT proof of 200, so it deliberately does NOT reset —
+                # keeping a genuine revoked-creds streak counting toward
+                # give-up rather than letting an unrelated 500 defeat the
+                # circuit breaker.
+                consecutive_post_refresh_401s = 0
                 print(f"{label}: FETCH FAILED — {e}")
                 break
             except RuntimeError as e:
