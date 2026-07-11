@@ -86,7 +86,7 @@ def _server_base():
 # ─── Wish list fetching ───────────────────────────────────────────────────────
 
 def fetch_wish_list():
-    """Fetch the wish list from the gixen server API. Returns a list of
+    """Fetch the wish list from the comics server API. Returns a list of
     {id, name} dicts.
 
     BUI-88 (R10): seller-scan lives in apps/ebay, which is NOT a uv workspace
@@ -276,15 +276,28 @@ _EXIT_INCOMPLETE = 3
 # verification didn't fully complete for at least one."
 _EXIT_SELLER_ERROR = 2
 
+# BUI-324: exit code for a batch where at least one seller's WORKER CRASHED —
+# an unhandled exception inside _scan_one_seller_impl, isolated by the
+# _scan_one_seller wrapper (BUI-319) — as opposed to an expected, resolvable
+# per-seller failure (unknown seller name / listing-fetch transport error),
+# which stays on _EXIT_SELLER_ERROR=2. Before this ticket both cases shared
+# exit 2 and were only distinguishable by grepping the per-seller `error`
+# string for "seller scan crashed:" vs "unknown seller"/"listing fetch
+# failed" — a monitoring caller can now branch on the exit code alone. Picked
+# as the next unused code (0-3 already taken) rather than renumbering any
+# existing tier, so an existing monitor keyed on 0/1/2/3 keeps working.
+_EXIT_SELLER_CRASHED = 4
+
 # BUI-270/BUI-297: the `claude` verifier is globally unavailable (CLI missing,
 # broken auth, or every chunk failed transport). verify_with_claude sys.exit(1)s
 # on this. It's the MOST severe outcome — nothing could be verified and the run
-# is truncated — so it takes priority over incomplete/seller-error/clean.
+# is truncated — so it takes priority over incomplete/crashed/seller-error/clean.
 # Multi-seller exit-code priority (main()):
-#   1 (_EXIT_VERIFIER_DOWN) — verifier globally down, run truncated
-#   3 (_EXIT_INCOMPLETE)    — verifier worked but some candidates never verified
-#   2 (_EXIT_SELLER_ERROR)  — a seller couldn't be resolved/fetched
-#   0                       — clean
+#   1 (_EXIT_VERIFIER_DOWN)  — verifier globally down, run truncated
+#   3 (_EXIT_INCOMPLETE)     — verifier worked but some candidates never verified
+#   4 (_EXIT_SELLER_CRASHED) — a seller's worker crashed unexpectedly (BUI-324)
+#   2 (_EXIT_SELLER_ERROR)   — a seller couldn't be resolved/fetched
+#   0                        — clean
 _EXIT_VERIFIER_DOWN = 1
 
 
@@ -946,7 +959,7 @@ def print_matches(matches, seller_label=None):
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def _seller_result(seller, username, *, matches=None, dropped=None,
-                   filtered=None, skipped=0, error=None):
+                   filtered=None, skipped=0, error=None, crashed=False):
     """Build one seller's result slot for the --json `sellers` array.
 
     BUI-298: a single factory for the per-seller shape so its keys are defined
@@ -960,6 +973,14 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
     skipped entirely (no CLI call) — surfaced as `skipped_cached_candidates`
     so an unattended caller can see cache coverage (how much verification
     cost this scan avoided) without scraping stderr.
+
+    BUI-324: `crashed` marks a slot whose `error` came from an unexpected
+    worker exception (the _scan_one_seller crash-isolation wrapper), not a
+    normal resolvable failure (unknown seller / listing fetch). It drives
+    main()'s distinct `_EXIT_SELLER_CRASHED` exit code, and is surfaced here
+    too (not just via the exit code) so a `--json` caller inspecting a
+    specific seller's slot doesn't have to pattern-match its `error` string
+    to tell the two apart.
     """
     dropped = dropped or []
     return {
@@ -971,6 +992,7 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
         "skipped_cached_candidates": skipped,
         "incomplete": bool(dropped),
         "error": error,
+        "crashed": crashed,
     }
 
 
@@ -1013,7 +1035,8 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
         # differs from the listing-fetch branch's `{e}` (a known RequestException
         # where the type adds nothing) — here the type is the whole point.
         return _seller_result(
-            seller_arg, username, error=f"seller scan crashed: {e!r}"
+            seller_arg, username, error=f"seller scan crashed: {e!r}",
+            crashed=True,
         )
 
 
@@ -1402,6 +1425,11 @@ def main(argv=None):
 
     any_incomplete = any(r["incomplete"] for r in results)
     any_error = any(r["error"] for r in results)
+    # BUI-324: a crashed slot's `error` is also truthy (so any_error above and
+    # the non-json "Error: ..." printing below stay unchanged), but the exit
+    # code below checks this separately so a worker crash gets its own
+    # _EXIT_SELLER_CRASHED instead of the generic _EXIT_SELLER_ERROR.
+    any_crashed = any(r.get("crashed") for r in results)
 
     if args.json_output:
         # BUI-298 (fold-in A): --json is ALWAYS a top-level object — never a
@@ -1428,12 +1456,14 @@ def main(argv=None):
                 seller_label=(f"{r['seller']} ({r['username']})" if multi else None),
             )
 
-    # BUI-298 exit-code priority (see the exit-constant comments above):
-    # verifier-down (1) > incomplete (3) > seller-error (2) > clean (0).
+    # BUI-298/BUI-324 exit-code priority (see the exit-constant comments above):
+    # verifier-down (1) > incomplete (3) > crashed (4) > seller-error (2) > clean (0).
     if verifier_down:
         return _EXIT_VERIFIER_DOWN
     if any_incomplete:
         return _EXIT_INCOMPLETE
+    if any_crashed:
+        return _EXIT_SELLER_CRASHED
     if any_error:
         return _EXIT_SELLER_ERROR
     return 0
