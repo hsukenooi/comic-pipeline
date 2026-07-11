@@ -19,7 +19,9 @@ Pipeline (per the plan's diagram):
   10. Split by verdict cache; run Haiku verify on uncached survivors (R8/R9).
   11. Write new verdicts; re-apply ≥2 gate.
   12. Record all final item_ids as seen (global, seller=None — R11).
-  13. Emit compact table (default) or --json (R15).
+  13. Emit compact table (default) or --json (R15; BUI-309: --json is always
+      an object with `sellers` + `dropped_candidates`, and the process exits
+      non-zero when any candidate was never verified).
 
 Coverage note (plan N3): wish items whose name contains no '#N' issue number
 (GNs, HCs, TPBs like "Secret Wars HC") are silently skipped by
@@ -52,9 +54,11 @@ from ebay_fetch import (
     search_by_keyword,
 )
 from seller_scan import (
+    _EXIT_INCOMPLETE,  # BUI-309: reuse seller_scan's "partial run" exit code
     _normalize,
     _server_base,
     _strip_grades,
+    _strip_private,  # BUI-309: shared private-field stripper (BUI-245)
     _title_paren_years,
     _title_volume,
     _trunc,
@@ -113,6 +117,21 @@ def _title_key(title: str) -> str:
     same key — enabling cross-seller and relist cache hits.
     """
     return _normalize(_strip_grades(title))
+
+
+def _verdict_key(match: dict) -> tuple[str, str]:
+    """The (title_key, wish_name) pair a verify verdict is keyed by."""
+    return _title_key(match["title"]), match["wish_name"]
+
+
+def _fan_out(matches: list, keys: set) -> list:
+    """Return every match whose verdict key is in `keys`.
+
+    Fans a per-(title, wish) verdict back out to all listings sharing that
+    key — used for both the genuine (`verified`) and never-verified
+    (`dropped`) fan-outs in _verify_uncached_matches (BUI-309).
+    """
+    return [m for m in matches if _verdict_key(m) in keys]
 
 
 # ─── Pristine-match shortcut ──────────────────────────────────────────────────
@@ -508,49 +527,86 @@ def format_table(grouped: dict) -> str:
     return "\n".join(lines)
 
 
-def _emit(*, grouped: dict, json_output: bool) -> None:
-    """Emit the final compact result to stdout.
+def _emit(*, grouped: dict, dropped_candidates: list, json_output: bool) -> None:
+    """Emit the final result to stdout.
 
-    CRITICAL (R15): only the compact final result ever reaches stdout.
-    Private pipeline fields (_series, _issue) are stripped from JSON output.
+    CRITICAL (R15): only the final result ever reaches stdout. Private
+    pipeline fields (_series, _issue, …) are stripped from JSON output via
+    seller_scan's shared `_strip_private`.
+
+    BUI-309: `--json` is now ALWAYS a top-level OBJECT — never a bare array —
+    mirroring seller_scan.py's BUI-298 exit-code-first contract, so a
+    scheduler/monitoring consumer can branch on `incomplete` before drilling
+    into `sellers`/`dropped_candidates` regardless of clean/partial run. This
+    is a breaking shape change for any --json consumer; at BUI-309 time no
+    in-repo consumer parses this output (the skill doc and cron example in
+    docs/reference/wishlist-sellers-scheduling.md both use the human table),
+    so none needed updating.
+
+    `dropped_candidates` (BUI-297 never-verified candidates — timeout/
+    transport failure surviving bisection, or an unparseable verify response)
+    is surfaced as its own field so a partial run is machine-detectable, not
+    just a stderr WARNING a human running the tool unattended won't read.
+    Those candidates are never part of `grouped` (they were never verified as
+    genuine) and — per the existing BUI-297 data-safety invariant, unchanged
+    here — stay uncached and unseen so they resurface on the next run.
     """
-    if not grouped:
-        if json_output:
-            print("[]")
-        else:
-            print("No sellers found with ≥2 genuine matches.")
-        return
-
     if json_output:
-        out = [
-            {
-                "seller": seller,
-                "matches": [
-                    {k: v for k, v in m.items() if not k.startswith("_")}
-                    for m in matches
-                ],
-            }
+        # Strip private pipeline fields only on the path that consumes them —
+        # the table branch renders from `grouped`/`dropped_candidates` directly.
+        stripped_sellers = [
+            {"seller": seller, "matches": _strip_private(matches)}
             for seller, matches in sorted(grouped.items(), key=lambda kv: -len(kv[1]))
         ]
-        print(json.dumps(out))
+        print(json.dumps({
+            "incomplete": bool(dropped_candidates),
+            "sellers": stripped_sellers,
+            "dropped_candidates": _strip_private(dropped_candidates),
+        }))
+        return
+
+    if not grouped:
+        print("No sellers found with ≥2 genuine matches.")
     else:
         print(format_table(grouped))
+
+    if dropped_candidates:
+        # BUI-309: the non-JSON path signals the partial run too, not just the
+        # stderr WARNING already printed in _verify_uncached_matches — belt
+        # and suspenders for anyone reading stdout only.
+        print(
+            f"INCOMPLETE: {len(dropped_candidates)} candidate(s) were NEVER "
+            "verified (claude CLI timeout/transport failure). They are NOT "
+            "recorded as seen and WILL resurface on the next scheduled run."
+        )
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 
-def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list]:
-    """Split verdict-cache-miss matches into pristine (deterministic) and
-    Claude-verified survivors, persisting new verdicts to the cache.
+def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list, list]:
+    """Split verdict-cache-miss matches into pristine (deterministic),
+    Claude-verified, and never-verified survivors, persisting new verdicts to
+    the cache.
 
     Dedups needs-verify candidates cross-seller by (title_key, wish_name),
     calls verify_with_claude, fans the verified verdict back to every listing
     sharing a key, and persists new verdicts via verdict_put. Returns
-    (pristine_direct, verified) — both empty lists when `uncached` is empty.
+    (pristine_direct, verified, dropped) — all empty lists when `uncached` is
+    empty.
+
+    BUI-309: `dropped` is the never-verified listing-level fan-out of
+    verify_with_claude's `dropped` reps — every `needs_verify` listing whose
+    (title_key, wish_name) key never received a usable verdict (claude CLI
+    timeout/transport failure surviving bisection, or an unparseable
+    response). These are deliberately excluded from `verified`, never cached,
+    and never marked seen (unchanged BUI-297 data-safety behavior) — the
+    caller now also surfaces them via the `dropped_candidates` --json field
+    and a non-zero exit code so an unattended scheduled run signals a partial
+    result instead of relying on a stderr line nobody reads.
     """
     if not uncached:
-        return [], []
+        return [], [], []
 
     # BUI-224: deterministic shortcut — pristine score-1.0 listings skip Haiku.
     # Split before cross-seller dedup so only ambiguous candidates go to verify.
@@ -611,19 +667,20 @@ def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list]
         # before; wishlist-sellers has no use for the inline reasons, so it's
         # ignored here (the stderr "Filtered N …" line still prints).
         verified_reps, dropped_reps, _filtered_reps = verify_with_claude(representatives)
-        # Keys that came back as genuine from verify
-        genuine_keys = {(_title_key(m["title"]), m["wish_name"]) for m in verified_reps}
-        dropped_keys = {(_title_key(m["title"]), m["wish_name"]) for m in dropped_reps}
-        # Fan the verdict back out to ALL needs_verify listings sharing each key
-        verified = [
-            m for m in needs_verify
-            if (_title_key(m["title"]), m["wish_name"]) in genuine_keys
-        ]
+        # Keys that came back as genuine / never-verified from verify.
+        genuine_keys = {_verdict_key(m) for m in verified_reps}
+        dropped_keys = {_verdict_key(m) for m in dropped_reps}
+        # Fan each verdict back out to ALL needs_verify listings sharing its key.
+        # BUI-309: `dropped` fans out too, so the caller can report every
+        # affected listing (not just one representative per key) in the --json
+        # `dropped_candidates` field.
+        verified = _fan_out(needs_verify, genuine_keys)
+        dropped = _fan_out(needs_verify, dropped_keys)
         # Persist one verdict row per (title_key, wish_name) — not per listing —
         # but skip never-verified keys entirely so they stay uncached (BUI-297).
         persisted: set[tuple] = set()
         for m in needs_verify:
-            key = (_title_key(m["title"]), m["wish_name"])
+            key = _verdict_key(m)
             if key in dropped_keys:
                 continue
             if key not in persisted:
@@ -640,8 +697,9 @@ def _verify_uncached_matches(uncached: list, db_path: Path) -> tuple[list, list]
             )
     else:
         verified = []
+        dropped = []
 
-    return pristine_direct, verified
+    return pristine_direct, verified, dropped
 
 
 def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
@@ -799,7 +857,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
 
     if not all_matches:
         print("No wish-list matches found on eBay.", file=sys.stderr)
-        _emit(grouped={}, json_output=args.json_output)
+        _emit(grouped={}, dropped_candidates=[], json_output=args.json_output)
         return 0
 
     # ── Step 7: drop already-seen (global seen set, seller=None — R11) ───────
@@ -845,7 +903,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
 
     if not grouped:
         print("No sellers with ≥2 matches found.", file=sys.stderr)
-        _emit(grouped={}, json_output=args.json_output)
+        _emit(grouped={}, dropped_candidates=[], json_output=args.json_output)
         return 0
 
     # ── Step 7.5 (moved): item-specifics era gate — runs only on ≥2 candidates ──
@@ -879,7 +937,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         grouped = group_and_gate(candidates)
         if not grouped:
             print("No sellers with ≥2 matches found.", file=sys.stderr)
-            _emit(grouped={}, json_output=args.json_output)
+            _emit(grouped={}, dropped_candidates=[], json_output=args.json_output)
             return 0
         candidates = [m for ms in grouped.values() for m in ms]
 
@@ -893,7 +951,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         file=sys.stderr,
     )
 
-    pristine_direct, verified = _verify_uncached_matches(uncached, db_path)
+    pristine_direct, verified, dropped_candidates = _verify_uncached_matches(uncached, db_path)
 
     survivors = cached_genuine + pristine_direct + verified
 
@@ -916,7 +974,14 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         )
 
     # ── Step 13: emit ─────────────────────────────────────────────────────────
-    _emit(grouped=grouped, json_output=args.json_output)
+    _emit(grouped=grouped, dropped_candidates=dropped_candidates, json_output=args.json_output)
+
+    # BUI-309: an unattended scheduled run needs a machine-readable "this run
+    # was partial" signal, not just a stderr WARNING nobody reads. Reuses
+    # seller_scan.py's BUI-298 _EXIT_INCOMPLETE (3) so both CLI tools agree on
+    # what "some candidates never verified — re-run me" means on exit.
+    if dropped_candidates:
+        return _EXIT_INCOMPLETE
     return 0
 
 
