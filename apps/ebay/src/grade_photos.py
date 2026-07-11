@@ -33,6 +33,29 @@ item, keeping the fresh token for the rest of the batch. A second straight
 that item and continues — a token outliving a long batch no longer turns
 every remaining item into FETCH FAILED.
 
+BUI-322: BUI-310's per-item self-healing has no memory across items, so a
+systemic/permanent 401 (revoked creds, an app-level API restriction) was
+masked as ordinary per-item self-healing — every remaining item burned its
+own force-refresh OAuth POST before FETCH FAILED, hammering the OAuth
+endpoint for the whole batch instead of surfacing that the failure isn't
+per-item at all. main() now tracks `consecutive_post_refresh_401s` across
+items: a 401 that survives a force-refresh retry (a "post-refresh 401")
+increments it; a second straight one is corroborating evidence the refresh
+isn't helping, so main() sets `give_up_refreshing` and stops issuing
+force-refresh OAuth POSTs for the rest of the batch — remaining items still
+get a FETCH FAILED line (grade.md's per-line contract holds), just without
+paying for a refresh that's already proven useless. A refresh that raises
+SystemExit (get_token's own hard-failure exit) counts toward that SAME
+two-in-a-row threshold rather than latching immediately on one occurrence —
+get_token's sys.exit(1) fires on bad/revoked credentials but ALSO on a
+network error/429/5xx that merely outlasted its own retry budget, so one
+SystemExit alone isn't reliable proof of a permanent failure (caught in
+review: an earlier draft gave up after a single SystemExit, which would
+have let one transient network blip during a refresh starve the rest of an
+otherwise-healthy batch). Any successful fetch — including a 401 that DOES
+self-heal after refresh — resets the counter to 0, so an isolated/transient
+expiry still self-heals exactly as BUI-310 intended.
+
 Usage:
     python src/grade_photos.py ITEM_ID [ITEM_ID ...] [--workdir DIR]
 
@@ -185,6 +208,15 @@ def main(argv=None):
     # BUI-283: reuse ebay_fetch's cached get_token() (writes token_cache_{env}.json,
     # 5-min buffer) instead of a fresh OAuth call every run — see module docstring.
     token = get_token(client_id, client_secret, base_url)
+    # BUI-322: cross-item state so a systemic/permanent 401 (revoked creds)
+    # fails the batch fast instead of every remaining item burning its own
+    # force-refresh OAuth POST. `consecutive_post_refresh_401s` counts 401s
+    # that survived a force-refresh retry (i.e. the refresh did NOT help);
+    # two in a row is corroborating evidence the failure isn't per-item, so
+    # `give_up_refreshing` latches on and main() stops POSTing refreshes for
+    # the rest of the batch — see module docstring for the full rationale.
+    consecutive_post_refresh_401s = 0
+    give_up_refreshing = False
     for label, item_id in items:
         # BUI-310: a long batch can outlive the token fetched above. Two
         # attempts max — on a 401, force-refresh the token once (keeping it
@@ -198,6 +230,12 @@ def main(argv=None):
                 break
             except TokenExpiredError as e:
                 if attempt == 0:
+                    if give_up_refreshing:
+                        # BUI-322: a prior item already proved refreshing
+                        # doesn't help. Don't POST another refresh just to
+                        # watch it fail again — fail this item fast too.
+                        print(f"{label}: FETCH FAILED — {e} (refresh already failed earlier this batch)")
+                        break
                     # BUI-310: get_token() calls sys.exit(1) on a hard auth
                     # failure (bad/revoked credentials, or transient errors that
                     # outlast its own retry budget). SystemExit is a
@@ -211,9 +249,33 @@ def main(argv=None):
                     try:
                         token = get_token(client_id, client_secret, base_url, force_refresh=True)
                     except SystemExit:
+                        # BUI-322 (post-review correction): get_token()'s
+                        # sys.exit(1) fires on THREE different conditions —
+                        # bad/revoked credentials, a network error/429/5xx
+                        # that outlasted its own retry budget, or a malformed
+                        # token body — and only the first is truly permanent.
+                        # Treating every SystemExit as immediate, one-shot
+                        # proof of a systemic failure would let a single
+                        # transient network blip during one item's refresh
+                        # permanently starve the rest of the batch of ever
+                        # refreshing again. So this counts toward the SAME
+                        # "two consecutive" threshold as a post-refresh 401
+                        # below, rather than latching give_up_refreshing on
+                        # its own after just one occurrence.
+                        consecutive_post_refresh_401s += 1
+                        if consecutive_post_refresh_401s >= 2:
+                            give_up_refreshing = True
                         print(f"{label}: FETCH FAILED — token refresh failed after 401 (see stderr)")
                         break
                     continue
+                # BUI-322: this is a "post-refresh 401" — attempt 0 got a 401,
+                # we force-refreshed, and attempt 1 (this one) still got a
+                # 401. One of these is inconclusive (could be a fluke); two
+                # in a row means the refresh isn't fixing anything, so stop
+                # spending an OAuth POST on every remaining item.
+                consecutive_post_refresh_401s += 1
+                if consecutive_post_refresh_401s >= 2:
+                    give_up_refreshing = True
                 print(f"{label}: FETCH FAILED — {e}")
                 break
             except RuntimeError as e:
@@ -221,6 +283,13 @@ def main(argv=None):
                 break
         if result is None:
             continue
+        # BUI-322: any successful fetch — including a 401 that DID self-heal
+        # after the force-refresh above — proves the token (or a fresh one)
+        # works, so the streak of unhelpful refreshes is over. Reset the
+        # counter so a later isolated/transient 401 still gets its own
+        # refresh-and-retry per BUI-310, rather than inheriting a stale count
+        # from unrelated earlier failures.
+        consecutive_post_refresh_401s = 0
         price = result["current_price"]
         price_str = f"${price:.2f}" if price is not None else "n/a"
         print(f"{label}: {result['title']} — {result['image_count']} images — current bid {price_str} ({result['bid_count']} bids)")
