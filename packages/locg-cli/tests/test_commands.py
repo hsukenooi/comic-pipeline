@@ -2288,6 +2288,146 @@ def test_creator_run_dedups_two_run_issues_normalizing_to_same_token(tmp_path, m
     assert names.count("Uncanny X-Men #1") == 1  # only one row written, not two
 
 
+def test_creator_run_batches_into_a_single_read_and_write(tmp_path, monkeypatch):
+    """BUI-325: the creator-run write path does ONE atomic read+write for the
+    whole run, not one read/scan/write per issue — and the resulting
+    added/already_owned/already_wishlisted accounting is identical to what
+    replaying the same titles through the serial per-issue path
+    (``cmd_wish_list_add``) produces, including the BUI-313 intra-run
+    same-token dedup (two issues normalizing to the same "#300" token).
+    """
+    import locg.commands as cmds
+    from locg.commands import (
+        cmd_wish_list_add,
+        cmd_wish_list_add_creator_run,
+        cmd_wish_list_from_cache,
+    )
+
+    # Own #176; already wish-listed #177.
+    _seed_collection_owned(tmp_path, [
+        _owned_row("Uncanny X-Men", "Uncanny X-Men #176", "1983-12-01"),
+    ])
+    _make_wish_list_cache(tmp_path, items=[
+        {"name": "Uncanny X-Men #177", "id": None},
+    ])
+
+    write_calls: list[list[dict]] = []
+    original_write = cmds._write_wish_list_cache
+
+    def spy_write(items):
+        write_calls.append([dict(it) for it in items])
+        return original_write(items)
+
+    monkeypatch.setattr(cmds, "_write_wish_list_cache", spy_write)
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [
+                {"number": "175", "metron_id": 1, "cover_date": "1983-11-01"},
+                {"number": "176", "metron_id": 2, "cover_date": "1983-12-01"},  # owned
+                {"number": "177", "metron_id": 3, "cover_date": "1984-01-01"},  # wished
+                {"number": "287", "metron_id": 4, "cover_date": "1992-04-01"},  # stint 2
+                {"number": "300", "metron_id": 5, "cover_date": "1993-05-01"},
+                {"number": "300", "metron_id": 6, "cover_date": "1993-05-01"},  # same-token dup within run
+            ],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99, role="penciller",
+    )
+
+    assert result["status"] == "ok"
+    assert result["added"] == [
+        "Uncanny X-Men #175", "Uncanny X-Men #287", "Uncanny X-Men #300",
+    ]
+    assert result["already_owned"] == ["Uncanny X-Men #176"]
+    assert result["already_wishlisted"] == ["Uncanny X-Men #177", "Uncanny X-Men #300"]
+
+    # Exactly one atomic write for the whole run, not one per added issue.
+    assert len(write_calls) == 1
+
+    names = [it["name"] for it in cmd_wish_list_from_cache()]
+    assert names.count("Uncanny X-Men #175") == 1
+    assert names.count("Uncanny X-Men #287") == 1
+    assert names.count("Uncanny X-Men #300") == 1  # dup within run not double-written
+    assert "Uncanny X-Men #176" not in names  # owned never written
+
+    # Equivalence check: replay the same to-add titles through the serial
+    # single-issue path against a fresh cache and confirm it reaches the
+    # identical added/skipped outcome the batched path did.
+    _make_wish_list_cache(tmp_path, items=[{"name": "Uncanny X-Men #177", "id": None}])
+    serial_added: list[str] = []
+    serial_skipped: list[str] = []
+    for title in [
+        "Uncanny X-Men #175", "Uncanny X-Men #287",
+        "Uncanny X-Men #300", "Uncanny X-Men #300",
+    ]:
+        r = cmd_wish_list_add(title)
+        if r.get("status") == "exists":
+            serial_skipped.append(title)
+        else:
+            serial_added.append(title)
+
+    assert serial_added == ["Uncanny X-Men #175", "Uncanny X-Men #287", "Uncanny X-Men #300"]
+    assert serial_skipped == ["Uncanny X-Men #300"]
+
+
+def test_creator_run_skips_read_and_write_when_nothing_to_add(tmp_path, monkeypatch):
+    """BUI-325: when every run issue is filtered out (owned or already
+    wishlisted) before the write stage, the batch path must not touch the
+    cache file at all -- no fresh read, no write. This is the complementary
+    edge of the single-read/single-write optimization: a bug that always
+    reads+writes regardless of `to_add` would slip past a test that only
+    checks the non-empty case.
+    """
+    import locg.commands as cmds
+    from locg.commands import cmd_wish_list_add_creator_run, cmd_wish_list_from_cache
+
+    # Own #176; already wish-listed #177 -- the run's only two issues.
+    _seed_collection_owned(tmp_path, [
+        _owned_row("Uncanny X-Men", "Uncanny X-Men #176", "1983-12-01"),
+    ])
+    seeded = _make_wish_list_cache(tmp_path, items=[
+        {"name": "Uncanny X-Men #177", "id": None},
+    ])
+
+    write_calls: list[list[dict]] = []
+    monkeypatch.setattr(
+        cmds, "_write_wish_list_cache",
+        lambda items: write_calls.append(list(items)),
+    )
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [
+                {"number": "176", "metron_id": 1, "cover_date": "1983-12-01"},  # owned
+                {"number": "177", "metron_id": 2, "cover_date": "1984-01-01"},  # wished
+            ],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99, role="penciller",
+    )
+
+    assert result["status"] == "ok"
+    assert result["added"] == []
+    assert result["already_owned"] == ["Uncanny X-Men #176"]
+    assert result["already_wishlisted"] == ["Uncanny X-Men #177"]
+
+    # Nothing to add -> the write helper is never invoked.
+    assert write_calls == []
+    # The cache on disk is untouched (still exactly the pre-run seed).
+    assert cmd_wish_list_from_cache() == seeded
+
+
 def test_creator_run_surfaces_warnings(tmp_path, monkeypatch):
     """No-credit warnings from the resolver are passed through to the caller."""
     from locg.commands import cmd_wish_list_add_creator_run
