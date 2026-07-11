@@ -380,3 +380,4 @@ Confirm the `id` returned — that's the `comic_id` that will be linked to the b
 | Stating "Medium" confidence by feel | Use the rubric: n + CV decide it |
 | Forcing a number out of a one-sided or grade-smeared pool | If the pool doesn't bracket the target or spans >2.0 grades, it's flagged `needs_manual` — hand-price via §7/§7a or skip, don't report the smeared median |
 | Treating a `needs_manual` row like a no-comps row | A flagged book still has a linked comic stub (`manual_review=<reason>` in notes) and a real `comic_id` — it shows as `manual:<reason>` in the table, not `n/a` |
+| Issue number collides with a show/game/anniversary reuse (e.g. X-Men '97) | The year-less base query gets swamped by the modern-media merch and the hard-exclude regex empties the pool — add a manual disambiguator (`marvel`/`dc comics`, the year, or a distinguishing character name) to scope back to the comic (BUI-304) |

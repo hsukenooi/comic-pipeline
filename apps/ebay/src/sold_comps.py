@@ -105,15 +105,52 @@ def _cache_put(path: Path, data: dict) -> None:
 
 # ─── Query construction ──────────────────────────────────────────────────────
 
+def _publisher_qualifier(publisher: str | None) -> str | None:
+    """Normalize a publisher into the query qualifier keyword to append.
+
+    BUI-304 (issue 2): for the "big two" we emit the canonical "marvel comics"
+    / "dc comics" — a cheap disambiguator that keeps the *year-less* base query
+    (per /comic:buy's convention of omitting year to dodge the BUI-129
+    collection-check false-negative) from colliding with modern media that
+    reuses the issue number: e.g. "X-Men 97" vs the 2024 "X-Men '97" show's
+    merchandise. Indie publishers pass through unchanged — the caller already
+    supplies the noise-filtering name ("image comics", "dark horse"), which is
+    the primary indie noise filter (BUI-161). Returns None for an absent/blank
+    publisher so the base query is untouched.
+    """
+    if not publisher or not publisher.strip():
+        return None
+    p = publisher.strip()
+    if re.search(r"\bmarvel\b", p, re.IGNORECASE):
+        return "marvel comics"
+    if re.search(r"\bdc\b", p, re.IGNORECASE):
+        return "dc comics"
+    return p
+
+
 def build_query(title: str, issue: str, year: int | None = None,
-                publisher: str | None = None, grade_label: str | None = None,
+                publisher: str | None = None, variant: str | None = None,
+                grade_label: str | None = None,
                 exclude_graded: bool = True) -> str:
     """Build the _nkw search string. Returns the raw (unencoded) keyword string."""
     parts = [f'"{title} {issue}"']
     if year:
         parts.append(str(year))
-    if publisher:
-        parts.append(publisher)
+    # BUI-304 (issue 1): append the distribution variant (e.g. "Newsstand",
+    # "Direct") as a query keyword, mirroring the publisher mechanism below.
+    # Previously `variant` was DB-only (distinct comic_id per BUI-28) and never
+    # reached the search — so a plain "X-Men 123" blended newsstand + direct
+    # copies, and after grade-parsing losses too few remained attributable to
+    # either sub-market. Guard for empty/None so the base query is unchanged
+    # (byte-for-byte) when variant is absent.
+    variant = variant.strip() if variant else ""
+    if variant:
+        parts.append(variant)
+    # BUI-304 (issue 2): the publisher qualifier — indie passes through, Marvel/
+    # DC normalize to "marvel comics"/"dc comics" (see _publisher_qualifier).
+    qualifier = _publisher_qualifier(publisher)
+    if qualifier:
+        parts.append(qualifier)
     if grade_label:
         parts.append(grade_label)
     if exclude_graded:
@@ -356,6 +393,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     issue = str(book["issue"])
     year = book.get("year")
     publisher = book.get("publisher")
+    variant = book.get("variant")  # BUI-304: now a query keyword, not DB-only
     self_id = str(book.get("item_id", ""))
 
     queries_used: list[dict] = []
@@ -393,12 +431,14 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         return added
 
     # Tier 1 — base
-    base_nkw = build_query(title, issue, year=year, publisher=publisher)
+    base_nkw = build_query(title, issue, year=year, publisher=publisher,
+                           variant=variant)
     _run("base", base_nkw)
 
     # Tier 2 — auto-broaden if thin
     if len(comps) < THIN_RESULTS_THRESHOLD and year:
-        broader_nkw = build_query(title, issue, year=None, publisher=publisher)
+        broader_nkw = build_query(title, issue, year=None, publisher=publisher,
+                                  variant=variant)
         _run("broader", broader_nkw)
 
     # Tier 3 — grade-targeted if too few grade-tagged comps in pool so far
@@ -410,7 +450,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         label = _grade_label_for_query(target_grade)
         if label:
             grade_nkw = build_query(title, issue, year=year, publisher=publisher,
-                                    grade_label=label)
+                                    variant=variant, grade_label=label)
             _run("grade-targeted", grade_nkw)
 
     out_input = {
@@ -525,6 +565,7 @@ def main(argv=None) -> int:
     p.add_argument("--issue", help="Issue number (single-query mode).")
     p.add_argument("--year", type=int, help="Cover year (single-query mode).")
     p.add_argument("--publisher", help="Publisher (recommended for indie titles).")
+    p.add_argument("--variant", help="Distribution variant keyword (e.g. Newsstand).")
     p.add_argument("--grade", type=float, help="Target grade (single-query mode).")
     p.add_argument("--item-id", help="Self-exclude this product_id from comps.")
     p.add_argument("--out", help="Write full JSON to this path ('-' for stdout).")
@@ -552,6 +593,7 @@ def main(argv=None) -> int:
             "issue": args.issue,
             "year": args.year,
             "publisher": args.publisher,
+            "variant": args.variant,
             "grade": args.grade,
             "item_id": args.item_id,
         }]
