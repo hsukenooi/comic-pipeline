@@ -99,16 +99,24 @@ def test_ebay_fetch_uses_client_id_key():
 def test_grade_photos_reads_json_not_dotenv():
     # BUI-279: this credential-reading code lived inline in grade.md until it
     # was extracted to apps/ebay/src/grade_photos.py — assert against the
-    # extracted script, same intent as before the move.
+    # extracted script, same intent as before the move: credentials must come
+    # from the config.json / env-var mechanism, never from load_dotenv().
+    # BUI-283: grade_photos.py no longer does its own json.load() of
+    # config.json — it delegates to ebay_fetch.load_config() (env-var-first,
+    # config.json as fallback). The mechanism changed; the intent (no
+    # load_dotenv, correct credential path) did not, so assert on the
+    # delegation rather than the now-removed inline json.load().
     assert GRADE_PHOTOS_SCRIPT.is_file(), (
         f"grade_photos.py not found at {GRADE_PHOTOS_SCRIPT}"
     )
     content = GRADE_PHOTOS_SCRIPT.read_text()
     assert "load_dotenv" not in content, (
-        "grade_photos.py still uses load_dotenv() — should use json.load() for config.json"
+        "grade_photos.py uses load_dotenv() — credentials must come from "
+        "ebay_fetch.load_config() (env-var-first, config.json fallback)"
     )
-    assert "json.load" in content, (
-        "grade_photos.py does not use json.load() to read config.json"
+    assert "load_config" in content and "from ebay_fetch import" in content, (
+        "grade_photos.py does not delegate credential loading to "
+        "ebay_fetch.load_config() (BUI-283)"
     )
     assert "client_id" in content, (
         "grade_photos.py does not reference 'client_id' key — may be using old EBAY_APP_ID naming"
