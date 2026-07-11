@@ -984,6 +984,31 @@ class TestRunEndToEnd:
         assert sent_ids == [3, 7]
         assert all("_idx" not in b for b in captured["payload"])
 
+    def test_fetch_comps_forwards_publisher_to_subprocess(self, tmp_path,
+                                                          monkeypatch):
+        """BUI-315: the book's publisher must reach ebay-sold-comps in the batch
+        payload — that's what lets build_query activate the Marvel qualifier.
+        Dropping it here silently disables the whole feature."""
+        captured = {}
+
+        def fake_run(cmd, capture_output, text, timeout=None):
+            in_path = cmd[cmd.index("--batch") + 1]
+            out_path = cmd[cmd.index("--out") + 1]
+            with open(in_path) as fh:
+                captured["payload"] = json.load(fh)
+            with open(out_path, "w") as fh:
+                fh.write("[]")
+            return type("R", (), {"returncode": 0, "stderr": ""})()
+
+        monkeypatch.setattr(fmv_runner.shutil, "which", lambda _b: "/usr/bin/ebay")
+        monkeypatch.setattr(fmv_runner.subprocess, "run", fake_run)
+
+        books = [{"_idx": 0, "title": "Amazing Spider-Man", "issue": "300",
+                  "publisher": "Marvel"}]
+        fmv_runner._fetch_comps(books, force=False)
+
+        assert captured["payload"][0]["publisher"] == "Marvel"
+
 
 # ─── _fetch_comps robustness (BUI-184) ────────────────────────────────────────
 
