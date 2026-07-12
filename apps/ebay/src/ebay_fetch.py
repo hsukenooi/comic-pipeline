@@ -343,7 +343,17 @@ def atomic_write_json(path, data, *, mode=None):
     try:
         if mode is not None:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-            with os.fdopen(fd, "w") as f:
+            # BUI-341: os.fdopen(fd) can itself raise (e.g. OOM) before the
+            # `with` takes ownership of fd, which would otherwise leak the
+            # raw descriptor — the outer finally only unlinks the tmp path,
+            # it never closes a fd that was never wrapped. Guard the handoff
+            # explicitly.
+            try:
+                f = os.fdopen(fd, "w")
+            except Exception:
+                os.close(fd)
+                raise
+            with f:
                 json.dump(data, f)
         else:
             tmp.write_text(json.dumps(data))

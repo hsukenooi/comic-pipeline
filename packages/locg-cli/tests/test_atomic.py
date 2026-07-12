@@ -145,6 +145,30 @@ class TestAtomicWrite:
         assert path.read_text() == "durable data"
         assert _leftover_tmp_files(path) == []
 
+    def test_fdopen_failure_closes_fd_and_cleans_up_tmp(self, tmp_path):
+        """BUI-341: os.fdopen(fd) can itself raise (e.g. OOM) before the
+        `with` takes ownership of fd — the except-below only unlinks the tmp
+        path, so without an explicit close the raw fd would leak. Verify
+        os.close() is actually invoked on the mkstemp'd fd and the tmp file
+        is still cleaned up."""
+        path = tmp_path / "out.txt"
+        closed_fds = []
+        real_close = _atomic.os.close
+
+        def spy_close(fd):
+            closed_fds.append(fd)
+            real_close(fd)
+
+        with patch.object(_atomic.os, "fdopen", side_effect=OSError("simulated OOM")), \
+                patch.object(_atomic.os, "close", side_effect=spy_close) as mock_close:
+            with pytest.raises(OSError, match="simulated OOM"):
+                _atomic.atomic_write(path, "data")
+
+        assert mock_close.called
+        assert len(closed_fds) == 1
+        assert _leftover_tmp_files(path) == []
+        assert not path.exists()
+
 
 class TestAtomicWriteJson:
     def test_round_trips_payload(self, tmp_path):
