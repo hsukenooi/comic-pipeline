@@ -80,6 +80,7 @@ metron_curl() {
     headers_file="$(mktemp)"
     http_status="$(curl -sS -u "${METRON_USERNAME}:${METRON_PASSWORD}" \
       --max-time "$METRON_CURL_MAX_TIME" \
+      -A "comic-pipeline-metron/1.0" \
       -D "$headers_file" -o "$body_file" -w '%{http_code}' "$url" "$@")"
 
     _metron_log_rate_limit "$headers_file"
