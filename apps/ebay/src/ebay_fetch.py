@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -258,9 +259,22 @@ def _atomic_write_json(path, data, *, mode=None):
     file behind for the next writer to trip over. The cleanup itself never
     masks the original failure: an unlink error is swallowed, and the
     triggering exception always re-raises unchanged.
+
+    BUI-335: the tmp filename is unique per call (`<name>.<uuid4>.tmp`) rather
+    than the fixed `path.with_suffix(".tmp")` it used to be. Two concurrent
+    writers to the same `path` (e.g. sold_comps._cache_put() under
+    run_batch()'s ThreadPoolExecutor, when two workers fetch duplicate cache
+    keys in one batch) used to share that one deterministic tmp name, so they
+    could clobber each other's in-flight tmp file (a silent lost write), and
+    — since BUI-333 added the cleanup unlink above — one writer's failure
+    cleanup could delete a *different* writer's still-in-flight tmp, turning
+    the silent race into an active FileNotFoundError for that other writer.
+    The unique name lives in the same directory as `path` so the final
+    replace stays a same-filesystem atomic rename, and the cleanup `unlink`
+    here only ever removes *this call's own* tmp file, never a sibling's.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    tmp = path.parent / f"{path.name}.{uuid.uuid4().hex}.tmp"
     wrote = False
     try:
         if mode is not None:

@@ -375,6 +375,37 @@ class TestCache:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         assert sc._cache_get(tmp_path / "nope.json", 60) is None
 
+    def test_concurrent_put_to_same_key_under_thread_pool_executor(self, tmp_path, monkeypatch):
+        """BUI-335 regression, at the real collision surface named in
+        _atomic_write_json()'s docstring: run_batch() fans out fetch_book_comps
+        across a ThreadPoolExecutor, and two workers whose books resolve to the
+        same canonical SerpApi query (duplicate cache keys in one batch) both
+        call _cache_put() for the same path. Before the fix, a shared
+        deterministic tmp filename meant one worker's failure-cleanup could
+        unlink a different worker's still-in-flight tmp, raising
+        FileNotFoundError instead of just losing a write silently. Drive
+        _cache_put() from a real ThreadPoolExecutor (matching run_batch's own
+        concurrency primitive) with every worker targeting the same path and
+        assert none of them raise and the cache file ends up valid."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        path = sc._cache_path("https://example.com/q?_nkw=duplicate+key")
+
+        def put(n):
+            sc._cache_put(path, {"worker": n})
+
+        with sc.ThreadPoolExecutor(max_workers=sc.DEFAULT_MAX_WORKERS) as pool:
+            futures = [pool.submit(put, n) for n in range(sc.DEFAULT_MAX_WORKERS * 2)]
+            # Propagates any exception raised inside a worker (e.g. the
+            # BUI-335 FileNotFoundError) as a test failure instead of
+            # silently swallowing it.
+            for fut in futures:
+                fut.result()
+
+        cached = sc._cache_get(path, ttl_sec=60)
+        assert cached is not None
+        assert "worker" in cached
+        assert not list(tmp_path.glob(f"{path.name}.*.tmp"))
+
 
 # ─── Fetch with verification ──────────────────────────────────────────────────
 
