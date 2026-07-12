@@ -5,7 +5,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -15,6 +17,14 @@ import requests
 import ebay_fetch
 
 _MODULE = str(Path(__file__).parent.parent / "src" / "ebay_fetch.py")
+
+
+def _leftover_tmp_files(path):
+    """BUI-335: _atomic_write_json()'s tmp file is now `<name>.<uuid4>.tmp`
+    (per-call-unique) rather than the old deterministic `path.with_suffix(
+    ".tmp")`, so "no tmp left behind" assertions glob for the prefix/suffix
+    shape instead of one literal filename."""
+    return list(path.parent.glob(f"{path.name}.*.tmp"))
 
 
 # ============================================================
@@ -617,7 +627,7 @@ class TestAtomicWriteJsonHelper:
         path = tmp_path / "cache.json"
         ebay_fetch._atomic_write_json(path, {"a": 1})
         assert json.loads(path.read_text()) == {"a": 1}
-        assert not path.with_suffix(".tmp").exists()
+        assert _leftover_tmp_files(path) == []
 
     def test_creates_parent_directory(self, tmp_path):
         path = tmp_path / "nested" / "dir" / "cache.json"
@@ -645,7 +655,7 @@ class TestAtomicWriteJsonHelper:
         with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")):
             with pytest.raises(OSError):
                 ebay_fetch._atomic_write_json(path, {"new": True})
-        assert not path.with_suffix(".tmp").exists()
+        assert _leftover_tmp_files(path) == []
 
     def test_write_failure_cleans_up_tmp_file(self, tmp_path):
         """Same cleanup guarantee when the write itself (not just the replace)
@@ -654,7 +664,7 @@ class TestAtomicWriteJsonHelper:
         with patch.object(ebay_fetch.Path, "write_text", side_effect=OSError("disk full")):
             with pytest.raises(OSError):
                 ebay_fetch._atomic_write_json(path, {"new": True})
-        assert not path.with_suffix(".tmp").exists()
+        assert _leftover_tmp_files(path) == []
         assert not path.exists()
 
     def test_write_failure_with_mode_cleans_up_tmp_file(self, tmp_path):
@@ -664,7 +674,7 @@ class TestAtomicWriteJsonHelper:
         with patch("ebay_fetch.json.dump", side_effect=OSError("disk full")):
             with pytest.raises(OSError):
                 ebay_fetch._atomic_write_json(path, {"token": "x"}, mode=0o600)
-        assert not path.with_suffix(".tmp").exists()
+        assert _leftover_tmp_files(path) == []
         assert not path.exists()
 
     def test_replace_failure_cleanup_error_does_not_mask_original_exception(self, tmp_path):
@@ -676,6 +686,69 @@ class TestAtomicWriteJsonHelper:
                 patch.object(ebay_fetch.Path, "unlink", side_effect=OSError("cleanup also failed")):
             with pytest.raises(OSError, match="boom"):
                 ebay_fetch._atomic_write_json(path, {"new": True})
+
+    def test_failure_cleanup_never_touches_a_different_writers_tmp_file(self, tmp_path):
+        """BUI-335 regression: before the unique-tmp-name fix, every caller
+        computed the same deterministic `path.with_suffix(".tmp")`, so one
+        writer's best-effort cleanup on failure (added in BUI-333) could
+        unlink a *different* concurrent writer's still-in-flight tmp file —
+        turning a silent lost write into an active FileNotFoundError for the
+        other writer. Plant a stray tmp file shaped like another writer's
+        in-flight file, then force this call to fail; its cleanup must leave
+        the stray file untouched and only ever remove its own tmp."""
+        path = tmp_path / "cache.json"
+        other_writers_tmp = tmp_path / f"{path.name}.{uuid.uuid4().hex}.tmp"
+        other_writers_tmp.write_text('{"in_flight": "from-another-writer"}')
+
+        with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")):
+            with pytest.raises(OSError):
+                ebay_fetch._atomic_write_json(path, {"new": True})
+
+        # The sibling writer's tmp file survives untouched...
+        assert other_writers_tmp.exists()
+        assert json.loads(other_writers_tmp.read_text()) == {"in_flight": "from-another-writer"}
+        # ...and it's the only tmp file left (ours was cleaned up).
+        assert _leftover_tmp_files(path) == [other_writers_tmp]
+
+    def test_concurrent_writers_to_same_path_both_succeed(self, tmp_path):
+        """BUI-335 regression: two threads writing to the same `path` at the
+        same time must both complete without raising (no FileNotFoundError
+        from a shared tmp name getting unlinked out from under the other
+        writer), and the final file must hold one writer's valid JSON intact
+        — not a corrupted interleave of both. Last-writer-wins is acceptable
+        (unsynchronized writers to the same path); a crash or corruption is
+        not.
+
+        This is a timing-dependent stress test, not a deterministic proof —
+        it maximizes interleaving but can't guarantee it every run.
+        `test_failure_cleanup_never_touches_a_different_writers_tmp_file`
+        above is the deterministic pin for the actual root cause (the
+        cleanup unlink); this test is corroborating evidence at the
+        real-world call shape."""
+        path = tmp_path / "cache.json"
+        payloads = [{"writer": "a", "n": i} for i in range(20)]
+        payloads += [{"writer": "b", "n": i} for i in range(20)]
+        errors = []
+        barrier = threading.Barrier(len(payloads), timeout=10)
+
+        def writer(payload):
+            barrier.wait()  # start all threads together to maximize interleaving
+            try:
+                ebay_fetch._atomic_write_json(path, payload)
+            except Exception as exc:  # noqa: BLE001 — captured for the assertion below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(p,)) for p in payloads]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads)  # fail loudly, don't hang
+
+        assert errors == []
+        result = json.loads(path.read_text())
+        assert result in payloads
+        assert _leftover_tmp_files(path) == []
 
 
 class TestFetchItem:
@@ -1220,7 +1293,7 @@ class TestGetToken:
 
         assert token == "atomic-token"
         assert json.loads(cache_file.read_text())["access_token"] == "atomic-token"
-        assert not cache_file.with_suffix(".tmp").exists()
+        assert _leftover_tmp_files(cache_file) == []
 
     def test_crash_before_replace_leaves_old_cache_intact(self, tmp_path, monkeypatch, capsys):
         """If the process is interrupted after the tmp file is written but

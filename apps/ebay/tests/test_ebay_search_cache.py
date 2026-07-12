@@ -117,12 +117,15 @@ def test_get_returns_none_on_cache_miss():
 
 def test_put_writes_atomically_and_leaves_no_tmp_file():
     """BUI-333: put() routes through the shared ebay_fetch._atomic_write_json()
-    helper rather than a hand-rolled tmp→rename copy."""
+    helper rather than a hand-rolled tmp→rename copy. BUI-335: that helper's
+    tmp filename is now per-call-unique (`<name>.<uuid4>.tmp`), so "no tmp
+    left behind" is a glob for the prefix/suffix shape, not one literal
+    filename."""
     keyword = "Amazing Spider-Man #300"
     cache.put(keyword, [{"title": "ASM #300"}])
     path = cache.cache_path(keyword)
     assert path.exists()
-    assert not path.with_suffix(".tmp").exists()
+    assert list(path.parent.glob(f"{path.name}.*.tmp")) == []
 
 
 def test_get_returns_none_when_expired(tmp_path):

@@ -2002,7 +2002,10 @@ class TestRejectedCandidateCache:
         assert "could not persist rejected-candidate cache" in err
         # BUI-333: the shared _atomic_write_json() helper cleans up its .tmp
         # file on a failed write — no orphan left behind for the next save.
-        assert not self.cache_path.with_suffix(".tmp").exists()
+        # BUI-335: that tmp filename is now per-call-unique
+        # (`<name>.<uuid4>.tmp`), so glob for the shape rather than one
+        # literal filename.
+        assert list(self.cache_path.parent.glob(f"{self.cache_path.name}.*.tmp")) == []
 
     def test_save_helper_writes_via_shared_atomic_write_json(self, monkeypatch):
         """BUI-333: _save_rejected_cache() routes through the shared
@@ -2011,7 +2014,7 @@ class TestRejectedCandidateCache:
         entries = {self._key("111"): "2026-07-11T00:00:00+00:00"}
         seller_scan._save_rejected_cache(entries)
         assert json.loads(self.cache_path.read_text()) == entries
-        assert not self.cache_path.with_suffix(".tmp").exists()
+        assert list(self.cache_path.parent.glob(f"{self.cache_path.name}.*.tmp")) == []
 
     def test_save_failure_does_not_crash_verify(self, monkeypatch):
         """End-to-end: an OSError persisting a fresh rejection must not abort
