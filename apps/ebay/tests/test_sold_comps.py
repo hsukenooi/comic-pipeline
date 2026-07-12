@@ -377,7 +377,7 @@ class TestCache:
 
     def test_concurrent_put_to_same_key_under_thread_pool_executor(self, tmp_path, monkeypatch):
         """BUI-335 regression, at the real collision surface named in
-        _atomic_write_json()'s docstring: run_batch() fans out fetch_book_comps
+        atomic_write_json()'s docstring: run_batch() fans out fetch_book_comps
         across a ThreadPoolExecutor, and two workers whose books resolve to the
         same canonical SerpApi query (duplicate cache keys in one batch) both
         call _cache_put() for the same path. Before the fix, a shared
@@ -413,7 +413,7 @@ class TestFetch:
     def _mock_response(self, organic_results=None, ebay_url=None, error=None):
         m = MagicMock()
         m.raise_for_status = MagicMock()
-        m.status_code = 200  # BUI-333: _retry_request() reads status_code directly
+        m.status_code = 200  # BUI-333: retry_request() reads status_code directly
         body = {}
         if error:
             body["error"] = error
@@ -744,7 +744,7 @@ class TestFetchRetry:
 
     def test_exhausted_retryable_status_reraises_http_error(self, tmp_path, monkeypatch):
         """BUI-333: a persistent 503 across every retry attempt exercises the
-        _RetryExhausted(response=...) branch — fetch() must still raise an
+        RetryExhausted(response=...) branch — fetch() must still raise an
         HTTPError carrying the original status code, and requests.get must be
         called exactly FETCH_MAX_RETRIES times (no over/under-retrying)."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
@@ -763,7 +763,7 @@ class TestFetchRetry:
             assert mock_get.call_count == sc.FETCH_MAX_RETRIES
 
     def test_retry_then_succeed_other_request_exception_type(self, tmp_path, monkeypatch):
-        """BUI-333: the shared _retry_request() helper widens the retryable
+        """BUI-333: the shared retry_request() helper widens the retryable
         network-error catch from (Timeout, ConnectionError) to any
         requests.exceptions.RequestException. Confirm a different subtype
         (ChunkedEncodingError) is now retried rather than propagating

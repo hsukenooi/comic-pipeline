@@ -20,7 +20,7 @@ _MODULE = str(Path(__file__).parent.parent / "src" / "ebay_fetch.py")
 
 
 def _leftover_tmp_files(path):
-    """BUI-335: _atomic_write_json()'s tmp file is now `<name>.<uuid4>.tmp`
+    """BUI-335: atomic_write_json()'s tmp file is now `<name>.<uuid4>.tmp`
     (per-call-unique) rather than the old deterministic `path.with_suffix(
     ".tmp")`, so "no tmp left behind" assertions glob for the prefix/suffix
     shape instead of one literal filename."""
@@ -447,7 +447,7 @@ class TestLoadConfig:
 
 
 class TestRetryRequestHelper:
-    """BUI-323: _retry_request() is the shared retry/backoff loop that
+    """BUI-323: retry_request() is the shared retry/backoff loop that
     get_token(), fetch_item_with_status(), search_seller_listings(),
     search_by_keyword(), and get_item_aspects() all now call. These tests
     cover the helper directly (success, retry-then-success, exhausted-
@@ -457,7 +457,7 @@ class TestRetryRequestHelper:
         ok = MagicMock(status_code=200)
         make_request = MagicMock(return_value=ok)
 
-        resp = ebay_fetch._retry_request(
+        resp = ebay_fetch.retry_request(
             make_request,
             retries=3,
             is_retryable_status=lambda code: code == 429,
@@ -472,7 +472,7 @@ class TestRetryRequestHelper:
         make_request = MagicMock(side_effect=[rate_limited, ok])
 
         with patch("ebay_fetch.time.sleep") as mock_sleep:
-            resp = ebay_fetch._retry_request(
+            resp = ebay_fetch.retry_request(
                 make_request,
                 retries=3,
                 is_retryable_status=lambda code: code == 429,
@@ -487,8 +487,8 @@ class TestRetryRequestHelper:
         make_request = MagicMock(return_value=rate_limited)
 
         with patch("ebay_fetch.time.sleep"):
-            with pytest.raises(ebay_fetch._RetryExhausted) as excinfo:
-                ebay_fetch._retry_request(
+            with pytest.raises(ebay_fetch.RetryExhausted) as excinfo:
+                ebay_fetch.retry_request(
                     make_request,
                     retries=3,
                     is_retryable_status=lambda code: code == 429,
@@ -505,7 +505,7 @@ class TestRetryRequestHelper:
         )
 
         with patch("ebay_fetch.time.sleep") as mock_sleep:
-            resp = ebay_fetch._retry_request(
+            resp = ebay_fetch.retry_request(
                 make_request,
                 retries=3,
                 is_retryable_status=lambda code: code == 429,
@@ -520,8 +520,8 @@ class TestRetryRequestHelper:
         make_request = MagicMock(side_effect=exc)
 
         with patch("ebay_fetch.time.sleep"):
-            with pytest.raises(ebay_fetch._RetryExhausted) as excinfo:
-                ebay_fetch._retry_request(
+            with pytest.raises(ebay_fetch.RetryExhausted) as excinfo:
+                ebay_fetch.retry_request(
                     make_request,
                     retries=3,
                     is_retryable_status=lambda code: code == 429,
@@ -540,7 +540,7 @@ class TestRetryRequestHelper:
 
         with patch("ebay_fetch.time.sleep") as mock_sleep:
             with pytest.raises(requests.exceptions.ConnectionError):
-                ebay_fetch._retry_request(
+                ebay_fetch.retry_request(
                     make_request,
                     retries=3,
                     is_retryable_status=lambda code: code == 429,
@@ -556,7 +556,7 @@ class TestRetryRequestHelper:
         make_request = MagicMock(return_value=unauthorized)
 
         with patch("ebay_fetch.time.sleep") as mock_sleep:
-            resp = ebay_fetch._retry_request(
+            resp = ebay_fetch.retry_request(
                 make_request,
                 retries=3,
                 is_retryable_status=lambda code: code == 429,
@@ -578,7 +578,7 @@ class TestRetryRequestHelper:
             import contextlib
             buf = io.StringIO()
             with contextlib.redirect_stderr(buf):
-                resp = ebay_fetch._retry_request(
+                resp = ebay_fetch.retry_request(
                     make_request,
                     retries=3,
                     is_retryable_status=lambda code: code == 429,
@@ -594,8 +594,8 @@ class TestRetryRequestHelper:
         make_request = MagicMock(return_value=rate_limited)
 
         with patch("ebay_fetch.time.sleep") as mock_sleep:
-            with pytest.raises(ebay_fetch._RetryExhausted) as excinfo:
-                ebay_fetch._retry_request(
+            with pytest.raises(ebay_fetch.RetryExhausted) as excinfo:
+                ebay_fetch.retry_request(
                     make_request,
                     retries=1,
                     is_retryable_status=lambda code: code == 429,
@@ -611,7 +611,7 @@ class TestRetryRequestHelper:
         misleading result (e.g. a status the loop never actually observed)
         or an AssertionError that `python -O` would strip."""
         with pytest.raises(ValueError):
-            ebay_fetch._retry_request(
+            ebay_fetch.retry_request(
                 MagicMock(),
                 retries=0,
                 is_retryable_status=lambda code: code == 429,
@@ -620,23 +620,23 @@ class TestRetryRequestHelper:
 
 
 class TestAtomicWriteJsonHelper:
-    """BUI-323: _atomic_write_json() is the shared tmp→Path.replace() write
+    """BUI-323: atomic_write_json() is the shared tmp→Path.replace() write
     helper get_token()'s token cache and _aspects_cache_put() both call."""
 
     def test_writes_json_and_leaves_no_tmp_file(self, tmp_path):
         path = tmp_path / "cache.json"
-        ebay_fetch._atomic_write_json(path, {"a": 1})
+        ebay_fetch.atomic_write_json(path, {"a": 1})
         assert json.loads(path.read_text()) == {"a": 1}
         assert _leftover_tmp_files(path) == []
 
     def test_creates_parent_directory(self, tmp_path):
         path = tmp_path / "nested" / "dir" / "cache.json"
-        ebay_fetch._atomic_write_json(path, {"b": 2})
+        ebay_fetch.atomic_write_json(path, {"b": 2})
         assert json.loads(path.read_text()) == {"b": 2}
 
     def test_mode_restricts_permissions(self, tmp_path):
         path = tmp_path / "secret.json"
-        ebay_fetch._atomic_write_json(path, {"token": "x"}, mode=0o600)
+        ebay_fetch.atomic_write_json(path, {"token": "x"}, mode=0o600)
         assert json.loads(path.read_text()) == {"token": "x"}
         assert (path.stat().st_mode & 0o777) == 0o600
 
@@ -645,7 +645,7 @@ class TestAtomicWriteJsonHelper:
         path.write_text(json.dumps({"old": True}))
         with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")):
             with pytest.raises(OSError):
-                ebay_fetch._atomic_write_json(path, {"new": True})
+                ebay_fetch.atomic_write_json(path, {"new": True})
         assert json.loads(path.read_text()) == {"old": True}
 
     def test_replace_failure_cleans_up_tmp_file(self, tmp_path):
@@ -654,7 +654,7 @@ class TestAtomicWriteJsonHelper:
         path = tmp_path / "cache.json"
         with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")):
             with pytest.raises(OSError):
-                ebay_fetch._atomic_write_json(path, {"new": True})
+                ebay_fetch.atomic_write_json(path, {"new": True})
         assert _leftover_tmp_files(path) == []
 
     def test_write_failure_cleans_up_tmp_file(self, tmp_path):
@@ -663,7 +663,7 @@ class TestAtomicWriteJsonHelper:
         path = tmp_path / "cache.json"
         with patch.object(ebay_fetch.Path, "write_text", side_effect=OSError("disk full")):
             with pytest.raises(OSError):
-                ebay_fetch._atomic_write_json(path, {"new": True})
+                ebay_fetch.atomic_write_json(path, {"new": True})
         assert _leftover_tmp_files(path) == []
         assert not path.exists()
 
@@ -673,7 +673,7 @@ class TestAtomicWriteJsonHelper:
         path = tmp_path / "secret.json"
         with patch("ebay_fetch.json.dump", side_effect=OSError("disk full")):
             with pytest.raises(OSError):
-                ebay_fetch._atomic_write_json(path, {"token": "x"}, mode=0o600)
+                ebay_fetch.atomic_write_json(path, {"token": "x"}, mode=0o600)
         assert _leftover_tmp_files(path) == []
         assert not path.exists()
 
@@ -685,7 +685,7 @@ class TestAtomicWriteJsonHelper:
         with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")), \
                 patch.object(ebay_fetch.Path, "unlink", side_effect=OSError("cleanup also failed")):
             with pytest.raises(OSError, match="boom"):
-                ebay_fetch._atomic_write_json(path, {"new": True})
+                ebay_fetch.atomic_write_json(path, {"new": True})
 
     def test_failure_cleanup_never_touches_a_different_writers_tmp_file(self, tmp_path):
         """BUI-335 regression: before the unique-tmp-name fix, every caller
@@ -702,7 +702,7 @@ class TestAtomicWriteJsonHelper:
 
         with patch.object(ebay_fetch.Path, "replace", side_effect=OSError("boom")):
             with pytest.raises(OSError):
-                ebay_fetch._atomic_write_json(path, {"new": True})
+                ebay_fetch.atomic_write_json(path, {"new": True})
 
         # The sibling writer's tmp file survives untouched...
         assert other_writers_tmp.exists()
@@ -734,7 +734,7 @@ class TestAtomicWriteJsonHelper:
         def writer(payload):
             barrier.wait()  # start all threads together to maximize interleaving
             try:
-                ebay_fetch._atomic_write_json(path, payload)
+                ebay_fetch.atomic_write_json(path, payload)
             except Exception as exc:  # noqa: BLE001 — captured for the assertion below
                 errors.append(exc)
 
@@ -1777,7 +1777,7 @@ class TestGetItemAspects:
         Asserting call_count == 1 and that time.sleep was never invoked is
         what would actually catch a future regression that flipped this
         call site to retry_network_errors=True; get_item_aspects()'s single
-        `except (RequestException, _RetryExhausted): return None` collapses
+        `except (RequestException, RetryExhausted): return None` collapses
         both outcomes to the same return value, so `result is None` alone
         can't distinguish "failed fast" from "retried, then gave up"."""
         import requests as req
