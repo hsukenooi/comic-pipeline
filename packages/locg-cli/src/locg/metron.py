@@ -28,9 +28,50 @@ _RATE_LIMIT_MAX_SLEEP = 60.0
 # (``mokkari.session.REQUEST_TIMEOUT``), so this fires at most once per call.
 _CONNECTION_ERROR_PREFIX = "Connection error:"
 
+# BUI-342: single capped retry sleep for a Metron 5xx. Metron's best-practices
+# doc wants exponential backoff (1s→60s), but this client runs synchronously
+# inside the single-worker async route, so — exactly as for the rate-limit path
+# (BUI-260) — we do ONE short capped retry, not escalating backoff. Start at the
+# doc's 1s floor; a 5xx is rare and transient.
+_SERVER_ERROR_RETRY_SLEEP = 1.0
+
 
 def _is_connection_error(exc: BaseException) -> bool:
     return isinstance(exc, ApiError) and str(exc).startswith(_CONNECTION_ERROR_PREFIX)
+
+
+def _http_status_from_cause(exc: BaseException) -> Optional[int]:
+    """Recover the HTTP status of a mokkari ``ApiError`` from its chained cause.
+
+    A Metron HTTP error surfaces as ``ApiError`` because mokkari's
+    ``_handle_http_response`` does ``raise ApiError(msg) from err`` where ``err``
+    is the underlying ``requests.exceptions.HTTPError`` (which still carries
+    ``.response.status_code``). Reading the status off ``exc.__cause__`` is
+    robust across mokkari/requests versions — both the ``from err`` chaining and
+    ``HTTPError.response`` are stable API — unlike scraping the message string.
+    Data-shape ``ApiError``\\ s (pydantic validation) and ``detail``-based 404s
+    are raised WITHOUT ``from`` (or from a non-HTTP cause), so this returns
+    ``None`` for them, which is exactly what keeps a genuine no-match from
+    tripping the breaker.
+    """
+    cause = getattr(exc, "__cause__", None)
+    response = getattr(cause, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _is_server_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is an ``ApiError`` wrapping a genuine HTTP 5xx (BUI-342).
+
+    Deliberately narrow: only 500–599 with a recoverable status trips. A
+    data-shape / 404 / connection ``ApiError`` returns False so it stays a silent
+    ``None`` (a no-match), never a false "Metron is down" that would disable
+    enrichment for the rest of a batch.
+    """
+    if not isinstance(exc, ApiError):
+        return False
+    status = _http_status_from_cause(exc)
+    return status is not None and 500 <= status < 600
 
 
 def _retry_once_on_rate_limit(func):
@@ -48,12 +89,22 @@ def _retry_once_on_rate_limit(func):
 
     Also maintains ``self.degraded`` (BUI-255): reset to ``False`` at the
     start of every decorated call, then flipped ``True`` only by a failure
-    path — here on an exhausted retry, or inside the method body itself on a
-    connection-error ``ApiError`` (see ``_is_connection_error``). A batch
-    caller (``cmd_collection_record_win``) polls this after a ``None`` result
-    to tell "Metron is throttled/unreachable, stop calling it for the rest of
+    path — here on an exhausted rate-limit retry or an exhausted 5xx retry
+    (BUI-342), or inside the method body itself on a connection-error
+    ``ApiError`` (see ``_is_connection_error``). A batch caller
+    (``cmd_collection_record_win``) polls this after a ``None`` result to tell
+    "Metron is throttled/unreachable/erroring, stop calling it for the rest of
     the batch" apart from a genuine, exception-free "no match" — which never
     touches the flag and leaves it at the optimistic reset.
+
+    5xx handling (BUI-342): a genuine server error surfaces from the method
+    bodies as a re-raised ``ApiError`` (they swallow every OTHER ``ApiError`` —
+    data-shape, 404, connection — and return ``None``; only ``_is_server_error``
+    re-raises). It gets ONE short capped retry here, symmetric with the
+    rate-limit path. Both retries' inner handlers catch ``(RateLimitError,
+    ApiError)`` so a retry that fails with the *other* transient class (5xx
+    after a 429, or vice-versa) still trips ``degraded`` rather than escaping
+    the decorator and crashing the batch.
     """
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -69,9 +120,35 @@ def _retry_once_on_rate_limit(func):
             time.sleep(wait)
             try:
                 return func(self, *args, **kwargs)
-            except RateLimitError:
+            except (RateLimitError, ApiError):
                 logger.warning(
-                    "Metron rate limit hit again in %s after retry; giving up",
+                    "Metron still throttled/erroring in %s after rate-limit "
+                    "retry; giving up", func.__name__,
+                )
+                self.degraded = True
+                return None
+        except ApiError as exc:
+            # Only a genuine 5xx reaches here — see _is_server_error and the
+            # method-body handlers, which re-raise 5xx and swallow all other
+            # ApiErrors as None. Guard anyway: a non-5xx ApiError that somehow
+            # propagated is a plain failure, so mirror the body and return None
+            # WITHOUT tripping the breaker (a data-shape error is not an outage).
+            if not _is_server_error(exc):
+                logger.debug(
+                    "Metron non-5xx ApiError propagated to retry wrapper in %s: %s",
+                    func.__name__, exc,
+                )
+                return None
+            logger.warning(
+                "Metron 5xx in %s; retrying once after %.1fs",
+                func.__name__, _SERVER_ERROR_RETRY_SLEEP,
+            )
+            time.sleep(_SERVER_ERROR_RETRY_SLEEP)
+            try:
+                return func(self, *args, **kwargs)
+            except (RateLimitError, ApiError):
+                logger.warning(
+                    "Metron 5xx again in %s after retry; giving up",
                     func.__name__,
                 )
                 self.degraded = True
@@ -197,6 +274,11 @@ class MetronClient:
         except RateLimitError:
             raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip enrichment
+            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
+            # for one capped retry + a ``degraded`` trip; a data-shape/404
+            # ApiError does NOT (it stays a silent None, same as before).
+            if _is_server_error(exc):
+                raise
             if _is_connection_error(exc):
                 self.degraded = True
             logger.debug("Metron lookup failed for %r #%s: %s", series_query, issue_number, exc)
@@ -238,6 +320,11 @@ class MetronClient:
         except RateLimitError:
             raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip variant enrichment
+            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
+            # for one capped retry + a ``degraded`` trip; a data-shape/404
+            # ApiError does NOT (it stays a silent None, same as before).
+            if _is_server_error(exc):
+                raise
             if _is_connection_error(exc):
                 self.degraded = True
             logger.debug("Metron issue-detail lookup failed for id %s: %s", metron_id, exc)
@@ -308,6 +395,11 @@ class MetronClient:
         except RateLimitError:
             raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None
+            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
+            # for one capped retry + a ``degraded`` trip; a data-shape/404
+            # ApiError does NOT (it stays a silent None, same as before).
+            if _is_server_error(exc):
+                raise
             if _is_connection_error(exc):
                 self.degraded = True
             logger.debug("Metron creator lookup failed for %r: %s", name, exc)
@@ -361,6 +453,11 @@ class MetronClient:
         except RateLimitError:
             raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
         except Exception as exc:  # noqa: BLE001
+            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
+            # for one capped retry + a ``degraded`` trip; a data-shape/404
+            # ApiError does NOT (it stays a silent None, same as before).
+            if _is_server_error(exc):
+                raise
             if _is_connection_error(exc):
                 self.degraded = True
             logger.debug(
