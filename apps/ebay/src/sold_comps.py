@@ -26,7 +26,7 @@ from pathlib import Path
 import requests
 
 import comic_identity
-from ebay_fetch import _RetryExhausted, _atomic_write_json, _retry_request
+from ebay_fetch import RetryExhausted, atomic_write_json, retry_request
 
 
 def _version_string() -> str:
@@ -61,7 +61,7 @@ GRADE_TAGGED_THRESHOLD = 10    # add grade-targeted query if base returns fewer
 
 # Retry policy for transient SerpApi failures (network errors, 429/5xx). The
 # backoff schedule itself (2 ** attempt seconds) now lives in the shared
-# ebay_fetch._retry_request() helper (BUI-333) — only the attempt count stays
+# ebay_fetch.retry_request() helper (BUI-333) — only the attempt count stays
 # a fetch()-local knob.
 FETCH_MAX_RETRIES = 3
 
@@ -121,9 +121,9 @@ def _cache_get(path: Path, ttl_sec: int) -> dict | None:
 
 def _cache_put(path: Path, data: dict) -> None:
     """Write *data* to the SerpApi response cache (BUI-333: routed through the
-    shared ebay_fetch._atomic_write_json() rather than a hand-rolled
+    shared ebay_fetch.atomic_write_json() rather than a hand-rolled
     tmp→rename copy)."""
-    _atomic_write_json(path, data)
+    atomic_write_json(path, data)
 
 
 # ─── Query construction ──────────────────────────────────────────────────────
@@ -294,28 +294,28 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
         if cached is not None:
             return cached, True
 
-    # BUI-333: retry/backoff routed through the shared ebay_fetch._retry_request()
-    # helper rather than the hand-rolled loop this used to have. _retry_request()
+    # BUI-333: retry/backoff routed through the shared ebay_fetch.retry_request()
+    # helper rather than the hand-rolled loop this used to have. retry_request()
     # only classifies retryable vs. non-retryable *status codes* — it never calls
     # resp.raise_for_status() itself — so raise_for_status() is still called
     # explicitly below, reproducing the original "raise HTTPError on any non-2xx"
     # behavior exactly, including an un-retried 4xx raising immediately. One
     # intentional widening: the original narrowly caught (requests.Timeout,
     # requests.ConnectionError) as the retryable network-error types;
-    # _retry_request's retry_network_errors=True catches any
+    # retry_request's retry_network_errors=True catches any
     # requests.exceptions.RequestException, matching the broader catch
     # get_token()/fetch_item_with_status() already use in ebay_fetch.py. The
     # extra types that catch admits (TooManyRedirects, ChunkedEncodingError,
     # ...) can't arise from this internally-built URL in practice; treating
     # them as retryable rather than immediately fatal is strictly safer.
     try:
-        resp = _retry_request(
+        resp = retry_request(
             lambda: requests.get(request_url(canonical, api_key), timeout=SERPAPI_TIMEOUT_SEC),
             retries=FETCH_MAX_RETRIES,
             is_retryable_status=lambda code: code == 429 or code >= 500,
             retry_network_errors=True,
         )
-    except _RetryExhausted as exc:
+    except RetryExhausted as exc:
         if exc.network_error is not None:
             raise exc.network_error from exc
         # Retries exhausted on a persistently retryable (429/5xx) status —

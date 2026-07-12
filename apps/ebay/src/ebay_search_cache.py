@@ -4,7 +4,7 @@ ebay_search_cache.py — SHA-256-keyed disk cache for eBay keyword-search result
 Mirrors the cache layer in sold_comps.py (same pattern: _cache_path, _cache_get,
 _cache_put) but keyed on a keyword string rather than a canonical URL, and exposed
 as a clean public API instead of private helpers. put() writes through
-ebay_fetch._atomic_write_json() (BUI-333) rather than hand-rolling the
+ebay_fetch.atomic_write_json() (BUI-333) rather than hand-rolling the
 tmp-file-then-.replace() idiom, so the two caches share one atomic-write
 implementation.
 
@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ebay_fetch import _atomic_write_json
+from ebay_fetch import atomic_write_json
 
 CACHE_DIR: Path = Path.home() / ".cache" / "wishlist-sellers" / "searches"
 DEFAULT_CACHE_TTL_SEC: int = 7 * 24 * 3600  # 7 days
@@ -83,14 +83,14 @@ def get(keyword: str, *, mode: str = "all", ttl_sec: int = DEFAULT_CACHE_TTL_SEC
 def put(keyword: str, items: list, *, mode: str = "all") -> None:
     """Write *items* (list of result dicts) to the cache for *keyword* / *mode*.
 
-    Uses the shared atomic tmp→rename write (ebay_fetch._atomic_write_json(),
+    Uses the shared atomic tmp→rename write (ebay_fetch.atomic_write_json(),
     BUI-333 — was a hand-rolled copy of the same idiom).
 
     *mode* namespaces the file so that auction-only and mixed results never
     overwrite each other.
     """
     path = cache_path(keyword, mode)
-    _atomic_write_json(path, items)
+    atomic_write_json(path, items)
 
 
 # ─── Active-listing filter ────────────────────────────────────────────────────

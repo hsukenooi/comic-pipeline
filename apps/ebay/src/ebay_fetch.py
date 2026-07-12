@@ -126,24 +126,24 @@ def _token_cache_file(base_url):
 # given failure mode best (see docs/solutions/design-patterns/
 # oauth-token-refresh-retry-pattern.md, pattern 4) — which worked, but left
 # five hand-copied variants that could drift again (and one did: see
-# fetch_item_with_status()'s network-error branch below). _retry_request() is
-# now the single place the retry/backoff shape lives; _atomic_write_json() is
+# fetch_item_with_status()'s network-error branch below). retry_request() is
+# now the single place the retry/backoff shape lives; atomic_write_json() is
 # the equivalent consolidation of the tmp-file-then-.replace() write idiom
 # used by the OAuth token cache and the item-aspects disk cache.
 #
 # BUI-333: a reuse review after BUI-323 found the same two idioms hand-copied
 # elsewhere in apps/ebay/src/ — sold_comps.py's SerpApi retry loop + JSON
 # cache write, ebay_search_cache.py's JSON cache write, and seller_scan.py's
-# rejected-candidate cache write. Those now call _retry_request()/
-# _atomic_write_json() too, so apps/ebay has one retry/backoff and one
+# rejected-candidate cache write. Those now call retry_request()/
+# atomic_write_json() too, so apps/ebay has one retry/backoff and one
 # atomic-write implementation. (seller_scan.py's Claude-CLI verification
 # bisection retry and its single-shot `requests` calls without a retry budget
 # were left alone — neither matches this helper's shape; see that module for
 # why.)
 
 
-class _RetryExhausted(Exception):
-    """Raised by _retry_request() when the retry budget runs out.
+class RetryExhausted(Exception):
+    """Raised by retry_request() when the retry budget runs out.
 
     Exactly one of the two attributes is set, mirroring the two ways a call
     can keep failing:
@@ -164,7 +164,7 @@ class _RetryExhausted(Exception):
         super().__init__("retry budget exhausted")
 
 
-def _retry_request(
+def retry_request(
     make_request,
     *,
     retries,
@@ -187,7 +187,7 @@ def _retry_request(
     printing f"{status_retry_message(status)}, retrying in {wait}s..." when
     status_retry_message is given (pass None to retry silently, as
     get_item_aspects() has always done). Once `retries` is exhausted, raises
-    _RetryExhausted(response=<last response>).
+    RetryExhausted(response=<last response>).
 
     A RequestException is handled one of two ways, matching the two shapes
     that existed independently before this helper:
@@ -195,7 +195,7 @@ def _retry_request(
       retried with the same backoff — printing
       f"Network error {network_error_context}: {exc}, retrying in {wait}s..."
       when network_error_context is given — raising
-      _RetryExhausted(network_error=<last exc>) once exhausted.
+      RetryExhausted(network_error=<last exc>) once exhausted.
     - retry_network_errors=False (search_seller_listings(),
       search_by_keyword(), get_item_aspects()): re-raised immediately on the
       first occurrence. These callers have always failed fast on a network
@@ -222,7 +222,7 @@ def _retry_request(
                     )
                 time.sleep(wait)
                 continue
-            raise _RetryExhausted(network_error=exc) from exc
+            raise RetryExhausted(network_error=exc) from exc
 
         if not is_retryable_status(resp.status_code):
             return resp
@@ -236,12 +236,12 @@ def _retry_request(
                 )
             time.sleep(wait)
         else:
-            raise _RetryExhausted(response=resp)
+            raise RetryExhausted(response=resp)
 
-    raise _RetryExhausted(response=resp)  # pragma: no cover — unreachable for retries >= 1
+    raise RetryExhausted(response=resp)  # pragma: no cover — unreachable for retries >= 1
 
 
-def _atomic_write_json(path, data, *, mode=None):
+def atomic_write_json(path, data, *, mode=None):
     """Write `data` as JSON to `path` atomically (tmp file + Path.replace()),
     so a crash mid-write never leaves a partial/corrupted file for a
     concurrent reader — the pattern _aspects_cache_put() established first and
@@ -316,7 +316,7 @@ def get_token(client_id, client_secret, base_url, *, force_refresh=False):
         except Exception:  # noqa: BLE001  # malformed/wrong-shape cache → cache miss
             pass  # e.g. non-dict JSON, non-numeric expires_at, missing access_token
 
-    # Request new token via the shared _retry_request() helper (BUI-323) —
+    # Request new token via the shared retry_request() helper (BUI-323) —
     # the same one fetch_item_with_status() uses below, so a network error is
     # now retried with backoff exactly like a 429/5xx on both. Non-retryable
     # 4xx errors (e.g. 401 bad credentials) exit immediately. BUI-184: a
@@ -326,7 +326,7 @@ def get_token(client_id, client_secret, base_url, *, force_refresh=False):
     retries = 3
 
     try:
-        resp = _retry_request(
+        resp = retry_request(
             lambda: requests.post(
                 f"{base_url}/identity/v1/oauth2/token",
                 headers={
@@ -345,7 +345,7 @@ def get_token(client_id, client_secret, base_url, *, force_refresh=False):
             network_error_context="requesting token",
             status_retry_message=lambda code: f"Token request failed ({code})",
         )
-    except _RetryExhausted as exc:
+    except RetryExhausted as exc:
         if exc.network_error is not None:
             print(
                 f"Error: Authentication failed (network error after {retries} attempts): {exc.network_error}",
@@ -375,12 +375,12 @@ def get_token(client_id, client_secret, base_url, *, force_refresh=False):
     expires_in = token_data.get("expires_in", 7200)
 
     # Cache token with restrictive permissions, atomically (tmp→rename via the
-    # shared _atomic_write_json(), BUI-323) so a crash mid-write never leaves
+    # shared atomic_write_json(), BUI-323) so a crash mid-write never leaves
     # a partial cache file. Best-effort: an OSError here (e.g. disk full,
     # permission denied) must not discard the token we already got from
     # eBay — log and fall through, still returning the live token.
     try:
-        _atomic_write_json(
+        atomic_write_json(
             cache_file,
             {"access_token": access_token, "expires_at": time.time() + expires_in},
             mode=0o600,
@@ -422,7 +422,7 @@ def fetch_item_with_status(item_id, token, base_url, retries=3):
     mid-batch — should call this directly instead.
 
     BUI-323: a network error now consumes the retries budget with backoff via
-    the shared _retry_request() helper, the same as get_token() — it used to
+    the shared retry_request() helper, the same as get_token() — it used to
     return (None, None) on the very first RequestException, spending none of
     the retry budget a 429 gets (a real drift this fix removes).
     """
@@ -434,7 +434,7 @@ def fetch_item_with_status(item_id, token, base_url, retries=3):
     params = {"legacy_item_id": item_id}
 
     try:
-        resp = _retry_request(
+        resp = retry_request(
             lambda: requests.get(url, headers=headers, params=params, timeout=10),
             retries=retries,
             is_retryable_status=lambda code: code == 429,
@@ -442,7 +442,7 @@ def fetch_item_with_status(item_id, token, base_url, retries=3):
             network_error_context=f"fetching item {item_id}",
             status_retry_message=lambda code: "Rate limited",
         )
-    except _RetryExhausted as exc:
+    except RetryExhausted as exc:
         if exc.network_error is not None:
             print(
                 f"Network error fetching item {item_id}: {exc.network_error}, "
@@ -854,7 +854,7 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
         query = f"q=comic&filter={filter_val}&limit={page_size}&offset={offset}"
 
         try:
-            resp = _retry_request(
+            resp = retry_request(
                 lambda: requests.get(url, headers=headers, params=query, timeout=15),
                 retries=retries,
                 is_retryable_status=lambda code: code == 429,
@@ -867,7 +867,7 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
                 file=sys.stderr,
             )
             return _filter_by_seller(all_items, username)
-        except _RetryExhausted as exc:
+        except RetryExhausted as exc:
             resp = exc.response
 
         if resp.status_code != 200:
@@ -944,7 +944,7 @@ def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_optio
         query = f"q={safe_kw}&filter={filter_val}&limit={page_size}&offset={offset}"
 
         try:
-            resp = _retry_request(
+            resp = retry_request(
                 lambda: requests.get(url, headers=headers, params=query, timeout=15),
                 retries=retries,
                 is_retryable_status=lambda code: code == 429,
@@ -957,7 +957,7 @@ def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_optio
                 file=sys.stderr,
             )
             return all_items[:max_results]
-        except _RetryExhausted as exc:
+        except RetryExhausted as exc:
             resp = exc.response
 
         if resp.status_code != 200:
@@ -1012,8 +1012,8 @@ def _aspects_cache_get(item_id: str) -> "dict | None":
 
 def _aspects_cache_put(item_id: str, aspects: dict) -> None:
     """Write aspects dict to the item-level disk cache (atomic tmp→rename via
-    the shared _atomic_write_json(), BUI-323)."""
-    _atomic_write_json(_aspects_cache_path(item_id), aspects)
+    the shared atomic_write_json(), BUI-323)."""
+    atomic_write_json(_aspects_cache_path(item_id), aspects)
 
 
 def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries: int = 3) -> "dict | None":
@@ -1027,7 +1027,7 @@ def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries:
     swallowed — the aspects gate is advisory, not load-bearing.  The caller treats
     None as "no signal" and keeps the listing.
 
-    Request/retry style shares the module's _retry_request() helper (BUI-323),
+    Request/retry style shares the module's retry_request() helper (BUI-323),
     matching search_by_keyword's fail-fast-on-network-error / retry-silently-
     on-429 shape.
     """
@@ -1043,13 +1043,13 @@ def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries:
     params = {"legacy_item_id": legacy_item_id}
 
     try:
-        resp = _retry_request(
+        resp = retry_request(
             lambda: requests.get(url, headers=headers, params=params, timeout=10),
             retries=retries,
             is_retryable_status=lambda code: code == 429,
             retry_network_errors=False,
         )
-    except (requests.exceptions.RequestException, _RetryExhausted):
+    except (requests.exceptions.RequestException, RetryExhausted):
         return None  # network error or retry-exhausted → fail-open
 
     if resp.status_code != 200:

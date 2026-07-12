@@ -116,7 +116,7 @@ def test_get_returns_none_on_cache_miss():
 
 
 def test_put_writes_atomically_and_leaves_no_tmp_file():
-    """BUI-333: put() routes through the shared ebay_fetch._atomic_write_json()
+    """BUI-333: put() routes through the shared ebay_fetch.atomic_write_json()
     helper rather than a hand-rolled tmp→rename copy. BUI-335: that helper's
     tmp filename is now per-call-unique (`<name>.<uuid4>.tmp`), so "no tmp
     left behind" is a glob for the prefix/suffix shape, not one literal
