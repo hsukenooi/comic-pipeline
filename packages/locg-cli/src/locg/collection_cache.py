@@ -7,12 +7,12 @@ import logging
 import os
 import re
 import stat
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from locg._atomic import atomic_write, atomic_write_json
 from locg.config import collection_cache_path, import_history_path
 
 logger = logging.getLogger("locg")
@@ -554,44 +554,19 @@ def build_volume_candidates(payload: dict[str, Any]) -> dict[str, list[str]]:
 
 def _write_atomic(dest: Path, content: str) -> None:
     """Write a string to dest atomically via tempfile + os.replace."""
-    fd, tmp = tempfile.mkstemp(prefix=".bak-", suffix=".tmp", dir=dest.parent)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    os.replace(tmp, dest)
+    atomic_write(dest, content, tmp_prefix=".bak-")
 
 
 def _write_payload_atomic(path: Path, payload: dict[str, Any]) -> None:
     """Write JSON payload to path atomically with fsync on both fd and parent dir."""
-    fd, tmp = tempfile.mkstemp(
-        prefix=".collection-", suffix=".json.tmp", dir=path.parent
+    atomic_write_json(
+        path,
+        payload,
+        mode=stat.S_IRUSR | stat.S_IWUSR,  # 0600
+        fsync=True,
+        compact=True,
+        tmp_prefix=".collection-",
     )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, separators=(",", ":"), ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        # fsync the parent directory so the rename is durable
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
-    except Exception:
-        if os.path.exists(tmp):
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        raise
 
 
 class CollectionCache:
