@@ -2516,6 +2516,112 @@ def test_creator_run_empty_role_falls_back_to_penciller(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# cmd_creator_run_lookup (BUI-340) — read-only counterpart to
+# cmd_wish_list_add_creator_run: resolves via the same Metron methods but
+# never touches the wish-list or collection cache.
+# ---------------------------------------------------------------------------
+
+def test_creator_run_lookup_resolves_via_existing_metron_methods(tmp_path, monkeypatch):
+    """Calls the same resolve_creator/resolve_creator_run Metron methods the
+    write path uses, and reports the resolved run (including a discontinuous
+    second stint) without filtering owned/wishlisted issues."""
+    from locg.commands import cmd_creator_run_lookup
+
+    inst = _patch_metron_run(
+        monkeypatch,
+        creator={"id": 42, "name": "Erik Larsen"},
+        run={
+            "issues": [
+                {"number": "18", "metron_id": 1, "cover_date": "1990-11-01"},
+                {"number": "19", "metron_id": 2, "cover_date": "1990-12-01"},
+                {"number": "23", "metron_id": 3, "cover_date": "1991-04-01"},
+            ],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_creator_run_lookup(
+        series="The Amazing Spider-Man", creator="Erik Larsen", series_id=7, role="penciller",
+    )
+
+    assert result["status"] == "ok"
+    assert result["creator"] == "Erik Larsen"
+    assert result["creator_id"] == 42
+    assert result["run_issue_count"] == 3
+    assert result["issue_numbers"] == ["18", "19", "23"]
+    inst.resolve_creator.assert_called_once_with("Erik Larsen")
+    inst.resolve_creator_run.assert_called_once_with(
+        series_id=7, creator_id=42, creator_name="Erik Larsen", role="penciller",
+    )
+
+
+def test_creator_run_lookup_writes_nothing(tmp_path, monkeypatch):
+    """Zero cache/file writes: no collection-imported guard, no wish-list
+    read/write — unlike cmd_wish_list_add_creator_run, this path never even
+    checks whether the collection cache was imported."""
+    from locg.commands import cmd_creator_run_lookup, wish_list_cache_path
+
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "175", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [],
+        },
+    )
+
+    # Collection cache deliberately left un-imported (last_full_import is None,
+    # the R11 state that would hard-refuse the write path) — the lookup must
+    # succeed anyway, since it never consults the collection cache at all.
+    result = cmd_creator_run_lookup(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+
+    assert result["status"] == "ok"
+    assert result["issue_numbers"] == ["175"]
+
+    # No wish-list cache file was created, and no other file appeared under
+    # the isolated LOCG_DATA_DIR (tmp_path) as a side effect of the lookup.
+    assert not wish_list_cache_path().exists()
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_creator_run_lookup_unresolvable_creator_errors(tmp_path, monkeypatch):
+    """An ambiguous/unknown creator is a hard error, not a silent guess —
+    same contract as the write path."""
+    from locg.commands import cmd_creator_run_lookup
+
+    _patch_metron_run(monkeypatch, creator=None, run=None)
+    result = cmd_creator_run_lookup(series="Uncanny X-Men", creator="Romita", series_id=99)
+    assert "error" in result
+    assert "resolve creator" in result["error"]
+
+
+def test_creator_run_lookup_requires_series_and_creator(tmp_path):
+    from locg.commands import cmd_creator_run_lookup
+
+    assert "error" in cmd_creator_run_lookup(series="  ", creator="Erik Larsen", series_id=1)
+    assert "error" in cmd_creator_run_lookup(series="X", creator="  ", series_id=1)
+
+
+def test_creator_run_lookup_empty_role_falls_back_to_penciller(tmp_path, monkeypatch):
+    from locg.commands import cmd_creator_run_lookup
+
+    inst = _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={"issues": [], "warnings": []},
+    )
+
+    result = cmd_creator_run_lookup(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99, role="",
+    )
+    assert result["role"] == "penciller"
+    _, kwargs = inst.resolve_creator_run.call_args
+    assert kwargs["role"] == "penciller"
+
+
+# ---------------------------------------------------------------------------
 # cmd_wish_list_remove
 # ---------------------------------------------------------------------------
 

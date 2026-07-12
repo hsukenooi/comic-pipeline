@@ -401,6 +401,56 @@ def test_cli_wish_list_uses_cache_skips_client(monkeypatch, tmp_path, capsys):
     assert not client_constructed, "LOCGClient must not be constructed when wish-list cache is present"
 
 
+def test_cli_creator_run_dispatches_without_client_and_requires_series_id(monkeypatch, tmp_path, capsys):
+    """`locg creator-run` (BUI-340) is wired to cmd_creator_run_lookup, never
+    constructs LOCGClient (pure Metron lookup, no LOCG session needed), and
+    --series-id is a required flag (argparse exits 2 without it)."""
+    import locg.cli
+
+    client_constructed = []
+
+    class FakeClient:
+        def __init__(self):
+            client_constructed.append(True)
+        def close(self):
+            pass
+
+    calls = []
+
+    def fake_lookup(series, creator, series_id, role):
+        calls.append((series, creator, series_id, role))
+        return {"status": "ok", "series": series, "issue_numbers": ["18", "19"]}
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "cmd_creator_run_lookup", fake_lookup)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["locg", "creator-run", "The Amazing Spider-Man", "--creator", "Erik Larsen", "--series-id", "7"],
+    )
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert not client_constructed, "creator-run must not construct LOCGClient"
+    assert calls == [("The Amazing Spider-Man", "Erik Larsen", 7, "penciller")]
+
+    out = capsys.readouterr().out
+    assert json.loads(out)["issue_numbers"] == ["18", "19"]
+
+
+def test_cli_creator_run_requires_series_id(monkeypatch, capsys):
+    """Omitting --series-id is an argparse error (exit code 2)."""
+    monkeypatch.setattr(
+        sys, "argv",
+        ["locg", "creator-run", "The Amazing Spider-Man", "--creator", "Erik Larsen"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+
+
 def test_cli_wish_list_falls_back_to_live_when_no_cache(monkeypatch, tmp_path, capsys):
     """When wish-list cache is absent, cmd_wish_list (live) is called."""
     import locg.cli
