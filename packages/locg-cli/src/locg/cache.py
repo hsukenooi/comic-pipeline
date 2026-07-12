@@ -17,11 +17,11 @@ import logging
 import os
 import re
 import stat
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from ._atomic import atomic_write_json
 from .config import _cache_dir
 
 logger = logging.getLogger("locg")
@@ -114,20 +114,13 @@ class IDCache:
             return
         ensure_cache_dir()
         # Atomic write: temp file in same dir, then rename.
-        fd, tmp = tempfile.mkstemp(prefix=".ids-", suffix=".json.tmp", dir=self.path.parent)
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(self._data, f, separators=(",", ":"), ensure_ascii=False)
-            os.replace(tmp, self.path)
-            self.path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
-        except Exception:
-            # Best-effort cleanup of the tmp file if rename failed.
-            if os.path.exists(tmp):
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-            raise
+        atomic_write_json(
+            self.path,
+            self._data,
+            mode=stat.S_IRUSR | stat.S_IWUSR,  # 600
+            compact=True,
+            tmp_prefix=".ids-",
+        )
 
     # ----- Public API -----------------------------------------------------
 

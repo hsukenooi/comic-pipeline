@@ -10,14 +10,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import stat
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from locg._atomic import atomic_write_json
 from locg.config import wish_list_cache_path
 from locg.parsing import trailing_issue_token
 
@@ -306,7 +305,8 @@ def migrate_wish_list_source() -> dict[str, Any]:
     ``wish-list.json`` (and aborts before any mutation if the backup doesn't
     read back byte-for-byte identical), then stamps ``item["source"]`` on every
     item that lacks an explicit one (via :func:`_wish_source`), bumps
-    ``updated_at`` and rewrites atomically (tempfile + os.replace + chmod 600).
+    ``updated_at`` and rewrites atomically (via :func:`locg._atomic.atomic_write_json`,
+    chmod 600).
 
     Returns ``{"migrated": <stamped count>, "backup": <path|None>, "total": <n>}``;
     if the cache is absent, returns ``{"migrated": 0, "backup": None}``.
@@ -339,21 +339,12 @@ def migrate_wish_list_source() -> dict[str, Any]:
         "items": items,
     }
 
-    fd, tmp = tempfile.mkstemp(
-        prefix=".wish-list-", suffix=".json.tmp", dir=path.parent
+    atomic_write_json(
+        path,
+        payload,
+        mode=stat.S_IRUSR | stat.S_IWUSR,  # 600
+        tmp_prefix=".wish-list-",
     )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
-    except Exception:
-        if os.path.exists(tmp):
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        raise
 
     return {"migrated": migrated, "backup": str(backup), "total": len(items)}
 

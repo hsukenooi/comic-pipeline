@@ -5,10 +5,8 @@ import getpass
 import json
 import logging
 import math
-import os
 import re
 import stat
-import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +14,7 @@ from typing import Any, Optional
 
 from bs4 import BeautifulSoup
 
+from locg._atomic import atomic_write_json
 from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
 from locg.collection_cache import (
@@ -686,11 +685,12 @@ def _read_wish_list_cache_items() -> list[dict[str, Any]]:
 def _write_wish_list_cache(items: list[dict[str, Any]]) -> Path:
     """Atomically write ``items`` as the wish-list cache.
 
-    Tempfile + os.replace + chmod 600 — the same atomic write pattern used by
-    every wish-list cache writer. Shared by :func:`cmd_wish_list_add` (one
-    entry) and :func:`cmd_wish_list_add_creator_run` (BUI-325: the whole
-    run's entries in one call), so there is exactly one atomic write per
-    call site rather than a bespoke copy of the tempfile dance at each.
+    Uses :func:`locg._atomic.atomic_write_json` (tempfile + os.replace +
+    chmod 600) — the same atomic write pattern used by every wish-list
+    cache writer. Shared by :func:`cmd_wish_list_add` (one entry) and
+    :func:`cmd_wish_list_add_creator_run` (BUI-325: the whole run's entries
+    in one call), so there is exactly one atomic write per call site rather
+    than a bespoke copy of the tempfile dance at each.
     """
     path = wish_list_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -700,21 +700,12 @@ def _write_wish_list_cache(items: list[dict[str, Any]]) -> Path:
         "items": items,
     }
 
-    fd, tmp = tempfile.mkstemp(
-        prefix=".wish-list-", suffix=".json.tmp", dir=path.parent
+    atomic_write_json(
+        path,
+        new_payload,
+        mode=stat.S_IRUSR | stat.S_IWUSR,  # 600
+        tmp_prefix=".wish-list-",
     )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(new_payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
-    except Exception:
-        if os.path.exists(tmp):
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        raise
 
     return path
 
