@@ -933,6 +933,88 @@ def cmd_wish_list_add_creator_run(
     }
 
 
+def cmd_creator_run_lookup(
+    series: str,
+    creator: str,
+    series_id: int,
+    role: str = "penciller",
+) -> dict[str, Any]:
+    """Resolve a creator's run on a series from Metron and report it (BUI-340).
+
+    Read-only counterpart to :func:`cmd_wish_list_add_creator_run`: same
+    creator-id-pinning + per-issue role confirmation via
+    ``MetronClient.resolve_creator``/``resolve_creator_run``, but stops at
+    reporting the resolved issue list — no collection check, no wish-list
+    dedup, no cache read/write. Exists so a plain question ("what was X's run
+    on Y?") has a ground-truthed answer that doesn't require invoking the
+    wish-list-add write path (BUI-340: a Claude session answered such a
+    question from model memory instead, and got Erik Larsen's Spider-Man run
+    wrong — #19-43 instead of the Metron-credited #18-23 — because reaching
+    for `wish-list add --creator` felt like the wrong tool for a bare
+    question).
+
+    ``series`` is carried through only for the response's ``series`` field
+    (display / echo); it does not affect resolution, which is keyed entirely
+    off ``series_id``. Returns ``{status, series, creator, creator_id, role,
+    series_id, run_issue_count, issues, issue_numbers, warnings}`` on success,
+    or ``{"error": ...}`` if the series/creator can't be resolved unambiguously.
+    """
+    from locg.metron import MetronClient
+
+    series = (series or "").strip()
+    creator = (creator or "").strip()
+    role = (role or "penciller").strip().lower() or "penciller"
+    if not series:
+        return {"error": "creator-run: series must be non-empty"}
+    if not creator:
+        return {"error": "creator-run: --creator must be non-empty"}
+
+    metron = MetronClient()
+
+    resolved = metron.resolve_creator(creator)
+    if resolved is None:
+        return {
+            "error": (
+                f"Could not unambiguously resolve creator {creator!r} on Metron "
+                "(zero or multiple matches). Use the exact Metron creator name "
+                "to disambiguate (e.g. 'John Romita Jr.' vs 'John Romita')."
+            )
+        }
+
+    run = metron.resolve_creator_run(
+        series_id=series_id,
+        creator_id=resolved["id"],
+        creator_name=resolved["name"],
+        role=role,
+    )
+    if run is None:
+        return {
+            "error": (
+                f"Metron creator-run lookup failed for {resolved['name']!r} "
+                f"(id={resolved['id']}) on series_id={series_id}."
+            )
+        }
+
+    run_issues = run["issues"]
+    warnings = run["warnings"]
+    issue_numbers = [
+        issue.get("number") for issue in run_issues if issue.get("number") is not None
+    ]
+
+    return {
+        "status": "ok",
+        "series": series,
+        "creator": resolved["name"],
+        "creator_id": resolved["id"],
+        "role": role,
+        "series_id": series_id,
+        "run_issue_count": len(run_issues),
+        "issues": run_issues,
+        "issue_numbers": issue_numbers,
+        "warnings": warnings,
+    }
+
+
 def cmd_wish_list_remove(title: str) -> dict[str, Any]:
     """Remove the first matching entry from the local wish-list cache.
 

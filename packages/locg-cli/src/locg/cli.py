@@ -29,6 +29,7 @@ from locg.commands import (
     cmd_collection_record_win,
     cmd_collection_status,
     cmd_comic,
+    cmd_creator_run_lookup,
     cmd_find,
     cmd_login,
     cmd_lookup,
@@ -237,6 +238,41 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # creator-run (BUI-340): read-only lookup, no wish-list/collection writes.
+    p = sub.add_parser(
+        "creator-run",
+        parents=[common],
+        help="Look up a creator's run on a series via Metron (read-only, no writes)",
+        epilog=(
+            "Resolves the creator's Metron id and the exact issue set they hold "
+            "the given role on (per-issue credit confirmed, gaps and discontinuous "
+            "stints included), and prints it. Does NOT touch the wish-list or "
+            "collection cache. Use `wish-list add <series> --creator ... --series-id ...` "
+            "instead when you actually want the gap issues added to the wish-list."
+        ),
+    )
+    p.add_argument(
+        "series",
+        help="Series title, used only for the response's 'series' field (resolution is keyed off --series-id).",
+    )
+    p.add_argument(
+        "--creator",
+        required=True,
+        help="Creator name to resolve on Metron (e.g. 'John Romita Jr.').",
+    )
+    p.add_argument(
+        "--series-id",
+        dest="series_id",
+        type=int,
+        required=True,
+        help="Metron series id.",
+    )
+    p.add_argument(
+        "--role",
+        default="penciller",
+        help="Credit role to filter the run by (default: penciller).",
+    )
+
     # read-list
     p = sub.add_parser("read-list", parents=[common], help="View your read list (requires login)")
     p.add_argument("--title", help="Filter results by title (case-insensitive substring match)")
@@ -383,11 +419,13 @@ def main() -> None:
         args.command == "wish-list"
         and getattr(args, "wish_list_command", None) in ("add", "remove", "migrate-source")
     )
+    # creator-run is a pure Metron lookup — never needs the Playwright/LOCG client.
     _needs_client = not (
         args.command == "cache"
         or (_collection_sub in _LOCAL_COLLECTION_SUBCMDS)
         or _wish_list_cached
         or _wish_list_add
+        or args.command == "creator-run"
     )
 
     client: Optional[LOCGClient] = None
@@ -483,6 +521,13 @@ def main() -> None:
                     result = cmd_wish_list(client, title=args.title)
             else:
                 result = cmd_wish_list(client, title=args.title)
+        elif args.command == "creator-run":
+            result = cmd_creator_run_lookup(
+                series=args.series,
+                creator=args.creator,
+                series_id=args.series_id,
+                role=args.role or "penciller",
+            )
         elif args.command == "read-list":
             result = cmd_read_list(client, title=args.title)
         elif args.command == "add":
