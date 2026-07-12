@@ -751,6 +751,103 @@ class TestAtomicWriteJsonHelper:
         assert _leftover_tmp_files(path) == []
 
 
+class TestSweepOrphanTmpFiles:
+    """BUI-338: per-call-unique tmp names (BUI-335) are never reused, so a
+    mid-write crash's orphan is never overwritten by a later write like the
+    old deterministic name was — nothing swept it. _sweep_orphan_tmp_files()
+    (invoked from atomic_write_json() itself) fixes that, gated on age so it
+    can never mistake a live concurrent writer's in-flight tmp for an
+    orphan."""
+
+    def test_atomic_write_json_sweeps_an_old_orphan(self, tmp_path):
+        path = tmp_path / "cache.json"
+        orphan = tmp_path / f"{path.name}.{uuid.uuid4().hex}.tmp"
+        orphan.write_text('{"stale": true}')
+        old_time = time.time() - 7200  # 2 hours ago, well past the 1-hour TTL
+        os.utime(orphan, (old_time, old_time))
+
+        ebay_fetch.atomic_write_json(path, {"fresh": True})
+
+        assert not orphan.exists()
+        assert json.loads(path.read_text()) == {"fresh": True}
+
+    def test_atomic_write_json_does_not_sweep_a_fresh_tmp_file(self, tmp_path):
+        """A tmp file younger than the TTL must survive — it could be another
+        process/thread's still-in-flight write (BUI-335's whole reason for
+        per-call-unique names)."""
+        path = tmp_path / "cache.json"
+        in_flight = tmp_path / f"{path.name}.{uuid.uuid4().hex}.tmp"
+        in_flight.write_text('{"in_flight": "from-another-writer"}')
+
+        ebay_fetch.atomic_write_json(path, {"fresh": True})
+
+        assert in_flight.exists()
+        assert json.loads(in_flight.read_text()) == {"in_flight": "from-another-writer"}
+
+    def test_sweep_direct_removes_orphan_older_than_ttl(self, tmp_path):
+        path = tmp_path / "cache.json"
+        orphan = tmp_path / f"{path.name}.{uuid.uuid4().hex}.tmp"
+        orphan.write_text("{}")
+        old_time = time.time() - 100
+        os.utime(orphan, (old_time, old_time))
+
+        ebay_fetch._sweep_orphan_tmp_files(path, ttl_seconds=10)
+
+        assert not orphan.exists()
+
+    def test_sweep_direct_leaves_tmp_younger_than_ttl(self, tmp_path):
+        path = tmp_path / "cache.json"
+        fresh = tmp_path / f"{path.name}.{uuid.uuid4().hex}.tmp"
+        fresh.write_text("{}")
+
+        ebay_fetch._sweep_orphan_tmp_files(path, ttl_seconds=3600)
+
+        assert fresh.exists()
+
+    def test_sweep_only_touches_tmp_files_matching_this_paths_name(self, tmp_path):
+        """A sibling cache file's orphan tmp shares the directory but not the
+        `<name>.` prefix — it must be left for its own path's sweep, never
+        this one's."""
+        path = tmp_path / "cache.json"
+        other_path_orphan = tmp_path / f"other.json.{uuid.uuid4().hex}.tmp"
+        other_path_orphan.write_text("{}")
+        old_time = time.time() - 7200
+        os.utime(other_path_orphan, (old_time, old_time))
+
+        ebay_fetch._sweep_orphan_tmp_files(path)
+
+        assert other_path_orphan.exists()
+
+    def test_sweep_tolerates_missing_directory(self, tmp_path):
+        """Sweeping must never raise, even when the directory doesn't exist
+        yet (glob() on a nonexistent parent)."""
+        path = tmp_path / "does-not-exist" / "cache.json"
+        ebay_fetch._sweep_orphan_tmp_files(path)  # must not raise
+
+    def test_sweep_tolerates_file_vanishing_mid_sweep(self, tmp_path):
+        """The file can vanish between glob() listing it and unlink() acting
+        on it (another process's writer finished, or a concurrent sweep
+        already removed it) — must be swallowed, not raised. FileNotFoundError
+        is an OSError subclass, so this also covers the literal vanish case,
+        not just a generic unlink failure."""
+        path = tmp_path / "cache.json"
+        orphan = tmp_path / f"{path.name}.{uuid.uuid4().hex}.tmp"
+        orphan.write_text("{}")
+        old_time = time.time() - 7200
+        os.utime(orphan, (old_time, old_time))
+
+        with patch.object(ebay_fetch.Path, "unlink", side_effect=FileNotFoundError("gone")):
+            ebay_fetch._sweep_orphan_tmp_files(path)  # must not raise
+
+    def test_sweep_tolerates_stat_failure(self, tmp_path):
+        path = tmp_path / "cache.json"
+        orphan = tmp_path / f"{path.name}.{uuid.uuid4().hex}.tmp"
+        orphan.write_text("{}")
+
+        with patch.object(ebay_fetch.Path, "stat", side_effect=OSError("gone")):
+            ebay_fetch._sweep_orphan_tmp_files(path)  # must not raise
+
+
 class TestFetchItem:
     """Test fetch_item with mocked HTTP responses."""
 

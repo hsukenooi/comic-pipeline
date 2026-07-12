@@ -241,6 +241,64 @@ def retry_request(
     raise RetryExhausted(response=resp)  # pragma: no cover — unreachable for retries >= 1
 
 
+# BUI-338: how long an orphaned `<name>.<uuid4>.tmp` must sit untouched before
+# _sweep_orphan_tmp_files() will remove it. Must comfortably exceed the
+# longest realistic in-flight write (write_text()/json.dump() of a small
+# cache file completes in well under a second even under load) so a live
+# concurrent writer's tmp is never mistaken for an orphan — see
+# _sweep_orphan_tmp_files()'s docstring for the full reasoning.
+_ORPHAN_TMP_TTL_SECONDS = 3600
+
+
+def _sweep_orphan_tmp_files(path, *, ttl_seconds=_ORPHAN_TMP_TTL_SECONDS):
+    """Best-effort cleanup of stale `<name>.<uuid4>.tmp` orphans next to
+    `path` (BUI-338).
+
+    BUI-335 made atomic_write_json()'s tmp filename per-call-unique
+    specifically so concurrent writers to the same `path` (e.g.
+    sold_comps._cache_put() under run_batch()'s ThreadPoolExecutor) never
+    share — and therefore never clobber — one deterministic tmp name. The
+    tradeoff: unlike the old deterministic name, a tmp orphaned by a mid-write
+    crash is never reused/overwritten by a later write, and nothing swept it —
+    so orphans accumulate a few stray KB per crash, forever.
+
+    This can't be a one-time "sweep at process startup" — apps/ebay has
+    several independent console-script entry points (ebay-fetch,
+    ebay-sold-comps, seller-scan) that can run as separate OS processes at the
+    same time, each with its own ThreadPoolExecutor of concurrent writers to
+    a *shared* cache path. There is no point in time that is guaranteed to be
+    "before any concurrent writer anywhere is spawned." So instead this is
+    gated purely by age: a tmp file is only removed once its mtime is older
+    than `ttl_seconds` (default one hour) — far longer than any real write
+    takes — so a genuinely in-flight tmp from another process/thread is never
+    a candidate no matter when this function happens to run. It's invoked
+    from atomic_write_json() itself (see below), so every write is also an
+    opportunistic sweep of its own directory.
+
+    Every failure is swallowed and never propagates: a missing directory, a
+    tmp file that vanished between being listed and being unlinked (another
+    process's writer finished, or another sweep raced this one), or any other
+    OSError. This is opportunistic cleanup, not the write the caller asked
+    for — it must never turn into a new way for atomic_write_json() to fail.
+    """
+    try:
+        candidates = list(path.parent.glob(f"{path.name}.*.tmp"))
+    except OSError:
+        return
+    now = time.time()
+    for candidate in candidates:
+        try:
+            age = now - candidate.stat().st_mtime
+        except OSError:
+            continue  # vanished (or unreadable) between glob() and stat() — not ours to worry about
+        if age < ttl_seconds:
+            continue  # too young to be confidently orphaned — could be a live concurrent writer
+        try:
+            candidate.unlink()
+        except OSError:
+            pass  # another sweep/writer already removed it, or a transient FS error — best-effort only
+
+
 def atomic_write_json(path, data, *, mode=None):
     """Write `data` as JSON to `path` atomically (tmp file + Path.replace()),
     so a crash mid-write never leaves a partial/corrupted file for a
@@ -272,8 +330,14 @@ def atomic_write_json(path, data, *, mode=None):
     The unique name lives in the same directory as `path` so the final
     replace stays a same-filesystem atomic rename, and the cleanup `unlink`
     here only ever removes *this call's own* tmp file, never a sibling's.
+
+    BUI-338: before creating its own tmp file, best-effort sweeps any
+    `<name>.*.tmp` siblings older than an hour — orphans left behind by some
+    earlier call that crashed mid-write (see _sweep_orphan_tmp_files() for why
+    this is age-gated rather than a one-time startup sweep).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    _sweep_orphan_tmp_files(path)
     tmp = path.parent / f"{path.name}.{uuid.uuid4().hex}.tmp"
     wrote = False
     try:
