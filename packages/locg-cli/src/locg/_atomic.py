@@ -58,7 +58,16 @@ def atomic_write(
     """
     fd, tmp_name = tempfile.mkstemp(prefix=tmp_prefix, suffix=tmp_suffix, dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w") as f:
+        # BUI-341: os.fdopen(fd) can itself raise (e.g. OOM) before the `with`
+        # takes ownership of fd, which would otherwise leak the raw descriptor
+        # — the except-below only unlinks the tmp path, it never closes a
+        # fd that was never wrapped. Guard the handoff explicitly.
+        try:
+            f = os.fdopen(fd, "w")
+        except Exception:
+            os.close(fd)
+            raise
+        with f:
             f.write(content)
             if fsync:
                 f.flush()

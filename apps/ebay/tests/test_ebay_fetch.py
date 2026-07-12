@@ -677,6 +677,30 @@ class TestAtomicWriteJsonHelper:
         assert _leftover_tmp_files(path) == []
         assert not path.exists()
 
+    def test_fdopen_failure_with_mode_closes_fd_and_cleans_up_tmp(self, tmp_path):
+        """BUI-341: os.fdopen(fd) can itself raise (e.g. OOM) before the
+        `with` takes ownership of fd in the mode!=None branch — the outer
+        finally only unlinks the tmp path, so without an explicit close the
+        raw fd from os.open() would leak. Verify os.close() is actually
+        invoked on it and the tmp file is still cleaned up."""
+        path = tmp_path / "secret.json"
+        closed_fds = []
+        real_close = ebay_fetch.os.close
+
+        def spy_close(fd):
+            closed_fds.append(fd)
+            real_close(fd)
+
+        with patch.object(ebay_fetch.os, "fdopen", side_effect=OSError("simulated OOM")), \
+                patch.object(ebay_fetch.os, "close", side_effect=spy_close) as mock_close:
+            with pytest.raises(OSError, match="simulated OOM"):
+                ebay_fetch.atomic_write_json(path, {"token": "x"}, mode=0o600)
+
+        assert mock_close.called
+        assert len(closed_fds) == 1
+        assert _leftover_tmp_files(path) == []
+        assert not path.exists()
+
     def test_replace_failure_cleanup_error_does_not_mask_original_exception(self, tmp_path):
         """If the best-effort tmp.unlink() cleanup itself fails, the original
         write/replace OSError must still propagate — not be swallowed or
