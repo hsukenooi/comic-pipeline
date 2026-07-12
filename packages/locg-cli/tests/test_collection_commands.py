@@ -2299,6 +2299,44 @@ def test_record_win_metron_degraded_disables_metron(tmp_path):
     assert metron.lookup_issue.call_count == 1
 
 
+def test_record_win_metron_5xx_disables_metron(tmp_path):
+    """BUI-342: a Metron 5xx trips the SAME per-batch breaker as a rate-limit /
+    connection failure. A real MetronClient returns None (no exception) after
+    its single capped 5xx retry but flips .degraded True; once tripped, the
+    remaining rows fall back to manual and Metron is never called again —
+    instead of hammering a down server and silently recording every win as
+    'not in Metron' (the exact failure the ticket describes)."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.degraded = False
+
+    def _server_error_lookup(*_args, **_kwargs):
+        # Mirrors a real MetronClient after an exhausted 5xx retry: None + degraded.
+        metron.degraded = True
+        return None
+
+    metron.lookup_issue.side_effect = _server_error_lookup
+
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", series="Ghost Rider", issue="1"),
+            _make_win(item_id="2", series="Ghost Rider", issue="2"),
+        ],
+        cache=cache,
+        metron=metron,
+    )
+
+    # Both rows still get written; Metron is called exactly once — the breaker
+    # trips before row 2 ever asks it.
+    assert result["rows_written"] == 2
+    assert result["manual_series_count"] == 2
+    assert result["partial_failure"] is False
+    assert metron.lookup_issue.call_count == 1
+
+
 def test_record_win_metron_degraded_false_does_not_disable(tmp_path):
     """A genuine, exception-free 'no match' (degraded stays False) must NOT
     trip the breaker — every row still gets its own Metron attempt."""

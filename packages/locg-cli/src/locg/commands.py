@@ -2605,10 +2605,11 @@ RECORD_WIN_CHUNK_SIZE = 25
 def _check_metron_degraded(metron: Any, metron_disabled: bool) -> bool:
     """BUI-255: trip the per-batch Metron breaker on throttle/timeout.
 
-    ``metron.degraded`` is set by ``MetronClient``'s rate-limit-retry decorator
-    (BUI-260, exhausted a single capped 60s retry) or by a connection-error
-    ``ApiError`` — i.e. Metron itself signaling "this call failed because I'm
-    throttled/unreachable", never a genuine, exception-free "no match". Once
+    ``metron.degraded`` is set by ``MetronClient``'s retry decorator (BUI-260,
+    exhausted a single capped rate-limit retry; BUI-342, exhausted a single
+    capped 5xx retry) or by a connection-error ``ApiError`` — i.e. Metron itself
+    signaling "this call failed because I'm throttled/unreachable/erroring",
+    never a genuine, exception-free "no match". Once
     tripped, the caller stops calling Metron for the rest of the batch (same
     fallback ``MetronCredentialError`` already uses) instead of repeating a
     capped-but-still-real sleep on every remaining row — a 44-row batch could
@@ -2624,8 +2625,8 @@ def _check_metron_degraded(metron: Any, metron_disabled: bool) -> bool:
         return True
     if getattr(metron, "degraded", False) is True:
         logger.warning(
-            "Metron rate-limited/unreachable; disabling for the rest of this "
-            "record-win batch (remaining rows fall back to "
+            "Metron throttled/unreachable/erroring; disabling for the rest of "
+            "this record-win batch (remaining rows fall back to "
             "needs_manual_series_canonical)."
         )
         return True

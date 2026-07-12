@@ -373,6 +373,183 @@ def test_degraded_resets_on_next_successful_call():
 
 
 # ---------------------------------------------------------------------------
+# MetronClient.degraded — Metron 5xx server error (BUI-342)
+# ---------------------------------------------------------------------------
+
+def _server_error_api_error(status: int = 500) -> Any:
+    """Build an ``ApiError`` shaped exactly like mokkari's on a Metron 5xx.
+
+    mokkari's ``_handle_http_response`` does ``raise ApiError(msg) from err``
+    where ``err`` is the ``requests`` ``HTTPError`` from ``raise_for_status()``,
+    so the ``ApiError.__cause__`` carries ``.response.status_code``. We rebuild
+    that exact chain so the test exercises real detection (via ``__cause__``),
+    not a hand-set attribute.
+    """
+    import requests
+    from mokkari.exceptions import ApiError
+
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = b"Server Error"
+    resp.url = "https://metron.cloud/api/issue/"
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as err:
+        try:
+            raise ApiError(f"HTTP error: {err!r} | Response body: {resp.text}") from err
+        except ApiError as api_exc:
+            return api_exc
+    raise AssertionError("raise_for_status did not raise")  # pragma: no cover
+
+
+def test_degraded_true_on_server_error_5xx():
+    """A Metron 5xx (ApiError wrapping a 500) trips the batch breaker."""
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = _server_error_api_error(500)
+
+    with patch("locg.metron.time.sleep"):
+        assert client.lookup_issue("Fantastic Four", "1") is None
+    assert client.degraded is True
+
+
+def test_server_error_5xx_retries_once_then_succeeds():
+    """A single 5xx is retried once and can still succeed with degraded=False."""
+    client, session = _make_client_with_session(issues_list=[_mock_issue(id=100)])
+    session.series_list.side_effect = [
+        _server_error_api_error(503),
+        [_mock_series(id=1)],
+    ]
+
+    with patch("locg.metron.time.sleep") as mock_sleep:
+        result = client.lookup_issue("Fantastic Four", "1")
+
+    assert result is not None
+    assert result["metron_id"] == 100
+    assert session.series_list.call_count == 2
+    assert client.degraded is False
+    mock_sleep.assert_called_once()  # the single capped 5xx retry sleep
+
+
+def test_server_error_5xx_gives_up_after_second_5xx(caplog):
+    """A 5xx on both the call and its retry gives up -> None, degraded True,
+    and is logged at WARNING (not the DEBUG level of a genuine no-match)."""
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = _server_error_api_error(500)
+
+    with patch("locg.metron.time.sleep") as mock_sleep:
+        with caplog.at_level(logging.WARNING, logger="locg"):
+            result = client.lookup_issue("Fantastic Four", "1")
+
+    assert result is None
+    assert client.degraded is True
+    assert session.series_list.call_count == 2  # one retry
+    mock_sleep.assert_called_once()
+    assert any("5xx" in rec.message for rec in caplog.records)
+
+
+def test_degraded_false_on_4xx_api_error():
+    """A 4xx (client error, e.g. 404 wrapped with a chained response) is NOT a
+    5xx and must NOT trip the breaker — it is a genuine miss, not an outage."""
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = _server_error_api_error(404)
+
+    assert client.lookup_issue("Fantastic Four", "1") is None
+    assert client.degraded is False
+    # No retry for a 4xx — it hits the blanket handler and returns None directly.
+    assert session.series_list.call_count == 1
+
+
+def test_degraded_false_on_data_shape_api_error_no_cause():
+    """A data-shape ApiError (no chained HTTP response) is not a 5xx — a genuine
+    no-match must never look like an outage (the core BUI-342 regression guard)."""
+    from mokkari.exceptions import ApiError
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = ApiError("1 validation error for Issue")
+
+    assert client.lookup_issue("Fantastic Four", "1") is None
+    assert client.degraded is False
+    assert session.series_list.call_count == 1
+
+
+def test_is_server_error_detection_matrix():
+    """Unit-level: only a 5xx-with-recoverable-status is a server error."""
+    from locg.metron import _is_server_error
+    from mokkari.exceptions import ApiError
+
+    assert _is_server_error(_server_error_api_error(500)) is True
+    assert _is_server_error(_server_error_api_error(599)) is True
+    assert _is_server_error(_server_error_api_error(404)) is False
+    assert _is_server_error(_server_error_api_error(429)) is False
+    assert _is_server_error(ApiError("Connection error: timed out")) is False
+    assert _is_server_error(ApiError("no cause")) is False
+    assert _is_server_error(ConnectionError("not even an ApiError")) is False
+
+
+def test_is_server_error_against_real_mokkari_raise_path():
+    """Contract guard: detection is coupled to mokkari raising ``ApiError from
+    HTTPError`` on a 5xx (the ``__cause__`` chain we read). Drive mokkari's OWN
+    ``_handle_http_response`` (not our hand-built chain) so that if a future
+    mokkari upgrade stops chaining the HTTPError, this fails LOUDLY here instead
+    of silently regressing the breaker to never-trips (the pre-BUI-342 bug)."""
+    import mokkari
+    import requests
+    from locg.metron import _is_server_error
+
+    session = mokkari.api("u", "p", user_agent="locg-cli-test")  # offline; no network at construction
+    for status, expected in ((500, True), (503, True), (404, False)):
+        resp = requests.Response()
+        resp.status_code = status
+        resp._content = b"body"
+        resp.url = "https://metron.cloud/api/issue/"
+        try:
+            session._handle_http_response(resp)
+            raise AssertionError(f"mokkari did not raise on {status}")
+        except AssertionError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — pin whatever mokkari raises
+            assert _is_server_error(exc) is expected, (
+                f"mokkari 5xx-detection contract broke for {status}: {exc!r}"
+            )
+
+
+def test_5xx_then_rate_limit_on_retry_trips_degraded_no_escape():
+    """Cross-class retry (BUI-342): a 5xx that becomes a 429 on the retry must
+    trip the breaker and return None — NOT let an exception escape the decorator
+    into the batch caller (which only catches MetronCredentialError)."""
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = [
+        _server_error_api_error(500),
+        RateLimitError("rate limited", retry_after=5),
+    ]
+
+    with patch("locg.metron.time.sleep"):
+        result = client.lookup_issue("Fantastic Four", "1")  # must not raise
+
+    assert result is None
+    assert client.degraded is True
+    assert session.series_list.call_count == 2
+
+
+def test_rate_limit_then_5xx_on_retry_trips_degraded_no_escape():
+    """The mirror case: a 429 that becomes a 5xx on the retry also trips the
+    breaker and returns None rather than escaping the decorator."""
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = [
+        RateLimitError("rate limited", retry_after=5),
+        _server_error_api_error(500),
+    ]
+
+    with patch("locg.metron.time.sleep"):
+        result = client.lookup_issue("Fantastic Four", "1")  # must not raise
+
+    assert result is None
+    assert client.degraded is True
+    assert session.series_list.call_count == 2
+
+
+# ---------------------------------------------------------------------------
 # lookup_issue_detail — variant cover names (BUI-33)
 # ---------------------------------------------------------------------------
 
