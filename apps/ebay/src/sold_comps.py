@@ -597,6 +597,12 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     publisher = book.get("publisher")
     variant = book.get("variant")  # BUI-304: now a query keyword, not DB-only
     self_id = str(book.get("item_id", ""))
+    # BUI-348: opt-in graded-comp fetch for the CGC-proxy tier. Default (field
+    # absent/falsy) keeps exclude_graded=True — every existing caller's queries
+    # stay byte-for-byte identical. Only a book explicitly tagged
+    # `include_graded: true` (comic-fmv's second, proxy-only pass) drops the
+    # `-cgc -cbcs -graded -slab` terms so the CGC/CBCS slab ladder surfaces.
+    exclude_graded = not bool(book.get("include_graded"))
 
     queries_used: list[dict] = []
     seen_ids: set[str] = set()
@@ -634,13 +640,13 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
 
     # Tier 1 — base
     base_nkw = build_query(title, issue, year=year, publisher=publisher,
-                           variant=variant)
+                           variant=variant, exclude_graded=exclude_graded)
     _run("base", base_nkw)
 
     # Tier 2 — auto-broaden if thin
     if len(comps) < THIN_RESULTS_THRESHOLD and year:
         broader_nkw = build_query(title, issue, year=None, publisher=publisher,
-                                  variant=variant)
+                                  variant=variant, exclude_graded=exclude_graded)
         _run("broader", broader_nkw)
 
     # Tier 3 — grade-targeted if too few grade-tagged comps in pool so far
@@ -652,7 +658,8 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         label = _grade_label_for_query(target_grade)
         if label:
             grade_nkw = build_query(title, issue, year=year, publisher=publisher,
-                                    variant=variant, grade_label=label)
+                                    variant=variant, grade_label=label,
+                                    exclude_graded=exclude_graded)
             _run("grade-targeted", grade_nkw)
 
     out_input = {
@@ -778,6 +785,10 @@ def main(argv=None) -> int:
     p.add_argument("--variant", help="Distribution variant keyword (e.g. Newsstand).")
     p.add_argument("--grade", type=float, help="Target grade (single-query mode).")
     p.add_argument("--item-id", help="Self-exclude this product_id from comps.")
+    p.add_argument("--include-graded", action="store_true",
+                   help="Include CGC/CBCS graded (slab) comps instead of "
+                        "excluding them (BUI-348, for the CGC-proxy tier). "
+                        "Default: graded copies are excluded.")
     p.add_argument("--out", help="Write full JSON to this path ('-' for stdout).")
     p.add_argument("--force", action="store_true",
                    help="Bypass cache and refetch.")
@@ -806,6 +817,7 @@ def main(argv=None) -> int:
             "variant": args.variant,
             "grade": args.grade,
             "item_id": args.item_id,
+            "include_graded": args.include_graded,
         }]
     else:
         p.error("provide --batch <file> or (--title and --issue)")

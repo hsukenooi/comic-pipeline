@@ -223,6 +223,27 @@ class TestBuildQuery:
         q = sc.build_query("Batman", "224", year=1970, grade_label="FN")
         assert " FN " in q or q.endswith(" FN") or " FN -" in q
 
+    # ── BUI-348: exclude_graded toggle ──────────────────────────────────────
+    def test_default_excludes_graded(self):
+        q = sc.build_query("Amazing Spider-Man", "50", year=1967)
+        for t in ("-cgc", "-cbcs", "-graded", "-slab"):
+            assert t in q
+
+    def test_include_graded_omits_exclusion_terms(self):
+        q = sc.build_query("Amazing Spider-Man", "50", year=1967,
+                           exclude_graded=False)
+        for t in ("-cgc", "-cbcs", "-graded", "-slab"):
+            assert t not in q
+
+    def test_include_graded_only_removes_graded_terms(self):
+        # Dropping graded exclusion must NOT disturb the rest of the query — the
+        # base phrase, year, and BUI-347 vintage hardening are all still present.
+        q = sc.build_query("Amazing Spider-Man", "50", year=1967,
+                           exclude_graded=False)
+        assert '"Amazing Spider-Man 50"' in q
+        assert "1967" in q
+        assert "-variant" in q  # vintage-masthead hardening independent of graded
+
     # ── BUI-304 (issue 1): variant appended as a query keyword ──────────────
     def test_variant_appended_when_present(self):
         q = sc.build_query("X-Men", "123", variant="Newsstand")
@@ -763,6 +784,46 @@ class TestTieredStrategy:
         # base + broader + grade-targeted all fired, each carrying the variant.
         assert len(calls) == 3
         assert all("Newsstand" in nkw for nkw in calls)
+
+    _GRADED_TERMS = ("-cgc", "-cbcs", "-graded", "-slab")
+
+    def test_default_excludes_graded_on_every_tier(self, tmp_path, monkeypatch):
+        """BUI-348: a book WITHOUT include_graded keeps the graded-exclusion
+        terms on every tier — byte-for-byte the pre-BUI-348 behavior."""
+        results = [
+            [self._comp(str(i)) for i in range(2)],          # thin base → broaden
+            [self._comp(str(100 + i)) for i in range(3)],    # broader (ungraded)
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        sc.fetch_book_comps(
+            {"title": "Amazing Spider-Man", "issue": "50", "year": 1967,
+             "grade": 6.5},
+            "key",
+        )
+        assert len(calls) == 3  # all tiers fired
+        for nkw in calls:
+            assert all(t in nkw for t in self._GRADED_TERMS)
+
+    def test_include_graded_drops_exclusion_on_every_tier(self, tmp_path, monkeypatch):
+        """BUI-348: include_graded=True fetches CGC/CBCS slab comps by dropping
+        the graded-exclusion terms — on every tier that fires."""
+        results = [
+            [self._comp(str(i)) for i in range(2)],          # thin base → broaden
+            [self._comp(str(100 + i)) for i in range(3)],    # broader
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        sc.fetch_book_comps(
+            {"title": "Amazing Spider-Man", "issue": "50", "year": 1967,
+             "grade": 6.5, "include_graded": True},
+            "key",
+        )
+        assert len(calls) == 3
+        for nkw in calls:
+            assert not any(t in nkw for t in self._GRADED_TERMS)
+        # The vintage-masthead hardening (BUI-347) is INDEPENDENT of the graded
+        # switch — it must still fire on this pre-2000 rebootable masthead so a
+        # modern slab reprint doesn't pollute the ladder.
+        assert "-variant" in calls[0]
 
 
 # ─── End-to-end-ish: batch driver ────────────────────────────────────────────

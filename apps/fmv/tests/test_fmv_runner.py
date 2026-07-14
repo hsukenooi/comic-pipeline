@@ -1214,3 +1214,248 @@ class TestMalformedQueryIsNotFetchError:
             ],
         }
         assert fmv_runner._is_fetch_error(r) is False
+
+
+# ─── CGC-proxy rescue (BUI-348) ───────────────────────────────────────────────
+
+def _graded_result(req_id, ladder_comps):
+    """A graded ebay-sold-comps result echoing _req_id, carrying slab comps."""
+    return {"input": {"_req_id": req_id}, "comps": ladder_comps, "queries_used": []}
+
+
+def _slab(price, grade):
+    """A slab comp as ebay-sold-comps returns it: grade + price + CGC in title."""
+    return {"grade": grade, "price": price,
+            "title": f"Amazing Spider-Man 50 CGC {grade}"}
+
+
+_ASM50_SLABS = [
+    _slab(636, 4.0), _slab(780, 5.0), _slab(880, 5.0),
+    _slab(1200, 6.5), _slab(1800, 7.0), _slab(2143, 7.0),
+]
+
+
+class TestSlabCompsOnly:
+    def test_keeps_cgc_and_cbcs_drops_raw(self):
+        comps = [
+            {"grade": 6.5, "price": 1200, "title": "ASM 50 CGC 6.5"},
+            {"grade": 6.0, "price": 700, "title": "ASM 50 CBCS 6.0"},
+            {"grade": 6.0, "price": 650, "title": "ASM 50 FN 6.0 raw"},  # raw → dropped
+            {"grade": 5.5, "price": 600, "title": "ASM 50 ungraded VG/FN"},  # dropped
+        ]
+        out = fmv_runner._slab_comps_only(comps)
+        prices = sorted(c["price"] for c in out)
+        assert prices == [700, 1200]  # only the two certified slabs survive
+
+    def test_drops_comps_missing_grade_or_price(self):
+        comps = [
+            {"grade": None, "price": 1200, "title": "ASM 50 CGC"},
+            {"grade": 6.5, "price": None, "title": "ASM 50 CGC 6.5"},
+        ]
+        assert fmv_runner._slab_comps_only(comps) == []
+
+
+class TestIsUnpricedRaw:
+    def test_n0_no_number_is_candidate(self):
+        r = {"input": {"grade": 6.5}, "fmv": {"fmv_high": None, "interpolated": False}}
+        assert fmv_runner._is_unpriced_raw(r) is True
+
+    def test_priced_book_is_not_candidate(self):
+        r = {"input": {"grade": 6.5}, "fmv": {"fmv_high": 200, "interpolated": False}}
+        assert fmv_runner._is_unpriced_raw(r) is False
+
+    def test_interpolated_book_is_not_candidate(self):
+        r = {"input": {"grade": 6.5}, "fmv": {"fmv_high": 200, "interpolated": True}}
+        assert fmv_runner._is_unpriced_raw(r) is False
+
+    def test_no_numeric_grade_is_not_candidate(self):
+        r = {"input": {"grade": None}, "fmv": {"fmv_high": None, "interpolated": False}}
+        assert fmv_runner._is_unpriced_raw(r) is False
+
+
+class TestCgcProxyRescue:
+    def test_sparse_high_value_book_is_rescued(self, server_url):
+        books = [{"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False,
+                             "flag_reason": None},
+                     "source": "fresh"}}
+        upserts = []
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]) as fetch_mock, \
+             patch("fmv_runner._upsert_fmv",
+                   side_effect=lambda *a, **k: upserts.append(a[2])
+                   or {"comic_id": 7, "fmv_id": 9}):
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        # Graded pass ran with include_graded=True on the candidate book.
+        graded_books = fetch_mock.call_args[0][0]
+        assert graded_books[0]["include_graded"] is True
+        assert graded_books[0]["_idx"] == 0
+        # Result replaced with a proxy band, re-upserted, ids refreshed.
+        assert fresh[0]["source"] == "cgc-proxy"
+        assert fresh[0]["fmv"]["cgc_proxy"] is True
+        assert 600 <= fresh[0]["fmv"]["fmv_low"] <= fresh[0]["fmv"]["fmv_high"] <= 680
+        assert fresh[0]["fmv"]["confidence"] == "MEDIUM-LOW"
+        assert fresh[0]["comic_id"] == 7 and fresh[0]["fmv_id"] == 9
+        assert fresh[0]["db_row"] == {"comic_id": 7, "fmv_id": 9}
+        assert len(upserts) == 1
+
+    def test_modern_book_is_not_rescued(self, server_url):
+        # The 0.50-0.55 factor is vintage-calibrated; a modern book (year >=
+        # cutoff) must never reach the proxy even with a sparse raw pool.
+        fresh = {0: {"input": {"grade": 9.8, "year": 2021}, "source": "fresh",
+                     "fmv": {"fmv_high": None, "interpolated": False}}}
+        with patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, [{"grade": 9.8, "year": 2021}],
+                server_url=server_url, force=False)
+        fetch_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+        assert fresh[0]["source"] == "fresh"
+
+    def test_book_without_year_is_not_rescued(self, server_url):
+        # Conservative: no cover year → can't confirm vintage → no proxy.
+        fresh = {0: {"input": {"grade": 6.5}, "source": "fresh",
+                     "fmv": {"fmv_high": None, "interpolated": False}}}
+        with patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, [{"grade": 6.5}], server_url=server_url, force=False)
+        fetch_mock.assert_not_called()
+        assert fresh[0]["source"] == "fresh"
+
+    def test_proxy_upsert_failure_leaves_needs_manual(self, server_url, capsys):
+        # A server blip on the best-effort proxy WRITE must not promote the
+        # in-memory result to a price the DB doesn't hold, nor abort the run.
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False},
+                     "source": "fresh"}}
+        books = [{"title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv", return_value=None):  # soft-fail
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        assert fresh[0]["source"] == "fresh"          # NOT promoted
+        assert fresh[0]["fmv"].get("cgc_proxy") is None
+        assert "CGC-proxy upsert failed" in capsys.readouterr().err
+
+    def test_multi_candidate_maps_by_req_id_not_position(self, server_url):
+        # Two vintage sparse candidates (idx 0 and 2); the graded pass returns
+        # results in REVERSE order. Each must get its OWN ladder-derived band —
+        # mapping by _req_id, never by list position (BUI-174/187).
+        low_ladder = [_slab(636, 4.0), _slab(780, 5.0), _slab(880, 5.0),
+                      _slab(1200, 6.5), _slab(1800, 7.0), _slab(2143, 7.0)]
+        high_ladder = [_slab(1500, 6.0), _slab(1600, 6.0), _slab(2000, 8.0),
+                       _slab(2100, 8.0), _slab(2600, 9.0), _slab(2700, 9.0)]
+        fresh = {
+            0: {"input": {"grade": 6.5, "year": 1967}, "source": "fresh",
+                "fmv": {"fmv_high": None, "interpolated": False}},
+            1: {"input": {"grade": 9.2, "year": 1975},   # priced → not a candidate
+                "fmv": {"fmv_high": 100, "fmv_low": 80, "interpolated": False},
+                "source": "fresh"},
+            2: {"input": {"grade": 8.0, "year": 1968}, "source": "fresh",
+                "fmv": {"fmv_high": None, "interpolated": False}},
+        }
+        books = [{"grade": 6.5, "year": 1967}, {"grade": 9.2, "year": 1975},
+                 {"grade": 8.0, "year": 1968}]
+        # Results deliberately reversed relative to candidate order.
+        graded = [_graded_result(2, high_ladder), _graded_result(0, low_ladder)]
+        with patch("fmv_runner._fetch_comps", return_value=graded), \
+             patch("fmv_runner._upsert_fmv", return_value={"comic_id": 1}):
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        # idx 0 priced off the low ladder (slab 6.5=$1200 → ~$600-650).
+        assert 600 <= fresh[0]["fmv"]["fmv_low"] <= 660
+        # idx 2 priced off the high ladder (slab 8.0=$2050 → ~$1025-1125).
+        assert fresh[2]["fmv"]["fmv_low"] >= 1000
+        # idx 1 (already priced) untouched.
+        assert fresh[1]["source"] == "fresh"
+        assert fresh[1]["fmv"].get("cgc_proxy") is None
+
+    def test_priced_book_is_never_touched(self, server_url):
+        # Regression invariant: a book the raw math already priced must not
+        # trigger any graded fetch or upsert — proxy tier is strictly additive.
+        priced_fmv = {"fmv_high": 150, "fmv_low": 100, "interpolated": False,
+                      "confidence": "MEDIUM"}
+        fresh = {0: {"input": {"grade": 9.2}, "fmv": dict(priced_fmv),
+                     "source": "fresh"}}
+        with patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, [{"grade": 9.2}], server_url=server_url, force=False)
+        fetch_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+        assert fresh[0]["fmv"] == priced_fmv  # unchanged
+        assert fresh[0]["source"] == "fresh"
+
+    def test_soft_fetch_failure_leaves_needs_manual(self, server_url, capsys):
+        fresh = {0: {"input": {"grade": 6.5, "year": 1967}, "source": "fresh",
+                     "fmv": {"fmv_high": None, "interpolated": False}}}
+        with patch("fmv_runner._fetch_comps", return_value=None), \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, [{"grade": 6.5, "year": 1967}],
+                server_url=server_url, force=False)
+        upsert_mock.assert_not_called()
+        assert fresh[0]["source"] == "fresh"          # not rescued
+        assert fresh[0]["fmv"]["fmv_high"] is None
+        assert "CGC-proxy graded fetch failed" in capsys.readouterr().err
+
+    def test_thin_ladder_leaves_needs_manual(self, server_url):
+        fresh = {0: {"input": {"grade": 6.5, "year": 1967}, "source": "fresh",
+                     "fmv": {"fmv_high": None, "interpolated": False}}}
+        thin = [_slab(1200, 6.5)]  # 1 slab comp < MIN_LADDER_COMPS
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, thin)]), \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, [{"grade": 6.5, "year": 1967}],
+                server_url=server_url, force=False)
+        upsert_mock.assert_not_called()
+        assert fresh[0]["source"] == "fresh"
+        assert fresh[0]["fmv"].get("cgc_proxy") is None  # never overwritten
+
+
+class TestCgcProxyNotesAndTable:
+    def test_notes_carry_cgc_proxy_token(self):
+        proxy = fmv_math.cgc_proxy_fmv(_ASM50_SLABS, target_grade=6.5)
+        proxy["first_party_count"] = 0
+        notes = fmv_runner._build_notes(proxy)
+        assert "CGC proxy" in notes
+        assert "bid_haircut" in notes and "cgc_proxy" in notes
+
+    def test_cached_proxy_row_recovers_marker_and_caps_bid(self):
+        # A persisted proxy row: fmv_confidence collapses to "low", notes carry
+        # the "CGC proxy" token. On reuse the factor must be re-capped at the
+        # proxy rung (not the full 0.80×) and the marker recovered.
+        row = {"fmv_low": 600, "fmv_high": 650, "fmv_comps": 6,
+               "fmv_confidence": "low",
+               "fmv_notes": "window=±0.5 | CGC proxy: slab 6.5=$1200 × 0.5-0.55 raw"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["cgc_proxy"] is True
+        assert out["bid_factor"] <= fmv_math.CGC_PROXY_BID_FACTOR
+        assert out["max_bid"] == fmv_math.clean_round(650 * out["bid_factor"])
+
+    def test_cached_non_proxy_row_unaffected(self):
+        row = {"fmv_low": 100, "fmv_high": 150, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5 | cv=20%"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["cgc_proxy"] is False
+
+    def test_db_row_shape_parity_with_compute_fmv(self):
+        # The cache-reuse projection must carry every key compute_fmv emits, so
+        # downstream readers can iterate either dict uniformly (guards the
+        # effective_n / cgc_proxy drift the reviewers flagged).
+        computed = fmv_math.compute_fmv([{"price": 100, "grade": 9.2}],
+                                        target_grade=9.2)
+        row = {"fmv_low": 100, "fmv_high": 150, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5 | cv=20%"}
+        projected = fmv_runner._fmv_from_db_row(row)
+        for key in computed:
+            assert key in projected, f"_fmv_from_db_row missing key {key!r}"

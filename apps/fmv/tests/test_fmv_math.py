@@ -843,3 +843,148 @@ class TestInterpolationInComputeFmv:
         assert out["flag_reason"] is None          # priced, not needs_manual
         assert out["confidence"] == "LOW"          # n=2, cv defined → LOW rung
         assert out["bid_factor"] == fm.BASE_BID_FACTOR
+
+
+# ─── CGC-proxy tier (BUI-348) ─────────────────────────────────────────────────
+
+def _slab(price, grade):
+    """A graded (slab) comp — same shape as a raw comp, just a certified grade."""
+    return {"price": price, "grade": grade}
+
+
+# The ASM #50 (1967, 1st Kingpin) ladder from the ticket: the incident that
+# motivated the tier. eBay CGC sold: 4.0→$636, 5.0→$780-880, 6.5→$1200,
+# 7.0→$1800-2143. Hand-priced raw 6.5 band was $600-680.
+_ASM50_LADDER = [
+    _slab(636, 4.0),
+    _slab(780, 5.0), _slab(880, 5.0),
+    _slab(1200, 6.5),
+    _slab(1800, 7.0), _slab(2143, 7.0),
+]
+
+
+class TestCgcLadderPrice:
+    def test_exact_bucket_returned_directly(self):
+        ladder = {4.0: 636.0, 6.5: 1200.0, 7.0: 1971.5}
+        assert fm.cgc_ladder_price(ladder, 6.5) == 1200.0
+
+    def test_exact_match_preferred_over_interpolation(self):
+        # Unlike the raw §7 interpolate_grade_curve (which returns None on an
+        # exact match), the ladder USES the exact slab bucket — it's the anchor.
+        ladder = {5.0: 800.0, 6.5: 1200.0, 7.0: 2000.0}
+        assert fm.cgc_ladder_price(ladder, 6.5) == 1200.0
+
+    def test_interpolates_between_brackets(self):
+        ladder = {5.0: 800.0, 7.0: 2000.0}  # target 6.0 → midpoint 1400
+        assert fm.cgc_ladder_price(ladder, 6.0) == pytest.approx(1400.0)
+
+    def test_below_ladder_returns_none_no_extrapolation(self):
+        ladder = {4.0: 636.0, 6.5: 1200.0}
+        assert fm.cgc_ladder_price(ladder, 3.0) is None
+
+    def test_above_ladder_returns_none_no_extrapolation(self):
+        ladder = {4.0: 636.0, 6.5: 1200.0}
+        assert fm.cgc_ladder_price(ladder, 9.8) is None
+
+    def test_empty_ladder_returns_none(self):
+        assert fm.cgc_ladder_price({}, 6.5) is None
+
+
+class TestCgcProxyFmv:
+    def test_asm50_band_matches_hand_price(self):
+        """AC: ASM #50 raw 6.5 produces a ~$600-680 band from the CGC ladder
+        (validated via this synthetic fixture, NOT a live SerpApi pull)."""
+        out = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
+        assert out is not None
+        assert out["cgc_proxy"] is True
+        # slab 6.5 = $1200; band = [0.50, 0.55] × 1200 = $600-660 (clean-rounded)
+        assert out["fmv_low"] == 600
+        assert out["fmv_high"] == 650
+        assert 600 <= out["fmv_low"] <= out["fmv_high"] <= 680
+        assert out["median"] == 625
+        assert out["confidence"] == "MEDIUM-LOW"
+        assert out["cgc_ladder"]["slab_price"] == 1200.0
+
+    def test_confidence_capped_medium_low_regardless_of_ladder_size(self):
+        big = [_slab(1200, 6.5) for _ in range(40)]
+        out = fm.cgc_proxy_fmv(big, target_grade=6.5)
+        assert out["confidence"] == "MEDIUM-LOW"  # never HIGH, however many comps
+
+    def test_bid_factor_capped_at_proxy_rung(self):
+        out = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
+        # No grade_confidence: MEDIUM-LOW label alone would bid 0.80×; the proxy
+        # cap pulls it to 0.70 so the label actually constrains the bid.
+        assert out["bid_factor"] == fm.CGC_PROXY_BID_FACTOR
+        assert out["max_bid"] == fm.clean_round(out["fmv_high"] * fm.CGC_PROXY_BID_FACTOR)
+
+    def test_lower_grade_confidence_wins_over_proxy_cap(self):
+        # A present-and-lower photo grade_confidence must still win (min of the
+        # two), exactly like the §7 interpolated haircut.
+        out = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5,
+                               grade_confidence="low")
+        assert out["bid_factor"] == 0.60  # LOW grade_conf < 0.70 proxy cap
+
+    def test_interpolated_target_grade(self):
+        # Target 6.0 not in ladder → interpolate the slab price between the
+        # nearest bracketing buckets that hold >=2 comps (the thin-bracket money
+        # guard). In _ASM50_LADDER only 5.0 (n=2) and 7.0 (n=2) qualify — the
+        # single-comp 4.0 and 6.5 buckets can't anchor — so 6.0 brackets 5.0–7.0.
+        out = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.0)
+        assert out is not None
+        slab = out["cgc_ladder"]["slab_price"]
+        assert 830.0 < slab < 1971.5  # strictly between the 5.0 and 7.0 medians
+
+    def test_interpolation_requires_two_comp_anchors(self):
+        # A ladder whose only bracket for the target rests on single-comp buckets
+        # can't interpolate (BUI-318 thin-bracket guard) and stays needs_manual.
+        # 5.0 (n=1) below, 8.0 (n=1) above, plus a filler 9.8 (n=1) → total>=3 but
+        # no >=2-comp bracket around target 6.0.
+        thin_brackets = [_slab(800, 5.0), _slab(2000, 8.0), _slab(9000, 9.8)]
+        assert fm.cgc_proxy_fmv(thin_brackets, target_grade=6.0) is None
+
+    def test_non_monotonic_ladder_refused(self):
+        # A lower grade priced ABOVE a higher grade (a premium/variant/mistagged
+        # bucket) makes the ladder non-monotonic → refuse to price (needs_manual),
+        # never emit a suspect bid cap. 6.0 median ($1500) > 6.5 median ($1200).
+        inverted = [_slab(636, 4.0), _slab(1500, 6.0), _slab(1550, 6.0),
+                    _slab(1200, 6.5), _slab(1250, 6.5)]
+        assert fm.cgc_proxy_fmv(inverted, target_grade=6.5) is None
+
+    def test_none_when_ladder_too_thin(self):
+        assert fm.cgc_proxy_fmv([_slab(1200, 6.5)], target_grade=6.5) is None
+
+    def test_none_when_below_value_floor(self):
+        cheap = [_slab(300, 6.5), _slab(310, 6.5), _slab(305, 6.5)]
+        assert fm.cgc_proxy_fmv(cheap, target_grade=6.5) is None
+
+    def test_none_when_target_outside_ladder(self):
+        # High-value ladder but target grade below the whole ladder → no extrapolation.
+        assert fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=2.0) is None
+
+    def test_none_when_no_graded_comps(self):
+        assert fm.cgc_proxy_fmv([], target_grade=6.5) is None
+
+    def test_bucket_median_is_outlier_robust(self):
+        # Three comps at 6.5 ($1200, $1250, wild $5000) → median $1250, ignoring
+        # the outlier (the mean would be $2483 → a wild over-price).
+        comps = [_slab(1200, 6.5), _slab(1250, 6.5), _slab(5000, 6.5),
+                 _slab(636, 4.0)]
+        out = fm.cgc_proxy_fmv(comps, target_grade=6.5)
+        assert out["cgc_ladder"]["slab_price"] == 1250.0
+
+
+class TestCgcProxyShapeParity:
+    def test_compute_fmv_marks_non_proxy(self):
+        # A normal raw result must carry cgc_proxy=False so downstream readers
+        # (table, notes, cache) can iterate the dict uniformly.
+        comps = [_comp(p, 9.2) for p in [100, 110, 120, 130, 140]]
+        out = fm.compute_fmv(comps, target_grade=9.2)
+        assert out["cgc_proxy"] is False
+        assert out["cgc_ladder"] is None
+
+    def test_proxy_dict_has_all_compute_fmv_keys(self):
+        raw = fm.compute_fmv([_comp(100, 9.2)], target_grade=9.2)
+        proxy = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
+        # Every key compute_fmv emits must exist on the proxy dict (drop-in shape).
+        for key in raw:
+            assert key in proxy, f"proxy dict missing key {key!r}"
