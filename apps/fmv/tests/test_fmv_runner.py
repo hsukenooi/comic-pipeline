@@ -1095,3 +1095,122 @@ class TestFetchCompsRobustness:
                                 force=False)
         assert seen["timeout"] == (fmv_runner._SUBPROCESS_TIMEOUT_BASE
                                    + 3 * fmv_runner._SUBPROCESS_TIMEOUT_PER_BOOK)
+
+
+# ─── BUI-346: title normalization at the buy→FMV handoff ─────────────────────
+
+class TestTitleNormalizationHelpers:
+    def test_strip_leading_article(self):
+        assert fmv_runner._strip_leading_article("The Amazing Spider-Man") == "Amazing Spider-Man"
+        assert fmv_runner._strip_leading_article("A Man Called X") == "Man Called X"
+        assert fmv_runner._strip_leading_article("An X-Men Story") == "X-Men Story"
+        assert fmv_runner._strip_leading_article("Amazing Spider-Man") == "Amazing Spider-Man"
+
+    def test_strip_embedded_issue(self):
+        assert fmv_runner._strip_embedded_issue("Amazing Spider-Man #50", "50") == "Amazing Spider-Man"
+        assert fmv_runner._strip_embedded_issue("Amazing Spider-Man 50", "50") == "Amazing Spider-Man"
+        # A different number (not the separate issue field) survives.
+        assert fmv_runner._strip_embedded_issue("Spider-Man 2099", "50") == "Spider-Man 2099"
+        # (?<!\d) guard: issue="99" must not chew into "2099".
+        assert fmv_runner._strip_embedded_issue("X-Men 2099", "99") == "X-Men 2099"
+
+    def test_normalize_book_title_acceptance(self):
+        """BUI-346 acceptance criterion: a working-list row with
+        title="The Amazing Spider-Man #50", issue="50" must normalize to the
+        same title as a row already clean: title="Amazing Spider-Man",
+        issue="50" — the real ASM #50 incident's doubled-phrase bug."""
+        doubled = {"title": "The Amazing Spider-Man #50", "issue": "50"}
+        clean = {"title": "Amazing Spider-Man", "issue": "50"}
+        fmv_runner._normalize_book_title(doubled)
+        fmv_runner._normalize_book_title(clean)
+        assert doubled["title"] == clean["title"] == "Amazing Spider-Man"
+
+    def test_normalize_book_title_noop_without_title_or_issue(self):
+        no_title = {"issue": "50"}
+        fmv_runner._normalize_book_title(no_title)
+        assert no_title == {"issue": "50"}
+
+        no_issue = {"title": "The Amazing Spider-Man #50"}
+        fmv_runner._normalize_book_title(no_issue)
+        assert no_issue["title"] == "The Amazing Spider-Man #50"  # untouched
+
+
+class TestRunNormalizesTitlesAtHandoff:
+    def test_run_normalizes_titles_before_fetch_comps(self, tmp_path, server_url):
+        """The batch read from disk (the buy→FMV handoff) must be normalized
+        BEFORE it reaches _fetch_comps' subprocess call to ebay-sold-comps —
+        not left for build_query's defense-in-depth alone to catch."""
+        batch = [
+            {"item_id": "1", "title": "The Amazing Spider-Man #50",
+             "issue": "50", "year": 1967, "grade": 4.5},
+        ]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out.json"
+
+        fake_result = [{
+            "input": {"_req_id": 0, "title": "Amazing Spider-Man", "issue": "50",
+                      "year": 1967, "grade": 4.5, "item_id": "1"},
+            "comps": [], "queries_used": [{"tier": "base", "nkw": 0}],
+        }]
+        with patch("fmv_runner._fetch_comps", return_value=fake_result) as fetch_mock, \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        sent_books = fetch_mock.call_args[0][0]
+        assert sent_books[0]["title"] == "Amazing Spider-Man"
+
+    def test_run_normalized_title_reaches_db_upsert(self, tmp_path, server_url):
+        # The DB `title` column is documented as "series name only, no issue
+        # number" (fmv.md) — the normalized title must reach the upsert too,
+        # not just the ebay-sold-comps subprocess call.
+        batch = [
+            {"item_id": "1", "title": "The Amazing Spider-Man #50",
+             "issue": "50", "year": 1967, "grade": 4.5},
+        ]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out.json"
+
+        fake_comps = [_make_comp(p, 4.5) for p in [400, 450, 500, 550, 600]]
+        fake_result = [{
+            "input": {"_req_id": 0, "title": "Amazing Spider-Man", "issue": "50",
+                      "year": 1967, "grade": 4.5, "item_id": "1"},
+            "comps": fake_comps,
+            "queries_used": [{"tier": "base", "cached": False}],
+        }]
+        with patch("fmv_runner._fetch_comps", return_value=fake_result), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}) as upsert:
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        upserted_input = upsert.call_args[0][1]
+        assert upserted_input["title"] == "Amazing Spider-Man"
+
+
+# ─── BUI-346: malformed/doubled query is 0-results, never fetch-err ──────────
+
+class TestMalformedQueryIsNotFetchError:
+    def test_doubled_title_zero_results_is_not_fetch_error(self):
+        """The other half of BUI-346's acceptance criterion: a 0-results-on-
+        all-tiers outcome caused by a malformed/empty query (e.g. the doubled
+        "...#50 50" phrase before normalization) must NOT be reported as
+        'fetch-err' — that implies a SerpApi quota/outage, sending an operator
+        chasing the API key instead of noticing the query itself was bad. A
+        malformed-but-syntactically-valid query still gets a clean 200 from
+        SerpApi with zero organic_results — no 'error' key on any tier — so
+        _is_fetch_error must read this as a genuine empty pool, not a fetch
+        failure."""
+        r = {
+            "comp_count_total": 0,
+            "queries_used": [
+                {"tier": "base", "nkw": '"The Amazing Spider-Man #50 50" 1967',
+                 "raw_results": 0, "new_comps": 0, "cached": False},
+                {"tier": "broader", "nkw": '"The Amazing Spider-Man #50 50"',
+                 "raw_results": 0, "new_comps": 0, "cached": False},
+            ],
+        }
+        assert fmv_runner._is_fetch_error(r) is False

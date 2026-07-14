@@ -66,6 +66,59 @@ def _coerce_grade(value) -> float | None:
     return _LETTER_GRADE_MAP.get(s.upper())
 
 
+# ─── BUI-346: title normalization at the buy→FMV handoff ─────────────────────
+#
+# The working-list `title` field is passed through from the eBay listing name
+# (built by the /comic:buy orchestration, not by deterministic code), so it
+# routinely carries a leading article ("The Amazing Spider-Man") and/or an
+# embedded "#<issue>" that duplicates the separate `issue` field. Left as-is,
+# `ebay-sold-comps`' `build_query` doubles it into a malformed phrase like
+# `"The Amazing Spider-Man #50 50"`, which returns 0 results on every tier
+# (real incident: ASM #50, 2026-07-13 buy run — see BUI-346).
+#
+# Normalizing HERE, at the top of `run()` before anything else touches the
+# batch, is the deterministic enforcement point for the handoff: every book
+# in the working list is cleaned up before it reaches DB-cache lookup, the
+# ebay-sold-comps subprocess, or the DB upsert (whose `title` column is
+# documented as "series name only, no issue number" — see fmv.md). This is
+# belt-and-suspenders with `build_query`'s own defense-in-depth normalization
+# (apps/ebay/src/sold_comps.py) — duplicated rather than shared, since
+# comic-fmv shells out to ebay-sold-comps rather than importing it (see
+# CLAUDE.md's "FMV pipeline shells out across package boundaries").
+
+_LEADING_ARTICLE_RE = re.compile(r'^(?:the|a|an)\s+', re.IGNORECASE)
+
+
+def _strip_leading_article(title: str) -> str:
+    """Strip a leading article ("The"/"A"/"An") from a series title."""
+    return _LEADING_ARTICLE_RE.sub('', title or '').strip()
+
+
+def _strip_embedded_issue(title: str, issue) -> str:
+    """Strip an embedded ``#<issue>`` (or a bare trailing issue token) from
+    *title* when it duplicates the separate `issue` field. The `(?<!\\d)`
+    guard on the trailing-token strip prevents chewing into an unrelated
+    longer number (e.g. issue="99" must not touch the "2099" in "X-Men 2099")."""
+    issue_str = str(issue).strip() if issue else ""
+    if not title or not issue_str:
+        return title
+    cleaned = re.sub(rf'#\s*{re.escape(issue_str)}\b', '', title, flags=re.IGNORECASE)
+    cleaned = re.sub(rf'(?<!\d){re.escape(issue_str)}\s*$', '', cleaned.strip())
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+def _normalize_book_title(book: dict) -> None:
+    """Normalize `book["title"]` in place — strip a leading article, then an
+    embedded/trailing issue number matching `book["issue"]`. No-op if title
+    or issue is missing (fails open: an un-normalizable book is left as-is,
+    not dropped)."""
+    title = book.get("title")
+    issue = book.get("issue")
+    if not title or issue is None:
+        return
+    book["title"] = _strip_embedded_issue(_strip_leading_article(title), issue)
+
+
 # ─── Public entry point ──────────────────────────────────────────────────────
 
 def _fail_mapping(detail: str) -> None:
@@ -100,6 +153,11 @@ def run(*, batch_path: str | None, out_path: str | None,
     if not books:
         click.echo("Empty batch.", err=True)
         sys.exit(0)
+
+    # BUI-346: normalize each book's title at the handoff boundary, before
+    # anything downstream (DB cache lookup, subprocess, DB upsert) sees it.
+    for book in books:
+        _normalize_book_title(book)
 
     # 1. DB cache reuse (skipped if --force)
     cached, needs_compute = _split_by_db_cache(
