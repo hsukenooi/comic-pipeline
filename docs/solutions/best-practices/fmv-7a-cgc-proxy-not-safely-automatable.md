@@ -1,6 +1,7 @@
 ---
 title: "Why fmv.md §7a (CGC-proxy fallback) is not safely automatable — keep it human/LLM-gated"
 date: 2026-07-11
+last_updated: 2026-07-14
 category: docs/solutions/best-practices
 module: comic-fmv (apps/fmv)
 problem_type: best_practice
@@ -47,12 +48,17 @@ The FMV pipeline feeds a **bid cap** — a wrong high number spends real money o
 - Any ticket or proposal to "automate §7a", "make thin-comp books return an FMV instead of needs_manual via a CGC proxy", or "wire a Google/Heritage/GoCollect price source into comic-fmv."
 - More generally: before moving *any* fmv.md step from the skill into deterministic code, ask whether its inputs are structured (like `engine=ebay`) or prose (like `engine=google`), and whether its trigger gate is computable at the point it fires.
 
-## The one defensible automation path (if ever revisited)
+## The one defensible automation path — TAKEN in BUI-348 (2026-07-14)
 
-Not the google-snippet extractor. The only deterministic, testable path is an **eBay graded-slab proxy**: drop the `-cgc` exclusion, fetch CGC slabs at the target grade via `engine=ebay` (structured, parseable), apply a conservative raw-discount, and cap the bid (e.g. ≤0.60×). This still bakes a raw/graded divergence discount into a bid cap and still needs a non-circular value gate — so it is a real product/risk decision that must be scoped as **its own risk-gated ticket** with the discount, robustness thresholds (min graded-comp count / CV), and quantile anchor all decided up front. It is a re-spec (eBay slabs, not Heritage), not "implementing §7a."
+Not the google-snippet extractor. The only deterministic, testable path is an **eBay graded-slab proxy**: drop the `-cgc` exclusion, fetch CGC slabs at the target grade via `engine=ebay` (structured, parseable), apply a conservative raw-discount, and cap the bid. This still bakes a raw/graded divergence discount into a bid cap and still needs a non-circular value gate — so it is a real product/risk decision that had to be scoped as **its own risk-gated ticket** with the discount, robustness thresholds (min graded-comp count / CV), and quantile anchor all decided up front. It is a re-spec (eBay slabs, not Heritage), not "implementing §7a."
+
+**This path was revisited and shipped as BUI-348** — a distinct CGC-proxy *tier*, not an automation of §7a's prose extractor. It does exactly what this section prescribed: it fires only as a **rescue** on a sparse-pool book the raw math left unpriced (a `needs_manual`), runs a second graded-only `engine=ebay` pass, builds a CGC/CBCS slab grade→price ladder, and prices `raw ≈ conservative_factor × slab[target]` as a **MEDIUM-LOW** band with the bid factor hard-capped, "CGC proxy" in Notes. The non-circular value gate is a **vintage-year gate** (the discount factor is calibrated to vintage eBay CGC *sold* prices), plus a minimum ladder-comp floor, a monotonicity refusal (an inverted/premium ladder is not priced), and a slab-title-only filter so raw copies can't pollute the ladder. See [fmv-doubled-title-issue-empty-comps-false-fetch-err.md](../logic-errors/fmv-doubled-title-issue-empty-comps-false-fetch-err.md) for the sibling ASM #50 incident that motivated the vintage-key batch (BUI-346/347/348).
+
+**The core guidance of this doc is unchanged.** BUI-348 automated the *eBay-slab* proxy (structured `price.extracted`, bounded discount); it did **not** — and must not — automate the §7a **Heritage/Google-prose** extractor. Those remain two different things: the prose extractor's inputs are unstructured, its trigger is circular, and it stays human/LLM-gated inside `/comic:fmv`. A discount-basis caveat surfaced in BUI-348 reinforces the split: the eBay-CGC-*sold* factor is calibrated to a different price source than fmv.md §7a's Heritage *realized* basis — do not cross the multipliers.
 
 ## References
 
+- **BUI-348** — shipped the eBay graded-slab proxy tier described in "The one defensible automation path" above; validated the re-spec framing (a distinct tier, not §7a-prose automation).
 - **BUI-326** (Won't Do) — the automation ask; this doc is its writeup.
 - **BUI-328** — filed spec correction: fmv.md §7a should state SerpApi isn't in apps/fmv and note the >$200 trigger circularity.
 - **BUI-318** / [fmv-grade-curve-interpolation-overbid-guards.md](./fmv-grade-curve-interpolation-overbid-guards.md) — the sibling learning: automating §7 interpolation *was* safe, with guards. §7a is where automation stops being safe.
