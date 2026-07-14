@@ -339,6 +339,152 @@ class TestBuildQuery:
             assert pub in sc.build_query("Saga", "1", publisher=pub)
 
 
+# ── BUI-346: title normalization (leading article + embedded issue dedup) ──
+
+class TestTitleNormalization:
+    def test_leading_article_stripped(self):
+        assert sc._strip_leading_article("The Amazing Spider-Man") == "Amazing Spider-Man"
+        assert sc._strip_leading_article("A Man Called X") == "Man Called X"
+        assert sc._strip_leading_article("An X-Men Story") == "X-Men Story"
+        # Case-insensitive, and a title with none of these leading words is untouched.
+        assert sc._strip_leading_article("THE Amazing Spider-Man") == "Amazing Spider-Man"
+        assert sc._strip_leading_article("Amazing Spider-Man") == "Amazing Spider-Man"
+
+    def test_embedded_issue_stripped(self):
+        assert sc._strip_embedded_issue("Amazing Spider-Man #50", "50") == "Amazing Spider-Man"
+        # Bare trailing issue number (no '#') is also stripped.
+        assert sc._strip_embedded_issue("Amazing Spider-Man 50", "50") == "Amazing Spider-Man"
+
+    def test_embedded_issue_left_alone_when_it_does_not_match(self):
+        # A DIFFERENT number in the title (not the separate issue field) must
+        # survive — this isn't a generic "strip trailing digits" pass.
+        assert sc._strip_embedded_issue("Spider-Man 2099", "50") == "Spider-Man 2099"
+
+    def test_embedded_issue_guard_avoids_partial_digit_match(self):
+        # issue="99" must not chew into the "20" of "2099" — the (?<!\d) guard.
+        assert sc._strip_embedded_issue("X-Men 2099", "99") == "X-Men 2099"
+
+    def test_embedded_issue_noop_without_issue_or_title(self):
+        assert sc._strip_embedded_issue("Amazing Spider-Man #50", "") == "Amazing Spider-Man #50"
+        assert sc._strip_embedded_issue("", "50") == ""
+
+    # ── The BUI-346 acceptance criterion, verbatim ──
+    def test_doubled_title_and_clean_title_build_identical_query(self):
+        """A row title:"The Amazing Spider-Man #50", issue:"50" must build the
+        same query as title:"Amazing Spider-Man", issue:"50" — the real ASM #50
+        incident (2026-07-13): the un-normalized form doubled into
+        `"The Amazing Spider-Man #50 50"`, 0 results on every tier."""
+        doubled = sc.build_query("The Amazing Spider-Man #50", "50")
+        clean = sc.build_query("Amazing Spider-Man", "50")
+        assert doubled == clean
+        assert '"Amazing Spider-Man 50"' in clean
+        assert "50 50" not in doubled
+        assert "#50" not in doubled
+
+    def test_leading_article_alone_does_not_affect_issue_untouched(self):
+        # A leading article with NO embedded issue: only the article is stripped.
+        q = sc.build_query("The Amazing Spider-Man", "300")
+        assert '"Amazing Spider-Man 300"' in q
+
+    def test_embedded_issue_alone_no_leading_article(self):
+        q = sc.build_query("Fantastic Four #1", "1")
+        assert '"Fantastic Four 1"' in q
+        assert "1 1" not in q
+
+
+# ── BUI-347: vintage-key hardening on rebootable mastheads ─────────────────
+
+class TestVintageKeyHardening:
+    def test_vintage_rebootable_masthead_gets_exclusion_terms(self):
+        # Real incident: ASM #50 (1967) — the phrase-quoted base query collided
+        # with the 2018+ relaunch's own #50 (LGY #944), swamping genuine 1967
+        # sales with cheap modern variant listings.
+        q = sc.build_query("Amazing Spider-Man", "50", year=1967)
+        for term in ("-variant", "-foil", "-virgin", "-reprint", "-facsimile",
+                     "-homage", "-timeless"):
+            assert term in q, f"{term!r} missing from vintage query: {q}"
+        assert "1967" in q  # the year discriminator still applies
+
+    def test_modern_book_byte_for_byte_unaffected(self):
+        # Acceptance: modern books (recent year) must be COMPLETELY unaffected
+        # by the vintage hardening — same masthead, same shape, only the year
+        # differs, and the query must be identical to the pre-BUI-347 shape
+        # (no exclusion terms at all).
+        q = sc.build_query("Amazing Spider-Man", "50", year=2018)
+        for term in ("-variant", "-foil", "-virgin", "-reprint", "-facsimile",
+                     "-homage", "-timeless"):
+            assert term not in q
+        assert q == '"Amazing Spider-Man 50" 2018 -cgc -cbcs -graded -slab'
+
+    def test_no_year_rebootable_masthead_unaffected(self):
+        # No year at all → the hard year-gate can't fire (there's no year to
+        # compare), so a year-agnostic rebootable-masthead query is untouched.
+        q = sc.build_query("Amazing Spider-Man", "50")
+        assert "-variant" not in q
+        assert q == '"Amazing Spider-Man 50" -cgc -cbcs -graded -slab'
+
+    def test_non_rebootable_masthead_unaffected_even_if_old(self):
+        # Old year alone isn't enough — the masthead must ALSO be a known
+        # rebootable one. A vintage indie/one-shot title is untouched.
+        q = sc.build_query("Swamp Thing", "1", year=1972)
+        assert "-variant" not in q
+        assert q == '"Swamp Thing 1" 1972 -cgc -cbcs -graded -slab'
+
+    def test_year_boundary_2000_is_not_vintage(self):
+        # The cutoff is a hard pre-2000 gate — year=2000 itself is NOT vintage.
+        q2000 = sc.build_query("Batman", "1", year=2000)
+        q1999 = sc.build_query("Batman", "1", year=1999)
+        assert "-variant" not in q2000
+        assert "-variant" in q1999
+
+    def test_is_rebootable_masthead_matches_known_titles(self):
+        for title in ("Amazing Spider-Man", "The Amazing Spider-Man",
+                      "Fantastic Four", "Uncanny X-Men", "X-Men", "Avengers",
+                      "Thor", "Iron Man", "Incredible Hulk", "Captain America",
+                      "Batman", "Superman", "Wonder Woman"):
+            assert sc._is_rebootable_masthead(title), title
+
+    def test_is_rebootable_masthead_does_not_match_others(self):
+        for title in ("Swamp Thing", "Saga", "Invincible", "Spawn",
+                      "Hellboy", "The Walking Dead"):
+            assert not sc._is_rebootable_masthead(title), title
+
+    def test_masthead_gate_sees_the_bui_346_normalized_title(self):
+        # BUI-346 + BUI-347 interaction: the un-normalized "The Amazing
+        # Spider-Man #50" must still trip the vintage gate — the masthead
+        # check runs on the title AFTER the leading-article/embedded-issue
+        # strip, not the raw input.
+        q = sc.build_query("The Amazing Spider-Man #50", "50", year=1967)
+        assert "-variant" in q
+        assert q == sc.build_query("Amazing Spider-Man", "50", year=1967)
+
+    # ── Money-safety: the genuine vintage comp pool must survive ──
+    def test_vintage_comp_pool_survives_exclusion_terms(self):
+        """CRITICAL money-safety acceptance (BUI-347): no genuine vintage sale
+        may be excluded by the new terms. These are representative titles from
+        the ASM #50 (1967) genuine $402-$700 raw sale cluster (the incident
+        this ticket documents) — none of them may contain any of the new
+        exclusion tokens, or a real sale would be silently dropped from the
+        comp pool."""
+        genuine_1967_listings = [
+            "Amazing Spider-Man #50 1967 1st Appearance Kingpin Marvel VG+",
+            "Amazing Spider-Man 50 (Marvel, 1967) Spider-Man No More! FN-",
+            "AMAZING SPIDER-MAN #50 1st KINGPIN 1967 SILVER AGE KEY VG",
+            "Amazing Spider-Man #50 Marvel 1967 Romita Kingpin key GD/VG raw",
+            "Amazing Spider-Man 50 1967 1st app Kingpin ROMITA cover raw comic",
+        ]
+        excluded_tokens = ("variant", "foil", "virgin", "reprint",
+                           "facsimile", "homage", "timeless")
+        for listing in genuine_1967_listings:
+            lowered = listing.lower()
+            for token in excluded_tokens:
+                assert token not in lowered, (
+                    f"genuine vintage listing {listing!r} contains excluded "
+                    f"token {token!r} — would be wrongly dropped from the "
+                    "comp pool"
+                )
+
+
 class TestCanonicalUrl:
     def test_excludes_api_key(self):
         url = sc.canonical_serpapi_url('"X-Men 1"')

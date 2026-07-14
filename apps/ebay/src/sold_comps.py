@@ -226,11 +226,96 @@ def _publisher_qualifier(publisher: str | None) -> str | None:
     return p
 
 
+_LEADING_ARTICLE_RE = re.compile(r'^(?:the|a|an)\s+', re.IGNORECASE)
+
+
+def _strip_leading_article(title: str) -> str:
+    """Strip a leading article ("The"/"A"/"An") from a series title.
+
+    BUI-346 defense-in-depth: `build_query` normalizes its own `title` input
+    independent of whatever normalization (or lack of it) happened upstream in
+    the buy→FMV handoff (apps/fmv/src/fmv_runner.py does the same strip at the
+    working-list boundary). Duplicated rather than shared across apps/ebay and
+    apps/fmv per this repo's existing package boundary — comic-fmv shells out
+    to the ebay-sold-comps console script rather than importing it (see
+    CLAUDE.md's "FMV pipeline shells out across package boundaries").
+    """
+    return _LEADING_ARTICLE_RE.sub('', title or '').strip()
+
+
+def _strip_embedded_issue(title: str, issue: str) -> str:
+    """Strip an embedded ``#<issue>`` (or a bare trailing issue token) from
+    *title* when it duplicates the separate `issue` field.
+
+    BUI-346: without this, a title like "The Amazing Spider-Man #50" combined
+    with issue="50" makes the `f'"{title} {issue}"'` phrase double up into
+    `"The Amazing Spider-Man #50 50"`, which returns 0 results on every tier
+    (real incident: ASM #50, 2026-07-13 buy run). The `(?<!\\d)` guard on the
+    trailing-token strip prevents chewing into an unrelated longer number
+    (e.g. issue="99" must not touch the "2099" in "X-Men 2099").
+    """
+    issue = str(issue).strip() if issue else ""
+    if not title or not issue:
+        return title
+    cleaned = re.sub(rf'#\s*{re.escape(issue)}\b', '', title, flags=re.IGNORECASE)
+    cleaned = re.sub(rf'(?<!\d){re.escape(issue)}\s*$', '', cleaned.strip())
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+# BUI-347: rebootable mastheads — long-running Marvel/DC titles whose numbering
+# (or a same-numbered modern relaunch) collides with a vintage issue's own
+# number. List mirrors the one already documented for the analogous
+# collection-check ambiguity (.claude/commands/comic/collection-check.md) so
+# the two "which titles are rebootable" judgment calls don't drift apart.
+_REBOOTABLE_MASTHEADS = (
+    "fantastic four", "amazing spider-man", "spider-man", "uncanny x-men",
+    "x-men", "avengers", "thor", "iron man", "incredible hulk", "hulk",
+    "captain america", "batman", "superman", "wonder woman",
+)
+_REBOOTABLE_MASTHEAD_RES = [
+    re.compile(rf'\b{re.escape(m)}\b', re.IGNORECASE) for m in _REBOOTABLE_MASTHEADS
+]
+
+# Pre-2000 gate for "vintage" (BUI-347's own example threshold). Deliberately
+# simple/conservative — this is a hard gate, not a fuzzy score, so a modern
+# book's query is byte-for-byte unaffected.
+_VINTAGE_YEAR_CUTOFF = 2000
+
+# Conservative exclusion lexicon — every token here is a modern
+# printing/cover-variant convention that could not appear in a genuine 1960s/
+# 70s raw comic listing (variant covers, foil covers, "virgin"/no-logo covers,
+# and the "Timeless"/"Homage" modern cover programs are all post-1990s
+# inventions; "reprint"/"facsimile" describe a later, non-original printing —
+# exactly what a vintage-key comp query must exclude). Money-safety
+# (BUI-347): do NOT add anything broader than this without re-validating
+# against a real vintage sold-comp pool — see
+# test_vintage_comp_pool_survives_exclusion_terms.
+_VINTAGE_EXCLUSION_TERMS = (
+    "-variant", "-foil", "-virgin", "-reprint", "-facsimile", "-homage",
+    "-timeless",
+)
+
+
+def _is_rebootable_masthead(title: str) -> bool:
+    """True if *title* names a long-running masthead with a modern relaunch
+    that reuses low issue numbers (BUI-347)."""
+    return any(p.search(title or '') for p in _REBOOTABLE_MASTHEAD_RES)
+
+
 def build_query(title: str, issue: str, year: int | None = None,
                 publisher: str | None = None, variant: str | None = None,
                 grade_label: str | None = None,
                 exclude_graded: bool = True) -> str:
     """Build the _nkw search string. Returns the raw (unencoded) keyword string."""
+    # BUI-346: normalize the title before it's ever quoted — strip a leading
+    # article, then an embedded/trailing issue number that would otherwise
+    # double up with the separate `issue` field below. Guarded on a truthy
+    # title so a falsy/absent one (not a real, expected input, but `title` is
+    # a plain `str` param with no caller ever passing None in practice) keeps
+    # its pre-BUI-346 byte-for-byte behavior rather than silently becoming an
+    # empty string.
+    if title:
+        title = _strip_embedded_issue(_strip_leading_article(title), issue)
     parts = [f'"{title} {issue}"']
     if year:
         parts.append(str(year))
@@ -252,6 +337,13 @@ def build_query(title: str, issue: str, year: int | None = None,
         parts.append(qualifier)
     if grade_label:
         parts.append(grade_label)
+    # BUI-347: harden a vintage key's comp query against its own modern
+    # relaunch. Gated HARD on old-year AND a rebootable masthead — a modern
+    # book (recent year, or no year at all) or a non-rebootable title is
+    # completely untouched by this branch, so its query stays byte-for-byte
+    # identical to pre-BUI-347 output.
+    if year and year < _VINTAGE_YEAR_CUTOFF and _is_rebootable_masthead(title):
+        parts.extend(_VINTAGE_EXCLUSION_TERMS)
     if exclude_graded:
         parts.extend(["-cgc", "-cbcs", "-graded", "-slab"])
     return " ".join(parts)
