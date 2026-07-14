@@ -928,6 +928,47 @@ def test_resolve_creator_run_name_drift_is_warned_not_silently_dropped():
     assert "BUI-198" in w["reason"]
 
 
+def test_resolve_creator_run_stops_after_breaker_trips_mid_loop():
+    """BUI-344: once the breaker trips on an early candidate's issue-detail
+    fetch, the remaining candidates must NOT each pay their own capped retry
+    sleep against a down Metron — the loop stops and surfaces the rest as
+    explicitly-skipped warnings instead of silently grinding through them.
+    """
+    client = MetronClient()
+    session = MagicMock()
+    session.issues_list.return_value = [
+        _mock_base_issue(1, "10"),
+        _mock_base_issue(2, "11"),
+        _mock_base_issue(3, "12"),
+    ]
+    # Candidate #10's issue-detail fetch takes a genuine 5xx twice in a row —
+    # exhausts lookup_issue_detail's own capped retry and trips self.degraded,
+    # exactly as BUI-342 wired it.
+    session.issue.side_effect = [
+        _server_error_api_error(500),
+        _server_error_api_error(500),
+    ]
+    client._session = session
+
+    with patch("locg.metron.time.sleep"):
+        run = client.resolve_creator_run(
+            series_id=1, creator_id=355, creator_name="John Romita Jr.", role="penciller",
+        )
+
+    # Only candidate #10's lookup_issue_detail was attempted — its own inner
+    # retry consumes both side_effect entries. #11 and #12 were never queried
+    # once the breaker tripped: no capped retry sleep paid per remaining
+    # candidate against a down Metron.
+    assert session.issue.call_count == 2
+    assert client.degraded is True
+
+    assert run["issues"] == []
+    reasons_by_number = {w["number"]: w["reason"] for w in run["warnings"]}
+    assert "issue detail fetch failed" in reasons_by_number["10"]
+    assert "breaker tripped" in reasons_by_number["11"]
+    assert "breaker tripped" in reasons_by_number["12"]
+
+
 # ---------------------------------------------------------------------------
 # Credential error — raised, not swallowed
 # ---------------------------------------------------------------------------

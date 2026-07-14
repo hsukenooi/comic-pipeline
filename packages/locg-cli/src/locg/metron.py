@@ -470,7 +470,27 @@ class MetronClient:
         in_run: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
 
-        for cand in candidates:
+        for idx, cand in enumerate(candidates):
+            if self.degraded:
+                # BUI-344: the breaker already tripped (5xx / rate-limit-exhausted
+                # / connection error) on an earlier candidate's lookup_issue_detail
+                # call. Mirror the batch-breaker pattern cmd_collection_record_win
+                # uses (_check_metron_degraded, commands.py) — stop iterating so
+                # the rest of the candidate list doesn't each pay its own capped
+                # retry sleep against a down Metron. Surface every un-attempted
+                # candidate as a warning so the run reads as clearly incomplete
+                # rather than silently truncated.
+                for skipped in candidates[idx:]:
+                    warnings.append({
+                        "number": getattr(skipped, "number", None),
+                        "metron_id": getattr(skipped, "id", None),
+                        "reason": (
+                            "skipped: Metron breaker tripped on an earlier "
+                            "candidate (5xx/rate-limit/connection error) — "
+                            "run is incomplete (BUI-344)"
+                        ),
+                    })
+                break
             metron_id = getattr(cand, "id", None)
             number = getattr(cand, "number", None)
             if metron_id is None:
