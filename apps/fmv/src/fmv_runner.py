@@ -167,7 +167,10 @@ def run(*, batch_path: str | None, out_path: str | None,
     # 2. Fetch comps for the books that need fresh compute
     fresh_results: list[dict] = []
     if needs_compute:
-        fresh_results = _fetch_comps(needs_compute, force=force)
+        # Default hard_fail=True: any fetch failure sys.exits inside _fetch_comps,
+        # so a return here is always a real list (the None branch is soft-fail
+        # only, used by the BUI-348 proxy rescue).
+        fresh_results = _fetch_comps(needs_compute, force=force) or []
 
     # 3. Run FMV math + DB upsert for fresh books, mapped back to inputs by an
     #    explicit id — never by list position (BUI-174/187). The subprocess fans
@@ -201,6 +204,16 @@ def run(*, batch_path: str | None, out_path: str | None,
                 results_by_id[idx], books[idx],
                 server_url=server_url, grade_window=grade_window,
             )
+
+        # 3b. BUI-348 CGC-proxy rescue: a freshly-computed book that produced NO
+        # bid-able number (raw pool too sparse to price, no §7 interpolation) may
+        # be a vintage key priceable off the CGC slab ladder. Fetch graded comps
+        # for just those books and, where the ladder is trustworthy and
+        # high-value, replace the needs_manual result with a proxy band. Books
+        # that already priced are never touched (regression-safe by construction).
+        _apply_cgc_proxy_rescue(
+            fresh_fmvs, books, server_url=server_url, force=force,
+        )
 
     # 4. Stitch cached + fresh in input order
     final = _stitch(books, cached, fresh_fmvs)
@@ -282,9 +295,30 @@ def _db_lookup(server_url: str, *, locg_id: int, grade: float,
 
 # ─── Step 2 — Fetch comps via ebay-sold-comps ─────────────────────────────────
 
-def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
+def _fetch_abort(hard_fail: bool) -> None:
+    """Abort a ``_fetch_comps`` call after its error was already echoed.
+
+    Hard path (``hard_fail=True``): ``sys.exit(1)`` as before. Soft path
+    (the BUI-348 proxy rescue): return None so the caller degrades instead of
+    killing an otherwise-complete run.
+    """
+    if hard_fail:
+        sys.exit(1)
+    return None
+
+
+def _fetch_comps(books: list[dict], *, force: bool,
+                 hard_fail: bool = True) -> list[dict] | None:
     """Subprocess to ebay-sold-comps. Returns the parsed result list,
-    in the same order as `books`."""
+    in the same order as `books`.
+
+    ``hard_fail`` (default True) preserves the original behavior: any failure
+    (binary missing, timeout, non-zero exit, unreadable/empty/unparseable
+    output) aborts the run via ``sys.exit``. The BUI-348 proxy rescue passes
+    ``hard_fail=False`` so a failure on that best-effort second pass returns
+    None instead — the caller then leaves the candidate books as needs_manual
+    rather than nuking a run whose primary (raw) results already succeeded.
+    """
     if shutil.which(EBAY_SOLD_COMPS_BIN) is None:
         click.echo(
             f"Error: '{EBAY_SOLD_COMPS_BIN}' not found on PATH.\n"
@@ -292,7 +326,8 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
             f"{EBAY_SOLD_COMPS_BIN} entry point is available.",
             err=True,
         )
-        sys.exit(1)
+        _fetch_abort(hard_fail)
+        return None
 
     # Strip the orchestrator's _idx but thread a stable correlation id (_req_id,
     # = the original input index) the subprocess echoes back, so run() can map
@@ -329,14 +364,16 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
                 f"{len(books)} book(s).",
                 err=True,
             )
-            sys.exit(1)
+            _fetch_abort(hard_fail)
+            return None
         if result.returncode != 0:
             click.echo(
                 f"Error: {EBAY_SOLD_COMPS_BIN} failed (exit {result.returncode}):\n"
                 f"{result.stderr}",
                 err=True,
             )
-            sys.exit(1)
+            _fetch_abort(hard_fail)
+            return None
         # BUI-184: a returncode-0 child can still leave an empty/partial out file
         # (killed between create and write, disk-full). Guard the read+parse and
         # fail loud rather than crash with an opaque JSONDecodeError mid-batch.
@@ -345,14 +382,16 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
         except OSError as e:
             click.echo(f"Error: could not read {EBAY_SOLD_COMPS_BIN} output: {e}",
                        err=True)
-            sys.exit(1)
+            _fetch_abort(hard_fail)
+            return None
         if not raw.strip():
             click.echo(
                 f"Error: {EBAY_SOLD_COMPS_BIN} exited 0 but wrote no output "
                 "(empty results file).",
                 err=True,
             )
-            sys.exit(1)
+            _fetch_abort(hard_fail)
+            return None
         try:
             return json.loads(raw)
         except json.JSONDecodeError as e:
@@ -360,7 +399,8 @@ def _fetch_comps(books: list[dict], *, force: bool) -> list[dict]:
                 f"Error: {EBAY_SOLD_COMPS_BIN} produced unparseable output: {e}",
                 err=True,
             )
-            sys.exit(1)
+            _fetch_abort(hard_fail)
+            return None
     finally:
         for p in (in_path, out_path):
             try:
@@ -573,6 +613,147 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     }
 
 
+# ─── Step 3b — CGC-proxy rescue (BUI-348) ─────────────────────────────────────
+
+# The literal notes marker for a CGC-proxy band. Shared by `_build_notes`
+# (writer) and `_cgc_proxy_from_notes` (cache-reuse reader) so the round-trip
+# can't drift on a reword — a mismatch would silently drop the proxy bid-cap
+# haircut on a cache hit.
+_CGC_PROXY_NOTE_TOKEN = "CGC proxy"
+
+# The 0.50–0.55 proxy factor is calibrated on VINTAGE keys (ASM #50, 1967),
+# where a slab carries a large certification premium over raw. For modern books
+# the raw/slab ratio is far lower (everyone slabs, raw grade-risk is severe), so
+# applying the vintage factor to a modern high-grade slab would over-price the
+# raw badly. Gate the tier to pre-cutoff books (mirrors sold_comps'
+# _VINTAGE_YEAR_CUTOFF); a book with no year, or a modern one, stays
+# needs_manual rather than getting a mis-calibrated proxy band.
+_CGC_PROXY_VINTAGE_YEAR_CUTOFF = 2000
+
+# A genuine slab listing names its certifier (CGC/CBCS) in the title. The
+# graded pass drops the `-cgc -cbcs -graded -slab` exclusion, so its pool is a
+# MIX of slab AND raw listings that merely carry a grade token ("… FN 6.0 …").
+# Only certified-slab comps may seed the ladder: a raw copy blended in would
+# drag the per-grade slab median DOWN, under-pricing the proxy (a too-low bid
+# cap, or a false below-floor rejection). CGC/CBCS are unambiguous certifier
+# names; "graded"/"slab" are deliberately NOT matched (raw listings say
+# "ungraded"/"not graded", which would false-positive on a bare substring).
+_SLAB_TITLE_RE = re.compile(r"\b(?:cgc|cbcs)\b", re.IGNORECASE)
+
+
+def _slab_comps_only(comps: list[dict]) -> list[dict]:
+    """Keep only genuine CGC/CBCS slab comps (grade + price + certifier in title)."""
+    return [c for c in comps
+            if c.get("grade") is not None and c.get("price") is not None
+            and _SLAB_TITLE_RE.search(c.get("title") or "")]
+
+
+def _is_unpriced_raw(result: dict) -> bool:
+    """True if a fresh raw result produced no bid-able number and a numeric grade
+    is known — the precondition for the CGC-proxy tier.
+
+    Deliberately narrow: it fires ONLY on a book the raw pipeline could not price
+    (n=0, too_sparse/one_sided/too_wide with no §7 interpolation). A book that
+    got ANY number — a real range, or a §7 interpolated point — is excluded, so
+    the proxy tier can never change a book the raw math already priced.
+    """
+    fmv = result.get("fmv") or {}
+    grade = (result.get("input") or {}).get("grade")
+    return (fmv.get("fmv_high") is None
+            and not fmv.get("interpolated")
+            and isinstance(grade, (int, float)))
+
+
+def _is_vintage(result: dict) -> bool:
+    """True if the book's cover year is known and pre-cutoff — the CGC-proxy
+    factor is vintage-calibrated, so a modern (or year-unknown) book must not be
+    priced off it. Conservative: a missing year means no proxy, not a proxy."""
+    year = (result.get("input") or {}).get("year")
+    return isinstance(year, (int, float)) and year < _CGC_PROXY_VINTAGE_YEAR_CUTOFF
+
+
+def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
+                            server_url: str, force: bool) -> None:
+    """BUI-348: re-price sparse-raw needs_manual books off the CGC slab ladder.
+
+    Mutates ``fresh_fmvs`` in place. For each candidate (see ``_is_unpriced_raw``)
+    it fetches a GRADED-only comp pool in one second batch pass, builds the slab
+    ladder, and — when the ladder is trustworthy and clears the value floor
+    (``fmv_math.cgc_proxy_fmv``) — replaces the result's ``fmv`` with a CGC-proxy
+    band (MEDIUM-LOW, capped bid) and re-upserts it. A book whose ladder is too
+    thin / cheap / out-of-range keeps its raw needs_manual result untouched.
+
+    The graded fetch soft-fails (a SerpApi outage on this second pass leaves the
+    candidates as needs_manual rather than aborting an otherwise-complete run —
+    the proxy tier is a best-effort rescue, never a hard dependency).
+    """
+    candidates = [idx for idx in fresh_fmvs
+                  if _is_unpriced_raw(fresh_fmvs[idx])
+                  and _is_vintage(fresh_fmvs[idx])]
+    if not candidates:
+        return
+
+    # Second, graded-only pass. Thread _idx so _fetch_comps can round-trip a
+    # _req_id and we map results back by identity, never position (BUI-174/187).
+    # `books` is the raw batch (never carries _idx — _split_by_db_cache builds
+    # separate _idx-tagged dicts), so we add _idx here rather than strip it.
+    graded_books = [
+        {**books[idx], "_idx": idx, "include_graded": True}
+        for idx in candidates
+    ]
+    graded_results = _fetch_comps(graded_books, force=force, hard_fail=False)
+    if graded_results is None:  # soft fetch failure — leave candidates as-is
+        click.echo(
+            "Note: CGC-proxy graded fetch failed; "
+            f"{len(candidates)} book(s) left needs_manual.",
+            err=True,
+        )
+        return
+
+    by_id: dict[int, dict] = {}
+    for r in graded_results:
+        rid = (r.get("input") or {}).get("_req_id")
+        if isinstance(rid, int):
+            by_id[rid] = r
+
+    for idx in candidates:
+        result = by_id.get(idx)
+        if result is None:
+            continue  # no graded result for this book — leave needs_manual
+        graded_comps = _slab_comps_only(result.get("comps") or [])
+        inp = fresh_fmvs[idx].get("input") or {}
+        proxy = fmv_math.cgc_proxy_fmv(
+            graded_comps, target_grade=inp["grade"],
+            grade_confidence=inp.get("grade_confidence"),
+        )
+        if proxy is None:
+            continue  # ladder too thin / cheap / non-monotonic / out of range
+        # Match compute_fmv's post-processing: _build_notes reads first_party_count.
+        proxy["first_party_count"] = 0
+        # Re-upsert (soft): overwrite the n=0 stub row with the proxy band so the
+        # persisted comic carries a real (proxy) price + "CGC proxy" notes. This
+        # is the best-effort rescue tier, so a server blip on THIS write must not
+        # abort a run whose raw results already succeeded (hard_fail=False). Only
+        # promote the in-memory result to the proxy band AFTER a successful
+        # write, so the emitted result never shows a price the DB doesn't hold.
+        upserted = _upsert_fmv(server_url, inp, proxy, hard_fail=False)
+        if upserted is None:
+            click.echo(
+                f"Note: CGC-proxy upsert failed for {inp.get('title')} "
+                f"#{inp.get('issue')}; left needs_manual.",
+                err=True,
+            )
+            continue
+        comic_id, fmv_id = _extract_ids(upserted)
+        fresh_fmvs[idx]["fmv"] = proxy
+        fresh_fmvs[idx]["source"] = "cgc-proxy"
+        # Refresh the persisted-row fields so the emitted result is consistent
+        # with the proxy write (not the stale pre-proxy n=0 stub upsert).
+        fresh_fmvs[idx]["db_row"] = upserted
+        fresh_fmvs[idx]["comic_id"] = comic_id
+        fresh_fmvs[idx]["fmv_id"] = fmv_id
+
+
 def _extract_ids(row: dict | None) -> tuple[int | None, int | None]:
     """Pull comic_id and fmv_id from a /api/comics response.
 
@@ -584,13 +765,20 @@ def _extract_ids(row: dict | None) -> tuple[int | None, int | None]:
     return row.get("comic_id"), row.get("fmv_id")
 
 
-def _post_json(url: str, body: dict, *, what: str) -> dict:
+def _post_json(url: str, body: dict, *, what: str,
+               hard_fail: bool = True) -> dict | None:
     """POST JSON and return the parsed response, failing LOUD (BUI-186 / R11).
 
     A timeout, connection error, or non-2xx aborts the run with a clear message
     rather than returning None and letting the pipeline proceed on missing data:
     an un-persisted FMV silently breaks the downstream snipe-add FMV link (the
     book is priced but never linked, and verify reports it missing).
+
+    ``hard_fail=False`` (the BUI-348 proxy re-upsert): return None on failure
+    instead of aborting, so a server blip on the best-effort proxy write leaves
+    the book at its already-persisted raw needs_manual result rather than nuking
+    a run whose raw results all succeeded. The caller must then NOT promote the
+    in-memory result to a price the DB doesn't hold.
     """
     try:
         resp = requests.post(url, json=body, timeout=15)
@@ -598,12 +786,18 @@ def _post_json(url: str, body: dict, *, what: str) -> dict:
         return resp.json()
     except requests.RequestException as e:
         click.echo(f"Error: {what} failed (POST {url}): {e}", err=True)
-        sys.exit(1)
+        if hard_fail:
+            sys.exit(1)
+        return None
 
 
-def _upsert_fmv(server_url: str, inp: dict, fmv: dict) -> dict:
+def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
+                hard_fail: bool = True) -> dict | None:
     """POST /api/comics with the computed FMV. Returns the row JSON, or aborts
-    the run on a failed call (BUI-186) rather than silently returning None."""
+    the run on a failed call (BUI-186) rather than silently returning None.
+
+    ``hard_fail=False`` propagates to ``_post_json`` for the best-effort proxy
+    re-upsert (returns None on failure instead of ``sys.exit``)."""
     body = {
         "title": inp["title"],
         "issue": str(inp["issue"]),
@@ -634,6 +828,7 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict) -> dict:
         f"{server_url}/api/comics",
         body,
         what=f"FMV upsert for {inp.get('title')} #{inp.get('issue')}",
+        hard_fail=hard_fail,
     )
 
 
@@ -648,7 +843,11 @@ def _confidence_to_db_label(label: str) -> str:
 
 
 def _build_notes(fmv: dict) -> str:
-    parts = [f"window=±{fmv['window']}", f"cv={fmv['cv_pct']}",
+    # A CGC-proxy band has no grade window (it's priced off the slab ladder, not
+    # a raw ±window pool), so render "window=n/a" rather than "window=±None".
+    win = fmv.get("window")
+    win_str = f"±{win}" if win is not None else "n/a"
+    parts = [f"window={win_str}", f"cv={fmv['cv_pct']}",
              f"label={fmv['confidence']}"]
     # BUI-86: surface grade-span and the manual-pricing flag so a needs_manual
     # stub is legible (distinct from a never-filled n=0 stub) on inspection.
@@ -664,6 +863,18 @@ def _build_notes(fmv: dict) -> str:
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")
+    # BUI-348: state EXPLICITLY that the price is a CGC-proxy band (raw priced
+    # off the slab ladder, not off raw comps), naming the slab anchor and the
+    # discount so a downstream reader can see how the number was derived. The
+    # literal "CGC proxy" token is the documented marker (fmv.md §7a / Notes).
+    ladder = fmv.get("cgc_ladder")
+    if fmv.get("cgc_proxy") and ladder:
+        parts.append(
+            f"{_CGC_PROXY_NOTE_TOKEN}: slab {ladder['target_grade']:g}="
+            f"${ladder['slab_price']:g} "
+            f"× {ladder['factor_low']:g}-{ladder['factor_high']:g} raw; "
+            "confidence capped MEDIUM-LOW"
+        )
     # BUI-306 §7: state EXPLICITLY that the price was interpolated (not a direct
     # comp) and that confidence is reduced, naming the bracketing buckets used.
     interp = fmv.get("interpolation")
@@ -684,11 +895,16 @@ def _build_notes(fmv: dict) -> str:
     # misleading (its LOW label is forced by the flag, not a real haircut).
     factor = fmv.get("bid_factor")
     if not flag and factor is not None and factor < fmv_math.BASE_BID_FACTOR:
-        # BUI-318: attribute the haircut to its cause. An interpolated book's
-        # cap comes from the interpolated-LOW haircut (not grade_conf, which is
-        # typically absent here), so naming grade_conf=None would misread.
-        cause = ("interpolated" if fmv.get("interpolated")
-                 else f"grade_conf={fmv.get('grade_confidence')}")
+        # BUI-318/348: attribute the haircut to its cause. An interpolated or
+        # CGC-proxy book's cap comes from its own tier-specific haircut (not
+        # grade_conf, which is typically absent here), so naming grade_conf=None
+        # would misread.
+        if fmv.get("cgc_proxy"):
+            cause = "cgc_proxy"
+        elif fmv.get("interpolated"):
+            cause = "interpolated"
+        else:
+            cause = f"grade_conf={fmv.get('grade_confidence')}"
         parts.append(f"bid_haircut={factor:.2f} ({cause})")
     return " | ".join(parts)
 
@@ -745,6 +961,16 @@ def _interpolated_from_notes(notes: str | None) -> bool:
     return notes is not None and "interpolated=" in notes
 
 
+def _cgc_proxy_from_notes(notes: str | None) -> bool:
+    """Recover whether a cached FMV was priced by the BUI-348 CGC-proxy tier.
+
+    `_build_notes` writes a `CGC proxy: …` token for a proxy book, so the cached
+    path can re-mark it (and re-apply the proxy bid-factor cap) without a
+    dedicated DB column — same lossy-projection recovery as `interpolated`.
+    """
+    return notes is not None and _CGC_PROXY_NOTE_TOKEN in notes
+
+
 def _window_from_notes(notes: str | None) -> float | None:
     """Recover the grade window the FMV was built at from persisted fmv_notes.
 
@@ -794,8 +1020,20 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     interpolated = _interpolated_from_notes(row.get("fmv_notes"))
     if interpolated:
         factor = min(factor, fmv_math.INTERPOLATED_BID_FACTOR)
+    # BUI-348: a cached CGC-proxy row persists a plain "low" fmv_confidence, so
+    # bid_factor would return the full 0.80× and silently undo the proxy cap on
+    # reuse. Recover the proxy marker from notes and re-apply the MEDIUM-LOW-rung
+    # cap so a cached proxy row bids at the same haircut a fresh recompute would.
+    cgc_proxy = _cgc_proxy_from_notes(row.get("fmv_notes"))
+    if cgc_proxy:
+        factor = min(factor, fmv_math.CGC_PROXY_BID_FACTOR)
     return {
         "n": row.get("fmv_comps") or 0,
+        # Shape parity with compute_fmv (effective_n exists there for the
+        # recency-weighted confidence). A cached row has no per-comp weights, so
+        # it degenerates to the raw count — enough to keep the dict shape uniform
+        # for downstream readers that iterate it.
+        "effective_n": float(row.get("fmv_comps") or 0),
         "window": window,
         # BUI-86: shape parity with compute_fmv output. Flagged books are never
         # cache hits (_db_lookup filters null fmv_low), so a cached row is always
@@ -825,6 +1063,12 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "interpolated": interpolated,
         "interpolation": None,
         "suspect_buckets": [],
+        # BUI-348: shape parity + recovered proxy marker so a re-displayed /
+        # re-served cached row still reads as a proxy band, not a raw range. The
+        # full ladder detail isn't reconstructed (same lossy projection as
+        # median/cv/trimmed_pool); the marker is enough for the table + bid cap.
+        "cgc_proxy": cgc_proxy,
+        "cgc_ladder": None,
     }
 
 
@@ -876,6 +1120,12 @@ def _print_table(rows: list[dict]) -> None:
             fmv_str = f"manual:{fmv['flag_reason']}"
             med_str = "—"
             mb_str = "manual"
+        elif fmv.get("cgc_proxy"):
+            # BUI-348: CGC-proxy band (raw priced off the slab ladder) — mark it
+            # so it's never conflated with a real raw-comp range.
+            fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']} cgc"
+            med_str = f"${fmv.get('median') or '?'}"
+            mb_str = f"${fmv.get('max_bid') or '?'}"
         elif fmv.get("interpolated"):
             # BUI-306 §7: interpolated point estimate (fmv_low == fmv_high) — mark
             # it so it's never conflated with a real direct-comp range.
