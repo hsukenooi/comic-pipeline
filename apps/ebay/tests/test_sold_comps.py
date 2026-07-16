@@ -470,6 +470,51 @@ class TestVintageKeyHardening:
                       "Hellboy", "The Walking Dead"):
             assert not sc._is_rebootable_masthead(title), title
 
+    def test_she_hulk_does_not_trip_the_hulk_masthead_gate(self):
+        """BUI-351: a plain `\\bhulk\\b` matches INSIDE "She-Hulk" because the
+        word-boundary lands on the hyphen ("-" is a non-word char, so the
+        "-"→"h" transition already satisfies `\\b`). "She-Hulk" is a distinct
+        title, not the Hulk masthead, and must not trip the vintage-hardening
+        gate meant for genuine Hulk/Incredible Hulk keys."""
+        for title in ("She-Hulk", "She-Hulk (2004)", "Sensational She-Hulk",
+                      "The Savage She-Hulk"):
+            assert not sc._is_rebootable_masthead(title), title
+        # Acceptance at the build_query level too: a vintage "She-Hulk" query
+        # must stay byte-for-byte untouched by the Hulk exclusion terms.
+        q = sc.build_query("She-Hulk", "1", year=1980)
+        assert "-variant" not in q
+        assert q == '"She-Hulk 1" 1980 -cgc -cbcs -graded -slab'
+
+    def test_hulk_and_incredible_hulk_still_trip_the_masthead_gate(self):
+        """BUI-351 regression guard: tightening the boundary must not lose the
+        genuine matches — bare "Hulk" and "Incredible Hulk" (both real
+        rebootable mastheads) must still gate."""
+        for title in ("Hulk", "The Hulk", "Incredible Hulk",
+                      "The Incredible Hulk"):
+            assert sc._is_rebootable_masthead(title), title
+        q = sc.build_query("Incredible Hulk", "1", year=1962)
+        assert "-variant" in q
+
+    def test_masthead_boundary_edge_cases(self):
+        """BUI-351: pin down the new `(?<![-\\w])...(?![-\\w])` boundary's
+        behavior on shapes the hyphen fix didn't explicitly target, so a future
+        loosening of the character class (e.g. back toward plain `\\w`) fails
+        loudly instead of silently reintroducing a false match/non-match.
+        Digit-adjacency (no separating space/punctuation) is the one shape
+        where this boundary is intentionally as strict as `\\w`: a masthead
+        glued directly to a number is treated as part of a different token."""
+        # Digit-adjacent, no separator: correctly rejected (matches \w rules).
+        assert not sc._is_rebootable_masthead("X-Men2099")
+        assert not sc._is_rebootable_masthead("2099X-Men")
+        # Punctuation-adjacent (not a word char): still correctly matched.
+        assert sc._is_rebootable_masthead("X-Men's Legacy")
+        assert sc._is_rebootable_masthead("X-Men: Legacy")
+        assert sc._is_rebootable_masthead("Superman/Batman")
+        assert sc._is_rebootable_masthead("Hulk (1962)")
+        # A masthead directly abutting an unrelated hyphenated word is
+        # correctly rejected — the documented tradeoff of this fix.
+        assert not sc._is_rebootable_masthead("Hulk-Buster")
+
     def test_masthead_gate_sees_the_bui_346_normalized_title(self):
         # BUI-346 + BUI-347 interaction: the un-normalized "The Amazing
         # Spider-Man #50" must still trip the vintage gate — the masthead
@@ -478,6 +523,27 @@ class TestVintageKeyHardening:
         q = sc.build_query("The Amazing Spider-Man #50", "50", year=1967)
         assert "-variant" in q
         assert q == sc.build_query("Amazing Spider-Man", "50", year=1967)
+
+    # ── BUI-350 (issue 1): `vintage_year` gates hardening independent of the
+    #    query-text `year` (the broaden tier drops `year` from the text but
+    #    must not thereby drop the exclusion terms) ──
+    def test_vintage_year_gates_hardening_even_when_year_dropped_from_query(self):
+        q = sc.build_query("Amazing Spider-Man", "50", year=None, vintage_year=1967)
+        for term in ("-variant", "-foil", "-virgin", "-reprint", "-facsimile",
+                     "-homage", "-timeless"):
+            assert term in q, f"{term!r} missing: {q}"
+        assert "1967" not in q  # the year token itself is still absent
+
+    def test_vintage_year_defaults_to_year_when_omitted(self):
+        # Backward-compat: every pre-BUI-350 caller (no vintage_year arg) keeps
+        # byte-for-byte behavior — the gate falls back to `year`.
+        assert (sc.build_query("Amazing Spider-Man", "50", year=1967)
+                == sc.build_query("Amazing Spider-Man", "50", year=1967, vintage_year=None))
+
+    def test_vintage_year_modern_book_unaffected(self):
+        # A modern vintage_year (>= cutoff) must not gate, even with year=None.
+        q = sc.build_query("Amazing Spider-Man", "50", year=None, vintage_year=2018)
+        assert "-variant" not in q
 
     # ── Money-safety: the genuine vintage comp pool must survive ──
     def test_vintage_comp_pool_survives_exclusion_terms(self):
@@ -824,6 +890,31 @@ class TestTieredStrategy:
         # switch — it must still fire on this pre-2000 rebootable masthead so a
         # modern slab reprint doesn't pollute the ladder.
         assert "-variant" in calls[0]
+
+    def test_graded_broaden_query_keeps_vintage_hardening(self, tmp_path, monkeypatch):
+        """BUI-350 (issue 1): the tier-2 "broaden" query drops `year` from its
+        query TEXT to widen recall, but that must not also drop the BUI-347
+        vintage-masthead exclusion terms — a rebootable-masthead vintage key's
+        graded ladder (the CGC-proxy tier's `include_graded=True` pass) could
+        otherwise blend in modern CGC/CBCS-slabbed variant covers. Force the
+        broaden tier to fire (thin base) and assert the SECOND (broader) call
+        — not just the first — still carries the full exclusion lexicon."""
+        results = [
+            [self._comp(str(i)) for i in range(2)],          # thin base → broaden
+            [self._comp(str(100 + i)) for i in range(3)],    # broader
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        sc.fetch_book_comps(
+            {"title": "Amazing Spider-Man", "issue": "50", "year": 1967,
+             "grade": 6.5, "include_graded": True},
+            "key",
+        )
+        assert len(calls) >= 2
+        broader_nkw = calls[1]
+        assert "1967" not in broader_nkw  # year IS dropped from the query text
+        for term in ("-variant", "-foil", "-virgin", "-reprint", "-facsimile",
+                     "-homage", "-timeless"):
+            assert term in broader_nkw, f"{term!r} missing from broader query: {broader_nkw}"
 
 
 # ─── End-to-end-ish: batch driver ────────────────────────────────────────────

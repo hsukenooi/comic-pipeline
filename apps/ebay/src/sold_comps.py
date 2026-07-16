@@ -272,8 +272,16 @@ _REBOOTABLE_MASTHEADS = (
     "x-men", "avengers", "thor", "iron man", "incredible hulk", "hulk",
     "captain america", "batman", "superman", "wonder woman",
 )
+# BUI-351: plain `\b` treats a hyphen as a non-word char, so `\bhulk\b` matches
+# INSIDE "She-Hulk" (the boundary lands on the "-"). Anchor on a full
+# title-token match instead: forbid the masthead from being immediately
+# preceded or followed by a hyphen (or any other word char), so it can't be a
+# substring of a different hyphenated title. A masthead's OWN internal hyphen
+# (e.g. "spider-man") is untouched — re.escape keeps it literal; only the
+# match's outer edges get the tightened boundary.
 _REBOOTABLE_MASTHEAD_RES = [
-    re.compile(rf'\b{re.escape(m)}\b', re.IGNORECASE) for m in _REBOOTABLE_MASTHEADS
+    re.compile(rf'(?<![-\w]){re.escape(m)}(?![-\w])', re.IGNORECASE)
+    for m in _REBOOTABLE_MASTHEADS
 ]
 
 # Pre-2000 gate for "vintage" (BUI-347's own example threshold). Deliberately
@@ -305,8 +313,20 @@ def _is_rebootable_masthead(title: str) -> bool:
 def build_query(title: str, issue: str, year: int | None = None,
                 publisher: str | None = None, variant: str | None = None,
                 grade_label: str | None = None,
-                exclude_graded: bool = True) -> str:
-    """Build the _nkw search string. Returns the raw (unencoded) keyword string."""
+                exclude_graded: bool = True,
+                vintage_year: int | None = None) -> str:
+    """Build the _nkw search string. Returns the raw (unencoded) keyword string.
+
+    `vintage_year` (BUI-350): the book's real cover year, used ONLY to gate the
+    BUI-347 vintage-masthead exclusion terms — independent of whether `year`
+    itself is embedded in the query text. `fetch_book_comps`'s tier-2 "broaden"
+    query drops `year` (to widen recall) but must not thereby drop the vintage
+    hardening: a rebootable-masthead vintage key's broadened (year-less) query
+    could otherwise blend in modern slabbed variants. Callers that broaden pass
+    the original year here while passing `year=None` for the query text.
+    Defaults to `year` itself, so every existing caller that doesn't pass it
+    keeps byte-for-byte pre-BUI-350 behavior.
+    """
     # BUI-346: normalize the title before it's ever quoted — strip a leading
     # article, then an embedded/trailing issue number that would otherwise
     # double up with the separate `issue` field below. Guarded on a truthy
@@ -341,8 +361,10 @@ def build_query(title: str, issue: str, year: int | None = None,
     # relaunch. Gated HARD on old-year AND a rebootable masthead — a modern
     # book (recent year, or no year at all) or a non-rebootable title is
     # completely untouched by this branch, so its query stays byte-for-byte
-    # identical to pre-BUI-347 output.
-    if year and year < _VINTAGE_YEAR_CUTOFF and _is_rebootable_masthead(title):
+    # identical to pre-BUI-347 output. BUI-350: gate on `vintage_year`, not
+    # `year` — see the `vintage_year` docstring above for why.
+    gate_year = year if vintage_year is None else vintage_year
+    if gate_year and gate_year < _VINTAGE_YEAR_CUTOFF and _is_rebootable_masthead(title):
         parts.extend(_VINTAGE_EXCLUSION_TERMS)
     if exclude_graded:
         parts.extend(["-cgc", "-cbcs", "-graded", "-slab"])
@@ -643,10 +665,15 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                            variant=variant, exclude_graded=exclude_graded)
     _run("base", base_nkw)
 
-    # Tier 2 — auto-broaden if thin
+    # Tier 2 — auto-broaden if thin. BUI-350: pass the real `vintage_year`
+    # (even though the query text drops `year`) so a rebootable-masthead
+    # vintage key's broadened query keeps the BUI-347 exclusion terms — this
+    # applies to the CGC-proxy graded pass (`include_graded=True`) just as
+    # much as the ordinary raw pass, since both share this same tier.
     if len(comps) < THIN_RESULTS_THRESHOLD and year:
         broader_nkw = build_query(title, issue, year=None, publisher=publisher,
-                                  variant=variant, exclude_graded=exclude_graded)
+                                  variant=variant, exclude_graded=exclude_graded,
+                                  vintage_year=year)
         _run("broader", broader_nkw)
 
     # Tier 3 — grade-targeted if too few grade-tagged comps in pool so far

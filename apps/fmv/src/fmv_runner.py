@@ -867,13 +867,26 @@ def _build_notes(fmv: dict) -> str:
     # off the slab ladder, not off raw comps), naming the slab anchor and the
     # discount so a downstream reader can see how the number was derived. The
     # literal "CGC proxy" token is the documented marker (fmv.md §7a / Notes).
+    #
+    # BUI-350 (issue 2): also name `n` explicitly as the graded-ladder comp
+    # count, not raw-market depth. `fmv_comps`/`n` is written to the DB
+    # unconditionally (same field a raw-priced book uses for its SerpApi/
+    # first-party comp count — see fmv.md's `fmv_comps` doc), so a machine
+    # consumer reading it in isolation (e.g. the calibration report) would
+    # otherwise misread a proxy row's `n` as raw liquidity. A human already
+    # gets the "CGC proxy" token; this makes the `n` caveat legible to a
+    # parser too, without adding a new DB column for a distinction only this
+    # one tier needs (`fmv_notes` is already the documented lossy-projection
+    # channel for tier-specific detail — see `first_party=`/`interpolated=`
+    # above).
     ladder = fmv.get("cgc_ladder")
     if fmv.get("cgc_proxy") and ladder:
         parts.append(
             f"{_CGC_PROXY_NOTE_TOKEN}: slab {ladder['target_grade']:g}="
             f"${ladder['slab_price']:g} "
             f"× {ladder['factor_low']:g}-{ladder['factor_high']:g} raw; "
-            "confidence capped MEDIUM-LOW"
+            "confidence capped MEDIUM-LOW; "
+            f"n={fmv.get('n')} is graded-ladder comps, not raw-market depth"
         )
     # BUI-306 §7: state EXPLICITLY that the price was interpolated (not a direct
     # comp) and that confidence is reduced, naming the bracketing buckets used.

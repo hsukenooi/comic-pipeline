@@ -1430,6 +1430,19 @@ class TestCgcProxyNotesAndTable:
         assert "CGC proxy" in notes
         assert "bid_haircut" in notes and "cgc_proxy" in notes
 
+    def test_notes_annotate_n_as_graded_ladder_not_raw_depth(self):
+        """BUI-350 (issue 2): `fmv_comps`/`n` for a proxy row is the GRADED
+        ladder's comp count (here len(_ASM50_SLABS) == 6), not raw-market
+        liquidity. A machine consumer reading `fmv_notes` in isolation (e.g.
+        the calibration report) must be able to tell the two apart — assert
+        the note explicitly names `n=<ladder count>` alongside the caveat,
+        not just the bare "CGC proxy" token."""
+        proxy = fmv_math.cgc_proxy_fmv(_ASM50_SLABS, target_grade=6.5)
+        proxy["first_party_count"] = 0
+        assert proxy["n"] == len(_ASM50_SLABS) == 6
+        notes = fmv_runner._build_notes(proxy)
+        assert "n=6 is graded-ladder comps, not raw-market depth" in notes
+
     def test_cached_proxy_row_recovers_marker_and_caps_bid(self):
         # A persisted proxy row: fmv_confidence collapses to "low", notes carry
         # the "CGC proxy" token. On reuse the factor must be re-capped at the
