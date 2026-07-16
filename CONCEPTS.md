@@ -67,6 +67,9 @@ The export is **owned-safe**: it never instructs LOCG to un-collect a book you o
 
 ## FMV & Pricing
 
+### Money Path
+The chain of computation whose output the system will act on financially — a bid cap, max bid, or FMV band that real money follows. Guards on the money path are asymmetric by design: they may only ever move a price **down**, never up (a too-high cap overpays with real money; a too-low cap only misses an auction). A statistic feeding the money path must be outlier-robust before it is trusted — a median resists a single outlier only from three samples up; below that it is the sample itself or the plain mean. Diagnostic-only statistics (the [[Calibration Report]]'s metrics) are outside the money path and may deliberately trade robustness for coverage.
+
 ### First-Party Comp
 A sold-price comp sourced from **your own** resolved eBay auctions (`bids.winning_bid`), merged into the FMV comp pool alongside external eBay sold comps (BUI-286). Because a proxy-auction win's price is only ever *at or below* your max, a wins-only set is **truncated from above** and biases FMV down — so first-party comps are always pulled as wins **and** losses together, and a book whose in-window set is wins-only is dropped rather than merged (see the deflation-guard learning in `docs/solutions/best-practices/`).
 
@@ -79,6 +82,9 @@ The Calibration Report's ranking metric: `median(winning_bid / fmv_high)` over a
 ### Grade-Curve Interpolation
 Estimating an FMV for a comic at a grade with no direct sold comps by reading a price off the curve implied by comps at neighbouring grades. It is a **fallback only when the target grade's bucket is empty** — never used when real comps exist at the target grade — requires a minimum number of supporting comps, and its output is marked as interpolated at **low confidence** (including through cache reuse) so it is never conflated with a direct-comp price (see the over-bid-guards learning in `docs/solutions/best-practices/`).
 
+### Envelope Clamp
+An upper bound applied when a price is read from a comp bucket too thin to be outlier-robust: the direct bucket value is capped at the price its trustworthy neighboring grades imply, taking the lower of the two. It never rejects the thin bucket outright — a genuinely sparse key still gets priced — and it can only ever lower a price, never raise one ([[Money Path]] asymmetry). When no trustworthy neighbors exist to form the bound, the direct value is used unchecked; that residual case is the irreducible sparse-key exposure.
+
 ### needs_manual
 The FMV verdict emitted when even the fallbacks can't defensibly price a book (raw sold comps too thin, target grade's bucket empty and interpolation unsupported). It is a deliberate **punt to a human/LLM**, not a failure — the book gets hand-priced with judgment inside the `/comic:fmv` skill rather than auto-bid on a shaky estimate. Automating away a `needs_manual` on a high-value key removes the human check exactly where a mistake costs the most.
 
@@ -86,6 +92,6 @@ The FMV verdict emitted when even the fallbacks can't defensibly price a book (r
 Pricing a book off graded-slab (CGC/CBCS) prices instead of raw sold comps, discounted to a raw-equivalent. Two distinct forms exist, and they must not be conflated:
 
 - **§7a Heritage-prose proxy** — the fmv.md §7a step reading realized graded prices from Google/Heritage/GoCollect **prose**. It is **human/LLM-gated by design and deliberately not automated**: its inputs are unstructured (no extractable sold-price field), its value-based trigger is circular (no value estimate exists precisely when comps are too thin to price), and a mis-read number would be an unbounded over-bid in the bid-cap path. A future ask to automate *this* form should stop here (see the not-safely-automatable learning in `docs/solutions/best-practices/`; BUI-326 Won't Do).
-- **eBay-slab proxy tier** — the automated form: a second graded-only eBay-sold pass builds a slab grade→price ladder, and a raw price is read off it at a conservative discount, emitted at capped (low) confidence and only as a **rescue** for a sparse-pool book that would otherwise be [[needs_manual]]. Deterministic because its inputs are structured eBay sold prices, and bounded by a non-circular trigger, a minimum ladder depth, a monotonic-ladder requirement, and a hard bid-factor cap.
+- **eBay-slab proxy tier** — the automated form: a second graded-only eBay-sold pass builds a slab grade→price ladder, and a raw price is read off it at a conservative discount, emitted at capped (low) confidence and only as a **rescue** for a sparse-pool book that would otherwise be [[needs_manual]]. Deterministic because its inputs are structured eBay sold prices, and bounded by a non-circular trigger, a minimum ladder depth, a monotonic-ladder requirement, an [[Envelope Clamp]] on thin grade buckets, and a hard bid-factor cap.
 
 The discount factor differs by price source — an eBay CGC *sold* basis is not an auction-house *realized* basis — so a factor calibrated to one source must not be applied to the other.
