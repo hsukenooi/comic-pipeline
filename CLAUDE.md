@@ -21,6 +21,9 @@ The repo is a **uv workspace**: `packages/*` + `plugins/*` are members, and `uv 
 ```sh
 # Install the user-facing CLIs (ebay-fetch, ebay-sold-comps, seller-scan, comic-fmv, gixen, locg)
 ./scripts/install.sh            # uv tool install for apps/ebay + apps/fmv + packages/gixen-cli + packages/locg-cli
+# Re-run this (or `uv tool install --force ./packages/<pkg>`) on the Mac Mini after merging any packages/* change —
+# a uv tool install is a frozen copy and goes stale (BUI-365: a post-merge `gixen add` crashed with
+# `ModuleNotFoundError: No module named 'record_win_prep'` until reinstalled).
 
 # Sync the workspace env (packages/* + plugins/*) for development + tests
 uv sync --all-packages
