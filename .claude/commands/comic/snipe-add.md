@@ -14,6 +14,26 @@ If `gixen` isn't found, install the monorepo CLIs:
 ./scripts/install.sh
 ```
 
+## Role in /comic:buy (BUI-360 / BUI-361)
+
+The orchestrated buy flow does **not** dispatch this skill as a sub-agent:
+`/comic:buy` Step 5 calls `gixen add-batch` inline, with this skill's pre-flight
+bid sanity check and user approval gate folded into that step and the BUI-168
+failure semantics enforced by the CLI itself. This file therefore has **no
+EXECUTOR CONTRACT / ORCHESTRATOR NOTES split** (unlike `collection-check.md` and
+`verify.md`, BUI-361) — with no orchestrated dispatch, an ORCHESTRATOR NOTES
+section would have no reader. The whole file is the contract for its two
+remaining callers:
+
+- a **standalone `/comic:snipe-add`** invocation (user-approved item_ids + max
+  bids, outside the buy flow), and
+- an **ad-hoc dispatched executor** (e.g. "add one more snipe" after a run) —
+  point it at this file; everything it must do is here.
+
+`buy.md` references specific parts of this file (§ Bid groups, the CGC-float
+grade conversion under *Available `add` flags*, the pre-flight bid sanity
+check); keep those anchors stable when editing.
+
 ## Input
 
 A list of approved auctions, each with:

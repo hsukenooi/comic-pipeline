@@ -14,7 +14,28 @@ Mini see the same answer.
 > **STOP** and tell the user — never render "Not in collection" from a failed
 > call. A silent miss buys a duplicate. This is the whole point of the check.
 
-## Input
+## How to read this file (BUI-361)
+
+This skill is split into two sections:
+
+- **EXECUTOR CONTRACT** — everything the agent performing the check must do,
+  self-contained. `/comic:buy` dispatches a sub-agent with *"Read this file and
+  execute its EXECUTOR CONTRACT with this input: \<working list\>"*; the
+  executor reads the whole file and follows the contract.
+- **ORCHESTRATOR NOTES** — what a dispatching orchestrator reads *instead of*
+  the contract: dispatch input, hard-STOP handling, the Step 4 decision gate,
+  and carry-forward. The orchestrator never needs to ingest the contract body.
+
+**Standalone invocation** (`/comic:collection-check` run directly, no
+orchestrator): you are both roles — execute the EXECUTOR CONTRACT, then apply
+the ORCHESTRATOR NOTES yourself (present the table and run the Step 4 decision
+gate with the user).
+
+---
+
+## EXECUTOR CONTRACT
+
+### Input
 
 A list of identified comics (series + issue, optionally variant and year). Either
 from the `/comic:identify` output table or provided directly by the user.
@@ -30,7 +51,7 @@ against the wrong volume of a rebootable masthead). When the Year column is blan
 guessed year would risk the BUI-129 false-negative. Never fabricate a year to fill a
 blank; the blank is the safe, year-agnostic default.
 
-## Step 0: Resolve the server + bootstrap guard
+### Step 0: Resolve the server + bootstrap guard
 
 Resolve and health-gate the comics server through the **shared comics-server
 call convention** (BUI-172, `docs/conventions/comics-server-call.md`) — don't
@@ -60,7 +81,7 @@ curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 Save `cache_age_days`, `pending_push_count`, and `oldest_pending_days` from the
 response — you need them for output banners.
 
-## Step 1: Check each comic against the server
+### Step 1: Check each comic against the server
 
 Build one request covering the whole working list, not one call per comic —
 the batch endpoint (`POST /api/comics/collection/check/batch`, BUI-204) runs
@@ -182,7 +203,7 @@ curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
 Same R11 rule applies here too: a failed call is a hard STOP, never a silent
 "not owned".
 
-## Step 2: Apply stale-cache verdict downgrade
+### Step 2: Apply stale-cache verdict downgrade
 
 **When `cache_age_days > 14` AND `match_status == "not_in_cache"`:** downgrade the
 verdict from confident "Not in collection" to:
@@ -192,7 +213,7 @@ verdict from confident "Not in collection" to:
 A stale import may be missing recently added comics. This prevents a snipe going
 through on a comic you already own.
 
-## Step 2.5: Disambiguate known false-match patterns (advisory only)
+### Step 2.5: Disambiguate known false-match patterns (advisory only)
 
 The matcher has documented blind spots that produce **false positives** (reports
 owned when it isn't → you skip a book you wanted) and **false negatives** (reports
@@ -335,10 +356,10 @@ flagged the same way (a `2nd Printing` listing matched only by the owned base
 row).
 
 Carry every flag into the Notes column of the Step 3 table and surface flagged rows
-separately at the Step 4 decision gate. The user decides; the disambiguator only
-makes the ambiguity visible.
+separately at the Step 4 decision gate (ORCHESTRATOR NOTES). The user decides; the
+disambiguator only makes the ambiguity visible.
 
-## Step 3: Output table
+### Step 3: Output table
 
 ```
 | # | Comic | In Cache? | Full Title Matched | Matched Volume | Cache Age | Notes |
@@ -372,7 +393,48 @@ not the comic).
 - If `cache_age_days > 14`: `⚠️ Cache is N days old — consider re-importing from LOCG (leagueofcomicgeeks.com → My Comics → Export).`
 - Pending push: `N rows pending push to LOCG; oldest pending = X days.` Escalate tone when `oldest_pending_days > 21` or `pending_push_count > 25`.
 
-## Step 4: Decision gate
+### What to return to the caller
+
+When dispatched by an orchestrator, return the Step 3 table + status banners
+(flags included in the Notes column). If you hit an R11 STOP anywhere above,
+return the STOP report instead — state explicitly that **no verdicts were
+produced** and why (server unreachable / failed call / never-imported 409).
+Never return a partial table.
+
+### Common Mistakes
+
+| Mistake | Fix |
+|---|---|
+| Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11 — see the callout at the top of this skill) |
+| Passing the series start year (`year_began`) as `year` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`. Forwarding a series' first-published year (e.g. `1963` for *Uncanny X-Men*) filters out every owned issue and returns a false `not_in_cache` for the whole run (BUI-129). Pass `year` only with this issue's actual cover year; otherwise omit it |
+| Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — a confirmed, repeating false-positive (Giant-Size Fantastic Four vs. an owned Fantastic Four Annual); flag and let the user confirm, don't silently skip |
+| Letting the disambiguator flip a verdict on its own | It's advisory — it flags ambiguity for the user, it never invents ownership or overrides the hard-fail (R11) |
+
+---
+
+## ORCHESTRATOR NOTES
+
+**Dispatch input:** pass the working list — one row per comic: `series`, `issue`,
+the `/comic:identify` table's **Year exactly as emitted** (a blank Year stays
+blank — never backfill it with a guessed or series-start year; the executor's
+contract owns the BUI-316/BUI-129 forwarding rule), and `variant` when the
+listing is a variant. The executor resolves the server, runs the batch check,
+applies the stale-cache downgrade and the Pattern A–E disambiguation scan, and
+returns the Step 3 table + status banners.
+
+**Executor reuse (BUI-366):** the executor stays addressable for the rest of
+the run — for an incremental check (a comic added to the working list mid-run),
+SendMessage the same executor the new `{series, issue, year?, variant?}` row
+instead of respawning one that re-reads this contract from scratch (see buy.md
+§ Sub-agent reuse).
+
+**Hard STOP (R11):** if the executor reports it STOPPED (server unreachable,
+failed/non-200 check call, or the never-imported 409), the check produced **no
+verdicts** — halt the flow at this step and tell the user. Never reinterpret a
+STOP as "not in collection", and never proceed to bidding without real verdicts.
+A partial or missing answer is a stop, not a "not owned".
+
+### Step 4: Decision gate
 
 Ask the user how to handle results:
 
@@ -383,12 +445,3 @@ Ask the user how to handle results:
 - **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` or Pattern-E printing conflict should not be auto-skipped, and a Pattern-B/C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
 
 Remove skipped comics from the working list before passing to `/comic:fmv`.
-
-## Common Mistakes
-
-| Mistake | Fix |
-|---|---|
-| Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11 — see the callout at the top of this skill) |
-| Passing the series start year (`year_began`) as `year` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`. Forwarding a series' first-published year (e.g. `1963` for *Uncanny X-Men*) filters out every owned issue and returns a false `not_in_cache` for the whole run (BUI-129). Pass `year` only with this issue's actual cover year; otherwise omit it |
-| Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — a confirmed, repeating false-positive (Giant-Size Fantastic Four vs. an owned Fantastic Four Annual); flag and let the user confirm, don't silently skip |
-| Letting the disambiguator flip a verdict on its own | It's advisory — it flags ambiguity for the user, it never invents ownership or overrides the hard-fail (R11) |

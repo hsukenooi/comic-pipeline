@@ -59,6 +59,19 @@ The subagent returns the identification table directly. Present it to the user:
 
 This table is the input for `/comic:collection-check` and `/comic:fmv`.
 
+## Follow-ups: message the same agent (BUI-366)
+
+The identifier agent keeps the full `ebay_fetch.py` JSON in its context after it
+returns the table — item specifics, description text, printing/variant evidence
+none of which entered the caller's context. For a follow-up question about a
+listing it already fetched (e.g. "does item N's item specifics say first
+printing?", "what does the description say about the variant?"), SendMessage
+the **same** agent rather than dispatching a fresh one — the answer is one tool
+call from JSON it already holds; a fresh spawn re-fetches and re-parses
+everything (in the 2026-07-16 run: 1 tool call vs 9). Name the agent at spawn
+time so it's addressable. Current Price and Bids never need a follow-up — they
+are already columns in the table (BUI-359).
+
 ## Common Mistakes
 
 | Mistake | Fix |
