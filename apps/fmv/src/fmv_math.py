@@ -586,6 +586,16 @@ CGC_PROXY_CONFIDENCE = "MEDIUM-LOW"
 # constrain the bid — mirrors the BUI-318 interpolated-LOW haircut, one rung up.
 CGC_PROXY_BID_FACTOR = 0.70
 
+# Within-bucket outlier robustness floor (BUI-355): the smallest bucket size
+# whose median actually resists one outlier. median-of-1 IS the comp and
+# median-of-2 is just the mean of two — one $5000 mistag in an n=2 bucket
+# drags the "median" to the midpoint, with zero robustness. Only at n>=3 does
+# the median discard an extreme value. Exact target-grade buckets thinner than
+# this are subject to the BUI-349 envelope-sanity clamp below. Distinct from
+# MIN_BRACKET_COMPS (=2), which gates which buckets may ANCHOR an
+# interpolation — that semantic is unchanged.
+OUTLIER_ROBUST_BUCKET_N = 3
+
 
 def cgc_ladder_price(ladder: dict[float, float], target_grade: float,
                      counts: dict[float, int] | None = None,
@@ -617,28 +627,39 @@ def cgc_ladder_price(ladder: dict[float, float], target_grade: float,
     priced; the ladder-wide comp-count floor + the monotonicity guard in
     ``cgc_proxy_fmv`` are the ladder-wide money-safety nets.
 
-    BUI-349 envelope-sanity clamp: a THIN exact bucket (fewer than
-    ``min_bucket_n`` comps) has no within-bucket outlier protection — a lone
-    certified slab is used as-is, so one off-trend-high listing could set a
-    too-high cap that the monotonicity guard misses (that guard only refuses a
-    bucket priced above the NEXT one; a lone comp sitting BETWEEN its neighbors
-    yet above the linear trend between them stays monotone). So when trustworthy
-    (≥ ``min_bucket_n``) buckets BRACKET the target, bound a thin exact value
-    from ABOVE by the linear envelope those neighbors imply — ``min(exact,
-    envelope)``. This can only LOWER the price, never raise it (money-safe), and
-    preserves the sparse-key case: ASM #50's lone $1200 6.5 sits below its $1686
-    5.0–7.0 envelope, so it is unchanged; only an off-trend-high lone comp is
-    clamped down. A thick exact bucket (its median already outlier-robust) and a
-    thin exact bucket with no eligible bracket (no envelope to check — the
-    irreducible sparse-key case) both stay direct anchors. ``counts=None``
-    disables the clamp (a caller passing bare medians can't tell a thin bucket
-    from a thick one), preserving the exact-anchor behavior.
+    BUI-349 envelope-sanity clamp: an exact bucket too thin to have
+    within-bucket outlier protection (fewer than ``OUTLIER_ROBUST_BUCKET_N``
+    comps — BUI-355 widened this from ``< min_bucket_n``, i.e. n=1, to also
+    cover n=2, whose median-of-2 is just the mean of two and has zero
+    robustness) can let one off-trend-high listing set a too-high cap that the
+    monotonicity guard misses (that guard only refuses a bucket priced above
+    the NEXT one; a comp sitting BETWEEN its neighbors yet above the linear
+    trend between them stays monotone). So when trustworthy (≥ ``min_bucket_n``)
+    buckets BRACKET the target, bound a non-robust exact value from ABOVE by
+    the linear envelope those neighbors imply — ``min(exact, envelope)``. This
+    can only LOWER the price, never raise it (money-safe), and preserves the
+    sparse-key case: ASM #50's lone $1200 6.5 sits below its $1686 5.0–7.0
+    envelope, so it is unchanged; only an off-trend-high thin comp is clamped
+    down. A robust (n≥3) exact bucket (its median already discards an extreme)
+    and a thin exact bucket with no eligible bracket (no envelope to check —
+    the irreducible sparse-key case) both stay direct anchors. Note the two
+    thresholds stay distinct on purpose: ``min_bucket_n`` (≥2) still gates
+    which buckets may ANCHOR the envelope; the exact bucket NEEDS the envelope
+    check when thinner than ``max(min_bucket_n, OUTLIER_ROBUST_BUCKET_N)`` —
+    the ``max`` keeps the trigger tracking a caller-raised ``min_bucket_n``
+    (>3), so BUI-355 can never RAISE a price vs the old ``< min_bucket_n``
+    trigger for ANY caller (a no-op for the default; only-lowers by
+    construction). ``counts=None`` disables the clamp (a caller passing bare
+    medians can't tell a thin bucket from a thick one), preserving the
+    exact-anchor behavior.
     """
     if not ladder:
         return None
     if target_grade in ladder:
         exact = ladder[target_grade]
-        if counts is not None and counts.get(target_grade, 0) < min_bucket_n:
+        if (counts is not None
+                and counts.get(target_grade, 0)
+                < max(min_bucket_n, OUTLIER_ROBUST_BUCKET_N)):
             envelope = _bracket_interpolate(
                 ladder, target_grade, counts, min_bucket_n
             )
