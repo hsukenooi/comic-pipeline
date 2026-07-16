@@ -408,6 +408,83 @@ def test_check_year_resolves_cross_volume(client):
     assert body["matched_series_name"] == "Fantastic Four (Vol. 1) (1961 - 1996)"
 
 
+# --- printing-marker conflict (BUI-364) --------------------------------------
+
+# The confirmed BUI-364 incident state (Absolute Martian Manhunter #1, eBay
+# 147434010581): the 2nd printing is owned; the base printing is tracked
+# wish-list-only. A base-printing query must not read as unqualified ownership.
+_AMM_PRINTINGS = [
+    {
+        "full_title": "Absolute Martian Manhunter #1 2nd Printing",
+        "series_name": "Absolute Martian Manhunter (2025)",
+        "publisher_name": "DC Comics",
+        "release_date": "2025-06-18",
+        "in_collection": 1,
+    },
+    {
+        "full_title": "Absolute Martian Manhunter #1",
+        "series_name": "Absolute Martian Manhunter (2025)",
+        "publisher_name": "DC Comics",
+        "release_date": "2025-03-19",
+        "in_collection": 0,
+        "in_wish_list": 1,
+    },
+]
+
+
+def test_check_printing_conflict_surfaced(client):
+    """BUI-364: an owned '2nd Printing' row satisfying a base-printing query is
+    flagged mechanically — printing_conflict=True plus the conflicting rows,
+    showing the base printing is wish-listed, not owned. match_status stays
+    in_collection (the reprint IS owned); the flag qualifies, never flips (R11)."""
+    _seed_collection(client.store, _AMM_PRINTINGS)
+    r = client.get(
+        "/api/comics/collection/check",
+        params={"series": "Absolute Martian Manhunter", "issue": "1"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["match_status"] == "in_collection"
+    assert body["full_title_matched"] == "Absolute Martian Manhunter #1 2nd Printing"
+    assert body["printing_conflict"] is True
+    by_title = {c["full_title"]: c for c in body["printing_candidates"]}
+    base = by_title["Absolute Martian Manhunter #1"]
+    assert base["in_collection"] is False
+    assert base["in_wish_list"] is True
+
+
+def test_check_batch_printing_conflict_parity(client):
+    """BUI-364/BUI-204 parity: the batch endpoint surfaces the same
+    printing_conflict fields per item as the single-item endpoint."""
+    _seed_collection(client.store, _AMM_PRINTINGS)
+    r = client.post(
+        "/api/comics/collection/check/batch",
+        json={"items": [{"series": "Absolute Martian Manhunter", "issue": "1"}]},
+    )
+    assert r.status_code == 200, r.text
+    result = r.json()["results"][0]
+    assert result["match_status"] == "in_collection"
+    assert result["printing_conflict"] is True
+    assert any(
+        c["full_title"] == "Absolute Martian Manhunter #1"
+        for c in result["printing_candidates"]
+    )
+
+
+def test_check_unmarked_owned_row_printing_conflict_false(client):
+    """BUI-364: the field is present (False) on a clean owned verdict, so
+    callers can read it unconditionally on every row."""
+    r = client.get(
+        "/api/comics/collection/check",
+        params={"series": "Amazing Spider-Man", "issue": "300", "year": "1988"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["match_status"] == "in_collection"
+    assert body["printing_conflict"] is False
+    assert "printing_candidates" not in body
+
+
 def test_check_batch_cross_volume_returns_ambiguous(client):
     """BUI-284: the batch endpoint carries the ambiguous verdict per-item too."""
     _seed_collection(client.store, _CROSS_VOLUME_FF18)

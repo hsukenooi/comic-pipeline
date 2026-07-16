@@ -2191,6 +2191,17 @@ def _owned_series_issue_candidates(
     ]
 
 
+def _row_summary(row: dict[str, Any]) -> dict[str, Any]:
+    """Verdict-payload projection of a cache row — the three provenance fields
+    shared by the BUI-284 cross-volume ``candidates`` and the BUI-364
+    ``printing_candidates`` lists."""
+    return {
+        "full_title": row.get("full_title") or "",
+        "series_name": row.get("series_name"),
+        "release_date": row.get("release_date"),
+    }
+
+
 def _has_cross_volume_ambiguity(candidates: list[dict[str, Any]]) -> bool:
     """Return True when owned ``candidates`` (all sharing a normalized series
     key + issue token) span more than one distinct volume/era (BUI-284).
@@ -2358,6 +2369,138 @@ def _match_wishlisted_issue(
     return None
 
 
+# BUI-364: printing-marker conflict detection. LOCG catalogs each printing as
+# its own row whose full_title carries a trailing marker ("… #1 2nd Printing"),
+# and printings are DISTINCT collectibles — but the matcher's series+issue core
+# deliberately ignores everything after the issue token, so an owned reprint row
+# silently satisfies a query about the base printing. The confirmed incident
+# (Absolute Martian Manhunter #1, eBay 147434010581): the owned "2nd Printing"
+# row answered `in_collection` while the base printing — explicitly wish-listed —
+# was the book actually being bought, and the orchestrator skipped it (a missed
+# purchase, the BUI-308 danger direction).
+_PRINTING_ORDINAL_WORDS: dict[str, int] = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+
+# An ordinal (digit "2nd"/"3rd"/… or word "second"/"third"/…) immediately
+# followed by "print"/"printing(s)". Requiring the ordinal keeps a series whose
+# NAME merely contains "printing" from reading as a marker.
+_PRINTING_MARKER_RE = re.compile(
+    r"\b(?:(\d+)\s*(?:st|nd|rd|th)|("
+    + "|".join(_PRINTING_ORDINAL_WORDS)
+    + r"))[\s-]+print(?:ing)?s?\b",
+    re.IGNORECASE,
+)
+
+
+def _printing_ordinal(text: Optional[str]) -> int:
+    """Printing ordinal named in ``text``: 2 for "2nd Printing", 3 for "Third
+    Printing", … Unmarked text and an explicit "1st Printing" are both 1 — a
+    query without a marker means the base (first) printing, and an owned row
+    labeled "1st Printing" genuinely satisfies it."""
+    m = _PRINTING_MARKER_RE.search(text or "")
+    if not m:
+        return 1
+    if m.group(1):
+        return int(m.group(1))
+    return _PRINTING_ORDINAL_WORDS[m.group(2).lower()]
+
+
+def _printing_conflict_fields(
+    comics: list[dict[str, Any]],
+    query_text: str,
+    matched_row: dict[str, Any],
+    series_keys: frozenset[str],
+    issue_stripped: str,
+    issue: str,
+    year: Optional[str],
+) -> dict[str, Any]:
+    """BUI-364 verdict fields: ``{"printing_conflict": bool}`` plus, when the
+    flag is raised, ``"printing_candidates"`` — every same-era cache row
+    (owned or not) for the same series + issue across all printings, so the
+    caller can see e.g. that the base printing is wish-listed while only a
+    reprint is owned.
+
+    ``series_keys`` must be the FULL masthead-equivalence set
+    (:func:`owned_match_keys`), not just the key the match landed on — an
+    owned copy of the queried printing filed under an alias masthead (e.g.
+    the reprint under "Uncanny X-Men" while the base sits under "The X-Men",
+    BUI-200's split) must both clear the flag and appear in the candidates,
+    or the note would misstate an owned base as untracked.
+
+    The flag raises when the matched row's printing ordinal differs from the
+    query's (an unmarked query means printing 1), UNLESS some OTHER owned,
+    year-compatible row DOES carry the query's ordinal — owning both the base
+    and the 2nd printing must not flag a base query just because the matcher
+    happened to return the reprint row first. Two year rules keep that escape
+    honest:
+
+    * Candidates are year-gated (``_year_gate_accepts``, dateless rows
+      fail-open) so a wrong-era same-masthead row (a wished 2008 "Hulk #1"
+      against a 2021 query) can't render as "the query's own printing".
+    * When a ``year`` IS known, a DATELESS owned row cannot clear the flag
+      (mirrors BUI-197 MUST-FIX 2): ``_year_gate_accepts`` fails open on it,
+      so a dateless copy from a DIFFERENT era would otherwise silently
+      reproduce the missed-purchase incident. The noise direction (a dateless
+      same-era base flags falsely) is the safe one; the row still shows in
+      the candidates list.
+
+    Advisory only (R11): the flag qualifies the verdict, it never flips
+    ``match_status`` — every owned-guard consumer (the wish-list 409, the
+    conflicts audit, record-win dedup) behaves exactly as before.
+    """
+    query_ordinal = _printing_ordinal(query_text)
+    matched_ordinal = _printing_ordinal(matched_row.get("full_title") or "")
+    if matched_ordinal == query_ordinal:
+        return {"printing_conflict": False}
+
+    candidates = [
+        row
+        for row in comics
+        if any(
+            _row_matches_series_issue(row, key, issue_stripped, issue)
+            for key in series_keys
+        )
+        and _year_gate_accepts(year, row.get("release_date") or "")
+    ]
+    # The queried printing IS owned by another row — the verdict is not being
+    # satisfied by a foreign printing, so there is nothing to flag.
+    if any(
+        row.get("in_collection")
+        and _printing_ordinal(row.get("full_title") or "") == query_ordinal
+        and (not year or row.get("release_date"))
+        for row in candidates
+    ):
+        return {"printing_conflict": False}
+
+    return {
+        "printing_conflict": True,
+        "printing_candidates": [
+            {
+                **_row_summary(row),
+                # Raw store columns, coerced to bools (in_collection is a
+                # copies-owned count; truthy == owned).
+                "in_collection": bool(row.get("in_collection")),
+                "in_wish_list": bool(row.get("in_wish_list")),
+                # Mechanical ordinal (1 = base printing) so a caller can pick
+                # out the query's own printing among 3+ candidates without
+                # re-parsing full_title.
+                "printing_ordinal": _printing_ordinal(row.get("full_title") or ""),
+            }
+            for row in candidates
+        ],
+    }
+
+
 def cmd_collection_check(
     series: str,
     issue: str,
@@ -2395,6 +2538,18 @@ def cmd_collection_check(
     including "in_collection" — rather than only for "not_in_cache", since a
     duplicate row (one owned edition, one wish-list-only edition of the same
     issue) is a real, if rare, possibility.
+
+    BUI-364: `printing_conflict` (always a bool, present on every verdict) is
+    True when the ownership verdict is satisfied by a row whose full_title
+    carries a printing marker ("2nd Printing", "Third Printing", …) the query
+    never asked for — printings are distinct collectibles, so an owned reprint
+    must not silently read as owning the base printing (the Absolute Martian
+    Manhunter #1 missed-purchase incident: owned 2nd printing answered
+    `in_collection` while the base printing was wish-listed). When True, the
+    verdict adds `printing_candidates` — every same-series+issue row across
+    all printings with its owned/wish state. ADVISORY ONLY: match_status is
+    unchanged (the reprint IS owned), so every owned-guard consumer behaves
+    exactly as before; the caller flags, the user decides (R11).
     """
     cache = CollectionCache()
     payload = cache.load()
@@ -2408,6 +2563,15 @@ def cmd_collection_check(
     matched_row = _match_owned_issue(comics, series_key, issue_stripped, issue, variant, year)
     match_kind: Optional[str] = "exact" if matched_row is not None else None
     in_wish_list = _match_wishlisted_issue(comics, series_key, issue_stripped, issue, year) is not None
+
+    # BUI-364: the printing-conflict probe scans the FULL masthead-equivalence
+    # key set (exact + alias + the X-Men split), regardless of which key the
+    # match landed on — the ownership model's equivalence is symmetric, so an
+    # owned base filed under an alias masthead must be visible to the probe.
+    printing_keys = owned_match_keys(series, issue)
+    # The query's own printing wording lives in `series` (rarely) and `variant`
+    # (the normal carrier, e.g. variant="2nd Printing").
+    printing_query_text = f"{series} {variant}" if variant else series
 
     # BUI-284: cross-volume ambiguity guard (exact-key pass, no year). With no
     # `year`, the normalized series key can't distinguish two owned volumes of
@@ -2431,14 +2595,13 @@ def cmd_collection_check(
                 "match_kind": "cross_volume",
                 "in_wish_list": in_wish_list,
                 "cache_age_days": cache_age,
-                "candidates": [
-                    {
-                        "full_title": row.get("full_title") or "",
-                        "series_name": row.get("series_name"),
-                        "release_date": row.get("release_date"),
-                    }
-                    for row in candidates
-                ],
+                "candidates": [_row_summary(row) for row in candidates],
+                # BUI-364: same printing probe as the in_collection verdict, so
+                # the field is present (and meaningful) on every verdict shape.
+                **_printing_conflict_fields(
+                    comics, printing_query_text, matched_row,
+                    printing_keys, issue_stripped, issue, year,
+                ),
             }
 
     # BUI-200/BUI-197: an owned copy can be filed under a DIFFERENT series-name
@@ -2479,6 +2642,10 @@ def cmd_collection_check(
             "match_kind": match_kind,
             "in_wish_list": in_wish_list,
             "cache_age_days": cache_age,
+            **_printing_conflict_fields(
+                comics, printing_query_text, matched_row,
+                printing_keys, issue_stripped, issue, year,
+            ),
         }
 
     return {
@@ -2489,6 +2656,9 @@ def cmd_collection_check(
         "match_kind": None,
         "in_wish_list": in_wish_list,
         "cache_age_days": cache_age,
+        # BUI-364: no matched title, so no printing to conflate — but the field
+        # is present on every verdict so callers can read it unconditionally.
+        "printing_conflict": False,
     }
 
 
