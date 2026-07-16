@@ -380,6 +380,34 @@ def test_local_added_seq_ordering(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# write_wins: intra-batch duplicate handling (BUI-356)
+# ---------------------------------------------------------------------------
+
+def test_write_wins_intra_batch_duplicate_gixen_id_appends_once(tmp_path):
+    """Two rows sharing gixen_item_id in ONE write_wins call must not both append.
+
+    The duplicate index used to be built once before the loop, so neither row
+    saw the other as a duplicate and both got appended (BUI-356). The second
+    (later) row must instead overwrite the first, exactly like a duplicate
+    against the on-disk store.
+    """
+    cache = make_cache(tmp_path)
+    row_a = make_row(full_title="Amazing Spider-Man #300", seq=1, gixen_item_id="DUPE")
+    row_b = make_row(
+        full_title="Amazing Spider-Man #300 (variant)", seq=2, gixen_item_id="DUPE"
+    )
+
+    cache.write_wins([row_a, row_b])
+
+    payload = cache.load()
+    dupes = [r for r in payload["comics"] if r.get("gixen_item_id") == "DUPE"]
+    assert len(dupes) == 1
+    # Later row in the batch wins, matching duplicate-against-store overwrite
+    # semantics (payload["comics"][idx] = row).
+    assert dupes[0]["full_title"] == "Amazing Spider-Man #300 (variant)"
+
+
+# ---------------------------------------------------------------------------
 # Concurrent writers
 # ---------------------------------------------------------------------------
 

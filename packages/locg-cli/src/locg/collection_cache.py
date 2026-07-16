@@ -749,6 +749,10 @@ class CollectionCache:
 
         Duplicate detection is by gixen_item_id: an existing row with the
         same ID is overwritten; rows without a gixen_item_id are always
+        appended.  The index is kept up to date as rows are appended (BUI-356)
+        so two incoming rows sharing a gixen_item_id within the same call are
+        handled identically to a duplicate against the on-disk store — the
+        later row overwrites the earlier one in place rather than both being
         appended.  Callers are responsible for chunking large batches.
         """
         def mutate(payload: dict[str, Any]) -> None:
@@ -763,6 +767,8 @@ class CollectionCache:
                     payload["comics"][idx_by_gixen[gixen_id]] = row
                 else:
                     payload["comics"].append(row)
+                    if gixen_id:
+                        idx_by_gixen[gixen_id] = len(payload["comics"]) - 1
 
         self.apply(mutate, command=command)
 
