@@ -42,9 +42,14 @@ decision. The leaf skills still health-gate the server at their own steps.
 Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow it.
 
 **Input:** eBay URLs from the user.
-**Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **seller**).
+**Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**).
 
 Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step.
+
+**Keep the Current Price and Bids columns in the working list (BUI-359)** — Steps 4–5
+read them for the current-bid-vs-max pre-flight and urgency context. They came free
+with the identify fetch; re-asking the identifier subagent for prices mid-flow costs
+a round-trip and ~26k tokens for nothing.
 
 ### Seller reliability advisory (BUI-78)
 
@@ -78,6 +83,31 @@ Read `~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md` and 
 Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate). For any `⚠️ Not in cache (cache stale)` results, surface them separately so the user can decide whether to bid before verifying manually.
 
 Remove skipped comics from the working list before Step 2.5.
+
+### Duplicate listings of the same comic → Gixen bid group (BUI-363)
+
+When the working list contains **2+ listings of the same comic** (same series +
+issue + variant tier) and the user wants **at most one copy**, don't drop the
+later-ending copies — keep them all in the working list and mark them as one
+**bid-group candidate**. Gixen bid groups make "snipe every copy, win at most
+one" safe: per Gixen's documented semantics, once one snipe in a group wins,
+the remaining snipes in that group are automatically cancelled.
+
+- Each copy still flows through grade/FMV individually — **per-copy max bids
+  may legitimately differ by grade** (a VF copy and a VF+ copy of the same book
+  get different caps).
+- At Step 5, give every copy the same `"group": N` in its batch row (pick the
+  lowest N from 1–10 not already used by a live snipe — check `gixen list`,
+  which shows each snipe's group).
+- **End-time caveat (from Gixen's FAQ):** groups are only safe when the
+  grouped auctions **do not end within ~2 minutes of each other** — Gixen
+  cancels siblings *after* a win, so two copies ending near-simultaneously can
+  BOTH be bid and both won. If two copies end that close together, group them
+  anyway but warn the user and let them pick one to snipe instead.
+- If the user wants multiple copies (genuinely distinct variants, or an
+  intentional multi-buy), no group — omit the field.
+- After a group win, remind the user to run `gixen purge` promptly (see
+  snipe-add.md § Bid groups for why this matters for `/comic:collection-add`).
 
 ---
 
@@ -118,16 +148,22 @@ Gate: user confirms the assessed grades (or overrides any) before FMV. Map the g
 Run `comic-fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetch (via `ebay-fetch sold-comps`), cache, dedup, IQR, quartiles, confidence rubric, self-exclusion, and DB upsert.
 
 ```bash
-comic-fmv --batch <working_list.json> --out <results.json>
+comic-fmv --batch <working_list.json> --out <results.json> --brief
 ```
 
 **Input:** Working list JSON: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Pass `publisher` for non-Marvel/DC titles and `variant` for non-base editions — both feed FMV accuracy (BUI-161). Include `grade_confidence` (`high`|`medium`|`medium-low`|`low` — all four levels; fmv.md owns the haircut each applies) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
 
-**Output:** Human FMV table to stdout + structured JSON at `--out`. Carry the JSON forward to Step 4 **and Step 5**.
+**Output:** Human FMV table to stdout, followed by one compact JSON line per row
+(`--brief`, BUI-362): `{item_id, comic_id, fmv_id, max_bid, flag_reason,
+confidence}`. The full structured JSON still lands at `--out`, but **do not
+read the `--out` file into context** — it's dominated by `queries_used` and
+`trimmed_pool` (~6k tokens for 7 rows). The brief lines carry everything
+Steps 4–5 thread forward; keep `--out` on disk for deep dives only (e.g.
+inspecting the comp pool when CV >100%).
 
-Each row in the output JSON includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen add`. A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid.
+Each brief line includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen add-batch`. A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid.
 
-**Needs-manual rows (BUI-86):** a row whose `fmv.flag_reason` is set (`one_sided`, `too_wide`, or `too_sparse`) could not be honestly auto-priced — its `fmv_low`/`fmv_high`/`max_bid` are all `null`. It still has a real `comic_id` (the comic stub was written), so the `comic_id: null` check above will **not** catch it. Gate on `fmv.flag_reason` instead: surface these rows as **needs-manual** and do not auto-propose a max bid. The user either hand-prices them (via the `fmv.md` interpolation / CGC-proxy methods) or skips them — never bid the absent number.
+**Needs-manual rows (BUI-86):** a row whose `flag_reason` is set (`one_sided`, `too_wide`, or `too_sparse` — surfaced directly on its brief line) could not be honestly auto-priced — its `fmv_low`/`fmv_high`/`max_bid` are all `null`. It still has a real `comic_id` (the comic stub was written), so the `comic_id: null` check above will **not** catch it. Gate on `flag_reason` instead: surface these rows as **needs-manual** and do not auto-propose a max bid. The user either hand-prices them (via the `fmv.md` interpolation / CGC-proxy methods) or skips them — never bid the absent number.
 
 ### Why Step 3 captures `comic_id`
 
@@ -137,10 +173,10 @@ Flags worth knowing:
 - `--max-age-days N` (default 7) — reuses FMVs already in the comics server's DB if `fmv_updated_at` is recent. **Note (BUI-153):** DB-FMV reuse only fires for books that carry a `locg_id`, but the orchestrated buy flow derives series/issue from the eBay title and never resolves one — so this cache-skip is effectively inert in `/comic:buy` and every run recomputes FMV from comps (the ebay-sold-comps SerpApi response cache still applies). `--max-age-days` engages on the standalone `comic-fmv` path when the batch carries explicit `locg_id`s.
 - `--force` — bypasses both SerpApi and DB caches; use only when you suspect a stale comp pool
 
-**Confidence rubric:** fmv.md §8 owns the n/CV thresholds and the wide-window MEDIUM cap. The CLI returns these labels directly (the row's `window` field shows the window used) — surface them as-is in your presentation.
+**Confidence rubric:** fmv.md §8 owns the n/CV thresholds and the wide-window MEDIUM cap. The CLI returns these labels directly (in the human table and on each brief line; the `window` used lives in the `--out` JSON) — surface them as-is in your presentation.
 
 **Flagging rules** (apply when presenting the table to the user):
-- `fmv.flag_reason` set → present as **needs-manual (`<reason>`)**, no max bid; user hand-prices or skips (see the needs-manual note in Step 3)
+- `flag_reason` set (on the brief line) → present as **needs-manual (`<reason>`)**, no max bid; user hand-prices or skips (see the needs-manual note in Step 3)
 - LOW or MEDIUM-LOW with `n ≤ 3` → call out explicitly; user may want to skip or set a conservative max
 - Auction ends within 24h → mark with **⚠️ ends <date>** in the Notes column. Always surface urgency before max-bid approval
 - CV >100% → suspect a wild outlier survived; check the comp pool in the JSON output
@@ -152,7 +188,7 @@ If the CLI fails, fall back to the manual procedure in `~/Projects/comic-pipelin
 
 ## Step 4: Compute Max Bids
 
-The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is `0.80` by default; fmv.md §6 owns the haircut logic that lowers it when grade or comp confidence is low (see Step 2.5 for where `grade_confidence` comes from). When a haircut applied, the row's Notes carry `bid_haircut=…`. Present the proposed bids:
+The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is `0.80` by default; fmv.md §6 owns the haircut logic that lowers it when grade or comp confidence is low (see Step 2.5 for where `grade_confidence` comes from). When a haircut applied, the row's Notes carry `bid_haircut=…` — that notes string lives only in the `--out` JSON (`db_row.fmv_notes`), so when the brief line's `max_bid` is visibly below 80% of the table's FMV high, extract just that row's notes from the `--out` file (one-line python/jq) rather than reading the whole file. Present the proposed bids:
 
 ```
 | # | Comic | Grade | FMV Range | Max Bid | Notes |
@@ -165,7 +201,15 @@ The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_fa
 
 Clean-number rounding: $5 step below $50, $10 step from $50–$200, $25 step above $200.
 
-A `needs-manual` row (`fmv.flag_reason` set) has no CLI-computed max bid. Present it without a proposed number; the user supplies a hand-derived max bid (via the `fmv.md` interpolation / CGC-proxy methods) or skips it. Don't fabricate a max from the absent FMV.
+A `needs-manual` row (`flag_reason` set) has no CLI-computed max bid. Present it without a proposed number; the user supplies a hand-derived max bid (via the `fmv.md` interpolation / CGC-proxy methods) or skips it. Don't fabricate a max from the absent FMV.
+
+**Current-price context (BUI-359):** the Step 1 table already carries each
+auction's **Current Price** and **Bids** — use those columns here, do **not**
+re-fetch listings or re-ask the identifier subagent for prices. Flag any row
+whose current price is already at or above the proposed max (the user should
+raise or skip — see Step 5's pre-flight), and pair Bids with the Ends column
+for urgency context (e.g. `12 bids, ends 18h` = contested; `0 bids` = the
+seller can still end the auction early).
 
 Gate: user approves or overrides each max bid.
 
@@ -179,9 +223,9 @@ If `gixen` isn't found, install the monorepo CLIs first: `./scripts/install.sh`.
 
 **1. Bid sanity check (unchanged from `snipe-add.md`'s pre-flight):**
 
-Compare each approved auction's current bid against its proposed max bid. If current bid ≥ max bid, surface it to the user — Gixen will still register the snipe but it fires below market and won't win. Ask whether to raise the max or skip before proceeding.
+Compare each approved auction's current bid against its proposed max bid, **using the Current Price column already in the Step 1 identification table (BUI-359)** — do not re-fetch listings or re-dispatch the identifier subagent for prices. If current bid ≥ max bid, surface it to the user — Gixen will still register the snipe but it fires below market and won't win. Ask whether to raise the max or skip before proceeding. (Caveat: the Step 1 price is as-of-identify; for an auction that was already contested — high Bids count — and hours have passed, it can lag reality. It's still the right default; only re-fetch if the user asks.)
 
-**2. Build the rows JSON** from the working list carried forward — `item_id` + approved `max_bid` from Step 4, `comic_id` + numeric `grade` from the Step 3 FMV JSON, and the `seller`/`seller_grade`/`photo_grade` captured in Steps 1/2.5. Skip Buy It Now listings — Gixen is for auctions only. Write it to a scratch file, e.g.:
+**2. Build the rows JSON** from the working list carried forward — `item_id` + approved `max_bid` from Step 4, `comic_id` from the Step 3 **brief lines** (BUI-362), numeric `grade` as a CGC float from the working list (Step 2.5 photo grades are already numeric; convert a seller-stated letter grade, e.g. NM- → 9.2, the same mapping snipe-add.md documents for `--seller-grade`), and the `seller`/`seller_grade`/`photo_grade` captured in Steps 1/2.5. Skip Buy It Now listings — Gixen is for auctions only. For a Step 2 bid-group candidate (2+ copies of the same comic, user wants one — BUI-363), set the same `"group": N` on every copy's row; omit `group` otherwise (it defaults to 0 = no group). Write it to a scratch file, e.g.:
 
 ```json
 [
@@ -192,7 +236,8 @@ Compare each approved auction's current bid against its proposed max bid. If cur
     "grade": 9.2,
     "seller": "some_seller",
     "seller_grade": 9.0,
-    "photo_grade": 8.5
+    "photo_grade": 8.5,
+    "group": 1
   }
 ]
 ```
@@ -217,6 +262,9 @@ A non-zero exit code means at least one row did not land (failed or was left not
 
 When at least one row landed (`added`/`updated`), remind the user:
 > Run `/comic:collection-add` after auctions close to record wins. Check `locg collection status` for pending push count before uploading.
+
+If any rows shared a `group` (BUI-363), also remind the user:
+> After one copy in the group wins, run `gixen purge` promptly — it removes the group's cancelled sibling snipes from Gixen and tombstones them `REMOVED` in the DB. Left in place past their own auction end, siblings can be mislabeled as results (see snipe-add.md § Bid groups).
 
 ---
 

@@ -25,11 +25,11 @@ this context.
 The subagent returns the identification table directly. Present it to the user:
 
 ```
-| # | Comic | Issue | Year | Grade | Variant | Type | Seller | Ends | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | beatlebluecat | 2d | — |
-| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
-| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | someseller | — | ⚠️ Buy It Now |
+| # | Comic | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | $102.50 | 12 | beatlebluecat | 2d | — |
+| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | $5.00 | 0 | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
+| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | $250.00 | — | someseller | — | ⚠️ Buy It Now |
 ```
 
 - The `#` column links directly to the eBay listing (`https://www.ebay.com/itm/{item_id}`).
@@ -41,6 +41,12 @@ The subagent returns the identification table directly. Present it to the user:
   as the per-issue `year` to disambiguate rebootable-masthead volumes (e.g. Fantastic
   Four Vol. 1 vs. Vol. 7); a wrong/uncertain year is deliberately never emitted, so the
   check simply stays year-agnostic when it's blank.
+- **Current Price** and **Bids** (BUI-359) come straight from the fetch the subagent
+  already made (`current_price` / `bid_count` in the `ebay_fetch.py` JSON — no extra
+  API call). Current Price is the current bid for an auction, the buy price for a BIN;
+  Bids is the auction bid count (`—` for BIN). Carry both forward — `/comic:buy`
+  Steps 4–5 use them for the current-bid-vs-max pre-flight and urgency context
+  instead of re-fetching or re-asking this subagent mid-flow.
 - **Ends** shows time remaining, not the end date: `<60 min → "47m"`, `<24h → "18h"`,
   `≥1 day → "2d"`. Mark with ⚠️ in the Ends cell if under 24h.
 - Flag Buy It Now listings — they're skipped at the Gixen step.

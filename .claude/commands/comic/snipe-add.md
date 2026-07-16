@@ -95,7 +95,43 @@ These are the flags that exist in `packages/gixen-cli/cli.py` today. Anything el
 
 `--seller` / `--seller-grade` / `--photo-grade` are independent of FMV linking — they're written straight to the `bids` row at add time (omit any that are absent). They feed `/comic:buy`'s seller-reliability advisory; they do not affect the bid or FMV.
 
-### Canonical post-FMV invocation
+### Bid groups — duplicate listings of the same comic (BUI-363)
+
+When the approved list has **2+ listings of the same comic** and the user wants
+**at most one copy**, add them all with the same `--group N` (1–10) instead of
+sniping only the earliest-ending copy. Gixen bid groups mean "win at most one":
+per Gixen's own FAQ, *"all items with the same group number will be grouped
+together and remaining bids canceled once an item in the group is won."* This
+buys the win probability of every copy without dual-win risk. Per-copy max bids
+may differ by grade — a group is about the *comic*, not the price.
+
+- **Pass-through is real:** `--group` (and the `group` field on a `gixen
+  add-batch` row) travels row → `snipe_group` in `POST /api/bids` → the
+  `newsnipegroup` form field POSTed to gixen.com, and is stored on the local
+  `bids.snipe_group` column. `gixen list` shows each snipe's group, parsed back
+  from Gixen's own snipe table — confirm your adds landed grouped there.
+  (The win→auto-cancel behavior itself is verified from Gixen's documentation,
+  not exercised live by this repo's tests.)
+- **Pick an unused N:** check `gixen list` for groups already in use by live
+  snipes; reuse of a live group would merge unrelated books into one
+  win-at-most-one set.
+- **End-time caveat (Gixen FAQ):** don't group auctions ending **within ~2
+  minutes of each other** — cancellation happens after a win, so
+  near-simultaneous endings can win multiple copies. Warn the user and have
+  them pick one copy in that case.
+- **Retroactive grouping:** `gixen group N <item_id>...` assigns existing
+  snipes to a group (0 = ungroup). Note it's direct-Gixen only (no server-mode
+  branch), so the DB's `snipe_group` catches up on the next sync.
+- **After a group win, purge promptly.** `gixen purge` detects "sibling snipes
+  from groups with a win" and removes them from Gixen, tombstoning them
+  `REMOVED` in the DB — that's the status `/comic:collection-add` and the
+  results views correctly ignore (removed ≠ lost). If a cancelled sibling is
+  instead left sitting until its own auction ends, the server can only record
+  it as ENDED/LOST — and the eBay price fallback can then infer a **phantom
+  WON** for it (the BUI-146 accepted-risk class: final price below your max on
+  an auction you never actually bid). A phantom WON would flow into
+  `/comic:collection-add` as a recordable win. Purging between the group win
+  and the siblings' auction ends closes that window.
 
 After `/comic:fmv` (or `/comic:buy`) has produced a row with `comic_id` and a numeric `grade`:
 
@@ -157,3 +193,5 @@ Useful when FMV analysis shows an existing bid is too low.
 | Attempting to snipe a BIN listing | Skip — Gixen is for auctions only |
 | Max bid = FMV top | Use 80% × top — leaves margin for bidder competition |
 | Odd number bids ($137.43) | Round to clean numbers — doesn't materially change outcomes |
+| Sniping only the earliest-ending copy when 2+ listings of the same comic are approved | Add all copies with the same `--group N` — Gixen cancels the rest after one wins (BUI-363); skip grouping only when end times are within ~2 minutes |
+| Leaving a group's cancelled siblings on Gixen after a win | Run `gixen purge` promptly — unpurged siblings whose auctions later end can be mislabeled (worst case a BUI-146 phantom WON that leaks into `/comic:collection-add`) |

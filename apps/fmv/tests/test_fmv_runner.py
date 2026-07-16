@@ -1472,3 +1472,137 @@ class TestCgcProxyNotesAndTable:
         projected = fmv_runner._fmv_from_db_row(row)
         for key in computed:
             assert key in projected, f"_fmv_from_db_row missing key {key!r}"
+
+
+# ─── --brief projection (BUI-362) ─────────────────────────────────────────────
+
+class TestBriefProjection:
+    """`_brief_row` must project the six linkage/pricing fields under exactly
+    the names /comic:buy's Step 3 documents — item_id, comic_id, fmv_id,
+    max_bid, flag_reason, confidence — across all three row sources."""
+
+    BRIEF_KEYS = {"item_id", "comic_id", "fmv_id", "max_bid",
+                  "flag_reason", "confidence"}
+
+    def test_fresh_row_projects_top_level_ids(self):
+        row = {
+            "input": {"item_id": "111", "title": "X", "issue": "1", "grade": 9.0},
+            "fmv": {"max_bid": 80, "flag_reason": None, "confidence": "HIGH",
+                    "fmv_low": 90, "fmv_high": 100, "trimmed_pool": [1, 2, 3]},
+            "comp_count_total": 5, "queries_used": [{"tier": "base"}],
+            "db_row": {"id": 42, "comic_id": 42, "fmv_id": 7},
+            "comic_id": 42, "fmv_id": 7, "source": "fresh",
+        }
+        brief = fmv_runner._brief_row(row)
+        assert set(brief) == self.BRIEF_KEYS
+        assert brief == {"item_id": "111", "comic_id": 42, "fmv_id": 7,
+                         "max_bid": 80, "flag_reason": None,
+                         "confidence": "HIGH"}
+
+    def test_cached_row_falls_back_to_db_row_ids(self):
+        # A cached _stitch row has NO top-level comic_id/fmv_id — its ids live
+        # on the GET /api/comics db_row as `id` / `fmv_id`.
+        row = {
+            "input": {"item_id": "222", "title": "X", "issue": "1"},
+            "fmv": {"max_bid": 60, "flag_reason": None, "confidence": "MEDIUM"},
+            "db_row": {"id": 5, "fmv_id": 9, "fmv_low": 60, "fmv_high": 75},
+            "source": "cached",
+        }
+        brief = fmv_runner._brief_row(row)
+        assert brief["comic_id"] == 5
+        assert brief["fmv_id"] == 9
+        assert brief["max_bid"] == 60
+
+    def test_error_row_projects_nulls_not_missing_keys(self):
+        # A _stitch error row (no comps, no cache) has neither top-level ids
+        # nor a db_row nor an fmv dict — every field except item_id is null,
+        # but every key must still exist for a uniform downstream reader.
+        row = {
+            "input": {"item_id": "333", "title": "X", "issue": "1"},
+            "fmv": None, "db_row": None, "source": "error",
+            "error": "no comps fetched and no cache",
+        }
+        brief = fmv_runner._brief_row(row)
+        assert set(brief) == self.BRIEF_KEYS
+        assert brief["item_id"] == "333"
+        assert all(brief[k] is None for k in self.BRIEF_KEYS - {"item_id"})
+
+    def test_needs_manual_row_projects_flag_reason_with_real_comic_id(self):
+        # BUI-86: a flagged book still upserts a stub (real comic_id) but has
+        # no max_bid — the brief line is how the orchestrator gates on it.
+        row = {
+            "input": {"item_id": "444", "title": "X", "issue": "1"},
+            "fmv": {"max_bid": None, "flag_reason": "one_sided",
+                    "confidence": "LOW"},
+            "db_row": {"id": 8, "comic_id": 8, "fmv_id": 3},
+            "comic_id": 8, "fmv_id": 3, "source": "fresh",
+        }
+        brief = fmv_runner._brief_row(row)
+        assert brief["comic_id"] == 8
+        assert brief["max_bid"] is None
+        assert brief["flag_reason"] == "one_sided"
+
+    def test_print_brief_emits_one_json_line_per_row(self, capsys):
+        rows = [
+            {"input": {"item_id": "1"}, "fmv": {"max_bid": 10},
+             "db_row": None, "comic_id": 1, "fmv_id": 2, "source": "fresh"},
+            {"input": {"item_id": "2"}, "fmv": None, "db_row": None,
+             "source": "error"},
+        ]
+        fmv_runner._print_brief(rows)
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        parsed = [json.loads(ln) for ln in lines]
+        assert parsed[0]["item_id"] == "1" and parsed[0]["max_bid"] == 10
+        assert parsed[1]["item_id"] == "2" and parsed[1]["max_bid"] is None
+
+    def test_run_brief_prints_projection(self, tmp_path, server_url, capsys):
+        # End-to-end: --quiet suppresses the table but --brief still prints
+        # the JSON lines, carrying the ids the upsert returned.
+        batch = [{"item_id": "1", "title": "X", "issue": "1", "year": 1990,
+                  "grade": 9.0}]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+
+        fake_result = [{
+            "input": {"_req_id": 0, "title": "X", "issue": "1", "year": 1990,
+                      "grade": 9.0, "item_id": "1"},
+            "comps": [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]],
+            "queries_used": [{"tier": "base", "cached": False}],
+        }]
+        upserted = {"id": 42, "comic_id": 42, "fmv_id": 7}
+        with patch("fmv_runner._fetch_comps", return_value=fake_result), \
+             patch("fmv_runner._upsert_fmv", return_value=upserted):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           brief=True, server_url=server_url)
+
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert len(lines) == 1
+        brief = json.loads(lines[0])
+        assert brief["item_id"] == "1"
+        assert brief["comic_id"] == 42
+        assert brief["fmv_id"] == 7
+        assert brief["max_bid"] is not None
+        assert brief["confidence"]
+
+    def test_run_without_brief_prints_no_json_lines(self, tmp_path, server_url,
+                                                    capsys):
+        batch = [{"item_id": "1", "title": "X", "issue": "1", "year": 1990,
+                  "grade": 9.0}]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+
+        fake_result = [{
+            "input": {"_req_id": 0, "title": "X", "issue": "1", "year": 1990,
+                      "grade": 9.0, "item_id": "1"},
+            "comps": [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]],
+            "queries_used": [{"tier": "base", "cached": False}],
+        }]
+        with patch("fmv_runner._fetch_comps", return_value=fake_result), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 42}):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        assert capsys.readouterr().out.strip() == ""

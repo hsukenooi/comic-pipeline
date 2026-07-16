@@ -8,7 +8,7 @@ name = "comic-fmv"
 # alone signals staleness (a stale `uv tool install` was previously
 # indistinguishable from a current one — see `comic-fmv --version` below
 # for the finer-grained git-SHA signal).
-version = "0.2.0"
+version = "0.3.0"
 description = "Compute fair market value for comics from eBay sold comps"
 requires-python = ">=3.11"
 dependencies = [
