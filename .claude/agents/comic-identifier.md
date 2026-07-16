@@ -53,7 +53,8 @@ Fields to use from each object:
 | `item_id` | Row identifier |
 | `title` | Full listing title — run through `comic-identify` (below) to get series/issue, don't parse it yourself |
 | `listing_type` | `"Auction"` or `"BIN"` |
-| `current_price` | Current bid (auctions) or buy price (BIN) |
+| `current_price` | Current bid (auctions) or buy price (BIN) — the **Current Price** column (BUI-359). Already a formatted string (e.g. `$102.50`); emit verbatim |
+| `bid_count` | Auction bid count — the **Bids** column (BUI-359). `null` for BIN (render `—`); render `0` as `0`, not blank — zero bids is a real signal (seller can still end the auction early) |
 | `end_date` | When the auction ends (ISO-8601) |
 | `grade` | Parsed condition — `(NM-)`, `(VF)`, etc. Null if not found |
 | `grade_source` | `"item_specifics"`, `"title"`, or `"missing"` |
@@ -104,16 +105,20 @@ dropped items). Do not include raw JSON, intermediate reasoning, or parsing note
 caller's context receives only this output.
 
 ```
-| # | Comic | Issue | Year | Grade | Variant | Type | Seller | Ends | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | beatlebluecat | 2d | — |
-| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
-| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | someseller | — | ⚠️ Buy It Now |
+| # | Comic | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | $102.50 | 12 | beatlebluecat | 2d | — |
+| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | $5.00 | 0 | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
+| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | $250.00 | — | someseller | — | ⚠️ Buy It Now |
 ```
 
 Rules:
 - The `#` column links directly to the eBay listing (`https://www.ebay.com/itm/{item_id}`).
   No separate Item ID column.
+- **Current Price** is `current_price` verbatim (it's pre-formatted, e.g. `$102.50`).
+  **Bids** is `bid_count`: render `null` (BIN, or missing) as `—` and `0` as `0` —
+  a zero-bid auction is a real signal, not a blank. Both come from the fetch you
+  already made — never make an extra API call for them (BUI-359).
 - **Year** is the `cover_year` field verbatim — the confidence-gated per-issue cover
   year (BUI-316). Render `—` when it's `null` (the common case: the gate only fires
   when the title paren year and item-specifics `Publication Year` agree). This column
