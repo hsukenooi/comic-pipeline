@@ -59,12 +59,18 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
                    "NOT bypass the one-sided/spread guards (a guarded book stays "
                    "flagged for manual pricing).")
 @click.option("--quiet", is_flag=True, help="Suppress the human table on stdout.")
+@click.option("--brief", is_flag=True,
+              help="BUI-362: after the human table, print one compact JSON "
+                   "object per row (item_id, comic_id, fmv_id, max_bid, "
+                   "flag_reason, confidence) — the linkage fields /comic:buy "
+                   "threads into the snipe step, without reading the full "
+                   "--out file. Combine with --quiet for the JSON lines only.")
 @click.option("--server-url", envvar=["COMICS_SERVER_URL", "GIXEN_SERVER_URL"], default=None,
               help="Comics server URL (reads COMICS_SERVER_URL, "
                    "falling back to the deprecated GIXEN_SERVER_URL).")
 def cli(batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool, grade_window: float | None,
-        quiet: bool, server_url: str | None) -> None:
+        quiet: bool, brief: bool, server_url: str | None) -> None:
     """Compute fair market value for a batch of comics.
 
     Pipeline per book:
@@ -98,6 +104,7 @@ def cli(batch_path: str | None, out_path: str | None,
         force=force,
         grade_window=grade_window,
         quiet=quiet,
+        brief=brief,
         server_url=server_url,
     )
 

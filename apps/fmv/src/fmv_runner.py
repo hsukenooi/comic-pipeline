@@ -134,11 +134,16 @@ def _fail_mapping(detail: str) -> None:
 def run(*, batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool,
         quiet: bool, server_url: str | None,
-        grade_window: float | None = None) -> None:
+        grade_window: float | None = None,
+        brief: bool = False) -> None:
     """Driver for `comic-fmv`. Exits with sys.exit on hard failures.
 
     `grade_window` (BUI-86) caps how far the comp pool may widen; None uses
     fmv_math's default ceiling. It does not bypass the priceability guards.
+
+    `brief` (BUI-362) additionally prints one compact JSON object per row
+    (see `_brief_row`) after the human table — the linkage/pricing projection
+    an orchestrator needs, without re-reading the full `--out` file.
     """
     if not server_url:
         click.echo("Error: COMICS_SERVER_URL must be set. The fmv command "
@@ -220,6 +225,9 @@ def run(*, batch_path: str | None, out_path: str | None,
 
     if not quiet:
         _print_table(final)
+
+    if brief:
+        _print_brief(final)
 
     if out_path:
         _write_json(out_path, final)
@@ -1101,6 +1109,45 @@ def _write_json(path: str, data) -> None:
         sys.stdout.write("\n")
     else:
         Path(path).write_text(json.dumps(data, indent=2))
+
+
+def _brief_row(r: dict) -> dict:
+    """BUI-362: project one result row down to the linkage + pricing fields an
+    orchestrator (/comic:buy Step 3→5) actually threads forward. The full
+    `--out` row is dominated by `queries_used` and `trimmed_pool`; this is the
+    ~6-field subset that used to be extracted from it after the fact.
+
+    Field sources:
+      - item_id            → the row's input echo.
+      - comic_id / fmv_id  → top-level keys on fresh rows (the POST /api/comics
+        response ids); a cached row has no top-level keys — its ids live on the
+        GET /api/comics `db_row` as `id` / `fmv_id`, so fall back there. A row
+        that never upserted (source == "error") projects null for both.
+      - max_bid / flag_reason / confidence → the row's `fmv` dict (null when
+        `fmv` itself is null, e.g. an error row).
+    """
+    fmv = r.get("fmv") or {}
+    db_row = r.get("db_row") or {}
+    if "comic_id" in r:
+        comic_id = r.get("comic_id")
+        fmv_id = r.get("fmv_id")
+    else:
+        comic_id = db_row.get("id")
+        fmv_id = db_row.get("fmv_id")
+    return {
+        "item_id": (r.get("input") or {}).get("item_id"),
+        "comic_id": comic_id,
+        "fmv_id": fmv_id,
+        "max_bid": fmv.get("max_bid"),
+        "flag_reason": fmv.get("flag_reason"),
+        "confidence": fmv.get("confidence"),
+    }
+
+
+def _print_brief(rows: list[dict]) -> None:
+    """BUI-362: one compact JSON object per row (JSON Lines) on stdout."""
+    for r in rows:
+        click.echo(json.dumps(_brief_row(r)))
 
 
 def _is_fetch_error(r: dict) -> bool:
