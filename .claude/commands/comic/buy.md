@@ -33,6 +33,39 @@ skills without hand-copying their content.
 
 At each step, present results to the user and wait for approval before proceeding.
 
+### Sub-agent reuse — SendMessage, not respawn (BUI-366)
+
+Sub-agents spawned during a run stay addressable for the whole run. When a
+follow-up question or an incremental unit of work lands on context an existing
+agent **already holds**, route it to that agent via
+`SendMessage({to: <name>, message: ...})` instead of spawning fresh — a respawn
+re-fetches and re-instructs for data already sitting in the first agent's
+context. Give agents a `name` at spawn time so they're addressable later.
+
+Reuse targets in this flow:
+
+- **The identifier agent (Step 1)** holds the full `ebay_fetch.py` JSON for
+  every listing — item specifics, description text, printing/variant evidence
+  that never entered your context. Follow-ups like "is item N a first print or
+  a later printing?" are one SendMessage answered from JSON it already parsed
+  (2026-07-16 run: 1 tool call vs the 9 a fresh spawn needed). Current Price
+  and Bids are **not** a reason to message it — BUI-359 already emits them in
+  the Step 1 table; the pattern is for evidence the table doesn't carry.
+- **The collection-check executor (Step 2)** holds its loaded EXECUTOR CONTRACT
+  and the run's verdicts. A comic added to the working list mid-run =
+  SendMessage it the new `{series, issue, year?, variant?}` row for an
+  incremental check, rather than respawning an agent that re-reads the
+  contract from scratch.
+
+(There is no snipe-add sub-agent to reuse — BUI-360 made Step 5 an inline
+`gixen add-batch` call. A late "add one more snipe" is just another inline
+`gixen add`/`add-batch` invocation, or an ad-hoc executor per snipe-add.md.)
+
+Spawn fresh when the context *isn't* already held — a concern none of the live
+agents has data for. Reuse is about the data an agent holds, not about avoiding
+spawns on principle. And reuse never skips a gate: work routed via SendMessage
+still goes through the same user approvals as first-pass work.
+
 ---
 
 ## Step 0: Resolve the server

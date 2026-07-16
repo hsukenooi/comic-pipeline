@@ -422,6 +422,12 @@ listing is a variant. The executor resolves the server, runs the batch check,
 applies the stale-cache downgrade and the Pattern A–E disambiguation scan, and
 returns the Step 3 table + status banners.
 
+**Executor reuse (BUI-366):** the executor stays addressable for the rest of
+the run — for an incremental check (a comic added to the working list mid-run),
+SendMessage the same executor the new `{series, issue, year?, variant?}` row
+instead of respawning one that re-reads this contract from scratch (see buy.md
+§ Sub-agent reuse).
+
 **Hard STOP (R11):** if the executor reports it STOPPED (server unreachable,
 failed/non-200 check call, or the never-imported 409), the check produced **no
 verdicts** — halt the flow at this step and tell the user. Never reinterpret a
