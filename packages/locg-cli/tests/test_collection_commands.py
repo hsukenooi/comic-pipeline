@@ -3059,6 +3059,109 @@ def test_wish_list_remove_conflicts_surfaces_owner_and_spares_collection(tmp_pat
 
 
 # ---------------------------------------------------------------------------
+# BUI-372: printing-conflict exclusion from the conflicts audit
+# ---------------------------------------------------------------------------
+#
+# Reuses the AMM #1 incident fixture (_amm_rows, defined below in the BUI-364
+# printing-marker-conflict section): an owned "2nd Printing" row and a
+# wishlisted base row for the same series+issue. A wish-list entry for the
+# BASE title ("Absolute Martian Manhunter #1") must not be treated as a
+# removable conflict — the owned row is a DIFFERENT printing, so the wished
+# base genuinely isn't owned yet.
+
+def test_wish_list_conflicts_excludes_printing_conflict_decoy(tmp_path, monkeypatch):
+    """BUI-372: an owned reprint matching a wishlisted BASE printing is not a
+    genuine conflict — it goes into printing_conflicts, not conflicts, so
+    remove-conflicts can never sweep it (the BUI-249/BUI-259 incident class
+    through a new door)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1", "id": 1}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert result["conflicts"] == []
+    assert len(result["printing_conflicts"]) == 1
+    decoy = result["printing_conflicts"][0]
+    assert decoy["name"] == "Absolute Martian Manhunter #1"
+    assert decoy["full_title_matched"] == "Absolute Martian Manhunter #1 2nd Printing"
+    assert decoy["printing_candidates"]
+
+
+def test_wish_list_remove_conflicts_unscoped_never_removes_printing_decoy(tmp_path, monkeypatch):
+    """BUI-372: the unscoped sweep (names=None) takes every entry in
+    `conflicts` — since the printing decoy was never added there, it survives
+    an unscoped remove-conflicts call untouched."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1", "id": 1}])
+
+    result = cmds.cmd_wish_list_remove_conflicts()
+
+    assert result["removed_count"] == 0
+    assert result["removed"] == []
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Absolute Martian Manhunter #1"}
+    assert len(result["printing_conflicts"]) == 1
+
+
+def test_wish_list_remove_conflicts_scoped_rejects_printing_decoy_name(tmp_path, monkeypatch):
+    """BUI-372: explicitly naming a printing-conflict decoy in a scoped
+    removal gets a SPECIFIC error (distinct printing, not a genuine
+    duplicate) rather than either silently removing it or the generic
+    "not a conflict at all" message."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1", "id": 1}])
+
+    result = cmds.cmd_wish_list_remove_conflicts(names=["Absolute Martian Manhunter #1"])
+
+    assert result["removed_count"] == 0
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["name"] == "Absolute Martian Manhunter #1"
+    assert "printing" in error["error"].lower()
+    assert "genuine duplicate" in error["error"].lower()
+    # Nothing mutated.
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Absolute Martian Manhunter #1"}
+
+
+def test_wish_list_conflicts_genuine_conflict_alongside_printing_decoy(tmp_path, monkeypatch):
+    """BUI-372: a genuine conflict (no printing marker involved) and a
+    printing-conflict decoy can coexist in one audit — only the genuine one
+    lands in `conflicts` and is removable; the decoy never is."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows() + [_agent_win_row(full_title="Amazing Spider-Man #300")])
+    _seed_wish_list([
+        {"name": "Absolute Martian Manhunter #1", "id": 1},  # printing decoy
+        {"name": "Amazing Spider-Man #300", "id": 2},         # genuine conflict
+    ])
+
+    audit = cmds.cmd_wish_list_conflicts()
+    assert [c["name"] for c in audit["conflicts"]] == ["Amazing Spider-Man #300"]
+    assert [c["name"] for c in audit["printing_conflicts"]] == ["Absolute Martian Manhunter #1"]
+
+    result = cmds.cmd_wish_list_remove_conflicts()
+    assert result["removed_count"] == 1
+    assert [r["name"] for r in result["removed"]] == ["Amazing Spider-Man #300"]
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Absolute Martian Manhunter #1"}
+
+
+# ---------------------------------------------------------------------------
 # BUI-175: decimal / point-issue token regressions
 # ---------------------------------------------------------------------------
 

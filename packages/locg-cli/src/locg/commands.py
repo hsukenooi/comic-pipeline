@@ -1159,10 +1159,25 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
     :func:`cmd_wish_list_remove_conflicts`, which is the removal half of this
     audit and never removes anything not surfaced here first.
 
+    BUI-372: a match whose ``printing_conflict`` is True is NOT a genuine
+    conflict — it means the matched owned row is a DIFFERENT printing than
+    the wished title (printings are distinct collectibles; owning a reprint
+    is not owning the base printing being wished for). Left unhandled, this
+    is the BUI-249/BUI-259 incident class through a new door: an owned
+    reprint would produce a removable "conflict" for a wishlisted base
+    printing that is, in fact, still genuinely wanted and not owned. These
+    matches are therefore split into a separate ``printing_conflicts`` list
+    (same provenance fields plus ``printing_candidates``, the BUI-364 shape)
+    rather than into ``conflicts`` —
+    :func:`cmd_wish_list_remove_conflicts` only ever derives its removal set
+    from ``conflicts``, so a printing decoy can never be swept (unscoped or
+    scoped) through this audit.
+
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
     """
     items = cmd_wish_list_from_cache()
     conflicts: list[dict[str, Any]] = []
+    printing_conflicts: list[dict[str, Any]] = []
     unparseable: list[str] = []
     checked = 0
     for it in items:
@@ -1179,7 +1194,7 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
         # multiple-volumes book returns ambiguous, and missing it would let the
         # owned copy get exported In Collection=0 and deleted (BUI-122).
         if collection_check_reports_owned(result):
-            conflicts.append({
+            entry = {
                 "name": name,
                 "series": series,
                 "issue": issue,
@@ -1189,12 +1204,23 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
                 # is visible before this conflict is removed.
                 "series_name": result["matched_series_name"],
                 "release_date": result["matched_release_date"],
-            })
+            }
+            if result.get("printing_conflict"):
+                # BUI-372: a printing decoy, not a genuine duplicate — see the
+                # docstring above. Kept out of `conflicts` entirely so it can
+                # never be removed by this audit's own removal half.
+                printing_conflicts.append({
+                    **entry,
+                    "printing_candidates": result.get("printing_candidates"),
+                })
+            else:
+                conflicts.append(entry)
     return {
         "total": len(items),
         "checked": checked,
         "unparseable": unparseable,
         "conflicts": conflicts,
+        "printing_conflicts": printing_conflicts,
     }
 
 
@@ -1223,10 +1249,23 @@ def cmd_wish_list_remove_conflicts(names: Optional[list[str]] = None) -> dict[st
     without a second audit. The GET audit is the dry-run preview; this performs
     the removal.
 
+    BUI-372: :func:`cmd_wish_list_conflicts` keeps printing-conflict decoys
+    (an owned reprint matching a wishlisted base printing, or vice versa) out
+    of ``conflicts`` entirely, in its own ``printing_conflicts`` list — so
+    both the unscoped sweep (``names=None``, which takes every current
+    ``conflicts`` entry) and a scoped call naturally never remove one. An
+    explicit ``names`` entry that only matches a printing-conflict decoy gets
+    a specific error explaining why, distinct from "not a conflict at all".
+    The audit's ``printing_conflicts`` is also echoed back here (never
+    removed, purely informational) so a caller sees what was excluded and why.
+
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
     """
     audit = cmd_wish_list_conflicts()
     conflicts_by_name: dict[str, dict[str, Any]] = {c["name"]: c for c in audit["conflicts"]}
+    printing_conflicts_by_name: dict[str, dict[str, Any]] = {
+        c["name"]: c for c in audit["printing_conflicts"]
+    }
 
     errors: list[dict[str, Any]] = []
     if names is None:
@@ -1235,13 +1274,24 @@ def cmd_wish_list_remove_conflicts(names: Optional[list[str]] = None) -> dict[st
         targets = []
         for name in names:
             conflict = conflicts_by_name.get(name)
-            if conflict is None:
+            if conflict is not None:
+                targets.append(conflict)
+            elif name in printing_conflicts_by_name:
+                errors.append({
+                    "name": name,
+                    "error": (
+                        "printing conflict, not a genuine duplicate — the matched "
+                        "owned row is a DIFFERENT printing than the wished title "
+                        "(printings are distinct collectibles, BUI-372); remove it "
+                        "via DELETE /api/comics/wish-list if you no longer want it, "
+                        "not remove-conflicts"
+                    ),
+                })
+            else:
                 errors.append({
                     "name": name,
                     "error": "not a current wish-list/collection conflict — skipped, nothing removed",
                 })
-            else:
-                targets.append(conflict)
 
     removed: list[dict[str, Any]] = []
     for conflict in targets:
@@ -1279,6 +1329,9 @@ def cmd_wish_list_remove_conflicts(names: Optional[list[str]] = None) -> dict[st
         "remaining": remaining,
         "checked": audit["checked"],
         "unparseable": audit["unparseable"],
+        # BUI-372: never removed (see above) — surfaced so a caller sees what
+        # was excluded as a printing decoy rather than silently dropped.
+        "printing_conflicts": audit["printing_conflicts"],
     }
 
 

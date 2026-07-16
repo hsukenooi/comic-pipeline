@@ -1104,3 +1104,75 @@ def test_wish_list_add_wrong_year_fails_open_not_false_block(client):
         json={"title": "The Mighty Thor #154", "year": "1975"},
     )
     assert r.status_code == 200, r.text
+
+
+# --- BUI-372: printing awareness on the wish-list paths ----------------------
+
+def test_wish_list_add_409_detail_is_additive_dict(client):
+    """BUI-372: the 409 detail is now a dict — additive over the prior plain
+    string. A genuine duplicate (no printing marker involved) reports
+    printing_conflict=False/printing_candidates=None, and the human-readable
+    text still lives at detail['message'] for any consumer that used to read
+    detail as a string."""
+    r = client.post("/api/comics/wish-list", json={"title": "Amazing Spider-Man #300"})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["error"] == "already_owned"
+    assert "force=true" in detail["message"]
+    assert detail["matched_full_title"] == "The Amazing Spider-Man #300"
+    assert detail["printing_conflict"] is False
+    assert detail["printing_candidates"] is None
+
+
+def test_wish_list_add_409_detail_surfaces_printing_conflict(client):
+    """BUI-372: a printing-conflict 409 (AMM #1 incident, reproduced at
+    wish-list-add time) carries printing_conflict=True plus the
+    printing_candidates list, so a caller can tell force=true is the CORRECT
+    action here — a distinct printing, not a genuine duplicate."""
+    _seed_collection(client.store, _AMM_PRINTINGS)
+    r = client.post(
+        "/api/comics/wish-list", json={"title": "Absolute Martian Manhunter #1"}
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["printing_conflict"] is True
+    assert detail["matched_full_title"] == "Absolute Martian Manhunter #1 2nd Printing"
+    titles = {c["full_title"] for c in detail["printing_candidates"]}
+    assert "Absolute Martian Manhunter #1" in titles
+
+    # force=true is the documented escape hatch and still works.
+    forced = client.post(
+        "/api/comics/wish-list",
+        json={"title": "Absolute Martian Manhunter #1", "force": True},
+    )
+    assert forced.status_code == 200, forced.text
+
+
+def test_conflicts_endpoint_excludes_printing_decoy(client):
+    """BUI-372: an owned reprint matching a wishlisted BASE printing is not a
+    genuine conflict — GET .../conflicts puts it in printing_conflicts, not
+    conflicts, so it can never be swept by remove-conflicts."""
+    _seed_collection(client.store, _AMM_PRINTINGS)
+    _seed_wish_list(client.store, [{"name": "Absolute Martian Manhunter #1", "id": None}])
+
+    r = client.get("/api/comics/wish-list/conflicts")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["conflicts"] == []
+    assert [c["name"] for c in body["printing_conflicts"]] == ["Absolute Martian Manhunter #1"]
+
+
+def test_remove_conflicts_endpoint_never_removes_printing_decoy(client):
+    """BUI-372: even an explicit confirm=true unscoped sweep must not remove a
+    printing-conflict decoy — it was never in `conflicts` to begin with."""
+    _seed_collection(client.store, _AMM_PRINTINGS)
+    _seed_wish_list(client.store, [{"name": "Absolute Martian Manhunter #1", "id": None}])
+
+    r = client.post("/api/comics/wish-list/remove-conflicts", json={"confirm": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["removed_count"] == 0
+    assert len(body["printing_conflicts"]) == 1
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert names == {"Absolute Martian Manhunter #1"}
