@@ -36,6 +36,7 @@ from server.db import (
     get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     mark_bids_purged, cache_gixen_data, DEDUP_TOMBSTONE_NOTE,
+    CANCELLED_TOMBSTONE_NOTE,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
     TOMBSTONE_STATUSES_SQL,
 )
@@ -140,6 +141,14 @@ _GIXEN_TERMINAL_MAP: dict[str, str] = {
     "ENDED": "ENDED",
 }
 
+# Gixen statuses that are positive evidence Gixen actually processed our bid:
+# OUTBID means our bid was placed and beaten; BID UNDER ASKING PRICE means
+# Gixen evaluated the snipe at fire time. A snipe carrying one of these was
+# not group-cancelled, so its LOST is a genuine contested loss and is exempt
+# from the BUI-371 group-cancel reclassification (the calibration report
+# depends on real losses staying LOST).
+_BID_PROCESSED_STATUSES: frozenset[str] = frozenset({"OUTBID", "BID UNDER ASKING PRICE"})
+
 
 def _map_terminal_status(gixen_status: str, time_to_end: str) -> str | None:
     """Map a Gixen snipe to our internal terminal status when its auction is done.
@@ -239,6 +248,160 @@ def iso_to_relative(end_date_iso: str | None) -> str:
         return " ".join(parts) if parts else "<1m"
     except (ValueError, TypeError):
         return "—"
+
+
+# ---------------------------------------------------------------------------
+# Cancelled-before-end classification (BUI-371)
+# ---------------------------------------------------------------------------
+# A snipe cancelled while its auction was still live (user removal on Gixen's
+# web UI, or Gixen's bid-group auto-cancel after a sibling won) never places a
+# bid — so it must resolve to the REMOVED tombstone, never ENDED/LOST, or the
+# eBay price fallback can stamp a phantom WON on it (BUI-146). Per the BUI-146
+# decision the WON inference itself is never gated; instead these helpers
+# supply POSITIVE evidence of a pre-end cancellation, checked wherever a
+# PENDING row is about to take a terminal status. Anything ambiguous falls
+# through to today's WON-permissive behavior.
+#
+# Margin rationale: a snipe Gixen actually executes stays on Gixen's list until
+# its auction ends, so it can only be observed vanished *after* the end; and
+# Gixen cancels a group's remaining bids promptly after a win (its FAQ's
+# dual-win caveat is auctions ending within ~2 minutes of each other). The
+# margin only needs to absorb auction_end_at estimation error (computed from
+# Gixen's minute-granular countdown) plus clock skew — 10 minutes is
+# comfortably past both, while real cancel-to-end gaps are hours or days.
+_CANCEL_EVIDENCE_MARGIN = timedelta(minutes=10)
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    """_parse_end_iso, but tolerating SQLite's naive 'YYYY-MM-DD HH:MM:SS'
+    (the bids.added_at column default) by assuming UTC — every timestamp this
+    server writes is UTC. Needed because comparing a naive datetime against
+    the aware ones _parse_end_iso returns raises TypeError."""
+    dt = _parse_end_iso(value)
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _vanished_while_live(vanished_at_iso: str | None, end_dt: datetime | None) -> bool:
+    """True when the snipe was observed missing from a healthy Gixen list at
+    least _CANCEL_EVIDENCE_MARGIN before its auction end — it was cancelled
+    while live, not executed at end."""
+    vanished_dt = _parse_end_iso(vanished_at_iso)
+    if vanished_dt is None or end_dt is None:
+        return False
+    return vanished_dt <= end_dt - _CANCEL_EVIDENCE_MARGIN
+
+
+def _group_won_before(
+    db: sqlite3.Connection, item_id: str, snipe_group: str | int | None,
+    end_dt: datetime | None, added_at_iso: str | None,
+) -> bool:
+    """True when another snipe in the same non-zero bid group WON an auction
+    that ended during this row's lifetime (at or after its added_at) and at
+    least _CANCEL_EVIDENCE_MARGIN before this row's end — Gixen had cancelled
+    this snipe by then, so no bid was ever placed on it.
+
+    The lifetime lower bound is what makes group-number reuse safe: Gixen
+    groups are small integers (1-10) that get recycled across unrelated
+    campaigns, and a WON row keeps its group number forever. Without the
+    bound, a months-old win in a reused group would count as cancel evidence
+    for a brand-new unrelated snipe — worst case suppressing a real win the
+    eBay fallback would otherwise recover. A win that predates this snipe's
+    creation cannot have group-cancelled it.
+
+    DB-side sibling of gixen_client.find_sibling_cleanup_targets (which finds
+    the same won-group siblings on the *live* Gixen list for purge): this one
+    works from stored bids rows and adds the timing bounds, because here the
+    question is retrospective — was this snipe already cancelled by its own
+    auction's end?"""
+    if end_dt is None:
+        return False
+    try:
+        group = int(snipe_group or 0)
+    except (ValueError, TypeError):
+        return False
+    if group == 0:
+        return False
+    added_dt = _parse_iso_utc(added_at_iso)
+    if added_dt is None:
+        return False  # can't scope to a lifetime → no evidence (WON-permissive)
+    cutoff = end_dt - _CANCEL_EVIDENCE_MARGIN
+    rows = db.execute(
+        "SELECT auction_end_at, resolved_at FROM bids "
+        "WHERE snipe_group = ? AND status = 'WON' AND item_id != ?",
+        (group, item_id),
+    ).fetchall()
+    for row in rows:
+        won_end = _parse_iso_utc(row["auction_end_at"] or row["resolved_at"])
+        if won_end is not None and added_dt <= won_end <= cutoff:
+            return True
+    return False
+
+
+def _cancelled_before_end(
+    db: sqlite3.Connection, item_id: str, row: sqlite3.Row,
+    end_dt: datetime | None,
+) -> bool:
+    """Combined cancel-evidence test used by the vanished-ended resolver and
+    the eBay fallback. `row` must carry gixen_vanished_at, snipe_group,
+    local_snipe_result, and added_at.
+
+    An 'OK:' local_snipe_result is first-party proof our local sniper fired a
+    bid on this auction — whatever the vanish/group signals suggest, we DID
+    bid, so 'cancelled, never bid' cannot apply."""
+    if (row["local_snipe_result"] or "").startswith("OK:"):
+        return False
+    return _vanished_while_live(row["gixen_vanished_at"], end_dt) or _group_won_before(
+        db, item_id, row["snipe_group"], end_dt, row["added_at"]
+    )
+
+
+def _mark_cancelled_tombstone(db: sqlite3.Connection, row_id: int) -> None:
+    """Stamp the BUI-371 marker on a freshly-classified tombstone so it can be
+    told apart from user-cancel / completed-sweep tombstones in a later audit
+    (the BUI-67 DEDUP_TOMBSTONE_NOTE convention). COALESCE keeps any
+    pre-existing note. Caller commits."""
+    db.execute(
+        "UPDATE bids SET notes=COALESCE(notes, ?) WHERE id=?",
+        (CANCELLED_TOMBSTONE_NOTE, row_id),
+    )
+
+
+def _record_vanish_observations(
+    db: sqlite3.Connection, gixen_item_ids: set[str], now: str,
+    scrape_started_at: str,
+) -> None:
+    """Track when PENDING rows vanish from Gixen's list (BUI-371).
+
+    Caller must guard on a non-empty snipes list — a row missing from an empty
+    list is far more likely a scrape glitch than a removal. A stamp is cleared
+    the moment the row reappears, so a transient per-row scrape miss heals on
+    the next sync (10-min cadence) and can't later masquerade as cancel
+    evidence. Caller commits.
+
+    scrape_started_at guards the stamp against rows added while the scrape was
+    in flight: the background _sync_loop holds no _api_lock, so a concurrent
+    POST /api/bids can insert a PENDING row that is legitimately absent from a
+    list snapshot taken before it existed — that absence is not a vanish.
+    """
+    if not gixen_item_ids:
+        return  # defensive: `item_id IN ()` is a SQLite syntax error
+    placeholders = ",".join("?" * len(gixen_item_ids))
+    ids = list(gixen_item_ids)
+    db.execute(
+        "UPDATE bids SET gixen_vanished_at = NULL "
+        "WHERE status = 'PENDING' AND gixen_vanished_at IS NOT NULL "
+        f"AND item_id IN ({placeholders})",
+        ids,
+    )
+    db.execute(
+        "UPDATE bids SET gixen_vanished_at = ? "
+        "WHERE status = 'PENDING' AND gixen_vanished_at IS NULL "
+        f"AND item_id NOT IN ({placeholders}) "
+        "AND datetime(added_at) <= datetime(?)",
+        [now, *ids, scrape_started_at],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -351,15 +514,23 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     transitions (WON/LOST/...). Insert new snipes that arrived via Gixen's
     web UI. For PENDING DB rows that have vanished from Gixen's response and
     whose auction_end_at is in the past, flip status to ENDED so the eBay
-    fallback can backfill winning_bid. (Vanished-but-still-in-future rows are
-    left as PENDING — that's the "user removed via Gixen web UI before
-    auction end" case, where we have no signal to act on yet.)
+    fallback can backfill winning_bid — unless there is positive evidence the
+    snipe was cancelled while still live (BUI-371: vanished from a healthy
+    list well before its end, or a bid-group sibling won well before its end),
+    in which case it is tombstoned REMOVED so the fallback can't infer a
+    phantom WON on an auction we never bid. Vanished-but-still-in-future rows
+    stay PENDING, but the first sync that observes one missing from a
+    non-empty list stamps gixen_vanished_at — the timestamp that later
+    disambiguates "cancelled before end" from "executed at end".
 
     `reraise` lets a caller (namely `_sync_loop`, BUI-263) distinguish "Gixen
     genuinely unreachable" from "Gixen reached fine, zero live snipes right
     now" — both used to collapse to an empty list, which made a quiet week
     of no active snipes look identical to a sustained outage.
     """
+    # Captured before the scrape so vanish stamping can exclude rows added
+    # while the (lockless) scrape was in flight — see _record_vanish_observations.
+    scrape_started_at = datetime.now(timezone.utc).isoformat()
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
     except GixenConnectionError as e:
@@ -379,6 +550,13 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     now = now_dt.isoformat()
     gixen_item_ids = {s["item_id"] for s in snipes}
 
+    # BUI-371: vanish bookkeeping. Only against a non-empty list — an empty
+    # scrape is more likely a glitch (BUI-85's guard), and mass-stamping live
+    # snipes as vanished could later mislabel them as cancelled.
+    if snipes:
+        _record_vanish_observations(db, gixen_item_ids, now, scrape_started_at)
+
+    terminal_transitions: list[tuple[dict, str]] = []
     for snipe in snipes:
         iid = snipe["item_id"]
 
@@ -394,22 +572,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
         time_to_end = snipe.get("time_to_end", "")
         internal_status = _map_terminal_status(gixen_status, time_to_end)
         if internal_status is not None:
-            # For WON/LOST, current_bid is the final price (what we paid or
-            # what beat us). For ENDED/FAILED with unknown status string,
-            # there's no reliable price signal — leave winning_bid None and
-            # let the eBay fallback fill it in if it can.
-            winning_bid = None
-            if internal_status in ("WON", "LOST"):
-                current_bid = snipe.get("current_bid", "")
-                if current_bid:
-                    try:
-                        winning_bid = float(current_bid.split()[0])
-                    except (ValueError, IndexError):
-                        pass
-            update_bid_status(
-                db, iid, internal_status, winning_bid, now,
-                snipe.get("status_mirror"),
-            )
+            terminal_transitions.append((snipe, internal_status))
 
         # Refresh auction_end_at from Gixen's relative time string on every
         # sync. Gixen only gives "21 h, 30 m, 43 s" so we compute the absolute
@@ -423,12 +586,79 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
                 end_time = (now_dt + delta).isoformat()
                 set_auction_end_time(db, iid, end_time)
 
+    # Apply WON transitions before the rest: a WON row in the DB is the
+    # group-cancel evidence _group_won_before consults when classifying its
+    # siblings' ENDED/LOST below (BUI-371) — after a sync gap, the winner and
+    # a cancelled sibling can arrive in the same list pull.
+    terminal_transitions.sort(key=lambda pair: pair[1] != "WON")
+    for snipe, internal_status in terminal_transitions:
+        iid = snipe["item_id"]
+        gixen_status = snipe.get("status", "")
+        # For WON/LOST, current_bid is the final price (what we paid or
+        # what beat us). For ENDED/FAILED with unknown status string,
+        # there's no reliable price signal — leave winning_bid None and
+        # let the eBay fallback fill it in if it can.
+        winning_bid = None
+        if internal_status in ("WON", "LOST"):
+            current_bid = snipe.get("current_bid", "")
+            if current_bid:
+                try:
+                    winning_bid = float(current_bid.split()[0])
+                except (ValueError, IndexError):
+                    pass
+        # BUI-371: a still-listed snipe reaching its end as ENDED (unrecognized
+        # status) or a plain LOST may in fact be a group-cancelled sibling that
+        # was never bid on — resolve it REMOVED so the eBay fallback can't
+        # phantom-WON it and the calibration report doesn't count a loss we
+        # never contested. Exempt: statuses proving Gixen processed our bid
+        # (their LOST is genuine), an 'OK:' local snipe result (we bid
+        # locally), and rows already tombstoned (a REMOVED sibling stays on
+        # Gixen's list until purge — the update below is a no-op for it, and
+        # re-running the evidence query would re-log every sync). WON is never
+        # reclassified (dual-win within Gixen's ~2-minute group caveat is a
+        # real win).
+        if (
+            internal_status in ("ENDED", "LOST")
+            and gixen_status.upper().strip() not in _BID_PROCESSED_STATUSES
+        ):
+            db_row = get_bid_by_item_id(db, iid)
+            if (
+                db_row is not None
+                and db_row["status"] not in ("PURGED", "REMOVED")
+                and not (db_row["local_snipe_result"] or "").startswith("OK:")
+            ):
+                # No stored end → no evidence test. `now` is only an upper
+                # bound on the true end, and substituting it would WIDEN the
+                # evidence window (it can only add cancel classifications,
+                # including inside the dual-win margin). Skipping is safe:
+                # the row resolves ENDED below and the eBay fallback re-runs
+                # this check with the true end time fetched from eBay.
+                end_dt = _parse_end_iso(db_row["auction_end_at"])
+                if end_dt is not None and _group_won_before(
+                    db, iid, snipe.get("snipe_group"), end_dt, db_row["added_at"]
+                ):
+                    update_bid_status(
+                        db, iid, "REMOVED", None, now, snipe.get("status_mirror"),
+                        only_id=db_row["id"],
+                    )
+                    _mark_cancelled_tombstone(db, db_row["id"])
+                    logger.info(
+                        "_sync_gixen: %s group-cancelled before its end → REMOVED "
+                        "(Gixen showed %s/%s)", iid, gixen_status or "?", internal_status,
+                    )
+                    continue
+        update_bid_status(
+            db, iid, internal_status, winning_bid, now,
+            snipe.get("status_mirror"),
+        )
+
     # Vanished + ended → flip to ENDED. The eBay fallback path then picks
     # them up (ENDED rows with NULL winning_bid) and resolves the final
     # selling price when eBay's rate-limit budget allows.
     vanished_ended = db.execute(
         """
-        SELECT item_id FROM bids
+        SELECT item_id, id, auction_end_at, gixen_vanished_at, snipe_group,
+               local_snipe_result, added_at FROM bids
         WHERE status = 'PENDING'
           AND auction_end_at IS NOT NULL
           AND auction_end_at <= ?
@@ -439,6 +669,23 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
         iid = row["item_id"]
         if iid in gixen_item_ids:
             continue  # still on Gixen, will resolve via Gixen path
+        # BUI-371: disambiguate before flipping ENDED (which feeds the eBay
+        # WON inference). Positive evidence the snipe was cancelled while its
+        # auction was still live — observed vanished from a healthy Gixen list
+        # >= margin before end, or a bid-group sibling won >= margin earlier —
+        # means we never bid: tombstone REMOVED. No evidence → ENDED as before.
+        end_dt = _parse_end_iso(row["auction_end_at"])
+        if _cancelled_before_end(db, iid, row, end_dt):
+            update_bid_status(
+                db, iid, "REMOVED", winning_bid=None, resolved_at=now,
+                only_id=row["id"],
+            )
+            _mark_cancelled_tombstone(db, row["id"])
+            logger.info(
+                "_sync_gixen: %s vanished from Gixen while still live "
+                "(cancelled, never bid) → REMOVED", iid,
+            )
+            continue
         update_bid_status(db, iid, "ENDED", winning_bid=None, resolved_at=now)
         logger.info(
             "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
@@ -583,13 +830,15 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
     """
     return db.execute(
         f"""
-        SELECT item_id, max_bid, local_snipe_result, 0 AS is_purged FROM bids
+        SELECT item_id, id, max_bid, local_snipe_result, auction_end_at,
+               gixen_vanished_at, snipe_group, added_at, 0 AS is_purged FROM bids
         WHERE status IN ('PENDING', 'ENDED')
           AND auction_end_at IS NOT NULL
           AND auction_end_at <= ?
           AND winning_bid IS NULL
         UNION ALL
-        SELECT item_id, max_bid, local_snipe_result, 1 AS is_purged FROM bids
+        SELECT item_id, id, max_bid, local_snipe_result, auction_end_at,
+               gixen_vanished_at, snipe_group, added_at, 1 AS is_purged FROM bids
         WHERE status IN ({TOMBSTONE_STATUSES_SQL})
           AND winning_bid IS NULL
           AND notes IS NOT ?
@@ -668,6 +917,31 @@ async def _run_ebay_fallback() -> None:
                     await asyncio.sleep(1.5)
                     continue
 
+                # BUI-371: positive evidence this snipe was cancelled while its
+                # auction was still live (vanished from a healthy Gixen list
+                # >= margin before end, or a bid-group sibling won >= margin
+                # earlier) means we never bid — resolve REMOVED and never feed
+                # it to the WON/LOST price inference below. Normally the sync
+                # classifies these first, but the fallback can reach a row
+                # ahead of a successful sync (Gixen outage), and rows flipped
+                # ENDED before this fix landed are healed here too. Recording
+                # the final price keeps history parity with the purged branch.
+                end_dt = _parse_end_iso(row["auction_end_at"])
+                if _cancelled_before_end(db, iid, row, end_dt):
+                    update_bid_status(
+                        db, iid, "REMOVED",
+                        winning_bid=final_amount if final_amount and final_amount > 0 else None,
+                        resolved_at=now_iso,
+                        only_id=row["id"],
+                    )
+                    _mark_cancelled_tombstone(db, row["id"])
+                    logger.info(
+                        "_run_ebay_fallback: %s cancelled before end (never bid) "
+                        "→ REMOVED", iid,
+                    )
+                    await asyncio.sleep(1.5)
+                    continue
+
                 if final_amount is None or final_amount <= 0:
                     # eBay returns the high-water bid for reserve-not-met or
                     # unsold listings, which is often 0 or well below our max
@@ -694,21 +968,22 @@ async def _run_ebay_fallback() -> None:
                 #   2. local_snipe_result starts with "ERR:" → our bid never
                 #      landed; mark LOST regardless of price.
                 #
-                # BUI-146 (accepted risk, won't-fix — do NOT "fix" naively):
-                # a snipe the user CANCELLED in Gixen's web UI while still live
-                # also reaches here once its auction ends, and a final price
-                # below max_bid then stamps a phantom WON even though we never
-                # bid. The trigger (cancel a *live* snipe directly on Gixen) is
-                # near-unreachable in this deployment and the user reconciles
-                # against the real eBay payment, so it's accepted. Crucially,
-                # this same inference is how genuine wins are recovered when
-                # Gixen drops an ended snipe before sync reads its WON status —
-                # with the local sniper disabled, local_snipe_result is always
-                # NULL, so requiring local bid-evidence (or never inferring WON
-                # for vanished rows) would SUPPRESS REAL WINS. If you ever do
-                # fix this, do it by disambiguating at vanish-time on the
-                # auction end (still-live → REMOVED, like the BUI-85 path), not
-                # by gating the WON inference here. See BUI-146 for the full
+                # BUI-146 (do NOT "fix" this inference naively): a snipe
+                # cancelled while still live (user removal on Gixen's web UI,
+                # or a bid-group auto-cancel — BUI-371) also reaches here once
+                # its auction ends, and a final price below max_bid then stamps
+                # a phantom WON even though we never bid. Crucially, this same
+                # inference is how genuine wins are recovered when Gixen drops
+                # an ended snipe before sync reads its WON status — with the
+                # local sniper disabled, local_snipe_result is always NULL, so
+                # requiring local bid-evidence (or never inferring WON for
+                # vanished rows) would SUPPRESS REAL WINS. BUI-371 implemented
+                # the sanctioned vanish-time/group-win disambiguation UPSTREAM
+                # (positive cancel evidence → REMOVED before a row ever gets
+                # here — see _vanished_while_live/_group_won_before and the
+                # guard above). The residual evidence-less case (e.g. a live
+                # cancel never observed by any sync) remains accepted risk;
+                # never gate the inference itself. See BUI-146 for the full
                 # analysis.
                 local_result = row["local_snipe_result"] or ""
                 if local_result.startswith("ERR:") or final_amount >= float(row["max_bid"]):
@@ -1176,6 +1451,12 @@ async def api_get_all_bids():
             "seller": item.get("seller"),
             "local_snipe_at": item.get("local_snipe_at"),
             "local_snipe_result": item.get("local_snipe_result"),
+            # BUI-371: expose the vanish observation + tombstone-cause note so
+            # a REMOVED row's classification is auditable over HTTP (agents
+            # have no sqlite access to the Mac Mini) — parity with the
+            # server-log evidence trail.
+            "gixen_vanished_at": item.get("gixen_vanished_at"),
+            "notes": item.get("notes"),
         })
     return result
 

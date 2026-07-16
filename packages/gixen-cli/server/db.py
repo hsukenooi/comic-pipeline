@@ -83,6 +83,13 @@ _COLUMN_MIGRATIONS = [
     # existing/web-added rows start NULL (cache miss -> list fallback) until the
     # next sync fills them.
     "ALTER TABLE bids ADD COLUMN dbidid TEXT",
+    # BUI-371: when a PENDING snipe was first observed missing from a healthy
+    # (non-empty) Gixen list. Cleared if the snipe reappears. A vanish stamped
+    # well before auction_end_at is positive evidence the snipe was cancelled
+    # (user removal or bid-group auto-cancel) rather than executed — the
+    # vanish-time disambiguation BUI-146 sanctioned instead of gating the eBay
+    # WON inference.
+    "ALTER TABLE bids ADD COLUMN gixen_vanished_at TEXT",
 ]
 
 
@@ -113,7 +120,8 @@ _BIDS_TABLE_SQL = """
         fmv_id              INTEGER,
         seller_grade        REAL,
         photo_grade         REAL,
-        dbidid              TEXT
+        dbidid              TEXT,
+        gixen_vanished_at   TEXT
     )
 """
 
@@ -333,6 +341,15 @@ _DEDUP_FILL_FIELDS = (
 # completed-sweep tombstones (BUI-67). Written here and read by the server's
 # eBay-fallback exclusion — one constant so the writer and filter can't drift.
 DEDUP_TOMBSTONE_NOTE = "deduped BUI-67"
+
+# Marker on a tombstone written by the BUI-371 cancelled-before-end
+# classification (vanish-time / group-win evidence), so those REMOVED rows can
+# be told apart from user-cancel (delete_bid) and completed-sweep
+# (mark_bids_purged) tombstones in a post-hoc audit — same convention as
+# DEDUP_TOMBSTONE_NOTE. Unlike the dedup note, these rows are NOT excluded
+# from the eBay-fallback tombstone branch: their auctions really ended, so the
+# final price is still worth backfilling for history.
+CANCELLED_TOMBSTONE_NOTE = "cancelled before end BUI-371"
 _PENDING_UNIQUE_INDEX = "idx_bids_pending_item_id"
 
 
@@ -529,8 +546,14 @@ def update_bid(
     bid_offset: int,
     snipe_group: int,
 ) -> None:
+    # gixen_vanished_at=NULL: every caller runs right after a successful Gixen
+    # add/modify — first-party confirmation the snipe is live on Gixen, which
+    # invalidates any earlier vanish observation exactly like reappearing on
+    # the list does (BUI-371). Without this, a stale pre-end vanish stamp on a
+    # re-added snipe could later misclassify its genuine result as REMOVED.
     conn.execute(
-        "UPDATE bids SET max_bid=?, bid_offset=?, snipe_group=? WHERE item_id=? AND status='PENDING'",
+        "UPDATE bids SET max_bid=?, bid_offset=?, snipe_group=?, "
+        "gixen_vanished_at=NULL WHERE item_id=? AND status='PENDING'",
         (max_bid, bid_offset, snipe_group, item_id),
     )
     conn.commit()
@@ -543,17 +566,29 @@ def update_bid_status(
     winning_bid: float | None = None,
     resolved_at: str | None = None,
     status_mirror: str | None = None,
+    *,
+    only_id: int | None = None,
 ) -> None:
     # COALESCE on status_mirror so callers that don't have a fresh mirror value
     # (e.g. the eBay fallback path) don't clobber the last-known mirror status.
     # Caller must conn.commit() — this helper is hot-path inside loops where
     # the caller batches the commit at the end of the cycle.
+    #
+    # only_id narrows the write to one row. The default item_id-wide write is
+    # right for Gixen-driven transitions, but the BUI-371 REMOVED
+    # classification must not tombstone a *live* PENDING row that shares the
+    # item_id with the old row being classified (a re-listed auction re-added
+    # after the original resolved — the BUI-178 class of collateral damage).
+    id_clause = " AND id=?" if only_id is not None else ""
+    params: list = [status, winning_bid, resolved_at, resolved_at, status_mirror, item_id]
+    if only_id is not None:
+        params.append(only_id)
     conn.execute(
         "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, "
         "auction_end_at=COALESCE(auction_end_at, ?), "
         "status_mirror=COALESCE(?, status_mirror) "
-        f"WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL})",
-        (status, winning_bid, resolved_at, resolved_at, status_mirror, item_id),
+        f"WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL}){id_clause}",
+        params,
     )
 
 
