@@ -613,14 +613,38 @@ def cgc_ladder_price(ladder: dict[float, float], target_grade: float,
     mistagged listing away from smearing a wild over-bid across an interpolated
     span. The EXACT-match bucket is exempt from ``min_bucket_n`` (a single
     certified slab AT the target grade is a direct anchor, not a span
-    extrapolation); the ladder-wide comp-count floor + the monotonicity guard in
-    ``cgc_proxy_fmv`` are the money-safety nets against a fluke single-comp
-    ladder there.
+    extrapolation) so a genuinely sparse key (ASM #50's lone 6.5) can still be
+    priced; the ladder-wide comp-count floor + the monotonicity guard in
+    ``cgc_proxy_fmv`` are the ladder-wide money-safety nets.
+
+    BUI-349 envelope-sanity clamp: a THIN exact bucket (fewer than
+    ``min_bucket_n`` comps) has no within-bucket outlier protection — a lone
+    certified slab is used as-is, so one off-trend-high listing could set a
+    too-high cap that the monotonicity guard misses (that guard only refuses a
+    bucket priced above the NEXT one; a lone comp sitting BETWEEN its neighbors
+    yet above the linear trend between them stays monotone). So when trustworthy
+    (≥ ``min_bucket_n``) buckets BRACKET the target, bound a thin exact value
+    from ABOVE by the linear envelope those neighbors imply — ``min(exact,
+    envelope)``. This can only LOWER the price, never raise it (money-safe), and
+    preserves the sparse-key case: ASM #50's lone $1200 6.5 sits below its $1686
+    5.0–7.0 envelope, so it is unchanged; only an off-trend-high lone comp is
+    clamped down. A thick exact bucket (its median already outlier-robust) and a
+    thin exact bucket with no eligible bracket (no envelope to check — the
+    irreducible sparse-key case) both stay direct anchors. ``counts=None``
+    disables the clamp (a caller passing bare medians can't tell a thin bucket
+    from a thick one), preserving the exact-anchor behavior.
     """
     if not ladder:
         return None
     if target_grade in ladder:
-        return ladder[target_grade]
+        exact = ladder[target_grade]
+        if counts is not None and counts.get(target_grade, 0) < min_bucket_n:
+            envelope = _bracket_interpolate(
+                ladder, target_grade, counts, min_bucket_n
+            )
+            if envelope is not None:
+                return min(exact, envelope["target_price"])
+        return exact
     bracket = _bracket_interpolate(ladder, target_grade, counts, min_bucket_n)
     return bracket["target_price"] if bracket else None
 
