@@ -182,7 +182,7 @@ def _optional_float(row: dict, field_name: str) -> float | None:
     try:
         result = float(value)
     except (TypeError, ValueError):
-        raise _RowValidationError(f"invalid {field_name}: {value!r}")
+        raise _RowValidationError(f"invalid {field_name}: {value!r}") from None
     if not math.isfinite(result):
         # NaN/Infinity pass `float()` and Decimal() without error and can
         # slip past a naive server-side "v <= 0" positivity check (NaN
@@ -197,7 +197,7 @@ def _optional_int(row: dict, field_name: str, default: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        raise _RowValidationError(f"invalid {field_name}: {value!r}")
+        raise _RowValidationError(f"invalid {field_name}: {value!r}") from None
 
 
 def build_bid_payload(
@@ -248,7 +248,7 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         try:
             bid = Decimal(str(max_bid_raw))
         except InvalidOperation:
-            raise _RowValidationError(f"invalid max_bid: {max_bid_raw!r}")
+            raise _RowValidationError(f"invalid max_bid: {max_bid_raw!r}") from None
         if not bid.is_finite():
             # Decimal("nan")/Decimal("inf") parse without error (unlike
             # InvalidOperation above) and can bypass a naive server-side
