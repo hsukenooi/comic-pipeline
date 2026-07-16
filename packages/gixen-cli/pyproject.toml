@@ -55,7 +55,7 @@ gixen = "cli:cli"
 # ModuleNotFoundError for gixen_client/ebay_bidder/cli. This is what lets the
 # overlay drop its hardcoded pythonpath in U5.
 [tool.setuptools]
-py-modules = ["cli", "gixen_client", "ebay_bidder"]
+py-modules = ["cli", "gixen_client", "ebay_bidder", "record_win_prep"]
 
 [tool.setuptools.packages.find]
 where = ["."]

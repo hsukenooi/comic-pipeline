@@ -12,11 +12,16 @@ immediately — no git round-trip (R8). No Playwright, no live LOCG session need
 
 **Gixen CLI:** `gixen` (a uv-installed console script on PATH; run `./scripts/install.sh` if not found).
 
-## Step 0: Resolve the server + bootstrap guard
+**Every bash block below re-sources `scripts/comics-server.sh` and calls
+`comics_resolve_server` itself.** Each `## Step` is a *separate* bash block —
+they do not share shell state — so `COMICS_SERVER_URL` set in one block is
+gone by the next. This bit BUI-352: an empty `$COMICS_SERVER_URL` used to make
+a later `curl` fail with exit 3 ("No host part in the URL"), which an
+`|| echo ""` fallback silently swallowed as an *empty seen-set*, misclassifying
+every already-recorded win as new. Re-resolving in every block is cheap and
+idempotent — do not skip it because "Step 0 already did this."
 
-Resolve and health-gate the comics server through the **shared comics-server
-call convention** (BUI-172, `docs/conventions/comics-server-call.md`) — don't
-hand-roll URL resolution or the health check here:
+## Step 0: Resolve the server + bootstrap guard
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
@@ -36,137 +41,125 @@ curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 **If `last_full_import` is null:** Stop immediately with:
 > Collection empty on the server — run a full LOCG import before recording wins.
 
-## Step 1: Pull won auctions
+## Step 1: Build the new-wins payload (`gixen record-win-prep`)
 
-Pull the full snipe list from the Gixen CLI and filter it to genuine wins:
-
-```bash
-gixen list --json 2>/dev/null
-```
-
-This dumps **every** snipe, including still-live (PENDING) ones whose auctions
-haven't ended. Filter to wins with **both** conditions:
-- `time_to_end == "ENDED"` (excludes the live snipes)
-- `status` contains `WON` (case-insensitive)
-
-Then **deduplicate by `item_id`** (keep the first occurrence) before continuing.
-If no wins, print "No won auctions to add." and stop.
-
-Each snipe object exposes the fields Step 2 needs directly: `item_id`,
-`current_bid` (e.g. `"222.50 USD"`), `end_date_iso` (ISO timestamp), and `title`
-(the source for parsing `identify_data`).
-
-> **Optional fast-path (bandwidth only):** if you can establish the last
-> collection-add run was ≤7 days ago, `GET /api/comics/history` returns the same
-> wins in a smaller, server-enriched payload — already ended, already deduped,
-> tombstone excluded — so you'd filter by `status` contains `WON` alone (no
-> `time_to_end` check needed there). This is purely an optimization: the Step 1b
-> seen-set is what prevents double-recording regardless of source, and a missed
-> older win is the worse failure, so when the window is uncertain just use the
-> CLI above.
-
-## Step 1b: Fetch already-processed wins (BUI-121)
-
-Fetch the seen set so this run can skip wins already recorded in a prior run.
-Best-effort — a failed call falls back to processing all wins (same pattern as
-seller-scan):
+Steps 1/1b/2 used to be ~40 lines of hand-authored inline Python every run —
+filter `gixen list --json` to ENDED+WON, dedup by `item_id`, subtract the
+seen-set, then positionally zip `comic-identify --batch` output back onto the
+new wins (an off-by-one there would silently mis-attribute an identity to the
+wrong won auction). BUI-353 moved all of that into one tested subcommand:
 
 ```bash
-SEEN_IDS=$(curl -sf "$COMICS_SERVER_URL/api/comics/collection/record-win/seen" \
-  | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin)['item_ids']))" \
-  2>/dev/null || echo "")
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+gixen record-win-prep --output /tmp/prep.json \
+  || { echo "record-win-prep FAILED — see message above. STOP."; exit 1; }
+python3 -c "import json; d=json.load(open('/tmp/prep.json')); \
+  print(json.dumps({k: d[k] for k in ['total_ended_won','new_win_count'] } | {'wins_ready': len(d['wins']), 'needs_review': len(d['needs_review'])}))"
 ```
 
-From the filtered, deduped WON snipes in Step 1, exclude any whose `item_id`
-appears in `SEEN_IDS`. Call the remaining wins **new wins**.
-
-The seen-set is the **primary dedup mechanism**: it excludes already-recorded
-wins, so pulling the full `gixen list` (rather than a narrower window) never
-re-records anything a prior run already committed.
-
-If there are no new wins, print:
-> All won auctions already processed. Nothing new to record.
-
-…and stop (skip Steps 2–5 entirely).
-
-## Step 2: Build the record-win JSON
-
-For each **new** won snipe, build one entry in this format:
+`gixen record-win-prep` does, in one call: pull `gixen list --json` → filter to
+`time_to_end == "ENDED"` + `status` contains `WON` → dedup by `item_id` → fetch
+the BUI-121 seen-set and subtract it → run `comic-identify --batch` on the
+remaining titles → build `identify_data` for each (expanding lots across
+`constituent_issues`) → write `/tmp/prep.json`:
 
 ```json
 {
-  "item_id": "318318338906",
-  "current_bid": "222.50 USD",
-  "end_date_iso": "2026-05-24T18:14:48.929921+00:00",
-  "identify_data": {
-    "series": "Ghost Rider",
-    "issue": "1",
-    "year": 1973,
-    "variant_text": "Newsstand"
-  }
+  "wins": [
+    {
+      "item_id": "318318338906",
+      "current_bid": "222.50 USD",
+      "end_date_iso": "2026-05-24T18:14:48.929921+00:00",
+      "identify_data": {
+        "series": "Ghost Rider",
+        "issue": "1",
+        "year": 1973,
+        "variant_text": "Newsstand"
+      }
+    }
+  ],
+  "needs_review": [
+    {
+      "item_id": "444555666",
+      "title": "Marvel Silver Age Lot",
+      "current_bid": "45.00 USD",
+      "end_date_iso": "2026-05-20T10:00:00+00:00",
+      "reason": "lot with unparseable contents",
+      "identity": {"series": "Marvel", "issue": null, "is_lot": true, "constituent_issues": [], "error": null}
+    }
+  ],
+  "total_ended_won": 9,
+  "new_win_count": 2
 }
 ```
 
-`identify_data` fields:
-- `series` — series name without publisher prefix (e.g. `"Amazing Spider-Man"`, not `"Marvel: Amazing Spider-Man"`)
-- `issue` — issue number as a string (e.g. `"300"`, `"Annual 1"`)
-- `year` — publication year as an integer; omit if unknown
-- `variant_text` — variant description if the listing is explicitly a variant (e.g. `"Newsstand"`, `"Direct Edition"`); omit or `""` otherwise
+**`total_ended_won` vs `new_win_count`** — the counter you check decides which
+message to print:
+- `total_ended_won == 0`: print "No won auctions to add." and stop (no ended+won snipes exist at all).
+- `new_win_count == 0` (but `total_ended_won > 0`): print "All won auctions already processed. Nothing new to record." and stop (skip Steps 2–5) — everything ended+won was already recorded in a prior run.
+- Otherwise: continue to Step 2.
 
-**Source priority for `identify_data`:**
+**BUI-352 hardening lives inside the seen-set fetch this command makes:** a
+local/connectivity failure (bad or missing `COMICS_SERVER_URL`, connection
+refused, timeout) makes the command exit non-zero — **STOP**, do not process
+wins without a real seen-set. Only a genuine 5xx from the seen-set endpoint
+falls back to an empty seen-set (the server's own already-owned dedup, BUI-34,
+is the safety net for that one case); any other unexpected status is also a
+hard stop. You should never see the old silent "130 wins classified as new"
+failure mode from this command.
 
-1. **In-session context** — if this skill is being called from `/comic:buy` and you already identified the comics in Step 1, use those identifications directly.
-2. **Parse from gixen title via `comic-identify` (BUI-253/292)** — run the
-   canonical title-parser on the snipe titles instead of parsing them yourself.
-   **Identify all new wins in ONE `--batch` call**, not one process per title:
-   write the titles (one per line, in the order of your new-wins list) to a file
-   and pipe them through batch mode, which emits one JSONL result per line in the
-   same order:
+> **In-session context override:** if this skill is being invoked from a
+> caller that already identified the comics (e.g. a future `/comic:buy`
+> integration), skip this step and hand-build the `{"wins": [...]}` array
+> yourself in the shape shown above — `gixen record-win-prep` exists for the
+> standalone path where titles still need parsing.
 
-   ```bash
-   # /tmp/titles.txt: one snipe title per line, in new-wins order
-   comic-identify --batch < /tmp/titles.txt > /tmp/identities.jsonl
-   # each line, e.g.:
-   # {"title": "Ghost Rider #1 ... Newsstand", "series": "Ghost Rider", "issue": "1",
-   #  "year": 1973, "is_lot": false, "constituent_issues": [], "confidence": 1.0,
-   #  "variant_text": "Newsstand", ...}
-   ```
+## Step 2: Resolve `needs_review` entries (BUI-354)
 
-   Map each result straight into `identify_data`: `series` → `series`, `issue` →
-   `issue`, `year` → `year` (omit if `null`). The batch also computes
-   `variant_text` for the common **distribution** variants (Newsstand / Direct
-   Edition / Whitman) — use it directly when non-empty. It is precision-first,
-   **not** exhaustive: if `variant_text` is `""` but the title names some *other*
-   variant (a price variant like `"35 Cent"` / `"Canadian Price Variant"`, or a
-   cover/sketch/incentive variant), set `variant_text` to that yourself — those
-   distinguish genuinely different books and must not be collapsed into the base
-   issue.
+`needs_review` is the **only** gate — an entry lands here when
+`comic-identify` returned a null `series`/`issue`, an `"error"`, or a lot with
+empty/unparseable `constituent_issues`. There is deliberately no confidence
+threshold: `comic-identify` returns `confidence: 0.5` as its baseline for
+every cleanly-parsed title with no year to cross-check, so "ask if confidence
+is low" would fire on nearly every real title and defeat the batch automation
+— that clause has been dropped, not tightened.
 
-   Results are 1:1 with your input lines (one JSONL row per title, in order), so
-   map them back positionally; a row with `series`/`issue` `null` (or an
-   `"error"` field) is a title the parser couldn't resolve — fall through to the
-   blank-`series`/`issue` guard below and ask the user rather than recording it.
-
-   **For lots** (`"is_lot": true`): build one `identify_data` entry per issue number in
-   `constituent_issues`, all sharing the extracted `series`. If `constituent_issues` is
-   empty (a bundle whose contents couldn't be parsed — e.g. "Marvel Silver Age Lot") or
-   `confidence` is low, ask the user once before proceeding rather than guessing.
-
-Do not leave `series` or `issue` blank — if `comic-identify` can't determine them
-(`series`/`issue` are `null`, or `confidence` is low), ask the user for that specific
-snipe rather than guessing.
+If `/tmp/prep.json`'s `needs_review` array is non-empty, read it (small — one
+row per unresolved title) and ask the user for `series`/`issue` for each
+specific item (its `title`, `current_bid`, and `identity` are included so you
+don't need to go back to the raw snipe list). For each one the user resolves,
+build an entry in the same shape as Step 1's `wins` array (`item_id`,
+`current_bid`, `end_date_iso` — all already present on the `needs_review` row
+— plus the user-supplied `identify_data`) and write the full list to
+`/tmp/resolved_reviews.json` as `{"wins": [...]}`. **If nothing was resolved
+(no `needs_review`, or the user skipped some), still write the file** —
+`{"wins": []}` for "nothing to add" — so Step 3's merge below always has a
+file to read rather than branching on whether one exists.
 
 ## Step 3: Record wins
 
-Wrap the entries array as `{"wins": [...]}`, write it to a temp file, and POST it
-to the server's record-win endpoint. **Capture the response body to a file and
-read only the summary scalars into context** — the full response also carries
+Merge Step 1's `wins` with Step 2's `/tmp/resolved_reviews.json`, wrap as
+`{"wins": [...]}`, write it to a temp file, and POST it to the server's
+record-win endpoint. **Capture the response body to a file and read only the
+summary scalars into context** — the full response also carries
 `skipped_already_owned_titles` and `skipped_already_owned_detail` (one object per
 already-owned win), which on a large batch is thousands of tokens of detail you
 don't need in the loop. Keep it on disk; surface the scalars:
 
 ```bash
-# /tmp/wins.json contains: {"wins": [ {entry}, {entry}, ... ]}
+# /tmp/wins.json: Step 1's wins + Step 2's resolved_reviews, concatenated —
+# this is the actual merge; do not skip it even when resolved_reviews.json is
+# {"wins": []} (an earlier draft of this step only ever copied prep.json's
+# wins and silently dropped anything resolved in Step 2 — don't repeat that).
+python3 -c "import json; \
+  a=json.load(open('/tmp/prep.json'))['wins']; \
+  b=json.load(open('/tmp/resolved_reviews.json'))['wins']; \
+  json.dump({'wins': a + b}, open('/tmp/wins.json','w'))"
+
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+
 # rm the response file FIRST: on a connection failure curl leaves any prior
 # run's file in place (it only truncates -o once bytes arrive), and reading a
 # stale body would fabricate a "committed before failure" count for a request
@@ -226,6 +219,8 @@ were skipped.
 
 **Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200. The status-code check above routes this to the failure branch, which surfaces `rows_written` so the user knows which wins still need recording — never report success on a partial_failure.
 
+**If `/tmp/wins.json`'s `wins` array is empty** (everything from Step 1 landed in `needs_review` and none were resolved), skip the POST — there is nothing to record — and go straight to Step 4/5 to still report current collection status.
+
 ## Step 3b: Mark new wins seen (BUI-121)
 
 Only after a **successful** record-win POST, mark the new item IDs as processed
@@ -233,6 +228,9 @@ so future runs skip them. Best-effort — a failed mark is non-fatal (the
 already-owned dedup will catch a re-POST):
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+
 # Build {"item_ids": ["111", "222", ...]} from the item_ids of the new wins.
 # dict.fromkeys dedups while preserving order — a lot that expanded into several
 # entries shares one item_id, so a plain comprehension would POST it N times.
@@ -249,6 +247,9 @@ The export reads the *server* collection and returns the file contents; save the
 locally for the LOCG upload:
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+
 curl -sf "$COMICS_SERVER_URL/api/comics/collection/export" -o /tmp/export.json
 ts=$(date +%Y-%m-%dT%H%M%S)
 python3 -c "import json,sys,os; d=json.load(open('/tmp/export.json')); \
@@ -267,6 +268,9 @@ predates this run's wins, so it would undercount by exactly the rows you just
 added (BUI-156):
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+
 curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 # read pending_push_count and oldest_pending_days from this fresh response
 ```
@@ -306,4 +310,6 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
 | Marking wins seen before the POST succeeds | Only mark seen after a successful record-win POST — a failed call means wins weren't recorded |
 | Confusing `oldest_pending_days` with "days since last sync" | `oldest_pending_days` = age of oldest uncleared item; use `last_full_import` from status for sync recency |
-| Forgetting the `time_to_end == "ENDED"` filter on the `gixen list --json` pull | `gixen list` also dumps still-live PENDING snipes; filter on **both** `time_to_end == "ENDED"` and `status` contains `WON`, or you'll try to record auctions that haven't ended |
+| Assuming `$COMICS_SERVER_URL` carries over between Steps | Each `## Step` is a separate bash block with its own shell — re-source `scripts/comics-server.sh` and call `comics_resolve_server` in every block that calls the server, even if an earlier step already did (BUI-352) |
+| Re-deriving the ENDED+WON filter / dedup / seen-subtract / positional-identify-mapping by hand | Use `gixen record-win-prep` (BUI-353) — it owns that join in one tested place instead of ~40 lines of inline Python re-authored (and re-risked) every run |
+| Asking the user "if confidence is low" | Not a real gate — `comic-identify`'s baseline confidence is 0.5 for every clean parse. The only gate is `needs_review` (null series/issue, or an unparseable lot) — BUI-354 |
