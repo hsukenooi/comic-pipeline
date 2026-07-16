@@ -25,6 +25,7 @@ from gixen_client import (
     find_sibling_cleanup_targets,
 )
 import ebay_bidder
+from record_win_prep import RecordWinPrepError, build_payload
 
 load_dotenv()
 
@@ -502,6 +503,53 @@ def sync():
         sys.exit(1)
     result = _server_request("post", "/api/sync")
     click.echo(f"Synced {result.get('synced', '?')} snipes from Gixen.")
+
+
+@cli.command("record-win-prep")
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, writable=True),
+    default=None,
+    help="Write the JSON result to this file instead of stdout.",
+)
+def record_win_prep_cmd(output: str | None):
+    """Build the /comic:collection-add record-win payload in one call — see
+    record_win_prep.py for what it does and why (BUI-352/353/354).
+
+    Requires COMICS_SERVER_URL: this command fetches the seen-set from the
+    comics server, so a missing/unset URL here is a hard stop.
+
+    Prints the JSON result to stdout, or writes it to --output if given.
+    """
+    server_url = _server_url()
+    if not server_url:
+        click.echo(
+            "Error: COMICS_SERVER_URL is not set. record-win-prep needs the "
+            "comics server to fetch the seen-set and cannot safely proceed "
+            "without it (BUI-352) — source scripts/comics-server.sh and run "
+            "comics_resolve_server first.",
+            err=True,
+        )
+        sys.exit(1)
+
+    snipes = _server_request("get", "/api/snipes")
+
+    try:
+        payload = build_payload(snipes, server_url)
+    except RecordWinPrepError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    text = json.dumps(payload, indent=2)
+    if output:
+        Path(output).write_text(text)
+        click.echo(
+            f"Wrote {output}: {payload['new_win_count']} new win(s) "
+            f"({len(payload['wins'])} ready to record, "
+            f"{len(payload['needs_review'])} need review)."
+        )
+    else:
+        click.echo(text)
 
 
 @cli.command()
