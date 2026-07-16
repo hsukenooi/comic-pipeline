@@ -39,6 +39,8 @@ A Collection entry that originated from — or has round-tripped through — a L
 ### Pending Push
 A Collection entry that has been recorded locally but not yet confirmed present on LOCG. Clearing pending entries is the goal of a Collection Sync; an entry stays pending until it reappears in a LOCG export and reconciles.
 
+A subset needs manual resolution first: when the matcher cannot confidently determine an entry's canonical series (or its variant), the entry is flagged and excluded from every automated bulk-import — no Collection Sync can clear it as-is. It only clears once a person adds the title directly in LOCG and a subsequent Collection Sync re-import reconciles it. Because these entries never enter an automated import, they can sit at maximum pending age indefinitely without that age indicating a stale or missed Collection Sync.
+
 ## Matching & Volumes
 
 ### Masthead

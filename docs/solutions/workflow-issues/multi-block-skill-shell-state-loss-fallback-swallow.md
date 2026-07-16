@@ -109,5 +109,5 @@ The CLI command hard-fails immediately if `COMICS_SERVER_URL` is unset, so the m
 ## Related
 
 - `design-patterns/drain-started-cancel-tail-seen-set-loops.md` — the same seen-set data-loss *class* (a side-effect-recording seen-set silently losing entries on a failure path), different mechanism (thread-pool drain in seller-scan vs. shell-state + fallback here).
-- `best-practices/collection-add-workflow-patterns-2026-06-18.md` — same skill, earlier era. **Its Sections 1–2 are now stale** (the cutoff-date dedup it describes was replaced by the BUI-121 seen-set, and the `/api/comics/history`-vs-`gixen list` branch was removed in the 2026-07-05 refactor). Candidate for a targeted `ce-compound-refresh`.
+- `best-practices/collection-add-workflow-patterns-2026-06-18.md` — same skill, earlier era. Its original Sections 1–2 (the cutoff-date dedup, and the `/api/comics/history`-vs-`gixen list` selection) described mechanisms superseded by the BUI-121 seen-set and the 2026-07-05 refactor; a 2026-07-17 `ce-compound-refresh` (BUI-374) removed those two sections and re-verified the remaining pending-push-semantics / manual-resolution content against current code.
 - Tickets: BUI-352 (the bug), BUI-353 (the `record-win-prep` helper), BUI-354 (the confidence-gate fix). Shipped in PR #187.
