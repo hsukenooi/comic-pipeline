@@ -42,6 +42,15 @@ comics_health_gate     || exit 1
 
 If either fails, stop with: "Cannot verify — the comics server isn't reachable. Skipping verification step."
 
+> **Editor note — fenced blocks don't share shell state (BUI-375):** each
+> fenced bash block below runs in its own fresh shell — a freshly-spawned
+> executor invokes them as separate Bash tool calls, so `$COMICS_SERVER_URL`
+> and the sourced `comics_*` functions from Pre-flight do **not** carry
+> forward. The Call block below re-sources `comics-server.sh` and re-runs
+> `comics_resolve_server` at its own top — keep that pattern on any block you
+> add. This is the exact BUI-352 trap: an un-resourced block curls an empty
+> host, and a swallowing fallback can turn that into a silent false all-clear.
+
 ### Input
 
 A working list. Each entry needs `item_id` (eBay ID) and ideally `grade`. `locg_id` is optional but tightens matching when present.
@@ -65,6 +74,8 @@ surfaces the error body** instead of silently returning an empty string
 (BUI-169):
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 comics_curl -X POST "$COMICS_SERVER_URL/api/comics/verify" \
   -H 'content-type: application/json' \
   -d @working_list.verify.json || {

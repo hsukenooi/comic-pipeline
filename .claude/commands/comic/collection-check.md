@@ -66,9 +66,21 @@ comics_health_gate     || exit 1   # the server must answer
 **If either step fails: STOP immediately** — the collection cannot be checked,
 so do not proceed to bidding. Do not report any comic as "not in collection".
 
+> **Editor note — fenced blocks don't share shell state (BUI-375):** each
+> fenced bash block below runs in its own fresh shell — a freshly-spawned
+> executor invokes them as separate Bash tool calls, so `$COMICS_SERVER_URL`
+> and the sourced `comics_*` functions from Step 0 do **not** carry forward.
+> Every later block that touches `$COMICS_SERVER_URL` re-sources
+> `comics-server.sh` and re-runs `comics_resolve_server` at its own top —
+> keep that pattern on any block you add. This is the exact BUI-352 trap: an
+> un-resourced block curls an empty host, and a swallowing fallback can turn
+> that into a silent false "not owned" (R11).
+
 Then read collection status:
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 ```
 
@@ -115,6 +127,8 @@ specific issue** — ASM #300 shipped 1988, Uncanny X-Men #179 shipped 1984):
 # Build items.json from the working list, e.g.:
 #   {"items":[{"series":"Amazing Spider-Man","issue":"300","year":"1988"},
 #             {"series":"Uncanny X-Men","issue":"179","year":"1984","variant":"Newsstand"}]}
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
   -H 'content-type: application/json' \
   -d @items.json
@@ -194,6 +208,8 @@ echoed `series`/`issue`. Use `curl -sf -G --data-urlencode` so series names
 with spaces are encoded and a non-200 makes curl exit non-zero:
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
   --data-urlencode "series=Amazing Spider-Man" \
   --data-urlencode "issue=300" \
@@ -245,6 +261,8 @@ row's `series` (add `The ` if absent; strip it if present), passing the same
 `issue`/`year`/`variant` per row:
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
   -H 'content-type: application/json' \
   -d '{"items": [
@@ -270,6 +288,8 @@ wrong volume, or looks like a Metron-style name, fetch the cache's actual series
 names and check whether the queried name is present (or close to one):
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf "$COMICS_SERVER_URL/api/comics/collection/series-names"
 ```
 
