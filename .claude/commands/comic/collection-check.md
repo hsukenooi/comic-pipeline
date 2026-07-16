@@ -62,10 +62,16 @@ response — you need them for output banners.
 
 ## Step 1: Check each comic against the server
 
-For each comic, call the check endpoint. **`year` is a per-issue cover year, not
-a series start year — pass it only when you have the cover date of *this exact
-issue*, and NEVER forward Metron's `year_began` / the series' first-published
-year (BUI-129).** The server gates a match on `release_date.startswith(year)`, so
+Build one request covering the whole working list, not one call per comic —
+the batch endpoint (`POST /api/comics/collection/check/batch`, BUI-204) runs
+the exact same matcher the single-item `GET .../collection/check` endpoint
+does per pair, so the verdicts are identical; it just collapses N round-trips
+into one call and cuts the per-issue `curl` token cost.
+
+**`year` is a per-issue cover year, not a series start year — pass it only when
+you have the cover date of *this exact issue*, and NEVER forward Metron's
+`year_began` / the series' first-published year (BUI-129).** The server gates
+a match on `release_date.startswith(year)`, so
 passing a long-running series' start year (e.g. `1963` for *Uncanny X-Men*, whose
 issues actually shipped 1975–1991) filters out every owned row and returns a
 false `not_in_cache` for the whole run. When all you have is the series start
@@ -78,33 +84,53 @@ entry "Thor #154". Without a year that fallback is suppressed (to avoid collidin
 with same-masthead reboots like *The Mighty Thor* Vol. 3) — an acceptable trade
 versus the false-negative-for-the-whole-series risk of passing the wrong year.
 
-Use `curl -sf -G --data-urlencode` so series names with spaces are encoded and a
-non-200 makes curl exit non-zero (each `year` below is the **cover year of that
+Build the request body as a list of `{series, issue, year?, variant?}` items —
+one entry per comic in the working list, `year` present only when the Input
+section's forwarding rule applies (omitted otherwise), `variant` present only
+when the listing is a variant (each `year` below is the **cover year of that
 specific issue** — ASM #300 shipped 1988, Uncanny X-Men #179 shipped 1984):
 
 ```bash
-curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
-  --data-urlencode "series=Amazing Spider-Man" \
-  --data-urlencode "issue=300" \
-  --data-urlencode "year=1988"
-
-curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
-  --data-urlencode "series=Uncanny X-Men" \
-  --data-urlencode "issue=179" \
-  --data-urlencode "year=1984" \
-  --data-urlencode "variant=Newsstand"
+# Build items.json from the working list, e.g.:
+#   {"items":[{"series":"Amazing Spider-Man","issue":"300","year":"1988"},
+#             {"series":"Uncanny X-Men","issue":"179","year":"1984","variant":"Newsstand"}]}
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
+  -H 'content-type: application/json' \
+  -d @items.json
 ```
 
-Each call returns:
+The batch call returns one entry per input item, echoing its `series`/`issue`
+so you can correlate by key (don't rely on order) — otherwise each result is
+the exact same verdict shape the single-item endpoint returns (see the
+fallback at the end of this step); the batch is a fan-out, not a
+reimplementation:
 ```json
 {
-  "match_status": "in_collection",
-  "full_title_matched": "Amazing Spider-Man #300",
-  "matched_series_name": "The Amazing Spider-Man (1963 - 1998)",
-  "matched_release_date": "1988-05-01",
-  "match_kind": "exact",
-  "in_wish_list": false,
-  "cache_age_days": 3
+  "count": 2,
+  "results": [
+    {
+      "series": "Amazing Spider-Man",
+      "issue": "300",
+      "match_status": "in_collection",
+      "full_title_matched": "Amazing Spider-Man #300",
+      "matched_series_name": "The Amazing Spider-Man (1963 - 1998)",
+      "matched_release_date": "1988-05-01",
+      "match_kind": "exact",
+      "in_wish_list": false,
+      "cache_age_days": 3
+    },
+    {
+      "series": "Uncanny X-Men",
+      "issue": "179",
+      "match_status": "not_in_cache",
+      "full_title_matched": null,
+      "matched_series_name": null,
+      "matched_release_date": null,
+      "match_kind": null,
+      "in_wish_list": false,
+      "cache_age_days": 3
+    }
+  ]
 }
 ```
 
@@ -123,16 +149,36 @@ untracked issue, and a row that exists but is catalogued with zero owned copies
 wish list, not owned" in the output table, not as "untracked."** This is a
 direct field read, not a heuristic — it needs no Step 2.5 disambiguation.
 
-> **If any check call fails (curl non-zero / connection error / non-200): STOP
-> the entire check.** Report the server error to the user and render NO verdicts
-> — not even for the comics that already succeeded. A partial run invites a
-> "not in collection" misread on the comics that never got checked (R11).
+> **If the batch call fails (curl non-zero / connection error / non-200 —
+> including the 409 the store returns when it was never imported): STOP
+> the entire check.** The 409 is the same R11 refusal the single-item endpoint
+> makes, lifted to the whole batch — the server is declining to answer for
+> every item, not just some. Report the server error to the user and render NO
+> verdicts — not even for comics whose row would otherwise have looked fine. A
+> partial run invites a "not in collection" misread on comics that never got a
+> real answer (R11).
 
 **Variant flag-through (R42):** If the listing has a variant (e.g. "Newsstand")
-but the check with `variant=` returns `not_in_cache`, re-run without `variant` to
-check the canonical entry. If the canonical matches, record the verdict as
-`✅ In collection (canonical)` and add the note `⚠️ canonical match — listing
-variant not disambiguated`.
+but the batch result for its `variant=` item comes back `not_in_cache`, re-run
+that row without `variant` to check the canonical entry. If the canonical
+matches, record the verdict as `✅ In collection (canonical)` and add the note
+`⚠️ canonical match — listing variant not disambiguated`.
+
+**Fallback — single-comic check:** for a one-off check outside the full
+working-list flow (spot-checking a single book), the single-item `GET`
+endpoint still works and returns the same verdict shape shown above minus the
+echoed `series`/`issue`. Use `curl -sf -G --data-urlencode` so series names
+with spaces are encoded and a non-200 makes curl exit non-zero:
+
+```bash
+curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
+  --data-urlencode "series=Amazing Spider-Man" \
+  --data-urlencode "issue=300" \
+  --data-urlencode "year=1988"
+```
+
+Same R11 rule applies here too: a failed call is a hard STOP, never a silent
+"not owned".
 
 ## Step 2: Apply stale-cache verdict downgrade
 
@@ -169,24 +215,28 @@ confirmed, repeating case: *Giant-Size Fantastic Four #N* falsely matching an ow
 **Pattern B — leading-article false negative (The / A / An).**
 When a row returns `not_in_cache` AND the series name does or could carry a leading
 article (the cache may store `The Incredible Hulk` while `/comic:identify` emitted
-`Incredible Hulk`, or vice-versa — a real incident sniped 17 owned Hulks), re-run
-the check **once** with the article toggled (add `The ` if absent; strip it if
-present), passing the same `issue`/`year`/`variant`:
+`Incredible Hulk`, or vice-versa — a real incident sniped 17 owned Hulks), collect
+every row that matches this pattern and re-check them **together in one follow-up
+batch call** (same endpoint as Step 1) with the article toggled on each affected
+row's `series` (add `The ` if absent; strip it if present), passing the same
+`issue`/`year`/`variant` per row:
 
 ```bash
-curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
-  --data-urlencode "series=The Incredible Hulk" \
-  --data-urlencode "issue=330" \
-  --data-urlencode "year=1987"
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
+  -H 'content-type: application/json' \
+  -d '{"items": [
+    {"series": "The Incredible Hulk", "issue": "330", "year": "1987"},
+    {"series": "Incredible Hulk", "issue": "181", "year": "1974"}
+  ]}'
 ```
 
-- A successful re-query with an alternate series key is R11-safe (it's a new call,
-  not a fallback from a failed one). If the re-query itself fails / can't reach
-  the server → **STOP** (R11), don't proceed.
-- If the toggled query returns `in_collection`, surface **both** results and flag —
-  do **not** silently flip the verdict:
+- A successful re-query with alternate series keys is R11-safe (it's a new call,
+  not a fallback from a failed one). If this follow-up batch call itself fails /
+  can't reach the server → **STOP** (R11), don't proceed.
+- For each row whose toggled query returns `in_collection`, surface **both**
+  results and flag — do **not** silently flip the verdict:
   > ⚠️ owned under series key "The Incredible Hulk" — identify dropped/added a leading article; confirm before bidding
-- If it still returns `not_in_cache`, leave the original verdict and add no flag.
+- For rows still `not_in_cache`, leave the original verdict and add no flag.
 
 **Pattern C — ambiguous / unrecognized series name (wrong-volume or silent-miss risk).**
 The matcher requires an *exact* normalized series-key match, so a series name that
