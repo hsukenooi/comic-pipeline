@@ -986,6 +986,66 @@ class TestCgcLadderPrice:
         assert fm.cgc_ladder_price(ladder, 6.5) == 1900.0
 
 
+class TestCgcLadderPriceAndClamp:
+    """BUI-369: the (price, envelope_clamped) tuple `cgc_proxy_fmv` consumes
+    to surface the clamp in notes. `cgc_ladder_price` itself stays a scalar
+    (unchanged, still covered by TestCgcLadderPrice above); these tests pin
+    the second element of the shared private helper directly."""
+
+    def test_clamp_fires_flag_true(self):
+        ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
+        counts = {5.0: 2, 6.5: 1, 7.0: 2}
+        price, clamped = fm._cgc_ladder_price_and_clamp(
+            ladder, 6.5, counts=counts
+        )
+        assert price == pytest.approx(1686.125)
+        assert clamped is True
+
+    def test_clamp_does_not_fire_below_envelope_flag_false(self):
+        # ASM #50 sparse-key shape: thin exact bucket, but BELOW the envelope
+        # → min(exact, envelope) returns exact unchanged → nothing to flag.
+        ladder = {5.0: 830.0, 6.5: 1200.0, 7.0: 1971.5}
+        counts = {5.0: 2, 6.5: 1, 7.0: 2}
+        price, clamped = fm._cgc_ladder_price_and_clamp(
+            ladder, 6.5, counts=counts
+        )
+        assert price == 1200.0
+        assert clamped is False
+
+    def test_clamp_does_not_fire_robust_bucket_flag_false(self):
+        # n>=3 exact bucket is never subject to the clamp check at all.
+        ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
+        counts = {5.0: 2, 6.5: 3, 7.0: 2}
+        price, clamped = fm._cgc_ladder_price_and_clamp(
+            ladder, 6.5, counts=counts
+        )
+        assert price == 1900.0
+        assert clamped is False
+
+    def test_clamp_does_not_fire_no_counts_flag_false(self):
+        ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
+        price, clamped = fm._cgc_ladder_price_and_clamp(ladder, 6.5)
+        assert price == 1900.0
+        assert clamped is False
+
+    def test_clamp_does_not_fire_interpolated_path_flag_false(self):
+        # No exact bucket at all → interpolation path, never the clamp.
+        ladder = {5.0: 800.0, 7.0: 2000.0}
+        price, clamped = fm._cgc_ladder_price_and_clamp(ladder, 6.0)
+        assert price == pytest.approx(1400.0)
+        assert clamped is False
+
+    def test_empty_ladder_flag_false(self):
+        assert fm._cgc_ladder_price_and_clamp({}, 6.5) == (None, False)
+
+    def test_cgc_ladder_price_matches_first_element(self):
+        # cgc_ladder_price must stay the scalar wrapper — same price either way.
+        ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
+        counts = {5.0: 2, 6.5: 1, 7.0: 2}
+        price, _ = fm._cgc_ladder_price_and_clamp(ladder, 6.5, counts=counts)
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == price
+
+
 class TestCgcProxyFmv:
     def test_asm50_band_matches_hand_price(self):
         """AC: ASM #50 raw 6.5 produces a ~$600-680 band from the CGC ladder
@@ -1029,6 +1089,9 @@ class TestCgcProxyFmv:
         assert out is not None
         slab = out["cgc_ladder"]["slab_price"]
         assert 830.0 < slab < 1971.5  # strictly between the 5.0 and 7.0 medians
+        # BUI-369: the clamp only ever applies to an EXACT-bucket price; an
+        # interpolated target grade never triggers it.
+        assert out["cgc_ladder"]["envelope_clamped"] is False
 
     def test_interpolation_requires_two_comp_anchors(self):
         # A ladder whose only bracket for the target rests on single-comp buckets
@@ -1086,6 +1149,11 @@ class TestCgcProxyFmv:
         assert out["fmv_high"] == 925
         assert out["median"] == 875
         assert out["max_bid"] == 650
+        # BUI-369: the clamp fired, so the observability marker must be set —
+        # otherwise the $1686.125 vs. ladder['ladder'][6.5]==1900.0 mismatch
+        # would read as unexplained.
+        assert out["cgc_ladder"]["envelope_clamped"] is True
+        assert out["cgc_ladder"]["ladder"][6.5] == 1900.0
 
     def test_n2_offtrend_exact_bucket_clamped_end_to_end(self):
         # BUI-355: an n=2 exact 6.5 bucket holding one genuine comp ($1200) and
@@ -1105,6 +1173,9 @@ class TestCgcProxyFmv:
         assert out["fmv_high"] == 1450
         assert out["median"] == 1400
         assert out["max_bid"] == 1025
+        # BUI-369: same marker requirement for the n=2 (BUI-355) clamp path.
+        assert out["cgc_ladder"]["envelope_clamped"] is True
+        assert out["cgc_ladder"]["ladder"][6.5] == 3100.0
 
     def test_lone_plausible_exact_slab_still_priced_asm50(self):
         # The sparse-key case the tier exists for is preserved end-to-end: ASM
@@ -1115,6 +1186,9 @@ class TestCgcProxyFmv:
         assert out is not None
         assert out["cgc_ladder"]["slab_price"] == 1200.0
         assert out["fmv_low"] == 600 and out["fmv_high"] == 650
+        # BUI-369: the lone 6.5 is below its envelope, so no clamp fired —
+        # the flag must be False (never True just because the bucket is thin).
+        assert out["cgc_ladder"]["envelope_clamped"] is False
 
 
 class TestCgcProxyShapeParity:

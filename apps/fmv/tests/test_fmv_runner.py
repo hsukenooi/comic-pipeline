@@ -1443,6 +1443,37 @@ class TestCgcProxyNotesAndTable:
         notes = fmv_runner._build_notes(proxy)
         assert "n=6 is graded-ladder comps, not raw-market depth" in notes
 
+    def test_notes_carry_envelope_clamped_token_when_clamp_fires(self):
+        # BUI-369: a lone (n=1) off-trend-high 6.5 slab ($1900) bracketed by
+        # trustworthy 5.0/7.0 neighbors triggers the BUI-349 envelope clamp
+        # (same fixture shape as fmv_math's
+        # test_lone_offtrend_exact_slab_clamped_end_to_end). The notes must
+        # explicitly flag the clamp so the slab_price vs. ladder[target]
+        # mismatch reads as intentional, not a bug.
+        offtrend = [_slab(800, 5.0), _slab(860, 5.0),
+                    _slab(1900, 6.5),
+                    _slab(1800, 7.0), _slab(2143, 7.0)]
+        proxy = fmv_math.cgc_proxy_fmv(offtrend, target_grade=6.5)
+        assert proxy["cgc_ladder"]["envelope_clamped"] is True
+        proxy["first_party_count"] = 0
+        notes = fmv_runner._build_notes(proxy)
+        assert "envelope_clamped=" in notes
+        assert "raw exact $1900" in notes
+        # `:g` formatting matches the existing "CGC proxy: slab …" token's
+        # precision (6 significant digits), same as production code.
+        assert "clamped $1686.12" in notes
+
+    def test_notes_omit_envelope_clamped_token_when_clamp_does_not_fire(self):
+        # ASM #50 shape: the lone 6.5 slab sits BELOW its envelope, so the
+        # clamp never fires. The notes must be unchanged from the pre-BUI-369
+        # shape — no envelope_clamped token at all.
+        proxy = fmv_math.cgc_proxy_fmv(_ASM50_SLABS, target_grade=6.5)
+        assert proxy["cgc_ladder"]["envelope_clamped"] is False
+        proxy["first_party_count"] = 0
+        notes = fmv_runner._build_notes(proxy)
+        assert "envelope_clamped" not in notes
+        assert "CGC proxy" in notes  # unaffected: existing token still present
+
     def test_cached_proxy_row_recovers_marker_and_caps_bid(self):
         # A persisted proxy row: fmv_confidence collapses to "low", notes carry
         # the "CGC proxy" token. On reuse the factor must be re-capped at the
