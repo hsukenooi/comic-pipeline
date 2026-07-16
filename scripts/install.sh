@@ -6,7 +6,7 @@
 # Installs (uv-managed console scripts into ~/.local/bin — runtime model (a),
 # BUI-55: the apps AND the gixen/locg package CLIs live on PATH; the uv workspace
 # env is for development/server/tests only, not these user-facing commands):
-#   - ebay-tools  -> ebay-fetch, ebay-sold-comps, seller-scan   (apps/ebay)
+#   - ebay-tools  -> ebay-fetch, ebay-sold-comps, seller-scan, comic-identify, wishlist-sellers   (apps/ebay)
 #   - comic-fmv   -> comic-fmv                                   (apps/fmv)
 #   - gixen-cli   -> gixen                                       (packages/gixen-cli, editable)
 #   - locg        -> locg                                        (packages/locg-cli, editable)
@@ -33,6 +33,14 @@
 # diagnosing agent burned time before running
 # `uv tool install --force ./packages/gixen-cli` and retrying successfully.
 #
+# After merging overlay/server changes (gixen-cli server/, plugins/gixen-overlay),
+# the Mac Mini additionally needs (BUI-377):
+#   uv sync --all-packages
+#   launchctl kickstart -k gui/$(id -u)/com.gixen.server
+# (the comics server runs via launchd out of the workspace .venv, which this
+# script does NOT refresh; observed: post-merge the running server served
+# pre-merge verdicts until sync + kickstart).
+#
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -42,7 +50,7 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Installing ebay-tools (ebay-fetch, ebay-sold-comps, seller-scan)..."
+echo "Installing ebay-tools (ebay-fetch, ebay-sold-comps, seller-scan, comic-identify, wishlist-sellers)..."
 # BUI-241: --editable so the file-relative _load_dotenv() in seller_scan.py
 # resolves back into the source tree (apps/ebay/.env) regardless of caller cwd;
 # secrets stay out of the built wheel.
@@ -65,7 +73,7 @@ uv tool install --reinstall --editable "$REPO_ROOT/packages/locg-cli"
 # positively identify as the broken wrappers, never anything else on PATH.
 # (The pre-merge locg install was exactly this python@3.14 wrapper.)
 echo "Cleaning up stale wrappers..."
-for name in comic-fmv ebay-fetch ebay-sold-comps seller-scan gixen locg; do
+for name in comic-fmv ebay-fetch ebay-sold-comps seller-scan comic-identify wishlist-sellers gixen locg; do
   stale="/opt/homebrew/bin/$name"
   if [ -f "$stale" ] && grep -q "python@3.14" "$stale" 2>/dev/null; then
     echo "  removing stale $stale"
@@ -76,6 +84,6 @@ done
 bin_dir="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
 echo
 echo "Done. CLIs installed via uv into $bin_dir:"
-for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan gixen locg; do
+for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers gixen locg; do
   printf '  %-16s -> %s\n' "$name" "$(command -v "$name" 2>/dev/null || echo 'NOT ON PATH — add '"$bin_dir"' to PATH')"
 done
