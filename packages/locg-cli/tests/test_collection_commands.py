@@ -2380,6 +2380,120 @@ def test_record_win_duplicate_gixen_id_updates_not_inserts(tmp_path):
     assert len(dupes) == 1
 
 
+# --- rows_written vs rows_inserted/rows_overwritten split (BUI-367) ---
+
+def test_record_win_rows_inserted_pure_insert_batch(tmp_path):
+    """A batch of wholly new item_ids: rows_written == rows_inserted, zero overwrites."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    wins = [
+        _make_win(item_id="1", series="Amazing Spider-Man", issue="300"),
+        _make_win(item_id="2", series="Amazing Spider-Man", issue="301"),
+        _make_win(item_id="3", series="Amazing Spider-Man", issue="302"),
+    ]
+
+    result = cmd_collection_record_win(wins, cache=cache, metron=_null_metron())
+
+    assert result["rows_written"] == 3
+    assert result["rows_inserted"] == 3
+    assert result["rows_overwritten"] == 0
+
+
+def test_record_win_rows_overwritten_only_batch(tmp_path):
+    """Re-recording the same item_ids with CORRECTED identify_data is all overwrites.
+
+    Modeling a real correction flow: the user re-runs record-win for the same
+    Gixen auctions with fixed series/issue values. Note the corrected issue
+    numbers (997/998/999) are disjoint from ALL three originally-owned issues
+    (300/301/302), not just their own row's original issue — reusing any of
+    300/301/302 would instead hit the BUI-34 "already owned" skip in
+    _build_win_row (keyed on (series, issue) across the whole owned set,
+    checked BEFORE write_wins is ever called), which is a different code path
+    than the write_wins-level gixen_item_id dedup this test targets. The
+    pre-BUI-367 behavior reported
+    rows_written=3 on the second call too, as though 3 new rows had been
+    added — misleading a caller who reads rows_written as "new rows recorded".
+    rows_inserted must reflect the truth: nothing new landed.
+    """
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    wins = [
+        _make_win(item_id="1", series="Amazing Spider-Man", issue="300"),
+        _make_win(item_id="2", series="Amazing Spider-Man", issue="301"),
+        _make_win(item_id="3", series="Amazing Spider-Man", issue="302"),
+    ]
+
+    first = cmd_collection_record_win(wins, cache=cache, metron=_null_metron())
+    assert first["rows_inserted"] == 3
+    assert first["rows_overwritten"] == 0
+
+    corrected_wins = [
+        _make_win(item_id="1", series="Amazing Spider-Man", issue="997"),
+        _make_win(item_id="2", series="Amazing Spider-Man", issue="998"),
+        _make_win(item_id="3", series="Amazing Spider-Man", issue="999"),
+    ]
+    second = cmd_collection_record_win(corrected_wins, cache=cache, metron=_null_metron())
+
+    assert second["rows_written"] == 3
+    assert second["rows_inserted"] == 0
+    assert second["rows_overwritten"] == 3
+
+    payload = cache.load()
+    # Still exactly 3 rows on disk — the second call overwrote in place.
+    assert len([r for r in payload["comics"] if r.get("gixen_item_id")]) == 3
+
+
+def test_record_win_rows_mixed_batch_splits_inserted_and_overwritten(tmp_path):
+    """A batch mixing brand-new item_ids with a corrected existing one splits accurately."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    seed_win = _make_win(item_id="EXISTING", series="Amazing Spider-Man", issue="300")
+    cmd_collection_record_win([seed_win], cache=cache, metron=_null_metron())
+
+    mixed_wins = [
+        # Corrected issue for the same auction item_id — not caught by the
+        # BUI-34 already-owned skip (issue differs from the owned #300), so it
+        # reaches write_wins and overwrites the existing gixen_item_id row.
+        _make_win(item_id="EXISTING", series="Amazing Spider-Man", issue="399"),
+        _make_win(item_id="NEW-1", series="Amazing Spider-Man", issue="301"),  # insert
+        _make_win(item_id="NEW-2", series="Amazing Spider-Man", issue="302"),  # insert
+    ]
+    result = cmd_collection_record_win(mixed_wins, cache=cache, metron=_null_metron())
+
+    assert result["rows_written"] == 3
+    assert result["rows_inserted"] == 2
+    assert result["rows_overwritten"] == 1
+
+
+def test_record_win_rows_intra_batch_duplicate_counts_as_overwrite(tmp_path):
+    """Two wins sharing gixen_item_id in ONE call (BUI-356 lineage): one insert, one overwrite.
+
+    Distinct from the cross-call overwrite case above — this exercises the
+    intra-batch collision path where the duplicate never touches the on-disk
+    store until this same commit.
+    """
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    wins = [
+        _make_win(item_id="DUPE", series="Amazing Spider-Man", issue="300"),
+        _make_win(item_id="DUPE", series="Amazing Spider-Man", issue="300", current_bid=150.00),
+    ]
+
+    result = cmd_collection_record_win(wins, cache=cache, metron=_null_metron())
+
+    assert result["rows_written"] == 2
+    assert result["rows_inserted"] == 1
+    assert result["rows_overwritten"] == 1
+
+    payload = cache.load()
+    dupes = [r for r in payload["comics"] if r.get("gixen_item_id") == "DUPE"]
+    assert len(dupes) == 1
+
+
 # --- Monotonic seq ---
 
 def test_record_win_same_timestamp_gets_distinct_seq(tmp_path):

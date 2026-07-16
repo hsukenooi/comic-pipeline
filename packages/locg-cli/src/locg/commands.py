@@ -3226,7 +3226,11 @@ def cmd_collection_record_win(
       3. Bare series name, needs_manual_series_canonical=True (fallback)
 
     Commits in chunks of 25 rows (RECORD_WIN_CHUNK_SIZE) so a crash only
-    rolls back the in-flight chunk.  Returns summary metrics.
+    rolls back the in-flight chunk.  Returns summary metrics, including the
+    BUI-367 rows_written/rows_inserted/rows_overwritten split: rows_written is
+    every row submitted to write_wins, while rows_inserted counts only the
+    ones that added a genuinely new row (rows_overwritten replaced an existing
+    row sharing its gixen_item_id and added none).
     """
     from datetime import datetime, timezone
     from locg.collection_cache import (
@@ -3284,6 +3288,8 @@ def cmd_collection_record_win(
         owned_index.setdefault(key, []).append(r)
 
     rows_written = 0
+    rows_inserted = 0
+    rows_overwritten = 0
     chunks_committed = 0
     skipped_already_owned = 0
     skipped_already_owned_titles: list[str] = []
@@ -3341,8 +3347,10 @@ def cmd_collection_record_win(
             built_rows.append(result["row"])
 
         try:
-            cache.write_wins(built_rows, command="record-win")
+            write_result = cache.write_wins(built_rows, command="record-win")
             rows_written += len(built_rows)
+            rows_inserted += write_result.inserted
+            rows_overwritten += write_result.overwritten
             chunks_committed += 1
             manual_variant_count += chunk_manual_variant
             manual_series_count += chunk_manual_series
@@ -3356,6 +3364,16 @@ def cmd_collection_record_win(
 
     return {
         "rows_written": rows_written,
+        # BUI-367: rows_written counts every row SUBMITTED to write_wins, which
+        # over-reports "new rows added" whenever a duplicate gixen_item_id (vs
+        # the store, or intra-batch per BUI-356) overwrites an existing row in
+        # place instead of appending. rows_inserted/rows_overwritten are the
+        # accurate split; rows_inserted + rows_overwritten == rows_written.
+        # Additive fields (rows_written is unchanged) so existing consumers
+        # (the overlay's record-win endpoint, the /comic:collection-add skill)
+        # keep working without modification.
+        "rows_inserted": rows_inserted,
+        "rows_overwritten": rows_overwritten,
         "chunks_committed": chunks_committed,
         "skipped_already_owned": skipped_already_owned,
         "skipped_already_owned_titles": skipped_already_owned_titles,
