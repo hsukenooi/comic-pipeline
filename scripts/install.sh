@@ -21,6 +21,18 @@
 # `ModuleNotFoundError`. uv installs to ~/.local/bin, which precedes
 # /opt/homebrew/bin on PATH; this script also removes the stale wrappers.
 #
+# Re-run after merging packages/* changes (BUI-365): a `uv tool install`ed CLI
+# is a frozen copy of the source tree at install time — it does NOT pick up
+# commits merged into packages/gixen-cli or packages/locg-cli afterward. After
+# merging a PR that touches packages/*, re-run this script (or
+# `uv tool install --force ./packages/<pkg>`) on every machine that runs these
+# CLIs, including the Mac Mini. Incident: the first `gixen add` of the
+# 2026-07-16 `/comic:buy` run crashed with `ModuleNotFoundError: No module
+# named 'record_win_prep'` — the Mac Mini's installed `gixen` predated the
+# BUI-352/353/354 merge (2026-07-14) that added that module — and the
+# diagnosing agent burned time before running
+# `uv tool install --force ./packages/gixen-cli` and retrying successfully.
+#
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
