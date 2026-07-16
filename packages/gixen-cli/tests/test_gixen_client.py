@@ -1329,6 +1329,53 @@ class TestCliListAddedSince:
 
 
 # ---------------------------------------------------------------------------
+# CLI: _server_request_result (BUI-360 — real implementation, mocked at the
+# `requests` boundary rather than replaced wholesale, unlike every add-batch
+# test elsewhere which patches this function directly)
+# ---------------------------------------------------------------------------
+
+class TestServerRequestResult:
+    def test_sets_a_default_timeout(self):
+        from cli import _server_request_result
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"ok": True}
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("requests.get", return_value=fake_resp) as mock_get:
+            ok, data, err = _server_request_result("get", "/health")
+
+        assert ok is True
+        assert data == {"ok": True}
+        assert mock_get.call_args.kwargs["timeout"] == 15
+
+    def test_explicit_timeout_kwarg_is_not_overridden(self):
+        from cli import _server_request_result
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {}
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("requests.get", return_value=fake_resp) as mock_get:
+            _server_request_result("get", "/health", timeout=5)
+
+        assert mock_get.call_args.kwargs["timeout"] == 5
+
+    def test_malformed_json_200_response_is_a_clean_failure_not_a_crash(self):
+        """BUI-360 hardening: a 2xx response with a non-JSON body must
+        degrade to (False, None, <message>) like any other server failure —
+        not raise ValueError/JSONDecodeError up through a batch loop."""
+        from cli import _server_request_result
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.json.side_effect = ValueError("Expecting value: line 1 column 1")
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("requests.get", return_value=fake_resp):
+            ok, data, err = _server_request_result("get", "/health")
+
+        assert ok is False
+        assert data is None
+        assert "not valid JSON" in err
+        assert "200" in err
+
+
+# ---------------------------------------------------------------------------
 # CLI: add history helpers
 # ---------------------------------------------------------------------------
 
@@ -1357,6 +1404,27 @@ class TestAddHistory:
         assert "222" in history
         assert isinstance(history["111"], float)
         assert history["222"] >= history["111"]
+
+    def test_record_adds_bulk_writes_once(self, tmp_path):
+        """add-batch's bulk recorder (BUI-360) — one read-modify-write for
+        the whole list, same net effect as calling _record_add per item_id."""
+        from cli import _record_adds, _load_add_history
+        hist_file = tmp_path / "history.json"
+        with patch("cli.HISTORY_FILE", hist_file):
+            _record_adds(["111", "222"])
+            history = _load_add_history()
+
+        assert set(history) == {"111", "222"}
+        assert isinstance(history["111"], float)
+
+    def test_record_adds_empty_list_is_a_noop(self, tmp_path):
+        """An empty list must not even touch the history file (no
+        read-modify-write for a batch that created nothing new)."""
+        from cli import _record_adds
+        hist_file = tmp_path / "history.json"
+        with patch("cli.HISTORY_FILE", hist_file):
+            _record_adds([])
+        assert not hist_file.exists()
 
 
 # ---------------------------------------------------------------------------
