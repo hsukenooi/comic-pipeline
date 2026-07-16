@@ -434,7 +434,9 @@ Never return a partial table.
 
 ## ORCHESTRATOR NOTES
 
-**Dispatch input:** pass the working list — one row per comic: `series`, `issue`,
+### Dispatch input
+
+Pass the working list — one row per comic: `series`, `issue`,
 the `/comic:identify` table's **Year exactly as emitted** (a blank Year stays
 blank — never backfill it with a guessed or series-start year; the executor's
 contract owns the BUI-316/BUI-129 forwarding rule), and `variant` when the
@@ -442,17 +444,29 @@ listing is a variant. The executor resolves the server, runs the batch check,
 applies the stale-cache downgrade and the Pattern A–E disambiguation scan, and
 returns the Step 3 table + status banners.
 
-**Executor reuse (BUI-366):** the executor stays addressable for the rest of
+### Executor reuse (BUI-366)
+
+The executor stays addressable for the rest of
 the run — for an incremental check (a comic added to the working list mid-run),
 SendMessage the same executor the new `{series, issue, year?, variant?}` row
 instead of respawning one that re-reads this contract from scratch (see buy.md
 § Sub-agent reuse).
 
-**Hard STOP (R11):** if the executor reports it STOPPED (server unreachable,
+### Hard STOP (R11)
+
+If the executor reports it STOPPED (server unreachable,
 failed/non-200 check call, or the never-imported 409), the check produced **no
 verdicts** — halt the flow at this step and tell the user. Never reinterpret a
 STOP as "not in collection", and never proceed to bidding without real verdicts.
 A partial or missing answer is a stop, not a "not owned".
+
+**Blast radius during incremental reuse (BUI-366):** if a SendMessage'd
+follow-up row (a comic added to the working list mid-run — § Executor reuse
+above) hits this STOP, it invalidates only that new row's verdict. Verdicts
+already rendered from the original batch dispatch stand — they came from a
+successful earlier call and don't need to be re-litigated. Halt only the
+addition of the new row (tell the user its verdict couldn't be produced)
+rather than discarding or re-running the table already presented.
 
 ### Step 4: Decision gate
 
@@ -462,6 +476,13 @@ Ask the user how to handle results:
 - **Continue anyway** (condition upgrade — they want a better copy)
 - **Wishlisted-not-owned (`📋`)**: not a duplicate risk — proceed like any other `not_in_cache` comic — but worth a callout since the user has already flagged it as wanted
 - **Stale-cache cases**: surface separately so the user can manually verify before bidding
+- **Canonical-match rows (R42, Step 1)**: `✅ In collection (canonical)` means the listing's specific variant wasn't in cache but the canonical edition is — surface the `⚠️ canonical match — listing variant not disambiguated` note and let the user confirm the variant isn't a distinct wanted collectible before skipping
 - **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` or Pattern-E printing conflict should not be auto-skipped, and a Pattern-B/C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
 
-Remove skipped comics from the working list before passing to `/comic:fmv`.
+### Carry-forward
+
+Remove skipped comics from the working list before passing it to `/comic:fmv`.
+Kept rows carry forward their identify-emitted fields plus this step's
+verdict-driven flags (the R42 canonical-match note, Pattern A–E notes) so
+whoever reads the row next (Step 2.5 grading, FMV) can see why it's still in
+play.

@@ -14,8 +14,15 @@ This is a **warn-only** verification — it doesn't fix anything, just surfaces 
 This skill is split into two sections:
 
 - **EXECUTOR CONTRACT** — everything the agent performing the verification call
-  must do (pre-flight, the call, hard-fail semantics, presentation). This is the
-  section a dispatched executor — or a standalone `/comic:verify` run — executes.
+  must do (pre-flight, the call, hard-fail semantics, presentation),
+  self-contained like collection-check.md's — the executor reads the whole
+  file and follows the contract. It has one declared cross-reference: its
+  Presentation step reads the verdict ladder from ORCHESTRATOR NOTES § Verdict
+  ladder instead of restating it (kept as a single copy on purpose so the two
+  can't drift apart). Because the executor reads the whole file, not just this
+  section, that reference resolves within the same read — it isn't a promise
+  of isolation the file then breaks. This is the section a dispatched executor
+  — or a standalone `/comic:verify` run — executes.
 - **ORCHESTRATOR NOTES** — the verdict ladder, per-verdict guidance, and
   when-to-invoke. **`/comic:buy` Step 6 reads only this section**: BUI-360 folded
   the verify call into `gixen add-batch --verify`, so in the buy flow there is
