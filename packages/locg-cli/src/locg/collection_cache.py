@@ -10,7 +10,7 @@ import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from locg._atomic import atomic_write, atomic_write_json
 from locg.config import collection_cache_path, import_history_path
@@ -75,6 +75,23 @@ TRACKING_FIELDS: tuple[str, ...] = (
     "gixen_item_id",
     "previous_full_title",
 )
+
+
+class WriteWinsResult(NamedTuple):
+    """Split of a :meth:`CollectionCache.write_wins` batch (BUI-367).
+
+    ``inserted`` counts rows that added a genuinely new entry to the store;
+    ``overwritten`` counts rows whose ``gixen_item_id`` matched an existing row
+    (from the on-disk store, or another row earlier in the same batch per
+    BUI-356) and replaced it in place. ``inserted + overwritten`` always equals
+    the number of rows passed to ``write_wins`` — a caller counting only
+    ``len(rows)`` submitted (the pre-BUI-367 behavior) over-reports how many
+    *new* rows actually landed whenever a duplicate is present.
+    """
+
+    inserted: int
+    overwritten: int
+
 
 # Per-process monotonic counter for tiebreaking rows with identical timestamps
 _SEQ_COUNTER: int = 0
@@ -744,7 +761,9 @@ class CollectionCache:
         finally:
             lock_file.close()
 
-    def write_wins(self, rows: list[dict[str, Any]], command: str = "record-win") -> None:
+    def write_wins(
+        self, rows: list[dict[str, Any]], command: str = "record-win"
+    ) -> WriteWinsResult:
         """Insert or update a batch of agent_win rows under exclusive lock.
 
         Duplicate detection is by gixen_item_id: an existing row with the
@@ -754,8 +773,16 @@ class CollectionCache:
         handled identically to a duplicate against the on-disk store — the
         later row overwrites the earlier one in place rather than both being
         appended.  Callers are responsible for chunking large batches.
+
+        Returns a :class:`WriteWinsResult` (inserted, overwritten) so callers
+        can report the accurate split instead of treating every submitted row
+        as a new one (BUI-367) — an overwrite adds no new row to the store.
         """
+        inserted = 0
+        overwritten = 0
+
         def mutate(payload: dict[str, Any]) -> None:
+            nonlocal inserted, overwritten
             idx_by_gixen: dict[str, int] = {
                 row["gixen_item_id"]: i
                 for i, row in enumerate(payload["comics"])
@@ -765,12 +792,15 @@ class CollectionCache:
                 gixen_id = row.get("gixen_item_id")
                 if gixen_id and gixen_id in idx_by_gixen:
                     payload["comics"][idx_by_gixen[gixen_id]] = row
+                    overwritten += 1
                 else:
                     payload["comics"].append(row)
                     if gixen_id:
                         idx_by_gixen[gixen_id] = len(payload["comics"]) - 1
+                    inserted += 1
 
         self.apply(mutate, command=command)
+        return WriteWinsResult(inserted=inserted, overwritten=overwritten)
 
     def append_audit(self, record: dict[str, Any]) -> None:
         """Append a JSON audit record to import-history.jsonl.

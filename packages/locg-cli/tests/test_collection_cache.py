@@ -397,7 +397,7 @@ def test_write_wins_intra_batch_duplicate_gixen_id_appends_once(tmp_path):
         full_title="Amazing Spider-Man #300 (variant)", seq=2, gixen_item_id="DUPE"
     )
 
-    cache.write_wins([row_a, row_b])
+    result = cache.write_wins([row_a, row_b])
 
     payload = cache.load()
     dupes = [r for r in payload["comics"] if r.get("gixen_item_id") == "DUPE"]
@@ -405,6 +405,90 @@ def test_write_wins_intra_batch_duplicate_gixen_id_appends_once(tmp_path):
     # Later row in the batch wins, matching duplicate-against-store overwrite
     # semantics (payload["comics"][idx] = row).
     assert dupes[0]["full_title"] == "Amazing Spider-Man #300 (variant)"
+    # BUI-367: the intra-batch collision is one insert (row_a) + one overwrite
+    # (row_b replacing row_a in place), never two inserts.
+    assert result.inserted == 1
+    assert result.overwritten == 1
+
+
+# ---------------------------------------------------------------------------
+# write_wins: inserted/overwritten split (BUI-367)
+# ---------------------------------------------------------------------------
+
+def test_write_wins_pure_insert_batch_counts_all_inserted(tmp_path):
+    """A batch with no gixen_item_id collisions is all inserts, zero overwrites."""
+    cache = make_cache(tmp_path)
+    rows = [
+        make_row(full_title="Amazing Spider-Man #300", seq=1, gixen_item_id="A"),
+        make_row(full_title="Amazing Spider-Man #301", seq=2, gixen_item_id="B"),
+        make_row(full_title="Amazing Spider-Man #302", seq=3, gixen_item_id="C"),
+    ]
+
+    result = cache.write_wins(rows)
+
+    assert result.inserted == 3
+    assert result.overwritten == 0
+    payload = cache.load()
+    assert len(payload["comics"]) == 3
+
+
+def test_write_wins_overwrite_only_batch_counts_all_overwritten(tmp_path):
+    """A batch whose every gixen_item_id already exists on disk is all overwrites."""
+    cache = make_cache(tmp_path)
+    seed_rows = [
+        make_row(full_title="Amazing Spider-Man #300", seq=1, gixen_item_id="A"),
+        make_row(full_title="Amazing Spider-Man #301", seq=2, gixen_item_id="B"),
+    ]
+    cache.write_wins(seed_rows)
+
+    updated_rows = [
+        make_row(full_title="Amazing Spider-Man #300 (CGC 9.8)", seq=3, gixen_item_id="A"),
+        make_row(full_title="Amazing Spider-Man #301 (CGC 9.6)", seq=4, gixen_item_id="B"),
+    ]
+    result = cache.write_wins(updated_rows)
+
+    assert result.inserted == 0
+    assert result.overwritten == 2
+    payload = cache.load()
+    # Still 2 rows total — both updated in place, none appended.
+    assert len(payload["comics"]) == 2
+    titles = {r["full_title"] for r in payload["comics"]}
+    assert titles == {"Amazing Spider-Man #300 (CGC 9.8)", "Amazing Spider-Man #301 (CGC 9.6)"}
+
+
+def test_write_wins_mixed_batch_splits_inserted_and_overwritten(tmp_path):
+    """A batch mixing new gixen_item_ids with ones already on disk splits accurately."""
+    cache = make_cache(tmp_path)
+    seed_rows = [
+        make_row(full_title="Amazing Spider-Man #300", seq=1, gixen_item_id="A"),
+    ]
+    cache.write_wins(seed_rows)
+
+    mixed_rows = [
+        make_row(full_title="Amazing Spider-Man #300 (CGC 9.8)", seq=2, gixen_item_id="A"),  # overwrite
+        make_row(full_title="Amazing Spider-Man #301", seq=3, gixen_item_id="B"),  # insert
+        make_row(full_title="Amazing Spider-Man #302", seq=4, gixen_item_id="C"),  # insert
+    ]
+    result = cache.write_wins(mixed_rows)
+
+    assert result.inserted == 2
+    assert result.overwritten == 1
+    payload = cache.load()
+    assert len(payload["comics"]) == 3
+
+
+def test_write_wins_row_without_gixen_id_always_inserted(tmp_path):
+    """Rows without a gixen_item_id can never match an existing row — always inserted."""
+    cache = make_cache(tmp_path)
+    rows = [
+        make_row(full_title="Amazing Spider-Man #300", seq=1, gixen_item_id=None),
+        make_row(full_title="Amazing Spider-Man #301", seq=2, gixen_item_id=None),
+    ]
+
+    result = cache.write_wins(rows)
+
+    assert result.inserted == 2
+    assert result.overwritten == 0
 
 
 # ---------------------------------------------------------------------------
