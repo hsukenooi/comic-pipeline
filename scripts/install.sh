@@ -33,6 +33,14 @@
 # diagnosing agent burned time before running
 # `uv tool install --force ./packages/gixen-cli` and retrying successfully.
 #
+# After merging overlay/server changes (gixen-cli server/, plugins/gixen-overlay),
+# the Mac Mini additionally needs (BUI-377):
+#   uv sync --all-packages
+#   launchctl kickstart -k gui/$(id -u)/com.gixen.server
+# (the comics server runs via launchd out of the workspace .venv, which this
+# script does NOT refresh; observed: post-merge the running server served
+# pre-merge verdicts until sync + kickstart).
+#
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
