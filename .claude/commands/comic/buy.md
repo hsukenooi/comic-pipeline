@@ -13,7 +13,23 @@ Each leaf skill is also usable standalone. Use this when the user provides eBay 
 
 ## Execution Pattern
 
-Read each leaf skill file from disk and follow its instructions inline. This ensures the orchestrator stays in sync with any updates to the leaf skills.
+Leaf skills that run in sub-agents are split into two marked sections (BUI-361):
+an **EXECUTOR CONTRACT** (everything the executing agent must do, self-contained)
+and **ORCHESTRATOR NOTES** (gates, decision guidance, carry-forward). Dispatch
+those steps as:
+
+> Read `<absolute skill path>` and execute its EXECUTOR CONTRACT with this
+> input: \<the step's working-list input\>
+
+The sub-agent reads the skill file itself — do **not** re-serialize or digest
+the skill body into the dispatch prompt (that pays for the content twice and
+drifts from the file). As the orchestrator, read **only** the ORCHESTRATOR
+NOTES section of those skills, never their full body.
+
+Steps without a sub-agent dispatch stay inline: read the skill file and follow
+it (`identify.md`, `grade.md`) or call the CLI directly (Steps 3 and 5) as each
+step says. This keeps the orchestrator in sync with any updates to the leaf
+skills without hand-copying their content.
 
 At each step, present results to the user and wait for approval before proceeding.
 
@@ -75,12 +91,23 @@ When `sample_size >= 1`, surface a line before the user decides whether to grade
 
 ## Step 2: Collection Check
 
-Read `~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md` and follow it.
+Dispatch a sub-agent:
+
+> Read `~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md`
+> and execute its EXECUTOR CONTRACT with this input: \<the working list — one
+> row per comic: series, issue, the Step 1 Year column exactly as emitted
+> (blank stays blank — never backfill it), and variant when present\>
+
+Read only that skill's **ORCHESTRATOR NOTES** yourself — they carry the
+dispatch input shape, the hard-STOP rule, and the Step 4 decision gate. Do not
+ingest its EXECUTOR CONTRACT.
 
 **Input:** Comic identification table from Step 1.
-**Output:** Table showing collection membership from the local cache. Cache may lag LOCG by up to N days (shown as "Cache age" in the results).
+**Output:** the executor returns the skill's Step 3 table + status banners — collection membership from the server-side cache. Cache may lag LOCG by up to N days (shown as "Cache age" in the results).
 
-Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate). For any `⚠️ Not in cache (cache stale)` results, surface them separately so the user can decide whether to bid before verifying manually.
+**Hard STOP (R11):** if the executor reports it STOPPED (server unreachable, failed/non-200 check call, or the never-imported 409), the check produced **no verdicts** — halt the run at this step. Never treat a STOP as "not in collection" and never proceed to bidding without real verdicts.
+
+Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate). For any `⚠️ Not in cache (cache stale)` results, surface them separately so the user can decide whether to bid before verifying manually. For disambiguator-flagged rows (Patterns A–E in the executor's Notes column), follow the skill's ORCHESTRATOR NOTES — the user resolves each flag; never act on the raw verdict.
 
 Remove skipped comics from the working list before Step 2.5.
 
@@ -270,7 +297,7 @@ If any rows shared a `group` (BUI-363), also remind the user:
 
 ## Step 6: Verify
 
-Step 5's `--verify` already appended a `verify` verdict to every landed row in its JSON output — this step is now just **interpreting that data**, not making another call. Read `~/Projects/comic-pipeline/.claude/commands/comic/verify.md` for the verdict ladder and the per-verdict guidance table (§ Presentation) and apply them here:
+Step 5's `--verify` already appended a `verify` verdict to every landed row in its JSON output — this step is now just **interpreting that data**, not making another call. Read **only the ORCHESTRATOR NOTES section** of `~/Projects/comic-pipeline/.claude/commands/comic/verify.md` — it carries the verdict ladder, the per-verdict guidance, and the no-false-all-clear rule (BUI-361; no executor dispatch, the contract half is for standalone runs) — and apply them here:
 
 - **`rows[].verify` is null** — either the row didn't land (`failed`/`not_attempted`, nothing to verify) or it landed without a `grade` (add-batch's `--verify` only submits landed rows that carry a grade, since verify.md's endpoint needs one to match an `fmv` row). Treat a gradeless landed row as **unverified**, not as an implicit `fully_linked` — say so rather than staying silent.
 - **`rows[].verify.verdict != "fully_linked"`** — surface the row in a table plus its one-line guidance from `verify.md`'s per-verdict mapping (`needs_manual`, `fmv_stub`, `no_fmv_at_grade`, `no_comic`, `partial`, `no_bid`).
