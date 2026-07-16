@@ -37,11 +37,14 @@ bash server/install.sh
 
 ## Architecture
 
-Three components:
+Four components:
 
 - **`gixen_client.py`** — `GixenClient` class that manages a `requests.Session`, handles login via HTML form POST, extracts session IDs from meta-refresh redirects, and parses the snipe table from raw HTML using regex. All Gixen operations (add/modify/remove/purge) work by POSTing form data to `home_2.php` with the session ID as a query param. Auto-re-logins on session expiration.
 - **`cli.py`** — Click CLI. When `COMICS_SERVER_URL` is set in `.env` (the deprecated alias `GIXEN_SERVER_URL` is still honored), routes writes (add/edit/remove/purge) to the FastAPI server and reads (`list`) from `GET /api/snipes`. When not set, talks directly to Gixen (existing behavior).
 - **`server/`** — FastAPI app (`main.py`) with SQLite storage (`db.py`) and LaunchAgent installer (`install.sh`). Proxies Gixen operations, stores bid history, and serves the web dashboard. `/api/snipes` pulls live state from Gixen synchronously on each visit (deduped within `_SYNC_TTL=5s` across concurrent calls) and reads cached rows from SQLite — no background sync loop. eBay's Browse API is invoked only as a fire-and-forget fallback when an auction has ended without a captured `winning_bid`. Server credentials and DB path are configured via `~/.gixen-server/.env`. Plugins register additional routes, DB tables, and dashboard tabs via the `gixen.plugins` entry-point group (see `gixen/plugins.py`).
+- **`record_win_prep.py`** (BUI-352/353/354) — backs the `record-win-prep` CLI command. One call does gixen-list → filter to ENDED+WON+dedup → subtract the BUI-121 seen-set (fetched from the comics server) → shell out to `comic-identify --batch` → positionally map identities back onto wins, building the `/comic:collection-add` record-win payload (`{"wins": [...], "needs_review": [...]}`). Raises `RecordWinPrepError` (hard stop) instead of degrading silently on a seen-set connectivity failure or a comic-identify launch/timeout/line-count mismatch — the positional join is exactly the silent-misattribution bug BUI-353 exists to prevent.
+
+**gixen-cli → comic-identify: a workspace package shelling out to a non-workspace console script.** `record_win_prep.py`'s `identify_titles()` runs `subprocess.run(["comic-identify", "--batch"], ...)` — the same pattern as the root `CLAUDE.md`'s `comic-fmv` → `ebay-sold-comps` precedent, except here the caller (gixen-cli) is itself a **uv workspace member**, while `comic-identify` (`apps/ebay`, entry point `comic_identify:main`) is not — it's reachable only via `uv tool install` on PATH (`scripts/install.sh`). Same operational implication as the FMV case: if apps/ebay isn't installed, `subprocess.run` raises `OSError` (missing binary), which `identify_titles` catches and re-raises as `RecordWinPrepError` pointing at `./scripts/install.sh`. There's no import here, so the failure mode is "command not found," not `ModuleNotFoundError` — but the root cause (the console script missing from PATH) is the same class of problem as the FMV precedent.
 
 ## Key Details
 
