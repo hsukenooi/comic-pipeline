@@ -55,6 +55,11 @@ The publication year printed on an issue's cover, used as the **per-issue** key 
 ### Record-Win
 The process of recording a won eBay auction into the Collection as a Win-Sourced Entry.
 
+### Seen-Set
+The set of won-auction item IDs already recorded into the Collection, used by Record-Win to skip wins it processed in a prior run — the **primary** cross-run dedup for `/comic:collection-add`.
+
+A second, independent net (the server's already-owned check) sits behind it: a book already in the Collection is rejected even if it slips past the seen-set. The two are not redundant — the seen-set prevents *reprocessing* at all (and the token/cost blowup of re-identifying dozens of already-recorded wins), while the already-owned check only prevents a duplicate *write*. Correctness and cost should ride on the seen-set; the already-owned check is a backstop, not a substitute. A fetch of the seen-set that fails locally (unreachable server, unset URL) must hard-stop, never fall back to an empty set — an empty seen-set silently reclassifies every prior win as new.
+
 ### Collection Sync
 The round-trip that mirrors the Collection up to LOCG and reconciles it back: export the pending entries to a bulk-import file, upload it to LOCG, re-export from LOCG, and re-import to clear pending.
 
