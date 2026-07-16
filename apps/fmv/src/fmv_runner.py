@@ -896,6 +896,20 @@ def _build_notes(fmv: dict) -> str:
             "confidence capped MEDIUM-LOW; "
             f"n={fmv.get('n')} is graded-ladder comps, not raw-market depth"
         )
+    # BUI-369: when the BUI-349/BUI-355 envelope-sanity clamp lowered the
+    # exact-bucket slab price, `slab_price` above will disagree with
+    # `ladder['ladder'][target_grade]` (the raw, un-clamped exact value) —
+    # with no marker, that reads as a bug, and an auditor could "correct"
+    # the cap upward, defeating the guard. State it explicitly so the
+    # contradiction is legible as an intentional, money-safe clamp rather
+    # than silent drift.
+    if fmv.get("cgc_proxy") and ladder and ladder.get("envelope_clamped"):
+        raw_exact = ladder["ladder"].get(ladder["target_grade"])
+        parts.append(
+            "envelope_clamped=slab price bounded by envelope-sanity guard "
+            f"(BUI-349/355): raw exact ${raw_exact:g} → clamped "
+            f"${ladder['slab_price']:g}; do not raise to match ladder[target]"
+        )
     # BUI-306 §7: state EXPLICITLY that the price was interpolated (not a direct
     # comp) and that confidence is reduced, naming the bracketing buckets used.
     interp = fmv.get("interpolation")

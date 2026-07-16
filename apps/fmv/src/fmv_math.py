@@ -597,6 +597,47 @@ CGC_PROXY_BID_FACTOR = 0.70
 OUTLIER_ROBUST_BUCKET_N = 3
 
 
+def _cgc_ladder_price_and_clamp(
+    ladder: dict[float, float], target_grade: float,
+    counts: dict[float, int] | None = None,
+    min_bucket_n: int = MIN_BRACKET_COMPS,
+) -> tuple[float | None, bool]:
+    """Shared core of ``cgc_ladder_price``: returns ``(price, envelope_clamped)``.
+
+    ``envelope_clamped`` (BUI-369) is True only when the BUI-349/BUI-355
+    envelope-sanity clamp actually LOWERED the exact-bucket price (the
+    envelope bound was strictly below the raw exact value). When the
+    envelope is at or above the exact value, ``min(exact, envelope)``
+    returns ``exact`` unchanged, so there is nothing to flag — the notes
+    would otherwise falsely suggest a clamp happened when the price is
+    simply the direct exact-bucket anchor.
+
+    Split out from ``cgc_ladder_price`` so ``cgc_proxy_fmv`` can surface the
+    flag in ``cgc_ladder`` for the notes builder (fmv.md §7a: an auditor
+    seeing ``slab_price`` disagree with ``ladder[target]`` needs to know
+    that's the clamp, not a bug, or they could "fix" the cap upward and
+    defeat the guard) — without changing ``cgc_ladder_price``'s public
+    scalar return shape. See that function's docstring for the full clamp
+    rationale.
+    """
+    if not ladder:
+        return None, False
+    if target_grade in ladder:
+        exact = ladder[target_grade]
+        if (counts is not None
+                and counts.get(target_grade, 0)
+                < max(min_bucket_n, OUTLIER_ROBUST_BUCKET_N)):
+            envelope = _bracket_interpolate(
+                ladder, target_grade, counts, min_bucket_n
+            )
+            if envelope is not None:
+                clamped_price = min(exact, envelope["target_price"])
+                return clamped_price, clamped_price < exact
+        return exact, False
+    bracket = _bracket_interpolate(ladder, target_grade, counts, min_bucket_n)
+    return (bracket["target_price"], False) if bracket else (None, False)
+
+
 def cgc_ladder_price(ladder: dict[float, float], target_grade: float,
                      counts: dict[float, int] | None = None,
                      min_bucket_n: int = MIN_BRACKET_COMPS) -> float | None:
@@ -653,21 +694,10 @@ def cgc_ladder_price(ladder: dict[float, float], target_grade: float,
     medians can't tell a thin bucket from a thick one), preserving the
     exact-anchor behavior.
     """
-    if not ladder:
-        return None
-    if target_grade in ladder:
-        exact = ladder[target_grade]
-        if (counts is not None
-                and counts.get(target_grade, 0)
-                < max(min_bucket_n, OUTLIER_ROBUST_BUCKET_N)):
-            envelope = _bracket_interpolate(
-                ladder, target_grade, counts, min_bucket_n
-            )
-            if envelope is not None:
-                return min(exact, envelope["target_price"])
-        return exact
-    bracket = _bracket_interpolate(ladder, target_grade, counts, min_bucket_n)
-    return bracket["target_price"] if bracket else None
+    price, _ = _cgc_ladder_price_and_clamp(
+        ladder, target_grade, counts, min_bucket_n
+    )
+    return price
 
 
 def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
@@ -701,7 +731,9 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
     # and leave the book needs_manual rather than emit a suspect bid cap.
     if monotonicity_violations(ladder):
         return None
-    slab = cgc_ladder_price(ladder, target_grade, counts=counts)
+    slab, envelope_clamped = _cgc_ladder_price_and_clamp(
+        ladder, target_grade, counts=counts
+    )
     if slab is None or slab < CGC_PROXY_MIN_SLAB_PRICE:
         return None
 
@@ -745,6 +777,13 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
             "factor_low": CGC_PROXY_FACTOR_LOW,
             "factor_high": CGC_PROXY_FACTOR_HIGH,
             "ladder": dict(sorted(ladder.items())),
+            # BUI-369: True when the BUI-349/BUI-355 envelope-sanity clamp
+            # lowered `slab_price` below the raw `ladder[target_grade]`
+            # value — so `_build_notes` can state it explicitly rather than
+            # leaving an unexplained contradiction an auditor might "fix"
+            # upward (defeating the guard). See
+            # `_cgc_ladder_price_and_clamp`'s docstring for when this fires.
+            "envelope_clamped": envelope_clamped,
         },
     }
 
