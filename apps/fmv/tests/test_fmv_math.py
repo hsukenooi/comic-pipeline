@@ -889,6 +889,62 @@ class TestCgcLadderPrice:
     def test_empty_ladder_returns_none(self):
         assert fm.cgc_ladder_price({}, 6.5) is None
 
+    # ── BUI-349 envelope-sanity clamp on a THIN exact bucket ─────────────────
+    def test_thin_exact_offtrend_high_clamped_to_envelope(self):
+        # Lone (n=1) 6.5 slab at $1900 sits BETWEEN its trustworthy neighbors
+        # 5.0 ($830, n=2) and 7.0 ($1971.5, n=2), so it passes the monotonicity
+        # guard (830 < 1900 < 1971.5) — yet it is above the linear 5.0–7.0
+        # envelope at 6.5 ($1686.125). The clamp caps it at that envelope.
+        ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
+        counts = {5.0: 2, 6.5: 1, 7.0: 2}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == pytest.approx(1686.125)
+
+    def test_thin_exact_below_envelope_unchanged_asm50_class(self):
+        # The ASM #50 sparse-key case: a lone 6.5 slab BELOW its bracketing
+        # envelope must be used AS-IS (not lifted to the envelope) — the clamp
+        # only ever lowers, never raises.
+        ladder = {5.0: 830.0, 6.5: 1200.0, 7.0: 1971.5}
+        counts = {5.0: 2, 6.5: 1, 7.0: 2}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 1200.0
+
+    def test_thin_exact_no_eligible_bracket_stays_direct_anchor(self):
+        # Off-trend-high lone 6.5, but no trustworthy bucket BELOW it → no
+        # envelope to sanity-check against, so the lone slab is used directly
+        # (the irreducible sparse-key case the tier must still serve).
+        ladder = {6.5: 1900.0, 7.0: 1971.5}
+        counts = {6.5: 1, 7.0: 2}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 1900.0
+
+    def test_thin_exact_bracket_present_but_ineligible_stays_direct_anchor(self):
+        # Distinct from the no-bucket case: a below-neighbor EXISTS (5.0) but is
+        # itself thin (n=1), so it is ineligible to anchor the envelope → no
+        # eligible bracket → the off-trend-high lone 6.5 is used directly. The
+        # clamp only bites when TRUSTWORTHY neighbors bracket the target.
+        ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
+        counts = {5.0: 1, 6.5: 1, 7.0: 2}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 1900.0
+
+    def test_thin_exact_top_edge_stays_direct_anchor(self):
+        # Symmetric to the bottom-edge case: a thin exact bucket at the TOP of
+        # the ladder (no bucket above) has no envelope to check against → the
+        # lone slab is used directly.
+        ladder = {5.0: 830.0, 6.0: 1200.0, 6.5: 1900.0}
+        counts = {5.0: 2, 6.0: 2, 6.5: 1}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 1900.0
+
+    def test_thick_exact_bucket_not_clamped(self):
+        # A ≥2-comp exact bucket has an outlier-robust median already; leave it
+        # as a direct anchor even above the neighbor envelope.
+        ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
+        counts = {5.0: 2, 6.5: 2, 7.0: 2}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 1900.0
+
+    def test_no_counts_disables_clamp(self):
+        # Without a counts map the caller can't tell thin from thick, so the
+        # exact bucket stays a direct anchor (BUI-348 back-compat behavior).
+        ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
+        assert fm.cgc_ladder_price(ladder, 6.5) == 1900.0
+
 
 class TestCgcProxyFmv:
     def test_asm50_band_matches_hand_price(self):
@@ -971,6 +1027,35 @@ class TestCgcProxyFmv:
                  _slab(636, 4.0)]
         out = fm.cgc_proxy_fmv(comps, target_grade=6.5)
         assert out["cgc_ladder"]["slab_price"] == 1250.0
+
+    def test_lone_offtrend_exact_slab_clamped_end_to_end(self):
+        # BUI-349: a LONE (n=1) 6.5 slab priced off-trend high ($1900) but still
+        # below the next bucket (7.0=$1971.5) passes the monotonicity guard, yet
+        # the envelope clamp bounds it at the trustworthy 5.0–7.0 trend
+        # ($1686.125) instead of setting a too-high cap off the lone outlier.
+        offtrend = [_slab(800, 5.0), _slab(860, 5.0),      # 5.0 median 830, n=2
+                    _slab(1900, 6.5),                        # 6.5 lone, off-trend
+                    _slab(1800, 7.0), _slab(2143, 7.0)]      # 7.0 median 1971.5
+        out = fm.cgc_proxy_fmv(offtrend, target_grade=6.5)
+        assert out is not None
+        assert out["cgc_ladder"]["slab_price"] == pytest.approx(1686.125)
+        # Band + cap derive from the CLAMPED slab ($1686.125), not the $1900
+        # outlier. Pin the exact money-facing output (as the ASM-#50 test does),
+        # not a loose inequality — the unclamped band would be $950-$1050.
+        assert out["fmv_low"] == 850
+        assert out["fmv_high"] == 925
+        assert out["median"] == 875
+        assert out["max_bid"] == 650
+
+    def test_lone_plausible_exact_slab_still_priced_asm50(self):
+        # The sparse-key case the tier exists for is preserved end-to-end: ASM
+        # #50's lone 6.5 ($1200), which sits BELOW its bracketing envelope, is
+        # used as-is and still yields a bid-able band (not pushed to
+        # needs_manual by the clamp).
+        out = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
+        assert out is not None
+        assert out["cgc_ladder"]["slab_price"] == 1200.0
+        assert out["fmv_low"] == 600 and out["fmv_high"] == 650
 
 
 class TestCgcProxyShapeParity:
