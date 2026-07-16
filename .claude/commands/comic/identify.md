@@ -15,6 +15,8 @@ dispatch the **`comic-identifier` subagent** with:
 - **ITEM IDS** — the IDs (or full URLs) you extracted, space-separated
 - **CURRENT UTC TIME** — current UTC time in ISO-8601 format (compute it now via
   `date -u +"%Y-%m-%dT%H:%M:%SZ"`)
+- **NAME** — give the subagent a name at spawn (e.g. `comic-identifier`, BUI-366)
+  so it stays addressable for follow-ups later in the run (see § Follow-ups below)
 
 The subagent runs `ebay_fetch.py --json`, parses the JSON, and returns **only** the
 formatted identification table. Raw JSON and intermediate parse steps never appear in
@@ -38,9 +40,8 @@ The subagent returns the identification table directly. Present it to the user:
   when the title's parenthesized year and eBay's item-specifics `Publication Year`
   corroborate each other (and the listing isn't a facsimile/reprint) — otherwise `—`.
   A blank is the common, safe case. `/comic:collection-check` forwards this exact value
-  as the per-issue `year` to disambiguate rebootable-masthead volumes (e.g. Fantastic
-  Four Vol. 1 vs. Vol. 7); a wrong/uncertain year is deliberately never emitted, so the
-  check simply stays year-agnostic when it's blank.
+  as the per-issue `year` (see its EXECUTOR CONTRACT § Input for the full
+  BUI-316/BUI-129 forwarding rule); a blank stays year-agnostic there too.
 - **Current Price** and **Bids** (BUI-359) come straight from the fetch the subagent
   already made (`current_price` / `bid_count` in the `ebay_fetch.py` JSON — no extra
   API call). Current Price is the current bid for an auction, the buy price for a BIN;
@@ -66,11 +67,12 @@ returns the table — item specifics, description text, printing/variant evidenc
 none of which entered the caller's context. For a follow-up question about a
 listing it already fetched (e.g. "does item N's item specifics say first
 printing?", "what does the description say about the variant?"), SendMessage
-the **same** agent rather than dispatching a fresh one — the answer is one tool
-call from JSON it already holds; a fresh spawn re-fetches and re-parses
-everything (in the 2026-07-16 run: 1 tool call vs 9). Name the agent at spawn
-time so it's addressable. Current Price and Bids never need a follow-up — they
-are already columns in the table (BUI-359).
+the **same named** agent (§ Step 1 — naming it at spawn is the precondition
+that makes this addressable) rather than dispatching a fresh one — the answer
+is one tool call from JSON it already holds; a fresh spawn re-fetches and
+re-parses everything (in the 2026-07-16 run: 1 tool call vs 9). Current Price
+and Bids never need a follow-up — they are already columns in the table
+(BUI-359).
 
 ## Common Mistakes
 

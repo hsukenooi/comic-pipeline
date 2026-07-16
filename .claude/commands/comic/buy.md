@@ -18,8 +18,12 @@ an **EXECUTOR CONTRACT** (everything the executing agent must do, self-contained
 and **ORCHESTRATOR NOTES** (gates, decision guidance, carry-forward). Dispatch
 those steps as:
 
-> Read `<absolute skill path>` and execute its EXECUTOR CONTRACT with this
+> Read `<skill path>` and execute its EXECUTOR CONTRACT with this
 > input: \<the step's working-list input\>
+
+Spell out the full path the same way the dispatch bullets below do (e.g.
+`~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md`) — not a
+bare filename the sub-agent would have to search for.
 
 The sub-agent reads the skill file itself — do **not** re-serialize or digest
 the skill body into the dispatch prompt (that pays for the content twice and
@@ -31,6 +35,15 @@ it (`identify.md`, `grade.md`) or call the CLI directly (Steps 3 and 5) as each
 step says. This keeps the orchestrator in sync with any updates to the leaf
 skills without hand-copying their content.
 
+A third pattern applies to `verify.md` (post-BUI-360): it's split into
+EXECUTOR CONTRACT / ORCHESTRATOR NOTES the same as `collection-check.md`, but
+Step 6 never dispatches an executor and never reads its EXECUTOR CONTRACT at
+all — `gixen add-batch --verify` (Step 5) already performed the equivalent of
+the executor's call inline, so Step 6 reads *only* `verify.md`'s ORCHESTRATOR
+NOTES section, inline, to interpret the verdicts already embedded in that
+CLI's output. Treat it like reading the ORCHESTRATOR NOTES of a dispatched
+skill — there's just no matching executor dispatch to pair it with.
+
 At each step, present results to the user and wait for approval before proceeding.
 
 ### Sub-agent reuse — SendMessage, not respawn (BUI-366)
@@ -40,17 +53,20 @@ follow-up question or an incremental unit of work lands on context an existing
 agent **already holds**, route it to that agent via
 `SendMessage({to: <name>, message: ...})` instead of spawning fresh — a respawn
 re-fetches and re-instructs for data already sitting in the first agent's
-context. Give agents a `name` at spawn time so they're addressable later.
+context. This depends on the agent having been named at spawn (an unnamed
+agent silently degrades reuse back to a respawn) — the dispatch bullets below
+(Step 1, Step 2) already tell you to name the agent when you spawn it.
 
 Reuse targets in this flow:
 
 - **The identifier agent (Step 1)** holds the full `ebay_fetch.py` JSON for
   every listing — item specifics, description text, printing/variant evidence
-  that never entered your context. Follow-ups like "is item N a first print or
-  a later printing?" are one SendMessage answered from JSON it already parsed
-  (2026-07-16 run: 1 tool call vs the 9 a fresh spawn needed). Current Price
-  and Bids are **not** a reason to message it — BUI-359 already emits them in
-  the Step 1 table; the pattern is for evidence the table doesn't carry.
+  that never entered your context. Route follow-ups like "is item N a first
+  print or a later printing?" to it via SendMessage instead of a fresh spawn —
+  see identify.md § Follow-ups for the full rationale and the 2026-07-16
+  example. Current Price and Bids are **not** a reason to message it — BUI-359
+  already emits them in the Step 1 table; the pattern is for evidence the
+  table doesn't carry.
 - **The collection-check executor (Step 2)** holds its loaded EXECUTOR CONTRACT
   and the run's verdicts. A comic added to the working list mid-run =
   SendMessage it the new `{series, issue, year?, variant?}` row for an
@@ -88,7 +104,10 @@ decision. The leaf skills still health-gate the server at their own steps.
 
 ## Step 1: Identify
 
-Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow it.
+Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow
+it — name the identifier subagent it dispatches (e.g. `comic-identifier`) at
+spawn time (BUI-366) so it stays addressable for follow-ups later in the run
+(see § Sub-agent reuse above and identify.md § Follow-ups).
 
 **Input:** eBay URLs from the user.
 **Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**).
@@ -124,12 +143,15 @@ When `sample_size >= 1`, surface a line before the user decides whether to grade
 
 ## Step 2: Collection Check
 
-Dispatch a sub-agent:
+Dispatch a sub-agent, naming it at spawn (e.g. `collection-checker`, BUI-366)
+so it stays addressable for incremental follow-up checks:
 
 > Read `~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md`
 > and execute its EXECUTOR CONTRACT with this input: \<the working list — one
-> row per comic: series, issue, the Step 1 Year column exactly as emitted
-> (blank stays blank — never backfill it), and variant when present\>
+> row per comic: series, issue, the Step 1 Year column exactly as emitted (a
+> blank stays blank — never backfill it; see collection-check.md's EXECUTOR
+> CONTRACT § Input for the full BUI-316/BUI-129 forwarding rule), and variant
+> when present\>
 
 Read only that skill's **ORCHESTRATOR NOTES** yourself — they carry the
 dispatch input shape, the hard-STOP rule, and the Step 4 decision gate. Do not
@@ -138,9 +160,9 @@ ingest its EXECUTOR CONTRACT.
 **Input:** Comic identification table from Step 1.
 **Output:** the executor returns the skill's Step 3 table + status banners — collection membership from the server-side cache. Cache may lag LOCG by up to N days (shown as "Cache age" in the results).
 
-**Hard STOP (R11):** if the executor reports it STOPPED (server unreachable, failed/non-200 check call, or the never-imported 409), the check produced **no verdicts** — halt the run at this step. Never treat a STOP as "not in collection" and never proceed to bidding without real verdicts.
+**Hard STOP (R11):** if the executor reports it STOPPED, halt the run at this step — never treat a STOP as "not in collection" and never proceed to bidding without real verdicts. Full STOP conditions and the incremental-reuse blast radius are collection-check.md's ORCHESTRATOR NOTES § Hard STOP (R11); this is a pointer, not a restatement.
 
-Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate). For any `⚠️ Not in cache (cache stale)` results, surface them separately so the user can decide whether to bid before verifying manually. For disambiguator-flagged rows (Patterns A–E in the executor's Notes column), follow the skill's ORCHESTRATOR NOTES — the user resolves each flag; never act on the raw verdict.
+Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate). Route stale-cache rows, R42 canonical-match rows (`✅ In collection (canonical)` — the listing's specific variant wasn't in cache but the canonical edition is), and disambiguator-flagged rows (Patterns A–E in the executor's Notes column) through collection-check.md's ORCHESTRATOR NOTES § Step 4: Decision gate — the user resolves each; never act on the raw verdict.
 
 Remove skipped comics from the working list before Step 2.5.
 

@@ -14,8 +14,15 @@ This is a **warn-only** verification — it doesn't fix anything, just surfaces 
 This skill is split into two sections:
 
 - **EXECUTOR CONTRACT** — everything the agent performing the verification call
-  must do (pre-flight, the call, hard-fail semantics, presentation). This is the
-  section a dispatched executor — or a standalone `/comic:verify` run — executes.
+  must do (pre-flight, the call, hard-fail semantics, presentation),
+  self-contained like collection-check.md's — the executor reads the whole
+  file and follows the contract. It has one declared cross-reference: its
+  Presentation step reads the verdict ladder from ORCHESTRATOR NOTES § Verdict
+  ladder instead of restating it (kept as a single copy on purpose so the two
+  can't drift apart). Because the executor reads the whole file, not just this
+  section, that reference resolves within the same read — it isn't a promise
+  of isolation the file then breaks. This is the section a dispatched executor
+  — or a standalone `/comic:verify` run — executes.
 - **ORCHESTRATOR NOTES** — the verdict ladder, per-verdict guidance, and
   when-to-invoke. **`/comic:buy` Step 6 reads only this section**: BUI-360 folded
   the verify call into `gixen add-batch --verify`, so in the buy flow there is
@@ -42,6 +49,15 @@ comics_health_gate     || exit 1
 
 If either fails, stop with: "Cannot verify — the comics server isn't reachable. Skipping verification step."
 
+> **Editor note — fenced blocks don't share shell state (BUI-375):** each
+> fenced bash block below runs in its own fresh shell — a freshly-spawned
+> executor invokes them as separate Bash tool calls, so `$COMICS_SERVER_URL`
+> and the sourced `comics_*` functions from Pre-flight do **not** carry
+> forward. The Call block below re-sources `comics-server.sh` and re-runs
+> `comics_resolve_server` at its own top — keep that pattern on any block you
+> add. This is the exact BUI-352 trap: an un-resourced block curls an empty
+> host, and a swallowing fallback can turn that into a silent false all-clear.
+
 ### Input
 
 A working list. Each entry needs `item_id` (eBay ID) and ideally `grade`. `locg_id` is optional but tightens matching when present.
@@ -65,6 +81,8 @@ surfaces the error body** instead of silently returning an empty string
 (BUI-169):
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 comics_curl -X POST "$COMICS_SERVER_URL/api/comics/verify" \
   -H 'content-type: application/json' \
   -d @working_list.verify.json || {

@@ -66,9 +66,21 @@ comics_health_gate     || exit 1   # the server must answer
 **If either step fails: STOP immediately** — the collection cannot be checked,
 so do not proceed to bidding. Do not report any comic as "not in collection".
 
+> **Editor note — fenced blocks don't share shell state (BUI-375):** each
+> fenced bash block below runs in its own fresh shell — a freshly-spawned
+> executor invokes them as separate Bash tool calls, so `$COMICS_SERVER_URL`
+> and the sourced `comics_*` functions from Step 0 do **not** carry forward.
+> Every later block that touches `$COMICS_SERVER_URL` re-sources
+> `comics-server.sh` and re-runs `comics_resolve_server` at its own top —
+> keep that pattern on any block you add. This is the exact BUI-352 trap: an
+> un-resourced block curls an empty host, and a swallowing fallback can turn
+> that into a silent false "not owned" (R11).
+
 Then read collection status:
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
 ```
 
@@ -115,6 +127,8 @@ specific issue** — ASM #300 shipped 1988, Uncanny X-Men #179 shipped 1984):
 # Build items.json from the working list, e.g.:
 #   {"items":[{"series":"Amazing Spider-Man","issue":"300","year":"1988"},
 #             {"series":"Uncanny X-Men","issue":"179","year":"1984","variant":"Newsstand"}]}
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
   -H 'content-type: application/json' \
   -d @items.json
@@ -194,6 +208,8 @@ echoed `series`/`issue`. Use `curl -sf -G --data-urlencode` so series names
 with spaces are encoded and a non-200 makes curl exit non-zero:
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
   --data-urlencode "series=Amazing Spider-Man" \
   --data-urlencode "issue=300" \
@@ -245,6 +261,8 @@ row's `series` (add `The ` if absent; strip it if present), passing the same
 `issue`/`year`/`variant` per row:
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
   -H 'content-type: application/json' \
   -d '{"items": [
@@ -270,6 +288,8 @@ wrong volume, or looks like a Metron-style name, fetch the cache's actual series
 names and check whether the queried name is present (or close to one):
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 curl -sf "$COMICS_SERVER_URL/api/comics/collection/series-names"
 ```
 
@@ -414,7 +434,9 @@ Never return a partial table.
 
 ## ORCHESTRATOR NOTES
 
-**Dispatch input:** pass the working list — one row per comic: `series`, `issue`,
+### Dispatch input
+
+Pass the working list — one row per comic: `series`, `issue`,
 the `/comic:identify` table's **Year exactly as emitted** (a blank Year stays
 blank — never backfill it with a guessed or series-start year; the executor's
 contract owns the BUI-316/BUI-129 forwarding rule), and `variant` when the
@@ -422,17 +444,29 @@ listing is a variant. The executor resolves the server, runs the batch check,
 applies the stale-cache downgrade and the Pattern A–E disambiguation scan, and
 returns the Step 3 table + status banners.
 
-**Executor reuse (BUI-366):** the executor stays addressable for the rest of
+### Executor reuse (BUI-366)
+
+The executor stays addressable for the rest of
 the run — for an incremental check (a comic added to the working list mid-run),
 SendMessage the same executor the new `{series, issue, year?, variant?}` row
 instead of respawning one that re-reads this contract from scratch (see buy.md
 § Sub-agent reuse).
 
-**Hard STOP (R11):** if the executor reports it STOPPED (server unreachable,
+### Hard STOP (R11)
+
+If the executor reports it STOPPED (server unreachable,
 failed/non-200 check call, or the never-imported 409), the check produced **no
 verdicts** — halt the flow at this step and tell the user. Never reinterpret a
 STOP as "not in collection", and never proceed to bidding without real verdicts.
 A partial or missing answer is a stop, not a "not owned".
+
+**Blast radius during incremental reuse (BUI-366):** if a SendMessage'd
+follow-up row (a comic added to the working list mid-run — § Executor reuse
+above) hits this STOP, it invalidates only that new row's verdict. Verdicts
+already rendered from the original batch dispatch stand — they came from a
+successful earlier call and don't need to be re-litigated. Halt only the
+addition of the new row (tell the user its verdict couldn't be produced)
+rather than discarding or re-running the table already presented.
 
 ### Step 4: Decision gate
 
@@ -442,6 +476,13 @@ Ask the user how to handle results:
 - **Continue anyway** (condition upgrade — they want a better copy)
 - **Wishlisted-not-owned (`📋`)**: not a duplicate risk — proceed like any other `not_in_cache` comic — but worth a callout since the user has already flagged it as wanted
 - **Stale-cache cases**: surface separately so the user can manually verify before bidding
+- **Canonical-match rows (R42, Step 1)**: `✅ In collection (canonical)` means the listing's specific variant wasn't in cache but the canonical edition is — surface the `⚠️ canonical match — listing variant not disambiguated` note and let the user confirm the variant isn't a distinct wanted collectible before skipping
 - **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` or Pattern-E printing conflict should not be auto-skipped, and a Pattern-B/C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
 
-Remove skipped comics from the working list before passing to `/comic:fmv`.
+### Carry-forward
+
+Remove skipped comics from the working list before passing it to `/comic:fmv`.
+Kept rows carry forward their identify-emitted fields plus this step's
+verdict-driven flags (the R42 canonical-match note, Pattern A–E notes) so
+whoever reads the row next (Step 2.5 grading, FMV) can see why it's still in
+play.
