@@ -3440,3 +3440,359 @@ def test_collection_check_reports_owned_helper():
     assert cmds.collection_check_reports_owned({"match_status": "ambiguous_cross_volume"})
     assert not cmds.collection_check_reports_owned({"match_status": "not_in_cache"})
     assert not cmds.collection_check_reports_owned({})
+
+
+# ---------------------------------------------------------------------------
+# cmd_collection_check printing-marker conflict (BUI-364)
+# ---------------------------------------------------------------------------
+
+def _amm_rows() -> list[dict[str, Any]]:
+    """The confirmed BUI-364 incident state: the 2nd printing is owned while the
+    base printing is tracked wish-list-only (in_collection=0, in_wish_list=1)."""
+    owned_reprint = _agent_win_row(
+        publisher="DC Comics",
+        series="Absolute Martian Manhunter (2025)",
+        full_title="Absolute Martian Manhunter #1 2nd Printing",
+        release_date="2025-06-18",
+        gixen_item_id="147000000001",
+    )
+    wished_base = _agent_win_row(
+        publisher="DC Comics",
+        series="Absolute Martian Manhunter (2025)",
+        full_title="Absolute Martian Manhunter #1",
+        release_date="2025-03-19",
+        gixen_item_id="147000000002",
+    )
+    wished_base["in_collection"] = 0
+    wished_base["in_wish_list"] = 1
+    return [owned_reprint, wished_base]
+
+
+def test_check_owned_reprint_flags_printing_conflict(tmp_path, monkeypatch):
+    """BUI-364 (the required AMM #1 case): a query WITHOUT a printing marker
+    matched by an owned '2nd Printing' row must not read as an unqualified
+    `in_collection` — the verdict carries printing_conflict=True plus the
+    conflicting rows, showing the base printing is wish-listed, not owned."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+
+    result = cmds.cmd_collection_check(series="Absolute Martian Manhunter", issue="1")
+    # match_status is unchanged (the reprint IS owned) — the flag qualifies it.
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Absolute Martian Manhunter #1 2nd Printing"
+    assert result["in_wish_list"] is True
+    assert result["printing_conflict"] is True
+
+    by_title = {c["full_title"]: c for c in result["printing_candidates"]}
+    base = by_title["Absolute Martian Manhunter #1"]
+    assert base["in_collection"] is False
+    assert base["in_wish_list"] is True
+    assert base["printing_ordinal"] == 1
+    reprint = by_title["Absolute Martian Manhunter #1 2nd Printing"]
+    assert reprint["in_collection"] is True
+    assert reprint["printing_ordinal"] == 2
+
+
+def test_check_owned_reprint_flags_printing_conflict_with_year(tmp_path, monkeypatch):
+    """BUI-364: the flag also fires on a year-bearing query (the buy path
+    forwards the identify cover year, BUI-316) — the year gate tolerates the
+    reprint's later same-year release_date, so the conflation survives it."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+
+    result = cmds.cmd_collection_check(
+        series="Absolute Martian Manhunter", issue="1", year="2025"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["printing_conflict"] is True
+
+
+def test_check_query_with_printing_variant_no_conflict(tmp_path, monkeypatch):
+    """BUI-364: a query that DOES carry the printing marker (variant='2nd
+    Printing') matches the owned reprint row cleanly — no conflict, no
+    candidates payload."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+
+    result = cmds.cmd_collection_check(
+        series="Absolute Martian Manhunter", issue="1", variant="2nd Printing"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Absolute Martian Manhunter #1 2nd Printing"
+    assert result["printing_conflict"] is False
+    assert "printing_candidates" not in result
+
+
+def test_check_base_owned_no_conflict(tmp_path, monkeypatch):
+    """BUI-364 no-regression: a plain owned base row with no printing marker
+    stays an unflagged in_collection."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row()])
+
+    result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="300")
+    assert result["match_status"] == "in_collection"
+    assert result["printing_conflict"] is False
+    assert "printing_candidates" not in result
+
+
+def test_check_owned_first_printing_row_no_conflict(tmp_path, monkeypatch):
+    """BUI-364: an explicit '1st Printing' row is the base printing — an
+    unmarked query means printing 1, so this is a clean match, not a conflict."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Amazing Spider-Man #300 1st Printing",
+    )])
+
+    result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="300")
+    assert result["match_status"] == "in_collection"
+    assert result["printing_conflict"] is False
+
+
+def test_check_word_ordinal_printing_marker_flagged(tmp_path, monkeypatch):
+    """BUI-364: word-form markers ('Second Printing') are detected too."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        full_title="Amazing Spider-Man #300 Second Printing",
+    )])
+
+    result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="300")
+    assert result["match_status"] == "in_collection"
+    assert result["printing_conflict"] is True
+
+
+def test_check_both_printings_owned_no_conflict(tmp_path, monkeypatch):
+    """BUI-364: owning BOTH the base and the 2nd printing must not flag a base
+    query, regardless of which row the matcher happens to return first — the
+    queried printing is genuinely owned."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    # Reprint row FIRST so the matcher returns it before the base row.
+    reprint = _agent_win_row(
+        full_title="Amazing Spider-Man #300 2nd Printing",
+        release_date="1988-08-10",
+        gixen_item_id="101",
+    )
+    base = _agent_win_row(gixen_item_id="102")
+    _seed_cache(cache, [reprint, base])
+
+    result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="300")
+    assert result["match_status"] == "in_collection"
+    assert result["printing_conflict"] is False
+
+
+def test_check_printing_query_satisfied_by_base_row_flagged(tmp_path, monkeypatch):
+    """BUI-364 (reverse direction): a '2nd Printing' query matched only by the
+    owned BASE row (the BUI-176 variant soft-preference fallback) is the same
+    distinct-collectible conflation — flag it rather than reading 'owns the
+    base' as 'owns the reprint'."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row()])  # base ASM #300 only
+
+    result = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="300", variant="2nd Printing"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Amazing Spider-Man #300"
+    assert result["printing_conflict"] is True
+
+
+def test_check_not_in_cache_printing_conflict_false(tmp_path, monkeypatch):
+    """BUI-364: the field is present (False) on a not_in_cache verdict so
+    callers can read it unconditionally."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row()])
+
+    result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="999")
+    assert result["match_status"] == "not_in_cache"
+    assert result["printing_conflict"] is False
+    assert "printing_candidates" not in result
+
+
+def test_check_alias_match_printing_conflict_flagged(tmp_path, monkeypatch):
+    """BUI-364: the probe follows the alias pass — an owned 'Thor #154 2nd
+    Printing' satisfying a year-bearing 'The Mighty Thor #154' query is flagged,
+    and the candidate scan covers the alias key the match landed on."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Thor (Vol. 1) (1966 - 1996)",
+        full_title="Thor #154 2nd Printing",
+        release_date="1968-07-01",
+    )])
+
+    result = cmds.cmd_collection_check(
+        series="The Mighty Thor", issue="154", year="1968"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["match_kind"] == "alias"
+    assert result["printing_conflict"] is True
+    titles = {c["full_title"] for c in result["printing_candidates"]}
+    assert "Thor #154 2nd Printing" in titles
+
+
+def test_check_dateless_cross_era_row_does_not_clear_flag(tmp_path, monkeypatch):
+    """BUI-364 review fix (BUI-197 MUST-FIX 2 mirrored): with a year supplied,
+    a DATELESS owned base row must not clear the printing-conflict flag — the
+    year gate fails open on it, so a dateless copy from a different era would
+    silently reproduce the missed-purchase incident. It still appears in the
+    candidates list (display fail-open)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    reprint = _agent_win_row(
+        series="Fantastic Four (Vol. 7) (2022 - 2025)",
+        full_title="Fantastic Four #18 2nd Printing",
+        release_date="2024-04-10",
+        gixen_item_id="301",
+    )
+    dateless_base = _agent_win_row(
+        series="Fantastic Four (Vol. 1) (1961 - 1996)",
+        full_title="Fantastic Four #18",
+        release_date="",  # e.g. an index-resolved record-win, date not stamped
+        gixen_item_id="302",
+    )
+    _seed_cache(cache, [reprint, dateless_base])
+
+    result = cmds.cmd_collection_check(series="Fantastic Four", issue="18", year="2024")
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Fantastic Four #18 2nd Printing"
+    assert result["printing_conflict"] is True
+    titles = {c["full_title"] for c in result["printing_candidates"]}
+    assert "Fantastic Four #18" in titles  # dateless row still visible
+
+
+def test_check_printing_candidates_are_year_gated(tmp_path, monkeypatch):
+    """BUI-364 review fix: a wrong-era same-masthead row must not pollute the
+    candidates list — a wished 2008 'Hulk #1' would otherwise render as 'the
+    2021 query's own printing is explicitly wanted'."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    reprint = _agent_win_row(
+        series="Hulk (2021 - 2023)",
+        full_title="Hulk #1 2nd Printing",
+        release_date="2021-12-15",
+        gixen_item_id="401",
+    )
+    wrong_era_wish = _agent_win_row(
+        series="Hulk (2008 - 2012)",
+        full_title="Hulk #1",
+        release_date="2008-01-09",
+        gixen_item_id="402",
+    )
+    wrong_era_wish["in_collection"] = 0
+    wrong_era_wish["in_wish_list"] = 1
+    _seed_cache(cache, [reprint, wrong_era_wish])
+
+    result = cmds.cmd_collection_check(series="Hulk", issue="1", year="2021")
+    assert result["printing_conflict"] is True
+    titles = {c["full_title"] for c in result["printing_candidates"]}
+    assert titles == {"Hulk #1 2nd Printing"}  # 2008 row filtered out
+
+
+def test_check_both_printings_owned_with_year_no_conflict(tmp_path, monkeypatch):
+    """BUI-364: the owned-escape's year-gate arm — a DATED same-era owned base
+    row clears the flag on a year-bearing query (contrast with the dateless
+    and wrong-era cases above)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    reprint = _agent_win_row(
+        full_title="Amazing Spider-Man #300 2nd Printing",
+        release_date="1988-08-10",
+        gixen_item_id="501",
+    )
+    base = _agent_win_row(gixen_item_id="502")  # 1988-05-10 base row
+    _seed_cache(cache, [reprint, base])
+
+    result = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="300", year="1988"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["printing_conflict"] is False
+
+
+def test_check_alias_filed_owned_base_clears_flag(tmp_path, monkeypatch):
+    """BUI-364 review fix: the probe scans the FULL masthead-equivalence key
+    set — an owned base filed under an alias masthead (BUI-200's X-Men split:
+    reprint under 'Uncanny X-Men', base under 'The X-Men') clears the flag
+    instead of being misstated as untracked."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    reprint = _agent_win_row(
+        series="Uncanny X-Men (Vol. 1) (1963 - 2011)",
+        full_title="Uncanny X-Men #107 2nd Printing",
+        release_date="1977-10-01",
+        gixen_item_id="601",
+    )
+    alias_base = _agent_win_row(
+        series="The X-Men (Vol. 1) (1963 - 1981)",
+        full_title="The X-Men #107",
+        release_date="1977-10-01",
+        gixen_item_id="602",
+    )
+    _seed_cache(cache, [reprint, alias_base])
+
+    result = cmds.cmd_collection_check(series="Uncanny X-Men", issue="107", year="1977")
+    assert result["match_status"] == "in_collection"
+    assert result["printing_conflict"] is False
+
+
+def test_check_ambiguous_cross_volume_carries_printing_field(tmp_path, monkeypatch):
+    """BUI-364 shape parity: the ambiguous_cross_volume verdict also carries
+    printing_conflict, so callers can read the field on every verdict."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Fantastic Four (Vol. 7) (2022 - 2025)",
+            full_title="Fantastic Four #18",
+            release_date="2024-02-14",
+            gixen_item_id="201",
+        ),
+        _agent_win_row(
+            series="Fantastic Four (Vol. 1) (1961 - 1996)",
+            full_title="Fantastic Four #18",
+            release_date="1963-09-01",
+            gixen_item_id="202",
+        ),
+    ])
+
+    result = cmds.cmd_collection_check(series="Fantastic Four", issue="18")
+    assert result["match_status"] == "ambiguous_cross_volume"
+    assert result["printing_conflict"] is False

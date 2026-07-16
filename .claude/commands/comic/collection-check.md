@@ -117,6 +117,7 @@ reimplementation:
       "matched_release_date": "1988-05-01",
       "match_kind": "exact",
       "in_wish_list": false,
+      "printing_conflict": false,
       "cache_age_days": 3
     },
     {
@@ -128,6 +129,7 @@ reimplementation:
       "matched_release_date": null,
       "match_kind": null,
       "in_wish_list": false,
+      "printing_conflict": false,
       "cache_age_days": 3
     }
   ]
@@ -309,6 +311,29 @@ blindly — eyeball the **Matched Volume** column against the era/volume the lis
 for, and re-check with the listing's cover `year` (`?year=<YYYY>`) if you can source
 one and they might differ.
 
+**Pattern E — printing conflict (false positive, BUI-364).**
+Mechanized, not heuristic: when a row returns `in_collection` AND
+`printing_conflict: true`, the verdict was satisfied by a row whose
+`full_title` names a printing the query never asked for (`2nd Printing`,
+`Third Printing`, …). Printings are distinct collectibles — owning the reprint
+is NOT owning the base printing (confirmed incident, 2026-07-16: *Absolute
+Martian Manhunter #1* first print read as owned off the owned "2nd Printing"
+row while the base printing sat wish-listed; the orchestrator skipped an
+explicitly wanted $30 book). No re-query is needed — the response's
+`printing_candidates` list shows every same-era printing of the issue with its
+owned/wish state and a `printing_ordinal` (1 = base printing; match it against
+the listing's printing instead of re-parsing `full_title`). Render the
+conflict in the Notes column:
+> ⚠️ printing conflict — matched "{full_title_matched}", a different printing than the listing; the listing's printing is {wishlisted / not owned / untracked} per printing_candidates; confirm before skipping
+
+A `printing_candidates` row for the query's own printing with
+`in_wish_list: true` and `in_collection: false` is the strongest signal the
+book is explicitly wanted — say so in the note. Do **not** auto-flip the
+verdict to "not owned" (R11): the reprint genuinely is owned, and only the
+user decides whether the listing's printing matters. The reverse direction is
+flagged the same way (a `2nd Printing` listing matched only by the owned base
+row).
+
 Carry every flag into the Notes column of the Step 3 table and surface flagged rows
 separately at the Step 4 decision gate. The user decides; the disambiguator only
 makes the ambiguity visible.
@@ -355,7 +380,7 @@ Ask the user how to handle results:
 - **Continue anyway** (condition upgrade — they want a better copy)
 - **Wishlisted-not-owned (`📋`)**: not a duplicate risk — proceed like any other `not_in_cache` comic — but worth a callout since the user has already flagged it as wanted
 - **Stale-cache cases**: surface separately so the user can manually verify before bidding
-- **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` should not be auto-skipped, and a Pattern-B/C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
+- **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` or Pattern-E printing conflict should not be auto-skipped, and a Pattern-B/C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
 
 Remove skipped comics from the working list before passing to `/comic:fmv`.
 

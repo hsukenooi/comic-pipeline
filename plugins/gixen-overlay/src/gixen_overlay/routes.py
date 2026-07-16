@@ -1044,6 +1044,14 @@ async def api_collection_check(
     (the issue is owned under more than one masthead volume and can't be
     disambiguated without a cover year). It passes through as a 200 — the caller
     must flag it and re-check WITH a year, never read it as owned or not-owned.
+
+    BUI-364: every verdict carries ``printing_conflict`` (bool). True means the
+    ownership verdict was satisfied by a row whose full_title names a printing
+    ("2nd Printing", …) the query never asked for — printings are distinct
+    collectibles, so treat the verdict as qualified, not as a plain "owned";
+    ``printing_candidates`` lists the same-issue rows across printings with
+    their owned/wish state. Advisory only: ``match_status`` is unchanged, and
+    the caller must flag it for the user, never auto-flip the verdict (R11).
     """
     _ensure_collection_store()
     try:
@@ -1090,6 +1098,11 @@ async def api_collection_check_batch(req: CollectionCheckBatchRequest):
     BUI-284: a per-item verdict may be ``ambiguous_cross_volume`` (owned under
     more than one masthead volume, no year to disambiguate) — same passthrough
     semantics as the single-item endpoint; the caller flags and re-checks it.
+
+    BUI-364: per-item verdicts carry the same ``printing_conflict`` (and, when
+    True, ``printing_candidates``) fields the single-item endpoint returns —
+    the batch is a fan-out of the same matcher, so the printing-conflation
+    surfacing cannot drift between the two. Advisory only; flag, never flip.
     """
     if not req.items:
         raise HTTPException(status_code=422, detail="items must be a non-empty list")
