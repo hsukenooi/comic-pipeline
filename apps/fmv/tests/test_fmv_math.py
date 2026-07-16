@@ -932,12 +932,52 @@ class TestCgcLadderPrice:
         counts = {5.0: 2, 6.0: 2, 6.5: 1}
         assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 1900.0
 
-    def test_thick_exact_bucket_not_clamped(self):
-        # A ≥2-comp exact bucket has an outlier-robust median already; leave it
-        # as a direct anchor even above the neighbor envelope.
+    def test_robust_exact_bucket_not_clamped(self):
+        # A ≥3-comp exact bucket has a genuinely outlier-robust median (n>=3
+        # discards an extreme; BUI-355 raised the bar from >=2); leave it as a
+        # direct anchor even above the neighbor envelope.
         ladder = {5.0: 830.0, 6.5: 1900.0, 7.0: 1971.5}
-        counts = {5.0: 2, 6.5: 2, 7.0: 2}
+        counts = {5.0: 2, 6.5: 3, 7.0: 2}
         assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 1900.0
+
+    # ── BUI-355: n=2 exact bucket (median-of-2 = mean, zero robustness) ──────
+    def test_n2_exact_offtrend_high_clamped_to_envelope(self):
+        # The BUI-355 ticket scenario: a monotone ladder (830 < 3100 < 3250
+        # passes the monotonicity guard) whose n=2 exact 6.5 bucket hides a
+        # $5000 mistag — statistics.median([1200, 5000]) == 3100 is just the
+        # MEAN of two, with zero outlier robustness. The trustworthy n=2
+        # neighbors imply a 5.0–7.0 envelope of 830 + 0.75*(3250-830) = $2645
+        # at 6.5; the clamp bounds the exact value there.
+        ladder = {5.0: 830.0, 6.5: 3100.0, 7.0: 3250.0}
+        counts = {5.0: 2, 6.5: 2, 7.0: 2}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == pytest.approx(2645.0)
+
+    def test_n2_exact_below_envelope_unchanged_clamp_only_lowers(self):
+        # min(exact, envelope) can only LOWER a cap, never raise one: an n=2
+        # exact bucket BELOW its neighbor envelope ($2645 at 6.5) is used
+        # as-is, not lifted toward the envelope.
+        ladder = {5.0: 830.0, 6.5: 2000.0, 7.0: 3250.0}
+        counts = {5.0: 2, 6.5: 2, 7.0: 2}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 2000.0
+
+    def test_raised_min_bucket_n_keeps_clamp_tracking_it(self):
+        # The trigger is max(min_bucket_n, OUTLIER_ROBUST_BUCKET_N): a caller
+        # demanding stricter anchors (min_bucket_n=4) still clamps an n=3
+        # exact bucket, exactly as the pre-BUI-355 `< min_bucket_n` trigger
+        # did — the widened threshold must never RAISE a price for ANY caller.
+        ladder = {5.0: 830.0, 6.5: 3100.0, 7.0: 3250.0}
+        counts = {5.0: 4, 6.5: 3, 7.0: 4}
+        assert fm.cgc_ladder_price(
+            ladder, 6.5, counts=counts, min_bucket_n=4
+        ) == pytest.approx(2645.0)
+
+    def test_n2_exact_no_eligible_bracket_stays_direct_anchor(self):
+        # An n=2 exact bucket at the ladder edge (nothing above) has no
+        # envelope to check against → used directly, same as the n=1 edge
+        # case — BUI-355 must not push unbracketed sparse keys to needs_manual.
+        ladder = {5.0: 830.0, 6.5: 3100.0}
+        counts = {5.0: 2, 6.5: 2}
+        assert fm.cgc_ladder_price(ladder, 6.5, counts=counts) == 3100.0
 
     def test_no_counts_disables_clamp(self):
         # Without a counts map the caller can't tell thin from thick, so the
@@ -1046,6 +1086,25 @@ class TestCgcProxyFmv:
         assert out["fmv_high"] == 925
         assert out["median"] == 875
         assert out["max_bid"] == 650
+
+    def test_n2_offtrend_exact_bucket_clamped_end_to_end(self):
+        # BUI-355: an n=2 exact 6.5 bucket holding one genuine comp ($1200) and
+        # one $5000 mistag medians at $3100 (mean-of-2, zero robustness). The
+        # ladder is monotone (830 < 3100 < 3250) so the monotonicity guard
+        # passes it, and under BUI-349's n=1-only trigger the $3100 anchor
+        # sailed through. The widened clamp bounds it at the trustworthy
+        # 5.0–7.0 envelope ($2645). Pin the exact money-facing output — the
+        # unclamped band would be $1550–$1700 with a $1200 max bid.
+        mistagged = [_slab(800, 5.0), _slab(860, 5.0),       # 5.0 median 830, n=2
+                     _slab(1200, 6.5), _slab(5000, 6.5),     # 6.5 median 3100, n=2
+                     _slab(3200, 7.0), _slab(3300, 7.0)]     # 7.0 median 3250, n=2
+        out = fm.cgc_proxy_fmv(mistagged, target_grade=6.5)
+        assert out is not None
+        assert out["cgc_ladder"]["slab_price"] == pytest.approx(2645.0)
+        assert out["fmv_low"] == 1325
+        assert out["fmv_high"] == 1450
+        assert out["median"] == 1400
+        assert out["max_bid"] == 1025
 
     def test_lone_plausible_exact_slab_still_priced_asm50(self):
         # The sparse-key case the tier exists for is preserved end-to-end: ASM
