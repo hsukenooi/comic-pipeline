@@ -13,6 +13,14 @@ A Python CLI for managing eBay snipes on Gixen.com. Since Gixen's official API i
 pytest tests/test_gixen_client.py
 pytest tests/test_server_api.py
 pytest tests/test_server_db.py
+pytest tests/test_add_batch.py
+pytest tests/test_cli_add_batch.py
+pytest tests/test_cli_record_win_prep.py
+pytest tests/test_ebay_fallback.py
+pytest tests/test_log_config.py
+pytest tests/test_record_win_prep.py
+pytest tests/test_skill_migration.py
+pytest tests/test_standalone_server.py
 
 # Run integration tests (requires GIXEN_USERNAME and GIXEN_PASSWORD in .env)
 pytest -m integration
@@ -45,6 +53,8 @@ Four components:
 - **`record_win_prep.py`** (BUI-352/353/354) — backs the `record-win-prep` CLI command. One call does gixen-list → filter to ENDED+WON+dedup → subtract the BUI-121 seen-set (fetched from the comics server) → shell out to `comic-identify --batch` → positionally map identities back onto wins, building the `/comic:collection-add` record-win payload (`{"wins": [...], "needs_review": [...]}`). Raises `RecordWinPrepError` (hard stop) instead of degrading silently on a seen-set connectivity failure or a comic-identify launch/timeout/line-count mismatch — the positional join is exactly the silent-misattribution bug BUI-353 exists to prevent.
 
 **gixen-cli → comic-identify: a workspace package shelling out to a non-workspace console script.** `record_win_prep.py`'s `identify_titles()` runs `subprocess.run(["comic-identify", "--batch"], ...)` — the same pattern as the root `CLAUDE.md`'s `comic-fmv` → `ebay-sold-comps` precedent, except here the caller (gixen-cli) is itself a **uv workspace member**, while `comic-identify` (`apps/ebay`, entry point `comic_identify:main`) is not — it's reachable only via `uv tool install` on PATH (`scripts/install.sh`). Same operational implication as the FMV case: if apps/ebay isn't installed, `subprocess.run` raises `OSError` (missing binary), which `identify_titles` catches and re-raises as `RecordWinPrepError` pointing at `./scripts/install.sh`. There's no import here, so the failure mode is "command not found," not `ModuleNotFoundError` — but the root cause (the console script missing from PATH) is the same class of problem as the FMV precedent.
+
+**`add-batch` is server-mode-only — unlike `add`/`edit`/`remove`, it has no direct-Gixen fallback.** `add`, `edit`, and `remove` each check `_server_url()` and, when `COMICS_SERVER_URL` is unset, fall back to talking directly to Gixen via `_make_client()`/`GixenClient` (`cli.py`'s `add`/`edit`/`remove` commands). `add_batch_cmd` doesn't: it resolves `_server_url()` once and, if unset, prints an error and `sys.exit(1)` immediately — there is no equivalent direct-Gixen branch to fall back to. This is intentional (BUI-360), not a gap to fill in later: `add-batch` exists specifically to encode BUI-168's mid-batch failure semantics as deterministic code instead of an LLM-followed skill loop — marking a failed row FAILED with its error, re-checking server health before the next row, halting and marking every remaining row NOT_ATTEMPTED if the server is down, and never emitting an all-success summary after a failure (see `add_batch.py`'s module docstring and `run_batch()`). Every one of those mechanics is built from comics-server-only primitives — `GET /health` as the inter-row health check and `POST /api/bids` per row, plus `POST /api/comics/verify` for the optional `--verify` flag — and `GixenClient`'s direct-Gixen path has no equivalent for any of them (no health endpoint, no verify endpoint; a direct-mode failure is just a raised `GixenError` with no separate "is the service still up" signal to gate a halt decision on). Without the comics server there's nothing left to build BUI-168's semantics out of, so a "direct-Gixen add-batch" isn't a smaller version of the feature — it's not the feature at all.
 
 ## Key Details
 
