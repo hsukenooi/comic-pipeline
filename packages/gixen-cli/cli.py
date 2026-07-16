@@ -26,6 +26,21 @@ from gixen_client import (
 )
 import ebay_bidder
 from record_win_prep import RecordWinPrepError, build_payload
+from add_batch import (
+    AddBatchError,
+    BatchOutcome,
+    RowResult,
+    STATUS_ADDED,
+    STATUS_FAILED,
+    STATUS_NOT_ATTEMPTED,
+    STATUS_UPDATED,
+    apply_verify_results,
+    build_bid_payload,
+    created_from_response,
+    parse_rows,
+    run_batch,
+    verify_items,
+)
 
 load_dotenv()
 
@@ -64,19 +79,35 @@ def _server_url() -> str | None:
     return url.rstrip("/") or None
 
 
-def _server_request(method: str, path: str, **kwargs) -> dict | list:
-    """Make a request to the comics server. Raises SystemExit on failure."""
+_DEFAULT_SERVER_TIMEOUT = 15  # seconds
+
+
+def _server_request_result(method: str, path: str, **kwargs) -> tuple[bool, dict | list | None, str | None]:
+    """Make a request to the comics server, returning (ok, data, error)
+    instead of printing + sys.exit'ing on failure. `_server_request` below is
+    a thin wrapper that preserves the original sys.exit behavior for every
+    pre-existing command; `add-batch` (BUI-360) calls this directly so a
+    single row's failure doesn't abort the whole batch process — including a
+    sequential batch loop, where a hang or a malformed response must degrade
+    to a per-row failure rather than block/crash the whole run."""
+    kwargs.setdefault("timeout", _DEFAULT_SERVER_TIMEOUT)
     url = f"{_server_url()}{path}"
     try:
         resp = getattr(requests, method)(url, **kwargs)
         resp.raise_for_status()
-        return resp.json()
+        try:
+            return True, resp.json(), None
+        except ValueError:
+            # Covers json.JSONDecodeError / requests' JSONDecodeError — a 2xx
+            # response with a non-JSON or truncated body. Treated as a
+            # request failure (not raised) so a batch loop degrades to a
+            # per-row failure instead of crashing with an unhandled traceback
+            # and losing the report for rows already processed.
+            return False, None, f"Server returned {resp.status_code} but the response body was not valid JSON"
     except requests.ConnectionError:
-        click.echo("Error: Server unreachable. Is the comics server running?", err=True)
-        sys.exit(1)
+        return False, None, "Server unreachable. Is the comics server running?"
     except requests.Timeout:
-        click.echo("Error: Server timed out.", err=True)
-        sys.exit(1)
+        return False, None, "Server timed out."
     except requests.HTTPError as e:
         status_code = "unknown"
         detail = ""
@@ -86,8 +117,16 @@ def _server_request(method: str, path: str, **kwargs) -> dict | list:
                 detail = e.response.json().get("detail", "")
             except (ValueError, AttributeError):
                 pass
-        click.echo(f"Error: Server returned {status_code}: {detail}", err=True)
+        return False, None, f"Server returned {status_code}: {detail}"
+
+
+def _server_request(method: str, path: str, **kwargs) -> dict | list:
+    """Make a request to the comics server. Raises SystemExit on failure."""
+    ok, data, error = _server_request_result(method, path, **kwargs)
+    if not ok:
+        click.echo(f"Error: {error}", err=True)
         sys.exit(1)
+    return data
 
 
 @click.group()
@@ -269,26 +308,19 @@ def add(
         catalog_id = None
 
     if _server_url():
-        payload = {
-            "item_id": item_id,
-            "max_bid": float(bid),
-            "bid_offset": offset,
-            "snipe_group": group,
-        }
         # BUI-78: pass seller + grades when supplied (server stores + lowercases
-        # seller). Omit unset keys so the payload stays minimal.
-        if seller is not None:
-            payload["seller"] = seller
-        if seller_grade is not None:
-            payload["seller_grade"] = seller_grade
-        if photo_grade is not None:
-            payload["photo_grade"] = photo_grade
+        # seller); BUI-360 factors the payload shape into add_batch.py so
+        # `add` and `add-batch` can't silently drift on a future field.
+        payload = build_bid_payload(
+            item_id, bid, offset, group,
+            seller=seller, seller_grade=seller_grade, photo_grade=photo_grade,
+        )
         resp = _server_request("post", "/api/bids", json=payload)
         # BUI-67: the server upserts. created=False means an existing live snipe
         # was updated in place — don't reset the add-history timestamp (that drives
         # the --added-since window), and tell the user it was an update so an
         # accidental re-add (e.g. a lowered max bid) is visible.
-        created = resp.get("created", True) if isinstance(resp, dict) else True
+        created = created_from_response(resp)
         if created:
             _record_add(item_id)
         verb = "Added" if created else "Updated existing snipe"
@@ -381,6 +413,184 @@ def add(
     except GixenError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+_STATUS_ICON = {
+    STATUS_ADDED: "✅ Added",
+    STATUS_UPDATED: "🔄 Updated",
+    STATUS_FAILED: "❌ Failed",
+    STATUS_NOT_ATTEMPTED: "⏸️  Not attempted",
+}
+
+
+def _add_batch_status_cell(row: dict) -> str:
+    label = _STATUS_ICON.get(row["status"], row["status"])
+    if row["status"] == STATUS_FAILED and row.get("error"):
+        return f"{label} ({row['error']})"
+    if row["status"] in (STATUS_ADDED, STATUS_UPDATED) and row.get("link_attempted"):
+        if row.get("link_ok"):
+            return f"{label} + linked"
+        detail = row.get("link_error")
+        return f"{label} (FMV link failed: {detail})" if detail else f"{label} (FMV link failed)"
+    return label
+
+
+def _print_add_batch_table(rows: list[dict]) -> None:
+    click.echo(
+        f"{'#':<4}{'Item ID':<16}{'Grade':<8}{'Max Bid':<12}{'Status'}"
+    )
+    click.echo("-" * 80)
+    for i, row in enumerate(rows, start=1):
+        grade = row.get("grade")
+        max_bid = row.get("max_bid")
+        click.echo(
+            f"{i:<4}"
+            f"{(row.get('item_id') or '—'):<16}"
+            f"{(f'{grade:g}' if grade is not None else '—'):<8}"
+            f"{(_format_bid(max_bid) if max_bid is not None else '—'):<12}"
+            f"{_add_batch_status_cell(row)}"
+        )
+
+
+@cli.command("add-batch")
+@click.argument("rows_file", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--verify",
+    is_flag=True,
+    help="POST every landed (added/updated) row to /api/comics/verify and "
+         "append the verdict to its result.",
+)
+@click.option(
+    "--json-out",
+    type=click.Path(dir_okay=False, writable=True),
+    default=None,
+    help="Also write the JSON result summary to this file.",
+)
+def add_batch_cmd(rows_file: str, verify: bool, json_out: str | None):
+    """Add a batch of snipes strictly sequentially, with BUI-168 failure
+    semantics built in (BUI-360).
+
+    ROWS_FILE is a JSON list of rows (or an object with a top-level "rows"
+    list). Required per row: item_id (str), max_bid (number). Optional:
+    comic_id (int), grade (number), seller (str), seller_grade (number),
+    photo_grade (number), group (int, default 0), offset (int, default 6).
+    item_id must be unique across rows in one file (the server upserts on
+    item_id, so a duplicate would collapse into one bid). Reuses the same
+    server-mode request path as `gixen add` (POST /api/bids, then POST
+    .../link-fmv when grade+comic_id are both given) rather than re-deriving
+    it — --comic-id/--catalog-id ambiguity doesn't apply here: this row
+    schema only has comic_id.
+
+    On a failed row: mark it failed with the error, then re-check server
+    health before the next row. If the server is down, halt the batch and
+    report every remaining row as not-attempted — never keep firing adds at
+    a dead server, and never print an all-success summary after a failure.
+    Exits non-zero if any row failed or was left not-attempted.
+    """
+    server_url = _server_url()
+    if not server_url:
+        click.echo(
+            "Error: COMICS_SERVER_URL is not set. add-batch requires the "
+            "comics server (BUI-360/BUI-168) — set the variable and confirm "
+            "the server is running before continuing.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if json_out and Path(json_out).resolve() == Path(rows_file).resolve():
+        click.echo(
+            f"Error: --json-out ({json_out}) is the same file as ROWS_FILE — "
+            "refusing, since writing the result would destroy the original "
+            "batch input before a halted/failed run could be retried from it.",
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        raw = json.loads(Path(rows_file).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        click.echo(f"Error: could not read/parse {rows_file}: {e}", err=True)
+        sys.exit(1)
+
+    try:
+        rows = parse_rows(raw)
+    except AddBatchError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    if not rows:
+        click.echo("No rows to add.")
+        _emit_add_batch_result(BatchOutcome(), json_out)
+        sys.exit(0)
+
+    def _health_check() -> bool:
+        return _server_request_result("get", "/health")[0]
+
+    if not _health_check():
+        click.echo(
+            f"Error: The comics server at {server_url} is not responding. "
+            "Halting before any adds — no rows attempted.",
+            err=True,
+        )
+        outcome = BatchOutcome(
+            rows=[
+                RowResult(item_id=r.get("item_id"), status=STATUS_NOT_ATTEMPTED)
+                for r in rows
+            ],
+            halted=True,
+        )
+        _emit_add_batch_result(outcome, json_out)
+        sys.exit(1)
+
+    outcome = run_batch(rows, server_request=_server_request_result, health_check=_health_check)
+
+    # Record-add history only for genuine new creates — mirrors `add`'s own
+    # BUI-67 rule (an in-place update must not reset the --added-since
+    # window). Derived from `outcome.rows` (already computed by run_batch)
+    # rather than re-detecting "created" via a second, independent check —
+    # `RowResult.status == STATUS_ADDED` *is* the created signal.
+    created_item_ids = [r.item_id for r in outcome.rows if r.status == STATUS_ADDED and r.item_id]
+    if created_item_ids:
+        _record_adds(created_item_ids)
+
+    if verify:
+        items = verify_items(outcome)
+        if items:
+            ok, resp, err = _server_request_result(
+                "post", "/api/comics/verify", json={"items": items}
+            )
+            if ok and isinstance(resp, dict):
+                apply_verify_results(outcome, resp)
+            else:
+                outcome.verify_error = err or "verify call returned no parseable JSON"
+
+    _emit_add_batch_result(outcome, json_out)
+
+    if outcome.verify_error:
+        click.echo(f"⚠️  --verify: {outcome.verify_error}", err=True)
+
+    sys.exit(outcome.exit_code())
+
+
+def _emit_add_batch_result(outcome: BatchOutcome, json_out: str | None) -> None:
+    """Print the human table + JSON summary (serialized once, reused for
+    both the stdout echo and --json-out) — shared by every exit path of
+    `add_batch_cmd` (empty-rows, pre-flight-halted, and normal completion)
+    so `--json-out` is honored consistently regardless of how the run ended."""
+    _print_add_batch_table([r.to_dict() for r in outcome.rows])
+    text = json.dumps(outcome.to_dict(), indent=2)
+    click.echo(text)
+    if json_out:
+        try:
+            Path(json_out).write_text(text)
+        except OSError as e:
+            # The batch's own success/failure already happened and is fully
+            # represented in `text` above (stdout has it) — a failure to
+            # ALSO persist it to --json-out is reported, but must not raise
+            # past this point and turn an otherwise-successful batch's exit
+            # code into an unrelated traceback (cli.py's caller still exits
+            # via `outcome.exit_code()`, not this write).
+            click.echo(f"warning: could not write --json-out ({json_out}): {e}", err=True)
 
 
 @cli.command()
@@ -669,6 +879,27 @@ def _record_add(item_id: str) -> None:
     history = _load_add_history()
     history[item_id] = datetime.now(timezone.utc).timestamp()
     HISTORY_FILE.write_text(json.dumps(history))
+
+
+def _record_adds(item_ids: list[str]) -> None:
+    """Bulk form of `_record_add` — one read-modify-write for the whole list
+    instead of one per item_id (add-batch's per-row equivalent).
+
+    Called mid-batch, after real bids may already have landed on the live
+    server and before add-batch has emitted its JSON/table summary — a local
+    filesystem hiccup here (disk full, permissions) must not raise past this
+    point and cost the caller the whole batch report over what is, at worst,
+    a stale `--added-since` filter."""
+    if not item_ids:
+        return
+    history = _load_add_history()
+    now = datetime.now(timezone.utc).timestamp()
+    for item_id in item_ids:
+        history[item_id] = now
+    try:
+        HISTORY_FILE.write_text(json.dumps(history))
+    except OSError as e:
+        click.echo(f"warning: could not update add-history file: {e}", err=True)
 
 
 @cli.command("ebay-auth")

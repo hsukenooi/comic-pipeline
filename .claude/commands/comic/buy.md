@@ -171,45 +171,64 @@ Gate: user approves or overrides each max bid.
 
 ---
 
-## Step 5: Snipe Add
+## Step 5: Snipe Add (Batch)
 
-Read `~/Projects/comic-pipeline/.claude/commands/comic/snipe-add.md` and follow it.
+**BUI-360:** this step calls `gixen add-batch` **inline** — one CLI invocation for the whole approved list — instead of dispatching to `snipe-add.md`'s per-item prose loop. `gixen add-batch` reuses the exact same server-mode code path as `gixen add` (POST `/api/bids`, then `/api/bids/{id}/link-fmv` when grade+comic_id are both given) and has the BUI-168 mid-batch failure semantics built into the CLI itself: a failed row is marked failed with its error, server health is re-checked before the next row, and the batch halts (remaining rows reported `not_attempted`) if the server goes down mid-run — never an all-✅ summary after a partial failure. `snipe-add.md` is still the right read for a standalone/ad-hoc add outside this flow (it documents the same `add` flags this batch input maps to); it is unchanged by this step.
 
-**Input:** Approved auctions with max bids **plus the `comic_id` and numeric grade for each row from the Step 3 FMV JSON**, and the `seller` username + grades captured earlier. Without `comic_id`, the bid will be added but `bids.comic_id` / `bids.fmv_id` will stay NULL — see PER-140.
+If `gixen` isn't found, install the monorepo CLIs first: `./scripts/install.sh`.
 
-For each approved auction call:
+**1. Bid sanity check (unchanged from `snipe-add.md`'s pre-flight):**
 
-```bash
-gixen add {item_id} {max_bid} \
-  --comic-id {comic_id} --grade {grade_numeric} \
-  --seller {seller_username} --seller-grade {seller_grade} --photo-grade {photo_grade}
+Compare each approved auction's current bid against its proposed max bid. If current bid ≥ max bid, surface it to the user — Gixen will still register the snipe but it fires below market and won't win. Ask whether to raise the max or skip before proceeding.
+
+**2. Build the rows JSON** from the working list carried forward — `item_id` + approved `max_bid` from Step 4, `comic_id` + numeric `grade` from the Step 3 FMV JSON, and the `seller`/`seller_grade`/`photo_grade` captured in Steps 1/2.5. Skip Buy It Now listings — Gixen is for auctions only. Write it to a scratch file, e.g.:
+
+```json
+[
+  {
+    "item_id": "123456789",
+    "max_bid": 800,
+    "comic_id": 42,
+    "grade": 9.2,
+    "seller": "some_seller",
+    "seller_grade": 9.0,
+    "photo_grade": 8.5
+  }
+]
 ```
 
-- `--seller` is the username from Step 1 (stored lowercased; the seller-reliability key).
-- `--seller-grade` is the seller's stated grade as a CGC float (convert "VF/NM" → `9.0`); omit if the seller stated no grade or it's unmappable.
-- `--photo-grade` is the **raw** Step 2.5 consensus (BUI-78) — omit unless the book was photo-graded; never pass a user-overridden value here.
-- These three are independent of FMV linkage — they populate `bids.seller`/`seller_grade`/`photo_grade` for the seller-reliability advisory and don't affect the bid.
+- Omit `comic_id`/`grade` for a row whose Step 3 `comic_id` was null (FMV upsert skipped, e.g. `n=0`) — the bid still adds, just without FMV linkage (PER-140); surface that to the user rather than fabricating an id.
+- Omit any of `seller`/`seller_grade`/`photo_grade` that weren't captured for that comic.
+- `--comic-id`'s CLI caveat still applies conceptually: never put the internal `comic_id` where an LOCG id is expected — the batch row schema only has `comic_id` (no `catalog_id`), so this can't happen by construction here.
 
-If `comic_id` is null for a row (FMV upsert was skipped, e.g. `n=0`), omit `--comic-id` and surface that this bid will not have FMV linkage in the dashboard. Do **not** pass the internal `comic_id` to `--catalog-id` — that flag expects an LOCG id and silently fails to link.
+**Gate: user approves the full batch** (the item_id + max_bid list) before any add is attempted — same approval point `snipe-add.md` gates on, just moved ahead of one CLI call instead of N.
 
-**Output:** Gixen confirmation table.
+**3. Call the batch add, with verification folded in:**
 
-Skip Buy It Now listings. Run sequentially (not in parallel) — Gixen session is stateful.
+```bash
+gixen add-batch <rows.json> --verify --json-out <results.json>
+```
 
-When snipes are added, remind the user:
+Adds run strictly sequentially inside the CLI (Gixen sessions are stateful — parallel adds fail; this is now enforced in code, not by agent discipline). `--verify` POSTs every landed row **that carries a grade** to `/api/comics/verify` and appends a verdict per row (see Step 6) in the same call — this is what collapses the old separate Step 6 sub-agent into this one invocation.
+
+A non-zero exit code means at least one row did not land (failed or was left not-attempted after a mid-batch halt) — **read the JSON, don't treat non-zero as total failure.** Present the human table the CLI printed (or reformat it with the comic names from Steps 1–4, joined by `item_id`, for readability) and call out any `failed`/`not_attempted` rows explicitly.
+
+**Output:** the add-batch JSON (also at `--json-out`): `{"summary": {...}, "halted": bool, "verify_error": ..., "rows": [{"item_id", "status", "max_bid", "grade", "created", "link_attempted", "link_ok", "error", "link_error", "verify"}, ...]}`. `error` is set only when the row itself failed to add (`status: "failed"`); `link_error` is a separate field set when the add landed but the FMV link call failed (`status` stays `"added"`/`"updated"`) — don't conflate the two when scanning for failures.
+
+When at least one row landed (`added`/`updated`), remind the user:
 > Run `/comic:collection-add` after auctions close to record wins. Check `locg collection status` for pending push count before uploading.
 
 ---
 
 ## Step 6: Verify
 
-Read `~/Projects/comic-pipeline/.claude/commands/comic/verify.md` and follow it.
+Step 5's `--verify` already appended a `verify` verdict to every landed row in its JSON output — this step is now just **interpreting that data**, not making another call. Read `~/Projects/comic-pipeline/.claude/commands/comic/verify.md` for the verdict ladder and the per-verdict guidance table (§ Presentation) and apply them here:
 
-**Input:** Working list of `{item_id, grade, locg_id?}` for every comic that was sniped in Step 5. Skip Buy It Now listings (they have no bid to verify).
+- **`rows[].verify` is null** — either the row didn't land (`failed`/`not_attempted`, nothing to verify) or it landed without a `grade` (add-batch's `--verify` only submits landed rows that carry a grade, since verify.md's endpoint needs one to match an `fmv` row). Treat a gradeless landed row as **unverified**, not as an implicit `fully_linked` — say so rather than staying silent.
+- **`rows[].verify.verdict != "fully_linked"`** — surface the row in a table plus its one-line guidance from `verify.md`'s per-verdict mapping (`needs_manual`, `fmv_stub`, `no_fmv_at_grade`, `no_comic`, `partial`, `no_bid`).
+- **top-level `verify_error` is non-null** — the `/api/comics/verify` call itself failed (server hiccup after the adds already landed). Do **not** report an all-clear for verification in this case — say verification could not be confirmed for the landed rows and point at `/comic:verify` as a manual follow-up.
 
-**Output:** Verification table with a verdict per row.
-
-Warn-only — don't block. If `summary.issues > 0`, surface the table and the per-verdict guidance from `verify.md`. The pipeline is done; the goal is to tell the user *now* about gaps so they don't discover them when the auction ends and `/comic:collection-add` chokes (PER-70 cascade).
+Warn-only — don't block. The pipeline is done; the goal is to tell the user *now* about gaps so they don't discover them when the auction ends and `/comic:collection-add` chokes (PER-70 cascade).
 
 Born from PER-99 — `/comic:buy` ran to apparent success in past incidents while leaving rows partially populated (missing comic row, FMV stub, `bids.fmv_id` null).
 
