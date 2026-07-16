@@ -2378,6 +2378,19 @@ def _match_wishlisted_issue(
 # row answered `in_collection` while the base printing — explicitly wish-listed —
 # was the book actually being bought, and the orchestrator skipped it (a missed
 # purchase, the BUI-308 danger direction).
+#
+# BUI-373: this is now the ONE printing-marker detector for the whole package.
+# It used to have a second, independent implementation living in
+# VARIANT_SUFFIX_MAP's "2nd print"/"second print"/"2nd printing" dict keys
+# (consumed by the record-win dedup guard and the full_title builder further
+# below) — an exact-string lookup that recognized fewer spellings than this
+# regex and could silently drift from it (neither recognized "2nd Ptg" or a
+# bare "Reprint", so a reprint filed under either spelling produced NO
+# conflict flag AND could wrongly dedup-skip a genuinely new win — see
+# _dedup_variant_compatible). Both call sites now compute ordinals through
+# _printing_ordinal()/_PRINTING_MARKER_RE; VARIANT_SUFFIX_MAP keeps only the
+# non-printing edition suffixes (Newsstand/Direct/Facsimile) it was always
+# right to own.
 _PRINTING_ORDINAL_WORDS: dict[str, int] = {
     "first": 1,
     "second": 2,
@@ -2391,28 +2404,95 @@ _PRINTING_ORDINAL_WORDS: dict[str, int] = {
     "tenth": 10,
 }
 
+# The "print word" itself, in any of the spellings a listing/catalog title
+# uses: "Print"/"Printing"/"Prints"/"Printings", the "Ptg"/"Ptgs" abbreviation,
+# or "Reprint"/"Reprints" as the noun after an ordinal ("2nd Reprint" reads the
+# same as "2nd Printing").
+_PRINT_WORD = r"(?:ptgs?|reprints?|print(?:ing)?s?)"
+
 # An ordinal (digit "2nd"/"3rd"/… or word "second"/"third"/…) immediately
-# followed by "print"/"printing(s)". Requiring the ordinal keeps a series whose
-# NAME merely contains "printing" from reading as a marker.
+# followed by one of the _PRINT_WORD spellings (groups 1/2), OR a bare
+# "Reprint"/"Reprints" with NO ordinal at all (group 3) — a real, if
+# imprecise, printing marker: every reprint is SOME printing after the first,
+# just not a specific numbered one. Requiring an ordinal for the other
+# spellings keeps a series whose NAME merely contains "printing" (or a
+# variant like "Art Print"/"Printing Error") from reading as a marker.
 _PRINTING_MARKER_RE = re.compile(
-    r"\b(?:(\d+)\s*(?:st|nd|rd|th)|("
-    + "|".join(_PRINTING_ORDINAL_WORDS)
-    + r"))[\s-]+print(?:ing)?s?\b",
+    r"\b(?:"
+    r"(\d+)\s*(?:st|nd|rd|th)[\s-]+" + _PRINT_WORD + r"|"
+    r"(" + "|".join(_PRINTING_ORDINAL_WORDS) + r")[\s-]+" + _PRINT_WORD + r"|"
+    r"(reprints?)"
+    r")\b",
     re.IGNORECASE,
 )
 
+# Sentinel ordinal for a bare "Reprint"/"Reprints" marker with no explicit
+# number attached. Deliberately NOT collapsed to a guessed integer (e.g. 2):
+# doing so would falsely equate an unspecified reprint with a specifically
+# labeled "2nd Printing" row that might actually be a 3rd-or-later printing
+# (a false dedup-compatible / false conflict-cleared result in either
+# direction), and would reproduce the very ordinal-1 base collision this
+# detector exists to prevent if the guess were ever wrong. -1 can never equal
+# a real (1-based) ordinal, so a bare "Reprint" is always treated as "some
+# printing, not the base, not provably the SAME printing as a
+# specifically-numbered one" — the safe default everywhere this detector is
+# used (conflict-flagging and dedup alike).
+_UNSPECIFIED_REPRINT_ORDINAL = -1
+
 
 def _printing_ordinal(text: Optional[str]) -> int:
-    """Printing ordinal named in ``text``: 2 for "2nd Printing", 3 for "Third
-    Printing", … Unmarked text and an explicit "1st Printing" are both 1 — a
-    query without a marker means the base (first) printing, and an owned row
-    labeled "1st Printing" genuinely satisfies it."""
+    """Printing ordinal named in ``text``: 2 for "2nd Printing"/"2nd Ptg", 3
+    for "Third Printing", :data:`_UNSPECIFIED_REPRINT_ORDINAL` for a bare
+    "Reprint"/"Reprints" with no number attached. Unmarked text and an
+    explicit "1st Printing" are both 1 — a query without a marker means the
+    base (first) printing, and an owned row labeled "1st Printing" genuinely
+    satisfies it.
+
+    BUI-373: this is the single shared printing-marker detector — every
+    caller (the collection-check printing_conflict probe, the record-win
+    dedup guard via :func:`_dedup_variant_compatible`, the full_title suffix
+    builder via :func:`_printing_marker_suffix`) computes ordinals through
+    this one function, so a spelling recognized in one place is recognized
+    everywhere.
+    """
     m = _PRINTING_MARKER_RE.search(text or "")
     if not m:
         return 1
     if m.group(1):
         return int(m.group(1))
-    return _PRINTING_ORDINAL_WORDS[m.group(2).lower()]
+    if m.group(2):
+        return _PRINTING_ORDINAL_WORDS[m.group(2).lower()]
+    return _UNSPECIFIED_REPRINT_ORDINAL
+
+
+def _ordinal_suffix(n: int) -> str:
+    """"2nd"/"3rd"/"11th"/"21st"/… — standard English ordinal spelling of ``n``."""
+    if 10 <= (n % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _printing_marker_suffix(text: Optional[str]) -> Optional[str]:
+    """Canonical "<N>th Printing" suffix for ``text`` when it carries an
+    EXPLICIT printing ordinal (digit or word), else ``None``.
+
+    BUI-373: the record-win-side consumer of the shared detector — it used to
+    be VARIANT_SUFFIX_MAP's "2nd print"/"second print"/"2nd printing" keys, an
+    exact-match dict that missed "2nd Ptg" and any ordinal past 2nd.
+    Deliberately returns ``None`` (rather than a guessed ordinal) for the bare
+    "Reprint"/"Reprints" marker (:data:`_UNSPECIFIED_REPRINT_ORDINAL`) —
+    writing a specific printing number into a LOCG-facing title on a guess
+    risks minting a title that doesn't match the real catalog row; the
+    caller falls back to its existing manual-variant path for that ambiguous
+    case, same as it does for an unrecognized cover variant.
+    """
+    m = _PRINTING_MARKER_RE.search(text or "")
+    if not m or not (m.group(1) or m.group(2)):
+        return None
+    ordinal = int(m.group(1)) if m.group(1) else _PRINTING_ORDINAL_WORDS[m.group(2).lower()]
+    return f"{_ordinal_suffix(ordinal)} Printing"
 
 
 def _printing_conflict_fields(
@@ -2703,14 +2783,19 @@ def cmd_collection_series_names() -> dict[str, Any]:
     return {"series_names": names, "count": len(names)}
 
 
+# BUI-373: printing suffixes ("2nd print"/"second print"/"2nd printing") used
+# to live here as exact-match keys — a second, independent, less-complete
+# printing-marker detector that could drift from _PRINTING_MARKER_RE (it never
+# recognized "2nd Ptg" or "3rd Printing"/"Third Printing", and had no bare
+# "Reprint" entry). Printing recognition now routes entirely through
+# _printing_ordinal()/_printing_marker_suffix() (see their consumers below);
+# this map keeps only the non-printing edition suffixes it was always right
+# to own.
 VARIANT_SUFFIX_MAP: dict[str, str] = {
     "newsstand": "Newsstand Edition",
     "newsstand edition": "Newsstand Edition",
     "direct": "Direct Edition",
     "direct edition": "Direct Edition",
-    "2nd print": "2nd Printing",
-    "second print": "2nd Printing",
-    "2nd printing": "2nd Printing",
     "facsimile": "Facsimile Edition",
     "facsimile edition": "Facsimile Edition",
 }
@@ -2771,7 +2856,20 @@ def _owned_row_variant_suffix(full_title: str) -> Optional[str]:
 def _dedup_variant_compatible(variant_text: str, candidate_suffix: Optional[str]) -> bool:
     """True unless the win and an owned row are provably DISTINCT print editions.
 
-    BUI-267: a known edition suffix (Newsstand/Direct/2nd Printing/Facsimile —
+    BUI-373: printing-ordinal recognition routes through the single shared
+    detector (:func:`_printing_ordinal`) — the same one the collection-check
+    printing_conflict probe uses — so a spelling recognized by one is
+    recognized by both. Either side carrying a printing marker (an ordinal
+    != 1, including the "2nd Ptg"/"Reprint" spellings a bare
+    VARIANT_SUFFIX_MAP lookup used to miss entirely) makes them distinct
+    printings unless the ordinals agree. A bare "Reprint" (no explicit
+    number, :data:`_UNSPECIFIED_REPRINT_ORDINAL`) is therefore only
+    "compatible" with another bare "Reprint" — never with a specifically
+    numbered printing it might not actually match, and never with the base
+    — the safe direction here (record a possibly-duplicate win rather than
+    silently skip a genuinely new one, per BUI-34's original bias).
+
+    BUI-267: a known non-printing edition suffix (Newsstand/Direct/Facsimile —
     :data:`VARIANT_SUFFIX_MAP`) names a genuinely separate LOCG catalog entry,
     so a base win must not be deduped against an owned Newsstand copy (or vice
     versa) — the reported Uncanny X-Men #201 base win incorrectly skipped
@@ -2780,17 +2878,20 @@ def _dedup_variant_compatible(variant_text: str, candidate_suffix: Optional[str]
     against a suffix, so it stays permissive — preserving the pre-existing
     BUI-34 behavior of deduping through cosmetic cover variants.
 
-    Known limitation (safe direction): recognition is by EXACT
+    Known limitation (safe direction): non-printing recognition is by EXACT
     :data:`VARIANT_SUFFIX_MAP` key, so a novel phrasing like
     ``"newsstand variant"`` (not a map key) reads as ``None`` and stays
     permissive — a newsstand win against an owned newsstand row then dedups
     through, at worst producing a duplicate owned row (never hiding a new
     win). The load-bearing direction — a *base* win must NOT dedup against an
     owned Newsstand row — always holds, because the owned row's parsed
-    ``candidate_suffix`` ("Newsstand Edition") IS a map key. VARIANT_SUFFIX_MAP
-    isn't widened here on purpose: it also feeds the full_title builder
-    (see its other consumer), so new keys would change more than this check.
+    ``candidate_suffix`` ("Newsstand Edition") IS a map key.
     """
+    win_printing_ordinal = _printing_ordinal(variant_text) if variant_text else 1
+    candidate_printing_ordinal = _printing_ordinal(candidate_suffix) if candidate_suffix else 1
+    if win_printing_ordinal != 1 or candidate_printing_ordinal != 1:
+        return win_printing_ordinal == candidate_printing_ordinal
+
     known_win_suffix = VARIANT_SUFFIX_MAP.get(variant_text) if variant_text else None
     known_candidate_suffix = (
         VARIANT_SUFFIX_MAP.get(candidate_suffix.lower()) if candidate_suffix else None
@@ -3079,7 +3180,15 @@ def _build_win_row(
     # series_name stays decorated/unchanged.
     base_title = base_full_title(canonical_series, issue_num or None)
     if variant_text:
-        suffix = VARIANT_SUFFIX_MAP.get(variant_text)
+        # BUI-373: an explicit printing ordinal ("2nd Ptg", "Third Printing", …)
+        # is recognized by the shared detector first, so this canonicalizes the
+        # SAME spellings the dedup guard above and the collection-check
+        # printing_conflict probe recognize — no second, narrower lexicon.
+        # VARIANT_SUFFIX_MAP is still consulted for non-printing suffixes
+        # (Newsstand/Direct/Facsimile); an ambiguous bare "Reprint" (no
+        # ordinal) is deliberately left to the Metron/manual-variant path
+        # below rather than guessing a specific printing number.
+        suffix = _printing_marker_suffix(variant_text) or VARIANT_SUFFIX_MAP.get(variant_text)
         if suffix:
             full_title = f"{base_title} {suffix}"
         else:
