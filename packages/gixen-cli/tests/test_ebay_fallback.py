@@ -368,6 +368,69 @@ def test_fallback_inferred_won_records_group_evidence(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# BUI-385: re-keying the ledger to (group, item, won_end_at) records genuine
+# re-wins at distinct ends WITHOUT enabling a false REMOVED — the member_since
+# bound in _group_won_before still gates every stored end.
+# ---------------------------------------------------------------------------
+
+def test_fallback_rewin_distinct_ends_each_gated_by_its_own_bound(
+        tmp_path, monkeypatch):
+    """Two genuine wins for the same (group, item) are recorded at distinct
+    ends (the BUI-385 re-win case), positioned so EACH is excluded by a
+    DIFFERENT bound in _group_won_before: end A predates the sibling's
+    membership (lower bound), end B falls after the sibling's own auction end
+    (upper/dual-win-margin bound). With both ledger rows present, the sibling
+    still resolves WON — a distinct-end second entry cannot manufacture cancel
+    evidence unless it genuinely falls inside member_since..cutoff. (The
+    load-bearing multi-row proof — a second end that DOES fall in-window
+    correctly classifying REMOVED — is the paired
+    test_fallback_rewin_recent_end_within_membership_classifies below.)"""
+    conn = init_db(tmp_path / "fb.db")
+    # Sibling joined its group 5d ago; its own auction ended 1h ago.
+    _seed(conn, "485000001", snipe_group=2,
+          auction_end_at=_iso(timedelta(hours=-1)),
+          added_at=_iso(timedelta(days=-5)))
+    # End A: 30d ago — before member_since (lower bound excludes it).
+    record_group_win(conn, "485000099", 2, _iso(timedelta(days=-30)))
+    # End B: 1min ago — after the sibling's own end, so it cannot have
+    # cancelled it (cutoff = end - margin; upper bound excludes it).
+    record_group_win(conn, "485000099", 2, _iso(timedelta(minutes=-1)))
+    conn.commit()
+    # Both ends stored — the re-win was not collapsed to one row.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM group_wins WHERE item_id='485000099'"
+    ).fetchone()[0] == 2
+    _run_fallback(monkeypatch, conn, price="$10.00")
+    row = _status_row(conn, "485000001")
+    conn.close()
+    assert row["status"] == "WON"  # not REMOVED — no false cancel
+    assert row["winning_bid"] == 10.0
+
+
+def test_fallback_rewin_recent_end_within_membership_classifies(
+        tmp_path, monkeypatch):
+    """The value BUI-385 adds: with a stale recycled-group win (T-30d) AND a
+    genuine recent re-win (T-2h) both recorded, a sibling whose membership
+    spans the recent win is correctly classified REMOVED off it. The old
+    (group, item) key kept only the first (stale) end and would have MISSED
+    this — a WON-permissive evidence gap. The recent end is a genuine auction
+    end, so this is sound cancel evidence, not a false REMOVED."""
+    conn = init_db(tmp_path / "fb.db")
+    # Sibling seeded a week ago (default), ending 1h ago.
+    _seed(conn, "485000002", snipe_group=3,
+          auction_end_at=_iso(timedelta(hours=-1)))
+    # Stale end recorded FIRST (the order the old key kept), genuine re-win
+    # second.
+    record_group_win(conn, "485000098", 3, _iso(timedelta(days=-30)))
+    record_group_win(conn, "485000098", 3, _iso(timedelta(hours=-2)))
+    conn.commit()
+    _run_fallback(monkeypatch, conn, price="$10.00")
+    row = _status_row(conn, "485000002")
+    conn.close()
+    assert row["status"] == "REMOVED"
+
+
+# ---------------------------------------------------------------------------
 # BUI-382: every fallback write must be id-targeted, not item_id-wide. A
 # re-listed/re-added item can carry a live PENDING row sharing an item_id
 # with an old resolved/tombstoned row (the BUI-178 class of blast radius —
