@@ -325,3 +325,297 @@ def test_fallback_inferred_won_records_group_evidence(tmp_path, monkeypatch):
     assert row["status"] == "WON"
     assert ledger is not None
     assert ledger["snipe_group"] == 4
+
+
+# ---------------------------------------------------------------------------
+# BUI-382: every fallback write must be id-targeted, not item_id-wide. A
+# re-listed/re-added item can carry a live PENDING row sharing an item_id
+# with an old resolved/tombstoned row (the BUI-178 class of blast radius —
+# see test_mark_bids_purged_spares_live_pending_sharing_item_id in
+# test_server_db.py for the analogous mark_bids_purged fix).
+# ---------------------------------------------------------------------------
+
+def test_fallback_won_write_spares_live_pending_sharing_item_id(tmp_path, monkeypatch):
+    """The WON-inference write and the title/end-date write both must target
+    only the resolved row's id. Pre-fix, both were item_id-wide and would
+    collateral-stamp a live re-added PENDING snipe sharing the item_id: the
+    title/end write would corrupt its (not-yet-captured) auction_end_at with
+    the OLD auction's end time, and update_bid_status's default WHERE
+    (status NOT IN tombstones) would flip the live PENDING row itself to
+    WON."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "491000001", status="ENDED",
+          auction_end_at=_iso(timedelta(hours=-1)))
+    old_id = conn.execute(
+        "SELECT id FROM bids WHERE item_id='491000001'"
+    ).fetchone()["id"]
+    # Re-added live snipe for the same (re-listed) item_id. auction_end_at
+    # is NULL — not yet captured — exactly the state an item_id-wide
+    # COALESCE write would corrupt.
+    cur = conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group) "
+        "VALUES ('491000001', 40.0, 'PENDING', 0)"
+    )
+    live_id = cur.lastrowid
+    conn.commit()
+
+    monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+    monkeypatch.setattr(
+        m, "_fetch_ebay_item_sync",
+        lambda iid: {"item_id": iid, "title": "Old Auction Title",
+                     "current_price": "$10.00",
+                     "end_date_iso": "2026-01-01T00:00:00.000Z"},
+    )
+
+    async def _nosleep(_):
+        return None
+
+    monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
+    asyncio.run(m._run_ebay_fallback())
+
+    old = conn.execute("SELECT * FROM bids WHERE id=?", (old_id,)).fetchone()
+    live = conn.execute("SELECT * FROM bids WHERE id=?", (live_id,)).fetchone()
+    conn.close()
+
+    assert old["status"] == "WON"
+    assert old["winning_bid"] == 10.0
+    assert old["ebay_title"] == "Old Auction Title"
+
+    # The live re-added snipe must be completely untouched.
+    assert live["status"] == "PENDING"
+    assert live["winning_bid"] is None
+    assert live["ebay_title"] is None
+    assert live["auction_end_at"] is None
+
+
+def test_fallback_ended_no_price_write_spares_live_pending_sharing_item_id(
+        tmp_path, monkeypatch):
+    """Same guard for the "no usable price" ENDED write: pre-fix, its
+    item_id-wide update_bid_status call would also flip a live re-added
+    PENDING sibling to ENDED."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "491000002", status="ENDED",
+          auction_end_at=_iso(timedelta(hours=-1)))
+    cur = conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group) "
+        "VALUES ('491000002', 40.0, 'PENDING', 0)"
+    )
+    live_id = cur.lastrowid
+    conn.commit()
+
+    _run_fallback(monkeypatch, conn, price=None)
+
+    old = conn.execute(
+        "SELECT status, winning_bid FROM bids WHERE item_id='491000002' "
+        "AND status='ENDED'"
+    ).fetchone()
+    live = conn.execute("SELECT * FROM bids WHERE id=?", (live_id,)).fetchone()
+    conn.close()
+
+    assert old["status"] == "ENDED"
+    assert old["winning_bid"] is None
+    assert live["status"] == "PENDING"          # not clobbered to ENDED
+    assert live["winning_bid"] is None
+
+
+def test_fallback_purged_price_write_does_not_leak_to_sibling_tombstone(
+        tmp_path, monkeypatch):
+    """The purged-branch winning_bid write must target only the row being
+    resolved. Multiple tombstoned rows can share an item_id (e.g. a
+    re-listed item swept twice) — pre-fix, the item_id-wide UPDATE would
+    stamp this price onto an unrelated sibling tombstone's already-recorded
+    winning_bid too."""
+    conn = init_db(tmp_path / "fb.db")
+    recent = _iso(timedelta(hours=-1))
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, resolved_at) "
+        "VALUES ('491000003', 25.0, 'REMOVED', ?, ?)", (recent, recent),
+    )
+    target_id = conn.execute(
+        "SELECT id FROM bids WHERE item_id='491000003' AND winning_bid IS NULL"
+    ).fetchone()["id"]
+    # An older, already-resolved tombstone sharing the same item_id — well
+    # outside the 7-day window so it never enters _ebay_fallback_rows itself.
+    old_resolved = _iso(timedelta(days=-30))
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, "
+        "resolved_at, winning_bid) VALUES "
+        "('491000003', 10.0, 'REMOVED', ?, ?, 5.0)",
+        (old_resolved, old_resolved),
+    )
+    sibling_id = conn.execute(
+        "SELECT id FROM bids WHERE item_id='491000003' AND winning_bid=5.0"
+    ).fetchone()["id"]
+    conn.commit()
+
+    _run_fallback(monkeypatch, conn, price="$15.00")
+
+    target = conn.execute(
+        "SELECT winning_bid FROM bids WHERE id=?", (target_id,)
+    ).fetchone()
+    sibling = conn.execute(
+        "SELECT winning_bid FROM bids WHERE id=?", (sibling_id,)
+    ).fetchone()
+    conn.close()
+
+    assert target["winning_bid"] == 15.0
+    assert sibling["winning_bid"] == 5.0  # untouched
+
+
+# ---------------------------------------------------------------------------
+# BUI-382: ebay_no_price_at short-circuits the re-scan set once eBay has
+# already given a definitive "no usable price" answer for a row.
+# ---------------------------------------------------------------------------
+
+def test_fallback_ended_no_price_stays_in_rescan_set(tmp_path, monkeypatch):
+    """A non-purged ENDED row with no usable eBay price does NOT get
+    ebay_no_price_at stamped, unlike the tombstone branches below — it stays
+    eligible for a future WON inference. A single "no price" answer here
+    can't be told apart from eBay's item data not having settled yet, and
+    permanently excluding it would risk foreclosing a genuine win (forbidden
+    by BUI-146). This is a deliberate scope decision (see the comment at the
+    call site in _run_ebay_fallback): the unbounded re-scan cost for this
+    branch is accepted risk, not fixed by BUI-382."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "491000004", status="ENDED",
+          auction_end_at=_iso(timedelta(hours=-1)))
+    _run_fallback(monkeypatch, conn, price=None)
+
+    row = conn.execute(
+        "SELECT status, winning_bid, ebay_no_price_at FROM bids "
+        "WHERE item_id='491000004'"
+    ).fetchone()
+    now = datetime.now(timezone.utc).isoformat()
+    remaining = {r["item_id"] for r in m._ebay_fallback_rows(conn, now)}
+    conn.close()
+
+    assert row["status"] == "ENDED"
+    assert row["winning_bid"] is None
+    assert row["ebay_no_price_at"] is None
+    assert "491000004" in remaining
+
+
+def test_fallback_purged_no_price_stamps_marker_and_exits_rescan_set(
+        tmp_path, monkeypatch):
+    """A tombstoned row with no usable eBay price gets ebay_no_price_at
+    stamped and no longer matches the 7-day tombstone branch of
+    _ebay_fallback_rows — pre-fix it would be re-fetched every sync until it
+    aged out of the window."""
+    conn = init_db(tmp_path / "fb.db")
+    recent = _iso(timedelta(hours=-1))
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, resolved_at) "
+        "VALUES ('491000005', 25.0, 'REMOVED', ?, ?)", (recent, recent),
+    )
+    conn.commit()
+
+    _run_fallback(monkeypatch, conn, price=None)
+
+    row = conn.execute(
+        "SELECT status, winning_bid, ebay_no_price_at FROM bids "
+        "WHERE item_id='491000005'"
+    ).fetchone()
+    now = datetime.now(timezone.utc).isoformat()
+    remaining = {r["item_id"] for r in m._ebay_fallback_rows(conn, now)}
+    conn.close()
+
+    assert row["status"] == "REMOVED"
+    assert row["winning_bid"] is None
+    assert row["ebay_no_price_at"] is not None
+    assert "491000005" not in remaining
+
+
+def test_fallback_cancelled_removed_no_price_stamps_marker(tmp_path, monkeypatch):
+    """The BUI-371 cancelled-before-end REMOVED classification also produces
+    a NULL-winning_bid tombstone when eBay has no usable price — it must get
+    the same ebay_no_price_at treatment so it doesn't re-enter the 7-day
+    re-scan set either (notes carries CANCELLED_TOMBSTONE_NOTE, not
+    DEDUP_TOMBSTONE_NOTE, so the notes-based dedup-loser exclusion alone
+    would not have caught it)."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "491000006", status="PENDING",
+          auction_end_at=_iso(timedelta(hours=-1)),
+          gixen_vanished_at=_iso(timedelta(hours=-3)))
+    _run_fallback(monkeypatch, conn, price=None)
+
+    row = conn.execute(
+        "SELECT status, winning_bid, ebay_no_price_at FROM bids "
+        "WHERE item_id='491000006'"
+    ).fetchone()
+    now = datetime.now(timezone.utc).isoformat()
+    remaining = {r["item_id"] for r in m._ebay_fallback_rows(conn, now)}
+    conn.close()
+
+    assert row["status"] == "REMOVED"
+    assert row["winning_bid"] is None
+    assert row["ebay_no_price_at"] is not None
+    assert "491000006" not in remaining
+
+
+def test_fallback_no_price_marker_prevents_second_ebay_fetch(tmp_path, monkeypatch):
+    """End-to-end: once a tombstoned row is marked ebay_no_price_at, a
+    subsequent _run_ebay_fallback call must not invoke the eBay fetch for it
+    again."""
+    conn = init_db(tmp_path / "fb.db")
+    recent = _iso(timedelta(hours=-1))
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, resolved_at) "
+        "VALUES ('491000007', 25.0, 'REMOVED', ?, ?)", (recent, recent),
+    )
+    conn.commit()
+
+    fetch = MagicMock(return_value={
+        "item_id": "491000007", "title": "T",
+        "current_price": None, "end_date_iso": None,
+    })
+    monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+    monkeypatch.setattr(m, "_fetch_ebay_item_sync", fetch)
+
+    async def _nosleep(_):
+        return None
+
+    monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
+    asyncio.run(m._run_ebay_fallback())
+    assert fetch.call_count == 1
+
+    asyncio.run(m._run_ebay_fallback())
+    conn.close()
+    assert fetch.call_count == 1  # no second fetch — row already excluded
+
+
+def test_fallback_won_ledger_write_scoped_to_own_group_not_sibling(
+        tmp_path, monkeypatch):
+    """The id-targeted WON write (BUI-382) must not widen group_wins evidence
+    capture: a live re-added sibling sharing the item_id but carrying a
+    DIFFERENT snipe_group must not contribute its group to the ledger entry
+    recorded for the resolved row's own group."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "491000008", status="ENDED", snipe_group=5,
+          auction_end_at=_iso(timedelta(hours=-1)))
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group, auction_end_at) "
+        "VALUES ('491000008', 40.0, 'PENDING', 7, ?)",
+        (_iso(timedelta(days=1)),),
+    )
+    conn.commit()
+
+    _run_fallback(monkeypatch, conn, price="$10.00")
+
+    won = conn.execute(
+        "SELECT status FROM bids WHERE item_id='491000008' AND status='WON'"
+    ).fetchone()
+    ledger = conn.execute(
+        "SELECT snipe_group FROM group_wins WHERE item_id='491000008'"
+    ).fetchall()
+    live = conn.execute(
+        "SELECT status FROM bids WHERE item_id='491000008' AND snipe_group=7"
+    ).fetchone()
+    conn.close()
+
+    assert won is not None
+    assert [row["snipe_group"] for row in ledger] == [5]
+    assert live["status"] == "PENDING"  # sibling untouched

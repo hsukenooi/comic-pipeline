@@ -113,6 +113,14 @@ _COLUMN_MIGRATIONS = [
     # vanish-time disambiguation BUI-146 sanctioned instead of gating the eBay
     # WON inference.
     "ALTER TABLE bids ADD COLUMN gixen_vanished_at TEXT",
+    # BUI-382: stamped by _run_ebay_fallback when eBay returned data for this
+    # row but no usable positive price (reserve not met / unsold) — a
+    # definitive answer that will not change on a later check. Excludes the
+    # row from _ebay_fallback_rows' re-scan set so an already-answered
+    # auction doesn't keep burning an eBay call every sync: forever for a
+    # non-purged ENDED row (that branch has no time bound at all), or on
+    # every sync within the 7-day window for a REMOVED/PURGED tombstone.
+    "ALTER TABLE bids ADD COLUMN ebay_no_price_at TEXT",
 ]
 
 
@@ -144,7 +152,8 @@ _BIDS_TABLE_SQL = """
         seller_grade        REAL,
         photo_grade         REAL,
         dbidid              TEXT,
-        gixen_vanished_at   TEXT
+        gixen_vanished_at   TEXT,
+        ebay_no_price_at    TEXT
     )
 """
 

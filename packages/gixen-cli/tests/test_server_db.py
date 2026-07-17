@@ -439,6 +439,46 @@ def test_update_bid_clears_vanish_stamp(db):
     assert row["max_bid"] == 30.0
 
 
+# ---------------------------------------------------------------------------
+# ebay_no_price_at column migration (BUI-382)
+# ---------------------------------------------------------------------------
+
+
+def test_bids_ebay_no_price_at_column_present_on_fresh_db(tmp_path):
+    conn = init_db(tmp_path / "fresh_no_price.db")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "ebay_no_price_at" in cols
+    conn.close()
+
+
+def test_bids_ebay_no_price_at_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem_no_price.db"
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "ebay_no_price_at" in cols
+    conn2.close()
+
+
+def test_ebay_no_price_at_present_after_legacy_rebuild(tmp_path):
+    """A pre-BUI-49 DB forces the status-rename table rebuild; the rebuilt
+    table (created from _BIDS_TABLE_SQL) must still carry ebay_no_price_at —
+    the ALTER runs before the rebuild, so a missing _BIDS_TABLE_SQL entry
+    would either drop the column or fail the rebuild's column copy."""
+    db_path = tmp_path / "legacy_no_price.db"
+    _seed_old_db(db_path)
+    conn = init_db(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "ebay_no_price_at" in cols
+    # And the rebuild actually happened (CHECK now permits REMOVED).
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bids'"
+    ).fetchone()["sql"]
+    assert "REMOVED" in sql
+    conn.close()
+
+
 def test_grade_columns_survive_bids_rebuild(tmp_path):
     """BUI-78: seller_grade/photo_grade must be in _BIDS_TABLE_SQL so the
     FK-removal rebuild preserves them (and their data). A legacy DB carrying the
