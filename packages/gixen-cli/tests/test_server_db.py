@@ -1154,3 +1154,248 @@ def test_cache_gixen_data_skips_dbidid_on_removed_row(db):
     db.commit()
     row = get_bid_by_item_id(db, "700000012")
     assert row["dbidid"] is None
+
+
+# ---------------------------------------------------------------------------
+# BUI-381: durable group-win evidence ledger (group_wins)
+# ---------------------------------------------------------------------------
+
+def test_group_wins_table_created(db):
+    tables = {row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    assert "group_wins" in tables
+
+
+def test_update_bid_status_won_records_group_win(db):
+    """A WON classification on a grouped row with a captured auction end
+    lands in the group_wins ledger with that genuine end."""
+    insert_bid(db, "881000001", 50.0, 6, 3, "s")
+    db.execute(
+        "UPDATE bids SET auction_end_at='2026-06-30T23:55:00+00:00' "
+        "WHERE item_id='881000001'"
+    )
+    update_bid_status(db, "881000001", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    row = db.execute(
+        "SELECT * FROM group_wins WHERE item_id='881000001'"
+    ).fetchone()
+    assert row is not None
+    assert row["snipe_group"] == 3
+    assert row["won_end_at"] == "2026-06-30T23:55:00+00:00"
+
+
+def test_update_bid_status_won_without_end_records_nothing(db):
+    """A WON whose auction end was never captured records NO ledger entry —
+    the permanent ledger never stores the COALESCE observation-time proxy
+    (it could falsely group-cancel a sibling added after the real win). The
+    live WON row keeps serving its shipped BUI-371 proxy evidence instead,
+    until purged."""
+    insert_bid(db, "881000011", 50.0, 6, 3, "s")
+    update_bid_status(db, "881000011", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    # The row itself got the proxy end via COALESCE (shipped behavior)...
+    assert get_bid_by_item_id(db, "881000011")["auction_end_at"] == \
+        "2026-07-01T00:00:00+00:00"
+    # ...but the ledger stays clean.
+    assert db.execute(
+        "SELECT 1 FROM group_wins WHERE item_id='881000011'"
+    ).fetchone() is None
+
+
+def test_update_bid_status_won_group_zero_records_nothing(db):
+    """Group 0 means 'no group' — never evidence."""
+    insert_bid(db, "881000002", 50.0, 6, 0, "s")
+    update_bid_status(db, "881000002", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    assert db.execute(
+        "SELECT 1 FROM group_wins WHERE item_id='881000002'"
+    ).fetchone() is None
+
+
+def test_update_bid_status_non_won_records_nothing(db):
+    insert_bid(db, "881000003", 50.0, 6, 3, "s")
+    update_bid_status(db, "881000003", "LOST", 60.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    assert db.execute(
+        "SELECT 1 FROM group_wins WHERE item_id='881000003'"
+    ).fetchone() is None
+
+
+def test_group_win_evidence_survives_purge_sweep(db):
+    """The BUI-381 case-1 core: mark_bids_purged destroys the WON row (status
+    REMOVED), but the ledger entry recorded at classification time survives."""
+    insert_bid(db, "881000004", 50.0, 6, 5, "s")
+    db.execute(
+        "UPDATE bids SET auction_end_at='2026-06-30T23:55:00+00:00' "
+        "WHERE item_id='881000004'"
+    )
+    update_bid_status(db, "881000004", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    mark_bids_purged(db, ["881000004"])
+    assert get_bid_by_item_id(db, "881000004")["status"] == "REMOVED"
+    row = db.execute(
+        "SELECT * FROM group_wins WHERE item_id='881000004'"
+    ).fetchone()
+    assert row is not None
+    assert row["snipe_group"] == 5
+
+
+def test_update_bid_status_only_id_scopes_recording(db):
+    """With only_id, both the WON write and the ledger recording are scoped
+    to the one row — an older resolved row sharing the item_id (the BUI-178
+    re-listed shape) contributes nothing."""
+    old_id = insert_bid(db, "881000012", 50.0, 6, 4, "s")
+    db.execute(
+        "UPDATE bids SET status='LOST', auction_end_at='2026-05-01T00:00:00+00:00' "
+        "WHERE id=?", (old_id,),
+    )
+    new_id = insert_bid(db, "881000012", 60.0, 6, 5, "s")
+    db.execute(
+        "UPDATE bids SET auction_end_at='2026-06-30T23:55:00+00:00' WHERE id=?",
+        (new_id,),
+    )
+    db.commit()
+    update_bid_status(
+        db, "881000012", "WON", 42.0, "2026-07-01T00:00:00+00:00", only_id=new_id,
+    )
+    db.commit()
+    groups = {
+        r["snipe_group"] for r in db.execute(
+            "SELECT snipe_group FROM group_wins WHERE item_id='881000012'"
+        )
+    }
+    assert groups == {5}  # only the targeted row's group; old LOST row ignored
+    old_status = db.execute(
+        "SELECT status FROM bids WHERE id=?", (old_id,)
+    ).fetchone()["status"]
+    assert old_status == "LOST"
+
+
+def test_record_group_win_skips_null_end(db):
+    """End-less evidence is unsound against the lifetime bound — never
+    recorded."""
+    from server.db import record_group_win
+    record_group_win(db, "881000005", 3, None)
+    db.commit()
+    assert db.execute(
+        "SELECT 1 FROM group_wins WHERE item_id='881000005'"
+    ).fetchone() is None
+
+
+def test_record_group_win_skips_unparseable_end(db):
+    """An end the classifier could never parse is useless — never stored."""
+    from server.db import record_group_win
+    record_group_win(db, "881000013", 3, "not-a-timestamp")
+    db.commit()
+    assert db.execute(
+        "SELECT 1 FROM group_wins WHERE item_id='881000013'"
+    ).fetchone() is None
+
+
+def test_record_group_win_skips_far_future_end(db):
+    """A 'win' whose end is beyond the estimation allowance has not ended —
+    self-contradictory input (e.g. eBay describing a re-listed same-ID
+    auction), never stored. An end just inside the allowance (normal
+    end-time estimation error) still records."""
+    from datetime import datetime, timedelta, timezone
+    from server.db import record_group_win
+    far_future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    near_future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    record_group_win(db, "881000014", 3, far_future)
+    record_group_win(db, "881000015", 3, near_future)
+    db.commit()
+    assert db.execute(
+        "SELECT 1 FROM group_wins WHERE item_id='881000014'"
+    ).fetchone() is None
+    assert db.execute(
+        "SELECT 1 FROM group_wins WHERE item_id='881000015'"
+    ).fetchone() is not None
+
+
+def test_record_group_win_idempotent(db):
+    from server.db import record_group_win
+    record_group_win(db, "881000006", 3, "2026-07-01T00:00:00+00:00")
+    record_group_win(db, "881000006", 3, "2026-07-02T00:00:00+00:00")
+    db.commit()
+    rows = db.execute(
+        "SELECT * FROM group_wins WHERE item_id='881000006'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["won_end_at"] == "2026-07-01T00:00:00+00:00"  # first write wins
+
+
+def test_migration_backfills_group_wins_from_existing_won_rows(tmp_path):
+    """WON rows that predate recording-at-classification-time are seeded into
+    the ledger on startup; rows with no usable end time are skipped, and so
+    are the identifiable proxy shapes (auction_end_at == resolved_at, i.e.
+    the COALESCE fill at resolution or the BUI-83 legacy backfill) — the
+    permanent ledger stores only genuine auction ends."""
+    path = tmp_path / "backfill.db"
+    conn = init_db(path)
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group, "
+        "auction_end_at, resolved_at) "
+        "VALUES ('881000007', 25.0, 'WON', 4, '2026-06-01T00:00:00+00:00', "
+        "'2026-06-01T00:05:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group) "
+        "VALUES ('881000008', 25.0, 'WON', 4)"  # no end, no resolved_at
+    )
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group, "
+        "auction_end_at, resolved_at) "
+        "VALUES ('881000016', 25.0, 'WON', 4, '2026-06-02T00:00:00+00:00', "
+        "'2026-06-02T00:00:00+00:00')"  # proxy shape: end == resolved_at
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        row = conn.execute(
+            "SELECT won_end_at FROM group_wins WHERE item_id='881000007'"
+        ).fetchone()
+        assert row is not None
+        assert row["won_end_at"] == "2026-06-01T00:00:00+00:00"
+        assert conn.execute(
+            "SELECT 1 FROM group_wins WHERE item_id='881000008'"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM group_wins WHERE item_id='881000016'"
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_refresh_snipe_group_updates_pending_only(db):
+    from server.db import refresh_snipe_group
+    insert_bid(db, "881000009", 50.0, 6, 0, "s")
+    insert_bid(db, "881000010", 50.0, 6, 7, "s")
+    update_bid_status(db, "881000010", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    refresh_snipe_group(db, "881000009", 4)   # PENDING → updated
+    refresh_snipe_group(db, "881000010", 9)   # WON → untouched
+    db.commit()
+    assert get_bid_by_item_id(db, "881000009")["snipe_group"] == 4
+    assert get_bid_by_item_id(db, "881000010")["snipe_group"] == 7
+
+
+def test_refresh_snipe_group_spares_terminal_row_sharing_item_id(db):
+    """The literal BUI-178 shape: an old resolved row and a live PENDING row
+    share one item_id — the refresh touches only the PENDING row."""
+    from server.db import refresh_snipe_group
+    old_id = insert_bid(db, "881000017", 50.0, 6, 7, "s")
+    db.execute("UPDATE bids SET status='WON' WHERE id=?", (old_id,))
+    new_id = insert_bid(db, "881000017", 60.0, 6, 0, "s")
+    db.commit()
+    refresh_snipe_group(db, "881000017", 4)
+    db.commit()
+    rows = {
+        r["id"]: r["snipe_group"] for r in db.execute(
+            "SELECT id, snipe_group FROM bids WHERE item_id='881000017'"
+        )
+    }
+    assert rows[old_id] == 7   # terminal row untouched
+    assert rows[new_id] == 4   # live row refreshed

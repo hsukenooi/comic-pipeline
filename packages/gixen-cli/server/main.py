@@ -38,6 +38,7 @@ from server.db import (
     mark_bids_purged, cache_gixen_data, DEDUP_TOMBSTONE_NOTE,
     CANCELLED_TOMBSTONE_NOTE,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
+    refresh_snipe_group, record_group_win,
     TOMBSTONE_STATUSES_SQL,
 )
 import ebay_bidder
@@ -98,6 +99,12 @@ _EBAY_COOLDOWN = 300.0  # seconds; suppress eBay fallback after a rate-limit sto
 # BUI-85: cap eBay lookups for vanished PENDING rows with no captured end time,
 # so a backlog of them can't flood the rate-limited eBay budget in one sync.
 _VANISHED_NULL_END_MAX_PER_SYNC = 5
+# BUI-381: same discipline for row-less listed-winner evidence lookups — a
+# post-outage catch-up sync with several unrecorded group winners must not
+# serialize unbounded 30s-timeout eBay subprocess calls inside the sync
+# (which api callers hold _api_lock across). Unrecorded winners retry on
+# later syncs; they stay on Gixen's list until purged.
+_LISTED_WIN_FETCH_MAX_PER_SYNC = 5
 # Tracked so the lifespan teardown can cancel + await any in-flight fallback
 # task before _db.close() runs. Without this the task can hit a closed DB.
 _ebay_fallback_task: asyncio.Task | None = None
@@ -283,6 +290,23 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
     return dt
 
 
+def _parse_snipe_group(value: str | int | None) -> int | None:
+    """Parse a Gixen-reported snipe_group to an int, or None when the value
+    is absent, blank, or unparseable (a scrape quirk like 'N/A'). Callers
+    must treat None as 'unknown' — never coerce it to 0, because group 0 is
+    a positive claim ('no group') that clears membership / suppresses
+    evidence. Caveat: the scraper itself encodes a regex miss as '0'
+    (gixen_client._parse_snipe_table), indistinguishable here from a genuine
+    no-group — always in the WON-permissive direction (evidence weakened,
+    never fabricated); fixing the encoding is a client-side follow-up."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
 def _vanished_while_live(vanished_at_iso: str | None, end_dt: datetime | None) -> bool:
     """True when the snipe was observed missing from a healthy Gixen list at
     least _CANCEL_EVIDENCE_MARGIN before its auction end — it was cancelled
@@ -314,26 +338,36 @@ def _group_won_before(
     the same won-group siblings on the *live* Gixen list for purge): this one
     works from stored bids rows and adds the timing bounds, because here the
     question is retrospective — was this snipe already cancelled by its own
-    auction's end?"""
+    auction's end?
+
+    Consults two sources under identical bounds (BUI-381): live WON bids rows,
+    and the durable group_wins ledger — which survives the winner row's
+    destruction (mark_bids_purged sweeps WON → REMOVED) and covers winners
+    that never got a bids row (first seen already-terminal via the web-add
+    path). The live-row arm looks redundant now that every WON writer also
+    records to the ledger, but it is deliberate skew tolerance (the
+    TOMBSTONE_STATUSES_SQL convention): a WON written by an older installed
+    gixen-cli lacks a ledger entry until the next server restart backfills
+    it, and evidence must not silently weaken in that window."""
     if end_dt is None:
         return False
-    try:
-        group = int(snipe_group or 0)
-    except (ValueError, TypeError):
-        return False
-    if group == 0:
-        return False
+    group = _parse_snipe_group(snipe_group)
+    if not group:
+        return False  # no group, or unparseable → no evidence (WON-permissive)
     added_dt = _parse_iso_utc(added_at_iso)
     if added_dt is None:
         return False  # can't scope to a lifetime → no evidence (WON-permissive)
     cutoff = end_dt - _CANCEL_EVIDENCE_MARGIN
     rows = db.execute(
-        "SELECT auction_end_at, resolved_at FROM bids "
-        "WHERE snipe_group = ? AND status = 'WON' AND item_id != ?",
-        (group, item_id),
+        "SELECT COALESCE(auction_end_at, resolved_at) AS won_end_at FROM bids "
+        "WHERE snipe_group = ? AND status = 'WON' AND item_id != ? "
+        "UNION ALL "
+        "SELECT won_end_at FROM group_wins "
+        "WHERE snipe_group = ? AND item_id != ?",
+        (group, item_id, group, item_id),
     ).fetchall()
     for row in rows:
-        won_end = _parse_iso_utc(row["auction_end_at"] or row["resolved_at"])
+        won_end = _parse_iso_utc(row["won_end_at"])
         if won_end is not None and added_dt <= won_end <= cutoff:
             return True
     return False
@@ -482,7 +516,10 @@ def _insert_web_added_bids(db: sqlite3.Connection, snipes: list) -> None:
                 insert_bid(
                     db, snipe["item_id"], max_bid,
                     int(snipe.get("bid_offset", 6)),
-                    int(snipe.get("snipe_group", 0)),
+                    # BUI-381: never int()-crash the sync batch on a scrape
+                    # quirk ('N/A'); an unknown group inserts as 0 and the
+                    # per-sync refresh corrects it once it parses.
+                    _parse_snipe_group(snipe.get("snipe_group")) or 0,
                     snipe.get("seller"),
                 )
                 logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
@@ -504,6 +541,73 @@ def _insert_web_added_bids(db: sqlite3.Connection, snipes: list) -> None:
                     "_sync_gixen: %s already present (concurrent add); skipping insert",
                     snipe["item_id"],
                 )
+
+
+async def _record_listed_win_evidence(
+    db: sqlite3.Connection, snipe: dict, now: str
+) -> bool:
+    """Record group-win evidence for a listed WON snipe whose win is not in
+    the bids table (BUI-381). Returns True when an eBay fetch was performed
+    (consuming the caller's per-sync budget), False on any early skip.
+
+    The web-add path never inserts a snipe first seen already-terminal
+    (_insert_web_added_bids skips those), so such a winner's WON transition is
+    a no-op and the win would otherwise leave no trace for _group_won_before —
+    its cancelled siblings would fall through to the fallback's phantom-WON
+    window. Winners that DO transition WON on a bids row are recorded inside
+    update_bid_status; this covers the row-less (or tombstoned-row) case, and
+    the case where the row's stored group diverges from the listed one (the
+    WON-row guard is group-aware, so a winner that resolved before its group
+    was known still gets eBay-backed evidence under the listed group).
+
+    The win's true end time is fetched from eBay — Gixen's list only says
+    'ENDED' — because recording an observation-time proxy would be unsound
+    against the classifier's lifetime bound: a win that actually predates a
+    sibling's added_at could falsely group-cancel it (the recycled-group
+    hazard from the BUI-371 review). No end, no evidence (WON-permissive), and
+    the next sync retries naturally: the winner stays on Gixen's list until
+    purged, while the already-recorded check keeps this to at most one eBay
+    call per (group, item). An end in the future (past the estimation margin)
+    is self-contradictory for a WON — eBay is describing a different,
+    re-listed auction under the same item id — and records nothing. Caller
+    commits.
+
+    Deliberately awaited inline in the sync (same blocking trade as the
+    BUI-85 _resolve_vanished_null_end_bids resolver, same cooldown gate,
+    same per-sync cap) rather than deferred to the fire-and-forget fallback
+    task: the evidence must exist before the sibling's classification runs
+    later in this same sync — a deferred write races the fallback's WON
+    inference, and a WON stamped with a price is never revisited."""
+    group = _parse_snipe_group(snipe.get("snipe_group"))
+    if not group:
+        return False
+    iid = snipe["item_id"]
+    if db.execute(
+        "SELECT 1 FROM bids WHERE item_id=? AND status='WON' AND snipe_group=? "
+        "LIMIT 1",
+        (iid, group),
+    ).fetchone() is not None:
+        return False  # update_bid_status recorded this win at transition time
+    if db.execute(
+        "SELECT 1 FROM group_wins WHERE snipe_group=? AND item_id=?",
+        (group, iid),
+    ).fetchone() is not None:
+        return False
+    if _ebay_fetch_bin() is None:
+        return False
+    if datetime.now(timezone.utc).timestamp() < _ebay_cooldown_until:
+        return False
+    ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+    end_iso = (ebay or {}).get("end_date_iso")
+    end_dt = _parse_end_iso(end_iso)
+    if end_dt is None or end_dt > datetime.now(timezone.utc) + _CANCEL_EVIDENCE_MARGIN:
+        return True  # no usable end → record nothing (WON-permissive); fetch spent
+    record_group_win(db, iid, group, end_iso, recorded_at=now)
+    logger.info(
+        "_sync_gixen: recorded group-win evidence for row-less winner %s "
+        "(group %d, ended %s)", iid, group, end_iso,
+    )
+    return True
 
 
 async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: bool = False) -> list:
@@ -568,6 +672,15 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
             snipe.get("dbidid") or None,  # BUI-116: warm the edit fast-path cache
         )
 
+        # BUI-381: mirror the list's snipe_group onto the live row on every
+        # sync (see refresh_snipe_group). Runs before the terminal transitions
+        # below, so a winner whose group was applied retroactively on Gixen's
+        # web UI carries it by the time its WON is recorded as group evidence.
+        # An unparseable value (None) is skipped — see _parse_snipe_group.
+        listed_group = _parse_snipe_group(snipe.get("snipe_group"))
+        if listed_group is not None:
+            refresh_snipe_group(db, iid, listed_group)
+
         gixen_status = snipe.get("status", "")
         time_to_end = snipe.get("time_to_end", "")
         internal_status = _map_terminal_status(gixen_status, time_to_end)
@@ -591,6 +704,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     # siblings' ENDED/LOST below (BUI-371) — after a sync gap, the winner and
     # a cancelled sibling can arrive in the same list pull.
     terminal_transitions.sort(key=lambda pair: pair[1] != "WON")
+    listed_win_fetches = 0  # BUI-381: per-sync eBay budget for row-less winners
     for snipe, internal_status in terminal_transitions:
         iid = snipe["item_id"]
         gixen_status = snipe.get("status", "")
@@ -651,6 +765,18 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
             db, iid, internal_status, winning_bid, now,
             snipe.get("status_mirror"),
         )
+        if (
+            internal_status == "WON"
+            and listed_win_fetches < _LISTED_WIN_FETCH_MAX_PER_SYNC
+        ):
+            # BUI-381: a winner first seen already-terminal has no DB row
+            # (the web-add insert below skips terminal snipes), so the
+            # update above was a no-op and its win left no group evidence —
+            # record it from the list + eBay's end time. No-op when the
+            # update did land on a grouped row (update_bid_status records
+            # those). Capped per sync like the BUI-85 resolver.
+            if await _record_listed_win_evidence(db, snipe, now):
+                listed_win_fetches += 1
 
     # Vanished + ended → flip to ENDED. The eBay fallback path then picks
     # them up (ENDED rows with NULL winning_bid) and resolves the final

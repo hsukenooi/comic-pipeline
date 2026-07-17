@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 def resolve_server_dir() -> Path:
@@ -60,6 +60,29 @@ CREATE TABLE IF NOT EXISTS bids (
 );
 
 CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+
+-- BUI-381: append-only ledger of bid-group wins, written the moment a WON is
+-- classified. The BUI-371 group-cancel evidence used to live only in the WON
+-- bids row, which is destructible — a completed-bids sweep (mark_bids_purged)
+-- tombstones it to REMOVED, and a winner first seen already-terminal via the
+-- web-add path never gets a row at all. Either way _group_won_before's
+-- live-row query found nothing and the cancelled siblings fell through to the
+-- eBay fallback's phantom-WON window. Nothing tombstones or deletes rows
+-- here; the classifier applies the same lifetime/margin bounds to this ledger
+-- as to live WON rows. won_end_at is NOT NULL by design: end-less evidence
+-- cannot be bounded against a sibling's lifetime (recording an
+-- observation-time proxy could falsely group-cancel a sibling added after
+-- the real win — the recycled-group hazard from the BUI-371 review).
+CREATE TABLE IF NOT EXISTS group_wins (
+    id          INTEGER PRIMARY KEY,
+    snipe_group INTEGER NOT NULL,
+    item_id     TEXT NOT NULL,
+    won_end_at  TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_group_wins_group_item
+    ON group_wins(snipe_group, item_id);
 """
 
 
@@ -323,6 +346,29 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
+    # BUI-381: seed the durable group-win ledger from WON rows that predate
+    # recording-at-classification-time (or were written by an older package
+    # version — the usual version-skew tolerance). Runs every startup; the
+    # (snipe_group, item_id) unique index + INSERT OR IGNORE make it a no-op
+    # once seeded. Only genuine auction ends are seeded — the ledger never
+    # stores an observation-time proxy (see the group_wins schema comment).
+    # `auction_end_at != resolved_at` excludes the two identifiable proxy
+    # shapes: update_bid_status's COALESCE fill at resolution time and the
+    # BUI-83 legacy backfill, both of which set auction_end_at := resolved_at
+    # verbatim. Excluded rows keep serving proxy evidence via the live-row
+    # arm of _group_won_before until purged (shipped BUI-371 behavior);
+    # after a purge their evidence is lost — WON-permissive.
+    conn.execute(
+        "INSERT OR IGNORE INTO group_wins "
+        "(snipe_group, item_id, won_end_at, recorded_at) "
+        "SELECT snipe_group, item_id, auction_end_at, ? "
+        "FROM bids WHERE status='WON' AND snipe_group != 0 "
+        "AND auction_end_at IS NOT NULL "
+        "AND (resolved_at IS NULL OR auction_end_at != resolved_at)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    conn.commit()
+
     # Enforce at most one live (PENDING) snipe per item_id (BUI-67). Runs last,
     # after the PURGED->REMOVED remap so the CHECK already permits the REMOVED
     # tombstone this writes on dedup losers.
@@ -559,6 +605,55 @@ def update_bid(
     conn.commit()
 
 
+# Sanity allowance for record_group_win's future-end check. Mirrors
+# server.main._CANCEL_EVIDENCE_MARGIN (auction_end_at is estimated from
+# Gixen's minute-granular countdown, plus clock skew) — a WON whose stored
+# end is slightly in the future is normal estimation error, but one further
+# out than this is self-contradictory input.
+_WON_END_FUTURE_ALLOWANCE = timedelta(minutes=10)
+
+
+def record_group_win(
+    conn: sqlite3.Connection,
+    item_id: str,
+    snipe_group: int,
+    won_end_at: str | None,
+    recorded_at: str | None = None,
+) -> None:
+    """Append BUI-381 group-win evidence to the durable ledger (see the
+    group_wins schema comment). INSERT OR IGNORE against the
+    (snipe_group, item_id) unique index makes re-recording a no-op.
+
+    The ledger is permanent (nothing tombstones it), so it holds itself to a
+    stricter evidence standard than the live-row query and stores only sound
+    entries — anything else is skipped, WON-permissive:
+    - group 0 (no group), or a missing end time: an end-less win cannot be
+      bounded against a sibling's lifetime, and an observation-time proxy
+      could falsely group-cancel a sibling added after the real win (the
+      recycled-group hazard).
+    - an unparseable end: useless to the classifier, never stored.
+    - an end beyond the future allowance: a "win" that has not ended yet is
+      self-contradictory input (e.g. eBay describing a re-listed same-ID
+      auction) — not evidence.
+    Caller must conn.commit()."""
+    if not snipe_group or not won_end_at:
+        return
+    try:
+        won_end = datetime.fromisoformat(won_end_at.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return
+    if won_end.tzinfo is None:
+        won_end = won_end.replace(tzinfo=timezone.utc)
+    if won_end > datetime.now(timezone.utc) + _WON_END_FUTURE_ALLOWANCE:
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO group_wins "
+        "(snipe_group, item_id, won_end_at, recorded_at) VALUES (?, ?, ?, ?)",
+        (snipe_group, item_id, won_end_at,
+         recorded_at or datetime.now(timezone.utc).isoformat()),
+    )
+
+
 def update_bid_status(
     conn: sqlite3.Connection,
     item_id: str,
@@ -580,6 +675,32 @@ def update_bid_status(
     # item_id with the old row being classified (a re-listed auction re-added
     # after the original resolved — the BUI-178 class of collateral damage).
     id_clause = " AND id=?" if only_id is not None else ""
+    win_rows: list[sqlite3.Row] = []
+    if status == "WON":
+        # BUI-381: capture group-win evidence at classification time, for
+        # every WON writer (Gixen sync transitions, the eBay fallback
+        # inference). The WON row itself is destructible — mark_bids_purged
+        # sweeps it to REMOVED — and _group_won_before's live-row query would
+        # then find nothing, reopening the phantom-WON window for exactly the
+        # cancelled siblings this win should classify.
+        #
+        # Captured BEFORE the UPDATE, and only for rows with a genuine
+        # auction_end_at: the UPDATE below COALESCE-fills a NULL end with
+        # resolved_at (an observation-time proxy), and the permanent ledger
+        # must never store a proxy — it could falsely group-cancel a sibling
+        # added after the real win. Skipping is WON-permissive: the live WON
+        # row still serves its (shipped BUI-371) proxy evidence until purged.
+        # Same predicate as the UPDATE, so every captured row is one the
+        # UPDATE flips to WON.
+        params_won: list = [item_id]
+        if only_id is not None:
+            params_won.append(only_id)
+        win_rows = conn.execute(
+            "SELECT snipe_group, auction_end_at FROM bids "
+            "WHERE item_id=? AND snipe_group != 0 AND auction_end_at IS NOT NULL "
+            f"AND status NOT IN ({TOMBSTONE_STATUSES_SQL}){id_clause}",
+            params_won,
+        ).fetchall()
     params: list = [status, winning_bid, resolved_at, resolved_at, status_mirror, item_id]
     if only_id is not None:
         params.append(only_id)
@@ -590,6 +711,11 @@ def update_bid_status(
         f"WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL}){id_clause}",
         params,
     )
+    for row in win_rows:
+        record_group_win(
+            conn, item_id, row["snipe_group"], row["auction_end_at"],
+            recorded_at=resolved_at,
+        )
 
 
 def cache_gixen_data(
@@ -684,6 +810,28 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
         [now, *item_ids],
     )
     conn.commit()
+
+
+def refresh_snipe_group(
+    conn: sqlite3.Connection, item_id: str, snipe_group: int
+) -> None:
+    """Mirror Gixen's listed snipe_group onto the live (PENDING) row (BUI-381).
+
+    _sync_gixen used to never refresh snipe_group on existing rows, so a
+    retroactive `gixen group N` applied via Gixen's web UI strengthened
+    nothing — the winner's row kept group 0 and its group win classified no
+    siblings. Gixen's list is the same authority the BUI-371 classifier
+    already trusts for group evidence, in both directions: 0→N arms winner
+    evidence, N→0 (user un-grouped) clears stale membership that could
+    otherwise false-classify a genuine result as REMOVED.
+
+    Caller must conn.commit() — hot-path inside the _sync_gixen loop where
+    commits are batched at the end of the cycle."""
+    conn.execute(
+        "UPDATE bids SET snipe_group=? "
+        "WHERE item_id=? AND status='PENDING' AND snipe_group != ?",
+        (snipe_group, item_id, snipe_group),
+    )
 
 
 def set_auction_end_time(conn: sqlite3.Connection, item_id: str, end_time_iso: str) -> None:
