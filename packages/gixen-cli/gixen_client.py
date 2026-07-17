@@ -555,13 +555,17 @@ class GixenClient:
     # Public API
     # ------------------------------------------------------------------
 
-    def list_snipes(self) -> List[Dict[str, str]]:
+    def list_snipes(self) -> List[Dict[str, Optional[str]]]:
         """Fetch and parse the current snipe list.
 
         Returns:
             List of dicts with keys: item_id, title, max_bid, current_bid,
             status, status_mirror, time_to_end, bid_offset, bid_offset_mirror,
             dbidid, snipe_group, seller.
+
+            snipe_group is the scraped string ("0" = genuinely ungrouped) or
+            None when the field couldn't be parsed at all — "unknown", which
+            consumers must never coerce to 0 (BUI-383; see _parse_snipe_table).
         """
         html = self._get_home_page()
         try:
@@ -819,7 +823,7 @@ class GixenClient:
     # HTML parsing
     # ------------------------------------------------------------------
 
-    def _parse_snipe_table(self, html: str) -> List[Dict[str, str]]:
+    def _parse_snipe_table(self, html: str) -> List[Dict[str, Optional[str]]]:
         """Parse the desktop snipe table from the home page HTML."""
         # Check that the expected form exists
         if '<form name="bids"' not in html and '<form name="addsnipe"' not in html:
@@ -835,7 +839,9 @@ class GixenClient:
                 "Gixen may be down or the page structure has changed."
             )
 
-        snipes: List[Dict[str, str]] = []
+        # snipe_group may be None on a regex miss (BUI-383); every other
+        # value is a str, but the dict is typed loosely to admit it.
+        snipes: List[Dict[str, Optional[str]]] = []
 
         # Each snipe in the desktop table has hidden inputs with names like
         # edititemid_<ITEMID>, editmaxbid_<ITEMID>, etc., plus a
@@ -852,7 +858,7 @@ class GixenClient:
         )
 
         for suffix, item_id in edit_items:
-            snipe: Dict[str, str] = {"item_id": item_id}
+            snipe: Dict[str, Optional[str]] = {"item_id": item_id}
 
             # Max bid
             m = re.search(
@@ -878,13 +884,20 @@ class GixenClient:
             )
             snipe["bid_offset_mirror"] = m.group(1) if m else "6"
 
-            # Snipe group
+            # Snipe group. A regex MISS is encoded as None ("unknown"), never
+            # "0" (BUI-383): "0" is a positive "no group" claim, and the
+            # server's per-sync mirror (refresh_snipe_group) trusts it in
+            # both directions — a miss collapsed to "0" would durably CLEAR
+            # real group membership in the DB (N → 0), weakening the BUI-371
+            # group-cancel evidence. The server skips None/blank/unparseable
+            # values (server.main._parse_snipe_group), so an unknown here
+            # preserves whatever membership the DB already knows.
             m = re.search(
                 rf'name="editsnipegroup_{re.escape(suffix)}" type="hidden" '
                 rf'id="editsnipegroup" value="([^"]*)"',
                 html,
             )
-            snipe["snipe_group"] = m.group(1) if m else "0"
+            snipe["snipe_group"] = m.group(1) if m else None
 
             # Comment
             m = re.search(
@@ -984,7 +997,9 @@ class GixenClient:
         return unique_snipes
 
     @staticmethod
-    def _find_snipe(snipes: List[Dict[str, str]], item_id: str) -> Dict[str, str]:
+    def _find_snipe(
+        snipes: List[Dict[str, Optional[str]]], item_id: str
+    ) -> Dict[str, Optional[str]]:
         """Find a snipe by item_id in the list."""
         for snipe in snipes:
             if snipe["item_id"] == item_id:
@@ -998,25 +1013,50 @@ class GixenClient:
 # Pure helpers
 # ---------------------------------------------------------------------------
 
+def _canonical_snipe_group(value: object) -> Optional[str]:
+    """Canonical non-zero snipe_group for sibling matching, or None.
+
+    None is returned for every value that is not a positive group claim:
+    None itself (a parse miss — "unknown", BUI-383), blank/whitespace, "0"
+    (genuinely ungrouped), and anything non-numeric (a scrape quirk like
+    "N/A"). Digits are normalized through int() so "01" and "1" match.
+    Matching on anything weaker would be dangerous: these targets get
+    REMOVED from Gixen, so two snipes sharing an empty-string or unparseable
+    group must never be treated as won-group siblings."""
+    if value is None:
+        return None
+    v = str(value).strip()
+    if not v.isdigit():
+        return None
+    n = int(v)
+    return str(n) if n else None
+
+
 def find_sibling_cleanup_targets(
-    snipes: List[Dict[str, str]],
-) -> List[Dict[str, str]]:
+    snipes: List[Dict[str, Optional[str]]],
+) -> List[Dict[str, Optional[str]]]:
     """Return snipes that should be removed because a sibling in their snipe
     group has already won.
 
     A "sibling" is any snipe sharing a non-zero ``snipe_group`` value with a
     snipe whose ``status`` is ``"WON"``. The winning snipe(s) themselves are
-    never returned. Group ``"0"`` (no group) is ignored entirely.
+    never returned. Group ``"0"`` (no group) is ignored entirely, as are
+    unknown/blank/unparseable group values (see _canonical_snipe_group) —
+    an empty-string group must not register as a won group (BUI-383).
 
     Pure function — no I/O. Input order is preserved in the result.
     """
-    won_groups = {
-        s.get("snipe_group", "0")
-        for s in snipes
-        if s.get("status") == "WON" and s.get("snipe_group", "0") != "0"
-    }
-    return [
-        s
-        for s in snipes
-        if s.get("snipe_group", "0") in won_groups and s.get("status") != "WON"
-    ]
+    won_groups = set()
+    for s in snipes:
+        if s.get("status") == "WON":
+            group = _canonical_snipe_group(s.get("snipe_group"))
+            if group is not None:
+                won_groups.add(group)
+    targets = []
+    for s in snipes:
+        if s.get("status") == "WON":
+            continue
+        group = _canonical_snipe_group(s.get("snipe_group"))
+        if group is not None and group in won_groups:
+            targets.append(s)
+    return targets

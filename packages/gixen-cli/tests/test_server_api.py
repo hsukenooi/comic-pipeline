@@ -1148,7 +1148,8 @@ def test_vanished_null_end_still_on_gixen_not_touched(api, monkeypatch):
 
 def _seed_bid_row(item_id, *, status="PENDING", max_bid=25.0, snipe_group=0,
                   auction_end_at=None, gixen_vanished_at=None,
-                  winning_bid=None, resolved_at=None, added_at=None):
+                  winning_bid=None, resolved_at=None, added_at=None,
+                  group_changed_at=None):
     """Raw-insert a bids row so tests control every disambiguation input.
 
     added_at defaults to a week ago so seeded rows predate any group win the
@@ -1159,10 +1160,12 @@ def _seed_bid_row(item_id, *, status="PENDING", max_bid=25.0, snipe_group=0,
     conn = _dbconn()
     conn.execute(
         "INSERT INTO bids (item_id, max_bid, status, snipe_group, "
-        "auction_end_at, gixen_vanished_at, winning_bid, resolved_at, added_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "auction_end_at, gixen_vanished_at, winning_bid, resolved_at, added_at, "
+        "group_changed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (item_id, max_bid, status, snipe_group, auction_end_at,
-         gixen_vanished_at, winning_bid, resolved_at, added_at),
+         gixen_vanished_at, winning_bid, resolved_at, added_at,
+         group_changed_at),
     )
     conn.commit()
     conn.close()
@@ -1553,6 +1556,42 @@ def test_sync_unparseable_snipe_group_keeps_db_value(api):
     assert _read_col("381000002", "snipe_group") == 3
 
 
+def test_sync_parse_miss_snipe_group_preserves_membership(api):
+    """BUI-383: a client-side snipe_group parse miss now arrives as None
+    ('unknown') instead of the old '0' — the refresh must skip it so real
+    membership survives a transient scrape miss. Pre-fix, the miss arrived
+    as the perfectly-parseable '0' and durably CLEARED the group (N → 0),
+    weakening the BUI-371 group-cancel evidence."""
+    _seed_bid_row("383000001", snipe_group=3)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("383000001", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group=None),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("383000001", "snipe_group") == 3
+
+    # A genuine listed '0' is a positive un-group claim and IS mirrored.
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("383000001", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group="0"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("383000001", "snipe_group") == 0
+
+
+def test_web_added_bid_insert_survives_parse_miss_snipe_group(api):
+    """BUI-383 companion to the 'N/A' case: a brand-new web-added snipe whose
+    snipe_group arrives as None (a client parse miss) inserts as group 0 and
+    the refresh corrects it once the value parses."""
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("383000002", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group=None),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("383000002")["status"] == "PENDING"
+    assert _read_col("383000002", "snipe_group") == 0
+
+
 def test_group_evidence_survives_winner_purge_with_failed_sibling_removal(api):
     """The BUI-381 case-1 regression: a purge sweeps the WON winner to REMOVED
     while its sibling-removal leg fails (sibling stays live). The sibling must
@@ -1903,3 +1942,121 @@ def test_parse_time_to_end_normal_values():
     assert m._parse_time_to_end("1 d, 20 h, 59 m") == timedelta(
         days=1, hours=20, minutes=59)
     assert m._parse_time_to_end("45 s") == timedelta(seconds=45)
+
+
+# ---------------------------------------------------------------------------
+# BUI-384: late group join must not be backdated — _group_won_before bounds
+# evidence by max(added_at, group_changed_at), and every snipe_group write
+# path stamps group_changed_at on a real change
+# ---------------------------------------------------------------------------
+
+def test_late_group_join_via_sync_not_backdated(api):
+    """THE BUI-384 regression (false-REMOVED direction): a snipe added long
+    ago and joined to a group on Gixen's web UI only AFTER that group's win
+    (the join lands via the BUI-381 sync mirror) must NOT be classified
+    REMOVED off the pre-join win — the win predates its membership. It keeps
+    the WON-permissive ENDED so a genuine result can still be inferred."""
+    _seed_bid_row("384000001", status="WON", snipe_group=3,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    # Added a week ago (well before the win), but grouped only now: the DB
+    # row still carries group 0; the list mirrors the retroactive join.
+    _seed_bid_row("384000002", snipe_group=0, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("384000002", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="3"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("384000002")["status"] == "ENDED"   # not REMOVED
+    # The mirror stamped the membership start that protected it.
+    assert _read_col("384000002", "snipe_group") == 3
+    assert _read_col("384000002", "group_changed_at") is not None
+
+
+def test_late_group_join_via_edit_not_backdated(api):
+    """Same false-REMOVED shape through the edit path: PATCHing a snipe into
+    a group after that group's win stamps group_changed_at, so the pre-join
+    win is not cancel evidence at the row's own end."""
+    _seed_bid_row("384000003", status="WON", snipe_group=4,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("384000004", snipe_group=0, auction_end_at=_iso_ago(hours=1))
+    r = api.patch("/api/bids/384000004",
+                  json={"max_bid": 30.0, "snipe_group": 4})
+    assert r.status_code == 200
+    assert _read_col("384000004", "group_changed_at") is not None
+
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("384000004", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="4", max_bid="30.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("384000004")["status"] == "ENDED"  # not REMOVED
+
+
+def test_late_group_join_vanished_row_not_backdated(api):
+    """The vanished-ended resolver applies the same membership bound (its row
+    query must carry group_changed_at): a late-joined sibling that vanished
+    from Gixen's list (purged with the winner, say) still isn't classified
+    off the pre-join win."""
+    _seed_bid_row("384000005", status="WON", snipe_group=5,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    # Joined the group only 30 minutes ago (post-win), then ended; absent
+    # from the (non-empty) list with no pre-end vanish stamp.
+    _seed_bid_row("384000006", snipe_group=5, auction_end_at=_iso_ago(hours=1),
+                  group_changed_at=_iso_ago(minutes=30))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("384099999", status="SCHEDULED", time_to_end="3 h"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("384000006")["status"] == "ENDED"  # not REMOVED
+
+
+def test_group_change_before_win_still_classifies_removed(api):
+    """Guard against over-suppression: a membership change that PRECEDES the
+    win keeps the group-cancel classification — the win fell inside the
+    row's membership window."""
+    _seed_bid_row("384000007", status="WON", snipe_group=6,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("384000008", snipe_group=6, auction_end_at=_iso_ago(hours=1),
+                  group_changed_at=_iso_ago(days=2))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("384000008", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="6"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("384000008")["status"] == "REMOVED"
+
+
+def test_unparseable_group_changed_at_is_not_evidence(api):
+    """A present-but-unparseable membership stamp makes the membership start
+    unknowable — WON-permissive: classify nothing."""
+    _seed_bid_row("384000009", status="WON", snipe_group=7,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("384000010", snipe_group=7, auction_end_at=_iso_ago(hours=1),
+                  group_changed_at="not-a-timestamp")
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("384000010", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="7"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("384000010")["status"] == "ENDED"
+
+
+def test_null_group_changed_at_keeps_added_at_bound(api):
+    """Rows whose group never changed since insert (stamp NULL — every
+    pre-migration row) keep the original added_at bound: win inside the
+    lifetime → REMOVED, exactly the shipped BUI-371 behavior."""
+    _seed_bid_row("384000011", status="WON", snipe_group=8,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("384000012", snipe_group=8, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("384000012", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="8"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("384000012")["status"] == "REMOVED"

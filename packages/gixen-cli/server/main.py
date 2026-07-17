@@ -295,10 +295,9 @@ def _parse_snipe_group(value: str | int | None) -> int | None:
     is absent, blank, or unparseable (a scrape quirk like 'N/A'). Callers
     must treat None as 'unknown' — never coerce it to 0, because group 0 is
     a positive claim ('no group') that clears membership / suppresses
-    evidence. Caveat: the scraper itself encodes a regex miss as '0'
-    (gixen_client._parse_snipe_table), indistinguishable here from a genuine
-    no-group — always in the WON-permissive direction (evidence weakened,
-    never fabricated); fixing the encoding is a client-side follow-up."""
+    evidence. Since BUI-383 the scraper honors the same contract: a regex
+    miss arrives as None (unknown), so a listed '0' really is Gixen saying
+    'no group' — the refresh mirror below may trust it."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
@@ -320,11 +319,13 @@ def _vanished_while_live(vanished_at_iso: str | None, end_dt: datetime | None) -
 def _group_won_before(
     db: sqlite3.Connection, item_id: str, snipe_group: str | int | None,
     end_dt: datetime | None, added_at_iso: str | None,
+    group_changed_at_iso: str | None,
 ) -> bool:
     """True when another snipe in the same non-zero bid group WON an auction
-    that ended during this row's lifetime (at or after its added_at) and at
-    least _CANCEL_EVIDENCE_MARGIN before this row's end — Gixen had cancelled
-    this snipe by then, so no bid was ever placed on it.
+    that ended during this row's group membership (at or after
+    max(added_at, group_changed_at)) and at least _CANCEL_EVIDENCE_MARGIN
+    before this row's end — Gixen had cancelled this snipe by then, so no bid
+    was ever placed on it.
 
     The lifetime lower bound is what makes group-number reuse safe: Gixen
     groups are small integers (1-10) that get recycled across unrelated
@@ -333,6 +334,20 @@ def _group_won_before(
     for a brand-new unrelated snipe — worst case suppressing a real win the
     eBay fallback would otherwise recover. A win that predates this snipe's
     creation cannot have group-cancelled it.
+
+    group_changed_at tightens that bound to group MEMBERSHIP, not row
+    lifetime (BUI-384): a snipe joined to a group AFTER that group's win
+    (retroactive `gixen group N` on the web UI landing via the BUI-381 sync
+    mirror, or an edit) has an added_at that predates the win, so the
+    lifetime bound alone would falsely classify it REMOVED — the one residual
+    in the false-REMOVED direction. Gixen's own FAQ frames the group cancel
+    as an event at win time ("remaining bids canceled once an item in the
+    group is won"), applied to bids then in the group; it says nothing about
+    late joins, so per the BUI-371 policy the ambiguity resolves
+    WON-permissive: a pre-membership win is not cancel evidence. NULL
+    group_changed_at (group unchanged since insert) keeps the added_at
+    bound; a present-but-unparseable stamp means membership start is
+    unknowable → no evidence.
 
     DB-side sibling of gixen_client.find_sibling_cleanup_targets (which finds
     the same won-group siblings on the *live* Gixen list for purge): this one
@@ -357,6 +372,15 @@ def _group_won_before(
     added_dt = _parse_iso_utc(added_at_iso)
     if added_dt is None:
         return False  # can't scope to a lifetime → no evidence (WON-permissive)
+    member_since = added_dt
+    if group_changed_at_iso:
+        changed_dt = _parse_iso_utc(group_changed_at_iso)
+        if changed_dt is None:
+            # A stamp exists but can't be parsed: the membership start is
+            # unknowable, so any win might predate the join → no evidence
+            # (WON-permissive), matching the added_at-unparseable case.
+            return False
+        member_since = max(member_since, changed_dt)
     cutoff = end_dt - _CANCEL_EVIDENCE_MARGIN
     rows = db.execute(
         "SELECT COALESCE(auction_end_at, resolved_at) AS won_end_at FROM bids "
@@ -368,7 +392,7 @@ def _group_won_before(
     ).fetchall()
     for row in rows:
         won_end = _parse_iso_utc(row["won_end_at"])
-        if won_end is not None and added_dt <= won_end <= cutoff:
+        if won_end is not None and member_since <= won_end <= cutoff:
             return True
     return False
 
@@ -379,7 +403,7 @@ def _cancelled_before_end(
 ) -> bool:
     """Combined cancel-evidence test used by the vanished-ended resolver and
     the eBay fallback. `row` must carry gixen_vanished_at, snipe_group,
-    local_snipe_result, and added_at.
+    local_snipe_result, added_at, and group_changed_at.
 
     An 'OK:' local_snipe_result is first-party proof our local sniper fired a
     bid on this auction — whatever the vanish/group signals suggest, we DID
@@ -387,7 +411,8 @@ def _cancelled_before_end(
     if (row["local_snipe_result"] or "").startswith("OK:"):
         return False
     return _vanished_while_live(row["gixen_vanished_at"], end_dt) or _group_won_before(
-        db, item_id, row["snipe_group"], end_dt, row["added_at"]
+        db, item_id, row["snipe_group"], end_dt, row["added_at"],
+        row["group_changed_at"],
     )
 
 
@@ -690,9 +715,12 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
         # below, so a winner whose group was applied retroactively on Gixen's
         # web UI carries it by the time its WON is recorded as group evidence.
         # An unparseable value (None) is skipped — see _parse_snipe_group.
+        # A real change stamps group_changed_at=now (BUI-384), which bounds
+        # _group_won_before so this retroactive join can't be backdated to
+        # the row's added_at and swallow a pre-join win as cancel evidence.
         listed_group = _parse_snipe_group(snipe.get("snipe_group"))
         if listed_group is not None:
-            refresh_snipe_group(db, iid, listed_group)
+            refresh_snipe_group(db, iid, listed_group, changed_at=now)
 
         gixen_status = snipe.get("status", "")
         time_to_end = snipe.get("time_to_end", "")
@@ -762,7 +790,8 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
                 # this check with the true end time fetched from eBay.
                 end_dt = _parse_end_iso(db_row["auction_end_at"])
                 if end_dt is not None and _group_won_before(
-                    db, iid, snipe.get("snipe_group"), end_dt, db_row["added_at"]
+                    db, iid, snipe.get("snipe_group"), end_dt, db_row["added_at"],
+                    db_row["group_changed_at"],
                 ):
                     update_bid_status(
                         db, iid, "REMOVED", None, now, snipe.get("status_mirror"),
@@ -797,7 +826,7 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     vanished_ended = db.execute(
         """
         SELECT item_id, id, auction_end_at, gixen_vanished_at, snipe_group,
-               local_snipe_result, added_at FROM bids
+               local_snipe_result, added_at, group_changed_at FROM bids
         WHERE status = 'PENDING'
           AND auction_end_at IS NOT NULL
           AND auction_end_at <= ?
@@ -994,14 +1023,16 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
     return db.execute(
         f"""
         SELECT item_id, id, max_bid, local_snipe_result, auction_end_at,
-               gixen_vanished_at, snipe_group, added_at, 0 AS is_purged FROM bids
+               gixen_vanished_at, snipe_group, added_at, group_changed_at,
+               0 AS is_purged FROM bids
         WHERE status IN ('PENDING', 'ENDED')
           AND auction_end_at IS NOT NULL
           AND auction_end_at <= ?
           AND winning_bid IS NULL
         UNION ALL
         SELECT item_id, id, max_bid, local_snipe_result, auction_end_at,
-               gixen_vanished_at, snipe_group, added_at, 1 AS is_purged FROM bids
+               gixen_vanished_at, snipe_group, added_at, group_changed_at,
+               1 AS is_purged FROM bids
         WHERE status IN ({TOMBSTONE_STATUSES_SQL})
           AND winning_bid IS NULL
           AND notes IS NOT ?
@@ -1690,6 +1721,9 @@ async def api_get_all_bids():
             # BUI-382: same auditability rationale — exposes why a tombstoned
             # row stopped being re-fetched by the eBay fallback.
             "ebay_no_price_at": item.get("ebay_no_price_at"),
+            # BUI-384: same auditability rationale — the group-membership
+            # start that bounds _group_won_before's cancel evidence.
+            "group_changed_at": item.get("group_changed_at"),
         })
     return result
 

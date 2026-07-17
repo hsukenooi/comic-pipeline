@@ -50,7 +50,15 @@ def _make_snipe_row(item_id, dbidid, max_bid="10", title="Test Item",
                     current_bid="5.00 USD", status="SCHEDULED",
                     seller="testseller", time_to_end="1 h, 2 m, 3 s",
                     offset="6", group="0"):
-    """Build HTML for one snipe row in the desktop table."""
+    """Build HTML for one snipe row in the desktop table.
+
+    group=None omits the editsnipegroup hidden input entirely (a layout
+    drift / parse-miss shape, BUI-383)."""
+    group_input = (
+        f'<input name="editsnipegroup_{item_id}" type="hidden" '
+        f'id="editsnipegroup" value="{group}" size="14" />\n'
+        if group is not None else ''
+    )
     return (
         f'<tr class=d1>\n'
         f'<td rowspan="2"><input type="checkbox" name="dbidid_{dbidid}" value="{dbidid}" /></td>'
@@ -62,7 +70,7 @@ def _make_snipe_row(item_id, dbidid, max_bid="10", title="Test Item",
         f'<input name="edititemid_{item_id}" type="hidden" id="edititemid" value="{item_id}" size="14" />\n'
         f'<input name="editbidoffset_{item_id}" type="hidden" id="editbidoffset" value="{offset}" size="14" />\n'
         f'<input name="editbidoffsetmirror_{item_id}" type="hidden" id="editbidoffsetmirror" value="{offset}" size="14" />\n'
-        f'<input name="editsnipegroup_{item_id}" type="hidden" id="editsnipegroup" value="{group}" size="14" />\n'
+        f'{group_input}'
         f'<input name="editmaxbid_{item_id}" type="hidden" id="editmaxbid" value="{max_bid}" size="14" />\n'
         f'<input name="editcomment_{item_id}" type="hidden" id="editcomment" value="" size="128" />\n'
         f'<input name="username" type="hidden" id="username" value="testuser" size="14" />'
@@ -361,6 +369,42 @@ class TestListSnipes:
         assert snipes[0]["bid_offset"] == "6"
         assert snipes[0]["snipe_group"] == "0"
         assert snipes[0]["seller"] == "widgetseller"
+
+    def test_parse_snipe_group_miss_is_none_not_zero(self):
+        """BUI-383: a missing editsnipegroup input (layout drift) parses as
+        None ('unknown'), never '0' — '0' is a positive no-group claim that
+        the server's sync mirror would trust and use to durably CLEAR real
+        group membership (N → 0), weakening BUI-371 group-cancel evidence."""
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("111222333", "5001", group=None),
+        )
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        assert len(snipes) == 1
+        assert snipes[0]["snipe_group"] is None
+
+    def test_parse_snipe_group_real_values_pass_through(self):
+        """A matched value passes through verbatim: '0' (genuinely ungrouped),
+        a real group number, and an empty value attr (which the server
+        treats as unknown, same as None)."""
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("111", "5001", group="0"),
+            _make_snipe_row("222", "5002", group="3"),
+            _make_snipe_row("333", "5003", group=""),
+        )
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        assert [s["snipe_group"] for s in snipes] == ["0", "3", ""]
 
     def test_parse_multiple_snipes(self):
         client = _client()
@@ -1517,6 +1561,61 @@ class TestFindSiblingCleanupTargets:
         result = find_sibling_cleanup_targets(snipes)
         assert [s["item_id"] for s in result] == ["999", "555"]
 
+    def test_empty_string_group_is_not_a_won_group(self):
+        """BUI-383 audit: an empty-string group (an empty value attr in
+        Gixen's HTML) must not register as a won group — these targets get
+        REMOVED from Gixen, so two ''-group snipes are not siblings."""
+        snipes = [
+            _snipe("111", status="WON", group=""),
+            _snipe("222", status="SCHEDULED", group=""),
+        ]
+        assert find_sibling_cleanup_targets(snipes) == []
+
+    def test_none_group_is_not_a_won_group(self):
+        """BUI-383: a parse miss now arrives as None ('unknown') — never
+        treated as a group, in either the winner or the sibling position."""
+        snipes = [
+            _snipe("111", status="WON", group=None),
+            _snipe("222", status="SCHEDULED", group=None),
+            # And an unknown-group snipe is never matched into a REAL won group.
+            _snipe("333", status="WON", group="2"),
+            _snipe("444", status="SCHEDULED", group=None),
+        ]
+        assert find_sibling_cleanup_targets(snipes) == []
+
+    def test_unparseable_group_is_not_a_won_group(self):
+        """A scrape quirk like 'N/A' is not a group claim."""
+        snipes = [
+            _snipe("111", status="WON", group="N/A"),
+            _snipe("222", status="SCHEDULED", group="N/A"),
+        ]
+        assert find_sibling_cleanup_targets(snipes) == []
+
+    def test_group_numbers_are_normalized_for_matching(self):
+        """'01' and '1' are the same group number."""
+        snipes = [
+            _snipe("111", status="WON", group="01"),
+            _snipe("222", status="SCHEDULED", group="1"),
+        ]
+        result = find_sibling_cleanup_targets(snipes)
+        assert [s["item_id"] for s in result] == ["222"]
+
+
+class TestCanonicalSnipeGroup:
+    """BUI-383: the group-canonicalizer behind find_sibling_cleanup_targets."""
+
+    def test_none_blank_zero_and_nonnumeric_are_not_groups(self):
+        from gixen_client import _canonical_snipe_group
+        for v in (None, "", "   ", "0", "00", "N/A", "abc", "1.5", "-1"):
+            assert _canonical_snipe_group(v) is None, v
+
+    def test_positive_numbers_canonicalize(self):
+        from gixen_client import _canonical_snipe_group
+        assert _canonical_snipe_group("1") == "1"
+        assert _canonical_snipe_group("01") == "1"   # normalized
+        assert _canonical_snipe_group(" 3 ") == "3"  # stripped
+        assert _canonical_snipe_group(7) == "7"      # int input
+
 
 # ---------------------------------------------------------------------------
 # CLI: purge with sibling cleanup
@@ -1685,6 +1784,9 @@ class TestCliListShowsGroup:
         assert _format_group("") == ""
         assert _format_group("1") == "1"
         assert _format_group("10") == "10"
+        # BUI-383: a scrape miss now arrives as None (was "0"); the list
+        # display must render it blank, not crash.
+        assert _format_group(None) == ""
 
     def test_active_list_shows_group_column(self):
         from cli import cli

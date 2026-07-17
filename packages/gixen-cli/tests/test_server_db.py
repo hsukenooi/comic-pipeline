@@ -1439,3 +1439,121 @@ def test_refresh_snipe_group_spares_terminal_row_sharing_item_id(db):
     }
     assert rows[old_id] == 7   # terminal row untouched
     assert rows[new_id] == 4   # live row refreshed
+
+
+# ---------------------------------------------------------------------------
+# BUI-384: group_changed_at — stamp every snipe_group mutation so
+# _group_won_before can bound evidence by group MEMBERSHIP, not row lifetime
+# ---------------------------------------------------------------------------
+
+def test_group_changed_at_column_present_on_fresh_db(db):
+    cols = [r[1] for r in db.execute("PRAGMA table_info(bids)")]
+    assert "group_changed_at" in cols
+
+
+def test_bids_group_changed_at_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem_group_changed.db"
+    init_db(db_path).close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "group_changed_at" in cols
+    conn2.close()
+
+
+def test_group_changed_at_survives_table_rebuild(tmp_path):
+    """The rebuild shape (_BIDS_TABLE_SQL) carries the column: a legacy DB
+    whose CHECK still lacks REMOVED is rebuilt after the column migration
+    ran, and the copied rows keep their stamps."""
+    path = tmp_path / "rebuild.db"
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    # Minimal legacy shape: PURGED-only CHECK forces the BUI-49 rebuild.
+    conn.execute(
+        "CREATE TABLE bids ("
+        " id INTEGER PRIMARY KEY, item_id TEXT NOT NULL, max_bid REAL NOT NULL,"
+        " bid_offset INTEGER DEFAULT 6, snipe_group INTEGER DEFAULT 0,"
+        " status TEXT DEFAULT 'PENDING' CHECK(status IN "
+        " ('PENDING','WON','LOST','FAILED','ENDED','PURGED')),"
+        " winning_bid REAL, seller TEXT, comic_id INTEGER,"
+        " auction_end_at TEXT, local_snipe_at TEXT, local_snipe_result TEXT,"
+        " notes TEXT, added_at TEXT DEFAULT (datetime('now')), resolved_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, snipe_group) VALUES ('884000001', 10.0, 3)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(bids)")]
+        assert "group_changed_at" in cols
+        row = get_bid_by_item_id(conn, "884000001")
+        assert row["group_changed_at"] is None  # never changed → NULL
+    finally:
+        conn.close()
+
+
+def test_update_bid_stamps_group_changed_at_on_change(db):
+    insert_bid(db, "884000002", 50.0, 6, 0, "s")
+    assert get_bid_by_item_id(db, "884000002")["group_changed_at"] is None
+    update_bid(db, "884000002", 55.0, 6, 4)  # 0 → 4: a real group change
+    row = get_bid_by_item_id(db, "884000002")
+    assert row["snipe_group"] == 4
+    assert row["group_changed_at"] is not None
+
+
+def test_update_bid_does_not_stamp_when_group_unchanged(db):
+    """An edit that keeps the group (e.g. a max_bid bump) must not re-stamp —
+    that would narrow the evidence window and weaken legitimate group-cancel
+    evidence."""
+    insert_bid(db, "884000003", 50.0, 6, 4, "s")
+    update_bid(db, "884000003", 60.0, 6, 4)  # same group
+    row = get_bid_by_item_id(db, "884000003")
+    assert row["snipe_group"] == 4
+    assert row["group_changed_at"] is None
+
+    # And once stamped, an unchanged-group edit preserves the ORIGINAL stamp.
+    update_bid(db, "884000003", 60.0, 6, 7)
+    first_stamp = get_bid_by_item_id(db, "884000003")["group_changed_at"]
+    assert first_stamp is not None
+    update_bid(db, "884000003", 65.0, 6, 7)
+    assert get_bid_by_item_id(db, "884000003")["group_changed_at"] == first_stamp
+
+
+def test_update_bid_stamps_on_ungroup(db):
+    """Leaving a group (N → 0) is also a membership change and stamps."""
+    insert_bid(db, "884000004", 50.0, 6, 5, "s")
+    update_bid(db, "884000004", 50.0, 6, 0)
+    row = get_bid_by_item_id(db, "884000004")
+    assert row["snipe_group"] == 0
+    assert row["group_changed_at"] is not None
+
+
+def test_refresh_snipe_group_stamps_group_changed_at(db):
+    from server.db import refresh_snipe_group
+    insert_bid(db, "884000005", 50.0, 6, 0, "s")
+    refresh_snipe_group(db, "884000005", 4, changed_at="2026-07-01T00:00:00+00:00")
+    db.commit()
+    row = get_bid_by_item_id(db, "884000005")
+    assert row["snipe_group"] == 4
+    assert row["group_changed_at"] == "2026-07-01T00:00:00+00:00"
+
+
+def test_refresh_snipe_group_no_stamp_when_unchanged(db):
+    """Mirroring the same group every sync (the common case) must not
+    re-stamp — the WHERE's `snipe_group != ?` guards the write."""
+    from server.db import refresh_snipe_group
+    insert_bid(db, "884000006", 50.0, 6, 4, "s")
+    refresh_snipe_group(db, "884000006", 4, changed_at="2026-07-01T00:00:00+00:00")
+    db.commit()
+    assert get_bid_by_item_id(db, "884000006")["group_changed_at"] is None
+
+
+def test_refresh_snipe_group_defaults_changed_at_to_now(db):
+    from server.db import refresh_snipe_group
+    insert_bid(db, "884000007", 50.0, 6, 0, "s")
+    refresh_snipe_group(db, "884000007", 2)
+    db.commit()
+    stamp = get_bid_by_item_id(db, "884000007")["group_changed_at"]
+    assert stamp is not None
