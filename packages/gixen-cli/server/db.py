@@ -729,10 +729,10 @@ def update_bid(
 
 
 # Sanity allowance for record_group_win's future-end check. Mirrors
-# server.main._CANCEL_EVIDENCE_MARGIN (auction_end_at is estimated from
-# Gixen's minute-granular countdown, plus clock skew) — a WON whose stored
-# end is slightly in the future is normal estimation error, but one further
-# out than this is self-contradictory input.
+# server.fallback._CANCEL_EVIDENCE_MARGIN (moved from server.main in BUI-389;
+# auction_end_at is estimated from Gixen's minute-granular countdown, plus
+# clock skew) — a WON whose stored end is slightly in the future is normal
+# estimation error, but one further out than this is self-contradictory input.
 _WON_END_FUTURE_ALLOWANCE = timedelta(minutes=10)
 
 
