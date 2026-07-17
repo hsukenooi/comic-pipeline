@@ -84,6 +84,11 @@ A set of snipes Gixen treats as alternatives for the same want: when one member 
 
 A cancelled sibling that is never purged still reaches its auction's end and re-enters outcome classification, which is why cancelled-sibling handling is built into classification itself rather than depending on manual post-win cleanup.
 
+### Group-Win Evidence
+A durable, append-only record that a [[Bid Group]] member won, kept so a cancelled sibling can still be classified even after the winning snipe itself is swept to a [[Tombstone]]. Distinct from the live snipe records: purging the winner no longer destroys the proof that its siblings were cancelled, which is why post-win purge is now hygiene rather than a correctness requirement.
+
+Only genuine auction ends are recorded (never an observation-time approximation, which could falsely implicate a sibling added after the real win), and the record is consulted permissively — an ambiguous or missing entry weakens the evidence but never fabricates a cancel. *Known in code and tickets as:* the `group_wins` ledger.
+
 ### Tombstone
 The soft-delete status for a snipe removed from the working set — written when a live snipe is removed, when completed bids are swept, or when evidence shows the bid was cancelled before its auction ended (a group-cancelled sibling). It is **not** a terminal auction outcome and must be excluded from every results view and from outcome inference. *Known in code and tickets as:* `REMOVED` (formerly `PURGED`).
 
