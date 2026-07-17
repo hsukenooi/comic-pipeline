@@ -837,6 +837,72 @@ def test_sync_gixen_scheduled_stays_pending(api):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/sync structured error handling (BUI-386)
+# ---------------------------------------------------------------------------
+
+
+def test_api_sync_returns_503_on_gixen_connection_error(api):
+    """A Gixen-unreachable failure must surface as an honest 503 with a
+    structured detail, not a misleadingly-successful {"synced": 0} (the old
+    behavior, since _sync_gixen's default reraise=False swallowed the error
+    internally) and not a raw unhandled-exception 500."""
+    from gixen_client import GixenConnectionError
+
+    api.mock_gixen.list_snipes.side_effect = GixenConnectionError("no route to host")
+    r = api.post("/api/sync")
+    assert r.status_code == 503
+    assert "no route to host" in r.json()["detail"]
+
+
+def test_api_sync_returns_503_on_gixen_error(api):
+    """A generic GixenError (e.g. a login/parse failure) also surfaces as 503,
+    matching the convention every other Gixen-backed endpoint in this file
+    already uses (api_add_bid, api_edit_bid, api_remove_bid)."""
+    from gixen_client import GixenError
+
+    api.mock_gixen.list_snipes.side_effect = GixenError("session expired")
+    r = api.post("/api/sync")
+    assert r.status_code == 503
+    assert "session expired" in r.json()["detail"]
+
+
+def test_api_sync_returns_structured_500_on_unexpected_error(api, monkeypatch):
+    """A genuine server bug downstream of the Gixen call (not a GixenError)
+    must not propagate as a raw unhandled exception — it must be caught,
+    logged, and reported as a structured 500. Regression for BUI-386: before
+    the fix, this exception would escape api_sync entirely and hit FastAPI's
+    generic handler."""
+    import server.main as m
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m, "cache_gixen_data", _boom)
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "600000006",
+        "max_bid": "25.00 USD",
+        "current_bid": "5.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "2 d, 4 h",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+    }]
+    r = api.post("/api/sync")
+    assert r.status_code == 500
+    assert r.json()["detail"]  # structured payload, not an empty/raw body
+
+
+def test_api_sync_succeeds_when_gixen_healthy(api):
+    """Sanity check: the reraise=True + try/except wiring must not disturb
+    the ordinary success path."""
+    api.mock_gixen.list_snipes.return_value = []
+    r = api.post("/api/sync")
+    assert r.status_code == 200
+    assert r.json() == {"synced": 0}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/dashboard-tabs (PER-28)
 # ---------------------------------------------------------------------------
 
