@@ -188,8 +188,11 @@ the remaining snipes in that group are automatically cancelled.
   anyway but warn the user and let them pick one to snipe instead.
 - If the user wants multiple copies (genuinely distinct variants, or an
   intentional multi-buy), no group — omit the field.
-- After a group win, remind the user to run `gixen purge` promptly (see
-  snipe-add.md § Bid groups for why this matters for `/comic:collection-add`).
+- After a group win, remind the user that `gixen purge` cleans up the
+  group's cancelled sibling snipes on Gixen and in the DB — worth running for
+  a tidy list, but no longer a safety requirement: the server classifies an
+  unpurged sibling `REMOVED` on its own once its auction ends (BUI-371/
+  BUI-381 — see snipe-add.md § Bid groups for how).
 
 ---
 
@@ -346,7 +349,7 @@ When at least one row landed (`added`/`updated`), remind the user:
 > Run `/comic:collection-add` after auctions close to record wins. Check `locg collection status` for pending push count before uploading.
 
 If any rows shared a `group` (BUI-363), also remind the user:
-> After one copy in the group wins, run `gixen purge` promptly — it removes the group's cancelled sibling snipes from Gixen and tombstones them `REMOVED` in the DB. Left in place past their own auction end, siblings can be mislabeled as results (see snipe-add.md § Bid groups).
+> After one copy in the group wins, `gixen purge` will clean up the group's cancelled sibling snipes on Gixen and in the DB. Handy for a tidy list, but not required for correctness — the server now classifies an unpurged sibling `REMOVED` on its own once its auction ends (see snipe-add.md § Bid groups).
 
 ---
 

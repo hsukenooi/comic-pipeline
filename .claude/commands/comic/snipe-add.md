@@ -140,18 +140,27 @@ may differ by grade — a group is about the *comic*, not the price.
   near-simultaneous endings can win multiple copies. Warn the user and have
   them pick one copy in that case.
 - **Retroactive grouping:** `gixen group N <item_id>...` assigns existing
-  snipes to a group (0 = ungroup). Note it's direct-Gixen only (no server-mode
-  branch), so the DB's `snipe_group` catches up on the next sync.
-- **After a group win, purge promptly.** `gixen purge` detects "sibling snipes
-  from groups with a win" and removes them from Gixen, tombstoning them
-  `REMOVED` in the DB — that's the status `/comic:collection-add` and the
-  results views correctly ignore (removed ≠ lost). If a cancelled sibling is
-  instead left sitting until its own auction ends, the server can only record
-  it as ENDED/LOST — and the eBay price fallback can then infer a **phantom
-  WON** for it (the BUI-146 accepted-risk class: final price below your max on
-  an auction you never actually bid). A phantom WON would flow into
-  `/comic:collection-add` as a recordable win. Purging between the group win
-  and the siblings' auction ends closes that window.
+  snipes to a group (0 = ungroup). It's direct-Gixen only (no server-mode
+  branch) — but as of BUI-381, the sync (`refresh_snipe_group`) mirrors
+  Gixen's listed `snipe_group` back onto the DB's row on every sync, in both
+  directions (0→N and N→0), as long as the row is still `PENDING`. So the
+  DB's `snipe_group` genuinely does catch up on the next sync — no
+  server-mode add required.
+- **Purge is hygiene, not the safety net (BUI-371 / BUI-381).** `gixen purge`
+  detects "sibling snipes from groups with a win" and removes them from
+  Gixen, tombstoning them `REMOVED` in the DB — that's the status
+  `/comic:collection-add` and the results views correctly ignore (removed ≠
+  lost). Running it keeps the live Gixen list and dashboard tidy, but it's no
+  longer what prevents a **phantom WON** (the BUI-146 accepted-risk class:
+  final price below your max on an auction you never actually bid). The
+  server itself now classifies a group-cancelled sibling `REMOVED` from
+  vanish-time/group-win evidence before the eBay price fallback ever sees it
+  — structurally closing the window instead of depending on purge timing.
+  That evidence is durable, too: BUI-381's append-only `group_wins` ledger
+  records the group win at classification time and survives `mark_bids_purged`
+  destroying the winner's own row, and covers a winner first seen
+  already-terminal via the web-add path. Purge whenever it's convenient;
+  safety doesn't ride on when (or whether) you do.
 
 After `/comic:fmv` (or `/comic:buy`) has produced a row with `comic_id` and a numeric `grade`:
 
@@ -214,4 +223,4 @@ Useful when FMV analysis shows an existing bid is too low.
 | Max bid = FMV top | Use 80% × top — leaves margin for bidder competition |
 | Odd number bids ($137.43) | Round to clean numbers — doesn't materially change outcomes |
 | Sniping only the earliest-ending copy when 2+ listings of the same comic are approved | Add all copies with the same `--group N` — Gixen cancels the rest after one wins (BUI-363); skip grouping only when end times are within ~2 minutes |
-| Leaving a group's cancelled siblings on Gixen after a win | Run `gixen purge` promptly — unpurged siblings whose auctions later end can be mislabeled (worst case a BUI-146 phantom WON that leaks into `/comic:collection-add`) |
+| Leaving a group's cancelled siblings on Gixen after a win | No longer a safety risk (BUI-371/BUI-381 classify them `REMOVED` regardless of purge timing) — run `gixen purge` anyway to keep the live Gixen list and dashboard tidy |
