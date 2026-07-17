@@ -82,6 +82,8 @@ A listing and a snipe are not one-to-one: the same auction listing can accumulat
 ### Bid Group
 A set of snipes Gixen treats as alternatives for the same want: when one member wins, Gixen cancels the remaining siblings before their own auctions end. Group numbers come from a small fixed pool that Gixen recycles across campaigns, so a group number alone never identifies a campaign — any evidence keyed on a group must also be bounded by the individual snipe's own lifetime.
 
+That lifetime bound was itself refined to group *membership*: a snipe can join a group after another member already won it — a retroactive grouping applied on Gixen's web UI, or a plain edit — and the snipe's own lifetime alone would predate that win even though it was never a member of the group when the win happened. A win from before a snipe's membership began is not cancel evidence for it. *Known in code and tickets as:* the `group_changed_at` column, stamped whenever a snipe's group actually changes (BUI-384).
+
 A cancelled sibling that is never purged still reaches its auction's end and re-enters outcome classification, which is why cancelled-sibling handling is built into classification itself rather than depending on manual post-win cleanup.
 
 ### Group-Win Evidence
