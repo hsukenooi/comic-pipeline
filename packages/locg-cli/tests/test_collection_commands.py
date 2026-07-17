@@ -3162,6 +3162,119 @@ def test_wish_list_conflicts_genuine_conflict_alongside_printing_decoy(tmp_path,
 
 
 # ---------------------------------------------------------------------------
+# BUI-379: printing marker carried in the WISH NAME itself (reverse of BUI-372)
+# ---------------------------------------------------------------------------
+#
+# BUI-372 catches the case where the OWNED row's full_title carries the
+# printing marker. This is the reverse incident direction: the wish-list
+# entry's own stored NAME carries the marker (e.g. literally wish-listing
+# "Foo #1 2nd Printing"), and only the BASE printing is owned.
+# _split_wish_list_name drops everything after the issue token — including
+# that marker — before cmd_wish_list_conflicts ever sees it, so unless the
+# marker is re-detected from the raw name, this reads as a plain (removable)
+# conflict even though the wished 2nd printing genuinely isn't owned.
+
+def test_split_wish_list_name_drops_trailing_printing_marker():
+    """Documents the actual (unchanged) behavior _wish_list_name_printing_variant
+    exists to work around: the plain split silently loses a trailing printing
+    marker, same as it loses any other trailing variant text."""
+    from locg.commands import _split_wish_list_name
+
+    assert _split_wish_list_name("Absolute Martian Manhunter #1 2nd Printing") == (
+        "Absolute Martian Manhunter",
+        "1",
+    )
+
+
+def test_wish_list_name_printing_variant_detects_marker():
+    from locg.commands import _wish_list_name_printing_variant
+
+    assert _wish_list_name_printing_variant("Absolute Martian Manhunter #1 2nd Printing") == \
+        "2nd Printing"
+    assert _wish_list_name_printing_variant("Amazing Spider-Man #300") is None
+    assert _wish_list_name_printing_variant("Amazing Spider-Man #300 (Direct)") is None
+
+
+def _amm_reverse_rows() -> list[dict[str, Any]]:
+    """BUI-379 reproduction state: only the BASE printing is owned. The 2nd
+    printing exists only as a wish-list NAME, not as any cache row — the
+    reverse of `_amm_rows`' incident direction."""
+    owned_base = _agent_win_row(
+        publisher="DC Comics",
+        series="Absolute Martian Manhunter (2025)",
+        full_title="Absolute Martian Manhunter #1",
+        release_date="2025-03-19",
+        gixen_item_id="147000000003",
+    )
+    return [owned_base]
+
+
+def test_wish_list_conflicts_wish_name_printing_marker_not_plain_conflict(tmp_path, monkeypatch):
+    """BUI-379: a wish-list entry named "...2nd Printing" must not be treated
+    as a plain conflict just because the BASE printing is owned — it belongs
+    in printing_conflicts (held), never conflicts (removable)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_reverse_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1 2nd Printing", "id": 1}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert result["conflicts"] == []
+    assert len(result["printing_conflicts"]) == 1
+    decoy = result["printing_conflicts"][0]
+    assert decoy["name"] == "Absolute Martian Manhunter #1 2nd Printing"
+    assert decoy["full_title_matched"] == "Absolute Martian Manhunter #1"
+    assert decoy["printing_candidates"]
+
+
+def test_wish_list_remove_conflicts_never_removes_wish_name_printing_marker(tmp_path, monkeypatch):
+    """BUI-379: the unscoped sweep must never delete a wish whose own name
+    carries a printing marker just because the base is owned — this is the
+    data-loss direction the ticket exists to close."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_reverse_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1 2nd Printing", "id": 1}])
+
+    result = cmds.cmd_wish_list_remove_conflicts()
+
+    assert result["removed_count"] == 0
+    assert result["removed"] == []
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Absolute Martian Manhunter #1 2nd Printing"}
+    assert len(result["printing_conflicts"]) == 1
+
+
+def test_wish_list_remove_conflicts_scoped_rejects_wish_name_printing_marker(tmp_path, monkeypatch):
+    """BUI-379: explicitly naming the wish-name-marker decoy in a scoped
+    removal gets the same specific "printing conflict" error as the BUI-372
+    owned-side decoy, not a silent removal."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_reverse_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1 2nd Printing", "id": 1}])
+
+    result = cmds.cmd_wish_list_remove_conflicts(
+        names=["Absolute Martian Manhunter #1 2nd Printing"]
+    )
+
+    assert result["removed_count"] == 0
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["name"] == "Absolute Martian Manhunter #1 2nd Printing"
+    assert "printing" in error["error"].lower()
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Absolute Martian Manhunter #1 2nd Printing"}
+
+
+# ---------------------------------------------------------------------------
 # BUI-175: decimal / point-issue token regressions
 # ---------------------------------------------------------------------------
 

@@ -1090,12 +1090,50 @@ def _split_wish_list_name(name: str) -> Optional[tuple[str, str]]:
     name has no ``#`` token at all or no series text before it — those entries
     can't be ownership-checked and are reported as ``unparseable`` rather than
     silently dropped.
+
+    NOTE (BUI-379): everything AFTER the issue token — including a trailing
+    printing marker like "2nd Printing" — is dropped here, same as any other
+    trailing variant text (see the ``(Direct)`` case in this function's test).
+    That's fine for the plain series/issue split, but a CALLER doing a
+    printing-aware ownership comparison must not treat that silence as "no
+    marker" — see :func:`_wish_list_name_printing_variant`, which re-derives
+    the marker from the same raw ``name`` via the shared BUI-373 detector.
+    Kept as a 2-tuple deliberately (not widened here) so this split's only
+    two current call sites (:func:`_find_duplicate_wish_entry`'s dedup and
+    this docstring's own test) stay unchanged; BUI-387's planned per-issue-year
+    extension can widen this return independently without colliding with the
+    printing-marker fix.
     """
     series, issue = split_series_issue_for_ownership(name or "")
     series = series.strip()
     if not series or not issue:
         return None
     return series, issue
+
+
+def _wish_list_name_printing_variant(name: str) -> Optional[str]:
+    """Printing-marker substring (e.g. ``"2nd Printing"``) found anywhere in a
+    raw wish-list entry ``name``, or ``None`` when it carries none.
+
+    BUI-379: ``_split_wish_list_name`` throws away everything after the issue
+    token, so a wish literally named "Foo #1 2nd Printing" loses that marker
+    before :func:`cmd_wish_list_conflicts` ever sees it — the conflicts audit
+    would then match it against an owned BASE printing as a plain conflict,
+    and ``remove-conflicts`` could delete a wanted 2nd-printing wish because
+    only the base is owned. Re-detecting straight from the raw name (rather
+    than threading it through the split) uses the SAME shared detector
+    (:data:`_PRINTING_MARKER_RE`, BUI-373) so a spelling recognized anywhere
+    else in the package is recognized here too, without touching
+    ``_split_wish_list_name``'s return shape or its other call site.
+
+    The result is meant to be forwarded as :func:`cmd_collection_check`'s
+    ``variant`` argument — a SOFT preference (BUI-176), never a hard filter —
+    so it restores the marker to the printing-conflict probe's
+    ``printing_query_text`` without risking a false ``not_in_cache`` on the
+    owned-match itself.
+    """
+    m = _PRINTING_MARKER_RE.search(name or "")
+    return m.group(0) if m else None
 
 
 def _find_duplicate_wish_entry(title: str, items: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -1173,6 +1211,20 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
     from ``conflicts``, so a printing decoy can never be swept (unscoped or
     scoped) through this audit.
 
+    BUI-379: BUI-372's split only catches the case where the OWNED row's
+    ``full_title`` carries the printing marker. The reverse also happens: a
+    wish-list entry can itself be named with a marker (e.g. literally
+    "Foo #1 2nd Printing"), and :func:`_split_wish_list_name` silently drops
+    that marker before this loop ever sees it (it isn't part of ``series`` or
+    ``issue``). Left alone, an owned BASE printing would then satisfy the
+    query with matching (unmarked) ordinals, ``printing_conflict`` would read
+    False, and the wanted 2nd printing would land in the removable
+    ``conflicts`` list. :func:`_wish_list_name_printing_variant` re-derives
+    the marker from the raw ``name`` and forwards it as ``variant`` so the
+    printing-conflict probe inside :func:`cmd_collection_check` sees the
+    query's true (marked) ordinal and correctly routes this into
+    ``printing_conflicts`` instead.
+
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
     """
     items = cmd_wish_list_from_cache()
@@ -1188,7 +1240,8 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
             continue
         series, issue = parsed
         checked += 1
-        result = cmd_collection_check(series=series, issue=issue)
+        variant = _wish_list_name_printing_variant(name)
+        result = cmd_collection_check(series=series, issue=issue, variant=variant)
         # BUI-284: ambiguous_cross_volume counts as owned here — this audit is
         # always year-free (a wish name has no cover date), so an owned-under-
         # multiple-volumes book returns ambiguous, and missing it would let the
