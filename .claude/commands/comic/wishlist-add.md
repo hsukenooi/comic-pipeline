@@ -166,17 +166,33 @@ curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
 ```
 
 The response is `{"count": N, "results": [{series, issue, match_status,
-full_title_matched, cache_age_days}, ...]}` — one entry per input item, echoing
-its `series`/`issue` so you can correlate by key (don't rely on order). Per item:
+full_title_matched, cache_age_days, printing_conflict, printing_candidates},
+...]}` — one entry per input item, echoing its `series`/`issue` so you can
+correlate by key (don't rely on order). Per item:
 
-- `{"match_status": "in_collection"}` → **owned, skip it** (don't wish-list).
-- `{"match_status": "ambiguous_cross_volume"}` → **owned, skip it** (don't
-  wish-list) — same as `in_collection` (BUI-284: owned under >1 volume, no year
-  to disambiguate — still an ownership signal). This is backstopped by the
-  per-issue `POST /api/comics/wish-list` owned-guard, which also treats it as
-  owned and 409s (so a slip-through here isn't a data-loss risk, just a wasted
-  round-trip) — but skip it client-side anyway (BUI-302) so it never reaches
-  the to-add list in the first place.
+- `{"match_status": "in_collection", "printing_conflict": false}` → **owned,
+  skip it** (don't wish-list).
+- `{"match_status": "ambiguous_cross_volume", "printing_conflict": false}` →
+  **owned, skip it** (don't wish-list) — same as `in_collection` (BUI-284:
+  owned under >1 volume, no year to disambiguate — still an ownership
+  signal). This is backstopped by the per-issue `POST /api/comics/wish-list`
+  owned-guard, which also treats it as owned and 409s (so a slip-through here
+  isn't a data-loss risk, just a wasted round-trip) — but skip it client-side
+  anyway (BUI-302) so it never reaches the to-add list in the first place.
+- **`printing_conflict: true` (either match_status above) → do NOT auto-skip
+  (BUI-372, Pattern E from `/comic:collection-check` — BUI-364).** The match
+  was satisfied by a row whose `full_title` names a printing this query never
+  asked for ("2nd Printing", "Reprint", …). Printings are distinct
+  collectibles — owning the reprint is NOT owning the base printing (the
+  confirmed AMM #1 incident: *Absolute Martian Manhunter #1* read as owned off
+  an owned "2nd Printing" row while the base sat wish-listed; unpatched, Step 3
+  would have silently skipped wish-listing that explicitly wanted base
+  printing). Put this issue in a THIRD bucket — **printing-conflict (needs a
+  decision)** — instead of already-owned, carrying `full_title_matched` and
+  `printing_candidates` forward to Step 4. Do not decide for the user; the
+  candidates list (with each row's `printing_ordinal`/`in_collection`/
+  `in_wish_list`) is what lets them see whether *their* printing is
+  untracked/wishlisted before choosing.
 - `{"match_status": "not_in_cache"}` → not owned, keep it.
 
 The batch call's HTTP status is the whole-batch signal:
@@ -192,7 +208,10 @@ The batch call's HTTP status is the whole-batch signal:
 - **Any other non-200** (500, network error) → hard-fail; do not wish-list
   anything from a failed check (R11).
 
-Carry forward two lists: **to-add** (not owned) and **already-owned** (skipped).
+Carry forward three lists: **to-add** (not owned), **already-owned** (skipped,
+no printing conflict), and **printing-conflict** (BUI-372 — owned match, but
+under a different printing; needs the user's decision at Step 4, never
+auto-skipped and never auto-added).
 
 ## Step 3b: Skip issues already on the wish-list (single in-memory scan)
 
@@ -230,11 +249,34 @@ Proceed? (yes / no)
 Use the series name as the user typed it for the `#<N>` titles (the simplest,
 LOCG-searchable form). Mention that the Metron canonical name is
 `<series display name>` in case they prefer that. If **all** issues are already
-owned, say so and stop — nothing to add.
+owned (and none are printing-conflict), say so and stop — nothing to add.
+
+**Printing-conflict bucket (BUI-372).** Render these separately from both
+"already owned" and "will add" — they are neither, until the user decides:
+
+```
+Printing conflict — needs your decision (1):
+  #300 — matched "Amazing Spider-Man #300 2nd Printing" (a different printing
+    than this wish); per printing_candidates the base printing is untracked
+    (not owned, not wish-listed). Add the base printing anyway? (yes / no)
+```
+
+For each flagged issue, show `full_title_matched` and, from
+`printing_candidates`, the query's own printing's state (owned / wish-listed /
+untracked, via `printing_ordinal` — 1 is the base, 2+ a specific numbered
+reprint, `null` an unspecified bare "Reprint"/"Re-Print" row). Ask the user per issue
+(or as a reviewed batch) whether to add it. An issue the user confirms moves
+into the same add list Step 5 writes; one they decline moves to "already
+owned" for the report. Never auto-resolve this bucket either way — a false
+"add" risks a redundant wish-list entry the owned-guard would 409 anyway (safe
+direction), but a false "skip" reproduces the AMM #1 incident (a missed wish
+for a book actually wanted).
 
 ## Step 5: Add each issue
 
-On confirmation, add one issue per call (`curl -sf` so a non-200 fails loudly):
+On confirmation, add one issue per call (`curl -sf` so a non-200 fails loudly)
+— this includes both the original to-add list and any printing-conflict
+issues the user confirmed adding in Step 4:
 
 Include each issue's **cover year** (Step 2) in the body so the server-side
 owned-guard's masthead fallback (BUI-184) gets the same catch the Step 3 filter
@@ -260,6 +302,15 @@ Step 3's per-issue filter). With the per-issue `year` in the body it now also
 catches a masthead-stored owned book (BUI-184). If Step 3 was done correctly
 you'll never hit it; a 409 here means the book is owned — skip it. To wish-list
 an owned book on purpose (a different printing/variant), pass `"force": true`.
+
+**Printing-conflict adds need `force=true` (BUI-372).** Any issue you're
+posting because the user confirmed a Step 4 printing-conflict decision WILL
+409 again here without `force: true` — the owned-guard re-runs the exact same
+check and matches the exact same reprint row. The 409's `detail` now carries
+`printing_conflict`/`printing_candidates` alongside the message (additive
+JSON fields, BUI-372) precisely so you can tell "this 409 is the printing
+decoy Step 4 already resolved — retry with force=true" apart from a genuine
+duplicate you should actually skip.
 
 ## Step 6: Report
 
@@ -387,4 +438,6 @@ is treated as final, same as the numeric-range path.
 | Wish-listing issues you already own | Collection-check each issue first (Step 3) and skip owned ones — wishing an owned book is what deleted collection rows in BUI-122 |
 | Passing `year` (Metron's `year_began`) to `collection/check` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`, not a series disambiguator. Forwarding a series start-year filters out every owned mid-run issue and returns a false `not_in_cache`, so an owned book gets wish-listed (BUI-129/BUI-131). Check by series + issue only |
 | Enumerating a creator's run from memory — even for a plain question, not just a wish-list add | Memory silently drops DISCONTINUOUS stints (JR JR's 1993 Uncanny X-Men return; BUI-340's Erik Larsen Spider-Man #19–43 vs. actual #18–23). Just answering a question → `locg creator-run --creator … --series-id …` (read-only, BUI-340). Actually adding to the wish-list → `locg wish-list add --creator … --series-id …` (BUI-134) |
+| Treating a `printing_conflict: true` match as owned and auto-skipping it | Step 3/Step 4 (BUI-372) — the match is a different printing, not the queried one; move it to the printing-conflict bucket and let the user decide, don't fold it into "already owned" |
+| Retrying a Step 4-confirmed printing-conflict add without `force: true` | It will 409 again for the same reason Step 3 flagged it (BUI-372) — the owned-guard matches the same reprint row; pass `force: true` on that specific POST |
 | Conflating same-name creators | "John Romita Jr." vs "John Romita" (Sr.) are distinct Metron ids; the resolver pins the id. Always pass the exact Metron creator name |

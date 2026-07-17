@@ -3059,6 +3059,109 @@ def test_wish_list_remove_conflicts_surfaces_owner_and_spares_collection(tmp_pat
 
 
 # ---------------------------------------------------------------------------
+# BUI-372: printing-conflict exclusion from the conflicts audit
+# ---------------------------------------------------------------------------
+#
+# Reuses the AMM #1 incident fixture (_amm_rows, defined below in the BUI-364
+# printing-marker-conflict section): an owned "2nd Printing" row and a
+# wishlisted base row for the same series+issue. A wish-list entry for the
+# BASE title ("Absolute Martian Manhunter #1") must not be treated as a
+# removable conflict — the owned row is a DIFFERENT printing, so the wished
+# base genuinely isn't owned yet.
+
+def test_wish_list_conflicts_excludes_printing_conflict_decoy(tmp_path, monkeypatch):
+    """BUI-372: an owned reprint matching a wishlisted BASE printing is not a
+    genuine conflict — it goes into printing_conflicts, not conflicts, so
+    remove-conflicts can never sweep it (the BUI-249/BUI-259 incident class
+    through a new door)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1", "id": 1}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert result["conflicts"] == []
+    assert len(result["printing_conflicts"]) == 1
+    decoy = result["printing_conflicts"][0]
+    assert decoy["name"] == "Absolute Martian Manhunter #1"
+    assert decoy["full_title_matched"] == "Absolute Martian Manhunter #1 2nd Printing"
+    assert decoy["printing_candidates"]
+
+
+def test_wish_list_remove_conflicts_unscoped_never_removes_printing_decoy(tmp_path, monkeypatch):
+    """BUI-372: the unscoped sweep (names=None) takes every entry in
+    `conflicts` — since the printing decoy was never added there, it survives
+    an unscoped remove-conflicts call untouched."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1", "id": 1}])
+
+    result = cmds.cmd_wish_list_remove_conflicts()
+
+    assert result["removed_count"] == 0
+    assert result["removed"] == []
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Absolute Martian Manhunter #1"}
+    assert len(result["printing_conflicts"]) == 1
+
+
+def test_wish_list_remove_conflicts_scoped_rejects_printing_decoy_name(tmp_path, monkeypatch):
+    """BUI-372: explicitly naming a printing-conflict decoy in a scoped
+    removal gets a SPECIFIC error (distinct printing, not a genuine
+    duplicate) rather than either silently removing it or the generic
+    "not a conflict at all" message."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows())
+    _seed_wish_list([{"name": "Absolute Martian Manhunter #1", "id": 1}])
+
+    result = cmds.cmd_wish_list_remove_conflicts(names=["Absolute Martian Manhunter #1"])
+
+    assert result["removed_count"] == 0
+    assert len(result["errors"]) == 1
+    error = result["errors"][0]
+    assert error["name"] == "Absolute Martian Manhunter #1"
+    assert "printing" in error["error"].lower()
+    assert "genuine duplicate" in error["error"].lower()
+    # Nothing mutated.
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Absolute Martian Manhunter #1"}
+
+
+def test_wish_list_conflicts_genuine_conflict_alongside_printing_decoy(tmp_path, monkeypatch):
+    """BUI-372: a genuine conflict (no printing marker involved) and a
+    printing-conflict decoy can coexist in one audit — only the genuine one
+    lands in `conflicts` and is removable; the decoy never is."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, _amm_rows() + [_agent_win_row(full_title="Amazing Spider-Man #300")])
+    _seed_wish_list([
+        {"name": "Absolute Martian Manhunter #1", "id": 1},  # printing decoy
+        {"name": "Amazing Spider-Man #300", "id": 2},         # genuine conflict
+    ])
+
+    audit = cmds.cmd_wish_list_conflicts()
+    assert [c["name"] for c in audit["conflicts"]] == ["Amazing Spider-Man #300"]
+    assert [c["name"] for c in audit["printing_conflicts"]] == ["Absolute Martian Manhunter #1"]
+
+    result = cmds.cmd_wish_list_remove_conflicts()
+    assert result["removed_count"] == 1
+    assert [r["name"] for r in result["removed"]] == ["Amazing Spider-Man #300"]
+    remaining_names = {it["name"] for it in cmds.cmd_wish_list_from_cache()}
+    assert remaining_names == {"Absolute Martian Manhunter #1"}
+
+
+# ---------------------------------------------------------------------------
 # BUI-175: decimal / point-issue token regressions
 # ---------------------------------------------------------------------------
 
@@ -3910,3 +4013,346 @@ def test_check_ambiguous_cross_volume_carries_printing_field(tmp_path, monkeypat
     result = cmds.cmd_collection_check(series="Fantastic Four", issue="18")
     assert result["match_status"] == "ambiguous_cross_volume"
     assert result["printing_conflict"] is False
+
+
+# ---------------------------------------------------------------------------
+# BUI-373: unified printing-marker detector (extended spellings + drift guard)
+# ---------------------------------------------------------------------------
+
+_PRINTING_MARKER_SPELLINGS = [
+    ("2nd Printing", 2),
+    ("2nd Print", 2),
+    ("2nd Ptg", 2),
+    ("2nd Ptgs", 2),
+    ("Second Printing", 2),
+    ("Second Print", 2),
+    ("3rd Printing", 3),
+    ("Third Printing", 3),
+    ("3rd Ptg", 3),
+    ("4th Printing", 4),
+    ("Fourth Printing", 4),
+]
+
+
+@pytest.mark.parametrize("text,expected_ordinal", _PRINTING_MARKER_SPELLINGS)
+def test_printing_ordinal_spelling_coverage(text, expected_ordinal):
+    """BUI-373: every spelling the ticket calls out ("Ptg", digit AND word
+    ordinals) is recognized by the shared detector, with the correct
+    ordinal — not just recognized as *a* marker, but as the RIGHT one."""
+    from locg.commands import _printing_ordinal
+
+    assert _printing_ordinal(f"Amazing Spider-Man #300 {text}") == expected_ordinal
+
+
+def test_printing_ordinal_bare_reprint_is_unspecified_not_base():
+    """BUI-373: a bare "Reprint"/"Reprints" (no ordinal) reads as SOME later
+    printing, not the base (1) — this is the previously-unrecognized spelling
+    that used to silently produce no printing_conflict flag."""
+    from locg.commands import _printing_ordinal, _UNSPECIFIED_REPRINT_ORDINAL
+
+    assert _printing_ordinal("Amazing Spider-Man #300 Reprint") == _UNSPECIFIED_REPRINT_ORDINAL
+    assert _printing_ordinal("Amazing Spider-Man #300 Reprints") == _UNSPECIFIED_REPRINT_ORDINAL
+    assert _UNSPECIFIED_REPRINT_ORDINAL != 1
+
+
+@pytest.mark.parametrize("text", [
+    "Amazing Spider-Man #300 Reprint",
+    "Amazing Spider-Man #300 Reprints",
+    "Amazing Spider-Man #300 Re-Print",
+    "Amazing Spider-Man #300 Re Print",
+    "Amazing Spider-Man #300 RE-PRINT",
+    "Amazing Spider-Man #300 re print",
+])
+def test_printing_ordinal_bare_reprint_spelling_variants(text):
+    """BUI-373 review (adversarial pass): "Reprint" is commonly spelled with a
+    hyphen or space ("Re-Print"/"Re Print") in real eBay/LOCG titles — all
+    variants must resolve to the same unspecified-reprint sentinel, not
+    silently read as the base (ordinal 1)."""
+    from locg.commands import _printing_ordinal, _UNSPECIFIED_REPRINT_ORDINAL
+
+    assert _printing_ordinal(text) == _UNSPECIFIED_REPRINT_ORDINAL
+
+
+@pytest.mark.parametrize("text,expected_ordinal", [
+    ("1st Reprint", 2),
+    ("First Reprint", 2),
+    ("2nd Reprint", 3),
+    ("Second Reprint", 3),
+    ("3rd Reprint", 4),
+])
+def test_printing_ordinal_reprint_with_ordinal_offsets_by_one(text, expected_ordinal):
+    """BUI-373 review (adversarial pass): "Nth Reprint" names the Nth print run
+    AFTER the original — "1st Reprint" is the SECOND print run overall
+    (equivalent to "2nd Printing"), not the first. Without this +1 offset,
+    "1st Reprint"/"First Reprint" would compute to ordinal 1 and be silently
+    indistinguishable from an unmarked base query or an explicit "1st
+    Printing" row — reproducing the exact collision this detector exists to
+    prevent, for one specific spelling."""
+    from locg.commands import _printing_ordinal
+
+    assert _printing_ordinal(f"Amazing Spider-Man #300 {text}") == expected_ordinal
+
+
+@pytest.mark.parametrize("text", [
+    "Amazing Spider-Man #300",
+    "Amazing Spider-Man #300 1st Printing",
+    "Amazing Spider-Man #300 Art Print Variant",
+    "Amazing Spider-Man #300 Printing Error Variant",
+    "Blueprint Comics #1",
+    "Fine Print Publishing #1",
+    "Amazing Spider-Man #300 Newsstand Edition",
+    "Pre-Print Ashcan #1",
+    "More Prints Available #1",
+])
+def test_printing_ordinal_false_positive_guard(text):
+    """BUI-373: bare "print"/"printing" with no ordinal, and words that merely
+    CONTAIN "print" ("Blueprint", "Art Print", "Printing Error"), must NOT read
+    as a printing marker — the danger direction the ticket calls out (a false
+    marker on a genuinely-owned base could suppress a legitimate conflict
+    verdict). An explicit "1st Printing" is the base printing (ordinal 1).
+    "Pre-Print"/"More Prints" (adversarial pass) must not falsely trigger the
+    hyphen/space-tolerant bare-"Reprint" spelling either — "re" only counts as
+    the reprint prefix when it starts its own word (a \\b boundary), not when
+    it's the tail of "Pre" or the head of "prints" inside "More Prints"."""
+    from locg.commands import _printing_ordinal
+
+    assert _printing_ordinal(text) == 1
+
+
+def test_printing_marker_suffix_canonicalizes_explicit_ordinals():
+    """BUI-373: the record-win full_title builder's consumer of the shared
+    detector produces the canonical "<N>th Printing" suffix for any recognized
+    EXPLICIT-ordinal spelling — including ones VARIANT_SUFFIX_MAP never had a
+    key for ("2nd Ptg", "Third Printing")."""
+    from locg.commands import _printing_marker_suffix
+
+    assert _printing_marker_suffix("2nd ptg") == "2nd Printing"
+    assert _printing_marker_suffix("2nd Printing") == "2nd Printing"
+    assert _printing_marker_suffix("third printing") == "3rd Printing"
+    assert _printing_marker_suffix("Fourth Ptg") == "4th Printing"
+
+
+def test_printing_marker_suffix_canonicalizes_reprint_with_ordinal():
+    """BUI-373 review: "1st Reprint"/"2nd Reprint" carry an EXPLICIT ordinal
+    (just spelled with "Reprint" instead of "Printing"), so — unlike a bare
+    "Reprint" — the full_title builder DOES canonicalize them, using the
+    +1-adjusted ordinal ("1st Reprint" = the second print run = "2nd
+    Printing")."""
+    from locg.commands import _printing_marker_suffix
+
+    assert _printing_marker_suffix("1st reprint") == "2nd Printing"
+    assert _printing_marker_suffix("second reprint") == "3rd Printing"
+
+
+@pytest.mark.parametrize("n,expected", [
+    (1, "1st"), (2, "2nd"), (3, "3rd"), (4, "4th"),
+    (10, "10th"), (11, "11th"), (12, "12th"), (13, "13th"),
+    (20, "20th"), (21, "21st"), (22, "22nd"), (23, "23rd"), (24, "24th"),
+    (100, "100th"), (101, "101st"), (111, "111th"), (113, "113th"),
+])
+def test_ordinal_suffix_boundary_cases(n, expected):
+    """Coverage gap flagged independently by 3 reviewers (correctness,
+    maintainability, testing): the 11th-13th vs 21st-23rd English ordinal
+    exception was only exercised for n in {2, 3, 4} before this test."""
+    from locg.commands import _ordinal_suffix
+
+    assert _ordinal_suffix(n) == expected
+
+
+def test_printing_conflict_candidates_translate_sentinel_to_null(tmp_path, monkeypatch):
+    """BUI-373 review (maintainability): _UNSPECIFIED_REPRINT_ORDINAL (-1) is
+    an internal sentinel — it must never leak into the public
+    printing_candidates JSON as a raw -1 (undocumented, could be misread as a
+    real negative ordinal). A same-era bare-"Reprint" candidate reports
+    printing_ordinal: null instead."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    owned_reprint = _agent_win_row(
+        series="Absolute Martian Manhunter (2025)",
+        full_title="Absolute Martian Manhunter #1 Reprint",
+        release_date="2025-06-18",
+    )
+    wished_base = _agent_win_row(
+        series="Absolute Martian Manhunter (2025)",
+        full_title="Absolute Martian Manhunter #1",
+        release_date="2025-03-19",
+    )
+    wished_base["in_collection"] = 0
+    wished_base["in_wish_list"] = 1
+    _seed_cache(cache, [owned_reprint, wished_base])
+
+    result = cmds.cmd_collection_check(series="Absolute Martian Manhunter", issue="1")
+    assert result["printing_conflict"] is True
+    by_title = {c["full_title"]: c for c in result["printing_candidates"]}
+    assert by_title["Absolute Martian Manhunter #1 Reprint"]["printing_ordinal"] is None
+    assert by_title["Absolute Martian Manhunter #1"]["printing_ordinal"] == 1
+
+
+def test_printing_marker_suffix_declines_ambiguous_bare_reprint():
+    """BUI-373: a bare "Reprint" has no explicit ordinal, so the full_title
+    builder deliberately does NOT guess one — writing a specific printing
+    number into a LOCG-facing title on a guess risks minting a title that
+    mismatches the real catalog row. Falls through to the existing
+    manual-variant path instead (same as an unrecognized cover variant)."""
+    from locg.commands import _printing_marker_suffix
+
+    assert _printing_marker_suffix("reprint") is None
+    assert _printing_marker_suffix("Reprints") is None
+    assert _printing_marker_suffix("newsstand") is None  # not a printing marker at all
+
+
+def test_variant_suffix_map_no_longer_encodes_printing_markers():
+    """BUI-373 drift guard: VARIANT_SUFFIX_MAP used to carry its OWN printing
+    keys ("2nd print"/"second print"/"2nd printing") — a second, independent,
+    less-complete detector. They must never come back; printing recognition
+    lives ONLY in _printing_ordinal/_PRINTING_MARKER_RE. Guards against a
+    future edit silently reintroducing the drift this ticket fixes."""
+    from locg.commands import VARIANT_SUFFIX_MAP
+
+    printing_keys = {"2nd print", "second print", "2nd printing", "2nd ptg", "reprint"}
+    assert not (set(VARIANT_SUFFIX_MAP.keys()) & printing_keys)
+    # Every remaining key is a genuinely non-printing edition suffix.
+    assert set(VARIANT_SUFFIX_MAP.keys()) == {
+        "newsstand", "newsstand edition", "direct", "direct edition",
+        "facsimile", "facsimile edition",
+    }
+
+
+@pytest.mark.parametrize("text,_expected", _PRINTING_MARKER_SPELLINGS)
+def test_printing_marker_detection_agrees_across_call_sites(text, _expected):
+    """BUI-373 drift guard: the two real call sites — the record-win dedup
+    guard (_dedup_variant_compatible) and the full_title suffix builder
+    (_printing_marker_suffix) — must agree that each spelling in the coverage
+    corpus is a printing marker distinct from the base. If a future change
+    forked either one back onto its own lexicon, one of these would silently
+    stop agreeing with the other (and with the collection-check
+    printing_conflict probe, which shares the same _printing_ordinal call)."""
+    from locg.commands import _dedup_variant_compatible, _printing_marker_suffix
+
+    # Dedup guard: this spelling must NOT be treated as compatible with an
+    # unmarked (base) owned row — they are distinct printings.
+    assert _dedup_variant_compatible(text.lower(), None) is False
+    # full_title builder: every spelling here carries an EXPLICIT ordinal, so
+    # it must canonicalize to a suffix rather than falling through unresolved.
+    assert _printing_marker_suffix(text) is not None
+
+
+def test_dedup_variant_compatible_cross_ordinal_mismatch():
+    """BUI-373 review (testing gap): two DIFFERENT specifically-numbered
+    printings must not be treated as dedup-compatible with each other either
+    — not just each against the base. "2nd Printing" vs "3rd Printing"."""
+    from locg.commands import _dedup_variant_compatible
+
+    assert _dedup_variant_compatible("2nd printing", "3rd printing") is False
+    assert _dedup_variant_compatible("2nd printing", "2nd printing") is True
+
+
+# ---------------------------------------------------------------------------
+# BUI-373: record-win integration — full_title suffix + dedup, extended spellings
+# ---------------------------------------------------------------------------
+
+def test_record_win_2nd_ptg_suffix(tmp_path):
+    """BUI-373: the "Ptg" abbreviation, previously unrecognized by
+    VARIANT_SUFFIX_MAP, now canonicalizes the same way "newsstand" does."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_hit("Amazing Spider-Man (1963 - 1998)")
+    result = cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man", issue="300", variant_text="2nd ptg")],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    assert result["manual_variant_count"] == 0
+    row = cache.load()["comics"][-1]
+    assert row["full_title"].endswith("2nd Printing")
+    assert row["needs_manual_variant"] is False
+
+
+def test_record_win_dedup_2nd_ptg_matches_owned_2nd_printing(tmp_path):
+    """BUI-373: a "2nd Ptg" win IS deduped against an owned "2nd Printing" row
+    of the same issue — same printing, different spelling, recognized as the
+    same ordinal by the shared detector."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 2nd Printing",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985, variant_text="2nd ptg")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    assert result["rows_written"] == 0
+
+
+def test_record_win_dedup_base_not_conflated_with_owned_2nd_ptg_reprint(tmp_path):
+    """BUI-373 (the bug this ticket fixes): a base-edition win must not be
+    deduped against an owned "2nd Ptg" row — the exact BUI-267 Newsstand bug
+    pattern, but for a printing spelling VARIANT_SUFFIX_MAP never recognized.
+    Before this fix, both sides read as an unrecognized/unknown suffix and the
+    dedup guard permissively (and wrongly) skipped recording the base win."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 2nd Ptg",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
+def test_record_win_dedup_bare_reprint_matches_bare_reprint(tmp_path):
+    """BUI-373: two independently-unspecified "Reprint" labels (no ordinal on
+    either side) ARE treated as the same printing — the safe reading of two
+    identically-ambiguous labels."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 Reprint",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985, variant_text="reprint")],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    assert result["rows_written"] == 0
+
+
+def test_record_win_dedup_base_not_conflated_with_owned_bare_reprint(tmp_path):
+    """BUI-373 review (testing/correctness gap): the bare-"Reprint" sibling of
+    test_record_win_dedup_base_not_conflated_with_owned_2nd_ptg_reprint — a
+    base-edition win must not dedup against an owned bare "Reprint" row
+    either. Confirms the asymmetric direction (unspecified reprint vs base)
+    stays safe end-to-end through record-win, not just at the
+    _dedup_variant_compatible unit level."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 Reprint",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1

@@ -362,7 +362,9 @@ Martian Manhunter #1* first print read as owned off the owned "2nd Printing"
 row while the base printing sat wish-listed; the orchestrator skipped an
 explicitly wanted $30 book). No re-query is needed — the response's
 `printing_candidates` list shows every same-era printing of the issue with its
-owned/wish state and a `printing_ordinal` (1 = base printing; match it against
+owned/wish state and a `printing_ordinal` (1 = base printing, 2+ = a
+specifically-numbered reprint, `null` = a same-era row labeled with a bare
+"Reprint"/"Re-Print" and no explicit number — BUI-373; match it against
 the listing's printing instead of re-parsing `full_title`). Render the
 conflict in the Notes column:
 > ⚠️ printing conflict — matched "{full_title_matched}", a different printing than the listing; the listing's printing is {wishlisted / not owned / untracked} per printing_candidates; confirm before skipping

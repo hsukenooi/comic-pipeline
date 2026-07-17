@@ -52,6 +52,9 @@ The ownership-matcher state where a queried issue number is owned under more tha
 ### Cover Year
 The publication year printed on an issue's cover, used as the **per-issue** key the matcher's year gate compares against a stored release date (within a small tolerance for cover-vs-onsale skew). Distinct from a series' **start year** (`year_began`): feeding a series start year into the per-issue gate is the wrong-year error that hides owned books, whereas the correct per-issue Cover Year disambiguates volumes without that risk.
 
+### Printing
+A specific press run of an issue — the base (first) printing, or a numbered reprint ("2nd Printing", "3rd Printing", a bare "Reprint", …). **Printings are distinct collectibles, not variants of one book**: owning a reprint is not owning the base printing, and vice versa (confirmed incident, BUI-364 — an owned "2nd Printing" of *Absolute Martian Manhunter #1* satisfied a check for the base printing, hiding the fact that the base was explicitly wish-listed and still unowned). The ownership matcher's series+issue core deliberately ignores everything after the issue token, so it can conflate printings unless a caller reads the mechanical `printing_conflict` flag (plus the `printing_candidates` list, each carrying a `printing_ordinal`) that every collection-check verdict, the `POST /api/comics/wish-list` 409, and the wish-list conflicts audit all carry (BUI-364/BUI-372/BUI-373) — advisory only (R11): the flag qualifies a verdict, it never flips one, and the conflicts audit keeps a printing-conflict match out of its removable set entirely rather than risk it being swept as a genuine duplicate.
+
 ## Sync Processes
 
 ### Record-Win

@@ -1210,20 +1210,28 @@ async def api_wish_list_conflicts():
     the dry-run preview; ``POST .../remove-conflicts`` performs the removal.
 
     Returns ``{total, checked, unparseable, conflicts:[{name, series, issue,
-    id, full_title_matched, series_name, release_date}]}``. ``series_name``/
-    ``release_date`` (BUI-266) are the matched owned row's BUI-249 provenance
-    — this audit is year/variant-blind by necessity (a wish-list name carries
-    no per-issue year), so review these before scoping a
-    ``POST .../remove-conflicts`` call to catch a decoy cross-era/cross-edition
-    match. 409 when the store was never imported (R11); an absent wish-list
-    yields an empty (zero-conflict) result.
+    id, full_title_matched, series_name, release_date}], printing_conflicts:[
+    {..., printing_candidates}]}``. ``series_name``/``release_date`` (BUI-266)
+    are the matched owned row's BUI-249 provenance — this audit is
+    year/variant-blind by necessity (a wish-list name carries no per-issue
+    year), so review these before scoping a ``POST .../remove-conflicts`` call
+    to catch a decoy cross-era/cross-edition match.
+
+    BUI-372: ``printing_conflicts`` holds matches where the owned row is a
+    DIFFERENT printing than the wished title (printings are distinct
+    collectibles) — NOT genuine conflicts, so they're never in ``conflicts``
+    and ``POST .../remove-conflicts`` can never remove one, scoped or
+    unscoped.
+
+    409 when the store was never imported (R11); an absent wish-list yields an
+    empty (zero-conflict) result.
     """
     _ensure_collection_store()
     _require_imported_collection()
     try:
         return cmd_wish_list_conflicts()
     except FileNotFoundError:
-        return {"total": 0, "checked": 0, "unparseable": [], "conflicts": []}
+        return {"total": 0, "checked": 0, "unparseable": [], "conflicts": [], "printing_conflicts": []}
 
 
 @router.post("/api/comics/wish-list/remove-conflicts")
@@ -1257,11 +1265,17 @@ async def api_wish_list_remove_conflicts(payload: dict = Body(default={})):
       the audit and explicitly wants everything cleared.
 
     Returns ``{removed, removed_count, errors, remaining, checked,
-    unparseable, scoped}`` (mutating calls) or the audit shape plus
-    ``dry_run: true`` (preview). Same 409 never-imported guard as the audit
-    (R11). Each removed entry carries ``matched_series_name`` /
+    unparseable, scoped, printing_conflicts}`` (mutating calls) or the audit
+    shape plus ``dry_run: true`` (preview). Same 409 never-imported guard as
+    the audit (R11). Each removed entry carries ``matched_series_name`` /
     ``matched_release_date`` — the BUI-249 provenance of the owned row it was
     matched against.
+
+    BUI-372: ``printing_conflicts`` (never removed — see the audit endpoint)
+    is echoed back so a caller can see what was excluded as a distinct-printing
+    decoy rather than silently dropped. Naming one in ``names`` is reported as
+    an error distinct from "not a conflict at all" — see
+    :func:`cmd_wish_list_remove_conflicts`.
     """
     _ensure_collection_store()
     _require_imported_collection()
@@ -1283,10 +1297,14 @@ async def api_wish_list_remove_conflicts(payload: dict = Body(default={})):
         return {
             "removed": [],
             "removed_count": 0,
+            # Pre-existing gap (found in review): the normal-path response
+            # always includes "scoped"; this fallback previously omitted it.
+            "scoped": names is not None,
             "errors": [],
             "remaining": 0,
             "checked": 0,
             "unparseable": [],
+            "printing_conflicts": [],
         }
 
 
@@ -1676,6 +1694,18 @@ async def api_wish_list_add(req: WishListAddRequest):
     BUI-122 fix is the real safety net); pass ``force=true`` to override
     intentionally (a different printing/variant).
 
+    BUI-372: the 409 ``detail`` is a dict (``{error, message, full_title_matched,
+    printing_conflict, printing_candidates}``), additive over the prior plain
+    string so an existing consumer reading ``detail`` as text still finds it at
+    ``detail["message"]``. ``full_title_matched`` reuses the name
+    ``cmd_collection_check`` itself uses for this value (also the name the
+    batch-check response and the wish-list conflicts audit use) rather than
+    minting a new spelling for the same concept. ``printing_conflict``/
+    ``printing_candidates`` (BUI-364 shape, straight from ``cmd_collection_check``)
+    let a caller tell a genuine duplicate apart from a distinct-printing decoy —
+    where ``force=true`` is the
+    CORRECT next action, not an override of a real duplicate.
+
     BUI-285: idempotent. After the owned-guard, an add whose series + issue token
     already exists in the wish-list is a no-op — it returns ``{status: "exists",
     existing, items}`` with 200 instead of appending a duplicate row. A duplicate
@@ -1712,12 +1742,23 @@ async def api_wish_list_add(req: WishListAddRequest):
             if check is not None and collection_check_reports_owned(check):
                 raise HTTPException(
                     status_code=409,
-                    detail=(
-                        f"'{req.title}' is already in the collection "
-                        f"({check['full_title_matched']}). Wish-listing an owned book "
-                        "risks deleting it on the next sync (BUI-122). Pass force=true "
-                        "to override."
-                    ),
+                    detail={
+                        "error": "already_owned",
+                        "message": (
+                            f"'{req.title}' is already in the collection "
+                            f"({check['full_title_matched']}). Wish-listing an owned book "
+                            "risks deleting it on the next sync (BUI-122). Pass force=true "
+                            "to override."
+                        ),
+                        "full_title_matched": check["full_title_matched"],
+                        # BUI-372: additive — a caller can tell a genuine
+                        # duplicate apart from a distinct-printing decoy (where
+                        # force=true is the CORRECT action, not an override of
+                        # a real duplicate). printing_candidates is None when
+                        # printing_conflict is False (BUI-364 shape).
+                        "printing_conflict": check.get("printing_conflict", False),
+                        "printing_candidates": check.get("printing_candidates"),
+                    },
                 )
 
     # BUI-285/BUI-313: idempotency now lives entirely in cmd_wish_list_add's
