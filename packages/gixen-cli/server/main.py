@@ -402,6 +402,19 @@ def _mark_cancelled_tombstone(db: sqlite3.Connection, row_id: int) -> None:
     )
 
 
+def _mark_no_price_checked(db: sqlite3.Connection, row_id: int, checked_at: str) -> None:
+    """Stamp ebay_no_price_at (BUI-382) once eBay has given a definitive "no
+    usable price" answer for an already-tombstoned (REMOVED/PURGED) row, so it
+    stops re-entering _ebay_fallback_rows' 7-day tombstone window. Only ever
+    called for tombstoned rows — never for a live PENDING/ENDED row, which
+    must stay eligible for the WON inference on every future sync (see
+    _ebay_fallback_rows' docstring). Caller commits."""
+    db.execute(
+        "UPDATE bids SET ebay_no_price_at = ? WHERE id = ?",
+        (checked_at, row_id),
+    )
+
+
 def _record_vanish_observations(
     db: sqlite3.Connection, gixen_item_ids: set[str], now: str,
     scrape_started_at: str,
@@ -953,6 +966,20 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
     are not real ended auctions, and the 7-day window matches on their freshly-set
     resolved_at, so without this guard they'd burn an eBay call and could get a
     phantom winning_bid/WON stamp. The 'IS NOT' comparison keeps NULL-notes rows.
+
+    Set 2 also excludes rows already stamped ebay_no_price_at (BUI-382): a
+    prior fallback run got a definitive "eBay has no usable final price"
+    answer for an already-tombstoned row (reserve not met / unsold), which
+    will not change on a later check, so without this it would burn an eBay
+    call every sync for the rest of its 7-day window on an auction already
+    conclusively classified. Set 1 (PENDING/ENDED, not yet tombstoned) is
+    deliberately NOT given this exclusion: a row there is still eligible for
+    the WON inference on a future sync, and this single "no price" answer
+    could be eBay's data not having settled yet rather than a genuine no-sale
+    — nothing here can tell the two apart, so permanently excluding it would
+    risk foreclosing a real win (forbidden by the BUI-146 policy). Its
+    unbounded re-scan cost is accepted risk, not fixed by this ticket — see
+    the comment at its _run_ebay_fallback call site.
     """
     return db.execute(
         f"""
@@ -968,6 +995,7 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
         WHERE status IN ({TOMBSTONE_STATUSES_SQL})
           AND winning_bid IS NULL
           AND notes IS NOT ?
+          AND ebay_no_price_at IS NULL
           AND datetime(COALESCE(auction_end_at, resolved_at)) >= datetime('now', '-7 days')
         """,
         (now_iso, DEDUP_TOMBSTONE_NOTE),
@@ -976,8 +1004,21 @@ def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
 
 async def _run_ebay_fallback() -> None:
     """Fire-and-forget: ask eBay for the final selling price of any auction
-    that's ended without a captured winning_bid. One eBay call per such item,
-    ever — once winning_bid is set, the row no longer matches the filter.
+    that's ended without a captured winning_bid. One eBay call per row once
+    winning_bid is set. For an already-tombstoned (REMOVED/PURGED) row,
+    ebay_no_price_at additionally short-circuits a definitive "no usable
+    price" answer (BUI-382) out of the 7-day re-scan window — a tombstoned
+    row is already known dead, so this is pure waste reduction. A live
+    (PENDING/ENDED) row gets no such permanent stamp: it stays eligible for
+    the WON inference on every future sync, by design (see _ebay_fallback_rows'
+    docstring).
+
+    Every write in the loop below is id-targeted (only_id= / WHERE id=), not
+    item_id-wide (BUI-382, matching the pattern BUI-371 introduced for its
+    REMOVED classification): a re-listed/re-added item can carry a live
+    PENDING row sharing an item_id with an old resolved/tombstoned row, and an
+    item_id-wide write would collateral-stamp the live row too (the BUI-178
+    class of blast radius).
 
     Skipped if a fallback is already running or if we're in rate-limit
     cooldown from a recent failure storm.
@@ -1012,14 +1053,21 @@ async def _run_ebay_fallback() -> None:
                 # Write title and end_date_iso for all rows regardless of
                 # status. update_bid_status / cache_gixen_data both skip the
                 # tombstone (PURGED/REMOVED) rows, so use direct SQL here.
+                # BUI-382: id-targeted, like every other write below — a
+                # re-listed/re-added item can carry a live PENDING row
+                # sharing this item_id (the BUI-178 class of collateral
+                # damage), and an item_id-wide write here would leak an
+                # unrelated auction's end time onto it, corrupting the
+                # local sniper's fire-time calculation for a still-live
+                # snipe.
                 ebay_title = ebay.get("title") or None
                 ebay_end_iso = ebay.get("end_date_iso") or None
                 db.execute(
                     "UPDATE bids SET "
                     "ebay_title = COALESCE(?, ebay_title), "
                     "auction_end_at = COALESCE(auction_end_at, ?) "
-                    "WHERE item_id = ?",
-                    (ebay_title, ebay_end_iso, iid),
+                    "WHERE id = ?",
+                    (ebay_title, ebay_end_iso, row["id"]),
                 )
 
                 final_amount: float | None = None
@@ -1029,17 +1077,29 @@ async def _run_ebay_fallback() -> None:
                         final_amount = float(str(price).lstrip("$").strip())
                     except (ValueError, TypeError):
                         final_amount = None
+                has_usable_price = final_amount is not None and final_amount > 0
 
                 if is_purged:
-                    if final_amount is not None and final_amount > 0:
+                    if has_usable_price:
+                        # id-targeted (BUI-382): multiple tombstoned rows can
+                        # share an item_id (dedup losers, re-listed items), so
+                        # an item_id-wide write here could stamp this price
+                        # onto an unrelated tombstoned sibling.
                         db.execute(
-                            f"UPDATE bids SET winning_bid = ? WHERE item_id = ? AND status IN ({TOMBSTONE_STATUSES_SQL})",
-                            (final_amount, iid),
+                            f"UPDATE bids SET winning_bid = ? WHERE id = ? AND status IN ({TOMBSTONE_STATUSES_SQL})",
+                            (final_amount, row["id"]),
                         )
                         logger.info(
                             "_run_ebay_fallback: %s (purged) winning_bid=$%.2f",
                             iid, final_amount,
                         )
+                    else:
+                        # BUI-382: eBay answered but this tombstone has no
+                        # usable price (reserve not met / unsold) — that
+                        # won't change, so stamp it out of the 7-day re-scan
+                        # set instead of re-fetching every sync until it ages
+                        # out of the window.
+                        _mark_no_price_checked(db, row["id"], now_iso)
                     await asyncio.sleep(1.5)
                     continue
 
@@ -1056,11 +1116,20 @@ async def _run_ebay_fallback() -> None:
                 if _cancelled_before_end(db, iid, row, end_dt):
                     update_bid_status(
                         db, iid, "REMOVED",
-                        winning_bid=final_amount if final_amount and final_amount > 0 else None,
+                        winning_bid=final_amount if has_usable_price else None,
                         resolved_at=now_iso,
                         only_id=row["id"],
                     )
                     _mark_cancelled_tombstone(db, row["id"])
+                    if not has_usable_price:
+                        # BUI-382: this REMOVED row would otherwise still
+                        # match _ebay_fallback_rows' tombstone set (NULL
+                        # winning_bid, notes carries CANCELLED_TOMBSTONE_NOTE
+                        # not DEDUP_TOMBSTONE_NOTE) and get re-fetched from
+                        # eBay on every sync for the rest of its 7-day window
+                        # even though "no price" here is just as definitive
+                        # as in the purged branch below.
+                        _mark_no_price_checked(db, row["id"], now_iso)
                     logger.info(
                         "_run_ebay_fallback: %s cancelled before end (never bid) "
                         "→ REMOVED", iid,
@@ -1068,17 +1137,37 @@ async def _run_ebay_fallback() -> None:
                     await asyncio.sleep(1.5)
                     continue
 
-                if final_amount is None or final_amount <= 0:
+                if not has_usable_price:
                     # eBay returns the high-water bid for reserve-not-met or
                     # unsold listings, which is often 0 or well below our max
                     # — falsely stamping WON. Treat as ENDED with no winning
-                    # claim instead. We still mark resolved_at so the row
-                    # leaves the fallback queue.
+                    # claim instead. id-targeted (BUI-382), matching every
+                    # other write in this loop — a re-listed/re-added item can
+                    # carry a live PENDING row sharing this item_id.
                     update_bid_status(
                         db, iid, "ENDED",
                         winning_bid=None,
                         resolved_at=now_iso,
+                        only_id=row["id"],
                     )
+                    # BUI-382 review (reliability/adversarial): deliberately
+                    # NOT stamping ebay_no_price_at here, unlike the two
+                    # REMOVED-producing branches above/below. Those tombstone
+                    # a row that is already known dead (cancelled-before-end,
+                    # or a completed sweep) inside a 7-day window, so a
+                    # permanent stamp only trims already-bounded waste. This
+                    # branch's row is a genuinely-ended auction still eligible
+                    # for the WON inference below on some *future* sync — this
+                    # single eBay answer could be a transient "price not
+                    # settled yet" read rather than a genuine no-sale, and
+                    # nothing here can tell the two apart. Permanently
+                    # excluding it would risk foreclosing a real win the
+                    # inference exists to recover, which the BUI-146 policy
+                    # forbids. Left on its pre-existing unbounded forever-retry
+                    # semantics; the resulting waste is accepted risk, not
+                    # fixed by this ticket (see BUI-146's own accepted-risk
+                    # precedent for the same "correctness over efficiency"
+                    # trade-off).
                     logger.info(
                         "_run_ebay_fallback: %s -> ENDED (no final price; max=$%.2f)",
                         iid, row["max_bid"],
@@ -1116,10 +1205,15 @@ async def _run_ebay_fallback() -> None:
                     inferred_status = "LOST"
                 else:
                     inferred_status = "WON"
+                # id-targeted (BUI-382): a re-listed/re-added item can carry a
+                # live PENDING row sharing this item_id — an item_id-wide
+                # write here would collateral-stamp WON/LOST onto it (the
+                # BUI-178 class of blast radius).
                 update_bid_status(
                     db, iid, inferred_status,
                     winning_bid=final_amount,
                     resolved_at=now_iso,
+                    only_id=row["id"],
                 )
                 logger.info(
                     "_run_ebay_fallback: %s -> %s @ $%.2f (max=$%.2f)",
@@ -1583,6 +1677,9 @@ async def api_get_all_bids():
             # server-log evidence trail.
             "gixen_vanished_at": item.get("gixen_vanished_at"),
             "notes": item.get("notes"),
+            # BUI-382: same auditability rationale — exposes why a tombstoned
+            # row stopped being re-fetched by the eBay fallback.
+            "ebay_no_price_at": item.get("ebay_no_price_at"),
         })
     return result
 
