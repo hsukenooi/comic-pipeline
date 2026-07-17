@@ -1417,8 +1417,26 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         # has no row, meaning the snipe was added via Gixen's web UI and we
         # haven't ingested it yet. Run one sync (which has the web-added
         # insert path) so the response shape matches every other PATCH.
-        async with _api_lock:
-            await _sync_gixen(db, _api_client)
+        try:
+            async with _api_lock:
+                await _sync_gixen(db, _api_client)
+        except Exception as e:
+            # BUI-399: same rollback-on-unexpected-exception guard as
+            # api_sync (BUI-386) / api_purge. Gixen already accepted the
+            # modify by this point (_modify_with_cache_fallback above), but
+            # an unexpected bug in this post-modify sync's DML batch must not
+            # leave stray uncommitted writes stranded on the shared singleton
+            # connection for a later sync's commit to absorb. reraise=False
+            # here (the default) already keeps GixenConnectionError/GixenError
+            # from reaching this except, so only a genuine unexpected bug
+            # lands here.
+            db.rollback()
+            logger.exception(
+                "api_edit_bid: unexpected error during post-modify sync"
+            )
+            raise HTTPException(
+                status_code=500, detail="edit failed: internal error"
+            ) from e
         # _sync_gixen ingests with the snipe's existing max_bid from Gixen,
         # but we want the user-supplied value to win. Re-apply locally.
         update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
@@ -1501,8 +1519,24 @@ async def api_purge(req: PurgeRequest):
 
     # 1. Sync first to capture any outstanding WON/LOST transitions;
     #    reuse the snipes list for sibling detection (avoids a second Gixen call)
-    async with _api_lock:
-        gixen_snipes = await _sync_gixen(db, _api_client)
+    try:
+        async with _api_lock:
+            gixen_snipes = await _sync_gixen(db, _api_client)
+    except Exception as e:
+        # BUI-399: roll back the shared singleton connection, matching
+        # api_sync (BUI-386) / _ensure_fresh_sync + _sync_loop (BUI-391).
+        # _sync_gixen batches its DML into one end-of-cycle commit, so an
+        # unexpected mid-cycle bug can leave stray uncommitted writes on this
+        # process-wide connection (_get_db()) for whatever the next
+        # successful sync happens to commit. reraise=False here (the default)
+        # already keeps GixenConnectionError/GixenError from reaching this
+        # except — _sync_gixen swallows those internally and returns [] — so
+        # only a genuine unexpected bug lands here.
+        db.rollback()
+        logger.exception("api_purge: unexpected error during pre-purge sync")
+        raise HTTPException(
+            status_code=500, detail="purge failed: internal error"
+        ) from e
 
     # 2. Detect siblings server-side (client may also pass explicit IDs)
     server_siblings = find_sibling_cleanup_targets(gixen_snipes)

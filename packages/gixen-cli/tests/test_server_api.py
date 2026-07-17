@@ -2496,6 +2496,84 @@ def test_background_entry_points_rollback_on_unexpected_exception(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# BUI-399: api_purge and api_edit_bid must apply the same
+# rollback-on-unexpected-exception guard around their _sync_gixen calls as
+# api_sync (BUI-386) and the background entry points (BUI-391) — generalizing
+# the discipline to every coroutine that mutates the shared singleton
+# connection via _sync_gixen.
+# ---------------------------------------------------------------------------
+
+
+class _RollbackSpy:
+    """Thin proxy around the app's real DB connection: delegates every
+    attribute except rollback() (counted here). A bare MagicMock won't do —
+    api_purge/api_edit_bid run real queries (e.g. the completed-bids SELECT,
+    get_bid_by_item_id) before the injected _sync_gixen failure fires, and
+    sqlite3.Connection is an immutable C type (monkeypatching rollback at the
+    class level raises TypeError), so the connection itself can't be spied on
+    directly."""
+
+    def __init__(self, real):
+        self._real = real
+        self.rollbacks = 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def rollback(self):
+        self.rollbacks += 1
+        self._real.rollback()
+
+
+def test_api_purge_rolls_back_on_unexpected_sync_error(api, monkeypatch):
+    """api_purge's pre-purge sync must roll back the shared singleton
+    connection on a genuine unexpected bug (not a GixenError — _sync_gixen's
+    default reraise=False already swallows those internally), matching
+    api_sync (BUI-386). _sync_gixen batches its DML into one end-of-cycle
+    commit, so without the rollback a partial cycle's writes could ride along
+    on a later successful sync's commit."""
+    import server.main as m
+
+    spy = _RollbackSpy(m._db)
+    monkeypatch.setattr(m, "_db", spy)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m, "_sync_gixen", _boom)
+
+    r = api.post("/api/purge", json={})
+    assert r.status_code == 500
+    assert r.json()["detail"]
+    assert spy.rollbacks == 1
+
+
+def test_api_edit_bid_rolls_back_on_unexpected_post_modify_sync_error(api, monkeypatch):
+    """api_edit_bid's post-modify sync (the web-added-snipe-not-yet-ingested
+    branch) must roll back on a genuine unexpected bug, matching api_sync
+    (BUI-386) / api_purge — Gixen already accepted the modify by this point,
+    but the bookkeeping sync afterward shares the same partial-commit hazard
+    on the shared connection."""
+    import server.main as m
+
+    spy = _RollbackSpy(m._db)
+    monkeypatch.setattr(m, "_db", spy)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m, "_sync_gixen", _boom)
+
+    # No prior /api/bids insert for this item_id — get_bid_by_item_id returns
+    # None after the modify (mock_gixen.modify_snipe succeeds by default),
+    # driving api_edit_bid into the post-modify sync branch under test.
+    r = api.patch("/api/bids/399000001", json={"max_bid": 25.0})
+    assert r.status_code == 500
+    assert r.json()["detail"]
+    assert spy.rollbacks == 1
+
+
+# ---------------------------------------------------------------------------
 # BUI-394: GET /api/bids exposes `id` + accepts ?item_id=/?snipe_group=
 # filters, for correlating a /api/group-wins ledger entry back to the exact
 # bids row it classified. Additive only — existing fields/shape unchanged.

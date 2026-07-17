@@ -616,4 +616,15 @@ async def _run_ebay_fallback() -> None:
                     failures, len(rows), int(_EBAY_COOLDOWN),
                 )
         except Exception:  # noqa: BLE001  # fire-and-forget task-level safety net (same shape as this file's other bare excepts and server.main's own, e.g. its lifespan-shutdown one); ruff's logging-call exemption doesn't recognize the two-level `main.logger.exception(...)` this module's `import server.main as main` pattern requires (BUI-389), unlike the identical bare `logger.exception(...)` this had verbatim in server/main.py
+            # BUI-399: roll back the shared singleton connection, matching
+            # api_sync (BUI-386) and _ensure_fresh_sync/_sync_loop (BUI-391).
+            # The loop above batches its DML into one end-of-cycle commit (see
+            # db.commit() a few lines up), so an unexpected mid-loop bug can
+            # leave stray uncommitted writes on this process-wide connection
+            # for whatever the *next* successful cycle's commit happens to
+            # absorb. Read the global directly (not the local `db`, unbound
+            # if main._get_db() itself raised before the local assignment) —
+            # same reasoning as _sync_loop's identical guard.
+            if main._db is not None:
+                main._db.rollback()
             main.logger.exception("_run_ebay_fallback: error")
