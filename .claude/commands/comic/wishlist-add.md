@@ -263,7 +263,8 @@ Printing conflict — needs your decision (1):
 
 For each flagged issue, show `full_title_matched` and, from
 `printing_candidates`, the query's own printing's state (owned / wish-listed /
-untracked, via `printing_ordinal` — 1 is the base). Ask the user per issue
+untracked, via `printing_ordinal` — 1 is the base, 2+ a specific numbered
+reprint, `null` an unspecified bare "Reprint"/"Re-Print" row). Ask the user per issue
 (or as a reviewed batch) whether to add it. An issue the user confirms moves
 into the same add list Step 5 writes; one they decline moves to "already
 owned" for the report. Never auto-resolve this bucket either way — a false

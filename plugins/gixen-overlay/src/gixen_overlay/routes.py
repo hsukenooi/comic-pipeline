@@ -1297,6 +1297,9 @@ async def api_wish_list_remove_conflicts(payload: dict = Body(default={})):
         return {
             "removed": [],
             "removed_count": 0,
+            # Pre-existing gap (found in review): the normal-path response
+            # always includes "scoped"; this fallback previously omitted it.
+            "scoped": names is not None,
             "errors": [],
             "remaining": 0,
             "checked": 0,
@@ -1691,12 +1694,16 @@ async def api_wish_list_add(req: WishListAddRequest):
     BUI-122 fix is the real safety net); pass ``force=true`` to override
     intentionally (a different printing/variant).
 
-    BUI-372: the 409 ``detail`` is a dict (``{error, message, matched_full_title,
+    BUI-372: the 409 ``detail`` is a dict (``{error, message, full_title_matched,
     printing_conflict, printing_candidates}``), additive over the prior plain
     string so an existing consumer reading ``detail`` as text still finds it at
-    ``detail["message"]``. ``printing_conflict``/``printing_candidates`` (BUI-364
-    shape, straight from ``cmd_collection_check``) let a caller tell a genuine
-    duplicate apart from a distinct-printing decoy — where ``force=true`` is the
+    ``detail["message"]``. ``full_title_matched`` reuses the name
+    ``cmd_collection_check`` itself uses for this value (also the name the
+    batch-check response and the wish-list conflicts audit use) rather than
+    minting a new spelling for the same concept. ``printing_conflict``/
+    ``printing_candidates`` (BUI-364 shape, straight from ``cmd_collection_check``)
+    let a caller tell a genuine duplicate apart from a distinct-printing decoy —
+    where ``force=true`` is the
     CORRECT next action, not an override of a real duplicate.
 
     BUI-285: idempotent. After the owned-guard, an add whose series + issue token
@@ -1743,7 +1750,7 @@ async def api_wish_list_add(req: WishListAddRequest):
                             "risks deleting it on the next sync (BUI-122). Pass force=true "
                             "to override."
                         ),
-                        "matched_full_title": check["full_title_matched"],
+                        "full_title_matched": check["full_title_matched"],
                         # BUI-372: additive — a caller can tell a genuine
                         # duplicate apart from a distinct-printing decoy (where
                         # force=true is the CORRECT action, not an override of

@@ -4056,6 +4056,44 @@ def test_printing_ordinal_bare_reprint_is_unspecified_not_base():
 
 
 @pytest.mark.parametrize("text", [
+    "Amazing Spider-Man #300 Reprint",
+    "Amazing Spider-Man #300 Reprints",
+    "Amazing Spider-Man #300 Re-Print",
+    "Amazing Spider-Man #300 Re Print",
+    "Amazing Spider-Man #300 RE-PRINT",
+    "Amazing Spider-Man #300 re print",
+])
+def test_printing_ordinal_bare_reprint_spelling_variants(text):
+    """BUI-373 review (adversarial pass): "Reprint" is commonly spelled with a
+    hyphen or space ("Re-Print"/"Re Print") in real eBay/LOCG titles — all
+    variants must resolve to the same unspecified-reprint sentinel, not
+    silently read as the base (ordinal 1)."""
+    from locg.commands import _printing_ordinal, _UNSPECIFIED_REPRINT_ORDINAL
+
+    assert _printing_ordinal(text) == _UNSPECIFIED_REPRINT_ORDINAL
+
+
+@pytest.mark.parametrize("text,expected_ordinal", [
+    ("1st Reprint", 2),
+    ("First Reprint", 2),
+    ("2nd Reprint", 3),
+    ("Second Reprint", 3),
+    ("3rd Reprint", 4),
+])
+def test_printing_ordinal_reprint_with_ordinal_offsets_by_one(text, expected_ordinal):
+    """BUI-373 review (adversarial pass): "Nth Reprint" names the Nth print run
+    AFTER the original — "1st Reprint" is the SECOND print run overall
+    (equivalent to "2nd Printing"), not the first. Without this +1 offset,
+    "1st Reprint"/"First Reprint" would compute to ordinal 1 and be silently
+    indistinguishable from an unmarked base query or an explicit "1st
+    Printing" row — reproducing the exact collision this detector exists to
+    prevent, for one specific spelling."""
+    from locg.commands import _printing_ordinal
+
+    assert _printing_ordinal(f"Amazing Spider-Man #300 {text}") == expected_ordinal
+
+
+@pytest.mark.parametrize("text", [
     "Amazing Spider-Man #300",
     "Amazing Spider-Man #300 1st Printing",
     "Amazing Spider-Man #300 Art Print Variant",
@@ -4063,13 +4101,19 @@ def test_printing_ordinal_bare_reprint_is_unspecified_not_base():
     "Blueprint Comics #1",
     "Fine Print Publishing #1",
     "Amazing Spider-Man #300 Newsstand Edition",
+    "Pre-Print Ashcan #1",
+    "More Prints Available #1",
 ])
 def test_printing_ordinal_false_positive_guard(text):
     """BUI-373: bare "print"/"printing" with no ordinal, and words that merely
     CONTAIN "print" ("Blueprint", "Art Print", "Printing Error"), must NOT read
     as a printing marker — the danger direction the ticket calls out (a false
     marker on a genuinely-owned base could suppress a legitimate conflict
-    verdict). An explicit "1st Printing" is the base printing (ordinal 1)."""
+    verdict). An explicit "1st Printing" is the base printing (ordinal 1).
+    "Pre-Print"/"More Prints" (adversarial pass) must not falsely trigger the
+    hyphen/space-tolerant bare-"Reprint" spelling either — "re" only counts as
+    the reprint prefix when it starts its own word (a \\b boundary), not when
+    it's the tail of "Pre" or the head of "prints" inside "More Prints"."""
     from locg.commands import _printing_ordinal
 
     assert _printing_ordinal(text) == 1
@@ -4086,6 +4130,64 @@ def test_printing_marker_suffix_canonicalizes_explicit_ordinals():
     assert _printing_marker_suffix("2nd Printing") == "2nd Printing"
     assert _printing_marker_suffix("third printing") == "3rd Printing"
     assert _printing_marker_suffix("Fourth Ptg") == "4th Printing"
+
+
+def test_printing_marker_suffix_canonicalizes_reprint_with_ordinal():
+    """BUI-373 review: "1st Reprint"/"2nd Reprint" carry an EXPLICIT ordinal
+    (just spelled with "Reprint" instead of "Printing"), so — unlike a bare
+    "Reprint" — the full_title builder DOES canonicalize them, using the
+    +1-adjusted ordinal ("1st Reprint" = the second print run = "2nd
+    Printing")."""
+    from locg.commands import _printing_marker_suffix
+
+    assert _printing_marker_suffix("1st reprint") == "2nd Printing"
+    assert _printing_marker_suffix("second reprint") == "3rd Printing"
+
+
+@pytest.mark.parametrize("n,expected", [
+    (1, "1st"), (2, "2nd"), (3, "3rd"), (4, "4th"),
+    (10, "10th"), (11, "11th"), (12, "12th"), (13, "13th"),
+    (20, "20th"), (21, "21st"), (22, "22nd"), (23, "23rd"), (24, "24th"),
+    (100, "100th"), (101, "101st"), (111, "111th"), (113, "113th"),
+])
+def test_ordinal_suffix_boundary_cases(n, expected):
+    """Coverage gap flagged independently by 3 reviewers (correctness,
+    maintainability, testing): the 11th-13th vs 21st-23rd English ordinal
+    exception was only exercised for n in {2, 3, 4} before this test."""
+    from locg.commands import _ordinal_suffix
+
+    assert _ordinal_suffix(n) == expected
+
+
+def test_printing_conflict_candidates_translate_sentinel_to_null(tmp_path, monkeypatch):
+    """BUI-373 review (maintainability): _UNSPECIFIED_REPRINT_ORDINAL (-1) is
+    an internal sentinel — it must never leak into the public
+    printing_candidates JSON as a raw -1 (undocumented, could be misread as a
+    real negative ordinal). A same-era bare-"Reprint" candidate reports
+    printing_ordinal: null instead."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    owned_reprint = _agent_win_row(
+        series="Absolute Martian Manhunter (2025)",
+        full_title="Absolute Martian Manhunter #1 Reprint",
+        release_date="2025-06-18",
+    )
+    wished_base = _agent_win_row(
+        series="Absolute Martian Manhunter (2025)",
+        full_title="Absolute Martian Manhunter #1",
+        release_date="2025-03-19",
+    )
+    wished_base["in_collection"] = 0
+    wished_base["in_wish_list"] = 1
+    _seed_cache(cache, [owned_reprint, wished_base])
+
+    result = cmds.cmd_collection_check(series="Absolute Martian Manhunter", issue="1")
+    assert result["printing_conflict"] is True
+    by_title = {c["full_title"]: c for c in result["printing_candidates"]}
+    assert by_title["Absolute Martian Manhunter #1 Reprint"]["printing_ordinal"] is None
+    assert by_title["Absolute Martian Manhunter #1"]["printing_ordinal"] == 1
 
 
 def test_printing_marker_suffix_declines_ambiguous_bare_reprint():
@@ -4135,6 +4237,16 @@ def test_printing_marker_detection_agrees_across_call_sites(text, _expected):
     # full_title builder: every spelling here carries an EXPLICIT ordinal, so
     # it must canonicalize to a suffix rather than falling through unresolved.
     assert _printing_marker_suffix(text) is not None
+
+
+def test_dedup_variant_compatible_cross_ordinal_mismatch():
+    """BUI-373 review (testing gap): two DIFFERENT specifically-numbered
+    printings must not be treated as dedup-compatible with each other either
+    — not just each against the base. "2nd Printing" vs "3rd Printing"."""
+    from locg.commands import _dedup_variant_compatible
+
+    assert _dedup_variant_compatible("2nd printing", "3rd printing") is False
+    assert _dedup_variant_compatible("2nd printing", "2nd printing") is True
 
 
 # ---------------------------------------------------------------------------
@@ -4221,3 +4333,26 @@ def test_record_win_dedup_bare_reprint_matches_bare_reprint(tmp_path):
 
     assert result["skipped_already_owned"] == 1
     assert result["rows_written"] == 0
+
+
+def test_record_win_dedup_base_not_conflated_with_owned_bare_reprint(tmp_path):
+    """BUI-373 review (testing/correctness gap): the bare-"Reprint" sibling of
+    test_record_win_dedup_base_not_conflated_with_owned_2nd_ptg_reprint — a
+    base-edition win must not dedup against an owned bare "Reprint" row
+    either. Confirms the asymmetric direction (unspecified reprint vs base)
+    stays safe end-to-end through record-win, not just at the
+    _dedup_variant_compatible unit level."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache, "Uncanny X-Men (Vol. 1) (1980 - 2011)", "Uncanny X-Men #201 Reprint",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="201", year=1985)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1

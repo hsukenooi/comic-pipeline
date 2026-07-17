@@ -1120,7 +1120,7 @@ def test_wish_list_add_409_detail_is_additive_dict(client):
     assert isinstance(detail, dict)
     assert detail["error"] == "already_owned"
     assert "force=true" in detail["message"]
-    assert detail["matched_full_title"] == "The Amazing Spider-Man #300"
+    assert detail["full_title_matched"] == "The Amazing Spider-Man #300"
     assert detail["printing_conflict"] is False
     assert detail["printing_candidates"] is None
 
@@ -1137,7 +1137,7 @@ def test_wish_list_add_409_detail_surfaces_printing_conflict(client):
     assert r.status_code == 409, r.text
     detail = r.json()["detail"]
     assert detail["printing_conflict"] is True
-    assert detail["matched_full_title"] == "Absolute Martian Manhunter #1 2nd Printing"
+    assert detail["full_title_matched"] == "Absolute Martian Manhunter #1 2nd Printing"
     titles = {c["full_title"] for c in detail["printing_candidates"]}
     assert "Absolute Martian Manhunter #1" in titles
 

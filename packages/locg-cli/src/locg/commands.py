@@ -2457,24 +2457,31 @@ _PRINTING_ORDINAL_WORDS: dict[str, int] = {
     "tenth": 10,
 }
 
+# "Reprint"/"Re-Print"/"Re Print" — the hyphen/space is a common real-world
+# spelling variant (LOCG and eBay listings are inconsistent about it). Shared
+# by the bare-marker branch below AND embedded in _PRINT_WORD, so both read
+# the same set of spellings.
+_REPRINT_WORD = r"re[\s-]?prints?"
+_REPRINT_WORD_RE = re.compile(_REPRINT_WORD, re.IGNORECASE)
+
 # The "print word" itself, in any of the spellings a listing/catalog title
 # uses: "Print"/"Printing"/"Prints"/"Printings", the "Ptg"/"Ptgs" abbreviation,
 # or "Reprint"/"Reprints" as the noun after an ordinal ("2nd Reprint" reads the
-# same as "2nd Printing").
-_PRINT_WORD = r"(?:ptgs?|reprints?|print(?:ing)?s?)"
+# same as "2nd Printing" — see _explicit_ordinal_from_match's +1 adjustment).
+_PRINT_WORD_ALTS = rf"ptgs?|{_REPRINT_WORD}|print(?:ing)?s?"
 
 # An ordinal (digit "2nd"/"3rd"/… or word "second"/"third"/…) immediately
-# followed by one of the _PRINT_WORD spellings (groups 1/2), OR a bare
-# "Reprint"/"Reprints" with NO ordinal at all (group 3) — a real, if
-# imprecise, printing marker: every reprint is SOME printing after the first,
-# just not a specific numbered one. Requiring an ordinal for the other
-# spellings keeps a series whose NAME merely contains "printing" (or a
+# followed by one of the _PRINT_WORD_ALTS spellings (named groups pw1/pw2),
+# OR a bare "Reprint"/"Reprints" with NO ordinal at all (named group bare) —
+# a real, if imprecise, printing marker: every reprint is SOME printing after
+# the first, just not a specific numbered one. Requiring an ordinal for the
+# other spellings keeps a series whose NAME merely contains "printing" (or a
 # variant like "Art Print"/"Printing Error") from reading as a marker.
 _PRINTING_MARKER_RE = re.compile(
     r"\b(?:"
-    r"(\d+)\s*(?:st|nd|rd|th)[\s-]+" + _PRINT_WORD + r"|"
-    r"(" + "|".join(_PRINTING_ORDINAL_WORDS) + r")[\s-]+" + _PRINT_WORD + r"|"
-    r"(reprints?)"
+    rf"(?P<digit>\d+)\s*(?:st|nd|rd|th)[\s-]+(?P<pw1>{_PRINT_WORD_ALTS})|"
+    rf"(?P<word>{'|'.join(_PRINTING_ORDINAL_WORDS)})[\s-]+(?P<pw2>{_PRINT_WORD_ALTS})|"
+    rf"(?P<bare>{_REPRINT_WORD})"
     r")\b",
     re.IGNORECASE,
 )
@@ -2493,13 +2500,41 @@ _PRINTING_MARKER_RE = re.compile(
 _UNSPECIFIED_REPRINT_ORDINAL = -1
 
 
+def _explicit_ordinal_from_match(m: "re.Match[str]") -> Optional[int]:
+    """Ordinal named by an ordinal-PREFIXED match (the digit or word branch
+    of :data:`_PRINTING_MARKER_RE`), or ``None`` when only the bare branch
+    matched (no explicit number to report).
+
+    Adds 1 when the matched print-word is itself "Reprint(s)" (in any of its
+    spelling variants): "Nth Reprint" names the Nth print run AFTER the
+    original, i.e. absolute printing #(N+1) — "1st Reprint" is the second
+    print run overall (equivalent to "2nd Printing"), "2nd Reprint" the
+    third, and so on. Without this adjustment "1st Reprint"/"First Reprint"
+    would compute to ordinal 1 and be silently indistinguishable from an
+    unmarked base query or an explicit "1st Printing" row — reproducing,
+    for this one spelling, the exact ordinal-1 collision _PRINTING_MARKER_RE
+    exists to prevent (found in BUI-373 review).
+    """
+    if m.group("digit") is not None:
+        ordinal = int(m.group("digit"))
+        printword = m.group("pw1")
+    elif m.group("word") is not None:
+        ordinal = _PRINTING_ORDINAL_WORDS[m.group("word").lower()]
+        printword = m.group("pw2")
+    else:
+        return None
+    if _REPRINT_WORD_RE.fullmatch(printword):
+        ordinal += 1
+    return ordinal
+
+
 def _printing_ordinal(text: Optional[str]) -> int:
     """Printing ordinal named in ``text``: 2 for "2nd Printing"/"2nd Ptg", 3
-    for "Third Printing", :data:`_UNSPECIFIED_REPRINT_ORDINAL` for a bare
-    "Reprint"/"Reprints" with no number attached. Unmarked text and an
-    explicit "1st Printing" are both 1 — a query without a marker means the
-    base (first) printing, and an owned row labeled "1st Printing" genuinely
-    satisfies it.
+    for "Third Printing"/"1st Reprint", :data:`_UNSPECIFIED_REPRINT_ORDINAL`
+    for a bare "Reprint"/"Re-Print"/"Reprints" with no number attached.
+    Unmarked text and an explicit "1st Printing" are both 1 — a query
+    without a marker means the base (first) printing, and an owned row
+    labeled "1st Printing" genuinely satisfies it.
 
     BUI-373: this is the single shared printing-marker detector — every
     caller (the collection-check printing_conflict probe, the record-win
@@ -2511,11 +2546,8 @@ def _printing_ordinal(text: Optional[str]) -> int:
     m = _PRINTING_MARKER_RE.search(text or "")
     if not m:
         return 1
-    if m.group(1):
-        return int(m.group(1))
-    if m.group(2):
-        return _PRINTING_ORDINAL_WORDS[m.group(2).lower()]
-    return _UNSPECIFIED_REPRINT_ORDINAL
+    ordinal = _explicit_ordinal_from_match(m)
+    return ordinal if ordinal is not None else _UNSPECIFIED_REPRINT_ORDINAL
 
 
 def _ordinal_suffix(n: int) -> str:
@@ -2525,6 +2557,22 @@ def _ordinal_suffix(n: int) -> str:
     else:
         suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{n}{suffix}"
+
+
+def _public_printing_ordinal(full_title: Optional[str]) -> Optional[int]:
+    """``printing_ordinal`` value safe for the public JSON API (the
+    ``printing_candidates`` shape every collection-check/wish-list consumer
+    reads): the mechanical ordinal (1 = base), or ``None`` for a bare
+    "Reprint" with no explicit number.
+
+    BUI-373 review: :data:`_UNSPECIFIED_REPRINT_ORDINAL` (``-1``) is an
+    internal sentinel meaningful only to this module's own equality checks
+    (``_printing_ordinal(a) == _printing_ordinal(b)``) — it must never leak
+    into the JSON API as a raw ``-1``, which no consumer/doc describes and
+    which a naive caller could misread as a real (negative) ordinal.
+    """
+    ordinal = _printing_ordinal(full_title)
+    return None if ordinal == _UNSPECIFIED_REPRINT_ORDINAL else ordinal
 
 
 def _printing_marker_suffix(text: Optional[str]) -> Optional[str]:
@@ -2542,9 +2590,11 @@ def _printing_marker_suffix(text: Optional[str]) -> Optional[str]:
     case, same as it does for an unrecognized cover variant.
     """
     m = _PRINTING_MARKER_RE.search(text or "")
-    if not m or not (m.group(1) or m.group(2)):
+    if not m:
         return None
-    ordinal = int(m.group(1)) if m.group(1) else _PRINTING_ORDINAL_WORDS[m.group(2).lower()]
+    ordinal = _explicit_ordinal_from_match(m)
+    if ordinal is None:
+        return None
     return f"{_ordinal_suffix(ordinal)} Printing"
 
 
@@ -2624,10 +2674,11 @@ def _printing_conflict_fields(
                 # copies-owned count; truthy == owned).
                 "in_collection": bool(row.get("in_collection")),
                 "in_wish_list": bool(row.get("in_wish_list")),
-                # Mechanical ordinal (1 = base printing) so a caller can pick
+                # Mechanical ordinal (1 = base printing; null = an
+                # unspecified bare "Reprint", BUI-373) so a caller can pick
                 # out the query's own printing among 3+ candidates without
                 # re-parsing full_title.
-                "printing_ordinal": _printing_ordinal(row.get("full_title") or ""),
+                "printing_ordinal": _public_printing_ordinal(row.get("full_title") or ""),
             }
             for row in candidates
         ],
@@ -2940,8 +2991,8 @@ def _dedup_variant_compatible(variant_text: str, candidate_suffix: Optional[str]
     owned Newsstand row — always holds, because the owned row's parsed
     ``candidate_suffix`` ("Newsstand Edition") IS a map key.
     """
-    win_printing_ordinal = _printing_ordinal(variant_text) if variant_text else 1
-    candidate_printing_ordinal = _printing_ordinal(candidate_suffix) if candidate_suffix else 1
+    win_printing_ordinal = _printing_ordinal(variant_text)
+    candidate_printing_ordinal = _printing_ordinal(candidate_suffix)
     if win_printing_ordinal != 1 or candidate_printing_ordinal != 1:
         return win_printing_ordinal == candidate_printing_ordinal
 
