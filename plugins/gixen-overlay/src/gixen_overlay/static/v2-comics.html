@@ -367,8 +367,6 @@ function renderActive(snipes) {
     }
     const maxCell = `<span class="editable-max" data-item-id="${r.item_id}" `
       + `data-current-max="${max != null ? max : ''}" `
-      + `data-bid-offset="${r.bid_offset ?? 6}" `
-      + `data-snipe-group="${r.snipe_group ?? 0}" `
       + `title="click to edit">${maxInner}</span>`;
     const fullTitle = displayTitle(r);
     const rowClass = [overbid ? "overbid" : "", r.needs_linking ? "needs-linking" : ""]
@@ -564,8 +562,6 @@ function startMaxEdit(cell) {
 
 async function saveMaxBid(cell, newMax) {
   const itemId = cell.dataset.itemId;
-  const bidOffset = parseInt(cell.dataset.bidOffset, 10) || 6;
-  const snipeGroup = parseInt(cell.dataset.snipeGroup, 10) || 0;
 
   cell.classList.remove("editing");
   cell.classList.add("saving");
@@ -577,13 +573,15 @@ async function saveMaxBid(cell, newMax) {
   const timer = setTimeout(() => ctrl.abort(), 30000);
 
   try {
+    // BUI-401: this inline edit changes only max_bid, so bid_offset/snipe_group
+    // are omitted from the PATCH body — the server's passthrough preserves the
+    // stored values rather than this re-sending a possibly-stale rendered value
+    // that would reset the fire-offset to 6 or un-group the snipe.
     const resp = await fetch(`/api/bids/${itemId}`, {
       method: "PATCH",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({
         max_bid: newMax,
-        bid_offset: bidOffset,
-        snipe_group: snipeGroup,
       }),
       signal: ctrl.signal,
     });

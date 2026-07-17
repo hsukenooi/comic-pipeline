@@ -350,8 +350,6 @@ function renderActive(snipes) {
     const maxInner = overbid ? `<span class="warn-cell">▲ $${max.toFixed(2)}</span>` : fmtUSD(r.max_bid);
     const maxCell = `<span class="editable-max" data-item-id="${r.item_id}" `
       + `data-current-max="${parseFloat(r.max_bid)}" `
-      + `data-bid-offset="${r.bid_offset ?? 6}" `
-      + `data-snipe-group="${r.snipe_group ?? 0}" `
       + `title="click to edit">${maxInner}</span>`;
     const fullTitle = r.title || displayTitle(r);
     return `<tr class="${overbid?"overbid":""}" data-item-id="${r.item_id}">
@@ -535,18 +533,18 @@ function startMaxEdit(cell) {
 
 async function saveMaxBid(cell, newMax) {
   const itemId = cell.dataset.itemId;
-  const bidOffset = parseInt(cell.dataset.bidOffset, 10) || 6;
-  const snipeGroup = parseInt(cell.dataset.snipeGroup, 10) || 0;
 
   cell.classList.remove("editing", "save-error");
   cell.classList.add("saving");
   cell.innerHTML = `$${newMax.toFixed(2)}`;
   suppressRefresh = true;
 
+  // BUI-401: this inline edit changes only max_bid, so bid_offset/snipe_group
+  // are omitted from the PATCH body — the server's passthrough preserves the
+  // stored values rather than this re-sending a possibly-stale rendered value
+  // that would reset the fire-offset to 6 or un-group the snipe.
   const body = JSON.stringify({
     max_bid: newMax,
-    bid_offset: bidOffset,
-    snipe_group: snipeGroup,
   });
 
   // Bound each PATCH so a hung Gixen call can't strand suppressRefresh=true

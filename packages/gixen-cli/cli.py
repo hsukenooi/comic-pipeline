@@ -596,10 +596,18 @@ def _emit_add_batch_result(outcome: BatchOutcome, json_out: str | None) -> None:
 @cli.command()
 @click.argument("item_id")
 @click.argument("max_bid")
-@click.option("--offset", default=6, help="Seconds before end to place bid (1-15)")
-@click.option("--group", default=0, help="Snipe group (0=none, 1-10)")
-def edit(item_id: str, max_bid: str, offset: int, group: int):
-    """Change the bid on an existing snipe."""
+@click.option("--offset", type=int, default=None,
+              help="Seconds before end to place bid (1-15); omit to keep the current offset")
+@click.option("--group", type=int, default=None,
+              help="Snipe group (0=none, 1-10); omit to keep the current group")
+def edit(item_id: str, max_bid: str, offset: int | None, group: int | None):
+    """Change the bid on an existing snipe.
+
+    BUI-401: --offset / --group default to None so a bare `edit <id> <bid>`
+    changes only the max bid — the field is omitted from the PATCH body (server
+    mode) or from the modify kwargs (direct mode) so the current value is
+    preserved instead of being reset to 6 / un-grouped.
+    """
     try:
         bid = Decimal(max_bid)
     except InvalidOperation:
@@ -607,18 +615,26 @@ def edit(item_id: str, max_bid: str, offset: int, group: int):
         sys.exit(1)
 
     if _server_url():
-        payload = {
-            "max_bid": float(bid),
-            "bid_offset": offset,
-            "snipe_group": group,
-        }
+        payload: dict = {"max_bid": float(bid)}
+        if offset is not None:
+            payload["bid_offset"] = offset
+        if group is not None:
+            payload["snipe_group"] = group
         _server_request("patch", f"/api/bids/{item_id}", json=payload)
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
         return
 
     client = _make_client()
+    # Direct mode has no local store to resolve a "keep current" value from, so
+    # an omitted field falls back to modify_snipe's own defaults (offset 6 /
+    # group 0) — the pre-BUI-401 direct-mode behavior, left unchanged.
+    modify_kwargs: dict = {}
+    if offset is not None:
+        modify_kwargs["bid_offset"] = offset
+    if group is not None:
+        modify_kwargs["snipe_group"] = group
     try:
-        client.modify_snipe(item_id, bid, bid_offset=offset, snipe_group=group)
+        client.modify_snipe(item_id, bid, **modify_kwargs)
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
     except GixenSnipeNotFoundError:
         click.echo(f"Error: Item {item_id} not found in your snipe list", err=True)

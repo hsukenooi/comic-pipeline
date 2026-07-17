@@ -393,6 +393,151 @@ def test_edit_bid_no_pending_row_falls_back_to_zero_not_stale_terminal_group(api
     assert api.mock_gixen.modify_snipe.call_args.kwargs.get("snipe_group") == 0
 
 
+# ---------------------------------------------------------------------------
+# BUI-401: bid_offset gets the same None-passthrough as snipe_group — a
+# max_bid-only edit must not silently reset a tuned fire-offset back to 6, on
+# either the local DB row or the live Gixen snipe.
+# ---------------------------------------------------------------------------
+
+def test_edit_bid_max_bid_only_preserves_bid_offset_and_group(api):
+    """Omitting bid_offset AND snipe_group from the PATCH body preserves both —
+    the pre-BUI-401 default of 6 silently reset the tuned offset."""
+    api.post("/api/bids", json={"item_id": "200000020", "max_bid": 50.0,
+                                "bid_offset": 12, "snipe_group": 4})
+    r = api.patch("/api/bids/200000020", json={"max_bid": 75.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["max_bid"] == 75.0
+    assert data["bid_offset"] == 12   # preserved, not reset to 6
+    assert data["snipe_group"] == 4   # preserved (BUI-392)
+    # Gixen's modify form has no passthrough — it must receive the resolved
+    # current values, not literal Nones or defaults.
+    kwargs = api.mock_gixen.modify_snipe.call_args.kwargs
+    assert kwargs.get("bid_offset") == 12
+    assert kwargs.get("snipe_group") == 4
+
+
+def test_edit_bid_explicit_bid_offset_writes_through(api):
+    """An explicit bid_offset is a real change — written locally and sent to
+    Gixen — while an omitted snipe_group is still preserved."""
+    api.post("/api/bids", json={"item_id": "200000021", "max_bid": 50.0,
+                                "bid_offset": 12, "snipe_group": 4})
+    r = api.patch("/api/bids/200000021", json={"max_bid": 75.0, "bid_offset": 9})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["bid_offset"] == 9
+    assert data["snipe_group"] == 4   # omitted → preserved
+    kwargs = api.mock_gixen.modify_snipe.call_args.kwargs
+    assert kwargs.get("bid_offset") == 9
+    assert kwargs.get("snipe_group") == 4
+
+
+def test_edit_bid_no_pending_row_falls_back_to_default_offset(api):
+    """With no live PENDING row (only a stale terminal row) and bid_offset
+    omitted, the Gixen-side resolution falls back to 6 — it must NOT leak the
+    terminal row's offset, mirroring the snipe_group fallback."""
+    _seed_bid_row("200000022", status="WON", snipe_group=7)
+    r = api.patch("/api/bids/200000022", json={"max_bid": 75.0})
+    assert r.status_code == 200
+    assert api.mock_gixen.modify_snipe.call_args.kwargs.get("bid_offset") == 6
+
+
+# ---------------------------------------------------------------------------
+# BUI-402: the bid_offset/snipe_group passthrough resolve read must run INSIDE
+# _api_lock (with the modify + update_bid), closing the TOCTOU where a
+# concurrent group/offset-changing PATCH landed between the read and the modify
+# and was silently reverted on Gixen. The modify/retry path still works under
+# the single acquisition.
+# ---------------------------------------------------------------------------
+
+def test_edit_bid_resolves_passthrough_under_api_lock(api, monkeypatch):
+    """The passthrough resolve (get_pending_bid_by_item_id) fires while
+    _api_lock is held — pre-fix that read happened before the lock, so a
+    concurrent PATCH could change the group/offset in the window."""
+    import server.main as sm
+    api.post("/api/bids", json={"item_id": "200000023", "max_bid": 50.0,
+                                "bid_offset": 11, "snipe_group": 5})
+
+    real = sm.get_pending_bid_by_item_id
+    observed = []
+
+    def spy(conn, item_id):
+        lock = sm._api_lock
+        observed.append(lock is not None and lock.locked())
+        return real(conn, item_id)
+
+    monkeypatch.setattr(sm, "get_pending_bid_by_item_id", spy)
+    r = api.patch("/api/bids/200000023", json={"max_bid": 75.0})  # omits both
+    assert r.status_code == 200
+    # The resolve is the first get_pending_bid_by_item_id call, and it saw the
+    # lock held.
+    assert observed and observed[0] is True
+
+
+def test_edit_bid_cache_fallback_retry_resends_resolved_passthrough(api):
+    """The stale-cached-dbidid retry (BUI-116) still works under the single
+    _api_lock acquisition, and the retry re-sends the RESOLVED current
+    bid_offset/snipe_group — not None/defaults."""
+    from gixen_client import GixenModifyNotConfirmedError
+
+    api.post("/api/bids", json={"item_id": "200000024", "max_bid": 50.0,
+                                "bid_offset": 11, "snipe_group": 5})
+    # Warm a cached dbidid so the fast path (with dbidid) is attempted first;
+    # the list-lookup retry only runs when a cached id was used.
+    conn = _dbconn()
+    conn.execute("UPDATE bids SET dbidid='stale-abc' WHERE item_id='200000024'")
+    conn.commit()
+    conn.close()
+
+    api.mock_gixen.modify_snipe.side_effect = [
+        GixenModifyNotConfirmedError("200000024", 75.0),  # cached id stale
+        None,  # retry via list lookup succeeds
+    ]
+    r = api.patch("/api/bids/200000024", json={"max_bid": 75.0})  # omits both
+    assert r.status_code == 200
+    assert api.mock_gixen.modify_snipe.call_count == 2
+    # The retry (second call, dbidid cleared) carries the resolved values.
+    retry_kwargs = api.mock_gixen.modify_snipe.call_args_list[1].kwargs
+    assert retry_kwargs.get("bid_offset") == 11
+    assert retry_kwargs.get("snipe_group") == 5
+    # Local DB reflects the new bid but preserves offset + group.
+    data = r.json()
+    assert data["max_bid"] == 75.0
+    assert data["bid_offset"] == 11
+    assert data["snipe_group"] == 5
+
+
+def test_cli_edit_max_bid_only_preserves_both_end_to_end(api, monkeypatch):
+    """BUI-401 end-to-end: a bare `gixen edit <id> <bid>` (server mode) routed
+    through the real PATCH route preserves BOTH the tuned bid_offset AND the
+    snipe_group — neither silently reset. Exercises CLI payload composition →
+    server passthrough → update_bid → DB."""
+    from urllib.parse import urlparse
+    from click.testing import CliRunner
+    import cli as cli_mod
+
+    api.post("/api/bids", json={"item_id": "200000025", "max_bid": 50.0,
+                                "bid_offset": 12, "snipe_group": 6})
+
+    # Route the CLI's requests.<method> call into the in-process TestClient.
+    def fake_patch(url, **kwargs):
+        kwargs.pop("timeout", None)
+        return api.patch(urlparse(url).path, json=kwargs.get("json"))
+
+    monkeypatch.setattr(cli_mod.requests, "patch", fake_patch)
+    monkeypatch.setattr(cli_mod, "_server_url", lambda: "http://testserver")
+
+    result = CliRunner().invoke(cli_mod.cli, ["edit", "200000025", "75.0"])
+    assert result.exit_code == 0, result.output
+
+    row = _dbconn().execute(
+        "SELECT max_bid, bid_offset, snipe_group FROM bids WHERE item_id='200000025'"
+    ).fetchone()
+    assert row["max_bid"] == 75.0
+    assert row["bid_offset"] == 12   # not reset to 6
+    assert row["snipe_group"] == 6   # not un-grouped
+
+
 def test_edit_bid_not_found(api):
     from gixen_client import GixenSnipeNotFoundError
     api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("not found")
