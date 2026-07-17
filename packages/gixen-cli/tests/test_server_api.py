@@ -630,6 +630,70 @@ def test_sync_gixen_flips_vanished_ended_to_ended(api):
     assert len(rows) == 1
 
 
+def test_sync_gixen_vanished_ended_write_spares_resolved_sibling_sharing_item_id(api):
+    """BUI-388: the vanished-ended ENDED write (server/main.py, just below the
+    BUI-371 REMOVED branch) must target only the row being transitioned, not
+    every row sharing its item_id. Pre-fix, its item_id-wide update_bid_status
+    call would also collateral-stamp an older resolved-but-not-yet-purged
+    sibling sharing the item_id (e.g. a prior listing of a re-listed/re-added
+    item) — clobbering its already-recorded status/winning_bid/resolved_at
+    with this row's ENDED/None/now values (the BUI-178 class, the same one
+    BUI-371 already guarded against for the REMOVED branch immediately above
+    this one, and BUI-382 guarded for every write in _run_ebay_fallback)."""
+    import os, sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    # Live snipe that will vanish + end.
+    api.post("/api/bids", json={"item_id": "700000001", "max_bid": 25.0})
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET auction_end_at=? WHERE item_id=? AND status='PENDING'",
+        (past, "700000001"),
+    )
+    live_id = raw.execute(
+        "SELECT id FROM bids WHERE item_id=? AND status='PENDING'",
+        ("700000001",),
+    ).fetchone()[0]
+
+    # Old, already-resolved sibling sharing the same item_id (a prior listing
+    # of a re-listed item) — WON and not yet purged, so it is still visible
+    # to an item_id-wide write (WON/ENDED/etc. are not tombstone statuses).
+    old_resolved_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    cur = raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, winning_bid, resolved_at, "
+        "snipe_group) VALUES (?, 50.0, 'WON', 45.0, ?, 0)",
+        ("700000001", old_resolved_at),
+    )
+    old_id = cur.lastrowid
+    raw.commit()
+    raw.close()
+
+    # Gixen returns empty → the live snipe vanished and its recorded end has
+    # already passed.
+    api.mock_gixen.list_snipes.return_value = []
+    api.post("/api/sync")
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    old_row = raw.execute(
+        "SELECT status, winning_bid, resolved_at FROM bids WHERE id=?", (old_id,)
+    ).fetchone()
+    live_row = raw.execute(
+        "SELECT status, winning_bid FROM bids WHERE id=?", (live_id,)
+    ).fetchone()
+    raw.close()
+
+    # The old resolved sibling must be completely untouched.
+    assert old_row["status"] == "WON"
+    assert old_row["winning_bid"] == 45.0
+    assert old_row["resolved_at"] == old_resolved_at
+    # The vanished live snipe transitions to ENDED as intended.
+    assert live_row["status"] == "ENDED"
+    assert live_row["winning_bid"] is None
+
+
 def _read_db_row(item_id):
     """Read raw bid row by item_id for assertion."""
     import os, sqlite3

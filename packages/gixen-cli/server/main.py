@@ -825,7 +825,17 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
                 "(cancelled, never bid) → REMOVED", iid,
             )
             continue
-        update_bid_status(db, iid, "ENDED", winning_bid=None, resolved_at=now)
+        # BUI-388: id-targeted, matching the REMOVED branch above (BUI-371)
+        # and the BUI-382 pattern in _run_ebay_fallback — an item_id-wide
+        # write here could collateral-stamp an unrelated non-tombstoned
+        # sibling sharing this item_id (e.g. an older resolved-but-not-yet-
+        # purged row from a prior listing of a re-listed/re-added item),
+        # overwriting its status/winning_bid/resolved_at with this row's
+        # ENDED transition (the BUI-178 class of blast radius).
+        update_bid_status(
+            db, iid, "ENDED", winning_bid=None, resolved_at=now,
+            only_id=row["id"],
+        )
         logger.info(
             "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
             iid,
