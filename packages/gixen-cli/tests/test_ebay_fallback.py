@@ -722,3 +722,61 @@ def test_fallback_won_ledger_write_scoped_to_own_group_not_sibling(
     assert won is not None
     assert [row["snipe_group"] for row in ledger] == [5]
     assert live["status"] == "PENDING"  # sibling untouched
+
+
+# ---------------------------------------------------------------------------
+# BUI-399: _run_ebay_fallback must roll back the shared singleton connection
+# on an unexpected exception, matching api_sync (BUI-386) and
+# _ensure_fresh_sync/_sync_loop (BUI-391) — the loop above batches its DML
+# into one end-of-cycle commit (BUI-382's db.commit()), so an unexpected
+# mid-loop bug can leave stray uncommitted writes stranded on the connection
+# for whatever the *next* successful cycle's commit happens to absorb.
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_rolls_back_on_unexpected_exception(tmp_path, monkeypatch):
+    """A genuine bug partway through the fallback loop (not a Gixen/eBay
+    connectivity issue — those are handled per-row, not via this generic
+    except) must roll back the shared connection instead of silently letting
+    a partial cycle's writes ride along on a future commit."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "471099001", auction_end_at=_iso(timedelta(hours=-1)))
+
+    class _RollbackSpy:
+        """Thin proxy around a real connection: delegates everything except
+        rollback() (counted here), matching the BUI-391 rollback-spy test
+        pattern (test_server_api.py's test_background_entry_points_..._
+        rollback_on_unexpected_exception). A real connection is needed
+        underneath (unlike that test's bare MagicMock) because
+        _ebay_fallback_rows runs a genuine SQL query before the injected
+        failure fires."""
+
+        def __init__(self, real):
+            self._real = real
+            self.rollbacks = 0
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def rollback(self):
+            self.rollbacks += 1
+            self._real.rollback()
+
+    spy = _RollbackSpy(conn)
+    monkeypatch.setattr(m, "_db", spy)
+    monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+
+    def _boom(_iid):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m, "_fetch_ebay_item_sync", _boom)
+
+    async def _nosleep(_):
+        return None
+
+    monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
+
+    asyncio.run(m._run_ebay_fallback())  # must swallow (fire-and-forget), not raise
+    conn.close()
+    assert spy.rollbacks == 1
