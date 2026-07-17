@@ -937,7 +937,12 @@ class EditBidRequest(BaseModel):
 
     max_bid: float
     bid_offset: int = 6
-    snipe_group: int = 0
+    # BUI-392: None means "leave snipe_group unchanged" (passthrough) — a
+    # max_bid-only PATCH that omits this field must not silently un-group the
+    # snipe. Explicit 0 still means "un-group". See update_bid's None branch
+    # and this route's Gixen-side resolution below for the two halves of the
+    # fix (local DB state vs. the live Gixen snipe).
+    snipe_group: int | None = None
 
     @field_validator("max_bid")
     @classmethod
@@ -1196,18 +1201,38 @@ async def api_get_history():
 
 
 @app.get("/api/bids")
-async def api_get_all_bids():
-    """All bids from the DB, newest first. Pure DB read — no Gixen sync."""
+async def api_get_all_bids(item_id: str | None = None, snipe_group: int | None = None):
+    """All bids from the DB, newest first. Pure DB read — no Gixen sync.
+
+    BUI-394: optional ?item_id= and/or ?snipe_group= filter the returned
+    slice (mirroring /api/group-wins' filter semantics) so an agent can pull
+    a correlated slice instead of the whole table when tracing a
+    /api/group-wins ledger entry back to the bids row(s) it classified. No
+    filter params → unchanged full-table behavior. /api/bids is an
+    established contract (agents rely on its field names/shapes), so this
+    change is additive only — every existing field stays as-is.
+    """
     db = _get_db()
-    rows = db.execute("""
-        SELECT * FROM bids
-        ORDER BY COALESCE(auction_end_at, added_at) DESC
-    """).fetchall()
+    clauses: list[str] = []
+    params: list = []
+    if item_id is not None:
+        clauses.append("item_id = ?")
+        params.append(item_id)
+    if snipe_group is not None:
+        clauses.append("snipe_group = ?")
+        params.append(snipe_group)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = db.execute(
+        f"SELECT * FROM bids {where} "
+        "ORDER BY COALESCE(auction_end_at, added_at) DESC",
+        params,
+    ).fetchall()
 
     result = []
     for row in rows:
         item = dict(row)
         result.append({
+            "id": item["id"],
             "item_id": item["item_id"],
             "title": item.get("ebay_title") or None,
             "max_bid": item["max_bid"],
@@ -1351,10 +1376,31 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
     if not re.match(r"^\d+$", item_id):
         raise HTTPException(status_code=422, detail="item_id must be numeric")
     db = _get_db()
+
+    # BUI-392: req.snipe_group is None means "leave unchanged" (a max_bid-only
+    # PATCH). update_bid's None branch handles our local DB state, but
+    # Gixen's own modify form (GixenClient.modify_snipe) has no passthrough
+    # concept — it always submits an explicit newsnipegroup — so resolve the
+    # snipe's current group from our DB and send that, keeping Gixen's state
+    # in sync with "unchanged" intent instead of un-grouping it there too.
+    #
+    # Deliberately PENDING-only (not the get_bid_by_item_id fallback used for
+    # dbidid caching below): get_bid_by_item_id has no status filter, so it
+    # can return a stale terminal row from an earlier bidding cycle on the
+    # same item_id (BUI-178-style re-listing) — using THAT row's snipe_group
+    # would leak an unrelated old value into the live snipe instead of
+    # preserving it. Falls back to 0 only when there's no live row at all
+    # (e.g. a web-added snipe never ingested), matching the pre-existing
+    # default in that edge case.
+    gixen_snipe_group = req.snipe_group
+    if gixen_snipe_group is None:
+        current = get_pending_bid_by_item_id(db, item_id)
+        gixen_snipe_group = current["snipe_group"] if current is not None else 0
+
     try:
         await _modify_with_cache_fallback(
             db, item_id, Decimal(str(req.max_bid)),
-            req.bid_offset, req.snipe_group,
+            req.bid_offset, gixen_snipe_group,
         )
     except GixenSnipeNotFoundError as e:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen") from e

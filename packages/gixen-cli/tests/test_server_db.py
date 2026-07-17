@@ -201,6 +201,17 @@ def test_update_bid_noop_on_non_pending(db):
     assert row["max_bid"] == 50.0  # unchanged — update_bid guards on status='PENDING'
 
 
+def test_update_bid_none_snipe_group_noop_on_non_pending(db):
+    """BUI-392's None-passthrough branch is a separate SQL statement from the
+    explicit-int branch above — confirm it independently honors the same
+    WHERE status='PENDING' guard rather than silently dropping it."""
+    insert_bid(db, "300000002", 50.0, 6, 4, "s")
+    update_bid_status(db, "300000002", "WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")
+    update_bid(db, "300000002", max_bid=999.0, bid_offset=6, snipe_group=None)
+    row = get_bid_by_item_id(db, "300000002")
+    assert row["max_bid"] == 50.0  # unchanged — the None branch guards on status='PENDING' too
+
+
 # ---------------------------------------------------------------------------
 # FK-removal migration
 # ---------------------------------------------------------------------------
@@ -1840,6 +1851,55 @@ def test_update_bid_stamps_on_ungroup(db):
     insert_bid(db, "884000004", 50.0, 6, 5, "s")
     update_bid(db, "884000004", 50.0, 6, 0)
     row = get_bid_by_item_id(db, "884000004")
+    assert row["snipe_group"] == 0
+    assert row["group_changed_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# BUI-392: snipe_group=None passthrough — a max_bid-only edit must not
+# silently un-group the snipe or stamp group_changed_at for a membership
+# change that never happened. Explicit 0 must still un-group.
+# ---------------------------------------------------------------------------
+
+def test_update_bid_none_snipe_group_preserves_existing_group(db):
+    """A max_bid-only edit (snipe_group=None) leaves snipe_group untouched —
+    the pre-BUI-392 bug coerced this to 0 and silently un-grouped the snipe."""
+    insert_bid(db, "884000008", 50.0, 6, 4, "s")
+    update_bid(db, "884000008", 60.0, 6, None)
+    row = get_bid_by_item_id(db, "884000008")
+    assert row["max_bid"] == 60.0       # the field the caller actually meant to change
+    assert row["snipe_group"] == 4      # unchanged, not coerced to 0
+
+
+def test_update_bid_none_snipe_group_does_not_stamp_group_changed_at(db):
+    """No membership change occurred, so group_changed_at must stay NULL."""
+    insert_bid(db, "884000009", 50.0, 6, 4, "s")
+    update_bid(db, "884000009", 60.0, 6, None)
+    assert get_bid_by_item_id(db, "884000009")["group_changed_at"] is None
+
+
+def test_update_bid_none_snipe_group_preserves_existing_stamp(db):
+    """If group_changed_at was already stamped by a prior real group change,
+    a subsequent max_bid-only (None) edit must not clear or move that stamp."""
+    insert_bid(db, "884000010", 50.0, 6, 0, "s")
+    update_bid(db, "884000010", 50.0, 6, 4)  # real change: stamps
+    first_stamp = get_bid_by_item_id(db, "884000010")["group_changed_at"]
+    assert first_stamp is not None
+
+    update_bid(db, "884000010", 70.0, 6, None)  # max_bid-only edit
+    row = get_bid_by_item_id(db, "884000010")
+    assert row["max_bid"] == 70.0
+    assert row["snipe_group"] == 4               # still untouched
+    assert row["group_changed_at"] == first_stamp  # stamp preserved verbatim
+
+
+def test_update_bid_explicit_zero_still_ungroups_after_none_passthrough(db):
+    """Explicit 0 is a real request to un-group, distinct from None passthrough
+    — the whole point of the None/0 split."""
+    insert_bid(db, "884000011", 50.0, 6, 4, "s")
+    update_bid(db, "884000011", 55.0, 6, None)  # passthrough: no-op on group
+    update_bid(db, "884000011", 55.0, 6, 0)     # explicit un-group
+    row = get_bid_by_item_id(db, "884000011")
     assert row["snipe_group"] == 0
     assert row["group_changed_at"] is not None
 
