@@ -1451,6 +1451,15 @@ def test_group_changed_at_column_present_on_fresh_db(db):
     assert "group_changed_at" in cols
 
 
+def test_bids_group_changed_at_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem_group_changed.db"
+    init_db(db_path).close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "group_changed_at" in cols
+    conn2.close()
+
+
 def test_group_changed_at_survives_table_rebuild(tmp_path):
     """The rebuild shape (_BIDS_TABLE_SQL) carries the column: a legacy DB
     whose CHECK still lacks REMOVED is rebuilt after the column migration

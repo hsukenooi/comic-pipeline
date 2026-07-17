@@ -555,7 +555,7 @@ class GixenClient:
     # Public API
     # ------------------------------------------------------------------
 
-    def list_snipes(self) -> List[Dict[str, str]]:
+    def list_snipes(self) -> List[Dict[str, Optional[str]]]:
         """Fetch and parse the current snipe list.
 
         Returns:
@@ -823,7 +823,7 @@ class GixenClient:
     # HTML parsing
     # ------------------------------------------------------------------
 
-    def _parse_snipe_table(self, html: str) -> List[Dict[str, str]]:
+    def _parse_snipe_table(self, html: str) -> List[Dict[str, Optional[str]]]:
         """Parse the desktop snipe table from the home page HTML."""
         # Check that the expected form exists
         if '<form name="bids"' not in html and '<form name="addsnipe"' not in html:
@@ -839,7 +839,9 @@ class GixenClient:
                 "Gixen may be down or the page structure has changed."
             )
 
-        snipes: List[Dict[str, str]] = []
+        # snipe_group may be None on a regex miss (BUI-383); every other
+        # value is a str, but the dict is typed loosely to admit it.
+        snipes: List[Dict[str, Optional[str]]] = []
 
         # Each snipe in the desktop table has hidden inputs with names like
         # edititemid_<ITEMID>, editmaxbid_<ITEMID>, etc., plus a
@@ -856,7 +858,7 @@ class GixenClient:
         )
 
         for suffix, item_id in edit_items:
-            snipe: Dict[str, str] = {"item_id": item_id}
+            snipe: Dict[str, Optional[str]] = {"item_id": item_id}
 
             # Max bid
             m = re.search(
@@ -995,7 +997,9 @@ class GixenClient:
         return unique_snipes
 
     @staticmethod
-    def _find_snipe(snipes: List[Dict[str, str]], item_id: str) -> Dict[str, str]:
+    def _find_snipe(
+        snipes: List[Dict[str, Optional[str]]], item_id: str
+    ) -> Dict[str, Optional[str]]:
         """Find a snipe by item_id in the list."""
         for snipe in snipes:
             if snipe["item_id"] == item_id:
@@ -1029,8 +1033,8 @@ def _canonical_snipe_group(value: object) -> Optional[str]:
 
 
 def find_sibling_cleanup_targets(
-    snipes: List[Dict[str, str]],
-) -> List[Dict[str, str]]:
+    snipes: List[Dict[str, Optional[str]]],
+) -> List[Dict[str, Optional[str]]]:
     """Return snipes that should be removed because a sibling in their snipe
     group has already won.
 

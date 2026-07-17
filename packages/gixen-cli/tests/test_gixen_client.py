@@ -1601,6 +1601,22 @@ class TestFindSiblingCleanupTargets:
         assert [s["item_id"] for s in result] == ["222"]
 
 
+class TestCanonicalSnipeGroup:
+    """BUI-383: the group-canonicalizer behind find_sibling_cleanup_targets."""
+
+    def test_none_blank_zero_and_nonnumeric_are_not_groups(self):
+        from gixen_client import _canonical_snipe_group
+        for v in (None, "", "   ", "0", "00", "N/A", "abc", "1.5", "-1"):
+            assert _canonical_snipe_group(v) is None, v
+
+    def test_positive_numbers_canonicalize(self):
+        from gixen_client import _canonical_snipe_group
+        assert _canonical_snipe_group("1") == "1"
+        assert _canonical_snipe_group("01") == "1"   # normalized
+        assert _canonical_snipe_group(" 3 ") == "3"  # stripped
+        assert _canonical_snipe_group(7) == "7"      # int input
+
+
 # ---------------------------------------------------------------------------
 # CLI: purge with sibling cleanup
 # ---------------------------------------------------------------------------
@@ -1768,6 +1784,9 @@ class TestCliListShowsGroup:
         assert _format_group("") == ""
         assert _format_group("1") == "1"
         assert _format_group("10") == "10"
+        # BUI-383: a scrape miss now arrives as None (was "0"); the list
+        # display must render it blank, not crash.
+        assert _format_group(None) == ""
 
     def test_active_list_shows_group_column(self):
         from cli import cli
