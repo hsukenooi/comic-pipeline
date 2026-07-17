@@ -96,7 +96,7 @@ def _iso(delta: timedelta) -> str:
 
 def _seed(conn: sqlite3.Connection, item_id: str, *, status="ENDED",
           max_bid=25.0, snipe_group=0, auction_end_at=None,
-          gixen_vanished_at=None, added_at=None):
+          gixen_vanished_at=None, added_at=None, group_changed_at=None):
     # added_at defaults to a week ago so seeded rows predate any group win the
     # test stages (the _group_won_before lifetime bound requires the win to
     # fall at or after the classified row's added_at).
@@ -104,9 +104,10 @@ def _seed(conn: sqlite3.Connection, item_id: str, *, status="ENDED",
         added_at = _iso(timedelta(days=-7))
     conn.execute(
         "INSERT INTO bids (item_id, max_bid, status, snipe_group, "
-        "auction_end_at, gixen_vanished_at, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "auction_end_at, gixen_vanished_at, added_at, group_changed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (item_id, max_bid, status, snipe_group, auction_end_at,
-         gixen_vanished_at, added_at),
+         gixen_vanished_at, added_at, group_changed_at),
     )
     conn.commit()
 
@@ -307,6 +308,45 @@ def test_fallback_ledger_respects_lifetime_bound(tmp_path, monkeypatch):
     conn.close()
     assert row["status"] == "WON"
     assert row["winning_bid"] == 10.0
+
+
+def test_fallback_late_group_join_not_backdated(tmp_path, monkeypatch):
+    """BUI-384 in the fallback path: an ENDED row that joined its group only
+    AFTER the group's win (group_changed_at postdates the win) is not
+    classified REMOVED off that pre-membership win — the genuine-win
+    inference must still run. Also exercises _ebay_fallback_rows carrying
+    group_changed_at through to _cancelled_before_end."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "484000001", status="WON", snipe_group=2,
+          auction_end_at=_iso(timedelta(days=-1)))
+    conn.execute("UPDATE bids SET winning_bid=20.0 WHERE item_id='484000001'")
+    conn.commit()
+    _seed(conn, "484000002", snipe_group=2,
+          auction_end_at=_iso(timedelta(hours=-1)),
+          group_changed_at=_iso(timedelta(minutes=-30)))
+    _run_fallback(monkeypatch, conn, price="$10.00")
+    row = _status_row(conn, "484000002")
+    conn.close()
+    assert row["status"] == "WON"
+    assert row["winning_bid"] == 10.0
+
+
+def test_fallback_group_change_before_win_still_blocks_phantom_won(
+        tmp_path, monkeypatch):
+    """Converse guard: a membership change that PRECEDES the win keeps the
+    fallback's cancel classification — REMOVED, not a phantom WON."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "484000003", status="WON", snipe_group=3,
+          auction_end_at=_iso(timedelta(days=-1)))
+    conn.execute("UPDATE bids SET winning_bid=20.0 WHERE item_id='484000003'")
+    conn.commit()
+    _seed(conn, "484000004", snipe_group=3,
+          auction_end_at=_iso(timedelta(hours=-1)),
+          group_changed_at=_iso(timedelta(days=-2)))
+    _run_fallback(monkeypatch, conn, price="$10.00")
+    row = _status_row(conn, "484000004")
+    conn.close()
+    assert row["status"] == "REMOVED"
 
 
 def test_fallback_inferred_won_records_group_evidence(tmp_path, monkeypatch):

@@ -121,6 +121,15 @@ _COLUMN_MIGRATIONS = [
     # non-purged ENDED row (that branch has no time bound at all), or on
     # every sync within the 7-day window for a REMOVED/PURGED tombstone.
     "ALTER TABLE bids ADD COLUMN ebay_no_price_at TEXT",
+    # BUI-384: when this row's snipe_group last CHANGED (the edit path via
+    # update_bid, or the BUI-381 sync mirror via refresh_snipe_group). NULL
+    # while the group has never changed since insert — added_at already
+    # bounds membership then. _group_won_before bounds its evidence window
+    # by max(added_at, group_changed_at): a snipe joined to a group AFTER
+    # that group's win must not be classified REMOVED off a win that
+    # predates its membership (the win postdates added_at but predates the
+    # join — the late-join backdating false-REMOVED).
+    "ALTER TABLE bids ADD COLUMN group_changed_at TEXT",
 ]
 
 
@@ -153,7 +162,8 @@ _BIDS_TABLE_SQL = """
         photo_grade         REAL,
         dbidid              TEXT,
         gixen_vanished_at   TEXT,
-        ebay_no_price_at    TEXT
+        ebay_no_price_at    TEXT,
+        group_changed_at    TEXT
     )
 """
 
@@ -606,10 +616,20 @@ def update_bid(
     # invalidates any earlier vanish observation exactly like reappearing on
     # the list does (BUI-371). Without this, a stale pre-end vanish stamp on a
     # re-added snipe could later misclassify its genuine result as REMOVED.
+    #
+    # group_changed_at (BUI-384): stamped only when snipe_group actually
+    # changes — every SET expression sees the pre-UPDATE row, so the CASE
+    # compares against the old value. An edit that keeps the group must NOT
+    # re-stamp: that would narrow _group_won_before's evidence window and
+    # weaken legitimate group-cancel evidence for no reason.
+    now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "UPDATE bids SET max_bid=?, bid_offset=?, snipe_group=?, "
+        "UPDATE bids SET max_bid=?, bid_offset=?, "
+        "group_changed_at=CASE WHEN snipe_group != ? THEN ? "
+        "ELSE group_changed_at END, "
+        "snipe_group=?, "
         "gixen_vanished_at=NULL WHERE item_id=? AND status='PENDING'",
-        (max_bid, bid_offset, snipe_group, item_id),
+        (max_bid, bid_offset, snipe_group, now, snipe_group, item_id),
     )
     conn.commit()
 
@@ -822,7 +842,8 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
 
 
 def refresh_snipe_group(
-    conn: sqlite3.Connection, item_id: str, snipe_group: int
+    conn: sqlite3.Connection, item_id: str, snipe_group: int,
+    changed_at: str | None = None,
 ) -> None:
     """Mirror Gixen's listed snipe_group onto the live (PENDING) row (BUI-381).
 
@@ -834,12 +855,21 @@ def refresh_snipe_group(
     evidence, N→0 (user un-grouped) clears stale membership that could
     otherwise false-classify a genuine result as REMOVED.
 
+    group_changed_at (BUI-384) is stamped with `changed_at` (defaulting to
+    now) whenever the mirror actually changes the group — the WHERE's
+    `snipe_group != ?` guarantees the stamp only lands on a real change. The
+    observation time is an upper bound on the true change time, so the stamp
+    can only NARROW _group_won_before's evidence window (WON-permissive) —
+    never widen it. This is what stops a retroactive group join from being
+    backdated to added_at and swallowing a pre-join win as cancel evidence.
+
     Caller must conn.commit() — hot-path inside the _sync_gixen loop where
     commits are batched at the end of the cycle."""
     conn.execute(
-        "UPDATE bids SET snipe_group=? "
+        "UPDATE bids SET snipe_group=?, group_changed_at=? "
         "WHERE item_id=? AND status='PENDING' AND snipe_group != ?",
-        (snipe_group, item_id, snipe_group),
+        (snipe_group, changed_at or datetime.now(timezone.utc).isoformat(),
+         item_id, snipe_group),
     )
 
 
