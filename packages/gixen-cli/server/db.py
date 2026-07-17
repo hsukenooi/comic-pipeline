@@ -703,7 +703,7 @@ def update_bid(
     item_id: str,
     max_bid: float,
     bid_offset: int,
-    snipe_group: int,
+    snipe_group: int | None,
 ) -> None:
     # gixen_vanished_at=NULL: every caller runs right after a successful Gixen
     # add/modify — first-party confirmation the snipe is live on Gixen, which
@@ -716,15 +716,27 @@ def update_bid(
     # compares against the old value. An edit that keeps the group must NOT
     # re-stamp: that would narrow _group_won_before's evidence window and
     # weaken legitimate group-cancel evidence for no reason.
+    #
+    # snipe_group=None (BUI-392): "leave unchanged" (a max_bid-only PATCH).
+    # Neither snipe_group nor group_changed_at is touched — there is no
+    # membership change to record. Explicit 0 still means "un-group" and goes
+    # through the normal CASE-stamped branch below.
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "UPDATE bids SET max_bid=?, bid_offset=?, "
-        "group_changed_at=CASE WHEN snipe_group != ? THEN ? "
-        "ELSE group_changed_at END, "
-        "snipe_group=?, "
-        "gixen_vanished_at=NULL WHERE item_id=? AND status='PENDING'",
-        (max_bid, bid_offset, snipe_group, now, snipe_group, item_id),
-    )
+    if snipe_group is None:
+        conn.execute(
+            "UPDATE bids SET max_bid=?, bid_offset=?, "
+            "gixen_vanished_at=NULL WHERE item_id=? AND status='PENDING'",
+            (max_bid, bid_offset, item_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE bids SET max_bid=?, bid_offset=?, "
+            "group_changed_at=CASE WHEN snipe_group != ? THEN ? "
+            "ELSE group_changed_at END, "
+            "snipe_group=?, "
+            "gixen_vanished_at=NULL WHERE item_id=? AND status='PENDING'",
+            (max_bid, bid_offset, snipe_group, now, snipe_group, item_id),
+        )
     conn.commit()
 
 

@@ -324,6 +324,75 @@ def test_edit_bid(api):
     api.mock_gixen.modify_snipe.assert_called_once()
 
 
+# ---------------------------------------------------------------------------
+# BUI-392: PATCH /api/bids/{id} snipe_group None-vs-0 passthrough — a
+# max_bid-only edit (snipe_group omitted from the body) must not silently
+# un-group the snipe, on either the local DB row or the live Gixen snipe.
+# ---------------------------------------------------------------------------
+
+def test_edit_bid_max_bid_only_preserves_snipe_group(api):
+    """Omitting snipe_group from the PATCH body preserves the existing group
+    — the pre-fix default of 0 silently un-grouped the snipe."""
+    api.post("/api/bids", json={"item_id": "200000010", "max_bid": 50.0, "snipe_group": 4})
+    r = api.patch("/api/bids/200000010", json={"max_bid": 75.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["max_bid"] == 75.0
+    assert data["snipe_group"] == 4
+    # Gixen's own modify form has no passthrough concept — it must still
+    # receive the resolved current group, not a literal "None".
+    assert api.mock_gixen.modify_snipe.call_args.kwargs.get("snipe_group") == 4
+
+
+def test_edit_bid_max_bid_only_does_not_stamp_group_changed_at(api):
+    api.post("/api/bids", json={"item_id": "200000011", "max_bid": 50.0, "snipe_group": 4})
+    r = api.patch("/api/bids/200000011", json={"max_bid": 75.0})
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT group_changed_at FROM bids WHERE item_id='200000011'"
+    ).fetchone()
+    assert row["group_changed_at"] is None
+
+
+def test_edit_bid_explicit_zero_still_ungroups(api):
+    """An explicit snipe_group=0 in the body is still a real un-group request,
+    distinct from omitting the field entirely."""
+    api.post("/api/bids", json={"item_id": "200000012", "max_bid": 50.0, "snipe_group": 4})
+    r = api.patch("/api/bids/200000012", json={"max_bid": 75.0, "snipe_group": 0})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["snipe_group"] == 0
+    row = _dbconn().execute(
+        "SELECT group_changed_at FROM bids WHERE item_id='200000012'"
+    ).fetchone()
+    assert row["group_changed_at"] is not None
+    assert api.mock_gixen.modify_snipe.call_args.kwargs.get("snipe_group") == 0
+
+
+def test_edit_bid_explicit_group_change_stamps_group_changed_at(api):
+    api.post("/api/bids", json={"item_id": "200000013", "max_bid": 50.0, "snipe_group": 4})
+    r = api.patch("/api/bids/200000013", json={"max_bid": 75.0, "snipe_group": 9})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["snipe_group"] == 9
+    row = _dbconn().execute(
+        "SELECT group_changed_at FROM bids WHERE item_id='200000013'"
+    ).fetchone()
+    assert row["group_changed_at"] is not None
+
+
+def test_edit_bid_no_pending_row_falls_back_to_zero_not_stale_terminal_group(api):
+    """Adversarial-review catch: when there's no live PENDING row for item_id
+    (only an old terminal row from a prior bidding cycle, e.g. a BUI-178-style
+    re-listing) and the PATCH omits snipe_group, the Gixen-side resolution
+    must NOT leak the terminal row's stale snipe_group into the live snipe —
+    it falls back to 0, same as the fully-un-ingested edge case."""
+    _seed_bid_row("200000014", status="WON", snipe_group=7)
+    r = api.patch("/api/bids/200000014", json={"max_bid": 75.0})
+    assert r.status_code == 200
+    assert api.mock_gixen.modify_snipe.call_args.kwargs.get("snipe_group") == 0
+
+
 def test_edit_bid_not_found(api):
     from gixen_client import GixenSnipeNotFoundError
     api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("not found")
@@ -2424,3 +2493,74 @@ def test_background_entry_points_rollback_on_unexpected_exception(monkeypatch):
         return spy.rollbacks
 
     assert asyncio.run(loop_case()) >= 1
+
+
+# ---------------------------------------------------------------------------
+# BUI-394: GET /api/bids exposes `id` + accepts ?item_id=/?snipe_group=
+# filters, for correlating a /api/group-wins ledger entry back to the exact
+# bids row it classified. Additive only — existing fields/shape unchanged.
+# ---------------------------------------------------------------------------
+
+def test_get_all_bids_exposes_id(api):
+    api.post("/api/bids", json={"item_id": "394000001", "max_bid": 25.0})
+    rows = api.get("/api/bids").json()
+    row = next(b for b in rows if b["item_id"] == "394000001")
+    assert isinstance(row["id"], int)
+
+
+def test_get_all_bids_filters_by_item_id(api):
+    _seed_bid_row("394000002", snipe_group=5)
+    _seed_bid_row("394000003", snipe_group=5)
+    rows = api.get("/api/bids?item_id=394000002").json()
+    assert [r["item_id"] for r in rows] == ["394000002"]
+
+
+def test_get_all_bids_filters_by_snipe_group(api):
+    _seed_bid_row("394000004", snipe_group=8)
+    _seed_bid_row("394000005", snipe_group=8)
+    _seed_bid_row("394000006", snipe_group=9)
+    rows = api.get("/api/bids?snipe_group=8").json()
+    assert sorted(r["item_id"] for r in rows) == ["394000004", "394000005"]
+
+
+def test_get_all_bids_combined_filters_no_match(api):
+    _seed_bid_row("394000007", snipe_group=8)
+    assert api.get("/api/bids?snipe_group=8&item_id=394000099").json() == []
+
+
+def test_get_all_bids_combined_filters_positive_match(api):
+    """Both filters together narrow to the single row satisfying both (AND
+    semantics), not just the no-match case above."""
+    _seed_bid_row("394000011", snipe_group=8)
+    _seed_bid_row("394000012", snipe_group=8)
+    rows = api.get("/api/bids?snipe_group=8&item_id=394000011").json()
+    assert [r["item_id"] for r in rows] == ["394000011"]
+
+
+def test_get_all_bids_snipe_group_non_integer_returns_422(api):
+    r = api.get("/api/bids?snipe_group=notanumber")
+    assert r.status_code == 422
+
+
+def test_get_all_bids_no_filter_returns_full_table_unchanged(api):
+    """No filter params → every existing row is returned, same as before
+    BUI-394 (contract stability for the no-filter call)."""
+    _seed_bid_row("394000008", snipe_group=1)
+    _seed_bid_row("394000009", snipe_group=2)
+    rows = api.get("/api/bids").json()
+    ids = {r["item_id"] for r in rows}
+    assert {"394000008", "394000009"}.issubset(ids)
+
+
+def test_get_all_bids_response_shape_still_includes_pre_existing_fields(api):
+    """Guards additive-only: every field present before BUI-394 must still be
+    present and unrenamed alongside the new `id` field."""
+    api.post("/api/bids", json={"item_id": "394000010", "max_bid": 25.0})
+    rows = api.get("/api/bids").json()
+    row = next(b for b in rows if b["item_id"] == "394000010")
+    assert set(row) == {
+        "id", "item_id", "title", "max_bid", "bid_offset", "snipe_group",
+        "end_date_iso", "added_at", "status", "status_mirror", "winning_bid",
+        "seller", "local_snipe_at", "local_snipe_result", "gixen_vanished_at",
+        "notes", "ebay_no_price_at", "group_changed_at",
+    }
