@@ -215,6 +215,33 @@ owned row's `series_name`/`release_date`:
   see `docs/solutions/integration-issues/wishlist-conflict-scoped-removal-2026-07-02.md`
   for the worked examples. Leave decoys wishlisted.
 
+**A third bucket — `printing_conflicts` — needs your decision too (BUI-372/380).**
+The audit response carries `printing_conflicts` alongside `conflicts`: same
+provenance fields (`name`, `series`, `issue`, `full_title_matched`, `series_name`,
+`release_date`) plus `printing_candidates`. An entry here means the wish matched
+an owned row that is a **different printing** of the same series+issue (e.g. you
+own the "2nd Printing" but wished the base issue, or vice versa) — printings are
+distinct collectibles, so this is neither a genuine conflict nor a decoy. Render
+it as a Pattern E-style advisory, mirroring `/comic:wishlist-add` Step 3/4's
+BUI-372 handling, and let the user decide rather than folding it into either
+bucket above:
+
+```
+Printing conflict — needs your decision (1):
+  Amazing Spider-Man #300 — wish-list entry matches an owned "Amazing Spider-Man
+  #300 2nd Printing" (full_title_matched); per printing_candidates the base
+  printing (printing_ordinal: 1) is <owned/wish-listed/untracked>. Keep the wish
+  (you still want the base) or drop it (you're satisfied with the reprint you
+  own)?
+```
+
+**These are never auto-removed.** `remove-conflicts` derives its removal set
+ONLY from `conflicts` — a `printing_conflicts` entry can't be swept, scoped or
+unscoped (naming one in `names` below returns an explicit error, not a silent
+no-op). If the user decides they no longer want the wish, remove it directly
+with `DELETE /api/comics/wish-list?title=<name>` (BUI-128) — not through
+`remove-conflicts`.
+
 Then remove **only the reviewed genuine conflicts**, scoped by their exact
 `name` values from the audit:
 
@@ -235,10 +262,12 @@ reviewing the full audit and confirming there are no decoys. Prefer scoped
 Both endpoints 409 if the collection was never imported. **Do not proceed to a
 wish push (Step 3b) until every *genuine* conflict has been dropped** (decoys
 left in the audit are false positives, not owned-but-wished entries — they must
-not block the push, and must not be removed). This conflicts audit + scoped
-remove is the sync's **fulfillment-drop** (BUI-208 U2): a wished book you now own
-has its wish dropped and the owned copy kept; it touches only wish state (never a
-collection row), and each drop is logged with the matched owned identity.
+not block the push, and must not be removed; `printing_conflicts` entries are the
+same — they are advisory, not blocking, and must not be removed via
+`remove-conflicts` either). This conflicts audit + scoped remove is the sync's
+**fulfillment-drop** (BUI-208 U2): a wished book you now own has its wish dropped
+and the owned copy kept; it touches only wish state (never a collection row),
+and each drop is logged with the matched owned identity.
 
 **A clean conflicts audit is a strong signal, not a proof of owned-safety.** The
 audit and the export parse issue tokens slightly differently and apply the same
