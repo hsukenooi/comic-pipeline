@@ -813,11 +813,17 @@ def update_bid_status(
     # Caller must conn.commit() — this helper is hot-path inside loops where
     # the caller batches the commit at the end of the cycle.
     #
-    # only_id narrows the write to one row. The default item_id-wide write is
-    # right for Gixen-driven transitions, but the BUI-371 REMOVED
-    # classification must not tombstone a *live* PENDING row that shares the
-    # item_id with the old row being classified (a re-listed auction re-added
-    # after the original resolved — the BUI-178 class of collateral damage).
+    # only_id narrows the write to one row. Every _sync_gixen and fallback
+    # caller now passes it (the BUI-371 REMOVED classification first, then the
+    # item_id-wide legacy writes narrowed by BUI-382/BUI-388/BUI-390): a
+    # terminal/tombstone write must land only on the row it is resolving, never
+    # on a *live* PENDING row or an older resolved-but-unpurged sibling that
+    # shares the item_id (a re-listed auction re-added after the original
+    # resolved — the BUI-178 class of collateral damage). No in-tree caller
+    # omits only_id; the transition loop passes only_id=None only for the
+    # row-less-winner no-op (no rows share the item_id), so the item_id-wide
+    # branch is retained for that boundary and the legacy contract, never for a
+    # deliberate multi-row write. Prefer only_id whenever the site holds a row id.
     id_clause = " AND id=?" if only_id is not None else ""
     win_rows: list[sqlite3.Row] = []
     if status == "WON":
