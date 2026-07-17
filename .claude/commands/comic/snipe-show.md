@@ -37,6 +37,8 @@ Split results into two groups based on `time_to_end`:
 - **Active** — `time_to_end` is not `"ENDED"`
 - **Recently Ended** — `time_to_end` is `"ENDED"`
 
+**Tombstoned snipes never appear in either table.** `gixen list --json` reads `/api/snipes`, which excludes `REMOVED`/`PURGED` rows entirely — including a bid-group sibling the server classified `REMOVED` on its own after another copy in the group won (BUI-371). Don't expect to see it as "Ended" or "Lost"; it's gone from both tables, not mislabeled in one.
+
 ### Table Formatting Rules
 
 To prevent markdown table rendering issues in the terminal:
