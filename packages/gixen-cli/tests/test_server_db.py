@@ -202,8 +202,8 @@ def test_update_bid_noop_on_non_pending(db):
 
 
 def test_update_bid_none_snipe_group_noop_on_non_pending(db):
-    """BUI-392's None-passthrough branch is a separate SQL statement from the
-    explicit-int branch above — confirm it independently honors the same
+    """The snipe_group=None passthrough (BUI-392) assembles a different SET list
+    than the explicit-int branch — confirm it still carries the same
     WHERE status='PENDING' guard rather than silently dropping it."""
     insert_bid(db, "300000002", 50.0, 6, 4, "s")
     update_bid_status(db, "300000002", "WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")
@@ -1902,6 +1902,53 @@ def test_update_bid_explicit_zero_still_ungroups_after_none_passthrough(db):
     row = get_bid_by_item_id(db, "884000011")
     assert row["snipe_group"] == 0
     assert row["group_changed_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# BUI-401: bid_offset=None passthrough — a max_bid-only edit must not silently
+# reset a tuned fire-offset back to 6 (the same latent bug snipe_group had
+# pre-BUI-392). An explicit offset still writes through. bid_offset and
+# snipe_group passthrough are independent — either, both, or neither can be None.
+# ---------------------------------------------------------------------------
+
+def test_update_bid_none_bid_offset_preserves_existing_offset(db):
+    """A max_bid-only edit (bid_offset=None) leaves bid_offset untouched — the
+    pre-BUI-401 code always wrote bid_offset, resetting a tuned 12 back to 6."""
+    insert_bid(db, "884001001", 50.0, 12, 0, "s")
+    update_bid(db, "884001001", 60.0, None, 0)
+    row = get_bid_by_item_id(db, "884001001")
+    assert row["max_bid"] == 60.0       # the field the caller meant to change
+    assert row["bid_offset"] == 12      # unchanged, not reset to 6
+
+
+def test_update_bid_explicit_bid_offset_writes_through(db):
+    """An explicit offset is a real change and IS written."""
+    insert_bid(db, "884001002", 50.0, 12, 0, "s")
+    update_bid(db, "884001002", 60.0, 9, 0)
+    assert get_bid_by_item_id(db, "884001002")["bid_offset"] == 9
+
+
+def test_update_bid_both_none_preserves_offset_and_group(db):
+    """A true max_bid-only edit (both fields None) changes only max_bid, leaving
+    the tuned offset AND the group membership intact."""
+    insert_bid(db, "884001003", 50.0, 12, 7, "s")
+    update_bid(db, "884001003", 88.0, None, None)
+    row = get_bid_by_item_id(db, "884001003")
+    assert row["max_bid"] == 88.0
+    assert row["bid_offset"] == 12
+    assert row["snipe_group"] == 7
+    assert row["group_changed_at"] is None  # no membership change recorded
+
+
+def test_update_bid_none_bid_offset_noop_on_non_pending(db):
+    """The bid_offset passthrough branch must honor the same WHERE
+    status='PENDING' guard as every other update_bid path."""
+    insert_bid(db, "884001004", 50.0, 12, 0, "s")
+    update_bid_status(db, "884001004", "WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")
+    update_bid(db, "884001004", max_bid=999.0, bid_offset=None, snipe_group=None)
+    row = get_bid_by_item_id(db, "884001004")
+    assert row["max_bid"] == 50.0       # unchanged — guarded on status='PENDING'
+    assert row["bid_offset"] == 12
 
 
 def test_refresh_snipe_group_stamps_group_changed_at(db):

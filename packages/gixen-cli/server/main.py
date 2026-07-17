@@ -936,7 +936,11 @@ class EditBidRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     max_bid: float
-    bid_offset: int = 6
+    # BUI-401: None means "leave bid_offset unchanged" (passthrough) — same
+    # latent bug snipe_group had pre-BUI-392: a max_bid-only PATCH that omits
+    # this field must not silently reset a tuned fire-offset back to 6. See
+    # update_bid's passthrough and this route's Gixen-side resolution below.
+    bid_offset: int | None = None
     # BUI-392: None means "leave snipe_group unchanged" (passthrough) — a
     # max_bid-only PATCH that omits this field must not silently un-group the
     # snipe. Explicit 0 still means "un-group". See update_bid's None branch
@@ -1327,28 +1331,34 @@ async def _modify_with_cache_fallback(
     """BUI-116: modify using the cached dbidid (fast path, no pre-POST list). If
     a cached id was used but the modify couldn't be confirmed (stale id — the
     snipe was re-created with a new dbidid), clear the cache and retry once via
-    the list-based lookup. Holds _api_lock across both attempts so the sequence
-    stays atomic. Exceptions propagate to the caller for HTTP mapping."""
+    the list-based lookup. Exceptions propagate to the caller for HTTP mapping.
+
+    BUI-402: caller must ALREADY HOLD _api_lock — this no longer acquires it.
+    api_edit_bid resolves the bid_offset/snipe_group passthrough from the live
+    DB row, calls this, and writes update_bid all under one acquisition, so the
+    resolve read, the Gixen modify, and the local write stay atomic against a
+    concurrent group/offset-changing PATCH (asyncio.Lock is not reentrant, so
+    acquiring here would deadlock that single-acquisition caller). Both attempts
+    below still run under that held lock, keeping the retry sequence atomic."""
     cached = _cached_dbidid(db, item_id)
-    async with _api_lock:
-        try:
-            await asyncio.to_thread(
-                _api_client.modify_snipe, item_id, max_bid,
-                bid_offset=bid_offset, snipe_group=snipe_group, dbidid=cached,
-            )
-            return
-        except GixenModifyNotConfirmedError:
-            if cached is None:
-                raise  # already used the list path — genuinely unconfirmable
-            logger.warning(
-                "modify with cached dbidid for %s unconfirmed; clearing cache "
-                "and retrying via list lookup", item_id,
-            )
-            _clear_cached_dbidid(db, item_id)
-            await asyncio.to_thread(
-                _api_client.modify_snipe, item_id, max_bid,
-                bid_offset=bid_offset, snipe_group=snipe_group,  # dbidid=None
-            )
+    try:
+        await asyncio.to_thread(
+            _api_client.modify_snipe, item_id, max_bid,
+            bid_offset=bid_offset, snipe_group=snipe_group, dbidid=cached,
+        )
+        return
+    except GixenModifyNotConfirmedError:
+        if cached is None:
+            raise  # already used the list path — genuinely unconfirmable
+        logger.warning(
+            "modify with cached dbidid for %s unconfirmed; clearing cache "
+            "and retrying via list lookup", item_id,
+        )
+        _clear_cached_dbidid(db, item_id)
+        await asyncio.to_thread(
+            _api_client.modify_snipe, item_id, max_bid,
+            bid_offset=bid_offset, snipe_group=snipe_group,  # dbidid=None
+        )
 
 
 async def _remove_with_cache_fallback(db: sqlite3.Connection, item_id: str) -> None:
@@ -1377,39 +1387,56 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         raise HTTPException(status_code=422, detail="item_id must be numeric")
     db = _get_db()
 
-    # BUI-392: req.snipe_group is None means "leave unchanged" (a max_bid-only
-    # PATCH). update_bid's None branch handles our local DB state, but
-    # Gixen's own modify form (GixenClient.modify_snipe) has no passthrough
-    # concept — it always submits an explicit newsnipegroup — so resolve the
-    # snipe's current group from our DB and send that, keeping Gixen's state
-    # in sync with "unchanged" intent instead of un-grouping it there too.
+    # BUI-392/401: req.bid_offset / req.snipe_group being None means "leave
+    # unchanged" (a max_bid-only PATCH). update_bid's passthrough handles our
+    # local DB state, but Gixen's own modify form (GixenClient.modify_snipe) has
+    # no passthrough concept — it always submits an explicit newbidoffset /
+    # newsnipegroup — so resolve the snipe's current values from our DB and send
+    # those, keeping Gixen's state in sync with "unchanged" intent instead of
+    # resetting the offset to 6 / un-grouping it there too.
     #
     # Deliberately PENDING-only (not the get_bid_by_item_id fallback used for
     # dbidid caching below): get_bid_by_item_id has no status filter, so it
     # can return a stale terminal row from an earlier bidding cycle on the
-    # same item_id (BUI-178-style re-listing) — using THAT row's snipe_group
+    # same item_id (BUI-178-style re-listing) — using THAT row's values
     # would leak an unrelated old value into the live snipe instead of
-    # preserving it. Falls back to 0 only when there's no live row at all
-    # (e.g. a web-added snipe never ingested), matching the pre-existing
-    # default in that edge case.
-    gixen_snipe_group = req.snipe_group
-    if gixen_snipe_group is None:
-        current = get_pending_bid_by_item_id(db, item_id)
-        gixen_snipe_group = current["snipe_group"] if current is not None else 0
-
+    # preserving it. Falls back to the plain defaults (6 / 0) only when there's
+    # no live row at all (e.g. a web-added snipe never ingested), matching the
+    # pre-existing default in that edge case.
+    #
+    # BUI-402: the resolve read, the Gixen modify, AND the local update_bid all
+    # run under ONE _api_lock acquisition. Resolving OUTSIDE the lock let a
+    # concurrent group/offset-changing PATCH land between the read and the
+    # modify and get silently reverted on Gixen's side while our DB kept the
+    # newer value — a divergence that, unlike the stale-dbidid case, does NOT
+    # self-heal via a confirm-retry. update_bid is inside the same lock too, so
+    # the resolve can't read a state a concurrent edit already committed to
+    # Gixen but not yet to the DB. _modify_with_cache_fallback no longer
+    # acquires the lock (asyncio.Lock is not reentrant); this is the single
+    # acquisition.
     try:
-        await _modify_with_cache_fallback(
-            db, item_id, Decimal(str(req.max_bid)),
-            req.bid_offset, gixen_snipe_group,
-        )
+        async with _api_lock:
+            gixen_bid_offset = req.bid_offset
+            gixen_snipe_group = req.snipe_group
+            if gixen_bid_offset is None or gixen_snipe_group is None:
+                current = get_pending_bid_by_item_id(db, item_id)
+                if gixen_bid_offset is None:
+                    gixen_bid_offset = current["bid_offset"] if current is not None else 6
+                if gixen_snipe_group is None:
+                    gixen_snipe_group = current["snipe_group"] if current is not None else 0
+            await _modify_with_cache_fallback(
+                db, item_id, Decimal(str(req.max_bid)),
+                gixen_bid_offset, gixen_snipe_group,
+            )
+            # Passthrough (None) values go to update_bid so a max_bid-only edit
+            # leaves both fields untouched locally; explicit values write through.
+            update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
     except GixenSnipeNotFoundError as e:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen") from e
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except requests.HTTPError as e:
         raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}") from e
-
-    update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
 
     row = get_bid_by_item_id(db, item_id)
     if row is None:

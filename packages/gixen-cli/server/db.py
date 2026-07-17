@@ -702,7 +702,7 @@ def update_bid(
     conn: sqlite3.Connection,
     item_id: str,
     max_bid: float,
-    bid_offset: int,
+    bid_offset: int | None,
     snipe_group: int | None,
 ) -> None:
     # gixen_vanished_at=NULL: every caller runs right after a successful Gixen
@@ -711,32 +711,42 @@ def update_bid(
     # the list does (BUI-371). Without this, a stale pre-end vanish stamp on a
     # re-added snipe could later misclassify its genuine result as REMOVED.
     #
+    # bid_offset / snipe_group passthrough (BUI-401 / BUI-392): None means
+    # "leave this field unchanged" — a max_bid-only PATCH must not silently
+    # reset a tuned fire-offset back to 6 (BUI-401) or un-group the snipe
+    # (BUI-392). Each field joins the SET list only when non-None, so a
+    # max_bid-only edit (both None) touches neither. An explicit value writes
+    # through the normal branch; an explicit snipe_group=0 still un-groups.
+    #
     # group_changed_at (BUI-384): stamped only when snipe_group actually
     # changes — every SET expression sees the pre-UPDATE row, so the CASE
     # compares against the old value. An edit that keeps the group must NOT
     # re-stamp: that would narrow _group_won_before's evidence window and
-    # weaken legitimate group-cancel evidence for no reason.
-    #
-    # snipe_group=None (BUI-392): "leave unchanged" (a max_bid-only PATCH).
-    # Neither snipe_group nor group_changed_at is touched — there is no
-    # membership change to record. Explicit 0 still means "un-group" and goes
-    # through the normal CASE-stamped branch below.
+    # weaken legitimate group-cancel evidence for no reason. A None snipe_group
+    # skips its SET entirely, so group_changed_at is never touched then.
     now = datetime.now(timezone.utc).isoformat()
-    if snipe_group is None:
-        conn.execute(
-            "UPDATE bids SET max_bid=?, bid_offset=?, "
-            "gixen_vanished_at=NULL WHERE item_id=? AND status='PENDING'",
-            (max_bid, bid_offset, item_id),
-        )
-    else:
-        conn.execute(
-            "UPDATE bids SET max_bid=?, bid_offset=?, "
+    # Every fragment below is a static literal — only the bound values are
+    # caller-supplied — so this dynamic assembly carries no injection surface.
+    set_clauses = ["max_bid=?"]
+    params: list = [max_bid]
+    if bid_offset is not None:
+        set_clauses.append("bid_offset=?")
+        params.append(bid_offset)
+    if snipe_group is not None:
+        set_clauses.append(
             "group_changed_at=CASE WHEN snipe_group != ? THEN ? "
-            "ELSE group_changed_at END, "
-            "snipe_group=?, "
-            "gixen_vanished_at=NULL WHERE item_id=? AND status='PENDING'",
-            (max_bid, bid_offset, snipe_group, now, snipe_group, item_id),
+            "ELSE group_changed_at END"
         )
+        params.extend([snipe_group, now])
+        set_clauses.append("snipe_group=?")
+        params.append(snipe_group)
+    set_clauses.append("gixen_vanished_at=NULL")
+    params.append(item_id)
+    conn.execute(
+        f"UPDATE bids SET {', '.join(set_clauses)} "
+        "WHERE item_id=? AND status='PENDING'",
+        params,
+    )
     conn.commit()
 
 
