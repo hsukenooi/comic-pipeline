@@ -38,7 +38,7 @@ from server.db import (
     mark_bids_purged, cache_gixen_data, DEDUP_TOMBSTONE_NOTE,
     CANCELLED_TOMBSTONE_NOTE,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
-    refresh_snipe_group, record_group_win,
+    refresh_snipe_group, record_group_win, GROUP_WIN_SOURCE_LISTED_WIN,
     TOMBSTONE_STATUSES_SQL,
 )
 import ebay_bidder
@@ -640,7 +640,10 @@ async def _record_listed_win_evidence(
     end_dt = _parse_end_iso(end_iso)
     if end_dt is None or end_dt > datetime.now(timezone.utc) + _CANCEL_EVIDENCE_MARGIN:
         return True  # no usable end → record nothing (WON-permissive); fetch spent
-    record_group_win(db, iid, group, end_iso, recorded_at=now)
+    record_group_win(
+        db, iid, group, end_iso, recorded_at=now,
+        source=GROUP_WIN_SOURCE_LISTED_WIN,
+    )
     logger.info(
         "_sync_gixen: recorded group-win evidence for row-less winner %s "
         "(group %d, ended %s)", iid, group, end_iso,
@@ -1726,6 +1729,44 @@ async def api_get_all_bids():
             "group_changed_at": item.get("group_changed_at"),
         })
     return result
+
+
+@app.get("/api/group-wins")
+async def api_get_group_wins(
+    item_id: str | None = None, snipe_group: int | None = None
+):
+    """BUI-385 forensics: the durable group_wins evidence ledger (BUI-381), the
+    thing that classifies a cancelled bid-group sibling REMOVED. Pure DB read —
+    no Gixen sync. Answers "which win classified this row REMOVED": pass
+    ?snipe_group=N (and optionally ?item_id=) to see the wins in that group,
+    each with its recorded_at and source provenance
+    (status-transition / startup-backfill / listed-win / legacy — the
+    GROUP_WIN_SOURCES vocabulary). Agents have no sqlite access to the Mac
+    Mini, so this is the only way to audit the ledger over HTTP — parity with
+    the /api/bids evidence-trail fields (gixen_vanished_at, notes,
+    group_changed_at).
+
+    This is a gixen bidding-side concept (snipe groups, wins) owned by
+    gixen-cli's own table, so it lives here beside /api/history and /api/bids —
+    NOT on the overlay's provider-neutral /api/comics/* surface, which is for
+    comic collection/FMV data.
+    """
+    db = _get_db()
+    clauses: list[str] = []
+    params: list = []
+    if item_id is not None:
+        clauses.append("item_id = ?")
+        params.append(item_id)
+    if snipe_group is not None:
+        clauses.append("snipe_group = ?")
+        params.append(snipe_group)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = db.execute(
+        "SELECT id, snipe_group, item_id, won_end_at, recorded_at, source "
+        f"FROM group_wins {where} ORDER BY recorded_at DESC, id DESC",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _cached_dbidid(db: sqlite3.Connection, item_id: str) -> str | None:

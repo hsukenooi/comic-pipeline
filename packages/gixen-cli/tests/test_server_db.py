@@ -1354,15 +1354,38 @@ def test_record_group_win_skips_far_future_end(db):
 
 
 def test_record_group_win_idempotent(db):
+    """Re-recording the SAME win (same group, item, end) is a no-op — the
+    common case of a WON row re-classified WON on every sync. Keyed on
+    (group, item, won_end_at) since BUI-385, so identical re-records still
+    collapse to one row."""
     from server.db import record_group_win
     record_group_win(db, "881000006", 3, "2026-07-01T00:00:00+00:00")
-    record_group_win(db, "881000006", 3, "2026-07-02T00:00:00+00:00")
+    record_group_win(db, "881000006", 3, "2026-07-01T00:00:00+00:00")
     db.commit()
     rows = db.execute(
         "SELECT * FROM group_wins WHERE item_id='881000006'"
     ).fetchall()
     assert len(rows) == 1
-    assert rows[0]["won_end_at"] == "2026-07-01T00:00:00+00:00"  # first write wins
+    assert rows[0]["won_end_at"] == "2026-07-01T00:00:00+00:00"
+
+
+def test_record_group_win_relisted_rewin_records_distinct_end(db):
+    """BUI-385: a genuine re-listed re-win of the same eBay id in the same
+    group ends at a DISTINCT time and records a SECOND ledger entry — the old
+    (group, item) key collapsed it to the first win, a WON-permissive evidence
+    miss for recycled group numbers. Both stored ends are genuine auction ends
+    (record_group_win's guards reject proxies), so this strengthens evidence
+    soundly, never a false-REMOVED double-count."""
+    from server.db import record_group_win
+    record_group_win(db, "881000018", 3, "2026-06-01T00:00:00+00:00")
+    record_group_win(db, "881000018", 3, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    ends = {
+        r["won_end_at"] for r in db.execute(
+            "SELECT won_end_at FROM group_wins WHERE item_id='881000018'"
+        )
+    }
+    assert ends == {"2026-06-01T00:00:00+00:00", "2026-07-01T00:00:00+00:00"}
 
 
 def test_migration_backfills_group_wins_from_existing_won_rows(tmp_path):
@@ -1409,7 +1432,298 @@ def test_migration_backfills_group_wins_from_existing_won_rows(tmp_path):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# BUI-385: group_wins ledger hardening — source provenance + re-win re-keying
+# ---------------------------------------------------------------------------
+
+def test_group_wins_source_column_present(db):
+    cols = {r[1] for r in db.execute("PRAGMA table_info(group_wins)")}
+    assert "source" in cols
+
+
+def test_group_wins_source_migration_idempotent(tmp_path):
+    """Re-opening an already-migrated DB doesn't choke on the duplicate
+    `source` column add (the _COLUMN_MIGRATIONS 'duplicate column' guard)."""
+    path = tmp_path / "idem_source.db"
+    init_db(path).close()
+    conn2 = init_db(path)
+    cols = {r[1] for r in conn2.execute("PRAGMA table_info(group_wins)")}
+    conn2.close()
+    assert "source" in cols
+
+
+def test_group_wins_unique_index_rekeyed_to_include_end(db):
+    """The unique index is (snipe_group, item_id, won_end_at) — the old 2-col
+    index is gone, so a distinct-end re-win is no longer blocked."""
+    idx_names = {
+        r[0] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='group_wins'"
+        )
+    }
+    assert "idx_group_wins_group_item_end" in idx_names
+    assert "idx_group_wins_group_item" not in idx_names
+    cols = [
+        r[2] for r in db.execute("PRAGMA index_info(idx_group_wins_group_item_end)")
+    ]
+    assert cols == ["snipe_group", "item_id", "won_end_at"]
+
+
+def test_group_wins_index_swap_migrates_and_is_idempotent(tmp_path):
+    """A legacy DB carrying the old 2-col unique index is re-keyed on open, and
+    re-opening the migrated DB leaves the 3-col index in place (idempotent)."""
+    path = tmp_path / "idx_swap.db"
+    conn = init_db(path)
+    # Simulate a pre-BUI-385 DB: drop the new index, recreate the old 2-col one.
+    conn.execute("DROP INDEX IF EXISTS idx_group_wins_group_item_end")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_group_wins_group_item "
+        "ON group_wins(snipe_group, item_id)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)  # migration should swap the index
+    try:
+        idx = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='group_wins'"
+            )
+        }
+        assert "idx_group_wins_group_item_end" in idx
+        assert "idx_group_wins_group_item" not in idx
+    finally:
+        conn.close()
+
+    # Re-open the already-swapped DB — still exactly the 3-col index.
+    conn = init_db(path)
+    try:
+        idx = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='group_wins'"
+            )
+        }
+        assert "idx_group_wins_group_item_end" in idx
+        assert "idx_group_wins_group_item" not in idx
+    finally:
+        conn.close()
+
+
+def test_update_bid_status_won_records_status_transition_source(db):
+    """Writer 1: update_bid_status's WON transition tags source
+    'status-transition'."""
+    from server.db import GROUP_WIN_SOURCE_STATUS_TRANSITION
+    insert_bid(db, "885000001", 50.0, 6, 3, "s")
+    db.execute(
+        "UPDATE bids SET auction_end_at='2026-06-30T23:55:00+00:00' "
+        "WHERE item_id='885000001'"
+    )
+    update_bid_status(db, "885000001", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    row = db.execute(
+        "SELECT source FROM group_wins WHERE item_id='885000001'"
+    ).fetchone()
+    assert row["source"] == GROUP_WIN_SOURCE_STATUS_TRANSITION
+
+
+def test_record_group_win_default_source_is_status_transition(db):
+    from server.db import record_group_win, GROUP_WIN_SOURCE_STATUS_TRANSITION
+    record_group_win(db, "885000002", 3, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    row = db.execute(
+        "SELECT source FROM group_wins WHERE item_id='885000002'"
+    ).fetchone()
+    assert row["source"] == GROUP_WIN_SOURCE_STATUS_TRANSITION
+
+
+def test_record_group_win_listed_win_source_stored(db):
+    """Writer 3 stores its provenance verbatim (main.py passes it)."""
+    from server.db import (
+        record_group_win, GROUP_WIN_SOURCE_LISTED_WIN, GROUP_WIN_SOURCES,
+    )
+    record_group_win(
+        db, "885000003", 3, "2026-07-01T00:00:00+00:00",
+        source=GROUP_WIN_SOURCE_LISTED_WIN,
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT source FROM group_wins WHERE item_id='885000003'"
+    ).fetchone()
+    assert row["source"] == GROUP_WIN_SOURCE_LISTED_WIN
+    assert row["source"] in GROUP_WIN_SOURCES
+
+
+def test_migration_backfill_tags_startup_backfill_source(tmp_path):
+    """Writer 2: the startup backfill tags the rows it seeds
+    'startup-backfill'."""
+    from server.db import GROUP_WIN_SOURCE_STARTUP_BACKFILL
+    path = tmp_path / "bf_source.db"
+    conn = init_db(path)
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group, "
+        "auction_end_at, resolved_at) "
+        "VALUES ('885000004', 25.0, 'WON', 4, '2026-06-01T00:00:00+00:00', "
+        "'2026-06-01T00:05:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        row = conn.execute(
+            "SELECT source FROM group_wins WHERE item_id='885000004'"
+        ).fetchone()
+        assert row is not None
+        assert row["source"] == GROUP_WIN_SOURCE_STARTUP_BACKFILL
+    finally:
+        conn.close()
+
+
+def test_migration_tags_pre_column_rows_legacy(tmp_path):
+    """A ledger row written before the source column existed (NULL source) is
+    stamped 'legacy' on the next open — no writer can leave a NULL source."""
+    from server.db import GROUP_WIN_SOURCE_LEGACY
+    path = tmp_path / "legacy_source.db"
+    conn = init_db(path)
+    # Simulate a pre-BUI-385 write: a ledger row with no source set. (The
+    # column exists post-migration, so force it NULL to mimic the old shape.)
+    conn.execute(
+        "INSERT INTO group_wins (snipe_group, item_id, won_end_at, recorded_at, "
+        "source) VALUES (7, '885000005', '2026-06-01T00:00:00+00:00', "
+        "'2026-06-01T00:00:00+00:00', NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        row = conn.execute(
+            "SELECT source FROM group_wins WHERE item_id='885000005'"
+        ).fetchone()
+        assert row["source"] == GROUP_WIN_SOURCE_LEGACY
+        # And no row anywhere is left NULL.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM group_wins WHERE source IS NULL"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_record_group_win_rejects_unknown_source(db):
+    """The closed vocabulary is enforced at the write boundary — a typo'd tag
+    raises instead of silently landing in the permanent ledger and surfacing
+    over /api/group-wins. Nothing is written."""
+    from server.db import record_group_win
+    with pytest.raises(ValueError, match="unknown source"):
+        record_group_win(
+            db, "885000006", 3, "2026-07-01T00:00:00+00:00", source="bogus",
+        )
+    db.commit()
+    assert db.execute(
+        "SELECT COUNT(*) FROM group_wins WHERE item_id='885000006'"
+    ).fetchone()[0] == 0
+
+
+def test_update_bid_status_won_resync_is_ledger_idempotent(db):
+    """The common re-sync case: a WON row re-classified WON on a later sync
+    (same status, same genuine end) must NOT add a second ledger row under the
+    (group, item, won_end_at) key — only a genuinely distinct end does. Guards
+    against per-sync ledger bloat from the re-key."""
+    insert_bid(db, "885000007", 50.0, 6, 3, "s")
+    db.execute(
+        "UPDATE bids SET auction_end_at='2026-06-30T23:55:00+00:00' "
+        "WHERE item_id='885000007'"
+    )
+    update_bid_status(db, "885000007", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    update_bid_status(db, "885000007", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    assert db.execute(
+        "SELECT COUNT(*) FROM group_wins WHERE item_id='885000007'"
+    ).fetchone()[0] == 1
+
+
+def test_migration_backfill_records_distinct_ends_for_rewin(tmp_path):
+    """The re-key reaches the startup backfill too: two WON bids rows sharing
+    (group, item) with DISTINCT genuine ends seed TWO ledger rows, where the
+    old 2-col key collapsed them to one. Both tagged startup-backfill."""
+    from server.db import GROUP_WIN_SOURCE_STARTUP_BACKFILL
+    path = tmp_path / "bf_rewin.db"
+    conn = init_db(path)
+    # Two WON rows, same item+group, distinct non-proxy ends (resolved_at NULL).
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group, auction_end_at) "
+        "VALUES ('885000008', 25.0, 'WON', 4, '2026-06-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group, auction_end_at) "
+        "VALUES ('885000008', 25.0, 'WON', 4, '2026-07-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        rows = conn.execute(
+            "SELECT won_end_at, source FROM group_wins WHERE item_id='885000008'"
+        ).fetchall()
+        ends = {r["won_end_at"] for r in rows}
+        assert ends == {"2026-06-01T00:00:00+00:00", "2026-07-01T00:00:00+00:00"}
+        assert {r["source"] for r in rows} == {GROUP_WIN_SOURCE_STARTUP_BACKFILL}
+    finally:
+        conn.close()
+
+
+def test_group_wins_index_swap_over_populated_legacy_table(tmp_path):
+    """The 'the 3-col index can never fail to build' guarantee, with ACTUAL
+    rows present in a pre-BUI-385 2-col-unique table. Migrating swaps the
+    index, preserves all rows, and the new key then admits a distinct-end
+    re-win the old key would have collapsed."""
+    path = tmp_path / "idx_populated.db"
+    conn = init_db(path)
+    # Simulate a pre-BUI-385 DB: the old 2-col unique index over seeded rows.
+    conn.execute("DROP INDEX IF EXISTS idx_group_wins_group_item_end")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_group_wins_group_item "
+        "ON group_wins(snipe_group, item_id)"
+    )
+    conn.execute(
+        "INSERT INTO group_wins (snipe_group, item_id, won_end_at, recorded_at) "
+        "VALUES (5, '886000001', '2026-06-01T00:00:00+00:00', "
+        "'2026-06-01T00:00:00+00:00'), "
+        "(5, '886000002', '2026-06-02T00:00:00+00:00', '2026-06-02T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)  # must not crash building the 3-col index over rows
+    try:
+        idx = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='group_wins'"
+            )
+        }
+        assert "idx_group_wins_group_item_end" in idx
+        assert "idx_group_wins_group_item" not in idx
+        # Both legacy rows survived the swap.
+        assert conn.execute("SELECT COUNT(*) FROM group_wins").fetchone()[0] == 2
+        # And a distinct (past) re-win end of an existing (group, item) now
+        # records — the 2-col key would have collapsed it.
+        from server.db import record_group_win
+        record_group_win(conn, "886000001", 5, "2026-06-15T00:00:00+00:00")
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM group_wins WHERE item_id='886000001'"
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
 def test_refresh_snipe_group_updates_pending_only(db):
+    from server.db import refresh_snipe_group
     from server.db import refresh_snipe_group
     insert_bid(db, "881000009", 50.0, 6, 0, "s")
     insert_bid(db, "881000010", 50.0, 6, 7, "s")

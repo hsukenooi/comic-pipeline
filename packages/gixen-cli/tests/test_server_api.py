@@ -2060,3 +2060,82 @@ def test_null_group_changed_at_keeps_added_at_bound(api):
     ]
     assert api.post("/api/sync").status_code == 200
     assert _read_db_row("384000012")["status"] == "REMOVED"
+
+
+# ---------------------------------------------------------------------------
+# BUI-385: group_wins forensics endpoint + listed-win provenance end-to-end
+# ---------------------------------------------------------------------------
+
+def _seed_group_win(snipe_group, item_id, won_end_at, recorded_at, source):
+    conn = _dbconn()
+    conn.execute(
+        "INSERT INTO group_wins (snipe_group, item_id, won_end_at, recorded_at, "
+        "source) VALUES (?, ?, ?, ?, ?)",
+        (snipe_group, item_id, won_end_at, recorded_at, source),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_get_group_wins_endpoint_shape(api):
+    """GET /api/group-wins exposes the ledger with provenance — the forensics
+    surface answering 'which win classified this row REMOVED' over HTTP."""
+    _seed_group_win(5, "385000001", "2026-06-01T00:00:00+00:00",
+                    "2026-06-01T00:05:00+00:00", "status-transition")
+    r = api.get("/api/group-wins")
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert set(row) == {
+        "id", "snipe_group", "item_id", "won_end_at", "recorded_at", "source",
+    }
+    assert row["snipe_group"] == 5
+    assert row["item_id"] == "385000001"
+    assert row["won_end_at"] == "2026-06-01T00:00:00+00:00"
+    assert row["recorded_at"] == "2026-06-01T00:05:00+00:00"
+    assert row["source"] == "status-transition"
+
+
+def test_get_group_wins_filters_by_group_and_item(api):
+    _seed_group_win(5, "385000002", "2026-06-01T00:00:00+00:00",
+                    "2026-06-01T00:05:00+00:00", "status-transition")
+    _seed_group_win(6, "385000003", "2026-06-02T00:00:00+00:00",
+                    "2026-06-02T00:05:00+00:00", "listed-win")
+    # snipe_group filter
+    rows = api.get("/api/group-wins?snipe_group=6").json()
+    assert [r["item_id"] for r in rows] == ["385000003"]
+    assert rows[0]["source"] == "listed-win"
+    # item_id filter
+    rows = api.get("/api/group-wins?item_id=385000002").json()
+    assert [r["snipe_group"] for r in rows] == [5]
+    # combined, no match
+    assert api.get("/api/group-wins?snipe_group=5&item_id=385000003").json() == []
+
+
+def test_get_group_wins_orders_newest_recorded_first(api):
+    _seed_group_win(7, "385000004", "2026-06-01T00:00:00+00:00",
+                    "2026-06-01T00:00:00+00:00", "startup-backfill")
+    _seed_group_win(7, "385000005", "2026-06-05T00:00:00+00:00",
+                    "2026-06-05T00:00:00+00:00", "status-transition")
+    rows = api.get("/api/group-wins?snipe_group=7").json()
+    assert [r["item_id"] for r in rows] == ["385000005", "385000004"]
+
+
+def test_web_added_terminal_winner_records_listed_win_source(api, monkeypatch):
+    """Writer 3 end-to-end: a row-less winner recorded via the sync's listed-win
+    path is tagged source 'listed-win' in the ledger, and the endpoint shows
+    it — the full forensics loop for the web-add case."""
+    _seed_bid_row("385000007", snipe_group=9, auction_end_at=_iso_ago(hours=1))
+    _arm_ebay(monkeypatch, _iso_ago(days=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("385000006", status="WON", time_to_end="ENDED",
+                       snipe_group="9", current_bid="20.00 USD"),
+        _gixen_listing("385000007", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="9"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    rows = api.get("/api/group-wins?item_id=385000006").json()
+    assert len(rows) == 1
+    assert rows[0]["source"] == "listed-win"
+    assert rows[0]["snipe_group"] == 9

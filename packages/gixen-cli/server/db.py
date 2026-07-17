@@ -73,6 +73,21 @@ CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
 -- cannot be bounded against a sibling's lifetime (recording an
 -- observation-time proxy could falsely group-cancel a sibling added after
 -- the real win — the recycled-group hazard from the BUI-371 review).
+--
+-- BUI-385: `source` (added via _COLUMN_MIGRATIONS) tags which writer recorded
+-- a row — a closed vocabulary (GROUP_WIN_SOURCES) exposed over /api/group-wins
+-- for forensics ("which win classified this row REMOVED"). The unique index
+-- keys on (snipe_group, item_id, won_end_at), NOT (snipe_group, item_id): a
+-- genuine re-listed re-win of the same eBay id in the same group ends at a
+-- DISTINCT time and records a second, equally-genuine entry, where the old
+-- 2-col key collapsed it to the first win (a WON-permissive evidence miss for
+-- recycled group numbers). Every stored end is still a genuine auction end
+-- (only record_group_win's guards write here, never an observation-time
+-- proxy), so a distinct-end second row is real cancel evidence, not a
+-- false-REMOVED double-count (_group_won_before is a boolean over ends,
+-- dup-insensitive). The index itself is created/re-keyed in _apply_migrations
+-- (single-sourced there so a fresh DB and a legacy 2-col DB converge on one
+-- definition — the _BIDS_TABLE_SQL precedent).
 CREATE TABLE IF NOT EXISTS group_wins (
     id          INTEGER PRIMARY KEY,
     snipe_group INTEGER NOT NULL,
@@ -80,10 +95,46 @@ CREATE TABLE IF NOT EXISTS group_wins (
     won_end_at  TEXT NOT NULL,
     recorded_at TEXT NOT NULL
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_group_wins_group_item
-    ON group_wins(snipe_group, item_id);
 """
+
+# BUI-385: the group_wins unique index, defined once. _apply_migrations creates
+# it (and drops the legacy 2-col idx_group_wins_group_item) on every startup, so
+# both a fresh DB and an already-populated pre-BUI-385 DB converge here.
+_GROUP_WINS_UNIQUE_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_group_wins_group_item_end "
+    "ON group_wins(snipe_group, item_id, won_end_at)"
+)
+
+
+# BUI-385: closed vocabulary of group_wins.source provenance tags. Keeping it a
+# frozenset (not free-form strings) is what makes the /api/group-wins forensics
+# surface trustworthy — a typo'd tag would be caught by the writers' tests, and
+# no writer may land a NULL source (record_group_win defaults to the primary
+# writer; the startup backfill tags its own rows; pre-column rows are stamped
+# LEGACY). Values are hyphenated to read cleanly in the JSON endpoint.
+GROUP_WIN_SOURCE_STATUS_TRANSITION = "status-transition"  # update_bid_status WON
+GROUP_WIN_SOURCE_STARTUP_BACKFILL = "startup-backfill"    # _apply_migrations seed
+GROUP_WIN_SOURCE_LISTED_WIN = "listed-win"                # _record_listed_win_evidence
+GROUP_WIN_SOURCE_LEGACY = "legacy"                        # pre-BUI-385 rows
+GROUP_WIN_SOURCES = frozenset({
+    GROUP_WIN_SOURCE_STATUS_TRANSITION,
+    GROUP_WIN_SOURCE_STARTUP_BACKFILL,
+    GROUP_WIN_SOURCE_LISTED_WIN,
+    GROUP_WIN_SOURCE_LEGACY,
+})
+
+# BUI-385 — retraction (WON reversal) deliberately NOT implemented. The ticket
+# paired re-win collapse with "a WON reversal has no signal into the ledger",
+# but no code path reverses a WON: the eBay fallback selects only
+# PENDING/ENDED/tombstone rows (never WON — see _ebay_fallback_rows), and Gixen
+# keeps a completed auction WON, so a re-sync only re-classifies WON→WON
+# (idempotent under the unique index). A retraction mechanism would guard a
+# transition the system never makes (YAGNI), and eagerly DELETING a genuine win
+# on a spurious re-classification would itself weaken real cancel evidence. The
+# `source` + `recorded_at` provenance above makes any future retraction need
+# diagnosable — the actual gap the BUI-381 P3 review was reaching for. If a
+# real WON→non-WON path is ever introduced, revisit with a superseded flag
+# (append-only, forensics-preserving) rather than a DELETE.
 
 
 _COLUMN_MIGRATIONS = [
@@ -130,6 +181,11 @@ _COLUMN_MIGRATIONS = [
     # predates its membership (the win postdates added_at but predates the
     # join — the late-join backdating false-REMOVED).
     "ALTER TABLE bids ADD COLUMN group_changed_at TEXT",
+    # BUI-385: provenance tag on the group_wins ledger (which writer recorded
+    # a row) — a GROUP_WIN_SOURCES value, exposed over /api/group-wins for
+    # forensics. Nullable on ADD; _apply_migrations stamps pre-column rows
+    # LEGACY and every writer tags its own rows so no NULL source persists.
+    "ALTER TABLE group_wins ADD COLUMN source TEXT",
 ]
 
 
@@ -365,26 +421,64 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
+    # BUI-385: re-key the ledger's unique index from (snipe_group, item_id) to
+    # (snipe_group, item_id, won_end_at), so a genuine re-listed re-win at a
+    # distinct end can record a second entry instead of being collapsed to the
+    # first (see the group_wins schema comment). This is the sole creation site
+    # for both fresh and existing DBs. DROP IF EXISTS + CREATE IF NOT EXISTS is
+    # idempotent: the explicit DROP of the OLD name is what forces the re-key
+    # (a bare `CREATE UNIQUE INDEX IF NOT EXISTS` under a changed column list
+    # would silently no-op — the SQLite idempotent-by-NAME trap). The old 2-col
+    # index guaranteed (group, item) uniqueness, so (group, item, won_end_at)
+    # is trivially unique over existing rows — the new index can never fail to
+    # build. On a fresh DB the DROP is a no-op.
+    #
+    # Forward-only, like this file's other migrations (the PURGED->REMOVED
+    # rename is equally non-reversible). Rollback caveat: once a genuine re-win
+    # has recorded two rows sharing (group, item), reverting to pre-BUI-385
+    # code — whose _SCHEMA rebuilds the strict 2-col index under the now-absent
+    # old name — fails to start until an operator collapses the duplicates:
+    #   DELETE FROM group_wins WHERE id NOT IN
+    #     (SELECT MIN(id) FROM group_wins GROUP BY snipe_group, item_id);
+    conn.execute("DROP INDEX IF EXISTS idx_group_wins_group_item")
+    conn.execute(_GROUP_WINS_UNIQUE_INDEX_SQL)
+    conn.commit()
+
     # BUI-381: seed the durable group-win ledger from WON rows that predate
     # recording-at-classification-time (or were written by an older package
     # version — the usual version-skew tolerance). Runs every startup; the
-    # (snipe_group, item_id) unique index + INSERT OR IGNORE make it a no-op
-    # once seeded. Only genuine auction ends are seeded — the ledger never
-    # stores an observation-time proxy (see the group_wins schema comment).
-    # `auction_end_at != resolved_at` excludes the two identifiable proxy
-    # shapes: update_bid_status's COALESCE fill at resolution time and the
-    # BUI-83 legacy backfill, both of which set auction_end_at := resolved_at
-    # verbatim. Excluded rows keep serving proxy evidence via the live-row
-    # arm of _group_won_before until purged (shipped BUI-371 behavior);
-    # after a purge their evidence is lost — WON-permissive.
+    # (snipe_group, item_id, won_end_at) unique index + INSERT OR IGNORE make
+    # it a no-op once seeded. Only genuine auction ends are seeded — the ledger
+    # never stores an observation-time proxy (see the group_wins schema
+    # comment). `auction_end_at != resolved_at` excludes the two identifiable
+    # proxy shapes: update_bid_status's COALESCE fill at resolution time and
+    # the BUI-83 legacy backfill, both of which set auction_end_at :=
+    # resolved_at verbatim. Excluded rows keep serving proxy evidence via the
+    # live-row arm of _group_won_before until purged (shipped BUI-371
+    # behavior); after a purge their evidence is lost — WON-permissive. BUI-385
+    # tags these rows GROUP_WIN_SOURCE_STARTUP_BACKFILL for the forensics
+    # surface.
     conn.execute(
         "INSERT OR IGNORE INTO group_wins "
-        "(snipe_group, item_id, won_end_at, recorded_at) "
-        "SELECT snipe_group, item_id, auction_end_at, ? "
+        "(snipe_group, item_id, won_end_at, recorded_at, source) "
+        "SELECT snipe_group, item_id, auction_end_at, ?, ? "
         "FROM bids WHERE status='WON' AND snipe_group != 0 "
         "AND auction_end_at IS NOT NULL "
         "AND (resolved_at IS NULL OR auction_end_at != resolved_at)",
-        (datetime.now(timezone.utc).isoformat(),),
+        (datetime.now(timezone.utc).isoformat(), GROUP_WIN_SOURCE_STARTUP_BACKFILL),
+    )
+    conn.commit()
+
+    # BUI-385: stamp any ledger row still missing a provenance tag — rows
+    # written by update_bid_status / _record_listed_win_evidence before the
+    # source column existed — as LEGACY. They can't be attributed to a specific
+    # writer retroactively. Idempotent: matches 0 rows once every row is tagged
+    # (the backfill INSERT above always sets source, so this only ever catches
+    # pre-column rows). Runs after the backfill so a WON row that both predates
+    # the column and matches a current WON row stays LEGACY, not re-tagged.
+    conn.execute(
+        "UPDATE group_wins SET source=? WHERE source IS NULL",
+        (GROUP_WIN_SOURCE_LEGACY,),
     )
     conn.commit()
 
@@ -648,10 +742,20 @@ def record_group_win(
     snipe_group: int,
     won_end_at: str | None,
     recorded_at: str | None = None,
+    source: str = GROUP_WIN_SOURCE_STATUS_TRANSITION,
 ) -> None:
     """Append BUI-381 group-win evidence to the durable ledger (see the
     group_wins schema comment). INSERT OR IGNORE against the
-    (snipe_group, item_id) unique index makes re-recording a no-op.
+    (snipe_group, item_id, won_end_at) unique index makes re-recording the
+    same win a no-op, while a genuine re-listed re-win at a DISTINCT end
+    records a second entry (BUI-385 — the old 2-col key collapsed it).
+
+    `source` is the provenance tag (a GROUP_WIN_SOURCES value) surfaced by
+    /api/group-wins; it defaults to the primary writer (update_bid_status's
+    WON transition) so no caller can silently land a NULL source. The
+    _record_listed_win_evidence path passes GROUP_WIN_SOURCE_LISTED_WIN; the
+    startup backfill writes its rows directly (not through here) tagged
+    GROUP_WIN_SOURCE_STARTUP_BACKFILL.
 
     The ledger is permanent (nothing tombstones it), so it holds itself to a
     stricter evidence standard than the live-row query and stores only sound
@@ -665,6 +769,16 @@ def record_group_win(
       self-contradictory input (e.g. eBay describing a re-listed same-ID
       auction) — not evidence.
     Caller must conn.commit()."""
+    if source not in GROUP_WIN_SOURCES:
+        # Enforce the closed vocabulary at the write boundary so a typo'd tag
+        # can never land in the permanent ledger and surface, uncaught, over
+        # /api/group-wins. Every production call site passes a
+        # GROUP_WIN_SOURCE_* constant, so this only fires on a programming
+        # error (caught by tests), never in the classification path.
+        raise ValueError(
+            f"record_group_win: unknown source {source!r} "
+            f"(expected one of {sorted(GROUP_WIN_SOURCES)})"
+        )
     if not snipe_group or not won_end_at:
         return
     try:
@@ -677,9 +791,10 @@ def record_group_win(
         return
     conn.execute(
         "INSERT OR IGNORE INTO group_wins "
-        "(snipe_group, item_id, won_end_at, recorded_at) VALUES (?, ?, ?, ?)",
+        "(snipe_group, item_id, won_end_at, recorded_at, source) "
+        "VALUES (?, ?, ?, ?, ?)",
         (snipe_group, item_id, won_end_at,
-         recorded_at or datetime.now(timezone.utc).isoformat()),
+         recorded_at or datetime.now(timezone.utc).isoformat(), source),
     )
 
 
@@ -744,6 +859,7 @@ def update_bid_status(
         record_group_win(
             conn, item_id, row["snipe_group"], row["auction_end_at"],
             recorded_at=resolved_at,
+            source=GROUP_WIN_SOURCE_STATUS_TRANSITION,
         )
 
 
