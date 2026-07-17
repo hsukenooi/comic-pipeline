@@ -1556,6 +1556,42 @@ def test_sync_unparseable_snipe_group_keeps_db_value(api):
     assert _read_col("381000002", "snipe_group") == 3
 
 
+def test_sync_parse_miss_snipe_group_preserves_membership(api):
+    """BUI-383: a client-side snipe_group parse miss now arrives as None
+    ('unknown') instead of the old '0' — the refresh must skip it so real
+    membership survives a transient scrape miss. Pre-fix, the miss arrived
+    as the perfectly-parseable '0' and durably CLEARED the group (N → 0),
+    weakening the BUI-371 group-cancel evidence."""
+    _seed_bid_row("383000001", snipe_group=3)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("383000001", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group=None),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("383000001", "snipe_group") == 3
+
+    # A genuine listed '0' is a positive un-group claim and IS mirrored.
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("383000001", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group="0"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("383000001", "snipe_group") == 0
+
+
+def test_web_added_bid_insert_survives_parse_miss_snipe_group(api):
+    """BUI-383 companion to the 'N/A' case: a brand-new web-added snipe whose
+    snipe_group arrives as None (a client parse miss) inserts as group 0 and
+    the refresh corrects it once the value parses."""
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("383000002", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group=None),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("383000002")["status"] == "PENDING"
+    assert _read_col("383000002", "snipe_group") == 0
+
+
 def test_group_evidence_survives_winner_purge_with_failed_sibling_removal(api):
     """The BUI-381 case-1 regression: a purge sweeps the WON winner to REMOVED
     while its sibling-removal leg fails (sibling stays live). The sibling must

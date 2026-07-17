@@ -295,10 +295,9 @@ def _parse_snipe_group(value: str | int | None) -> int | None:
     is absent, blank, or unparseable (a scrape quirk like 'N/A'). Callers
     must treat None as 'unknown' — never coerce it to 0, because group 0 is
     a positive claim ('no group') that clears membership / suppresses
-    evidence. Caveat: the scraper itself encodes a regex miss as '0'
-    (gixen_client._parse_snipe_table), indistinguishable here from a genuine
-    no-group — always in the WON-permissive direction (evidence weakened,
-    never fabricated); fixing the encoding is a client-side follow-up."""
+    evidence. Since BUI-383 the scraper honors the same contract: a regex
+    miss arrives as None (unknown), so a listed '0' really is Gixen saying
+    'no group' — the refresh mirror below may trust it."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
