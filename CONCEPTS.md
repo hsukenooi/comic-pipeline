@@ -70,6 +70,24 @@ The round-trip that mirrors the Collection up to LOCG and reconciles it back: ex
 
 The export is **owned-safe**: it never instructs LOCG to un-collect a book you own. LOCG's bulk import treats an `In Collection=0` row as "remove from collection," so the export pushes only genuinely-new wishes you do not already own. The re-import is reconciliation-based: it matches a pending Win-Sourced Entry to its LOCG counterpart even when LOCG has canonicalized the publisher or release date, and never creates a duplicate-identity entry. As of BUI-208 the up-CSV is **wins-only by default** — the code refuses to emit any `In Collection=0` row unless an explicit owned-safe wish push is requested (a machine-enforced gate, on top of the human-reviewed LOCG import preview). There is **no row-count limit** on uploads; the importer hangs only on incomplete/dateless rows (the old "≤20 rows" advice was a misdiagnosis).
 
+## Bidding & Snipes
+
+### Snipe
+A scheduled last-second bid on an eBay auction, placed through Gixen rather than directly on eBay. A snipe runs from pending to a terminal outcome (won, lost, ended-unresolved, failed); removal from the working set is a [[Tombstone]], never a terminal outcome.
+
+An ended-unresolved snipe may have its true outcome recovered by inference from the auction's final price (a price under our max reads as a win). That inference is deliberately permissive — see [[Phantom WON]] for the failure class this creates and the guard that contains it.
+
+### Bid Group
+A set of snipes Gixen treats as alternatives for the same want: when one member wins, Gixen cancels the remaining siblings before their own auctions end. Group numbers come from a small fixed pool that Gixen recycles across campaigns, so a group number alone never identifies a campaign — any evidence keyed on a group must also be bounded by the individual snipe's own lifetime.
+
+A cancelled sibling that is never purged still reaches its auction's end and re-enters outcome classification, which is why cancelled-sibling handling is built into classification itself rather than depending on manual post-win cleanup.
+
+### Tombstone
+The soft-delete status for a snipe removed from the working set — written when a live snipe is removed, when completed bids are swept, or when evidence shows the bid was cancelled before its auction ended (a group-cancelled sibling). It is **not** a terminal auction outcome and must be excluded from every results view and from outcome inference. *Known in code and tickets as:* `REMOVED` (formerly `PURGED`).
+
+### Phantom WON
+The failure class where the system records a win on an auction it never actually bid: a snipe cancelled while live still has its auction end, and a final price under the snipe's max reads as a win to price-based outcome inference. The guard is evidence-layer disambiguation — a row with positive evidence of a pre-end cancel (it vanished from Gixen well before its auction end, or a [[Bid Group]] sibling already won within its lifetime) is tombstoned before inference runs. The inference itself stays permissive: requiring bid evidence would suppress the genuine wins it exists to recover.
+
 ## FMV & Pricing
 
 ### Money Path
