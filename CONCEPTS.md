@@ -77,6 +77,8 @@ A scheduled last-second bid on an eBay auction, placed through Gixen rather than
 
 An ended-unresolved snipe may have its true outcome recovered by inference from the auction's final price (a price under our max reads as a win). That inference is deliberately permissive — see [[Phantom WON]] for the failure class this creates and the guard that contains it.
 
+A listing and a snipe are not one-to-one: the same auction listing can accumulate multiple snipe records over its life (one re-added after an earlier one resolved, or a duplicate collapsed into a [[Tombstone]]). Lifecycle state belongs to the individual snipe record, never to "all snipes on this listing" — resolving or removing by listing alone stamps records that are still pending.
+
 ### Bid Group
 A set of snipes Gixen treats as alternatives for the same want: when one member wins, Gixen cancels the remaining siblings before their own auctions end. Group numbers come from a small fixed pool that Gixen recycles across campaigns, so a group number alone never identifies a campaign — any evidence keyed on a group must also be bounded by the individual snipe's own lifetime.
 
