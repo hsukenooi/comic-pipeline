@@ -267,3 +267,61 @@ def test_fallback_local_ok_bid_overrides_cancel_evidence(tmp_path, monkeypatch):
     row = _status_row(conn, "471000010")
     conn.close()
     assert row["status"] == "WON"
+
+
+# ---------------------------------------------------------------------------
+# BUI-381: the fallback consults the durable group_wins ledger, and its own
+# WON inference feeds it.
+# ---------------------------------------------------------------------------
+
+from server.db import record_group_win
+
+
+def test_fallback_ledger_evidence_blocks_phantom_won_after_winner_purged(
+        tmp_path, monkeypatch):
+    """Winner-row destruction (the BUI-381 case-1 window): with no WON bids row
+    anywhere — it was swept to REMOVED by a purge — a ledger entry recorded at
+    WON time still classifies the cancelled sibling REMOVED, not WON."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "481000001", snipe_group=2,
+          auction_end_at=_iso(timedelta(hours=-1)))
+    record_group_win(conn, "481000099", 2, _iso(timedelta(days=-1)))
+    conn.commit()
+    _run_fallback(monkeypatch, conn, price="$10.00")
+    row = _status_row(conn, "481000001")
+    conn.close()
+    assert row["status"] == "REMOVED"
+
+
+def test_fallback_ledger_respects_lifetime_bound(tmp_path, monkeypatch):
+    """A ledger win that predates the sibling's added_at is a stale entry from
+    a recycled group number — the genuine-win inference must still run."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "481000002", snipe_group=3,
+          auction_end_at=_iso(timedelta(hours=-1)),
+          added_at=_iso(timedelta(days=-2)))
+    record_group_win(conn, "481000098", 3, _iso(timedelta(days=-30)))
+    conn.commit()
+    _run_fallback(monkeypatch, conn, price="$10.00")
+    row = _status_row(conn, "481000002")
+    conn.close()
+    assert row["status"] == "WON"
+    assert row["winning_bid"] == 10.0
+
+
+def test_fallback_inferred_won_records_group_evidence(tmp_path, monkeypatch):
+    """A WON inferred by the fallback itself on a grouped row lands in the
+    ledger — so even this recovered win survives a later purge sweep as
+    evidence for its siblings."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "481000003", snipe_group=4,
+          auction_end_at=_iso(timedelta(hours=-1)))
+    _run_fallback(monkeypatch, conn, price="$10.00")
+    row = _status_row(conn, "481000003")
+    ledger = conn.execute(
+        "SELECT * FROM group_wins WHERE item_id='481000003'"
+    ).fetchone()
+    conn.close()
+    assert row["status"] == "WON"
+    assert ledger is not None
+    assert ledger["snipe_group"] == 4

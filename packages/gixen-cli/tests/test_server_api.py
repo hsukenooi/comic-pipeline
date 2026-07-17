@@ -1366,6 +1366,301 @@ def test_vanish_stamp_respects_scrape_start(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# BUI-381: group-evidence durability (snipe_group sync refresh + the durable
+# group_wins ledger surviving winner-row destruction)
+# ---------------------------------------------------------------------------
+
+def _read_col(item_id, col):
+    conn = _dbconn()
+    row = conn.execute(
+        f"SELECT {col} FROM bids WHERE item_id=?", (item_id,)
+    ).fetchone()
+    conn.close()
+    return row[col] if row else None
+
+
+def _group_win_row(item_id):
+    conn = _dbconn()
+    row = conn.execute(
+        "SELECT * FROM group_wins WHERE item_id=?", (item_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def test_sync_refreshes_snipe_group_on_pending_row(api):
+    """A retroactive `gixen group N` applied on Gixen's web UI reaches the DB
+    on the next sync — previously _sync_gixen never refreshed snipe_group on
+    existing rows, so a later group win strengthened nothing (BUI-381)."""
+    api.post("/api/bids", json={"item_id": "381000001", "max_bid": 25.0})
+    assert _read_col("381000001", "snipe_group") == 0
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000001", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group="4"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("381000001", "snipe_group") == 4
+
+    # Un-grouping flows back too: stale membership could otherwise falsely
+    # group-cancel a genuine result (the dangerous direction).
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000001", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group="0"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("381000001", "snipe_group") == 0
+
+
+def test_sync_unparseable_snipe_group_keeps_db_value(api):
+    """A Gixen parse quirk ('N/A') must not clobber real group membership —
+    the refresh skips unparseable values rather than coercing to 0."""
+    _seed_bid_row("381000002", snipe_group=3)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000002", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group="N/A"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("381000002", "snipe_group") == 3
+
+
+def test_group_evidence_survives_winner_purge_with_failed_sibling_removal(api):
+    """The BUI-381 case-1 regression: a purge sweeps the WON winner to REMOVED
+    while its sibling-removal leg fails (sibling stays live). The sibling must
+    STILL classify REMOVED at its own end — from the group_wins ledger written
+    at WON time, not from the (now destroyed) WON row."""
+    from gixen_client import GixenError
+    _seed_bid_row("381000003", snipe_group=6, auction_end_at=_iso_ago(days=1))
+    _seed_bid_row("381000004", snipe_group=6, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000003", status="WON", time_to_end="ENDED",
+                       snipe_group="6", current_bid="20.00 USD"),
+        _gixen_listing("381000004", status="SCHEDULED", time_to_end="5 h",
+                       snipe_group="6"),
+    ]
+    api.mock_gixen.remove_snipe.side_effect = GixenError("Gixen down")
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 200
+    assert r.json()["removed_siblings"] == 0
+    # The sweep destroyed the WON row; the ledger entry survives it.
+    assert _read_db_row("381000003")["status"] == "REMOVED"
+    assert _read_db_row("381000004")["status"] == "PENDING"
+    won = _group_win_row("381000003")
+    assert won is not None and won["snipe_group"] == 6
+
+    # The sibling later reaches its own end, still cancelled on Gixen's list.
+    conn = _dbconn()
+    conn.execute(
+        "UPDATE bids SET auction_end_at=? WHERE item_id='381000004'",
+        (_iso_ago(hours=1),),
+    )
+    conn.commit()
+    conn.close()
+    api.mock_gixen.remove_snipe.side_effect = None
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000004", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="6"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("381000004")["status"] == "REMOVED"
+
+
+def test_web_added_terminal_winner_classifies_sibling(api, monkeypatch):
+    """A winner first seen already-terminal via the web-add path never gets a
+    bids row — its win must still be recorded (from the list + eBay's end
+    time) so the cancelled sibling resolves REMOVED, not ENDED (BUI-381)."""
+    _seed_bid_row("381000006", snipe_group=9, auction_end_at=_iso_ago(hours=1))
+    _arm_ebay(monkeypatch, _iso_ago(days=1))  # the winner's true end, from eBay
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000005", status="WON", time_to_end="ENDED",
+                       snipe_group="9", current_bid="20.00 USD"),
+        _gixen_listing("381000006", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="9"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    # The winner still never gets a bids row (web-add skips terminal snipes)...
+    assert _read_db_row("381000005") is None
+    # ...but its win landed in the durable ledger...
+    won = _group_win_row("381000005")
+    assert won is not None and won["snipe_group"] == 9
+    # ...and classified the cancelled sibling.
+    assert _read_db_row("381000006")["status"] == "REMOVED"
+
+
+def test_web_added_terminal_winner_no_ebay_end_stays_permissive(api, monkeypatch):
+    """When eBay can't supply the row-less winner's end time, no evidence is
+    recorded — an observation-time proxy would be unsound against the
+    lifetime bound — and the sibling keeps today's WON-permissive ENDED."""
+    _seed_bid_row("381000008", snipe_group=8, auction_end_at=_iso_ago(hours=1))
+    _arm_ebay(monkeypatch, None)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000007", status="WON", time_to_end="ENDED",
+                       snipe_group="8", current_bid="20.00 USD"),
+        _gixen_listing("381000008", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="8"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _group_win_row("381000007") is None
+    assert _read_db_row("381000008")["status"] == "ENDED"
+
+
+def test_web_added_winner_end_predating_sibling_add_is_not_evidence(api, monkeypatch):
+    """Ledger evidence obeys the same lifetime bound as live WON rows: a
+    row-less win whose eBay end predates the sibling's added_at is a stale win
+    in a recycled group number, not cancel evidence (the BUI-371 review's P0,
+    extended to the BUI-381 ledger)."""
+    _seed_bid_row("381000010", snipe_group=7, auction_end_at=_iso_ago(hours=1),
+                  added_at=_iso_ago(days=2))
+    _arm_ebay(monkeypatch, _iso_ago(days=30))  # win long before the sibling existed
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000009", status="WON", time_to_end="ENDED",
+                       snipe_group="7", current_bid="20.00 USD"),
+        _gixen_listing("381000010", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="7"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    # Recorded (it is a real win) but excluded by the lifetime bound.
+    assert _group_win_row("381000009") is not None
+    assert _read_db_row("381000010")["status"] == "ENDED"
+
+
+def _arm_ebay_counting(monkeypatch, end_iso):
+    """_arm_ebay, but returns the list of item_ids fetched from eBay."""
+    import server.main as m
+    calls = []
+    monkeypatch.setattr(m, "_ebay_fetch_bin", lambda: "ebay-fetch")
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+
+    def _fetch(iid):
+        calls.append(iid)
+        return {"end_date_iso": end_iso} if end_iso is not None else None
+
+    monkeypatch.setattr(m, "_fetch_ebay_item_sync", _fetch)
+    return calls
+
+
+def test_web_added_winner_future_ebay_end_not_recorded(api, monkeypatch):
+    """eBay reporting a FUTURE end for a snipe Gixen says WON is
+    self-contradictory — eBay is describing a different (re-listed same-ID)
+    auction. Never recorded; the sibling keeps WON-permissive ENDED."""
+    _seed_bid_row("381000012", snipe_group=6, auction_end_at=_iso_ago(hours=1))
+    _arm_ebay(monkeypatch, _iso_ago(hours=-5))  # 5 hours in the FUTURE
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000011", status="WON", time_to_end="ENDED",
+                       snipe_group="6", current_bid="20.00 USD"),
+        _gixen_listing("381000012", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="6"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _group_win_row("381000011") is None
+    assert _read_db_row("381000012")["status"] == "ENDED"
+
+
+def test_web_added_winner_second_sync_skips_ebay_call(api, monkeypatch):
+    """Once a row-less winner's evidence is recorded, later syncs (the winner
+    stays listed until purge) must not spend another eBay call on it."""
+    calls = _arm_ebay_counting(monkeypatch, _iso_ago(days=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000013", status="WON", time_to_end="ENDED",
+                       snipe_group="5", current_bid="20.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert api.post("/api/sync").status_code == 200
+    assert calls == ["381000013"]  # exactly one fetch across both syncs
+    assert _group_win_row("381000013") is not None
+
+
+def test_web_added_winner_cooldown_blocks_fetch(api, monkeypatch):
+    """An active eBay cooldown suppresses the row-less-winner fetch entirely
+    (retry on a later sync); nothing is recorded and the sibling keeps the
+    WON-permissive ENDED."""
+    import server.main as m
+    from datetime import datetime, timezone
+    calls = _arm_ebay_counting(monkeypatch, _iso_ago(days=1))
+    monkeypatch.setattr(
+        m, "_ebay_cooldown_until",
+        datetime.now(timezone.utc).timestamp() + 600,
+    )
+    _seed_bid_row("381000015", snipe_group=4, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000014", status="WON", time_to_end="ENDED",
+                       snipe_group="4", current_bid="20.00 USD"),
+        _gixen_listing("381000015", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="4"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert calls == []
+    assert _group_win_row("381000014") is None
+    assert _read_db_row("381000015")["status"] == "ENDED"
+
+
+def test_web_added_winner_fetch_cap_per_sync(api, monkeypatch):
+    """Row-less-winner eBay fetches are capped per sync (the BUI-85
+    discipline) so a post-outage backlog can't serialize unbounded blocking
+    subprocess calls inside one sync."""
+    import server.main as m
+    calls = _arm_ebay_counting(monkeypatch, _iso_ago(days=1))
+    monkeypatch.setattr(m, "_LISTED_WIN_FETCH_MAX_PER_SYNC", 1)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000016", status="WON", time_to_end="ENDED",
+                       snipe_group="2", current_bid="20.00 USD"),
+        _gixen_listing("381000017", status="WON", time_to_end="ENDED",
+                       snipe_group="3", current_bid="20.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert len(calls) == 1  # budget spent; the second winner waits for the next sync
+    assert api.post("/api/sync").status_code == 200
+    assert len(calls) == 2  # and gets recorded then
+
+
+def test_web_added_bid_insert_survives_bad_snipe_group(api):
+    """A brand-new non-terminal web-added snipe with an unparseable
+    snipe_group must not crash the sync batch (int('N/A') used to raise an
+    uncaught ValueError) — it inserts as group 0 and the refresh corrects it
+    once the value parses."""
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000018", status="SCHEDULED", time_to_end="3 h",
+                       snipe_group="N/A"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("381000018")["status"] == "PENDING"
+    assert _read_col("381000018", "snipe_group") == 0
+
+
+def test_tombstoned_winner_still_records_evidence(api, monkeypatch):
+    """A winner whose DB row was tombstoned (user removed it, but Gixen kept
+    the snipe and it won) gets eBay-backed ledger evidence — update_bid_status
+    skips tombstones, so without this path the win would leave no trace."""
+    _seed_bid_row("381000019", status="REMOVED", snipe_group=8,
+                  resolved_at=_iso_ago(days=3))
+    _seed_bid_row("381000020", snipe_group=8, auction_end_at=_iso_ago(hours=1))
+    _arm_ebay(monkeypatch, _iso_ago(days=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("381000019", status="WON", time_to_end="ENDED",
+                       snipe_group="8", current_bid="20.00 USD"),
+        _gixen_listing("381000020", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="8"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("381000019")["status"] == "REMOVED"  # tombstone kept
+    assert _group_win_row("381000019") is not None
+    assert _read_db_row("381000020")["status"] == "REMOVED"
+
+
+def test_parse_snipe_group_variants():
+    """Blank/absent/unparseable → None (unknown — never coerced to the
+    positive 'no group' claim); genuine values, including '0', parse."""
+    from server.main import _parse_snipe_group
+    assert _parse_snipe_group("3") == 3
+    assert _parse_snipe_group(4) == 4
+    assert _parse_snipe_group("0") == 0
+    assert _parse_snipe_group(0) == 0
+    assert _parse_snipe_group(None) is None
+    assert _parse_snipe_group("") is None
+    assert _parse_snipe_group("   ") is None
+    assert _parse_snipe_group("N/A") is None
+
+
+# ---------------------------------------------------------------------------
 # BUI-116: cached-dbidid edit fast-path + staleness fallback
 # ---------------------------------------------------------------------------
 
