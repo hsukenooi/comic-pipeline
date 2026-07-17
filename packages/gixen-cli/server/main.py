@@ -825,7 +825,17 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
                 "(cancelled, never bid) → REMOVED", iid,
             )
             continue
-        update_bid_status(db, iid, "ENDED", winning_bid=None, resolved_at=now)
+        # BUI-388: id-targeted, matching the REMOVED branch above (BUI-371)
+        # and the BUI-382 pattern in _run_ebay_fallback — an item_id-wide
+        # write here could collateral-stamp an unrelated non-tombstoned
+        # sibling sharing this item_id (e.g. an older resolved-but-not-yet-
+        # purged row from a prior listing of a re-listed/re-added item),
+        # overwriting its status/winning_bid/resolved_at with this row's
+        # ENDED transition (the BUI-178 class of blast radius).
+        update_bid_status(
+            db, iid, "ENDED", winning_bid=None, resolved_at=now,
+            only_id=row["id"],
+        )
         logger.info(
             "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
             iid,
@@ -1821,10 +1831,40 @@ async def api_remove_bid(item_id: str):
 
 @app.post("/api/sync")
 async def api_sync():
-    """Pull live Gixen state and insert any web-added snipes missing from the DB."""
+    """Pull live Gixen state and insert any web-added snipes missing from the DB.
+
+    BUI-386: this is the only sync entry point that used to propagate an
+    exception straight to FastAPI's generic 500 handler. The other two
+    (_sync_loop, _ensure_fresh_sync) already catch and degrade gracefully —
+    but both are best-effort background refreshers where swallowing the
+    error and continuing with stale-but-present data is the right call. This
+    endpoint is a user-triggered action, so a failure must be reported
+    honestly instead of degrading silently: reraise=True (the _sync_loop
+    pattern, BUI-263) surfaces a genuine Gixen-side failure as a 503 rather
+    than letting it collapse into a misleadingly-successful
+    ``{"synced": 0}``, and any other exception is a genuine server bug,
+    logged in full and reported as a structured 500 instead of an unhandled
+    traceback.
+    """
     db = _get_db()
-    async with _api_lock:
-        snipes = await _sync_gixen(db, _api_client)
+    try:
+        async with _api_lock:
+            snipes = await _sync_gixen(db, _api_client, reraise=True)
+    except (GixenConnectionError, GixenError) as e:
+        logger.warning("api_sync: Gixen sync failed: %s", e)
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:
+        # _sync_gixen batches its DML into one commit at the end of the
+        # cycle (see its own callees' "caller must conn.commit()" contracts),
+        # so a bug partway through the loop can leave uncommitted writes on
+        # this process-wide singleton connection (_get_db()). Roll back so a
+        # genuine server bug doesn't silently smuggle a partial cycle's
+        # writes into whatever the *next* successful sync happens to commit.
+        db.rollback()
+        logger.exception("api_sync: unexpected error during sync")
+        raise HTTPException(
+            status_code=500, detail="sync failed: internal error"
+        ) from e
     return {"synced": len(snipes)}
 
 
