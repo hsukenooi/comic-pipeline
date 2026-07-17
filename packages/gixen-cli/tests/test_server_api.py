@@ -694,6 +694,124 @@ def test_sync_gixen_vanished_ended_write_spares_resolved_sibling_sharing_item_id
     assert live_row["winning_bid"] is None
 
 
+def test_sync_gixen_terminal_transition_write_spares_resolved_sibling_sharing_item_id(api):
+    """BUI-390: the terminal write in _sync_gixen's Gixen-status transition loop
+    must target only the row being transitioned, not every row sharing its
+    item_id. Pre-fix, its item_id-wide update_bid_status call would also
+    collateral-stamp an older resolved-but-unpurged sibling (a prior listing of
+    a re-listed/re-added item) with this snipe's terminal status + winning_bid —
+    the BUI-178 class the REMOVED branch (BUI-371), the vanished-ended write
+    (BUI-388) and every _run_ebay_fallback write (BUI-382) already guard."""
+    from datetime import datetime, timedelta, timezone
+
+    # Old, already-resolved WON sibling — INSERTED FIRST so it gets the LOWER id.
+    # A live PENDING row is always the newest row for its item_id (no second row
+    # can be added while a PENDING one exists), which is exactly why
+    # get_bid_by_item_id (id DESC LIMIT 1) resolves to the live row below, not
+    # this stale one. WON is not a tombstone, so an item_id-wide write sees it.
+    old_resolved_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    conn = _dbconn()
+    old_id = conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, winning_bid, resolved_at, "
+        "snipe_group) VALUES (?, 50.0, 'WON', 45.0, ?, 0)",
+        ("710000001", old_resolved_at),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    # Live snipe (new PENDING row, higher id). Gixen now reports it OUTBID/ENDED
+    # → transitions to LOST with current_bid as the price that beat us. OUTBID is
+    # in _BID_PROCESSED_STATUSES, so the BUI-371 REMOVED branch is skipped and we
+    # exercise the plain terminal write under test.
+    api.post("/api/bids", json={"item_id": "710000001", "max_bid": 25.0})
+    conn = _dbconn()
+    live_id = conn.execute(
+        "SELECT id FROM bids WHERE item_id=? AND status='PENDING'", ("710000001",)
+    ).fetchone()["id"]
+    conn.close()
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "710000001", "title": "T", "max_bid": "25.00 USD",
+        "current_bid": "30.00 USD", "status": "OUTBID",
+        "status_mirror": "OUTBID: EBAY BID INCREMENT RULE NOT MET",
+        "time_to_end": "ENDED", "seller": "s", "snipe_group": "0",
+        "bid_offset": "6", "bid_offset_mirror": "6", "dbidid": "d710",
+    }]
+    api.post("/api/sync")
+
+    # The old resolved WON sibling must be completely untouched.
+    old_row = _read_row_by_id(old_id)
+    assert old_row["status"] == "WON"
+    assert old_row["winning_bid"] == 45.0
+    assert old_row["resolved_at"] == old_resolved_at
+    # The live snipe transitions to LOST with the beating price.
+    live_row = _read_row_by_id(live_id)
+    assert live_row["status"] == "LOST"
+    assert live_row["winning_bid"] == 30.0
+
+
+def test_sync_gixen_won_transition_spares_sibling_group_wins_ledger(api):
+    """BUI-390 (WON branch): on a WON transition the id-targeted write must also
+    keep update_bid_status's group-win capture from recording a FALSE group_wins
+    ledger entry for an older resolved sibling sharing the item_id + snipe_group.
+    Pre-fix, the item_id-wide write captured every non-tombstoned sibling with a
+    non-null auction_end_at, ledgering a win for a stale row it also (wrongly)
+    stamped WON. This exercises the one branch the OUTBID->LOST test above can't:
+    update_bid_status's WON-only win_rows SELECT (server/db.py), now id-scoped."""
+    from datetime import datetime, timedelta, timezone
+
+    old_end = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    old_resolved_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    live_end = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    # Old resolved LOST sibling in group 7 with a real auction_end_at — INSERTED
+    # FIRST (lower id). LOST is not a tombstone and its end is non-null, so an
+    # item_id-wide WON capture would ledger it as a (false) group win.
+    conn = _dbconn()
+    old_id = conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, winning_bid, resolved_at, "
+        "snipe_group, auction_end_at) VALUES (?, 50.0, 'LOST', 45.0, ?, 7, ?)",
+        ("720000001", old_resolved_at, old_end),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    # Live snipe in the same group 7 (higher id); give it its own auction_end_at
+    # so its OWN legitimate win is the only ledger entry expected.
+    api.post("/api/bids", json={"item_id": "720000001", "max_bid": 25.0})
+    conn = _dbconn()
+    conn.execute(
+        "UPDATE bids SET auction_end_at=?, snipe_group=7 "
+        "WHERE item_id=? AND status='PENDING'",
+        (live_end, "720000001"),
+    )
+    live_id = conn.execute(
+        "SELECT id FROM bids WHERE item_id=? AND status='PENDING'", ("720000001",)
+    ).fetchone()["id"]
+    conn.commit()
+    conn.close()
+
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "720000001", "title": "T", "max_bid": "25.00 USD",
+        "current_bid": "60.00 USD", "status": "WON", "status_mirror": None,
+        "time_to_end": "ENDED", "seller": "s", "snipe_group": "7",
+        "bid_offset": "6", "bid_offset_mirror": "6", "dbidid": "d720",
+    }]
+    assert api.post("/api/sync").status_code == 200
+
+    # The old LOST sibling must be completely untouched.
+    old_row = _read_row_by_id(old_id)
+    assert old_row["status"] == "LOST"
+    assert old_row["winning_bid"] == 45.0
+    assert old_row["resolved_at"] == old_resolved_at
+    # The live snipe won.
+    assert _read_row_by_id(live_id)["status"] == "WON"
+    # The ledger carries only the live win's end — never the stale sibling's.
+    ledger = api.get("/api/group-wins?item_id=720000001").json()
+    ends = [r["won_end_at"] for r in ledger]
+    assert old_end not in ends
+    assert ends == [live_end]
+
+
 def _read_db_row(item_id):
     """Read raw bid row by item_id for assertion."""
     import os, sqlite3
@@ -1140,6 +1258,80 @@ def test_vanished_null_end_still_on_gixen_not_touched(api, monkeypatch):
 
     assert api.post("/api/sync").status_code == 200
     assert _read_db_row("850000005")["status"] == "PENDING"
+
+
+def _insert_old_resolved_won_sibling(item_id):
+    """Insert an older, already-resolved WON row sharing item_id (a prior
+    listing of a re-listed/re-added item). WON is not a tombstone, so an
+    item_id-wide write would clobber it. Returns (old_id, old_resolved_at)."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    old_resolved_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    conn = _dbconn()
+    old_id = conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, winning_bid, resolved_at, "
+        "snipe_group) VALUES (?, 50.0, 'WON', 45.0, ?, 0)",
+        (item_id, old_resolved_at),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+    return old_id, old_resolved_at
+
+
+def _read_row_by_id(row_id):
+    conn = _dbconn()
+    row = conn.execute(
+        "SELECT status, winning_bid, resolved_at FROM bids WHERE id=?", (row_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def test_vanished_null_end_ended_write_spares_resolved_sibling_sharing_item_id(api, monkeypatch):
+    """BUI-390: _resolve_vanished_null_end_bids' ENDED write must id-target the
+    row it is resolving, not stamp every row sharing the item_id. Pre-fix, its
+    item_id-wide update_bid_status would also clobber an older resolved WON
+    sibling — the BUI-178 class the sync-loop writes (BUI-388) already guard."""
+    from datetime import datetime, timedelta, timezone
+    _seed_pending_null_end(api, "860000001")
+    old_id, old_resolved_at = _insert_old_resolved_won_sibling("860000001")
+
+    api.mock_gixen.list_snipes.return_value = []  # vanished
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    _arm_ebay(monkeypatch, past)  # eBay: already ended → ENDED
+
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("860000001")["status"] == "ENDED"
+    old = _read_row_by_id(old_id)
+    assert old["status"] == "WON"
+    assert old["winning_bid"] == 45.0
+    assert old["resolved_at"] == old_resolved_at
+
+
+def test_vanished_null_end_removed_write_spares_resolved_sibling_sharing_item_id(api, monkeypatch):
+    """BUI-390: _resolve_vanished_null_end_bids' REMOVED (tombstone) write must
+    id-target the row it is resolving. Pre-fix, its item_id-wide write would
+    also tombstone an older resolved WON sibling sharing the item_id."""
+    from datetime import datetime, timedelta, timezone
+    _seed_pending_null_end(api, "860000002")
+    old_id, old_resolved_at = _insert_old_resolved_won_sibling("860000002")
+
+    # Gixen returns a DIFFERENT live snipe → non-empty list (not a scrape
+    # glitch), so a future-end vanished row tombstones REMOVED.
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "860099999", "max_bid": "10.00 USD", "current_bid": "1.00 USD",
+        "status": "SCHEDULED", "time_to_end": "3h", "seller": "s",
+        "snipe_group": "0", "bid_offset": "6",
+    }]
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+    _arm_ebay(monkeypatch, future)
+
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("860000002")["status"] == "REMOVED"
+    old = _read_row_by_id(old_id)
+    assert old["status"] == "WON"
+    assert old["winning_bid"] == 45.0
+    assert old["resolved_at"] == old_resolved_at
 
 
 # ---------------------------------------------------------------------------
@@ -2139,3 +2331,96 @@ def test_web_added_terminal_winner_records_listed_win_source(api, monkeypatch):
     assert len(rows) == 1
     assert rows[0]["source"] == "listed-win"
     assert rows[0]["snipe_group"] == 9
+
+
+# ---------------------------------------------------------------------------
+# BUI-391: _sync_gixen reraise error-path hygiene
+# ---------------------------------------------------------------------------
+
+def test_sync_gixen_gixenerror_log_wording_matches_reraise(monkeypatch):
+    """BUI-391: the GixenError log claims 'suppressed' only when the exception
+    is actually swallowed (reraise=False). On the reraise path (api_sync,
+    _sync_loop) it must NOT falsely claim suppression — the exception is about
+    to propagate to the caller. Exercised directly: list_snipes raises before
+    any DB use, so no lifespan/connection is needed."""
+    import asyncio
+    from unittest.mock import MagicMock
+    import server.main as m
+
+    client = MagicMock()
+    client.list_snipes.side_effect = m.GixenError("boom")
+    db = MagicMock()  # never touched — the error is raised before any DB work
+
+    logged: list[str] = []
+    monkeypatch.setattr(
+        m.logger, "warning",
+        lambda msg, *a, **k: logged.append(msg % a if a else msg),
+    )
+
+    # reraise=False → swallowed → returns [] → log accurately says "suppressed".
+    logged.clear()
+    assert asyncio.run(m._sync_gixen(db, client, reraise=False)) == []
+    gx = [line for line in logged if "GixenError" in line]
+    assert gx, "expected a GixenError log line on the suppress path"
+    assert all("suppressed" in line and "reraised" not in line for line in gx)
+
+    # reraise=True → propagates → log must NOT claim suppression.
+    logged.clear()
+    with pytest.raises(m.GixenError):
+        asyncio.run(m._sync_gixen(db, client, reraise=True))
+    gx = [line for line in logged if "GixenError" in line]
+    assert gx, "expected a GixenError log line on the reraise path"
+    assert all("reraised" in line and "suppressed" not in line for line in gx)
+
+
+def test_background_entry_points_rollback_on_unexpected_exception(monkeypatch):
+    """BUI-391: _ensure_fresh_sync and _sync_loop must roll back the shared
+    singleton connection when _sync_gixen raises an unexpected (non-Gixen)
+    exception mid-cycle — the api_sync discipline (BUI-386). _sync_gixen batches
+    its DML into one end-of-cycle commit, so without the rollback a partial
+    cycle's uncommitted writes could ride along on the next successful commit."""
+    import asyncio
+    from unittest.mock import MagicMock
+    import server.main as m
+
+    class _RollbackSpy:
+        def __init__(self):
+            self.rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    async def boom(*a, **k):
+        raise RuntimeError("kaboom")
+
+    # --- _ensure_fresh_sync (dashboard on-visit pull) ---
+    async def ensure_case():
+        spy = _RollbackSpy()
+        monkeypatch.setattr(m, "_db", spy)
+        monkeypatch.setattr(m, "_sync_gixen", boom)
+        monkeypatch.setattr(m, "_api_client", MagicMock())
+        monkeypatch.setattr(m, "_last_sync_at", 0.0)  # force staleness → runs
+        # Locks must be created inside this running loop.
+        monkeypatch.setattr(m, "_sync_lock", asyncio.Lock())
+        monkeypatch.setattr(m, "_api_lock", asyncio.Lock())
+        await m._ensure_fresh_sync()  # must swallow (degrade), not raise
+        return spy.rollbacks
+
+    assert asyncio.run(ensure_case()) == 1
+
+    # --- _sync_loop (one background iteration) ---
+    async def loop_case():
+        spy = _RollbackSpy()
+        monkeypatch.setattr(m, "_db", spy)
+        monkeypatch.setattr(m, "_sync_gixen", boom)
+        monkeypatch.setattr(m, "_sync_client", MagicMock())
+        task = asyncio.create_task(m._sync_loop())
+        await asyncio.sleep(0.05)  # let one iteration run + fail + back off
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return spy.rollbacks
+
+    assert asyncio.run(loop_case()) >= 1
