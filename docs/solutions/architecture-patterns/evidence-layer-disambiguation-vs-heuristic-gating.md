@@ -2,7 +2,7 @@
 title: "Evidence-layer disambiguation beats heuristic-gating for permissive classifiers"
 date: 2026-07-17
 category: architecture-patterns
-module: "gixen-cli (server/main.py — bids WON-inference / classification pipeline)"
+module: "gixen-cli (server/fallback.py — bids WON-inference / classification pipeline)"
 problem_type: architecture_pattern
 component: background_job
 severity: high
@@ -34,7 +34,7 @@ tags:
 
 ## Context
 
-BUI-50 (2026-06-01) found purged/removed snipes rendering as "won" in the dashboard — the immediate fix was endpoint-level tombstone filtering (`docs/solutions/ui-bugs/purged-snipes-shown-as-won-2026-06-01.md`). The deeper issue was upstream: `_run_ebay_fallback` in `packages/gixen-cli/server/main.py` infers WON/LOST from eBay's final sold price by comparing it to `max_bid` — a heuristic needed because Gixen sometimes drops an ended snipe from its list before syncing its true WON status, and the local sniper is disabled (so `local_snipe_result` is always NULL).
+BUI-50 (2026-06-01) found purged/removed snipes rendering as "won" in the dashboard — the immediate fix was endpoint-level tombstone filtering (`docs/solutions/ui-bugs/purged-snipes-shown-as-won-2026-06-01.md`). The deeper issue was upstream: `_run_ebay_fallback` in `packages/gixen-cli/server/fallback.py` infers WON/LOST from eBay's final sold price by comparing it to `max_bid` — a heuristic needed because Gixen sometimes drops an ended snipe from its list before syncing its true WON status, and the local sniper is disabled (so `local_snipe_result` is always NULL).
 
 BUI-146 examined the case where a snipe was *cancelled* while still live: the auction still ends, eBay still reports a final price, and if that price came in under `max_bid`, the heuristic stamps a phantom WON on an auction never actually bid on. It was closed **accepted-risk** on an explicit premise — live-snipe cancellation was a rare, near-unreachable path — with the sanctioned fix direction (vanish-time disambiguation, BUI-85 style) recorded in a comment at the inference site.
 
@@ -74,7 +74,7 @@ Rows with matching evidence are tombstoned `REMOVED` (with a cause marker in `no
 
 ## Examples
 
-The margin and the vanish-time proof (`packages/gixen-cli/server/main.py`):
+The margin and the vanish-time proof (`packages/gixen-cli/server/fallback.py`):
 
 ```python
 _CANCEL_EVIDENCE_MARGIN = timedelta(minutes=10)
@@ -106,7 +106,14 @@ def _group_won_before(db, item_id, snipe_group, end_dt, added_at_iso,
             return False
         member_since = max(member_since, changed_dt)
     cutoff = end_dt - _CANCEL_EVIDENCE_MARGIN
-    ...
+    rows = db.execute(
+        "SELECT COALESCE(auction_end_at, resolved_at) AS won_end_at FROM bids "
+        "WHERE snipe_group = ? AND status = 'WON' AND item_id != ? "
+        "UNION ALL "
+        "SELECT won_end_at FROM group_wins "
+        "WHERE snipe_group = ? AND item_id != ?",
+        (group, item_id, group, item_id),
+    ).fetchall()
     for row in rows:
         won_end = _parse_iso_utc(row["won_end_at"])
         if won_end is not None and member_since <= won_end <= cutoff:
