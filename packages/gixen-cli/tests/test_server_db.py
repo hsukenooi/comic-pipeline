@@ -381,6 +381,64 @@ def test_bids_grade_migration_is_idempotent(tmp_path):
     conn2.close()
 
 
+# ---------------------------------------------------------------------------
+# gixen_vanished_at column migration (BUI-371)
+# ---------------------------------------------------------------------------
+
+
+def test_bids_gixen_vanished_at_column_present_on_fresh_db(tmp_path):
+    conn = init_db(tmp_path / "fresh.db")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "gixen_vanished_at" in cols
+    conn.close()
+
+
+def test_bids_gixen_vanished_at_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem_vanish.db"
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "gixen_vanished_at" in cols
+    conn2.close()
+
+
+def test_gixen_vanished_at_present_after_legacy_rebuild(tmp_path):
+    """A pre-BUI-49 DB forces the status-rename table rebuild; the rebuilt
+    table (created from _BIDS_TABLE_SQL) must still carry gixen_vanished_at —
+    the ALTER runs before the rebuild, so a missing _BIDS_TABLE_SQL entry
+    would either drop the column or fail the rebuild's column copy."""
+    db_path = tmp_path / "legacy_vanish.db"
+    _seed_old_db(db_path)
+    conn = init_db(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "gixen_vanished_at" in cols
+    # And the rebuild actually happened (CHECK now permits REMOVED).
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bids'"
+    ).fetchone()["sql"]
+    assert "REMOVED" in sql
+    conn.close()
+
+
+def test_update_bid_clears_vanish_stamp(db):
+    """update_bid runs right after a successful Gixen add/modify — first-party
+    proof the snipe is live, so any stale vanish stamp must be cleared."""
+    insert_bid(db, "900200001", 25.0, 6, 0, None)
+    db.execute(
+        "UPDATE bids SET gixen_vanished_at='2026-01-01T00:00:00+00:00' "
+        "WHERE item_id='900200001'"
+    )
+    db.commit()
+    from server.db import update_bid
+    update_bid(db, "900200001", 30.0, 6, 0)
+    row = db.execute(
+        "SELECT gixen_vanished_at, max_bid FROM bids WHERE item_id='900200001'"
+    ).fetchone()
+    assert row["gixen_vanished_at"] is None
+    assert row["max_bid"] == 30.0
+
+
 def test_grade_columns_survive_bids_rebuild(tmp_path):
     """BUI-78: seller_grade/photo_grade must be in _BIDS_TABLE_SQL so the
     FK-removal rebuild preserves them (and their data). A legacy DB carrying the

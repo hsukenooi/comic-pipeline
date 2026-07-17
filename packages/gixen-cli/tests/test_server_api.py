@@ -1013,6 +1013,359 @@ def test_vanished_null_end_still_on_gixen_not_touched(api, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# BUI-371: cancelled-before-end disambiguation (vanish-time + group-win)
+# ---------------------------------------------------------------------------
+
+def _seed_bid_row(item_id, *, status="PENDING", max_bid=25.0, snipe_group=0,
+                  auction_end_at=None, gixen_vanished_at=None,
+                  winning_bid=None, resolved_at=None, added_at=None):
+    """Raw-insert a bids row so tests control every disambiguation input.
+
+    added_at defaults to a week ago so seeded rows predate any group win the
+    test stages (the _group_won_before lifetime bound requires the win to fall
+    at or after the classified row's added_at)."""
+    if added_at is None:
+        added_at = _iso_ago(days=7)
+    conn = _dbconn()
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, snipe_group, "
+        "auction_end_at, gixen_vanished_at, winning_bid, resolved_at, added_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (item_id, max_bid, status, snipe_group, auction_end_at,
+         gixen_vanished_at, winning_bid, resolved_at, added_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _gixen_listing(item_id, *, status, time_to_end, snipe_group="0",
+                   current_bid="10.00 USD", max_bid="25.00 USD"):
+    return {
+        "item_id": item_id, "title": "T", "max_bid": max_bid,
+        "current_bid": current_bid, "status": status, "status_mirror": None,
+        "time_to_end": time_to_end, "seller": "s",
+        "snipe_group": snipe_group, "bid_offset": "6", "bid_offset_mirror": "6",
+        "dbidid": f"d{item_id}",
+    }
+
+
+def _iso_ago(**kwargs):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(**kwargs)).isoformat()
+
+
+def _vanish_col(item_id):
+    conn = _dbconn()
+    row = conn.execute(
+        "SELECT gixen_vanished_at FROM bids WHERE item_id=?", (item_id,)
+    ).fetchone()
+    conn.close()
+    return row["gixen_vanished_at"]
+
+
+def test_group_cancelled_sibling_listed_ended_tombstones_removed(api):
+    """A sibling still listed on Gixen with an unrecognized (cancelled) status
+    that reaches its own auction end must resolve REMOVED, not ENDED — ENDED
+    would feed the eBay fallback's phantom-WON inference (BUI-371)."""
+    _seed_bid_row("371000001", status="WON", snipe_group=3,
+                  auction_end_at=_iso_ago(days=2), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=2))
+    _seed_bid_row("371000002", snipe_group=3, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000002", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="3"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000002")["status"] == "REMOVED"
+    # The tombstone carries the BUI-371 audit marker (BUI-67 convention).
+    from server.db import CANCELLED_TOMBSTONE_NOTE
+    conn = _dbconn()
+    note = conn.execute(
+        "SELECT notes FROM bids WHERE item_id='371000002'"
+    ).fetchone()["notes"]
+    conn.close()
+    assert note == CANCELLED_TOMBSTONE_NOTE
+
+
+def test_group_cancelled_sibling_listed_lost_tombstones_removed(api):
+    """A plain Gixen LOST on a group-cancelled sibling is a loss we never
+    contested — REMOVED, so it can't pollute the calibration report's
+    LOST-above-fmv_high analysis (BUI-371 secondary)."""
+    _seed_bid_row("371000003", status="WON", snipe_group=4,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("371000004", snipe_group=4, auction_end_at=_iso_ago(hours=2))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000004", status="LOST", time_to_end="ENDED",
+                       snipe_group="4", current_bid="30.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    row = _read_db_row("371000004")
+    assert row["status"] == "REMOVED"
+    assert row["winning_bid"] is None
+
+
+def test_group_sibling_outbid_stays_lost(api):
+    """OUTBID proves Gixen placed our bid — the loss is genuine and must stay
+    LOST (calibration correctness) even when a group sibling won earlier."""
+    _seed_bid_row("371000005", status="WON", snipe_group=5,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("371000006", snipe_group=5, auction_end_at=_iso_ago(hours=2))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000006", status="OUTBID", time_to_end="ENDED",
+                       snipe_group="5", current_bid="28.50 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    row = _read_db_row("371000006")
+    assert row["status"] == "LOST"
+    assert row["winning_bid"] == 28.5
+
+
+def test_group_win_within_margin_not_reclassified(api):
+    """Gixen's FAQ: auctions ending within ~2 minutes can BOTH fire (dual-win
+    window). A group win inside the safety margin is not cancel evidence —
+    keep today's WON-permissive ENDED so a real result can still be inferred."""
+    _seed_bid_row("371000007", status="WON", snipe_group=6,
+                  auction_end_at=_iso_ago(hours=2, minutes=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(hours=2))
+    _seed_bid_row("371000008", snipe_group=6, auction_end_at=_iso_ago(hours=2))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000008", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="6"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000008")["status"] == "ENDED"
+
+
+def test_winner_and_sibling_same_sync_processed_won_first(api):
+    """After a sync gap, the winner's WON and the sibling's cancelled-ENDED
+    arrive in one list pull. The WON transition must be applied first so the
+    sibling's classification sees the group-win evidence — even when the
+    sibling precedes the winner in Gixen's list order."""
+    _seed_bid_row("371000009", snipe_group=7, auction_end_at=_iso_ago(days=2))
+    _seed_bid_row("371000010", snipe_group=7, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000010", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="7"),
+        _gixen_listing("371000009", status="WON", time_to_end="ENDED",
+                       snipe_group="7", current_bid="20.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000009")["status"] == "WON"
+    assert _read_db_row("371000010")["status"] == "REMOVED"
+
+
+def test_vanish_stamp_set_and_cleared_on_reappear(api):
+    """A PENDING row missing from a healthy (non-empty) list gets
+    gixen_vanished_at stamped; reappearing clears it (transient scrape miss)."""
+    api.post("/api/bids", json={"item_id": "371000011", "max_bid": 25.0})
+    other = _gixen_listing("371099999", status="SCHEDULED", time_to_end="3 h")
+    api.mock_gixen.list_snipes.return_value = [other]
+    assert api.post("/api/sync").status_code == 200
+    assert _vanish_col("371000011") is not None
+
+    api.mock_gixen.list_snipes.return_value = [
+        other,
+        _gixen_listing("371000011", status="SCHEDULED", time_to_end="2 h"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _vanish_col("371000011") is None
+
+
+def test_empty_list_does_not_stamp_vanish(api):
+    """An empty scrape is a possible glitch — never stamp vanish times off it."""
+    api.post("/api/bids", json={"item_id": "371000012", "max_bid": 25.0})
+    api.mock_gixen.list_snipes.return_value = []
+    assert api.post("/api/sync").status_code == 200
+    assert _vanish_col("371000012") is None
+
+
+def test_vanished_well_before_end_tombstones_removed(api):
+    """Observed missing from Gixen well before its auction end → the snipe was
+    cancelled while live (user or group cancel) → REMOVED, never ENDED."""
+    _seed_bid_row("371000013", auction_end_at=_iso_ago(minutes=30),
+                  gixen_vanished_at=_iso_ago(hours=2))
+    api.mock_gixen.list_snipes.return_value = []
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000013")["status"] == "REMOVED"
+
+
+def test_vanished_after_end_flips_ended(api):
+    """First observed missing only after the auction ended — consistent with a
+    normally-executed snipe Gixen dropped → ENDED (fallback may infer WON)."""
+    _seed_bid_row("371000014", auction_end_at=_iso_ago(hours=1),
+                  gixen_vanished_at=_iso_ago(minutes=30))
+    api.mock_gixen.list_snipes.return_value = []
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000014")["status"] == "ENDED"
+
+
+def test_vanished_within_margin_flips_ended(api):
+    """A vanish observed inside the safety margin of the end is ambiguous
+    (end-time estimation error) → preserve WON-permissive ENDED."""
+    _seed_bid_row("371000015", auction_end_at=_iso_ago(minutes=30),
+                  gixen_vanished_at=_iso_ago(minutes=35))
+    api.mock_gixen.list_snipes.return_value = []
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000015")["status"] == "ENDED"
+
+
+def test_vanished_group_sibling_removed_without_vanish_stamp(api):
+    """Group-win evidence alone (no vanish stamp — e.g. server was down when
+    the sibling vanished) still classifies a vanished-ended sibling REMOVED."""
+    _seed_bid_row("371000016", status="WON", snipe_group=8,
+                  auction_end_at=_iso_ago(days=1), winning_bid=15.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("371000017", snipe_group=8, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = []
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000017")["status"] == "REMOVED"
+
+
+def test_group_zero_is_never_group_evidence(api):
+    """snipe_group=0 means 'no group' (the schema default for most snipes).
+    A WON group-0 row must never count as cancel evidence for an unrelated
+    group-0 row — without the guard, any past win would tombstone any
+    unrelated ended snipe."""
+    _seed_bid_row("371000018", status="WON", snipe_group=0,
+                  auction_end_at=_iso_ago(days=1), winning_bid=15.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("371000019", snipe_group=0, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000019", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="0"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000019")["status"] == "ENDED"
+
+
+def test_group_sibling_bid_under_asking_price_stays_lost(api):
+    """BID UNDER ASKING PRICE proves Gixen evaluated our snipe at fire time —
+    like OUTBID, it is exempt from group-cancel reclassification."""
+    _seed_bid_row("371000020", status="WON", snipe_group=9,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("371000021", snipe_group=9, auction_end_at=_iso_ago(hours=2))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000021", status="BID UNDER ASKING PRICE",
+                       time_to_end="ENDED", snipe_group="9",
+                       current_bid="40.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    row = _read_db_row("371000021")
+    assert row["status"] == "LOST"
+    assert row["winning_bid"] == 40.0
+
+
+def test_invalid_snipe_group_string_is_not_evidence(api):
+    """A non-numeric snipe_group from a Gixen parse quirk must not crash the
+    sync or trigger reclassification — it parses as 'no group'."""
+    _seed_bid_row("371000022", status="WON", snipe_group=4,
+                  auction_end_at=_iso_ago(days=1), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("371000023", snipe_group=4, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000023", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="N/A"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000023")["status"] == "ENDED"
+
+
+def test_group_evidence_uses_resolved_at_when_winner_end_missing(api):
+    """A WON sibling whose auction_end_at was never captured still provides
+    evidence via its resolved_at (when we observed the win)."""
+    _seed_bid_row("371000024", status="WON", snipe_group=5,
+                  auction_end_at=None, winning_bid=20.0,
+                  resolved_at=_iso_ago(days=1))
+    _seed_bid_row("371000025", snipe_group=5, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000025", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="5"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000025")["status"] == "REMOVED"
+
+
+def test_reused_group_number_old_win_is_not_evidence(api):
+    """Gixen group numbers (1-10) get recycled across unrelated campaigns.
+    A WON row from a prior campaign — ended before this snipe was even added
+    — cannot have group-cancelled it and must not reclassify its result
+    (worst case it would suppress a real win via the fallback)."""
+    _seed_bid_row("371000026", status="WON", snipe_group=7,
+                  auction_end_at=_iso_ago(days=30), winning_bid=20.0,
+                  resolved_at=_iso_ago(days=30), added_at=_iso_ago(days=37))
+    # New, unrelated snipe reusing group 7; added well after that old win.
+    _seed_bid_row("371000027", snipe_group=7, auction_end_at=_iso_ago(hours=1),
+                  added_at=_iso_ago(days=2))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("371000027", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="7"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("371000027")["status"] == "ENDED"
+
+
+def test_readd_clears_vanish_stamp(api):
+    """Re-adding a snipe (update-in-place upsert) is first-party proof it is
+    live on Gixen again — the stale vanish stamp must be cleared so it can't
+    later masquerade as cancel evidence."""
+    api.post("/api/bids", json={"item_id": "371000028", "max_bid": 25.0})
+    conn = _dbconn()
+    conn.execute(
+        "UPDATE bids SET gixen_vanished_at=? WHERE item_id='371000028'",
+        (_iso_ago(hours=2),),
+    )
+    conn.commit()
+    conn.close()
+    r = api.post("/api/bids", json={"item_id": "371000028", "max_bid": 30.0})
+    assert r.status_code == 200
+    assert r.json()["created"] is False  # update-in-place path
+    assert _vanish_col("371000028") is None
+
+
+def test_vanish_stamp_respects_scrape_start(tmp_path):
+    """A PENDING row added after the scrape snapshot began is legitimately
+    absent from that list — its absence is not a vanish observation."""
+    from datetime import datetime, timedelta, timezone
+    from server.db import init_db
+    from server.main import _record_vanish_observations
+
+    conn = init_db(tmp_path / "vanish.db")
+    now_dt = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, added_at) "
+        "VALUES ('900100001', 10.0, 'PENDING', ?)",
+        (now_dt.isoformat(),),
+    )
+    conn.commit()
+
+    # Scrape started BEFORE the row was added → not stamped.
+    _record_vanish_observations(
+        conn, {"other-item"}, now_dt.isoformat(),
+        (now_dt - timedelta(minutes=1)).isoformat(),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT gixen_vanished_at FROM bids WHERE item_id='900100001'"
+    ).fetchone()
+    assert row["gixen_vanished_at"] is None
+
+    # Scrape started AFTER the row was added → genuine vanish, stamped.
+    _record_vanish_observations(
+        conn, {"other-item"}, now_dt.isoformat(),
+        (now_dt + timedelta(minutes=1)).isoformat(),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT gixen_vanished_at FROM bids WHERE item_id='900100001'"
+    ).fetchone()
+    conn.close()
+    assert row["gixen_vanished_at"] is not None
+
+
+# ---------------------------------------------------------------------------
 # BUI-116: cached-dbidid edit fast-path + staleness fallback
 # ---------------------------------------------------------------------------
 
