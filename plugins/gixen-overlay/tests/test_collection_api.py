@@ -713,6 +713,37 @@ def test_wish_list_add_appends(client):
     assert "Daredevil #1" in names
 
 
+def test_wish_list_add_persists_year(client):
+    """BUI-387: POST /api/comics/wish-list stamps the per-issue cover year on the
+    created entry (a separate `year` field) — not only consumed by the add-time
+    owned-guard — and it round-trips on the wish-list read (also exposed for
+    seller-scan precision)."""
+    r = client.post("/api/comics/wish-list", json={"title": "Daredevil #1", "year": "1964"})
+    assert r.status_code == 200, r.text
+    assert r.json()["added"]["year"] == "1964"
+    items = {i["name"]: i for i in client.get("/api/comics/wish-list").json()}
+    assert items["Daredevil #1"]["year"] == "1964"
+
+
+def test_wish_list_add_without_year_stores_no_year_field(client):
+    """BUI-387: omitting `year` keeps the exact pre-387 entry shape (no `year`
+    key) so an unstamped wish stays year-blind in the conflicts audit."""
+    r = client.post("/api/comics/wish-list", json={"title": "Daredevil #1"})
+    assert r.status_code == 200, r.text
+    items = {i["name"]: i for i in client.get("/api/comics/wish-list").json()}
+    assert "year" not in items["Daredevil #1"]
+
+
+def test_wish_list_add_rejects_malformed_year(client):
+    """BUI-387: a malformed `year` (a range paste / garbage) is rejected 422 at
+    the endpoint — the shared 4-digit guard in cmd_wish_list_add surfaces through
+    api_wish_list_add's error path — and nothing is persisted."""
+    r = client.post("/api/comics/wish-list", json={"title": "Daredevil #1", "year": "1963 - 2011"})
+    assert r.status_code == 422, r.text
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Daredevil #1" not in names
+
+
 def test_wish_list_add_rejects_empty_title(client):
     assert client.post("/api/comics/wish-list", json={"title": "   "}).status_code == 422
     assert client.post("/api/comics/wish-list", json={}).status_code == 422

@@ -91,6 +91,12 @@ class WishListAddRequest(BaseModel):
     issue's *cover* year, never a series START year (``year_began``), or the
     matcher's per-issue year gate falsely reports owned mid-run issues as
     not-owned and the guard fails open.
+
+    BUI-387: ``year`` is now also PERSISTED on the created wish entry (a separate
+    ``year`` field), not only consumed by the add-time owned-guard. The stored
+    Cover Year lets the later conflicts audit year-scope this wish so a vintage
+    want stops re-flagging against an owned modern volume on every audit. Same
+    BUI-129 rule: it must be the issue's cover year, never ``year_began``.
     """
 
     title: str

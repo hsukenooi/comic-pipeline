@@ -451,6 +451,63 @@ def test_cli_creator_run_requires_series_id(monkeypatch, capsys):
     assert exc.value.code == 2
 
 
+def test_cli_wish_list_set_year_dispatches_without_client(monkeypatch, tmp_path, capsys):
+    """BUI-387: `locg wish-list set-year <name> <year>` is a pure local-cache
+    write — it dispatches to cmd_wish_list_set_year and never constructs a
+    Playwright/LOCG client."""
+    import locg.cli
+
+    client_constructed = []
+
+    class FakeClient:
+        def __init__(self):
+            client_constructed.append(True)
+        def close(self):
+            pass
+
+    calls = []
+
+    def fake_set_year(name, year):
+        calls.append((name, year))
+        return {"status": "ok", "name": name, "year": year, "matched": 1}
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "cmd_wish_list_set_year", fake_set_year)
+    monkeypatch.setattr(sys, "argv", ["locg", "wish-list", "set-year", "The X-Men #1", "1963"])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert not client_constructed, "set-year must not construct LOCGClient"
+    assert calls == [("The X-Men #1", "1963")]
+    assert json.loads(capsys.readouterr().out)["year"] == "1963"
+
+
+def test_cli_wish_list_add_threads_year(monkeypatch, tmp_path, capsys):
+    """BUI-387: `locg wish-list add <title> --year <yyyy>` forwards the cover
+    year to cmd_wish_list_add so it is stamped on the entry."""
+    import locg.cli
+
+    calls = []
+
+    def fake_add(title, year=None):
+        calls.append((title, year))
+        return {"status": "ok", "added": {"name": title, "year": year}, "items": 1}
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", lambda: (_ for _ in ()).throw(AssertionError("no client")))
+    monkeypatch.setattr(locg.cli, "cmd_wish_list_add", fake_add)
+    monkeypatch.setattr(sys, "argv", ["locg", "wish-list", "add", "The X-Men #1", "--year", "1963"])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert calls == [("The X-Men #1", "1963")]
+
+
 def test_cli_wish_list_falls_back_to_live_when_no_cache(monkeypatch, tmp_path, capsys):
     """When wish-list cache is absent, cmd_wish_list (live) is called."""
     import locg.cli

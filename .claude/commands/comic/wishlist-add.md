@@ -278,9 +278,16 @@ On confirmation, add one issue per call (`curl -sf` so a non-200 fails loudly)
 — this includes both the original to-add list and any printing-conflict
 issues the user confirmed adding in Step 4:
 
-Include each issue's **cover year** (Step 2) in the body so the server-side
-owned-guard's masthead fallback (BUI-184) gets the same catch the Step 3 filter
-does; omit `year` only for an issue Metron had no `cover_date` for.
+Include each issue's **cover year** (Step 2) in the body. It does double duty:
+the server-side owned-guard's masthead fallback (BUI-184) gets the same catch
+the Step 3 filter does, AND as of **BUI-387** the year is now **persisted** on
+the wish entry (a separate `year` field). That persisted Cover Year is what lets
+the later conflicts audit (`/comic:collection-sync`, wish-list conflicts) match a
+vintage want only against its matching-volume owned copy — so a grail like "The
+X-Men #1" (1963) stops re-flagging every audit against an owned modern volume.
+Omit `year` only for an issue Metron had no `cover_date` for (it is then added
+unstamped — safe, year-blind, exactly as before). **Never pass `year_began`
+(BUI-129)** — it must be THIS issue's cover year, or the wish is mis-scoped.
 
 ```bash
 curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list" \
@@ -291,10 +298,11 @@ curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list" \
 # …
 ```
 
-Each call appends `{name: "<title>", id: null}` to the server wish-list and
-returns `{"status": "ok", ...}`. As of BUI-285 the endpoint is idempotent: a
-re-added series+issue returns `{"status": "exists", ...}` with 200 (no duplicate
-row), so a retried title is safe. Stop and report if any call returns a non-200.
+Each call appends `{name: "<title>", id: null[, year: "<cover_year>"]}` to the
+server wish-list and returns `{"status": "ok", ...}`. As of BUI-285 the endpoint
+is idempotent: a re-added series+issue returns `{"status": "exists", ...}` with
+200 (no duplicate row), so a retried title is safe. Stop and report if any call
+returns a non-200.
 
 **Owned-title guard (BUI-130/BUI-184):** `POST /api/comics/wish-list` rejects an
 already-owned title with **409** at the API boundary (defense in depth behind

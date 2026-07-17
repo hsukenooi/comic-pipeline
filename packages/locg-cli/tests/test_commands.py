@@ -1979,6 +1979,47 @@ def test_cmd_wish_list_add_then_read_returns_new_entry(tmp_path):
     assert any(it["name"] == "Uncanny X-Men #185" and it["id"] is None for it in items)
 
 
+def test_cmd_wish_list_add_stamps_year(tmp_path):
+    """BUI-387: a `year` argument is persisted as a separate `year` field on the
+    new entry (the per-issue Cover Year), never encoded into `name`."""
+    import json as _json
+    from locg.commands import cmd_wish_list_add, wish_list_cache_path
+
+    result = cmd_wish_list_add("The X-Men #1", year="1963")
+
+    assert result["added"] == {
+        "name": "The X-Men #1", "id": None, "source": "local", "year": "1963",
+    }
+    payload = _json.loads(wish_list_cache_path().read_text())
+    assert payload["items"][-1]["year"] == "1963"
+
+
+def test_cmd_wish_list_add_without_year_omits_field(tmp_path):
+    """BUI-387: an add with no `year` keeps the exact pre-387 entry shape — no
+    `year` key at all — so a never-stamped wish stays year-blind."""
+    from locg.commands import cmd_wish_list_add
+
+    result = cmd_wish_list_add("Batman #224")
+
+    assert "year" not in result["added"]
+    assert result["added"] == {"name": "Batman #224", "id": None, "source": "local"}
+
+
+def test_cmd_wish_list_add_rejects_malformed_year(tmp_path):
+    """BUI-387: the persisted add path validates the year with the SAME 4-digit
+    guard as set-year — a range paste / garbage is rejected loudly (never stored
+    to later mis-scope the audit), at the shared chokepoint the endpoint add also
+    flows through."""
+    from locg.commands import cmd_wish_list_add, wish_list_cache_path
+
+    for bad in ["1963 - 2011", "63", "banana"]:
+        result = cmd_wish_list_add("The X-Men #1", year=bad)
+        assert "error" in result, bad
+
+    # A rejected add writes nothing.
+    assert not wish_list_cache_path().exists()
+
+
 def test_cmd_wish_list_add_file_mode_is_600(tmp_path):
     """Atomic write leaves the cache file mode set to 600."""
     import stat as _stat
@@ -2151,6 +2192,35 @@ def test_creator_run_adds_gap_issues_filtering_owned_and_wishlisted(tmp_path, mo
     assert "Uncanny X-Men #175" in names
     assert "Uncanny X-Men #287" in names  # discontinuous second stint added
     assert "Uncanny X-Men #176" not in names  # owned never written
+
+
+def test_creator_run_stamps_per_issue_cover_year(tmp_path, monkeypatch):
+    """BUI-387: creator-run adds carry each issue's OWN Metron cover year (never
+    year_began), so the run's wishes are year-scoped from the start. An issue
+    Metron has no cover_date for is added UNSTAMPED (safe year-blind default)."""
+    from locg.commands import cmd_wish_list_add_creator_run, cmd_wish_list_from_cache
+
+    _mark_collection_imported(tmp_path)  # R11 guard satisfied, nothing owned
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [
+                {"number": "175", "metron_id": 1, "cover_date": "1983-11-01"},
+                {"number": "287", "metron_id": 4, "cover_date": None},  # no date
+            ],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99, role="penciller",
+    )
+    assert result["status"] == "ok"
+
+    by_name = {it["name"]: it for it in cmd_wish_list_from_cache()}
+    assert by_name["Uncanny X-Men #175"]["year"] == "1983"       # stamped cover year
+    assert "year" not in by_name["Uncanny X-Men #287"]           # no cover_date → unstamped
 
 
 def test_creator_run_dedup_catches_leading_zero_that_exact_string_match_would_miss(tmp_path, monkeypatch):

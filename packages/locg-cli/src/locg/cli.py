@@ -46,6 +46,7 @@ from locg.commands import (
     cmd_wish_list_from_cache,
     cmd_wish_list_migrate_source,
     cmd_wish_list_remove,
+    cmd_wish_list_set_year,
     parse_lookup_spec,
 )
 
@@ -187,12 +188,14 @@ def create_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="Append a manual entry to the local wish-list cache, or a whole creator run",
         epilog=(
-            "Writes {name: <title>, id: null} to data/locg/wish-list.json. "
-            "A subsequent `locg collection import` overwrites the cache from "
-            "the LOCG XLSX export, so manually-added entries are not preserved "
-            "across imports. With --creator + --series-id, resolves the creator's "
-            "run on the series from Metron credits and adds the gap issues "
-            "(owned + already-wishlisted issues are filtered out first)."
+            "Writes {name: <title>, id: null, source: local[, year: <cover_year>]} "
+            "to wish-list.json. As of BUI-208 a subsequent `locg collection import` "
+            "no longer touches wish-list.json, so local adds — and any BUI-387 "
+            "`year` (cover-year) stamp — survive imports (wish-list.json is the "
+            "single source of truth; only a server-side removal or a manual re-seed "
+            "changes it). With --creator + --series-id, resolves the creator's run "
+            "on the series from Metron credits and adds the gap issues (owned + "
+            "already-wishlisted issues are filtered out first)."
         ),
     )
     # `title` is the simple single-entry path; optional when --creator is used
@@ -222,12 +225,37 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         help="Metron series id (required with --creator).",
     )
+    p_wish_add.add_argument(
+        "--year",
+        help=(
+            "Per-issue COVER YEAR to stamp on the entry (BUI-387), e.g. 1963 for "
+            "'The X-Men #1'. Year-scopes the conflicts audit so a vintage want no "
+            "longer flags against an owned modern volume. Must be the issue's own "
+            "cover year, NEVER a series start year (year_began, BUI-129). Ignored "
+            "with --creator (that path stamps each issue's Metron cover year "
+            "automatically)."
+        ),
+    )
     p_wish_remove = wish_sub.add_parser(
         "remove",
         parents=[common],
         help="Remove a title from the local wish-list cache",
     )
     p_wish_remove.add_argument("title", help="Exact title to remove (e.g. 'Amazing Spider-Man #300')")
+    p_wish_set_year = wish_sub.add_parser(
+        "set-year",
+        parents=[common],
+        help="Stamp a per-issue cover year on an existing wish-list entry (BUI-387 backfill)",
+        epilog=(
+            "Sets a `year` field on the exact-named wish entry so the conflicts "
+            "audit year-scopes it. Pass the issue's OWN cover year, never a series "
+            "start year (year_began, BUI-129). The one-time backfill for the "
+            "cross-volume decoy holds — resolve each held issue's cover year from "
+            "Metron first (see the wish-list-year backfill process doc)."
+        ),
+    )
+    p_wish_set_year.add_argument("title", help="Exact wish-list entry name (e.g. 'The X-Men #1')")
+    p_wish_set_year.add_argument("year", help="Per-issue cover year, 4 digits (e.g. 1963)")
     wish_sub.add_parser(
         "migrate-source",
         parents=[common],
@@ -414,10 +442,11 @@ def main() -> None:
     # wish-list skips Playwright when the local cache exists; it still needs a
     # client when no cache is present (live fallback, R5).
     _wish_list_cached = args.command == "wish-list" and wish_list_cache_path().exists()
-    # wish-list add/remove/migrate-source are pure local-cache writes — never need a client.
+    # wish-list add/remove/migrate-source/set-year are pure local-cache writes — never need a client.
     _wish_list_add = (
         args.command == "wish-list"
-        and getattr(args, "wish_list_command", None) in ("add", "remove", "migrate-source")
+        and getattr(args, "wish_list_command", None)
+        in ("add", "remove", "migrate-source", "set-year")
     )
     # creator-run is a pure Metron lookup — never needs the Playwright/LOCG client.
     _needs_client = not (
@@ -507,9 +536,13 @@ def main() -> None:
                         role=getattr(args, "role", "penciller") or "penciller",
                     )
                 else:
-                    result = cmd_wish_list_add(args.title)
+                    # BUI-387: --year stamps the entry's per-issue cover year.
+                    result = cmd_wish_list_add(args.title, year=getattr(args, "year", None))
             elif getattr(args, "wish_list_command", None) == "remove":
                 result = cmd_wish_list_remove(args.title)
+            elif getattr(args, "wish_list_command", None) == "set-year":
+                # BUI-387 backfill: stamp a per-issue cover year on an existing entry.
+                result = cmd_wish_list_set_year(args.title, args.year)
             elif getattr(args, "wish_list_command", None) == "migrate-source":
                 result = cmd_wish_list_migrate_source()
             elif _wish_list_cached:
