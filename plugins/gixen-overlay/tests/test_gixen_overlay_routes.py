@@ -843,6 +843,118 @@ def test_locg_link_sets_locg_id(api):
     assert r.json()["is_primary"] is True
 
 
+def test_locg_link_commits_under_write_lock(api, monkeypatch):
+    """BUI-408 (Stage 1 of BUI-400's shared-connection isolation rollout):
+    api_link_locg's write now goes through write_transaction() under the
+    same app-wide _write_lock every gixen-cli writer uses (routes.py:
+    `async with _write_locked(): with write_transaction(_get_db_path())`),
+    instead of committing directly on the shared `db` (app.state.db) with
+    no lock (design doc finding 1). Uses the same commit-lock-checking-
+    connection technique as gixen-cli's own test_server_api.py BUI-408
+    tests: sqlite3.Connection is an immutable C type, so a factory subclass
+    is the supported way to observe a real connection's commit() calls.
+    Patches server.db's sqlite3.connect AFTER seeding (and after the `api`
+    fixture has already opened the app's long-lived _db, since this test
+    depends on `api` running first) — sqlite3.connect is one shared
+    attribute on the single process-wide sqlite3 module object, so patching
+    it earlier would also catch this test's own raw admin seed writes.
+    """
+    import server.db as db_module
+    import server.main as m
+
+    api.post("/api/bids", json={"item_id": "555000012", "max_bid": 30.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    # Title must include a grade so extract-comics creates an fmv row and sets fmv_id
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Daredevil #1 1993 VF", "555000012"))
+    raw.commit()
+    raw.close()
+    api.post("/api/extract-comics")
+
+    record: list[bool] = []
+
+    class _Checking(sqlite3.Connection):
+        def commit(self):
+            locked = bool(m._write_lock and m._write_lock.locked())
+            record.append(locked)
+            assert locked, (
+                "BUI-408 invariant violated: api_link_locg committed while "
+                "_write_lock was not held"
+            )
+            return super().commit()
+
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=_Checking, **kw)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_check)
+
+    r = api.post("/api/bids/555000012/comics/locg", json={"locg_id": 1931244})
+    assert r.status_code == 200
+    assert r.json()["locg_id"] == 1931244
+    assert record, "guard never observed a commit — test is vacuous"
+    assert all(record)
+
+
+def test_locg_link_auto_create_commits_under_write_lock(api, monkeypatch):
+    """BUI-408: covers api_link_locg's auto-create branch specifically
+    (upsert_comic/upsert_fmv/link_fmv_to_bid) — these self-commit internally
+    (gixen_overlay/db.py) and, per a code-review finding, used to still land
+    on the shared `db` with no lock even after routing the function's FINAL
+    locg_id UPDATE — the fix bundles the whole resolve-then-write sequence
+    (including these upserts) into ONE write_transaction() block. Passing
+    `issue` for an issue not already linked to this bid forces this branch
+    (test_locg_link_sets_locg_id's setup creates a primary comic/fmv at
+    issue '1'; this passes issue '2', which has no existing match)."""
+    import server.db as db_module
+    import server.main as m
+
+    api.post("/api/bids", json={"item_id": "555000013", "max_bid": 30.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Daredevil #1 1993 VF", "555000013"))
+    raw.commit()
+    raw.close()
+    api.post("/api/extract-comics")
+
+    record: list[bool] = []
+
+    class _Checking(sqlite3.Connection):
+        def commit(self):
+            locked = bool(m._write_lock and m._write_lock.locked())
+            record.append(locked)
+            assert locked, (
+                "BUI-408 invariant violated: api_link_locg's auto-create "
+                "branch committed while _write_lock was not held"
+            )
+            return super().commit()
+
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=_Checking, **kw)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_check)
+
+    r = api.post(
+        "/api/bids/555000013/comics/locg",
+        json={"locg_id": 1931245, "issue": "2"},
+    )
+    assert r.status_code == 200
+    assert r.json()["issue"] == "2"
+    assert r.json()["locg_id"] == 1931245
+    assert record, "guard never observed a commit — test is vacuous"
+    assert len(record) >= 2, (
+        "expected multiple commits (upsert_comic/upsert_fmv self-commit "
+        "internally, plus the block's own final commit) — too few observed "
+        "to plausibly have exercised the auto-create branch"
+    )
+    assert all(record)
+
+
 def test_locg_link_unknown_item_returns_404(api):
     r = api.post("/api/bids/000000000/comics/locg", json={"locg_id": 12345})
     assert r.status_code == 404
