@@ -26,7 +26,7 @@ The repo is a **uv workspace**: `packages/*` + `plugins/*` are members, and `uv 
 # `ModuleNotFoundError: No module named 'record_win_prep'` until reinstalled).
 # After merging overlay/server changes (gixen-cli server/, plugins/gixen-overlay), additionally (BUI-377):
 #   uv sync --all-packages
-#   launchctl kickstart -k gui/$(id -u)/com.gixen.server
+#   launchctl kickstart -k gui/$(id -u)/com.comics.server
 # (the comics server runs via launchd out of the workspace .venv, which install.sh does NOT refresh)
 
 # Sync the workspace env (packages/* + plugins/*) for development + tests

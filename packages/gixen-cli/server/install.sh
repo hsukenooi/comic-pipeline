@@ -16,10 +16,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="$(dirname "$SCRIPT_DIR")"               # packages/gixen-cli
 MONOREPO_ROOT="$(cd "$PKG_DIR/../.." && pwd)"    # monorepo root (uv workspace)
 VENV="$MONOREPO_ROOT/.venv"                      # shared workspace venv
-# BUI-220: fresh installs use the canonical comics-server names. The live Mac
-# Mini still runs the old com.gixen.server LaunchAgent against ~/.gixen-server
-# until its data is physically moved; that migration is intentionally NOT done
-# here (re-running this script on the Mini would point at a fresh empty DB).
+# BUI-220: fresh installs use the canonical comics-server names
+# (com.comics.server / ~/.comics-server). If the Mini has not yet run
+# docs/runbooks/comics-server-dir-migration.md, its live LaunchAgent label and
+# data dir may still be the pre-migration com.gixen.server / ~/.gixen-server
+# (BUI-411: verify with `launchctl list | grep -E 'com\.(comics|gixen)\.server'`
+# before relying on either name). Re-running this script does NOT perform that
+# migration — doing so on an unmigrated Mini would point at a fresh empty DB.
 SERVER_DIR="$HOME/.comics-server"
 PLIST="$HOME/Library/LaunchAgents/com.comics.server.plist"
 
