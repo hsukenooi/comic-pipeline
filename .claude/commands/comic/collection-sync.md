@@ -357,8 +357,14 @@ curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/import" \
   -F "file=@<XLSX>"
 ```
 
-Surface `added` / `updated` / `reconciled` from the response. **If the POST
-fails, STOP** — do not report success; the backup from Step 1 is intact.
+Surface `added` / `updated` / `reconciled` from the response. **If `warnings`
+is non-empty, surface every entry too** — each is a plain human-readable
+string (not a structured object with separate fields), covering both the
+BUI-412 `null_release_date_owned` data-quality notice and any pre-existing
+`ambiguous_reconciliation` / reconciliation-collision notices. List them for
+the operator; don't drop them just because they fall outside the
+added/updated/reconciled counts. **If the POST fails, STOP** — do not report
+success; the backup from Step 1 is intact.
 
 ## Step 6: Post-import safety check
 
@@ -392,13 +398,32 @@ Re-import:        added=A  updated=U  reconciled=R
 Pending:          PENDING_BEFORE → PENDING_AFTER  (cleared ~N)
 Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = genuine LOCG-side adds)
 Wish-list:        unchanged (local-only adds preserved)
+Warnings:         W warning(s) from the re-import (see below) — or "none"
 ```
+
+**If the Step 5 response's `warnings` array is non-empty, list every entry
+below the summary block** — each is already a complete, human-readable
+string (not a structured object to reformat), so just enumerate them:
+
+```
+Warnings (2):
+  - 3 owned collection row(s) have no release_date — this silently defeats
+    the year-scoped wish-list conflicts audit (BUI-412). Consider
+    backfilling release_date on these rows.
+  - Ambiguous reconciliation for 'Amazing Spider-Man #300'
+```
+
+These are advisories, not failures — they don't change Step 6's pass/fail
+assertions, but they flag real data-quality gaps (e.g. BUI-412's
+`null_release_date_owned`) or rows that need manual follow-up, so they must
+reach the operator rather than stay buried in the raw JSON.
 
 Some pending rows may legitimately remain: wins for a book the collection
 **already owns** (under a different identity) are left pending and logged
-`ambiguous_reconciliation` rather than merged or duplicated. Check `.notes.md`
-and the server's `import-history.jsonl`; resolve them via the duplicate
-win-records cleanup in
+`ambiguous_reconciliation` rather than merged or duplicated — this is one of
+the `warnings` entries above, not just an `import-history.jsonl` detail.
+Check `.notes.md` and the server's `import-history.jsonl` for the full
+audit trail; resolve them via the duplicate win-records cleanup in
 `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
 ## Common Mistakes
