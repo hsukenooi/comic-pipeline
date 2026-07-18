@@ -115,7 +115,7 @@ _GROUP_WINS_UNIQUE_INDEX_SQL = (
 # LEGACY). Values are hyphenated to read cleanly in the JSON endpoint.
 GROUP_WIN_SOURCE_STATUS_TRANSITION = "status-transition"  # update_bid_status WON
 GROUP_WIN_SOURCE_STARTUP_BACKFILL = "startup-backfill"    # _apply_migrations seed
-GROUP_WIN_SOURCE_LISTED_WIN = "listed-win"                # _record_listed_win_evidence
+GROUP_WIN_SOURCE_LISTED_WIN = "listed-win"                # _apply_listed_win_evidence (BUI-410; was _record_listed_win_evidence)
 GROUP_WIN_SOURCE_LEGACY = "legacy"                        # pre-BUI-385 rows
 GROUP_WIN_SOURCES = frozenset({
     GROUP_WIN_SOURCE_STATUS_TRANSITION,
@@ -471,7 +471,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.commit()
 
     # BUI-385: stamp any ledger row still missing a provenance tag — rows
-    # written by update_bid_status / _record_listed_win_evidence before the
+    # written by update_bid_status / the listed-win evidence path before the
     # source column existed — as LEGACY. They can't be attributed to a specific
     # writer retroactively. Idempotent: matches 0 rows once every row is tagged
     # (the backfill INSERT above always sets source, so this only ever catches
@@ -837,8 +837,8 @@ def record_group_win(
     `source` is the provenance tag (a GROUP_WIN_SOURCES value) surfaced by
     /api/group-wins; it defaults to the primary writer (update_bid_status's
     WON transition) so no caller can silently land a NULL source. The
-    _record_listed_win_evidence path passes GROUP_WIN_SOURCE_LISTED_WIN; the
-    startup backfill writes its rows directly (not through here) tagged
+    _apply_listed_win_evidence path (BUI-410) passes GROUP_WIN_SOURCE_LISTED_WIN;
+    the startup backfill writes its rows directly (not through here) tagged
     GROUP_WIN_SOURCE_STARTUP_BACKFILL.
 
     The ledger is permanent (nothing tombstones it), so it holds itself to a

@@ -1,15 +1,16 @@
 ---
 title: "Shared singleton sqlite connection: every _db-mutating coroutine must rollback on unexpected exception"
 date: 2026-07-17
+status: superseded
+superseded_by: BUI-400 (staged rollout BUI-407..BUI-410), landed 2026-07-18
+superseded_date: 2026-07-18
 category: conventions
 module: packages/gixen-cli/server (comics server sync + eBay fallback + API write paths)
 problem_type: convention
 component: database
 severity: medium
 applies_when:
-  - "Adding a new async entry point that mutates the comics server's shared _db connection"
-  - "A coroutine batches DML and commits once at end-of-cycle rather than per-statement"
-  - "Writing or reviewing a broad except Exception around a batch-then-commit body in server/main.py or server/fallback.py"
+  - "HISTORICAL — retained for context; do NOT re-apply this convention to new code (see the SUPERSEDED banner)"
 related_components:
   - background_job
   - gixen-cli
@@ -21,9 +22,46 @@ tags:
   - transaction
   - error-handling
   - gixen-cli
+  - superseded
 ---
 
 # Shared singleton sqlite connection: every _db-mutating coroutine must rollback on unexpected exception
+
+> ## ⚠️ SUPERSEDED (2026-07-18, BUI-400 staged rollout BUI-407..BUI-410)
+>
+> **This convention is retired. Do NOT add per-caller `_db.rollback()` guards to
+> new code, and do NOT cite this as a live rule in review.** It is kept for
+> historical context (it explains why the pre-2026-07-18 code looked the way it
+> did, and the data-integrity hazard the new model closes structurally).
+>
+> **What replaced it.** BUI-400's staged rollout removed the shared-transaction
+> root cause the guards were mitigating. `_db` is now a **read-only + lifecycle**
+> connection (migrations, WAL checkpoint, the one immediate-commit
+> `api_remove_bid` `delete_bid()`); **every batched writer** — the API write
+> paths and overlay `api_link_locg` (Stage 1, BUI-408), `_run_ebay_fallback`
+> (Stage 2, BUI-409), and `_sync_gixen` + `_sync_loop`'s `refresh_snipe_group`
+> (Stage 3, BUI-410) — now runs its DML on its **own short-lived
+> `write_transaction()` connection**, opened under the app-wide `_write_lock`
+> and held only across an **await-free** apply block (network work is hoisted
+> ahead of it, gather-then-apply). `write_transaction()` (in `server/db.py`)
+> **rolls back and closes its own connection on any exception inside its `with`
+> block**, so a failed cycle discards *only its own* writes — it can no longer
+> strand a partial batch on a shared connection for an unrelated coroutine's
+> `commit()` to flush. The cross-coroutine "stray write flushed later" hazard is
+> therefore **structurally impossible**, not merely mitigated.
+>
+> **Consequence for the old guards.** The per-caller `_db.rollback()` calls in
+> `api_sync`, `api_purge`, `api_edit_bid`, `_ensure_fresh_sync`, `_sync_loop`,
+> and `_run_ebay_fallback` were **removed** in BUI-410 (they had become dead
+> no-ops — `_db` no longer carries uncommitted batched writes). Their `except`
+> handlers stay (they still degrade / return a structured 500 / log), just
+> without the rollback.
+>
+> **The one honesty rule below still applies** (it is not about rollback):
+> keep `except` log wording accurate about **suppressed vs reraised**
+> (BUI-391) — see that subsection.
+>
+> Everything below this banner is the **original (now-historical)** convention.
 
 ## Context
 
@@ -100,6 +138,10 @@ except GixenError as e:
 - **BUI-386** — established the rollback-on-unexpected-exception guard for `api_sync`.
 - **BUI-391** — extended it to `_ensure_fresh_sync` / `_sync_loop` and fixed the misleading "suppressed" log.
 - **BUI-399** — remaining gaps (`_run_ebay_fallback`, `api_purge`, `api_modify_bid`); candidate to centralize the discipline in a helper.
-- **BUI-400** — the structural root cause: one process-wide singleton connection + shared transaction across coroutines.
+- **BUI-400** — the structural root cause: one process-wide singleton connection + shared transaction across coroutines. **Now resolved** by the staged rollout below, which **supersedes this convention** (see the banner at the top). Design: `docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md`.
+- **BUI-407 (Stage 0)** — commit-free write helpers + the `write_transaction()` factory + `busy_timeout`; demoted `_db` to reads/lifecycle.
+- **BUI-408 (Stage 1)** — routed the already-await-free writers (API paths, sniper, overlay `api_link_locg`) through `write_transaction()` under `_write_lock`.
+- **BUI-409 (Stage 2)** — `_run_ebay_fallback` gather-then-apply.
+- **BUI-410 (Stage 3)** — `_sync_gixen` gather-then-apply (folding in BUI-405's lock-free `refresh_snipe_group`); **removed the per-caller rollback guards** this doc prescribed, retiring the convention.
 - `../architecture-patterns/durable-evidence-store-encode-unknowns-and-identity-precisely.md` — sibling piece of the same shared-connection hardening arc (sentinel encoding + `group_wins` identity); a reader fixing one write-safety class in these files will likely need the other.
 - `../design-patterns/scope-status-writes-to-row-id-not-item-id.md` — companion write-hygiene discipline for the same `server/main.py` / `server/fallback.py` write paths (id-target terminal writes, don't write item_id-wide).

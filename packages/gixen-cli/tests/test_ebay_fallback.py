@@ -88,7 +88,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from server.db import init_db
+from server.db import init_db, write_transaction
 
 
 def _iso(delta: timedelta) -> str:
@@ -776,29 +776,30 @@ def test_fallback_won_ledger_write_scoped_to_own_group_not_sibling(
 # ---------------------------------------------------------------------------
 
 
-def test_fallback_rolls_back_on_unexpected_exception(tmp_path, monkeypatch):
+def test_fallback_swallows_unexpected_exception_without_db_rollback(tmp_path, monkeypatch):
     """A genuine bug in the fallback's gather phase (not a Gixen/eBay
     connectivity issue — those are handled per-row inside gather, not via
-    this generic except) must still roll back the shared `_db` connection.
-    BUI-409: this function no longer writes to `_db` itself (see
-    _run_ebay_fallback's except-block comment), so the rollback is no longer
-    protecting a partial cycle of ITS OWN writes — it stays as the
-    still-active BUI-386/391/399 systemwide convention (a defensive
-    safety net for whatever else might be mid-write on the shared
-    connection when an unrelated coroutine's bug fires) until Stage 3
-    (BUI-410) retires it. This test guards that the call site itself wasn't
-    dropped in the BUI-409 restructure."""
+    this generic except) must still be SWALLOWED (fire-and-forget), not raised.
+
+    BUI-410 (Stage 3 landed): the `_db.rollback()` this except block used to
+    call is now RETIRED. Through Stage 2 it stayed as a defensive net for
+    whatever else might be mid-write on the shared `_db` — specifically the
+    then-unmigrated `_sync_gixen`, which self-committed its batch on `_db`.
+    Stage 3 routed `_sync_gixen` through its own write_transaction() too, so
+    NO code path leaves uncommitted DML on `_db` for this handler to rescue:
+    the fallback's own writes are on its ephemeral write_transaction()
+    connection (rolled back + closed by that factory on any error), and its
+    gather phase only reads `_db`. This test guards that (a) the exception is
+    still swallowed, and (b) the handler no longer reaches for `_db.rollback()`
+    (there is nothing to roll back)."""
     conn = init_db(tmp_path / "fb.db")
     _seed(conn, "471099001", auction_end_at=_iso(timedelta(hours=-1)))
 
     class _RollbackSpy:
         """Thin proxy around a real connection: delegates everything except
-        rollback() (counted here), matching the BUI-391 rollback-spy test
-        pattern (test_server_api.py's test_background_entry_points_..._
-        rollback_on_unexpected_exception). A real connection is needed
-        underneath (unlike that test's bare MagicMock) because
-        _ebay_fallback_rows runs a genuine SQL query before the injected
-        failure fires."""
+        rollback() (counted here). A real connection is needed underneath
+        because _ebay_fallback_rows runs a genuine SQL query before the
+        injected failure fires."""
 
         def __init__(self, real):
             self._real = real
@@ -833,7 +834,9 @@ def test_fallback_rolls_back_on_unexpected_exception(tmp_path, monkeypatch):
 
     asyncio.run(run())
     conn.close()
-    assert spy.rollbacks == 1
+    # Stage 3: the retired rollback is never called — the shared `_db` holds no
+    # uncommitted sync/fallback writes to discard.
+    assert spy.rollbacks == 0
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +965,103 @@ def test_freeze_mid_cycle_purge_does_not_corrupt_fallback_apply(tmp_path, monkey
     # The unconditional title/end-date write (BUI-382: runs regardless of
     # status) DOES still land — it's harmless and orthogonal to status.
     assert row["ebay_title"] == "T"
+
+
+# ---------------------------------------------------------------------------
+# BUI-410 (Stage 3): freeze-mid-cycle harness for _sync_gixen (design §6),
+# the sync-path twin of the fallback freeze test above. Proves _sync_gixen's
+# gather-then-apply restructure never holds _write_lock (nor any uncommitted
+# DML) across its gather-phase eBay fetch await.
+# ---------------------------------------------------------------------------
+
+def test_sync_freeze_mid_gather_does_not_hold_write_lock(tmp_path, monkeypatch):
+    """Gate _sync_gixen's gather-phase eBay fetch on an asyncio.Event the test
+    owns, pause the sync mid-gather, and assert:
+
+    1. A concurrent writer that takes _write_lock + write_transaction()
+       completes WHILE the sync is frozen in gather — proving _write_lock is
+       never held across the fetch await (if it regressed to hold the lock
+       across the fetch, this would deadlock; the timeout fails fast instead
+       of hanging the suite).
+    2. At that moment the sync's own apply writes have NOT landed (the
+       vanished-with-NULL-end row is still PENDING) — the apply phase, which
+       opens the write_transaction(), hasn't started.
+    3. After the gate releases, the sync's apply runs and resolves the row
+       (eBay end in the past → ENDED).
+
+    The eBay fetch runs inside asyncio.to_thread, so the gate handshake
+    crosses threads via call_soon_threadsafe / run_coroutine_threadsafe."""
+    conn = init_db(tmp_path / "syncfreeze.db")
+    # A vanished PENDING row with NULL end → the gather fetches eBay to
+    # disambiguate it (BUI-85), which is the await we freeze on.
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, added_at) "
+        "VALUES ('410900001', 25.0, 'PENDING', NULL, ?)",
+        (_iso(timedelta(days=-7)),),
+    )
+    conn.commit()
+    path = Path(_db_path_of(conn))
+
+    client = MagicMock()
+    client.list_snipes.return_value = []  # vanished (row absent from the list)
+
+    monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_db_path", path)
+    monkeypatch.setattr(m, "_ebay_fetch_bin", lambda: "ebay-fetch")
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+
+    past_end = _iso(timedelta(hours=-1))
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+
+        fetch_gate = asyncio.Event()
+        fetch_entered = asyncio.Event()
+
+        def _gated_fetch(iid):
+            loop.call_soon_threadsafe(fetch_entered.set)
+            asyncio.run_coroutine_threadsafe(fetch_gate.wait(), loop).result()
+            return {"end_date_iso": past_end}
+
+        monkeypatch.setattr(m, "_fetch_ebay_item_sync", _gated_fetch)
+
+        sync_task = asyncio.create_task(m._sync_gixen(conn, client))
+        await asyncio.wait_for(fetch_entered.wait(), timeout=5.0)
+        # The sync is now frozen inside the gather fetch, holding no _write_lock
+        # and no open write transaction (the apply block hasn't been entered).
+
+        async def concurrent_write():
+            async with m._write_locked():
+                with write_transaction(path) as w:
+                    w.execute(
+                        "INSERT INTO bids (item_id, max_bid, status) "
+                        "VALUES ('410900002', 5.0, 'PENDING')"
+                    )
+
+        # (1) Must not deadlock — the frozen sync isn't holding _write_lock.
+        await asyncio.wait_for(concurrent_write(), timeout=5.0)
+
+        # (2) The sync's apply hasn't started — the vanished row is still PENDING.
+        mid = conn.execute(
+            "SELECT status FROM bids WHERE item_id='410900001'"
+        ).fetchone()
+        assert mid["status"] == "PENDING"
+        # The concurrent write committed while the sync was frozen.
+        assert conn.execute(
+            "SELECT 1 FROM bids WHERE item_id='410900002'"
+        ).fetchone() is not None
+
+        fetch_gate.set()  # release the gate — gather completes, apply runs
+        await asyncio.wait_for(sync_task, timeout=5.0)
+
+    asyncio.run(run())
+    row = conn.execute(
+        "SELECT status FROM bids WHERE item_id='410900001'"
+    ).fetchone()
+    conn.close()
+    # (3) The sync's apply resolved the vanished-null-end row (eBay end past).
+    assert row["status"] == "ENDED"
 
 
 # ---------------------------------------------------------------------------
