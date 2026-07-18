@@ -691,7 +691,14 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
 
     Returns a summary dict: {added, updated, untouched, reconciled,
     possibly_removed, ownership_downgrades_held, behavioral_drift_count,
-    warnings}.
+    auto_healed_duplicates, null_release_date_owned, warnings}.
+
+    `null_release_date_owned` (BUI-412) is a non-blocking data-quality count of
+    owned rows (`in_collection` truthy) whose `release_date` is null/empty,
+    post-import; a corresponding message is appended to `warnings` when > 0.
+    This never rejects the import or alters/drops any row — it only surfaces
+    the gap, since a null-dated owned row silently defeats the year-scoped
+    wish-list conflicts audit.
     """
     # Validate and parse outside the lock — bad files abort cleanly
     xlsx_rows = parse_xlsx(path)
@@ -709,6 +716,9 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # already owned under an established locg_export identity (folds in
         # cleanup_duplicates.py class 1 — same-book/different-identity dup wins).
         "auto_healed_duplicates": 0,
+        # BUI-412: owned rows with no release_date, post-import. Non-blocking —
+        # a data-quality count only, never used to reject/alter/drop a row.
+        "null_release_date_owned": 0,
         "warnings": [],
     }
 
@@ -786,6 +796,32 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                     },
                 })
                 summary["possibly_removed"] += 1
+
+        # ----- Data-quality report: owned rows missing release_date (BUI-412) --
+        # A null/empty release_date on an OWNED row silently defeats the
+        # year-scoped wish-list conflicts audit: the year-gate can't confirm two
+        # years differ against a null-dated owned row, so it conservatively keeps
+        # flagging a real match as a conflict (the BUI-122-safe over-flag
+        # direction, but still noisy). Non-blocking by design (per BUI-412's
+        # decision) — this only counts and surfaces the gap; it never rejects the
+        # import, drops a row, or alters release_date (or any other field).
+        # `in_collection` truthy is the established "owned" predicate elsewhere
+        # in this module (see _owned_series_issue_index / wish_rows_for_export)
+        # — it excludes rows the export carries only because they're wish-listed
+        # (in_collection=0), which must never inflate this count.
+        null_release_date_owned = sum(
+            1
+            for row in comics
+            if row.get("in_collection") and not (row.get("release_date") or "").strip()
+        )
+        summary["null_release_date_owned"] = null_release_date_owned
+        if null_release_date_owned:
+            summary["warnings"].append(
+                f"{null_release_date_owned} owned collection row(s) have no "
+                "release_date — this silently defeats the year-scoped wish-list "
+                "conflicts audit (BUI-412). Consider backfilling release_date "
+                "on these rows."
+            )
 
         # ----- Rebuild series_name_index --------------------------------------
         payload["series_name_index"] = rebuild_series_name_index(payload)
