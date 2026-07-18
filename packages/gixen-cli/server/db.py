@@ -744,6 +744,26 @@ def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | 
     ).fetchone()
 
 
+def get_bid_by_id(conn: sqlite3.Connection, row_id: int) -> sqlite3.Row | None:
+    """Return the bids row with this id, or None if it no longer exists.
+
+    The by-id counterpart to get_bid_by_item_id. Its reason to exist is the
+    BUI-417 TOCTOU guard: both _run_ebay_fallback (server/fallback.py) and
+    _sync_gixen's vanished-null-end apply (server/main.py) decide a terminal
+    write from a status snapshot read LOCK-FREE at gather time, then apply it
+    under _write_lock. A concurrent writer can commit a genuine terminal
+    transition (or re-add the snipe) into the gather->apply window; because the
+    terminal writes guard on status CLASS (`status NOT IN tombstones`), not
+    equality vs the snapshot, a non-tombstone outcome like WON is not caught.
+    Re-reading the row by its id INSIDE the apply transaction lets each apply
+    path re-validate every precondition its gather-time decision rested on
+    before committing — see both call sites (they share this guard's rationale
+    and reference each other)."""
+    return conn.execute(
+        "SELECT * FROM bids WHERE id=?", (row_id,)
+    ).fetchone()
+
+
 def get_pending_bid_by_item_id(
     conn: sqlite3.Connection, item_id: str
 ) -> sqlite3.Row | None:

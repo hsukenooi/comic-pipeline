@@ -1234,3 +1234,117 @@ def test_fallback_same_cycle_group_win_classifies_sibling_in_one_call(
         "winner's group_wins evidence even though it was written by an "
         "EARLIER iteration of this same apply-phase loop, not a prior call"
     )
+
+
+# ---------------------------------------------------------------------------
+# BUI-417: cross-writer read-then-write TOCTOU. The fallback snapshots a row's
+# status LOCK-FREE at gather time (phase 1), then writes under _write_lock
+# (phase 2). A concurrent _sync_gixen can commit a genuine terminal transition
+# (or a re-add) into that window; the apply must re-read the row FRESH under
+# the lock and re-validate its gather-time decision before writing.
+# ---------------------------------------------------------------------------
+
+def _run_fallback_custom(monkeypatch, conn, fetch_fn):
+    """Like _run_fallback, but drives _run_ebay_fallback with a caller-supplied
+    _fetch_ebay_item_sync so a test can inject a concurrent DB write (a WON, or
+    a re-add) as a side effect DURING the gather-phase fetch — i.e. after the
+    row was snapshotted but before the apply write_transaction opens."""
+    from pathlib import Path
+    monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_db_path", Path(_db_path_of(conn)))
+    monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+    monkeypatch.setattr(m, "_fetch_ebay_item_sync", fetch_fn)
+
+    async def _nosleep(_):
+        return None
+
+    monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
+
+    async def run():
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        await m._run_ebay_fallback()
+
+    asyncio.run(run())
+
+
+def test_fallback_skips_stale_inference_when_won_committed_since_gather(tmp_path, monkeypatch):
+    """BUI-417 (the money path): a genuine WON committed by a concurrent writer
+    between the fallback's gather-time status snapshot and its apply write must
+    NOT be overwritten by the now-stale eBay-price inference. update_bid_status'
+    status-CLASS guard (`status NOT IN tombstones`) would MISS the WON (not a
+    tombstone) — only the BUI-417 fresh re-read catches it. Pre-fix this row
+    ended LOST @ $30; post-fix the real WON @ $99 survives."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "417000001", status="ENDED", max_bid=25.0,
+          auction_end_at=_iso(timedelta(hours=-1)))
+    db_path = _db_path_of(conn)
+
+    def _fetch_then_win(iid):
+        # A separate connection commits a genuine WON while the fallback is
+        # still in phase 1 (this fetch) — i.e. before phase 2's write lands.
+        side = sqlite3.connect(db_path)
+        side.execute(
+            "UPDATE bids SET status='WON', winning_bid=99.0, resolved_at=? "
+            "WHERE item_id=?",
+            (_iso(timedelta(0)), iid),
+        )
+        side.commit()
+        side.close()
+        # eBay says $30 (>= our $25 max → the stale inference would be LOST).
+        return {"item_id": iid, "title": "T", "current_price": "$30.00",
+                "end_date_iso": None}
+
+    _run_fallback_custom(monkeypatch, conn, _fetch_then_win)
+    row = _status_row(conn, "417000001")
+    conn.close()
+    assert row["status"] == "WON", "a genuine WON must not be overwritten by a stale inference"
+    assert row["winning_bid"] == 99.0
+
+
+def test_fallback_inference_still_lands_when_nothing_changed(tmp_path, monkeypatch):
+    """BUI-417 negative control: with NO concurrent change between gather and
+    apply, the fresh-read guard does not over-block — the normal inference
+    still lands. Same setup as the TOCTOU test but without the injected WON:
+    $30 >= $25 max → LOST."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "417000009", status="ENDED", max_bid=25.0,
+          auction_end_at=_iso(timedelta(hours=-1)))
+    _run_fallback(monkeypatch, conn, price="$30.00")
+    row = _status_row(conn, "417000009")
+    conn.close()
+    assert row["status"] == "LOST"
+    assert row["winning_bid"] == 30.0
+
+
+def test_fallback_readd_between_gather_and_apply_not_tombstoned(tmp_path, monkeypatch):
+    """BUI-417 (re-add): a vanished-well-before-end row carries positive
+    cancel evidence (gixen_vanished_at set) that WOULD classify it REMOVED. If
+    it is RE-ADDED between gather and apply — clearing gixen_vanished_at, as
+    update_bid does — the evidence must be re-read FRESH so it is no longer
+    "vanished while live": the row is NOT tombstoned REMOVED. (This function,
+    unlike _sync_gixen's apply, never re-stamps gixen_vanished_at, so the
+    fresh value faithfully reflects the re-add's clear.) Pre-fix: REMOVED;
+    post-fix: the normal inference runs ($10 < $25 → WON)."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "417000002", status="ENDED", max_bid=25.0,
+          auction_end_at=_iso(timedelta(hours=-1)),
+          gixen_vanished_at=_iso(timedelta(hours=-3)))
+    db_path = _db_path_of(conn)
+
+    def _fetch_then_readd(iid):
+        side = sqlite3.connect(db_path)
+        side.execute(
+            "UPDATE bids SET gixen_vanished_at=NULL WHERE item_id=?", (iid,)
+        )
+        side.commit()
+        side.close()
+        return {"item_id": iid, "title": "T", "current_price": "$10.00",
+                "end_date_iso": None}
+
+    _run_fallback_custom(monkeypatch, conn, _fetch_then_readd)
+    row = _status_row(conn, "417000002")
+    conn.close()
+    assert row["status"] != "REMOVED", "a re-added snipe (vanish evidence cleared) must not be tombstoned"
+    assert row["status"] == "WON"
+    assert row["winning_bid"] == 10.0

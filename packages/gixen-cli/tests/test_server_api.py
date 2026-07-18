@@ -1508,6 +1508,22 @@ def _arm_ebay(monkeypatch, end_iso):
     )
 
 
+def _stamp_vanished_before_scrape(item_id, *, hours=1):
+    """BUI-417: _apply_vanished_null_end now tombstones REMOVED only for a
+    SUSTAINED vanish — gixen_vanished_at observed before this sync's scrape,
+    not a same-cycle first observation (which is indistinguishable from a
+    concurrent re-add that _record_vanish_observations re-stamps). Stamp the
+    row's vanish time in the past so a single sync reaches the REMOVED decision
+    (the way a snipe seen vanished on a prior cycle would)."""
+    conn = _dbconn()
+    conn.execute(
+        "UPDATE bids SET gixen_vanished_at=? WHERE item_id=? AND status='PENDING'",
+        (_iso_ago(hours=hours), item_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def test_vanished_null_end_past_ebay_end_flips_to_ended(api, monkeypatch):
     """Vanished PENDING + NULL end + eBay says the auction already ended → ENDED."""
     from datetime import datetime, timedelta, timezone
@@ -1522,9 +1538,14 @@ def test_vanished_null_end_past_ebay_end_flips_to_ended(api, monkeypatch):
 
 def test_vanished_null_end_future_ebay_end_tombstones_removed(api, monkeypatch):
     """Vanished PENDING + NULL end + eBay says the auction is still live (Gixen
-    healthy this sync) → user removed it → REMOVED, never WON/LOST/ENDED."""
+    healthy this sync) → user removed it → REMOVED, never WON/LOST/ENDED.
+
+    BUI-417: the vanish must be SUSTAINED (observed before this sync's scrape)
+    for the REMOVED to land in one cycle — a same-cycle first observation is
+    now deferred (it can't be told apart from a concurrent re-add)."""
     from datetime import datetime, timedelta, timezone
     _seed_pending_null_end(api, "850000002")
+    _stamp_vanished_before_scrape("850000002")  # sustained vanish (BUI-417)
     # Gixen returns a *different* live snipe → non-empty list (not a scrape glitch).
     api.mock_gixen.list_snipes.return_value = [{
         "item_id": "850099999", "max_bid": "10.00 USD", "current_bid": "1.00 USD",
@@ -1536,6 +1557,94 @@ def test_vanished_null_end_future_ebay_end_tombstones_removed(api, monkeypatch):
 
     assert api.post("/api/sync").status_code == 200
     assert _read_db_row("850000002")["status"] == "REMOVED"
+
+
+def test_vanished_null_end_readd_between_gather_and_apply_not_removed(api, monkeypatch):
+    """BUI-417 crux (re-add TOCTOU). A vanished PENDING null-end row with a
+    SUSTAINED vanish + future eBay end WOULD tombstone REMOVED (see the test
+    above). But if the snipe is RE-ADDED between the gather-phase eBay fetch and
+    the apply, it must NOT be tombstoned — it is live again.
+
+    The subtlety this guards: a re-add clears gixen_vanished_at, but
+    _record_vanish_observations (run earlier in the SAME apply) RE-STAMPS it to
+    NOW, so a naive "gixen_vanished_at still set" check cannot see the re-add.
+    The guard instead keys on the stamp's AGE: a same-cycle stamp (>= this
+    scrape) defers REMOVED one cycle, so the re-added live snipe survives (and
+    reappears in the next scrape's list, clearing the stamp for good)."""
+    import server.main as m
+    from datetime import datetime, timedelta, timezone
+    _seed_bid_row("870000001", status="PENDING", auction_end_at=None,
+                  gixen_vanished_at=_iso_ago(hours=1))  # sustained (prior-cycle) vanish
+    # A different live snipe keeps the list non-empty (not a scrape glitch).
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "870099999", "max_bid": "10.00 USD", "current_bid": "1.00 USD",
+        "status": "SCHEDULED", "time_to_end": "3h", "seller": "s",
+        "snipe_group": "0", "bid_offset": "6",
+    }]
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+
+    def _fetch_then_readd(iid):
+        # Simulate a re-add landing during the gather-phase eBay fetch: a
+        # separate connection clears gixen_vanished_at (what update_bid does),
+        # committed before the apply opens its write_transaction.
+        conn = _dbconn()
+        conn.execute(
+            "UPDATE bids SET gixen_vanished_at=NULL WHERE item_id=?", (iid,)
+        )
+        conn.commit()
+        conn.close()
+        return {"end_date_iso": future}
+
+    monkeypatch.setattr(m, "_ebay_fetch_bin", lambda: "ebay-fetch")
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+    monkeypatch.setattr(m, "_fetch_ebay_item_sync", _fetch_then_readd)
+
+    assert api.post("/api/sync").status_code == 200
+    # Re-added → still a live PENDING snipe, NOT tombstoned REMOVED.
+    assert _read_db_row("870000001")["status"] == "PENDING"
+
+
+def test_vanished_null_end_first_observation_defers_and_stays_null_end(api, monkeypatch):
+    """BUI-417 money-path safety (guard-2 deferral must not strand or arm a row).
+
+    A GENUINE first-observation vanish (no prior gixen_vanished_at stamp) defers
+    REMOVED one cycle — but the deferred row MUST stay PENDING with auction_end_at
+    STILL NULL, so it (a) re-enters _gather_vanished_null_end next cycle (that
+    query requires auction_end_at IS NULL) and (b) never becomes local-sniper-
+    eligible (get_bids_ready_to_snipe fires on PENDING rows with a NON-NULL end).
+    Writing the future eBay end on the defer path would strand the row PENDING and
+    let the sniper place a real bid on an auction the user cancelled. Cycle 2 (the
+    vanish is now sustained) resolves it REMOVED."""
+    from datetime import datetime, timedelta, timezone
+    from server.db import get_bids_ready_to_snipe
+    _seed_pending_null_end(api, "880000001")  # genuine: gixen_vanished_at is NULL
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "880099999", "max_bid": "10.00 USD", "current_bid": "1.00 USD",
+        "status": "SCHEDULED", "time_to_end": "3h", "seller": "s",
+        "snipe_group": "0", "bid_offset": "6",
+    }]
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+    _arm_ebay(monkeypatch, future)
+
+    # Cycle 1: first observation of the vanish → deferred, NOT tombstoned.
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("880000001")["status"] == "PENDING"
+    conn = _dbconn()
+    end_after = conn.execute(
+        "SELECT auction_end_at FROM bids WHERE item_id='880000001'"
+    ).fetchone()["auction_end_at"]
+    # The deferred row stays genuinely NULL-end (the fix): sniper-inert + still a
+    # vanished-null-end candidate. The bug wrote `future` here.
+    assert end_after is None
+    # And even past the would-be future fire time, a NULL-end row never fires.
+    way_past = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    ready_ids = {r["item_id"] for r in get_bids_ready_to_snipe(conn, way_past)}
+    conn.close()
+    assert "880000001" not in ready_ids
+
+    # Cycle 2: the vanish is now sustained (stamped last cycle) → resolves REMOVED.
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("880000001")["status"] == "REMOVED"
 
 
 def test_vanished_null_end_future_ebay_end_empty_list_left_pending(api, monkeypatch):
@@ -1636,6 +1745,7 @@ def test_vanished_null_end_removed_write_spares_resolved_sibling_sharing_item_id
     sibling sharing the item_id."""
     from datetime import datetime, timedelta, timezone
     _seed_pending_null_end(api, "860000002")
+    _stamp_vanished_before_scrape("860000002")  # sustained vanish (BUI-417)
     old_id, old_resolved_at = _insert_old_resolved_won_sibling("860000002")
 
     # Gixen returns a DIFFERENT live snipe → non-empty list (not a scrape
