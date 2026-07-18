@@ -747,6 +747,61 @@ def test_purge_sibling_failure_swallowed(api):
     assert r.json()["removed_siblings"] == 0
 
 
+def test_purge_sibling_db_error_does_not_abort_loop(api, monkeypatch):
+    """BUI-416: api_purge's sibling-removal loop used to catch only
+    GixenError. A non-GixenError exception from the delete_bid()/
+    write_transaction() block (e.g. sqlite3.OperationalError from a BUSY
+    write_transaction()) would propagate out of the loop uncaught, silently
+    stranding every sibling still queued after the one that failed — even
+    though remove_snipe() had already succeeded on Gixen for it (a local vs
+    Gixen state divergence, and a worse one for the failing sibling itself
+    since Gixen already dropped it).
+
+    Regression guard: seed three explicit siblings, make delete_bid raise for
+    the middle one only, and assert remove_snipe is still attempted (and
+    delete_bid still applied) for the THIRD sibling — proving the loop
+    continued past the DB error instead of aborting.
+    """
+    import server.main as smain
+    from server.db import delete_bid as real_delete_bid
+
+    for iid in ("700000001", "700000002", "700000003"):
+        api.post("/api/bids", json={"item_id": iid, "max_bid": 10.0})
+
+    def flaky_delete_bid(conn, item_id):
+        if item_id == "700000002":
+            raise sqlite3.OperationalError("database is locked")
+        return real_delete_bid(conn, item_id)
+
+    monkeypatch.setattr(smain, "delete_bid", flaky_delete_bid)
+
+    r = api.post("/api/purge", json={
+        "sibling_ids": ["700000001", "700000002", "700000003"],
+    })
+    assert r.status_code == 200
+    # Gixen-side removal was attempted for ALL THREE siblings — proving the
+    # DB error on the middle one didn't abort the loop before it ever reached
+    # the third.
+    assert api.mock_gixen.remove_snipe.call_count == 3
+    api.mock_gixen.remove_snipe.assert_any_call("700000003")
+    # Only the two whose delete_bid succeeded count as fully removed.
+    assert r.json()["removed_siblings"] == 2
+
+    rows = {
+        row["item_id"]: row["status"]
+        for row in _dbconn().execute(
+            "SELECT item_id, status FROM bids WHERE item_id IN (?,?,?)",
+            ("700000001", "700000002", "700000003"),
+        )
+    }
+    assert rows["700000001"] == "REMOVED"
+    assert rows["700000003"] == "REMOVED"
+    # This is the divergence the fix surfaces (logged) rather than crashing
+    # on: Gixen already removed this sibling (remove_snipe succeeded, per the
+    # call_count assertion above) but the local row was never tombstoned.
+    assert rows["700000002"] == "PENDING"
+
+
 # ----------------------------------------------------------------------------
 # Tests added per ce-review residual #21 — coverage for code paths the initial
 # pass missed.
@@ -791,6 +846,37 @@ def test_cache_gixen_data_coalesces_none_inputs(tmp_path):
     row = get_bid_by_item_id(db, "111111")
     assert row["cached_at"] == first_cached_at  # unchanged
     assert row["ebay_title"] == "First Title"  # preserved
+
+
+def test_insert_web_added_bids_uses_passed_existing_ids(tmp_path):
+    """BUI-418: _insert_web_added_bids must dedupe using the existing_ids SET
+    PASSED IN by the caller (now computed in _sync_gixen's gather phase), not
+    by re-querying the bids table itself — proving the read was actually
+    hoisted out rather than just relocating a comment while keeping an
+    internal re-scan.
+
+    Discriminating case: an item_id NOT yet in the bids table, but INCLUDED
+    in the existing_ids passed in (as if the caller's gather-phase read had
+    already covered it). If the function still did its own live table scan
+    internally, it would find no such row and insert a duplicate; trusting
+    the parameter means it must skip the insert instead.
+    """
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from server.db import init_db, get_all_bids
+    from server.main import _insert_web_added_bids
+
+    conn = init_db(tmp_path / "existing_ids.db")
+    snipe = {
+        "item_id": "410300002", "max_bid": "20.00 USD", "current_bid": "1.00 USD",
+        "status": "SCHEDULED", "time_to_end": "2h", "seller": "seller",
+        "snipe_group": "0", "bid_offset": "6",
+    }
+
+    _insert_web_added_bids(conn, [snipe], existing_ids={"410300002"})
+    conn.commit()
+
+    assert get_all_bids(conn) == []
 
 
 def test_sync_gixen_inserts_web_added_snipe(api):

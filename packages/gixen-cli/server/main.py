@@ -492,7 +492,9 @@ def _apply_vanished_null_end(
             )
 
 
-def _insert_web_added_bids(conn: sqlite3.Connection, snipes: list) -> None:
+def _insert_web_added_bids(
+    conn: sqlite3.Connection, snipes: list, existing_ids: set[str],
+) -> None:
     # Insert any Gixen snipes not yet in the DB (e.g. added via web UI). Use
     # the full bids table — not just PENDING — so a snipe we already
     # transitioned to a terminal status earlier in this same sync run isn't
@@ -501,10 +503,27 @@ def _insert_web_added_bids(conn: sqlite3.Connection, snipes: list) -> None:
     # BUI-410: runs on `conn` (_sync_gixen's single write_transaction()
     # connection) inside the apply block, not on the shared _db, and no longer
     # self-commits — the write_transaction() owns the one commit for the whole
-    # cycle. existing_ids therefore reads this cycle's own (uncommitted, same-
-    # connection) terminal transitions too, so a snipe just resolved is not
-    # re-inserted.
-    existing_ids = {b["item_id"] for b in get_all_bids(conn)}
+    # cycle.
+    #
+    # BUI-418: existing_ids used to be recomputed here every cycle via
+    # get_all_bids(conn) — an unindexed full scan of the never-pruned bids
+    # history table, run on `conn` (== wconn) INSIDE the apply phase's single
+    # write_transaction(), extending how long the app-wide _write_lock is
+    # held. It's now computed once by the caller in _sync_gixen's read-only
+    # GATHER phase (a plain get_all_bids(db) read on the shared singleton,
+    # BEFORE write_transaction()/_write_lock is ever taken) and passed in.
+    # This is provably equivalent to the old same-connection read: every
+    # apply-phase write ahead of this call (cache_gixen_data,
+    # refresh_snipe_group, set_auction_end_time, update_bid_status,
+    # _apply_listed_win_evidence) only UPDATEs a row for an item_id Gixen
+    # already returned this cycle — none of them INSERTs a new bids row — so
+    # the set of existing item_ids can't change between the gather-time read
+    # and this apply-time use. The original BUI-410 concern (a snipe this
+    # same cycle already transitioned to a terminal status must not be
+    # re-inserted as PENDING) still holds: that snipe's row already existed
+    # in the table — as PENDING — before this sync began, so it was already
+    # captured by the gather-phase read. Same-cycle visibility is preserved;
+    # only the timing of the read moved earlier.
     for snipe in snipes:
         snipe_terminal = _map_terminal_status(
             snipe.get("status", ""), snipe.get("time_to_end", "")
@@ -540,10 +559,15 @@ def _insert_web_added_bids(conn: sqlite3.Connection, snipes: list) -> None:
                 )
                 logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
             except sqlite3.IntegrityError:
-                # existing_ids was snapshotted before the list_snipes await; a
-                # concurrent api_add_bid can insert this PENDING row in that
-                # window. This loop runs unlocked-against-Gixen (_sync_loop uses
-                # a separate client, no _api_lock), so the partial unique index
+                # existing_ids is snapshotted in the GATHER phase, right after
+                # the list_snipes scrape completes (BUI-418) — a concurrent
+                # api_add_bid can still insert a PENDING row for this item_id
+                # any time after that snapshot, including during the eBay
+                # lookups/vanished-null-end gather and the write_transaction()
+                # that follow (a wider window than the pre-BUI-418 snapshot
+                # point, which was taken even later, at apply-phase entry).
+                # This loop runs unlocked-against-Gixen (_sync_loop uses a
+                # separate client, no _api_lock), so the partial unique index
                 # is what actually prevents the duplicate — catch its violation
                 # and skip rather than aborting the whole sync run (BUI-67
                 # U4/KTD6).
@@ -600,6 +624,13 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     read-after-write dependency the BUI-371/381 evidence path relies on (a
     winner's WON row / group_wins entry feeding a sibling's _group_won_before
     check) is preserved bit-for-bit.
+
+    BUI-418 folds one more read into the same GATHER phase:
+    _insert_web_added_bids' existing-item_id dedup set, previously
+    recomputed every cycle via a full unindexed scan of the bids table INSIDE
+    the apply phase's write_transaction() (extending how long _write_lock was
+    held). It's now read once, write-free, on the shared `db` before the lock
+    is ever taken, and passed into the apply phase.
     """
     # Captured before the scrape so vanish stamping can exclude rows added
     # while the (lockless) scrape was in flight — see _record_vanish_observations.
@@ -650,6 +681,13 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     terminal_transitions.sort(key=lambda pair: pair[1] != "WON")
 
     # ---- GATHER PHASE (reads on `db`, network awaits, NO DB write held) ----
+    # BUI-418: the _insert_web_added_bids dedup set, read once here (plain,
+    # write-free, on the shared singleton `db`) instead of re-scanning the
+    # full bids table on `wconn` inside the apply phase's write_transaction()
+    # every cycle — see _insert_web_added_bids' docstring comment for the
+    # equivalence argument.
+    existing_ids = {b["item_id"] for b in get_all_bids(db)}
+
     # BUI-410: hoist every eBay lookup ahead of the write transaction so no
     # uncommitted DML is ever held across a network await (design §2/§5).
     # eBay bin + cooldown gate the whole phase (matching the pre-BUI-410
@@ -866,9 +904,12 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
             # BUI-85 vanished-with-NULL-end: apply the gather-phase eBay results.
             _apply_vanished_null_end(wconn, vanished_null_end, snipes, now_dt, now)
 
-            # Web-added inserts join the same transaction (BUI-410) — read
-            # existing_ids on wconn so it sees this cycle's own transitions.
-            _insert_web_added_bids(wconn, snipes)
+            # Web-added inserts join the same transaction (BUI-410).
+            # BUI-418: existing_ids was already computed in the GATHER phase
+            # above (write-free, off the shared `db`) — see
+            # _insert_web_added_bids' docstring comment for why that's still
+            # equivalent to reading it here on wconn.
+            _insert_web_added_bids(wconn, snipes, existing_ids)
 
     return snipes
 
@@ -1907,15 +1948,55 @@ async def api_purge(req: PurgeRequest):
         try:
             async with _api_lock:
                 await asyncio.to_thread(_api_client.remove_snipe, sibling_id)
-            # BUI-408: await-free write, entered after this iteration's
-            # remove_snipe await — its own short-lived write_transaction()
-            # under _write_lock (the next iteration's await happens under a
-            # fresh _api_lock acquisition, after this commit has landed).
+        except GixenError as e:
+            # Gixen-side removal itself failed — nothing changed on either
+            # side for this sibling, so it's safe to just move on to the
+            # next one (unchanged from before BUI-416).
+            logger.warning(
+                "api_purge: remove_snipe failed for sibling %s; leaving it "
+                "tracked locally: %s", sibling_id, e,
+            )
+            continue
+
+        # BUI-408: await-free write, entered after this iteration's
+        # remove_snipe await — its own short-lived write_transaction()
+        # under _write_lock (the next iteration's await happens under a
+        # fresh _api_lock acquisition, after this commit has landed).
+        #
+        # BUI-416: remove_snipe above already succeeded — Gixen no longer has
+        # this sibling. Any exception here (e.g. sqlite3.OperationalError
+        # from SQLITE_BUSY on write_transaction()'s busy_timeout) is a WORSE
+        # outcome than the GixenError branch above: it leaves local/Gixen
+        # state actually diverged (removed upstream, still tracked as live
+        # locally), not just "nothing happened yet". Scope the broad catch to
+        # only this DB write (not the remove_snipe call, and not the whole
+        # per-sibling block) so a real bug elsewhere still surfaces normally;
+        # log it loudly (logger.exception, full traceback) so the divergence
+        # is visible for a later audit/retry instead of silently stranding
+        # it — and keep going, since the point of this fix is that one
+        # sibling's DB hiccup must not abort every remaining sibling in the
+        # loop.
+        try:
             async with _write_locked():
                 with write_transaction(_get_db_path()) as wconn:
                     delete_bid(wconn, sibling_id)
             removed += 1
-        except GixenError:
-            pass
+        except Exception:
+            # Note: this sibling won't be re-offered to THIS loop on the next
+            # purge — find_sibling_cleanup_targets() only re-detects it from
+            # a fresh Gixen snipe list, and remove_snipe above already took
+            # it off Gixen. The row is left PENDING/live locally, so it's the
+            # general vanished-row handling in _sync_gixen (this same
+            # endpoint's step 1, and the background _sync_loop) that
+            # eventually resolves it via the vanished-from-Gixen path — a
+            # different mechanism than this loop, but one that does still run
+            # on every subsequent sync.
+            logger.exception(
+                "api_purge: sibling %s removed from Gixen but local "
+                "delete_bid failed — local DB now diverged from Gixen for "
+                "this item (still tracked as live); expect the next sync's "
+                "vanished-row handling to resolve it",
+                sibling_id,
+            )
 
     return {"purged_completed": len(completed_ids), "removed_siblings": removed}
