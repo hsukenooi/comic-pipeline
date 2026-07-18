@@ -1218,7 +1218,26 @@ def _find_duplicate_wish_entry(title: str, items: list[dict[str, Any]]) -> Optio
     :func:`_split_wish_list_name`), compared case-insensitively with leading
     zeros stripped (:func:`normalize_issue_key`) — never ``_normalize_series_key``,
     which collapses ``(Vol. N)``/year decoration and would merge genuinely
-    different volumes of the same masthead (the BUI-284 trap).
+    different volumes of the same masthead (the BUI-284 trap) — PLUS the
+    printing ordinal (BUI-403, see below). A same-(series, issue) pair is only
+    a duplicate when its printing also matches.
+
+    BUI-403: ``_split_wish_list_name`` drops everything after the issue
+    token, including a trailing printing marker like "2nd Printing" (same
+    BUI-379 blind spot on this path). Left unguarded, wish-listing "Foo #1
+    2nd Printing" when base "Foo #1" is already wished (or vice versa) would
+    silently no-op as a "duplicate" even though it's a distinct, wanted book
+    — the BUI-122-class data-loss direction (a wanted printing never gets
+    added). Printing equality is decided by the SAME shared ordinal
+    comparator every other printing-aware call site in this module uses
+    (:func:`_printing_ordinal`, built on the BUI-373 :data:`_PRINTING_MARKER_RE`
+    detector and BUI-379's ``_wish_list_name_printing_variant`` re-detection
+    approach) — run directly against the raw, unsplit ``title``/``name`` text
+    so a marker anywhere after the issue token is still seen. An unmarked
+    title and an explicit "1st Printing" both resolve to ordinal 1 (still a
+    duplicate); "2nd Printing" and "2nd Ptg" both resolve to ordinal 2 (also
+    still a duplicate — same printing, different spelling) — only a genuine
+    ordinal mismatch (e.g. unmarked vs "2nd Printing") escapes the dedup.
 
     BUI-313: this is the SINGLE shared dedup implementation. Both local
     wish-list-add entry points call it — ``cmd_wish_list_add`` (plain CLI/local
@@ -1239,12 +1258,18 @@ def _find_duplicate_wish_entry(title: str, items: list[dict[str, Any]]) -> Optio
     series, issue = parsed
     series_cmp = series.strip().lower()
     issue_cmp = normalize_issue_key(issue)
+    printing_cmp = _printing_ordinal(title)
     for item in items:
-        item_parsed = _split_wish_list_name(item.get("name") or "")
+        item_name = item.get("name") or ""
+        item_parsed = _split_wish_list_name(item_name)
         if item_parsed is None:
             continue
         item_series, item_issue = item_parsed
-        if item_series.strip().lower() == series_cmp and normalize_issue_key(item_issue) == issue_cmp:
+        if (
+            item_series.strip().lower() == series_cmp
+            and normalize_issue_key(item_issue) == issue_cmp
+            and _printing_ordinal(item_name) == printing_cmp
+        ):
             return item
     return None
 
