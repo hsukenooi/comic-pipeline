@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 
 from server.db import (
     CANCELLED_TOMBSTONE_NOTE, DEDUP_TOMBSTONE_NOTE, GROUP_WIN_SOURCE_LISTED_WIN,
-    TOMBSTONE_STATUSES_SQL, record_group_win, update_bid_status,
+    TOMBSTONE_STATUSES_SQL, record_group_win, update_bid_status, write_transaction,
 )
 
 import server.main as main
@@ -395,6 +395,67 @@ async def _run_ebay_fallback() -> None:
     the WON inference on every future sync, by design (see _ebay_fallback_rows'
     docstring).
 
+    BUI-409 (Stage 2 of BUI-400's shared-connection isolation rollout):
+    gather-then-apply, replacing the old interleaved-commit-once shape.
+    Phase 1 (gather) does every row's eBay fetch — the
+    `await asyncio.to_thread(...)` + rate-limit `sleep(1.5)` pacing across
+    the whole cycle — with NO DB write held open across any of those awaits.
+    Phase 2 (apply) is exactly one `write_transaction()` block under the
+    app-wide `_write_lock` (the same short-held-lock pattern BUI-408 wired
+    up for the already-await-free writers), entered only AFTER every fetch
+    above has already completed: every per-row write for the cycle lands on
+    that single short-lived connection (`wconn`), sequentially, then commits
+    once on a clean exit. This removes the cross-await open transaction the
+    design doc's §2 names as this function's bleed window. The shared
+    long-lived `_db` singleton is used only for the read-only row selection
+    below (`_ebay_fallback_rows`) — this function never writes to it.
+
+    Classification is unchanged: the apply loop processes `rows` in the same
+    order the old interleaved loop did, sequentially on the ONE `wconn`
+    connection with no `await` between any two rows' reads/writes. So a
+    same-cycle read-after-write dependency — e.g. row A's WON write (via
+    `update_bid_status`, which inserts into the durable `group_wins` ledger)
+    feeding `_group_won_before`'s evidence query for a later sibling row B in
+    the SAME batch — still sees it: same-connection visibility of an
+    uncommitted write to a later statement on that same connection doesn't
+    care whether the statements were emitted from a "gather" or "apply"
+    phase, only that they run in the same order on the same connection with
+    no intervening commit/rollback, which they do.
+
+    KNOWN RESIDUAL RISK (BUI-409 review, not fixed by this ticket — see
+    design doc §7's convention-supersession note and Stage 3/BUI-410):
+    phase 2's terminal writes (the WON/LOST inference, and the "no usable
+    price" ENDED write) target a row by id with a status-CLASS guard
+    (`update_bid_status`'s `status NOT IN (<tombstones>)`), not a status-
+    EQUALITY guard against what phase 1 observed. `_sync_gixen` (still
+    unmigrated — Stage 3) can concurrently transition the SAME row to a
+    different non-tombstone terminal status (e.g. a genuine WON, sourced
+    from Gixen itself) between this cycle's phase-1 snapshot and phase-2's
+    write; because that transition doesn't tombstone the row, the guard
+    above does not catch it, and this function's now-stale eBay-price
+    inference could silently overwrite it. This vulnerability class
+    predates BUI-409 (the pre-existing row snapshot was always taken once
+    at the top of the cycle, and `update_bid_status` never re-verified
+    status equality), but gather-then-apply widens its window for early-
+    fetched rows in a large batch — a full fix belongs with Stage 3, which
+    brings `_sync_gixen` under the same `_write_lock` and removes the
+    possibility of an interleaved terminal-status transition entirely.
+
+    A row whose eBay fetch failed in phase 1 (`fetched[row["id"]]` is falsy)
+    is simply skipped in phase 2 — no write for that row, but every OTHER
+    row already fetched successfully still gets applied; one row's fetch
+    failure never aborts the batch. This isolation is scoped to fetch
+    failures specifically — it is NOT per-row exception isolation. An
+    unexpected exception raised while applying one row (as opposed to a
+    graceful falsy fetch) still aborts the whole apply transaction:
+    `write_transaction()` rolls back everything written so far in that
+    `with` block, including any earlier rows in the SAME cycle that already
+    applied successfully. This matches the old code's behavior exactly (it
+    also batched every row's write into one end-of-cycle `db.commit()`, so a
+    mid-loop bug there also discarded the whole cycle, not just one row) —
+    not a regression, just worth stating precisely since only the fetch-
+    failure case gets true per-row isolation.
+
     Every write in the loop below is id-targeted (only_id= / WHERE id=), not
     item_id-wide (BUI-382, matching the pattern BUI-371 introduced for its
     REMOVED classification): a re-listed/re-added item can carry a live
@@ -421,188 +482,216 @@ async def _run_ebay_fallback() -> None:
             if not rows:
                 return
 
+            # ---- Phase 1 (gather): every eBay fetch + its rate-limit sleep,
+            # in row order, with NO DB write held across any await (BUI-409).
+            # Keyed by row id (not item_id — a re-listed/re-added item can
+            # have two distinct eligible rows sharing an item_id, per the
+            # BUI-382 id-targeting invariant this whole function preserves).
             failures = 0
+            fetched: dict[int, dict | None] = {}
             for row in rows:
                 iid = row["item_id"]
-                is_purged = bool(row["is_purged"])
                 ebay = await asyncio.to_thread(main._fetch_ebay_item_sync, iid)
                 if not ebay:
                     failures += 1
-                    await asyncio.sleep(1.5)
-                    continue
-
-                # Write title and end_date_iso for all rows regardless of
-                # status. update_bid_status / cache_gixen_data both skip the
-                # tombstone (PURGED/REMOVED) rows, so use direct SQL here.
-                # BUI-382: id-targeted, like every other write below — a
-                # re-listed/re-added item can carry a live PENDING row
-                # sharing this item_id (the BUI-178 class of collateral
-                # damage), and an item_id-wide write here would leak an
-                # unrelated auction's end time onto it, corrupting the
-                # local sniper's fire-time calculation for a still-live
-                # snipe.
-                ebay_title = ebay.get("title") or None
-                ebay_end_iso = ebay.get("end_date_iso") or None
-                db.execute(
-                    "UPDATE bids SET "
-                    "ebay_title = COALESCE(?, ebay_title), "
-                    "auction_end_at = COALESCE(auction_end_at, ?) "
-                    "WHERE id = ?",
-                    (ebay_title, ebay_end_iso, row["id"]),
-                )
-
-                final_amount: float | None = None
-                price = ebay.get("current_price")
-                if price:
-                    try:
-                        final_amount = float(str(price).lstrip("$").strip())
-                    except (ValueError, TypeError):
-                        final_amount = None
-                has_usable_price = final_amount is not None and final_amount > 0
-
-                if is_purged:
-                    if has_usable_price:
-                        # id-targeted (BUI-382): multiple tombstoned rows can
-                        # share an item_id (dedup losers, re-listed items), so
-                        # an item_id-wide write here could stamp this price
-                        # onto an unrelated tombstoned sibling.
-                        db.execute(
-                            f"UPDATE bids SET winning_bid = ? WHERE id = ? AND status IN ({TOMBSTONE_STATUSES_SQL})",
-                            (final_amount, row["id"]),
-                        )
-                        main.logger.info(
-                            "_run_ebay_fallback: %s (purged) winning_bid=$%.2f",
-                            iid, final_amount,
-                        )
-                    else:
-                        # BUI-382: eBay answered but this tombstone has no
-                        # usable price (reserve not met / unsold) — that
-                        # won't change, so stamp it out of the 7-day re-scan
-                        # set instead of re-fetching every sync until it ages
-                        # out of the window.
-                        _mark_no_price_checked(db, row["id"], now_iso)
-                    await asyncio.sleep(1.5)
-                    continue
-
-                # BUI-371: positive evidence this snipe was cancelled while its
-                # auction was still live (vanished from a healthy Gixen list
-                # >= margin before end, or a bid-group sibling won >= margin
-                # earlier) means we never bid — resolve REMOVED and never feed
-                # it to the WON/LOST price inference below. Normally the sync
-                # classifies these first, but the fallback can reach a row
-                # ahead of a successful sync (Gixen outage), and rows flipped
-                # ENDED before this fix landed are healed here too. Recording
-                # the final price keeps history parity with the purged branch.
-                end_dt = main._parse_end_iso(row["auction_end_at"])
-                if _cancelled_before_end(db, iid, row, end_dt):
-                    update_bid_status(
-                        db, iid, "REMOVED",
-                        winning_bid=final_amount if has_usable_price else None,
-                        resolved_at=now_iso,
-                        only_id=row["id"],
-                    )
-                    _mark_cancelled_tombstone(db, row["id"])
-                    if not has_usable_price:
-                        # BUI-382: this REMOVED row would otherwise still
-                        # match _ebay_fallback_rows' tombstone set (NULL
-                        # winning_bid, notes carries CANCELLED_TOMBSTONE_NOTE
-                        # not DEDUP_TOMBSTONE_NOTE) and get re-fetched from
-                        # eBay on every sync for the rest of its 7-day window
-                        # even though "no price" here is just as definitive
-                        # as in the purged branch below.
-                        _mark_no_price_checked(db, row["id"], now_iso)
-                    main.logger.info(
-                        "_run_ebay_fallback: %s cancelled before end (never bid) "
-                        "→ REMOVED", iid,
-                    )
-                    await asyncio.sleep(1.5)
-                    continue
-
-                if not has_usable_price:
-                    # eBay returns the high-water bid for reserve-not-met or
-                    # unsold listings, which is often 0 or well below our max
-                    # — falsely stamping WON. Treat as ENDED with no winning
-                    # claim instead. id-targeted (BUI-382), matching every
-                    # other write in this loop — a re-listed/re-added item can
-                    # carry a live PENDING row sharing this item_id.
-                    update_bid_status(
-                        db, iid, "ENDED",
-                        winning_bid=None,
-                        resolved_at=now_iso,
-                        only_id=row["id"],
-                    )
-                    # BUI-382 review (reliability/adversarial): deliberately
-                    # NOT stamping ebay_no_price_at here, unlike the two
-                    # REMOVED-producing branches above/below. Those tombstone
-                    # a row that is already known dead (cancelled-before-end,
-                    # or a completed sweep) inside a 7-day window, so a
-                    # permanent stamp only trims already-bounded waste. This
-                    # branch's row is a genuinely-ended auction still eligible
-                    # for the WON inference below on some *future* sync — this
-                    # single eBay answer could be a transient "price not
-                    # settled yet" read rather than a genuine no-sale, and
-                    # nothing here can tell the two apart. Permanently
-                    # excluding it would risk foreclosing a real win the
-                    # inference exists to recover, which the BUI-146 policy
-                    # forbids. Left on its pre-existing unbounded forever-retry
-                    # semantics; the resulting waste is accepted risk, not
-                    # fixed by this ticket (see BUI-146's own accepted-risk
-                    # precedent for the same "correctness over efficiency"
-                    # trade-off).
-                    main.logger.info(
-                        "_run_ebay_fallback: %s -> ENDED (no final price; max=$%.2f)",
-                        iid, row["max_bid"],
-                    )
-                    await asyncio.sleep(1.5)
-                    continue
-
-                # Heuristic: 0 < final_price < our max_bid suggests we outbid
-                # everyone; final_price >= max_bid means someone matched or beat
-                # us. Two additional guards against false positives:
-                #   1. Tie at final_price == max_bid → eBay's first-bidder rule
-                #      means we likely lost (strict < instead of <=).
-                #   2. local_snipe_result starts with "ERR:" → our bid never
-                #      landed; mark LOST regardless of price.
-                #
-                # BUI-146 (do NOT "fix" this inference naively): a snipe
-                # cancelled while still live (user removal on Gixen's web UI,
-                # or a bid-group auto-cancel — BUI-371) also reaches here once
-                # its auction ends, and a final price below max_bid then stamps
-                # a phantom WON even though we never bid. Crucially, this same
-                # inference is how genuine wins are recovered when Gixen drops
-                # an ended snipe before sync reads its WON status — with the
-                # local sniper disabled, local_snipe_result is always NULL, so
-                # requiring local bid-evidence (or never inferring WON for
-                # vanished rows) would SUPPRESS REAL WINS. BUI-371 implemented
-                # the sanctioned vanish-time/group-win disambiguation UPSTREAM
-                # (positive cancel evidence → REMOVED before a row ever gets
-                # here — see _vanished_while_live/_group_won_before and the
-                # guard above). The residual evidence-less case (e.g. a live
-                # cancel never observed by any sync) remains accepted risk;
-                # never gate the inference itself. See BUI-146 for the full
-                # analysis.
-                local_result = row["local_snipe_result"] or ""
-                if local_result.startswith("ERR:") or final_amount >= float(row["max_bid"]):
-                    inferred_status = "LOST"
-                else:
-                    inferred_status = "WON"
-                # id-targeted (BUI-382): a re-listed/re-added item can carry a
-                # live PENDING row sharing this item_id — an item_id-wide
-                # write here would collateral-stamp WON/LOST onto it (the
-                # BUI-178 class of blast radius).
-                update_bid_status(
-                    db, iid, inferred_status,
-                    winning_bid=final_amount,
-                    resolved_at=now_iso,
-                    only_id=row["id"],
-                )
-                main.logger.info(
-                    "_run_ebay_fallback: %s -> %s @ $%.2f (max=$%.2f)",
-                    iid, inferred_status, final_amount, row["max_bid"],
-                )
+                fetched[row["id"]] = ebay
                 await asyncio.sleep(1.5)
 
-            db.commit()
+            # ---- Phase 2 (apply): one write_transaction() under the
+            # app-wide _write_lock, entered only after every await above has
+            # already completed — never held across a fetch. Every per-row
+            # write for the cycle lands on this single short-lived
+            # connection, sequentially, then commits once on a clean exit
+            # (write_transaction() rolls back + closes on its own if
+            # anything inside raises, so no explicit rollback needed here —
+            # see that factory's docstring).
+            async with main._write_locked():
+                with write_transaction(main._get_db_path()) as wconn:
+                    for row in rows:
+                        iid = row["item_id"]
+                        is_purged = bool(row["is_purged"])
+                        ebay = fetched.get(row["id"])
+                        if not ebay:
+                            continue  # this row's fetch failed — skip only its write
+
+                        # Write title and end_date_iso for all rows regardless of
+                        # status. update_bid_status / cache_gixen_data both skip the
+                        # tombstone (PURGED/REMOVED) rows, so use direct SQL here.
+                        # BUI-382: id-targeted, like every other write below — a
+                        # re-listed/re-added item can carry a live PENDING row
+                        # sharing this item_id (the BUI-178 class of collateral
+                        # damage), and an item_id-wide write here would leak an
+                        # unrelated auction's end time onto it, corrupting the
+                        # local sniper's fire-time calculation for a still-live
+                        # snipe.
+                        #
+                        # Deliberately no status guard (unlike every other write
+                        # below, which is scoped to a tombstone or non-tombstone
+                        # status set): both columns are COALESCE-protected against
+                        # a concurrent writer — auction_end_at only ever fills a
+                        # NULL, and ebay_title only overwrites a NULL/falsy value,
+                        # matching cache_gixen_data's own COALESCE semantics for
+                        # the same field. So even if another writer (e.g.
+                        # _sync_gixen) changes this row's status between phase 1's
+                        # snapshot and this write landing, this specific UPDATE
+                        # cannot clobber a value that writer already set — see
+                        # test_freeze_mid_cycle_purge_does_not_corrupt_fallback_apply.
+                        ebay_title = ebay.get("title") or None
+                        ebay_end_iso = ebay.get("end_date_iso") or None
+                        wconn.execute(
+                            "UPDATE bids SET "
+                            "ebay_title = COALESCE(?, ebay_title), "
+                            "auction_end_at = COALESCE(auction_end_at, ?) "
+                            "WHERE id = ?",
+                            (ebay_title, ebay_end_iso, row["id"]),
+                        )
+
+                        final_amount: float | None = None
+                        price = ebay.get("current_price")
+                        if price:
+                            try:
+                                final_amount = float(str(price).lstrip("$").strip())
+                            except (ValueError, TypeError):
+                                final_amount = None
+                        has_usable_price = final_amount is not None and final_amount > 0
+
+                        if is_purged:
+                            if has_usable_price:
+                                # id-targeted (BUI-382): multiple tombstoned rows can
+                                # share an item_id (dedup losers, re-listed items), so
+                                # an item_id-wide write here could stamp this price
+                                # onto an unrelated tombstoned sibling.
+                                wconn.execute(
+                                    f"UPDATE bids SET winning_bid = ? WHERE id = ? AND status IN ({TOMBSTONE_STATUSES_SQL})",
+                                    (final_amount, row["id"]),
+                                )
+                                main.logger.info(
+                                    "_run_ebay_fallback: %s (purged) winning_bid=$%.2f",
+                                    iid, final_amount,
+                                )
+                            else:
+                                # BUI-382: eBay answered but this tombstone has no
+                                # usable price (reserve not met / unsold) — that
+                                # won't change, so stamp it out of the 7-day re-scan
+                                # set instead of re-fetching every sync until it ages
+                                # out of the window.
+                                _mark_no_price_checked(wconn, row["id"], now_iso)
+                            continue
+
+                        # BUI-371: positive evidence this snipe was cancelled while its
+                        # auction was still live (vanished from a healthy Gixen list
+                        # >= margin before end, or a bid-group sibling won >= margin
+                        # earlier) means we never bid — resolve REMOVED and never feed
+                        # it to the WON/LOST price inference below. Normally the sync
+                        # classifies these first, but the fallback can reach a row
+                        # ahead of a successful sync (Gixen outage), and rows flipped
+                        # ENDED before this fix landed are healed here too. Recording
+                        # the final price keeps history parity with the purged branch.
+                        end_dt = main._parse_end_iso(row["auction_end_at"])
+                        if _cancelled_before_end(wconn, iid, row, end_dt):
+                            update_bid_status(
+                                wconn, iid, "REMOVED",
+                                winning_bid=final_amount if has_usable_price else None,
+                                resolved_at=now_iso,
+                                only_id=row["id"],
+                            )
+                            _mark_cancelled_tombstone(wconn, row["id"])
+                            if not has_usable_price:
+                                # BUI-382: this REMOVED row would otherwise still
+                                # match _ebay_fallback_rows' tombstone set (NULL
+                                # winning_bid, notes carries CANCELLED_TOMBSTONE_NOTE
+                                # not DEDUP_TOMBSTONE_NOTE) and get re-fetched from
+                                # eBay on every sync for the rest of its 7-day window
+                                # even though "no price" here is just as definitive
+                                # as in the purged branch below.
+                                _mark_no_price_checked(wconn, row["id"], now_iso)
+                            main.logger.info(
+                                "_run_ebay_fallback: %s cancelled before end (never bid) "
+                                "→ REMOVED", iid,
+                            )
+                            continue
+
+                        if not has_usable_price:
+                            # eBay returns the high-water bid for reserve-not-met or
+                            # unsold listings, which is often 0 or well below our max
+                            # — falsely stamping WON. Treat as ENDED with no winning
+                            # claim instead. id-targeted (BUI-382), matching every
+                            # other write in this loop — a re-listed/re-added item can
+                            # carry a live PENDING row sharing this item_id.
+                            update_bid_status(
+                                wconn, iid, "ENDED",
+                                winning_bid=None,
+                                resolved_at=now_iso,
+                                only_id=row["id"],
+                            )
+                            # BUI-382 review (reliability/adversarial): deliberately
+                            # NOT stamping ebay_no_price_at here, unlike the two
+                            # REMOVED-producing branches above/below. Those tombstone
+                            # a row that is already known dead (cancelled-before-end,
+                            # or a completed sweep) inside a 7-day window, so a
+                            # permanent stamp only trims already-bounded waste. This
+                            # branch's row is a genuinely-ended auction still eligible
+                            # for the WON inference below on some *future* sync — this
+                            # single eBay answer could be a transient "price not
+                            # settled yet" read rather than a genuine no-sale, and
+                            # nothing here can tell the two apart. Permanently
+                            # excluding it would risk foreclosing a real win the
+                            # inference exists to recover, which the BUI-146 policy
+                            # forbids. Left on its pre-existing unbounded forever-retry
+                            # semantics; the resulting waste is accepted risk, not
+                            # fixed by this ticket (see BUI-146's own accepted-risk
+                            # precedent for the same "correctness over efficiency"
+                            # trade-off).
+                            main.logger.info(
+                                "_run_ebay_fallback: %s -> ENDED (no final price; max=$%.2f)",
+                                iid, row["max_bid"],
+                            )
+                            continue
+
+                        # Heuristic: 0 < final_price < our max_bid suggests we outbid
+                        # everyone; final_price >= max_bid means someone matched or beat
+                        # us. Two additional guards against false positives:
+                        #   1. Tie at final_price == max_bid → eBay's first-bidder rule
+                        #      means we likely lost (strict < instead of <=).
+                        #   2. local_snipe_result starts with "ERR:" → our bid never
+                        #      landed; mark LOST regardless of price.
+                        #
+                        # BUI-146 (do NOT "fix" this inference naively): a snipe
+                        # cancelled while still live (user removal on Gixen's web UI,
+                        # or a bid-group auto-cancel — BUI-371) also reaches here once
+                        # its auction ends, and a final price below max_bid then stamps
+                        # a phantom WON even though we never bid. Crucially, this same
+                        # inference is how genuine wins are recovered when Gixen drops
+                        # an ended snipe before sync reads its WON status — with the
+                        # local sniper disabled, local_snipe_result is always NULL, so
+                        # requiring local bid-evidence (or never inferring WON for
+                        # vanished rows) would SUPPRESS REAL WINS. BUI-371 implemented
+                        # the sanctioned vanish-time/group-win disambiguation UPSTREAM
+                        # (positive cancel evidence → REMOVED before a row ever gets
+                        # here — see _vanished_while_live/_group_won_before and the
+                        # guard above). The residual evidence-less case (e.g. a live
+                        # cancel never observed by any sync) remains accepted risk;
+                        # never gate the inference itself. See BUI-146 for the full
+                        # analysis.
+                        local_result = row["local_snipe_result"] or ""
+                        if local_result.startswith("ERR:") or final_amount >= float(row["max_bid"]):
+                            inferred_status = "LOST"
+                        else:
+                            inferred_status = "WON"
+                        # id-targeted (BUI-382): a re-listed/re-added item can carry a
+                        # live PENDING row sharing this item_id — an item_id-wide
+                        # write here would collateral-stamp WON/LOST onto it (the
+                        # BUI-178 class of blast radius).
+                        update_bid_status(
+                            wconn, iid, inferred_status,
+                            winning_bid=final_amount,
+                            resolved_at=now_iso,
+                            only_id=row["id"],
+                        )
+                        main.logger.info(
+                            "_run_ebay_fallback: %s -> %s @ $%.2f (max=$%.2f)",
+                            iid, inferred_status, final_amount, row["max_bid"],
+                        )
 
             # Threshold is 1 when there's a single ended-unresolved item, else
             # half the batch. Without the floor, a single persistently-failing
@@ -616,15 +705,24 @@ async def _run_ebay_fallback() -> None:
                     failures, len(rows), int(_EBAY_COOLDOWN),
                 )
         except Exception:  # noqa: BLE001  # fire-and-forget task-level safety net (same shape as this file's other bare excepts and server.main's own, e.g. its lifespan-shutdown one); ruff's logging-call exemption doesn't recognize the two-level `main.logger.exception(...)` this module's `import server.main as main` pattern requires (BUI-389), unlike the identical bare `logger.exception(...)` this had verbatim in server/main.py
-            # BUI-399: roll back the shared singleton connection, matching
-            # api_sync (BUI-386) and _ensure_fresh_sync/_sync_loop (BUI-391).
-            # The loop above batches its DML into one end-of-cycle commit (see
-            # db.commit() a few lines up), so an unexpected mid-loop bug can
-            # leave stray uncommitted writes on this process-wide connection
-            # for whatever the *next* successful cycle's commit happens to
-            # absorb. Read the global directly (not the local `db`, unbound
-            # if main._get_db() itself raised before the local assignment) —
-            # same reasoning as _sync_loop's identical guard.
+            # BUI-399, updated for BUI-409: this function no longer performs
+            # any DML on the shared singleton `_db` — phase 1 above only
+            # reads it (via _ebay_fallback_rows), and every write lands on
+            # phase 2's own ephemeral write_transaction() connection, which
+            # already rolls back + closes itself on any exception raised
+            # inside its `with` block (see that factory's docstring). So
+            # this rollback no longer protects THIS function's own writes
+            # the way it did pre-BUI-409 — there are none left on `_db` to
+            # strand. It stays, unchanged, as the still-active BUI-386/391/399
+            # systemwide convention: `_sync_gixen` (Stage 3, BUI-410) still
+            # writes + self-commits on the shared `_db`, so an exception here
+            # at the wrong instant could otherwise strand ITS uncommitted
+            # work for a later unrelated commit to absorb. Retire this call
+            # only when Stage 3 lands (design doc §7's convention-
+            # supersession note) — not before. Read the global directly (not
+            # the local `db`, unbound if main._get_db() itself raised before
+            # the local assignment) — same reasoning as _sync_loop's
+            # identical guard.
             if main._db is not None:
                 main._db.rollback()
             main.logger.exception("_run_ebay_fallback: error")

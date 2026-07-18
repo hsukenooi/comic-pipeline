@@ -3327,8 +3327,9 @@ def test_lockfree_sync_write_and_overlay_write_are_isolated(tmp_path):
     contend or block each other — SQLite's own single-writer-at-a-time
     constraint (see below) still serializes them at the engine level; that
     residual busy_timeout/stall exposure between the migrated writers and
-    the still-untouched _sync_gixen/_run_ebay_fallback is real and is Stage
-    2/3's job to close, not this test's.
+    the still-untouched _sync_gixen (BUI-409 already migrated
+    _run_ebay_fallback) is real and is Stage 3's job to close, not this
+    test's.
 
     Uses a real background thread (not asyncio) for the batcher's delay:
     SQLite allows only one writer transaction at a time process-wide even in
