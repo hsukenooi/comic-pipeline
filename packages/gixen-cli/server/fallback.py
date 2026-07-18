@@ -14,9 +14,15 @@ one-way split:
     decomposed it in place, and it is not part of this cluster) directly
     calls several helpers defined here (`_group_won_before`,
     `_cancelled_before_end`, `_mark_cancelled_tombstone`,
-    `_record_vanish_observations`, `_record_listed_win_evidence`,
-    `_parse_snipe_group`) — server.main re-imports them back (see the bottom
-    of that file's classification-section replacement).
+    `_record_vanish_observations`, `_listed_win_evidence_already_covered`,
+    `_apply_listed_win_evidence`, `_parse_snipe_group`) — server.main
+    re-imports them back (see the bottom of that file's classification-section
+    replacement). BUI-410 split the pre-existing async `_record_listed_win_evidence`
+    into a pre-cycle skip predicate (`_listed_win_evidence_already_covered`,
+    which decides whether the gather phase spends an eBay fetch) and a sync,
+    await-free recorder (`_apply_listed_win_evidence`, which runs in
+    `_sync_gixen`'s single write_transaction() apply block) so no DB write is
+    held across the fetch await — see those two functions.
   - This module needs server.main's app-state (`_get_db`, `logger`,
     `_ebay_fallback_lock`, `_ebay_cooldown_until`) and its eBay-fetch helpers
     (`_fetch_ebay_item_sync`, `_ebay_fetch_bin`, `_parse_end_iso`).
@@ -36,7 +42,8 @@ from datetime import datetime, timedelta, timezone
 
 from server.db import (
     CANCELLED_TOMBSTONE_NOTE, DEDUP_TOMBSTONE_NOTE, GROUP_WIN_SOURCE_LISTED_WIN,
-    TOMBSTONE_STATUSES_SQL, record_group_win, update_bid_status, write_transaction,
+    TOMBSTONE_STATUSES_SQL, get_bid_by_item_id, record_group_win,
+    update_bid_status, write_transaction,
 )
 
 import server.main as main
@@ -266,74 +273,117 @@ def _record_vanish_observations(
     )
 
 
-async def _record_listed_win_evidence(
-    db: sqlite3.Connection, snipe: dict, now: str
+def _listed_win_evidence_already_covered(
+    db: sqlite3.Connection, item_id: str, snipe_group: int
 ) -> bool:
-    """Record group-win evidence for a listed WON snipe whose win is not in
-    the bids table (BUI-381). Returns True when an eBay fetch was performed
-    (consuming the caller's per-sync budget), False on any early skip.
+    """True when a listed WON snipe's BUI-381 group-win evidence is already —
+    or will be, later in THIS sync — recorded, so `_sync_gixen`'s gather phase
+    must NOT spend an eBay fetch (or the per-sync budget) on it.
 
-    The web-add path never inserts a snipe first seen already-terminal
-    (_insert_web_added_bids skips those), so such a winner's WON transition is
-    a no-op and the win would otherwise leave no trace for _group_won_before —
-    its cancelled siblings would fall through to the fallback's phantom-WON
-    window. Winners that DO transition WON on a bids row are recorded inside
-    update_bid_status; this covers the row-less (or tombstoned-row) case, and
-    the case where the row's stored group diverges from the listed one (the
-    WON-row guard is group-aware, so a winner that resolved before its group
-    was known still gets eBay-backed evidence under the listed group).
+    BUI-410 gather-then-apply: the pre-BUI-410 `_record_listed_win_evidence`
+    made this same skip decision INLINE, with two SELECTs run AFTER the WON
+    transition had already written to the row. Gather-then-apply must decide
+    it BEFORE any write, so this reproduces the identical decision purely from
+    pre-cycle state:
 
-    The win's true end time is fetched from eBay — Gixen's list only says
-    'ENDED' — because recording an observation-time proxy would be unsound
-    against the classifier's lifetime bound: a win that actually predates a
-    sibling's added_at could falsely group-cancel it (the recycled-group
-    hazard from the BUI-371 review). No end, no evidence (WON-permissive), and
-    the next sync retries naturally: the winner stays on Gixen's list until
-    purged, while the already-recorded check keeps this to at most one eBay
-    call per (group, item). An end in the future (past the estimation margin)
-    is self-contradictory for a WON — eBay is describing a different,
-    re-listed auction under the same item id — and records nothing. Caller
-    commits.
+      1. The durable `group_wins` ledger already holds (snipe_group, item_id)
+         — a prior sync recorded it, so re-fetching is pure waste
+         (the second-sync idempotence the BUI-381 tests assert). Checked on
+         pre-cycle state, which is faithful: for every winner that reaches a
+         fetch (i.e. is NOT case 2 below), this sync does not add (group,
+         item_id) to the ledger before the fetch decision, so pre-cycle ==
+         post-write here.
+      2. A WON `bids` row with (item_id, snipe_group) will exist after this
+         cycle — `update_bid_status` records the ledger for such a row itself,
+         so a fetch here would be redundant. That row exists post-cycle iff:
+           - a pre-cycle WON row with (item_id, snipe_group) already exists
+             (a re-listed item's older WON sibling, still unpurged), OR
+           - THIS snipe's own WON transition creates one: `get_bid_by_item_id`
+             (the exact row `_sync_gixen`'s transition loop resolves, id DESC)
+             is non-tombstone AND either
+               * PENDING — `refresh_snipe_group` mirrors the listed group onto
+                 it before the WON write, so the row ends up carrying
+                 `snipe_group`; or
+               * a non-tombstone terminal row already carrying `snipe_group`
+                 (`refresh_snipe_group` skips non-PENDING rows, so its stored
+                 group is unchanged by this cycle).
+         A tombstoned newest row (update_bid_status no-ops on it) or a terminal
+         row whose group DIVERGES from the listed one both fall through to
+         False → the fetch runs, matching the pre-BUI-410 behavior for the
+         row-less / tombstoned / divergent-group winner cases.
 
-    Deliberately awaited inline in the sync (same blocking trade as the
-    BUI-85 _resolve_vanished_null_end_bids resolver, same cooldown gate,
-    same per-sync cap) rather than deferred to the fire-and-forget fallback
-    task: the evidence must exist before the sibling's classification runs
-    later in this same sync — a deferred write races the fallback's WON
-    inference, and a WON stamped with a price is never revisited."""
+    Skipping case-2 winners at GATHER time (not just re-checking at apply time)
+    is load-bearing, not an optimization: the per-sync fetch budget
+    (`_LISTED_WIN_FETCH_MAX_PER_SYNC`) must not be burned on a winner whose
+    evidence `update_bid_status` records for free, or a genuinely row-less
+    winner later in the same sync could be starved of its one fetch and leave a
+    cancelled sibling to phantom-WON — the exact BUI-146/371 failure. Both
+    directions of a wrong answer here reintroduce a phantom-WON, so this must
+    reproduce the pre-BUI-410 skip EXACTLY (guarded by
+    test_listed_win_case_a_does_not_consume_fetch_budget)."""
+    if db.execute(
+        "SELECT 1 FROM group_wins WHERE snipe_group=? AND item_id=? LIMIT 1",
+        (snipe_group, item_id),
+    ).fetchone() is not None:
+        return True
+    if db.execute(
+        "SELECT 1 FROM bids WHERE item_id=? AND status='WON' AND snipe_group=? LIMIT 1",
+        (item_id, snipe_group),
+    ).fetchone() is not None:
+        return True
+    row = get_bid_by_item_id(db, item_id)
+    if row is None or row["status"] in ("PURGED", "REMOVED"):
+        return False
+    if row["status"] == "PENDING":
+        return True
+    return row["snipe_group"] == snipe_group
+
+
+def _apply_listed_win_evidence(
+    conn: sqlite3.Connection, snipe: dict, now: str, ebay: dict | None
+) -> None:
+    """Record BUI-381 group-win evidence for a listed WON snipe the gather
+    phase already fetched eBay for (and already decided needs recording — see
+    `_listed_win_evidence_already_covered`). The record-half of the pre-BUI-410
+    `_record_listed_win_evidence`, made sync + await-free so it runs inside
+    `_sync_gixen`'s single write_transaction() apply block. Caller commits.
+
+    The win's true end time comes from eBay (`ebay['end_date_iso']`) — Gixen's
+    list only says 'ENDED' — because recording an observation-time proxy would
+    be unsound against the classifier's lifetime bound: a win that actually
+    predates a sibling's added_at could falsely group-cancel it (the
+    recycled-group hazard from the BUI-371 review). No usable end → record
+    nothing (WON-permissive), and the next sync retries naturally: the winner
+    stays on Gixen's list until purged. An end in the future (past the
+    estimation margin) is self-contradictory for a WON — eBay is describing a
+    different, re-listed auction under the same item id — and records nothing
+    (`record_group_win` re-checks the same future bound, but the gate here
+    keeps the log line honest).
+
+    This covers the row-less winner (the web-add path never inserts a snipe
+    first seen already-terminal, so its WON transition is a no-op and the win
+    would otherwise leave no trace for `_group_won_before`), the tombstoned-row
+    winner (update_bid_status skips tombstones), and the divergent-group case
+    (the winner resolved before its group was known — recorded under the listed
+    group). Winners that transition WON on a live row are recorded by
+    update_bid_status instead and never reach here (the gather phase skips
+    them via `_listed_win_evidence_already_covered`)."""
     group = _parse_snipe_group(snipe.get("snipe_group"))
     if not group:
-        return False
+        return  # defensive: the gather only fetches grouped winners
     iid = snipe["item_id"]
-    if db.execute(
-        "SELECT 1 FROM bids WHERE item_id=? AND status='WON' AND snipe_group=? "
-        "LIMIT 1",
-        (iid, group),
-    ).fetchone() is not None:
-        return False  # update_bid_status recorded this win at transition time
-    if db.execute(
-        "SELECT 1 FROM group_wins WHERE snipe_group=? AND item_id=?",
-        (group, iid),
-    ).fetchone() is not None:
-        return False
-    if main._ebay_fetch_bin() is None:
-        return False
-    if datetime.now(timezone.utc).timestamp() < main._ebay_cooldown_until:
-        return False
-    ebay = await asyncio.to_thread(main._fetch_ebay_item_sync, iid)
     end_iso = (ebay or {}).get("end_date_iso")
     end_dt = main._parse_end_iso(end_iso)
     if end_dt is None or end_dt > datetime.now(timezone.utc) + _CANCEL_EVIDENCE_MARGIN:
-        return True  # no usable end → record nothing (WON-permissive); fetch spent
+        return  # no usable end → record nothing (WON-permissive)
     record_group_win(
-        db, iid, group, end_iso, recorded_at=now,
+        conn, iid, group, end_iso, recorded_at=now,
         source=GROUP_WIN_SOURCE_LISTED_WIN,
     )
     main.logger.info(
         "_sync_gixen: recorded group-win evidence for row-less winner %s "
         "(group %d, ended %s)", iid, group, end_iso,
     )
-    return True
 
 
 def _ebay_fallback_rows(db: sqlite3.Connection, now_iso: str) -> list:
@@ -422,24 +472,32 @@ async def _run_ebay_fallback() -> None:
     phase, only that they run in the same order on the same connection with
     no intervening commit/rollback, which they do.
 
-    KNOWN RESIDUAL RISK (BUI-409 review, not fixed by this ticket — see
-    design doc §7's convention-supersession note and Stage 3/BUI-410):
-    phase 2's terminal writes (the WON/LOST inference, and the "no usable
-    price" ENDED write) target a row by id with a status-CLASS guard
-    (`update_bid_status`'s `status NOT IN (<tombstones>)`), not a status-
-    EQUALITY guard against what phase 1 observed. `_sync_gixen` (still
-    unmigrated — Stage 3) can concurrently transition the SAME row to a
-    different non-tombstone terminal status (e.g. a genuine WON, sourced
+    KNOWN RESIDUAL RISK (BUI-409 review; re-examined and NOT closed by
+    BUI-410 — flagged for a dedicated follow-up, see server/main.py's
+    module-level "KNOWN RESIDUAL" note and design doc §7): phase 2's terminal
+    writes (the WON/LOST inference, and the "no usable price" ENDED write)
+    target a row by id with a status-CLASS guard (`update_bid_status`'s
+    `status NOT IN (<tombstones>)`), not a status-EQUALITY guard against what
+    phase 1 observed. `_sync_gixen` can concurrently transition the SAME row
+    to a different non-tombstone terminal status (e.g. a genuine WON, sourced
     from Gixen itself) between this cycle's phase-1 snapshot and phase-2's
-    write; because that transition doesn't tombstone the row, the guard
-    above does not catch it, and this function's now-stale eBay-price
-    inference could silently overwrite it. This vulnerability class
-    predates BUI-409 (the pre-existing row snapshot was always taken once
-    at the top of the cycle, and `update_bid_status` never re-verified
-    status equality), but gather-then-apply widens its window for early-
-    fetched rows in a large batch — a full fix belongs with Stage 3, which
-    brings `_sync_gixen` under the same `_write_lock` and removes the
-    possibility of an interleaved terminal-status transition entirely.
+    write; because that transition doesn't tombstone the row, the guard above
+    does not catch it, and this function's now-stale eBay-price inference
+    could silently overwrite it. This vulnerability class predates BUI-409
+    (the row snapshot was always taken once at the top of the cycle, and
+    `update_bid_status` never re-verified status equality).
+
+    BUI-410 correction: Stage 3 brought `_sync_gixen` under the same
+    `_write_lock`, which serializes the two writers' APPLY phases so they no
+    longer interleave at the statement level — but it does NOT close this
+    TOCTOU. Both writers still SNAPSHOT status with a LOCK-FREE read at gather
+    time, BEFORE taking `_write_lock`, and act on that stale decision in the
+    apply; serializing the writes does not undo a decision already made from a
+    pre-lock read. A proper fix (re-read the row's status inside the apply,
+    under the lock, and skip the terminal write when it changed to an
+    unexpected terminal/non-tombstone status since gather) touches BOTH this
+    apply and `_sync_gixen`'s vanished-null-end apply and earns its own ticket
+    + tests — deliberately out of scope for the high-stakes Stage 3.
 
     A row whose eBay fetch failed in phase 1 (`fetched[row["id"]]` is falsy)
     is simply skipped in phase 2 — no write for that row, but every OTHER
@@ -705,24 +763,18 @@ async def _run_ebay_fallback() -> None:
                     failures, len(rows), int(_EBAY_COOLDOWN),
                 )
         except Exception:  # noqa: BLE001  # fire-and-forget task-level safety net (same shape as this file's other bare excepts and server.main's own, e.g. its lifespan-shutdown one); ruff's logging-call exemption doesn't recognize the two-level `main.logger.exception(...)` this module's `import server.main as main` pattern requires (BUI-389), unlike the identical bare `logger.exception(...)` this had verbatim in server/main.py
-            # BUI-399, updated for BUI-409: this function no longer performs
-            # any DML on the shared singleton `_db` — phase 1 above only
-            # reads it (via _ebay_fallback_rows), and every write lands on
-            # phase 2's own ephemeral write_transaction() connection, which
-            # already rolls back + closes itself on any exception raised
-            # inside its `with` block (see that factory's docstring). So
-            # this rollback no longer protects THIS function's own writes
-            # the way it did pre-BUI-409 — there are none left on `_db` to
-            # strand. It stays, unchanged, as the still-active BUI-386/391/399
-            # systemwide convention: `_sync_gixen` (Stage 3, BUI-410) still
-            # writes + self-commits on the shared `_db`, so an exception here
-            # at the wrong instant could otherwise strand ITS uncommitted
-            # work for a later unrelated commit to absorb. Retire this call
-            # only when Stage 3 lands (design doc §7's convention-
-            # supersession note) — not before. Read the global directly (not
-            # the local `db`, unbound if main._get_db() itself raised before
-            # the local assignment) — same reasoning as _sync_loop's
-            # identical guard.
-            if main._db is not None:
-                main._db.rollback()
+            # BUI-410 (Stage 3 landed): the pre-BUI-409 `main._db.rollback()`
+            # that used to live here has been retired, exactly as its own
+            # comment instructed ("Retire this call only when Stage 3 lands").
+            # It was kept through Stage 2 solely because `_sync_gixen` still
+            # wrote + self-committed on the shared singleton `_db`, so an
+            # exception here at the wrong instant could strand ITS uncommitted
+            # batch for a later unrelated commit to absorb. Stage 3 routed
+            # `_sync_gixen` through its own ephemeral write_transaction() too,
+            # so NO code path leaves uncommitted DML on `_db` for this handler
+            # to rescue: phase 1 above only reads `_db`, and every write in
+            # this function lands on phase 2's own write_transaction()
+            # connection, which rolls back + closes itself on any exception in
+            # its `with` block. The per-caller rollback net is now superseded —
+            # see docs/solutions/conventions/shared-singleton-connection-rollback-on-unexpected-exception.md.
             main.logger.exception("_run_ebay_fallback: error")

@@ -58,7 +58,8 @@ from server.fallback import (
     _CANCEL_EVIDENCE_MARGIN, _parse_iso_utc, _parse_snipe_group,
     _vanished_while_live, _group_won_before, _cancelled_before_end,
     _mark_cancelled_tombstone, _mark_no_price_checked,
-    _record_vanish_observations, _record_listed_win_evidence,
+    _record_vanish_observations,
+    _listed_win_evidence_already_covered, _apply_listed_win_evidence,
     _ebay_fallback_rows, _run_ebay_fallback,
 )
 import ebay_bidder
@@ -126,31 +127,39 @@ if not _plugin_logger.handlers:
 # BUI-409 (Stage 2): _run_ebay_fallback (server/fallback.py) is now ALSO
 # routed through write_transaction()/_write_lock, gather-then-apply (every
 # eBay fetch first, no DB write held across an await; one write_transaction()
-# block applies the whole cycle's writes after). The remaining cross-await
-# writers are _sync_gixen and refresh_snipe_group — they still own _db
-# directly and self-commit; that's Stage 3 (BUI-410).
+# block applies the whole cycle's writes after).
+#
+# BUI-410 (Stage 3, landed): _sync_gixen (below) is now gather-then-apply
+# too — every eBay evidence lookup (_listed_win_evidence / _resolve_vanished_
+# null_end) is hoisted into a read-only gather phase ahead of the writes, and
+# ALL its DML (including _sync_loop's formerly lock-free refresh_snipe_group
+# PENDING mirror — BUI-405, folded in here — and the web-added inserts that
+# used to self-commit) lands on ONE write_transaction() connection under
+# _write_lock. No sync writer holds an open transaction on _db across an
+# await any more, so _db is now used ONLY for reads + lifecycle (migrations,
+# WAL checkpoint) + the single api_remove_bid delete_bid()/commit() that Stage
+# 1 left in place (an immediate-commit write, never a cross-await bleed).
+# The interim "≤5s single-event-loop stall" a Stage-1/2 write_transaction()
+# could hit while _sync_gixen held an open _db transaction across a network
+# await (the shape that made two writers contend on SQLite's single-writer
+# constraint) is GONE with that open-transaction-across-await shape removed —
+# both halves of design §7's sniper-timing worry are now closed.
 # See docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md.
 #
-# KNOWN RESIDUAL RISK for Stage 3 (BUI-410), sharpening design doc §7's open
-# sniper-timing question: because _sync_gixen can hold an open, uncommitted
-# write transaction on _db across a network await, a write_transaction()
-# opened by ANY Stage-1/2-routed writer (including, since BUI-409,
-# _run_ebay_fallback's own apply phase) that happens to start during that
-# window can hit SQLite's single-writer-at-a-time constraint (true even in
-# WAL mode) and block on busy_timeout — and because this server is one event
-# loop on one thread, that block is NOT cooperative: it can stall the ENTIRE
-# server (every request, plus the sniper's fire path) for up to busy_timeout
-# (5000ms), not just the one racing writer, until _sync_gixen's own coroutine
-# gets a chance to resume and commit. Bounded (≤5s) and does not compound
-# across the request queue, but is a genuinely new class of stall these
-# stages introduce (the pre-Stage-1 shared connection had no such contention,
-# only the data-corruption risk this project exists to fix). Stage 3's
-# gather-then-apply rewrite of _sync_gixen removes the open-transaction-
-# across-await shape entirely, closing this — BUI-409 already closed HALF of
-# this interim window (the _run_ebay_fallback side); Stage 3 closes the
-# other half (_sync_gixen/refresh_snipe_group). Until then, this is accepted
-# risk, not a Stage 1/2 defect — do not attempt to close it here without
-# touching _sync_gixen (out of Stage 2's scope by design).
+# KNOWN RESIDUAL (BUI-409 review; NOT closed by Stage 3 — flagged for a
+# dedicated follow-up, see _run_ebay_fallback's docstring): a cross-writer
+# read-then-write TOCTOU survives. Both _run_ebay_fallback and _sync_gixen
+# snapshot a row's status with a LOCK-FREE read at gather time, BEFORE
+# acquiring _write_lock; the terminal writes in each apply guard on status
+# CLASS (NOT IN tombstones), not status EQUALITY vs the gather snapshot. So a
+# writer whose apply lands after a concurrent writer committed a genuine
+# WON/terminal transition to the same row (a non-tombstone status the class
+# guard does not catch) can still overwrite it with a now-stale inference.
+# Serializing the two APPLIES under _write_lock (what Stage 3 adds) does NOT
+# close this, because the stale DECISION was made from a pre-lock read. A
+# proper fix (re-read status under the lock in the apply and skip on an
+# unexpected terminal transition since gather) touches BOTH apply paths and
+# earns its own ticket + tests — out of scope for this high-stakes stage.
 _db: sqlite3.Connection | None = None
 # BUI-408: the resolved runtime DB path (the same value passed to init_db()
 # below), stashed so write_transaction() callers can target the correct file.
@@ -176,10 +185,10 @@ _ebay_cooldown_until: float = 0.0
 # _EBAY_COOLDOWN (the cooldown duration) moved to server/fallback.py (BUI-389)
 # — it has no reader left in this file, only in _run_ebay_fallback there.
 # _ebay_cooldown_until (the timestamp it governs) stays here: it's read by
-# _resolve_vanished_null_end_bids below as well as by server.fallback, so it
-# remains server.main's own app-state global (server.fallback reads/writes it
-# via `main._ebay_cooldown_until`, not a stale copy — see that module's
-# docstring).
+# _sync_gixen's gather phase below (the listed-win + _gather_vanished_null_end
+# eBay fetches) as well as by server.fallback, so it remains server.main's own
+# app-state global (server.fallback reads/writes it via
+# `main._ebay_cooldown_until`, not a stale copy — see that module's docstring).
 # BUI-85: cap eBay lookups for vanished PENDING rows with no captured end time,
 # so a backlog of them can't flood the rate-limited eBay budget in one sync.
 _VANISHED_NULL_END_MAX_PER_SYNC = 5
@@ -391,92 +400,111 @@ def iso_to_relative(end_date_iso: str | None) -> str:
 # Gixen sync helper (used by api_purge and ended-bid resolution)
 # ---------------------------------------------------------------------------
 
-async def _resolve_vanished_null_end_bids(
+async def _gather_vanished_null_end(
     db: sqlite3.Connection,
-    snipes: list,
     gixen_item_ids: set,
+    now_dt: datetime,
+) -> list[tuple[str, int, dict | None]]:
+    """BUI-410 gather half of the BUI-85 vanished-with-NULL-end resolver.
+
+    PENDING rows that vanished from Gixen but never had an end time captured
+    (auction_end_at IS NULL) escape the vanished_ended query in _sync_gixen —
+    it requires a non-NULL end. They are ambiguous on their own ("the auction
+    ended and Gixen dropped it" vs "the user removed the snipe via Gixen's web
+    UI before any sync ran"), so eBay's listing end time is fetched here as the
+    disambiguating signal; _apply_vanished_null_end below turns it into the
+    ENDED / REMOVED / leave-PENDING decision.
+
+    This is the READ + FETCH phase only — no DB write — so it can run in the
+    gather stage before _sync_gixen opens its write transaction. The candidate
+    set is write-independent: a vanished row (not in gixen_item_ids) is touched
+    by NONE of the apply-phase writes (loop-1 set_auction_end_time / cache /
+    refresh and the terminal transitions all key off snipes that ARE in Gixen's
+    list; the vanished_ended pass keys off non-NULL ends). So this pre-cycle
+    read returns exactly what the apply would have selected. Gated by the eBay
+    cooldown and capped per sync to bound rate-limited I/O. Returns
+    (item_id, row_id, ebay) tuples — row_id lets the apply id-target its write
+    (BUI-390), never stamping a sibling sharing the item_id."""
+    if _ebay_fetch_bin() is None or now_dt.timestamp() < _ebay_cooldown_until:
+        return []
+    candidates = db.execute(
+        "SELECT item_id, id FROM bids "
+        "WHERE status = 'PENDING' AND auction_end_at IS NULL"
+    ).fetchall()
+    resolved: list[tuple[str, int, dict | None]] = []
+    checked = 0
+    for row in candidates:
+        iid = row["item_id"]
+        if iid in gixen_item_ids:
+            continue  # still live on Gixen; the time_to_end path sets end
+        if checked >= _VANISHED_NULL_END_MAX_PER_SYNC:
+            break
+        checked += 1
+        ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+        resolved.append((iid, row["id"], ebay))
+    return resolved
+
+
+def _apply_vanished_null_end(
+    conn: sqlite3.Connection,
+    resolved: list[tuple[str, int, dict | None]],
+    snipes: list,
     now_dt: datetime,
     now: str,
 ) -> None:
-    # BUI-85: PENDING rows that vanished from Gixen but never had an end time
-    # captured (auction_end_at IS NULL) escape the vanished_ended query above —
-    # it requires a non-NULL end. These rows are ambiguous on their own ("the
-    # auction ended and Gixen dropped it" vs "the user removed the snipe via
-    # Gixen's web UI before any sync ran"), so they can't be blindly marked
-    # ENDED. eBay's listing end time is the external signal that disambiguates:
-    #   - end in the past  → the auction genuinely ended → ENDED (the eBay
-    #     fallback then fills winning_bid). Glitch-safe: a still-live snipe has
-    #     a future end, so it can never wrongly land here.
-    #   - end in the future → the auction is still live but the snipe is gone →
-    #     the user removed it → tombstone REMOVED (never ENDED/WON/LOST). Only
-    #     when Gixen returned a non-empty list this sync, so an empty-list
-    #     scrape glitch can't mass-cancel live snipes.
-    #   - no eBay data      → leave PENDING and retry a later sync.
-    # Gated by the eBay cooldown and capped per sync to bound rate-limited I/O.
-    if _ebay_fetch_bin() is not None and now_dt.timestamp() >= _ebay_cooldown_until:
-        # BUI-390: fetch id alongside item_id so both terminal writes below can
-        # id-target the exact row being resolved (only_id=), not every row
-        # sharing this item_id — the BUI-178 class of blast radius the REMOVED
-        # branch (BUI-371), the vanished-ended write (BUI-388) and every
-        # _run_ebay_fallback write (BUI-382) already guard. Each row here is the
-        # live PENDING one (status='PENDING'), so its id is the exact target.
-        vanished_null_end = db.execute(
-            "SELECT item_id, id FROM bids "
-            "WHERE status = 'PENDING' AND auction_end_at IS NULL"
-        ).fetchall()
-        checked = 0
-        for row in vanished_null_end:
-            iid = row["item_id"]
-            if iid in gixen_item_ids:
-                continue  # still live on Gixen; the time_to_end path sets end
-            if checked >= _VANISHED_NULL_END_MAX_PER_SYNC:
-                break
-            checked += 1
-            ebay = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
-            end_iso = (ebay or {}).get("end_date_iso")
-            end_dt = _parse_end_iso(end_iso)
-            if end_dt is None:
-                continue  # can't disambiguate yet — leave PENDING, retry later
-            # BUI-407: set_auction_end_time no longer self-commits. Unlike
-            # every OTHER call site of the 7 de-committed helpers, this one is
-            # deliberately left uncommitted here, not given its own immediate
-            # db.commit() — this function is called from _sync_gixen (see its
-            # docstring) before that function's single end-of-cycle
-            # db.commit(), and this write joins the batch alongside
-            # update_bid_status/cache_gixen_data/refresh_snipe_group (already
-            # caller-commit, unchanged by this ticket). This is the intended
-            # consolidation from a fragmented self-commit into one coherent
-            # transaction boundary (design doc §2 finding 2 / §4) — every
-            # exception path between here and that commit already rolls back
-            # the whole batch (the pre-existing BUI-386/391/399 convention),
-            # so nothing here is silently lost on a caught failure.
-            set_auction_end_time(db, iid, end_iso)
-            if end_dt <= now_dt:
-                update_bid_status(
-                    db, iid, "ENDED", winning_bid=None, resolved_at=now,
-                    only_id=row["id"],  # BUI-390: id-target, don't stamp siblings
-                )
-                logger.info(
-                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s is past → ENDED",
-                    iid, end_iso,
-                )
-            elif snipes:
-                update_bid_status(
-                    db, iid, "REMOVED", winning_bid=None, resolved_at=now,
-                    only_id=row["id"],  # BUI-390: id-target, don't stamp siblings
-                )
-                logger.info(
-                    "_sync_gixen: %s vanished w/ NULL end; eBay end %s still future "
-                    "→ removed from Gixen, tombstoned REMOVED", iid, end_iso,
-                )
+    """BUI-410 apply half of the BUI-85 resolver — sync + await-free, runs
+    inside _sync_gixen's single write_transaction(). For each row the gather
+    phase fetched eBay for:
+      - end in the past   → the auction genuinely ended → ENDED (the eBay
+        fallback then fills winning_bid). Glitch-safe: a still-live snipe has
+        a future end, so it can never wrongly land here.
+      - end in the future → the auction is still live but the snipe is gone →
+        the user removed it → tombstone REMOVED (never ENDED/WON/LOST). Only
+        when Gixen returned a non-empty list this sync (`snipes`), so an
+        empty-list scrape glitch can't mass-cancel live snipes.
+      - no eBay data      → leave PENDING and retry a later sync.
+    Every write id-targets its row (only_id=, BUI-390) — the BUI-178 class of
+    blast radius the REMOVED branch (BUI-371), the vanished-ended write
+    (BUI-388) and every _run_ebay_fallback write (BUI-382) already guard."""
+    for iid, row_id, ebay in resolved:
+        end_iso = (ebay or {}).get("end_date_iso")
+        end_dt = _parse_end_iso(end_iso)
+        if end_dt is None:
+            continue  # can't disambiguate yet — leave PENDING, retry later
+        set_auction_end_time(conn, iid, end_iso)
+        if end_dt <= now_dt:
+            update_bid_status(
+                conn, iid, "ENDED", winning_bid=None, resolved_at=now,
+                only_id=row_id,  # BUI-390: id-target, don't stamp siblings
+            )
+            logger.info(
+                "_sync_gixen: %s vanished w/ NULL end; eBay end %s is past → ENDED",
+                iid, end_iso,
+            )
+        elif snipes:
+            update_bid_status(
+                conn, iid, "REMOVED", winning_bid=None, resolved_at=now,
+                only_id=row_id,  # BUI-390: id-target, don't stamp siblings
+            )
+            logger.info(
+                "_sync_gixen: %s vanished w/ NULL end; eBay end %s still future "
+                "→ removed from Gixen, tombstoned REMOVED", iid, end_iso,
+            )
 
 
-def _insert_web_added_bids(db: sqlite3.Connection, snipes: list) -> None:
+def _insert_web_added_bids(conn: sqlite3.Connection, snipes: list) -> None:
     # Insert any Gixen snipes not yet in the DB (e.g. added via web UI). Use
     # the full bids table — not just PENDING — so a snipe we already
     # transitioned to a terminal status earlier in this same sync run isn't
     # re-inserted as a fresh PENDING duplicate.
-    existing_ids = {b["item_id"] for b in get_all_bids(db)}
+    #
+    # BUI-410: runs on `conn` (_sync_gixen's single write_transaction()
+    # connection) inside the apply block, not on the shared _db, and no longer
+    # self-commits — the write_transaction() owns the one commit for the whole
+    # cycle. existing_ids therefore reads this cycle's own (uncommitted, same-
+    # connection) terminal transitions too, so a snipe just resolved is not
+    # re-inserted.
+    existing_ids = {b["item_id"] for b in get_all_bids(conn)}
     for snipe in snipes:
         snipe_terminal = _map_terminal_status(
             snipe.get("status", ""), snipe.get("time_to_end", "")
@@ -486,36 +514,48 @@ def _insert_web_added_bids(db: sqlite3.Connection, snipes: list) -> None:
                 max_bid = float(snipe.get("max_bid") or 0)
             except (ValueError, TypeError):
                 max_bid = 0.0
+            # BUI-410: guard bid_offset the same way max_bid (above) and
+            # snipe_group (below) already are. Before Stage 3, _insert_web_added_bids
+            # ran AFTER _sync_gixen's commit, so an int('N/A') ValueError here only
+            # failed the (already-committed) web-add. Now this loop runs INSIDE the
+            # single write_transaction() apply, so an unguarded crash would abort
+            # the WHOLE cycle — discarding every terminal transition and BUI-371
+            # REMOVED classification + BUI-381 group_wins evidence already applied,
+            # and a persistently-malformed snipe would crash every sync, leaving a
+            # cancelled sibling exposed to the independent fallback's phantom-WON
+            # window. Fall back to the default offset instead (as with an unknown
+            # group), so one scrape quirk never costs the cycle its evidence.
+            try:
+                bid_offset = int(snipe.get("bid_offset", 6))
+            except (ValueError, TypeError):
+                bid_offset = 6
             try:
                 insert_bid(
-                    db, snipe["item_id"], max_bid,
-                    int(snipe.get("bid_offset", 6)),
+                    conn, snipe["item_id"], max_bid, bid_offset,
                     # BUI-381: never int()-crash the sync batch on a scrape
                     # quirk ('N/A'); an unknown group inserts as 0 and the
                     # per-sync refresh corrects it once it parses.
                     _parse_snipe_group(snipe.get("snipe_group")) or 0,
                     snipe.get("seller"),
                 )
-                # BUI-407: insert_bid no longer self-commits — commit here,
-                # at the same point its self-commit used to fire.
-                db.commit()
                 logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
             except sqlite3.IntegrityError:
                 # existing_ids was snapshotted before the list_snipes await; a
                 # concurrent api_add_bid can insert this PENDING row in that
-                # window. This loop runs unlocked (_sync_loop uses a separate
-                # client, no _api_lock), so the partial unique index is what
-                # actually prevents the duplicate — catch its violation and skip
-                # rather than aborting the whole sync run (BUI-67 U4/KTD6).
+                # window. This loop runs unlocked-against-Gixen (_sync_loop uses
+                # a separate client, no _api_lock), so the partial unique index
+                # is what actually prevents the duplicate — catch its violation
+                # and skip rather than aborting the whole sync run (BUI-67
+                # U4/KTD6).
                 #
-                # rollback() scope: the only uncommitted statement here is this
-                # failed INSERT — every earlier successful insert_bid in this
-                # loop, and the terminal/cache writes from the earlier loop,
-                # were already committed (the db.commit() above, per-insert
-                # since BUI-407; the batched db.commit() earlier in
-                # _sync_gixen for the rest). So this discards just the failed
-                # insert, not any batched sibling work.
-                db.rollback()
+                # BUI-410: do NOT conn.rollback() here (the pre-Stage-3 code,
+                # which self-committed each insert on the shared _db, did). A
+                # SQLite constraint violation rolls back only the failed
+                # statement, NOT the open transaction — the connection stays
+                # usable and every earlier successful insert + every apply-phase
+                # write in this same write_transaction() remains pending for the
+                # single end-of-block commit. Calling rollback() here would
+                # instead discard the WHOLE cycle's apply. Just skip this row.
                 logger.debug(
                     "_sync_gixen: %s already present (concurrent add); skipping insert",
                     snipe["item_id"],
@@ -543,6 +583,23 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     genuinely unreachable" from "Gixen reached fine, zero live snipes right
     now" — both used to collapse to an empty list, which made a quiet week
     of no active snipes look identical to a sustained outage.
+
+    BUI-410 (Stage 3 of BUI-400's shared-connection isolation rollout):
+    gather-then-apply. The scrape and every eBay evidence lookup
+    (_listed_win_evidence, _resolve_vanished_null_end) run FIRST, in a
+    read-only GATHER phase that holds no DB write across any `await`; their
+    results are keyed by item_id. Then a single APPLY phase runs ALL the DML
+    on ONE short-lived write_transaction() connection under the app-wide
+    _write_lock, with ZERO awaits inside — so the lock is never held across a
+    network call, and no uncommitted sync DML ever bleeds across an await on
+    the shared singleton `_db` (design §2's bleed window, now closed). This
+    also folds in BUI-405: _sync_loop's formerly lock-free refresh_snipe_group
+    PENDING mirror now routes through the same _write_lock path. The apply
+    replays the terminal transitions in the SAME WON-first order as before, on
+    ONE connection with no intervening commit, so every same-cycle
+    read-after-write dependency the BUI-371/381 evidence path relies on (a
+    winner's WON row / group_wins entry feeding a sibling's _group_won_before
+    check) is preserved bit-for-bit.
     """
     # Captured before the scrape so vanish stamping can exclude rows added
     # while the (lockless) scrape was in flight — see _record_vanish_observations.
@@ -574,216 +631,244 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     now = now_dt.isoformat()
     gixen_item_ids = {s["item_id"] for s in snipes}
 
-    # BUI-371: vanish bookkeeping. Only against a non-empty list — an empty
-    # scrape is more likely a glitch (BUI-85's guard), and mass-stamping live
-    # snipes as vanished could later mislabel them as cancelled.
-    if snipes:
-        _record_vanish_observations(db, gixen_item_ids, now, scrape_started_at)
-
+    # Terminal transitions, computed up front (pure — no DB) so the gather
+    # phase can iterate winners WON-first for the listed-win eBay fetches and
+    # the apply phase can replay them in the identical order.
     terminal_transitions: list[tuple[dict, str]] = []
     for snipe in snipes:
-        iid = snipe["item_id"]
-
-        cache_gixen_data(
-            db, iid,
-            snipe.get("title") or None,
-            snipe.get("seller") or None,
-            snipe.get("current_bid") or None,
-            snipe.get("dbidid") or None,  # BUI-116: warm the edit fast-path cache
+        internal_status = _map_terminal_status(
+            snipe.get("status", ""), snipe.get("time_to_end", ""),
         )
-
-        # BUI-381: mirror the list's snipe_group onto the live row on every
-        # sync (see refresh_snipe_group). Runs before the terminal transitions
-        # below, so a winner whose group was applied retroactively on Gixen's
-        # web UI carries it by the time its WON is recorded as group evidence.
-        # An unparseable value (None) is skipped — see _parse_snipe_group.
-        # A real change stamps group_changed_at=now (BUI-384), which bounds
-        # _group_won_before so this retroactive join can't be backdated to
-        # the row's added_at and swallow a pre-join win as cancel evidence.
-        listed_group = _parse_snipe_group(snipe.get("snipe_group"))
-        if listed_group is not None:
-            refresh_snipe_group(db, iid, listed_group, changed_at=now)
-
-        gixen_status = snipe.get("status", "")
-        time_to_end = snipe.get("time_to_end", "")
-        internal_status = _map_terminal_status(gixen_status, time_to_end)
         if internal_status is not None:
             terminal_transitions.append((snipe, internal_status))
-
-        # Refresh auction_end_at from Gixen's relative time string on every
-        # sync. Gixen only gives "21 h, 30 m, 43 s" so we compute the absolute
-        # end timestamp here. (Originally only eBay populated this — bringing
-        # in main's logic so the local-sniper has a current end time without
-        # depending on eBay being reachable.)
-        time_to_end = snipe.get("time_to_end", "")
-        if time_to_end and time_to_end.upper() != "ENDED":
-            delta = _parse_time_to_end(time_to_end)
-            if delta is not None:
-                end_time = (now_dt + delta).isoformat()
-                # BUI-407: same deliberate no-immediate-commit treatment as
-                # the set_auction_end_time call in _resolve_vanished_null_end_bids
-                # above — this write joins _sync_gixen's single end-of-cycle
-                # db.commit() rather than getting its own, consolidating what
-                # used to be a mid-cycle self-commit (see that call site's
-                # comment for the full rationale).
-                set_auction_end_time(db, iid, end_time)
-
-    # Apply WON transitions before the rest: a WON row in the DB is the
-    # group-cancel evidence _group_won_before consults when classifying its
-    # siblings' ENDED/LOST below (BUI-371) — after a sync gap, the winner and
-    # a cancelled sibling can arrive in the same list pull.
+    # Apply WON transitions before the rest: a WON row in the DB (and the
+    # group_wins ledger entry it writes) is the group-cancel evidence
+    # _group_won_before consults when classifying its siblings' ENDED/LOST
+    # below (BUI-371) — after a sync gap, the winner and a cancelled sibling
+    # can arrive in the same list pull. Stable sort keeps Gixen's list order
+    # within each status class.
     terminal_transitions.sort(key=lambda pair: pair[1] != "WON")
-    listed_win_fetches = 0  # BUI-381: per-sync eBay budget for row-less winners
-    for snipe, internal_status in terminal_transitions:
-        iid = snipe["item_id"]
-        gixen_status = snipe.get("status", "")
-        # BUI-390: the DB row this Gixen snipe transitions. Fetched once and
-        # reused by both the BUI-371 REMOVED branch and the terminal write
-        # below so both can id-target their write (only_id=). A live PENDING
-        # row is always the newest row for its item_id — the partial unique
-        # index + upsert path forbid inserting a second row while a PENDING one
-        # exists — so get_bid_by_item_id's (id DESC LIMIT 1) always returns the
-        # exact row to transition, never an older resolved sibling of a
-        # re-listed/re-added item.
-        db_row = get_bid_by_item_id(db, iid)
-        # For WON/LOST, current_bid is the final price (what we paid or
-        # what beat us). For ENDED/FAILED with unknown status string,
-        # there's no reliable price signal — leave winning_bid None and
-        # let the eBay fallback fill it in if it can.
-        winning_bid = None
-        if internal_status in ("WON", "LOST"):
-            current_bid = snipe.get("current_bid", "")
-            if current_bid:
-                try:
-                    winning_bid = float(current_bid.split()[0])
-                except (ValueError, IndexError):
-                    pass
-        # BUI-371: a still-listed snipe reaching its end as ENDED (unrecognized
-        # status) or a plain LOST may in fact be a group-cancelled sibling that
-        # was never bid on — resolve it REMOVED so the eBay fallback can't
-        # phantom-WON it and the calibration report doesn't count a loss we
-        # never contested. Exempt: statuses proving Gixen processed our bid
-        # (their LOST is genuine), an 'OK:' local snipe result (we bid
-        # locally), and rows already tombstoned (a REMOVED sibling stays on
-        # Gixen's list until purge — the update below is a no-op for it, and
-        # re-running the evidence query would re-log every sync). WON is never
-        # reclassified (dual-win within Gixen's ~2-minute group caveat is a
-        # real win).
-        if (
-            internal_status in ("ENDED", "LOST")
-            and gixen_status.upper().strip() not in _BID_PROCESSED_STATUSES
-        ):
-            if (
-                db_row is not None
-                and db_row["status"] not in ("PURGED", "REMOVED")
-                and not (db_row["local_snipe_result"] or "").startswith("OK:")
-            ):
-                # No stored end → no evidence test. `now` is only an upper
-                # bound on the true end, and substituting it would WIDEN the
-                # evidence window (it can only add cancel classifications,
-                # including inside the dual-win margin). Skipping is safe:
-                # the row resolves ENDED below and the eBay fallback re-runs
-                # this check with the true end time fetched from eBay.
-                end_dt = _parse_end_iso(db_row["auction_end_at"])
-                if end_dt is not None and _group_won_before(
-                    db, iid, snipe.get("snipe_group"), end_dt, db_row["added_at"],
-                    db_row["group_changed_at"],
+
+    # ---- GATHER PHASE (reads on `db`, network awaits, NO DB write held) ----
+    # BUI-410: hoist every eBay lookup ahead of the write transaction so no
+    # uncommitted DML is ever held across a network await (design §2/§5).
+    # eBay bin + cooldown gate the whole phase (matching the pre-BUI-410
+    # per-call checks); results are consulted, write-free, in the apply phase.
+    ebay_ready = (
+        _ebay_fetch_bin() is not None
+        and now_dt.timestamp() >= _ebay_cooldown_until
+    )
+
+    # BUI-381 listed-win evidence for row-less / tombstoned / divergent-group
+    # winners. _listed_win_evidence_already_covered reproduces, from pre-cycle
+    # state, the exact skip the pre-BUI-410 in-loop _record_listed_win_evidence
+    # applied AFTER the WON write — so a Case-A winner (whose evidence
+    # update_bid_status records for free) neither fetches nor spends the
+    # per-sync budget, keeping the budget for genuinely row-less winners later
+    # in the same sync (a wrong skip either way reintroduces a phantom-WON —
+    # see that helper's docstring). Keyed by item_id (unique within snipes).
+    listed_win_ebay: dict[str, dict | None] = {}
+    if ebay_ready:
+        listed_win_fetches = 0
+        for snipe, internal_status in terminal_transitions:
+            if internal_status != "WON":
+                continue
+            if listed_win_fetches >= _LISTED_WIN_FETCH_MAX_PER_SYNC:
+                break
+            group = _parse_snipe_group(snipe.get("snipe_group"))
+            if not group:
+                continue
+            iid = snipe["item_id"]
+            if _listed_win_evidence_already_covered(db, iid, group):
+                continue
+            listed_win_ebay[iid] = await asyncio.to_thread(_fetch_ebay_item_sync, iid)
+            listed_win_fetches += 1
+
+    # BUI-85 vanished-with-NULL-end resolution (candidate set is write-
+    # independent — see _gather_vanished_null_end).
+    vanished_null_end = await _gather_vanished_null_end(db, gixen_item_ids, now_dt)
+
+    # ---- APPLY PHASE (one write_transaction() under _write_lock, NO awaits) ----
+    # BUI-410 + BUI-405: every write below lands on ONE short-lived connection
+    # committed once, with _write_lock held only across this await-free block
+    # (never across the gather fetches above) — the same short-held-lock
+    # discipline Stage 1/2 wired up for the already-await-free writers.
+    async with _write_locked():
+        with write_transaction(_get_db_path()) as wconn:
+            # BUI-371: vanish bookkeeping. Only against a non-empty list — an
+            # empty scrape is more likely a glitch (BUI-85's guard), and mass-
+            # stamping live snipes as vanished could later mislabel them.
+            if snipes:
+                _record_vanish_observations(wconn, gixen_item_ids, now, scrape_started_at)
+
+            for snipe in snipes:
+                iid = snipe["item_id"]
+                cache_gixen_data(
+                    wconn, iid,
+                    snipe.get("title") or None,
+                    snipe.get("seller") or None,
+                    snipe.get("current_bid") or None,
+                    snipe.get("dbidid") or None,  # BUI-116: warm the edit fast-path cache
+                )
+                # BUI-381/BUI-405: mirror the list's snipe_group onto the live
+                # row on every sync (see refresh_snipe_group), now under
+                # _write_lock. Runs before the terminal transitions below, so a
+                # winner whose group was applied retroactively on Gixen's web UI
+                # carries it by the time its WON is recorded as group evidence.
+                # An unparseable value (None) is skipped. A real change stamps
+                # group_changed_at=now (BUI-384), which bounds _group_won_before
+                # so this retroactive join can't be backdated to added_at and
+                # swallow a pre-join win as cancel evidence.
+                listed_group = _parse_snipe_group(snipe.get("snipe_group"))
+                if listed_group is not None:
+                    refresh_snipe_group(wconn, iid, listed_group, changed_at=now)
+                # Refresh auction_end_at from Gixen's relative time string on
+                # every sync (Gixen only gives "21 h, 30 m, 43 s") so the local
+                # sniper has a current end time without depending on eBay.
+                time_to_end = snipe.get("time_to_end", "")
+                if time_to_end and time_to_end.upper() != "ENDED":
+                    delta = _parse_time_to_end(time_to_end)
+                    if delta is not None:
+                        set_auction_end_time(wconn, iid, (now_dt + delta).isoformat())
+
+            for snipe, internal_status in terminal_transitions:
+                iid = snipe["item_id"]
+                gixen_status = snipe.get("status", "")
+                # BUI-390: the DB row this Gixen snipe transitions, read fresh
+                # on wconn (so it reflects this cycle's loop-1 writes above).
+                # Reused by both the BUI-371 REMOVED branch and the terminal
+                # write so both id-target (only_id=). A live PENDING row is
+                # always the newest for its item_id (the partial unique index +
+                # upsert path forbid a second row while a PENDING one exists),
+                # so id DESC LIMIT 1 returns the exact row to transition.
+                db_row = get_bid_by_item_id(wconn, iid)
+                # For WON/LOST, current_bid is the final price. For
+                # ENDED/FAILED with an unknown status string there's no reliable
+                # price — leave winning_bid None for the eBay fallback.
+                winning_bid = None
+                if internal_status in ("WON", "LOST"):
+                    current_bid = snipe.get("current_bid", "")
+                    if current_bid:
+                        try:
+                            winning_bid = float(current_bid.split()[0])
+                        except (ValueError, IndexError):
+                            pass
+                # BUI-371: a still-listed snipe reaching its end as ENDED
+                # (unrecognized status) or a plain LOST may be a group-cancelled
+                # sibling that was never bid on — resolve it REMOVED so the eBay
+                # fallback can't phantom-WON it and the calibration report
+                # doesn't count a loss we never contested. Exempt: statuses
+                # proving Gixen processed our bid, an 'OK:' local snipe result,
+                # and already-tombstoned rows. WON is never reclassified.
+                if (
+                    internal_status in ("ENDED", "LOST")
+                    and gixen_status.upper().strip() not in _BID_PROCESSED_STATUSES
                 ):
+                    if (
+                        db_row is not None
+                        and db_row["status"] not in ("PURGED", "REMOVED")
+                        and not (db_row["local_snipe_result"] or "").startswith("OK:")
+                    ):
+                        # No stored end → no evidence test. `now` is only an
+                        # upper bound on the true end; substituting it would
+                        # WIDEN the window. Skipping is safe: the row resolves
+                        # ENDED below and the eBay fallback re-runs this check
+                        # with eBay's true end time.
+                        end_dt = _parse_end_iso(db_row["auction_end_at"])
+                        if end_dt is not None and _group_won_before(
+                            wconn, iid, snipe.get("snipe_group"), end_dt,
+                            db_row["added_at"], db_row["group_changed_at"],
+                        ):
+                            update_bid_status(
+                                wconn, iid, "REMOVED", None, now,
+                                snipe.get("status_mirror"), only_id=db_row["id"],
+                            )
+                            _mark_cancelled_tombstone(wconn, db_row["id"])
+                            logger.info(
+                                "_sync_gixen: %s group-cancelled before its end → REMOVED "
+                                "(Gixen showed %s/%s)", iid, gixen_status or "?", internal_status,
+                            )
+                            continue
+                # BUI-390: id-target the terminal write. Item_id-wide, this
+                # could collateral-stamp an older resolved-but-unpurged sibling
+                # sharing the item_id — and, for WON, record a false group_wins
+                # entry for that stale row. db_row is None only for a snipe first
+                # seen already-terminal (the web-add insert below skips ALL
+                # terminal snipes); only_id=None keeps the item_id-wide form, a
+                # harmless no-op there. For a WON that's the row-less-winner case
+                # the BUI-381 evidence path below then handles.
+                update_bid_status(
+                    wconn, iid, internal_status, winning_bid, now,
+                    snipe.get("status_mirror"),
+                    only_id=db_row["id"] if db_row is not None else None,
+                )
+                if internal_status == "WON" and iid in listed_win_ebay:
+                    # BUI-381: this winner is row-less / tombstoned / divergent-
+                    # group (the gather phase decided so via
+                    # _listed_win_evidence_already_covered and fetched its eBay
+                    # end time), so update_bid_status above recorded no ledger
+                    # evidence — record it here from that fetched end. Runs in
+                    # the WON-first portion of the loop, so the ledger entry
+                    # exists before any sibling's _group_won_before check below.
+                    # Case-A winners are never in listed_win_ebay (update_bid_status
+                    # recorded those), so this is a no-op for them.
+                    _apply_listed_win_evidence(wconn, snipe, now, listed_win_ebay[iid])
+
+            # Vanished + ended → flip to ENDED. The eBay fallback then picks
+            # these up (ENDED rows with NULL winning_bid). Read fresh on wconn
+            # so it excludes rows this cycle already transitioned.
+            vanished_ended = wconn.execute(
+                """
+                SELECT item_id, id, auction_end_at, gixen_vanished_at, snipe_group,
+                       local_snipe_result, added_at, group_changed_at FROM bids
+                WHERE status = 'PENDING'
+                  AND auction_end_at IS NOT NULL
+                  AND auction_end_at <= ?
+                """,
+                (now,),
+            ).fetchall()
+            for row in vanished_ended:
+                iid = row["item_id"]
+                if iid in gixen_item_ids:
+                    continue  # still on Gixen, will resolve via Gixen path
+                # BUI-371: disambiguate before flipping ENDED (which feeds the
+                # eBay WON inference). Positive evidence the snipe was cancelled
+                # while its auction was still live — observed vanished from a
+                # healthy Gixen list >= margin before end, or a bid-group
+                # sibling won >= margin earlier — means we never bid: REMOVED.
+                # No evidence → ENDED as before.
+                end_dt = _parse_end_iso(row["auction_end_at"])
+                if _cancelled_before_end(wconn, iid, row, end_dt):
                     update_bid_status(
-                        db, iid, "REMOVED", None, now, snipe.get("status_mirror"),
-                        only_id=db_row["id"],
+                        wconn, iid, "REMOVED", winning_bid=None, resolved_at=now,
+                        only_id=row["id"],
                     )
-                    _mark_cancelled_tombstone(db, db_row["id"])
+                    _mark_cancelled_tombstone(wconn, row["id"])
                     logger.info(
-                        "_sync_gixen: %s group-cancelled before its end → REMOVED "
-                        "(Gixen showed %s/%s)", iid, gixen_status or "?", internal_status,
+                        "_sync_gixen: %s vanished from Gixen while still live "
+                        "(cancelled, never bid) → REMOVED", iid,
                     )
                     continue
-        # BUI-390: id-target the terminal write, mirroring the REMOVED branch
-        # above (BUI-371), the vanished-ended write (BUI-388) and every
-        # _run_ebay_fallback write (BUI-382). Item_id-wide, this could
-        # collateral-stamp an older resolved-but-unpurged sibling sharing the
-        # item_id (a prior listing of a re-listed/re-added item) with this
-        # snipe's terminal status — and, for WON, its winning-bid capture would
-        # also record a false group_wins ledger entry for that stale row.
-        # db_row is None only for a snipe first seen already-terminal (no DB row
-        # yet — the web-add insert below skips ALL terminal snipes, not just
-        # winners); only_id=None keeps the item_id-wide form, a harmless no-op
-        # there (no rows to hit). For a WON specifically, this is also the
-        # row-less-winner case the BUI-381 evidence path below then handles.
-        update_bid_status(
-            db, iid, internal_status, winning_bid, now,
-            snipe.get("status_mirror"),
-            only_id=db_row["id"] if db_row is not None else None,
-        )
-        if (
-            internal_status == "WON"
-            and listed_win_fetches < _LISTED_WIN_FETCH_MAX_PER_SYNC
-        ):
-            # BUI-381: a winner first seen already-terminal has no DB row
-            # (the web-add insert below skips terminal snipes), so the
-            # update above was a no-op and its win left no group evidence —
-            # record it from the list + eBay's end time. No-op when the
-            # update did land on a grouped row (update_bid_status records
-            # those). Capped per sync like the BUI-85 resolver.
-            if await _record_listed_win_evidence(db, snipe, now):
-                listed_win_fetches += 1
+                # BUI-388: id-targeted, matching the REMOVED branch above and
+                # the BUI-382 pattern in _run_ebay_fallback — an item_id-wide
+                # write here could collateral-stamp an unrelated non-tombstoned
+                # sibling sharing this item_id (the BUI-178 class of blast
+                # radius).
+                update_bid_status(
+                    wconn, iid, "ENDED", winning_bid=None, resolved_at=now,
+                    only_id=row["id"],
+                )
+                logger.info(
+                    "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
+                    iid,
+                )
 
-    # Vanished + ended → flip to ENDED. The eBay fallback path then picks
-    # them up (ENDED rows with NULL winning_bid) and resolves the final
-    # selling price when eBay's rate-limit budget allows.
-    vanished_ended = db.execute(
-        """
-        SELECT item_id, id, auction_end_at, gixen_vanished_at, snipe_group,
-               local_snipe_result, added_at, group_changed_at FROM bids
-        WHERE status = 'PENDING'
-          AND auction_end_at IS NOT NULL
-          AND auction_end_at <= ?
-        """,
-        (now,),
-    ).fetchall()
-    for row in vanished_ended:
-        iid = row["item_id"]
-        if iid in gixen_item_ids:
-            continue  # still on Gixen, will resolve via Gixen path
-        # BUI-371: disambiguate before flipping ENDED (which feeds the eBay
-        # WON inference). Positive evidence the snipe was cancelled while its
-        # auction was still live — observed vanished from a healthy Gixen list
-        # >= margin before end, or a bid-group sibling won >= margin earlier —
-        # means we never bid: tombstone REMOVED. No evidence → ENDED as before.
-        end_dt = _parse_end_iso(row["auction_end_at"])
-        if _cancelled_before_end(db, iid, row, end_dt):
-            update_bid_status(
-                db, iid, "REMOVED", winning_bid=None, resolved_at=now,
-                only_id=row["id"],
-            )
-            _mark_cancelled_tombstone(db, row["id"])
-            logger.info(
-                "_sync_gixen: %s vanished from Gixen while still live "
-                "(cancelled, never bid) → REMOVED", iid,
-            )
-            continue
-        # BUI-388: id-targeted, matching the REMOVED branch above (BUI-371)
-        # and the BUI-382 pattern in _run_ebay_fallback — an item_id-wide
-        # write here could collateral-stamp an unrelated non-tombstoned
-        # sibling sharing this item_id (e.g. an older resolved-but-not-yet-
-        # purged row from a prior listing of a re-listed/re-added item),
-        # overwriting its status/winning_bid/resolved_at with this row's
-        # ENDED transition (the BUI-178 class of blast radius).
-        update_bid_status(
-            db, iid, "ENDED", winning_bid=None, resolved_at=now,
-            only_id=row["id"],
-        )
-        logger.info(
-            "_sync_gixen: %s vanished from Gixen and auction has ended → ENDED",
-            iid,
-        )
+            # BUI-85 vanished-with-NULL-end: apply the gather-phase eBay results.
+            _apply_vanished_null_end(wconn, vanished_null_end, snipes, now_dt, now)
 
-    await _resolve_vanished_null_end_bids(db, snipes, gixen_item_ids, now_dt, now)
-
-    db.commit()
-
-    _insert_web_added_bids(db, snipes)
+            # Web-added inserts join the same transaction (BUI-410) — read
+            # existing_ids on wconn so it sees this cycle's own transitions.
+            _insert_web_added_bids(wconn, snipes)
 
     return snipes
 
@@ -812,14 +897,15 @@ async def _sync_loop() -> None:
             consecutive_failures += 1
             last_error = e
         except Exception as e:
-            # BUI-391: roll back the shared singleton connection, matching
-            # api_sync (BUI-386). _sync_gixen batches its DML into one
-            # end-of-cycle commit, so an unexpected mid-cycle failure can leave
-            # stray uncommitted writes that the next successful cycle's commit
-            # would otherwise absorb. Read the global directly (not the local
-            # `db`, unbound if _sync_client was None or _get_db() itself raised).
-            if _db is not None:
-                _db.rollback()
+            # BUI-410 (Stage 3 landed): the BUI-391 `_db.rollback()` that used
+            # to live here is retired. _sync_gixen no longer batches DML on the
+            # shared singleton `_db` — every write goes through its own
+            # write_transaction() (which rolls back + closes itself on any
+            # exception), and the gather phase only READS `_db`. So an
+            # unexpected failure can no longer leave stray uncommitted sync
+            # writes for the next cycle's commit to absorb; there is nothing to
+            # roll back. Per-caller rollback net superseded — see
+            # docs/solutions/conventions/shared-singleton-connection-rollback-on-unexpected-exception.md.
             logger.exception("_sync_loop: unexpected error, continuing")
             consecutive_failures += 1
             last_error = e
@@ -924,11 +1010,12 @@ async def _ensure_fresh_sync() -> None:
             async with _api_lock:
                 await _sync_gixen(db, _api_client)
         except Exception:
-            # BUI-391: roll back the shared singleton connection, matching
-            # api_sync (BUI-386) and _sync_loop — an unexpected mid-cycle
-            # failure can leave _sync_gixen's not-yet-committed batch stranded
-            # on the connection for the next successful cycle's commit to absorb.
-            db.rollback()
+            # BUI-410 (Stage 3 landed): the BUI-391 `db.rollback()` here is
+            # retired — _sync_gixen no longer writes the shared `_db` (all DML
+            # goes through its own write_transaction(), the gather phase only
+            # reads), so there is no stranded batch to roll back. Superseded
+            # per-caller rollback convention — see
+            # docs/solutions/conventions/shared-singleton-connection-rollback-on-unexpected-exception.md.
             logger.exception("_ensure_fresh_sync: gixen pull failed")
             return
         _last_sync_at = datetime.now(timezone.utc).timestamp()
@@ -1664,16 +1751,15 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             async with _api_lock:
                 await _sync_gixen(db, _api_client)
         except Exception as e:
-            # BUI-399: same rollback-on-unexpected-exception guard as
-            # api_sync (BUI-386) / api_purge. Gixen already accepted the
-            # modify by this point (_modify_with_cache_fallback above), but
-            # an unexpected bug in this post-modify sync's DML batch must not
-            # leave stray uncommitted writes stranded on the shared singleton
-            # connection for a later sync's commit to absorb. reraise=False
-            # here (the default) already keeps GixenConnectionError/GixenError
-            # from reaching this except, so only a genuine unexpected bug
-            # lands here.
-            db.rollback()
+            # BUI-410 (Stage 3 landed): the BUI-399 `db.rollback()` here is
+            # retired — this post-modify _sync_gixen no longer writes the
+            # shared `_db` (its DML is on its own write_transaction(); the
+            # gather phase only reads), so there is no stranded batch to roll
+            # back. reraise=False (the default) still keeps
+            # GixenConnectionError/GixenError out of this except, so only a
+            # genuine unexpected bug lands here. Superseded per-caller rollback
+            # convention — see
+            # docs/solutions/conventions/shared-singleton-connection-rollback-on-unexpected-exception.md.
             logger.exception(
                 "api_edit_bid: unexpected error during post-modify sync"
             )
@@ -1683,10 +1769,11 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         # _sync_gixen ingests with the snipe's existing max_bid from Gixen,
         # but we want the user-supplied value to win. Re-apply locally.
         # BUI-408: await-free write, entered after _sync_gixen's await above
-        # completed — its own short-lived write_transaction() under
-        # _write_lock. (_sync_gixen itself is untouched here — Stage 3
-        # territory.) Read-back on `wconn` too, inside the block — same
-        # staleness reasoning as the main write above.
+        # completed — its own short-lived write_transaction() under _write_lock.
+        # (_sync_gixen is itself now gather-then-apply under _write_lock too —
+        # BUI-410 — so this re-apply serializes cleanly behind the sync's own
+        # commit.) Read-back on `wconn` too, inside the block — same staleness
+        # reasoning as the main write above.
         async with _write_locked():
             with write_transaction(_get_db_path()) as wconn:
                 update_bid(wconn, item_id, req.max_bid, req.bid_offset, req.snipe_group)
@@ -1752,13 +1839,13 @@ async def api_sync():
         logger.warning("api_sync: Gixen sync failed: %s", e)
         raise HTTPException(status_code=503, detail=str(e)) from e
     except Exception as e:
-        # _sync_gixen batches its DML into one commit at the end of the
-        # cycle (see its own callees' "caller must conn.commit()" contracts),
-        # so a bug partway through the loop can leave uncommitted writes on
-        # this process-wide singleton connection (_get_db()). Roll back so a
-        # genuine server bug doesn't silently smuggle a partial cycle's
-        # writes into whatever the *next* successful sync happens to commit.
-        db.rollback()
+        # BUI-410 (Stage 3 landed): the BUI-386 `db.rollback()` here is retired
+        # — _sync_gixen no longer batches DML on the shared singleton `_db`
+        # (all writes go through its own write_transaction(), the gather phase
+        # only reads), so a genuine server bug can no longer strand a partial
+        # cycle's writes for the next sync to smuggle in. Superseded per-caller
+        # rollback convention — see
+        # docs/solutions/conventions/shared-singleton-connection-rollback-on-unexpected-exception.md.
         logger.exception("api_sync: unexpected error during sync")
         raise HTTPException(
             status_code=500, detail="sync failed: internal error"
@@ -1776,16 +1863,15 @@ async def api_purge(req: PurgeRequest):
         async with _api_lock:
             gixen_snipes = await _sync_gixen(db, _api_client)
     except Exception as e:
-        # BUI-399: roll back the shared singleton connection, matching
-        # api_sync (BUI-386) / _ensure_fresh_sync + _sync_loop (BUI-391).
-        # _sync_gixen batches its DML into one end-of-cycle commit, so an
-        # unexpected mid-cycle bug can leave stray uncommitted writes on this
-        # process-wide connection (_get_db()) for whatever the next
-        # successful sync happens to commit. reraise=False here (the default)
-        # already keeps GixenConnectionError/GixenError from reaching this
-        # except — _sync_gixen swallows those internally and returns [] — so
-        # only a genuine unexpected bug lands here.
-        db.rollback()
+        # BUI-410 (Stage 3 landed): the BUI-399 `db.rollback()` here is retired
+        # — _sync_gixen no longer batches DML on the shared singleton `_db`
+        # (all writes go through its own write_transaction(), the gather phase
+        # only reads), so an unexpected bug can no longer strand a partial
+        # cycle's writes on `_db`. reraise=False (the default) still keeps
+        # GixenConnectionError/GixenError out of this except (_sync_gixen
+        # swallows those and returns []), so only a genuine unexpected bug
+        # lands here. Superseded per-caller rollback convention — see
+        # docs/solutions/conventions/shared-singleton-connection-rollback-on-unexpected-exception.md.
         logger.exception("api_purge: unexpected error during pre-purge sync")
         raise HTTPException(
             status_code=500, detail="purge failed: internal error"

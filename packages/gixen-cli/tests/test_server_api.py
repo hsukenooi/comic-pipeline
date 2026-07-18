@@ -1522,10 +1522,11 @@ def _read_row_by_id(row_id):
 
 
 def test_vanished_null_end_ended_write_spares_resolved_sibling_sharing_item_id(api, monkeypatch):
-    """BUI-390: _resolve_vanished_null_end_bids' ENDED write must id-target the
-    row it is resolving, not stamp every row sharing the item_id. Pre-fix, its
-    item_id-wide update_bid_status would also clobber an older resolved WON
-    sibling — the BUI-178 class the sync-loop writes (BUI-388) already guard."""
+    """BUI-390: the vanished-null-end ENDED write (now _apply_vanished_null_end,
+    BUI-410) must id-target the row it is resolving, not stamp every row sharing
+    the item_id. Pre-fix, its item_id-wide update_bid_status would also clobber
+    an older resolved WON sibling — the BUI-178 class the sync-loop writes
+    (BUI-388) already guard."""
     from datetime import datetime, timedelta, timezone
     _seed_pending_null_end(api, "860000001")
     old_id, old_resolved_at = _insert_old_resolved_won_sibling("860000001")
@@ -1543,9 +1544,10 @@ def test_vanished_null_end_ended_write_spares_resolved_sibling_sharing_item_id(a
 
 
 def test_vanished_null_end_removed_write_spares_resolved_sibling_sharing_item_id(api, monkeypatch):
-    """BUI-390: _resolve_vanished_null_end_bids' REMOVED (tombstone) write must
-    id-target the row it is resolving. Pre-fix, its item_id-wide write would
-    also tombstone an older resolved WON sibling sharing the item_id."""
+    """BUI-390: the vanished-null-end REMOVED (tombstone) write (now
+    _apply_vanished_null_end, BUI-410) must id-target the row it is resolving.
+    Pre-fix, its item_id-wide write would also tombstone an older resolved WON
+    sibling sharing the item_id."""
     from datetime import datetime, timedelta, timezone
     _seed_pending_null_end(api, "860000002")
     old_id, old_resolved_at = _insert_old_resolved_won_sibling("860000002")
@@ -2241,6 +2243,152 @@ def test_tombstoned_winner_still_records_evidence(api, monkeypatch):
     assert _read_db_row("381000020")["status"] == "REMOVED"
 
 
+# ---------------------------------------------------------------------------
+# BUI-410 (Stage 3): _sync_gixen gather-then-apply. These guard the two
+# properties the gather-then-apply restructure had to preserve exactly and
+# that no pre-existing test covered: (1) the listed-win fetch budget is not
+# spent on a Case-A winner (whose evidence update_bid_status records for free),
+# so a genuinely row-less winner later in the same sync keeps its fetch — a
+# wrong answer either way reintroduces a phantom-WON; and (2) the sync commits
+# only through its own write_transaction(), never on the shared _db.
+# ---------------------------------------------------------------------------
+
+def test_listed_win_case_a_does_not_consume_fetch_budget(api, monkeypatch):
+    """The listed-win eBay fetch budget must NOT be burned on a Case-A winner
+    (one with a live PENDING row whose WON transition records the group_win
+    itself). If the pre-cycle skip predicate _listed_win_evidence_already_covered
+    were wrong and fetched Case-A winners, budget=1 would be exhausted by the
+    Case-A winner ordered first, STARVING the genuinely row-less winner behind
+    it of its one fetch — leaving that winner's cancelled sibling to phantom-WON
+    (the exact BUI-146/371 failure). With the correct predicate, the Case-A
+    winner is skipped (no fetch, no budget) and the row-less winner is fetched."""
+    import server.main as m
+    # Case-A winner: a live PENDING row (group 2) with a genuine end, so its
+    # WON transition records its own ledger entry via update_bid_status.
+    _seed_bid_row("410000001", snipe_group=2, auction_end_at=_iso_ago(days=1))
+    # Row-less (Case-B) winner: group 3, no DB row.
+    calls = _arm_ebay_counting(monkeypatch, _iso_ago(days=1))
+    monkeypatch.setattr(m, "_LISTED_WIN_FETCH_MAX_PER_SYNC", 1)
+    api.mock_gixen.list_snipes.return_value = [
+        # Case-A winner listed FIRST — if it wrongly consumed the budget, the
+        # row-less winner below would be starved.
+        _gixen_listing("410000001", status="WON", time_to_end="ENDED",
+                       snipe_group="2", current_bid="20.00 USD"),
+        _gixen_listing("410000002", status="WON", time_to_end="ENDED",
+                       snipe_group="3", current_bid="20.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    # Only the row-less winner was fetched — the Case-A winner was skipped
+    # pre-fetch, so the single budget slot went to the winner that needs it.
+    assert calls == ["410000002"]
+    # Both winners still leave ledger evidence: the Case-A one via
+    # update_bid_status (from its stored end), the row-less one via the fetch.
+    assert _read_db_row("410000001")["status"] == "WON"
+    assert _group_win_row("410000001") is not None
+    assert _group_win_row("410000002") is not None
+
+
+def test_sync_routes_all_writes_off_shared_db(api, _db_untouched):
+    """BUI-410 core isolation property: a full _sync_gixen cycle that applies a
+    real terminal transition commits ONLY on its own write_transaction()
+    connection — never on the shared singleton _db (whose bleed-across-await
+    this whole rollout exists to remove). The transition still lands durably
+    (read back via a SEPARATE connection to prove the cross-connection commit
+    is visible, not just the app's own connection seeing its uncommitted work)."""
+    api.post("/api/bids", json={"item_id": "410000010", "max_bid": 50.0})
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("410000010", status="WON", time_to_end="ENDED",
+                       snipe_group="0", current_bid="42.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _db_untouched.commits == 0, (
+        "the shared _db was committed by _sync_gixen — it must route through "
+        "write_transaction() only (BUI-410)"
+    )
+    row = _dbconn().execute(
+        "SELECT status, winning_bid FROM bids WHERE item_id='410000010'"
+    ).fetchone()
+    assert row["status"] == "WON"
+    assert row["winning_bid"] == 42.0
+
+
+def test_web_added_bid_insert_survives_bad_bid_offset(api):
+    """BUI-410 companion to test_web_added_bid_insert_survives_bad_snipe_group:
+    a brand-new web-added snipe whose bid_offset is an unparseable scrape quirk
+    ('N/A') must not crash the sync — it inserts with the default offset 6.
+    Before Stage 3 an int('N/A') here only failed the (already-committed)
+    web-add; now _insert_web_added_bids runs inside _sync_gixen's single
+    write_transaction(), so an unguarded crash would abort the whole cycle."""
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "410200001", "max_bid": "30.00 USD", "current_bid": "5.00 USD",
+        "status": "SCHEDULED", "time_to_end": "2h", "seller": "s",
+        "snipe_group": "0", "bid_offset": "N/A",
+    }]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("410200001")["status"] == "PENDING"
+    assert _read_col("410200001", "bid_offset") == 6
+
+
+def test_bad_bid_offset_web_add_does_not_abort_cycle_evidence(api):
+    """BUI-410 regression guard (found by code review): a malformed bid_offset
+    on ONE web-added snipe must not discard the rest of the cycle's committed
+    work. A WON transition applied earlier in the SAME sync (and its group_wins
+    evidence) must survive even though a co-listed web-added snipe carries an
+    unparseable bid_offset. Pre-fix, the int('N/A') ValueError aborted the whole
+    write_transaction(), reverting the WON row to PENDING and dropping its ledger
+    entry — leaving a cancelled sibling exposed to the fallback's phantom-WON."""
+    _seed_bid_row("410200010", snipe_group=3, auction_end_at=_iso_ago(days=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("410200010", status="WON", time_to_end="ENDED",
+                       snipe_group="3", current_bid="20.00 USD"),
+        {"item_id": "410200011", "max_bid": "10.00 USD", "current_bid": "1.00 USD",
+         "status": "SCHEDULED", "time_to_end": "3h", "seller": "s",
+         "snipe_group": "0", "bid_offset": "N/A"},
+    ]
+    assert api.post("/api/sync").status_code == 200
+    # The WON transition + its ledger survived (the cycle was not aborted).
+    assert _read_db_row("410200010")["status"] == "WON"
+    assert _group_win_row("410200010") is not None
+    # ...and the malformed web-added snipe still inserted with the default offset.
+    assert _read_db_row("410200011")["status"] == "PENDING"
+    assert _read_col("410200011", "bid_offset") == 6
+
+
+def test_listed_win_divergent_group_records_under_listed_group(api, monkeypatch):
+    """BUI-410 _listed_win_evidence_already_covered divergent-group branch
+    (flagged untested by code review): a winner whose newest DB row is a
+    non-tombstone terminal row carrying a DIFFERENT group than Gixen now lists
+    (it resolved before its group was known) must still get eBay-backed ledger
+    evidence recorded under the LISTED group — so a sibling in the listed group
+    classifies REMOVED. The pre-cycle predicate must return False (fetch) here;
+    a wrong skip would drop the evidence and phantom-WON the sibling."""
+    # Winner: an ENDED row from a prior cycle carrying group 5, now listed WON
+    # under group 7 (the divergent-group case — refresh_snipe_group skips the
+    # non-PENDING row, so its stored group stays 5).
+    _seed_bid_row("410300001", status="ENDED", snipe_group=5,
+                  auction_end_at=_iso_ago(days=1))
+    # Sibling in the LISTED group (7), cancelled and reaching its own end.
+    _seed_bid_row("410300002", snipe_group=7, auction_end_at=_iso_ago(hours=1))
+    _arm_ebay(monkeypatch, _iso_ago(days=1))  # winner's true end, from eBay
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("410300001", status="WON", time_to_end="ENDED",
+                       snipe_group="7", current_bid="20.00 USD"),
+        _gixen_listing("410300002", status="CANCELLED", time_to_end="ENDED",
+                       snipe_group="7"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_db_row("410300001")["status"] == "WON"
+    # Evidence recorded under the LISTED group (7), not the stale stored group 5.
+    conn = _dbconn()
+    g7 = conn.execute(
+        "SELECT 1 FROM group_wins WHERE item_id='410300001' AND snipe_group=7"
+    ).fetchone()
+    conn.close()
+    assert g7 is not None
+    # ...and it classified the group-7 sibling REMOVED.
+    assert _read_db_row("410300002")["status"] == "REMOVED"
+
+
 def test_parse_snipe_group_variants():
     """Blank/absent/unparseable → None (unknown — never coerced to the
     positive 'no group' claim); genuine values, including '0', parse."""
@@ -2607,12 +2755,15 @@ def test_sync_gixen_gixenerror_log_wording_matches_reraise(monkeypatch):
     assert all("reraised" in line and "suppressed" not in line for line in gx)
 
 
-def test_background_entry_points_rollback_on_unexpected_exception(monkeypatch):
-    """BUI-391: _ensure_fresh_sync and _sync_loop must roll back the shared
-    singleton connection when _sync_gixen raises an unexpected (non-Gixen)
-    exception mid-cycle — the api_sync discipline (BUI-386). _sync_gixen batches
-    its DML into one end-of-cycle commit, so without the rollback a partial
-    cycle's uncommitted writes could ride along on the next successful commit."""
+def test_background_entry_points_swallow_unexpected_exception_without_db_rollback(monkeypatch):
+    """BUI-410 (Stage 3 landed): _ensure_fresh_sync and _sync_loop must still
+    SWALLOW an unexpected (non-Gixen) exception from _sync_gixen and degrade
+    (not propagate), but they no longer reach for `_db.rollback()`. The BUI-391
+    rollback is retired because _sync_gixen no longer batches DML on the shared
+    singleton `_db` — its writes are on its own write_transaction() (rolled
+    back + closed by that factory on error) and its gather phase only reads
+    `_db`, so there is no stranded partial cycle to roll back. This test guards
+    both halves: the exception is handled, and `_db.rollback()` is NOT called."""
     import asyncio
     from unittest.mock import MagicMock
     import server.main as m
@@ -2640,7 +2791,7 @@ def test_background_entry_points_rollback_on_unexpected_exception(monkeypatch):
         await m._ensure_fresh_sync()  # must swallow (degrade), not raise
         return spy.rollbacks
 
-    assert asyncio.run(ensure_case()) == 1
+    assert asyncio.run(ensure_case()) == 0
 
     # --- _sync_loop (one background iteration) ---
     async def loop_case():
@@ -2657,15 +2808,17 @@ def test_background_entry_points_rollback_on_unexpected_exception(monkeypatch):
             pass
         return spy.rollbacks
 
-    assert asyncio.run(loop_case()) >= 1
+    assert asyncio.run(loop_case()) == 0
 
 
 # ---------------------------------------------------------------------------
-# BUI-399: api_purge and api_edit_bid must apply the same
-# rollback-on-unexpected-exception guard around their _sync_gixen calls as
-# api_sync (BUI-386) and the background entry points (BUI-391) — generalizing
-# the discipline to every coroutine that mutates the shared singleton
-# connection via _sync_gixen.
+# BUI-410 (Stage 3 landed): api_purge and api_edit_bid no longer roll back the
+# shared singleton connection around their _sync_gixen calls — the BUI-386/391/
+# 399 per-caller rollback net is superseded now that _sync_gixen writes only
+# through its own write_transaction() (see the convention doc). These still
+# guard that an unexpected bug is reported as a structured 500 (not an
+# unhandled crash) — just WITHOUT a `_db.rollback()`, since there is no
+# stranded partial cycle on `_db` to discard.
 # ---------------------------------------------------------------------------
 
 
@@ -2690,13 +2843,13 @@ class _RollbackSpy:
         self._real.rollback()
 
 
-def test_api_purge_rolls_back_on_unexpected_sync_error(api, monkeypatch):
-    """api_purge's pre-purge sync must roll back the shared singleton
-    connection on a genuine unexpected bug (not a GixenError — _sync_gixen's
-    default reraise=False already swallows those internally), matching
-    api_sync (BUI-386). _sync_gixen batches its DML into one end-of-cycle
-    commit, so without the rollback a partial cycle's writes could ride along
-    on a later successful sync's commit."""
+def test_api_purge_reports_500_on_unexpected_sync_error_without_db_rollback(api, monkeypatch):
+    """api_purge's pre-purge sync must still report a structured 500 on a
+    genuine unexpected bug (not a GixenError — _sync_gixen's default
+    reraise=False swallows those internally), but BUI-410 retired the
+    accompanying `_db.rollback()`: _sync_gixen no longer batches DML on the
+    shared `_db` (its writes go through write_transaction(), the gather phase
+    only reads), so there is no stranded partial cycle to discard."""
     import server.main as m
 
     spy = _RollbackSpy(m._db)
@@ -2710,15 +2863,14 @@ def test_api_purge_rolls_back_on_unexpected_sync_error(api, monkeypatch):
     r = api.post("/api/purge", json={})
     assert r.status_code == 500
     assert r.json()["detail"]
-    assert spy.rollbacks == 1
+    assert spy.rollbacks == 0
 
 
-def test_api_edit_bid_rolls_back_on_unexpected_post_modify_sync_error(api, monkeypatch):
+def test_api_edit_bid_reports_500_on_unexpected_post_modify_sync_error_without_rollback(api, monkeypatch):
     """api_edit_bid's post-modify sync (the web-added-snipe-not-yet-ingested
-    branch) must roll back on a genuine unexpected bug, matching api_sync
-    (BUI-386) / api_purge — Gixen already accepted the modify by this point,
-    but the bookkeeping sync afterward shares the same partial-commit hazard
-    on the shared connection."""
+    branch) must still report a structured 500 on a genuine unexpected bug —
+    Gixen already accepted the modify by this point — but BUI-410 retired the
+    `_db.rollback()`: the post-modify _sync_gixen strands nothing on `_db`."""
     import server.main as m
 
     spy = _RollbackSpy(m._db)
@@ -2735,7 +2887,7 @@ def test_api_edit_bid_rolls_back_on_unexpected_post_modify_sync_error(api, monke
     r = api.patch("/api/bids/399000001", json={"max_bid": 25.0})
     assert r.status_code == 500
     assert r.json()["detail"]
-    assert spy.rollbacks == 1
+    assert spy.rollbacks == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2899,11 +3051,13 @@ class _DbCommitSpy:
 
 @pytest.fixture
 def _db_untouched(api, monkeypatch):
-    """See _DbCommitSpy. NOT safe to attach to a test that legitimately
-    triggers _sync_gixen (api_purge's pre-purge sync, api_edit_bid's
-    post-sync-reapply branch) — that call path commits on `_db` by design
-    (Stage 3 territory, untouched here); asserting zero commits there would
-    be a false failure, not a caught regression."""
+    """See _DbCommitSpy. As of BUI-410 (Stage 3) this is now safe to attach to
+    a test that triggers _sync_gixen too: the sync no longer commits on the
+    shared `_db` (all its DML goes through its own write_transaction(), the
+    gather phase only reads), so asserting zero `_db` commits across a sync is
+    a genuine Stage-3 regression guard, not a false failure. (The one direct
+    `_db` writer still standing is api_remove_bid's delete_bid()/commit(), so
+    keep this off the remove path.)"""
     import server.main as m
     spy = _DbCommitSpy(m._db)
     monkeypatch.setattr(m, "_db", spy)
@@ -2939,8 +3093,9 @@ def test_readd_existing_commits_under_write_lock(api, _write_lock_guard, _db_unt
 def test_edit_bid_commits_under_write_lock(api, _write_lock_guard, _db_untouched):
     """Covers api_edit_bid's main update_bid write. The item is seeded first
     so get_bid_by_item_id finds it after the modify — never falls into the
-    post-sync-reapply branch that legitimately commits on _db (see
-    _db_untouched's docstring), so it's safe to assert zero here too."""
+    post-sync-reapply branch (which, as of BUI-410, also commits only through
+    write_transaction(), never on `_db`), so asserting zero `_db` commits is
+    safe here."""
     api.post("/api/bids", json={"item_id": "408000003", "max_bid": 12.0})
     r = api.patch(
         "/api/bids/408000003",
@@ -3006,16 +3161,15 @@ def test_edit_bid_cache_clear_retry_commits_under_write_lock(api, monkeypatch):
     )
 
 
-def test_purge_commits_under_write_lock(api, _write_lock_guard):
+def test_purge_commits_under_write_lock(api, _write_lock_guard, _db_untouched):
     """Covers both api_purge write sites: mark_bids_purged and the sibling
     loop's delete_bid (reuses test_purge_removes_siblings' setup).
 
-    No `_db_untouched` fixture here (unlike its sibling tests above):
-    api_purge's step 1 always runs a pre-purge `_sync_gixen` (untouched,
-    Stage 3 territory), which legitimately commits on the shared `_db` at
-    its own end-of-cycle — asserting zero `_db` commits here would be a
-    false failure, not a caught regression (see `_db_untouched`'s
-    docstring)."""
+    BUI-410: api_purge's step 1 pre-purge `_sync_gixen` now routes all its DML
+    through write_transaction() too (never `_db`), so `_db_untouched` is now a
+    valid guard here — it directly proves the sync was routed off the shared
+    connection, the core Stage-3 property. mark_bids_purged + delete_bid + the
+    sync all commit under `_write_lock` (checked by `_write_lock_guard`)."""
     api.post("/api/bids", json={"item_id": "408000005", "max_bid": 50.0})
     api.mock_gixen.list_snipes.return_value = [
         {
@@ -3036,6 +3190,12 @@ def test_purge_commits_under_write_lock(api, _write_lock_guard):
     assert r.json()["removed_siblings"] == 1
     assert _write_lock_guard
     assert all(_write_lock_guard)
+    # BUI-410: the pre-purge _sync_gixen (which set 408000005 WON) committed
+    # only on its own write_transaction() connection, never on the shared _db.
+    assert _db_untouched.commits == 0, (
+        "the shared _db was committed during purge — _sync_gixen must route "
+        "through write_transaction() only (BUI-410)"
+    )
 
 
 def test_add_bid_integrity_recovery_commits_under_write_lock(api, monkeypatch):
@@ -3138,11 +3298,11 @@ def test_edit_bid_post_sync_reapply_commits_under_write_lock(api, monkeypatch):
     equivalent here — kept manual for consistency with the other two
     call-site tests above.
 
-    No `_DbCommitSpy`/`_db_untouched` check here: this branch's whole POINT
-    is running `_sync_gixen` (untouched, Stage 3 territory), which
-    legitimately commits on the shared `_db` at its own end-of-cycle — see
-    `_db_untouched`'s docstring for why asserting zero there would be a
-    false failure, not a caught regression.
+    BUI-410: this branch's whole POINT is running `_sync_gixen`, which as of
+    Stage 3 commits only through its own write_transaction() (a _Checking
+    connection here, so its commit is one of the `record` entries and is
+    asserted to be under `_write_lock` too) — it no longer commits on the
+    shared `_db`.
     """
     import server.db as db_module
 
