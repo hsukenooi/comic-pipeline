@@ -70,6 +70,11 @@ The round-trip that mirrors the Collection up to LOCG and reconciles it back: ex
 
 The export is **owned-safe**: it never instructs LOCG to un-collect a book you own. LOCG's bulk import treats an `In Collection=0` row as "remove from collection," so the export pushes only genuinely-new wishes you do not already own. The re-import is reconciliation-based: it matches a pending Win-Sourced Entry to its LOCG counterpart even when LOCG has canonicalized the publisher or release date, and never creates a duplicate-identity entry. As of BUI-208 the up-CSV is **wins-only by default** — the code refuses to emit any `In Collection=0` row unless an explicit owned-safe wish push is requested (a machine-enforced gate, on top of the human-reviewed LOCG import preview). There is **no row-count limit** on uploads; the importer hangs only on incomplete/dateless rows (the old "≤20 rows" advice was a misdiagnosis).
 
+### Conflicts Audit
+The audit of the Wish List for entries you already own, so a Collection Sync's wish push can drop them before uploading (`GET /api/comics/wish-list/conflicts`, BUI-130). It is a **surfacing** layer, not a data-safety guard: it decides which wishes to *show*, and its removal half deletes only from the **Wish List**, never from the Collection.
+
+The guarantee that an owned book is never sent to LOCG for deletion lives entirely in the **owned-safe export** (above), independently and **year-blind** — so a mistake in this audit can only fail to clean a wish, never delete an owned book. The audit is year-blind by default (a Wish List name carries no year), which lets it match a wish against the wrong volume/era of the same issue number; since BUI-387 a wish may carry an optional per-issue **Cover Year** that scopes its check to the matching volume (an unstamped wish stays year-blind — the safe over-flagging default). It is also **Printing**-aware: a printing-conflict match is held out of the removable set rather than swept as a duplicate.
+
 ## Bidding & Snipes
 
 ### Snipe
