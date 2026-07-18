@@ -2084,6 +2084,66 @@ def test_cmd_wish_list_add_distinct_volume_still_appends(tmp_path):
     assert "X-Men #1" in names
 
 
+def test_cmd_wish_list_add_second_printing_not_deduped_against_base(tmp_path):
+    """BUI-403: wish-listing a 2nd printing when the base is already wished is
+    NOT a duplicate — they're distinct printings, both genuinely wanted. Prior
+    to BUI-403 this silently no-opped (the base's (series, issue) key matched),
+    dropping the printing the user actually asked for — the BUI-122-class
+    data-loss direction (a wanted book never gets added)."""
+    from locg.commands import cmd_wish_list_add, cmd_wish_list_from_cache
+
+    _make_wish_list_cache(tmp_path)  # includes bare "Amazing Spider-Man #300"
+    result = cmd_wish_list_add("Amazing Spider-Man #300 2nd Printing")
+
+    assert result["status"] == "ok"
+    names = {it["name"] for it in cmd_wish_list_from_cache()}
+    assert "Amazing Spider-Man #300 2nd Printing" in names
+    assert "Amazing Spider-Man #300" in names
+
+
+def test_cmd_wish_list_add_base_not_deduped_against_existing_second_printing(tmp_path):
+    """BUI-403 reverse direction: wish-listing the base when a 2nd printing is
+    already wished is also NOT a duplicate."""
+    from locg.commands import cmd_wish_list_add, cmd_wish_list_from_cache
+
+    _make_wish_list_cache(
+        tmp_path,
+        items=[{"name": "Amazing Spider-Man #300 2nd Printing", "id": None,
+                "series_name": "Amazing Spider-Man"}],
+    )
+    result = cmd_wish_list_add("Amazing Spider-Man #300")
+
+    assert result["status"] == "ok"
+    names = {it["name"] for it in cmd_wish_list_from_cache()}
+    assert "Amazing Spider-Man #300" in names
+    assert "Amazing Spider-Man #300 2nd Printing" in names
+
+
+def test_cmd_wish_list_add_same_printing_still_deduped(tmp_path):
+    """BUI-403 guard against under-dedup: a genuine same-printing duplicate —
+    including a differently-SPELLED marker for the same ordinal ("2nd Ptg" vs
+    "2nd Printing") — must still be caught as a duplicate, not appended as a
+    second row."""
+    from locg.commands import cmd_wish_list_add, cmd_wish_list_from_cache
+
+    seeded = _make_wish_list_cache(
+        tmp_path,
+        items=[{"name": "Amazing Spider-Man #300 2nd Printing", "id": None,
+                "series_name": "Amazing Spider-Man"}],
+    )
+    result = cmd_wish_list_add("Amazing Spider-Man #300 2nd Ptg")
+
+    assert result["status"] == "exists"
+    assert result["existing"]["name"] == "Amazing Spider-Man #300 2nd Printing"
+    items = cmd_wish_list_from_cache()
+    assert len(items) == len(seeded)  # no duplicate row appended
+
+    # And the exact same marker/spelling is caught too.
+    result2 = cmd_wish_list_add("Amazing Spider-Man #300 2nd Printing")
+    assert result2["status"] == "exists"
+    assert len(cmd_wish_list_from_cache()) == len(seeded)
+
+
 # ---------------------------------------------------------------------------
 # cmd_wish_list_add_creator_run (BUI-134)
 # ---------------------------------------------------------------------------
