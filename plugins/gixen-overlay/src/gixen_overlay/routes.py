@@ -1166,7 +1166,13 @@ async def api_wish_list(title: str | None = None):
     """Wish-list read (R3) for seller-scan to match against. Returns
     ``[{name, id, ...}]``. A never-imported wish-list (FileNotFoundError) yields
     an empty list: an empty wish-list is a correct, non-dangerous answer (a miss
-    only fails to surface a wanted book; it cannot buy a dupe)."""
+    only fails to surface a wanted book; it cannot buy a dupe).
+
+    BUI-387: entries are returned verbatim, so a year-scoped wish now also
+    carries its per-issue ``year`` (Cover Year) field — seller-scan can read it
+    to narrow a match to the wanted volume. It is absent on unstamped (pre-387)
+    wishes; a consumer must treat a missing ``year`` as year-blind, never as a
+    signal to reject."""
     _ensure_collection_store()
     try:
         return cmd_wish_list_from_cache(title)
@@ -1770,7 +1776,14 @@ async def api_wish_list_add(req: WishListAddRequest):
     # printing/variant that shares series + issue (mirrors the owned-guard's own
     # force bypass above). Passing it is load-bearing: without it, a force add
     # would still be silently no-op'd by the callee's dedup.
-    result = cmd_wish_list_add(req.title, force=req.force)
+    #
+    # BUI-387: req.year is now also PERSISTED on the new entry (a separate `year`
+    # field, the issue's per-issue Cover Year — never year_began, BUI-129), not
+    # just used for the owned-guard above. Stamping it lets the conflicts audit
+    # year-scope this wish so a vintage want no longer re-flags against an owned
+    # modern volume every audit. req.year is None for an issue with no cover date
+    # → an unstamped, year-blind entry (today's behavior, unchanged).
+    result = cmd_wish_list_add(req.title, force=req.force, year=req.year)
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
     return result

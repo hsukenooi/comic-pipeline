@@ -628,8 +628,42 @@ def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]
     return items
 
 
+def _normalize_wish_year(year: Optional[str]) -> Optional[str]:
+    """Normalize + validate an optional per-issue Cover Year for a wish entry.
+
+    Returns the 4-digit year string (stripped) when valid, ``None`` when the
+    input is None/empty (an unstamped wish — the safe year-blind default).
+    Raises ``ValueError`` for a non-4-digit value (e.g. a ``"1963 - 2011"``
+    year-RANGE paste — the BUI-129 ``year_began`` trap — or other garbage).
+
+    BUI-387: shared by EVERY write path that PERSISTS a year — the CLI/endpoint
+    add (:func:`_wish_list_add_to_items`) and the backfill
+    (:func:`cmd_wish_list_set_year`) — so a malformed year is rejected
+    identically at all of them, never silently stored to later mis-scope the
+    conflicts audit. It CANNOT catch a valid-but-wrong 4-digit year (a start
+    year that happens to be 4 digits); that stays the caller's BUI-129
+    responsibility (pass the issue's OWN cover year). A mis-scoped stamp is not
+    a data-loss risk regardless — the export-side owned-safe filter
+    (``wish_rows_for_export``) is year-blind and independently refuses to emit
+    an ``In Collection=0`` row for any owned book — it only means the audit
+    fails to surface that wish for cleanup.
+    """
+    if year is None:
+        return None
+    year = str(year).strip()
+    if not year:
+        return None
+    if not re.fullmatch(r"\d{4}", year):
+        raise ValueError(
+            f"year must be a 4-digit Cover Year (got {year!r}); pass the issue's "
+            "own cover year, never a series start year or range (BUI-129)."
+        )
+    return year
+
+
 def _wish_list_add_to_items(
-    title: str, items: list[dict[str, Any]], force: bool = False
+    title: str, items: list[dict[str, Any]], force: bool = False,
+    year: Optional[str] = None,
 ) -> dict[str, Any]:
     """In-memory core of a single wish-list add: dedup-check + append, no I/O.
 
@@ -641,17 +675,39 @@ def _wish_list_add_to_items(
     ``cmd_wish_list_add`` returns for its dedup/append branches, minus the
     ``path`` key (no write happened here — the caller writes once, after
     resolving every title).
+
+    BUI-387: ``year`` is the entry's optional per-issue **Cover Year** — the
+    publication year printed on THIS issue's cover, never the series' start
+    year (``year_began`` — the BUI-129 trap that hides owned mid-run books).
+    When supplied it is stamped as a separate ``year`` field on the entry (NOT
+    encoded into ``name`` — the name parse surface, :func:`_split_wish_list_name`,
+    is left untouched), so the conflicts audit can year-scope its ownership
+    check and stop matching a vintage want against an owned modern volume.
+    When absent the entry carries no ``year`` key at all — byte-for-byte the
+    pre-387 schema — and every year-blind consumer behaves exactly as before.
     """
     title = (title or "").strip()
     if not title:
         return {"error": "wish-list add: title must be non-empty"}
+    # BUI-387: validate the year up front (before dedup) so a malformed year
+    # fails loudly here — at the shared chokepoint the CLI add, the endpoint add,
+    # and creator-run all flow through — rather than being silently persisted.
+    try:
+        year = _normalize_wish_year(year)
+    except ValueError as exc:
+        return {"error": f"wish-list add: {exc}"}
 
     if not force:
         duplicate = _find_duplicate_wish_entry(title, items)
         if duplicate is not None:
             return {"status": "exists", "existing": duplicate, "items": len(items)}
 
-    entry = {"name": title, "id": None, "source": "local"}
+    entry: dict[str, Any] = {"name": title, "id": None, "source": "local"}
+    # BUI-387: only stamp `year` when a valid Cover Year was supplied — an
+    # unstamped add keeps the exact pre-387 entry shape (no `year` key), so a
+    # never-year-stamped wish stays year-blind in the conflicts audit.
+    if year:
+        entry["year"] = year
     items.append(entry)
     return {"status": "ok", "added": entry, "items": len(items)}
 
@@ -710,13 +766,23 @@ def _write_wish_list_cache(items: list[dict[str, Any]]) -> Path:
     return path
 
 
-def cmd_wish_list_add(title: str, force: bool = False) -> dict[str, Any]:
+def cmd_wish_list_add(
+    title: str, force: bool = False, year: Optional[str] = None
+) -> dict[str, Any]:
     """Append a manual entry to the local wish-list cache.
 
     Writes ``{"name": title, "id": None, "source": "local"}`` to
     ``data/locg/wish-list.json`` using the same atomic write pattern as the rest
     of the wish-list cache writers (tempfile + os.replace + chmod 600, via
     :func:`_write_wish_list_cache`).
+
+    BUI-387: ``year`` is the optional per-issue **Cover Year** stamped on the
+    new entry (a separate ``year`` field, never encoded into ``name``). It lets
+    the conflicts audit year-scope this wish's ownership check so a vintage want
+    no longer flags against an owned modern volume. It MUST be the issue's own
+    cover year — never a series START year (``year_began``, the BUI-129 trap);
+    an unstamped add (``year=None``) keeps the exact pre-387 entry shape and
+    today's year-blind audit behavior.
 
     Manual adds carry ``source: "local"`` (BUI-208), which marks them as the
     local diff LOCG doesn't have yet. Since the LOCG import no longer rewrites
@@ -737,7 +803,7 @@ def cmd_wish_list_add(title: str, force: bool = False) -> dict[str, Any]:
     """
     items = _read_wish_list_cache_items()
 
-    result = _wish_list_add_to_items(title, items, force=force)
+    result = _wish_list_add_to_items(title, items, force=force, year=year)
     if "error" in result or result.get("status") == "exists":
         return result
 
@@ -873,7 +939,12 @@ def cmd_wish_list_add_creator_run(
             already_wishlisted.append(title)
             continue
 
-        to_add.append({"title": title, "number": number})
+        # BUI-387: carry the per-issue cover_year (already the issue's OWN cover
+        # year here — never year_began, BUI-129) so the wish entry is stamped
+        # year-scoped, matching the numeric-range path's Step 5 behavior. Metron
+        # issues with no cover_date leave `year` None → an unstamped, year-blind
+        # entry (safe default).
+        to_add.append({"title": title, "number": number, "year": cover_year})
         # BUI-313: track this queued title in `existing` too, not just the
         # on-disk cache — two run issues that normalize to the SAME
         # series+issue token (e.g. Metron reporting both "1" and "001") would
@@ -901,7 +972,9 @@ def cmd_wish_list_add_creator_run(
         write_items = _read_wish_list_cache_items()
 
         for item in to_add:
-            result = _wish_list_add_to_items(item["title"], write_items)
+            result = _wish_list_add_to_items(
+                item["title"], write_items, year=item.get("year")
+            )
             if "error" in result:
                 errors.append({"title": item["title"], "error": result["error"]})
             elif result.get("status") == "exists":
@@ -1098,11 +1171,13 @@ def _split_wish_list_name(name: str) -> Optional[tuple[str, str]]:
     printing-aware ownership comparison must not treat that silence as "no
     marker" — see :func:`_wish_list_name_printing_variant`, which re-derives
     the marker from the same raw ``name`` via the shared BUI-373 detector.
-    Kept as a 2-tuple deliberately (not widened here) so this split's only
-    two current call sites (:func:`_find_duplicate_wish_entry`'s dedup and
-    this docstring's own test) stay unchanged; BUI-387's planned per-issue-year
-    extension can widen this return independently without colliding with the
-    printing-marker fix.
+    Kept as a 2-tuple deliberately (not widened here). BUI-387 (per-issue year
+    scoping) deliberately did NOT widen this either: a wish's Cover Year is a
+    SEPARATE stored ``year`` field on the entry dict, never encoded into the
+    ``name`` this parser splits — so the audit reads ``it.get("year")`` directly
+    and this parse surface (and BUI-379's printing-marker sibling) stays
+    untouched. The split's only two call sites (:func:`_find_duplicate_wish_entry`'s
+    dedup and this docstring's own test) therefore stay unchanged.
     """
     series, issue = split_series_issue_for_ownership(name or "")
     series = series.strip()
@@ -1183,19 +1258,26 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
     BUI-122 data-loss risk: ``/comic:collection-sync`` exports it with
     ``In Collection=0``, which tells LOCG to *remove* it from the collection.
 
-    ``year`` is deliberately NOT passed to :func:`cmd_collection_check`: a
-    wish-list name carries only series + issue, never a per-issue cover date,
-    and forwarding a series start-year is exactly the BUI-129 bug (it filters
-    out every owned row whose release year differs). Consequently this audit
-    can land on the WRONG volume/era of a same-numbered issue (BUI-266: a
-    decoy UK-reprint "The Avengers (1973 - 1976)" #52 matched against an owned
-    1968 Vol. 1, and a base "Uncanny X-Men #201" wish matched an owned
-    Newsstand copy). Each conflict therefore carries the SAME BUI-249
-    provenance fields ``cmd_collection_check`` returns (``series_name``,
-    ``release_date`` of the matched row) so a caller can visually catch a
-    cross-era/cross-edition false match before removing it — see
-    :func:`cmd_wish_list_remove_conflicts`, which is the removal half of this
-    audit and never removes anything not surfaced here first.
+    BUI-387: ``year`` is now forwarded to :func:`cmd_collection_check` PER WISH
+    — but only a wish's OWN stamped per-issue Cover Year (``it.get("year")``,
+    written at add time from the issue's cover date, never a series start year
+    — the BUI-129 trap). A year-scoped wish therefore only conflicts with the
+    matching-volume owned copy: a vintage grail (e.g. "The X-Men #1" stamped
+    1963) no longer flags against an owned modern volume (a 1991/2018 copy),
+    clearing the permanent cross-volume decoys structurally. An UNSTAMPED wish
+    (no ``year`` field — the pre-387 shape) forwards ``year=None`` and keeps the
+    exact year-blind behavior below, so an un-backfilled wish still matches
+    ANY owned volume of its issue number (the safe, BUI-122-preserving default:
+    it can over-flag a cross-era decoy, never miss an owned book). This audit
+    can therefore still land on the WRONG volume/era of a same-numbered
+    *unstamped* issue (BUI-266: a decoy UK-reprint "The Avengers (1973 - 1976)"
+    #52 matched against an owned 1968 Vol. 1, and a base "Uncanny X-Men #201"
+    wish matched an owned Newsstand copy). Each conflict therefore carries the
+    SAME BUI-249 provenance fields ``cmd_collection_check`` returns
+    (``series_name``, ``release_date`` of the matched row) so a caller can
+    visually catch a cross-era/cross-edition false match before removing it —
+    see :func:`cmd_wish_list_remove_conflicts`, which is the removal half of
+    this audit and never removes anything not surfaced here first.
 
     BUI-372: a match whose ``printing_conflict`` is True is NOT a genuine
     conflict — it means the matched owned row is a DIFFERENT printing than
@@ -1241,11 +1323,20 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
         series, issue = parsed
         checked += 1
         variant = _wish_list_name_printing_variant(name)
-        result = cmd_collection_check(series=series, issue=issue, variant=variant)
-        # BUI-284: ambiguous_cross_volume counts as owned here — this audit is
-        # always year-free (a wish name has no cover date), so an owned-under-
-        # multiple-volumes book returns ambiguous, and missing it would let the
-        # owned copy get exported In Collection=0 and deleted (BUI-122).
+        # BUI-387: forward this wish's OWN stamped Cover Year (or None if never
+        # stamped — the pre-387 year-blind path). A stamped year resolves the
+        # volume via the release-date gate; an unstamped wish stays year-blind.
+        wish_year = it.get("year")
+        result = cmd_collection_check(
+            series=series, issue=issue, variant=variant, year=wish_year,
+        )
+        # BUI-284: ambiguous_cross_volume counts as owned here. For an UNSTAMPED
+        # wish (year=None) the audit is year-free, so an owned-under-multiple-
+        # volumes book returns ambiguous and missing it would let the owned copy
+        # get exported In Collection=0 and deleted (BUI-122). For a STAMPED wish
+        # (BUI-387) the cover year resolves the collision via the release-date
+        # gate, so ambiguous won't fire — but treating it as owned when it does
+        # stays the safe direction either way.
         if collection_check_reports_owned(result):
             entry = {
                 "name": name,
@@ -1385,6 +1476,73 @@ def cmd_wish_list_remove_conflicts(names: Optional[list[str]] = None) -> dict[st
         # BUI-372: never removed (see above) — surfaced so a caller sees what
         # was excluded as a printing decoy rather than silently dropped.
         "printing_conflicts": audit["printing_conflicts"],
+    }
+
+
+def cmd_wish_list_set_year(name: str, year: str) -> dict[str, Any]:
+    """Stamp a per-issue **Cover Year** onto an existing wish-list entry (BUI-387).
+
+    The one-time backfill primitive for the 33 permanent cross-volume decoy
+    holds (vintage grail wishes that flag every audit against an owned modern
+    volume): stamp each with its issue's own cover year and it only conflicts
+    with the matching-volume copy thereafter (see :func:`cmd_wish_list_conflicts`).
+
+    Matches on the EXACT ``name`` field (as returned by the conflicts audit /
+    ``GET /api/comics/wish-list``) and sets a ``year`` field on every matching
+    row — idempotent (re-stamping the same year is a no-op-shaped success), and
+    a re-stamp with a different year overwrites. Writes via the shared atomic
+    writer (:func:`_write_wish_list_cache`), the same one every wish-list write
+    path uses.
+
+    CRITICAL (BUI-129): ``year`` MUST be the issue's own **Cover Year**, never
+    the series START year (``year_began``). This primitive only sanity-checks
+    that ``year`` is a 4-digit year — it CANNOT tell a cover year from a start
+    year, so the caller (the documented Metron-per-issue backfill pass) owns
+    that distinction. Stamping a start year would reintroduce the exact bug that
+    hid 16 owned X-Men. When in doubt, leave the wish UNSTAMPED (it keeps
+    today's safe year-blind behavior) rather than guess.
+
+    Returns ``{status, name, year, matched}`` on success (``matched`` = rows
+    stamped, 0 if the name isn't present) or ``{error}`` for a blank name, a
+    non-4-digit year, or a missing cache.
+    """
+    name = (name or "").strip()
+    if not name:
+        return {"error": "wish-list set-year: name must be non-empty"}
+    # Same 4-digit guard as the add paths (shared helper) — rejects a range
+    # paste / garbage; a valid-but-wrong 4-digit year stays the caller's BUI-129
+    # responsibility (see the backfill process doc).
+    try:
+        year = _normalize_wish_year(year)
+    except ValueError as exc:
+        return {"error": f"wish-list set-year: {exc}"}
+    if year is None:
+        return {"error": "wish-list set-year: year is required (a 4-digit Cover Year)."}
+
+    path = wish_list_cache_path()
+    if not path.exists():
+        return {"error": f"Wish-list cache not found: {path}. Run: locg collection import"}
+
+    with open(path) as f:
+        payload = json.load(f)
+    items: list[dict[str, Any]] = payload.get("items") or []
+
+    matched = 0
+    for item in items:
+        if item.get("name") == name:
+            item["year"] = year
+            matched += 1
+
+    if matched == 0:
+        return {"error": f"wish-list set-year: '{name}' not found in cache"}
+
+    written_path = _write_wish_list_cache(items)
+    return {
+        "status": "ok",
+        "name": name,
+        "year": year,
+        "matched": matched,
+        "path": str(written_path),
     }
 
 

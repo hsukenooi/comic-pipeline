@@ -3275,6 +3275,183 @@ def test_wish_list_remove_conflicts_scoped_rejects_wish_name_printing_marker(tmp
 
 
 # ---------------------------------------------------------------------------
+# BUI-387: per-issue year-scoped wish entries
+# ---------------------------------------------------------------------------
+
+def _owned_modern_ff18_row():
+    """Owned MODERN Fantastic Four #18 (Vol. 7, 2022) — the cross-volume decoy a
+    year-blind vintage FF #18 wish falsely conflicts against (ticket example)."""
+    return _agent_win_row(
+        series="Fantastic Four (2018 - 2022)",
+        full_title="Fantastic Four #18",
+        release_date="2022-11-01",
+    )
+
+
+def test_wish_list_conflicts_year_scoped_wish_skips_modern_owned_volume(tmp_path, monkeypatch):
+    """BUI-387: a wish stamped with its vintage Cover Year (1963) no longer
+    conflicts with an owned MODERN volume of the same issue number (2022) — the
+    year gate rejects the wrong-era owned row, clearing the permanent decoy."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_owned_modern_ff18_row()])  # own ONLY the 2022 volume
+    _seed_wish_list([{"name": "Fantastic Four #18", "id": 1, "year": "1963"}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert result["checked"] == 1
+    assert result["conflicts"] == []          # year-scoped → not the owned volume
+    assert result["printing_conflicts"] == []
+
+
+def test_wish_list_conflicts_unstamped_wish_keeps_year_blind_match(tmp_path, monkeypatch):
+    """BUI-387: an UNSTAMPED wish (no `year` field — the pre-387 shape) keeps
+    today's year-blind behavior: it still flags against the owned modern volume,
+    preserving the BUI-122-safe over-flagging default so an un-backfilled wish
+    can never silently miss an owned book."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_owned_modern_ff18_row()])
+    _seed_wish_list([{"name": "Fantastic Four #18", "id": 1}])  # no year field
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["Fantastic Four #18"]
+
+
+def test_wish_list_conflicts_year_scoped_wish_still_flags_matching_volume(tmp_path, monkeypatch):
+    """BUI-387: year scoping narrows the match, it doesn't suppress real ones —
+    a wish stamped 1963 against an owned 1963 copy of that issue IS owned, so it
+    must stay a conflict (else an owned book gets exported In Collection=0 and
+    deleted, BUI-122)."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Fantastic Four (1961 - 1996)",
+        full_title="Fantastic Four #18",
+        release_date="1963-09-01",
+    )])
+    _seed_wish_list([{"name": "Fantastic Four #18", "id": 1, "year": "1963"}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["Fantastic Four #18"]
+
+
+def test_wish_list_conflicts_year_scoped_tolerates_one_year_skew(tmp_path, monkeypatch):
+    """BUI-387 reuses the existing ±1 year-gate tolerance (BUI-214/BUI-251):
+    a wish stamped 1982 against an owned copy whose release_date is 1983 (the
+    cover-vs-onsale skew — the ASM #238 incident class) still conflicts. Year
+    scoping must NOT tighten the gate into a strict equality that false-negates
+    a 1-year skew and hides an owned book."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="The Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #238",
+        release_date="1983-01-01",   # onsale slipped past the 1982 cover year
+    )])
+    _seed_wish_list([{"name": "Amazing Spider-Man #238", "id": 1, "year": "1982"}])
+
+    result = cmds.cmd_wish_list_conflicts()
+
+    assert [c["name"] for c in result["conflicts"]] == ["Amazing Spider-Man #238"]
+
+
+def test_wish_list_set_year_stamps_named_entry_only(tmp_path):
+    """BUI-387 backfill: set-year stamps the given Cover Year onto the EXACT
+    named entry and no other, and the value is stored verbatim."""
+    from locg.commands import cmd_wish_list_set_year, cmd_wish_list_from_cache
+
+    _seed_wish_list([
+        {"name": "The X-Men #1", "id": 1},
+        {"name": "The X-Men #2", "id": 2},
+    ])
+
+    result = cmd_wish_list_set_year("The X-Men #1", "1963")
+
+    assert result["status"] == "ok"
+    assert result["matched"] == 1
+    assert result["year"] == "1963"
+    items = {it["name"]: it for it in cmd_wish_list_from_cache()}
+    assert items["The X-Men #1"]["year"] == "1963"
+    assert "year" not in items["The X-Men #2"]     # only the named entry stamped
+
+
+def test_wish_list_set_year_rejects_non_four_digit_year(tmp_path):
+    """BUI-387/BUI-129 guard: set-year refuses anything that isn't a 4-digit
+    year — including the ``1963 - 2011`` series year-RANGE form, a common
+    year_began paste that would reintroduce the wrong-year data-loss bug."""
+    from locg.commands import cmd_wish_list_set_year, cmd_wish_list_from_cache
+
+    _seed_wish_list([{"name": "The X-Men #1", "id": 1}])
+
+    for bad in ["1963 - 2011", "63", "", "nineteen"]:
+        result = cmd_wish_list_set_year("The X-Men #1", bad)
+        assert "error" in result, bad
+
+    # Nothing was written on rejection.
+    assert "year" not in cmd_wish_list_from_cache()[0]
+
+
+def test_wish_list_set_year_unknown_name_is_error(tmp_path):
+    """BUI-387: naming an entry not present is an explicit error, never a silent
+    no-op that a backfill script could mistake for success."""
+    from locg.commands import cmd_wish_list_set_year
+
+    _seed_wish_list([{"name": "The X-Men #1", "id": 1}])
+
+    result = cmd_wish_list_set_year("Uncanny X-Men #500", "2008")
+
+    assert "error" in result
+    assert "not found" in result["error"]
+
+
+def test_wish_list_set_year_backfill_clears_decoy_end_to_end(tmp_path, monkeypatch):
+    """BUI-387 end-to-end: an unstamped vintage wish flags a modern-owned decoy;
+    after the set-year backfill stamps its Cover Year, a fresh audit no longer
+    flags it — the structural fix the ticket asks for."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_owned_modern_ff18_row()])
+    _seed_wish_list([{"name": "Fantastic Four #18", "id": 1}])  # unstamped
+
+    before = cmds.cmd_wish_list_conflicts()
+    assert [c["name"] for c in before["conflicts"]] == ["Fantastic Four #18"]
+
+    stamp = cmds.cmd_wish_list_set_year("Fantastic Four #18", "1963")
+    assert stamp["status"] == "ok"
+
+    after = cmds.cmd_wish_list_conflicts()
+    assert after["conflicts"] == []
+
+
+def test_wish_list_year_survives_collection_import(tmp_path, monkeypatch):
+    """BUI-387 forward-compat: a stamped `year` is durable across a
+    `collection import` (BUI-208: import no longer touches wish-list.json), so
+    the backfill isn't silently undone on the next sync."""
+    import locg.commands as cmds
+
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: make_cache(tmp_path))
+    _seed_wish_list([{"name": "The X-Men #1", "id": None, "source": "local", "year": "1963"}])
+
+    cmds.cmd_collection_import(str(SAMPLE_XLSX))  # rewrites collection cache only
+
+    items = {it["name"]: it for it in cmds.cmd_wish_list_from_cache()}
+    assert items["The X-Men #1"]["year"] == "1963"     # stamp preserved
+
+
+# ---------------------------------------------------------------------------
 # BUI-175: decimal / point-issue token regressions
 # ---------------------------------------------------------------------------
 
