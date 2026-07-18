@@ -39,6 +39,7 @@ from server.db import (
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
     refresh_snipe_group,
     TOMBSTONE_STATUSES_SQL,
+    write_transaction,
 )
 # BUI-389: the eBay-fallback/cancel-evidence cluster (_run_ebay_fallback and
 # its BUI-371 cancel-evidence helpers) was extracted to server/fallback.py to
@@ -116,13 +117,50 @@ if not _plugin_logger.handlers:
 # write-side counterpart (a fresh short-lived connection per transaction).
 # Stage 0 does not yet route any caller through write_transaction() — _db
 # still owns every write in this file, unchanged from before this ticket.
-# Stage 1+ (BUI-400 §5) is what actually moves writers off _db onto
-# write_transaction() under a short-held _write_lock. See
-# docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md.
+#
+# BUI-408 (Stage 1): the already-await-free writers (api_add_bid, api_edit_bid,
+# api_purge, _sniper_loop's set_local_snipe_result, and the overlay's
+# api_link_locg) now route through write_transaction() under the short-held
+# _write_lock below instead of _db — see _write_locked()'s docstring. The
+# cross-await writers (_run_ebay_fallback, _sync_gixen, refresh_snipe_group)
+# are UNCHANGED — they still own _db directly; that's Stage 2/3 (BUI-409/410).
+# See docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md.
+#
+# KNOWN RESIDUAL RISK for Stage 2/3 (BUI-409/410), sharpening design doc §7's
+# open sniper-timing question: because _sync_gixen can hold an open,
+# uncommitted write transaction on _db across a network await, a Stage-1
+# write_transaction() that happens to start during that window can hit
+# SQLite's single-writer-at-a-time constraint (true even in WAL mode) and
+# block on busy_timeout — and because this server is one event loop on one
+# thread, that block is NOT cooperative: it can stall the ENTIRE server
+# (every request, plus the sniper's fire path) for up to busy_timeout
+# (5000ms), not just the one racing writer, until _sync_gixen's own coroutine
+# gets a chance to resume and commit. Bounded (≤5s) and does not compound
+# across the request queue, but is a genuinely new class of stall this stage
+# introduces (the pre-Stage-1 shared connection had no such contention, only
+# the data-corruption risk this project exists to fix). Stage 3's gather-
+# then-apply rewrite of _sync_gixen removes the open-transaction-across-await
+# shape entirely, closing this. Until then, this is accepted risk, not a
+# Stage 1 defect — do not attempt to close it here without touching
+# _sync_gixen/_run_ebay_fallback (out of this stage's scope by design).
 _db: sqlite3.Connection | None = None
+# BUI-408: the resolved runtime DB path (the same value passed to init_db()
+# below), stashed so write_transaction() callers can target the correct file.
+# server.db.DB_PATH's own bare default is fixed at db.py's IMPORT time via
+# resolve_server_dir() and does NOT see the DB_PATH env-var override lifespan
+# applies (install.sh's .env pins DB_PATH explicitly to ~/.comics-server —
+# on a Mac Mini that hasn't physically migrated off the legacy
+# ~/.gixen-server yet, resolve_server_dir() would still resolve there,
+# diverging from the .env value). A write_transaction() opened on the wrong
+# path would silently write to a DIFFERENT database file than every reader —
+# always resolve through _get_db_path(), never write_transaction()'s bare
+# default.
+_db_path: Path | None = None
 _api_client: GixenClient | None = None
 _api_lock: asyncio.Lock | None = None
 _sync_lock: asyncio.Lock | None = None
+# BUI-408 (Stage 1): the single app-wide write lock — see _write_locked().
+_write_lock: asyncio.Lock | None = None
 _last_sync_at: float = 0.0
 _SYNC_TTL = 5.0  # concurrent dashboard loads within this window share one Gixen pull
 _ebay_fallback_lock: asyncio.Lock | None = None
@@ -160,6 +198,52 @@ _SYNC_BACKOFF_MAX = 3600  # cap exponential backoff at 1 hour
 def _get_db() -> sqlite3.Connection:
     assert _db is not None, "DB not initialized"
     return _db
+
+
+def _get_db_path() -> Path:
+    """The resolved runtime DB path (BUI-408) — see _db_path's module-global
+    docstring for why this must be used instead of write_transaction()'s bare
+    default. Same call-time-lookup shape as _get_db()."""
+    assert _db_path is not None, "DB path not initialized"
+    return _db_path
+
+
+@asynccontextmanager
+async def _write_locked():
+    """BUI-408 (Stage 1 of BUI-400's shared-connection isolation rollout):
+    acquire the single app-wide ``_write_lock`` — the "small helper" BUI-408
+    calls for, implementing the short-held-lock discipline
+    docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md §3
+    decides on. Bracket ONLY a ``write_transaction()`` block with this,
+    entered AFTER any network ``await`` has already completed::
+
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                ...  # fast, await-free local DML
+
+    Because at most one writer can hold ``_write_lock`` at a time, two
+    ephemeral ``write_transaction()`` connections can never overlap —
+    SQLITE_BUSY between our own writers becomes unreachable (see
+    ``write_transaction``'s docstring and
+    docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md §3).
+    NEVER hold this across a network ``await`` — that would serialize request
+    latency behind background work, exactly what Approach A was rejected for.
+
+    Exposed as a module-level function (not inlined at each call site)
+    because the overlay's ``api_link_locg`` (BUI-400 finding 1: it mutates
+    the same shared DB with no lock today) must serialize through this SAME
+    lock instance as every gixen-cli writer — a plain
+    ``from server.main import _write_lock`` would freeze on the pre-lifespan
+    ``None`` (the import happens before lifespan runs and reassigns the
+    global), so, like ``_get_db()`` does for ``_db``, this reads the live
+    module global at CALL time instead.
+    """
+    if _write_lock is None:
+        raise RuntimeError(
+            "_write_lock not initialized — server not started via lifespan"
+        )
+    async with _write_lock:
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -782,15 +866,26 @@ async def _sniper_loop() -> None:
                     logger.info("_sniper_loop: firing %d bid(s) concurrently", len(ready))
                     bids = [{"item_id": b["item_id"], "max_bid": b["max_bid"]} for b in ready]
                     results = await _bidder.place_bids_concurrent(bids)
+                    # BUI-408: one write_transaction() PER bid, not one
+                    # bundling all N — these bids were already fired
+                    # (irreversibly) on eBay above, and get_bids_ready_to_snipe
+                    # re-selects anything with local_snipe_at still NULL. A
+                    # single batched transaction would mean one bid's write
+                    # failure (e.g. a transient BUSY against the still-lock-free
+                    # _sync_gixen/_run_ebay_fallback writers) rolls back every
+                    # OTHER bid's already-successful result in the same batch,
+                    # so the next 10s tick would re-fire bids that already
+                    # placed a real bid — a duplicate submission. Each bid's
+                    # write is still fully await-free (no yield point inside
+                    # the loop body — the one await already happened above),
+                    # so per-bid locking stays cheap; matches api_purge's
+                    # sibling-removal loop, which already does one
+                    # write_transaction() per iteration for the same reason.
                     for bid, result in zip(ready, results):
                         result_str = ("OK: " if result["success"] else "ERR: ") + result["message"]
-                        set_local_snipe_result(db, bid["item_id"], fired_at, result_str)
-                        # BUI-407: set_local_snipe_result no longer
-                        # self-commits — commit here, at the same point its
-                        # self-commit used to fire (once per bid; no await
-                        # separates the iterations, so this doesn't move any
-                        # write across a yield point).
-                        db.commit()
+                        async with _write_locked():
+                            with write_transaction(_get_db_path()) as wconn:
+                                set_local_snipe_result(wconn, bid["item_id"], fired_at, result_str)
                         logger.info("_sniper_loop: %s — %s", bid["item_id"], result_str)
         except Exception:
             logger.exception("_sniper_loop: unexpected error, continuing")
@@ -844,7 +939,7 @@ def _spawn_fallback_task() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _db, _api_client, _sync_client, _api_lock, _sync_lock, _ebay_fallback_lock, _bidder
+    global _db, _db_path, _api_client, _sync_client, _api_lock, _sync_lock, _write_lock, _ebay_fallback_lock, _bidder
     if env_file := os.getenv("ENV_FILE"):
         load_dotenv(env_file)
     # Resolve the eBay fallback binary now that the .env (EBAY_FETCH_BIN, PATH)
@@ -859,10 +954,12 @@ async def lifespan(app: FastAPI):
         )
     db_path = Path(os.getenv("DB_PATH", str(DB_PATH)))
     _db = init_db(db_path)
+    _db_path = db_path  # BUI-408: write_transaction() callers resolve through this
     app.state.db = _db
     _api_client = GixenClient()
     _api_lock = asyncio.Lock()
     _sync_lock = asyncio.Lock()
+    _write_lock = asyncio.Lock()
     _ebay_fallback_lock = asyncio.Lock()
 
     # Plugin loading: discover entry-point plugins, then fire startup hooks.
@@ -1066,7 +1163,7 @@ def api_dashboard_tabs(request: Request) -> list[dict]:
 
 
 async def _modify_and_update_bid(
-    db: sqlite3.Connection, item_id: str, max_bid: float,
+    item_id: str, max_bid: float,
     bid_offset: int, snipe_group: int,
     seller: str | None = None, seller_grade: float | None = None,
     photo_grade: float | None = None,
@@ -1075,27 +1172,39 @@ async def _modify_and_update_bid(
     GixenSnipeNotFoundError so the caller owns the not-found *policy* (add falls
     back; edit 404s). Caller must already hold _api_lock — this does NOT acquire
     it, so the lookup→Gixen→DB-write sequence stays atomic (BUI-67 KTD6/KTD7).
+
+    BUI-408: no longer takes a `db` parameter — every read/write below now
+    happens on `wconn` inside the write_transaction() block (see the
+    read-after-write staleness note there), so the shared `_db` connection
+    has no legitimate use left in this function.
     """
     await asyncio.to_thread(
         _api_client.modify_snipe,
         item_id, Decimal(str(max_bid)),
         bid_offset=bid_offset, snipe_group=snipe_group,
     )
-    update_bid(db, item_id, max_bid, bid_offset, snipe_group)
-    # BUI-407: update_bid no longer self-commits — commit here, at the same
-    # point its self-commit used to fire.
-    db.commit()
-    # BUI-78 C2: fill any NULL seller/grade columns from this request without
-    # overwriting values a prior add already set.
-    update_bid_grades(db, item_id, seller=seller, seller_grade=seller_grade,
-                      photo_grade=photo_grade)
-    # BUI-407: update_bid_grades no longer self-commits — same reasoning.
-    db.commit()
-    return get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
+    # BUI-408: both writes are await-free once we get here (the network call
+    # above already completed), so they land as ONE write_transaction() under
+    # _write_lock instead of two separate commits on the shared _db. The
+    # read-back also happens on `wconn`, INSIDE the block — not on the
+    # shared `db` afterward: `db` can have its own open transaction from an
+    # unrelated in-flight _sync_gixen cycle (commit-free DML, then an await,
+    # per its own design), which pins `db` to a snapshot that predates this
+    # commit — a `db` read right after would risk returning stale/missing
+    # data for the row this function JUST wrote. `wconn` always sees its own
+    # writes regardless of `db`'s transaction state.
+    async with _write_locked():
+        with write_transaction(_get_db_path()) as wconn:
+            update_bid(wconn, item_id, max_bid, bid_offset, snipe_group)
+            # BUI-78 C2: fill any NULL seller/grade columns from this request
+            # without overwriting values a prior add already set.
+            update_bid_grades(wconn, item_id, seller=seller, seller_grade=seller_grade,
+                              photo_grade=photo_grade)
+            return get_pending_bid_by_item_id(wconn, item_id) or get_bid_by_item_id(wconn, item_id)
 
 
 async def _add_bid_row(
-    db: sqlite3.Connection, item_id: str, max_bid: float,
+    item_id: str, max_bid: float,
     bid_offset: int, snipe_group: int,
     seller: str | None = None, seller_grade: float | None = None,
     photo_grade: float | None = None,
@@ -1106,36 +1215,54 @@ async def _add_bid_row(
     the same item landed first (BUI-67 KTD6) — recover by updating the existing
     live row and return (row, created=False) instead of 500. Caller holds
     _api_lock.
+
+    BUI-408: no longer takes a `db` parameter — same reasoning as
+    _modify_and_update_bid's docstring.
     """
     await asyncio.to_thread(
         _api_client.add_snipe,
         item_id, Decimal(str(max_bid)),
         bid_offset=bid_offset, snipe_group=snipe_group,
     )
+    # BUI-408: both the insert and the integrity-recovery update are
+    # await-free once we get here — each lands on its own short-lived
+    # write_transaction() under _write_lock instead of the shared _db. A
+    # failed insert's write_transaction() rolls back and closes wconn on its
+    # own (see write_transaction's docstring), so no explicit db.rollback()
+    # is needed here anymore — the failed attempt never touched _db at all.
+    #
+    # Read-back also happens on `wconn`, INSIDE each block — not on the
+    # shared `db` afterward: `db` can have its own open transaction from an
+    # unrelated in-flight _sync_gixen cycle (commit-free DML, then an await,
+    # per its own design), which pins `db` to a snapshot that predates this
+    # commit — a `db` read right after would risk returning stale/missing
+    # data (even a None where a row was just inserted) for the row this
+    # function JUST wrote. `wconn` always sees its own writes regardless of
+    # `db`'s transaction state.
     try:
-        bid_id = insert_bid(
-            db, item_id=item_id, max_bid=max_bid,
-            bid_offset=bid_offset, snipe_group=snipe_group, seller=seller,
-            seller_grade=seller_grade, photo_grade=photo_grade,
-        )
-        # BUI-407: insert_bid no longer self-commits — commit here, at the
-        # same point its self-commit used to fire (before the SELECT, so the
-        # read below can never observe an uncommitted row on a connection
-        # some other path later rolls back).
-        db.commit()
-        return db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone(), True
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                bid_id = insert_bid(
+                    wconn, item_id=item_id, max_bid=max_bid,
+                    bid_offset=bid_offset, snipe_group=snipe_group, seller=seller,
+                    seller_grade=seller_grade, photo_grade=photo_grade,
+                )
+                return wconn.execute(
+                    "SELECT * FROM bids WHERE id=?", (bid_id,)
+                ).fetchone(), True
     except sqlite3.IntegrityError:
-        db.rollback()
-        update_bid(db, item_id, max_bid, bid_offset, snipe_group)
-        # BUI-407: update_bid no longer self-commits — same reasoning.
-        db.commit()
-        # BUI-78 C2: a racing sync insert won the row; still fill its NULL grades.
-        update_bid_grades(db, item_id, seller=seller, seller_grade=seller_grade,
-                          photo_grade=photo_grade)
-        # BUI-407: update_bid_grades no longer self-commits — same reasoning.
-        db.commit()
-        row = get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
-        return row, False
+        # A racing unlocked _sync_loop insert for the same item won the
+        # partial unique index first (BUI-67 KTD6) — recover in a fresh
+        # write_transaction().
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                update_bid(wconn, item_id, max_bid, bid_offset, snipe_group)
+                # BUI-78 C2: a racing sync insert won the row; still fill its
+                # NULL grades.
+                update_bid_grades(wconn, item_id, seller=seller, seller_grade=seller_grade,
+                                  photo_grade=photo_grade)
+                row = get_pending_bid_by_item_id(wconn, item_id) or get_bid_by_item_id(wconn, item_id)
+                return row, False
 
 
 @app.post("/api/bids")
@@ -1156,7 +1283,7 @@ async def api_add_bid(req: AddBidRequest):
                 # an already-sniped item (code 202), so modify, not add.
                 try:
                     row = await _modify_and_update_bid(
-                        db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                        req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
                         seller=seller, seller_grade=req.seller_grade,
                         photo_grade=req.photo_grade,
                     )
@@ -1167,7 +1294,7 @@ async def api_add_bid(req: AddBidRequest):
                     # existing row visible rather than a bare 503 that hides it.
                     try:
                         row, created = await _add_bid_row(
-                            db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                            req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
                             seller=seller, seller_grade=req.seller_grade,
                             photo_grade=req.photo_grade,
                         )
@@ -1176,7 +1303,7 @@ async def api_add_bid(req: AddBidRequest):
                         return {**dict(existing), "created": False, "applied": False}
 
             row, created = await _add_bid_row(
-                db, req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
                 seller=seller, seller_grade=req.seller_grade,
                 photo_grade=req.photo_grade,
             )
@@ -1377,8 +1504,11 @@ def _cached_dbidid(db: sqlite3.Connection, item_id: str) -> str | None:
 
 
 def _clear_cached_dbidid(db: sqlite3.Connection, item_id: str) -> None:
+    """Caller must commit (BUI-408) — both call sites below now wrap this in
+    a write_transaction() under _write_lock instead of self-committing on
+    the shared _db (same commit-free contract BUI-407 gave insert_bid et al.,
+    see its docstring)."""
     db.execute("UPDATE bids SET dbidid=NULL WHERE item_id=?", (item_id,))
-    db.commit()
 
 
 async def _modify_with_cache_fallback(
@@ -1411,7 +1541,11 @@ async def _modify_with_cache_fallback(
             "modify with cached dbidid for %s unconfirmed; clearing cache "
             "and retrying via list lookup", item_id,
         )
-        _clear_cached_dbidid(db, item_id)
+        # BUI-408: await-free write, entered after the network await above —
+        # its own short-lived write_transaction() under _write_lock.
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                _clear_cached_dbidid(wconn, item_id)
         await asyncio.to_thread(
             _api_client.modify_snipe, item_id, max_bid,
             bid_offset=bid_offset, snipe_group=snipe_group,  # dbidid=None
@@ -1434,7 +1568,13 @@ async def _remove_with_cache_fallback(db: sqlite3.Connection, item_id: str) -> N
                 "remove with cached dbidid for %s failed; clearing cache and "
                 "retrying via list lookup", item_id,
             )
-            _clear_cached_dbidid(db, item_id)
+            # BUI-408: _clear_cached_dbidid is now commit-free (shared with
+            # _modify_with_cache_fallback above) — route this call site
+            # through the same write_transaction()/_write_lock pattern so it
+            # still actually commits.
+            async with _write_locked():
+                with write_transaction(_get_db_path()) as wconn:
+                    _clear_cached_dbidid(wconn, item_id)
             await asyncio.to_thread(_api_client.remove_snipe, item_id)  # dbidid=None
 
 
@@ -1487,10 +1627,19 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             )
             # Passthrough (None) values go to update_bid so a max_bid-only edit
             # leaves both fields untouched locally; explicit values write through.
-            update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
-            # BUI-407: update_bid no longer self-commits — commit here, at
-            # the same point its self-commit used to fire.
-            db.commit()
+            # BUI-408: await-free write, entered after the Gixen modify await
+            # above — its own short-lived write_transaction() under _write_lock
+            # instead of a commit on the shared _db. The read-back also
+            # happens on `wconn`, INSIDE the block — not on the shared `db`
+            # afterward: `db` can have its own open transaction from an
+            # unrelated in-flight _sync_gixen cycle (commit-free DML, then an
+            # await, per its own design), which pins `db` to a snapshot that
+            # predates this commit — a `db` read right after would risk
+            # returning stale/missing data for the row this just wrote.
+            async with _write_locked():
+                with write_transaction(_get_db_path()) as wconn:
+                    update_bid(wconn, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+                    row = get_bid_by_item_id(wconn, item_id)
     except GixenSnipeNotFoundError as e:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen") from e
     except GixenError as e:
@@ -1498,7 +1647,6 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
     except requests.HTTPError as e:
         raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}") from e
 
-    row = get_bid_by_item_id(db, item_id)
     if row is None:
         # Gixen accepted the modify, so this snipe lives there — but our DB
         # has no row, meaning the snipe was added via Gixen's web UI and we
@@ -1526,10 +1674,15 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             ) from e
         # _sync_gixen ingests with the snipe's existing max_bid from Gixen,
         # but we want the user-supplied value to win. Re-apply locally.
-        update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
-        # BUI-407: update_bid no longer self-commits — same reasoning.
-        db.commit()
-        row = get_bid_by_item_id(db, item_id)
+        # BUI-408: await-free write, entered after _sync_gixen's await above
+        # completed — its own short-lived write_transaction() under
+        # _write_lock. (_sync_gixen itself is untouched here — Stage 3
+        # territory.) Read-back on `wconn` too, inside the block — same
+        # staleness reasoning as the main write above.
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                update_bid(wconn, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+                row = get_bid_by_item_id(wconn, item_id)
         if row is None:
             raise HTTPException(
                 status_code=500,
@@ -1647,11 +1800,12 @@ async def api_purge(req: PurgeRequest):
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
-    # 5. Mark completed bids with the soft-delete tombstone (REMOVED) in DB
-    mark_bids_purged(db, completed_ids)
-    # BUI-407: mark_bids_purged no longer self-commits — commit here, at the
-    # same point its self-commit used to fire.
-    db.commit()
+    # 5. Mark completed bids with the soft-delete tombstone (REMOVED) in DB.
+    # BUI-408: await-free write, entered after the purge_completed await
+    # above — its own short-lived write_transaction() under _write_lock.
+    async with _write_locked():
+        with write_transaction(_get_db_path()) as wconn:
+            mark_bids_purged(wconn, completed_ids)
 
     # 6. Remove sibling snipes (best-effort)
     removed = 0
@@ -1659,12 +1813,13 @@ async def api_purge(req: PurgeRequest):
         try:
             async with _api_lock:
                 await asyncio.to_thread(_api_client.remove_snipe, sibling_id)
-            delete_bid(db, sibling_id)
-            # BUI-407: delete_bid no longer self-commits — commit here, at
-            # the same point its self-commit used to fire (once per sibling;
-            # the next iteration's await happens under a fresh _api_lock
-            # acquisition, after this commit has already landed).
-            db.commit()
+            # BUI-408: await-free write, entered after this iteration's
+            # remove_snipe await — its own short-lived write_transaction()
+            # under _write_lock (the next iteration's await happens under a
+            # fresh _api_lock acquisition, after this commit has landed).
+            async with _write_locked():
+                with write_transaction(_get_db_path()) as wconn:
+                    delete_bid(wconn, sibling_id)
             removed += 1
         except GixenError:
             pass

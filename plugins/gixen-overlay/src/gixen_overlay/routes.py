@@ -44,8 +44,19 @@ from gixen_overlay.models import (
     CollectionCheckBatchRequest,
 )
 from gixen_overlay.title_parser import parse_title
-from server.db import get_bid_by_item_id, resolve_server_dir, TOMBSTONE_STATUSES_SQL
-from server.main import _ensure_fresh_sync, iso_to_relative, _spawn_fallback_task
+from server.db import (
+    get_bid_by_item_id,
+    resolve_server_dir,
+    TOMBSTONE_STATUSES_SQL,
+    write_transaction,
+)
+from server.main import (
+    _ensure_fresh_sync,
+    iso_to_relative,
+    _spawn_fallback_task,
+    _get_db_path,
+    _write_locked,
+)
 
 # BUI-91/92: the overlay wraps locg-cli's existing collection + wish-list logic
 # (the accumulated matcher with its four documented bugfixes, plus the three
@@ -398,77 +409,101 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
     target_fmv_id: int | None = None
     target_comic_id: int | None = None
 
-    if req.issue is not None:
-        # Find an fmv whose comic has the requested issue, linked to this bid
-        match = db.execute(
-            """
-            SELECT bf.fmv_id, c.id AS comic_id
-            FROM bid_fmvs bf
-            JOIN fmv f ON f.id = bf.fmv_id
-            JOIN comics c ON c.id = f.comic_id
-            WHERE bf.bid_id = ? AND c.issue = ?
-            LIMIT 1
-            """,
-            (bid_row["id"], req.issue),
-        ).fetchone()
-        if match:
-            target_fmv_id = match["fmv_id"]
-            target_comic_id = match["comic_id"]
-        else:
-            primary = get_primary_fmv_for_bid(db, bid_row["id"])
-            if primary is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Bid {item_id} has no primary fmv; cannot infer series/year "
-                        "for auto-create. Run extract-comics first or use cli.py add."
-                    ),
-                )
-            target_comic_id = upsert_comic(
-                db,
-                title=primary["title"],
-                issue=req.issue,
-                year=primary["year"],
+    # BUI-408 (Stage 1 of BUI-400's shared-connection isolation rollout): the
+    # whole function is await-free (no network call — see BUI-24/25's
+    # docstring), so the entire resolve-then-write sequence below — including
+    # the auto-create upserts (upsert_comic/upsert_fmv/link_fmv_to_bid), which
+    # used to land + self-commit directly on the shared singleton `db`
+    # (app.state.db) with NO lock, same as the final UPDATE — now runs on ONE
+    # short-lived write_transaction() connection under the same app-wide
+    # _write_lock every gixen-cli writer uses (design doc finding 1's second
+    # lock-free writer, alongside _sync_loop -> _sync_gixen). Bundling
+    # read-decide-write into one transaction is also strictly safer than the
+    # split that used to exist: upsert_comic/upsert_fmv/link_fmv_to_bid each
+    # self-commit independently (gixen_overlay/db.py), so a failure partway
+    # through used to leave a created comic/fmv committed even though the
+    # overall link never completed; a raised HTTPException inside this block
+    # now rolls back the whole partial sequence instead.
+    async with _write_locked():
+        with write_transaction(_get_db_path()) as wconn:
+            if req.issue is not None:
+                # Find an fmv whose comic has the requested issue, linked to this bid
+                match = wconn.execute(
+                    """
+                    SELECT bf.fmv_id, c.id AS comic_id
+                    FROM bid_fmvs bf
+                    JOIN fmv f ON f.id = bf.fmv_id
+                    JOIN comics c ON c.id = f.comic_id
+                    WHERE bf.bid_id = ? AND c.issue = ?
+                    LIMIT 1
+                    """,
+                    (bid_row["id"], req.issue),
+                ).fetchone()
+                if match:
+                    target_fmv_id = match["fmv_id"]
+                    target_comic_id = match["comic_id"]
+                else:
+                    primary = get_primary_fmv_for_bid(wconn, bid_row["id"])
+                    if primary is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Bid {item_id} has no primary fmv; cannot infer series/year "
+                                "for auto-create. Run extract-comics first or use cli.py add."
+                            ),
+                        )
+                    target_comic_id = upsert_comic(
+                        wconn,
+                        title=primary["title"],
+                        issue=req.issue,
+                        year=primary["year"],
+                    )
+                    # Create an fmv stub at the primary's grade for the lot issue
+                    new_fmv_id = upsert_fmv(wconn, target_comic_id, primary["grade"])
+                    link_fmv_to_bid(wconn, bid_row["id"], new_fmv_id, is_primary=False)
+                    target_fmv_id = new_fmv_id
+            else:
+                primary_fmv_id = bid_row["fmv_id"]
+                if primary_fmv_id is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Bid {item_id} has no primary fmv. Pass --issue to target a "
+                            "specific issue or run extract-comics first."
+                        ),
+                    )
+                target_fmv_id = primary_fmv_id
+                fmv_row = wconn.execute(
+                    "SELECT comic_id FROM fmv WHERE id=?", (primary_fmv_id,)
+                ).fetchone()
+                target_comic_id = fmv_row["comic_id"] if fmv_row else None
+
+            if target_comic_id is None:
+                raise HTTPException(status_code=500, detail="Could not resolve target comic")
+
+            wconn.execute(
+                """
+                UPDATE comics
+                SET locg_id = ?,
+                    locg_variant_id = COALESCE(?, locg_variant_id)
+                WHERE id = ?
+                """,
+                (req.locg_id, req.locg_variant_id, target_comic_id),
             )
-            # Create an fmv stub at the primary's grade for the lot issue
-            new_fmv_id = upsert_fmv(db, target_comic_id, primary["grade"])
-            link_fmv_to_bid(db, bid_row["id"], new_fmv_id, is_primary=False)
-            target_fmv_id = new_fmv_id
-    else:
-        primary_fmv_id = bid_row["fmv_id"]
-        if primary_fmv_id is None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Bid {item_id} has no primary fmv. Pass --issue to target a "
-                    "specific issue or run extract-comics first."
-                ),
-            )
-        target_fmv_id = primary_fmv_id
-        fmv_row = db.execute(
-            "SELECT comic_id FROM fmv WHERE id=?", (primary_fmv_id,)
-        ).fetchone()
-        target_comic_id = fmv_row["comic_id"] if fmv_row else None
 
-    if target_comic_id is None:
-        raise HTTPException(status_code=500, detail="Could not resolve target comic")
+            # Read-back also happens on `wconn`, INSIDE the block — not on
+            # the shared `db` afterward: `db` can have its own open
+            # transaction from an unrelated in-flight _sync_gixen cycle
+            # (commit-free DML, then an await, per its own design), which
+            # pins `db` to a snapshot that predates this commit — a `db`
+            # read right after would risk returning stale data for the
+            # comic this just wrote.
+            row = wconn.execute(
+                "SELECT id AS comic_id, title, issue, year, locg_id, locg_variant_id "
+                "FROM comics WHERE id = ?",
+                (target_comic_id,),
+            ).fetchone()
 
-    db.execute(
-        """
-        UPDATE comics
-        SET locg_id = ?,
-            locg_variant_id = COALESCE(?, locg_variant_id)
-        WHERE id = ?
-        """,
-        (req.locg_id, req.locg_variant_id, target_comic_id),
-    )
-    db.commit()
-
-    row = db.execute(
-        "SELECT id AS comic_id, title, issue, year, locg_id, locg_variant_id "
-        "FROM comics WHERE id = ?",
-        (target_comic_id,),
-    ).fetchone()
     # is_primary: target fmv matches the bid's primary fmv_id
     is_primary = (target_fmv_id == bid_row["fmv_id"])
     return {**dict(row), "is_primary": is_primary}

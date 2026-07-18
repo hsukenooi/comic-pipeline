@@ -2807,3 +2807,591 @@ def test_get_all_bids_response_shape_still_includes_pre_existing_fields(api):
         "seller", "local_snipe_at", "local_snipe_result", "gixen_vanished_at",
         "notes", "ebay_no_price_at", "group_changed_at",
     }
+
+
+# ---------------------------------------------------------------------------
+# BUI-408 (Stage 1 of BUI-400's shared-connection isolation rollout): the
+# already-await-free writers (api_add_bid, api_edit_bid, api_purge,
+# _sniper_loop's set_local_snipe_result — the overlay's api_link_locg is
+# covered in gixen-overlay's own test suite) now commit on their own
+# short-lived write_transaction() connection under the single app-wide
+# _write_lock, instead of the shared _db. Tests below cover the two
+# regression nets the design doc's §6 calls for (the debug/test invariant
+# guard, and the pure lock-free isolation proof) plus confirm each routed
+# writer actually holds _write_lock at the moment it commits.
+# ---------------------------------------------------------------------------
+
+
+def _make_lock_checking_connection():
+    """Factory (BUI-408 design doc §6's "debug/test invariant guard: fail if
+    commit() is ever called while not _write_lock.locked()"). Returns a
+    fresh sqlite3.Connection subclass + the list its commit() calls record
+    into: each commit() appends whether server.main._write_lock was held at
+    that instant, then asserts it.
+
+    sqlite3.Connection is an immutable C type (monkeypatching commit()
+    directly raises TypeError — see test_server_db.py's
+    test_write_transaction_calls_rollback_explicitly_on_exception), so a
+    factory subclass passed as sqlite3.connect(..., factory=...) is the
+    supported way to observe a real connection's method calls. A fresh class
+    per call keeps each test's record list isolated."""
+    import server.main as m
+
+    record: list[bool] = []
+
+    class _Checking(sqlite3.Connection):
+        def commit(self):
+            locked = bool(m._write_lock and m._write_lock.locked())
+            record.append(locked)
+            assert locked, (
+                "BUI-408 invariant violated: commit() called while "
+                "_write_lock was not held"
+            )
+            return super().commit()
+
+    return _Checking, record
+
+
+@pytest.fixture
+def _write_lock_guard(api, monkeypatch):
+    """Scoped commit-lock invariant guard. Depends on `api` so fixture setup
+    order guarantees the app's long-lived _db is already open (via the real
+    lifespan) BEFORE this patches server.db's `sqlite3.connect` — so this
+    only ever intercepts write_transaction()'s ephemeral write connections,
+    never _db's own startup-migration commits. Returns the observed-lock-
+    state list so a test can assert the guard actually engaged (non-empty)
+    rather than passing vacuously."""
+    import server.db as db_module
+
+    checking_cls, record = _make_lock_checking_connection()
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=checking_cls, **kw)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_check)
+    return record
+
+
+class _DbCommitSpy:
+    """Proxy around the app's real `_db` connection: delegates everything
+    except commit(), which is counted (BUI-408, mirrors the existing
+    _RollbackSpy pattern below/BUI-399). Complementary proof that the
+    shared `_db` is genuinely never committed by a routed writer — closes a
+    gap `_write_lock_guard` alone can't: that guard only observes
+    connections opened via `write_transaction()` AFTER it patches
+    `sqlite3.connect`, so it structurally cannot see a stray commit on the
+    already-open `_db` (a regression that kept the correct
+    `write_transaction()` call but ALSO left a stray `db.commit()` on `_db`
+    would pass `_write_lock_guard`'s checks unnoticed)."""
+
+    def __init__(self, real):
+        self._real = real
+        self.commits = 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def commit(self):
+        self.commits += 1
+        self._real.commit()
+
+
+@pytest.fixture
+def _db_untouched(api, monkeypatch):
+    """See _DbCommitSpy. NOT safe to attach to a test that legitimately
+    triggers _sync_gixen (api_purge's pre-purge sync, api_edit_bid's
+    post-sync-reapply branch) — that call path commits on `_db` by design
+    (Stage 3 territory, untouched here); asserting zero commits there would
+    be a false failure, not a caught regression."""
+    import server.main as m
+    spy = _DbCommitSpy(m._db)
+    monkeypatch.setattr(m, "_db", spy)
+    return spy
+
+
+def test_add_bid_commits_under_write_lock(api, _write_lock_guard, _db_untouched):
+    """Covers _add_bid_row's insert path."""
+    r = api.post("/api/bids", json={"item_id": "408000001", "max_bid": 12.0})
+    assert r.status_code == 200
+    assert _write_lock_guard, "guard never observed a commit — test is vacuous"
+    assert all(_write_lock_guard)
+    assert _db_untouched.commits == 0, (
+        "the shared _db was committed — this writer must route through "
+        "write_transaction() only"
+    )
+
+
+def test_readd_existing_commits_under_write_lock(api, _write_lock_guard, _db_untouched):
+    """Covers _modify_and_update_bid's write path (api_add_bid's modify
+    branch, taken when a live PENDING row already exists)."""
+    api.post("/api/bids", json={"item_id": "408000002", "max_bid": 12.0})
+    r = api.post("/api/bids", json={"item_id": "408000002", "max_bid": 15.0})
+    assert r.status_code == 200
+    assert _write_lock_guard
+    assert all(_write_lock_guard)
+    assert _db_untouched.commits == 0, (
+        "the shared _db was committed — this writer must route through "
+        "write_transaction() only"
+    )
+
+
+def test_edit_bid_commits_under_write_lock(api, _write_lock_guard, _db_untouched):
+    """Covers api_edit_bid's main update_bid write. The item is seeded first
+    so get_bid_by_item_id finds it after the modify — never falls into the
+    post-sync-reapply branch that legitimately commits on _db (see
+    _db_untouched's docstring), so it's safe to assert zero here too."""
+    api.post("/api/bids", json={"item_id": "408000003", "max_bid": 12.0})
+    r = api.patch(
+        "/api/bids/408000003",
+        json={"max_bid": 20.0, "bid_offset": 6, "snipe_group": 0},
+    )
+    assert r.status_code == 200
+    assert _write_lock_guard
+    assert all(_write_lock_guard)
+    assert _db_untouched.commits == 0, (
+        "the shared _db was committed — this writer must route through "
+        "write_transaction() only"
+    )
+
+
+def test_edit_bid_cache_clear_retry_commits_under_write_lock(api, monkeypatch):
+    """Covers _modify_with_cache_fallback's _clear_cached_dbidid write path —
+    the GixenModifyNotConfirmedError retry branch, reached only when a
+    cached dbidid exists.
+
+    Does NOT use the `_write_lock_guard` fixture: `sqlite3.connect` is one
+    shared attribute on the single process-wide `sqlite3` module object, so
+    patching it (as that fixture does) patches EVERY caller, including this
+    test's own admin seed write via `_dbconn()`. Seed first, THEN install
+    the guard, so only the write under test is checked. Also asserts the
+    shared `_db` is never committed (complementary to `_db_untouched` — see
+    that fixture's docstring; this test predates seeding _db_untouched's
+    manual-pattern siblings, so it inlines the same _DbCommitSpy check)."""
+    from gixen_client import GixenModifyNotConfirmedError
+    import server.db as db_module
+    import server.main as m
+
+    api.post("/api/bids", json={"item_id": "408000004", "max_bid": 12.0})
+    conn = _dbconn()
+    conn.execute(
+        "UPDATE bids SET dbidid=? WHERE item_id=?", ("cache408004", "408000004")
+    )
+    conn.commit()
+    conn.close()
+
+    checking_cls, record = _make_lock_checking_connection()
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=checking_cls, **kw)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_check)
+    db_spy = _DbCommitSpy(m._db)
+    monkeypatch.setattr(m, "_db", db_spy)
+
+    api.mock_gixen.modify_snipe.side_effect = [
+        GixenModifyNotConfirmedError("408000004", 20.0), None,
+    ]
+    r = api.patch(
+        "/api/bids/408000004",
+        json={"max_bid": 20.0, "bid_offset": 6, "snipe_group": 0},
+    )
+    assert r.status_code == 200
+    assert record, "guard never observed a commit — test is vacuous"
+    assert all(record)
+    assert db_spy.commits == 0, (
+        "the shared _db was committed — this writer must route through "
+        "write_transaction() only"
+    )
+
+
+def test_purge_commits_under_write_lock(api, _write_lock_guard):
+    """Covers both api_purge write sites: mark_bids_purged and the sibling
+    loop's delete_bid (reuses test_purge_removes_siblings' setup).
+
+    No `_db_untouched` fixture here (unlike its sibling tests above):
+    api_purge's step 1 always runs a pre-purge `_sync_gixen` (untouched,
+    Stage 3 territory), which legitimately commits on the shared `_db` at
+    its own end-of-cycle — asserting zero `_db` commits here would be a
+    false failure, not a caught regression (see `_db_untouched`'s
+    docstring)."""
+    api.post("/api/bids", json={"item_id": "408000005", "max_bid": 50.0})
+    api.mock_gixen.list_snipes.return_value = [
+        {
+            "item_id": "408000005", "status": "WON", "snipe_group": "1",
+            "title": "Item A", "max_bid": "50.00 USD", "current_bid": "45.00 USD",
+            "time_to_end": "ENDED", "seller": "s",
+            "bid_offset": "6", "bid_offset_mirror": "6", "dbidid": "a1",
+        },
+        {
+            "item_id": "408000006", "status": "SCHEDULED", "snipe_group": "1",
+            "title": "Item A alt", "max_bid": "50.00 USD", "current_bid": "0.00 USD",
+            "time_to_end": "5h 0m", "seller": "s",
+            "bid_offset": "6", "bid_offset_mirror": "6", "dbidid": "b2",
+        },
+    ]
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 200
+    assert r.json()["removed_siblings"] == 1
+    assert _write_lock_guard
+    assert all(_write_lock_guard)
+
+
+def test_add_bid_integrity_recovery_commits_under_write_lock(api, monkeypatch):
+    """Covers _add_bid_row's IntegrityError-recovery write_transaction()
+    block (main.py's second _write_locked() site inside _add_bid_row) —
+    reuses test_add_defensive_integrity_recovery's stale-read setup to force
+    the partial-unique-index collision recovery path. Not using
+    `_write_lock_guard`: seed first, THEN install the guard (see
+    test_edit_bid_cache_clear_retry_commits_under_write_lock's docstring for
+    why — sqlite3.connect is one shared process-wide attribute)."""
+    import server.db as db_module
+    import server.main as m
+
+    seed = _dbconn()
+    seed.execute(
+        "INSERT INTO bids (item_id, max_bid, status) VALUES ('408000030', 10.0, 'PENDING')"
+    )
+    seed.commit()
+    seed.close()
+    real = m.get_pending_bid_by_item_id
+    state = {"first": True}
+
+    def stale_then_real(c, iid):
+        if state["first"]:
+            state["first"] = False
+            return None
+        return real(c, iid)
+
+    monkeypatch.setattr("server.main.get_pending_bid_by_item_id", stale_then_real)
+
+    checking_cls, record = _make_lock_checking_connection()
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=checking_cls, **kw)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_check)
+    db_spy = _DbCommitSpy(m._db)
+    monkeypatch.setattr(m, "_db", db_spy)
+
+    r = api.post("/api/bids", json={"item_id": "408000030", "max_bid": 22.0})
+    assert r.status_code == 200
+    assert r.json()["created"] is False
+    assert record, "guard never observed a commit — test is vacuous"
+    assert all(record)
+    assert db_spy.commits == 0, (
+        "the shared _db was committed — this writer must route through "
+        "write_transaction() only"
+    )
+
+
+def test_remove_bid_cache_clear_retry_commits_under_write_lock(api, monkeypatch):
+    """Covers _remove_with_cache_fallback's _clear_cached_dbidid write path
+    (api_remove_bid's stale-cached-dbidid retry branch) — mirrors
+    test_edit_bid_cache_clear_retry_commits_under_write_lock's pattern for
+    the DELETE endpoint. Not using `_write_lock_guard`: seed first, THEN
+    install the guard (see that test's docstring for why).
+
+    No `_DbCommitSpy`/`_db_untouched` check here (unlike its edit-endpoint
+    sibling): api_remove_bid is NOT in BUI-408's scope (the ticket names
+    only api_add_bid/api_edit_bid/api_purge) — its own final
+    `delete_bid(db, item_id); db.commit()` still legitimately writes
+    through the shared `_db`, only the shared `_clear_cached_dbidid` helper
+    call (used by both this and api_edit_bid) was routed. Asserting zero
+    `_db` commits here would be a false failure, not a caught regression.
+    """
+    from gixen_client import GixenError
+    import server.db as db_module
+
+    api.post("/api/bids", json={"item_id": "408000031", "max_bid": 12.0})
+    conn = _dbconn()
+    conn.execute(
+        "UPDATE bids SET dbidid=? WHERE item_id=?", ("cache408031", "408000031")
+    )
+    conn.commit()
+    conn.close()
+
+    checking_cls, record = _make_lock_checking_connection()
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=checking_cls, **kw)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_check)
+
+    api.mock_gixen.remove_snipe.side_effect = [GixenError("stale dbidid"), True]
+    r = api.delete("/api/bids/408000031")
+    assert r.status_code == 200
+    assert record, "guard never observed a commit — test is vacuous"
+    assert all(record)
+
+
+def test_edit_bid_post_sync_reapply_commits_under_write_lock(api, monkeypatch):
+    """Covers api_edit_bid's post-sync re-apply write_transaction() block —
+    the self-heal-via-sync branch reached when Gixen accepts the modify but
+    the item has no DB row yet (mirrors
+    test_edit_bid_not_in_db_self_heals_via_sync's setup). Not using
+    `_write_lock_guard`: this test has no admin seed write to worry about,
+    but the guard must still be installed before the PATCH call, which is
+    equivalent here — kept manual for consistency with the other two
+    call-site tests above.
+
+    No `_DbCommitSpy`/`_db_untouched` check here: this branch's whole POINT
+    is running `_sync_gixen` (untouched, Stage 3 territory), which
+    legitimately commits on the shared `_db` at its own end-of-cycle — see
+    `_db_untouched`'s docstring for why asserting zero there would be a
+    false failure, not a caught regression.
+    """
+    import server.db as db_module
+
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "408000032",
+        "max_bid": "75.00 USD",
+        "current_bid": "10.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "1d",
+        "seller": "someseller",
+        "snipe_group": "0",
+        "bid_offset": "6",
+    }]
+
+    checking_cls, record = _make_lock_checking_connection()
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=checking_cls, **kw)
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_check)
+
+    r = api.patch(
+        "/api/bids/408000032",
+        json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0},
+    )
+    assert r.status_code == 200
+    assert "added_at" in r.json()  # proves the post-sync branch actually ran
+    assert record, "guard never observed a commit — test is vacuous"
+    assert all(record)
+
+
+def test_sniper_loop_commits_under_write_lock(tmp_path, monkeypatch):
+    """BUI-408: no test anywhere drives _sniper_loop directly (see
+    test_server_db.py's BUI-407 comment on set_local_snipe_result) — this is
+    the only coverage for both the commit-free contract AND, now, the lock
+    invariant on this specific writer. Follows
+    test_background_entry_points_rollback_on_unexpected_exception's pattern
+    above: drive the loop as a real background task against a real on-disk
+    DB, bypassing the TestClient/lifespan portal entirely so the
+    asyncio.Lock created below lives on the SAME loop asyncio.run() drives
+    this test on (a Lock built on a different loop raises on first `async
+    with`)."""
+    import asyncio
+    import server.db as db_module
+    import server.main as m
+    from server.db import init_db
+
+    path = tmp_path / "sniper.db"
+    db = init_db(path)
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, bid_offset) "
+        "VALUES ('408000010', 15.0, 'PENDING', '2020-01-01T00:00:00+00:00', 6)"
+    )
+    db.commit()
+
+    checking_cls, record = _make_lock_checking_connection()
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=checking_cls, **kw)
+
+    class _FakeBidder:
+        async def place_bids_concurrent(self, bids):
+            return [{"success": True, "message": "placed"} for _ in bids]
+
+    # _sniper_loop never calls _sync_gixen, so — unlike api_purge/the
+    # post-sync-reapply branch — the shared _db has no legitimate commit of
+    # its own here; wrap it in _DbCommitSpy so a regression that routed
+    # set_local_snipe_result back through _db would be caught, not just one
+    # that skipped _write_lock.
+    db_spy = _DbCommitSpy(db)
+    monkeypatch.setattr(m, "_db", db_spy)
+    monkeypatch.setattr(m, "_db_path", path)
+    monkeypatch.setattr(m, "_bidder", _FakeBidder())
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_check)
+
+    async def run():
+        # Created inside the running loop asyncio.run() drives this test on.
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        task = asyncio.create_task(m._sniper_loop())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+
+    row = db.execute(
+        "SELECT local_snipe_result FROM bids WHERE item_id='408000010'"
+    ).fetchone()
+    db.close()
+
+    assert row["local_snipe_result"] == "OK: placed"
+    assert record, "guard never observed a commit — test is vacuous"
+    assert all(record)
+    assert db_spy.commits == 0, (
+        "the shared _db was committed — this writer must route through "
+        "write_transaction() only"
+    )
+
+
+def test_write_lock_invariant_guard_fires_without_lock(tmp_path):
+    """BUI-408 design doc §6: proves the guard mechanism itself is live —
+    calling write_transaction() directly, bypassing _write_locked(), must
+    trip the assertion. This is the regression net that would catch a
+    future writer that forgets to acquire the lock."""
+    import asyncio
+    import server.db as db_module
+    from server.db import init_db, insert_bid, write_transaction
+
+    checking_cls, record = _make_lock_checking_connection()
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=checking_cls, **kw)
+
+    path = tmp_path / "invariant_unlocked.db"
+    init_db(path).close()
+
+    async def unlocked_write():
+        with write_transaction(path) as conn:  # bypasses _write_locked()
+            insert_bid(conn, "408200001", 10.0, 6, 0, "s")
+
+    with patch.object(db_module.sqlite3, "connect", _connect_with_check):
+        with pytest.raises(AssertionError, match="BUI-408 invariant"):
+            asyncio.run(unlocked_write())
+
+    assert record == [False], "guard must observe exactly one unlocked commit attempt"
+
+
+def test_write_lock_invariant_guard_silent_when_locked(tmp_path, monkeypatch):
+    """Complement to the test above: the correct _write_locked()-wrapped
+    pattern every Stage-1 writer now uses must NOT trip the guard."""
+    import asyncio
+    import server.db as db_module
+    import server.main as m
+    from server.db import init_db, insert_bid, write_transaction
+
+    checking_cls, record = _make_lock_checking_connection()
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_check(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=checking_cls, **kw)
+
+    path = tmp_path / "invariant_locked.db"
+    init_db(path).close()
+    monkeypatch.setattr(m, "_db_path", path)
+
+    async def locked_write():
+        # Created inside the running loop asyncio.run() drives this on.
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        async with m._write_locked():
+            with write_transaction(m._get_db_path()) as conn:
+                insert_bid(conn, "408200002", 10.0, 6, 0, "s")
+
+    with patch.object(db_module.sqlite3, "connect", _connect_with_check):
+        asyncio.run(locked_write())  # must NOT raise
+
+    assert record == [True], "guard must observe exactly one LOCKED commit"
+
+
+def test_lockfree_sync_write_and_overlay_write_are_isolated(tmp_path):
+    """BUI-408 design doc §6 'pure lock-free regression': before Stage 1,
+    the overlay's api_link_locg wrote + committed directly on the shared
+    _db with NO lock (design doc §2's second lock-free writer, alongside
+    _sync_loop -> _sync_gixen) — a shared connection meant either side's
+    commit()/rollback() could flush or discard the OTHER's not-yet-committed
+    DML (design doc §1's exposure). Stage 1 moves the overlay's write onto
+    its OWN write_transaction() connection — still no lock (only the four
+    gixen-cli writers + set_local_snipe_result take _write_lock; the
+    overlay's remaining lock-free peer, _sync_gixen, is untouched — Stage 3
+    territory) — so this proves isolation now comes from being on SEPARATE
+    connections, not from an app-level asyncio.Lock (`_write_lock`): a
+    _sync_gixen-style batcher (DML on _db, held open across a delay — the
+    "await" bleed window design doc §1 identifies) and an api_link_locg-style
+    write (write_transaction() on its own connection, committing while the
+    batcher is still uncommitted) can interleave with ZERO app-level lock and
+    neither corrupts the other's DATA. This does NOT prove the two can never
+    contend or block each other — SQLite's own single-writer-at-a-time
+    constraint (see below) still serializes them at the engine level; that
+    residual busy_timeout/stall exposure between the migrated writers and
+    the still-untouched _sync_gixen/_run_ebay_fallback is real and is Stage
+    2/3's job to close, not this test's.
+
+    Uses a real background thread (not asyncio) for the batcher's delay:
+    SQLite allows only one writer transaction at a time process-wide even in
+    WAL mode, so once the overlay's write below legitimately contends for
+    that slot, its blocking C-level busy_timeout retry would otherwise
+    freeze the single-threaded event loop and deadlock against a same-loop
+    coroutine's timer (verified — an asyncio.Event-gated version of this
+    test hangs, and production code never crosses threads with a connection
+    either — a single uvicorn worker, one event loop). A background thread's
+    commit doesn't depend on the event loop, so busy_timeout's
+    retry-then-succeed behavior works as designed (verified against a
+    minimal reproduction outside pytest first). check_same_thread=False is
+    a test-harness-only device to get that real concurrent write window;
+    the batcher connection is used from exactly one thread at a time
+    (main thread only up to thread.start(), background thread only after).
+    """
+    import threading
+    import time
+    from server.db import init_db, insert_bid, write_transaction
+
+    path = tmp_path / "lockfree_regression.db"
+    init_db(path).close()  # create schema on a throwaway connection first
+    db = sqlite3.connect(str(path), check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")
+    db.row_factory = sqlite3.Row
+
+    batcher_dml_landed = threading.Event()
+
+    def batcher():
+        # Mimics _sync_gixen's shape: DML on the shared _db, THEN a delay
+        # (the bleed window), THEN commit — deliberately with NO lock,
+        # matching _sync_loop's lock-free design.
+        insert_bid(db, "408300001", 11.0, 6, 0, "batcher")
+        batcher_dml_landed.set()
+        time.sleep(0.2)
+        db.commit()
+
+    thread = threading.Thread(target=batcher)
+    thread.start()
+    batcher_dml_landed.wait()
+
+    # Mimics api_link_locg's Stage-1 write: its OWN write_transaction()
+    # connection, no lock — the zero-lock case. The batcher's transaction is
+    # still open here (mid-sleep); write_transaction()'s busy_timeout=5000
+    # makes this block briefly and then succeed once the batcher commits and
+    # releases SQLite's single-writer slot, rather than corrupting data or
+    # erroring.
+    with write_transaction(path) as wconn:
+        insert_bid(wconn, "408300002", 22.0, 6, 0, "overlay")
+
+    thread.join()
+    db.close()
+
+    check = sqlite3.connect(str(path))
+    check.row_factory = sqlite3.Row
+    try:
+        rows = {r["item_id"] for r in check.execute("SELECT item_id FROM bids").fetchall()}
+    finally:
+        check.close()
+
+    assert "408300001" in rows, "the batcher's write must land once IT commits"
+    assert "408300002" in rows, (
+        "the overlay's isolated write_transaction() write must land "
+        "independent of the batcher's still-uncommitted DML on _db"
+    )

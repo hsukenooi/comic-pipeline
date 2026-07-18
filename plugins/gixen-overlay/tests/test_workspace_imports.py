@@ -22,11 +22,13 @@ def test_overlay_routes_importable_via_workspace():
 def test_gixen_cli_private_helper_surface_resolves():
     """The exact private helpers the overlay depends on must be importable
     from gixen-cli. If any is renamed upstream, this is the canary."""
-    from server.db import TOMBSTONE_STATUSES_SQL, get_bid_by_item_id
+    from server.db import TOMBSTONE_STATUSES_SQL, get_bid_by_item_id, write_transaction
     from server.main import (
         _ensure_fresh_sync,
         _spawn_fallback_task,
         iso_to_relative,
+        _get_db_path,
+        _write_locked,
     )
 
     assert all(
@@ -36,6 +38,9 @@ def test_gixen_cli_private_helper_surface_resolves():
             _spawn_fallback_task,
             iso_to_relative,
             get_bid_by_item_id,
+            write_transaction,
+            _get_db_path,
+            _write_locked,
         )
     )
     # BUI-272: routes.py also imports this tombstone-filter constant from
@@ -129,4 +134,34 @@ def test_gixen_cli_private_helper_signatures_pinned():
     assert _required_positional_count(_spawn_fallback_task) == 0
     assert inspect.iscoroutinefunction(_ensure_fresh_sync), (
         "routes.py:634 awaits _ensure_fresh_sync() — it must stay async"
+    )
+
+
+def test_write_lock_helper_signatures_pinned():
+    """BUI-408 (Stage 1 of BUI-400's shared-connection isolation rollout):
+    same rationale as test_gixen_cli_private_helper_signatures_pinned above,
+    for the write-lock coupling api_link_locg's write now depends on —
+    ``async with _write_locked(): with write_transaction(_get_db_path()) as
+    wconn:`` (routes.py's ``/api/bids/{item_id}/comics/locg`` handler).
+    """
+    from pathlib import Path
+
+    from server.db import write_transaction
+    from server.main import _get_db_path, _write_locked
+
+    # write_transaction(_get_db_path()) — must accept exactly one positional
+    # path argument (it also has a default, so _required_positional_count
+    # alone can't see this — bind() proves the call shape directly).
+    inspect.signature(write_transaction).bind(Path("/tmp/pinned.db"))
+
+    # _get_db_path() — no arguments, called synchronously.
+    assert _required_positional_count(_get_db_path) == 0
+    assert not inspect.iscoroutinefunction(_get_db_path)
+
+    # _write_locked() — no arguments, used as `async with _write_locked():`.
+    assert _required_positional_count(_write_locked) == 0
+    cm = _write_locked()
+    assert hasattr(cm, "__aenter__") and hasattr(cm, "__aexit__"), (
+        "routes.py awaits `async with _write_locked():` — it must stay an "
+        "async context manager"
     )
