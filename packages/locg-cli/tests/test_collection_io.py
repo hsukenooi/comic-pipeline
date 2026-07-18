@@ -1725,3 +1725,72 @@ def test_count_decrease_that_stays_owned_copies_normally(tmp_path):
     assert rows[0]["in_collection"] == 1, "count change that stays owned applies"
     assert result["ownership_downgrades_held"] == 0
     assert "ownership_downgrade_held" not in _audit_types(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# import_xlsx — BUI-412: non-blocking data-quality report for owned rows with
+# no release_date. A null-dated owned row silently defeats the year-scoped
+# wish-list conflicts audit (the year-gate can't confirm two years differ
+# against a null-dated owned row). The importer must surface — never guard
+# against — this gap: count it, warn about it, and store the row unchanged.
+# ---------------------------------------------------------------------------
+
+def test_import_reports_null_release_date_on_owned_row(tmp_path):
+    """An owned row with an empty release_date is counted + warned about, and
+    is still stored unchanged (non-blocking: no reject, no drop, no alter)."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    xlsx = tmp_path / "import.xlsx"
+    _build_export_xlsx(xlsx, [
+        {
+            "publisher": "Marvel Comics", "series": "Fantastic Four (Vol. 7)",
+            "full_title": "Fantastic Four (Vol. 7) #4", "release_date": "",
+            "in_collection": 1, "in_wish_list": 0,
+        },
+    ])
+
+    result = import_xlsx(xlsx, cache)
+
+    # The report fired.
+    assert result["null_release_date_owned"] == 1
+    assert any("release_date" in w and "BUI-412" in w for w in result["warnings"]), (
+        f"expected a BUI-412 release_date warning, got: {result['warnings']}"
+    )
+
+    # The row is still present, unchanged (added, not rejected/dropped/altered).
+    assert result["added"] == 1
+    rows = [
+        r for r in cache.load()["comics"]
+        if r["full_title"] == "Fantastic Four (Vol. 7) #4"
+    ]
+    assert len(rows) == 1, "row must still be stored"
+    assert rows[0]["in_collection"] == 1
+    assert not (rows[0]["release_date"] or ""), "release_date must be left null/empty, not backfilled"
+
+
+def test_import_null_release_date_report_excludes_dated_and_wish_only_rows(tmp_path):
+    """The count/warning must fire only for OWNED rows with a null/empty
+    release_date — not for a dated owned row, and not for a wish-only row
+    (in_collection=0) that also happens to lack a release_date."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    xlsx = tmp_path / "import.xlsx"
+    _build_export_xlsx(xlsx, [
+        {
+            "publisher": "Marvel Comics", "series": "Daredevil",
+            "full_title": "Daredevil #181", "release_date": "1982-04-10",
+            "in_collection": 1, "in_wish_list": 0,
+        },
+        {
+            "publisher": "Marvel Comics", "series": "Saga",
+            "full_title": "Saga #1", "release_date": "",
+            "in_collection": 0, "in_wish_list": 1,
+        },
+    ])
+
+    result = import_xlsx(xlsx, cache)
+
+    assert result["null_release_date_owned"] == 0
+    assert not any("BUI-412" in w for w in result["warnings"])
