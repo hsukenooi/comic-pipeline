@@ -58,6 +58,30 @@ def _make_client() -> GixenClient:
     return GixenClient(username=username, password=password)
 
 
+def _parse_optional_int(value: object) -> int | None:
+    """Parse a Gixen-scraped bid_offset/snipe_group to int, or None when
+    unparseable/blank.
+
+    Mirrors server/fallback.py's `_parse_snipe_group` contract (BUI-383) for
+    snipe_group: None must never be coerced to 0 by a caller — group 0 is a
+    positive "no group" claim, so treating an unparseable/blank value as 0
+    could silently un-group a snipe whose real group we simply failed to
+    read. `edit`'s direct-mode passthrough (BUI-404) applies the identical
+    fail-closed contract to bid_offset: silently substituting a hardcoded
+    default (6) for an unreadable current value is the same "silent reset"
+    bug this fix exists to prevent, just on the other field.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
 # BUI-220: the canonical env var is COMICS_SERVER_URL (this is the comics
 # server, not the Gixen bidding service). GIXEN_SERVER_URL is a deprecated alias
 # still read as a fallback; using it emits a one-line deprecation warning (once).
@@ -603,10 +627,13 @@ def _emit_add_batch_result(outcome: BatchOutcome, json_out: str | None) -> None:
 def edit(item_id: str, max_bid: str, offset: int | None, group: int | None):
     """Change the bid on an existing snipe.
 
-    BUI-401: --offset / --group default to None so a bare `edit <id> <bid>`
-    changes only the max bid — the field is omitted from the PATCH body (server
-    mode) or from the modify kwargs (direct mode) so the current value is
-    preserved instead of being reset to 6 / un-grouped.
+    BUI-401/BUI-404: --offset / --group default to None so a bare
+    `edit <id> <bid>` changes only the max bid — the field is omitted from the
+    PATCH body (server mode) so the server's DB-backed passthrough preserves
+    the current value, or resolved from a `list_snipes` lookup (direct mode,
+    which has no local store) before calling `modify_snipe` (which has no
+    passthrough concept of its own and would otherwise reset to its 6 / 0
+    defaults).
     """
     try:
         bid = Decimal(max_bid)
@@ -625,14 +652,74 @@ def edit(item_id: str, max_bid: str, offset: int | None, group: int | None):
         return
 
     client = _make_client()
-    # Direct mode has no local store to resolve a "keep current" value from, so
-    # an omitted field falls back to modify_snipe's own defaults (offset 6 /
-    # group 0) — the pre-BUI-401 direct-mode behavior, left unchanged.
     modify_kwargs: dict = {}
     if offset is not None:
         modify_kwargs["bid_offset"] = offset
     if group is not None:
         modify_kwargs["snipe_group"] = group
+
+    if offset is None or group is None:
+        # BUI-404: direct mode has no local store to resolve "keep current"
+        # from the way server-mode's api_edit_bid does from the DB — resolve
+        # the omitted field(s) from Gixen's own live snipe list instead, so a
+        # max_bid-only edit doesn't fall through to modify_snipe's own
+        # defaults (offset 6 / group 0) and silently reset a tuned fire-offset
+        # or un-group the snipe. A list_snipes failure or a not-found item
+        # aborts the edit here rather than proceeding with guessed defaults.
+        try:
+            snipes = client.list_snipes()
+        except GixenError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+        snipe = next(
+            (s for s in snipes if s.get("item_id") == str(item_id)), None
+        )
+        if snipe is None:
+            click.echo(
+                f"Error: Item {item_id} not found in your snipe list", err=True
+            )
+            sys.exit(1)
+        if offset is None:
+            current_offset = _parse_optional_int(snipe.get("bid_offset"))
+            if current_offset is None:
+                # An unparseable/blank bid_offset is "unknown" — silently
+                # substituting the hardcoded default (6) would be the exact
+                # silent-reset bug this fix exists to prevent, just on this
+                # field instead of snipe_group. Fail closed instead of
+                # guessing, same as the snipe_group branch below.
+                click.echo(
+                    f"Error: current bid_offset for {item_id} could not be "
+                    "read from Gixen (unknown/unparseable) — pass --offset "
+                    "explicitly to avoid an unintended change.",
+                    err=True,
+                )
+                sys.exit(1)
+            modify_kwargs["bid_offset"] = current_offset
+        if group is None:
+            current_group = _parse_optional_int(snipe.get("snipe_group"))
+            if current_group is None:
+                # BUI-383: an unparseable/blank snipe_group is "unknown", not
+                # "0" — coercing it to 0 would silently un-group a snipe whose
+                # real group we simply failed to read. Fail closed instead of
+                # guessing.
+                click.echo(
+                    f"Error: current snipe_group for {item_id} could not be "
+                    "read from Gixen (unknown/unparseable) — pass --group "
+                    "explicitly to avoid an unintended change.",
+                    err=True,
+                )
+                sys.exit(1)
+            modify_kwargs["snipe_group"] = current_group
+        # Deliberately NOT passing the dbidid resolved above through to
+        # modify_snipe: that would let it skip its own fresh list_snipes()
+        # lookup right before the POST, reusing a resolution that's now one
+        # extra round trip older — a stale-dbidid window this code didn't
+        # have before (pre-fix, modify_snipe always resolved dbidid fresh
+        # immediately pre-POST, since cli.py never passed one). Eating one
+        # extra list_snipes() call keeps that same-call freshness guarantee;
+        # the ticket already treats one extra round trip as an acceptable
+        # cost for the "keep current" resolution.
+
     try:
         client.modify_snipe(item_id, bid, **modify_kwargs)
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
