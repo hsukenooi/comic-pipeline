@@ -651,6 +651,18 @@ def edit(item_id: str, max_bid: str, offset: int | None, group: int | None):
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
         return
 
+    # BUI-414: this whole direct-mode branch (the list_snipes resolve below
+    # plus the modify_snipe call at the end) has NO mutual exclusion against
+    # another concurrent `gixen edit` invocation on the same item_id — unlike
+    # server mode, which serializes under _api_lock (BUI-402). An in-process
+    # lock can't fix that here: each CLI invocation is its own short-lived
+    # process, so there's no shared process for a lock to live in. This is
+    # deliberately left unguarded — direct mode is a single-human-terminal
+    # fallback path (used when the comics server is unreachable), not a
+    # concurrent service, and building an OS-level file lock to close this
+    # window would trade a low-likelihood race for real complexity (stale
+    # lock cleanup, etc). Don't run concurrent direct-mode edits against the
+    # same item_id. See packages/gixen-cli/CLAUDE.md "Key Details".
     client = _make_client()
     modify_kwargs: dict = {}
     if offset is not None:
