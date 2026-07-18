@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from server.db import (
     init_db, insert_bid, get_bid_by_item_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
-    get_pending_bids, mark_bids_purged,
+    get_pending_bids, mark_bids_purged, set_local_snipe_result,
 )
 
 
@@ -1978,3 +1978,222 @@ def test_refresh_snipe_group_defaults_changed_at_to_now(db):
     db.commit()
     stamp = get_bid_by_item_id(db, "884000007")["group_changed_at"]
     assert stamp is not None
+
+
+# ---------------------------------------------------------------------------
+# BUI-407 (Stage 0 of BUI-400): write helpers are commit-free; write_transaction()
+# ---------------------------------------------------------------------------
+# insert_bid/update_bid/update_bid_grades/delete_bid/mark_bids_purged/
+# set_auction_end_time/set_local_snipe_result all used to self-commit(); they
+# no longer do (the caller owns the commit). Every test above in this file
+# reads back through the SAME connection it wrote on, so those assertions
+# would pass whether or not a commit actually happened — a same-connection
+# read sees its own uncommitted writes regardless. The tests below instead
+# open a SECOND connection to the same on-disk file, which can only see
+# committed data, so they are the actual regression net for "did I forget a
+# caller-side commit."
+
+from server.db import write_transaction  # noqa: E402
+
+
+def test_insert_bid_visible_from_second_connection_only_after_commit(tmp_path):
+    """insert_bid no longer self-commits (BUI-407): a second connection to the
+    same file must see nothing until the writer explicitly commits."""
+    path = tmp_path / "second_conn.db"
+    writer = init_db(path)
+    insert_bid(writer, "990000001", 25.0, 6, 0, "s")
+
+    reader = sqlite3.connect(str(path))
+    reader.row_factory = sqlite3.Row
+    try:
+        assert reader.execute(
+            "SELECT 1 FROM bids WHERE item_id=?", ("990000001",)
+        ).fetchone() is None  # not yet committed
+
+        writer.commit()
+
+        assert reader.execute(
+            "SELECT 1 FROM bids WHERE item_id=?", ("990000001",)
+        ).fetchone() is not None  # visible once the writer commits
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_set_local_snipe_result_visible_from_second_connection_only_after_commit(tmp_path):
+    """set_local_snipe_result no longer self-commits (BUI-407). This is the
+    helper _sniper_loop calls right after firing a real eBay bid
+    (server/main.py's _sniper_loop) — no test anywhere drives that async
+    loop directly, so this is the only regression coverage the commit-free
+    contract for this specific helper has. Mirrors
+    test_insert_bid_visible_from_second_connection_only_after_commit."""
+    path = tmp_path / "snipe_result_second_conn.db"
+    writer = init_db(path)
+    insert_bid(writer, "990000008", 25.0, 6, 0, "s")
+    writer.commit()
+
+    set_local_snipe_result(writer, "990000008", "2026-07-18T00:00:00+00:00", "OK: bid placed")
+
+    reader = sqlite3.connect(str(path))
+    reader.row_factory = sqlite3.Row
+    try:
+        row = reader.execute(
+            "SELECT local_snipe_result FROM bids WHERE item_id=?", ("990000008",)
+        ).fetchone()
+        assert row["local_snipe_result"] is None  # not yet committed
+
+        writer.commit()
+
+        row = reader.execute(
+            "SELECT local_snipe_result FROM bids WHERE item_id=?", ("990000008",)
+        ).fetchone()
+        assert row["local_snipe_result"] == "OK: bid placed"  # visible once committed
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_write_transaction_commits_on_success(tmp_path):
+    """write_transaction() commits exactly once on a clean exit — a fresh
+    connection to the same file sees the write afterward."""
+    path = tmp_path / "wt_commit.db"
+    init_db(path).close()
+
+    with write_transaction(path) as conn:
+        insert_bid(conn, "990000002", 30.0, 6, 0, "s")
+
+    check = sqlite3.connect(str(path))
+    try:
+        row = check.execute(
+            "SELECT item_id FROM bids WHERE item_id=?", ("990000002",)
+        ).fetchone()
+        assert row is not None
+    finally:
+        check.close()
+
+
+def test_write_transaction_rolls_back_on_exception(tmp_path):
+    """An exception raised inside the `with` block rolls back the write and
+    propagates — nothing lands on disk."""
+    path = tmp_path / "wt_rollback.db"
+    init_db(path).close()
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        with write_transaction(path) as conn:
+            insert_bid(conn, "990000003", 30.0, 6, 0, "s")
+            raise _Boom("simulated failure mid-transaction")
+
+    check = sqlite3.connect(str(path))
+    try:
+        row = check.execute(
+            "SELECT item_id FROM bids WHERE item_id=?", ("990000003",)
+        ).fetchone()
+        assert row is None  # rolled back, never committed
+    finally:
+        check.close()
+
+
+def test_write_transaction_calls_rollback_explicitly_on_exception(tmp_path, monkeypatch):
+    """Proves conn.rollback() is actually INVOKED on the exception path, not
+    merely that the write never lands on disk.
+
+    A bare `finally: conn.close()` with no explicit rollback() call would
+    ALSO leave no row on disk — Python's sqlite3 silently discards an
+    uncommitted transaction on close() (verified: stripping write_transaction's
+    `except Exception: conn.rollback()` down to a no-op leaves
+    test_write_transaction_rolls_back_on_exception above passing unchanged).
+    So the disk-state assertion up there cannot, by itself, distinguish "we
+    called rollback()" from "we forgot to and got the same result by
+    accident." This test closes that gap with a Connection subclass that
+    records calls to rollback() — sqlite3.Connection is a C extension type,
+    so it can't be patched directly (unittest.mock.patch.object raises
+    TypeError on it); a factory subclass is the supported way to observe
+    method calls on a real connection.
+    """
+    import server.db as db_module
+
+    calls: list[int] = []
+
+    class _SpyConnection(sqlite3.Connection):
+        def rollback(self):
+            calls.append(1)
+            return super().rollback()
+
+    real_connect = db_module.sqlite3.connect
+
+    def _connect_with_spy(path_arg, *a, **kw):
+        return real_connect(path_arg, *a, factory=_SpyConnection, **kw)
+
+    path = tmp_path / "wt_rollback_spy.db"
+    init_db(path).close()
+    monkeypatch.setattr(db_module.sqlite3, "connect", _connect_with_spy)
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        with write_transaction(path) as conn:
+            insert_bid(conn, "990000006", 30.0, 6, 0, "s")
+            raise _Boom("simulated failure mid-transaction")
+
+    assert calls == [1], "write_transaction() must call conn.rollback() exactly once on exception"
+
+
+def test_write_transaction_closes_connection_on_success(tmp_path):
+    """The connection is closed after a clean exit — using it afterward raises."""
+    path = tmp_path / "wt_close_success.db"
+    init_db(path).close()
+
+    with write_transaction(path) as conn:
+        pass
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
+def test_write_transaction_closes_connection_on_exception(tmp_path):
+    """The connection is closed after an exception too, not left dangling."""
+    path = tmp_path / "wt_close_error.db"
+    init_db(path).close()
+
+    with pytest.raises(RuntimeError):
+        with write_transaction(path) as conn:
+            raise RuntimeError("boom")
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
+def test_write_transaction_sets_busy_timeout(tmp_path):
+    """busy_timeout=5000 is actually set on the connection write_transaction
+    yields (BUI-407's required safety margin against WAL-checkpoint /
+    external-process contention)."""
+    path = tmp_path / "wt_busy_timeout.db"
+    init_db(path).close()
+
+    with write_transaction(path) as conn:
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        assert row[0] == 5000
+
+
+def test_write_transaction_sets_wal_and_foreign_keys(tmp_path):
+    path = tmp_path / "wt_pragmas.db"
+    init_db(path).close()
+
+    with write_transaction(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_db_read_connection_sets_busy_timeout(tmp_path):
+    """The long-lived read connection (init_db, i.e. server.main._db) also
+    gets busy_timeout=5000 per BUI-407 scope."""
+    conn = init_db(tmp_path / "read_conn.db")
+    try:
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        assert row[0] == 5000
+    finally:
+        conn.close()
