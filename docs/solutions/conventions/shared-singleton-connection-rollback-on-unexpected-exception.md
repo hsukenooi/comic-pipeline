@@ -143,5 +143,6 @@ except GixenError as e:
 - **BUI-408 (Stage 1)** — routed the already-await-free writers (API paths, sniper, overlay `api_link_locg`) through `write_transaction()` under `_write_lock`.
 - **BUI-409 (Stage 2)** — `_run_ebay_fallback` gather-then-apply.
 - **BUI-410 (Stage 3)** — `_sync_gixen` gather-then-apply (folding in BUI-405's lock-free `refresh_snipe_group`); **removed the per-caller rollback guards** this doc prescribed, retiring the convention.
+- `write-transaction-per-cycle-isolation.md` — **the live convention** this banner summarizes: how to write a new comics-server DB writer today (gather-then-apply through `write_transaction()` under `_write_lock`), plus the read-then-write TOCTOU (BUI-417) a shared `_write_lock` does NOT close.
 - `../architecture-patterns/durable-evidence-store-encode-unknowns-and-identity-precisely.md` — sibling piece of the same shared-connection hardening arc (sentinel encoding + `group_wins` identity); a reader fixing one write-safety class in these files will likely need the other.
 - `../design-patterns/scope-status-writes-to-row-id-not-item-id.md` — companion write-hygiene discipline for the same `server/main.py` / `server/fallback.py` write paths (id-target terminal writes, don't write item_id-wide).
