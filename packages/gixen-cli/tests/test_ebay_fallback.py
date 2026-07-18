@@ -86,12 +86,25 @@ def test_fetch_timeout_returns_none(ebay_ready):
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from server.db import init_db
 
 
 def _iso(delta: timedelta) -> str:
     return (datetime.now(timezone.utc) + delta).isoformat()
+
+
+def _db_path_of(conn: sqlite3.Connection) -> str:
+    """BUI-409: _run_ebay_fallback's apply phase now opens its OWN
+    write_transaction() connection resolved via main._get_db_path() — a
+    SEPARATE connection from the seed/assert `conn` this file's tests build
+    with init_db(). Both point at the same on-disk WAL file (committed
+    writes on one are visible to the other), so tests just need to hand
+    main._db_path the same path `conn` was opened on. PRAGMA database_list's
+    3rd column is that path, avoiding a second `tmp_path` thread-through at
+    every call site."""
+    return conn.execute("PRAGMA database_list").fetchone()[2]
 
 
 def _seed(conn: sqlite3.Connection, item_id: str, *, status="ENDED",
@@ -113,8 +126,18 @@ def _seed(conn: sqlite3.Connection, item_id: str, *, status="ENDED",
 
 
 def _run_fallback(monkeypatch, conn, *, price="$10.00"):
-    """Drive _run_ebay_fallback against a real (tmp) DB with eBay mocked."""
+    """Drive _run_ebay_fallback against a real (tmp) DB with eBay mocked.
+
+    BUI-409: the apply phase now runs inside `async with m._write_locked():`
+    and resolves its write_transaction() connection via `m._get_db_path()`
+    (a SEPARATE connection from `conn`, same on-disk file — see
+    `_db_path_of`'s docstring), so both must be set alongside `m._db`.
+    `_write_lock` is created here rather than at module scope so it's bound
+    to the SAME loop asyncio.run() below drives this on (the established
+    convention — see test_server_api.py's test_sniper_loop_commits_under_
+    write_lock)."""
     monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_db_path", Path(_db_path_of(conn)))
     monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
     monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
     monkeypatch.setattr(
@@ -127,7 +150,12 @@ def _run_fallback(monkeypatch, conn, *, price="$10.00"):
         return None
 
     monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
-    asyncio.run(m._run_ebay_fallback())
+
+    async def run():
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        await m._run_ebay_fallback()
+
+    asyncio.run(run())
 
 
 def _status_row(conn, item_id):
@@ -463,6 +491,7 @@ def test_fallback_won_write_spares_live_pending_sharing_item_id(tmp_path, monkey
     conn.commit()
 
     monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_db_path", Path(_db_path_of(conn)))
     monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
     monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
     monkeypatch.setattr(
@@ -476,7 +505,12 @@ def test_fallback_won_write_spares_live_pending_sharing_item_id(tmp_path, monkey
         return None
 
     monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
-    asyncio.run(m._run_ebay_fallback())
+
+    async def run():
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        await m._run_ebay_fallback()
+
+    asyncio.run(run())
 
     old = conn.execute("SELECT * FROM bids WHERE id=?", (old_id,)).fetchone()
     live = conn.execute("SELECT * FROM bids WHERE id=?", (live_id,)).fetchone()
@@ -674,6 +708,7 @@ def test_fallback_no_price_marker_prevents_second_ebay_fetch(tmp_path, monkeypat
         "current_price": None, "end_date_iso": None,
     })
     monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_db_path", Path(_db_path_of(conn)))
     monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
     monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
     monkeypatch.setattr(m, "_fetch_ebay_item_sync", fetch)
@@ -682,10 +717,17 @@ def test_fallback_no_price_marker_prevents_second_ebay_fetch(tmp_path, monkeypat
         return None
 
     monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
-    asyncio.run(m._run_ebay_fallback())
+
+    async def run():
+        # Fresh _write_lock per asyncio.run() call — a Lock created on one
+        # loop can't be awaited from another (see _run_fallback's docstring).
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        await m._run_ebay_fallback()
+
+    asyncio.run(run())
     assert fetch.call_count == 1
 
-    asyncio.run(m._run_ebay_fallback())
+    asyncio.run(run())
     conn.close()
     assert fetch.call_count == 1  # no second fetch — row already excluded
 
@@ -735,10 +777,17 @@ def test_fallback_won_ledger_write_scoped_to_own_group_not_sibling(
 
 
 def test_fallback_rolls_back_on_unexpected_exception(tmp_path, monkeypatch):
-    """A genuine bug partway through the fallback loop (not a Gixen/eBay
-    connectivity issue — those are handled per-row, not via this generic
-    except) must roll back the shared connection instead of silently letting
-    a partial cycle's writes ride along on a future commit."""
+    """A genuine bug in the fallback's gather phase (not a Gixen/eBay
+    connectivity issue — those are handled per-row inside gather, not via
+    this generic except) must still roll back the shared `_db` connection.
+    BUI-409: this function no longer writes to `_db` itself (see
+    _run_ebay_fallback's except-block comment), so the rollback is no longer
+    protecting a partial cycle of ITS OWN writes — it stays as the
+    still-active BUI-386/391/399 systemwide convention (a defensive
+    safety net for whatever else might be mid-write on the shared
+    connection when an unrelated coroutine's bug fires) until Stage 3
+    (BUI-410) retires it. This test guards that the call site itself wasn't
+    dropped in the BUI-409 restructure."""
     conn = init_db(tmp_path / "fb.db")
     _seed(conn, "471099001", auction_end_at=_iso(timedelta(hours=-1)))
 
@@ -764,6 +813,7 @@ def test_fallback_rolls_back_on_unexpected_exception(tmp_path, monkeypatch):
 
     spy = _RollbackSpy(conn)
     monkeypatch.setattr(m, "_db", spy)
+    monkeypatch.setattr(m, "_db_path", Path(_db_path_of(conn)))
     monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
     monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
 
@@ -777,6 +827,310 @@ def test_fallback_rolls_back_on_unexpected_exception(tmp_path, monkeypatch):
 
     monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
 
-    asyncio.run(m._run_ebay_fallback())  # must swallow (fire-and-forget), not raise
+    async def run():
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        await m._run_ebay_fallback()  # must swallow (fire-and-forget), not raise
+
+    asyncio.run(run())
     conn.close()
     assert spy.rollbacks == 1
+
+
+# ---------------------------------------------------------------------------
+# BUI-409 (Stage 2 of BUI-400's shared-connection isolation rollout):
+# freeze-mid-cycle harness (design doc §6). Proves the gather-then-apply
+# restructure actually removed the cross-await open transaction: while
+# _run_ebay_fallback is paused mid-fetch (no DB write held — it hasn't
+# reached its write_transaction() apply phase yet), a concurrent api_purge
+# must be free to run to completion and commit, and _run_ebay_fallback's
+# later apply phase must neither prematurely have committed anything during
+# the pause nor get rolled back by (or itself roll back) api_purge's write.
+# ---------------------------------------------------------------------------
+
+def test_freeze_mid_cycle_purge_does_not_corrupt_fallback_apply(tmp_path, monkeypatch):
+    """Gate the eBay fetch on an asyncio.Event the test owns, pause the
+    fallback mid-gather, run api_purge concurrently, then release the gate
+    and let the fallback finish. Asserts:
+
+    1. api_purge completes (and tombstones the row) WHILE the fallback is
+       still frozen in phase 1 — proving _write_lock is never held across
+       the fetch await (Stage 1's api_purge write is not blocked by the
+       paused fallback).
+    2. At that same moment, the fallback's own writes (ebay_title,
+       winning_bid) have NOT landed yet — proving phase 2 (apply) hasn't
+       started, so nothing was prematurely committed mid-pause.
+    3. After the gate is released and the fallback's apply phase runs, the
+       purge's REMOVED tombstone survives untouched — update_bid_status's
+       own tombstone WHERE-guard (`status NOT IN (...)`) makes the
+       fallback's now-stale WON/LOST write for this row a no-op, so neither
+       writer corrupts or rolls back the other's committed work.
+
+    The eBay fetch runs inside asyncio.to_thread (a real worker thread), so
+    the Event/gate handshake crosses threads via call_soon_threadsafe /
+    run_coroutine_threadsafe rather than touching the asyncio primitives
+    directly from the worker thread.
+    """
+    conn = init_db(tmp_path / "freeze.db")
+    _seed(conn, "409000001", status="ENDED",
+          auction_end_at=_iso(timedelta(hours=-1)))
+    conn.commit()
+    path = Path(_db_path_of(conn))
+
+    mock_client = MagicMock()
+    mock_client.list_snipes.return_value = []
+    mock_client.purge_completed.return_value = None
+    mock_client.remove_snipe.return_value = True
+
+    monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_db_path", path)
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+    monkeypatch.setattr(m, "_api_client", mock_client)
+
+    async def _nosleep(_):
+        return None
+
+    monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        # Fresh, loop-bound locks/state — same convention as _run_fallback.
+        monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        monkeypatch.setattr(m, "_api_lock", asyncio.Lock())
+
+        fetch_gate = asyncio.Event()
+        fetch_entered = asyncio.Event()
+
+        def _gated_fetch(iid):
+            # Runs in a to_thread worker thread — signal + wait via
+            # threadsafe primitives, never touch the Event directly here.
+            loop.call_soon_threadsafe(fetch_entered.set)
+            asyncio.run_coroutine_threadsafe(fetch_gate.wait(), loop).result()
+            return {"item_id": iid, "title": "T", "current_price": "$10.00",
+                    "end_date_iso": None}
+
+        monkeypatch.setattr(m, "_fetch_ebay_item_sync", _gated_fetch)
+
+        fallback_task = asyncio.create_task(m._run_ebay_fallback())
+        await asyncio.wait_for(fetch_entered.wait(), timeout=5.0)
+        # The fallback is now frozen in phase 1 (gather), blocked inside the
+        # fetch, with zero DB writes held — the property BUI-409 exists to
+        # guarantee.
+
+        # Timeout, not a bare await: if _run_ebay_fallback ever regressed to
+        # hold _write_lock across the fetch (exactly the bug this test
+        # exists to catch), api_purge's own _write_locked() acquisition
+        # would block forever on a lock the frozen fallback task can't
+        # release until fetch_gate.set() below — which is unreachable past
+        # a hang here. Fail fast instead of hanging the whole suite.
+        purge_result = await asyncio.wait_for(
+            m.api_purge(m.PurgeRequest(sibling_ids=[])), timeout=5.0
+        )
+        assert purge_result["purged_completed"] == 1
+
+        mid_pause = conn.execute(
+            "SELECT status, winning_bid, ebay_title FROM bids "
+            "WHERE item_id='409000001'"
+        ).fetchone()
+        # (1) api_purge ran to completion and committed while the fallback
+        # was still paused — not blocked by a lock the fallback would have
+        # held across the fetch await under the old (pre-BUI-409) shape.
+        assert mid_pause["status"] == "REMOVED"
+        # (2) The fallback's own apply-phase writes have not landed — phase
+        # 2 hasn't started yet, so nothing was prematurely committed.
+        assert mid_pause["winning_bid"] is None
+        assert mid_pause["ebay_title"] is None
+
+        fetch_gate.set()  # release the gate — gather completes, apply runs
+        await asyncio.wait_for(fallback_task, timeout=5.0)
+
+    asyncio.run(run())
+
+    row = conn.execute(
+        "SELECT status, winning_bid, ebay_title FROM bids "
+        "WHERE item_id='409000001'"
+    ).fetchone()
+    conn.close()
+    # (3) The purge's REMOVED tombstone survives: the fallback's apply
+    # phase used its stale (pre-purge) snapshot (is_purged=False, since the
+    # row was still ENDED when phase 1 read it) and so attempted the
+    # WON/LOST-inference update_bid_status() call — but that call's own
+    # `status NOT IN (tombstones)` WHERE guard makes it a no-op against the
+    # now-REMOVED row. Neither writer rolled back or clobbered the other's
+    # committed work.
+    assert row["status"] == "REMOVED"
+    # The unconditional title/end-date write (BUI-382: runs regardless of
+    # status) DOES still land — it's harmless and orthogonal to status.
+    assert row["ebay_title"] == "T"
+
+
+# ---------------------------------------------------------------------------
+# BUI-409 review follow-up: regression coverage for the two new code paths
+# the gather-then-apply restructure introduces — a mixed-outcome batch
+# (one row's fetch fails, a sibling's succeeds, in the SAME cycle), and an
+# unexpected exception raised inside phase 2 (apply) rather than phase 1
+# (gather, already covered by test_fallback_rolls_back_on_unexpected_
+# exception above).
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_mixed_fetch_outcomes_only_skips_failing_row(tmp_path, monkeypatch):
+    """Two rows eligible in the SAME cycle: one whose eBay fetch fails, one
+    that succeeds. The failing row must get NO write at all (still exactly
+    as seeded) while the sibling row — fetched successfully in the same
+    gather phase — still gets applied in phase 2. Proves the `fetched`
+    dict's per-row failure isolation actually works across a real multi-row
+    batch, not just a single-row cycle (every other existing test in this
+    file seeds at most one row that _ebay_fallback_rows actually matches)."""
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "409100001", auction_end_at=_iso(timedelta(hours=-1)))
+    _seed(conn, "409100002", auction_end_at=_iso(timedelta(hours=-1)))
+    conn.commit()
+
+    def _fetch(iid):
+        if iid == "409100001":
+            return None  # simulated fetch failure for this row only
+        return {"item_id": iid, "title": "T", "current_price": "$10.00",
+                "end_date_iso": None}
+
+    monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_db_path", Path(_db_path_of(conn)))
+    monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+    monkeypatch.setattr(m, "_fetch_ebay_item_sync", _fetch)
+
+    async def _nosleep(_):
+        return None
+
+    monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
+
+    async def run():
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        await m._run_ebay_fallback()
+
+    asyncio.run(run())
+
+    failed_row = _status_row(conn, "409100001")
+    ok_row = _status_row(conn, "409100002")
+    conn.close()
+
+    # The failing row's fetch never returned data — untouched, still
+    # exactly as seeded.
+    assert failed_row["status"] == "ENDED"
+    assert failed_row["winning_bid"] is None
+    # The sibling, fetched successfully in the SAME cycle, still gets
+    # applied — one row's fetch failure doesn't abort the batch.
+    assert ok_row["status"] == "WON"
+    assert ok_row["winning_bid"] == 10.0
+
+
+def test_fallback_apply_phase_exception_rolls_back_whole_batch(tmp_path, monkeypatch):
+    """An unexpected exception raised INSIDE phase 2 (apply) — as opposed to
+    test_fallback_rolls_back_on_unexpected_exception's phase-1 (gather)
+    trigger via a raising _fetch_ebay_item_sync — must roll back
+    write_transaction()'s entire batch, including any row that already
+    applied successfully earlier in the SAME transaction. This matches the
+    old code's single-end-of-cycle-commit behavior exactly: a mid-loop bug
+    there also discarded the whole cycle's writes, not just the offending
+    row's. Forces the exception via update_bid_status (as imported into
+    server.fallback) rather than the eBay fetch, so it fires only after
+    gather has already succeeded for both rows and phase 2 is underway."""
+    import server.fallback as fb
+
+    conn = init_db(tmp_path / "fb.db")
+    _seed(conn, "409200001", auction_end_at=_iso(timedelta(hours=-1)))
+    _seed(conn, "409200002", auction_end_at=_iso(timedelta(hours=-1)))
+    conn.commit()
+
+    real_update_bid_status = fb.update_bid_status
+
+    def _boom_for_002(conn_arg, item_id, *a, **kw):
+        if item_id == "409200002":
+            raise RuntimeError("apply-phase boom")
+        return real_update_bid_status(conn_arg, item_id, *a, **kw)
+
+    monkeypatch.setattr(fb, "update_bid_status", _boom_for_002)
+    monkeypatch.setattr(m, "_db", conn)
+    monkeypatch.setattr(m, "_db_path", Path(_db_path_of(conn)))
+    monkeypatch.setattr(m, "_ebay_fallback_lock", asyncio.Lock())
+    monkeypatch.setattr(m, "_ebay_cooldown_until", 0.0)
+    monkeypatch.setattr(
+        m, "_fetch_ebay_item_sync",
+        lambda iid: {"item_id": iid, "title": "T", "current_price": "$10.00",
+                     "end_date_iso": None},
+    )
+
+    async def _nosleep(_):
+        return None
+
+    monkeypatch.setattr(m.asyncio, "sleep", _nosleep)
+
+    async def run():
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        await m._run_ebay_fallback()  # must swallow (fire-and-forget), not raise
+
+    asyncio.run(run())
+
+    row1 = _status_row(conn, "409200001")
+    row2 = _status_row(conn, "409200002")
+    conn.close()
+
+    # Whichever row processed first (plain SELECT, no ORDER BY — order
+    # isn't guaranteed), NEITHER row's write survives: write_transaction()'s
+    # rollback discards the whole apply transaction, not just the row that
+    # raised.
+    assert row1["status"] == "ENDED"
+    assert row1["winning_bid"] is None
+    assert row2["status"] == "ENDED"
+    assert row2["winning_bid"] is None
+
+
+def test_fallback_same_cycle_group_win_classifies_sibling_in_one_call(
+        tmp_path, monkeypatch):
+    """The core same-connection read-after-write claim in
+    _run_ebay_fallback's docstring, proven with BOTH rows resolved by a
+    SINGLE _run_ebay_fallback() call (every other group-evidence test in
+    this file pre-seeds the winning row's group_wins ledger entry via a
+    SEPARATE record_group_win() call before invoking the fallback — this
+    test instead lets the fallback itself classify the winner as WON mid-
+    cycle, via update_bid_status's own group_wins insert, and checks a
+    LATER row in the SAME batch sees that evidence). Winner ends well
+    before the sibling (respecting the _group_won_before margin/lifetime
+    bounds), so the sibling — a snipe in the same group whose own auction
+    ended after the winner's — resolves REMOVED (cancelled before end) off
+    evidence recorded during THIS SAME cycle, not a pre-existing row."""
+    conn = init_db(tmp_path / "fb.db")
+    # Winner: ended 3 hours ago, well past the winner's own event; added a
+    # week ago (default) so member_since predates its win.
+    _seed(conn, "409300001", snipe_group=9,
+          auction_end_at=_iso(timedelta(hours=-3)))
+    # Sibling: same group, added a week ago too, its OWN auction ending
+    # 1 hour ago — after the winner's end (3h ago) plus the 10-minute
+    # margin, so the winner's evidence covers it.
+    _seed(conn, "409300002", snipe_group=9,
+          auction_end_at=_iso(timedelta(hours=-1)))
+    conn.commit()
+
+    # Winner's price ($10, below its $25 max) infers WON; the sibling's own
+    # fetch price is irrelevant once cancel evidence classifies it REMOVED
+    # first (the cancelled-before-end check runs before the WON/LOST
+    # inference branch).
+    _run_fallback(monkeypatch, conn, price="$10.00")
+
+    winner = _status_row(conn, "409300001")
+    sibling = _status_row(conn, "409300002")
+    ledger = conn.execute(
+        "SELECT * FROM group_wins WHERE item_id='409300001'"
+    ).fetchone()
+    conn.close()
+
+    assert winner["status"] == "WON"
+    assert ledger is not None, (
+        "the winner's WON transition (inferred mid-cycle by this SAME "
+        "_run_ebay_fallback() call) must have recorded group-win evidence"
+    )
+    assert sibling["status"] == "REMOVED", (
+        "the sibling, resolved in the SAME batch/cycle, must see the "
+        "winner's group_wins evidence even though it was written by an "
+        "EARLIER iteration of this same apply-phase loop, not a prior call"
+    )

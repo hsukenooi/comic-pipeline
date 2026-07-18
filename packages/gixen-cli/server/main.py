@@ -121,28 +121,36 @@ if not _plugin_logger.handlers:
 # BUI-408 (Stage 1): the already-await-free writers (api_add_bid, api_edit_bid,
 # api_purge, _sniper_loop's set_local_snipe_result, and the overlay's
 # api_link_locg) now route through write_transaction() under the short-held
-# _write_lock below instead of _db — see _write_locked()'s docstring. The
-# cross-await writers (_run_ebay_fallback, _sync_gixen, refresh_snipe_group)
-# are UNCHANGED — they still own _db directly; that's Stage 2/3 (BUI-409/410).
+# _write_lock below instead of _db — see _write_locked()'s docstring.
+#
+# BUI-409 (Stage 2): _run_ebay_fallback (server/fallback.py) is now ALSO
+# routed through write_transaction()/_write_lock, gather-then-apply (every
+# eBay fetch first, no DB write held across an await; one write_transaction()
+# block applies the whole cycle's writes after). The remaining cross-await
+# writers are _sync_gixen and refresh_snipe_group — they still own _db
+# directly and self-commit; that's Stage 3 (BUI-410).
 # See docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md.
 #
-# KNOWN RESIDUAL RISK for Stage 2/3 (BUI-409/410), sharpening design doc §7's
-# open sniper-timing question: because _sync_gixen can hold an open,
-# uncommitted write transaction on _db across a network await, a Stage-1
-# write_transaction() that happens to start during that window can hit
-# SQLite's single-writer-at-a-time constraint (true even in WAL mode) and
-# block on busy_timeout — and because this server is one event loop on one
-# thread, that block is NOT cooperative: it can stall the ENTIRE server
-# (every request, plus the sniper's fire path) for up to busy_timeout
+# KNOWN RESIDUAL RISK for Stage 3 (BUI-410), sharpening design doc §7's open
+# sniper-timing question: because _sync_gixen can hold an open, uncommitted
+# write transaction on _db across a network await, a write_transaction()
+# opened by ANY Stage-1/2-routed writer (including, since BUI-409,
+# _run_ebay_fallback's own apply phase) that happens to start during that
+# window can hit SQLite's single-writer-at-a-time constraint (true even in
+# WAL mode) and block on busy_timeout — and because this server is one event
+# loop on one thread, that block is NOT cooperative: it can stall the ENTIRE
+# server (every request, plus the sniper's fire path) for up to busy_timeout
 # (5000ms), not just the one racing writer, until _sync_gixen's own coroutine
 # gets a chance to resume and commit. Bounded (≤5s) and does not compound
-# across the request queue, but is a genuinely new class of stall this stage
-# introduces (the pre-Stage-1 shared connection had no such contention, only
-# the data-corruption risk this project exists to fix). Stage 3's gather-
-# then-apply rewrite of _sync_gixen removes the open-transaction-across-await
-# shape entirely, closing this. Until then, this is accepted risk, not a
-# Stage 1 defect — do not attempt to close it here without touching
-# _sync_gixen/_run_ebay_fallback (out of this stage's scope by design).
+# across the request queue, but is a genuinely new class of stall these
+# stages introduce (the pre-Stage-1 shared connection had no such contention,
+# only the data-corruption risk this project exists to fix). Stage 3's
+# gather-then-apply rewrite of _sync_gixen removes the open-transaction-
+# across-await shape entirely, closing this — BUI-409 already closed HALF of
+# this interim window (the _run_ebay_fallback side); Stage 3 closes the
+# other half (_sync_gixen/refresh_snipe_group). Until then, this is accepted
+# risk, not a Stage 1/2 defect — do not attempt to close it here without
+# touching _sync_gixen (out of Stage 2's scope by design).
 _db: sqlite3.Connection | None = None
 # BUI-408: the resolved runtime DB path (the same value passed to init_db()
 # below), stashed so write_transaction() callers can target the correct file.
