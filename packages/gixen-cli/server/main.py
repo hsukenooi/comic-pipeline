@@ -33,7 +33,7 @@ from gixen.plugins import (
 )
 from server.db import (
     DB_PATH, init_db, insert_bid, update_bid_grades, get_bid_by_item_id,
-    get_pending_bid_by_item_id,
+    get_bid_by_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
@@ -146,20 +146,29 @@ if not _plugin_logger.handlers:
 # both halves of design §7's sniper-timing worry are now closed.
 # See docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md.
 #
-# KNOWN RESIDUAL (BUI-409 review; NOT closed by Stage 3 — flagged for a
-# dedicated follow-up, see _run_ebay_fallback's docstring): a cross-writer
-# read-then-write TOCTOU survives. Both _run_ebay_fallback and _sync_gixen
-# snapshot a row's status with a LOCK-FREE read at gather time, BEFORE
-# acquiring _write_lock; the terminal writes in each apply guard on status
-# CLASS (NOT IN tombstones), not status EQUALITY vs the gather snapshot. So a
-# writer whose apply lands after a concurrent writer committed a genuine
-# WON/terminal transition to the same row (a non-tombstone status the class
-# guard does not catch) can still overwrite it with a now-stale inference.
-# Serializing the two APPLIES under _write_lock (what Stage 3 adds) does NOT
-# close this, because the stale DECISION was made from a pre-lock read. A
-# proper fix (re-read status under the lock in the apply and skip on an
-# unexpected terminal transition since gather) touches BOTH apply paths and
-# earns its own ticket + tests — out of scope for this high-stakes stage.
+# BUI-417 (closes the BUI-409/410 cross-writer read-then-write TOCTOU): both
+# _run_ebay_fallback and _sync_gixen snapshot a row's status with a LOCK-FREE
+# read at gather time, BEFORE acquiring _write_lock; the terminal writes in
+# each apply guard on status CLASS (NOT IN tombstones), not status EQUALITY vs
+# the gather snapshot. So a writer whose apply lands after a concurrent writer
+# committed a genuine WON/terminal transition to the same row (a non-tombstone
+# status the class guard does not catch) could still overwrite it with a
+# now-stale inference. Serializing the two APPLIES under _write_lock (Stage 3)
+# did NOT close this, because the stale DECISION was made from a pre-lock read.
+# The fix re-reads the row FRESH under the lock in each apply (via
+# get_bid_by_id) and re-validates every precondition the gather-time decision
+# rested on before writing:
+#   - _run_ebay_fallback (server/fallback.py): skip the terminal write unless
+#     the row is still in the actionable {PENDING, ENDED} set, and re-evaluate
+#     the cancel evidence on the fresh row (closing the re-add).
+#   - _apply_vanished_null_end (below): skip unless still PENDING, and — for
+#     the REMOVED (user-removed) branch — tombstone only when gixen_vanished_at
+#     predates THIS cycle's scrape. A mere "gixen_vanished_at still set" check
+#     is INSUFFICIENT here: _record_vanish_observations, run earlier in the
+#     SAME apply, RE-STAMPS gixen_vanished_at=now on a row a concurrent re-add
+#     just cleared — so a re-added snipe looks identically vanished and only the
+#     timestamp's age (predates the scrape => a sustained absence, not a re-add)
+#     separates them. See both apply sites for the full rationale.
 _db: sqlite3.Connection | None = None
 # BUI-408: the resolved runtime DB path (the same value passed to init_db()
 # below), stashed so write_transaction() callers can target the correct file.
@@ -451,6 +460,7 @@ def _apply_vanished_null_end(
     snipes: list,
     now_dt: datetime,
     now: str,
+    scrape_started_at: str,
 ) -> None:
     """BUI-410 apply half of the BUI-85 resolver — sync + await-free, runs
     inside _sync_gixen's single write_transaction(). For each row the gather
@@ -465,14 +475,65 @@ def _apply_vanished_null_end(
       - no eBay data      → leave PENDING and retry a later sync.
     Every write id-targets its row (only_id=, BUI-390) — the BUI-178 class of
     blast radius the REMOVED branch (BUI-371), the vanished-ended write
-    (BUI-388) and every _run_ebay_fallback write (BUI-382) already guard."""
+    (BUI-388) and every _run_ebay_fallback write (BUI-382) already guard.
+
+    BUI-417 TOCTOU guards. `resolved` (the candidate set + each row's eBay end)
+    was built by _gather_vanished_null_end in the LOCK-FREE gather phase, so a
+    concurrent writer may have transitioned or re-added a row into the
+    gather->apply window. Two guards, both keyed on a FRESH re-read of the row
+    under _write_lock (get_bid_by_id on `conn`):
+
+      1. Status re-check (both branches): skip unless the row is still PENDING.
+         A terminal outcome committed since gather (WON is not a tombstone, so
+         update_bid_status's class guard would miss it) must not be overwritten.
+
+      2. Re-add guard (REMOVED branch only): a snipe RE-ADDED between gather and
+         apply keeps status='PENDING', so guard 1 does NOT catch it — and the
+         obvious "gixen_vanished_at still set" check does NOT either, because
+         _record_vanish_observations (run earlier in THIS same apply) RE-STAMPS
+         gixen_vanished_at=now on a row a re-add just cleared. The only reliable
+         signal is the stamp's AGE: tombstone REMOVED only when the vanish was
+         observed BEFORE this cycle's scrape (`gixen_vanished_at <
+         scrape_started_at`) — a sustained absence. A same-cycle stamp (a
+         genuine first-observation OR a re-add re-stamp — indistinguishable
+         here) defers the REMOVED one sync: next cycle a real removal is still
+         gone (→ REMOVED then), while a re-add has reappeared in the list (→
+         gixen_vanished_at cleared, never tombstoned). Safe to defer: a NULL-end
+         PENDING row is inert to the eBay fallback (its set-1 needs a non-NULL
+         end) and to the local sniper (which fires on auction_end_at), so the
+         one-cycle deferral can leak neither a phantom-WON nor a stray bid."""
+    scrape_started_dt = _parse_iso_utc(scrape_started_at)
     for iid, row_id, ebay in resolved:
         end_iso = (ebay or {}).get("end_date_iso")
         end_dt = _parse_end_iso(end_iso)
         if end_dt is None:
             continue  # can't disambiguate yet — leave PENDING, retry later
-        set_auction_end_time(conn, iid, end_iso)
+        # BUI-417 guard 1: re-read the row FRESH under the lock. A terminal
+        # outcome (or a delete) landed since the gather selected this candidate
+        # → leave it to that outcome; do not overwrite from a stale decision.
+        fresh = get_bid_by_id(conn, row_id)
+        if fresh is None or fresh["status"] != "PENDING":
+            if fresh is not None:
+                logger.info(
+                    "_sync_gixen: %s status is %s (not PENDING) since gather — "
+                    "skipping stale vanished-null-end write (BUI-417 TOCTOU)",
+                    iid, fresh["status"],
+                )
+            continue
+        # set_auction_end_time is deliberately NOT called up here (it was, pre-
+        # BUI-417). It must run ONLY alongside a terminal write below, never on
+        # the guard-2 defer path: a deferred row has to stay genuinely NULL-end
+        # so it (a) remains a _gather_vanished_null_end candidate next cycle
+        # (that query requires auction_end_at IS NULL) and (b) stays inert to the
+        # local sniper (get_bids_ready_to_snipe fires on PENDING rows with a
+        # NON-NULL end). Writing a future end on the defer path would strand the
+        # row PENDING and expose it to a stray bid on an auction the user
+        # cancelled — the exact leak this branch's docstring promises the
+        # deferral cannot cause.
         if end_dt <= now_dt:
+            # Genuinely ended: record the eBay end (the fallback keys its
+            # winning_bid backfill on a non-NULL auction_end_at) and flip ENDED.
+            set_auction_end_time(conn, iid, end_iso)
             update_bid_status(
                 conn, iid, "ENDED", winning_bid=None, resolved_at=now,
                 only_id=row_id,  # BUI-390: id-target, don't stamp siblings
@@ -482,6 +543,27 @@ def _apply_vanished_null_end(
                 iid, end_iso,
             )
         elif snipes:
+            # BUI-417 guard 2 (re-add): tombstone only a SUSTAINED vanish —
+            # gixen_vanished_at stamped before this cycle's scrape. A same-cycle
+            # stamp (first-observation or a re-add re-stamped by
+            # _record_vanish_observations, indistinguishable) defers one cycle.
+            vanished_dt = _parse_iso_utc(fresh["gixen_vanished_at"])
+            if (
+                scrape_started_dt is None
+                or vanished_dt is None
+                or vanished_dt >= scrape_started_dt
+            ):
+                # DEFER — leave the row PENDING and NULL-end (see the note above
+                # on why auction_end_at must not be written here).
+                logger.info(
+                    "_sync_gixen: %s vanished w/ NULL end + future eBay end, but its "
+                    "vanish was not observed before this scrape (possible re-add) — "
+                    "deferring REMOVED one cycle (BUI-417)", iid,
+                )
+                continue
+            # Sustained vanish → the user removed it. Record the eBay end (history
+            # parity with the pre-BUI-417 write) and tombstone REMOVED.
+            set_auction_end_time(conn, iid, end_iso)
             update_bid_status(
                 conn, iid, "REMOVED", winning_bid=None, resolved_at=now,
                 only_id=row_id,  # BUI-390: id-target, don't stamp siblings
@@ -902,7 +984,12 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
                 )
 
             # BUI-85 vanished-with-NULL-end: apply the gather-phase eBay results.
-            _apply_vanished_null_end(wconn, vanished_null_end, snipes, now_dt, now)
+            # BUI-417: scrape_started_at lets the REMOVED branch tell a
+            # sustained vanish (stamped before this scrape) from a same-cycle
+            # stamp that a concurrent re-add may have caused.
+            _apply_vanished_null_end(
+                wconn, vanished_null_end, snipes, now_dt, now, scrape_started_at,
+            )
 
             # Web-added inserts join the same transaction (BUI-410).
             # BUI-418: existing_ids was already computed in the GATHER phase
