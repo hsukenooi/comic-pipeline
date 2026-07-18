@@ -55,7 +55,8 @@ in the result). Pass `--no-cache` to bypass; use `locg cache stats` and
 `locg cache clear` to manage. The cache dir is resolved by `config._cache_dir`
 with precedence `LOCG_DATA_DIR` env → `<repo>/data/locg` → `~/.cache/locg`
 fallback (BUI-84); it also holds `collection.json` and `wish-list.json`, which
-are versioned so the collection travels with the repo.
+are a local-only working cache, gitignored since BUI-87/93 — the comics server
+on the Mac Mini is the source of truth for collection and wish-list state.
 
 Note on the 140-issue limit: `locg series <id>` returns at most 140 issues
 per call (date-desc by default). For series with more than 140 issues, the
