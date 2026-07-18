@@ -11,6 +11,8 @@ import requests
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from record_win_prep import (
+    MISSING_YEAR_PRICE_THRESHOLD,
+    REASON_MISSING_YEAR,
     REASON_NULL_SERIES_OR_ISSUE,
     REASON_UNPARSEABLE_LOT,
     RecordWinPrepError,
@@ -390,6 +392,122 @@ def test_entries_for_win_lot_dedupes_repeated_issue_numbers():
     entries, review = entries_for_win(win, identity)
     assert review is None
     assert [e["identify_data"]["issue"] for e in entries] == ["100", "101"]
+
+
+# ---------------------------------------------------------------------------
+# entries_for_win — BUI-422 missing-year gate
+# ---------------------------------------------------------------------------
+
+
+def test_entries_for_win_null_year_above_threshold_needs_review():
+    """A null year on a win priced at/above the threshold is exactly the
+    vintage-key volume-mis-resolution risk BUI-422 exists to catch."""
+    win = _snipe("1", current_bid=f"${MISSING_YEAR_PRICE_THRESHOLD:.2f}")
+    identity = _identity(series="FANTASTIC FOUR", issue="1", year=None)
+    entries, review = entries_for_win(win, identity)
+    assert entries == []
+    assert review["reason"] == REASON_MISSING_YEAR
+    assert review["item_id"] == "1"
+    assert review["identity"]["series"] == "FANTASTIC FOUR"
+
+
+def test_entries_for_win_null_year_above_threshold_needs_review_numeric_bid():
+    """Price parsing must handle a plain float/int current_bid, not just the
+    '$X.XX USD'-shaped strings gixen-list happens to emit."""
+    win = _snipe("1", current_bid=233.0)
+    identity = _identity(series="Amazing Spider-Man", issue="89", year=None)
+    entries, review = entries_for_win(win, identity)
+    assert entries == []
+    assert review["reason"] == REASON_MISSING_YEAR
+
+
+def test_entries_for_win_null_year_below_threshold_still_records():
+    """Below the threshold, a null year keeps the pre-BUI-422 behavior: the
+    win entry is still built, with `year` simply omitted — cheap modern
+    filler/reprint titles shouldn't pay a review-friction cost."""
+    win = _snipe("1", current_bid="$5.00")
+    identity = _identity(series="Ghost Rider", issue="1", year=None)
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert len(entries) == 1
+    assert "year" not in entries[0]["identify_data"]
+
+
+def test_entries_for_win_null_year_price_exactly_at_threshold_needs_review():
+    """The gate is inclusive (>=) at the threshold boundary."""
+    win = _snipe("1", current_bid=f"{MISSING_YEAR_PRICE_THRESHOLD:.2f} USD")
+    identity = _identity(series="Ghost Rider", issue="1", year=None)
+    entries, review = entries_for_win(win, identity)
+    assert entries == []
+    assert review["reason"] == REASON_MISSING_YEAR
+
+
+def test_entries_for_win_null_year_price_just_below_threshold_still_records():
+    """One cent under the threshold must NOT gate — confirms the boundary
+    isn't off-by-one in the other direction."""
+    win = _snipe("1", current_bid=f"${MISSING_YEAR_PRICE_THRESHOLD - 0.01:.2f}")
+    identity = _identity(series="Ghost Rider", issue="1", year=None)
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert len(entries) == 1
+
+
+@pytest.mark.parametrize("bad_bid", [None, "", "no bid", "TBD", "$", "USD"])
+def test_entries_for_win_null_year_missing_or_unparseable_price_fails_safe(bad_bid):
+    """BUI-422 fail-safe: a missing/unparseable price must NEVER be treated
+    as below the threshold — that would let exactly the case with no price
+    signal at all bypass the gate."""
+    win = _snipe("1", current_bid=bad_bid)
+    identity = _identity(series="Ghost Rider", issue="1", year=None)
+    entries, review = entries_for_win(win, identity)
+    assert entries == []
+    assert review["reason"] == REASON_MISSING_YEAR
+
+
+def test_entries_for_win_year_present_ignores_price_entirely():
+    """Sanity check that the BUI-422 gate only ever looks at price when year
+    is null — a high-value win with a real year must build a normal win
+    entry regardless of price."""
+    win = _snipe("1", current_bid="$999.00")
+    identity = _identity(series="Ghost Rider", issue="1", year=1973)
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert entries[0]["identify_data"]["year"] == 1973
+
+
+def test_entries_for_win_lot_null_year_above_threshold_needs_review():
+    """The BUI-422 gate applies to the lot path too — a lot's constituent
+    issues parsed fine, but a null year is still the same mis-resolution
+    risk before it's expanded into per-issue win entries."""
+    win = _snipe("1", title="X-Men lot #1-3", current_bid="$150.00")
+    identity = _identity(series="X-Men", issue=None, year=None, is_lot=True,
+                          constituent_issues=["1", "2", "3"])
+    entries, review = entries_for_win(win, identity)
+    assert entries == []
+    assert review["reason"] == REASON_MISSING_YEAR
+
+
+def test_entries_for_win_lot_null_year_below_threshold_still_expands():
+    """Lot path mirror of the below-threshold non-lot case: a cheap lot with
+    a null year still expands into win entries as before BUI-422."""
+    win = _snipe("1", title="X-Men lot #1-3", current_bid="$10.00")
+    identity = _identity(series="X-Men", issue=None, year=None, is_lot=True,
+                          constituent_issues=["1", "2", "3"])
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert [e["identify_data"]["issue"] for e in entries] == ["1", "2", "3"]
+
+
+def test_entries_for_win_lot_unparseable_lot_takes_priority_over_year_gate():
+    """When a lot's constituents are unparseable AND its year is null, the
+    existing REASON_UNPARSEABLE_LOT gate must still fire — there's no need to
+    (and no benefit to) reclassifying that as a missing-year review."""
+    win = _snipe("1", title="Marvel Silver Age Lot", current_bid="$150.00")
+    identity = _identity(series="Marvel", issue=None, year=None, is_lot=True,
+                          constituent_issues=[])
+    entries, review = entries_for_win(win, identity)
+    assert entries == []
+    assert review["reason"] == REASON_UNPARSEABLE_LOT
 
 
 # ---------------------------------------------------------------------------
