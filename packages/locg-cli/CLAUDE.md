@@ -82,8 +82,10 @@ locg collection has "Amazing Spider-Man #300"
 locg collection --fields name,id
 
 # Append a title to the local wish-list cache (no LOCG round-trip).
-# A subsequent `locg collection import` overwrites the cache from the XLSX
-# export, so manually-added entries are NOT preserved across imports.
+# As of BUI-208, `locg collection import` no longer touches wish-list.json —
+# it is the single source of truth for wish state, so this local add (marked
+# source: local) survives a subsequent import; only a server-side removal or
+# a manual re-seed changes it.
 locg wish-list add "Amazing Spider-Man #300"
 
 # Add/remove a comic to/from a list (pull, collection, wish, read)
