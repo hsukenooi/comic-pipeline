@@ -712,6 +712,15 @@ def test_purge_removes_siblings(api):
     assert r.status_code == 200
     assert r.json()["removed_siblings"] == 1
     api.mock_gixen.remove_snipe.assert_called_once_with("500000002")
+    # BUI-407: delete_bid no longer self-commits — api_purge's sibling loop
+    # must now commit itself. removed_siblings is a plain in-process counter
+    # and the mock-call assertion above proves nothing about the DB write, so
+    # read the sibling back via a SEPARATE connection (not the app's own) to
+    # prove the tombstone actually landed on disk.
+    row = _dbconn().execute(
+        "SELECT status FROM bids WHERE item_id=?", ("500000002",)
+    ).fetchone()
+    assert row["status"] == "REMOVED"
 
 
 def test_purge_sibling_failure_swallowed(api):
@@ -802,6 +811,17 @@ def test_sync_gixen_inserts_web_added_snipe(api):
     assert r.status_code == 200
     items = r.json()
     assert any(i["item_id"] == "777888999" for i in items)
+    # BUI-407: insert_bid no longer self-commits — _insert_web_added_bids must
+    # now commit itself. GET /api/snipes reads via the app's OWN _db
+    # singleton, the same connection _sync_gixen just wrote on, so it would
+    # see this row even with no commit at all (a connection always sees its
+    # own uncommitted writes). Read back via a SEPARATE connection to prove
+    # the insert actually reached disk.
+    row = _dbconn().execute(
+        "SELECT status FROM bids WHERE item_id=?", ("777888999",)
+    ).fetchone()
+    assert row is not None
+    assert row["status"] == "PENDING"
 
 
 def test_sync_gixen_does_not_purge_vanished(api):

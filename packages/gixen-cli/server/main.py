@@ -106,6 +106,19 @@ if not _plugin_logger.handlers:
 # App state
 # ---------------------------------------------------------------------------
 
+# BUI-407 (Stage 0 of BUI-400's shared-connection isolation rollout): _db is
+# a long-lived, module-global connection, handed out via _get_db()/app.state.db
+# to every request handler and background loop — reads, migrations (init_db),
+# and lifespan teardown's WAL checkpoint are its legitimate uses. It is
+# DEMOTED to that role by convention as of this ticket: every write helper in
+# server.db is now commit-free (the caller owns the commit — see e.g.
+# insert_bid's docstring), and server.db.write_transaction() exists as the
+# write-side counterpart (a fresh short-lived connection per transaction).
+# Stage 0 does not yet route any caller through write_transaction() — _db
+# still owns every write in this file, unchanged from before this ticket.
+# Stage 1+ (BUI-400 §5) is what actually moves writers off _db onto
+# write_transaction() under a short-held _write_lock. See
+# docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md.
 _db: sqlite3.Connection | None = None
 _api_client: GixenClient | None = None
 _api_lock: asyncio.Lock | None = None
@@ -332,6 +345,19 @@ async def _resolve_vanished_null_end_bids(
             end_dt = _parse_end_iso(end_iso)
             if end_dt is None:
                 continue  # can't disambiguate yet — leave PENDING, retry later
+            # BUI-407: set_auction_end_time no longer self-commits. Unlike
+            # every OTHER call site of the 7 de-committed helpers, this one is
+            # deliberately left uncommitted here, not given its own immediate
+            # db.commit() — this function is called from _sync_gixen (see its
+            # docstring) before that function's single end-of-cycle
+            # db.commit(), and this write joins the batch alongside
+            # update_bid_status/cache_gixen_data/refresh_snipe_group (already
+            # caller-commit, unchanged by this ticket). This is the intended
+            # consolidation from a fragmented self-commit into one coherent
+            # transaction boundary (design doc §2 finding 2 / §4) — every
+            # exception path between here and that commit already rolls back
+            # the whole batch (the pre-existing BUI-386/391/399 convention),
+            # so nothing here is silently lost on a caught failure.
             set_auction_end_time(db, iid, end_iso)
             if end_dt <= now_dt:
                 update_bid_status(
@@ -378,6 +404,9 @@ def _insert_web_added_bids(db: sqlite3.Connection, snipes: list) -> None:
                     _parse_snipe_group(snipe.get("snipe_group")) or 0,
                     snipe.get("seller"),
                 )
+                # BUI-407: insert_bid no longer self-commits — commit here,
+                # at the same point its self-commit used to fire.
+                db.commit()
                 logger.info("_sync_gixen: inserted web-added snipe %s", snipe["item_id"])
             except sqlite3.IntegrityError:
                 # existing_ids was snapshotted before the list_snipes await; a
@@ -388,10 +417,12 @@ def _insert_web_added_bids(db: sqlite3.Connection, snipes: list) -> None:
                 # rather than aborting the whole sync run (BUI-67 U4/KTD6).
                 #
                 # rollback() scope: the only uncommitted statement here is this
-                # failed INSERT — the terminal/cache writes from the earlier loop
-                # were committed at the db.commit() above, and each insert_bid
-                # self-commits. So this discards just the failed insert, not any
-                # batched sibling work.
+                # failed INSERT — every earlier successful insert_bid in this
+                # loop, and the terminal/cache writes from the earlier loop,
+                # were already committed (the db.commit() above, per-insert
+                # since BUI-407; the batched db.commit() earlier in
+                # _sync_gixen for the rest). So this discards just the failed
+                # insert, not any batched sibling work.
                 db.rollback()
                 logger.debug(
                     "_sync_gixen: %s already present (concurrent add); skipping insert",
@@ -497,6 +528,12 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
             delta = _parse_time_to_end(time_to_end)
             if delta is not None:
                 end_time = (now_dt + delta).isoformat()
+                # BUI-407: same deliberate no-immediate-commit treatment as
+                # the set_auction_end_time call in _resolve_vanished_null_end_bids
+                # above — this write joins _sync_gixen's single end-of-cycle
+                # db.commit() rather than getting its own, consolidating what
+                # used to be a mid-cycle self-commit (see that call site's
+                # comment for the full rationale).
                 set_auction_end_time(db, iid, end_time)
 
     # Apply WON transitions before the rest: a WON row in the DB is the
@@ -748,6 +785,12 @@ async def _sniper_loop() -> None:
                     for bid, result in zip(ready, results):
                         result_str = ("OK: " if result["success"] else "ERR: ") + result["message"]
                         set_local_snipe_result(db, bid["item_id"], fired_at, result_str)
+                        # BUI-407: set_local_snipe_result no longer
+                        # self-commits — commit here, at the same point its
+                        # self-commit used to fire (once per bid; no await
+                        # separates the iterations, so this doesn't move any
+                        # write across a yield point).
+                        db.commit()
                         logger.info("_sniper_loop: %s — %s", bid["item_id"], result_str)
         except Exception:
             logger.exception("_sniper_loop: unexpected error, continuing")
@@ -1039,10 +1082,15 @@ async def _modify_and_update_bid(
         bid_offset=bid_offset, snipe_group=snipe_group,
     )
     update_bid(db, item_id, max_bid, bid_offset, snipe_group)
+    # BUI-407: update_bid no longer self-commits — commit here, at the same
+    # point its self-commit used to fire.
+    db.commit()
     # BUI-78 C2: fill any NULL seller/grade columns from this request without
     # overwriting values a prior add already set.
     update_bid_grades(db, item_id, seller=seller, seller_grade=seller_grade,
                       photo_grade=photo_grade)
+    # BUI-407: update_bid_grades no longer self-commits — same reasoning.
+    db.commit()
     return get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
 
 
@@ -1070,13 +1118,22 @@ async def _add_bid_row(
             bid_offset=bid_offset, snipe_group=snipe_group, seller=seller,
             seller_grade=seller_grade, photo_grade=photo_grade,
         )
+        # BUI-407: insert_bid no longer self-commits — commit here, at the
+        # same point its self-commit used to fire (before the SELECT, so the
+        # read below can never observe an uncommitted row on a connection
+        # some other path later rolls back).
+        db.commit()
         return db.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone(), True
     except sqlite3.IntegrityError:
         db.rollback()
         update_bid(db, item_id, max_bid, bid_offset, snipe_group)
+        # BUI-407: update_bid no longer self-commits — same reasoning.
+        db.commit()
         # BUI-78 C2: a racing sync insert won the row; still fill its NULL grades.
         update_bid_grades(db, item_id, seller=seller, seller_grade=seller_grade,
                           photo_grade=photo_grade)
+        # BUI-407: update_bid_grades no longer self-commits — same reasoning.
+        db.commit()
         row = get_pending_bid_by_item_id(db, item_id) or get_bid_by_item_id(db, item_id)
         return row, False
 
@@ -1431,6 +1488,9 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             # Passthrough (None) values go to update_bid so a max_bid-only edit
             # leaves both fields untouched locally; explicit values write through.
             update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+            # BUI-407: update_bid no longer self-commits — commit here, at
+            # the same point its self-commit used to fire.
+            db.commit()
     except GixenSnipeNotFoundError as e:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen") from e
     except GixenError as e:
@@ -1467,6 +1527,8 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         # _sync_gixen ingests with the snipe's existing max_bid from Gixen,
         # but we want the user-supplied value to win. Re-apply locally.
         update_bid(db, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+        # BUI-407: update_bid no longer self-commits — same reasoning.
+        db.commit()
         row = get_bid_by_item_id(db, item_id)
         if row is None:
             raise HTTPException(
@@ -1496,6 +1558,9 @@ async def api_remove_bid(item_id: str):
         raise HTTPException(status_code=503, detail=str(e)) from e
 
     delete_bid(db, item_id)
+    # BUI-407: delete_bid no longer self-commits — commit here, at the same
+    # point its self-commit used to fire.
+    db.commit()
     # Response status mirrors the soft-delete tombstone, renamed PURGED ->
     # REMOVED in BUI-49. No in-repo consumer string-matches the old value.
     return {"item_id": item_id, "status": "REMOVED"}
@@ -1584,6 +1649,9 @@ async def api_purge(req: PurgeRequest):
 
     # 5. Mark completed bids with the soft-delete tombstone (REMOVED) in DB
     mark_bids_purged(db, completed_ids)
+    # BUI-407: mark_bids_purged no longer self-commits — commit here, at the
+    # same point its self-commit used to fire.
+    db.commit()
 
     # 6. Remove sibling snipes (best-effort)
     removed = 0
@@ -1592,6 +1660,11 @@ async def api_purge(req: PurgeRequest):
             async with _api_lock:
                 await asyncio.to_thread(_api_client.remove_snipe, sibling_id)
             delete_bid(db, sibling_id)
+            # BUI-407: delete_bid no longer self-commits — commit here, at
+            # the same point its self-commit used to fire (once per sibling;
+            # the next iteration's await happens under a fresh _api_lock
+            # acquisition, after this commit has already landed).
+            db.commit()
             removed += 1
         except GixenError:
             pass

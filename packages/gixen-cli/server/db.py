@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -603,12 +604,28 @@ def _dedup_pending_and_index(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _connect(path: Path) -> sqlite3.Connection:
+    """Open a raw connection with this server's standard pragmas (BUI-407):
+    WAL, ``foreign_keys=ON``, and a 5s ``busy_timeout`` as a safety margin
+    against WAL-checkpoint / external-process contention — not a per-write
+    retry loop, see ``write_transaction``'s docstring for why concurrent BUSY
+    between our own writers isn't the failure mode this guards against
+    (that's Stage 1+ of BUI-400's staged rollout). Shared by both the
+    long-lived read connection (``init_db``) and the ephemeral per-transaction
+    write connection (``write_transaction``) so the pragma set can't drift
+    between them.
+    """
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _connect(path)
     try:
         conn.executescript(_SCHEMA)
         conn.commit()
@@ -618,6 +635,47 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _apply_migrations(conn)
     os.chmod(path, 0o600)
     return conn
+
+
+@contextmanager
+def write_transaction(path: Path = DB_PATH):
+    """Open a fresh, short-lived write connection scoped to one transaction.
+
+    BUI-407 (Stage 0 of BUI-400's shared-connection isolation rollout): this
+    is the write-side counterpart to the long-lived read connection
+    (``server.main._db``, opened by ``init_db`` above). It opens its own
+    connection (WAL, ``foreign_keys=ON``, ``busy_timeout=5000``), yields it
+    to the caller, commits exactly once on a clean exit, and rolls back +
+    closes on any exception raised inside the ``with`` block — so a caller's
+    mid-transaction failure can never leave a stray uncommitted write parked
+    on a connection some *other* code path later commits (the fragmentation
+    ``insert_bid``/``set_auction_end_time`` used to cause by self-committing
+    mid-cycle — see the design doc's §2 finding 2).
+
+    Stage 0 only adds this factory — no caller is wired to it yet. The
+    existing shared ``_db`` singleton in ``server.main`` still owns every
+    write; routing writers through here (under a short-held ``_write_lock``
+    so two ephemeral write connections never overlap) is Stage 1+.
+    See ``docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md``
+    §3/§5 for the full design and staged rollout.
+    """
+    conn = _connect(path)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        # rollback itself may fail (e.g. the connection is already broken by
+        # whatever raised); suppress that secondary failure so the ORIGINAL
+        # exception from the `with` block is what propagates, not a masking
+        # error from rollback() — same idiom as _rebuild_bids_table /
+        # _repair_bid_fmvs_fk / _dedup_pending_and_index above.
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 def insert_bid(
@@ -632,6 +690,10 @@ def insert_bid(
 ) -> int:
     # seller_grade/photo_grade are trailing defaults (BUI-78) so existing
     # positional callers (e.g. _sync_gixen) keep working unchanged.
+    #
+    # Caller must conn.commit() (BUI-407) — this used to self-commit, which
+    # fragmented _sync_gixen's intended single end-of-cycle commit (see the
+    # design doc's §2 finding 2). Every caller now commits explicitly.
     cur = conn.execute(
         """
         INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller,
@@ -640,7 +702,6 @@ def insert_bid(
         """,
         (item_id, max_bid, bid_offset, snipe_group, seller, seller_grade, photo_grade),
     )
-    conn.commit()
     return cur.lastrowid
 
 
@@ -661,7 +722,9 @@ def update_bid_grades(
       `COALESCE(<col>, ?)` — completing an incomplete insert without editing an
       already-set grade (BUI-78 C2; re-grading is a deferred follow-up).
 
-    No-op when all inputs are None."""
+    No-op when all inputs are None.
+
+    Caller must conn.commit() (BUI-407) — see insert_bid's docstring."""
     if seller is None and seller_grade is None and photo_grade is None:
         return
     conn.execute(
@@ -672,7 +735,6 @@ def update_bid_grades(
         "WHERE item_id=? AND status='PENDING'",
         (seller, seller_grade, photo_grade, item_id),
     )
-    conn.commit()
 
 
 def get_bid_by_item_id(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
@@ -742,12 +804,12 @@ def update_bid(
         params.append(snipe_group)
     set_clauses.append("gixen_vanished_at=NULL")
     params.append(item_id)
+    # Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
     conn.execute(
         f"UPDATE bids SET {', '.join(set_clauses)} "
         "WHERE item_id=? AND status='PENDING'",
         params,
     )
-    conn.commit()
 
 
 # Sanity allowance for record_group_win's future-end check. Mirrors
@@ -948,11 +1010,12 @@ def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
     # Soft-delete tombstone. Renamed PURGED -> REMOVED in BUI-49; skip rows that
     # already carry either tombstone value so we don't re-stamp resolved_at.
+    #
+    # Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
     conn.execute(
         f"UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL})",
         (now, item_id),
     )
-    conn.commit()
 
 
 def get_all_bids(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -976,13 +1039,14 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     # can have a live PENDING row alongside an old WON/LOST row sharing the
     # item_id. Without this filter the completed-sweep tombstones BOTH and the
     # live snipe silently vanishes. Only tombstone resolved (completed) rows.
+    #
+    # Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
     conn.execute(
         f"UPDATE bids SET status='REMOVED', resolved_at=? "
         f"WHERE item_id IN ({placeholders}) "
         f"AND status NOT IN ('PENDING', {TOMBSTONE_STATUSES_SQL})",
         [now, *item_ids],
     )
-    conn.commit()
 
 
 def refresh_snipe_group(
@@ -1018,11 +1082,11 @@ def refresh_snipe_group(
 
 
 def set_auction_end_time(conn: sqlite3.Connection, item_id: str, end_time_iso: str) -> None:
+    """Caller must conn.commit() (BUI-407) — see insert_bid's docstring."""
     conn.execute(
         "UPDATE bids SET auction_end_at=? WHERE item_id=? AND status='PENDING'",
         (end_time_iso, item_id),
     )
-    conn.commit()
 
 
 def get_bids_ready_to_snipe(conn: sqlite3.Connection, now_iso: str) -> list[sqlite3.Row]:
@@ -1045,8 +1109,8 @@ def set_local_snipe_result(
     fired_at: str,
     result: str,
 ) -> None:
+    """Caller must conn.commit() (BUI-407) — see insert_bid's docstring."""
     conn.execute(
         "UPDATE bids SET local_snipe_at=?, local_snipe_result=? WHERE item_id=? AND status='PENDING'",
         (fired_at, result, item_id),
     )
-    conn.commit()
