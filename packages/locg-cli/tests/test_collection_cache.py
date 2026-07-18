@@ -859,6 +859,129 @@ def test_resolve_unknown_key_returns_none():
     assert resolve_series_for_win("totally-unknown", "1", 2000, {}, None) is None
 
 
+# --- BUI-421: don't guess a volume when the year is missing or contradicts ---
+
+
+def test_resolve_multi_volume_no_year_returns_none():
+    """BUI-421 Fix A: >1 distinct volumes and no year is unknowable — refuse to
+    guess via the last-writer index (the $233 FF #16 filed as a modern issue)
+    and return None so the caller flags needs_manual_series_canonical."""
+    from locg.collection_cache import resolve_series_for_win
+    v1 = "Fantastic Four (Vol. 1) (1961 - 1996)"
+    v3 = "Fantastic Four (Vol. 3) (1998 - 2003)"
+    candidates = {"fantastic four": [v1, v3]}
+    # No year (None) with two volumes → None, regardless of index/order.
+    index = {"fantastic four": v3}  # last-writer index would have guessed v3
+    assert (
+        resolve_series_for_win("fantastic four", "16", None, index, candidates)
+        is None
+    )
+    assert (
+        resolve_series_for_win("fantastic four", "16", None, {}, candidates)
+        is None
+    )
+
+
+def test_resolve_single_wrong_candidate_contradicting_year_returns_none():
+    """BUI-421 Fix B: the only known volume post-dates the win's year, so it
+    cannot contain the issue — return None (Metron / manual) rather than file a
+    1969 book under a 2015 volume."""
+    from locg.collection_cache import resolve_series_for_win
+    modern_only = "The Mighty Thor (Vol. 3) (2015 - 2018)"
+    candidates = {"mighty thor": [modern_only]}
+    assert (
+        resolve_series_for_win("mighty thor", "164", 1969, {}, candidates) is None
+    )
+
+
+def test_resolve_single_correct_candidate_matching_year_returned():
+    """BUI-421 Fix B: a single candidate whose OWN range contains the year is
+    still returned (the guard only refuses genuine contradictions)."""
+    from locg.collection_cache import resolve_series_for_win
+    vol1 = "Thor (Vol. 1) (1966 - 1996)"
+    candidates = {"thor": [vol1]}
+    assert resolve_series_for_win("thor", "300", 1980, {}, candidates) == vol1
+
+
+def test_resolve_single_candidate_no_year_still_returned():
+    """BUI-421 Fix B: a single candidate with NO year must still resolve — the
+    no-year guard applies only to the multi-candidate case (no over-refusal)."""
+    from locg.collection_cache import resolve_series_for_win
+    vol1 = "Thor (Vol. 1) (1966 - 1996)"
+    candidates = {"thor": [vol1]}
+    assert resolve_series_for_win("thor", "300", None, {}, candidates) == vol1
+    # Also via the one-to-one index alone (no volume_candidates map).
+    assert resolve_series_for_win("thor", "300", None, {"thor": vol1}, None) == vol1
+
+
+def test_resolve_single_candidate_undecorated_range_not_over_refused():
+    """BUI-421 Fix B: a candidate with no parseable (Vol/year) decoration can't
+    be proven to contradict the year, so it's still returned even with a year."""
+    from locg.collection_cache import resolve_series_for_win
+    plain = "Some Indie Series"
+    candidates = {"some indie series": [plain]}
+    assert (
+        resolve_series_for_win("some indie series", "5", 1999, {}, candidates)
+        == plain
+    )
+
+
+def test_resolve_mighty_thor_masthead_via_alias_expansion():
+    """BUI-421 Fix C: a "mighty thor" #164 (1969) win must resolve to the
+    "thor"-keyed Vol. 1 via masthead-alias candidate expansion — the true
+    volume lives under a different key and would otherwise never be a candidate.
+
+    Covers both stores: (a) only the correct "thor" Vol. 1 present, and (b) the
+    "mighty thor" modern Vol. 3 ALSO present — the year picks Vol. 1 either way.
+    """
+    from locg.collection_cache import resolve_series_for_win
+    thor_v1 = "Thor (Vol. 1) (1966 - 1996)"
+    mighty_v3 = "The Mighty Thor (Vol. 3) (2015 - 2018)"
+    # (a) Alias pulls the correct Vol. 1 in even with no "mighty thor" key.
+    assert (
+        resolve_series_for_win("mighty thor", "164", 1969, {}, {"thor": [thor_v1]})
+        == thor_v1
+    )
+    # (b) Both mastheads present: year 1969 disambiguates to Vol. 1.
+    both = {"mighty thor": [mighty_v3], "thor": [thor_v1]}
+    assert (
+        resolve_series_for_win("mighty thor", "164", 1969, {}, both) == thor_v1
+    )
+
+
+def test_resolve_alias_expansion_preserves_xmen_split():
+    """BUI-421: alias expansion (uncanny x-men ↔ x-men are BOTH a split key AND
+    an alias pair) must not disturb the classic X-Men split or the BUI-265
+    later-volume-wins logic — the split branch runs before candidate-gathering."""
+    from locg.collection_cache import resolve_series_for_win
+    early = "The X-Men (Vol. 1) (1963 - 1981)"
+    late = "Uncanny X-Men (Vol. 1) (1980 - 2011)"
+    vol2 = "X-Men (Vol. 2) (1991 - 2001)"
+    # Classic split still fires with no candidates.
+    assert resolve_series_for_win("x-men", "141", 1980, {}, None) == early
+    assert resolve_series_for_win("uncanny x-men", "142", 1981, {}, None) == late
+    # BUI-265 later volume still wins over the split.
+    assert resolve_series_for_win("x-men", "7", 1991, {}, {"x-men": [vol2]}) == vol2
+    # Genuine classic Vol. 1 issue still splits, alias notwithstanding.
+    assert (
+        resolve_series_for_win("x-men", "107", 1979, {}, {"x-men": [early]}) == early
+    )
+
+
+def test_resolve_modern_xmen_not_cross_filed_to_uncanny_alias():
+    """BUI-421 guard: a MODERN "x-men" win (year > 2011) must NOT be alias-
+    expanded onto a distinct modern "uncanny x-men" volume. The X-Men split
+    keys' cross-masthead equivalence is the CLASSIC split (owned by the split
+    branch); in the modern era they are different relaunches, so candidate-
+    gathering gathers from the exact key only. With only the Uncanny volume in
+    the store, the win resolves to None (→ Metron), never to the Uncanny volume."""
+    from locg.collection_cache import resolve_series_for_win
+    uncanny_v5 = "Uncanny X-Men (Vol. 5) (2018 - 2019)"
+    store = {"uncanny x-men": [uncanny_v5]}
+    result = resolve_series_for_win("x-men", "1", 2019, {}, store)
+    assert result is None
+
+
 # --- BUI-197: owned_match_keys masthead aliases (single source of equivalence) ---
 
 def test_owned_match_keys_includes_self():

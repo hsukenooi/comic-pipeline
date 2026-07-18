@@ -485,6 +485,27 @@ def resolve_series_for_win(
       ``volume_candidates`` for a volume whose OWN range contains ``year`` —
       that later volume wins over the hardcoded split (BUI-265).
 
+    Three BUI-421 correctness guards close the volume-mis-resolution holes that
+    silently filed vintage wins under modern volumes on LOCG upload:
+
+    * **Masthead-alias candidate expansion** — the candidate gather now unions
+      every alias-equivalent key (:func:`_alias_keys_for` /
+      :data:`_MASTHEAD_ALIAS_PAIRS`), so a ``"mighty thor"`` win also sees the
+      ``"thor"``-keyed Vol. 1, an ``"incredible hulk"`` win sees ``"hulk"``,
+      etc. Without this a masthead-drifted win could never even reach its true
+      volume as a candidate. Expansion is applied ONLY here, AFTER the X-Men
+      split branch has run, so it never perturbs the classic split / BUI-265.
+    * **Single candidate + contradicting year → None** — a sole candidate whose
+      OWN year range cannot contain ``year`` is no longer returned (it would
+      file the issue under a volume that started after it). We fall through to
+      Metron / manual instead. A sole candidate with no year, or with no
+      parseable range, is still returned (no over-refusal).
+    * **Multiple candidates + no year → None** — the old last-writer
+      ``series_name_index`` guess is removed. When >1 distinct volumes share the
+      key and no year disambiguates, resolution is genuinely unknowable here, so
+      we return None (caller flags ``needs_manual_series_canonical``) rather than
+      file the win under an order-dependent random volume.
+
     ``volume_candidates`` (norm_key -> [decorated names]) is the multi-volume
     map from :func:`build_volume_candidates`; when omitted the resolver behaves
     like a plain index lookup (plus the classic X-Men split).
@@ -511,16 +532,58 @@ def resolve_series_for_win(
         if split is not None:
             return split
 
+    # Gather volume candidates across all masthead-alias-equivalent keys
+    # (BUI-421 Fix C). A masthead-drifted win (e.g. "mighty thor" #164) is
+    # keyed under an adjective the LOCG catalog dropped, so its true volume
+    # ("Thor (Vol. 1)") lives under a DIFFERENT key and would otherwise never
+    # be a candidate. _alias_keys_for(norm_key) always includes norm_key
+    # itself; expansion happens ONLY here — after the X-Men split branch — so
+    # the classic split / BUI-265 logic (which keys off the exact norm_key) is
+    # untouched. Per key we prefer its multi-volume list, else its one-to-one
+    # index entry; results are de-duplicated by decorated name so the same
+    # volume filed under two aliases counts once.
+    #
+    # EXCEPTION: the X-Men split keys ("x-men" ↔ "uncanny x-men") are ALSO an
+    # alias pair, but their cross-masthead equivalence is the CLASSIC Vol. 1
+    # split, already resolved by the split branch above. Candidate-gathering is
+    # only reached for them in the MODERN era (year > 2011), where "X-Men" and
+    # "Uncanny X-Men" are GENUINELY DIFFERENT relaunches — alias-expanding there
+    # would cross-file a modern X-Men win under a modern Uncanny volume (a new
+    # mis-file this ticket must not introduce). So for those keys, gather from
+    # the exact key only.
+    alias_keys = (
+        frozenset({norm_key})
+        if norm_key in _XMEN_SPLIT_KEYS
+        else _alias_keys_for(norm_key)
+    )
     candidates: list[str] = []
-    if volume_candidates and norm_key in volume_candidates:
-        candidates = list(volume_candidates[norm_key])
-    elif norm_key in series_name_index:
-        candidates = [series_name_index[norm_key]]
+    seen: set[str] = set()
+    for key in alias_keys:
+        if volume_candidates and key in volume_candidates:
+            key_candidates: list[str] = volume_candidates[key]
+        elif key in series_name_index:
+            key_candidates = [series_name_index[key]]
+        else:
+            continue
+        for name in key_candidates:
+            if name not in seen:
+                seen.add(name)
+                candidates.append(name)
 
     if not candidates:
         return None
     if len(candidates) == 1:
-        return candidates[0]
+        sole = candidates[0]
+        # BUI-421 Fix B: with a year present, don't file the win under the only
+        # known volume if that volume's own range cannot contain the year (e.g.
+        # "mighty thor" 1969 → the sole "The Mighty Thor (Vol. 3) (2015-2018)")
+        # — fall through to Metron / manual. No year, or an undecorated range we
+        # can't parse, still returns the sole candidate (no over-refusal).
+        if yr is not None:
+            rng = series_year_range(sole)
+            if rng is not None and not (rng[0] <= yr <= rng[1]):
+                return None
+        return sole
 
     # Multiple volumes share this key — disambiguate by year/era when we can.
     if yr is not None:
@@ -531,8 +594,11 @@ def resolve_series_for_win(
         # not yet in the local export) — return None so Metron resolves it
         # rather than silently picking a wrong volume.
         return None
-    # No year — fall back to the single index entry (deterministic).
-    return series_name_index.get(norm_key) or candidates[0]
+    # BUI-421 Fix A: multiple distinct volumes and no year to disambiguate.
+    # The old last-writer series_name_index guess picked a volume by export
+    # order (the $233 FF #16 filed as a ~$4 modern issue), so refuse to guess —
+    # return None and let the caller flag needs_manual_series_canonical.
+    return None
 
 
 def rebuild_series_name_index(payload: dict[str, Any]) -> dict[str, str]:
