@@ -1,6 +1,7 @@
 ---
 title: Comics-server write isolation — gather-then-apply through write_transaction() under _write_lock
 date: 2026-07-18
+last_updated: 2026-07-18
 category: conventions
 module: comics-server (gixen-cli server + gixen-overlay)
 problem_type: convention
@@ -67,7 +68,7 @@ This gives transaction isolation (each writer's rollback only ever discards its 
 
 ## Examples
 
-**The TOCTOU this model does NOT close (open follow-up BUI-417).** Serializing writers' *writes* under `_write_lock` does not close a read-then-write race:
+**The TOCTOU a shared write lock does NOT close — and how BUI-417 closed it (shipped 2026-07-18).** Serializing writers' *writes* under `_write_lock` does not close a read-then-write race:
 
 ```
 writer A (fallback): gather → reads status = PENDING   (lock-free read, before the lock)
@@ -77,14 +78,21 @@ writer A (fallback): acquires _write_lock, applies a stale eBay-price inference
                      not equality-vs-gather → silently overwrites the real WON
 ```
 
-Serializing the applies cannot undo a decision already made from a **pre-lock read**. Closing it needs a status re-check *inside* the apply transaction — and that re-check must handle the vanished-null-end re-add variant (a re-added snipe keeps `status='PENDING'`, so status-equality alone is insufficient; also check `gixen_vanished_at` cleared / end now non-NULL). **Takeaway: a shared write lock isolates transactions, not decisions. Any write derived from a pre-lock read must re-validate the row's state under the lock.**
+Serializing the applies cannot undo a decision already made from a **pre-lock read**. **Takeaway: a shared write lock isolates transactions, not decisions. Any write derived from a pre-lock read must re-validate the row's state under the lock.** BUI-417 closed it by re-reading the row FRESH inside the apply transaction (`get_bid_by_id(conn, row_id)`, under `_write_lock`) in BOTH apply paths (`_run_ebay_fallback` and `_apply_vanished_null_end`) and re-checking every precondition the gather-time decision rested on before writing. Three non-obvious sub-traps that fix surfaced, each reusable beyond this code:
+
+- **A status-CLASS guard is not a status-EQUALITY guard.** `status NOT IN (<tombstones>)` still passes a genuine WON that landed since gather (WON is not a tombstone), so the re-check must validate against *the actionable set the gather assumed* (`{PENDING, ENDED}`), not merely "not a tombstone."
+- **The re-add variant needs a timestamp-AGE signal, not a status or non-NULL check.** A snipe re-added between gather and apply keeps `status='PENDING'` (a status check passes it), and `_record_vanish_observations` — run earlier in the *same* apply — re-stamps its cleared `gixen_vanished_at` to `now` (a "still vanished?" non-NULL check passes it too). Only the stamp's *age* disambiguates: tombstone REMOVED only for a SUSTAINED vanish (`gixen_vanished_at < scrape_started_at`); a same-cycle stamp (a genuine first-observation OR a re-add re-stamp — indistinguishable) defers one cycle. This holds only because `_record_vanish_observations` stamps first-observation only (`WHERE gixen_vanished_at IS NULL`), so a genuine removal keeps its old pre-scrape stamp. **Takeaway: when a boolean/non-NULL flag can be re-set inside the same cycle you're deciding in, it can't distinguish the two states — reach for the flag's age against a cycle-start timestamp instead.**
+- **A defer/skip branch must not write terminal-adjacent fields.** The review-caught P1: calling `set_auction_end_time` *before* the defer left a deferred row PENDING with a non-NULL FUTURE end — local-sniper-eligible (a stray bid on a cancelled auction) and stranded from next cycle's null-end gather (which requires `auction_end_at IS NULL`). **Takeaway: a "leave it for next cycle" branch must leave the row in EXACTLY the state next cycle's gather expects — write nothing that changes its eligibility.** (A NULL-end PENDING row is inert to both the eBay fallback and the sniper; that inertness is the whole safety argument for the one-cycle deferral.)
 
 **Consolidating commit scope widens blast radius.** BUI-410 moved `_insert_web_added_bids` (previously an independent commit) inside `_sync_gixen`'s single transaction. That turned a pre-existing *local* failure — an unguarded `int(bid_offset)` on one malformed web-add scrape — into a **whole-cycle abort** that would roll back that cycle's WON/REMOVED transitions and `group_wins` evidence: a phantom-WON vector. Tests were green; only the adversarial review caught it. **Takeaway: when you pull previously-independent writes into one transaction, audit each newly co-transacted write's failure modes — a local exception now aborts everything sharing the transaction.**
+
+**A durable evidence ledger stores genuine facts, never observation-time proxies** (BUI-419, closed → BUI-420). The append-only `group_wins` ledger deliberately records only a WON's *genuine* auction end, never a `resolved_at` (observation-time) proxy — enforced three-consistently at `update_bid_status`'s `win_rows` SELECT, `record_group_win`'s null-end guard, and the startup backfill's `auction_end_at != resolved_at` exclusion. A proxy can lag the true end by hours/days and reintroduce a recycled-group false-REMOVED (suppress a real win → duplicate purchase). So the tempting "just store `COALESCE(auction_end_at, resolved_at)` so a null-end winner isn't lost on purge" is the wrong fix — the right one fetches the *genuine* eBay end (as `_apply_listed_win_evidence` already does for grouped winners) instead of substituting the proxy. **Takeaway: a permanent store holds itself to a stricter evidence standard than a live-row query — don't let a convenient in-hand proxy into a ledger whose reader assumes exactness; if the genuine fact is fetchable, fetch it.**
 
 ## Related
 
 - `docs/solutions/conventions/shared-singleton-connection-rollback-on-unexpected-exception.md` — the interim per-caller rollback convention this model **supersedes** (now carries a SUPERSEDED banner).
 - `docs/solutions/design-patterns/scope-status-writes-to-row-id-not-item-id.md` — sibling write-hygiene rule on the same `server/main.py` / `server/fallback.py` write paths (row-id vs item_id scoping); different failure class, same surface.
 - `docs/plans/2026-07-18-001-design-shared-connection-isolation-plan.md` — the BUI-400 design (approach decision, staged rollout, test strategy).
-- BUI-417 — open follow-up to close the read-then-write TOCTOU described above.
-- BUI-418 — `get_all_bids` full-table scan now inside the write critical section (latency).
+- BUI-417 — **closed** the read-then-write TOCTOU described above (fresh re-read under `_write_lock` + scrape-age re-add disambiguation), shipped 2026-07-18.
+- BUI-418 — **closed** the `get_all_bids` full-table scan that BUI-410 pulled into the write critical section (hoisted the dedup read into the gather phase), shipped 2026-07-18.
+- BUI-419 (closed → BUI-420) — the null-end WON evidence-durability gap that motivated the "genuine facts, never proxies" ledger takeaway above; the fix lives in `fallback.py`'s `_listed_win_evidence_already_covered`, not `db.py`.
