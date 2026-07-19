@@ -240,3 +240,24 @@ class RecordWinCommitRequest(BaseModel):
 
     wins: list[dict] = Field(default_factory=list)
     resolved_reviews: list[dict] = Field(default_factory=list)
+
+
+class CollectionRestoreRequest(BaseModel):
+    """POST /api/comics/collection/restore — restore the collection store
+    from a named backup (BUI-433).
+
+    ``backup_path`` must be a path this server itself returned from
+    ``POST /api/comics/collection/backup`` — the route handler validates it
+    resolves to a subdirectory of the server's backups root before touching
+    the filesystem, refusing anything else with 422 (never trust a client-
+    supplied filesystem path verbatim).
+    """
+
+    backup_path: str
+
+    @field_validator("backup_path")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("backup_path must be a non-empty string")
+        return v.strip()

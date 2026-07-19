@@ -52,3 +52,30 @@ def test_no_dangling_csv_variable(text):
     references $CSV it must also bind it."""
     if "$CSV" in text:
         assert "CSV=" in text, "$CSV is read but never assigned in the skill"
+
+
+def test_step1_backup_has_no_hostname_ssh_branching(text):
+    """BUI-433: Step 1 used to back up the store via client-orchestrated
+    `cp -r` + `ssh` + `case "$(hostname)"` MacBook/Mac-Mini branching. The
+    server now backs up its own store locally, so that branching must be
+    gone — the ONLY remaining `hostname` reference in the doc is the
+    unrelated `comics_resolve_server` convention note, not backup logic."""
+    assert 'case "$(hostname)"' not in text
+    assert "ssh mini" not in text
+    assert "ssh " not in text
+    assert "*MacBook*" not in text and "*macbook*" not in text
+
+
+def test_step1_backup_is_one_server_call(text):
+    """BUI-433: Step 1 becomes a single POST to the backup endpoint."""
+    assert 'comics_post "$COMICS_SERVER_URL/api/comics/collection/backup"' in text
+    assert "BACKUP_PATH=" in text
+    assert "do not proceed without a backup" in text
+
+
+def test_abort_paths_reference_restore_endpoint(text):
+    """BUI-433: Steps 3/3b/6's abort instructions must reference the
+    executable restore endpoint, not just prose ("restore from the Step 1
+    backup" with no command)."""
+    assert text.count('"$COMICS_SERVER_URL/api/comics/collection/restore"') >= 3
+    assert "backup_path" in text
