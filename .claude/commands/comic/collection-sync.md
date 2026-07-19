@@ -106,50 +106,37 @@ python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \
   print('csv:', base+'.csv'); print('ready:', d['ready_count'], '| manual_series:', d['manual_series_count'], '| wish:', d['wish_list_count'])"
 ```
 
-(Why a fresh `mktemp` path and a hard-fail before parsing: BUI-138 in
-`docs/audit/2026-06-15-seam-audit.md` — the old fixed temp path let a failed
-export silently build a CSV from a prior run's stale data.)
+(Fresh `mktemp` + hard-fail before parsing prevents building a CSV from a
+prior run's stale data — BUI-138, `docs/audit/2026-06-15-seam-audit.md`.)
 
 Surface `ready_count` (collection rows that will upload), `manual_series_count`
 (rows withheld from the CSV — they stay pending until you resolve them in
 `.notes.md`), and `wish_list_count`.
 
-**Owned-safe export coverage (BUI-122/BUI-200) — partial, not complete:** the
-CSV's wish rows are only local-only adds (derived wishes already on LOCG are
-dropped), and the export excludes a wish when it can match an owned copy on
-normalized *(series, issue)* rather than literal title.
+**Owned-safe export coverage (BUI-122/BUI-200) — partial, not complete.** The
+export excludes a local-only wish add when it can match an owned copy on
+normalized *(series, issue)* — this catches common variants (leading articles,
+`Vol. N`/year decoration, the classic `The X-Men` #1–141 ↔ `Uncanny X-Men`
+#142+ split) but **not** other masthead aliases, subtitle relaunches, Annuals,
+or spelling differences (tracked under BUI-197). Full variant list and the
+underlying incident:
+`docs/solutions/integration-issues/locg-export-deletes-owned-wished-books.md`.
 
-**Structurally owned-safe now** (the export will NOT emit `In Collection=0` for an
-owned copy in these cases):
-- leading-article variants (`The X-Men` ↔ `X-Men`),
-- `(Vol. N)` and year-range / bare-year decoration (`Fantastic Four (Vol. 3) (1997 - 2012)` ↔ `Fantastic Four`),
-- the **classic X-Men main-run split only**: `The X-Men #1–141` ↔ `Uncanny X-Men #142+`.
-
-**NOT yet structurally covered** — the export can still emit `In Collection=0` for
-a book you own when the wish and the owned copy differ by any of these, so they
-rely entirely on the import preview (below):
-- other masthead aliases — `The Mighty Thor` ↔ `Thor`, `Invincible Iron Man` ↔ `Iron Man`, `Tales of Suspense` → `Iron Man`,
-- subtitle / adjective relaunches — `X-Men: Legacy`, `Astonishing X-Men`, etc.,
-- Annuals (`X-Men Annual` vs `X-Men`),
-- spelling differences — `&` vs `and`, accents, dotted abbreviations (`Marvel Two-In-One` vs `Marvel Two in One`).
-
-These uncovered cases are tracked under **BUI-197**. Until it lands, the **LOCG
-import preview + abort-on-"Deleted from Collection." (Steps 3 / 3b) is the
-load-bearing defense, not optional.** Keep the wish push opt-in and off by default
-(Step 3b); for wins alone, deletion is structurally impossible, so the bulk of a
-normal sync is safe.
+**Because coverage is partial, the LOCG import preview + abort-on-"Deleted from
+Collection." (Steps 3/3b) is the load-bearing defense, not optional** — keep
+the wish push opt-in and off by default (Step 3b); wins alone can't delete, so
+the bulk of a normal sync is safe regardless.
 
 ## Step 2a: The export is wins-only by default (machine gate)
 
-**No client-side split is needed.** As of BUI-208 the export ships **only wins**
-(`In Collection=1`): the Mac Mini's `generate_csv` *refuses* to emit any
-`In Collection=0` row unless an explicit owned-safe wish push is requested
-(`?push_wishes=true`). So the file from Step 2 **is** your wins file, and the
-default sync is structurally incapable of deleting a collection book — wins can
-only add. Wishes (the only rows that can delete) are pushed solely via the
-separate, opt-in Step 3b, and only after the wish-list has been conflict-cleaned
-(Step 2b). `wish_list_count` from Step 2 will be `0` on a default (wins-only)
-export — that is expected.
+**No client-side split needed.** As of BUI-208 the export ships **only wins**
+(`In Collection=1`) — the server's `generate_csv` *refuses* to emit any
+`In Collection=0` row unless `?push_wishes=true` is explicitly requested. So
+the Step 2 file **is** your wins file, and the default sync is structurally
+incapable of deleting a collection book. Wishes (the only rows that can
+delete) go up solely via the separate, opt-in Step 3b, after the wish-list has
+been conflict-cleaned (Step 2b). `wish_list_count` will be `0` on a default
+export — expected.
 
 ## Step 2b: Pre-sync data-quality audit (BUI-199, BUI-432)
 
@@ -195,44 +182,36 @@ comics_curl "$COMICS_SERVER_URL/api/comics/wish-list/conflicts"
 
 **Review each conflict's provenance before removing anything (BUI-266) — the
 audit is year/variant-blind by necessity (a wish-list name has no per-issue
-year), so it can land on the WRONG volume/era of a same-numbered issue.** For
-every conflict, compare the wished book's real era/edition against the matched
-owned row's `series_name`/`release_date`:
+year), so it can land on the WRONG volume/era of a same-numbered issue.**
+Compare the wished book's real era/edition against the matched owned row's
+`series_name`/`release_date`:
 
 - **Genuine conflict** — the owned row is the *same* book you wished (same
-  volume/era, same print edition). Safe to drop the wish (you now own it).
+  volume/era, same print edition). Safe to drop the wish.
 - **Decoy — do NOT remove** — a *different* comic that only shares a masthead +
-  issue number (a cross-era match, or the opposite print edition of the same
-  issue). Removing decoys caused a 114-item over-removal incident (BUI-259);
-  see `docs/solutions/integration-issues/wishlist-conflict-scoped-removal-2026-07-02.md`
-  for the worked examples. Leave decoys wishlisted.
+  issue number (cross-era, or the opposite print edition of the same issue).
+  Removing decoys caused a 114-item over-removal incident (BUI-259); worked
+  examples: `docs/solutions/integration-issues/wishlist-conflict-scoped-removal-2026-07-02.md`.
+  Leave decoys wishlisted.
 
 **A third bucket — `printing_conflicts` — needs your decision too (BUI-372/380).**
-The audit response carries `printing_conflicts` alongside `conflicts`: same
-provenance fields (`name`, `series`, `issue`, `full_title_matched`, `series_name`,
-`release_date`) plus `printing_candidates`. An entry here means the wish matched
-an owned row that is a **different printing** of the same series+issue (e.g. you
-own the "2nd Printing" but wished the base issue, or vice versa) — printings are
-distinct collectibles, so this is neither a genuine conflict nor a decoy. Render
-it as a Pattern E-style advisory, mirroring `/comic:wishlist-add` Step 3/4's
-BUI-372 handling, and let the user decide rather than folding it into either
-bucket above:
+An entry here means the wish matched an owned row that is a **different
+printing** of the same series+issue (e.g. you own the "2nd Printing" but wished
+the base issue) — neither a genuine conflict nor a decoy. Render it as an
+advisory using the entry's `name`/`series`/`issue`/`printing_candidates` and let
+the user decide (mirrors `/comic:wishlist-add` Step 3/4's BUI-372 handling):
 
 ```
 Printing conflict — needs your decision (1):
   Amazing Spider-Man #300 — wish-list entry matches an owned "Amazing Spider-Man
-  #300 2nd Printing" (full_title_matched); per printing_candidates the base
-  printing (printing_ordinal: 1) is <owned/wish-listed/untracked>. Keep the wish
-  (you still want the base) or drop it (you're satisfied with the reprint you
-  own)?
+  #300 2nd Printing"; per printing_candidates the base printing is
+  <owned/wish-listed/untracked>. Keep the wish or drop it?
 ```
 
-**These are never auto-removed.** `remove-conflicts` derives its removal set
-ONLY from `conflicts` — a `printing_conflicts` entry can't be swept, scoped or
-unscoped (naming one in `names` below returns an explicit error, not a silent
-no-op). If the user decides they no longer want the wish, remove it directly
-with `DELETE /api/comics/wish-list?title=<name>` (BUI-128) — not through
-`remove-conflicts`.
+**These are never auto-removed** — `remove-conflicts` derives its removal set
+ONLY from `conflicts`; naming a `printing_conflicts` entry in `names` below
+returns an explicit error, not a silent no-op. To drop one, use `DELETE
+/api/comics/wish-list?title=<name>` (BUI-128) directly, not `remove-conflicts`.
 
 Then remove **only the reviewed genuine conflicts**, scoped by their exact
 `name` values from the audit:
@@ -245,28 +224,20 @@ comics_curl -X POST "$COMICS_SERVER_URL/api/comics/wish-list/remove-conflicts" \
 ```
 
 **The unscoped POST (no body) no longer removes anything (BUI-266 foot-gun
-guard)** — it returns a non-mutating dry-run preview (`dry_run: true`). Passing
-`{"confirm": true}` still performs the original *remove-every-conflict* global
-sweep, but that reintroduces the decoy risk above, so use it **only** after
-reviewing the full audit and confirming there are no decoys. Prefer scoped
-`names`.
+guard)** — it returns a non-mutating dry-run preview. `{"confirm": true}` still
+performs the original remove-every-conflict sweep, but that reintroduces the
+decoy risk above — prefer scoped `names`.
 
 Both endpoints 409 if the collection was never imported. **Do not proceed to a
-wish push (Step 3b) until every *genuine* conflict has been dropped** (decoys
-left in the audit are false positives, not owned-but-wished entries — they must
-not block the push, and must not be removed; `printing_conflicts` entries are the
-same — they are advisory, not blocking, and must not be removed via
-`remove-conflicts` either). This conflicts audit + scoped remove is the sync's
-**fulfillment-drop** (BUI-208 U2): a wished book you now own has its wish dropped
-and the owned copy kept; it touches only wish state (never a collection row),
-and each drop is logged with the matched owned identity.
+wish push (Step 3b) until every *genuine* conflict has been dropped** — decoys
+and `printing_conflicts` entries are advisory, not blocking, and must NOT be
+removed via `remove-conflicts`. This is the sync's fulfillment-drop (BUI-208
+U2); full model:
+`docs/solutions/integration-issues/locg-sync-unified-model-2026-06-22.md`.
 
-**A clean conflicts audit is a strong signal, not a proof of owned-safety.** The
-audit and the export parse issue tokens slightly differently and apply the same
-partial variant coverage as above, so a zero-conflict result does NOT guarantee
-the export carries no `In Collection=0` for an owned book. The LOCG import preview
-remains the final gate. (Parser parity between the audit and the export is being
-unified in BUI-197.)
+**A clean conflicts audit is a strong signal, not proof of owned-safety** — the
+audit and export parse issue tokens slightly differently (BUI-197 is unifying
+this), so the LOCG import preview remains the final gate.
 
 ## Step 3: Probe, then upload the wins CSV to LOCG (manual — you)
 
@@ -287,13 +258,12 @@ comics_post "$COMICS_SERVER_URL/api/comics/collection/restore" \
   -d "{\"backup_path\": \"$BACKUP_PATH\"}"
 ```
 
-Only after a clean probe, upload the rest. **The constraint that matters is data
-completeness, not row count** — there is no row limit. (The earlier "≤20 rows per
-batch" belief was a misdiagnosis: the hangs were caused by incomplete/dateless
-rows, not batch size.) Every row must be complete and exact — publisher +
-canonical series + exact full_title (no decoration) + accurate Release Date —
-which Step 2b already audited. An **incomplete or all-dateless batch hangs** the
-importer; a complete batch uploads fine at any size.
+Only after a clean probe, upload the rest. **Data completeness is the
+constraint, not row count** — there is no row limit (the earlier "≤20 rows per
+batch" belief was a misdiagnosis of incomplete/dateless rows, not batch size;
+see `docs/solutions/integration-issues/locg-sync-unified-model-2026-06-22.md`).
+Every row must be complete and exact — Step 2b already audited this. An
+**incomplete or all-dateless batch hangs** the importer regardless of size.
 
 Re-uploading is **safe** — wins are idempotent (`In Collection=1` re-applies as a
 no-op, never a delete), so retry freely. **Watch the preview/result and abort on
@@ -430,10 +400,10 @@ reach the operator rather than stay buried in the raw JSON.
 
 Some pending rows may legitimately remain: wins for a book the collection
 **already owns** (under a different identity) are left pending and logged
-`ambiguous_reconciliation` rather than merged or duplicated — this is one of
-the `warnings` entries above, not just an `import-history.jsonl` detail.
-Check `.notes.md` and the server's `import-history.jsonl` for the full
-audit trail; resolve them via the duplicate win-records cleanup in
+`ambiguous_reconciliation` (one of the `warnings` entries above, not just an
+`import-history.jsonl` detail). Check `.notes.md` and the server's
+`import-history.jsonl` for the audit trail; resolve via the duplicate
+win-records cleanup in
 `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
 ## Common Mistakes
