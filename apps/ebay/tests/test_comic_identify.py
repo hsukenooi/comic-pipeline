@@ -365,3 +365,69 @@ class TestComicIdentifyAnnualAdjacency:
         data = json.loads(capsys.readouterr().out)
         assert data["edition"] == "annual"
         assert data["issue"] == "1"
+
+    # --- BUI-456 case 1: promo/year digit right after "annual" --------------
+    # A "#N" issue token BEFORE "annual" means the digit AFTER it is a promo
+    # year, not a real annual number. Guarded so an existing issue number is not
+    # reclassified as a nonexistent "<Series> Annual #N".
+    def test_promo_year_after_annual_is_regular(self, capsys):
+        """The ticket's exact case: '#252 annual 2024 sale' — the \\d matched the
+        promo year 2024, but #252 is the real issue. Must stay single-issue."""
+        comic_identify.main(["ASM #252 annual 2024 sale"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
+        assert data["issue"] == "252"
+
+    def test_hash_issue_before_annual_with_trailing_number_is_regular(self, capsys):
+        """Generalizes the guard: any #-issue token before 'annual' demotes it,
+        even when a real-looking small number follows ('#300 annual 5 left')."""
+        comic_identify.main(["Uncanny X-Men #300 annual 5 left"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
+        assert data["issue"] == "300"
+
+    def test_marketing_hash_before_genuine_annual_is_accepted_false_negative(self, capsys):
+        """ACCEPTED trade-off (BUI-456 case-1 guard): a listing that leads with a
+        marketing '#N' and then carries a REAL annual is demoted to single-issue.
+        This is the recoverable duplicate-buy direction and rarer than the misfile
+        the guard prevents — locked here so the trade-off is explicit, not a
+        surprise. If the guard is ever revisited, update this expectation."""
+        comic_identify.main(["#1 seller Amazing Spider-Man Annual #1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
+        assert data["issue"] == "1"
+
+    # --- BUI-456 case 2: non-space / non-"#" separators ---------------------
+    # Genuine annuals whose number is joined by "No.", ":" or "-" must still
+    # classify as annual (the separator class was broadened beyond "\\s*#?\\s*").
+    def test_genuine_annual_no_dot_separator(self, capsys):
+        comic_identify.main(["Amazing Spider-Man Annual No. 1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "1"
+
+    def test_genuine_annual_no_dot_missing_dot_separator(self, capsys):
+        """The dot is optional — 'Annual No 1' classifies too."""
+        comic_identify.main(["Amazing Spider-Man Annual No 1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "1"
+
+    def test_genuine_annual_colon_separator(self, capsys):
+        comic_identify.main(["X-Men Annual: 1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "1"
+
+    def test_genuine_annual_hyphen_hash_separator(self, capsys):
+        comic_identify.main(["Avengers Annual-#5"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "5"
+
+    def test_stray_word_after_separator_is_still_regular(self, capsys):
+        """The number is still REQUIRED after the broadened separator — a colon
+        followed by a non-number word must not become an annual."""
+        comic_identify.main(["X-Men Annual: Special Issue"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
