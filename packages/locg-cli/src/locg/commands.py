@@ -3440,6 +3440,46 @@ def _resolve_price(raw: Any) -> Optional[float]:
         return None
 
 
+# BUI-426: editions LOCG nests INSIDE the parent series' full_title — "Annual"
+# and "Treasury" — are stripped out of comic-identify's extracted series text
+# (an annual's series is "Uncanny X-Men"; the qualifier survives only in the
+# identity's `edition` field). The win pipeline then DROPPED `edition`, so a win
+# like "Uncanny X-Men Annual 6" reached resolution as bare series "Uncanny
+# X-Men" + issue "6", and the classic X-Men issue-number split (#<=141 ->
+# The X-Men) filed it as the Silver-Age "The X-Men #6" (1964) — a completely
+# different, often valuable book falsely claimed as owned (and the far cheaper
+# annual hidden). Re-attaching the qualifier to the series BEFORE resolution
+# restores the distinct identity: the norm_key becomes "uncanny x-men annual"
+# (outside _XMEN_SPLIT_KEYS, so the #141 boundary never fires), base_full_title
+# yields the canonical "Uncanny X-Men Annual #6", and the existing annual-aware
+# alias/owned-match machinery (_alias_keys_for, owned_match_keys) resolves it to
+# the right volume — or falls through to Metron/manual, the safe flagged
+# direction, never a false regular-issue claim.
+#
+# Giant-Size and King-Size are deliberately NOT re-attached: comic-identify
+# KEEPS those words in the series text because LOCG catalogs them as their OWN
+# series (e.g. "Giant-Size X-Men" is distinct from "X-Men"), so they already
+# resolve as distinct identities without help here.
+_EDITION_QUALIFIERS: dict[str, str] = {"annual": "Annual", "treasury": "Treasury"}
+
+
+def _edition_qualified_series(series_raw: str, edition: str) -> str:
+    """Re-attach a stripped Annual/Treasury qualifier to the series text.
+
+    Returns *series_raw* unchanged for any other edition (single-issue,
+    giant-size, king-size, collected, ...) or an empty series. Idempotent: a
+    manually-built identify_data may already carry the qualifier in the series
+    (e.g. series="Uncanny X-Men Annual"), so the qualifier is appended only when
+    it is not already present as a whole word.
+    """
+    qualifier = _EDITION_QUALIFIERS.get((edition or "").strip().lower())
+    if not qualifier or not series_raw:
+        return series_raw
+    if re.search(rf"\b{re.escape(qualifier)}\b", series_raw, re.IGNORECASE):
+        return series_raw
+    return f"{series_raw} {qualifier}"
+
+
 def _build_win_row(
     win: dict[str, Any],
     *,
@@ -3477,6 +3517,14 @@ def _build_win_row(
 
     identify = win.get("identify_data") or {}
     series_raw = str(identify.get("series") or "").strip()
+    # BUI-426: re-attach the Annual/Treasury qualifier that comic-identify
+    # strips out of the series text, so an annual resolves as its DISTINCT
+    # "<Series> Annual #N" identity rather than the same-numbered regular issue
+    # in the wrong volume (a false ownership claim). No-op for regular issues
+    # and for giant-size/king-size (whose qualifier already lives in the series
+    # text), so genuine regular-issue resolution and the classic X-Men split are
+    # untouched. See _edition_qualified_series.
+    series_raw = _edition_qualified_series(series_raw, str(identify.get("edition") or ""))
     issue_num = str(identify.get("issue") or "").strip()
     year_raw = identify.get("year")
     variant_text = str(identify.get("variant_text") or "").strip().lower()

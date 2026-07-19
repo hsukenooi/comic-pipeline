@@ -226,3 +226,65 @@ class TestComicIdentifyVariantText:
         rows = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.strip()]
         assert rows[0]["variant_text"] == "Newsstand"
         assert rows[1]["variant_text"] == ""
+
+
+class TestComicIdentifyEditionInJson:
+    """BUI-426: the CLI JSON must expose `edition` so the win pipeline can carry
+    the annual/king-size/giant-size qualifier through record-win-prep to the
+    resolver. Dropping it filed "Uncanny X-Men Annual 6" as the Silver-Age
+    regular "The X-Men #6" — a different, valuable book falsely claimed owned.
+    These lock the UPSTREAM signal the fix depends on.
+    """
+
+    def test_edition_field_present_in_json(self, capsys):
+        comic_identify.main(["Batman #1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
+
+    def test_uncanny_xmen_annual_6_ticket_case(self, capsys):
+        comic_identify.main(["Uncanny X-men Annual 6 Marvel 1982 Dracula"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "6"
+        assert data["year"] == 1982
+        # The qualifier is stripped OUT of the series text (it nests in the
+        # parent series' full_title) — the whole reason `edition` must survive.
+        assert "annual" not in data["series"].lower()
+
+    def test_uncanny_xmen_annual_10_ticket_case(self, capsys):
+        comic_identify.main(["Uncanny X-men Annual 10 Marvel 1986 1st X-Babies"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "10"
+        assert data["year"] == 1986
+
+    def test_fantastic_four_annual_4_ticket_case(self, capsys):
+        comic_identify.main(["Fantastic Four Annual #4 1st SA GA Human Torch"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "4"
+        assert data["series"] == "Fantastic Four"
+
+    def test_giant_size_edition_in_json(self, capsys):
+        comic_identify.main(["Giant-Size X-Men #1 Marvel 1975"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "giant-size"
+        # Giant-Size stays IN the series (LOCG's own series) — a distinct
+        # identity already, so it never collides with regular X-Men #1.
+        assert data["series"] == "Giant-Size X-Men"
+
+    def test_edition_present_in_batch_rows(self, monkeypatch, capsys):
+        import io
+
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO("Uncanny X-men Annual 6 Marvel 1982\nBatman #1\n"),
+        )
+        comic_identify.main(["--batch"])
+        rows = [
+            json.loads(ln)
+            for ln in capsys.readouterr().out.splitlines()
+            if ln.strip()
+        ]
+        assert rows[0]["edition"] == "annual"
+        assert rows[1]["edition"] == "single-issue"

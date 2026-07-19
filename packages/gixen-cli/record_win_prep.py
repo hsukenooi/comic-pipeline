@@ -259,6 +259,7 @@ def _build_review_entry(win: dict, identity: dict, reason: str) -> dict:
             "series": identity.get("series"),
             "issue": identity.get("issue"),
             "year": identity.get("year"),
+            "edition": identity.get("edition"),  # BUI-426: annual/etc. qualifier
             "is_lot": identity.get("is_lot"),
             "constituent_issues": identity.get("constituent_issues"),
             "error": identity.get("error"),
@@ -276,6 +277,19 @@ def _build_win_entry(win: dict, identity: dict, *, issue: str) -> dict:
     variant_text = identity.get("variant_text") or ""
     if variant_text:
         identify_data["variant_text"] = variant_text
+    # BUI-426: forward the edition qualifier (annual / giant-size / king-size /
+    # treasury) so the downstream resolver files an annual as its DISTINCT
+    # "<Series> Annual #N" identity instead of the same-numbered REGULAR issue
+    # in the wrong volume. comic-identify strips "Annual"/"Treasury" out of the
+    # extracted series text (those nest in the parent series' full_title),
+    # recording the fact only in `edition`; dropping `edition` here is exactly
+    # what let "Uncanny X-Men Annual 6" resolve to bare series "Uncanny X-Men" +
+    # issue "6" and get filed as the Silver-Age "The X-Men #6" — a different,
+    # valuable book falsely claimed as owned. Only non-default kinds carry
+    # information; "single-issue" is the default and is omitted.
+    edition = identity.get("edition") or ""
+    if edition and edition != "single-issue":
+        identify_data["edition"] = edition
     return {
         "item_id": win.get("item_id"),
         "current_bid": win.get("current_bid"),
