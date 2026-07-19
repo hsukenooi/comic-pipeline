@@ -54,7 +54,7 @@ comics_health_gate     || exit 1
 ## Step 1: Look up the series on Metron
 
 ```bash
-metron_curl "https://metron.cloud/api/series/?name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")"
+metron_curl "https://metron.cloud/api/series/" -G --data-urlencode "name=<SERIES>"
 ```
 
 **Filter by start year server-side when you know it (BUI-204).** The bare `name`
@@ -65,7 +65,8 @@ supplied a year, or you otherwise know the run's start year, add Metron's
 of every same-named title:
 
 ```bash
-metron_curl "https://metron.cloud/api/series/?name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "<SERIES>")&year_began=<YEAR>"
+metron_curl "https://metron.cloud/api/series/" -G \
+  --data-urlencode "name=<SERIES>" --data-urlencode "year_began=<YEAR>"
 ```
 
 Each result has `id`, `series` (display name incl. year, e.g.
@@ -75,8 +76,8 @@ Each result has `id`, `series` (display name incl. year, e.g.
 - Exactly one result → use it.
 - Multiple results → show the user the candidates (`series` + `year_began` +
   `issue_count`) and ask which one. If the user supplied a year, prefer the
-  series whose `year_began` matches (or just add `&year_began=<YEAR>` above to
-  narrow the search before you ever see the candidates).
+  series whose `year_began` matches (or just add the `year_began` filter to the
+  call above to narrow the search before you ever see the candidates).
 - Zero results → stop and report that Metron has no series by that name (suggest
   the user check spelling or supply the exact Metron title). If you used a
   `year_began` filter, retry once without it before declaring zero — the year may
@@ -125,7 +126,9 @@ catalog — the matcher-owned endpoint returns a scalar verdict, never the full
 catalog array:
 
 ```bash
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/series-names/resolve" \
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+comics_post "$COMICS_SERVER_URL/api/comics/collection/series-names/resolve" \
   -H 'content-type: application/json' \
   -d "$(python3 -c 'import json,sys; print(json.dumps({"names": [sys.argv[1]]}))' "<SERIES>")"
 ```
@@ -165,7 +168,9 @@ year (drop the key entirely for an issue with no `cover_date`):
 # Build items.json programmatically from your number→cover_year map, e.g.:
 #   {"items":[{"series":"Uncanny X-Men","issue":"185","year":"1984"},
 #             {"series":"Uncanny X-Men","issue":"186","year":"1984"}, ...]}
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+comics_post "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
   -H 'content-type: application/json' \
   -d @items.json
 ```
@@ -200,18 +205,21 @@ correlate by key (don't rely on order). Per item:
   untracked/wishlisted before choosing.
 - `{"match_status": "not_in_cache"}` → not owned, keep it.
 
-The batch call's HTTP status is the whole-batch signal:
+The batch call's HTTP status is the whole-batch signal. Because Step 3 now
+routes this through `comics_post` (above), a non-200 already exits non-zero
+AND prints the response body to stderr for free (BUI-186's
+`--fail-with-body`) — no need to hand-roll `-o body -w '%{http_code}'` to
+recover it:
 
 - **HTTP 409** (store never imported) → ownership can't be verified for ANY item.
-  Warn the user ("couldn't check ownership — collection not imported"), and
-  proceed with all issues. (The export fix is the safety net: even a wrongly-
-  wished owned book is no longer deleted — but flag it so the user knows the
-  check was skipped.) Because `curl -sf` exits non-zero on the 409, capture the
-  status explicitly (e.g. `-o body -w '%{http_code}'`) so you can distinguish
-  this expected case from a real network failure rather than silently treating
-  every issue as un-owned (R11 — a failed call must never read as "not owned").
-- **Any other non-200** (500, network error) → hard-fail; do not wish-list
-  anything from a failed check (R11).
+  The printed body names this exact condition ("collection store has no import
+  yet — cannot determine ownership"); when you see that, warn the user
+  ("couldn't check ownership — collection not imported") and proceed with all
+  issues. (The export fix is the safety net: even a wrongly-wished owned book is
+  no longer deleted — but flag it so the user knows the check was skipped.)
+- **Any other failure** (500, network error, timeout) → hard-fail; do not
+  wish-list anything from a failed check (R11 — a failed call must never read
+  as "not owned").
 
 Carry forward three lists: **to-add** (not owned), **already-owned** (skipped,
 no printing conflict), and **printing-conflict** (BUI-372 — owned match, but
@@ -229,6 +237,8 @@ re-grepped per issue. A real wish-list is large (685 items in the motivating
 run); a per-issue grep over that payload is the redundant work this step removes.
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
 comics_curl "$COMICS_SERVER_URL/api/comics/wish-list" || exit 1
 ```
 
@@ -311,7 +321,9 @@ never waives the guard for any other item in the same call.
 #     {"title": "Children of the Vault #2"},
 #     {"title": "Amazing Spider-Man #300 2nd Printing", "year": "1988", "force": true}
 #   ]}
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list/batch" \
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+comics_post "$COMICS_SERVER_URL/api/comics/wish-list/batch" \
   -H 'content-type: application/json' \
   -d @batch_items.json
 ```
@@ -370,104 +382,33 @@ touches owned books. See
 so you no longer need to SSH into the Mac Mini to run `locg wish-list remove`:
 
 ```bash
-curl -sf -X DELETE "$COMICS_SERVER_URL/api/comics/wish-list?title=Children+of+the+Vault+%231"
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+comics_curl -X DELETE -G "$COMICS_SERVER_URL/api/comics/wish-list" \
+  --data-urlencode "title=Children of the Vault #1"
 ```
 
-Pass the exact `name` of the wished entry as the `title` query param (URL-encoded).
-Returns `{"status": "ok", "removed": {...}, "items": N}` on success, **404** if no
-entry matches that title, **422** if the title is blank. Like an add, a removal is
-overwritten by the next full `collection import` unless pushed to LOCG first.
+Pass the exact `name` of the wished entry as the `title` query param
+(`--data-urlencode` handles the encoding). Returns `{"status": "ok", "removed":
+{...}, "items": N}` on success, **404** if no entry matches that title, **422**
+if the title is blank. Like an add, a removal is overwritten by the next full
+`collection import` unless pushed to LOCG first.
 
 ## Creator runs (BUI-134): "add X's run on series Y"
 
-"Add John Romita Jr.'s run on Uncanny X-Men to the wish-list" has **no
-ground-truth source in model memory** — and memory silently drops DISCONTINUOUS
-runs. Asked for JR JR's Uncanny X-Men pencils, an agent recalls only #175–211
-and misses his ~1993 second stint (#287, #300–311).
-
 **Never enumerate a creator run from memory — for ANY claim, not just a
-wish-list write.** This includes a bare conversational question ("what was
-Erik Larsen's Spider-Man run?") with no wish-list intent at all. BUI-340: asked
-exactly that as a plain question, an agent answered from model memory (said
-#19–43) instead of grounding it in Metron, because invoking the full
-wish-list-add flow felt like the wrong tool for "just answer a question." The
-Metron-credited run was actually #18–23. The fix isn't "remember to ground
-it" — it's reaching for the right tool, which now exists:
+wish-list write.** Memory silently drops discontinuous stints and gets ranges
+wrong (BUI-340: an agent recalled Erik Larsen's Spider-Man as #19–43 from
+memory for a plain question, no wish-list intent at all; the Metron-credited
+run is actually #18–23). Ground every creator-run claim in Metron: `locg
+creator-run --creator … --series-id …` for a read-only question (zero cache/
+file writes), `locg wish-list add --creator … --series-id …` to actually write
+the run's gap issues to the wish-list.
 
-- **Just answering a question, no write intended** → `locg creator-run`
-  (below) — read-only, zero cache/file writes, prints the resolved issue
-  list/range. This is the tool to reach for by default whenever a creator-run
-  claim is needed, wish-list-add or not.
-- **Actually adding the run's gap issues to the wish-list** → `locg wish-list
-  add --creator …` (this section) — resolves the same way, then writes.
-
-### Read-only lookup: `locg creator-run`
-
-For a plain question — no wish-list write intended — use the read-only
-counterpart instead of the write path:
-
-```bash
-locg creator-run "The Amazing Spider-Man" \
-  --creator "Erik Larsen" --series-id <METRON_SERIES_ID> --role penciller
-```
-
-It calls the same `resolve_creator`/`resolve_creator_run` Metron methods
-described below (same id-pinning, same discontinuous-stint handling, same
-per-issue role confirmation) and prints `{creator, creator_id, issues,
-issue_numbers, warnings, ...}` — no collection check, no wish-list dedup, no
-cache read or write of any kind. Use this whenever the ask is "what was X's
-run" rather than "add X's run."
-
-### Writing the run to the wish-list
-
-To actually add the run's gap issues to the wish-list, ground it in Metron's
-per-issue creator credits via the `locg` resolver:
-
-```bash
-# series = the LOCG-searchable title used for the "<series> #<N>" wish entries
-# --series-id = the Metron series id (from the Step 1 series lookup)
-# --creator   = the EXACT Metron creator name (disambiguates JR vs Sr by id)
-# --role      = credit role to filter by (default: penciller)
-locg wish-list add "Uncanny X-Men" \
-  --creator "John Romita Jr." --series-id <METRON_SERIES_ID> --role penciller
-```
-
-What it does, in order:
-1. **Pins the creator's Metron id** (`/creator/?name=`). "John Romita Jr." and
-   "John Romita" (Sr.) are distinct ids — the resolver matches by id, never a
-   loose name string. An ambiguous or unknown name is a **hard error**, not a
-   guess; pass the exact Metron creator name.
-2. **Resolves the EXACT issue set** the creator holds `--role` on, from each
-   issue's Metron credits. The candidate set comes from Metron's issue-list
-   `creator` filter (so BOTH stints are in scope), then each issue's credits
-   confirm the role. This returns the discontinuous #287/#300–311 stint that
-   memory drops.
-3. **Filters owned + already-wishlisted issues** before any write — owned via
-   the same per-issue collection check (by that issue's **cover year**, never
-   `year_began`, BUI-129), already-wishlisted via the local cache.
-4. Appends the remaining `"<series> #<N>"` titles to the wish-list cache.
-
-**Role is EXPLICIT.** The default `penciller` matches **only** a `Penciller`
-credit — it does NOT auto-include `Breakdowns`, `Layouts`, `Co-Penciller`, etc.
-To widen the run, pass that role name explicitly (`--role breakdowns`); you can
-only request one role per call.
-
-**Low-confidence WARNING on thin credits.** Metron's credit data is sparse/
-occasionally wrong on older Silver/Bronze books. An issue in the candidate set
-that Metron has **no credits at all** for is reported in the result's `warnings`
-(not silently treated as "not in the run"). Surface these to the user — the run
-membership for those issues is unverified and may need a manual eyeball.
-
-The result JSON carries `added`, `already_owned`, `already_wishlisted`,
-`warnings`, `creator`/`creator_id` (the pinned Metron id), and `run_issue_count`.
-Show the user the preview (added vs skipped vs warnings) and confirm before this
-is treated as final, same as the numeric-range path.
-
-> Note: the `locg wish-list add` path writes the **local** cache. The
-> server-backed `POST /api/comics/wish-list` flow above (Steps 1–6) is the
-> machine-visible path; the creator-run resolver is currently a local-cache
-> convenience for enumerating the exact issue set. When adding to the server,
-> feed the resolved issue numbers into the Step 5 `POST` loop.
+Full walkthrough — id-pinning (JR Jr vs Sr), `--role` filtering, low-confidence
+credit warnings, and the local-cache vs server-backed write-path distinction —
+lives in `docs/conventions/wishlist-add-creator-run.md` (BUI-448); read it
+before running either command for the first time.
 
 ## Common Mistakes
 
