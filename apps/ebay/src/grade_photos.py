@@ -73,17 +73,30 @@ Usage:
     python src/grade_photos.py ITEM_ID [ITEM_ID ...] [--workdir DIR]
 
 Labels each item comic-1, comic-2, ... in input order (matches the
-/tmp/comic-grading/comic-N/ layout the grader agents expect). Prints one
-line per item:
+<workdir>/comic-N/ layout the grader agents expect). Prints one line per
+item:
 
     comic-1: FETCH FAILED — <error>
     comic-1: <title> — <N> images — current bid $12.34 (3 bids)
+
+BUI-440: when --workdir is not given, each run gets its own fresh directory
+under /tmp/comic-grading (via tempfile.mkdtemp) instead of writing straight
+into that fixed root. Previously the root was never cleared and only the
+per-label comic-N dir was wiped (BUI-300, download_listing() below) — so a
+prior larger run's comic-3..comic-N dirs survived into a later smaller run,
+and two overlapping runs (e.g. a /comic:buy run + a standalone /comic:grade
+run) collided on comic-1/comic-2 and could rmtree each other's in-flight
+images. main() prints the resolved directory as `WORKDIR: <path>` (only
+when auto-generated — an explicit --workdir is echoed by the caller, not by
+this script) so grade.md's Step 2 can address each comic's images at
+<workdir>/comic-N.
 """
 
 import argparse
 import importlib.metadata
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import requests
@@ -115,6 +128,14 @@ def _version_string() -> str:
 # which takes no timeout) — matching the timeout idiom every other network
 # call in this package already uses (ebay_fetch.py, seller_scan.py, etc.).
 _DOWNLOAD_TIMEOUT_SECONDS = 15
+
+# BUI-440: parent directory for auto-generated (--workdir not given) run
+# directories. It is only ever mkdir'd and used as the `dir=` argument to
+# tempfile.mkdtemp() — never written into or rmtree'd directly — so it is
+# safe for it to accumulate across runs. A module-level constant (rather than
+# inlined in main()) so tests can monkeypatch it to a tmp_path instead of
+# touching the real /tmp.
+_DEFAULT_WORKDIR_ROOT = Path("/tmp/comic-grading")
 
 
 class TokenExpiredError(RuntimeError):
@@ -251,10 +272,28 @@ def main(argv=None):
     )
     parser.add_argument("item_ids", nargs="+", help="eBay legacy item IDs (numeric).")
     parser.add_argument(
-        "--workdir", default="/tmp/comic-grading",
-        help="Output root; each item lands in <workdir>/comic-N/ (default: /tmp/comic-grading).",
+        "--workdir", default=None,
+        help="Output root; each item lands in <workdir>/comic-N/. Default: a "
+             "fresh per-run directory created under /tmp/comic-grading "
+             "(BUI-440) — printed as `WORKDIR: <path>` on stdout so a caller "
+             "that didn't pass --workdir can discover it.",
     )
     args = parser.parse_args(argv)
+
+    # BUI-440: an explicit --workdir is used as-is (the caller owns that path
+    # and is responsible for not colliding with another run). When omitted,
+    # namespace this run under its own tempfile.mkdtemp() directory rather
+    # than the bare fixed root — that's what actually stops a prior run's
+    # stale comic-N dirs from leaking into this one AND stops two concurrent
+    # runs from ever sharing a root (each gets a distinct, unpredictable
+    # directory name). Just clearing the fixed root at batch start would not
+    # be safe for the concurrent case: two runs starting close together could
+    # each clear the other's in-flight files.
+    workdir = args.workdir
+    if workdir is None:
+        _DEFAULT_WORKDIR_ROOT.mkdir(parents=True, exist_ok=True)
+        workdir = tempfile.mkdtemp(prefix="run-", dir=_DEFAULT_WORKDIR_ROOT)
+        print(f"WORKDIR: {workdir}")
 
     items = [(f"comic-{i}", item_id) for i, item_id in enumerate(args.item_ids, 1)]
     client_id, client_secret, base_url = load_config()
@@ -279,7 +318,7 @@ def main(argv=None):
         result = None
         for attempt in range(2):
             try:
-                result = download_listing(token, item_id, f"{args.workdir}/{label}", base_url)
+                result = download_listing(token, item_id, f"{workdir}/{label}", base_url)
                 break
             except TokenExpiredError as e:
                 if attempt == 0:
