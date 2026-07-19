@@ -277,13 +277,15 @@ owned" for the report. Never auto-resolve this bucket either way — a false
 direction), but a false "skip" reproduces the AMM #1 incident (a missed wish
 for a book actually wanted).
 
-## Step 5: Add each issue
+## Step 5: Add every issue in one batch call
 
-On confirmation, add one issue per call (`curl -sf` so a non-200 fails loudly)
-— this includes both the original to-add list and any printing-conflict
-issues the user confirmed adding in Step 4:
+On confirmation, add every issue in **one** request (BUI-447) — this replaces
+the old per-issue `curl` loop, which turned a 40-issue run into 40 sequential
+POSTs. Build a single items list covering both the original to-add list and
+any printing-conflict issues the user confirmed adding in Step 4, and POST it
+once:
 
-Include each issue's **cover year** (Step 2) in the body. It does double duty:
+Include each issue's **cover year** (Step 2) in its item. It does double duty:
 the server-side owned-guard's masthead fallback (BUI-184) gets the same catch
 the Step 3 filter does, AND as of **BUI-387** the year is now **persisted** on
 the wish entry (a separate `year` field). That persisted Cover Year is what lets
@@ -294,43 +296,68 @@ Omit `year` only for an issue Metron had no `cover_date` for (it is then added
 unstamped — safe, year-blind, exactly as before). **Never pass `year_began`
 (BUI-129)** — it must be THIS issue's cover year, or the wish is mis-scoped.
 
+**`force: true` is per item, never batch-wide.** Set it ONLY on an issue the
+user explicitly confirmed adding despite a Step 4 printing-conflict decision —
+it will otherwise 409 again against the same reprint row (BUI-372), since the
+owned-guard re-runs the exact same check per item regardless of what any other
+item in the batch sets. Every other item should omit `force` (defaults to
+false) so its own owned-guard still runs; setting `force: true` on one item
+never waives the guard for any other item in the same call.
+
 ```bash
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list" \
+# batch_items.json, built from your to-add + confirmed-printing-conflict lists:
+#   {"items": [
+#     {"title": "The Mighty Thor #154", "year": "1968"},
+#     {"title": "Children of the Vault #2"},
+#     {"title": "Amazing Spider-Man #300 2nd Printing", "year": "1988", "force": true}
+#   ]}
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list/batch" \
   -H 'content-type: application/json' \
-  -d '{"title": "The Mighty Thor #154", "year": "1968"}'
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/wish-list" \
-  -H 'content-type: application/json' -d '{"title": "Children of the Vault #2"}'  # no cover_date → no year
-# …
+  -d @batch_items.json
 ```
 
-Each call appends `{name: "<title>", id: null[, year: "<cover_year>"]}` to the
-server wish-list and returns `{"status": "ok", ...}`. As of BUI-285 the endpoint
-is idempotent: a re-added series+issue returns `{"status": "exists", ...}` with
-200 (no duplicate row), so a retried title is safe. Stop and report if any call
-returns a non-200.
+The response is `{"count": N, "results": [{title, status, ...}, ...]}`, one
+entry **per input item, in request order** — correlate by index, not by
+title (two items can share a title, e.g. a duplicate you're intentionally
+force-adding). Per-item `status`:
 
-**Owned-title guard (BUI-130/BUI-184):** `POST /api/comics/wish-list` rejects an
-already-owned title with **409** at the API boundary (defense in depth behind
-Step 3's per-issue filter). With the per-issue `year` in the body it now also
-catches a masthead-stored owned book (BUI-184). If Step 3 was done correctly
-you'll never hit it; a 409 here means the book is owned — skip it. To wish-list
-an owned book on purpose (a different printing/variant), pass `"force": true`.
+- **`"ok"`** — added. `added` carries the persisted entry; `items` is the new
+  wish-list total.
+- **`"exists"`** — BUI-285 idempotent no-op: this series+issue token was
+  already on the wish-list. `existing` carries the row it matched. Not an
+  error — count it as "already wished," not "added."
+- **`"owned-409"`** — the BUI-130/BUI-122 owned-guard rejected this item (the
+  same guard the single-item endpoint's real 409 applies — surfaced inline
+  here because the batch call itself always returns 200 even when individual
+  items are rejected). `message`/`full_title_matched`/`printing_conflict`/
+  `printing_candidates` mirror the single endpoint's 409 detail. If Step 3/3b
+  were done correctly you should rarely see this; if you do, treat that issue
+  as owned and do not blanket-retry the whole batch with `force: true` — only
+  a genuine printing-conflict item the user confirmed at Step 4 should be
+  re-posted with `force: true` (as its own follow-up item, not as license to
+  force everything).
+- **`"error"`** — that one item's write failed for a reason other than
+  ownership (e.g. a malformed `year`). Report it; it does not affect any
+  other item's result — the batch keeps processing the rest.
 
-**Printing-conflict adds need `force=true` (BUI-372).** Any issue you're
-posting because the user confirmed a Step 4 printing-conflict decision WILL
-409 again here without `force: true` — the owned-guard re-runs the exact same
-check and matches the exact same reprint row. The 409's `detail` now carries
-`printing_conflict`/`printing_candidates` alongside the message (additive
-JSON fields, BUI-372) precisely so you can tell "this 409 is the printing
-decoy Step 4 already resolved — retry with force=true" apart from a genuine
-duplicate you should actually skip.
+A non-200 on the batch call itself (e.g. 422 for an empty `items` list) is a
+hard failure covering the WHOLE call — stop and report; nothing in the batch
+was written in that case. A 200 with a mix of `ok`/`exists`/`owned-409`/`error`
+per item is the normal outcome of a real run and is not itself a failure.
 
 ## Step 6: Report
 
+Build the report straight from the batch response's per-item `status` —
+distinguish **added** (`ok`), **already wished** (`exists`), and **owned/
+skipped** (`owned-409`, plus anything Step 3 filtered out before the batch
+call ever ran):
+
 ```
-**Wish-listed 9 issues of Marvel Tales:**
-  #224, #225, #230, #233, #236–239  →  server wish-list (N items total)
-  Skipped 8 already-owned issues.
+**Wish-listed 7 issues of Marvel Tales:**
+  Added (7): #224, #225, #230, #233, #236–238
+  Already on wish-list (1): #239 (idempotent no-op)
+  Owned — rejected (1): #227 (matched "Marvel Tales #227"; pass force=true to override)
+  Already owned — skipped before the batch call (8): #223, #226, #228, #229, #231, #232, #234, #235
 ```
 
 **Sync note:** local wish-list adds **survive** a `collection import` (BUI-47 is

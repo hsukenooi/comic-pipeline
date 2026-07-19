@@ -111,6 +111,32 @@ class WishListAddRequest(BaseModel):
         return v
 
 
+class WishListAddBatchRequest(BaseModel):
+    """POST /api/comics/wish-list/batch (BUI-447).
+
+    A list of ``{title, year?, force?}`` entries — reuses ``WishListAddRequest``
+    directly as the per-item shape (identical fields, identical non-empty-title
+    validator) rather than minting a parallel model, so a batch item validates
+    byte-for-byte the same way a standalone add does. Eliminates the per-issue
+    HTTP fan-out ``/comic:wishlist-add`` Step 5 used to do (a 40-issue run was
+    40 sequential ``POST /api/comics/wish-list`` calls).
+
+    Each item is added via the exact same owned-guard + ``cmd_wish_list_add``
+    idempotency path the single-item endpoint uses — see
+    ``api_wish_list_add_batch`` in routes.py. The owned-guard (BUI-130/BUI-122)
+    runs PER ITEM and is never bypassed by another item's ``force`` flag.
+    """
+
+    items: list[WishListAddRequest]
+
+    @field_validator("items")
+    @classmethod
+    def _non_empty(cls, v: list[WishListAddRequest]) -> list[WishListAddRequest]:
+        if not v:
+            raise ValueError("items must be a non-empty list")
+        return v
+
+
 class CollectionCheckItem(BaseModel):
     """One (series, issue, [year], [variant]) pair for the batch check.
 

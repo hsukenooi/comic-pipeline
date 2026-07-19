@@ -38,6 +38,7 @@ from gixen_overlay.models import (
     LinkFmvRequest,
     VerifyRequest,
     WishListAddRequest,
+    WishListAddBatchRequest,
     RecordWinRequest,
     SellerScanSeenRequest,
     CollectionWinsSeenRequest,
@@ -1848,6 +1849,100 @@ async def api_wish_list_add(req: WishListAddRequest):
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
     return result
+
+
+@router.post("/api/comics/wish-list/batch")
+async def api_wish_list_add_batch(req: WishListAddBatchRequest):
+    """Batch wish-list add (BUI-447).
+
+    Accepts a list of ``{title, year?, force?}`` entries — the same shape as
+    the single-item ``POST /api/comics/wish-list`` — and adds each one in a
+    single HTTP call. Eliminates the per-issue fan-out ``/comic:wishlist-add``
+    Step 5 used to do (a 40-issue run was previously 40 sequential POSTs).
+    Returns ``{"count": <n>, "results": [{title, status, ...}, ...]}`` in
+    request order.
+
+    Each item is run through the EXACT SAME two checks
+    ``api_wish_list_add`` applies, in the same order — this is a fan-out, not a
+    reimplementation:
+
+    1. The BUI-130 owned-guard (unless the item itself sets ``force=true``): a
+       title already in the collection is rejected. Wish-listing a book you
+       already own is the BUI-122 data-loss trigger (a later sync exports it
+       with ``In Collection=0``, telling LOCG to delete it from the
+       collection), so this guard runs PER ITEM and is never bypassed at the
+       batch boundary or by any other item's ``force`` flag. Because a batch
+       response is a single 200 covering N items, a rejected item can't use
+       the HTTP status line the single endpoint uses (409) — it is reported
+       inline instead as ``{"status": "owned-409", "message",
+       "full_title_matched", "printing_conflict", "printing_candidates"}``
+       (same fields the single endpoint's 409 detail carries) so a caller
+       distinguishes it from a real add exactly as it would the standalone
+       409.
+    2. ``cmd_wish_list_add``'s BUI-285 idempotency dedup: a title whose
+       series+issue token already exists on the wish-list is a no-op,
+       reported as ``{"status": "exists", "existing", "items"}``.
+
+    A successful add is ``{"status": "ok", "added": {...}, "items": <total>}``.
+    A per-item failure from ``cmd_wish_list_add`` itself (e.g. a malformed
+    non-4-digit ``year``) is reported as ``{"status": "error", "error":
+    <message>}`` rather than aborting the whole batch — one bad item must not
+    block the other 39.
+
+    Each item goes through ``cmd_wish_list_add``'s own read-check-write (the
+    same call the single endpoint makes), so an owned/duplicate title earlier
+    in the SAME batch is already reflected on disk by the time a later item is
+    checked — no intra-batch blind spot.
+    """
+    _ensure_collection_store()
+
+    results: list[dict[str, Any]] = []
+    for item in req.items:
+        if not item.force:
+            parsed = _split_wish_list_name(item.title)
+            if parsed is not None:
+                series, issue = parsed
+                try:
+                    check = cmd_collection_check(series=series, issue=issue, year=item.year)
+                except RuntimeError:
+                    check = None  # store unavailable → fail open, don't block the add
+                # BUI-284: ambiguous_cross_volume counts as owned — same rule the
+                # single endpoint's owned-guard applies.
+                if check is not None and collection_check_reports_owned(check):
+                    results.append({
+                        "title": item.title,
+                        "status": "owned-409",
+                        "message": (
+                            f"'{item.title}' is already in the collection "
+                            f"({check['full_title_matched']}). Wish-listing an owned book "
+                            "risks deleting it on the next sync (BUI-122). Pass force=true "
+                            "to override."
+                        ),
+                        "full_title_matched": check["full_title_matched"],
+                        "printing_conflict": check.get("printing_conflict", False),
+                        "printing_candidates": check.get("printing_candidates"),
+                    })
+                    continue
+
+        result = cmd_wish_list_add(item.title, force=item.force, year=item.year)
+        if "error" in result:
+            results.append({"title": item.title, "status": "error", "error": result["error"]})
+        elif result.get("status") == "exists":
+            results.append({
+                "title": item.title,
+                "status": "exists",
+                "existing": result["existing"],
+                "items": result["items"],
+            })
+        else:
+            results.append({
+                "title": item.title,
+                "status": "ok",
+                "added": result["added"],
+                "items": result["items"],
+            })
+
+    return {"count": len(results), "results": results}
 
 
 @router.delete("/api/comics/wish-list")

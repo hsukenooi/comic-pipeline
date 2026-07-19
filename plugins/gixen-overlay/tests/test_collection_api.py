@@ -1222,6 +1222,135 @@ def test_wish_list_add_409_detail_surfaces_printing_conflict(client):
     assert forced.status_code == 200, forced.text
 
 
+# --- wish-list add (batch, BUI-447) -----------------------------------------
+
+def test_wish_list_add_batch_new_items_are_ok(client):
+    """Two brand-new titles in one batch call both add successfully."""
+    r = client.post(
+        "/api/comics/wish-list/batch",
+        json={"items": [{"title": "Daredevil #181"}, {"title": "Swamp Thing #21"}]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 2
+    assert [item["status"] for item in body["results"]] == ["ok", "ok"]
+    assert [item["title"] for item in body["results"]] == ["Daredevil #181", "Swamp Thing #21"]
+
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert {"Daredevil #181", "Swamp Thing #21"} <= names
+
+
+def test_wish_list_add_batch_existing_item_is_idempotent(client):
+    """BUI-285 idempotency carries into the batch path: re-adding 'X-Men #1'
+    (already seeded) is a no-op reported as status 'exists', not a duplicate row."""
+    before = client.get("/api/comics/wish-list").json()
+    r = client.post("/api/comics/wish-list/batch", json={"items": [{"title": "X-Men #1"}]})
+    assert r.status_code == 200, r.text
+    result = r.json()["results"][0]
+    assert result["status"] == "exists"
+    assert result["existing"]["name"] == "X-Men #1"
+
+    after = client.get("/api/comics/wish-list").json()
+    assert len(after) == len(before)  # no new row appended
+    assert sum(1 for i in after if i["name"] == "X-Men #1") == 1
+
+
+def test_wish_list_add_batch_owned_item_is_rejected(client):
+    """The BUI-130 owned-guard fires per item — an already-owned title in the
+    batch is reported as owned-409, not silently added (BUI-122 data-loss guard)."""
+    r = client.post(
+        "/api/comics/wish-list/batch",
+        json={"items": [{"title": "Amazing Spider-Man #300"}]},
+    )
+    assert r.status_code == 200, r.text  # the batch call itself always 200s
+    result = r.json()["results"][0]
+    assert result["status"] == "owned-409"
+    assert result["full_title_matched"] == "The Amazing Spider-Man #300"
+    assert "force=true" in result["message"]
+    assert result["printing_conflict"] is False
+
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Amazing Spider-Man #300" not in names
+
+
+def test_wish_list_add_batch_owned_item_with_force_is_added(client):
+    """force=true on the OWNED item itself overrides the guard — per item, not
+    a batch-wide switch."""
+    r = client.post(
+        "/api/comics/wish-list/batch",
+        json={"items": [{"title": "Amazing Spider-Man #300", "force": True}]},
+    )
+    assert r.status_code == 200, r.text
+    result = r.json()["results"][0]
+    assert result["status"] == "ok"
+
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Amazing Spider-Man #300" in names
+
+
+def test_wish_list_add_batch_partial_mix_reports_each_item_correctly(client):
+    """Adversarial case: a batch with one new, one owned (no force), one owned
+    WITH force, and one already-wishlisted item must report each item's own
+    correct status — the owned-guard must never leak across items (an owned
+    item's force=True must not waive the guard for a different owned item that
+    didn't set force), and nothing is silently dropped."""
+    r = client.post(
+        "/api/comics/wish-list/batch",
+        json={
+            "items": [
+                {"title": "Daredevil #181"},  # new -> ok
+                {"title": "Amazing Spider-Man #300"},  # owned, no force -> owned-409
+                {"title": "Amazing Spider-Man #300", "force": True},  # owned, force -> ok
+                {"title": "X-Men #1"},  # already wishlisted -> exists
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 4
+    statuses = [item["status"] for item in body["results"]]
+    assert statuses == ["ok", "owned-409", "ok", "exists"]
+
+    names = [i["name"] for i in client.get("/api/comics/wish-list").json()]
+    assert "Daredevil #181" in names
+    assert names.count("Amazing Spider-Man #300") == 1  # only the force=true add landed
+    assert names.count("X-Men #1") == 1  # the exists no-op did not duplicate it
+
+
+def test_wish_list_add_batch_rejects_empty_items(client):
+    r = client.post("/api/comics/wish-list/batch", json={"items": []})
+    assert r.status_code == 422
+
+
+def test_wish_list_add_batch_rejects_blank_title(client):
+    r = client.post(
+        "/api/comics/wish-list/batch", json={"items": [{"title": "  "}]}
+    )
+    assert r.status_code == 422
+
+
+def test_wish_list_add_batch_item_error_does_not_abort_others(client):
+    """A malformed per-item year is reported as status 'error' for that item
+    only — it must not fail the whole batch or block a valid sibling item."""
+    r = client.post(
+        "/api/comics/wish-list/batch",
+        json={
+            "items": [
+                {"title": "Daredevil #181", "year": "1963 - 2011"},  # malformed year
+                {"title": "Swamp Thing #21"},  # valid, unaffected
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert results[0]["status"] == "error"
+    assert results[1]["status"] == "ok"
+
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Daredevil #181" not in names  # the malformed-year add did not persist
+    assert "Swamp Thing #21" in names
+
+
 def test_conflicts_endpoint_excludes_printing_decoy(client):
     """BUI-372: an owned reprint matching a wishlisted BASE printing is not a
     genuine conflict — GET .../conflicts puts it in printing_conflicts, not
