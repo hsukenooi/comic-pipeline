@@ -67,22 +67,10 @@ alongside 2+ sellers.
 
 ## Scanning multiple / known sellers (BUI-298)
 
-When the user asks to scan several sellers, or to scan "all known sellers",
-pass **every** seller as a positional arg to **one** `seller_scan.py`
-invocation in a **single Bash tool call** — do **not** spawn a `Task`/`Agent`
-subagent per seller.
+When the user asks to scan several sellers, or to scan "all known sellers", pass **every** seller as a positional arg to **one** `seller_scan.py` invocation in a **single Bash tool call** — do **not** spawn a `Task`/`Agent` subagent per seller. (Rationale for why a subagent-per-seller fan-out is both wasteful and unreliable: `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md`.)
 
 - Pull the store names straight from `apps/ebay/src/seller_aliases.json`'s
   keys when the user says "scan all known sellers."
-- **Why not subagents:** each seller's scan is just one deterministic
-  `seller_scan.py` invocation — there's no reasoning step a subagent adds.
-  Fanning out one Agent subagent per seller previously meant N separate LLM
-  reasoning loops, N idle-notifications, and manual aggregation of N
-  free-text reports. Worse, it's unreliable: a subagent asked to retry a
-  scan (after a verification timeout) once returned a stale/hallucinated
-  duplicate of its first report instead of actually re-executing. A
-  deterministic Bash re-run of the batched script cannot fabricate a
-  result — it either ran and produced real output, or it didn't run.
 
 ```bash
 cd ~/Projects/comic-pipeline/apps/ebay && \
@@ -101,22 +89,14 @@ machine won't re-surface the same matches.
 
 - Only the genuine **matches** are recorded as seen (a handful of item_ids per
   run, not every listing).
-- `--all` shows every match again, including already-seen ones. It still records
-  newly-surfaced matches — `--all` means "show me everything," not "forget."
-  BUI-317: it also force-re-verifies every candidate by bypassing the
-  rejected-candidate cache below (a normal run skips re-verifying a
-  (listing, wish) pair Claude already rejected within the last 14 days) —
-  use it to recheck a seller when you think a past rejection was wrong.
+- `--all` shows every match again, including already-seen ones (it still records newly-surfaced matches — `--all` means "show me everything," not "forget"), **and bypasses the 14-day rejected-candidate cache** (BUI-317), force-re-verifying every candidate — use it to recheck a seller when you think a past rejection was wrong.
 
 ```bash
 .venv/bin/python src/seller_scan.py <seller>          # only new matches
 .venv/bin/python src/seller_scan.py <seller> --all    # every match
 ```
 
-Seen-tracking is **best-effort**: if the server is unreachable, the scan warns
-and shows all matches rather than aborting (a duplicate is harmless; silently
-hiding a real match is not). This is deliberately *not* the wish-list's
-hard-fail behavior.
+Seen-tracking is **best-effort**: if the comics server is unreachable, the scan warns and shows all matches rather than aborting. This is deliberately the opposite of the **wish-list fetch below, which hard-fails** — see `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why each side made the opposite choice.
 
 ## Output
 
@@ -157,13 +137,7 @@ seller_scan.py <seller> 2>/dev/null
 }
 ```
 
-`sellers[*].skipped_cached_candidates` (BUI-317) is how many candidates were
-skipped entirely — no Claude CLI call — because that exact (listing, wish)
-pair was already rejected within the last 14 days (the BUI-301 cache). It's
-lower stakes than `dropped_candidates` (those were never verified at all);
-this is coverage info for unattended monitoring, and a nonzero count is
-expected/healthy on a repeat scan of the same seller. Always `0` when `--all`
-is passed, since `--all` bypasses the cache and force-re-verifies everything.
+`sellers[*].skipped_cached_candidates` (BUI-317) counts candidates skipped entirely — no Claude CLI call — because that exact (listing, wish) pair was already rejected within the last 14 days. Always `0` when `--all` is passed (it bypasses the cache). See `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why a nonzero count here is expected/healthy rather than a problem.
 
 **Parse exit-code-first, then drill in:**
 
@@ -191,15 +165,13 @@ inline (BUI-298) — no need to scrape stderr for them under `--json`.
 
 ## Verification is already done inside the script (BUI-149)
 
-The fuzzy matcher (issue-number-in-title + ≥50% series-token overlap) is deliberately loose so it doesn't miss a wish-list book — but that means a short or generic series name can produce a **false positive** (e.g. wish-list "Daredevil #1" matching a "Daredevil Annual #1" or an unrelated reprint). Those false positives are the leak at the **seller-scan → /comic:buy seam**: once a wrong URL flows into `/comic:buy`, identify + FMV will happily price the wrong book.
+**`seller_scan.py` already guards the seller-scan → `/comic:buy` seam itself — do not run a second verifier from the skill.** Before emitting anything, it runs an internal Claude (haiku) pass over **every** candidate and keeps only the genuine matches, so the rows in the table/JSON are already post-verified. A `general-purpose` subagent here would just re-verify an already-verified set.
 
-**`seller_scan.py` already guards this seam itself** — do **not** run a second verifier from the skill. Before emitting anything, the script runs an internal Claude (haiku) pass over **every** candidate and keeps only the genuine matches, so the rows you see in the table/JSON are already post-verified. Spawning a `general-purpose` subagent here would just re-verify an already-verified set.
+**No silent drops:** rejected candidates are printed to stderr as `Filtered N likely false positive(s)` (one-line reason each) and returned inline per-seller in `--json` as `sellers[*].filtered` (`{item_id, title, wish_name, reason}`) — surface this to the user alongside the match table so they can override a wrong rejection. Run without `2>/dev/null` so you see the stderr version too.
 
-**No silent drops:** the rejected candidates are printed to **stderr** as a `Filtered N likely false positive(s)` block with the model's one-line reason for each — and (BUI-298) the same data is also returned inline per-seller in `--json` output as `sellers[*].filtered` (`{item_id, title, wish_name, reason}`), so a caller piping `--json` into another tool doesn't have to scrape stderr to see why something was filtered. Surface that info to the user alongside the match table so they can override if the verifier was wrong — don't discard it. (Run without `2>/dev/null` so you actually see the stderr version too.)
+A candidate that was **never verified** (timeout/transport failure) is not the same as a model rejection — see exit code `3` in the Output section above. Every surfaced match clears the `match_score ≥ 0.65` floor (see *Matching algorithm* below); the 0.65–0.69 band is borderline and worth a user's eyeball even though Claude already passed it.
 
-Separately, a candidate that was **never verified** at all (a `claude` CLI timeout/transport failure that survived retries) is NOT the same as a model rejection — it lands in `sellers[*].dropped_candidates` and flips that seller's `incomplete` to `true` (exit code 3 overall). See the Output section's exit-code table.
-
-Every surfaced match has a `match_score ≥ 0.65` (the script's emit floor — see *Matching algorithm*); the **0.65–0.69** band is the genuinely-borderline range a user may still want to eyeball on the listing page, even though Claude already passed it.
+Full rationale for why a second verifier is redundant, and why false positives leak at this specific seam: `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md`.
 
 ## Feed matches into /comic:buy
 
@@ -212,19 +184,20 @@ Copy the eBay URLs from the URL column (MATCH rows, plus any UNCERTAIN rows the 
 - Matches when: issue number appears in the listing title AND ≥50% of series name tokens match
 - Emits a match only when the score is **≥ 0.65** (the floor in `seller_scan.py`); anything below 0.65 is discarded and never surfaced. Scores close to 1.0 are exact series matches; the 0.65–0.69 band is borderline. (A "0.5" score is never emitted — it's below the floor.)
 
-## Common issues
+## Troubleshooting
+
+Exit-code-specific failure modes (usage errors, INCOMPLETE/exit 3, worker crashes/exit 4) are the Output section's exit-code table above — that table is the single source for those. Remaining issues not tied to a specific exit code:
 
 | Issue | Fix |
 |---|---|
-| `unknown seller '<name>'` | The store name isn't in your alias map. Find the username (`_ssn=` in the seller's "See other items" URL) and re-run with `--add-alias <username>`. In a multi-seller batch this does NOT abort the other sellers — that seller's slot gets `error: "unknown seller '<name>'"` and the batch exits 2 (or 3/4 if another seller was incomplete/crashed) |
-| `--username`/`--add-alias apply to exactly one seller` (exit 2) | You passed `--username` or `--add-alias` alongside 2+ sellers — re-run with a single seller when using either flag |
+| `unknown seller '<name>'` (exit 2) | The store name isn't in your alias map. Find the username (`_ssn=` in the seller's "See other items" URL) and re-run with `--add-alias <username>` |
 | eBay rejected the seller filter | The resolved username isn't a valid eBay login username — re-check the `_ssn=` value and update the alias |
 | `Dropped N listing(s) from other sellers` | Safety net fired: eBay returned foreign sellers and they were filtered out. Usually means the alias points at the wrong/stale username |
 | 0 listings fetched | Seller may have no active auction listings; check their eBay page |
-| False positives (wrong comic) | Every surfaced match (score ≥ 0.65) has already passed the script's internal Claude verification; the 0.65–0.69 band is borderline and worth eyeballing on the listing page. Rejected candidates are printed to stderr (`Filtered N likely false positive(s)`) and, under `--json`, listed inline per-seller in `sellers[*].filtered` — check there if a real match seems missing |
-| Exit code 3 / `INCOMPLETE` | A candidate for at least one seller was NEVER verified (claude CLI timeout/transport failure). That seller's `sellers[*].dropped_candidates` lists them; they are NOT recorded as seen, so simply re-running the scan will retry them |
-| Expected a match but got nothing new | It was already surfaced in a prior scan and hidden by default. Re-run with `--all` to see every match. |
-| `could not fetch/record seen item IDs` warning | Best-effort seen-tracking couldn't reach the server, so the scan showed all matches (safe fallback). Check `$COMICS_SERVER_URL` is reachable if you want only-new filtering back. |
-| Wish list empty | seller-scan now fetches the wish-list from the comics server (`GET /api/comics/wish-list`), not a local `locg` call. Check `curl -sf "$COMICS_SERVER_URL/api/comics/wish-list"` returns items; if empty, run the LOCG import flow. |
-| `COMICS_SERVER_URL is not set` | seller-scan fetches the wish-list over HTTP (apps/ebay can't import locg). Set `COMICS_SERVER_URL` (MacBook → `http://mac-mini.tail9b7fa5.ts.net:8080`) and re-run. |
+| Expected a match but got nothing new | It was already surfaced in a prior scan and hidden by default. Re-run with `--all` to see every match |
+| `could not fetch/record seen item IDs` warning | Best-effort seen-tracking couldn't reach the server, so the scan showed all matches (safe fallback). Check `$COMICS_SERVER_URL` is reachable if you want only-new filtering back |
+| Wish list empty | seller-scan fetches the wish-list from the comics server (`GET /api/comics/wish-list`), not a local `locg` call. Check `curl -sf "$COMICS_SERVER_URL/api/comics/wish-list"` returns items; if empty, run the LOCG import flow |
+| `COMICS_SERVER_URL is not set` | The wish-list fetch **hard-fails** without it (apps/ebay can't import locg, so it must reach the server over HTTP). Set `COMICS_SERVER_URL` (MacBook → `http://mac-mini.tail9b7fa5.ts.net:8080`) and re-run |
 | Rate limit error | Re-run after a few seconds; the Browse API allows retries |
+
+For false-positive filtering, see "Verification is already done inside the script" above.
