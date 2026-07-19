@@ -35,6 +35,10 @@ path = "hatch_build.py"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+markers = [
+    "integration: marks tests as integration tests that hit live APIs (deselect with -m 'not integration')",
+]
+addopts = "-m 'not integration'"
 
 [tool.ruff.lint]
 # BUI-185: bare/blind-except rules only.

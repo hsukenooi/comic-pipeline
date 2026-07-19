@@ -1776,6 +1776,7 @@ class TestIntegrationFetch:
         result = ebay_fetch.fetch_item("1", token, base_url)
         assert result is None
 
+    @pytest.mark.integration
     def test_fetch_multiple_items(self, auth):
         token, base_url = auth
         ids = ["298217294954", "298210880012", "306871783258"]
@@ -1812,6 +1813,7 @@ class TestIntegrationCLI:
         assert len(data) == 1
         assert data[0]["item_id"] == "298217294954"
 
+    @pytest.mark.integration
     def test_multiple_items(self):
         result = subprocess.run(
             [sys.executable, _MODULE, "--json",
