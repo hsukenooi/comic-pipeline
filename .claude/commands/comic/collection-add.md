@@ -137,68 +137,73 @@ build an entry in the same shape as Step 1's `wins` array (`item_id`,
 `{"wins": []}` for "nothing to add" — so Step 3's merge below always has a
 file to read rather than branching on whether one exists.
 
-## Step 3: Record wins
+## Step 3: Record + mark-seen + status (one call, BUI-428)
 
-Merge Step 1's `wins` with Step 2's `/tmp/resolved_reviews.json`, wrap as
-`{"wins": [...]}`, write it to a temp file, and POST it to the server's
-record-win endpoint. **Capture the response body to a file and read only the
-summary scalars into context** — the full response also carries
-`skipped_already_owned_titles` and `skipped_already_owned_detail` (one object per
-already-owned win), which on a large batch is thousands of tokens of detail you
-don't need in the loop. Keep it on disk; surface the scalars:
+Steps 3/3b/5 used to be three separate calls glued together by hand-authored
+client code: an inline `a + b` merge of Step 1's `wins` and Step 2's
+`resolved_reviews` (an earlier draft silently dropped the resolved rows),
+then a mark-seen POST that re-derived its item_id set from `/tmp/wins.json`
+independently of what record-win actually committed — so a wrong merge could
+key record-win and mark-seen off two *different* sets. BUI-428 moved the
+merge, the record, the mark-seen, and the status re-read into one endpoint —
+`POST /api/comics/collection/record-win/commit` — that does all four
+atomically server-side: it merges `wins` + `resolved_reviews` itself, records
+via the unchanged Metron/BUI-34 path, marks seen **exactly** the item_ids it
+just merged and submitted (never a client re-derivation), and — only on full
+success — folds in a fresh `pending_push_count`/`oldest_pending_days` read.
+On a partial or failed commit it marks nothing seen at all (record + mark-seen
+are atomic), so there is no separate best-effort mark-seen step to run.
+
+Pass Step 1's `wins` and Step 2's `resolved_reviews` as **two separate
+arrays** in the request body — do not merge them yourself; that merge is
+exactly what this endpoint now owns:
 
 ```bash
-# /tmp/wins.json: Step 1's wins + Step 2's resolved_reviews, concatenated —
-# this is the actual merge; do not skip it even when resolved_reviews.json is
-# {"wins": []} (an earlier draft of this step only ever copied prep.json's
-# wins and silently dropped anything resolved in Step 2 — don't repeat that).
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+
 python3 -c "import json; \
   a=json.load(open('/tmp/prep.json'))['wins']; \
   b=json.load(open('/tmp/resolved_reviews.json'))['wins']; \
-  json.dump({'wins': a + b}, open('/tmp/wins.json','w'))"
-
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
+  json.dump({'wins': a, 'resolved_reviews': b}, open('/tmp/commit_request.json','w'))"
 
 # rm the response file FIRST: on a connection failure curl leaves any prior
 # run's file in place (it only truncates -o once bytes arrive), and reading a
 # stale body would fabricate a "committed before failure" count for a request
 # that never left the machine.
-rm -f /tmp/record_win_response.json
+rm -f /tmp/commit_response.json
 # Capture body + status separately (not `curl -f`, which discards the error
 # body): on a partial_failure we still need rows_written out of the 500 body.
 # curl still prints %{http_code} == 000 when it never connects.
-code=$(curl -sS -o /tmp/record_win_response.json -w '%{http_code}' \
-  -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win" \
+code=$(curl -sS -o /tmp/commit_response.json -w '%{http_code}' \
+  -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win/commit" \
   -H 'content-type: application/json' \
-  -d @/tmp/wins.json)
+  -d @/tmp/commit_request.json)
 
 if [ "${code:-000}" -ge 200 ] && [ "${code:-000}" -lt 300 ]; then
-  # Success — pull only the summary scalars into context (drops the big
-  # skipped_already_owned_* arrays, which stay in /tmp/record_win_response.json).
-  # A 200 with an unparseable/truncated body is NOT success — exit non-zero so
-  # the run stops rather than silently proceeding to mark-seen.
-  python3 -c "import json; d=json.load(open('/tmp/record_win_response.json')); \
-    print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded']}))" \
-    || { echo "record-win returned HTTP $code but the body could not be parsed — see /tmp/record_win_response.json; do NOT assume success or mark wins seen."; exit 1; }
+  # Success — pull only the summary scalars into context (the full response
+  # also carries skipped_already_owned_titles/_detail, which on a large batch
+  # is thousands of tokens you don't need in the loop; it stays on disk at
+  # /tmp/commit_response.json if you need to inspect it).
+  # A 200 with an unparseable/truncated body is NOT success — exit non-zero.
+  python3 -c "import json; d=json.load(open('/tmp/commit_response.json')); \
+    print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded','marked_seen','pending_push_count','oldest_pending_days']}))" \
+    || { echo "record-win/commit returned HTTP $code but the body could not be parsed — see /tmp/commit_response.json; do NOT assume success."; exit 1; }
 else
-  # Failure — STOP with a NON-ZERO exit (this replaces the hard-fail that
-  # `curl -sf` used to give and that BUI-137's 500 relies on). The exit 1 is
-  # load-bearing: without it, anything keying off this block's exit status would
-  # treat the failure as success and run Step 3b, permanently marking uncommitted
-  # wins seen. Surface rows_written from the partial_failure detail so the user
-  # knows which wins DID commit before continuing.
-  echo "record-win FAILED (HTTP $code) — STOP. Do not mark wins seen."
-  python3 -c "import json; d=json.load(open('/tmp/record_win_response.json')); det=d.get('detail', d); \
+  # Failure — STOP with a NON-ZERO exit. Nothing was marked seen (the server
+  # never reaches its mark-seen step on a non-2xx — see BUI-428/BUI-137), so
+  # there is nothing to undo; just report and stop before Step 4's export.
+  echo "record-win/commit FAILED (HTTP $code) — STOP. Nothing was recorded or marked seen."
+  python3 -c "import json; d=json.load(open('/tmp/commit_response.json')); det=d.get('detail', d); \
     print('error:', det.get('error'), '| rows_written (committed before failure):', det.get('rows_written'))" 2>/dev/null \
     || echo "(no parseable response body — the request likely never reached the server)"
   exit 1
 fi
 ```
 
-The server commits in batches of 25 using the same locg-cli logic (Metron series
-resolution + BUI-34 already-owned dedup). On a 2xx the scalar extraction above
-prints just:
+The server merges the two arrays, then commits in batches of 25 using the
+same locg-cli logic (Metron series resolution + BUI-34 already-owned dedup).
+On a 2xx the scalar extraction above prints just:
 
 ```json
 {
@@ -206,40 +211,31 @@ prints just:
   "skipped_already_owned": 0,
   "manual_variant_count": 0,
   "manual_series_count": 1,
-  "metron_lookups_succeeded": 2
+  "metron_lookups_succeeded": 2,
+  "marked_seen": 3,
+  "pending_push_count": 7,
+  "oldest_pending_days": 4
 }
 ```
 
+`marked_seen` is the count of item_ids the server just marked processed — the
+BUI-121 seen-set — keyed off exactly the wins+resolved_reviews it merged and
+committed, not a re-derivation. `pending_push_count`/`oldest_pending_days` are
+the SAME fresh status fields Step 5 used to fetch with a separate GET — carry
+them straight into Step 5's report; **do not** re-fetch status after Step 4's
+export (the export never mutates pending/pushed state, so this read is
+already current).
+
 The full response — including the `skipped_already_owned_titles` /
-`skipped_already_owned_detail` arrays — is preserved at
-`/tmp/record_win_response.json` if the user wants to inspect which owned titles
+`skipped_already_owned_detail` arrays and `committed_item_ids` — is preserved
+at `/tmp/commit_response.json` if the user wants to inspect which owned titles
 were skipped.
 
-`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails (non-2xx), STOP** — do not report success and do not mark the item IDs seen.
+`manual_series_count > 0` means those rows have `needs_manual_series_canonical=true` and will appear in the export's `.notes.md` for follow-up. **If the POST fails (non-2xx), STOP** — do not report success; nothing was recorded or marked seen.
 
-**Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200. The status-code check above routes this to the failure branch, which surfaces `rows_written` so the user knows which wins still need recording — never report success on a partial_failure.
+**Partial failures are non-200 (BUI-137):** the server commits in chunks of 25; if a later chunk fails to write, the endpoint returns **HTTP 500** with `{"detail": {"error": "partial_failure", "rows_written": <only-committed>, ...}}` rather than a misleading 200 — and, per BUI-428, marks nothing seen. The status-code check above routes this to the failure branch, which surfaces `rows_written` so the user knows which wins still need recording — never report success on a partial_failure.
 
-**If `/tmp/wins.json`'s `wins` array is empty** (everything from Step 1 landed in `needs_review` and none were resolved), skip the POST — there is nothing to record — and go straight to Step 4/5 to still report current collection status.
-
-## Step 3b: Mark new wins seen (BUI-121)
-
-Only after a **successful** record-win POST, mark the new item IDs as processed
-so future runs skip them. Best-effort — a failed mark is non-fatal (the
-already-owned dedup will catch a re-POST):
-
-```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-
-# Build {"item_ids": ["111", "222", ...]} from the item_ids of the new wins.
-# dict.fromkeys dedups while preserving order — a lot that expanded into several
-# entries shares one item_id, so a plain comprehension would POST it N times.
-python3 -c "import json; ids=list(dict.fromkeys(w['item_id'] for w in json.load(open('/tmp/wins.json'))['wins'])); print(json.dumps({'item_ids': ids}))" \
-  | curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win/seen" \
-    -H 'content-type: application/json' \
-    -d @- \
-  || echo "Warning: could not mark wins seen (non-fatal)"
-```
+**If both `wins` and `resolved_reviews` are empty** (everything from Step 1 landed in `needs_review` and none were resolved), still POST — the endpoint returns zero-valued scalars plus the current `pending_push_count`/`oldest_pending_days` in one call, so Step 5 still has fresh numbers to report.
 
 ## Step 4: Export to CSV
 
@@ -262,25 +258,20 @@ This writes a CSV at `~/Downloads/locg-bulk-import-<timestamp>.csv` plus a `.not
 
 ## Step 5: Report
 
-Re-fetch status **after** the write — `pending_push_count` is only produced by
-`/api/comics/collection/status`, never by the export, and the Step 0 read
-predates this run's wins, so it would undercount by exactly the rows you just
-added (BUI-156):
-
-```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-
-curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
-# read pending_push_count and oldest_pending_days from this fresh response
-```
+No separate status call needed (BUI-428 collapsed it into Step 3): read
+`pending_push_count` and `oldest_pending_days` straight out of Step 3's
+`/tmp/commit_response.json` — they were read fresh, right after the record-win
+write, and the Step 4 export never mutates pending/pushed state, so that
+number is still current. (The Step 0 status read predates this run's wins and
+would undercount by exactly the rows you just added — BUI-156 — which is why
+Step 3's own post-write read, not Step 0's, is the source here.)
 
 Note: `oldest_pending_days` is the age of the oldest uncleared pending item — it
 is **not** "days since last sync." Items with `needs_manual_series_canonical=true`
 never get cleared by an automated CSV export; they require a manual LOCG add
 followed by a full `/comic:collection-sync` round-trip.
 
-Print a summary (source `pending_push_count` from the fresh status read above,
+Print a summary (source `pending_push_count` from Step 3's response,
 not from Step 0):
 
 ```
@@ -303,13 +294,15 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 
 | Mistake | Fix |
 |---|---|
-| Using Playwright to add comics directly to LOCG | POST to `/api/comics/collection/record-win` then GET `/api/comics/collection/export` — no Playwright needed |
-| POSTing the bare entries array | The endpoint expects `{"wins": [ ... ]}`, not a top-level array |
+| Using Playwright to add comics directly to LOCG | POST to `/api/comics/collection/record-win/commit` then GET `/api/comics/collection/export` — no Playwright needed |
+| POSTing the bare entries array | The endpoint expects `{"wins": [...], "resolved_reviews": [...]}`, not a top-level array |
 | Recording wins against an unreachable server | Health-gate first; if the POST fails, STOP and report — don't claim success |
 | Passing LOCG IDs as part of record-win input | `record-win` does not take LOCG IDs; it resolves series via Metron and the server collection |
 | Leaving `series` or `issue` blank in `identify_data` | Ask the user for the specific snipe — do not guess |
-| Marking wins seen before the POST succeeds | Only mark seen after a successful record-win POST — a failed call means wins weren't recorded |
+| Hand-merging Step 1's `wins` with Step 2's `resolved_reviews` before POSTing | Don't — pass them as two separate arrays and let `/api/comics/collection/record-win/commit` merge them server-side (BUI-428); an earlier inline `a + b` draft silently dropped resolved rows |
+| Re-deriving the mark-seen item_id set from a client-side file (e.g. `/tmp/wins.json`) | Don't — the commit endpoint marks seen exactly the item_ids it merged and committed itself (BUI-428); a client re-derivation can key off a different set than what was actually recorded |
 | Confusing `oldest_pending_days` with "days since last sync" | `oldest_pending_days` = age of oldest uncleared item; use `last_full_import` from status for sync recency |
+| Re-fetching `/api/comics/collection/status` after the Step 4 export | Not needed — Step 3's commit response already carries a fresh `pending_push_count`/`oldest_pending_days`, and export never mutates pending/pushed state (BUI-428) |
 | Assuming `$COMICS_SERVER_URL` carries over between Steps | Each `## Step` is a separate bash block with its own shell — re-source `scripts/comics-server.sh` and call `comics_resolve_server` in every block that calls the server, even if an earlier step already did (BUI-352) |
 | Re-deriving the ENDED+WON filter / dedup / seen-subtract / positional-identify-mapping by hand | Use `gixen record-win-prep` (BUI-353) — it owns that join in one tested place instead of ~40 lines of inline Python re-authored (and re-risked) every run |
 | Asking the user "if confidence is low" | Not a real gate — `comic-identify`'s baseline confidence is 0.5 for every clean parse. The only gate is `needs_review` (null series/issue, or an unparseable lot) — BUI-354 |

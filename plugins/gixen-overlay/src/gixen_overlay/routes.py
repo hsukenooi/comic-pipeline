@@ -40,6 +40,7 @@ from gixen_overlay.models import (
     WishListAddRequest,
     WishListAddBatchRequest,
     RecordWinRequest,
+    RecordWinCommitRequest,
     SellerScanSeenRequest,
     CollectionWinsSeenRequest,
     CollectionCheckBatchRequest,
@@ -1528,6 +1529,112 @@ async def api_record_win(req: RecordWinRequest):
             },
         )
     return result
+
+
+@router.post("/api/comics/collection/record-win/commit")
+async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
+    """Collapse /comic:collection-add Steps 3/3b/5 into one atomic call (BUI-428).
+
+    Takes the SAME two lists the skill used to hand-merge inline
+    (`gixen record-win-prep`'s ``wins`` plus Step 2's user-resolved
+    ``resolved_reviews``) and concatenates them here — the merge leaves the
+    LLM entirely, so it can never again silently drop resolved rows the way
+    the skill's old inline ``a + b`` once did. Then, in one call:
+
+      1. Records the merged list via `cmd_collection_record_win` (unchanged
+         Metron resolution + BUI-34 already-owned dedup), off the event loop
+         via `asyncio.to_thread` — same BUI-255 rationale as `api_record_win`:
+         a throttled Metron lookup can sleep up to ~60s, and running that
+         directly on this coroutine would stall every other endpoint.
+      2. On an unhandled exception or a BUI-137 `partial_failure`, raises the
+         same shape of 500 `api_record_win` does — and returns *before* the
+         mark-seen step below runs. Record and mark-seen are therefore atomic:
+         nothing is ever marked seen on a partial or failed commit.
+      3. On full success (no exception, `partial_failure` is falsy), marks
+         seen exactly the item_ids THIS call merged and submitted — never a
+         re-derivation from a client-side file that might disagree with what
+         was actually recorded (the BUI-428 bug: a bad client merge keyed
+         record-win and mark-seen off two different sets).
+      4. Reads a fresh `cmd_collection_status()` and folds `pending_push_count`
+         / `oldest_pending_days` into the response, so the skill's old
+         separate Step 5 status re-fetch is no longer needed — `cmd_collection_export`
+         (a separate, unavoidably client-side call — see `api_collection_export`)
+         never mutates pushed/pending state, so this status read stays accurate
+         even before the caller exports.
+
+    Export stays a separate client call (`GET /api/comics/collection/export`):
+    it returns `csv`/`notes_md` file contents for the human LOCG upload, which
+    cannot move server-side.
+    """
+    _ensure_collection_store()
+    merged_wins = [*req.wins, *req.resolved_reviews]
+
+    try:
+        result = await asyncio.to_thread(cmd_collection_record_win, merged_wins)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"collection store unavailable: {exc}"
+        ) from exc
+    except Exception as exc:
+        # Mirrors api_record_win's BUI-184 backstop. Raised BEFORE any
+        # mark-seen call, so an unhandled mid-batch exception — commit state
+        # uncertain — never marks anything seen.
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "record_win_failed",
+                "message": (
+                    "record-win raised mid-batch; the commit state is uncertain "
+                    "— re-check the collection / re-import before treating any "
+                    "of these wins as recorded. Nothing was marked seen."
+                ),
+                "exception": f"{type(exc).__name__}: {exc}",
+            },
+        ) from exc
+
+    if result.get("partial_failure"):
+        # BUI-137: some chunk failed to commit partway through. Raised BEFORE
+        # any mark-seen call below — never mark seen on a partial commit, so a
+        # later re-run still sees these item_ids as unprocessed and retries
+        # them rather than silently skipping lost wins.
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "partial_failure",
+                "message": (
+                    "one or more chunks failed to commit; some wins were NOT "
+                    "recorded — nothing was marked seen"
+                ),
+                **result,
+            },
+        )
+
+    # Full success only past this point. The committed set is exactly the
+    # item_ids of THIS call's own merged_wins (deduped, preserving order) —
+    # not a re-read of any client file — so mark-seen can never key off a
+    # different set than what cmd_collection_record_win just processed.
+    # Includes skipped-already-owned item_ids on purpose: they were fully
+    # processed (matched an owned row), just not re-written, matching the
+    # existing BUI-121 "don't reprocess" semantics the old client-side
+    # dict.fromkeys(...) derivation already relied on.
+    committed_item_ids = list(
+        dict.fromkeys(
+            item_id
+            for w in merged_wins
+            if (item_id := str(w.get("item_id") or "").strip())
+        )
+    )
+    db = request.app.state.db
+    marked = mark_collection_wins_seen(db, committed_item_ids)
+
+    status = cmd_collection_status()
+    return {
+        **result,
+        "committed_item_ids": committed_item_ids,
+        "marked_seen": marked,
+        "pending_push_count": status.get("pending_push_count"),
+        "oldest_pending_days": status.get("oldest_pending_days"),
+    }
 
 
 def _is_pinned_collection_row(

@@ -1,7 +1,7 @@
 """Pydantic models for comic overlay API endpoints."""
 from __future__ import annotations
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class UpsertComicRequest(BaseModel):
@@ -220,3 +220,23 @@ class RecordWinRequest(BaseModel):
     """
 
     wins: list[dict]
+
+
+class RecordWinCommitRequest(BaseModel):
+    """POST /api/comics/collection/record-win/commit — merge + record +
+    mark-seen + status in one atomic call (BUI-428).
+
+    ``wins`` and ``resolved_reviews`` are the exact same two lists
+    /comic:collection-add used to hand-merge inline (`gixen record-win-prep`'s
+    ``wins`` output plus Step 2's user-resolved ``needs_review`` entries) —
+    the skill documented that an earlier draft of that inline ``a + b``
+    silently dropped resolved rows. The endpoint concatenates them itself so
+    the merge, and the item_id set later marked seen, can never drift from
+    what actually gets submitted to `cmd_collection_record_win`. Both default
+    to an empty list so a call with nothing new (everything already seen, or
+    nothing resolved in review) can omit either key and still get a fresh
+    status read back.
+    """
+
+    wins: list[dict] = Field(default_factory=list)
+    resolved_reviews: list[dict] = Field(default_factory=list)
