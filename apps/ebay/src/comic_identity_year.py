@@ -116,6 +116,19 @@ def _all_title_years(title: str) -> "list[int]":
 # that word STAYS in the extracted series text. This is the sharp edge BUI-253
 # called out explicitly.
 _ANNUAL_RE = re.compile(r"\bannual\b", re.IGNORECASE)
+# BUI-450: classification-only, TIGHTER than _ANNUAL_RE. Classify a title as
+# edition="annual" only when the word is IMMEDIATELY followed by an issue-number
+# token (optionally "#"): "Annual #1", "Annual 2", "Annual #14". A genuine annual
+# always writes its own sequence number AFTER the word ("Annual N"); a REGULAR
+# listing that merely mentions "annual" for an unrelated reason has no number
+# there ("ASM #252 annual sale" — the #252 sits BEFORE the stray word, followed
+# by "sale"), so it must NOT be mis-filed as "<Series> Annual #252" downstream
+# (BUI-426's qualifier threading). The direction-of-adjacency matters: the number
+# must FOLLOW "annual", because the false-positive class has the regular issue
+# number PRECEDING it. Kept separate from _ANNUAL_RE — the latter still strips
+# the bare word out of the series text (comic_identity.py), which must stay
+# permissive so "X-Men Annual #1" yields series "X-Men", not "X-Men Annual".
+_ANNUAL_EDITION_RE = re.compile(r"\bannual\b\s*#?\s*\d", re.IGNORECASE)
 # Matches an optional trailing "Edition" too ("Treasury Edition") so
 # stripping it from the series text doesn't leave a dangling "Edition" word
 # behind (e.g. "Superman Treasury Edition #1" -> series "Superman", not
@@ -167,7 +180,7 @@ def _classify_edition_kind(title: str) -> str:
         return "collected"
     if _marker_hit(title, _PROMO_REPRINT_MARKERS) or _second_print_reject(title):
         return "reprint"
-    if _ANNUAL_RE.search(title):
+    if _ANNUAL_EDITION_RE.search(title):  # BUI-450: number must FOLLOW "annual"
         return "annual"
     if _GIANT_SIZE_RE.search(title):
         return "giant-size"
