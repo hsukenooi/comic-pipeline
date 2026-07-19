@@ -246,45 +246,23 @@ scan the verdicts for the patterns below and **flag** the suspect rows.
 **Pattern A — Giant-Size / Annual / King-Size conflation (false positive).**
 When a row returns `in_collection` AND the series is a *distinct line that shares a
 masthead* with a base/annual series — `Giant-Size Fantastic Four`, `… Annual`,
-`King-Size …`, `… Special` — the cache may have matched the wrong series (a
-confirmed, repeating case: *Giant-Size Fantastic Four #N* falsely matching an owned
-*Fantastic Four Annual #N* — different books). **Do not auto-skip it.** Flag:
+`King-Size …`, `… Special` — the cache may have matched the wrong series (incident
+history: `docs/solutions/ui-bugs/collection-check-alias-and-printing-false-positives.md`).
+**Do not auto-skip it.** Flag:
 > ⚠️ possible false positive — "Giant-Size/Annual" line may be conflated with the base/annual series; confirm before skipping
 
-**Pattern B — leading-article false negative (The / A / An).**
-When a row returns `not_in_cache` AND the series name does or could carry a leading
-article (the cache may store `The Incredible Hulk` while `/comic:identify` emitted
-`Incredible Hulk`, or vice-versa — a real incident sniped 17 owned Hulks), collect
-every row that matches this pattern and re-check them **together in one follow-up
-batch call** (same endpoint as Step 1) with the article toggled on each affected
-row's `series` (add `The ` if absent; strip it if present), passing the same
-`issue`/`year`/`variant` per row:
-
-```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
-  -H 'content-type: application/json' \
-  -d '{"items": [
-    {"series": "The Incredible Hulk", "issue": "330", "year": "1987"},
-    {"series": "Incredible Hulk", "issue": "181", "year": "1974"}
-  ]}'
-```
-
-- A successful re-query with alternate series keys is R11-safe (it's a new call,
-  not a fallback from a failed one). If this follow-up batch call itself fails /
-  can't reach the server → **STOP** (R11), don't proceed.
-- For each row whose toggled query returns `in_collection`, surface **both**
-  results and flag — do **not** silently flip the verdict:
-  > ⚠️ owned under series key "The Incredible Hulk" — identify dropped/added a leading article; confirm before bidding
-- For rows still `not_in_cache`, leave the original verdict and add no flag.
-
-**Pattern C — ambiguous / unrecognized series name (wrong-volume or silent-miss risk).**
-A series name that isn't the LOCG catalog's exact spelling can yield a silent
-`not_in_cache` even when owned (BUI-129/171). When a `not_in_cache` row's series
-name is short/generic, could be the wrong volume, or looks like a Metron-style
-name, resolve it against the catalog (BUI-449) — this returns a scalar per name,
-never the full catalog array. Batch every suspect row's series name into one call:
+**Pattern C — ambiguous / unrecognized series name (wrong-volume, silent-miss, or
+spelling-drift risk).**
+A series name that isn't the LOCG catalog's exact spelling — punctuation,
+abbreviation, or Metron-vs-LOCG word-choice drift, but **never** a leading
+`The`/`A`/`An` (the matcher's `_normalize_series_key` already strips a leading
+article from both the query and every owned row, so toggling it recomputes an
+identical key — no re-query needed for that case; BUI-444, was Pattern B) — can
+yield a silent `not_in_cache` even when owned (BUI-129/171). When a `not_in_cache`
+row's series name is short/generic, could be the wrong volume, or looks like a
+Metron-style name, resolve it against the catalog (BUI-449) — this returns a scalar
+per name, never the full catalog array. Batch every suspect row's series name into
+one call:
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
@@ -305,84 +283,61 @@ If `resolved` is `null`, there is no confident catalog spelling to reconcile
 against — leave the verdict as-is.
 
 **Pattern D — masthead-alias match, unconfirmed volume (false positive, BUI-249).**
-This one is mechanized, not heuristic: when a row returns `in_collection` AND
-`match_kind == "alias"`, the verdict only matched because the query's masthead
-(e.g. "The Mighty Thor") aliases to a differently-named owned row ("Thor") —
-`_MASTHEAD_ALIAS_PAIRS` has no notion of *which* volume/era, so it can land on
-an owned issue from the wrong run (a real case: owning `Thor #5` Vol. 1 (1966)
-falsely satisfies a "The Mighty Thor #5" Vol. 3 (2015) query). No re-query is
-needed — read the volume/year straight off the response and flag:
+Mechanized: when a row returns `in_collection` AND `match_kind == "alias"`, the
+query's masthead (e.g. "The Mighty Thor") only matched via
+`_MASTHEAD_ALIAS_PAIRS`'s cross-masthead fallback to a differently-named owned
+row ("Thor") — the fallback has no notion of *which* volume/era, so it can land
+on the wrong run (incident history:
+`docs/solutions/ui-bugs/collection-check-alias-and-printing-false-positives.md`).
+Read the volume/year straight off the response and flag:
 > ⚠️ alias match — matched "{matched_series_name}" ({matched_release_date}); confirm this is the same volume as the listing before skipping
 
-If `matched_release_date`'s year is clearly the wrong era for the listing (e.g.
-a 1966 match against a 2015-era query), treat the flag as a likely false
-positive; if the era is ambiguous, still flag for the user rather than guessing.
-A `match_kind == "exact"` row needs no such *alias* flag — the series key
-matched directly (but a no-year exact match can still be the wrong volume — see
-Pattern D3).
+Treat an obviously-wrong era (e.g. a 1966 match against a 2015-era query) as a
+likely false positive; if ambiguous, still flag. `match_kind == "exact"` needs no
+alias flag (but see Pattern D3 for the no-year exact residual).
 
 **Pattern D2 — cross-volume ambiguity, no year given (false-positive guard, BUI-284).**
-Also mechanized: when `match_status == "ambiguous_cross_volume"` (equivalently
-`match_kind == "cross_volume"`), the same issue number is owned under **more than
-one volume of the same masthead** (e.g. Fantastic Four #18 in both the 1961
-Vol. 1 and the 2022 Vol. 7) and no `year` was supplied, so the matcher refused to
-guess which volume you meant. This is NEITHER owned nor not-owned — do **not**
-skip and do **not** buy on it. Read the colliding volumes off the `candidates`
-list and re-check WITH the listing's per-issue cover `year`
-(`?year=<YYYY>`), which resolves the collision via the release-date gate:
+Mechanized: `match_status == "ambiguous_cross_volume"` (`match_kind ==
+"cross_volume"`) means the issue is owned under **more than one volume of the
+same masthead** and no `year` was supplied, so the matcher refused to guess.
+This is NEITHER owned nor not-owned — do **not** skip and do **not** buy on it.
+Read the colliding volumes off `candidates` and re-check WITH the listing's
+per-issue cover `year` (`?year=<YYYY>`), which resolves it via the release-date
+gate:
 > ⚠️ cross-volume ambiguity — "{series} #{issue}" is owned in multiple volumes ({candidate series_names}); re-check with the listing's cover year before deciding
 
-Never resolve an `ambiguous_cross_volume` verdict yourself by picking a volume —
-supply the year and let the matcher decide.
+Never pick a volume yourself — supply the year and let the matcher decide.
 
 **Pattern D3 — single-owned-wrong-volume (false positive, BUI-308 → fixed by BUI-316).**
-The one case D/D2 cannot catch at the key level: when a masthead has multiple volumes
-but you own the queried issue in only **one** of them, a no-`year` query returns a
-confident `in_collection` with `match_kind == "exact"` — even when that single owned
-volume is the *wrong* one (e.g. you own *Fantastic Four* (Vol. 7) #18 but meant
-Kirby's Vol. 1 #18). Only one owned row matches, so there is no detectable ambiguity
-(unlike D2), and the year gate fails open with no year. Direction is dangerous: it
-reports owned when you don't own the volume you meant → a **missed purchase**.
-
-**The real fix is upstream (BUI-316), not a manual re-check here:** when `/comic:identify`
-is confident of the per-issue cover year, its Year column is populated and you forward
-it as `year=` (see Input + Step 1). That per-issue year is exactly what the matcher's
-year gate needs to reject the wrong volume, so this false positive never reaches the
-table. **So the primary defense is simply: always forward the identify Year when it's
-present.** The residual is now narrow — it only survives when the Year column is
-*blank* (the identify confidence gate didn't fire, e.g. the title had no parenthesized
-year to corroborate the Publication Year). For that blank-year case only, keep the old
-operator vigilance for long-running rebootable mastheads (Fantastic Four,
-Amazing/Uncanny X-Men, Avengers, Thor, Iron Man, Hulk, Captain America, Batman,
-Superman, Wonder Woman, …): do **not** trust a no-year `in_collection`/`exact`
-blindly — eyeball the **Matched Volume** column against the era/volume the listing is
-for, and re-check with the listing's cover `year` (`?year=<YYYY>`) if you can source
-one and they might differ.
+When a masthead has multiple volumes but you own the queried issue in only
+**one** of them, a no-`year` query returns a confident `in_collection`/`exact`
+even when that's the wrong volume — no detectable ambiguity (unlike D2) → a
+**missed purchase**. Always forward the identify Year when present (Input +
+Step 1); the year gate then rejects the wrong volume before this reaches the
+table. Only a *blank* Year leaves a residual: on long-running rebootable
+mastheads (Fantastic Four, Amazing/Uncanny X-Men, Avengers, Thor, Iron Man,
+Hulk, Captain America, Batman, Superman, Wonder Woman, …), don't trust a no-year
+`in_collection`/`exact` blindly — eyeball **Matched Volume** against the
+listing's era and re-check with `?year=<YYYY>` if you can source one. Full
+rationale:
+`docs/solutions/best-practices/collection-check-cover-year-forwarding-vs-bui129.md`.
 
 **Pattern E — printing conflict (false positive, BUI-364).**
-Mechanized, not heuristic: when a row returns `in_collection` AND
-`printing_conflict: true`, the verdict was satisfied by a row whose
-`full_title` names a printing the query never asked for (`2nd Printing`,
-`Third Printing`, …). Printings are distinct collectibles — owning the reprint
-is NOT owning the base printing (confirmed incident, 2026-07-16: *Absolute
-Martian Manhunter #1* first print read as owned off the owned "2nd Printing"
-row while the base printing sat wish-listed; the orchestrator skipped an
-explicitly wanted $30 book). No re-query is needed — the response's
-`printing_candidates` list shows every same-era printing of the issue with its
-owned/wish state and a `printing_ordinal` (1 = base printing, 2+ = a
-specifically-numbered reprint, `null` = a same-era row labeled with a bare
-"Reprint"/"Re-Print" and no explicit number — BUI-373; match it against
-the listing's printing instead of re-parsing `full_title`). Render the
-conflict in the Notes column:
+Mechanized: when a row returns `in_collection` AND `printing_conflict: true`,
+the match was satisfied by a different printing than the query asked for (`2nd
+Printing`, `Third Printing`, …) — printings are distinct collectibles, so
+owning a reprint is NOT owning the base printing (confirmed-incident history:
+`docs/solutions/ui-bugs/collection-check-alias-and-printing-false-positives.md`).
+Read `printing_candidates` (every same-era printing with its own owned/wish
+state and a `printing_ordinal`: `1` = base, `2+` = numbered reprint, `null` =
+bare "Reprint"/"Re-Print" — BUI-373) to describe the listing's own printing in
+the flag, rather than re-parsing `full_title`:
 > ⚠️ printing conflict — matched "{full_title_matched}", a different printing than the listing; the listing's printing is {wishlisted / not owned / untracked} per printing_candidates; confirm before skipping
 
-A `printing_candidates` row for the query's own printing with
-`in_wish_list: true` and `in_collection: false` is the strongest signal the
-book is explicitly wanted — say so in the note. Do **not** auto-flip the
-verdict to "not owned" (R11): the reprint genuinely is owned, and only the
-user decides whether the listing's printing matters. The reverse direction is
-flagged the same way (a `2nd Printing` listing matched only by the owned base
-row).
+Do **not** auto-flip the verdict to "not owned" (R11) — the matched printing
+genuinely is owned; only the user decides whether the listing's printing
+matters. Same rule in reverse (a `2nd Printing` listing matched only by the
+owned base row).
 
 Carry every flag into the Notes column of the Step 3 table and surface flagged rows
 separately at the Step 4 decision gate (ORCHESTRATOR NOTES). The user decides; the
@@ -450,7 +405,7 @@ the `/comic:identify` table's **Year exactly as emitted** (a blank Year stays
 blank — never backfill it with a guessed or series-start year; the executor's
 contract owns the BUI-316/BUI-129 forwarding rule), and `variant` when the
 listing is a variant. The executor resolves the server, runs the batch check,
-applies the stale-cache downgrade and the Pattern A–E disambiguation scan, and
+applies the stale-cache downgrade and the Step 2.5 disambiguation scan (Patterns A, C–E), and
 returns the Step 3 table + status banners.
 
 ### Executor reuse (BUI-366)
@@ -486,12 +441,12 @@ Ask the user how to handle results:
 - **Wishlisted-not-owned (`📋`)**: not a duplicate risk — proceed like any other `not_in_cache` comic — but worth a callout since the user has already flagged it as wanted
 - **Stale-cache cases**: surface separately so the user can manually verify before bidding
 - **Canonical-match rows (R42, Step 1)**: `✅ In collection (canonical)` means the listing's specific variant wasn't in cache but the canonical edition is — surface the `⚠️ canonical match — listing variant not disambiguated` note and let the user confirm the variant isn't a distinct wanted collectible before skipping
-- **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` or Pattern-E printing conflict should not be auto-skipped, and a Pattern-B/C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
+- **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` or Pattern-E printing conflict should not be auto-skipped, and a Pattern-C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
 
 ### Carry-forward
 
 Remove skipped comics from the working list before passing it to `/comic:fmv`.
 Kept rows carry forward their identify-emitted fields plus this step's
-verdict-driven flags (the R42 canonical-match note, Pattern A–E notes) so
+verdict-driven flags (the R42 canonical-match note, Patterns A, C–E notes) so
 whoever reads the row next (Step 2.5 grading, FMV) can see why it's still in
 play.
