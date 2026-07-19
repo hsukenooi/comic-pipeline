@@ -98,3 +98,23 @@ comics_get() {
 comics_post() {
   comics_curl -X POST "$@"
 }
+
+# BUI-430: one deterministic per-run scratch dir for /comic:* skill temp
+# files (prep.json, resolved_reviews.json, commit_request/response.json,
+# export.json, ...) instead of fixed /tmp/*.json names that a stale file from
+# a crashed/abandoned run, or a second concurrent run, could cross-contaminate.
+# Each `## Step` is a separate bash block with no shared shell state (see the
+# top of this file), so this can't rely on a var exported by an earlier block
+# — call it again in every block, same as comics_resolve_server. It re-derives
+# the SAME path every call by keying off the parent process id (stable for the
+# life of one Claude Code session; a resumed/retried run in the SAME session
+# correctly keeps seeing its own earlier-step files) plus a day bucket as a
+# coarse backstop against PID reuse across sessions. Override with
+# COMICS_SCRATCH_DIR for manual/test runs. Any rm -f guard a skill still has
+# on a specific file is belt-and-suspenders on top of this, not the only
+# protection.
+comics_scratch_dir() {
+  local dir="${COMICS_SCRATCH_DIR:-${TMPDIR:-/tmp}/comic-collection-add/${PPID}-$(date +%Y%m%d)}"
+  mkdir -p "$dir" || return 1
+  printf '%s' "$dir"
+}
