@@ -24,14 +24,23 @@
 # Re-run after merging packages/* changes (BUI-365): a `uv tool install`ed CLI
 # is a frozen copy of the source tree at install time — it does NOT pick up
 # commits merged into packages/gixen-cli or packages/locg-cli afterward. After
-# merging a PR that touches packages/*, re-run this script (or
-# `uv tool install --force ./packages/<pkg>`) on every machine that runs these
-# CLIs, including the Mac Mini. Incident: the first `gixen add` of the
-# 2026-07-16 `/comic:buy` run crashed with `ModuleNotFoundError: No module
-# named 'record_win_prep'` — the Mac Mini's installed `gixen` predated the
-# BUI-352/353/354 merge (2026-07-14) that added that module — and the
-# diagnosing agent burned time before running
-# `uv tool install --force ./packages/gixen-cli` and retrying successfully.
+# merging a PR that touches packages/*, re-run this script on every machine
+# that runs these CLIs, including the Mac Mini. Incident: the first `gixen
+# add` of the 2026-07-16 `/comic:buy` run crashed with `ModuleNotFoundError:
+# No module named 'record_win_prep'` — the Mac Mini's installed `gixen`
+# predated the BUI-352/353/354 merge (2026-07-14) that added that module —
+# and the diagnosing agent burned time before re-running this script and
+# retrying successfully.
+#
+# If you reinstall a single package by hand instead of re-running this script,
+# use `uv tool install --force --no-cache ./packages/<pkg>`, NOT plain
+# `--force` (BUI-455): uv keys its wheel cache on name+version, so plain
+# `--force` can silently reinstall a STALE cached wheel when the version is
+# unchanged — observed post-BUI-435, `uv tool install --force
+# ./packages/gixen-cli` still served a wheel missing `gixen build-batch` until
+# re-run with `--no-cache`. This script itself is unaffected: the
+# `--reinstall` flag used below implies `--refresh` and busts the cache, so it
+# always picks up fresh source.
 #
 # After merging overlay/server changes (gixen-cli server/, plugins/gixen-overlay),
 # the Mac Mini additionally needs (BUI-377):

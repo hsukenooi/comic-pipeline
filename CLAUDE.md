@@ -21,14 +21,23 @@ The repo is a **uv workspace**: `packages/*` + `plugins/*` are members, and `uv 
 ```sh
 # Install the user-facing CLIs (ebay-fetch, ebay-sold-comps, seller-scan, comic-fmv, gixen, locg)
 ./scripts/install.sh            # uv tool install for apps/ebay + apps/fmv + packages/gixen-cli + packages/locg-cli
-# Re-run this (or `uv tool install --force ./packages/<pkg>`) on the Mac Mini after merging any packages/* change —
+# Re-run this (or `uv tool install --force --no-cache ./packages/<pkg>`) on the Mac Mini after merging any packages/* change —
 # a uv tool install is a frozen copy and goes stale (BUI-365: a post-merge `gixen add` crashed with
-# `ModuleNotFoundError: No module named 'record_win_prep'` until reinstalled).
+# `ModuleNotFoundError: No module named 'record_win_prep'` until reinstalled). Plain `--force` is NOT
+# enough when the package version is unchanged (BUI-455): uv keys its wheel cache on name+version, so
+# `--force` alone silently reinstalls the STALE cached wheel — e.g. after merging BUI-435 (adds `gixen
+# build-batch`), `uv tool install --force ./packages/gixen-cli` still reported "No such command" because
+# it served the pre-merge wheel. `--no-cache` (or `uv cache clean <pkg>` first) is required to actually
+# pick up new source. `scripts/install.sh` itself is unaffected: it uses `--reinstall`, which implies
+# `--refresh` and busts the cache, so it already picks up fresh source without `--no-cache`.
 # After merging overlay/server changes (gixen-cli server/, plugins/gixen-overlay), additionally (BUI-377):
 #   uv sync --all-packages
 #   launchctl kickstart -k gui/$(id -u)/com.gixen.server
 # (the comics server runs via launchd out of the workspace .venv, which install.sh does NOT refresh;
 # the loaded launchd label is still com.gixen.server — the BUI-220 comics-server rename never reached it, BUI-425)
+# The comics server is also unaffected by the BUI-455 stale-wheel trap above — it runs from this same
+# editable workspace .venv (source, not a frozen wheel); only the frozen `uv tool install`ed console
+# scripts (gixen, locg, comic-identify, grade-photos) can go stale.
 
 # Sync the workspace env (packages/* + plugins/*) for development + tests
 uv sync --all-packages
