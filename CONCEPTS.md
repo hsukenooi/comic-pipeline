@@ -31,7 +31,7 @@ Comics you subscribe to receive as new releases through your local comic shop. M
 ### Win-Sourced Entry
 A Collection entry created by recording a won eBay auction, before it has round-tripped through LOCG. *Known in code and tickets as:* `agent_win`.
 
-Win-sourced entries carry no publisher (record-win does not supply one) and often a best-guess release date, which is why reconciling them against a LOCG export must tolerate a missing publisher and match on year rather than exact date.
+Win-sourced entries carry a publisher when the issue could be resolved (record-win captures it from the issue's full detail record), but the publisher is null on a lookup miss and the release date is often a best-guess — which is why reconciling them against a LOCG export must still tolerate a missing publisher and match on year rather than exact date.
 
 ### Import-Sourced Entry
 A Collection entry that originated from — or has round-tripped through — a LOCG export. *Known in code and tickets as:* `locg_export`. The counterpart to a Win-Sourced Entry.
