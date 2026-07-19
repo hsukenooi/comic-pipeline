@@ -5,6 +5,7 @@ tests/test_cli_add_batch.py for that). No network is ever touched: every
 (ok, data, error) contract as cli._server_request_result.
 """
 
+import json
 import os
 import sys
 
@@ -22,8 +23,10 @@ from add_batch import (
     RowResult,
     add_one_row,
     apply_verify_results,
+    build_batch_rows,
     build_bid_payload,
     created_from_response,
+    parse_brief_rows,
     parse_rows,
     run_batch,
     verify_items,
@@ -472,3 +475,342 @@ def test_apply_verify_results_leaves_unmatched_row_verify_none():
     outcome = BatchOutcome(rows=[RowResult(item_id="1", status=STATUS_ADDED, grade=9.2)])
     apply_verify_results(outcome, {"summary": {}, "results": []})
     assert outcome.rows[0].verify is None
+
+
+# ---------------------------------------------------------------------------
+# parse_brief_rows (BUI-435)
+# ---------------------------------------------------------------------------
+
+
+def _brief(item_id="1", comic_id=42, max_bid=100, flag_reason=None):
+    return {
+        "item_id": item_id,
+        "comic_id": comic_id,
+        "fmv_id": 7,
+        "max_bid": max_bid,
+        "flag_reason": flag_reason,
+        "confidence": "HIGH",
+    }
+
+
+def test_parse_brief_rows_bare_list():
+    rows = [_brief("1"), _brief("2")]
+    assert parse_brief_rows(rows) == rows
+
+
+def test_parse_brief_rows_object_with_rows_key():
+    rows = [_brief("1")]
+    assert parse_brief_rows({"rows": rows}) == rows
+
+
+def test_parse_brief_rows_object_with_brief_key():
+    rows = [_brief("1")]
+    assert parse_brief_rows({"brief": rows}) == rows
+
+
+def test_parse_brief_rows_object_missing_rows_key_errors():
+    with pytest.raises(AddBatchError):
+        parse_brief_rows({"other": []})
+
+
+def test_parse_brief_rows_clean_json_string():
+    rows = [_brief("1"), _brief("2")]
+    raw = json.dumps(rows)
+    assert parse_brief_rows(raw) == rows
+
+
+def test_parse_brief_rows_extracts_json_lines_from_mixed_stdout():
+    raw = (
+        "#   Comic                FMV Range      Max Bid\n"
+        "1   Amazing Spider-Man   $800-1000      $800\n"
+        + json.dumps(_brief("111")) + "\n"
+        + json.dumps(_brief("222")) + "\n"
+    )
+    rows = parse_brief_rows(raw)
+    assert [r["item_id"] for r in rows] == ["111", "222"]
+
+
+def test_parse_brief_rows_truncated_json_line_is_hard_error():
+    raw = '{"item_id": "111", "comic_id": 42, "max_bid": 800\n'  # missing closing brace
+    with pytest.raises(AddBatchError):
+        parse_brief_rows(raw)
+
+
+def test_parse_brief_rows_no_json_lines_found_errors():
+    raw = "just a human table\nwith no json in it\n"
+    with pytest.raises(AddBatchError):
+        parse_brief_rows(raw)
+
+
+def test_parse_brief_rows_duplicate_item_id_errors():
+    with pytest.raises(AddBatchError):
+        parse_brief_rows([_brief("1"), _brief("1")])
+
+
+def test_parse_brief_rows_missing_item_id_errors():
+    with pytest.raises(AddBatchError):
+        parse_brief_rows([{"comic_id": 1, "max_bid": 10}])
+
+
+def test_parse_brief_rows_row_not_a_dict_errors():
+    with pytest.raises(AddBatchError):
+        parse_brief_rows(["not a dict"])
+
+
+def test_parse_brief_rows_rejects_unusable_input_type():
+    with pytest.raises(AddBatchError):
+        parse_brief_rows(12345)
+
+
+# ---------------------------------------------------------------------------
+# build_batch_rows (BUI-435)
+# ---------------------------------------------------------------------------
+
+
+def _wl_row(item_id="1", **kwargs):
+    d = {"item_id": item_id}
+    d.update(kwargs)
+    return d
+
+
+def test_build_batch_rows_happy_path_merges_all_three_sources():
+    brief = [_brief("1", comic_id=42, max_bid=800)]
+    working_list = [_wl_row("1", grade=9.2, seller="tuners36", seller_grade=9.0, photo_grade=8.5)]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows == [{
+        "item_id": "1",
+        "max_bid": 800.0,
+        "comic_id": 42,
+        "grade": 9.2,
+        "seller": "tuners36",
+        "seller_grade": 9.0,
+        "photo_grade": 8.5,
+    }]
+    assert result.skipped == []
+    assert result.unlinked == []
+
+
+def test_build_batch_rows_never_drops_comic_id_when_present():
+    brief = [_brief("1", comic_id=999, max_bid=50)]
+    working_list = [_wl_row("1", grade=9.4)]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows[0]["comic_id"] == 999
+
+
+def test_build_batch_rows_letter_grade_is_coerced_to_cgc_float():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", grade="NM-")]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows[0]["grade"] == 9.2
+
+
+def test_build_batch_rows_override_max_bid_wins_over_brief():
+    brief = [_brief("1", max_bid=800)]
+    working_list = [_wl_row("1")]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"max_bid": 650}})
+    assert result.rows[0]["max_bid"] == 650.0
+
+
+def test_build_batch_rows_override_group_wins_over_working_list_default():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", group=3)]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"group": 7}})
+    assert result.rows[0]["group"] == 7
+
+
+def test_build_batch_rows_working_list_group_default_passes_through():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", group=2)]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows[0]["group"] == 2
+
+
+def test_build_batch_rows_zero_group_omitted_from_output():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1")]
+    result = build_batch_rows(brief, working_list)
+    assert "group" not in result.rows[0]
+
+
+def test_build_batch_rows_skips_bin_listing_type_field():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", listing_type="BIN")]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows == []
+    assert result.skipped == [{"item_id": "1", "reason": "bin"}]
+
+
+def test_build_batch_rows_skips_bin_type_field_alias_case_insensitive():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", type="bin")]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows == []
+    assert result.skipped == [{"item_id": "1", "reason": "bin"}]
+
+
+def test_build_batch_rows_user_skip_override_excludes_row():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1")]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"skip": True}})
+    assert result.rows == []
+    assert result.skipped == [{"item_id": "1", "reason": "user_skip"}]
+
+
+def test_build_batch_rows_user_skip_bypasses_missing_brief_row_check():
+    """skip=true is valid even for an item_id that was never priced (no
+    brief row at all) — it must not be required to also appear in brief."""
+    working_list = [_wl_row("1")]
+    result = build_batch_rows([], working_list, overrides={"1": {"skip": True}})
+    assert result.rows == []
+    assert result.skipped == [{"item_id": "1", "reason": "user_skip"}]
+
+
+def test_build_batch_rows_null_comic_id_omits_comic_id_and_grade_but_still_adds():
+    brief = [_brief("1", comic_id=None, max_bid=50)]
+    working_list = [_wl_row("1", grade=9.4)]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows == [{"item_id": "1", "max_bid": 50.0}]
+    assert "comic_id" not in result.rows[0]
+    assert "grade" not in result.rows[0]
+    assert result.unlinked == [{"item_id": "1", "reason": "comic_id_null"}]
+
+
+def test_build_batch_rows_needs_manual_without_override_is_hard_error():
+    brief = [_brief("1", comic_id=42, max_bid=None, flag_reason="one_sided")]
+    working_list = [_wl_row("1")]
+    with pytest.raises(AddBatchError, match="needs-manual"):
+        build_batch_rows(brief, working_list)
+
+
+def test_build_batch_rows_needs_manual_with_override_max_bid_succeeds():
+    brief = [_brief("1", comic_id=42, max_bid=None, flag_reason="one_sided")]
+    working_list = [_wl_row("1", grade=9.0)]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"max_bid": 120}})
+    assert result.rows[0]["max_bid"] == 120.0
+    assert result.rows[0]["comic_id"] == 42
+
+
+def test_build_batch_rows_needs_manual_with_skip_override_is_skipped_not_error():
+    brief = [_brief("1", comic_id=42, max_bid=None, flag_reason="too_sparse")]
+    working_list = [_wl_row("1")]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"skip": True}})
+    assert result.rows == []
+    assert result.skipped == [{"item_id": "1", "reason": "user_skip"}]
+
+
+def test_build_batch_rows_missing_brief_row_is_hard_error_not_silent_drop():
+    working_list = [_wl_row("1"), _wl_row("2")]
+    brief = [_brief("1", max_bid=50)]  # "2" never priced, no override
+    with pytest.raises(AddBatchError, match="no matching comic-fmv --brief row"):
+        build_batch_rows(brief, working_list)
+
+
+def test_build_batch_rows_duplicate_item_id_in_working_list_errors():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1"), _wl_row("1")]
+    with pytest.raises(AddBatchError, match="duplicate item_id"):
+        build_batch_rows(brief, working_list)
+
+
+def test_build_batch_rows_override_for_unknown_item_id_errors():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1")]
+    with pytest.raises(AddBatchError, match="not present in the working list"):
+        build_batch_rows(brief, working_list, overrides={"999": {"skip": True}})
+
+
+def test_build_batch_rows_unrecognized_grade_string_errors():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", grade="MINT CONDITION")]
+    with pytest.raises(AddBatchError, match="grade"):
+        build_batch_rows(brief, working_list)
+
+
+def test_build_batch_rows_negative_max_bid_errors():
+    brief = [_brief("1", max_bid=-10)]
+    working_list = [_wl_row("1")]
+    with pytest.raises(AddBatchError, match="max_bid"):
+        build_batch_rows(brief, working_list)
+
+
+def test_build_batch_rows_zero_max_bid_errors():
+    brief = [_brief("1", max_bid=0)]
+    working_list = [_wl_row("1")]
+    with pytest.raises(AddBatchError, match="max_bid"):
+        build_batch_rows(brief, working_list)
+
+
+def test_build_batch_rows_group_out_of_range_errors():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", group=11)]
+    with pytest.raises(AddBatchError, match="group"):
+        build_batch_rows(brief, working_list)
+
+
+def test_build_batch_rows_nan_max_bid_override_rejected():
+    """NaN passes float()/Decimal() without error and can slip past a naive
+    server-side "v <= 0" positivity check — reject it client-side too,
+    mirroring add_one_row's own NaN/Infinity guard."""
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1")]
+    with pytest.raises(AddBatchError, match="max_bid"):
+        build_batch_rows(brief, working_list, overrides={"1": {"max_bid": float("nan")}})
+
+
+def test_build_batch_rows_working_list_row_missing_item_id_errors():
+    brief = []
+    with pytest.raises(AddBatchError, match="missing item_id"):
+        build_batch_rows(brief, [{"grade": 9.0}])
+
+
+def test_build_batch_rows_seller_fields_omitted_when_absent():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1")]
+    result = build_batch_rows(brief, working_list)
+    row = result.rows[0]
+    assert "seller" not in row
+    assert "seller_grade" not in row
+    assert "photo_grade" not in row
+
+
+def test_build_batch_rows_rejects_non_dict_override_entry():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1")]
+    with pytest.raises(AddBatchError, match="must be a JSON object"):
+        build_batch_rows(brief, working_list, overrides={"1": "skip"})
+
+
+def test_build_batch_rows_rejects_non_dict_overrides_top_level():
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1")]
+    with pytest.raises(AddBatchError):
+        build_batch_rows(brief, working_list, overrides=["not", "a", "dict"])
+
+
+def test_build_batch_rows_rejects_non_list_brief_rows():
+    with pytest.raises(AddBatchError, match="brief_rows"):
+        build_batch_rows({"not": "a list"}, [_wl_row("1")])
+
+
+def test_build_batch_rows_rejects_non_list_working_list():
+    with pytest.raises(AddBatchError, match="working_list"):
+        build_batch_rows([_brief("1", max_bid=50)], {"not": "a list"})
+
+
+def test_build_batch_rows_rejects_non_dict_brief_row_entry():
+    with pytest.raises(AddBatchError):
+        build_batch_rows(["not a dict"], [_wl_row("1")])
+
+
+def test_build_batch_rows_multiple_copies_same_group_bid_group_scenario():
+    """BUI-363 bid-group scenario: two copies of the same book, same group,
+    different max bids by grade — both must land with the group intact."""
+    brief = [_brief("1", comic_id=10, max_bid=800), _brief("2", comic_id=10, max_bid=900)]
+    working_list = [
+        _wl_row("1", grade=9.0, group=4),
+        _wl_row("2", grade=9.2, group=4),
+    ]
+    result = build_batch_rows(brief, working_list)
+    assert len(result.rows) == 2
+    assert all(r["group"] == 4 for r in result.rows)
+    assert result.rows[0]["max_bid"] != result.rows[1]["max_bid"]

@@ -30,6 +30,12 @@ remaining callers:
 - an **ad-hoc dispatched executor** (e.g. "add one more snipe" after a run) —
   point it at this file; everything it must do is here.
 
+Both callers use the same routing rule as `/comic:buy` (BUI-436): **2+
+approved items with the comics server up → `gixen add-batch`** (§ Add to
+Gixen) is the primary path — the hand-looped per-item `gixen add` + BUI-168
+prose discipline is now scoped to a single add or the direct-Gixen fallback,
+where `add-batch` (server-mode-only) doesn't apply.
+
 `buy.md` references specific parts of this file (§ Bid groups, the CGC-float
 grade conversion under *Available `add` flags*, the pre-flight bid sanity
 check); keep those anchors stable when editing.
@@ -78,14 +84,58 @@ Compare each auction's current bid against the proposed max bid. If current bid 
 
 ## Add to Gixen
 
+**Primary path — 2+ approved items and the comics server is up (BUI-436):**
+build the rows JSON below and call `gixen add-batch` once. The BUI-168
+mid-batch failure semantics — mark a failed row, re-check server health
+before the next row, halt and report every remaining row not-attempted if
+the server goes down, never an all-✅ summary after a failure — are enforced
+by the CLI itself, not by hand-followed prose.
+
+```bash
+gixen add-batch rows.json --verify --json-out results.json
+```
+
+Rows JSON — one object per approved auction (required: `item_id`, `max_bid`;
+everything else optional — see *Available `add` flags* below for what each
+maps to):
+
+```json
+[
+  {
+    "item_id": "123456789",
+    "max_bid": 800,
+    "comic_id": 42,
+    "grade": 9.2,
+    "seller": "some_seller",
+    "seller_grade": 9.0,
+    "photo_grade": 8.5,
+    "group": 1
+  }
+]
+```
+
+Skip Buy It Now listings — leave them out of the rows file entirely.
+`/comic:buy` Step 5 builds this same rows JSON via `gixen build-batch`
+(BUI-435) from its comic-fmv brief output; for a standalone run with no
+brief to build from, write the rows file directly from the approved
+item_id + max_bid list.
+
+**Fallback — a single item, or no comics server (direct-Gixen mode):**
+`add-batch` is server-mode-only, with no direct-Gixen branch (see
+`packages/gixen-cli/CLAUDE.md`). Use the per-item loop below instead.
+
+### Per-item add (single item, or direct-Gixen fallback)
+
 **Run sequentially** — Gixen sessions are stateful and parallel adds will fail.
 
 ### Handling a failed add (BUI-168)
 
-The pre-flight health check can't catch a server that dies *between* adds. In
-server mode a Gixen error or a transient outage makes `gixen add` print an error
-to stderr and **exit non-zero** (the CLI `sys.exit(1)`s on a 503/connection
-error). On any non-zero `gixen add`:
+This applies to the per-item path above (add-batch enforces the same
+semantics in code for the batch path). The pre-flight health check can't
+catch a server that dies *between* adds. In server mode a Gixen error or a
+transient outage makes `gixen add` print an error to stderr and **exit
+non-zero** (the CLI `sys.exit(1)`s on a 503/connection error). On any
+non-zero `gixen add`:
 
 1. **Do not** record that item as `✅ Added` or silently continue as if it
    succeeded — mark it `❌ Failed` in the output table with the error.
@@ -119,48 +169,24 @@ These are the flags that exist in `packages/gixen-cli/cli.py` today. Anything el
 
 When the approved list has **2+ listings of the same comic** and the user wants
 **at most one copy**, add them all with the same `--group N` (1–10) instead of
-sniping only the earliest-ending copy. Gixen bid groups mean "win at most one":
-per Gixen's own FAQ, *"all items with the same group number will be grouped
-together and remaining bids canceled once an item in the group is won."* This
-buys the win probability of every copy without dual-win risk. Per-copy max bids
-may differ by grade — a group is about the *comic*, not the price.
+sniping only the earliest-ending copy — per-copy max bids may differ by grade,
+a group is about the *comic*, not the price. Four rules cover safe use; the
+full BUI-363/371/381 rationale (why purge isn't the safety net) lives in
+`docs/solutions/conventions/bid-group-purge-is-hygiene-not-safety-net.md`:
 
-- **Pass-through is real:** `--group` (and the `group` field on a `gixen
-  add-batch` row) travels row → `snipe_group` in `POST /api/bids` → the
-  `newsnipegroup` form field POSTed to gixen.com, and is stored on the local
-  `bids.snipe_group` column. `gixen list` shows each snipe's group, parsed back
-  from Gixen's own snipe table — confirm your adds landed grouped there.
-  (The win→auto-cancel behavior itself is verified from Gixen's documentation,
-  not exercised live by this repo's tests.)
-- **Pick an unused N:** check `gixen list` for groups already in use by live
-  snipes; reuse of a live group would merge unrelated books into one
-  win-at-most-one set.
-- **End-time caveat (Gixen FAQ):** don't group auctions ending **within ~2
-  minutes of each other** — cancellation happens after a win, so
-  near-simultaneous endings can win multiple copies. Warn the user and have
-  them pick one copy in that case.
-- **Retroactive grouping:** `gixen group N <item_id>...` assigns existing
-  snipes to a group (0 = ungroup). It's direct-Gixen only (no server-mode
-  branch) — but as of BUI-381, the sync (`refresh_snipe_group`) mirrors
-  Gixen's listed `snipe_group` back onto the DB's row on every sync, in both
-  directions (0→N and N→0), as long as the row is still `PENDING`. So the
-  DB's `snipe_group` genuinely does catch up on the next sync — no
-  server-mode add required.
-- **Purge is hygiene, not the safety net (BUI-371 / BUI-381).** `gixen purge`
-  detects "sibling snipes from groups with a win" and removes them from
-  Gixen, tombstoning them `REMOVED` in the DB — that's the status
-  `/comic:collection-add` and the results views correctly ignore (removed ≠
-  lost). Running it keeps the live Gixen list and dashboard tidy, but it's no
-  longer what prevents a **phantom WON** (the BUI-146 accepted-risk class:
-  final price below your max on an auction you never actually bid). The
-  server itself now classifies a group-cancelled sibling `REMOVED` from
-  vanish-time/group-win evidence before the eBay price fallback ever sees it
-  — structurally closing the window instead of depending on purge timing.
-  That evidence is durable, too: BUI-381's append-only `group_wins` ledger
-  records the group win at classification time and survives `mark_bids_purged`
-  destroying the winner's own row, and covers a winner first seen
-  already-terminal via the web-add path. Purge whenever it's convenient;
-  safety doesn't ride on when (or whether) you do.
+1. Same `--group N` (and the `group` field on a `gixen add-batch` row) for
+   every copy — it travels to `bids.snipe_group` and Gixen's own snipe table
+   (`gixen list` shows it, confirming the add landed grouped).
+2. **Pick an N unused by any live snipe** — check `gixen list`.
+3. **Don't group auctions ending within ~2 minutes of each other** — warn the
+   user and have them pick one copy instead.
+4. **`gixen purge` is optional hygiene, not the win-safety mechanism** — the
+   server classifies an unpurged cancelled sibling `REMOVED` on its own once
+   its auction ends, regardless of purge timing.
+
+Retroactive grouping: `gixen group N <item_id>...` assigns existing snipes to
+a group (0 = ungroup; direct-Gixen only, but the next sync mirrors it back
+onto the DB row per BUI-381 as long as the row is still `PENDING`).
 
 After `/comic:fmv` (or `/comic:buy`) has produced a row with `comic_id` and a numeric `grade`:
 
