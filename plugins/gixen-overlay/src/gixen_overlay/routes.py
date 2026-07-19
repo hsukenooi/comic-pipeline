@@ -70,6 +70,7 @@ from server.main import (
 from locg.collection_cache import CollectionCache
 from locg.collection_io import MAX_XLSX_BYTES
 from locg.commands import (
+    _decrement_or_remove,
     _split_wish_list_name,
     cmd_collection_check,
     collection_check_reports_owned,
@@ -1805,12 +1806,15 @@ async def api_collection_delete(
                 ),
             )
         row = candidates[0]
-        copies = row.get("in_collection") or 0
+        # BUI-454: same copies-owned math as the real mutate below, shared via
+        # BUI-427's `_decrement_or_remove` (locg-cli) instead of re-deriving
+        # the > 1 check independently here.
+        decrements, remaining = _decrement_or_remove(row.get("in_collection") or 0)
         return {
             "status": "preview",
-            "action": "would_decrement" if copies > 1 else "would_remove",
+            "action": "would_decrement" if decrements else "would_remove",
             "would_remove": dict(row),
-            "remaining_copies": copies - 1 if copies > 1 else 0,
+            "remaining_copies": remaining,
         }
 
     # Cheap no-lock pre-check: refuse an ambiguous pin BEFORE touching
@@ -1852,11 +1856,14 @@ async def api_collection_delete(
         i = candidates[0]
         row = comics[i]
         removed = dict(row)
-        copies = row.get("in_collection") or 0
-        if copies > 1:
-            row["in_collection"] = copies - 1
+        # BUI-454: same helper as the dry-run preview above (BUI-427's
+        # `_decrement_or_remove`) — one place derives the decrement-vs-remove
+        # decision instead of two independent copies-math sites.
+        decrements, remaining = _decrement_or_remove(row.get("in_collection") or 0)
+        if decrements:
+            row["in_collection"] = remaining
             action = "decremented"
-            remaining_copies = copies - 1
+            remaining_copies = remaining
         else:
             del comics[i]
             action = "removed"
@@ -1896,6 +1903,26 @@ async def api_collection_delete(
 
 
 # ---------------------------------------------------------------------------
+# BUI-454: `api_collection_delete` above was backported onto BUI-427's
+# `_decrement_or_remove` for the copies-owned math (both the dry-run preview
+# and the locked mutate now call it), removing that duplication. It was
+# deliberately NOT backported onto `_REMEDIATION_STATUS_CODES`/
+# `_remediation_response` below, even though the four HTTP codes happen to
+# line up numerically (422/409/404/409): that mapper raises with
+# `detail=result` — the WHOLE `cmd_collection_remediate_*` status dict, e.g.
+# `{"status": "not_found"}` — whereas `api_collection_delete` raises with a
+# human-readable string detail carrying endpoint-specific context (series,
+# issue, full_title, release_date, candidate count). Routing this endpoint's
+# errors through `_remediation_response` would silently swap that detail
+# shape from string to dict and drop the diagnostic content, a real response-
+# body change for callers/log-scrapers even though no test currently pins the
+# string. It would also couple two endpoints' status vocabularies that are
+# only coincidentally numeric matches today (`_REMEDIATION_STATUS_CODES` has
+# no entry for `api_collection_delete`'s 500-on-`RuntimeError` case, and any
+# future edit to that table for remediate's needs would silently reach into
+# this delete path too). Kept as its own inline `raise HTTPException(...)`
+# per branch instead.
+#
 # BUI-427: matcher-BYPASSING remediation. `api_collection_delete` above
 # locates its target via `cmd_collection_check` — the SAME masthead-alias /
 # X-Men-split / leading-article matcher that breaks down on a volume-mis-
