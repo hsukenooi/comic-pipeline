@@ -288,3 +288,80 @@ class TestComicIdentifyEditionInJson:
         ]
         assert rows[0]["edition"] == "annual"
         assert rows[1]["edition"] == "single-issue"
+
+
+class TestComicIdentifyAnnualAdjacency:
+    """BUI-450: a REGULAR listing that merely contains the standalone word
+    "annual" for an unrelated reason must NOT be classified edition="annual".
+
+    Before this fix the detector keyed off a bare ``\\bannual\\b`` match anywhere
+    in the title, so "ASM #252 annual sale" became edition="annual" and — after
+    BUI-426's qualifier threading — the win pipeline filed it as the nonexistent
+    "ASM Annual #252" instead of the regular #252. The discriminator: a genuine
+    annual writes its own sequence number AFTER the word ("Annual #N" / "Annual
+    N"), whereas the false-positive class has the regular issue number sitting
+    BEFORE an unrelated "annual". So the number must FOLLOW "annual" to classify.
+    Severity is low/recoverable (real annuals have low issue numbers, so no
+    valuable key is falsely claimed) — these lock the tightened boundary in both
+    directions.
+    """
+
+    # --- false positives that must now be REGULAR (single-issue) ------------
+    def test_annual_sale_ticket_case_is_regular(self, capsys):
+        """The ticket's exact example: 'annual' is a stray word (a 'sale'),
+        with the regular issue number BEFORE it, not an annual's number after."""
+        comic_identify.main(["ASM #252 annual sale"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
+        assert data["issue"] == "252"
+
+    def test_number_before_annual_is_regular(self, capsys):
+        """Direction matters: a number PRECEDING 'annual' (with a non-number
+        word after) is the false-positive shape, not a genuine annual."""
+        comic_identify.main(["Amazing Spider-Man #252 Annual Clearance Sale"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
+        assert data["issue"] == "252"
+
+    def test_stray_annual_word_after_issue_is_regular(self, capsys):
+        comic_identify.main(["Batman #400 3rd annual event"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
+        assert data["issue"] == "400"
+
+    def test_bare_annual_no_number_is_not_classified_annual(self, capsys):
+        """A title whose only 'annual' has no following number can't resolve to
+        a wrong regular issue (issue is None), so classifying it single-issue is
+        safe — and avoids the mis-file. (Behavioral nuance of the BUI-450 fix.)"""
+        comic_identify.main(["Amazing Spider-Man Annual"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "single-issue"
+        assert data["issue"] is None
+
+    # --- genuine annuals that must STILL classify as annual -----------------
+    def test_genuine_annual_hash_number(self, capsys):
+        comic_identify.main(["Amazing Spider-Man Annual #1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "1"
+        assert "annual" not in (data["series"] or "").lower()
+
+    def test_genuine_annual_bare_number(self, capsys):
+        comic_identify.main(["X-Men Annual 2"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "2"
+
+    def test_genuine_annual_leading_word(self, capsys):
+        comic_identify.main(["Annual #14"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "14"
+
+    def test_genuine_annual_number_after_year_prefix(self, capsys):
+        """A year before the word doesn't break it — the annual's own number
+        still FOLLOWS 'annual' ('... Annual #1')."""
+        comic_identify.main(["Star Wars 2021 Annual #1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["edition"] == "annual"
+        assert data["issue"] == "1"
