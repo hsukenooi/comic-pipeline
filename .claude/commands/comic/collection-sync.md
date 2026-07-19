@@ -144,54 +144,39 @@ separate, opt-in Step 3b, and only after the wish-list has been conflict-cleaned
 (Step 2b). `wish_list_count` from Step 2 will be `0` on a default (wins-only)
 export — that is expected.
 
-## Step 2b: Pre-sync data-quality audit (BUI-199)
+## Step 2b: Pre-sync data-quality audit (BUI-199, BUI-432)
 
 Before uploading anything, audit the rows that will go up. record-win can write
 garbage that LOCG silently rejects ("Not Found") or, worse, mis-files —
 decorated full_titles, placeholder/blank dates, volume mislabels (BUI-199). A
-single bad row can also hang a whole batch. Inspect the wins file:
+single bad row can also hang a whole batch. Audit the already-exported wins
+file with the tested `locg collection audit-pending` subcommand (BUI-432 moved
+this off hand-authored inline Python — never re-export before auditing, since
+the export re-blanks placeholder dates):
 
 ```bash
-python3 - "$CSV" <<'PY'
-import csv, re, sys
-path = sys.argv[1]   # the export is already wins-only (Step 2a)
-rows = list(csv.DictReader(open(path)))
-bad = []
-for r in rows:
-    pub, ser, ft, dt = r["Publisher Name"], r["Series Name"], r["Full Title"], r["Release Date"]
-    issues = []
-    if not pub.strip():                       issues.append("no publisher")
-    if not ser.strip():                       issues.append("no series")
-    if not ft.strip():                        issues.append("no full_title")
-    if "(Vol." in ft or re.search(r"\(\d{4}", ft):
-        issues.append("decorated full_title (LOCG full_title carries no (Vol.)/(year))")
-    if dt and re.match(r"^\d{4}-01-01$", dt):  issues.append("Jan-1 placeholder date (will read Not Found)")
-    if issues:
-        bad.append((ft or "(blank)", issues))
-print(f"{len(rows)} win rows; {len(bad)} flagged")
-for ft, iss in bad:
-    print(" -", ft, "::", "; ".join(iss))
-# Dateless rows HANG LOCG's importer. A single blank-date row matches fine, but a
-# batch that is all (or nearly all) dateless spins the importer at 0% — backfill first.
-dateless = [r["Full Title"] for r in rows if not r["Release Date"].strip()]
-if dateless:
-    print(f"DATELESS: {len(dateless)}/{len(rows)} rows lack a Release Date — backfill before upload:")
-    for ft in dateless: print("  -", ft)
-PY
+locg collection audit-pending "$CSV" --pretty
 ```
 
-**If any row is flagged, STOP and fix it at the source** (re-run `record-win`
-with a canonical series + exact full_title + accurate release date) before
-uploading. Partial or wrong rows import as "Not Found"; an all-dateless batch
-hangs. **Rows must be complete and exact: publisher + canonical series + exact
-full_title (no decoration) + accurate release date.**
+Read `row_count`, `flagged_count`, and `flagged_rows` (each entry has
+`full_title` and a human-readable `issues` list — missing
+publisher/series/full_title, decorated full_title, or a Jan-1 placeholder
+date) from the JSON response.
 
-**If any rows are DATELESS, backfill their Release Date before uploading** — do
-**not** upload a dateless batch (it hangs the importer at 0%). The durable fix is
-record-win populating dates (BUI-210); until then, follow the tiered procedure in
-**`references/date-backfill.md`** (cadence/Metron first, web-research sub-agent only
-for the residual). Fill the dates into the already-generated CSV (don't re-export —
-the export re-blanks placeholders), then continue.
+**If `flagged_count` is non-zero, STOP and fix each flagged row at the source**
+(re-run `record-win` with a canonical series + exact full_title + accurate
+release date) before uploading. Partial or wrong rows import as "Not Found";
+an all-dateless batch hangs. **Rows must be complete and exact: publisher +
+canonical series + exact full_title (no decoration) + accurate release date.**
+
+**If `dateless_count` is non-zero, backfill those rows' Release Date before
+uploading** — do **not** upload a dateless batch (`all_dateless: true` is the
+importer-hang scenario at 0%; surface the response's `dateless_warning` and
+`dateless_titles`). The durable fix is record-win populating dates (BUI-210);
+until then, follow the tiered procedure in **`references/date-backfill.md`**
+(cadence/Metron first, web-research sub-agent only for the residual). Fill the
+dates into the already-generated CSV (don't re-export — the export re-blanks
+placeholders), then continue.
 
 Then also clean the
 wish-list itself so no owned-but-wished entry survives to be pushed in Step 3b:

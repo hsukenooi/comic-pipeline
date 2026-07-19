@@ -2262,6 +2262,109 @@ def cmd_collection_export(
     }
 
 
+def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
+    """Audit an already-exported wins CSV for data-quality issues before upload (BUI-432).
+
+    Read-only: only opens and parses the CSV at ``csv_path``. Never touches the
+    collection store and never re-exports (re-exporting re-blanks placeholder
+    dates — the caller must pass the path to a CSV a prior `collection export`
+    already produced).
+
+    This replaces the ~30 lines of inline Python `/comic:collection-sync` Step 2b
+    used to re-author every run (BUI-199's pre-sync audit) with tested code.
+    Per row, flags:
+
+    - ``missing_publisher`` / ``missing_series`` / ``missing_full_title``: a
+      required column (``Publisher Name`` / ``Series Name`` / ``Full Title``)
+      is blank.
+    - ``decorated_full_title``: ``Full Title`` carries ``(Vol.`` or a
+      parenthesized 4-digit year — LOCG's own full_title never carries this
+      decoration, so it signals an un-canonicalized record-win row.
+    - ``placeholder_date``: ``Release Date`` is the literal ``YYYY-01-01``
+      placeholder, which LOCG's import reads as "Not Found".
+
+    Only rows with at least one flag appear in ``flagged_rows``; each entry also
+    carries a human-readable ``issues`` list (same wording as the inline audit
+    it replaces) for display.
+
+    Also returns a dateless summary: a blank ``Release Date`` matches fine for
+    a single row, but a batch that is all (or nearly all) dateless hangs LOCG's
+    importer at 0% — ``dateless_count``/``dateless_titles`` list every dateless
+    row, ``all_dateless`` is True when every row in the CSV is dateless, and
+    ``dateless_warning`` is a ready-to-surface string whenever any row lacks a
+    date (None when every row has one).
+
+    Returns {csv_path, row_count, flagged_count, flagged_rows, dateless_count,
+    dateless_titles, all_dateless, dateless_warning}.
+    """
+    import csv as _csv
+
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"CSV not found: {path}")
+
+    with path.open(newline="") as f:
+        rows = list(_csv.DictReader(f))
+
+    flagged_rows: list[dict[str, Any]] = []
+    for idx, r in enumerate(rows):
+        pub = r.get("Publisher Name", "")
+        ser = r.get("Series Name", "")
+        ft = r.get("Full Title", "")
+        dt = r.get("Release Date", "")
+
+        missing_publisher = not pub.strip()
+        missing_series = not ser.strip()
+        missing_full_title = not ft.strip()
+        decorated_full_title = bool("(Vol." in ft or re.search(r"\(\d{4}", ft))
+        placeholder_date = bool(dt and re.match(r"^\d{4}-01-01$", dt))
+
+        issues: list[str] = []
+        if missing_publisher:
+            issues.append("no publisher")
+        if missing_series:
+            issues.append("no series")
+        if missing_full_title:
+            issues.append("no full_title")
+        if decorated_full_title:
+            issues.append("decorated full_title (LOCG full_title carries no (Vol.)/(year))")
+        if placeholder_date:
+            issues.append("Jan-1 placeholder date (will read Not Found)")
+
+        if issues:
+            flagged_rows.append({
+                "row_index": idx,
+                "full_title": ft or "(blank)",
+                "missing_publisher": missing_publisher,
+                "missing_series": missing_series,
+                "missing_full_title": missing_full_title,
+                "decorated_full_title": decorated_full_title,
+                "placeholder_date": placeholder_date,
+                "issues": issues,
+            })
+
+    row_count = len(rows)
+    dateless_titles = [r.get("Full Title", "") for r in rows if not r.get("Release Date", "").strip()]
+    dateless_count = len(dateless_titles)
+    dateless_warning = (
+        f"DATELESS: {dateless_count}/{row_count} rows lack a Release Date — backfill "
+        "before upload (an all- or nearly-all-dateless batch hangs LOCG's importer at 0%)"
+        if dateless_count
+        else None
+    )
+
+    return {
+        "csv_path": str(path),
+        "row_count": row_count,
+        "flagged_count": len(flagged_rows),
+        "flagged_rows": flagged_rows,
+        "dateless_count": dateless_count,
+        "dateless_titles": dateless_titles,
+        "all_dateless": row_count > 0 and dateless_count == row_count,
+        "dateless_warning": dateless_warning,
+    }
+
+
 def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
     """Return cache status metrics.
 
