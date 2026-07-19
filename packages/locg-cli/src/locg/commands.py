@@ -4142,3 +4142,375 @@ def cmd_collection_doctor() -> dict[str, Any]:
         "next_action": next_action,
         "setup_steps": steps,
     }
+
+
+# --- BUI-427: matcher-bypassing remediation (delete-by-identity, set-copies) ---
+#
+# The BUI-254 DELETE endpoint locates its target row via cmd_collection_check
+# — the SAME masthead-alias / X-Men-split / leading-article matcher that
+# breaks on the exact class of bug this exists to fix: a volume-mis-filed row.
+# That matcher can resolve to the WRONG row (a correct twin at the same
+# series/issue), or refuse a legitimate deletion outright with
+# ambiguous_cross_volume -> 404. BUI-424's remediation had to hand-roll a
+# one-off CollectionCache.apply script keyed on gixen_item_id to work around
+# both failure modes.
+#
+# _stable_identity_candidates below is the single shared resolver both
+# cmd_collection_remediate_delete and cmd_collection_remediate_set_copies use
+# — it NEVER falls back to cmd_collection_check or any of its normalization.
+# It supports exactly two identity modes (never combined, never a fuzzy
+# fallback):
+#   1. gixen_item_id — the stable id stamped on a row at record-win time
+#      (the BUI-367 write_wins dedup key).
+#   2. full_title + release_date + source, matched EXACTLY on all three
+#      (missing release_date/source match a null/empty field on the row,
+#      never wildcarded) — source is what disambiguates the BUI-424
+#      "duplicate-twin" case, where a buggy agent_win row and its clean
+#      locg_export re-resolution share the same full_title + release_date.
+
+
+def _validate_remediation_identity(
+    gixen_item_id: Optional[str], full_title: Optional[str]
+) -> Optional[str]:
+    """None if exactly one identity mode is selected; else an error message."""
+    has_id = bool((gixen_item_id or "").strip())
+    has_title = bool((full_title or "").strip())
+    if has_id == has_title:
+        return (
+            "supply EXACTLY ONE identity: gixen_item_id, OR full_title "
+            "(+release_date, +source)"
+        )
+    return None
+
+
+def _stable_identity_candidates(
+    comics: list[dict[str, Any]],
+    *,
+    gixen_item_id: Optional[str],
+    full_title: Optional[str],
+    release_date: Optional[str],
+    source: Optional[str],
+) -> list[int]:
+    """Row indices matching a STABLE identity — never a fuzzy/masthead matcher.
+
+    Assumes the caller already validated exactly one identity mode is
+    selected (:func:`_validate_remediation_identity`); this is called again
+    UNDER LOCK by both remediation ops' `_mutate` closures with the same
+    already-validated args, purely to re-resolve row indices against the
+    freshly-loaded payload — never to re-decide which mode applies.
+
+    Returns EVERY matching index (not just the first) so the caller can
+    treat more than one match as an unresolvable ambiguity rather than
+    silently guessing via first-match.
+    """
+    gixen_item_id = (gixen_item_id or "").strip() or None
+    if gixen_item_id:
+        return [i for i, row in enumerate(comics) if row.get("gixen_item_id") == gixen_item_id]
+    full_title = (full_title or "").strip() or None
+    norm_release_date = release_date or None
+    norm_source = source or None
+    return [
+        i for i, row in enumerate(comics)
+        if row.get("full_title") == full_title
+        and (row.get("release_date") or None) == norm_release_date
+        and (row.get("source") or None) == norm_source
+    ]
+
+
+def _identity_match_error(candidates: list[int], verb: str) -> dict[str, Any]:
+    """Shared not_found/ambiguous shape for both remediation ops."""
+    if not candidates:
+        return {
+            "status": "not_found",
+            "error": f"no row matches the given identity — nothing to {verb}",
+        }
+    return {
+        "status": "ambiguous",
+        "count": len(candidates),
+        "error": (
+            f"{len(candidates)} rows match the given identity — refusing to "
+            f"guess which one to {verb}"
+        ),
+    }
+
+
+def _not_imported_error() -> dict[str, Any]:
+    """Shared R11 not_imported shape for both remediation ops."""
+    return {
+        "status": "not_imported",
+        "error": "collection store has no import yet — cannot remediate (R11)",
+    }
+
+
+def _decrement_or_remove(copies: int) -> tuple[bool, int]:
+    """BUI-249/250/251 copies-owned semantics (mirrors BUI-254's
+    `api_collection_delete`): a row with more than one copy DECREMENTS,
+    a single-copy row is REMOVED outright. Returns (decrements, remaining) —
+    shared by the dry-run preview and the locked mutate so both derive the
+    same decision from one place instead of re-deriving it independently.
+    """
+    return (True, copies - 1) if copies > 1 else (False, 0)
+
+
+def cmd_collection_remediate_delete(
+    *,
+    gixen_item_id: Optional[str] = None,
+    full_title: Optional[str] = None,
+    release_date: Optional[str] = None,
+    source: Optional[str] = None,
+    dry_run: bool = False,
+    cache: Optional[CollectionCache] = None,
+) -> dict[str, Any]:
+    """Delete (or decrement) ONE collection row by STABLE IDENTITY (BUI-427).
+
+    Matcher-BYPASSING remediation for a volume-mis-filed row: locates the
+    target by `gixen_item_id` OR by (`full_title`, `release_date`, `source`)
+    — see :func:`_stable_identity_candidates` — NEVER via
+    `cmd_collection_check`'s masthead-alias / X-Men-split / leading-article
+    matcher, which is exactly what can't disambiguate a mis-file (the BUI-424
+    case this replaces a one-off script for).
+
+    Same copies-owned semantics as the BUI-254 endpoint: a row with
+    `in_collection > 1` is decremented; a single-copy row is removed outright.
+    `dry_run=True` previews the op without mutating (no lock, no audit entry).
+    The real delete re-resolves the identity INSIDE `cache.apply()`'s
+    exclusive lock and self-verifies exactly one row still matches at that
+    point — a TOCTOU-safe guard against the store changing shape between the
+    cheap pre-check and the lock (mirrors the BUI-254/BUI-417 pattern).
+
+    Returns `{"status": "invalid_request", "error"}` for a malformed identity
+    (neither or both modes given). `{"status": "not_imported", "error"}` if
+    the store has never been imported (R11). `{"status": "not_found"}` when
+    nothing matches — a true no-op, never a silent wrong-row touch.
+    `{"status": "ambiguous", "count"}` when more than one row matches — a
+    data-quality problem surfaced rather than guessed at. On success:
+    `{"status": "ok"|"preview", "action": "removed"|"decremented"|
+    "would_remove"|"would_decrement", "removed"|"row", "remaining_copies"}`.
+    """
+    error = _validate_remediation_identity(gixen_item_id, full_title)
+    if error:
+        return {"status": "invalid_request", "error": error}
+
+    if cache is None:
+        cache = CollectionCache()
+    payload = cache.load()
+    if payload.get("last_full_import") is None:
+        return _not_imported_error()
+
+    candidates = _stable_identity_candidates(
+        payload.get("comics", []),
+        gixen_item_id=gixen_item_id,
+        full_title=full_title,
+        release_date=release_date,
+        source=source,
+    )
+    if len(candidates) != 1:
+        return _identity_match_error(candidates, "remove")
+
+    row = payload["comics"][candidates[0]]
+    decrements, remaining = _decrement_or_remove(row.get("in_collection") or 0)
+    if dry_run:
+        return {
+            "status": "preview",
+            "action": "would_decrement" if decrements else "would_remove",
+            "row": dict(row),
+            "remaining_copies": remaining,
+        }
+
+    outcome: dict[str, Any] = {}
+
+    def _mutate(locked_payload: dict[str, Any]) -> None:
+        comics = locked_payload.get("comics", [])
+        locked_candidates = _stable_identity_candidates(
+            comics,
+            gixen_item_id=gixen_item_id,
+            full_title=full_title,
+            release_date=release_date,
+            source=source,
+        )
+        if len(locked_candidates) != 1:
+            # Self-verify: what matched pre-lock no longer matches exactly
+            # one row under the lock (BUI-417 TOCTOU precedent) — record the
+            # mismatch and leave the store untouched rather than guess.
+            outcome.update(_identity_match_error(locked_candidates, "remove"))
+            return
+        i = locked_candidates[0]
+        locked_row = comics[i]
+        outcome["removed_row"] = dict(locked_row)
+        locked_decrements, locked_remaining = _decrement_or_remove(locked_row.get("in_collection") or 0)
+        if locked_decrements:
+            locked_row["in_collection"] = locked_remaining
+        else:
+            del comics[i]
+        outcome["action"] = "decremented" if locked_decrements else "removed"
+        outcome["remaining_copies"] = locked_remaining
+
+    cache.apply(_mutate, command="collection-remediate-delete")
+
+    if outcome.get("status"):
+        return outcome
+
+    cache.append_audit({
+        "type": "collection_remediate_delete",
+        "ts": _utcnow_iso(),
+        "command": "collection-remediate-delete",
+        "details": {
+            "identity": {
+                "gixen_item_id": gixen_item_id,
+                "full_title": full_title,
+                "release_date": release_date,
+                "source": source,
+            },
+            "action": outcome["action"],
+            "removed": outcome["removed_row"],
+        },
+    })
+
+    return {
+        "status": "ok",
+        "action": outcome["action"],
+        "removed": outcome["removed_row"],
+        "remaining_copies": outcome["remaining_copies"],
+    }
+
+
+def cmd_collection_remediate_set_copies(
+    *,
+    gixen_item_id: Optional[str] = None,
+    full_title: Optional[str] = None,
+    release_date: Optional[str] = None,
+    source: Optional[str] = None,
+    in_collection: Optional[int] = None,
+    delta: Optional[int] = None,
+    dry_run: bool = False,
+    cache: Optional[CollectionCache] = None,
+) -> dict[str, Any]:
+    """Set or adjust `in_collection` on ONE row by STABLE IDENTITY (BUI-427).
+
+    Matcher-BYPASSING copy-count remediation — same identity resolution as
+    :func:`cmd_collection_remediate_delete` (never the fuzzy check-matcher).
+    Supply EXACTLY ONE of `in_collection` (an explicit absolute value, must be
+    `>= 0`) or `delta` (a signed adjustment relative to the row's CURRENT
+    count); a delta that would take the count below 0 is refused, not
+    clamped.
+
+    UNLIKE remediate-delete, this never removes the row even at 0 —
+    `in_collection == 0` is itself a valid tracked-but-not-owned state
+    (BUI-249/250/251), distinct from row absence. Pair with remediate-delete
+    to actually remove a mis-filed row.
+
+    `dry_run=True` previews the op without mutating. The real write
+    re-resolves the identity INSIDE `cache.apply()`'s exclusive lock and
+    self-verifies exactly one row still matches (and the delta still holds
+    non-negative) at that point — the same TOCTOU-safe shape
+    `cmd_collection_remediate_delete` uses.
+
+    Return shape mirrors `cmd_collection_remediate_delete`'s status values
+    (`invalid_request`, `not_imported`, `not_found`, `ambiguous`); on success:
+    `{"status": "ok"|"preview", "row", "previous_in_collection"|
+    "current_in_collection", "new_in_collection"}`.
+    """
+    error = _validate_remediation_identity(gixen_item_id, full_title)
+    if error:
+        return {"status": "invalid_request", "error": error}
+    if (in_collection is None) == (delta is None):
+        return {
+            "status": "invalid_request",
+            "error": "supply EXACTLY ONE of in_collection (absolute) or delta (+/- adjustment)",
+        }
+    if in_collection is not None and in_collection < 0:
+        return {"status": "invalid_request", "error": "in_collection must be >= 0"}
+
+    if cache is None:
+        cache = CollectionCache()
+    payload = cache.load()
+    if payload.get("last_full_import") is None:
+        return _not_imported_error()
+
+    candidates = _stable_identity_candidates(
+        payload.get("comics", []),
+        gixen_item_id=gixen_item_id,
+        full_title=full_title,
+        release_date=release_date,
+        source=source,
+    )
+    if len(candidates) != 1:
+        return _identity_match_error(candidates, "update")
+
+    row = payload["comics"][candidates[0]]
+    current = row.get("in_collection") or 0
+    new_value = in_collection if in_collection is not None else current + delta
+    if new_value < 0:
+        return {
+            "status": "invalid_request",
+            "error": f"delta {delta} would take in_collection below 0 (current: {current})",
+        }
+    if dry_run:
+        return {
+            "status": "preview",
+            "row": dict(row),
+            "current_in_collection": current,
+            "new_in_collection": new_value,
+        }
+
+    outcome: dict[str, Any] = {}
+
+    def _mutate(locked_payload: dict[str, Any]) -> None:
+        comics = locked_payload.get("comics", [])
+        locked_candidates = _stable_identity_candidates(
+            comics,
+            gixen_item_id=gixen_item_id,
+            full_title=full_title,
+            release_date=release_date,
+            source=source,
+        )
+        if len(locked_candidates) != 1:
+            outcome.update(_identity_match_error(locked_candidates, "update"))
+            return
+        i = locked_candidates[0]
+        locked_row = comics[i]
+        locked_current = locked_row.get("in_collection") or 0
+        locked_new = in_collection if in_collection is not None else locked_current + delta
+        if locked_new < 0:
+            # Self-verify: the count moved between the pre-check and the
+            # lock (a concurrent writer) such that this delta would now go
+            # negative — refuse rather than clamp or guess.
+            outcome["status"] = "invalid_request"
+            outcome["error"] = (
+                f"delta {delta} would take in_collection below 0 "
+                f"(current: {locked_current})"
+            )
+            return
+        outcome["previous_row"] = dict(locked_row)
+        locked_row["in_collection"] = locked_new
+        outcome["current_in_collection"] = locked_current
+        outcome["new_in_collection"] = locked_new
+
+    cache.apply(_mutate, command="collection-remediate-set-copies")
+
+    if outcome.get("status"):
+        return outcome
+
+    cache.append_audit({
+        "type": "collection_remediate_set_copies",
+        "ts": _utcnow_iso(),
+        "command": "collection-remediate-set-copies",
+        "details": {
+            "identity": {
+                "gixen_item_id": gixen_item_id,
+                "full_title": full_title,
+                "release_date": release_date,
+                "source": source,
+            },
+            "previous_in_collection": outcome["current_in_collection"],
+            "new_in_collection": outcome["new_in_collection"],
+            "row": outcome["previous_row"],
+        },
+    })
+
+    return {
+        "status": "ok",
+        "row": outcome["previous_row"],
+        "previous_in_collection": outcome["current_in_collection"],
+        "new_in_collection": outcome["new_in_collection"],
+    }

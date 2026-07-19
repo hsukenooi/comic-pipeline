@@ -261,3 +261,68 @@ class CollectionRestoreRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("backup_path must be a non-empty string")
         return v.strip()
+
+
+class CollectionRemediateDeleteRequest(BaseModel):
+    """POST /api/comics/collection/remediate/delete (BUI-427).
+
+    Matcher-**bypassing** deletion by STABLE IDENTITY only — this never routes
+    through ``cmd_collection_check``'s masthead-alias / X-Men-split /
+    leading-article normalization, which is exactly what can't disambiguate a
+    volume-mis-filed row (the reason this endpoint exists — see BUI-424, whose
+    remediation had to hand-roll a one-off script keyed on ``gixen_item_id``
+    because the BUI-254 ``DELETE /api/comics/collection`` endpoint's matcher
+    either targeted the wrong row or refused the deletion outright).
+
+    Supply EXACTLY ONE identity:
+
+      - ``gixen_item_id`` — the row's own stable id, stamped at record-win
+        time (the BUI-367 dedup key).
+      - ``full_title`` (+ optionally ``release_date``, ``source``) — an exact
+        field match on all three. A field you omit is matched against a
+        null/empty value on the row, never wildcarded. ``source``
+        (``"agent_win"`` vs ``"locg_export"``, etc.) is what disambiguates the
+        BUI-424 "duplicate-twin" case, where a buggy win row and a clean
+        re-resolution share the same ``full_title`` + ``release_date``.
+
+    Same copies-owned semantics as BUI-254: a row with ``in_collection > 1``
+    is decremented, a single-copy row is removed outright. ``dry_run=true``
+    previews the exact op without mutating.
+    """
+
+    gixen_item_id: str | None = None
+    full_title: str | None = None
+    release_date: str | None = None
+    source: str | None = None
+    dry_run: bool = False
+
+
+class CollectionRemediateSetCopiesRequest(BaseModel):
+    """POST /api/comics/collection/remediate/set-copies (BUI-427).
+
+    Sets (or adjusts) ``in_collection`` — the copies-owned count
+    (BUI-249/250/251) — on ONE row located by the same STABLE IDENTITY
+    ``CollectionRemediateDeleteRequest`` uses (never the fuzzy check-matcher;
+    see that model's docstring for the two identity modes).
+
+    Supply EXACTLY ONE of:
+
+      - ``in_collection`` — an explicit absolute value (must be ``>= 0``).
+      - ``delta`` — a signed adjustment relative to the row's CURRENT count;
+        refused (never clamped) if it would take the count below 0.
+
+    Unlike remediate/delete, this NEVER removes the row even when the result
+    is 0 — ``in_collection == 0`` is itself a valid tracked-but-not-owned
+    state (a wish/pull-list row per BUI-249/250/251), distinct from row
+    absence. Pair with remediate/delete to actually remove a mis-filed row.
+
+    ``dry_run=true`` previews the exact op without mutating.
+    """
+
+    gixen_item_id: str | None = None
+    full_title: str | None = None
+    release_date: str | None = None
+    source: str | None = None
+    in_collection: int | None = None
+    delta: int | None = None
+    dry_run: bool = False
