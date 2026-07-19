@@ -294,10 +294,14 @@ class MetronClient:
         ``session.issue(metron_id)`` (BUI-33, BUI-134).
 
         Returns ``{"variants": [name, ...], "credits": [{"creator": name,
-        "creator_id": id, "roles": [role, ...]}, ...]}`` — the variant cover
-        names plus every creator credit Metron has for the issue — or ``None``
-        on any failure. MetronCredentialError is re-raised so a batch can
-        disable Metron rather than retry per win.
+        "creator_id": id, "roles": [role, ...]}, ...], "publisher": name}`` —
+        the variant cover names, every creator credit, plus the publisher
+        display name (e.g. ``"Marvel Comics"``; BUI-458) Metron has for the
+        issue — or ``None`` on any failure. The full ``Issue`` this already
+        fetches carries ``publisher``, so surfacing it costs no extra network
+        call. ``publisher`` is ``None`` when Metron has no publisher on the
+        issue (never a fabricated guess). MetronCredentialError is re-raised
+        so a batch can disable Metron rather than retry per win.
 
         Note on ``creator_id``: a mokkari ``Credit`` exposes ``id`` (the credit
         row id, **not** the creator id) and ``creator`` (the creator's canonical
@@ -314,7 +318,8 @@ class MetronClient:
                 if getattr(v, "name", None)
             ]
             credits = self._extract_credits(issue)
-            return {"variants": variants, "credits": credits}
+            publisher = self._extract_publisher(issue)
+            return {"variants": variants, "credits": credits, "publisher": publisher}
         except MetronCredentialError:
             raise
         except RateLimitError:
@@ -354,6 +359,25 @@ class MetronClient:
                 "roles": roles,
             })
         return out
+
+    @staticmethod
+    def _extract_publisher(issue: Any) -> Optional[str]:
+        """Pull the publisher display name (e.g. ``"Marvel Comics"``) from a
+        mokkari issue detail (BUI-458).
+
+        A mokkari ``Issue`` carries ``publisher`` as a ``GenericItem`` whose
+        ``name`` is the display name. Returns ``None`` when the attribute is
+        absent, is not a ``GenericItem`` with a string ``name``, or is blank —
+        so a Metron miss degrades to a null publisher (the pre-upload audit's
+        backstop) rather than a fabricated or defaulted value. The ``isinstance``
+        guard also keeps a bare ``MagicMock`` issue from injecting a mock as a
+        publisher name in tests.
+        """
+        publisher = getattr(issue, "publisher", None)
+        name = getattr(publisher, "name", None)
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return None
 
     @_retry_once_on_rate_limit
     def resolve_creator(self, name: str) -> Optional[dict[str, Any]]:

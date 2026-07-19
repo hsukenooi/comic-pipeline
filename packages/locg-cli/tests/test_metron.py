@@ -572,6 +572,9 @@ def test_lookup_issue_detail_returns_variant_names():
     assert result == {
         "variants": ["Capullo Variant", "Todd McFarlane Cover"],
         "credits": [],
+        # BUI-458: a bare MagicMock issue has no real ``publisher.name`` string,
+        # so the isinstance guard keeps publisher null (no mock injection).
+        "publisher": None,
     }
     session.issue.assert_called_once_with(5)
 
@@ -584,7 +587,11 @@ def test_lookup_issue_detail_no_variants():
     issue.credits = []
     session.issue.return_value = issue
     client._session = session
-    assert client.lookup_issue_detail(5) == {"variants": [], "credits": []}
+    assert client.lookup_issue_detail(5) == {
+        "variants": [],
+        "credits": [],
+        "publisher": None,
+    }
 
 
 def test_lookup_issue_detail_swallows_exception():
@@ -601,6 +608,48 @@ def test_lookup_issue_detail_raises_credential_error(monkeypatch):
     client = MetronClient()
     with pytest.raises(MetronCredentialError):
         client.lookup_issue_detail(5)
+
+
+# ---------------------------------------------------------------------------
+# lookup_issue_detail — publisher (BUI-458)
+# ---------------------------------------------------------------------------
+
+def _mock_publisher(name: Any) -> MagicMock:
+    p = MagicMock()
+    p.name = name
+    return p
+
+
+def test_lookup_issue_detail_extracts_publisher():
+    """BUI-458: the full Issue's publisher display name is surfaced on the
+    detail dict (it already fetches the full Issue, so no extra network call)."""
+    client = MetronClient()
+    session = MagicMock()
+    issue = MagicMock()
+    issue.variants = []
+    issue.credits = []
+    issue.publisher = _mock_publisher("Marvel Comics")
+    session.issue.return_value = issue
+    client._session = session
+
+    assert client.lookup_issue_detail(5)["publisher"] == "Marvel Comics"
+
+
+def test_lookup_issue_detail_publisher_null_on_miss_never_guesses():
+    """BUI-458 data safety: a Metron issue with no usable publisher yields a
+    null publisher (never a fabricated/defaulted value). Covers a missing
+    publisher object, a None name, and a blank/whitespace name — plus a bare
+    MagicMock publisher (whose ``.name`` is not a real str)."""
+    client = MetronClient()
+    session = MagicMock()
+    for pub in (None, _mock_publisher(None), _mock_publisher(""), _mock_publisher("   "), MagicMock()):
+        issue = MagicMock()
+        issue.variants = []
+        issue.credits = []
+        issue.publisher = pub
+        session.issue.return_value = issue
+        client._session = session
+        assert client.lookup_issue_detail(5)["publisher"] is None
 
 
 # ---------------------------------------------------------------------------

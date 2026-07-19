@@ -1394,8 +1394,18 @@ def _null_metron():
     return m
 
 
-def _metron_hit(series_name: str = "Amazing Spider-Man (1963 - 1998)", year_began: int = 1963, year_end: int | None = 1998):
-    """MetronClient stub that returns a successful lookup."""
+def _metron_hit(
+    series_name: str = "Amazing Spider-Man (1963 - 1998)",
+    year_began: int = 1963,
+    year_end: int | None = 1998,
+    publisher: str | None = "Marvel Comics",
+):
+    """MetronClient stub that returns a successful lookup.
+
+    BUI-458: also stubs ``lookup_issue_detail`` (the full-issue detail fetch
+    record-win now makes to capture the publisher) so a recorded win carries a
+    real ``publisher_name``. Pass ``publisher=None`` to simulate a Metron issue
+    with no publisher (the row must then keep ``publisher_name`` null)."""
     from unittest.mock import MagicMock
     m = MagicMock()
     m.lookup_issue.return_value = {
@@ -1408,6 +1418,11 @@ def _metron_hit(series_name: str = "Amazing Spider-Man (1963 - 1998)", year_bega
         "series_id": 42,
     }
     m.format_series_name.return_value = series_name
+    m.lookup_issue_detail.return_value = {
+        "variants": [],
+        "credits": [],
+        "publisher": publisher,
+    }
     return m
 
 
@@ -1564,6 +1579,8 @@ def test_record_win_metron_series_resolution_reprint_guard(tmp_path):
         "series_id": 42,
     }
     metron.format_series_name.return_value = "The Infinity Gauntlet (1991) (1991 - 1991)"
+    # BUI-458: record-win now fetches issue detail for the publisher.
+    metron.lookup_issue_detail.return_value = {"variants": [], "credits": [], "publisher": "Marvel Comics"}
     metron.degraded = False
 
     result = cmd_collection_record_win(
@@ -2166,7 +2183,13 @@ def _metron_with_variants(series_name: str, variants: list[str]):
         "series_id": 5,
     }
     m.format_series_name.return_value = series_name
-    m.lookup_issue_detail.return_value = {"variants": variants}
+    # BUI-458: record-win reuses this same detail fetch to also capture the
+    # publisher, so mirror the real client's dict shape (variants + publisher).
+    m.lookup_issue_detail.return_value = {
+        "variants": variants,
+        "credits": [],
+        "publisher": "Image Comics",
+    }
     return m
 
 
@@ -2212,8 +2235,13 @@ def test_record_win_metron_variant_no_match_flags(tmp_path):
     assert cache.load()["comics"][-1]["needs_manual_variant"] is True
 
 
-def test_record_win_no_variant_skips_detail_lookup(tmp_path):
-    """A known-suffix variant must not trigger a Metron issue-detail call."""
+def test_record_win_no_variant_skips_variant_detail_match(tmp_path):
+    """A known-suffix variant resolves via the suffix map, not a fuzzy match
+    against Metron variant names, so it must not count as a variant lookup.
+
+    BUI-458: the issue-detail call itself IS now made (once) to capture the
+    publisher, but the variant-lookup counter stays 0 because no variant fuzzy
+    match was attempted (the suffix map already produced the full_title)."""
     from locg.commands import cmd_collection_record_win
 
     cache = make_cache(tmp_path)
@@ -2224,8 +2252,126 @@ def test_record_win_no_variant_skips_detail_lookup(tmp_path):
         metron=metron,
     )
     assert result["metron_variant_lookups_attempted"] == 0
-    metron.lookup_issue_detail.assert_not_called()
+    # BUI-458: detail fetched once (for publisher), not repeatedly.
+    metron.lookup_issue_detail.assert_called_once()
     assert cache.load()["comics"][-1]["full_title"].endswith("Newsstand Edition")
+
+
+# --- BUI-458: record-win captures a real publisher from Metron ---
+
+def test_record_win_persists_metron_publisher(tmp_path):
+    """BUI-458: a recorded win carries the Metron issue's publisher (not None),
+    so the wins-only export imports to LOCG with a publisher instead of
+    Not Found."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_hit("Amazing Spider-Man (1963 - 1998)", publisher="Marvel Comics")
+    result = cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man", issue="300", year=1988)],
+        cache=cache, metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["publisher_name"] == "Marvel Comics"
+
+
+def test_record_win_publisher_null_on_metron_miss(tmp_path):
+    """BUI-458 data safety: when Metron never resolves an id (a plain miss), the
+    win row's publisher stays null — never a fabricated or defaulted guess — and
+    no wasted issue-detail call is made."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _null_metron()
+    result = cmd_collection_record_win(
+        [_make_win(series="Totally Unknown Series", issue="1", year=1995)],
+        cache=cache, metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["publisher_name"] is None
+    # No metron_id resolved → no issue-detail fetch spent on a miss.
+    metron.lookup_issue_detail.assert_not_called()
+
+
+def test_record_win_publisher_null_when_metron_detail_has_no_publisher(tmp_path):
+    """BUI-458 data safety: Metron resolves the issue but carries no publisher on
+    it → the row keeps a null publisher (never guessed from the masthead/series).
+    A missing publisher is caught by the pre-upload audit, which is the intended
+    backstop; a wrong one would import silently."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _metron_hit("Amazing Spider-Man (1963 - 1998)", publisher=None)
+    result = cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man", issue="300", year=1988)],
+        cache=cache, metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["publisher_name"] is None
+
+
+def test_record_win_variant_win_captures_publisher_with_single_detail_fetch(tmp_path):
+    """BUI-458 no-latency-regression: a variant win captures the publisher AND
+    resolves its variant cover from a SINGLE shared issue-detail fetch (the
+    publisher capture reuses the same detail the variant match needs)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    # _metron_with_variants stubs a publisher of "Image Comics" (Spawn).
+    metron = _metron_with_variants("Spawn (1992 - Present)", ["Capullo Variant", "Direct Edition"])
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        cache=cache, metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    assert result["metron_variant_matches"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["publisher_name"] == "Image Comics"
+    assert row["full_title"] == "Spawn #313 Capullo Variant"
+    # Exactly one detail call served both publisher capture and variant match.
+    metron.lookup_issue_detail.assert_called_once()
+
+
+def test_record_win_publisher_flows_to_export_csv_and_passes_audit(tmp_path):
+    """BUI-458 end-to-end: the stored publisher flows through the CSV export
+    column the audit reads, so `audit-pending` no longer flags "no publisher"
+    for a freshly recorded win."""
+    import csv as _csv
+    from locg.commands import cmd_collection_record_win, cmd_collection_audit_pending
+    from locg.collection_io import _row_to_csv_dict, LOCG_XLSX_HEADERS
+
+    cache = make_cache(tmp_path)
+    metron = _metron_hit("Amazing Spider-Man (1963 - 1998)", publisher="Marvel Comics")
+    cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man", issue="300", year=1988)],
+        cache=cache, metron=metron,
+    )
+    row = cache.load()["comics"][-1]
+
+    # The export maps publisher_name → the "Publisher Name" column faithfully.
+    csv_row = _row_to_csv_dict(row)
+    assert csv_row["Publisher Name"] == "Marvel Comics"
+
+    # Write a real wins CSV and audit it — no "no publisher" flag.
+    csv_path = tmp_path / "wins.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = _csv.DictWriter(f, fieldnames=LOCG_XLSX_HEADERS)
+        writer.writeheader()
+        writer.writerow(csv_row)
+
+    audit = cmd_collection_audit_pending(str(csv_path))
+    assert audit["row_count"] == 1
+    publisher_flags = [
+        r for r in audit["flagged_rows"] if "no publisher" in r["issues"]
+    ]
+    assert publisher_flags == []
 
 
 # --- BUI-34: dedup already-owned wins ---
@@ -2473,6 +2619,8 @@ def test_record_win_metron_release_date_store_date_preferred(tmp_path):
         "series_id": 1,
     }
     metron.format_series_name.return_value = "Amazing Spider-Man (1963 - 1998)"
+    # BUI-458: record-win now fetches issue detail for the publisher.
+    metron.lookup_issue_detail.return_value = {"variants": [], "credits": [], "publisher": "Marvel Comics"}
 
     cmd_collection_record_win(
         [_make_win(series="Amazing Spider-Man", issue="300")],
@@ -2502,6 +2650,8 @@ def test_record_win_metron_no_store_date_uses_cover_date(tmp_path):
         "series_id": 1,
     }
     metron.format_series_name.return_value = "Amazing Spider-Man (1963 - 1998)"
+    # BUI-458: record-win now fetches issue detail for the publisher.
+    metron.lookup_issue_detail.return_value = {"variants": [], "credits": [], "publisher": "Marvel Comics"}
 
     cmd_collection_record_win(
         [_make_win(series="Amazing Spider-Man", issue="300")],
@@ -2531,6 +2681,8 @@ def test_record_win_metron_no_dates_blank_release_date(tmp_path):
         "series_id": 1,
     }
     metron.format_series_name.return_value = "Amazing Spider-Man (1963 - 1998)"
+    # BUI-458: record-win now fetches issue detail for the publisher.
+    metron.lookup_issue_detail.return_value = {"variants": [], "credits": [], "publisher": "Marvel Comics"}
 
     cmd_collection_record_win(
         [_make_win(series="Amazing Spider-Man", issue="300")],
@@ -2583,6 +2735,8 @@ def test_record_win_index_path_backfills_real_metron_date(tmp_path):
         "series_name": "The X-Men",
         "series_id": 7,
     }
+    # BUI-458: record-win now fetches issue detail for the publisher.
+    metron.lookup_issue_detail.return_value = {"variants": [], "credits": [], "publisher": "Marvel Comics"}
 
     result = cmd_collection_record_win(
         [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
@@ -3020,6 +3174,8 @@ def test_record_win_integration_mix(tmp_path):
         return None
     metron.lookup_issue.side_effect = metron_lookup
     metron.format_series_name.side_effect = lambda d: f"{d['series_name']} ({d['series_year_began']} - Present)"
+    # BUI-458: the Spawn metron-hit win triggers an issue-detail fetch for the publisher.
+    metron.lookup_issue_detail.return_value = {"variants": [], "credits": [], "publisher": "Image Comics"}
 
     wins = [
         _make_win(item_id="1", series="Amazing Spider-Man (1963 - 1998)", issue="300"),  # index hit
