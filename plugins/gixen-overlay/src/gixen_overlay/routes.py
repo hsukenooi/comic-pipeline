@@ -39,13 +39,11 @@ from gixen_overlay.models import (
     VerifyRequest,
     WishListAddRequest,
     WishListAddBatchRequest,
-    RecordWinRequest,
     RecordWinCommitRequest,
     CollectionRestoreRequest,
     CollectionRemediateDeleteRequest,
     CollectionRemediateSetCopiesRequest,
     SellerScanSeenRequest,
-    CollectionWinsSeenRequest,
     CollectionCheckBatchRequest,
     SeriesNameResolveRequest,
 )
@@ -1572,75 +1570,6 @@ async def api_collection_import(file: UploadFile = File(...)):
                 pass
 
 
-@router.post("/api/comics/collection/record-win")
-async def api_record_win(req: RecordWinRequest):
-    """Append won auctions to the collection on the server (R6).
-
-    Mirrors `locg collection record-win`; the Metron series resolution and
-    BUI-34 already-owned dedup are unchanged (owned by locg-cli). Returns the
-    same summary metrics the CLI does.
-
-    BUI-255: `cmd_collection_record_win` is synchronous and can block for a
-    while — each new series costs a Metron lookup, and a throttled Metron can
-    add a capped-but-real 60s sleep per call (BUI-260's rate-limit retry;
-    BUI-255's own batch breaker stops it from repeating that on every row,
-    but the FIRST throttled row still sleeps once). Calling it directly on
-    this coroutine would block the single-worker event loop for that whole
-    stretch — every other endpoint (e.g. GET .../status) would hang until the
-    batch finished, which is exactly what happened during the BUI-247 audit.
-    `asyncio.to_thread` runs it on a worker thread so the loop stays
-    responsive; this matches the pattern gixen-cli's own server/main.py
-    already uses for its blocking calls.
-    """
-    _ensure_collection_store()
-    try:
-        result = await asyncio.to_thread(cmd_collection_record_win, req.wins)
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"collection store unavailable: {exc}"
-        ) from exc
-    except Exception as exc:
-        # BUI-184: record-win previously translated only RuntimeError, so any
-        # other mid-batch exception surfaced as an opaque 500 with no signal
-        # about commit state. Translate it to a 500 the caller can act on — the
-        # commit state is uncertain, so the user must re-verify before trusting
-        # it. (cmd_collection_record_win chunk-commits and flags partial_failure
-        # for handled failures; this is the unhandled-exception backstop.)
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "record_win_failed",
-                "message": (
-                    "record-win raised mid-batch; the commit state is uncertain "
-                    "— re-check the collection / re-import before treating any "
-                    "of these wins as recorded"
-                ),
-                "exception": f"{type(exc).__name__}: {exc}",
-            },
-        ) from exc
-
-    # BUI-137: cmd_collection_record_win commits in chunks of 25 and, if a chunk
-    # raises, logs the error, sets partial_failure=True, and CONTINUES — so a
-    # later chunk's wins are silently dropped while the function still returns
-    # normally. Returning that dict with HTTP 200 let `curl -sf` (the skill's
-    # only failure signal) read a partial commit as full success, silently
-    # losing recorded purchases. Raise a non-200 so any HTTP caller halts; carry
-    # the partial result in the detail so the user sees what was/wasn't written.
-    if result.get("partial_failure"):
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "partial_failure",
-                "message": (
-                    "one or more chunks failed to commit; some wins were NOT "
-                    "recorded — do not treat this as success"
-                ),
-                **result,
-            },
-        )
-    return result
-
-
 @router.post("/api/comics/collection/record-win/commit")
 async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
     """Collapse /comic:collection-add Steps 3/3b/5 into one atomic call (BUI-428).
@@ -1653,13 +1582,14 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
 
       1. Records the merged list via `cmd_collection_record_win` (unchanged
          Metron resolution + BUI-34 already-owned dedup), off the event loop
-         via `asyncio.to_thread` — same BUI-255 rationale as `api_record_win`:
-         a throttled Metron lookup can sleep up to ~60s, and running that
-         directly on this coroutine would stall every other endpoint.
-      2. On an unhandled exception or a BUI-137 `partial_failure`, raises the
-         same shape of 500 `api_record_win` does — and returns *before* the
-         mark-seen step below runs. Record and mark-seen are therefore atomic:
-         nothing is ever marked seen on a partial or failed commit.
+         via `asyncio.to_thread` — BUI-255 rationale: a throttled Metron
+         lookup can sleep up to ~60s, and running that directly on this
+         coroutine would stall every other endpoint.
+      2. On an unhandled exception or a BUI-137 `partial_failure`, raises a
+         500 (same detail shape as the BUI-137/BUI-184 handling below) and
+         returns *before* the mark-seen step below runs. Record and mark-seen
+         are therefore atomic: nothing is ever marked seen on a partial or
+         failed commit.
       3. On full success (no exception, `partial_failure` is falsy), marks
          seen exactly the item_ids THIS call merged and submitted — never a
          re-derivation from a client-side file that might disagree with what
@@ -1686,9 +1616,9 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
             status_code=500, detail=f"collection store unavailable: {exc}"
         ) from exc
     except Exception as exc:
-        # Mirrors api_record_win's BUI-184 backstop. Raised BEFORE any
-        # mark-seen call, so an unhandled mid-batch exception — commit state
-        # uncertain — never marks anything seen.
+        # BUI-184 backstop. Raised BEFORE any mark-seen call, so an
+        # unhandled mid-batch exception — commit state uncertain — never
+        # marks anything seen.
         raise HTTPException(
             status_code=500,
             detail={
@@ -2310,9 +2240,17 @@ async def api_seller_scan_seen_add(request: Request, req: SellerScanSeenRequest)
 # ---------------------------------------------------------------------------
 # BUI-121: collection-wins seen-tracking. Lets /comic:collection-add skip WON
 # snipes already processed in a prior run rather than re-POSTing them all and
-# relying on the server's already-owned dedup. Best-effort on the client: a
-# failed call only costs a duplicate POST (dedup still catches it), never a
-# skipped win.
+# relying on the server's already-owned dedup.
+#
+# BUI-453: the write side used to be a standalone POST endpoint
+# (`api_collection_wins_seen_add`), called by the skill as a separate step
+# after recording. BUI-428's `POST .../record-win/commit` replaced that with
+# an in-process call to `mark_collection_wins_seen` (see above) keyed off the
+# exact item_ids it just committed, so the standalone POST route had no
+# remaining HTTP caller and was removed. The GET route below is still live:
+# `gixen record-win-prep` (packages/gixen-cli/record_win_prep.py,
+# `fetch_seen_ids`) calls it directly to fetch the seen-set BEFORE building a
+# new commit payload — do not remove it.
 # ---------------------------------------------------------------------------
 
 
@@ -2320,17 +2258,9 @@ async def api_seller_scan_seen_add(request: Request, req: SellerScanSeenRequest)
 async def api_collection_wins_seen(request: Request):
     """Return item_ids already processed by /comic:collection-add as ``{"item_ids": [...]}``.
 
-    Used at the start of a collection-add run so the skill can skip wins that
-    were recorded on a previous run.
+    Used at the start of a collection-add run (`gixen record-win-prep`) so the
+    skill can skip wins that were recorded on a previous run. Still live —
+    see the BUI-453 note above before removing.
     """
     db = request.app.state.db
     return {"item_ids": sorted(get_collection_wins_seen(db))}
-
-
-@router.post("/api/comics/collection/record-win/seen")
-async def api_collection_wins_seen_add(request: Request, req: CollectionWinsSeenRequest):
-    """Mark win item_ids as processed. Idempotent — re-marking keeps the first
-    first_seen_at. Returns ``{"marked": <newly-inserted count>}``."""
-    db = request.app.state.db
-    inserted = mark_collection_wins_seen(db, req.item_ids)
-    return {"marked": inserted}
