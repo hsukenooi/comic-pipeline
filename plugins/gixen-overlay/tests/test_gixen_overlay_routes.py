@@ -227,46 +227,24 @@ def test_collection_wins_seen_empty_on_fresh_db(api):
     assert r.json() == {"item_ids": []}
 
 
-def test_collection_wins_seen_post_then_get_roundtrips(api):
-    r = api.post(
-        "/api/comics/collection/record-win/seen",
-        json={"item_ids": ["111", "222"]},
-    )
-    assert r.status_code == 200
-    assert r.json() == {"marked": 2}
-    assert api.get("/api/comics/collection/record-win/seen").json() == {
-        "item_ids": ["111", "222"]
-    }
-
-
-def test_collection_wins_seen_post_is_idempotent(api):
-    api.post("/api/comics/collection/record-win/seen", json={"item_ids": ["111"]})
-    # Re-marking an existing id inserts nothing new.
-    r = api.post(
-        "/api/comics/collection/record-win/seen",
-        json={"item_ids": ["111", "333"]},
-    )
-    assert r.json() == {"marked": 1}
-    assert api.get("/api/comics/collection/record-win/seen").json() == {
-        "item_ids": ["111", "333"]
-    }
-
-
-def test_collection_wins_seen_accumulates_across_posts(api):
-    api.post("/api/comics/collection/record-win/seen", json={"item_ids": ["111"]})
-    api.post("/api/comics/collection/record-win/seen", json={"item_ids": ["222"]})
-    assert api.get("/api/comics/collection/record-win/seen").json() == {
-        "item_ids": ["111", "222"]
-    }
+# BUI-453: the standalone `POST /api/comics/collection/record-win/seen`
+# endpoint (and its dedicated round-trip/idempotency/accumulates tests) was
+# removed as unreferenced — `POST .../record-win/commit` (BUI-428) marks
+# seen internally via `mark_collection_wins_seen` directly, never over HTTP.
+# The GET route above stays live (`gixen record-win-prep` still calls it) and
+# stays covered reading a non-empty state via the commit tests in
+# test_collection_api.py (e.g.
+# test_record_win_commit_merges_and_marks_exactly_the_committed_set), plus
+# the DB-layer mark/get unit tests in test_gixen_overlay_db.py.
 
 
 # ---------------------------------------------------------------------------
-# POST /api/comics/collection/record-win (BUI-255: async offload)
+# POST /api/comics/collection/record-win/commit (BUI-255: async offload)
 # ---------------------------------------------------------------------------
 
 
-def test_record_win_offloaded_does_not_block_other_endpoints(api):
-    """A slow record-win call must not freeze the rest of the server.
+def test_record_win_commit_offloaded_does_not_block_other_endpoints(api):
+    """A slow record-win/commit call must not freeze the rest of the server.
 
     Regression test for the BUI-247 audit finding: `cmd_collection_record_win`
     used to run directly on the request coroutine, so a Metron rate-limit
@@ -274,6 +252,9 @@ def test_record_win_offloaded_does_not_block_other_endpoints(api):
     endpoint (e.g. GET /api/comics) hung until the batch finished, requiring a
     server restart. `asyncio.to_thread` (BUI-255) now offloads the call to a
     worker thread so the event loop keeps serving other requests concurrently.
+    BUI-453: ported from the removed standalone `POST .../record-win`
+    endpoint to `.../record-win/commit` (the live path), which offloads via
+    the identical `asyncio.to_thread(cmd_collection_record_win, ...)` call.
 
     The mock uses a plain blocking wait (not `asyncio.sleep`) — that's what
     actually wedges an un-offloaded coroutine; an awaited `asyncio.sleep`
@@ -304,9 +285,9 @@ def test_record_win_offloaded_does_not_block_other_endpoints(api):
 
     result_holder: dict = {}
 
-    def _post_record_win():
+    def _post_record_win_commit():
         result_holder["response"] = api.post(
-            "/api/comics/collection/record-win",
+            "/api/comics/collection/record-win/commit",
             json={
                 "wins": [{
                     "item_id": "1",
@@ -321,7 +302,7 @@ def test_record_win_offloaded_does_not_block_other_endpoints(api):
         "gixen_overlay.routes.cmd_collection_record_win",
         side_effect=_slow_record_win,
     ):
-        thread = threading.Thread(target=_post_record_win)
+        thread = threading.Thread(target=_post_record_win_commit)
         thread.start()
         try:
             # Give the POST a moment to actually start and block on release.wait().
@@ -334,8 +315,8 @@ def test_record_win_offloaded_does_not_block_other_endpoints(api):
             thread.join(timeout=5)
 
     assert other.status_code == 200
-    # Must return promptly — NOT queued behind the still-blocked record-win
-    # call (which only releases after `release.set()` above).
+    # Must return promptly — NOT queued behind the still-blocked
+    # record-win/commit call (which only releases after `release.set()` above).
     assert elapsed < 2.0
 
     assert result_holder["response"].status_code == 200

@@ -661,90 +661,16 @@ def _reseed_with_index(store, index):
 _ASM_INDEX = {"amazing spider-man": "The Amazing Spider-Man"}
 
 
-def test_record_win_appends_and_is_readable(client):
-    _reseed_with_index(client.store, _ASM_INDEX)
-    win = {
-        "item_id": "115500000001",
-        "current_bid": "42.00",
-        "end_date_iso": "2026-06-04T18:00:00Z",
-        "identify_data": {"series": "Amazing Spider-Man", "issue": "301", "year": "1988"},
-    }
-    r = client.post("/api/comics/collection/record-win", json={"wins": [win]})
-    assert r.status_code == 200, r.text
-    assert r.json()["rows_written"] == 1
-
-    # R8: the append is immediately visible on the next read from the same store.
-    # No `year` filter here: a record-win row resolved via series_name_index has
-    # no Metron data, so release_date is None — a year-gated check would miss it
-    # (pre-existing locg-cli behavior, faithfully wrapped by the endpoint).
-    chk = client.get("/api/comics/collection/check", params={"series": "Amazing Spider-Man", "issue": "301"})
-    assert chk.json()["match_status"] == "in_collection"
-
-
-def test_record_win_skips_already_owned(client):
-    _reseed_with_index(client.store, _ASM_INDEX)
-    win = {
-        "item_id": "115500000002",
-        "current_bid": "999.00",
-        "end_date_iso": "2026-06-04T18:00:00Z",
-        "identify_data": {"series": "Amazing Spider-Man", "issue": "300", "year": "1988"},
-    }
-    r = client.post("/api/comics/collection/record-win", json={"wins": [win]})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["rows_written"] == 0
-    assert body["skipped_already_owned"] >= 1
-
-
-def test_record_win_partial_failure_returns_non_200(client):
-    """BUI-137: a chunked record-win where a later chunk's write raises returns
-    partial_failure=True with only the committed rows counted. The endpoint must
-    surface that as a non-200 (not a misleading HTTP 200) so the skill's `curl
-    -sf` halts instead of reporting success and silently dropping the lost wins.
-    """
-    partial = {
-        "rows_written": 25,
-        "partial_failure": True,
-        "manual_variant_count": 0,
-        "manual_series_count": 0,
-        "metron_lookups_succeeded": 0,
-        "skipped_already_owned": 0,
-    }
-    with patch("gixen_overlay.routes.cmd_collection_record_win", return_value=partial):
-        win = {
-            "item_id": "115500009999",
-            "current_bid": "10.00",
-            "end_date_iso": "2026-06-04T18:00:00Z",
-            "identify_data": {"series": "Amazing Spider-Man", "issue": "400", "year": "1995"},
-        }
-        r = client.post("/api/comics/collection/record-win", json={"wins": [win]})
-    assert r.status_code == 500, r.text
-    # The partial result is carried through so the user sees what was/wasn't written.
-    detail = r.json()["detail"]
-    assert detail["error"] == "partial_failure"
-    assert detail["rows_written"] == 25
-
-
-def test_record_win_non_runtime_error_returns_useful_500(client):
-    """BUI-184: a non-RuntimeError raised mid-batch must surface as a 500 with a
-    useful detail (which says the commit state is uncertain), not an opaque 500.
-    """
-    with patch(
-        "gixen_overlay.routes.cmd_collection_record_win",
-        side_effect=ValueError("boom mid-batch"),
-    ):
-        win = {
-            "item_id": "115500008888",
-            "current_bid": "10.00",
-            "end_date_iso": "2026-06-04T18:00:00Z",
-            "identify_data": {"series": "Amazing Spider-Man", "issue": "401", "year": "1995"},
-        }
-        r = client.post("/api/comics/collection/record-win", json={"wins": [win]})
-    assert r.status_code == 500, r.text
-    detail = r.json()["detail"]
-    assert detail["error"] == "record_win_failed"
-    assert "uncertain" in detail["message"]
-    assert "ValueError" in detail["exception"]
+# BUI-453: the standalone `POST /api/comics/collection/record-win` endpoint
+# (and its dedicated tests: appends-and-is-readable, skips-already-owned,
+# partial-failure-returns-non-200, non-runtime-error-returns-useful-500) was
+# removed as unreferenced — /comic:collection-add now goes exclusively
+# through `POST .../record-win/commit` (BUI-428) below, which already covers
+# the same series_name_index-resolution, BUI-137 partial-failure, and
+# BUI-184 non-RuntimeError behavior (see
+# test_record_win_commit_merges_and_marks_exactly_the_committed_set,
+# test_record_win_commit_partial_failure_returns_500_and_marks_nothing_seen,
+# test_record_win_commit_unhandled_exception_marks_nothing_seen).
 
 
 # ===========================================================================

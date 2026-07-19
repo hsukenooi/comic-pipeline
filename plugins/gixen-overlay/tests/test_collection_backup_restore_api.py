@@ -138,10 +138,13 @@ def test_backup_survives_subsequent_store_churn(client):
     backup_path = Path(r.json()["backup_path"])
     pre_churn = (backup_path / "collection.json").read_bytes()
 
-    # Churn the store past the 3-generation .bak ring depth via record-win.
+    # Churn the store past the 3-generation .bak ring depth via
+    # record-win/commit (BUI-453: the old standalone record-win endpoint was
+    # removed; commit is the sole write path now, and equally exercises the
+    # store-write/.bak-rotation logic this test is churning against).
     for i in range(5):
         client.post(
-            "/api/comics/collection/record-win",
+            "/api/comics/collection/record-win/commit",
             json={"wins": [{
                 "item_id": f"churn-{i}",
                 "current_bid": 1.0,

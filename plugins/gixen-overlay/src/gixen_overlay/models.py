@@ -203,25 +203,6 @@ class SellerScanSeenRequest(BaseModel):
     seller: str | None = None
 
 
-class CollectionWinsSeenRequest(BaseModel):
-    """POST /api/comics/collection/record-win/seen — mark win item_ids as processed (BUI-121)."""
-
-    item_ids: list[str]
-
-
-class RecordWinRequest(BaseModel):
-    """POST /api/comics/collection/record-win — append won auctions (BUI-92).
-
-    Each win mirrors the shape /comic:collection-add builds:
-    ``{item_id, current_bid, end_date_iso,
-       identify_data: {series, issue, year?, variant_text?}}``.
-    The list is passed straight to locg-cli's cmd_collection_record_win, which
-    owns the Metron series resolution + BUI-34 already-owned dedup.
-    """
-
-    wins: list[dict]
-
-
 class RecordWinCommitRequest(BaseModel):
     """POST /api/comics/collection/record-win/commit — merge + record +
     mark-seen + status in one atomic call (BUI-428).
