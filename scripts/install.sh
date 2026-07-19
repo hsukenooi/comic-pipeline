@@ -45,10 +45,13 @@
 # After merging overlay/server changes (gixen-cli server/, plugins/gixen-overlay),
 # the Mac Mini additionally needs (BUI-377):
 #   uv sync --all-packages
-#   launchctl kickstart -k gui/$(id -u)/com.comics.server
+#   launchctl kickstart -k gui/$(id -u)/com.gixen.server
 # (the comics server runs via launchd out of the workspace .venv, which this
 # script does NOT refresh; observed: post-merge the running server served
-# pre-merge verdicts until sync + kickstart).
+# pre-merge verdicts until sync + kickstart. The loaded launchd label is still
+# com.gixen.server — the BUI-220 comics-server rename never reached it,
+# BUI-425 — confirmed live with a PID on the Mac Mini during the BUI-450..455
+# deploy, BUI-457.)
 #
 set -euo pipefail
 
