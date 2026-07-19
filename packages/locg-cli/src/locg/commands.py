@@ -3123,6 +3123,101 @@ def cmd_collection_series_names() -> dict[str, Any]:
     return {"series_names": names, "count": len(names)}
 
 
+# BUI-449: series-name reconciliation was duplicated in two skills, each of
+# which pulled cmd_collection_series_names' FULL catalog array into model
+# context and hand-rolled its own normalized/fuzzy matching. This resolver is
+# the one tested place that logic lives now; the overlay endpoint is a thin
+# wrapper (routes.py) and both skills call it instead of reimplementing it.
+_SERIES_NAME_FUZZY_THRESHOLD = 0.8
+
+
+def _series_name_tokens(text: str) -> set[str]:
+    """Tokenize a series name for fuzzy comparison.
+
+    The exact-key pass (`_normalize_series_key`) already neutralizes leading
+    articles, `(Vol. N)`, and year suffixes/ranges — this tokenizer is only
+    reached for names that survive THAT pass unmatched, so it only needs to
+    smooth punctuation/spacing choices (hyphens, ampersands, casing), e.g.
+    "Spider-Man" vs "Spider Man".
+    """
+    return {t for t in re.sub(r"[^a-z0-9]+", " ", text.lower()).split() if t}
+
+
+def _fuzzy_series_name_match(query: str, catalog_names: list[str]) -> Optional[str]:
+    """Best confident fuzzy match of ``query`` against catalog series names.
+
+    Confirmed (BUI-171 verification): the only residual false-negative class
+    once `_normalize_series_key` handles article/Vol/year drift is a genuine
+    alt-spelling — punctuation, abbreviation, or Metron-vs-LOCG word choice —
+    which is real but narrow. Token-Jaccard similarity catches that class
+    while a high threshold (0.8) protects the BUI-26 conflation trap this
+    same module guards elsewhere: "Fantastic Four" vs "Fantastic Four Annual"
+    (or "Giant-Size ..." / "King-Size ..." / "... Special") always scores well
+    below 0.8 because Jaccard penalizes the extra/missing disambiguating
+    token, so a shared-masthead line-extension can never masquerade as its
+    base series here.
+
+    Also requires the winning match be UNIQUE at/above threshold — if two
+    catalog names both clear it, the query is genuinely ambiguous and this
+    returns ``None`` ("no confident match") rather than guessing between them.
+    """
+    want = _series_name_tokens(query)
+    if not want:
+        return None
+
+    winners: list[str] = []
+    for name in catalog_names:
+        have = _series_name_tokens(name)
+        if not have:
+            continue
+        score = len(want & have) / len(want | have)
+        if score >= _SERIES_NAME_FUZZY_THRESHOLD:
+            winners.append(name)
+
+    return winners[0] if len(winners) == 1 else None
+
+
+def cmd_collection_series_names_resolve(names: list[str]) -> dict[str, Any]:
+    """Reconcile one or more query series names to the LOCG catalog spelling.
+
+    For each name in ``names``, returns the reconciled catalog spelling — via
+    an exact `_normalize_series_key` hit first (covers leading-article/
+    `(Vol. N)`/year-suffix drift, the SAME normalization `cmd_collection_check`
+    gates ownership on), then a confidence-gated fuzzy fallback
+    (:func:`_fuzzy_series_name_match`, covers the narrower genuine-alt-spelling
+    residual, BUI-171) — or a "no confident match" verdict (``resolved: None``)
+    when neither pass finds one.
+
+    Returns ``{"results": [{"query", "resolved", "match_kind"}, ...]}`` in the
+    same order as ``names``. ``match_kind`` is ``"exact"``, ``"fuzzy"``, or
+    ``None`` (no confident match — ``resolved`` is also ``None`` in that case).
+    This is the ONE tested place the reconciliation lives (BUI-449); the
+    overlay's `/api/comics/collection/series-names/resolve` endpoint is a thin
+    wrapper over this function, and both `/comic:collection-check` and
+    `/comic:wishlist-add` call it instead of pulling the whole catalog array
+    into model context and hand-matching it in-model.
+    """
+    cache = CollectionCache()
+    payload = cache.load()
+    index: dict[str, str] = payload.get("series_name_index", {})
+    catalog_names = sorted(set(index.values()), key=str.lower)
+
+    results: list[dict[str, Any]] = []
+    for query in names:
+        key = _normalize_series_key(query)
+        if key in index:
+            results.append({"query": query, "resolved": index[key], "match_kind": "exact"})
+            continue
+
+        fuzzy = _fuzzy_series_name_match(query, catalog_names)
+        if fuzzy is not None:
+            results.append({"query": query, "resolved": fuzzy, "match_kind": "fuzzy"})
+        else:
+            results.append({"query": query, "resolved": None, "match_kind": None})
+
+    return {"results": results}
+
+
 # BUI-373: printing suffixes ("2nd print"/"second print"/"2nd printing") used
 # to live here as exact-match keys — a second, independent, less-complete
 # printing-marker detector that could drift from _PRINTING_MARKER_RE (it never

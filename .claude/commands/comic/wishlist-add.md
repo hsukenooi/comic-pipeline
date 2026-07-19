@@ -116,23 +116,28 @@ Wish-listing a book you already own is the bug that deleted real collection rows
 (BUI-122): an owned-but-wished book gets pushed to LOCG with `In Collection=0`,
 which removes it from the collection. Filter owned issues out **before** adding.
 
-**First, reconcile the Metron series name to the LOCG catalog spelling (BUI-171),**
-the same defense `/comic:collection-check` uses. The matcher already neutralizes
-leading articles (`The`/`A`/`An`), `(Vol. N)`, and year suffixes, but a genuine
+**First, reconcile the Metron series name to the LOCG catalog spelling
+(BUI-171/449),** the same defense `/comic:collection-check` uses. A genuine
 alt-spelling (punctuation, abbreviation, Metron-vs-LOCG word choice) makes every
 owned issue return a false `not_in_cache` — which Step 3 reads as "not owned" and
-wish-lists a book you already own. Fetch the catalog's actual series names and
-match the Metron `series` against them:
+wish-lists a book you already own. Resolve the Metron series name against the
+catalog — the matcher-owned endpoint returns a scalar verdict, never the full
+catalog array:
 
 ```bash
-comics_curl "$COMICS_SERVER_URL/api/comics/collection/series-names" || exit 1
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/series-names/resolve" \
+  -H 'content-type: application/json' \
+  -d "$(python3 -c 'import json,sys; print(json.dumps({"names": [sys.argv[1]]}))' "<SERIES>")"
 ```
 
-Normalized-match the Metron `series` (strip a leading article, lowercase) against
-the returned names. If a confident catalog match exists, use **that catalog
-spelling** as the `series` param in the per-issue check below. If none matches,
-proceed with the Metron name but note that ownership for this series couldn't be
-reconciled — a `not_in_cache` here may be a spelling miss, not genuinely un-owned.
+The response is `{"results": [{"query", "resolved", "match_kind"}]}` — one
+entry echoing your query. If `resolved` is non-null, use **that catalog
+spelling** as the `series` param in the per-issue check below (`match_kind`
+is `"exact"` when it's just an article/`(Vol. N)`/year-suffix difference,
+`"fuzzy"` for a genuine alt-spelling). If `resolved` is null ("no confident
+match"), proceed with the Metron name but note that ownership for this series
+couldn't be reconciled — a `not_in_cache` here may be a spelling miss, not
+genuinely un-owned.
 
 Check every resolved issue against the server's collection in **one batch call**
 (BUI-204), not a serial per-issue loop. The batch endpoint runs the exact same

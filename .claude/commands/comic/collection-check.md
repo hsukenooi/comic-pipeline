@@ -280,22 +280,29 @@ curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
 - For rows still `not_in_cache`, leave the original verdict and add no flag.
 
 **Pattern C — ambiguous / unrecognized series name (wrong-volume or silent-miss risk).**
-The matcher requires an *exact* normalized series-key match, so a series name that
-differs from the LOCG catalog spelling (e.g. Metron's `Uncanny X-Men (Vol. 1)` vs.
-the catalog's `Uncanny X-Men`) yields a silent `not_in_cache` even when owned
-(BUI-129). When a `not_in_cache` row's series name is short/generic, could be the
-wrong volume, or looks like a Metron-style name, fetch the cache's actual series
-names and check whether the queried name is present (or close to one):
+A series name that isn't the LOCG catalog's exact spelling can yield a silent
+`not_in_cache` even when owned (BUI-129/171). When a `not_in_cache` row's series
+name is short/generic, could be the wrong volume, or looks like a Metron-style
+name, resolve it against the catalog (BUI-449) — this returns a scalar per name,
+never the full catalog array. Batch every suspect row's series name into one call:
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
 comics_resolve_server || exit 1
-curl -sf "$COMICS_SERVER_URL/api/comics/collection/series-names"
+curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/series-names/resolve" \
+  -H 'content-type: application/json' \
+  -d '{"names": ["Uncanny X-Men (Vol. 1)", "<other suspect series names>"]}'
 ```
 
-If the queried series is **absent** from that list, the `not_in_cache` is suspect —
-flag and recommend re-checking under the matching catalog name:
-> ⚠️ ambiguous/unrecognized series — "Uncanny X-Men (Vol. 1)" is not a cache series name; did you mean "Uncanny X-Men"? Re-check under the catalog name before trusting this verdict
+The response is `{"results": [{"query", "resolved", "match_kind"}, ...]}` in
+request order — `match_kind` is `"exact"`, `"fuzzy"`, or `null` ("no confident
+match", `resolved` is also `null`). If `resolved` is non-null and differs from
+the row's original series name, the `not_in_cache` is suspect — flag and
+recommend re-checking under the resolved catalog spelling:
+> ⚠️ ambiguous/unrecognized series — "Uncanny X-Men (Vol. 1)" is not the catalog spelling; did you mean "Uncanny X-Men"? Re-check under the catalog name before trusting this verdict
+
+If `resolved` is `null`, there is no confident catalog spelling to reconcile
+against — leave the verdict as-is.
 
 **Pattern D — masthead-alias match, unconfirmed volume (false positive, BUI-249).**
 This one is mechanized, not heuristic: when a row returns `in_collection` AND
