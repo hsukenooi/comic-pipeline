@@ -148,7 +148,7 @@ Verdicts (ladder — first failure wins):
 
 One line per non-`fully_linked` verdict:
 
-- `needs_manual` → "This book is flagged `needs_manual` (reason: `<flag_reason>`) — its comp pool can't be auto-priced. Hand-price it via grade-curve interpolation or the CGC proxy (see `/comic:fmv` §7/§7a), or skip. Do NOT re-run `/comic:fmv` — it will just re-flag it."
+- `needs_manual` → "This book is flagged `needs_manual` (reason: `<flag_reason>`) — its comp pool can't be auto-priced. Hand-price it via grade-curve interpolation or the CGC proxy (see `docs/conventions/fmv-math-spec.md` §7/§7a), or skip. Do NOT re-run `/comic:fmv` — it will just re-flag it."
 - `fmv_stub` → "Run `/comic:fmv` for this comic at the missing grade(s)."
 - `no_fmv_at_grade` → "The bid's grade doesn't have an FMV row yet. Run `/comic:fmv` at this grade."
 - `no_comic` → "No comic linked. Run `POST /api/extract-comics` or re-run `/comic:snipe-add` with `--locg-id` set."
