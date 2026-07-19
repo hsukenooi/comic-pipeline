@@ -312,6 +312,26 @@ def _listed_win_evidence_already_covered(
          False → the fetch runs, matching the pre-BUI-410 behavior for the
          row-less / tombstoned / divergent-group winner cases.
 
+    BUI-420 exception to case 2: the "update_bid_status records the ledger for
+    such a row itself" premise is FALSE when the covering row's auction_end_at
+    is still NULL. update_bid_status's win_rows capture (db.py) filters
+    `auction_end_at IS NOT NULL` on purpose — the UPDATE's
+    `COALESCE(auction_end_at, resolved_at)` would otherwise fill the end with an
+    observation-time proxy, and the permanent ledger must never store a proxy
+    (it could falsely group-cancel a sibling added after the true win — the
+    recycled-group false-REMOVED hazard). So a null-end live-row winner is
+    covered by NEITHER the (skipped) update_bid_status ledger write NOR — if we
+    returned True here — the eBay-end fetch: a double-skip that leaves no
+    durable group_wins evidence, and a purge in the same cycle erases it
+    forever (the exact BUI-419 durability gap; the two db.py fixes it proposed
+    were both rejected as unsafe/unworkable). A null-end winner therefore falls
+    through to False so the gather phase fetches its GENUINE eBay end and
+    _apply_listed_win_evidence records that (never a proxy) — the same
+    genuine-end path the row-less / divergent-group winners take. Only null-end
+    Case-A winners newly consume a fetch; a non-null-end Case-A winner is still
+    skipped (its win_rows capture fires), so the budget-conservation guard
+    (test_listed_win_case_a_does_not_consume_fetch_budget) is preserved.
+
     Skipping case-2 winners at GATHER time (not just re-checking at apply time)
     is load-bearing, not an optimization: the per-sync fetch budget
     (`_LISTED_WIN_FETCH_MAX_PER_SYNC`) must not be burned on a winner whose
@@ -333,6 +353,18 @@ def _listed_win_evidence_already_covered(
         return True
     row = get_bid_by_item_id(db, item_id)
     if row is None or row["status"] in ("PURGED", "REMOVED"):
+        return False
+    # BUI-420: a live-row winner whose auction_end_at is still NULL is NOT
+    # covered by update_bid_status — its win_rows capture filters
+    # `auction_end_at IS NOT NULL` (refusing to promote the resolved_at proxy
+    # the UPDATE's COALESCE fills into the permanent ledger), so it records
+    # nothing for this row. Returning True here would double-skip it (no fetch
+    # AND no ledger) and a same-cycle purge would then erase the group-win
+    # evidence permanently (the BUI-419 durability gap). Fall through to the
+    # eBay-end fetch instead, so _apply_listed_win_evidence records a GENUINE
+    # end — never a proxy. A non-null end is left to the branches below, so the
+    # non-null-end Case-A budget guard is unchanged (see the docstring).
+    if row["auction_end_at"] is None:
         return False
     if row["status"] == "PENDING":
         return True
