@@ -11,26 +11,7 @@ This is a **warn-only** verification — it doesn't fix anything, just surfaces 
 
 ## How to read this file (BUI-361)
 
-This skill is split into two sections:
-
-- **EXECUTOR CONTRACT** — everything the agent performing the verification call
-  must do (pre-flight, the call, hard-fail semantics, presentation),
-  self-contained like collection-check.md's — the executor reads the whole
-  file and follows the contract. It has one declared cross-reference: its
-  Presentation step reads the verdict ladder from ORCHESTRATOR NOTES § Verdict
-  ladder instead of restating it (kept as a single copy on purpose so the two
-  can't drift apart). Because the executor reads the whole file, not just this
-  section, that reference resolves within the same read — it isn't a promise
-  of isolation the file then breaks. This is the section a dispatched executor
-  — or a standalone `/comic:verify` run — executes.
-- **ORCHESTRATOR NOTES** — the verdict ladder, per-verdict guidance, and
-  when-to-invoke. **`/comic:buy` Step 6 reads only this section**: BUI-360 folded
-  the verify call into `gixen add-batch --verify`, so in the buy flow there is
-  no verify executor — the orchestrator just interprets the embedded verdicts
-  with the ladder below.
-
-**Standalone invocation**: you are both roles — execute the EXECUTOR CONTRACT,
-then interpret and present the results with the ORCHESTRATOR NOTES.
+**EXECUTOR CONTRACT** = run it; **ORCHESTRATOR NOTES** = the verdict ladder + guidance that `/comic:buy` Step 6 reads directly (no executor dispatched there since BUI-360). Standalone `/comic:verify` runs: do both, in order.
 
 ---
 
@@ -49,14 +30,7 @@ comics_health_gate     || exit 1
 
 If either fails, stop with: "Cannot verify — the comics server isn't reachable. Skipping verification step."
 
-> **Editor note — fenced blocks don't share shell state (BUI-375):** each
-> fenced bash block below runs in its own fresh shell — a freshly-spawned
-> executor invokes them as separate Bash tool calls, so `$COMICS_SERVER_URL`
-> and the sourced `comics_*` functions from Pre-flight do **not** carry
-> forward. The Call block below re-sources `comics-server.sh` and re-runs
-> `comics_resolve_server` at its own top — keep that pattern on any block you
-> add. This is the exact BUI-352 trap: an un-resourced block curls an empty
-> host, and a swallowing fallback can turn that into a silent false all-clear.
+<!-- Editor note (BUI-375): fenced bash blocks below don't share shell state — each is a fresh shell, so Pre-flight's $COMICS_SERVER_URL / comics_* functions do not carry forward. The Call block re-sources comics-server.sh and re-runs comics_resolve_server at its own top; keep that pattern on any block you add that talks to the server (the BUI-352 trap: an un-resourced block curls an empty host, and a swallowing fallback can turn that into a silent false all-clear). Full writeup: docs/solutions/workflow-issues/multi-block-skill-shell-state-loss-fallback-swallow.md -->
 
 ### Input
 
@@ -72,6 +46,22 @@ A working list. Each entry needs `item_id` (eBay ID) and ideally `grade`. `locg_
 ```
 
 Lots (item_ids linked to multiple comics): pass one row per `(item_id, grade)` you want to confirm. The endpoint walks all `bid_fmvs` for the bid and matches by grade (and `locg_id` if given).
+
+### Write the input
+
+Before the Call block below, write this run's working list to `working_list.verify.json`, **unconditionally overwriting** any file already at that path:
+
+```bash
+cat > working_list.verify.json <<'EOF'
+{
+  "items": [
+    {"item_id": "123456789", "grade": 9.2, "locg_id": 6977652}
+  ]
+}
+EOF
+```
+
+Replace the example `items` array with this run's actual working list. Do this write every time, even if `working_list.verify.json` already exists — the fixed filename is reused across runs, and skipping the write risks the Call block below silently re-verifying a stale list left by a prior invocation instead of this one.
 
 ### Call
 
