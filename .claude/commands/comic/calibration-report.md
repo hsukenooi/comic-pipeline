@@ -18,7 +18,8 @@ scope for this skill.
 
 ## The one rule that must never be "fixed"
 
-> **The signal is OVERSHOOT vs `fmv_high` — never raw win/loss rate.**
+> **The signal is OVERSHOOT vs `fmv_high` — never raw win/loss rate, and
+> never `contested_win_margin`.**
 
 Losing is the *intended* outcome of the 80% (or 60%, on low confidence) bid
 haircut: you deliberately bid below fair value to bargain-hunt, so you are
@@ -26,16 +27,19 @@ haircut: you deliberately bid below fair value to bargain-hunt, so you are
 mispriced by that fact alone — it's the haircut working exactly as designed,
 as long as those losses clear **at or below** `fmv_high`. The only honest
 signal that FMV is too low is that losses persistently clear **above**
-`fmv_high`.
-
-**Do not "improve" this report by adding a win-rate or loss-rate ranking, and
-do not surface a book just because it has many losses.** That reintroduces
-the exact deflation/mispricing trap this report exists to avoid (R4 in the
-plan). If you are editing this skill or the server-side aggregate
+`fmv_high`. **Do not rank or surface a book on `loss_count`, a win/loss
+ratio, or `contested_win_margin` instead of `overshoot`** — that
+reintroduces the exact deflation/mispricing trap this report exists to avoid
+(R4 in the plan). Every other mention of this rule below (response shape,
+Common mistakes) is a one-line pointer back to this section, not a separate
+restatement — if you're tempted to relax the rule anywhere, come edit it
+here. If you are editing this skill or the server-side aggregate
 (`calibration_report` in `plugins/gixen-overlay/src/gixen_overlay/db.py`) and
-find yourself reaching for `loss_count` or a win/loss ratio as a ranking key
-— stop, re-read this section, and re-read the Problem Frame in
-`docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md` first.
+find yourself reaching for one of those banned fields as a ranking key —
+stop, re-read this section, and re-read the Problem Frame in
+`docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md` first
+(the plan and the `calibration_report` docstring carry the extended
+rationale; this section is intentionally the short version).
 
 A book with **only wins**, or **no resolved auctions at all**, never appears
 in this report — there is no loss to measure overshoot from. A book whose
@@ -127,12 +131,11 @@ re-price):
 - `overshoot` — `median(winning_bid / fmv_high)` over losses. **The ranking
   key.** Only rows with `overshoot > 1` appear at all.
 - `above_fmv_loss_rate` — % of losses where `winning_bid > fmv_high`.
-  Reported for context alongside `overshoot`; do not re-sort by it.
+  Context only, reported alongside `overshoot` — never re-sort by it (see
+  "The one rule that must never be 'fixed'" above).
 - `contested_win_margin` — `median(winning_bid / fmv_high)` over **wins**, or
-  `null` if there were no wins. **Context only.** A book winning far below
-  `fmv_high` is a bargain, not evidence the FMV is wrong — never rank on
-  this field, and never let it suppress or promote a row that overshoot
-  already flagged.
+  `null` if there were no wins. Context only — never rank, suppress, or
+  promote a row by it (see "The one rule that must never be 'fixed'" above).
 
 ## Present the results
 
@@ -174,8 +177,8 @@ concern like `/comic:wishlist-sellers` has. A steady-state run that returns
 
 | Mistake | Fix |
 |---|---|
-| Treating a high `loss_count` as the signal | It isn't. Re-read "The one rule that must never be 'fixed'" above — rank on `overshoot`, never on how many times a book lost. |
-| Sorting or filtering by `contested_win_margin` | It's context only. A cheap win is not evidence of a mispriced FMV. |
+| Treating a high `loss_count` as the signal | It isn't — see "The one rule that must never be 'fixed'" above. |
+| Sorting or filtering by `contested_win_margin` | It's context only — see "The one rule that must never be 'fixed'" above. |
 | Rendering an empty table on a failed `comics_get` call | STOP and report the error instead — the hard-fail-loud rule this skill shares with every other `/comic:*` server call. |
 | Assuming this report writes anything | It never does. `fmv_high` only changes when you explicitly re-run `/comic:fmv` afterward. |
 
