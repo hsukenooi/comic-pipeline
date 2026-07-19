@@ -1207,17 +1207,25 @@ def _make_win(
     variant_text: str | None = None,
     current_bid: float = 42.00,
     end_date_iso: str = "2026-05-20T15:00:00Z",
+    edition: str | None = None,
 ) -> dict[str, Any]:
+    identify_data: dict[str, Any] = {
+        "series": series,
+        "issue": issue,
+        "year": year,
+        "variant_text": variant_text,
+    }
+    # BUI-426: the annual/giant-size/king-size qualifier the win pipeline now
+    # carries through so an annual isn't filed as the regular same-numbered
+    # issue. Omitted by default so the existing regular-issue tests exercise the
+    # pre-BUI-426 payload shape unchanged.
+    if edition is not None:
+        identify_data["edition"] = edition
     return {
         "item_id": item_id,
         "current_bid": current_bid,
         "end_date_iso": end_date_iso,
-        "identify_data": {
-            "series": series,
-            "issue": issue,
-            "year": year,
-            "variant_text": variant_text,
-        },
+        "identify_data": identify_data,
     }
 
 
@@ -1574,6 +1582,268 @@ def test_record_win_xmen_modern_relaunch_uses_metron(tmp_path):
     row = cache.load()["comics"][-1]
     assert row["series_name"] == "X-Men (2019 - 2021)"
     assert row["full_title"] == "X-Men #1"
+
+
+# --- BUI-426: annual/king-size/giant-size qualifier must survive resolution ---
+
+def test_record_win_annual_not_filed_as_regular_xmen_issue(tmp_path):
+    """BUI-426 headline: "Uncanny X-Men Annual 6" (1982) must file as
+    "Uncanny X-Men Annual #6", NEVER as the Silver-Age regular "The X-Men #6"
+    (1964) — a different, valuable book the buyer does NOT own. Without the
+    edition qualifier the classic X-Men split (#6 <= 141 -> The X-Men) filed it
+    as the regular issue, falsely claiming ownership."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    # Both classic regular volumes AND the dedicated annual series are present,
+    # so the resolver has every chance to mis-file to a regular volume.
+    _seed_export_series(cache, [
+        "The X-Men (Vol. 1) (1963 - 1981)",
+        "Uncanny X-Men (Vol. 1) (1980 - 2011)",
+        "Uncanny X-Men Annual (1980 - 2011)",
+    ])
+
+    cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="6", year=1982, edition="annual")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["full_title"] == "Uncanny X-Men Annual #6"
+    assert row["series_name"] == "Uncanny X-Men Annual (1980 - 2011)"
+    # The false-ownership guard: it must NOT be the Silver-Age regular volume.
+    assert row["series_name"] != "The X-Men (Vol. 1) (1963 - 1981)"
+    assert "Annual" in row["full_title"]
+
+
+def test_record_win_annual_10_ticket_case(tmp_path):
+    """BUI-426 ticket case 2: Uncanny X-Men Annual 10 (1986)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, [
+        "The X-Men (Vol. 1) (1963 - 1981)",
+        "Uncanny X-Men Annual (1980 - 2011)",
+    ])
+
+    cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="10", year=1986, edition="annual")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["full_title"] == "Uncanny X-Men Annual #10"
+    assert row["series_name"] == "Uncanny X-Men Annual (1980 - 2011)"
+
+
+def test_record_win_fantastic_four_annual_ticket_case(tmp_path):
+    """BUI-426 ticket case 3: Fantastic Four Annual #4 must file as
+    "Fantastic Four Annual #4", not the modern regular "Fantastic Four #4"."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, [
+        "Fantastic Four (Vol. 7) (2022 - Present)",
+        "Fantastic Four Annual (1963 - 1974)",
+    ])
+
+    cmd_collection_record_win(
+        [_make_win(series="Fantastic Four", issue="4", year=1966, edition="annual")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["full_title"] == "Fantastic Four Annual #4"
+    assert row["series_name"] == "Fantastic Four Annual (1963 - 1974)"
+    assert "(Vol. 7)" not in row["series_name"]
+
+
+def test_record_win_annual_falls_through_to_manual_when_unseeded(tmp_path):
+    """When the store has no annual volume, an annual win must NOT resolve to a
+    regular volume — it falls through to manual (the safe, flagged direction)
+    with the qualifier preserved in the full_title, never a false regular
+    claim. This is the worst case (no local annual reference)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    # Only the regular X-Men volumes exist locally — the tempting mis-file.
+    _seed_export_series(cache, [
+        "The X-Men (Vol. 1) (1963 - 1981)",
+        "Uncanny X-Men (Vol. 1) (1980 - 2011)",
+    ])
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="6", year=1982, edition="annual")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    assert result["manual_series_count"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["needs_manual_series_canonical"] is True
+    assert "Annual" in row["full_title"]
+    # Never the false Silver-Age regular claim.
+    assert row["series_name"] != "The X-Men (Vol. 1) (1963 - 1981)"
+    assert row["full_title"] != "The X-Men #6"
+
+
+def test_record_win_annual_no_year_still_not_regular_claim(tmp_path):
+    """Adversarial (BUI-426): even with NO year, an annual must never collapse
+    into the classic X-Men issue-number split. The split keys off the exact
+    norm_key, which is now "uncanny x-men annual" (not a split key), so the
+    #<=141 boundary can't fire — no year needed. (record-win-prep's BUI-422
+    gate separately reviews high-value null-year wins upstream; this asserts the
+    resolver itself is safe if one reaches it.)"""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, [
+        "The X-Men (Vol. 1) (1963 - 1981)",
+        "Uncanny X-Men (Vol. 1) (1980 - 2011)",
+        "Uncanny X-Men Annual (1980 - 2011)",
+    ])
+
+    cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="6", year=None, edition="annual")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert "Annual" in row["full_title"]
+    assert row["full_title"] != "The X-Men #6"
+    assert row["series_name"] != "The X-Men (Vol. 1) (1963 - 1981)"
+
+
+def test_record_win_giant_size_not_filed_as_regular_issue(tmp_path):
+    """BUI-426: Giant-Size keeps its qualifier in the series text (LOCG's own
+    series), so it resolves as a distinct identity — never regular X-Men #1.
+    Worst case here: only the regular volume is seeded locally, so the
+    giant-size win falls through to manual with its qualifier intact rather than
+    collapsing into the tempting regular "The X-Men #1"."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, ["The X-Men (Vol. 1) (1963 - 1981)"])
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Giant-Size X-Men", issue="1", year=1975,
+                   edition="giant-size")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["full_title"] == "Giant-Size X-Men #1"
+    assert row["series_name"] != "The X-Men (Vol. 1) (1963 - 1981)"
+    assert result["manual_series_count"] == 1
+
+
+def test_record_win_giant_size_resolves_to_own_series_when_seeded(tmp_path):
+    """BUI-426: when the store DOES hold the Giant-Size series, the win resolves
+    to it (decoration stripped in full_title) — a distinct row from regular
+    X-Men. The seed uses a non-#1 issue so it doesn't dedup the #1 win away."""
+    from locg.commands import cmd_collection_record_win
+    from locg.collection_cache import rebuild_series_name_index
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(
+            series="Giant-Size X-Men (1975 - 1975)",
+            full_title="Giant-Size X-Men #2",
+        ),
+        "source": "locg_export",
+        "gixen_item_id": "gs-seed",
+    }])
+
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    cmd_collection_record_win(
+        [_make_win(series="Giant-Size X-Men", issue="1", year=1975,
+                   edition="giant-size")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["full_title"] == "Giant-Size X-Men #1"
+    assert row["series_name"] == "Giant-Size X-Men (1975 - 1975)"
+
+
+def test_record_win_king_size_special_not_filed_as_regular_issue(tmp_path):
+    """BUI-426: a King-Size Special win must never collapse into the regular
+    same-numbered issue. King-Size stays in the series text, so it resolves as
+    a distinct identity (or manual) — the safe direction, no false claim."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, ["The Amazing Spider-Man (Vol. 1) (1963 - 1998)"])
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man King-Size Special", issue="1",
+                   year=1964, edition="king-size")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    # It must NOT be filed as the regular ASM #1 (a $30k+ book).
+    assert row["full_title"] != "The Amazing Spider-Man #1"
+    assert row["series_name"] != "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+    assert "King-Size" in row["full_title"]
+    assert result["manual_series_count"] == 1
+
+
+def test_record_win_regular_xmen_issue_still_splits_no_edition(tmp_path):
+    """BUI-426 must NOT regress the classic X-Men split for GENUINE regular
+    issues: a plain "Uncanny X-Men #6" (no edition) still resolves to the
+    Silver-Age "The X-Men #6" exactly as before."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_export_series(cache, ["Uncanny X-Men (Vol. 1) (1980 - 2011)"])
+
+    cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="6", year=1966)],  # no edition
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "The X-Men (Vol. 1) (1963 - 1981)"
+    assert row["full_title"] == "The X-Men #6"
+
+
+def test_record_win_annual_dedups_against_owned_annual_not_regular(tmp_path):
+    """BUI-426 + BUI-34: an annual win must dedup against an owned ANNUAL row,
+    and must NOT be swallowed by (or swallow) an owned REGULAR same-numbered
+    issue — the two are distinct identities."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    # Own the regular The X-Men #6 already; the annual win is genuinely new.
+    _seed_cache(cache, [_agent_win_row(
+        series="The X-Men (Vol. 1) (1963 - 1981)",
+        full_title="The X-Men #6",
+    )])
+    _seed_export_series(cache, ["Uncanny X-Men Annual (1980 - 2011)"])
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Uncanny X-Men", issue="6", year=1982, edition="annual")],
+        cache=cache,
+        metron=_null_metron(),
+    )
+
+    # The annual is NOT skipped as already-owned (regular #6 must not shadow it).
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["full_title"] == "Uncanny X-Men Annual #6"
 
 
 def test_record_win_volume_resolved_by_year_iron_man(tmp_path):

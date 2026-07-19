@@ -395,6 +395,66 @@ def test_entries_for_win_lot_dedupes_repeated_issue_numbers():
 
 
 # ---------------------------------------------------------------------------
+# entries_for_win — BUI-426 edition qualifier forwarding
+# ---------------------------------------------------------------------------
+
+
+def test_entries_for_win_forwards_annual_edition():
+    """BUI-426: the annual qualifier must survive into identify_data so the
+    resolver files "<Series> Annual #N", not the same-numbered regular issue in
+    the wrong volume (which falsely claimed a different, valuable book)."""
+    win = _snipe("1", title="Uncanny X-men Annual 6 Marvel 1982")
+    identity = _identity(series="Uncanny X-Men", issue="6", year=1982)
+    identity["edition"] = "annual"
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert entries[0]["identify_data"]["edition"] == "annual"
+    assert entries[0]["identify_data"]["series"] == "Uncanny X-Men"
+
+
+def test_entries_for_win_omits_single_issue_edition():
+    """The default "single-issue" edition carries no information — it must NOT
+    bloat identify_data (keeps the common-case payload unchanged)."""
+    win = _snipe("1")
+    identity = _identity(series="Ghost Rider", issue="1")
+    identity["edition"] = "single-issue"
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert "edition" not in entries[0]["identify_data"]
+
+
+def test_entries_for_win_omits_edition_when_absent():
+    """A comic-identify result predating the edition field (or any caller that
+    omits it) must still build a clean identify_data with no `edition` key."""
+    win = _snipe("1")
+    identity = _identity(series="Ghost Rider", issue="1")  # no edition key
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert "edition" not in entries[0]["identify_data"]
+
+
+def test_entries_for_win_forwards_giant_size_edition():
+    """Giant-size is forwarded too (fidelity); the resolver leaves it in the
+    series text since LOCG catalogs it as its own series."""
+    win = _snipe("1", title="Giant-Size X-Men 1")
+    identity = _identity(series="Giant-Size X-Men", issue="1", year=1975)
+    identity["edition"] = "giant-size"
+    entries, _ = entries_for_win(win, identity)
+    assert entries[0]["identify_data"]["edition"] == "giant-size"
+
+
+def test_entries_for_win_annual_lot_forwards_edition_per_constituent():
+    """Each constituent of an annual lot inherits the edition qualifier."""
+    win = _snipe("1", title="X-Men Annual lot 1-2")
+    identity = _identity(series="X-Men", issue=None, is_lot=True,
+                         constituent_issues=["1", "2"])
+    identity["edition"] = "annual"
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert [e["identify_data"]["edition"] for e in entries] == ["annual", "annual"]
+
+
+# ---------------------------------------------------------------------------
 # entries_for_win — BUI-422 missing-year gate
 # ---------------------------------------------------------------------------
 
