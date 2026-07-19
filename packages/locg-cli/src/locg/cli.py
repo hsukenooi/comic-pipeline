@@ -28,6 +28,8 @@ from locg.commands import (
     cmd_collection_has,
     cmd_collection_import,
     cmd_collection_record_win,
+    cmd_collection_remediate_delete,
+    cmd_collection_remediate_set_copies,
     cmd_collection_status,
     cmd_comic,
     cmd_creator_run_lookup,
@@ -191,6 +193,50 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Path to a JSON file containing wins (use '-' to read from stdin)",
     )
+
+    # collection remediate-delete — matcher-bypassing single-row delete (BUI-427)
+    p_rem_del = coll_sub.add_parser(
+        "remediate-delete",
+        parents=[common],
+        help="Delete/decrement ONE collection row by STABLE IDENTITY, bypassing the check matcher",
+        epilog=(
+            "For a volume-mis-filed row the ordinary `collection check` matcher "
+            "can't disambiguate (masthead alias / X-Men split / leading-article "
+            "normalization can target the wrong row, or refuse via "
+            "ambiguous_cross_volume). Supply EXACTLY ONE identity: "
+            "--gixen-item-id, OR --full-title (+ --release-date, --source). "
+            "A row with in_collection > 1 is decremented; a single-copy row is "
+            "removed outright. --dry-run previews without mutating."
+        ),
+    )
+    p_rem_del.add_argument("--gixen-item-id", dest="gixen_item_id", help="The row's stable gixen_item_id")
+    p_rem_del.add_argument("--full-title", dest="full_title", help="Exact full_title to match (with --release-date/--source)")
+    p_rem_del.add_argument("--release-date", dest="release_date", help="Exact release_date to match alongside --full-title")
+    p_rem_del.add_argument("--source", help="Exact source to match alongside --full-title (e.g. agent_win, locg_export)")
+    p_rem_del.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview the op without mutating")
+
+    # collection remediate-set-copies — matcher-bypassing copy-count set/adjust (BUI-427)
+    p_rem_set = coll_sub.add_parser(
+        "remediate-set-copies",
+        parents=[common],
+        help="Set or adjust in_collection on ONE collection row by STABLE IDENTITY, bypassing the check matcher",
+        epilog=(
+            "Same identity resolution as remediate-delete. Supply EXACTLY ONE "
+            "of --in-collection (an explicit absolute value) or --delta (a "
+            "signed adjustment); a delta that would go negative is refused, "
+            "never clamped. Unlike remediate-delete, this never removes the "
+            "row even at 0 copies — in_collection == 0 is itself a valid "
+            "tracked-but-not-owned state."
+        ),
+    )
+    p_rem_set.add_argument("--gixen-item-id", dest="gixen_item_id", help="The row's stable gixen_item_id")
+    p_rem_set.add_argument("--full-title", dest="full_title", help="Exact full_title to match (with --release-date/--source)")
+    p_rem_set.add_argument("--release-date", dest="release_date", help="Exact release_date to match alongside --full-title")
+    p_rem_set.add_argument("--source", help="Exact source to match alongside --full-title (e.g. agent_win, locg_export)")
+    p_rem_set_count = p_rem_set.add_mutually_exclusive_group(required=True)
+    p_rem_set_count.add_argument("--in-collection", dest="in_collection", type=int, help="Set copies-owned to this exact value (>= 0)")
+    p_rem_set_count.add_argument("--delta", type=int, help="Adjust copies-owned by this signed amount")
+    p_rem_set.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview the op without mutating")
 
     # pull-list
     p = sub.add_parser("pull-list", parents=[common], help="View your pull list (requires login)")
@@ -450,7 +496,10 @@ def main() -> None:
     logger = logging.getLogger("locg")
 
     # Collection cache subcommands are purely local — skip Playwright browser launch.
-    _LOCAL_COLLECTION_SUBCMDS = {"import", "export", "status", "check", "doctor", "record-win", "audit-pending"}
+    _LOCAL_COLLECTION_SUBCMDS = {
+        "import", "export", "status", "check", "doctor", "record-win", "audit-pending",
+        "remediate-delete", "remediate-set-copies",
+    }
     _collection_sub = (
         getattr(args, "collection_command", None)
         if args.command == "collection"
@@ -535,6 +584,30 @@ def main() -> None:
                 if not isinstance(wins, list):
                     die("JSON input must be a list of win objects", code=2)
                 result = cmd_collection_record_win(wins)
+            elif sub_cmd == "remediate-delete":
+                result = cmd_collection_remediate_delete(
+                    gixen_item_id=getattr(args, "gixen_item_id", None),
+                    full_title=getattr(args, "full_title", None),
+                    release_date=getattr(args, "release_date", None),
+                    source=getattr(args, "source", None),
+                    dry_run=getattr(args, "dry_run", False),
+                )
+                if result.get("status") not in ("ok", "preview"):
+                    output(result, pretty=args.pretty, fields=fields)
+                    sys.exit(1)
+            elif sub_cmd == "remediate-set-copies":
+                result = cmd_collection_remediate_set_copies(
+                    gixen_item_id=getattr(args, "gixen_item_id", None),
+                    full_title=getattr(args, "full_title", None),
+                    release_date=getattr(args, "release_date", None),
+                    source=getattr(args, "source", None),
+                    in_collection=getattr(args, "in_collection", None),
+                    delta=getattr(args, "delta", None),
+                    dry_run=getattr(args, "dry_run", False),
+                )
+                if result.get("status") not in ("ok", "preview"):
+                    output(result, pretty=args.pretty, fields=fields)
+                    sys.exit(1)
             else:
                 result = cmd_collection(client, title=args.title)
         elif args.command == "pull-list":

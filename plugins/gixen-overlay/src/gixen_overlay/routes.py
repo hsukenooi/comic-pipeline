@@ -42,6 +42,8 @@ from gixen_overlay.models import (
     RecordWinRequest,
     RecordWinCommitRequest,
     CollectionRestoreRequest,
+    CollectionRemediateDeleteRequest,
+    CollectionRemediateSetCopiesRequest,
     SellerScanSeenRequest,
     CollectionWinsSeenRequest,
     CollectionCheckBatchRequest,
@@ -76,6 +78,8 @@ from locg.commands import (
     cmd_collection_export,
     cmd_collection_import,
     cmd_collection_record_win,
+    cmd_collection_remediate_delete,
+    cmd_collection_remediate_set_copies,
     cmd_collection_series_names,
     cmd_collection_series_names_resolve,
     cmd_collection_status,
@@ -1959,6 +1963,95 @@ async def api_collection_delete(
     })
 
     return {"status": "ok", "action": action, "removed": removed, "remaining_copies": remaining_copies}
+
+
+# ---------------------------------------------------------------------------
+# BUI-427: matcher-BYPASSING remediation. `api_collection_delete` above
+# locates its target via `cmd_collection_check` — the SAME masthead-alias /
+# X-Men-split / leading-article matcher that breaks down on a volume-mis-
+# filed row (it can resolve to the WRONG row, or refuse a legitimate
+# deletion with ambiguous_cross_volume -> 404). BUI-424's remediation had to
+# hand-roll a one-off `CollectionCache.apply` script keyed on `gixen_item_id`
+# to work around both failure modes. These two endpoints are the supported,
+# reviewable replacement: they locate the target row by STABLE IDENTITY only
+# (`gixen_item_id`, or `full_title`+`release_date`+`source`) via
+# `cmd_collection_remediate_delete`/`cmd_collection_remediate_set_copies` —
+# never through `cmd_collection_check` — and reuse `CollectionCache.apply`'s
+# flock + `.bak` rotation + audit trail exactly as `api_collection_delete`
+# does. Status codes are a plain dict->HTTPException mapping so both routes
+# share the exact same translation.
+# ---------------------------------------------------------------------------
+
+_REMEDIATION_STATUS_CODES: dict[str, int] = {
+    "invalid_request": 422,
+    "not_imported": 409,
+    "not_found": 404,
+    "ambiguous": 409,
+}
+
+
+def _remediation_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Translate a `cmd_collection_remediate_*` result into the HTTP shape.
+
+    `"ok"`/`"preview"` pass through as the 200 body; every other `status`
+    value raises the matching `HTTPException` (detail = the result dict, so
+    `count`/etc. survive alongside the message) rather than returning 200
+    with a body a caller could mistake for success.
+    """
+    status = result.get("status")
+    code = _REMEDIATION_STATUS_CODES.get(status) if isinstance(status, str) else None
+    if code is not None:
+        raise HTTPException(status_code=code, detail=result)
+    return result
+
+
+@router.post("/api/comics/collection/remediate/delete")
+async def api_collection_remediate_delete(req: CollectionRemediateDeleteRequest):
+    """Matcher-bypassing delete/decrement of ONE row by stable identity (BUI-427).
+
+    See `CollectionRemediateDeleteRequest` for the identity modes and
+    `cmd_collection_remediate_delete` for the full TOCTOU-safe apply shape
+    (cheap pre-check, then a locked re-resolve + self-verify inside
+    `CollectionCache.apply()`, mirroring `api_collection_delete`/BUI-417).
+    """
+    _ensure_collection_store()
+    try:
+        result = cmd_collection_remediate_delete(
+            gixen_item_id=req.gixen_item_id,
+            full_title=req.full_title,
+            release_date=req.release_date,
+            source=req.source,
+            dry_run=req.dry_run,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+    return _remediation_response(result)
+
+
+@router.post("/api/comics/collection/remediate/set-copies")
+async def api_collection_remediate_set_copies(req: CollectionRemediateSetCopiesRequest):
+    """Matcher-bypassing copy-count set/adjust on ONE row by stable identity (BUI-427).
+
+    See `CollectionRemediateSetCopiesRequest` for the identity modes and the
+    `in_collection`/`delta` semantics; `cmd_collection_remediate_set_copies`
+    for the TOCTOU-safe apply shape. Unlike delete, this never removes the
+    row even when the result is 0 copies — `in_collection == 0` is itself a
+    valid tracked-but-not-owned state (BUI-249/250/251).
+    """
+    _ensure_collection_store()
+    try:
+        result = cmd_collection_remediate_set_copies(
+            gixen_item_id=req.gixen_item_id,
+            full_title=req.full_title,
+            release_date=req.release_date,
+            source=req.source,
+            in_collection=req.in_collection,
+            delta=req.delta,
+            dry_run=req.dry_run,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+    return _remediation_response(result)
 
 
 @router.post("/api/comics/wish-list")
