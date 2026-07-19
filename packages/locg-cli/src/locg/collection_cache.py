@@ -8,9 +8,10 @@ import os
 import re
 import stat
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 from locg._atomic import atomic_write, atomic_write_json
 from locg.config import collection_cache_path, import_history_path
@@ -640,6 +641,31 @@ def _write_atomic(dest: Path, content: str) -> None:
     atomic_write(dest, content, tmp_prefix=".bak-")
 
 
+def verified_copy_bytes(src: Path, dest: Path, *, mode: Optional[int] = None) -> bytes:
+    """Copy ``src`` to ``dest``, verifying the write reads back byte-identical.
+
+    Reuses :func:`locg._atomic.atomic_write` (tempfile + ``os.replace`` — the
+    same primitive ``collection.json``/``wish-list.json`` are themselves
+    written with) for the actual write, then re-reads ``dest`` and compares
+    against the source bytes before returning. This is the ONE copy-and-verify
+    primitive shared by every backup-shaped operation in locg-cli: the
+    wish-list migration's pre-mutation backup
+    (:func:`locg.collection_io.migrate_wish_list_source`) and the durable
+    named collection-store snapshot + restore
+    (:meth:`CollectionCache.backup_store` / :meth:`CollectionCache.restore_from`,
+    BUI-433) all route through it rather than each hand-rolling their own
+    read/write/verify dance. Raises ``RuntimeError`` if the read-back doesn't
+    match — a hard failure, never a partial/soft success.
+    """
+    data = src.read_bytes()
+    atomic_write(dest, data.decode("utf-8"), mode=mode, tmp_prefix=".backup-")
+    if dest.read_bytes() != data:
+        raise RuntimeError(
+            f"backup verification failed: {dest} did not read back byte-for-byte"
+        )
+    return data
+
+
 def _write_payload_atomic(path: Path, payload: dict[str, Any]) -> None:
     """Write JSON payload to path atomically with fsync on both fd and parent dir."""
     atomic_write_json(
@@ -762,6 +788,42 @@ class CollectionCache:
                 f"'{payload.get('last_import_source', 'your most recent LOCG export')}'."
             )
 
+    @contextmanager
+    def _exclusive_lock(self, timeout: float = 30.0) -> Iterator[None]:
+        """Hold the exclusive flock on ``self.lock_path`` for the ``with`` block.
+
+        Creates the store directory and lock file if needed, then acquires
+        the lock via a non-blocking poll (raising ``TimeoutError`` past
+        ``timeout``) and releases it on exit. This is the ONE mutual-exclusion
+        primitive shared by :meth:`apply`, :meth:`backup_store`, and
+        :meth:`restore_from` — a backup can never observe a torn snapshot
+        across ``collection.json``/``wish-list.json`` while a concurrent
+        :meth:`apply` write is in flight, and a restore can never race one
+        either. Previously each method hand-rolled this same lock-acquire
+        loop independently.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.lock_path.exists():
+            self.lock_path.touch()
+
+        lock_file = open(self.lock_path)  # noqa: WPS515
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("another locg-cli operation in progress") from None
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
     def apply(
         self,
         mutate_fn: Callable[[dict[str, Any]], None],
@@ -775,57 +837,171 @@ class CollectionCache:
         in the written payload (flag is set and cleared in memory only —
         there is no on-disk state of "merged but flagged").
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.lock_path.exists():
-            self.lock_path.touch()
+        with self._exclusive_lock(timeout=timeout):
+            # Rotate backups BEFORE loading so .bak.0 captures pre-merge state
+            self._rotate_backups()
 
-        lock_file = open(self.lock_path)  # noqa: WPS515
-        try:
-            # Acquire exclusive lock with timeout via non-blocking poll
-            deadline = time.monotonic() + timeout
-            while True:
+            # Load current state under lock
+            if not self.path.exists():
+                payload = empty_payload()
+            else:
                 try:
-                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("another locg-cli operation in progress") from None
-                    time.sleep(0.05)
+                    with open(self.path) as f:
+                        payload = json.load(f)
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"Cache file {self.path} is corrupt ({exc}). "
+                        f"Restore from {self._bak_path(0)} or re-import from your most recent LOCG export."
+                    ) from exc
 
+            # Mutate in memory
+            mutate_fn(payload)
+
+            # Set final metadata — migration_in_progress is always False on disk
+            payload["migration_in_progress"] = False
+            payload["last_writer"] = {
+                "pid": os.getpid(),
+                "ts": _utcnow_iso(),
+                "command": command,
+            }
+
+            _write_payload_atomic(self.path, payload)
+
+    def backup_store(self, dest_dir: Path) -> dict[str, Any]:
+        """Durable, named snapshot of the collection store (BUI-433).
+
+        Distinct from the in-store rotating ``.bak.0/1/2`` ring
+        (:meth:`_rotate_backups`, which every :meth:`apply` write cycle
+        rotates through and evicts after 3 generations) — this writes a
+        verified byte-for-byte copy of ``collection.json`` + ``wish-list.json``
+        (whichever exist beside ``self.path``) into ``dest_dir``, a
+        caller-chosen directory OUTSIDE the store so ordinary mutation churn
+        can never touch or evict it. Each file goes through
+        :func:`verified_copy_bytes` — the same verify-then-trust contract
+        :func:`locg.collection_io.migrate_wish_list_source`'s own backup uses.
+
+        Returns ``{"backup_path", "files": {name: byte_count}, "comics_count",
+        "wish_list_count"}`` so a caller can assert the backup actually
+        captured real data before trusting it — an empty or corrupt backup
+        must never read as success. Raises ``RuntimeError`` if a copy fails
+        verification or a copied file isn't valid JSON in the expected shape.
+        A source file that doesn't exist is skipped, not an error (e.g. a
+        store with no wish-list.json yet); the caller decides whether the
+        resulting counts are acceptable.
+
+        Runs under the same exclusive flock :meth:`apply` uses, so the
+        ``collection.json`` + ``wish-list.json`` copies are a consistent joint
+        snapshot — a concurrent :meth:`apply`/:meth:`write_wins` call cannot
+        interleave between the two file reads and leave the backup with one
+        file's pre-write state and the other's post-write state.
+        """
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        store_dir = self.path.parent
+
+        files: dict[str, int] = {}
+        collection_bytes: Optional[bytes] = None
+        wish_bytes: Optional[bytes] = None
+
+        with self._exclusive_lock():
+            src = store_dir / "collection.json"
+            if src.exists():
+                collection_bytes = verified_copy_bytes(
+                    src, dest_dir / "collection.json", mode=stat.S_IRUSR | stat.S_IWUSR
+                )
+                files["collection.json"] = len(collection_bytes)
+
+            wish_src = store_dir / "wish-list.json"
+            if wish_src.exists():
+                wish_bytes = verified_copy_bytes(
+                    wish_src, dest_dir / "wish-list.json", mode=stat.S_IRUSR | stat.S_IWUSR
+                )
+                files["wish-list.json"] = len(wish_bytes)
+
+        comics_count = 0
+        if collection_bytes is not None:
             try:
-                # Rotate backups BEFORE loading so .bak.0 captures pre-merge state
-                self._rotate_backups()
+                comics_count = len(json.loads(collection_bytes.decode("utf-8")).get("comics") or [])
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError) as exc:
+                raise RuntimeError(
+                    f"backup verification failed: copied collection.json is not valid ({exc})"
+                ) from exc
 
-                # Load current state under lock
-                if not self.path.exists():
-                    payload = empty_payload()
-                else:
-                    try:
-                        with open(self.path) as f:
-                            payload = json.load(f)
-                    except (OSError, json.JSONDecodeError) as exc:
-                        raise RuntimeError(
-                            f"Cache file {self.path} is corrupt ({exc}). "
-                            f"Restore from {self._bak_path(0)} or re-import from your most recent LOCG export."
-                        ) from exc
+        wish_count = 0
+        if wish_bytes is not None:
+            try:
+                wish_count = len(json.loads(wish_bytes.decode("utf-8")).get("items") or [])
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError) as exc:
+                raise RuntimeError(
+                    f"backup verification failed: copied wish-list.json is not valid ({exc})"
+                ) from exc
 
-                # Mutate in memory
-                mutate_fn(payload)
+        return {
+            "backup_path": str(dest_dir),
+            "files": files,
+            "comics_count": comics_count,
+            "wish_list_count": wish_count,
+        }
 
-                # Set final metadata — migration_in_progress is always False on disk
-                payload["migration_in_progress"] = False
-                payload["last_writer"] = {
-                    "pid": os.getpid(),
-                    "ts": _utcnow_iso(),
-                    "command": command,
-                }
+    def restore_from(self, src_dir: Path, timeout: float = 30.0) -> dict[str, Any]:
+        """Restore ``collection.json`` + ``wish-list.json`` from a named
+        backup directory (BUI-433) — the executable counterpart to
+        :meth:`backup_store`.
 
-                _write_payload_atomic(self.path, payload)
+        Makes ``/comic:collection-sync``'s abort path real: Steps 3/3b used
+        to say "restore from the Step 1 backup" with no command behind it.
+        Runs under the SAME exclusive flock :meth:`apply` uses (via
+        ``self.lock_path``), so a restore can never race a concurrent write —
+        either fully happens before or fully after any in-flight
+        :meth:`apply`/:meth:`write_wins` call. Each file is copied back via
+        :func:`verified_copy_bytes` (verify read-back before trusting the
+        write). A file absent from the backup (e.g. a backup taken before
+        ``wish-list.json`` ever existed) is skipped, not an error — only a
+        backup directory with NEITHER file raises ``FileNotFoundError``.
 
-            finally:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-        finally:
-            lock_file.close()
+        Returns the same shape :meth:`backup_store` does — ``comics_count``/
+        ``wish_list_count`` are re-read from the just-restored LIVE files
+        (not the backup), so the response proves what's actually on disk now,
+        not just what the backup directory claimed to hold.
+        """
+        if not src_dir.is_dir():
+            raise FileNotFoundError(f"backup directory not found: {src_dir}")
+
+        store_dir = self.path.parent
+
+        restored: dict[str, int] = {}
+        with self._exclusive_lock(timeout=timeout):
+            for name in ("collection.json", "wish-list.json"):
+                candidate = src_dir / name
+                if not candidate.exists():
+                    continue
+                data = verified_copy_bytes(
+                    candidate, store_dir / name, mode=stat.S_IRUSR | stat.S_IWUSR
+                )
+                restored[name] = len(data)
+
+        if not restored:
+            raise FileNotFoundError(
+                f"backup directory {src_dir} contains neither collection.json nor "
+                "wish-list.json — nothing to restore"
+            )
+
+        payload = self.load()
+        comics_count = len(payload.get("comics", []))
+
+        wish_count = 0
+        wish_path = store_dir / "wish-list.json"
+        if wish_path.exists():
+            try:
+                wish_count = len(json.loads(wish_path.read_text()).get("items", []))
+            except (OSError, json.JSONDecodeError):
+                wish_count = 0
+
+        return {
+            "restored_from": str(src_dir),
+            "files": restored,
+            "comics_count": comics_count,
+            "wish_list_count": wish_count,
+        }
 
     def write_wins(
         self, rows: list[dict[str, Any]], command: str = "record-win"

@@ -41,6 +41,7 @@ from gixen_overlay.models import (
     WishListAddBatchRequest,
     RecordWinRequest,
     RecordWinCommitRequest,
+    CollectionRestoreRequest,
     SellerScanSeenRequest,
     CollectionWinsSeenRequest,
     CollectionCheckBatchRequest,
@@ -120,6 +121,24 @@ def _ensure_collection_store() -> None:
     store = db_path.parent / "collection-store"
     store.mkdir(parents=True, exist_ok=True)
     os.environ["LOCG_DATA_DIR"] = str(store)
+
+
+def _collection_backups_root() -> Path:
+    """Directory holding durable named collection-store snapshots (BUI-433).
+
+    A sibling of the store directory itself (``<store>-backups/``), never
+    inside it — so a snapshot here can NEVER be touched by
+    ``CollectionCache._rotate_backups``'s in-store ``.bak.0/1/2`` ring, which
+    every ``apply()`` write cycles through and evicts after 3 generations. A
+    `/comic:collection-sync` operator needs a backup that survives however
+    many writes happen between "I took this backup" and "something looked
+    wrong, restore it" — the 3-deep rotating ring cannot promise that, this
+    directory can (nothing here is ever overwritten or rotated out
+    automatically; each backup call adds one new timestamped subdirectory).
+    """
+    _ensure_collection_store()
+    store_dir = Path(os.environ["LOCG_DATA_DIR"])
+    return store_dir.parent / f"{store_dir.name}-backups"
 
 
 @router.get("/comics")
@@ -1408,6 +1427,93 @@ async def api_collection_export(push_wishes: bool = False):
 # already does flock + atomic tempfile-rename). After any write lands, both
 # machines see it on their next API read — no git commit/push/pull (R8).
 # ---------------------------------------------------------------------------
+
+
+@router.post("/api/comics/collection/backup")
+async def api_collection_backup():
+    """Durable, named snapshot of the collection store, taken locally on the
+    Mac Mini (BUI-433).
+
+    Replaces `/comic:collection-sync` Step 1's client-orchestrated
+    `cp -r` + `ssh` + `case "$(hostname)"` MacBook/Mac-Mini branching — the
+    store lives on the server host, so the server copies it locally instead
+    of a client guessing at a hostname pattern to decide whether to SSH in.
+
+    Distinct from `CollectionCache`'s in-store rotating `.bak.0/1/2` ring
+    (`_rotate_backups`) that every `apply()` write cycle rotates through and
+    evicts after 3 generations — see `_collection_backups_root`. Each call
+    creates a new timestamped subdirectory holding a verified byte-for-byte
+    copy of `collection.json` + `wish-list.json` (whichever exist).
+
+    Returns `{status, backup_path, files, comics_count, wish_list_count}`.
+    Hard-fails with 500 rather than reporting success when the copy
+    verification fails OR when the backup captured zero rows across both
+    files — an empty backup is indistinguishable from a broken one and must
+    never be mistaken for "the store is safely backed up", the invariant
+    `/comic:collection-sync` Step 1 depends on before any destructive write.
+    """
+    _ensure_collection_store()
+    backups_root = _collection_backups_root()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    dest_dir = backups_root / ts
+    cache = CollectionCache()
+    try:
+        result = cache.backup_store(dest_dir)
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"backup failed: {exc}") from exc
+
+    if result["comics_count"] == 0 and result["wish_list_count"] == 0:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"backup at {result['backup_path']} captured zero rows across "
+                "collection.json and wish-list.json — refusing to report "
+                "success on an empty/failed backup"
+            ),
+        )
+
+    return {"status": "ok", **result}
+
+
+@router.post("/api/comics/collection/restore")
+async def api_collection_restore(req: CollectionRestoreRequest):
+    """Restore the collection store from a named backup (BUI-433).
+
+    Makes `/comic:collection-sync`'s abort path EXECUTABLE: Steps 3/3b used
+    to say "restore from the Step 1 backup" with no actual command behind
+    it. `backup_path` must resolve under this server's backups root
+    (`_collection_backups_root` — i.e. a path this server itself returned
+    from `POST .../collection/backup`); anything else is refused with 422,
+    closing off a path-traversal read/write from request input.
+
+    Restores `collection.json` + `wish-list.json` (whichever are present in
+    the backup) back onto the live store, each verified byte-for-byte, under
+    the same exclusive lock `CollectionCache.apply()` uses so a restore can
+    never race a concurrent write. Returns the same shape `backup` does,
+    read back from the just-restored live files.
+    """
+    _ensure_collection_store()
+    backups_root = _collection_backups_root().resolve()
+    candidate = Path(req.backup_path).expanduser().resolve()
+    if backups_root not in candidate.parents:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "backup_path must be a backup created by POST "
+                f".../collection/backup under {backups_root} — refusing to "
+                "restore from an arbitrary path"
+            ),
+        )
+
+    cache = CollectionCache()
+    try:
+        result = cache.restore_from(candidate)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (RuntimeError, TimeoutError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"restore failed: {exc}") from exc
+
+    return {"status": "ok", **result}
 
 
 @router.post("/api/comics/collection/import")

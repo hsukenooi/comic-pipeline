@@ -66,20 +66,27 @@ them.
 ## Step 1: Back up the server store
 
 Back up the canonical store **before** any write, so any surprise is fully
-reversible. The store lives beside the comics server's DB on the server host
-(`~/.gixen-server/collection-store/`):
+reversible (BUI-433). The comics server already has filesystem access to its
+own store, so this is one API call — no hostname detection, no `ssh`; it
+works identically whether you're running from the Mac Mini or the MacBook:
 
 ```bash
-# On the Mac Mini (COMICS_SERVER_URL → localhost): local copy.
-# From the MacBook: run it over ssh on the mini.
-BACKUP="collection-store.bak.$(date +%Y%m%d-%H%M%S)"
-case "$(hostname)" in
-  *MacBook*|*macbook*) ssh mini "cp -r ~/.gixen-server/collection-store ~/.gixen-server/$BACKUP && echo backed up to ~/.gixen-server/$BACKUP" ;;
-  *)                   cp -r ~/.gixen-server/collection-store ~/.gixen-server/"$BACKUP" && echo "backed up to ~/.gixen-server/$BACKUP" ;;
-esac
+BACKUP_JSON="$(mktemp -t collection-backup.XXXXXX)"
+comics_post "$COMICS_SERVER_URL/api/comics/collection/backup" -o "$BACKUP_JSON" \
+  || { echo "backup failed — do not proceed without a backup"; exit 1; }
+BACKUP_PATH="$(python3 -c "import json; print(json.load(open('$BACKUP_JSON'))['backup_path'])")"
+python3 -c "import json; d=json.load(open('$BACKUP_JSON')); \
+  print('backup:', d['backup_path'], '| comics:', d['comics_count'], '| wish_list:', d['wish_list_count'])"
 ```
 
-**If the backup fails:** STOP. Do not proceed without a backup.
+**If the backup fails: STOP.** The endpoint itself hard-fails (non-2xx)
+rather than reporting success on an empty or unverifiable copy — a backup
+that captured zero rows across `collection.json`/`wish-list.json` is
+indistinguishable from a broken one, so `comics_post` never treats it as
+success. Do not proceed to Step 2 without a completed backup.
+
+Keep `$BACKUP_PATH` for the rest of the run — Steps 3/3b's abort path restores
+from it via `POST /api/comics/collection/restore`.
 
 ## Step 2: Export pending rows to a CSV
 
@@ -271,8 +278,14 @@ upload it alone. LOCG shows an import **preview/result** — read it row by row:
 
 - Expect every row to be **"Added to Collection"** (or already present).
 - **ABORT immediately on ANY "Deleted from Collection." line** — a win row should
-  never delete. If you see one, STOP, do not upload the rest, and report it; the
-  owned-safe export regressed and the Step 1 backup must be restored.
+  never delete. If you see one, STOP, do not upload the rest, report it, and
+  restore the Step 1 backup (BUI-433 — the owned-safe export regressed):
+
+```bash
+comics_post "$COMICS_SERVER_URL/api/comics/collection/restore" \
+  -H 'Content-Type: application/json' \
+  -d "{\"backup_path\": \"$BACKUP_PATH\"}"
+```
 
 Only after a clean probe, upload the rest. **The constraint that matters is data
 completeness, not row count** — there is no row limit. (The earlier "≤20 rows per
@@ -318,7 +331,13 @@ Probe it the same way (≤5 rows), reading LOCG's preview:
 - Expect every row to be **"Added to Wish List."**
 - **ABORT on ANY "Deleted from Collection."** — that means a wished book is owned
   under a variant the export missed. STOP, do not upload the rest, report it, and
-  restore from the Step 1 backup if a deletion already landed.
+  if a deletion already landed, restore the Step 1 backup (BUI-433):
+
+```bash
+comics_post "$COMICS_SERVER_URL/api/comics/collection/restore" \
+  -H 'Content-Type: application/json' \
+  -d "{\"backup_path\": \"$BACKUP_PATH\"}"
+```
 
 Only after a clean probe, upload the rest (complete-and-exact, no row-count limit).
 The wishes CSV is owned-safe by construction (BUI-200), but the preview is the last
@@ -366,8 +385,14 @@ Assert all of:
 - **No duplicate insertion:** `row_count` should grow only by books you genuinely
   added directly in the LOCG UI. The import summary's `added` is the tell — if
   `added` is large (close to `ready_count`), the re-import failed to reconcile
-  and inserted duplicates instead. **STOP and investigate** (restore from the
-  Step 1 backup if needed) — do not claim success.
+  and inserted duplicates instead. **STOP and investigate** — do not claim
+  success. Restore the Step 1 backup if needed (BUI-433):
+
+```bash
+comics_post "$COMICS_SERVER_URL/api/comics/collection/restore" \
+  -H 'Content-Type: application/json' \
+  -d "{\"backup_path\": \"$BACKUP_PATH\"}"
+```
 
 **If either assertion fails**, report the discrepancy and the backup path; do not
 proceed.
@@ -377,7 +402,7 @@ proceed.
 ```
 **LOCG collection sync complete**
 
-Backup:           ~/.gixen-server/collection-store.bak.<ts>
+Backup:           $BACKUP_PATH  (comics=N, wish_list=M — see Step 1)
 Exported (ready): N rows  (+ M withheld needs-manual-series — see .notes.md)
 Re-import:        added=A  updated=U  reconciled=R
 Pending:          PENDING_BEFORE → PENDING_AFTER  (cleared ~N)
@@ -417,8 +442,8 @@ audit trail; resolve them via the duplicate win-records cleanup in
 |---|---|
 | Trying to push wishes in the default sync | The export is wins-only (BUI-208 machine gate — it refuses to emit `In Collection=0`); wishes are a separate opt-in export (`?push_wishes=true`, Step 3b), gated on a clean conflicts audit. Wins can only add; wishes can delete |
 | Pushing wishes without cleaning conflicts first | Step 3b is gated on Step 2b reporting **zero** wish-list conflicts. An owned-but-wished entry pushed as In Collection=0 deletes the owned copy |
-| Syncing without a backup | Step 1 is mandatory and hard-stops on failure |
-| Seeing "Deleted from Collection" on upload | A win/wish row should never delete (BUI-122/BUI-200) — STOP, do not upload the rest, report it, restore from the Step 1 backup if a deletion landed |
+| Syncing without a backup | Step 1 is mandatory and hard-stops on failure (`POST /api/comics/collection/backup`, BUI-433) |
+| Seeing "Deleted from Collection" on upload | A win/wish row should never delete (BUI-122/BUI-200) — STOP, do not upload the rest, report it, restore the Step 1 backup if a deletion landed (`POST /api/comics/collection/restore` with `backup_path=$BACKUP_PATH`, BUI-433) |
 | "Error: timeout" at 0% on small batches | LOCG's import backend is degraded (a `queue_import_comic` XHR shows `(canceled)`); wait and retry later — not a file problem |
-| Claiming success when `added` is large | A large `added` means the re-import inserted duplicates instead of reconciling — STOP, investigate, restore from backup if needed |
+| Claiming success when `added` is large | A large `added` means the re-import inserted duplicates instead of reconciling — STOP, investigate, restore the backup if needed (`POST /api/comics/collection/restore`) |
 | Uploading the `.notes.md` rows | Only the `.csv` files go to LOCG; `.notes.md` lists rows withheld for manual resolution |

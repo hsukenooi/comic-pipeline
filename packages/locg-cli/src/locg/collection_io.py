@@ -30,6 +30,7 @@ from locg.collection_cache import (
     make_identity,
     owned_match_keys,
     rebuild_series_name_index,
+    verified_copy_bytes,
 )
 from locg.parsing import normalize_issue_key, split_series_issue_for_ownership
 
@@ -315,16 +316,12 @@ def migrate_wish_list_source() -> dict[str, Any]:
     if not path.exists():
         return {"migrated": 0, "backup": None}
 
-    original = path.read_bytes()
-
     ts = datetime.now(timezone.utc).isoformat().replace(":", "")
     backup = path.with_name(f"{path.name}.bak.{ts}")
-    backup.write_bytes(original)
-    backup.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
-    if backup.read_bytes() != original:
-        raise RuntimeError(
-            f"wish-list migration aborted: backup {backup} did not verify byte-for-byte"
-        )
+    try:
+        original = verified_copy_bytes(path, backup, mode=stat.S_IRUSR | stat.S_IWUSR)
+    except RuntimeError as exc:
+        raise RuntimeError(f"wish-list migration aborted: {exc}") from exc
 
     data = json.loads(original.decode())
     items: list[dict[str, Any]] = data.get("items") or []

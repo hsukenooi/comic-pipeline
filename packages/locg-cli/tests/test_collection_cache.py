@@ -1045,3 +1045,151 @@ def test_owned_match_keys_annual_plural_suffix():
     from locg.collection_cache import owned_match_keys
     keys = owned_match_keys("Hulk Annuals", "1")
     assert "incredible hulk annuals" in keys
+
+
+# ---------------------------------------------------------------------------
+# verified_copy_bytes / backup_store / restore_from (BUI-433)
+# ---------------------------------------------------------------------------
+
+def _write_wish_list(store_dir: Path, items: list[dict[str, Any]]) -> None:
+    (store_dir / "wish-list.json").write_text(
+        json.dumps({"updated_at": "2026-07-01T00:00:00Z", "items": items})
+    )
+
+
+def test_verified_copy_bytes_round_trips(tmp_path):
+    from locg.collection_cache import verified_copy_bytes
+
+    src = tmp_path / "src.json"
+    src.write_text('{"a": 1}')
+    dest_parent = tmp_path / "sub"
+    dest_parent.mkdir()
+    dest = dest_parent / "dest.json"
+
+    data = verified_copy_bytes(src, dest, mode=stat.S_IRUSR | stat.S_IWUSR)
+
+    assert data == b'{"a": 1}'
+    assert dest.read_bytes() == b'{"a": 1}'
+    assert stat.S_IMODE(dest.stat().st_mode) == stat.S_IRUSR | stat.S_IWUSR
+
+
+def test_backup_store_returns_path_and_nonempty_sanity_count(tmp_path):
+    """BUI-433: backup must return a durable path plus counts a caller can
+    assert are non-empty before trusting the backup."""
+    cache = make_cache(tmp_path)
+    cache.apply(lambda p: p["comics"].append(make_row()), command="seed")
+    _write_wish_list(tmp_path, [{"name": "Batman #1", "id": 1}])
+
+    dest_dir = tmp_path.parent / "backups" / "snap-1"
+    result = cache.backup_store(dest_dir)
+
+    assert result["backup_path"] == str(dest_dir)
+    assert result["comics_count"] == 1
+    assert result["wish_list_count"] == 1
+    assert result["files"]["collection.json"] > 0
+    assert result["files"]["wish-list.json"] > 0
+    assert (dest_dir / "collection.json").exists()
+    assert (dest_dir / "wish-list.json").exists()
+    # The copy is byte-identical to the live file at backup time.
+    assert (dest_dir / "collection.json").read_bytes() == (tmp_path / "collection.json").read_bytes()
+
+
+def test_backup_store_empty_store_raises_zero_counts_not_silent_success(tmp_path):
+    """An empty/never-written store must not silently report a 'successful'
+    backup with real-looking data — no files exist to copy, and both sanity
+    counts come back zero so a caller (the route) can hard-fail rather than
+    treat this as a captured backup."""
+    cache = make_cache(tmp_path)  # collection.json/wish-list.json never written
+    dest_dir = tmp_path.parent / "backups" / "snap-empty"
+
+    result = cache.backup_store(dest_dir)
+
+    assert result["files"] == {}
+    assert result["comics_count"] == 0
+    assert result["wish_list_count"] == 0
+
+
+def test_backup_store_is_distinct_from_rotating_bak_ring(tmp_path):
+    """BUI-433 constraint: the named backup must survive normal mutation
+    churn that rotates/evicts the in-store .bak.0/1/2 ring."""
+    cache = make_cache(tmp_path)
+    cache.apply(lambda p: p["comics"].append(make_row(full_title="Snapshot Comic")), command="seed")
+
+    dest_dir = tmp_path.parent / "backups" / "snap-durable"
+    result = cache.backup_store(dest_dir)
+    assert result["comics_count"] == 1
+
+    # Churn the store well past the 3-generation .bak ring depth.
+    for i in range(5):
+        cache.apply(
+            lambda p, i=i: p["comics"].append(make_row(full_title=f"Churn {i}", seq=i + 2)),
+            command=f"churn-{i}",
+        )
+
+    # The rotating ring only ever holds 3 generations of collection.json.bak.N
+    # inside the store dir; the named backup lives in a different directory
+    # entirely and must be untouched by any of that rotation.
+    reloaded = json.loads((dest_dir / "collection.json").read_bytes())
+    titles = {r["full_title"] for r in reloaded["comics"]}
+    assert titles == {"Snapshot Comic"}, "the durable backup must be unaffected by later .bak ring rotation"
+
+
+def test_restore_from_round_trips_a_store(tmp_path):
+    """BUI-433 acceptance: restore must round-trip a backed-up store."""
+    cache = make_cache(tmp_path)
+    cache.apply(lambda p: p["comics"].append(make_row(full_title="Original Comic")), command="seed")
+    _write_wish_list(tmp_path, [{"name": "Original Wish #1", "id": 1}])
+
+    dest_dir = tmp_path.parent / "backups" / "snap-restore"
+    backup_result = cache.backup_store(dest_dir)
+    assert backup_result["comics_count"] == 1
+
+    # Simulate a bad destructive write after the backup was taken.
+    cache.apply(lambda p: p["comics"].clear(), command="destructive-mutation")
+    _write_wish_list(tmp_path, [])
+    assert json.loads((tmp_path / "collection.json").read_text())["comics"] == []
+
+    restore_result = cache.restore_from(dest_dir)
+
+    assert restore_result["comics_count"] == 1
+    assert restore_result["wish_list_count"] == 1
+    live_comics = json.loads((tmp_path / "collection.json").read_text())["comics"]
+    assert {r["full_title"] for r in live_comics} == {"Original Comic"}
+    live_wish = json.loads((tmp_path / "wish-list.json").read_text())["items"]
+    assert {i["name"] for i in live_wish} == {"Original Wish #1"}
+
+
+def test_restore_from_missing_backup_dir_raises_file_not_found(tmp_path):
+    cache = make_cache(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        cache.restore_from(tmp_path / "does-not-exist")
+
+
+def test_restore_from_empty_backup_dir_raises_file_not_found(tmp_path):
+    """A backup directory with neither collection.json nor wish-list.json is
+    nothing to restore from — must not silently no-op as 'success'."""
+    cache = make_cache(tmp_path)
+    empty_backup = tmp_path.parent / "empty-backup"
+    empty_backup.mkdir()
+    with pytest.raises(FileNotFoundError):
+        cache.restore_from(empty_backup)
+
+
+def test_restore_from_partial_backup_skips_missing_file(tmp_path):
+    """A backup taken before wish-list.json ever existed only carries
+    collection.json — restoring it must not fail, and must not touch a
+    wish-list.json that already exists live."""
+    cache = make_cache(tmp_path)
+    cache.apply(lambda p: p["comics"].append(make_row()), command="seed")
+
+    partial_backup = tmp_path.parent / "partial-backup"
+    partial_backup.mkdir()
+    (partial_backup / "collection.json").write_text((tmp_path / "collection.json").read_text())
+
+    _write_wish_list(tmp_path, [{"name": "Untouched Wish #1", "id": 1}])
+
+    result = cache.restore_from(partial_backup)
+    assert result["files"] == {"collection.json": len((partial_backup / "collection.json").read_bytes())}
+    # The live wish-list, absent from the backup, is left exactly as-is.
+    live_wish = json.loads((tmp_path / "wish-list.json").read_text())["items"]
+    assert {i["name"] for i in live_wish} == {"Untouched Wish #1"}
