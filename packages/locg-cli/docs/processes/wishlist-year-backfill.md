@@ -41,12 +41,14 @@ Metron.
 choice" error until reinstalled. Before Step 3, on the Mac Mini:
 
 ```bash
-cd <repo> && uv tool install --force ./packages/locg-cli
+cd <repo> && uv tool install --force --no-cache ./packages/locg-cli
 ```
 
 (Same post-merge convention documented in `scripts/install.sh` / the root
-CLAUDE.md.) No server restart is needed for the store write itself (below), but
-the CLI binary must be current to have the subcommand.
+CLAUDE.md — plain `--force` alone can serve a stale cached wheel when the
+package version is unchanged, BUI-455.) No server restart is needed for the
+store write itself (below), but the CLI binary must be current to have the
+subcommand.
 
 ## Procedure (run on the Mac Mini, against the server store)
 
