@@ -128,7 +128,34 @@ _ANNUAL_RE = re.compile(r"\bannual\b", re.IGNORECASE)
 # number PRECEDING it. Kept separate from _ANNUAL_RE — the latter still strips
 # the bare word out of the series text (comic_identity.py), which must stay
 # permissive so "X-Men Annual #1" yields series "X-Men", not "X-Men Annual".
-_ANNUAL_EDITION_RE = re.compile(r"\bannual\b\s*#?\s*\d", re.IGNORECASE)
+#
+# BUI-456 case 2: broaden the separator between "annual" and its number beyond
+# "\s*#?\s*" to also accept "No.", ":" and "-" so genuine annuals that spell the
+# separator differently still classify — "Annual No. 1", "Annual: 1",
+# "Annual-#5". The gap is a SINGLE character class matched by ONE unbounded
+# quantifier, then the digit: whitespace, "#", ":", "-", "." and the letters
+# "n"/"o" (for "No."/"No", case-insensitively). A single "[...]*\d" is provably
+# linear — deliberately NOT "\s*(?:sep)?\s*#?\s*\d", whose three adjacent "\s*"
+# runs partition a whitespace run ambiguously and backtrack catastrophically on
+# a long-space title (a real ReDoS; caught in BUI-456 self-review). Word-internal
+# letters (t, v, e, ...) are NOT in the class, so the run can't leap across a
+# following word to a distant digit ("annual note 5", "annual-versary 3",
+# "annual. Best 5" all fail to reach a digit → single-issue). "\bannual\b" still
+# guards the left edge and the digit is still required, so a stray "annual"
+# followed by a non-number word ("annual sale") stays single-issue.
+_ANNUAL_EDITION_RE = re.compile(r"\bannual\b[\s#:.no-]*\d", re.IGNORECASE)
+# BUI-456 case 1: a "#N" issue token appearing BEFORE the word "annual" is
+# positive evidence that the digit which FOLLOWS "annual" is a promo year or
+# marketing number, not a real annual sequence number — "ASM #252 annual 2024
+# sale" would otherwise mis-file as the nonexistent "ASM Annual #252" (the \d
+# matched the promo "2024", while #252 is the true issue). A genuine annual
+# names its series first and never precedes "annual" with a #-issue token
+# (volume years are bare — "Star Wars 2021 Annual #1" — never "#2021"), so this
+# guard is safe there. Accepted false negative (recoverable, duplicate-buy
+# direction only): a listing that leads with a marketing "#N" and then carries a
+# real annual ("#1 seller ... Annual #1") is demoted to single-issue. That is
+# rarer than the misfile it prevents, and both directions are recoverable.
+_ISSUE_HASH_RE = re.compile(r"#\s*\d")
 # Matches an optional trailing "Edition" too ("Treasury Edition") so
 # stripping it from the series text doesn't leave a dangling "Edition" word
 # behind (e.g. "Superman Treasury Edition #1" -> series "Superman", not
@@ -180,7 +207,11 @@ def _classify_edition_kind(title: str) -> str:
         return "collected"
     if _marker_hit(title, _PROMO_REPRINT_MARKERS) or _second_print_reject(title):
         return "reprint"
-    if _ANNUAL_EDITION_RE.search(title):  # BUI-450: number must FOLLOW "annual"
+    annual_m = _ANNUAL_EDITION_RE.search(title)  # BUI-450: number must FOLLOW "annual"
+    if annual_m and not _ISSUE_HASH_RE.search(title, 0, annual_m.start()):
+        # BUI-456 case 1: only classify as annual when NO "#N" issue token
+        # precedes "annual" (a preceding #-issue means the trailing digit is a
+        # promo/year, not a real annual number).
         return "annual"
     if _GIANT_SIZE_RE.search(title):
         return "giant-size"
