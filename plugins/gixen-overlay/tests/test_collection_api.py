@@ -747,6 +747,178 @@ def test_record_win_non_runtime_error_returns_useful_500(client):
     assert "ValueError" in detail["exception"]
 
 
+# ===========================================================================
+# BUI-428: POST /api/comics/collection/record-win/commit — the atomic
+# merge + record + mark-seen + status endpoint that collapses
+# /comic:collection-add Steps 3/3b/5 into one call.
+# ===========================================================================
+
+def test_record_win_commit_merges_and_marks_exactly_the_committed_set(client):
+    """The mark-seen set must equal the set the server actually merged and
+    submitted to cmd_collection_record_win — the core BUI-428 fix. Verified
+    directly by reading back GET .../record-win/seen, not by trusting the
+    response body alone.
+    """
+    _reseed_with_index(client.store, _ASM_INDEX)
+    win_a = {
+        "item_id": "115500010001",
+        "current_bid": "12.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "310", "year": "1988"},
+    }
+    win_b = {
+        "item_id": "115500010002",
+        "current_bid": "15.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "311", "year": "1988"},
+    }
+    r = client.post(
+        "/api/comics/collection/record-win/commit",
+        json={"wins": [win_a], "resolved_reviews": [win_b]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rows_written"] == 2
+    assert set(body["committed_item_ids"]) == {"115500010001", "115500010002"}
+    assert body["marked_seen"] == 2
+    assert "pending_push_count" in body
+    assert "oldest_pending_days" in body
+
+    seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
+    assert set(seen) == {"115500010001", "115500010002"}
+
+
+def test_record_win_commit_skipped_already_owned_is_still_marked_seen(client):
+    """A win that matches an already-owned row (BUI-34) is fully processed —
+    just not re-written — so it belongs in the committed/seen set too, or a
+    future run would re-POST it forever.
+    """
+    _reseed_with_index(client.store, _ASM_INDEX)
+    win = {
+        "item_id": "115500010003",
+        "current_bid": "999.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "300", "year": "1988"},
+    }
+    r = client.post(
+        "/api/comics/collection/record-win/commit",
+        json={"wins": [win], "resolved_reviews": []},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rows_written"] == 0
+    assert body["skipped_already_owned"] >= 1
+    assert body["committed_item_ids"] == ["115500010003"]
+    assert body["marked_seen"] == 1
+
+    seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
+    assert "115500010003" in seen
+
+
+def test_record_win_commit_empty_payload_returns_zero_and_status_scalars(client):
+    """Nothing new to record (both lists empty or omitted) still returns the
+    scalar shape — including the fresh status fields — with zero counts and
+    marks nothing seen, matching the old skill's 'nothing to record, still
+    report status' branch.
+    """
+    r = client.post("/api/comics/collection/record-win/commit", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rows_written"] == 0
+    assert body["committed_item_ids"] == []
+    assert body["marked_seen"] == 0
+    assert "pending_push_count" in body
+    assert "oldest_pending_days" in body
+
+
+def test_record_win_commit_partial_failure_returns_500_and_marks_nothing_seen(client):
+    """BUI-137/BUI-428: a partial_failure must still 500 (never a misleading
+    200), AND — the atomicity requirement this endpoint adds — must mark
+    NOTHING seen, so a retry still finds these item_ids unprocessed.
+    """
+    partial = {
+        "rows_written": 25,
+        "partial_failure": True,
+        "manual_variant_count": 0,
+        "manual_series_count": 0,
+        "metron_lookups_succeeded": 0,
+        "skipped_already_owned": 0,
+    }
+    win = {
+        "item_id": "115500019999",
+        "current_bid": "10.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "402", "year": "1995"},
+    }
+    with patch("gixen_overlay.routes.cmd_collection_record_win", return_value=partial):
+        r = client.post(
+            "/api/comics/collection/record-win/commit",
+            json={"wins": [win], "resolved_reviews": []},
+        )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "partial_failure"
+    assert detail["rows_written"] == 25
+
+    seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
+    assert "115500019999" not in seen
+
+
+def test_record_win_commit_unhandled_exception_marks_nothing_seen(client):
+    """BUI-184/BUI-428: an unhandled mid-batch exception must 500 (commit
+    state uncertain) and must not mark the attempted item_ids seen — the
+    mark-seen step must never run past an exception.
+    """
+    win = {
+        "item_id": "115500018888",
+        "current_bid": "10.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "403", "year": "1995"},
+    }
+    with patch(
+        "gixen_overlay.routes.cmd_collection_record_win",
+        side_effect=ValueError("boom mid-batch"),
+    ):
+        r = client.post(
+            "/api/comics/collection/record-win/commit",
+            json={"wins": [win], "resolved_reviews": []},
+        )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "record_win_failed"
+
+    seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
+    assert "115500018888" not in seen
+
+
+def test_record_win_commit_dedups_item_id_shared_across_wins_and_reviews(client):
+    """A lot expanding into multiple entries (or the same item_id appearing in
+    both lists for any other reason) shares one item_id — the committed/seen
+    set must dedup it, not double-count.
+    """
+    _reseed_with_index(client.store, _ASM_INDEX)
+    win = {
+        "item_id": "115500010005",
+        "current_bid": "20.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "312", "year": "1988"},
+    }
+    review = {
+        "item_id": "115500010005",
+        "current_bid": "20.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "313", "year": "1988"},
+    }
+    r = client.post(
+        "/api/comics/collection/record-win/commit",
+        json={"wins": [win], "resolved_reviews": [review]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["committed_item_ids"] == ["115500010005"]
+    assert body["marked_seen"] == 1
+
+
 def test_wish_list_add_appends(client):
     r = client.post("/api/comics/wish-list", json={"title": "Daredevil #1"})
     assert r.status_code == 200, r.text
