@@ -3756,6 +3756,36 @@ def _build_win_row(
             else:
                 metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
+    # BUI-458: capture the issue's publisher (e.g. "Marvel Comics") from
+    # Metron's full-issue detail so the win row carries a real publisher_name
+    # instead of null. The lightweight lookup_issue (series_list/issues_list)
+    # carries NO publisher, so this full-issue detail fetch is the only place
+    # it is available — one fetch per win that resolved a metron_id, reused by
+    # the variant block below so a variant win still makes just one detail
+    # call. Runs after the BUI-34 dedup return above, so a skipped
+    # already-owned win never spends a Metron call on this.
+    #
+    # Data safety: on any Metron miss / None publisher / network error the
+    # publisher stays null (never a fabricated or defaulted value). A missing
+    # publisher fails the pre-upload audit (audit-pending "no publisher"),
+    # which is the intended backstop, whereas a wrong publisher would import
+    # silently to LOCG.
+    publisher_name: Optional[str] = None
+    issue_detail: Optional[dict[str, Any]] = None
+    detail_metron_id = metron_data.get("metron_id") if metron_data else None
+    if detail_metron_id is not None and not metron_disabled:
+        try:
+            issue_detail = metron.lookup_issue_detail(detail_metron_id)
+            if issue_detail:
+                publisher_name = issue_detail.get("publisher") or None
+        except MetronCredentialError:
+            metron_disabled = True
+            logger.warning(
+                "Metron credentials not configured; skipping publisher/variant resolution."
+            )
+        else:
+            metron_disabled = _check_metron_degraded(metron, metron_disabled)
+
     # R32: variant handling
     needs_manual_variant = False
     # BUI-199 Cause 1: full_title must use the BASE series name, not the
@@ -3779,27 +3809,20 @@ def _build_win_row(
             full_title = f"{base_title} {suffix}"
         else:
             # BUI-33: Metron variant resolution. The lightweight
-            # lookup_issue has no variants, so fetch issue detail and
-            # fuzzy-match the auction variant text against Metron's
-            # variant cover names. (LOCG title-search fallback is dead
-            # per the local-first pivot, ADR 0001 / BUI-25.)
+            # lookup_issue has no variants, so the full-issue detail already
+            # fetched above (BUI-458) is reused to fuzzy-match the auction
+            # variant text against Metron's variant cover names — no second
+            # network call. (LOCG title-search fallback is dead per the
+            # local-first pivot, ADR 0001 / BUI-25.)
             matched_variant: Optional[str] = None
-            metron_id = metron_data.get("metron_id") if metron_data else None
-            if metron_id is not None and not metron_disabled:
-                try:
-                    variant_detail_attempted += 1
-                    detail = metron.lookup_issue_detail(metron_id)
-                    if detail:
-                        matched_variant = _fuzzy_variant_match(
-                            variant_text, detail.get("variants") or []
-                        )
-                except MetronCredentialError:
-                    metron_disabled = True
-                    logger.warning(
-                        "Metron credentials not configured; skipping variant resolution."
+            if detail_metron_id is not None:
+                # A metron_id resolved, so a variant lookup was attempted
+                # (the detail fetch is shared with publisher capture above).
+                variant_detail_attempted += 1
+                if issue_detail is not None:
+                    matched_variant = _fuzzy_variant_match(
+                        variant_text, issue_detail.get("variants") or []
                     )
-                else:
-                    metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
             if matched_variant:
                 full_title = f"{base_title} {matched_variant}"
@@ -3857,7 +3880,9 @@ def _build_win_row(
             release_date = f"{year_str}-01-01"
 
     row: dict[str, Any] = {
-        "publisher_name": None,
+        # BUI-458: real publisher from Metron's full-issue detail (null on any
+        # Metron miss — never a fabricated guess).
+        "publisher_name": publisher_name,
         "series_name": canonical_series,
         "full_title": full_title,
         "release_date": release_date,
