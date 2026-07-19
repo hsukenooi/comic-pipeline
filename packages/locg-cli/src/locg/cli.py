@@ -21,6 +21,7 @@ from locg.commands import (
     cmd_cache_stats,
     cmd_check_lists,
     cmd_collection,
+    cmd_collection_audit_pending,
     cmd_collection_check,
     cmd_collection_doctor,
     cmd_collection_export,
@@ -157,6 +158,22 @@ def create_parser() -> argparse.ArgumentParser:
 
     # collection doctor — local cache
     coll_sub.add_parser("doctor", parents=[common], help="Print first-run setup walkthrough and cache status")
+
+    # collection audit-pending — read-only pre-sync data-quality audit (BUI-432)
+    p_audit = coll_sub.add_parser(
+        "audit-pending",
+        parents=[common],
+        help="Audit an already-exported wins CSV for data-quality issues before uploading to LOCG (read-only)",
+        epilog=(
+            "Flags missing publisher/series/full_title, a decorated full_title "
+            "((Vol.)/year), and the YYYY-01-01 placeholder date, plus a dateless "
+            "summary (count, titles, all_dateless) and a ready-to-surface "
+            "dateless_warning. Read-only — never mutates the store or the CSV. "
+            "Pass the path from a prior `collection export`; do not re-export "
+            "before auditing (re-exporting re-blanks placeholder dates)."
+        ),
+    )
+    p_audit.add_argument("csv_path", help="Path to the already-exported wins CSV (from `collection export`)")
 
     # collection record-win — agent win recording
     p_rw = coll_sub.add_parser(
@@ -433,7 +450,7 @@ def main() -> None:
     logger = logging.getLogger("locg")
 
     # Collection cache subcommands are purely local — skip Playwright browser launch.
-    _LOCAL_COLLECTION_SUBCMDS = {"import", "export", "status", "check", "doctor", "record-win"}
+    _LOCAL_COLLECTION_SUBCMDS = {"import", "export", "status", "check", "doctor", "record-win", "audit-pending"}
     _collection_sub = (
         getattr(args, "collection_command", None)
         if args.command == "collection"
@@ -500,6 +517,8 @@ def main() -> None:
                 )
             elif sub_cmd == "doctor":
                 result = cmd_collection_doctor()
+            elif sub_cmd == "audit-pending":
+                result = cmd_collection_audit_pending(args.csv_path)
             elif sub_cmd == "record-win":
                 import json as _json
                 import sys as _sys
