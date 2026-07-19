@@ -147,6 +147,29 @@ class CollectionCheckBatchRequest(BaseModel):
     items: list[CollectionCheckItem]
 
 
+class SeriesNameResolveRequest(BaseModel):
+    """POST /api/comics/collection/series-names/resolve (BUI-449).
+
+    Takes one or more query series names (e.g. Metron's "Uncanny X-Men
+    (Vol. 1)") and reconciles each to the LOCG catalog spelling, or a "no
+    confident match" verdict — the matcher-owned replacement for a caller
+    pulling the FULL catalog series-name array (`GET
+    /api/comics/collection/series-names`) into model context and hand-rolling
+    its own normalized/fuzzy matching (the BUI-353-class duplication that
+    `/comic:collection-check` Pattern C and `/comic:wishlist-add` Step 3 each
+    did independently).
+    """
+
+    names: list[str]
+
+    @field_validator("names")
+    @classmethod
+    def _non_empty(cls, v: list[str]) -> list[str]:
+        if not v or not all(isinstance(n, str) and n.strip() for n in v):
+            raise ValueError("names must be a non-empty list of non-empty strings")
+        return v
+
+
 class SellerScanSeenRequest(BaseModel):
     """POST /api/comics/seller-scan/seen — mark item_ids as already surfaced (BUI-113)."""
 

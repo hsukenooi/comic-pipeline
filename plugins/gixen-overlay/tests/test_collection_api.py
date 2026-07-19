@@ -565,6 +565,48 @@ def test_series_names_returns_canonical_names(client):
     assert body["count"] == 2
 
 
+# --- series-names resolve (BUI-449) -----------------------------------------
+
+def test_series_names_resolve_exact_match(client):
+    """Thin-wrapper wiring check: the overlay endpoint delegates to locg-cli's
+    resolver (the one tested place the matching logic lives) and round-trips
+    its response shape."""
+    payload = json.loads((client.store / "collection.json").read_text())
+    payload["series_name_index"] = {"uncanny x-men": "Uncanny X-Men"}
+    (client.store / "collection.json").write_text(json.dumps(payload))
+
+    r = client.post(
+        "/api/comics/collection/series-names/resolve",
+        json={"names": ["Uncanny X-Men (Vol. 1)"]},
+    )
+    assert r.status_code == 200
+    assert r.json() == {
+        "results": [
+            {
+                "query": "Uncanny X-Men (Vol. 1)",
+                "resolved": "Uncanny X-Men",
+                "match_kind": "exact",
+            }
+        ]
+    }
+
+
+def test_series_names_resolve_no_confident_match(client):
+    r = client.post(
+        "/api/comics/collection/series-names/resolve",
+        json={"names": ["Some Unknown Series"]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["results"][0]["resolved"] is None
+    assert body["results"][0]["match_kind"] is None
+
+
+def test_series_names_resolve_rejects_empty_names(client):
+    r = client.post("/api/comics/collection/series-names/resolve", json={"names": []})
+    assert r.status_code == 422
+
+
 def test_collection_export_returns_csv(client):
     r = client.get("/api/comics/collection/export")
     assert r.status_code == 200

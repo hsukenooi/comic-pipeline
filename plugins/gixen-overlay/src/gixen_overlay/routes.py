@@ -42,6 +42,7 @@ from gixen_overlay.models import (
     SellerScanSeenRequest,
     CollectionWinsSeenRequest,
     CollectionCheckBatchRequest,
+    SeriesNameResolveRequest,
 )
 from gixen_overlay.title_parser import parse_title
 from server.db import (
@@ -73,6 +74,7 @@ from locg.commands import (
     cmd_collection_import,
     cmd_collection_record_win,
     cmd_collection_series_names,
+    cmd_collection_series_names_resolve,
     cmd_collection_status,
     cmd_wish_list_add,
     cmd_wish_list_conflicts,
@@ -1192,6 +1194,30 @@ async def api_collection_series_names():
     _ensure_collection_store()
     try:
         return cmd_collection_series_names()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+
+
+@router.post("/api/comics/collection/series-names/resolve")
+async def api_collection_series_names_resolve(req: SeriesNameResolveRequest):
+    """Reconcile one or more query series names to the LOCG catalog spelling
+    (BUI-449).
+
+    Thin wrapper over locg-cli's `cmd_collection_series_names_resolve` — the
+    ONE tested place the reconciliation (an exact normalized-key match, then a
+    confidence-gated fuzzy fallback) lives, beside `cmd_collection_series_names`
+    itself. Replaces the `/comic:collection-check` Pattern C /
+    `/comic:wishlist-add` Step 3 pattern of pulling the whole catalog array
+    into model context and hand-matching it in-model.
+
+    Returns ``{"results": [{"query", "resolved", "match_kind"}, ...]}`` in the
+    same order as the request `names`. `resolved` is null (and `match_kind`
+    null) when there is no confident match — treat that as "not found", never
+    guess a volume from it.
+    """
+    _ensure_collection_store()
+    try:
+        return cmd_collection_series_names_resolve(req.names)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
 

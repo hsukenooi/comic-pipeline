@@ -700,6 +700,163 @@ def test_series_names_empty_cache_returns_empty(tmp_path, monkeypatch):
     assert result == {"series_names": [], "count": 0}
 
 
+# ---------------------------------------------------------------------------
+# cmd_collection_series_names_resolve (BUI-449)
+# ---------------------------------------------------------------------------
+
+def _seed_series_name_index(tmp_path, index: dict[str, str]):
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+
+    def mutate(payload):
+        payload["series_name_index"] = index
+    cache.apply(mutate, command="seed")
+    return cache
+
+
+def test_resolve_exact_match_strips_vol_suffix(tmp_path, monkeypatch):
+    """Metron's '(Vol. 1)' decoration is already neutralized by
+    _normalize_series_key, so this resolves via the exact-key pass — no
+    fuzzy fallback needed."""
+    import locg.commands as cmds
+
+    cache = _seed_series_name_index(tmp_path, {"uncanny x-men": "Uncanny X-Men"})
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    result = cmds.cmd_collection_series_names_resolve(["Uncanny X-Men (Vol. 1)"])
+    assert result == {
+        "results": [
+            {
+                "query": "Uncanny X-Men (Vol. 1)",
+                "resolved": "Uncanny X-Men",
+                "match_kind": "exact",
+            }
+        ]
+    }
+
+
+def test_resolve_exact_match_strips_leading_article(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    cache = _seed_series_name_index(tmp_path, {"incredible hulk": "The Incredible Hulk"})
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    result = cmds.cmd_collection_series_names_resolve(["Incredible Hulk"])
+    assert result["results"][0]["resolved"] == "The Incredible Hulk"
+    assert result["results"][0]["match_kind"] == "exact"
+
+
+def test_resolve_fuzzy_match_for_punctuation_alt_spelling(tmp_path, monkeypatch):
+    """The narrow BUI-171 residual: a genuine alt-spelling (here, a dropped
+    period) that survives the exact-key pass unmatched but is an unambiguous
+    fuzzy match."""
+    import locg.commands as cmds
+
+    cache = _seed_series_name_index(tmp_path, {"ms. marvel": "Ms. Marvel"})
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    result = cmds.cmd_collection_series_names_resolve(["Ms Marvel"])
+    assert result["results"][0]["resolved"] == "Ms. Marvel"
+    assert result["results"][0]["match_kind"] == "fuzzy"
+
+
+def test_resolve_no_confident_match_returns_none(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    cache = _seed_series_name_index(tmp_path, {"batman": "Batman"})
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    result = cmds.cmd_collection_series_names_resolve(["Aquaman"])
+    assert result["results"][0] == {
+        "query": "Aquaman",
+        "resolved": None,
+        "match_kind": None,
+    }
+
+
+def test_resolve_never_conflates_annual_with_base_series(tmp_path, monkeypatch):
+    """BUI-26 guard: a query for the base masthead must never fuzzy-match a
+    distinct line-extension that merely shares the masthead (Annual /
+    Giant-Size / King-Size / Special) — the Jaccard threshold is high enough
+    that the extra disambiguating token always sinks the score."""
+    import locg.commands as cmds
+
+    cache = _seed_series_name_index(
+        tmp_path, {"fantastic four annual": "Fantastic Four Annual"}
+    )
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    result = cmds.cmd_collection_series_names_resolve(["Fantastic Four"])
+    assert result["results"][0]["resolved"] is None
+    assert result["results"][0]["match_kind"] is None
+
+
+def test_resolve_ambiguous_fuzzy_match_returns_none(tmp_path, monkeypatch):
+    """Two catalog names both clear the fuzzy threshold for the same query —
+    genuinely ambiguous, so refuse to guess rather than picking one."""
+    import locg.commands as cmds
+
+    cache = _seed_series_name_index(
+        tmp_path,
+        {
+            "foo bar": "Foo Bar",
+            "foo-bar": "Foo-Bar",
+        },
+    )
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    result = cmds.cmd_collection_series_names_resolve(["Foo Bar!"])
+    assert result["results"][0]["resolved"] is None
+    assert result["results"][0]["match_kind"] is None
+
+
+def test_resolve_multiple_names_preserves_order(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    cache = _seed_series_name_index(
+        tmp_path,
+        {"uncanny x-men": "Uncanny X-Men", "batman": "Batman"},
+    )
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+
+    result = cmds.cmd_collection_series_names_resolve(
+        ["Uncanny X-Men (Vol. 1)", "Aquaman", "Batman"]
+    )
+    queries = [r["query"] for r in result["results"]]
+    resolved = [r["resolved"] for r in result["results"]]
+    assert queries == ["Uncanny X-Men (Vol. 1)", "Aquaman", "Batman"]
+    assert resolved == ["Uncanny X-Men", None, "Batman"]
+
+
+def test_resolve_empty_cache_returns_no_match(tmp_path, monkeypatch):
+    import locg.commands as cmds
+
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: make_cache(tmp_path))
+    result = cmds.cmd_collection_series_names_resolve(["Batman"])
+    assert result == {"results": [{"query": "Batman", "resolved": None, "match_kind": None}]}
+
+
+# --- BUI-449: the _fuzzy_series_name_match helper directly ---
+
+def test_fuzzy_series_name_match_confident_hit():
+    from locg.commands import _fuzzy_series_name_match
+
+    assert _fuzzy_series_name_match("Ms Marvel", ["Ms. Marvel"]) == "Ms. Marvel"
+
+
+def test_fuzzy_series_name_match_rejects_low_similarity():
+    from locg.commands import _fuzzy_series_name_match
+
+    assert _fuzzy_series_name_match("Fantastic Four", ["Fantastic Four Annual"]) is None
+
+
+def test_fuzzy_series_name_match_no_candidates():
+    from locg.commands import _fuzzy_series_name_match
+
+    assert _fuzzy_series_name_match("Batman", []) is None
+
+
 def test_check_empty_cache_returns_not_in_cache(tmp_path, monkeypatch):
     import locg.commands as cmds
 
