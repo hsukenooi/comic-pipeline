@@ -903,3 +903,104 @@ class TestEndToEndThroughEbayFetch:
             token = grade_photos.get_token("id", "secret", ebay_fetch.PRODUCTION_BASE)
         assert token == "cached-token"
         mock_post.assert_not_called()
+
+
+# ============================================================
+# BUI-440: default (no --workdir) run directory is namespaced per run
+# ============================================================
+
+
+class TestDefaultWorkdirNamespacing:
+    """grade_photos.py used to default --workdir to the bare fixed root
+    /tmp/comic-grading, which was never cleared: a prior larger run's
+    comic-3..comic-N dirs survived into a later smaller run, and two
+    overlapping runs (e.g. a /comic:buy run + a standalone /comic:grade run)
+    collided on comic-1/comic-2 and could rmtree each other's in-flight
+    images. These tests monkeypatch _DEFAULT_WORKDIR_ROOT to a tmp_path so
+    they never touch the real /tmp."""
+
+    def _run(self, monkeypatch, tmp_path, root_name, item_ids):
+        root = tmp_path / root_name
+        monkeypatch.setattr(grade_photos, "_DEFAULT_WORKDIR_ROOT", root)
+        item = {
+            "title": "Fantastic Four #52",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "currentBidPrice": {"value": "5.00"},
+            "bidCount": 1,
+        }
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", return_value="fake-token"):
+                with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
+                    with patch("grade_photos.requests.get", return_value=_ok_response()):
+                        grade_photos.main(item_ids)
+        return root
+
+    def test_prints_resolved_workdir_when_not_given(self, tmp_path, monkeypatch, capsys):
+        """The auto-generated run directory must be discoverable by a caller
+        that didn't pass --workdir (e.g. grade.md's Step 1), since it's no
+        longer a predictable fixed path."""
+        root = self._run(monkeypatch, tmp_path, "comic-grading", ["111"])
+        out = capsys.readouterr().out.strip().splitlines()
+        assert out[0].startswith("WORKDIR: ")
+        printed_workdir = out[0].removeprefix("WORKDIR: ")
+        assert Path(printed_workdir).parent == root
+        assert (Path(printed_workdir) / "comic-1" / "img-01.jpg").exists()
+
+    def test_two_runs_get_different_directories_under_shared_root(self, tmp_path, monkeypatch, capsys):
+        """Two runs sharing the same default root (simulating two overlapping
+        /comic:grade invocations) must land in different directories, so
+        neither run's comic-N rmtree (BUI-300) can touch the other's files."""
+        root = tmp_path / "comic-grading"
+        monkeypatch.setattr(grade_photos, "_DEFAULT_WORKDIR_ROOT", root)
+        item = {
+            "title": "Fantastic Four #52",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "currentBidPrice": {"value": "5.00"},
+            "bidCount": 1,
+        }
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", return_value="fake-token"):
+                with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
+                    with patch("grade_photos.requests.get", return_value=_ok_response()):
+                        grade_photos.main(["111"])
+                        first_workdir = capsys.readouterr().out.strip().splitlines()[0].removeprefix("WORKDIR: ")
+                        grade_photos.main(["222"])
+                        second_workdir = capsys.readouterr().out.strip().splitlines()[0].removeprefix("WORKDIR: ")
+        assert first_workdir != second_workdir
+        # Both directories survive — proof neither run's per-label rmtree
+        # (BUI-300) reached into the other run's comic-1.
+        assert (Path(first_workdir) / "comic-1").exists()
+        assert (Path(second_workdir) / "comic-1").exists()
+
+    def test_smaller_later_run_leaves_no_stale_comic_n_dirs(self, tmp_path, monkeypatch, capsys):
+        """A larger run's comic-3 must not survive into a later, smaller
+        run's fresh directory — the old bug was a shared fixed root that was
+        never cleared, so a prior run's higher-numbered comic-N dirs leaked
+        into every subsequent run regardless of size."""
+        root = tmp_path / "comic-grading"
+        monkeypatch.setattr(grade_photos, "_DEFAULT_WORKDIR_ROOT", root)
+        item = {
+            "title": "Fantastic Four #52",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "currentBidPrice": {"value": "5.00"},
+            "bidCount": 1,
+        }
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", return_value="fake-token"):
+                with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
+                    with patch("grade_photos.requests.get", return_value=_ok_response()):
+                        grade_photos.main(["111", "222", "333"])
+                        large_workdir = Path(
+                            capsys.readouterr().out.strip().splitlines()[0].removeprefix("WORKDIR: ")
+                        )
+                        grade_photos.main(["444"])
+                        small_workdir = Path(
+                            capsys.readouterr().out.strip().splitlines()[0].removeprefix("WORKDIR: ")
+                        )
+        assert large_workdir != small_workdir
+        assert (large_workdir / "comic-3").exists()
+        assert not (small_workdir / "comic-2").exists()
+        assert not (small_workdir / "comic-3").exists()

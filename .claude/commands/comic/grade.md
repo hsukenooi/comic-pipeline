@@ -21,9 +21,10 @@ Run the downloader script (BUI-279 — extracted from this skill so the OAuth + 
 python3 ~/Projects/comic-pipeline/apps/ebay/src/grade_photos.py 178057470740 178057488707 ...
 ```
 
-Item IDs are labeled `comic-1`, `comic-2`, ... in the order given, downloaded into `/tmp/comic-grading/<label>/` (override with `--workdir`). It prints one line per comic:
+Item IDs are labeled `comic-1`, `comic-2`, ... in the order given. **BUI-440:** when `--workdir` is not passed, each run gets its own fresh directory under `/tmp/comic-grading` (not the bare shared root) so a prior run's `comic-N` dirs never leak into a smaller later run, and two overlapping runs (a `/comic:buy` run + a standalone `/comic:grade` run) never collide on `comic-1`/`comic-2`. The script prints the resolved directory as its first line — read that line to get the base path for Step 2's IMAGE FOLDER inputs:
 
 ```
+WORKDIR: /tmp/comic-grading/run-a1b2c3
 comic-1: FETCH FAILED — <error>
 comic-1: Fantastic Four #48 (1966) 9.0 VF/NM — 8 images — current bid $42.50 (5 bids)
 ```
@@ -32,9 +33,9 @@ The printed current-bid figure per comic is the **value signal for the Step 2 va
 
 **A `FETCH FAILED` line is not an image-less listing (BUI-147).** If the download script prints `FETCH FAILED` for a comic (a down/429/404 eBay API), do **not** feed it to the triage pre-pass or drop it as "un-gradeable" — that's an API failure, not a photo-quality verdict. Re-run that item (the script retries 429 automatically); surface the failure to the user rather than silently grading 0 images.
 
-Output directory layout:
+Output directory layout (under the printed `WORKDIR:` path):
 ```
-/tmp/comic-grading/
+<workdir>/
   comic-1/
     img-01.jpg   ← front cover (first image returned by API)
     img-02.jpg   ← additional images
@@ -82,7 +83,7 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 2. **Boundary-ambiguous grade:** the grader identified a grade-capping defect (`GRADE CAP` ≠ none) and the grade sits within `CAP_BAND` of that ceiling — or is unsure whether a capping defect is present — OR a possible-restoration flag fired, OR the grader gave a wide GRADE RANGE (≥1.5 pts) **at MEDIUM confidence or higher**. (Proximity to a round grade with `GRADE CAP: none` is **not** a near-cap trigger — the cap must be an observed/suspected *defect*, not a number.) A wide range only escalates when it signals disagreement over *visible* evidence that more graders can resolve. A wide range at MEDIUM-LOW/LOW confidence is **coverage-driven** — the photos can't show the deciding surfaces (spine stress, interior, page edge), so adding graders cannot narrow it; it does **not** escalate on its own. (Near-cap and restoration still escalate regardless of coverage, since a second look can confirm a *visible* capping defect.)
 3. **Decision-relevant:** a half-grade swing would plausibly cross the buy/no-buy line the user cares about (if known at grade time).
 
-**Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, no cap/restoration flag fired, and any wide range is coverage-driven (MEDIUM-LOW/LOW confidence). Unknown `current_price` counts as below-threshold. Note the common case: a cheap 2-cover-photo lot draws a wide range *because* coverage is thin — that is the expected MEDIUM-LOW output, not an escalation signal. Escalating it would burn 3 graders on photos that structurally can't resolve the spread (the failure mode that negates the value gate on a typical thin-photo seller scan).
+**Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, no cap/restoration flag fired, and any wide range is coverage-driven (see trigger 2 above). Unknown `current_price` counts as below-threshold. The common case: a cheap 2-cover-photo lot hits exactly that coverage-driven case — expected MEDIUM-LOW output, not an escalation signal. Escalating it would burn 3 graders on photos that structurally can't resolve the spread (the failure mode that negates the value gate on a typical thin-photo seller scan).
 
 **Decision-sensitivity gate (optional — suppresses escalation when the grade can't change the buy).** When grading inside a flow that knows the auction's current price and can compute FMV (e.g. `/comic:buy`), a book that tripped an escalation trigger above can still **stay at 1 grader** if a tighter grade wouldn't change the decision. Before escalating, probe FMV at the **endpoints of the grade RANGE** (low and high) and compute the bid cap at each (same `grade_confidence` haircut at both). If **both** endpoints give the **same buy/no-buy call** against the current price **and** bid caps within `CAP_DECISION_TOLERANCE` of each other, the extra grader precision cannot move the outcome → do **not** escalate; report e.g. `1 grader (decision-insensitive: bid cap $34–$37 across 6.0–7.5, same buy call)`. Escalate only when the range straddles a decision boundary — the buy/no-buy call flips, or the bid-cap swing exceeds the tolerance. This is the highest-leverage skip on a value-gated scan: it stops a 3-grader panel from pinning a grade whose imprecision doesn't reach the bid. (The value trigger still escalates a high-value book whose decision *is* sensitive; the gate only suppresses escalation that provably can't matter.)
 
@@ -105,7 +106,7 @@ The OUTPUT FORMAT block the agent returns (`GRADE`, `GRADE RANGE`, `CONFIDENCE`,
 **Dynamic inputs to pass per invocation** (the only per-comic data the agent doesn't already carry):
 
 - **COMIC + YEAR** — e.g. `Fantastic Four #48 (1966)`
-- **IMAGE FOLDER** — e.g. `/tmp/comic-grading/comic-1`
+- **IMAGE FOLDER** — e.g. `<workdir>/comic-1`, where `<workdir>` is the path from Step 1's printed `WORKDIR:` line
 - **IMAGES** — `img-01.jpg` through `img-{N:02d}.jpg` (N photos)
 - **SELLER-STATED GRADE** — from the listing title/description if present, else `none stated`
 - **Item id label** — so batched output blocks are traceable
@@ -193,7 +194,7 @@ Always note these. Do not claim CGC accuracy.
 |---------|-----|
 | Grading from WebFetch text output | WebFetch returns markdown text, not images — useless for visual grading |
 | Giving all 3 agents the same agent name | Use distinct names (e.g., `grader-c1-a`, `grader-c1-b`) so results are traceable |
-| Escalating every 2-photo lot because its range is wide | A wide range at MEDIUM-LOW/LOW confidence is coverage-driven — more graders can't see the missing views, so it does NOT escalate (Step 2 trigger 2). Only escalate on a wide range at MEDIUM+ confidence, a near-cap grade, restoration, or value |
+| Escalating every 2-photo lot because its range is wide | A wide range at MEDIUM-LOW/LOW confidence is coverage-driven and does NOT escalate on its own (see Step 2 trigger 2) |
 | Auto-dropping a book in triage because it looks like a beater | Condition is not a triage kill — there's no FMV floor at grade time. FLAG suspected beaters for the user; only DROP un-gradeable photos or confirmed non-matches (Step 1.5). When unsure, KEEP |
 | Inflating grade because it's a key issue | Grade physical condition only — key issue premium belongs in FMV, not grade (criteria live in the `comic-grader` subagent, not this skill) |
 | Capping the grade over a printed credit/signature | Printed credits, facsimile signatures, barcodes, and price boxes are in the print layer — never defects (PRINT-LAYER RULE, in the `comic-grader` subagent). Only a post-print autograph caps. When unsure, do NOT cap |
