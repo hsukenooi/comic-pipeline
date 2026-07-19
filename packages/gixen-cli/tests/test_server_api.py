@@ -2484,6 +2484,115 @@ def test_listed_win_case_a_does_not_consume_fetch_budget(api, monkeypatch):
     assert _group_win_row("410000002") is not None
 
 
+def test_null_end_case_a_won_purged_same_cycle_keeps_durable_evidence(api, monkeypatch):
+    """BUI-420 (a): a WON row first observed with auction_end_at NULL, then
+    PURGED in the same /api/purge loop (which syncs, then sweeps the WON row to
+    REMOVED), still lands durable group_wins evidence recorded from a GENUINE
+    eBay end — so it survives the purge and stays available to _group_won_before
+    for a later recycled-group / sibling classification.
+
+    Pre-fix, _listed_win_evidence_already_covered marked this null-end Case-A
+    live-row winner 'already covered' and skipped the eBay fetch, while
+    update_bid_status recorded nothing (its win_rows capture filters
+    auction_end_at IS NOT NULL, skipping exactly this row) — so the same-cycle
+    purge erased the evidence forever, reopening the phantom-WON window BUI-381
+    closes."""
+    genuine_end = _iso_ago(days=2)  # the auction's true end, per eBay
+    # Live PENDING row with a NULL auction_end_at (the trigger condition).
+    _seed_bid_row("420000010", snipe_group=8, auction_end_at=None)
+    _arm_ebay(monkeypatch, genuine_end)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("420000010", status="WON", time_to_end="ENDED",
+                       snipe_group="8", current_bid="30.00 USD"),
+    ]
+    # /api/purge syncs first (records the ledger from the eBay fetch), then
+    # sweeps the freshly-WON row to REMOVED — the exact same-cycle purge.
+    assert api.post("/api/purge", json={"sibling_ids": []}).status_code == 200
+    # The winner row is gone (tombstoned)...
+    assert _read_db_row("420000010")["status"] == "REMOVED"
+    # ...but its durable group-win evidence survived, with eBay's GENUINE end.
+    gw = _group_win_row("420000010")
+    assert gw is not None
+    assert gw["won_end_at"] == genuine_end
+    assert gw["source"] == "listed-win"
+
+
+def test_null_end_case_a_durable_end_is_genuine_no_recycled_false_removed(api, monkeypatch):
+    """BUI-420 (b): the DURABLE ledger evidence for a null-end Case-A winner
+    stores eBay's GENUINE end, never a resolved_at / observation-time proxy (the
+    rejected BUI-419 Option A). Proven two ways after the winner row is purged
+    (so only the ledger — not the live row's proxy end — remains as evidence):
+
+    1. The surviving won_end_at equals eBay's end and differs from the row's own
+       proxy columns (resolved_at / auction_end_at, both ~now after the WON
+       UPDATE's COALESCE fill). Option A would have made them equal.
+    2. _group_won_before does NOT read the win as cancel evidence for a later
+       snipe that reused the group and joined AFTER the genuine win — the
+       lifetime bound excludes a win predating membership. A proxy end (~now)
+       would sit inside that sibling's window → false REMOVED → suppress a real
+       win → duplicate purchase (the worse-direction money bug the invariant
+       prevents)."""
+    from datetime import datetime, timedelta, timezone
+    from server.fallback import _group_won_before
+    genuine_end = _iso_ago(days=10)
+    _seed_bid_row("420000040", snipe_group=6, auction_end_at=None)  # NULL end
+    _arm_ebay(monkeypatch, genuine_end)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("420000040", status="WON", time_to_end="ENDED",
+                       snipe_group="6", current_bid="30.00 USD"),
+    ]
+    # Sync records the durable genuine-end evidence; purge sweeps the WON row so
+    # the live row's proxy end no longer serves as evidence — only the ledger.
+    assert api.post("/api/purge", json={"sibling_ids": []}).status_code == 200
+    assert _read_db_row("420000040")["status"] == "REMOVED"
+    gw = _group_win_row("420000040")
+    assert gw is not None
+    # (1) genuine end recorded, NOT the observation-time proxy.
+    assert gw["won_end_at"] == genuine_end
+    assert gw["won_end_at"] != _read_col("420000040", "resolved_at")
+    assert gw["won_end_at"] != _read_col("420000040", "auction_end_at")
+
+    # (2) a later snipe reused group 6 and joined 5 days ago — AFTER the genuine
+    # win (10 days ago), but where a `now` proxy would fall. Its own auction is
+    # still live (future end), so _group_won_before classifies it cancelled iff
+    # a stored win falls in [member_since, end - margin].
+    sibling_added = _iso_ago(days=5)
+    sibling_end = datetime.now(timezone.utc) + timedelta(days=1)
+    conn = _dbconn()
+    verdict = _group_won_before(conn, "420000099", 6, sibling_end, sibling_added, None)
+    conn.close()
+    # Genuine end (10d ago) predates membership (5d ago) → NOT cancel evidence.
+    # A proxy end near `now` would be inside the window → this would be True.
+    assert verdict is False
+
+
+def test_null_end_case_a_consumes_fetch_while_nonnull_still_skips(api, monkeypatch):
+    """BUI-420 (c): the budget delta. A null-end Case-A winner NEWLY consumes a
+    listed-win eBay fetch — update_bid_status cannot record its ledger (win_rows
+    filters auction_end_at IS NOT NULL) — while a non-null-end Case-A winner is
+    STILL skipped (update_bid_status records it for free), preserving
+    test_listed_win_case_a_does_not_consume_fetch_budget. Only the null-end
+    Case-A winner is fetched; both still leave durable evidence."""
+    end_iso = _iso_ago(days=1)
+    _seed_bid_row("420000030", snipe_group=2, auction_end_at=_iso_ago(days=1))  # non-null Case-A
+    _seed_bid_row("420000031", snipe_group=3, auction_end_at=None)              # null-end Case-A
+    calls = _arm_ebay_counting(monkeypatch, end_iso)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("420000030", status="WON", time_to_end="ENDED",
+                       snipe_group="2", current_bid="20.00 USD"),
+        _gixen_listing("420000031", status="WON", time_to_end="ENDED",
+                       snipe_group="3", current_bid="20.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    # Only the null-end winner was fetched; the non-null one stayed skipped.
+    assert calls == ["420000031"]
+    # Both still leave durable ledger evidence.
+    assert _group_win_row("420000030") is not None  # via update_bid_status (stored end)
+    g31 = _group_win_row("420000031")
+    assert g31 is not None                           # via the eBay fetch
+    assert g31["won_end_at"] == end_iso              # genuine eBay end, not a proxy
+
+
 def test_sync_routes_all_writes_off_shared_db(api, _db_untouched):
     """BUI-410 core isolation property: a full _sync_gixen cycle that applies a
     real terminal transition commits ONLY on its own write_transaction()
