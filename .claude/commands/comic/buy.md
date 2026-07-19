@@ -13,74 +13,42 @@ Each leaf skill is also usable standalone. Use this when the user provides eBay 
 
 ## Execution Pattern
 
-Leaf skills that run in sub-agents are split into two marked sections (BUI-361):
-an **EXECUTOR CONTRACT** (everything the executing agent must do, self-contained)
-and **ORCHESTRATOR NOTES** (gates, decision guidance, carry-forward). Dispatch
-those steps as:
+Leaf skills split into **EXECUTOR CONTRACT** (self-contained sub-agent
+instructions) and **ORCHESTRATOR NOTES** (gates, decision guidance) — BUI-361.
+Dispatch a step as:
 
 > Read `<skill path>` and execute its EXECUTOR CONTRACT with this
 > input: \<the step's working-list input\>
 
-Spell out the full path the same way the dispatch bullets below do (e.g.
-`~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md`) — not a
-bare filename the sub-agent would have to search for.
-
-The sub-agent reads the skill file itself — do **not** re-serialize or digest
-the skill body into the dispatch prompt (that pays for the content twice and
-drifts from the file). As the orchestrator, read **only** the ORCHESTRATOR
-NOTES section of those skills, never their full body.
+Use the full path (e.g.
+`~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md`), not a
+bare filename. As orchestrator, read only the dispatched skill's ORCHESTRATOR
+NOTES yourself — never its EXECUTOR CONTRACT, and never re-serialize the skill
+body into the dispatch prompt.
 
 Steps without a sub-agent dispatch stay inline: read the skill file and follow
-it (`identify.md`, `grade.md`) or call the CLI directly (Steps 3 and 5) as each
-step says. This keeps the orchestrator in sync with any updates to the leaf
-skills without hand-copying their content.
-
-A third pattern applies to `verify.md` (post-BUI-360): it's split into
-EXECUTOR CONTRACT / ORCHESTRATOR NOTES the same as `collection-check.md`, but
-Step 6 never dispatches an executor and never reads its EXECUTOR CONTRACT at
-all — `gixen add-batch --verify` (Step 5) already performed the equivalent of
-the executor's call inline, so Step 6 reads *only* `verify.md`'s ORCHESTRATOR
-NOTES section, inline, to interpret the verdicts already embedded in that
-CLI's output. Treat it like reading the ORCHESTRATOR NOTES of a dispatched
-skill — there's just no matching executor dispatch to pair it with.
+it (`identify.md`, `grade.md`), or call the CLI directly (Steps 3 and 5).
+`verify.md` is dispatched neither way at Step 6 — see Step 6 below for how
+its ORCHESTRATOR NOTES get read without a matching executor call.
 
 At each step, present results to the user and wait for approval before proceeding.
 
 ### Sub-agent reuse — SendMessage, not respawn (BUI-366)
 
-Sub-agents spawned during a run stay addressable for the whole run. When a
-follow-up question or an incremental unit of work lands on context an existing
-agent **already holds**, route it to that agent via
-`SendMessage({to: <name>, message: ...})` instead of spawning fresh — a respawn
-re-fetches and re-instructs for data already sitting in the first agent's
-context. This depends on the agent having been named at spawn (an unnamed
-agent silently degrades reuse back to a respawn) — the dispatch bullets below
-(Step 1, Step 2) already tell you to name the agent when you spawn it.
+Route follow-up work that lands on data an already-spawned agent holds to that
+agent via `SendMessage({to: <name>, message: ...})` instead of spawning fresh
+— this only works if the agent was named at spawn (Steps 1 and 2 do this).
+Reuse targets:
 
-Reuse targets in this flow:
+- **Identifier agent (Step 1)** — holds the full `ebay_fetch.py` JSON (item
+  specifics, description text, printing/variant evidence). Route follow-ups
+  like "is item N a first print?" to it; see identify.md § Follow-ups.
+- **Collection-check executor (Step 2)** — holds its EXECUTOR CONTRACT and
+  verdicts. A comic added mid-run = SendMessage it the new row, not a respawn.
 
-- **The identifier agent (Step 1)** holds the full `ebay_fetch.py` JSON for
-  every listing — item specifics, description text, printing/variant evidence
-  that never entered your context. Route follow-ups like "is item N a first
-  print or a later printing?" to it via SendMessage instead of a fresh spawn —
-  see identify.md § Follow-ups for the full rationale and the 2026-07-16
-  example. Current Price and Bids are **not** a reason to message it — BUI-359
-  already emits them in the Step 1 table; the pattern is for evidence the
-  table doesn't carry.
-- **The collection-check executor (Step 2)** holds its loaded EXECUTOR CONTRACT
-  and the run's verdicts. A comic added to the working list mid-run =
-  SendMessage it the new `{series, issue, year?, variant?}` row for an
-  incremental check, rather than respawning an agent that re-reads the
-  contract from scratch.
-
-(There is no snipe-add sub-agent to reuse — BUI-360 made Step 5 an inline
-`gixen add-batch` call. A late "add one more snipe" is just another inline
-`gixen add`/`add-batch` invocation, or an ad-hoc executor per snipe-add.md.)
-
-Spawn fresh when the context *isn't* already held — a concern none of the live
-agents has data for. Reuse is about the data an agent holds, not about avoiding
-spawns on principle. And reuse never skips a gate: work routed via SendMessage
-still goes through the same user approvals as first-pass work.
+There is no snipe-add sub-agent to reuse (Step 5 is inline). Reuse never skips
+a gate — routed work still goes through the same approvals as first-pass work.
+Full BUI-361/BUI-366 rationale: `docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md`.
 
 ---
 
@@ -95,47 +63,34 @@ source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
 comics_resolve_server || exit 1   # sets + exports COMICS_SERVER_URL
 ```
 
-Without this, Step 1's `curl` ran against an unset `COMICS_SERVER_URL` (empty
-host) and the seller-reliability advisory silently no-op'd for the whole run —
-suppressing the over-grader signal that informs the Step 2.5 photo-grade
-decision. The leaf skills still health-gate the server at their own steps.
+Without this, Step 1's seller-reliability advisory silently no-ops for the whole run (BUI-154). The leaf skills still health-gate the server at their own steps.
 
 ---
 
 ## Step 1: Identify
 
-Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow
-it — name the identifier subagent it dispatches (e.g. `comic-identifier`) at
-spawn time (BUI-366) so it stays addressable for follow-ups later in the run
-(see § Sub-agent reuse above and identify.md § Follow-ups).
+Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow it — name the identifier subagent (e.g. `comic-identifier`) at spawn time (BUI-366) so it stays addressable for follow-ups (§ Sub-agent reuse above; identify.md § Follow-ups).
 
 **Input:** eBay URLs from the user.
 **Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**).
 
 Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step.
 
-**Keep the Current Price and Bids columns in the working list (BUI-359)** — Steps 4–5
-read them for the current-bid-vs-max pre-flight and urgency context. They came free
-with the identify fetch; re-asking the identifier subagent for prices mid-flow costs
-a round-trip and ~26k tokens for nothing.
+**Keep the Current Price and Bids columns in the working list (BUI-359)** — Steps 4–5 need them for the current-bid-vs-max pre-flight and urgency context; they're already in the Step 1 fetch, so don't re-ask the identifier subagent for prices mid-flow.
 
 ### Seller reliability advisory (BUI-78)
 
-For each distinct seller in the table, query the seller's grading track record
-(cheap local GET; best-effort — on any error treat as no history and proceed).
-`COMICS_SERVER_URL` is already resolved in Step 0, so this advisory actually runs:
+For each distinct seller in the table, query their grading track record (cheap local GET; best-effort — on error treat as no history and proceed). `COMICS_SERVER_URL` is already resolved in Step 0, so this actually runs:
 
 ```bash
 curl -s "$COMICS_SERVER_URL/api/seller-reliability?seller=<seller_username>"
 ```
 
-When `sample_size >= 1`, surface a line before the user decides whether to grade
-(Step 2.5) or how aggressively to bid:
+When `sample_size >= 1`, surface a line before the grade (Step 2.5) / bid-aggressiveness decision:
 
 > ⚠️ Seller `beatlebluecat` has over-stated condition by ~**+1.5** grade points (n=4 prior assessments). Consider photo-grading this listing to verify condition before bidding.
 
-- `avg_deviation` is `seller_grade − photo_grade`; **positive = over-grades**. Render with an explicit sign.
-- For `sample_size` of 1–2, prefix **"early signal —"** and soften the wording (one or two data points, not an established pattern).
+- `avg_deviation` is `seller_grade − photo_grade` (**positive = over-grades**; render with an explicit sign). For `sample_size` 1–2, prefix **"early signal —"** and soften the wording.
 - `sample_size == 0` (or any error / no server): show nothing.
 - Advisory only — it never changes the grade, FMV, or max bid automatically.
 
@@ -168,43 +123,26 @@ Remove skipped comics from the working list before Step 2.5.
 
 ### Duplicate listings of the same comic → Gixen bid group (BUI-363)
 
-When the working list contains **2+ listings of the same comic** (same series +
-issue + variant tier) and the user wants **at most one copy**, don't drop the
-later-ending copies — keep them all in the working list and mark them as one
-**bid-group candidate**. Gixen bid groups make "snipe every copy, win at most
-one" safe: per Gixen's documented semantics, once one snipe in a group wins,
-the remaining snipes in that group are automatically cancelled.
+When the working list has **2+ listings of the same comic** and the user wants
+**at most one copy**, keep every copy in the working list (don't drop
+later-ending ones) and mark them a bid-group candidate — each copy still flows
+through grade/FMV individually (per-copy max bids may legitimately differ by
+grade). At Step 5, give every copy the same `"group": N`; omit it if the user
+genuinely wants multiple copies (distinct variants, intentional multi-buy).
 
-- Each copy still flows through grade/FMV individually — **per-copy max bids
-  may legitimately differ by grade** (a VF copy and a VF+ copy of the same book
-  get different caps).
-- At Step 5, give every copy the same `"group": N` in its batch row (pick the
-  lowest N from 1–10 not already used by a live snipe — check `gixen list`,
-  which shows each snipe's group).
-- **End-time caveat (from Gixen's FAQ):** groups are only safe when the
-  grouped auctions **do not end within ~2 minutes of each other** — Gixen
-  cancels siblings *after* a win, so two copies ending near-simultaneously can
-  BOTH be bid and both won. If two copies end that close together, group them
-  anyway but warn the user and let them pick one to snipe instead.
-- If the user wants multiple copies (genuinely distinct variants, or an
-  intentional multi-buy), no group — omit the field.
-- After a group win, remind the user that `gixen purge` cleans up the
-  group's cancelled sibling snipes on Gixen and in the DB — worth running for
-  a tidy list, but no longer a safety requirement: the server classifies an
-  unpurged sibling `REMOVED` on its own once its auction ends (BUI-371/
-  BUI-381 — see snipe-add.md § Bid groups for how).
+The four bid-group rules (picking N, the ~2 min end-time caveat, and why
+`gixen purge` is hygiene rather than the safety net) live in `snipe-add.md`
+§ Bid groups and `docs/solutions/conventions/bid-group-purge-is-hygiene-not-safety-net.md`
+— this section only carries the buy-flow-specific part: candidates surface
+here at Step 2, get applied at Step 5.
 
 ---
 
 ## Step 2.5: Grade Ungraded Comics (conditional)
 
-**Run after the collection check** — only grade comics that survived the collection check. No point assessing condition on a comic the user already owns and is skipping.
+**Run after the collection check** — only grade comics that survived it (no point assessing condition on a comic the user is skipping). Inspect the surviving working list for comics where `grade_source` is `"missing"` AND no grade signal appeared in the title or description.
 
-Inspect the surviving working list for comics where `grade_source` is `"missing"` AND no grade signal appeared in the title or description.
-
-**If any such comics remain:**
-
-Read `~/Projects/comic-pipeline/.claude/commands/comic/grade.md` and follow it for those listings only.
+**If any such comics remain:** read `~/Projects/comic-pipeline/.claude/commands/comic/grade.md` and follow it for those listings only.
 
 - Pass only the ungraded item IDs — already-graded comics skip this step
 - The skill downloads photos via the eBay Browse API and dispatches the **`comic-grader` subagent** by type per comic (value-gated: 1 grader for cheap/unambiguous lots, a 3-grader panel for high-value or boundary-ambiguous ones). The grader persona + OUTPUT FORMAT contract lives in `.claude/agents/comic-grader.md` (scoped `Read, Bash`); grade.md passes it only the dynamic per-comic inputs
@@ -238,24 +176,14 @@ comic-fmv --batch <working_list.json> --out <results.json> --brief
 
 **Input:** Working list JSON: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Pass `publisher` for non-Marvel/DC titles and `variant` for non-base editions — both feed FMV accuracy (BUI-161). Include `grade_confidence` (`high`|`medium`|`medium-low`|`low` — all four levels; fmv.md owns the haircut each applies) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
 
-**Output:** Human FMV table to stdout, followed by one compact JSON line per row
-(`--brief`, BUI-362): `{item_id, comic_id, fmv_id, max_bid, flag_reason,
-confidence}`. The full structured JSON still lands at `--out`, but **do not
-read the `--out` file into context** — it's dominated by `queries_used` and
-`trimmed_pool` (~6k tokens for 7 rows). The brief lines carry everything
-Steps 4–5 thread forward; keep `--out` on disk for deep dives only (e.g.
-inspecting the comp pool when CV >100%).
+**Output:** Human FMV table to stdout, followed by one compact JSON line per row (`--brief`, BUI-362): `{item_id, comic_id, fmv_id, max_bid, flag_reason, confidence}`. The full structured JSON still lands at `--out`, but **do not read the `--out` file into context** — it's dominated by `queries_used`/`trimmed_pool` (~6k tokens for 7 rows). The brief lines carry everything Steps 4–5 need; keep `--out` on disk for deep dives only (e.g. inspecting the comp pool when CV >100%).
 
-Each brief line includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen add-batch`. A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid.
+Each brief line includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen add-batch` (via `gixen build-batch`, BUI-435). A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid. Full rationale for why this capture matters (PER-140): `docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md`.
 
 **Needs-manual rows (BUI-86):** a row whose `flag_reason` is set (`one_sided`, `too_wide`, or `too_sparse` — surfaced directly on its brief line) could not be honestly auto-priced — its `fmv_low`/`fmv_high`/`max_bid` are all `null`. It still has a real `comic_id` (the comic stub was written), so the `comic_id: null` check above will **not** catch it. Gate on `flag_reason` instead: surface these rows as **needs-manual** and do not auto-propose a max bid. The user either hand-prices them (via the `fmv.md` interpolation / CGC-proxy methods) or skips them — never bid the absent number.
 
-### Why Step 3 captures `comic_id`
-
-Carrying `comic_id` forward from here through Step 5 is what fixes the recurring "bids.comic_id and bids.fmv_id are NULL" bug (PER-140) — snipe-add.md owns the full chain (its "Canonical post-FMV invocation" section) and the `--comic-id` vs `--catalog-id` distinction. If the `comic_id` is dropped at any step the snipe still records, but the dashboard loses condition and FMV data for that bid. Step 5 is where most past sessions broke the chain.
-
 Flags worth knowing:
-- `--max-age-days N` (default 7) — reuses FMVs already in the comics server's DB if `fmv_updated_at` is recent. **Note (BUI-153):** DB-FMV reuse only fires for books that carry a `locg_id`, but the orchestrated buy flow derives series/issue from the eBay title and never resolves one — so this cache-skip is effectively inert in `/comic:buy` and every run recomputes FMV from comps (the ebay-sold-comps SerpApi response cache still applies). `--max-age-days` engages on the standalone `comic-fmv` path when the batch carries explicit `locg_id`s.
+- `--max-age-days N` (default 7) — reuses FMVs already in the comics server's DB if `fmv_updated_at` is recent; rarely engages inside `/comic:buy` since this flow never resolves a `locg_id` (BUI-153 — see the doc link above for why).
 - `--force` — bypasses both SerpApi and DB caches; use only when you suspect a stale comp pool
 
 **Confidence rubric:** fmv.md §8 owns the n/CV thresholds and the wide-window MEDIUM cap. The CLI returns these labels directly (in the human table and on each brief line; the `window` used lives in the `--out` JSON) — surface them as-is in your presentation.
@@ -302,34 +230,35 @@ Gate: user approves or overrides each max bid.
 
 ## Step 5: Snipe Add (Batch)
 
-**BUI-360:** this step calls `gixen add-batch` **inline** — one CLI invocation for the whole approved list — instead of dispatching to `snipe-add.md`'s per-item prose loop. `gixen add-batch` reuses the exact same server-mode code path as `gixen add` (POST `/api/bids`, then `/api/bids/{id}/link-fmv` when grade+comic_id are both given) and has the BUI-168 mid-batch failure semantics built into the CLI itself: a failed row is marked failed with its error, server health is re-checked before the next row, and the batch halts (remaining rows reported `not_attempted`) if the server goes down mid-run — never an all-✅ summary after a partial failure. `snipe-add.md` is still the right read for a standalone/ad-hoc add outside this flow (it documents the same `add` flags this batch input maps to); it is unchanged by this step.
+This step calls `gixen add-batch` inline (BUI-360) instead of dispatching `snipe-add.md`'s per-item loop — the BUI-168 mid-batch failure semantics (failed-row marking, health re-check, halt-on-dead-server) are enforced by the CLI itself; see `packages/gixen-cli/add_batch.py`. `snipe-add.md` documents the same `add` flags this batch input maps to, for a standalone/ad-hoc add outside this flow.
 
 If `gixen` isn't found, install the monorepo CLIs first: `./scripts/install.sh`.
 
-**1. Bid sanity check (unchanged from `snipe-add.md`'s pre-flight):**
+**1. Bid sanity check:** same rule as `snipe-add.md`'s pre-flight — compare each approved auction's current bid against its proposed max bid using the Step 1 Current Price column (BUI-359), don't re-fetch. If current bid ≥ max bid, surface it and ask whether to raise the max or skip before proceeding.
 
-Compare each approved auction's current bid against its proposed max bid, **using the Current Price column already in the Step 1 identification table (BUI-359)** — do not re-fetch listings or re-dispatch the identifier subagent for prices. If current bid ≥ max bid, surface it to the user — Gixen will still register the snipe but it fires below market and won't win. Ask whether to raise the max or skip before proceeding. (Caveat: the Step 1 price is as-of-identify; for an auction that was already contested — high Bids count — and hours have passed, it can lag reality. It's still the right default; only re-fetch if the user asks.)
+**2. Build the rows JSON with `gixen build-batch`** (BUI-435) — a tested,
+deterministic transform, not a hand-merge:
 
-**2. Build the rows JSON** from the working list carried forward — `item_id` + approved `max_bid` from Step 4, `comic_id` from the Step 3 **brief lines** (BUI-362), numeric `grade` as a CGC float from the working list (Step 2.5 photo grades are already numeric; convert a seller-stated letter grade, e.g. NM- → 9.2, the same mapping snipe-add.md documents for `--seller-grade`), and the `seller`/`seller_grade`/`photo_grade` captured in Steps 1/2.5. Skip Buy It Now listings — Gixen is for auctions only. For a Step 2 bid-group candidate (2+ copies of the same comic, user wants one — BUI-363), set the same `"group": N` on every copy's row; omit `group` otherwise (it defaults to 0 = no group). Write it to a scratch file, e.g.:
-
-```json
-[
-  {
-    "item_id": "123456789",
-    "max_bid": 800,
-    "comic_id": 42,
-    "grade": 9.2,
-    "seller": "some_seller",
-    "seller_grade": 9.0,
-    "photo_grade": 8.5,
-    "group": 1
-  }
-]
+```bash
+gixen build-batch fmv_brief.json working_list.json --overrides overrides.json --out rows.json
 ```
 
-- Omit `comic_id`/`grade` for a row whose Step 3 `comic_id` was null (FMV upsert skipped, e.g. `n=0`) — the bid still adds, just without FMV linkage (PER-140); surface that to the user rather than fabricating an id.
-- Omit any of `seller`/`seller_grade`/`photo_grade` that weren't captured for that comic.
-- `--comic-id`'s CLI caveat still applies conceptually: never put the internal `comic_id` where an LOCG id is expected — the batch row schema only has `comic_id` (no `catalog_id`), so this can't happen by construction here.
+- `fmv_brief.json` — Step 3's `--brief` output, saved as-is (the raw captured
+  stdout works too — the builder extracts the JSON lines itself).
+- `working_list.json` — the working list carried forward: one object per
+  comic with `item_id`, `grade` (numeric, or a CGC letter grade like `NM-` —
+  the builder converts it), `listing_type` (`Auction`/`BIN` from Step 1 —
+  BIN rows are skipped automatically), `seller`/`seller_grade`/`photo_grade`
+  (Steps 1/2.5), and `group` (the Step 2 bid-group candidate, if any).
+- `--overrides overrides.json` — only needed when Step 4's gate changed
+  anything from the CLI-computed default: `{"<item_id>": {"max_bid": ...,
+  "group": ..., "skip": true}}`. Omit the flag when nothing was overridden.
+
+The builder never drops `comic_id` (PER-140) and never fabricates a max bid
+for a needs-manual row — it hard-fails (`AddBatchError`, nonzero exit) instead
+if a working-list item has no matching brief row, or a needs-manual row has
+neither an override nor `skip`. Fix the input and re-run rather than patching
+`rows.json` by hand.
 
 **Gate: user approves the full batch** (the item_id + max_bid list) before any add is attempted — same approval point `snipe-add.md` gates on, just moved ahead of one CLI call instead of N.
 
@@ -361,17 +290,10 @@ Step 5's `--verify` already appended a `verify` verdict to every landed row in i
 - **`rows[].verify.verdict != "fully_linked"`** — surface the row in a table plus its one-line guidance from `verify.md`'s per-verdict mapping (`needs_manual`, `fmv_stub`, `no_fmv_at_grade`, `no_comic`, `partial`, `no_bid`).
 - **top-level `verify_error` is non-null** — the `/api/comics/verify` call itself failed (server hiccup after the adds already landed). Do **not** report an all-clear for verification in this case — say verification could not be confirmed for the landed rows and point at `/comic:verify` as a manual follow-up.
 
-Warn-only — don't block. The pipeline is done; the goal is to tell the user *now* about gaps so they don't discover them when the auction ends and `/comic:collection-add` chokes (PER-70 cascade).
-
-Born from PER-99 — `/comic:buy` ran to apparent success in past incidents while leaving rows partially populated (missing comic row, FMV stub, `bids.fmv_id` null).
+Warn-only — don't block. The pipeline is done; the goal is to tell the user *now* about gaps so they don't discover them when the auction ends and `/comic:collection-add` chokes (PER-70 cascade). Origin (PER-99) and full context: `docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md`.
 
 ---
 
 ## Subagent Strategy (30+ books)
 
-`comic-fmv` already does async fan-out internally and serves cache hits without API calls, so the previous "split FMV across subagents at 30 books" rule mostly doesn't apply anymore — one CLI invocation handles 50+ books in a few seconds. Reach for subagents only when:
-
-- The eBay identification step is bottlenecked (Browse API rate limit or large batch)
-- You're processing 50+ unique books and want to keep the orchestrator's context tight
-
-Even then, FMV stays as one CLI call from the main agent (so the SerpApi cache is shared). Parallelize identification, not FMV.
+`comic-fmv` fans out internally and caches hits, so one CLI call handles 50+ books in seconds — reach for subagents only if eBay identification itself is rate-limited/large, or you want the orchestrator's context tight above 50+ books. FMV always stays a single CLI call regardless (shared SerpApi cache) — parallelize identification, not FMV.

@@ -15,6 +15,7 @@ pytest tests/test_server_api.py
 pytest tests/test_server_db.py
 pytest tests/test_add_batch.py
 pytest tests/test_cli_add_batch.py
+pytest tests/test_cli_build_batch.py
 pytest tests/test_cli_record_win_prep.py
 pytest tests/test_ebay_fallback.py
 pytest tests/test_log_config.py
@@ -35,6 +36,7 @@ python cli.py purge
 # Run the CLI (thin-client mode — set COMICS_SERVER_URL in .env)
 python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
 python cli.py add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
+python cli.py build-batch <brief.json> <working_list.json> [--overrides overrides.json] [--out rows.json]  # BUI-435: build add-batch's rows.json deterministically
 python cli.py sync                  # pull latest Gixen state into server DB
 
 # Run the server (development)

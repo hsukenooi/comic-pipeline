@@ -35,8 +35,10 @@ from add_batch import (
     STATUS_NOT_ATTEMPTED,
     STATUS_UPDATED,
     apply_verify_results,
+    build_batch_rows,
     build_bid_payload,
     created_from_response,
+    parse_brief_rows,
     parse_rows,
     run_batch,
     verify_items,
@@ -615,6 +617,101 @@ def _emit_add_batch_result(outcome: BatchOutcome, json_out: str | None) -> None:
             # code into an unrelated traceback (cli.py's caller still exits
             # via `outcome.exit_code()`, not this write).
             click.echo(f"warning: could not write --json-out ({json_out}): {e}", err=True)
+
+
+def _load_json_file(path: str, expected_type: type, type_description: str):
+    """Read + json.loads(path), exiting 1 with a clear message on any I/O or
+    parse failure, or if the parsed value isn't `expected_type`. Shared by
+    `build_batch_cmd`'s working-list and overrides file reads (below)."""
+    try:
+        value = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        click.echo(f"Error: could not read/parse {path}: {e}", err=True)
+        sys.exit(1)
+    if not isinstance(value, expected_type):
+        click.echo(f"Error: {path} must be {type_description}", err=True)
+        sys.exit(1)
+    return value
+
+
+@cli.command("build-batch")
+@click.argument("brief_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("working_list_file", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--overrides",
+    "overrides_file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help='JSON object {item_id: {"max_bid"?, "group"?, "skip"?}} — the '
+         "Step 4 user-approval gate's per-row overrides.",
+)
+@click.option(
+    "--out",
+    "out_file",
+    type=click.Path(dir_okay=False, writable=True),
+    default=None,
+    help="Also write the built rows JSON (ready for `gixen add-batch`) to this file.",
+)
+def build_batch_cmd(
+    brief_file: str, working_list_file: str, overrides_file: str | None, out_file: str | None
+):
+    """Build `gixen add-batch` ROWS_FILE input deterministically (BUI-435),
+    instead of hand-merging comic-fmv --brief output with the working list
+    in context.
+
+    BRIEF_FILE is comic-fmv --brief's captured output: either a clean JSON
+    list/`{"rows": [...]}`, or the raw stdout (human table + one JSON object
+    per line — non-JSON lines are ignored, but a line that looks like JSON
+    and fails to parse is a hard error). WORKING_LIST_FILE is a JSON list of
+    working-list rows: {item_id, grade?, listing_type?/type?, seller?,
+    seller_grade?, photo_grade?, group?}.
+
+    Prints the resulting rows JSON (feed straight into `gixen add-batch`),
+    and reports skipped (BIN / user-skip) and unlinked (null comic_id) rows
+    to stderr. Never drops comic_id silently and never fabricates a max_bid
+    for a needs-manual row — see add_batch.build_batch_rows for the full
+    per-row resolution rules. Exits non-zero on any structurally invalid
+    input (AddBatchError) rather than emitting a partial/guessed batch.
+    """
+    try:
+        brief_raw = Path(brief_file).read_text()
+    except OSError as e:
+        click.echo(f"Error: could not read {brief_file}: {e}", err=True)
+        sys.exit(1)
+
+    working_list = _load_json_file(
+        working_list_file, list, "a JSON list of working-list rows"
+    )
+
+    overrides: dict | None = None
+    if overrides_file:
+        overrides = _load_json_file(
+            overrides_file, dict, "a JSON object keyed by item_id"
+        )
+
+    try:
+        brief_rows = parse_brief_rows(brief_raw)
+        result = build_batch_rows(brief_rows, working_list, overrides)
+    except AddBatchError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    text = json.dumps(result.rows, indent=2)
+    click.echo(text)
+    if out_file:
+        try:
+            Path(out_file).write_text(text)
+        except OSError as e:
+            click.echo(f"warning: could not write --out ({out_file}): {e}", err=True)
+
+    if result.skipped:
+        click.echo(f"Skipped {len(result.skipped)} row(s): {result.skipped}", err=True)
+    if result.unlinked:
+        click.echo(
+            f"{len(result.unlinked)} row(s) will add without FMV linkage "
+            f"(comic_id null): {[r['item_id'] for r in result.unlinked]}",
+            err=True,
+        )
 
 
 @cli.command()
