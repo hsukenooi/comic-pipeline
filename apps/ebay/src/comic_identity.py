@@ -1027,6 +1027,34 @@ _PAREN_YEAR_ONLY_RE = re.compile(
 # fallback must find "175", not the "3" from "Vol 3").
 _VOLUME_MASK_RE = re.compile(r"\bvol(?:ume)?\.?\s*\d+\b", re.IGNORECASE)
 
+# BUI-460: BUI-456 broadened the separator _ANNUAL_EDITION_RE accepts between
+# "annual" and its issue number to ":", "-", "#", and "No."/"No" (e.g. "X-Men
+# Annual: 1", "Avengers Annual-#5", "Annual No. 1" all now correctly classify
+# edition="annual"). But the old word-only strip (`_ANNUAL_RE.sub("", ...)`)
+# only deleted the word "annual" itself, leaving that separator orphaned at
+# the end of the series text — "X-Men Annual: 1" -> series "X-Men :" instead
+# of "X-Men".
+#
+# This regex removes "annual" TOGETHER WITH the separator that immediately
+# FOLLOWS it, reusing the identical separator character class
+# _ANNUAL_EDITION_RE already validated (as a classification precondition)
+# sits between "annual" and the issue digit. It is anchored to the WORD
+# "annual" itself (\bannual\b) and only ever extends FORWARD from there to
+# the end of the already issue-number-truncated string — never backward past
+# "annual".
+#
+# That directionality is load-bearing, not cosmetic: an earlier draft of this
+# fix instead stripped separator-looking characters from wherever the string
+# happened to END, with no anchor to "annual" at all. That silently ate a
+# real trailing word out of a series name whenever it happened to be "No" —
+# e.g. "Just Say No Annual #1" -> "Just Say" — because after the word
+# "annual" is deleted, "No" that legitimately PRECEDES "annual" in the title
+# and "No." that is genuine separator residue AFTER "annual" (as in "Annual
+# No. 1") become indistinguishable from the end of the string alone. Anchoring
+# to "\bannual\b" and only matching forward removes that ambiguity: only text
+# actually adjacent to (i.e. after) the word being deleted is ever touched.
+_ANNUAL_WORD_AND_SEP_RE = re.compile(r"\bannual\b[\s#:.no-]*$", re.IGNORECASE)
+
 
 def _bare_issue_match(stripped_title: str) -> "tuple[re.Match | None, str]":
     """Best-effort issue-number fallback when no explicit "#N" is present.
@@ -1265,9 +1293,24 @@ def identify_comic(title: "str | None") -> ComicIdentity:
     else:
         pre_issue_text = stripped
 
-    if identity.edition in ("annual", "treasury"):
-        pre_issue_text = _ANNUAL_RE.sub("", pre_issue_text) if identity.edition == "annual" \
-            else _TREASURY_RE.sub("", pre_issue_text)
+    if identity.edition == "annual":
+        # BUI-460: first, strip "annual" together with its trailing separator
+        # residue in one anchored pass (see _ANNUAL_WORD_AND_SEP_RE).
+        pre_issue_text = _ANNUAL_WORD_AND_SEP_RE.sub("", pre_issue_text)
+        # Then always also run the original global bare-word strip. This is a
+        # no-op in the common single-"annual" case (already removed above),
+        # but it's still needed for two shapes the anchored pass alone can't
+        # reach: (1) the accepted BUI-129/BUI-456 bare-number-before-annual
+        # non-goal, e.g. "ASM 252 annual 2024", where the issue digit — and
+        # so pre_issue_text's truncation point — comes BEFORE "annual" even
+        # appears, so the anchored pass above is a no-op and this is the only
+        # thing that removes the word; and (2) a pathological double mention
+        # ("X-Men Annual Annual #1"), where the anchored pass only reaches
+        # the trailing occurrence and this catches the other one — matching
+        # the original global-strip behavior, which this fix must not narrow.
+        pre_issue_text = _ANNUAL_RE.sub("", pre_issue_text)
+    elif identity.edition == "treasury":
+        pre_issue_text = _TREASURY_RE.sub("", pre_issue_text)
     # Strip a purely-parenthetical year or year-range from the series text —
     # "Amazing Spider-Man (2022) #7" must yield series="Amazing Spider-Man"
     # with year=2022 reported separately (below), not folded into the series

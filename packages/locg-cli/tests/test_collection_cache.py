@@ -719,6 +719,36 @@ def test_normalize_series_key_strips_leading_article():
     assert _normalize_series_key("Theater of War") == "theater of war"
 
 
+def test_normalize_series_key_does_not_strip_stray_punctuation():
+    """BUI-460: _normalize_series_key only strips year/vol/article decoration,
+    NOT stray punctuation — so a series string with a leftover separator (the
+    BUI-456 residual comic_identity.py's _finalize now cleans up before
+    threading it here) would resolve to the WRONG key. This locks the
+    contract from the locg side: apps/ebay/src/comic_identity.py must hand
+    this function a clean series string, because this function will not
+    clean it up itself.
+
+    Fixed inputs (what comic-identify now produces for "X-Men Annual: 1",
+    "Avengers Annual-#5", "Amazing Spider-Man Annual No. 1") thread to the
+    same key the local series_name_index uses for those series.
+    """
+    from locg.collection_cache import _normalize_series_key
+
+    assert _normalize_series_key("X-Men") == "x-men"
+    assert _normalize_series_key("Avengers") == "avengers"
+    assert _normalize_series_key("Amazing Spider-Man") == "amazing spider-man"
+
+    # The pre-fix (buggy) series strings prove the point: a stray separator
+    # produces a DIFFERENT, wrong key that would miss the local index.
+    assert _normalize_series_key("X-Men :") == "x-men :" != _normalize_series_key("X-Men")
+    assert _normalize_series_key("Avengers -") == "avengers -" != _normalize_series_key(
+        "Avengers"
+    )
+    assert _normalize_series_key(
+        "Amazing Spider-Man No."
+    ) == "amazing spider-man no." != _normalize_series_key("Amazing Spider-Man")
+
+
 # ---------------------------------------------------------------------------
 # Integration: last_writer populated after apply
 # ---------------------------------------------------------------------------
