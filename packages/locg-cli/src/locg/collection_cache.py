@@ -45,7 +45,13 @@ LOCG_COLUMNS: tuple[str, ...] = (
     "grading_company",
 )
 
-# LOCG boolean columns stored as int 0/1 per R7
+# LOCG boolean/count columns stored as int per R7 — used by
+# collection_io.parse_xlsx (BUI-469) to coerce raw openpyxl cell values on
+# ingest. NOT all-boolean: `in_collection` is a copies-owned COUNT (0, 1,
+# 2+), never a flag, so every column here coerces to `int`, and callers must
+# never collapse `in_collection` to `bool` (`bool("0")` is `True` — the
+# BUI-462/BUI-469 trap). The other four columns (`in_wish_list`,
+# `marked_read`, `signature`, `slabbing`) are genuine 0/1 flags.
 LOCG_BOOLEAN_COLUMNS: frozenset[str] = frozenset(
     {"in_collection", "in_wish_list", "marked_read", "signature", "slabbing"}
 )
