@@ -1027,6 +1027,11 @@ def _wish_owned_by_series_issue(
 # matches on the EXACT Release Date — a wrong Jan-1 date reads as "Not Found",
 # whereas a BLANK date still matches by publisher+series+title (and the
 # year-precise round-trip restores LOCG's canonical date on re-import).
+#
+# This blanking is the whole reason the placeholder costs the export nothing:
+# a placeholder row and a dateless row emit the SAME empty Release Date. See
+# _build_win_row's BUI-105 block for why the stamp must stay in the store even
+# so (BUI-210's reopen proposed deleting it; it deletes wins).
 _PLACEHOLDER_DATE_RE = re.compile(r"^\d{4}-01-01$")
 
 
@@ -1038,7 +1043,8 @@ def _is_placeholder_release_date(row: dict[str, Any]) -> bool:
     Metron-sourced ``cover_date`` for a genuine January book is also
     ``YYYY-01-01`` but is a REAL date and must be kept (R66, BUI-199 finding 5).
     So require both an agent_win row AND a missing metron_id before treating a
-    Jan-1 date as a placeholder.
+    Jan-1 date as a placeholder — the shape alone would silently delete real
+    January dates, and ``metron_id`` is the only thing separating the two.
     """
     if row.get("source") != "agent_win":
         return False

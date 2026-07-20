@@ -1455,8 +1455,7 @@ def test_record_win_series_from_index(tmp_path):
     assert result["rows_written"] == 1
     assert result["manual_series_count"] == 0
     # BUI-210: the index path no longer resolves the SERIES via Metron, but it
-    # does attempt a Metron *issue* lookup to backfill a real release_date. Here
-    # the stub returns None (Metron miss), so we fall back to the placeholder.
+    # does attempt a Metron *issue* lookup to backfill a real release_date.
     metron.lookup_issue.assert_called_once()
 
     payload = cache.load()
@@ -2760,9 +2759,12 @@ def test_record_win_index_path_backfills_real_metron_date(tmp_path):
 
 
 def test_record_win_index_path_rejects_reprint_year_mismatch(tmp_path):
-    """BUI-210 reprint guard: a Metron date whose year ≠ the win's year (a
+    """BUI-210 reprint guard: a Metron date decades from the win's year (a
     collected-edition/reprint, e.g. The X-Men #59 → 2005) is rejected, and the
-    {year}-01-01 placeholder is kept."""
+    {year}-01-01 placeholder is kept.
+
+    The ±1 widening (BUI-210 reopen) must NOT weaken this: 2005 vs 1970 is
+    35 years, so the guard still rejects it outright."""
     from locg.commands import cmd_collection_record_win
     from unittest.mock import MagicMock
 
@@ -2785,10 +2787,13 @@ def test_record_win_index_path_rejects_reprint_year_mismatch(tmp_path):
     )
 
     row = cache.load()["comics"][-1]
-    # Reprint rejected → placeholder kept, metron_id stays None so the export
-    # blanks the placeholder (rather than shipping a wrong 2005 date).
+    # Reprint rejected → placeholder kept (never a wrong 2005 date), metron_id
+    # stays None so the export blanks the placeholder, and the whole
+    # metron_data is dropped: the id/publisher came from the same suspect
+    # issue match, so none of it is trustworthy on its own.
     assert row["release_date"] == "1970-01-01"
     assert row["metron_id"] is None
+    assert row["publisher_name"] is None
 
 
 def test_record_win_index_path_credential_error_keeps_placeholder(tmp_path):
@@ -2812,6 +2817,365 @@ def test_record_win_index_path_credential_error_keeps_placeholder(tmp_path):
     row = cache.load()["comics"][-1]
     assert row["release_date"] == "1970-01-01"
     assert row["metron_id"] is None
+
+
+def test_record_win_index_path_accepts_prior_year_store_date(tmp_path):
+    """BUI-210 (reopen), the production-evidence case: a January-cover book
+    ships the PREVIOUS November, so Metron's store_date year is year−1.
+
+    The old exact-year guard called that a reprint and threw the whole hit
+    away, leaving a placeholder; the ±1 era window (shared with
+    _year_gate_accepts) keeps LOCG's real on-sale date — and with it the
+    metron_id and BUI-458 publisher that came on the same hit."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 901,
+        "cover_date": "1970-01-01",   # genuine January cover
+        "store_date": "1969-11-10",   # actual on-sale, the PRIOR year
+        "series_year_began": 1963,
+        "series_year_end": 1981,
+        "series_name": "The X-Men",
+        "series_id": 7,
+    }
+    metron.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": "Marvel Comics",
+    }
+
+    cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1969-11-10"
+    assert row["metron_id"] == 901
+    assert row["publisher_name"] == "Marvel Comics"
+
+
+def test_record_win_accepts_following_year_store_date(tmp_path):
+    """BUI-210 (reopen): the era window is SYMMETRIC (BUI-251), so a
+    late-in-year cover whose on-sale slipped into the next January is kept
+    too — not just the year−1 direction."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 904,
+        "cover_date": "1970-12-01",
+        "store_date": "1971-01-05",  # slipped into the FOLLOWING year
+        "series_year_began": 1963,
+        "series_year_end": 1981,
+        "series_name": "The X-Men",
+        "series_id": 7,
+    }
+    metron.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": "Marvel Comics",
+    }
+
+    cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert cache.load()["comics"][-1]["release_date"] == "1971-01-05"
+
+
+def test_record_win_out_of_era_store_date_is_not_rescued_by_cover_date(tmp_path):
+    """BUI-210 (reopen): the guard judges ONE candidate, on purpose.
+
+    A modern store_date beside an original cover_date is the reprint
+    fingerprint, so falling back to the cover_date would weaken the guard
+    from "the best date is in era" to "some date is in era" and re-admit the
+    very hit BUI-268 exists to reject."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 902,
+        "cover_date": "1970-08-01",  # original cover date, in era
+        "store_date": "2005-03-09",  # reprint-era store date
+        "series_year_began": 1963,
+        "series_year_end": 1981,
+        "series_name": "The X-Men",
+        "series_id": 7,
+    }
+    metron.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": "Marvel Comics",
+    }
+
+    cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1970-01-01"  # rejected → placeholder
+    assert row["metron_id"] is None
+    assert row["publisher_name"] is None
+
+
+def test_record_win_retry_does_not_downgrade_a_prior_year_dated_row(tmp_path):
+    """BUI-210 (reopen): a batch retry must not overwrite a good win row.
+
+    `/comic:collection-add` re-submits the WHOLE batch after a
+    partial_failure, and `write_wins` overwrites by `gixen_item_id` — so if
+    the BUI-34 dedup fails to recognise the row it already wrote, the retry
+    rebuilds it. With a prior-year store_date and an undecorated series name
+    (no parseable `(YYYY - YYYY)` range), `_dedup_era_compatible`'s exact
+    year compare did exactly that, silently downgrading a real date +
+    publisher back to a placeholder + null. Worse, the retry is most likely
+    when Metron is down, which is when the rebuild has nothing to restore."""
+    from locg.collection_cache import rebuild_series_name_index
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Tomb of Dracula", full_title="Tomb of Dracula #1"),
+        "source": "locg_export",
+    }])
+    cache.apply(
+        lambda payload: payload.__setitem__(
+            "series_name_index", rebuild_series_name_index(payload)
+        ),
+        command="test-rebuild",
+    )
+
+    win = _make_win(series="Tomb of Dracula", issue="10", year=1973)
+
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 901,
+        "cover_date": "1973-07-01",
+        "store_date": "1972-11-10",  # prior-year on-sale date
+        "series_year_began": 1972,
+        "series_year_end": 1979,
+        "series_name": "Tomb of Dracula",
+        "series_id": 11,
+    }
+    metron.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": "Marvel Comics",
+    }
+    cmd_collection_record_win([win], cache=cache, metron=metron)
+
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1972-11-10"
+    assert row["publisher_name"] == "Marvel Comics"
+
+    # Retry the identical win with Metron unreachable — the common case.
+    dead_metron = MagicMock()
+    dead_metron.lookup_issue.return_value = None
+    result = cmd_collection_record_win([win], cache=cache, metron=dead_metron)
+
+    assert result["skipped_already_owned"] == 1
+    assert result["rows_written"] == 0
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1972-11-10"
+    assert row["publisher_name"] == "Marvel Comics"
+
+
+def test_record_win_off_by_one_cover_date_never_reaches_the_csv(tmp_path):
+    """BUI-210 (reopen), the worst case the ±1 window must not create.
+
+    A wrong-book hit with ``cover_date=1969-01-01`` against a 1970 win: if the
+    era gate forgave that year, the hit would be adopted, ``metron_id`` would
+    be set, and the export would ship the literal ``1969-01-01`` — a
+    WRONG-YEAR date wearing the exact Jan-1 shape the export exists to blank,
+    and un-blankable precisely because ``metron_id`` is now set. LOCG reads a
+    wrong-year date as "Not Found".
+
+    Gating ``cover_date`` on an exact year keeps that row on the placeholder
+    path, so it exports blank and still imports by title+series."""
+    import csv as _csv
+    from locg.collection_io import generate_csv
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 999,
+        "cover_date": "1969-01-01",
+        "store_date": None,
+        "series_year_began": 1963,
+        "series_year_end": 1981,
+        "series_name": "The X-Men",
+        "series_id": 7,
+    }
+    metron.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": "Marvel UK",
+    }
+
+    cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1970-01-01"  # placeholder, not 1969-01-01
+    assert row["metron_id"] is None
+    assert row["publisher_name"] is None  # wrong-book publisher not adopted
+
+    out = tmp_path / "wins.csv"
+    generate_csv([row], out)
+    with out.open(newline="") as f:
+        exported = list(_csv.DictReader(f))
+    assert exported[0]["Release Date"] == ""
+
+
+def test_metron_release_date_input_shapes():
+    """Direct unit coverage of the one helper both date sites now share."""
+    from locg.commands import _metron_release_date
+
+    hit = {"store_date": "1970-06-09", "cover_date": "1970-08-01"}
+
+    # No data / no dates → None.
+    assert _metron_release_date(None, 1970) is None
+    assert _metron_release_date({}, 1970) is None
+    assert _metron_release_date({"store_date": None, "cover_date": None}, 1970) is None
+
+    # store_date wins; cover_date is the fallback only when store_date is absent.
+    assert _metron_release_date(hit, 1970) == "1970-06-09"
+    assert _metron_release_date({"cover_date": "1970-08-01"}, 1970) == "1970-08-01"
+
+    # store_date: year_raw accepted as int or str; ±1 both ways (the real
+    # cover-vs-on-sale skew); anything further rejected.
+    assert _metron_release_date(hit, "1970") == "1970-06-09"
+    assert _metron_release_date({"store_date": "1969-11-10"}, 1970) == "1969-11-10"
+    assert _metron_release_date({"store_date": "1971-01-05"}, 1970) == "1971-01-05"
+    assert _metron_release_date({"store_date": "1972-01-05"}, 1970) is None
+    assert _metron_release_date({"store_date": "2005-03-09"}, 1970) is None
+
+    # cover_date: EXACT year only. It is the same quantity as year_raw, so a
+    # one-year gap is a wrong-book signal, not skew — and on the cover_date
+    # path this is the only era check the whole Metron result gets.
+    assert _metron_release_date({"cover_date": "1970-08-01"}, 1970) == "1970-08-01"
+    assert _metron_release_date({"cover_date": "1969-11-10"}, 1970) is None
+    assert _metron_release_date({"cover_date": "1971-03-01"}, 1970) is None
+
+    # Not a clean 4-digit year → nothing to guard against, candidate returned
+    # ungated (the R36 series-resolution path's long-standing behavior).
+    for bad_year in (None, "", "197", "19700", "n/a"):
+        assert _metron_release_date({"store_date": "2005-03-09"}, bad_year) == "2005-03-09"
+
+
+def test_record_win_genuine_january_metron_date_survives_export(tmp_path):
+    """BUI-210 (reopen) part (c): a REAL January cover date is not re-blanked.
+
+    ``_is_placeholder_release_date`` keys on intent (agent_win AND no
+    metron_id), not on the ``YYYY-01-01`` shape, so a Metron-sourced January
+    date on a metron_id-bearing row exports intact. Locked end-to-end here —
+    record-win write through CSV export — because the store writes both kinds
+    of Jan-1 value, so the shape alone can never tell them apart."""
+    import csv as _csv
+    from locg.collection_io import generate_csv
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 903,
+        "cover_date": "1970-01-01",
+        "store_date": None,  # vintage issue: Metron has no on-sale date
+        "series_year_began": 1963,
+        "series_year_end": 1981,
+        "series_name": "The X-Men",
+        "series_id": 7,
+    }
+    metron.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": "Marvel Comics",
+    }
+
+    cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1970-01-01"
+    assert row["metron_id"] == 903
+
+    out = tmp_path / "wins.csv"
+    generate_csv([row], out)
+    with out.open(newline="") as f:
+        exported = list(_csv.DictReader(f))
+    assert exported[0]["Release Date"] == "1970-01-01"
+
+
+def test_record_win_metron_miss_exports_blank_release_date(tmp_path):
+    """BUI-210: a Metron miss ships a BLANK Release Date to LOCG.
+
+    End-to-end (record-win write → CSV) so the two halves stay honest: the
+    store keeps the placeholder for the era guards, and the export drops it
+    because a wrong Jan-1 reads as "Not Found" on import. This is why
+    removing the placeholder would not have made a single row less dateless
+    — dateless CSV rows come from Metron misses, not from the stamp."""
+    import csv as _csv
+    from locg.collection_io import generate_csv
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(tmp_path)
+    metron = MagicMock()
+    metron.lookup_issue.return_value = None  # genuine miss
+
+    cmd_collection_record_win(
+        [_make_win(series="The X-Men (1963 - 1981)", issue="59", year=1970)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1970-01-01"
+
+    out = tmp_path / "wins.csv"
+    generate_csv([row], out)
+    with out.open(newline="") as f:
+        exported = list(_csv.DictReader(f))
+    assert exported[0]["Release Date"] == ""
+
+
+def test_placeholder_year_is_the_only_wrong_volume_reconcile_guard():
+    """BUI-210 (reopen): why the BUI-105 placeholder must NOT be removed.
+
+    Two volumes of one masthead normalize to the same series key and neither
+    carries a "(Vol. N)", so `_reconcile_score`'s year comparison is the last
+    thing standing between them. Dateless, that comparison fails OPEN and the
+    wrong-volume candidate scores a match — which `_reconcile_phase`'s BUI-122
+    collision guard then auto-heals (deletes) the pending win away, silently.
+
+    A win stuck pending is recoverable; a win dropped on import is not."""
+    from locg.collection_io import _reconcile_score
+
+    win = {
+        "publisher_name": "Marvel Comics",
+        "series_name": "The X-Men (1963 - 1981)",
+        "full_title": "The X-Men #59",
+    }
+    wrong_volume = {
+        "publisher_name": "Marvel Comics",
+        "series_name": "X-Men (1991 - 2011)",
+        "full_title": "X-Men #59",
+        "release_date": "1996-12-01",
+    }
+
+    assert _reconcile_score({**win, "release_date": "1970-01-01"}, wrong_volume) == 0
+    # The counterfactual this test exists to forbid:
+    assert _reconcile_score({**win, "release_date": None}, wrong_volume) > 0
 
 
 # --- Duplicate detection ---

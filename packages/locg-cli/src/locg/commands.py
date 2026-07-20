@@ -2280,8 +2280,15 @@ def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
     - ``decorated_full_title``: ``Full Title`` carries ``(Vol.`` or a
       parenthesized 4-digit year — LOCG's own full_title never carries this
       decoration, so it signals an un-canonicalized record-win row.
-    - ``placeholder_date``: ``Release Date`` is the literal ``YYYY-01-01``
-      placeholder, which LOCG's import reads as "Not Found".
+    - ``placeholder_date``: ``Release Date`` is ``YYYY-01-01``. This is a
+      SHAPE check, and it is advisory only: a legacy BUI-105 placeholder and a
+      genuine January cover date are the same string, and a CSV carries no
+      ``metron_id`` to tell them apart the way
+      ``_is_placeholder_release_date`` does on a store row. Verify against
+      Metron before "correcting" a flagged date — overwriting a real January
+      date is the more expensive mistake. (A genuine BUI-105 placeholder is
+      blanked on export, so a Jan-1 date that actually reaches an exported
+      wins CSV is usually a real January cover date, not a placeholder.)
 
     Only rows with at least one flag appear in ``flagged_rows``; each entry also
     carries a human-readable ``issues`` list (same wording as the inline audit
@@ -2329,7 +2336,10 @@ def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
         if decorated_full_title:
             issues.append("decorated full_title (LOCG full_title carries no (Vol.)/(year))")
         if placeholder_date:
-            issues.append("Jan-1 placeholder date (will read Not Found)")
+            issues.append(
+                "Jan-1 placeholder date (reads Not Found) — verify first: a genuine "
+                "January cover date is identical in a CSV and must be kept"
+            )
 
         if issues:
             flagged_rows.append({
@@ -3439,21 +3449,77 @@ def _dedup_variant_compatible(variant_text: str, candidate_suffix: Optional[str]
     return known_win_suffix == known_candidate_suffix
 
 
-def _date_matches_year(date: Optional[str], year_raw: Any) -> bool:
-    """True if ``date`` starts with the 4-digit year encoded in ``year_raw``.
+def _metron_release_date(metron_data: Optional[dict[str, Any]], year_raw: Any) -> Optional[str]:
+    """The trustworthy ``release_date`` for a win from a Metron lookup, or None.
 
-    Shared reprint-date check for the BUI-210/268 Metron guards, which only
-    accept a looked-up date when its year matches the win's identified year
-    (a naive lookup can otherwise return a reprint/collected-edition date).
-    False if ``date`` is falsy — callers still validate ``year_raw`` is a
-    clean 4-digit year themselves before relying on this, since each site
-    gates a different thing (attempting a lookup vs. rejecting a result) on
-    that validity.
+    ONE helper for the whole record-win date decision, so the site that decides
+    whether to *accept* a Metron hit (the BUI-210 date-only lookup) and the site
+    that *stores* the date (the BUI-268 guard on the row build) can never drift
+    on which date they picked or how they judged it. They were duplicated
+    before, and the duplication is exactly how the two ended up examining
+    different candidate dates.
+
+    Candidate — ``store_date`` when Metron has one, else ``cover_date``. LOCG's
+    own ``release_date`` is the ON-SALE date, so ``store_date`` is the closer
+    analogue; ``cover_date`` covers the many vintage issues Metron has no store
+    date for. Exactly ONE candidate is considered, deliberately: falling back to
+    ``cover_date`` when ``store_date`` fails the guard below would weaken the
+    guard from "the best date is in era" to "some date is in era", and a modern
+    ``store_date`` beside an original ``cover_date`` is the reprint fingerprint
+    itself, not a case worth rescuing.
+
+    Reprint guard — a naive ``lookup_issue("The X-Men", "59", 1970)`` can
+    return a collected-edition/reprint date (observed: 2005-03-09), and writing
+    that onto a 1970 row poisons the year-gated collection-check (BUI-268). So
+    the candidate is only accepted when its year sits in the same era as the
+    win's identified year. **How much slack that allows depends on WHICH date
+    we are holding, and the two are not interchangeable:**
+
+    * ``store_date`` gets the shared :func:`_year_gate_accepts` window — the
+      symmetric ±1 that ``_match_owned_issue``, ``_match_wishlisted_issue`` and
+      ``_dedup_era_compatible`` use, so this write gate and the gates that
+      later read the row back agree about what "same era" means. (One does
+      not: ``_reconcile_score`` in ``collection_io`` still compares years
+      exactly. That is deliberate and in our favour — matching LOCG's own
+      on-sale date is precisely what lets a January-cover win reconcile at
+      all.) The slack is earned: ``year_raw`` is the COVER
+      year comic-identify reads off the book while ``store_date`` is the
+      on-sale date, and a January-cover issue ships the previous November.
+      BUI-210's reopen is largely this — the old exact match called that
+      genuine 1969-11-10 a reprint and discarded the whole hit, leaving the
+      row dateless and (since BUI-458) publisher-less too. A real reprint is
+      decades away, so ±1 still rejects it.
+    * ``cover_date`` gets an EXACT year match. It is the same quantity as
+      ``year_raw`` — both are cover dates — so there is no skew to forgive
+      here, and a one-year disagreement is not skew but evidence that
+      ``lookup_issue`` matched a different book. This matters because
+      ``lookup_issue`` trusts a sole name-search hit with no year check of its
+      own (``_disambiguate_series``) and takes ``issues_list()[0]`` unfiltered,
+      which on vintage/aliased series makes this gate the only era check on the
+      whole result. Widening it would admit UK/foreign reprint editions and
+      one-year Metron data-entry slips for nothing in return.
+
+    When ``year_raw`` is not a clean 4-digit year there is nothing to guard
+    against either way, so the candidate is returned ungated — unchanged
+    behavior for the R36 series-resolution path, which is the only caller that
+    can reach here without a validated year.
     """
-    if not date:
-        return False
+    if not metron_data:
+        return None
+    store_date = metron_data.get("store_date")
+    candidate = str(store_date) if store_date else None
+    if candidate is None:
+        cover_date = metron_data.get("cover_date")
+        candidate = str(cover_date) if cover_date else None
+    if candidate is None:
+        return None
+
     year_str = str(year_raw).strip() if year_raw is not None else ""
-    return str(date).startswith(year_str)
+    if not re.fullmatch(r"\d{4}", year_str):
+        return candidate
+    if store_date:
+        return candidate if _year_gate_accepts(year_str, candidate) else None
+    return candidate if candidate.startswith(year_str) else None
 
 
 def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]) -> bool:
@@ -3484,9 +3550,24 @@ def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]
     rng = series_year_range(candidate_row.get("series_name") or "")
     if rng is not None:
         return rng[0] <= win_year <= rng[1]
-    candidate_year = _coerce_year(candidate_row.get("release_date"))
-    if candidate_year is not None:
-        return candidate_year == win_year
+    release_date = candidate_row.get("release_date") or ""
+    if _coerce_year(release_date) is not None:
+        # ±1, not an exact match, and specifically the SAME window the write
+        # gate uses (_metron_release_date -> _year_gate_accepts). A win row's
+        # stored release_date is Metron's on-sale date, which for a
+        # January-cover book is the previous November — so an exact compare
+        # here stopped recognising a row this same function had just written.
+        # That mattered on the retry path: /comic:collection-add re-submits a
+        # whole batch after a partial_failure, the dedup missed, and because
+        # write_wins overwrites by gixen_item_id the good row was REBUILT —
+        # silently downgrading a real date + publisher back to a placeholder
+        # and null whenever Metron was unreachable on the retry (which is a
+        # common reason the first attempt failed at all).
+        #
+        # This does not weaken BUI-267: the cross-era false-SKIP it exists to
+        # close (New Gods #7 1971 vs an owned 2024 Vol. 5 #7) is decades wide,
+        # nowhere near ±1.
+        return _year_gate_accepts(str(win_year), str(release_date))
     return True
 
 
@@ -3720,34 +3801,39 @@ def _build_win_row(
 
     # BUI-210: when the series resolved via series_name_index (the common
     # case — metron_data stays None), we still have no release_date, so
-    # the row would fall through to the {year}-01-01 placeholder, which
-    # the export blanks → the row ships dateless and an all-dateless
-    # batch hangs LOCG's importer. Do a Metron *issue* lookup purely to
-    # populate a real date; do NOT touch canonical_series (the
-    # index-resolved value is more reliable than Metron's
-    # format_series_name here). Runs after the BUI-34 dedup continue so
-    # we never spend a Metron call on a skipped already-owned win, and
-    # before the variant block so variant resolution can reuse metron_id.
+    # the row would ship dateless, and an all-dateless batch hangs LOCG's
+    # importer at 0%. Do a Metron *issue* lookup purely to populate a real
+    # date; do NOT touch canonical_series (the index-resolved value is more
+    # reliable than Metron's format_series_name here). Runs after the BUI-34
+    # dedup continue so we never spend a Metron call on a skipped
+    # already-owned win, and before the variant block so variant resolution
+    # can reuse metron_id.
     #
-    # Reprint guard: a naive lookup_issue("The X-Men", "59", 1970) can
-    # return a collected-edition/reprint date (observed: 2005-03-09).
-    # Only accept the result if the returned store/cover date's YEAR
-    # matches the win's year_raw; otherwise reject it and keep the
-    # placeholder fallback below.
+    # The accept test is _metron_release_date itself — the SAME call that
+    # later picks the stored date — so a hit taken here is accepted if and
+    # only if it yields a date this row will actually keep. See that helper
+    # for the reprint guard and why its year window is ±1 rather than exact
+    # (BUI-210 reopen: the exact match discarded genuine on-sale dates for
+    # January-cover books).
+    #
+    # On THIS path a rejected hit drops the whole metron_data, not just its
+    # date — the id, series and (BUI-458) publisher all came from the same
+    # possibly-wrong issue match. Note that is not true of the R36 step-2
+    # lookup above, which assigns metron_data before any date is judged: a
+    # hit whose date the guard later rejects still contributes its
+    # metron_id and publisher there. Pre-existing (BUI-268 shaped it that
+    # way); worth revisiting, since a reprint under a different imprint
+    # yields a wrong publisher that imports silently rather than tripping
+    # audit-pending's "no publisher" backstop.
     if metron_data is None and issue_num and not metron_disabled:
         year_str = str(year_raw).strip() if year_raw is not None else ""
         if re.fullmatch(r"\d{4}", year_str):
             try:
                 metron_attempted += 1
                 looked_up = metron.lookup_issue(series_raw, issue_num, year_raw)
-                if looked_up:
-                    looked_date = (
-                        looked_up.get("store_date")
-                        or looked_up.get("cover_date")
-                    )
-                    if _date_matches_year(looked_date, year_raw):
-                        metron_succeeded += 1
-                        metron_data = looked_up
+                if looked_up and _metron_release_date(looked_up, year_raw) is not None:
+                    metron_succeeded += 1
+                    metron_data = looked_up
             except MetronCredentialError:
                 metron_disabled = True
                 logger.warning(
@@ -3837,43 +3923,60 @@ def _build_win_row(
     else:
         full_title = base_title
 
-    # release_date: prefer store_date, fall back to cover_date.
+    # release_date: the one trustworthy Metron date, or nothing.
     #
-    # BUI-268: same reprint guard as the BUI-210 date-only lookup below
-    # — this metron_data can come from the FIRST Metron call (the R36
-    # step-2 series-resolution path a few lines up, used when
-    # series_name_index has no entry), which has no year filter of its
-    # own. Left unguarded, a reprint/collected-edition store_date
-    # (observed: Infinity Gauntlet #1 stamped 2022-09-14 from a 2022
-    # reprint hit, despite series_name correctly resolving to "The
-    # Infinity Gauntlet (1991) (1991 - 1991)") got written onto an
-    # otherwise-correct 1991 row, so a later year-gated
-    # collection-check for the real 1991 issue found the row and
-    # rejected it as a mismatched era. Only accept the Metron date when
-    # its year matches year_raw; a mismatch is dropped (R66: a Metron
-    # hit that lacks a trustworthy date stays blank — the relaxed year
-    # gate then fail-opens on this row rather than falsely rejecting a
-    # genuinely-owned copy).
-    release_date: Optional[str] = None
-    if metron_data:
-        candidate_date = metron_data.get("store_date") or metron_data.get("cover_date")
-        year_str = str(year_raw).strip() if year_raw is not None else ""
-        if (
-            re.fullmatch(r"\d{4}", year_str)
-            and candidate_date
-            and not _date_matches_year(candidate_date, year_raw)
-        ):
-            candidate_date = None
-        release_date = candidate_date
+    # The BUI-268 reprint guard lives inside _metron_release_date, which is
+    # also what the BUI-210 date-only lookup above used to accept this hit —
+    # one definition, so the accepted date and the stored date are the same
+    # date by construction. (This metron_data can also come from the FIRST
+    # Metron call — the R36 step-2 series-resolution path, used when
+    # series_name_index has no entry — which has no year filter of its own.
+    # Left unguarded, a reprint store_date got written onto an
+    # otherwise-correct row: Infinity Gauntlet #1 stamped 2022-09-14 from a
+    # 2022 reprint hit, which then made a year-gated collection-check reject
+    # the genuinely-owned 1991 copy as a mismatched era.)
+    #
+    release_date: Optional[str] = _metron_release_date(metron_data, year_raw)
 
     # BUI-105: when no Metron data backs this win (the series_name_index
     # path, or the bare-series manual fallback), there is no Metron date,
     # so the row would be written dateless and miss a year-gated
     # collection-check. Stamp a best-effort release_date from the identify
-    # year (Jan 1 — year precision is all the year.startswith() gate in
-    # _match_owned_issue needs) so a just-won book reads as in-collection.
-    # A Metron hit that simply lacks dates stays blank (R66) — the relaxed
-    # year gate already lets that row match.
+    # year (Jan 1 — year precision is all the year gate in _match_owned_issue
+    # needs) so a just-won book reads as in-collection. A Metron hit that
+    # simply lacks dates stays blank (R66) — the relaxed year gate already
+    # lets that row match.
+    #
+    # DO NOT REMOVE THIS. BUI-210's reopen asked for it ("Metron misses
+    # degrade gracefully to blank — never a placeholder"), on the premise
+    # that the placeholder is what ships rows dateless to LOCG. That premise
+    # is false, and removing the stamp was implemented, reviewed, and
+    # reverted. Three findings, each reproduced against this code:
+    #
+    #   * It changes NOTHING about the export. _row_to_csv_dict already
+    #     blanks the placeholder (_is_placeholder_release_date), so a
+    #     placeholder row and a dateless row emit the same empty Release
+    #     Date. Dateless rows come from Metron misses, not from this stamp.
+    #   * It silently DELETES wins. The year comparison in _reconcile_score
+    #     is the only discriminator left for two volumes of one masthead
+    #     ("The X-Men (1963 - 1981)" vs "X-Men (1991 - 2011)" normalize to
+    #     the same key and neither carries a "(Vol. N)"). Dateless, that
+    #     comparison fails OPEN, the wrong-volume candidate scores a match,
+    #     and _reconcile_phase's BUI-122 collision guard auto-heals the
+    #     pending win away — no warning. A win stuck pending is recoverable;
+    #     a win dropped on import is not.
+    #   * It buys duplicates. _match_owned_issue's alias/cross-masthead pass
+    #     (require_dated, BUI-197) rejects a dateless owned row outright, so
+    #     a check for "Hulk #181" stops finding the just-won "The Incredible
+    #     Hulk #181" and reports not_in_cache — the R11 failure direction.
+    #     The exact-key pass is not a fallback here; it is exactly what has
+    #     already failed when the alias pass runs.
+    #
+    # The year in this stamp is real (it is the identified cover year); only
+    # its month/day are fabricated, which is why the export drops it and the
+    # era guards keep it. Making a miss legible without losing the year needs
+    # a separate provenance field plus the four guards above taught to read
+    # it — not this deletion.
     if release_date is None and metron_data is None and year_raw is not None:
         year_str = str(year_raw).strip()
         if re.fullmatch(r"\d{4}", year_str):

@@ -12,9 +12,12 @@ Win-sourced rows are the usual offender: when record-win resolves a series from 
 existing store it skips Metron, stamps a `{year}-01-01` placeholder, and the export
 **blanks** that placeholder (a wrong Jan-1 reads as "Not Found"). Result: dateless rows.
 
-The durable fix is in code (record-win should fetch a real Metron date even when the
-series pre-exists — BUI-210). This doc is the **manual fallback** until that lands, and
-the last-resort tail afterward.
+The durable fix landed in code: record-win fetches a real Metron date even when the
+series pre-exists, and (BUI-210's reopen) accepts a date whose year is within ±1 of the
+identified cover year, so the January-cover book that shipped the previous November keeps
+its real on-sale date instead of being discarded as a reprint. This doc is the
+**last-resort tail** for what Metron genuinely cannot supply — most often a win whose
+`year` was never identified, which blocks the lookup outright.
 
 ## What "Release Date" must be
 
@@ -24,14 +27,16 @@ the last-resort tail afterward.
 - **Tolerance:** LOCG silently corrects a *roughly-right* date to its own canonical value
   (observed: sent `1969-05-01`, stored `1969-02-11`). So right **year** + approximately
   right **month** is enough. What fails:
-  - a **placeholder** `YYYY-01-01` (non-Metron stamp) → "Not Found",
+  - a **placeholder** `YYYY-01-01` (non-Metron stamp) → "Not Found". Careful: a
+    **genuine January cover date** is the same string and is correct — a CSV carries no
+    provenance, so verify against Metron before "correcting" one,
   - a **wrong-year** date → "Not Found",
   - a **blank** date → matches *individually*, but an **all-blank batch hangs**.
 
 ## Backfill, cheapest tier first
 
-**Tier 1 — let record-win populate it (no work here).** Once BUI-211 lands, dateless
-rows shouldn't reach the sync. If they do, continue.
+**Tier 1 — let record-win populate it (no work here).** Record-win dates wins from Metron
+(BUI-210), so most rows shouldn't reach the sync dateless. For the residue, continue.
 
 **Tier 2 — deterministic, near-zero tokens:**
 - **Cadence:** for a **consecutive run**, take one verified anchor issue's cover date and
