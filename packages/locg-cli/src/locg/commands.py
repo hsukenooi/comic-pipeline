@@ -3819,13 +3819,7 @@ def _build_win_row(
     #
     # On THIS path a rejected hit drops the whole metron_data, not just its
     # date — the id, series and (BUI-458) publisher all came from the same
-    # possibly-wrong issue match. Note that is not true of the R36 step-2
-    # lookup above, which assigns metron_data before any date is judged: a
-    # hit whose date the guard later rejects still contributes its
-    # metron_id and publisher there. Pre-existing (BUI-268 shaped it that
-    # way); worth revisiting, since a reprint under a different imprint
-    # yields a wrong publisher that imports silently rather than tripping
-    # audit-pending's "no publisher" backstop.
+    # possibly-wrong issue match.
     if metron_data is None and issue_num and not metron_disabled:
         year_str = str(year_raw).strip() if year_raw is not None else ""
         if re.fullmatch(r"\d{4}", year_str):
@@ -3842,6 +3836,33 @@ def _build_win_row(
                 )
             else:
                 metron_disabled = _check_metron_degraded(metron, metron_disabled)
+
+    # BUI-467: the R36 step-2 lookup above (used when series_name_index has
+    # no entry) assigns metron_data BEFORE any date is judged, unlike the
+    # BUI-210 date-only lookup just above — which only ever keeps a hit that
+    # has already passed this exact guard, so re-testing it here is a no-op
+    # for that path. For a step-2 hit, though, the guard rejecting a REAL
+    # candidate date is positive evidence the hit is the WRONG issue
+    # (reprint / collected edition), so treat it the same way the BUI-210
+    # path treats a rejection: drop metron_data entirely rather than let a
+    # wrong-issue hit go on to donate its metron_id, publisher, and variant
+    # list to the row. A reprint under a different imprint would otherwise
+    # import a wrong publisher to LOCG silently, whereas a null publisher
+    # trips audit-pending's "no publisher" backstop first (the BUI-458
+    # principle: a loud null beats a quiet wrong value). canonical_series is
+    # a separate variable captured earlier and is NOT reverted — series
+    # resolution is the one thing the step-2 path exists to produce, and
+    # BUI-199 volume boundaries mean it can be right even when the specific
+    # issue hit was a reprint.
+    #
+    # Gated on has_candidate_date so this only fires on an ACTUAL rejection
+    # (a store_date/cover_date existed and disagreed with the win's year),
+    # never on a plain Metron miss on dates (R66: a hit that simply has no
+    # date at all is not evidence of a wrong issue — it stays and the row
+    # ships dateless, same as before).
+    has_candidate_date = bool(metron_data and (metron_data.get("store_date") or metron_data.get("cover_date")))
+    if metron_data is not None and has_candidate_date and _metron_release_date(metron_data, year_raw) is None:
+        metron_data = None
 
     # BUI-458: capture the issue's publisher (e.g. "Marvel Comics") from
     # Metron's full-issue detail so the win row carries a real publisher_name
