@@ -169,9 +169,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Audit an already-exported wins CSV for data-quality issues before uploading to LOCG (read-only)",
         epilog=(
             "Flags missing publisher/series/full_title, a decorated full_title "
-            "((Vol.)/year), and the YYYY-01-01 placeholder date, plus a dateless "
-            "summary (count, titles, all_dateless) and a ready-to-surface "
-            "dateless_warning. Read-only — never mutates the store or the CSV. "
+            "((Vol.)/year), and a YYYY-01-01 date, plus a dateless summary "
+            "(count, titles, all_dateless) and a ready-to-surface "
+            "dateless_warning. BUI-466: a YYYY-01-01 date is cross-checked "
+            "against the collection store (source=agent_win + no metron_id) "
+            "before it hard-stops — a confirmed BUI-105 placeholder lands in "
+            "flagged_rows/flagged_count, a confirmed-genuine or unconfirmable "
+            "January cover date is demoted to advisory_rows/advisory_count and "
+            "does not hard-stop. Read-only — never mutates the store or the CSV. "
             "Pass the path from a prior `collection export`; do not re-export "
             "before auditing (re-exporting re-blanks placeholder dates)."
         ),

@@ -2263,13 +2263,16 @@ def cmd_collection_export(
     }
 
 
-def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
+def cmd_collection_audit_pending(
+    csv_path: str, cache: Optional[CollectionCache] = None
+) -> dict[str, Any]:
     """Audit an already-exported wins CSV for data-quality issues before upload (BUI-432).
 
-    Read-only: only opens and parses the CSV at ``csv_path``. Never touches the
-    collection store and never re-exports (re-exporting re-blanks placeholder
-    dates — the caller must pass the path to a CSV a prior `collection export`
-    already produced).
+    Read-only: only opens and parses the CSV at ``csv_path``, plus a read-only
+    ``cache.load()`` for the ``placeholder_date`` intent check below (BUI-466).
+    Never writes to the collection store and never re-exports (re-exporting
+    re-blanks placeholder dates — the caller must pass the path to a CSV a
+    prior `collection export` already produced).
 
     This replaces the ~30 lines of inline Python `/comic:collection-sync` Step 2b
     used to re-author every run (BUI-199's pre-sync audit) with tested code.
@@ -2281,19 +2284,48 @@ def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
     - ``decorated_full_title``: ``Full Title`` carries ``(Vol.`` or a
       parenthesized 4-digit year — LOCG's own full_title never carries this
       decoration, so it signals an un-canonicalized record-win row.
-    - ``placeholder_date``: ``Release Date`` is ``YYYY-01-01``. This is a
-      SHAPE check, and it is advisory only: a legacy BUI-105 placeholder and a
-      genuine January cover date are the same string, and a CSV carries no
-      ``metron_id`` to tell them apart the way
-      ``_is_placeholder_release_date`` does on a store row. Verify against
-      Metron before "correcting" a flagged date — overwriting a real January
-      date is the more expensive mistake. (A genuine BUI-105 placeholder is
-      blanked on export, so a Jan-1 date that actually reaches an exported
-      wins CSV is usually a real January cover date, not a placeholder.)
+    - ``placeholder_date``: ``Release Date`` is ``YYYY-01-01``. This is a pure
+      SHAPE check — a legacy BUI-105 placeholder and a genuine January cover
+      date are the same string, and the CSV itself carries no ``metron_id`` to
+      tell them apart (BUI-122 forbids widening the uploaded artifact's
+      columns to carry one). So this flag alone can never decide the row.
 
-    Only rows with at least one flag appear in ``flagged_rows``; each entry also
-    carries a human-readable ``issues`` list (same wording as the inline audit
-    it replaces) for display.
+      **BUI-466**: whenever a shape match is found, this command additionally
+      looks the row up in the collection STORE (by exact ``Series Name`` +
+      ``Full Title``, matched against the same "ready to push" set the export
+      itself drew from — see :func:`locg.collection_io._pending_push_rows`)
+      and, if exactly one store row matches, applies the INTENT test
+      ``_is_placeholder_release_date`` makes there (``source == "agent_win"``
+      AND ``metron_id is None``). Three outcomes, recorded in
+      ``placeholder_date_confirmed``:
+
+        * ``True`` — confirmed BUI-105 placeholder. Stays a HARD-STOP flag in
+          ``flagged_rows``/``flagged_count`` (run `locg collection backfill`
+          or re-run record-win to fix it at the source).
+        * ``False`` — confirmed genuine January cover date. Demoted to
+          ADVISORY: reported in ``advisory_rows``/``advisory_count`` but
+          excluded from ``flagged_count``, so it no longer hard-stops
+          `/comic:collection-sync`. Never "corrected" — that would overwrite
+          real data.
+        * ``None`` — no store row matched (zero or more than one), so the
+          intent can't be confirmed either way (also the fallback if the store
+          itself can't be read at all, e.g. never imported). Also demoted to
+          ADVISORY, not hard-stop: a genuine BUI-105 placeholder is always
+          blanked before it reaches the CSV (see ``_row_to_csv_dict``), so a
+          non-blank ``YYYY-01-01`` that DOES reach an exported wins CSV is, by
+          construction, almost always a real cover date — treating an
+          unconfirmable match as advisory errs on the side that matches
+          reality far more often, and never silently drops a genuine
+          BUI-105 placeholder either (it is still surfaced, just not blocking).
+
+    Only rows with at least one HARD-STOP flag appear in ``flagged_rows``; rows
+    whose only issue demoted to advisory (an unconfirmed or confirmed-genuine
+    placeholder date) appear in ``advisory_rows`` instead. Both carry the same
+    per-row shape (``row_index``, ``full_title``, the flag booleans, and a
+    human-readable ``issues`` list for display) — a row with BOTH a hard-stop
+    issue and an advisory-only placeholder note still lands in ``flagged_rows``
+    (for the hard-stop issue), with the placeholder note included in its
+    ``issues`` list.
 
     Also returns a dateless summary: a blank ``Release Date`` matches fine for
     a single row, but a batch that is all (or nearly all) dateless hangs LOCG's
@@ -2302,10 +2334,13 @@ def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
     ``dateless_warning`` is a ready-to-surface string whenever any row lacks a
     date (None when every row has one).
 
-    Returns {csv_path, row_count, flagged_count, flagged_rows, dateless_count,
-    dateless_titles, all_dateless, dateless_warning}.
+    Returns {csv_path, row_count, flagged_count, flagged_rows, advisory_count,
+    advisory_rows, dateless_count, dateless_titles, all_dateless,
+    dateless_warning}.
     """
     import csv as _csv
+
+    from locg.collection_io import _is_placeholder_release_date, _pending_push_rows
 
     path = Path(csv_path)
     if not path.exists():
@@ -2314,7 +2349,32 @@ def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
     with path.open(newline="") as f:
         rows = list(_csv.DictReader(f))
 
+    # BUI-466: index the store's current "ready to push" rows (the exact set
+    # the export drew the CSV from) by (Series Name, Full Title) so a
+    # placeholder-shaped CSV row can be matched back to its store row for the
+    # intent check. Best-effort and read-only: any failure to load the store
+    # (never imported, corrupt, unreadable) degrades to "can't confirm" for
+    # every row rather than raising — a store-read hiccup must never break the
+    # CSV-only checks above it.
+    placeholder_lookup: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    try:
+        store = cache if cache is not None else CollectionCache()
+        payload = store.load()
+        ready, _manual_variant, _manual_series = _pending_push_rows(payload)
+        for sr in ready:
+            key = (sr.get("series_name") or "", sr.get("full_title") or "")
+            placeholder_lookup.setdefault(key, []).append(sr)
+    except Exception:  # noqa: BLE001  # best-effort store read; failure -> "can't confirm", never a crash
+        placeholder_lookup = {}
+
+    def _confirm_placeholder(series: str, full_title: str) -> Optional[bool]:
+        matches = placeholder_lookup.get((series, full_title), [])
+        if len(matches) != 1:
+            return None
+        return _is_placeholder_release_date(matches[0])
+
     flagged_rows: list[dict[str, Any]] = []
+    advisory_rows: list[dict[str, Any]] = []
     for idx, r in enumerate(rows):
         pub = r.get("Publisher Name", "")
         ser = r.get("Series Name", "")
@@ -2327,23 +2387,40 @@ def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
         decorated_full_title = bool("(Vol." in ft or re.search(r"\(\d{4}", ft))
         placeholder_date = bool(dt and re.match(r"^\d{4}-01-01$", dt))
 
-        issues: list[str] = []
-        if missing_publisher:
-            issues.append("no publisher")
-        if missing_series:
-            issues.append("no series")
-        if missing_full_title:
-            issues.append("no full_title")
-        if decorated_full_title:
-            issues.append("decorated full_title (LOCG full_title carries no (Vol.)/(year))")
+        placeholder_confirmed: Optional[bool] = None
         if placeholder_date:
-            issues.append(
-                "Jan-1 placeholder date (reads Not Found) — verify first: a genuine "
-                "January cover date is identical in a CSV and must be kept"
-            )
+            placeholder_confirmed = _confirm_placeholder(ser, ft)
 
+        hard_stop_issues: list[str] = []
+        advisory_issues: list[str] = []
+        if missing_publisher:
+            hard_stop_issues.append("no publisher")
+        if missing_series:
+            hard_stop_issues.append("no series")
+        if missing_full_title:
+            hard_stop_issues.append("no full_title")
+        if decorated_full_title:
+            hard_stop_issues.append("decorated full_title (LOCG full_title carries no (Vol.)/(year))")
+        if placeholder_date:
+            if placeholder_confirmed is True:
+                hard_stop_issues.append(
+                    "confirmed BUI-105 placeholder (store row: agent_win, no metron_id) — "
+                    "run `locg collection backfill` or re-run record-win"
+                )
+            else:
+                verified = (
+                    "verified against the store as a genuine cover date"
+                    if placeholder_confirmed is False
+                    else "could not be matched to a store row to verify"
+                )
+                advisory_issues.append(
+                    f"Jan-1 date {verified} — advisory only, not a hard stop; a genuine "
+                    "January cover date must never be overwritten"
+                )
+
+        issues = hard_stop_issues + advisory_issues
         if issues:
-            flagged_rows.append({
+            row_entry = {
                 "row_index": idx,
                 "full_title": ft or "(blank)",
                 "missing_publisher": missing_publisher,
@@ -2351,8 +2428,13 @@ def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
                 "missing_full_title": missing_full_title,
                 "decorated_full_title": decorated_full_title,
                 "placeholder_date": placeholder_date,
+                "placeholder_date_confirmed": placeholder_confirmed,
                 "issues": issues,
-            })
+            }
+            if hard_stop_issues:
+                flagged_rows.append(row_entry)
+            else:
+                advisory_rows.append(row_entry)
 
     row_count = len(rows)
     dateless_titles = [r.get("Full Title", "") for r in rows if not r.get("Release Date", "").strip()]
@@ -2369,6 +2451,8 @@ def cmd_collection_audit_pending(csv_path: str) -> dict[str, Any]:
         "row_count": row_count,
         "flagged_count": len(flagged_rows),
         "flagged_rows": flagged_rows,
+        "advisory_count": len(advisory_rows),
+        "advisory_rows": advisory_rows,
         "dateless_count": dateless_count,
         "dateless_titles": dateless_titles,
         "all_dateless": row_count > 0 and dateless_count == row_count,
