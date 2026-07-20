@@ -35,6 +35,16 @@ _CONNECTION_ERROR_PREFIX = "Connection error:"
 # doc's 1s floor; a 5xx is rare and transient.
 _SERVER_ERROR_RETRY_SLEEP = 1.0
 
+# BUI-465: the burst budget above, and what each public lookup actually SPENDS
+# against it. A batch caller that paces itself per *call* under-counts, because
+# `lookup_issue` is two HTTP requests (`series_list` then `issues_list`) while
+# `lookup_issue_detail` is one (`session.issue`). These live here, next to the
+# methods whose request counts they describe, so a lookup that grows a third
+# request can't silently leave a caller's pacing maths behind.
+REQUESTS_PER_MINUTE = 20
+REQUESTS_LOOKUP_ISSUE = 2
+REQUESTS_LOOKUP_ISSUE_DETAIL = 1
+
 
 def _is_connection_error(exc: BaseException) -> bool:
     return isinstance(exc, ApiError) and str(exc).startswith(_CONNECTION_ERROR_PREFIX)
