@@ -121,6 +121,28 @@ marks seen exactly what it committed, and refreshes status — replacing three
 hand-glued calls that used to drift from each other (rationale doc has the
 history). Pass the two arrays **separately** — do not merge them yourself:
 
+**Expected duration — a multi-minute wait here is normal, not a hang
+(BUI-472).** `cmd_collection_record_win` paces Metron traffic to
+`METRON_REQUESTS_PER_MINUTE` (20 req/min, BUI-465) and spends up to 3 HTTP
+requests per win — 2 for `REQUESTS_LOOKUP_ISSUE` (the R36 step-2 series
+lookup, or the BUI-210 date-only lookup; mutually exclusive, never both)
+plus 1 for `REQUESTS_LOOKUP_ISSUE_DETAIL` (publisher/variant) — so pacing
+alone costs `60s / 20 req/min × 3 requests ≈ 9s/win`. A transient Metron
+trip additionally costs up to `METRON_MAX_TRANSIENT_TRIPS` (3) cooldowns of
+`METRON_TRANSIENT_COOLDOWN_SEC` (60s) each. Worst case for a batch of N
+wins: **N × 9s + 3 × 60s**. A 40-win batch: `40 × 9 + 180 = 540s (~9 min)`.
+
+The server side cannot stall on this — the blocking call runs off the event
+loop via `asyncio.to_thread` (BUI-428) — so the only real risk is the
+**calling harness's own Bash-invocation timeout** (the `curl` below has no
+`--max-time` of its own, and shouldn't grow one — the call is slow on
+purpose). **Invoke this bash block with an explicit timeout of 600000ms
+(10 minutes)** — the harness's own maximum for a single Bash call (it
+cannot be raised further), and comfortably covers the 40-win worst case
+above with ~60s of margin. A batch large enough to exceed even that ceiling
+(roughly N > 46 wins) can still time out at the harness level — see Step 3b
+below for what to do when that happens.
+
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
 comics_resolve_server || exit 1
@@ -134,8 +156,19 @@ python3 -c "import json; \
 # rm -f BEFORE the POST — a stale response file must never be misread as
 # this run's result (belt-and-suspenders on BUI-430's scratch dir).
 rm -f "$SCRATCH/commit_response.json"
+# BUI-472: this call is slow ON PURPOSE (BUI-465 pacing) — do not add
+# --max-time here. Worst case = batch_size x ~9s (pacing: 3 Metron requests
+# per win / 20 req-per-min budget = 60/20*3 = 9s/win) + up to 3 x 60s
+# transient-trip cooldowns (METRON_MAX_TRANSIENT_TRIPS x
+# METRON_TRANSIENT_COOLDOWN_SEC). A 40-win batch: 40*9 + 3*60 = 540s. The
+# risk is the HARNESS's Bash-invocation timeout, not this curl — that must
+# be set explicitly on the tool call that runs this block (see the prose
+# above: 600000ms, the harness's max).
 # Not `curl -f` (discards the error body) — a partial_failure needs
-# rows_written out of the 500 body. %{http_code} is 000 if never connected.
+# rows_written out of the 500 body. %{http_code} is 000 if never connected
+# — OR if the connection was cut mid-flight while the server kept working
+# (asyncio.to_thread, BUI-428). That case is AMBIGUOUS, not a confirmed
+# failure — see Step 3b.
 code=$(curl -sS -o "$SCRATCH/commit_response.json" -w '%{http_code}' \
   -X POST "$COMICS_SERVER_URL/api/comics/collection/record-win/commit" \
   -H 'content-type: application/json' \
@@ -148,13 +181,20 @@ if [ "${code:-000}" -ge 200 ] && [ "${code:-000}" -lt 300 ]; then
   python3 -c "import json; d=json.load(open('$SCRATCH/commit_response.json')); \
     print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded','marked_seen','pending_push_count','oldest_pending_days']}))" \
     || { echo "record-win/commit returned HTTP $code but the body could not be parsed — see $SCRATCH/commit_response.json; do NOT assume success."; exit 1; }
+elif [ "${code:-000}" = "000" ]; then
+  # No HTTP response at all — could be "never connected" OR "connection cut
+  # after the server already started/finished the write." AMBIGUOUS: do NOT
+  # report failure here. Go to Step 3b before saying anything to the operator.
+  echo "record-win/commit got no HTTP response (code 000) — AMBIGUOUS, not a confirmed failure. Do not assume nothing was recorded — see Step 3b."
+  exit 1
 else
-  # STOP, non-zero exit. Nothing was marked seen (non-2xx never reaches the
-  # server's mark-seen step, BUI-428/137) — nothing to undo, just report.
+  # A real HTTP error code WITH a body from the server is a genuine,
+  # unambiguous failure: non-2xx never reaches the server's mark-seen step
+  # (BUI-428/137), so nothing was marked seen — nothing to undo, just report.
   echo "record-win/commit FAILED (HTTP $code) — STOP. Nothing was recorded or marked seen."
   python3 -c "import json; d=json.load(open('$SCRATCH/commit_response.json')); det=d.get('detail', d); \
     print('error:', det.get('error'), '| rows_written (committed before failure):', det.get('rows_written'))" 2>/dev/null \
-    || echo "(no parseable response body — the request likely never reached the server)"
+    || echo "(HTTP $code but no parseable response body — treat as ambiguous, see Step 3b, rather than assuming failure)"
   exit 1
 fi
 ```
@@ -178,7 +218,9 @@ The full response (including `skipped_already_owned_titles`/`_detail` and
 `committed_item_ids`) is preserved at `$SCRATCH/commit_response.json`.
 `manual_series_count > 0` means those rows have
 `needs_manual_series_canonical=true` and will appear in the export's
-`.notes.md`. **If the POST fails (non-2xx), STOP** — do not report success.
+`.notes.md`. **If the POST fails with a real HTTP error code (non-2xx, with
+a parseable body), STOP** — do not report success; that failure is
+unambiguous (BUI-428/137 guarantee nothing was marked seen on that path).
 
 **Partial failures are non-200, never a misleading 200 (BUI-137):** a
 mid-batch chunk failure returns HTTP 500 with `rows_written` (only-committed),
@@ -186,6 +228,60 @@ and marks nothing seen (BUI-428). The status check above already routes
 this to the failure branch — never report success on a `partial_failure`.
 
 **If both arrays are empty**, still POST — the endpoint returns zero-valued scalars plus current pending counts, so Step 5 still has fresh numbers.
+
+**If the Bash tool call for Step 3 itself timed out** (the harness killed it
+before `curl` returned — no `$code`, nothing printed, nothing to read), or
+Step 3 printed the "code 000 — AMBIGUOUS" message: **do not** treat this as
+a confirmed failure and do not silently move on either. Go to Step 3b before
+reporting anything to the operator (BUI-472).
+
+## Step 3b: Disambiguate a timed-out or ambiguous Step 3 call
+
+Run this step only when Step 3's outcome was inconclusive — a harness-level
+Bash timeout, or the printed "code 000" message. **Skip it** when Step 3
+returned a clean 2xx, or a real non-2xx HTTP error with a parseable body
+(that failure is unambiguous already).
+
+**Why this matters:** BUI-428 made the commit atomic and marks the committed
+item_ids seen **only on full success**. A client-side timeout does not mean
+the server gave up — the write runs off the event loop (`asyncio.to_thread`)
+and can complete moments after the harness stopped waiting on the
+connection. Re-running Step 1 blind in that state finds `new_win_count == 0`
+and reads exactly like "nothing to do" — silently hiding a batch that
+actually landed. Disambiguate first.
+
+```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1
+SCRATCH="$(comics_scratch_dir)" || exit 1
+
+gixen record-win-prep --output "$SCRATCH/prep_recheck.json" \
+  || { echo "record-win-prep FAILED on recheck — see message above. STOP."; exit 1; }
+python3 -c "import json; d=json.load(open('$SCRATCH/prep_recheck.json')); \
+  print(json.dumps({k: d[k] for k in ['total_ended_won','new_win_count']}))"
+
+curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
+```
+
+Compare the recheck's `new_win_count` to Step 1's **original** `new_win_count`:
+
+- **Dropped to (approximately) 0, or dropped by roughly the size of the
+  batch just attempted:** the commit landed server-side despite the
+  timeout. Report to the operator: "The record-win commit timed out on this
+  end, but the collection status confirms it completed — the wins were
+  recorded. Do NOT re-run Step 3." Use the fresh
+  `pending_push_count`/`oldest_pending_days` from the status call above for
+  Step 5's report (Step 3's own response never arrived). Continue to Step 4
+  to export a CSV covering the newly-recorded rows.
+- **Unchanged from Step 1's original count:** the commit did not land.
+  Report: "The record-win commit timed out and nothing was recorded — safe
+  to re-run Step 3." Retry Step 3 (same explicit long timeout).
+
+**Never report a bare "nothing to do" after a Step 3 timeout without running
+this recheck.** "Genuinely nothing pending" and "just committed a moment
+ago" both leave `new_win_count` at 0 if you only look at the recheck in
+isolation — the comparison against the PRE-Step-3 count is what tells them
+apart.
 
 ## Step 4: Export to CSV
 
@@ -212,7 +308,10 @@ This writes a CSV at `~/Downloads/locg-bulk-import-<timestamp>.csv` plus a `.not
 No separate status call needed (BUI-428 collapsed it into Step 3): read
 `pending_push_count`/`oldest_pending_days` straight out of Step 3's response.
 **Do not use Step 0's status read** — it predates this run's wins and would
-undercount by exactly the rows you just added (BUI-156).
+undercount by exactly the rows you just added (BUI-156). **Exception:** if
+Step 3 timed out and Step 3b determined the commit landed anyway, Step 3's
+own response never arrived — use the `pending_push_count`/`oldest_pending_days`
+from Step 3b's status call instead (BUI-472).
 
 `oldest_pending_days` is the age of the oldest uncleared item — **not** "days
 since last sync." `needs_manual_series_canonical=true` rows never clear via
@@ -254,3 +353,5 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Re-deriving the ENDED+WON filter / dedup / seen-subtract / positional-identify-mapping by hand | Use `gixen record-win-prep` (BUI-353) — it owns that join in one tested place |
 | Asking the user "if confidence is low" | Not a real gate — baseline confidence is 0.5 for every clean parse; `needs_review` (Step 2) is the only gate (BUI-354) |
 | Assuming `needs_review` only covers null series/issue/lot parsing | It also gates a null `year` at/above $25 (`REASON_MISSING_YEAR`, BUI-422 — vintage-key mis-resolution risk) |
+| Invoking Step 3's Bash block without an explicit long timeout | It can legitimately run several minutes (BUI-465 pacing); set the tool call's timeout to 600000ms (the harness max) or it may hit the harness's own default timeout mid-write (BUI-472) |
+| Reporting "nothing to do" right after a Step 3 timeout / code-000 response | That is ambiguous, not confirmed failure — BUI-428 marks seen only on full success, so the timed-out call may have already landed; run Step 3b before saying anything (BUI-472) |
