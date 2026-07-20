@@ -331,14 +331,32 @@ curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/import" \
   -F "file=@<XLSX>"
 ```
 
-Surface `added` / `updated` / `reconciled` from the response. **If `warnings`
-is non-empty, surface every entry too** — each is a plain human-readable
-string (not a structured object with separate fields), covering both the
-BUI-412 `null_release_date_owned` data-quality notice and any pre-existing
-`ambiguous_reconciliation` / reconciliation-collision notices. List them for
-the operator; don't drop them just because they fall outside the
-added/updated/reconciled counts. **If the POST fails, STOP** — do not report
-success; the backup from Step 1 is intact.
+Surface `added` / `updated` / `reconciled` / `auto_healed_duplicates` /
+`second_copies_credited` from the response — all five are top-level summary
+counters already returned by the endpoint, not something to derive:
+
+- **`auto_healed_duplicates`** — pending win rows the reconciler **deleted**
+  because they were confirmed duplicates of an already-owned LOCG row
+  (BUI-211/BUI-462/BUI-470). Never let this pass by silently: report the count
+  to the operator. Each dropped row's full contents (not just its identity)
+  are recorded in the server's `import-history.jsonl` as
+  `type=auto_healed_duplicate_win` — that entry is the reversal path if a heal
+  turns out wrong.
+- **`second_copies_credited`** — of those healed duplicates, how many were
+  folded in as a genuine extra physical copy instead of being dropped
+  outright: `in_collection` was incremented by 1 on the surviving row
+  (BUI-470). This does **not** change `row_count` — it mutates a count field
+  on a row that already existed, not the row set — but it's still a store
+  mutation the operator didn't directly request, so surface it too. Logged as
+  `type=second_copy_credited` in the same `import-history.jsonl`.
+
+**If `warnings` is non-empty, surface every entry too** — each is a plain
+human-readable string (not a structured object with separate fields),
+covering both the BUI-412 `null_release_date_owned` data-quality notice and
+any pre-existing `ambiguous_reconciliation` / reconciliation-collision
+notices. List them for the operator; don't drop them just because they fall
+outside the added/updated/reconciled counts. **If the POST fails, STOP** — do
+not report success; the backup from Step 1 is intact.
 
 ## Step 6: Post-import safety check
 
@@ -352,11 +370,28 @@ Assert all of:
 - **Pending dropped:** `pending_push_count` < `PENDING_BEFORE` (the sync's whole
   point). Expect it to fall by roughly `ready_count`; the `manual_series_count`
   rows stay pending by design.
-- **No duplicate insertion:** `row_count` should grow only by books you genuinely
-  added directly in the LOCG UI. The import summary's `added` is the tell — if
-  `added` is large (close to `ready_count`), the re-import failed to reconcile
-  and inserted duplicates instead. **STOP and investigate** — do not claim
-  success. Restore the Step 1 backup if needed (BUI-433):
+- **Row count is fully explained, in EITHER direction (BUI-468):** exactly two
+  summary counters change `row_count` during Step 5's import —
+  `added` (genuine new rows, whether pushed from here or added directly in
+  the LOCG UI) and `auto_healed_duplicates` (pending win rows the reconciler
+  *deletes* as confirmed duplicates, BUI-211/BUI-462/BUI-470). Nothing else
+  does — `updated`/`reconciled` rewrite rows in place, and
+  `second_copies_credited` increments a field on a row that already existed,
+  not the row set. So compute:
+
+  ```
+  EXPECTED_ROWS = ROWS_BEFORE + added - auto_healed_duplicates
+  ```
+
+  and require `ROWS_AFTER == EXPECTED_ROWS` **exactly**. This is a two-sided
+  check, not a growth-only one: a store that *shrinks* by more (or less) than
+  `auto_healed_duplicates` accounts for is just as much a hard-stop as one
+  that grows unexpectedly — deleting rows from the collection must never be a
+  silent success. **STOP and investigate on any mismatch** — do not claim
+  success. An over-large `added` relative to `ready_count` means the
+  re-import failed to reconcile and inserted duplicates; a shrink beyond
+  `auto_healed_duplicates` means rows were dropped for a reason this skill
+  can't account for. Restore the Step 1 backup if needed (BUI-433):
 
 ```bash
 comics_post "$COMICS_SERVER_URL/api/comics/collection/restore" \
@@ -374,12 +409,24 @@ proceed.
 
 Backup:           $BACKUP_PATH  (comics=N, wish_list=M — see Step 1)
 Exported (ready): N rows  (+ M withheld needs-manual-series — see .notes.md)
-Re-import:        added=A  updated=U  reconciled=R
+Re-import:        added=A  updated=U  reconciled=R  auto_healed_duplicates=H  second_copies_credited=C
 Pending:          PENDING_BEFORE → PENDING_AFTER  (cleared ~N)
-Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = genuine LOCG-side adds)
+Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = added - auto_healed_duplicates, verified two-sided in Step 6)
 Wish-list:        unchanged (local-only adds preserved)
 Warnings:         W warning(s) from the re-import (see below) — or "none"
 ```
+
+**If `auto_healed_duplicates` (H above) is non-zero, say so plainly, not just
+as a warning string:** H pending win row(s) were deleted from the store as
+confirmed duplicates of an already-owned LOCG row. The reversal path is the
+server's `import-history.jsonl`, filtered to `type=auto_healed_duplicate_win`
+— each entry carries the WHOLE dropped row (not just its identity), so a
+wrong heal is fully reconstructable from that entry alone.
+
+**If `second_copies_credited` (C above) is non-zero, say so too:** C of those
+healed duplicates were folded in as a genuine extra copy rather than dropped
+outright — `in_collection` was incremented on the surviving row. Logged as
+`type=second_copy_credited` in the same `import-history.jsonl`.
 
 **If the Step 5 response's `warnings` array is non-empty, list every entry
 below the summary block** — each is already a complete, human-readable
@@ -415,5 +462,6 @@ win-records cleanup in
 | Syncing without a backup | Step 1 is mandatory and hard-stops on failure (`POST /api/comics/collection/backup`, BUI-433) |
 | Seeing "Deleted from Collection" on upload | A win/wish row should never delete (BUI-122/BUI-200) — STOP, do not upload the rest, report it, restore the Step 1 backup if a deletion landed (`POST /api/comics/collection/restore` with `backup_path=$BACKUP_PATH`, BUI-433) |
 | "Error: timeout" at 0% on small batches | LOCG's import backend is degraded (a `queue_import_comic` XHR shows `(canceled)`); wait and retry later — not a file problem |
-| Claiming success when `added` is large | A large `added` means the re-import inserted duplicates instead of reconciling — STOP, investigate, restore the backup if needed (`POST /api/comics/collection/restore`) |
+| Claiming success without checking `row_count` against `added - auto_healed_duplicates` | Step 6's check is two-sided (BUI-468): `ROWS_AFTER` must equal `ROWS_BEFORE + added - auto_healed_duplicates` exactly. A large `added` means duplicates were inserted instead of reconciled; a shrink beyond `auto_healed_duplicates` means rows vanished for an unaccounted reason. Either way — STOP, investigate, restore the backup if needed (`POST /api/comics/collection/restore`) |
+| Treating `auto_healed_duplicates`/`second_copies_credited` as buried-in-warnings trivia | Both are top-level Step 5 summary counters — report them by name in Step 7, not just via the `warnings` string (BUI-468). `auto_healed_duplicates` deletes rows; `second_copies_credited` silently increments `in_collection` on a survivor. Both are reversible via `import-history.jsonl` (`type=auto_healed_duplicate_win` / `type=second_copy_credited`) |
 | Uploading the `.notes.md` rows | Only the `.csv` files go to LOCG; `.notes.md` lists rows withheld for manual resolution |
