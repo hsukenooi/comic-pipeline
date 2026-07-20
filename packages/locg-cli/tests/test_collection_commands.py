@@ -1561,8 +1561,20 @@ def test_record_win_metron_series_resolution_reprint_guard(tmp_path):
     series to 'The Infinity Gauntlet (1991) (1991 - 1991)' but its cover_date
     was a 2022 reprint's. Left unguarded, that date got written verbatim, so a
     later year-gated collection-check for the real 1991 issue rejected the row
-    as a different era. The date must be dropped (left blank, R66) when its
-    year disagrees with the win's own year."""
+    as a different era. The reprint date must be dropped when its year
+    disagrees with the win's own year; the BUI-105 {year}-01-01 placeholder
+    is stamped in its place (metron_data is now fully dropped — see below —
+    so this row lands on the same placeholder path as a plain Metron miss,
+    matching the sibling BUI-210 index-path test).
+
+    BUI-467: a rejected hit is positive evidence of the WRONG issue, so its
+    issue-level metadata (metron_id, publisher_name) must be dropped too —
+    not just the date. Before the fix this reprint hit's publisher ("Marvel
+    Comics" here, but a real reprint under a DIFFERENT imprint would import
+    silently to LOCG) and metron_id rode along on the row despite the guard
+    rejecting the very date that flagged it as a reprint. The independently
+    corroborated series resolution (canonical_series) is the one thing this
+    path exists to produce and is kept."""
     from locg.commands import cmd_collection_record_win
     from unittest.mock import MagicMock
 
@@ -1578,8 +1590,9 @@ def test_record_win_metron_series_resolution_reprint_guard(tmp_path):
         "series_id": 42,
     }
     metron.format_series_name.return_value = "The Infinity Gauntlet (1991) (1991 - 1991)"
-    # BUI-458: record-win now fetches issue detail for the publisher.
-    metron.lookup_issue_detail.return_value = {"variants": [], "credits": [], "publisher": "Marvel Comics"}
+    # A different imprint than the genuine 1991 Marvel original — if this
+    # leaked onto the row it would import a wrong publisher to LOCG silently.
+    metron.lookup_issue_detail.return_value = {"variants": [], "credits": [], "publisher": "2022 Reprint Imprint"}
     metron.degraded = False
 
     result = cmd_collection_record_win(
@@ -1590,7 +1603,14 @@ def test_record_win_metron_series_resolution_reprint_guard(tmp_path):
     assert result["rows_written"] == 1
     row = cache.load()["comics"][-1]
     assert row["series_name"] == "The Infinity Gauntlet (1991) (1991 - 1991)"
-    assert row["release_date"] is None
+    # The rejected date is not kept verbatim; BUI-105 stamps the placeholder
+    # (blanked again on export, per collection_io._is_placeholder_release_date).
+    assert row["release_date"] == "1991-01-01"
+    # BUI-467: the rejected hit's issue-level metadata must not survive —
+    # null publisher trips audit-pending's backstop instead of importing the
+    # reprint's (wrong) imprint silently.
+    assert row["publisher_name"] is None
+    assert row["metron_id"] is None
 
 
 def test_record_win_metron_series_resolution_matching_date_kept(tmp_path):
@@ -2198,8 +2218,10 @@ def test_record_win_metron_variant_match(tmp_path):
 
     cache = make_cache(tmp_path)
     metron = _metron_with_variants("Spawn (1992 - Present)", ["Capullo Variant", "Direct Edition"])
+    # BUI-467: year must agree with _metron_with_variants' 1992-05-01 cover_date
+    # (±1) or the reprint guard drops metron_data before variant matching runs.
     result = cmd_collection_record_win(
-        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        [_make_win(series="Spawn", issue="313", year=1992, variant_text="Capullo Variant")],
         cache=cache,
         metron=metron,
     )
@@ -2222,8 +2244,10 @@ def test_record_win_metron_variant_no_match_flags(tmp_path):
 
     cache = make_cache(tmp_path)
     metron = _metron_with_variants("Spawn (1992 - Present)", ["Some Unrelated Cover"])
+    # BUI-467: year must agree with _metron_with_variants' 1992-05-01 cover_date
+    # (±1) or the reprint guard drops metron_data before variant matching runs.
     result = cmd_collection_record_win(
-        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        [_make_win(series="Spawn", issue="313", year=1992, variant_text="Capullo Variant")],
         cache=cache,
         metron=metron,
     )
@@ -2245,8 +2269,10 @@ def test_record_win_no_variant_skips_variant_detail_match(tmp_path):
 
     cache = make_cache(tmp_path)
     metron = _metron_with_variants("Spawn (1992 - Present)", ["Capullo Variant"])
+    # BUI-467: year must agree with _metron_with_variants' 1992-05-01 cover_date
+    # (±1) or the reprint guard drops metron_data before the detail fetch runs.
     result = cmd_collection_record_win(
-        [_make_win(series="Spawn", issue="313", variant_text="newsstand")],
+        [_make_win(series="Spawn", issue="313", year=1992, variant_text="newsstand")],
         cache=cache,
         metron=metron,
     )
@@ -2324,8 +2350,10 @@ def test_record_win_variant_win_captures_publisher_with_single_detail_fetch(tmp_
     cache = make_cache(tmp_path)
     # _metron_with_variants stubs a publisher of "Image Comics" (Spawn).
     metron = _metron_with_variants("Spawn (1992 - Present)", ["Capullo Variant", "Direct Edition"])
+    # BUI-467: year must agree with _metron_with_variants' 1992-05-01 cover_date
+    # (±1) or the reprint guard drops metron_data before variant matching runs.
     result = cmd_collection_record_win(
-        [_make_win(series="Spawn", issue="313", variant_text="Capullo Variant")],
+        [_make_win(series="Spawn", issue="313", year=1992, variant_text="Capullo Variant")],
         cache=cache, metron=metron,
     )
 
