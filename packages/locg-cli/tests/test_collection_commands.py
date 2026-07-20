@@ -11,6 +11,21 @@ FIXTURES = Path(__file__).parent / "fixtures"
 SAMPLE_XLSX = FIXTURES / "collection_export_sample.xlsx"
 
 
+@pytest.fixture(autouse=True)
+def metron_sleeps(monkeypatch):
+    """Capture every ``locg.commands`` sleep instead of serving it (BUI-465).
+
+    ``cmd_collection_record_win`` now paces itself against Metron's 20 req/min
+    budget and cools down after a transient trip, so an unpatched run of this
+    module would spend minutes of real wall-clock inside ``time.sleep``. Autouse
+    so no existing test has to opt in; the returned list is the assertion surface
+    for the tests that check the pacing itself.
+    """
+    slept: list[float] = []
+    monkeypatch.setattr("locg.commands.time.sleep", slept.append)
+    return slept
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -3235,25 +3250,40 @@ def test_record_win_metron_credential_error_disables_metron(tmp_path):
 
 # --- BUI-255: throttle/timeout trips the batch breaker like credential errors ---
 
-def test_record_win_metron_degraded_disables_metron(tmp_path):
-    """A throttled/unreachable Metron (MetronClient.degraded) trips the same
-    per-batch breaker as MetronCredentialError: after the first call reports
-    degraded, remaining rows fall back to manual and Metron is never called
-    again — instead of retrying (and sleeping) on every remaining row."""
-    from locg.commands import cmd_collection_record_win
+def _always_degrading_metron():
+    """MetronClient stub whose every lookup trips ``.degraded`` and returns None.
+
+    Mirrors a real client that has exhausted its single capped retry — for a
+    rate limit (BUI-260), a 5xx (BUI-342), or a connection error (BUI-255): no
+    exception escapes, but ``.degraded`` flips True.
+    """
     from unittest.mock import MagicMock
 
-    cache = make_cache(tmp_path)
     metron = MagicMock()
     metron.degraded = False
 
-    def _throttled_lookup(*_args, **_kwargs):
-        # Simulates a real MetronClient after its BUI-260 rate-limit retry
-        # is exhausted: returns None (no exception) but flips .degraded True.
+    def _degrading_lookup(*_args, **_kwargs):
         metron.degraded = True
         return None
 
-    metron.lookup_issue.side_effect = _throttled_lookup
+    metron.lookup_issue.side_effect = _degrading_lookup
+    metron.lookup_issue_detail.side_effect = _degrading_lookup
+    return metron
+
+
+def test_record_win_metron_degraded_stops_this_win_not_the_batch(tmp_path):
+    """BUI-465: a throttled Metron stops THIS win, then the batch recovers.
+
+    Before BUI-465 the ``degraded`` breaker latched for the whole batch, so one
+    transient trip on row 1 downgraded every remaining win to a `{year}-01-01`
+    placeholder with a null publisher and no Metron call at all. That is what
+    produced 40 of the 58 placeholder rows in the 2026-07-19 store. Now each
+    trip buys a cooldown and a reset, so row 2 gets its own genuine attempt.
+    """
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _always_degrading_metron()
 
     result = cmd_collection_record_win(
         [
@@ -3264,34 +3294,29 @@ def test_record_win_metron_degraded_disables_metron(tmp_path):
         metron=metron,
     )
 
-    # Both rows still get written (the batch completes and commits); Metron
-    # is called exactly once — the breaker trips before row 2 ever asks it.
     assert result["rows_written"] == 2
     assert result["manual_series_count"] == 2
     assert result["partial_failure"] is False
-    assert metron.lookup_issue.call_count == 1
+    # One call per win: the trip still short-circuits the rest of ITS OWN win
+    # (no point re-asking a throttled server three times for one row), but row 2
+    # is asked again rather than silently skipped.
+    assert metron.lookup_issue.call_count == 2
+    assert result["metron_transient_trips"] == 2
+    assert result["metron_credentials_missing"] is False
 
 
-def test_record_win_metron_5xx_disables_metron(tmp_path):
-    """BUI-342: a Metron 5xx trips the SAME per-batch breaker as a rate-limit /
-    connection failure. A real MetronClient returns None (no exception) after
-    its single capped 5xx retry but flips .degraded True; once tripped, the
-    remaining rows fall back to manual and Metron is never called again —
-    instead of hammering a down server and silently recording every win as
-    'not in Metron' (the exact failure the ticket describes)."""
+def test_record_win_metron_5xx_recovers_between_wins(tmp_path):
+    """BUI-342 + BUI-465: a 5xx trips the same breaker, and is equally transient.
+
+    A server error is exactly the kind of failure that can clear between two
+    rows, so it must not condemn the rest of the batch either. The BUI-342
+    property this replaces — don't hammer a down server — is preserved by the
+    per-win short-circuit plus the BUI-465 trip cap, not by a permanent latch.
+    """
     from locg.commands import cmd_collection_record_win
-    from unittest.mock import MagicMock
 
     cache = make_cache(tmp_path)
-    metron = MagicMock()
-    metron.degraded = False
-
-    def _server_error_lookup(*_args, **_kwargs):
-        # Mirrors a real MetronClient after an exhausted 5xx retry: None + degraded.
-        metron.degraded = True
-        return None
-
-    metron.lookup_issue.side_effect = _server_error_lookup
+    metron = _always_degrading_metron()
 
     result = cmd_collection_record_win(
         [
@@ -3302,12 +3327,150 @@ def test_record_win_metron_5xx_disables_metron(tmp_path):
         metron=metron,
     )
 
-    # Both rows still get written; Metron is called exactly once — the breaker
-    # trips before row 2 ever asks it.
     assert result["rows_written"] == 2
     assert result["manual_series_count"] == 2
     assert result["partial_failure"] is False
+    assert metron.lookup_issue.call_count == 2
+
+
+def test_record_win_recovered_trip_still_resolves_later_wins(tmp_path):
+    """BUI-465, the property that matters: a ONE-OFF trip costs one win, not all.
+
+    The regression signature this pins is the 2026-07-19 one — row 1 carries a
+    metron_id and every later row carries none, including further issues of a
+    series row 1 had just resolved.
+    """
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.degraded = False
+    metron.format_series_name.return_value = "Ghost Rider (1990 - 1998)"
+    hit = {
+        "metron_id": 77,
+        "cover_date": "1990-05-01",
+        "store_date": "1990-03-14",
+        "series_year_began": 1990,
+        "series_year_end": 1998,
+        "series_name": "Ghost Rider",
+        "series_id": 5,
+    }
+    calls = {"n": 0}
+
+    def _trips_once_then_works(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            metron.degraded = True
+            return None
+        metron.degraded = False
+        return hit
+
+    metron.lookup_issue.side_effect = _trips_once_then_works
+    metron.lookup_issue_detail.return_value = {"variants": [], "publisher": "Marvel Comics"}
+
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", series="Ghost Rider", issue="1", year=1990),
+            _make_win(item_id="2", series="Ghost Rider", issue="2", year=1990),
+            _make_win(item_id="3", series="Ghost Rider", issue="3", year=1990),
+        ],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["metron_transient_trips"] == 1
+    rows = {r["gixen_item_id"]: r for r in cache.load()["comics"]}
+    # Win 1 pays for the trip: no Metron data, and it says so.
+    assert rows["1"]["release_date"] == "1990-01-01"
+    assert rows["1"]["publisher_name"] is None
+    assert rows["1"]["metron_unavailable"] is True
+    # Wins 2 and 3 are fully resolved — the whole point.
+    for item_id in ("2", "3"):
+        assert rows[item_id]["release_date"] == "1990-03-14"
+        assert rows[item_id]["publisher_name"] == "Marvel Comics"
+        assert rows[item_id]["metron_unavailable"] is False
+    assert result["metron_unavailable_rows"] == 1
+
+
+def test_record_win_repeated_trips_eventually_latch_metron_off(tmp_path):
+    """BUI-255 survives BUI-465: a genuinely down Metron is stopped asking.
+
+    Recovery is capped at ``METRON_MAX_TRANSIENT_TRIPS``. Past that the breaker
+    stays shut for the rest of the batch, so an unreachable Metron cannot buy a
+    fresh capped sleep on every one of N remaining rows — the wedge BUI-255
+    exists to prevent.
+    """
+    from locg.commands import METRON_MAX_TRANSIENT_TRIPS, cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _always_degrading_metron()
+    wins = [_make_win(item_id=str(i), series="Ghost Rider", issue=str(i)) for i in range(1, 9)]
+
+    result = cmd_collection_record_win(wins, cache=cache, metron=metron)
+
+    assert result["rows_written"] == 8
+    assert result["metron_transient_trips"] == METRON_MAX_TRANSIENT_TRIPS
+    assert result["metron_degraded"] is True
+    # One call for each forgiven trip, plus the one that exhausted the budget.
+    assert metron.lookup_issue.call_count == METRON_MAX_TRANSIENT_TRIPS + 1
+    # Every row after the latch is marked never-asked, not asked-and-missed.
+    assert result["metron_unavailable_rows"] == 8
+
+
+def test_record_win_credential_error_still_latches_for_the_whole_batch(tmp_path):
+    """BUI-465 explicitly does NOT soften the credential path.
+
+    Missing credentials are not transient — they are absent from the process
+    environment and will still be absent on the next row — so this latches on
+    the first failure and is never retried or cooled down.
+    """
+    from locg.commands import cmd_collection_record_win
+    from locg.metron import MetronCredentialError
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.degraded = False
+    metron.lookup_issue.side_effect = MetronCredentialError("no creds")
+
+    result = cmd_collection_record_win(
+        [_make_win(item_id=str(i), series="Ghost Rider", issue=str(i)) for i in range(1, 6)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["rows_written"] == 5
+    assert result["metron_credentials_missing"] is True
+    assert result["metron_transient_trips"] == 0
+    assert result["metron_degraded"] is True
     assert metron.lookup_issue.call_count == 1
+
+
+def test_record_win_credential_error_costs_no_paced_requests(tmp_path, metron_sleeps):
+    """A credential error never reaches the network, so it must not be paced.
+
+    ``MetronCredentialError`` comes out of ``_get_session()`` before any HTTP
+    request leaves the process. Charging it against the per-minute budget would
+    make an unconfigured batch sleep for traffic Metron never saw.
+    """
+    from locg.commands import cmd_collection_record_win
+    from locg.metron import MetronCredentialError
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)
+    metron = MagicMock()
+    metron.degraded = False
+    metron.lookup_issue.side_effect = MetronCredentialError("no creds")
+
+    result = cmd_collection_record_win(
+        [_make_win(item_id=str(i), series="Ghost Rider", issue=str(i)) for i in range(1, 4)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["metron_requests_spent"] == 0
+    assert metron_sleeps == []
 
 
 def test_record_win_metron_degraded_false_does_not_disable(tmp_path):
@@ -3332,10 +3495,153 @@ def test_record_win_metron_degraded_false_does_not_disable(tmp_path):
 
     assert result["rows_written"] == 2
     assert result["manual_series_count"] == 2
-    # Each row gets its own series-resolution attempt AND its own BUI-210
-    # date-backfill attempt (metron_data stays None both times) — 2 calls per
-    # row, 4 total — proving the breaker never tripped and skipped none of them.
-    assert metron.lookup_issue.call_count == 4
+    # Each row gets its own series-resolution attempt, proving the breaker never
+    # tripped and skipped none of them. One call per row, not two: BUI-465 drops
+    # the BUI-210 date-only retry when step-2 has already asked Metron this exact
+    # question and been told no.
+    assert metron.lookup_issue.call_count == 2
+    # BUI-465: asked-and-missed, NOT never-asked. The breaker never shut, so the
+    # missing publisher/date is Metron's real answer and a backfill retry would
+    # only get the same one.
+    assert all(not row["metron_unavailable"] for row in cache.load()["comics"])
+    assert result["metron_unavailable_rows"] == 0
+
+
+def test_record_win_paces_metron_against_the_documented_request_budget(tmp_path, metron_sleeps):
+    """BUI-465: the batch throttles itself to Metron's 20 req/min burst budget.
+
+    Nothing throttled record-win before. At ~3 HTTP requests per win (a
+    two-request ``lookup_issue`` plus a one-request ``lookup_issue_detail``,
+    BUI-458) a batch blew the 20/min allowance after ~7 wins and then tripped
+    the breaker — which is what BUI-465's recovery path then has to clean up.
+    Pacing is the prevention half; the recovery is the backstop.
+    """
+    from locg.commands import METRON_REQUESTS_PER_MINUTE, cmd_collection_record_win
+    from locg.metron import REQUESTS_LOOKUP_ISSUE, REQUESTS_LOOKUP_ISSUE_DETAIL
+
+    cache = make_cache(tmp_path)
+    result = cmd_collection_record_win(
+        [
+            _make_win(item_id="1", issue="300"),
+            _make_win(item_id="2", issue="301"),
+            _make_win(item_id="3", issue="302"),
+        ],
+        cache=cache,
+        metron=_metron_hit(),
+    )
+
+    per_win = REQUESTS_LOOKUP_ISSUE + REQUESTS_LOOKUP_ISSUE_DETAIL
+    assert result["metron_requests_spent"] == 3 * per_win
+    # Three wins, but only two waits: each win pays for the PREVIOUS win's
+    # traffic, so the batch neither opens nor closes on a pointless sleep.
+    seconds_per_request = 60.0 / METRON_REQUESTS_PER_MINUTE
+    assert metron_sleeps == [seconds_per_request * per_win] * 2
+    # The pace really is the documented budget, not merely nonzero.
+    assert sum(metron_sleeps) / (result["metron_requests_spent"] - per_win) == seconds_per_request
+
+
+def test_record_win_zero_requests_per_minute_disables_pacing(tmp_path, metron_sleeps):
+    """``requests_per_minute=0`` opts out entirely, mirroring backfill's cadence=0."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    result = cmd_collection_record_win(
+        [_make_win(item_id="1", issue="300"), _make_win(item_id="2", issue="301")],
+        cache=cache,
+        metron=_metron_hit(),
+        requests_per_minute=0,
+    )
+
+    assert result["metron_requests_spent"] > 0
+    assert metron_sleeps == []
+
+
+def test_record_win_pacing_counts_requests_not_calls(tmp_path):
+    """A two-request ``lookup_issue`` must cost twice a one-request detail fetch.
+
+    Metering per CALL is the trap: it silently under-counts ``lookup_issue`` by
+    half and lets a "paced" batch run at 40 req/min against a 20 req/min budget.
+    """
+    from locg.commands import cmd_collection_record_win
+    from locg.metron import REQUESTS_LOOKUP_ISSUE, REQUESTS_LOOKUP_ISSUE_DETAIL
+
+    assert REQUESTS_LOOKUP_ISSUE == 2 * REQUESTS_LOOKUP_ISSUE_DETAIL
+
+    cache = make_cache(tmp_path)
+    # A miss spends ONE lookup_issue (step-2 series resolution; BUI-465 drops the
+    # byte-identical BUI-210 retry) and no detail fetch, because no metron_id
+    # resolved to fetch detail for.
+    missed = cmd_collection_record_win(
+        [_make_win(item_id="1", issue="300")], cache=make_cache(tmp_path / "miss"),
+        metron=_null_metron(),
+    )
+    assert missed["metron_requests_spent"] == REQUESTS_LOOKUP_ISSUE
+
+    # A hit spends one lookup_issue plus one detail fetch.
+    hit = cmd_collection_record_win(
+        [_make_win(item_id="1", issue="300")], cache=cache, metron=_metron_hit(),
+    )
+    assert hit["metron_requests_spent"] == REQUESTS_LOOKUP_ISSUE + REQUESTS_LOOKUP_ISSUE_DETAIL
+
+
+def test_record_win_does_not_repeat_an_identical_issue_lookup(tmp_path):
+    """BUI-465: one issue query per win, not two identical ones.
+
+    The R36 step-2 series lookup and the BUI-210 date-only lookup pass the same
+    three arguments. On a step-2 miss the second call could only ever get the
+    same answer, so it was two wasted requests against a 20/min budget — on the
+    exact path (needs_manual_series_canonical) that every pending win in the
+    2026-07-19 backlog was sitting on.
+    """
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _null_metron()
+    cmd_collection_record_win(
+        [_make_win(item_id="1", series="Nowhere Comic", issue="7", year=1988)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert metron.lookup_issue.call_count == 1
+    # Still the manual-series fallback with the BUI-105 placeholder — the dropped
+    # call changed the cost, not the outcome.
+    row = cache.load()["comics"][-1]
+    assert row["needs_manual_series_canonical"] is True
+    assert row["release_date"] == "1988-01-01"
+
+
+def test_record_win_index_path_still_makes_its_date_lookup(tmp_path):
+    """The BUI-465 dedup must not disarm BUI-210 on the path it exists for.
+
+    When series_name_index resolves the series, step-2 never runs, so nothing has
+    asked Metron anything yet — the date-only lookup is the row's ONLY chance at a
+    real release date and must still fire.
+    """
+    from locg.collection_cache import rebuild_series_name_index
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Amazing Spider-Man (1963 - 1998)", full_title="Amazing Spider-Man #1"),
+        "source": "locg_export",
+    }])
+    cache.apply(
+        lambda payload: payload.__setitem__("series_name_index", rebuild_series_name_index(payload)),
+        command="test-rebuild",
+    )
+
+    metron = _metron_hit("Amazing Spider-Man (1963 - 1998)")
+    cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man (1963 - 1998)", issue="300", year=1988)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert metron.lookup_issue.call_count == 1
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1988-05-10"
+    assert row["metron_unavailable"] is False
 
 
 def test_record_win_duplicate_gixen_id_updates_not_inserts(tmp_path):

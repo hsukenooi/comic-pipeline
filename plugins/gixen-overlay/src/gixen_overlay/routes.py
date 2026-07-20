@@ -112,7 +112,8 @@ def _ensure_collection_store() -> None:
     it at a server-owned directory beside the comics-server DB
     (``<dir(DB_PATH)>/collection-store``, default
     ``~/.comics-server/collection-store``, with a ``~/.gixen-server`` fallback
-    for the not-yet-migrated live server — see ``resolve_server_dir``). The
+    for any machine that hasn't run the BUI-220/BUI-463 dir migration yet —
+    see ``resolve_server_dir``). The
     directory is named neutrally, not "locg" (R1: "the path is not named for
     LOCG"). An explicitly-set ``LOCG_DATA_DIR`` always wins, so the Mac Mini
     launch env and the tests (which point it at a tmp dir) both override this

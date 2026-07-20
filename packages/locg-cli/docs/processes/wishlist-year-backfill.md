@@ -86,7 +86,7 @@ uses). Run one `set-year` per held wish with its resolved Cover Year:
 
 ```bash
 # On the Mac Mini:
-export LOCG_DATA_DIR=~/.gixen-server/collection-store
+export LOCG_DATA_DIR=~/.comics-server/collection-store
 locg wish-list set-year "The X-Men #1" 1963
 locg wish-list set-year "Fantastic Four #18" 1963
 locg wish-list set-year "Incredible Hulk #1" 1962
@@ -116,7 +116,7 @@ before it runs:
 
 ```bash
 # holds.tsv: one "<exact wish name>\t<cover_year>" per line, reviewed by hand.
-export LOCG_DATA_DIR=~/.gixen-server/collection-store
+export LOCG_DATA_DIR=~/.comics-server/collection-store
 while IFS=$'\t' read -r name year; do
   locg wish-list set-year "$name" "$year"
 done < holds.tsv
@@ -136,6 +136,6 @@ so a normal sync round-trip preserves it. But it is **not** written to the LOCG
 bulk-import CSV and LOCG has no wish cover-year field — so the ONE way to lose
 every stamp is a **manual re-seed** of the server `wish-list.json` from a fresh
 LOCG-derived export (e.g. re-running the one-time seed
-`cp data/locg/wish-list.json ~/.gixen-server/collection-store/`). A LOCG-derived
+`cp data/locg/wish-list.json ~/.comics-server/collection-store/`). A LOCG-derived
 wish-list carries no year to restore, so that overwrites the stamps with
 year-blind entries. If you ever re-seed, re-run this backfill afterward.
