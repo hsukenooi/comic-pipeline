@@ -158,11 +158,16 @@ def test_lookup_issue_disambiguates_into_ongoing_series():
 
 
 def test_lookup_issue_ambiguous_without_year_returns_none():
-    """Multiple series + no year → cannot disambiguate → None (manual fallback)."""
+    """Multiple series + no year → cannot disambiguate → None (manual fallback).
+
+    Both candidates share the query's exact (normalized) name — BUI-485's
+    name-exactness filter must NOT be what produces the None here, or this
+    stops exercising the no-year branch it's named for.
+    """
     client, _ = _make_client_with_session(
         series_list=[
-            _mock_series(id=1, year_began=1963, year_end=1998),
-            _mock_series(id=2, year_began=1999, year_end=2012),
+            _mock_series(id=1, display_name="Amazing Spider-Man", year_began=1963, year_end=1998),
+            _mock_series(id=2, display_name="Amazing Spider-Man", year_began=1999, year_end=2012),
         ],
         issues_list=[_mock_issue()],
     )
@@ -170,11 +175,18 @@ def test_lookup_issue_ambiguous_without_year_returns_none():
 
 
 def test_lookup_issue_ambiguous_year_in_two_ranges_returns_none():
-    """Year falls in two overlapping ranges → still ambiguous → None."""
+    """Year falls in two overlapping ranges → still ambiguous → None.
+
+    Both candidates share the query's exact (normalized) name, so both
+    survive BUI-485's name-exactness filter — this pins the year-window's
+    own "still ambiguous" branch (matches has more than one entry), which
+    none of the BUI-485 name-filter tests reach (they resolve to 0 or 1
+    exact-name survivors).
+    """
     client, _ = _make_client_with_session(
         series_list=[
-            _mock_series(id=1, year_began=1980, year_end=2011),
-            _mock_series(id=2, year_began=2000, year_end=None),
+            _mock_series(id=1, display_name="Uncanny X-Men", year_began=1980, year_end=2011),
+            _mock_series(id=2, display_name="Uncanny X-Men", year_began=2000, year_end=None),
         ],
         issues_list=[_mock_issue()],
     )
@@ -190,6 +202,106 @@ def test_lookup_issue_single_series_ignores_year_mismatch():
     result = client.lookup_issue("Fantastic Four", "1", year=2050)
     assert result is not None
     assert result["series_id"] == 7
+
+
+# ---------------------------------------------------------------------------
+# lookup_issue — name-exactness pre-filter (BUI-485)
+#
+# Metron's series_list({"name": q}) is a substring (icontains) search, so a
+# common masthead like "Batman" returns hundreds of off-topic candidates
+# ("Absolute Batman", "Batman Annual", ...). These cover the two measured
+# failure shapes from BUI-474's diagnosis: a large decoy-heavy candidate set,
+# and the small Annual-sibling case a year window alone can never separate.
+# ---------------------------------------------------------------------------
+
+def test_lookup_issue_exact_name_filters_large_decoy_set():
+    """The 433-candidate shape: decoys sharing the "Batman" substring must
+    not compete with the genuine "Batman" volume just because their year
+    range also covers 2003."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Batman (1940)", year_began=1940, year_end=2011),
+            _mock_series(id=2, display_name="Absolute Batman", year_began=2024, year_end=None),
+            _mock_series(
+                id=3, display_name="Tangent Comics / The Batman",
+                year_began=1998, year_end=1998,
+            ),
+            _mock_series(
+                id=4, display_name="Punisher / Batman: Deadly Knights",
+                year_began=1996, year_end=1996,
+            ),
+        ],
+        issues_list=[_mock_issue(id=240)],
+    )
+    result = client.lookup_issue("Batman", "1", year=2003)
+
+    assert result is not None
+    assert result["series_id"] == 1
+    session.issues_list.assert_called_once_with({"series_id": 1, "number": "1"})
+
+
+def test_lookup_issue_exact_name_separates_annual_sibling():
+    """A year window can never separate "Batman" from "Batman Annual" — both
+    ran 1940s-2011 — only the exact-name filter can. Batman #240 (1972) is
+    the real BUI-474 case: exactly 2 candidates, both survive the year gate."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Batman (1940)", year_began=1940, year_end=2011),
+            _mock_series(
+                id=2, display_name="Batman Annual (1961)",
+                year_began=1961, year_end=2011,
+            ),
+        ],
+        issues_list=[_mock_issue(id=240)],
+    )
+    result = client.lookup_issue("Batman", "240", year=1972)
+
+    assert result is not None
+    assert result["series_id"] == 1
+    session.issues_list.assert_called_once_with({"series_id": 1, "number": "240"})
+
+
+def test_lookup_issue_exact_name_strips_leading_article_both_ways():
+    """Query "Amazing Spider-Man" must still exact-match Metron's
+    "The Amazing Spider-Man (1963)" — article stripping is two-sided."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=1, display_name="The Amazing Spider-Man (1963)",
+                year_began=1963, year_end=1998,
+            ),
+            _mock_series(
+                id=2, display_name="Web of Spider-Man (1985)",
+                year_began=1985, year_end=1995,
+            ),
+        ],
+        issues_list=[_mock_issue(id=151)],
+    )
+    result = client.lookup_issue("Amazing Spider-Man", "151", year=1975)
+
+    assert result is not None
+    assert result["series_id"] == 1
+    session.issues_list.assert_called_once_with({"series_id": 1, "number": "151"})
+
+
+def test_lookup_issue_no_exact_name_match_returns_none_not_a_guess():
+    """Zero wrong picks: when no candidate's name exact-matches the query —
+    even though both fall inside the queried year — the function must return
+    None rather than guess between them."""
+    client, _ = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=1, display_name="Batman Beyond (1999)",
+                year_began=1999, year_end=2001,
+            ),
+            _mock_series(
+                id=2, display_name="Batman: Gotham Knights (2000)",
+                year_began=2000, year_end=2006,
+            ),
+        ],
+        issues_list=[_mock_issue(id=1)],
+    )
+    assert client.lookup_issue("Batman", "1", year=2000) is None
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import re
 import time
 from typing import Any, Optional
 
@@ -44,6 +45,36 @@ _SERVER_ERROR_RETRY_SLEEP = 1.0
 REQUESTS_PER_MINUTE = 20
 REQUESTS_LOOKUP_ISSUE = 2
 REQUESTS_LOOKUP_ISSUE_DETAIL = 1
+
+
+# BUI-485: Metron's ``series_list({"name": q})`` is a substring (icontains)
+# search anywhere in the name, so "Batman" returns hundreds of series —
+# "Absolute Batman", "Tangent Comics / The Batman", "Batman Annual" — that
+# the caller never asked for. These two normalize a query and a candidate's
+# ``display_name`` for an EXACT-match test (never substring/containment,
+# which is exactly the permissiveness this exists to correct):
+#   - a trailing " (YYYY)" decoration (Metron's display_name convention) is
+#     stripped, e.g. "The Amazing Spider-Man (1963)" -> "The Amazing Spider-Man"
+#   - a leading "The"/"A"/"An" article is stripped from BOTH sides, since the
+#     query and Metron's display_name may disagree on whether it's present
+#     (query "Amazing Spider-Man" must still match display_name
+#     "The Amazing Spider-Man (1963)")
+#   - casefold for case-insensitive comparison
+#
+# ``commands.py`` and ``collection_cache.py`` each already have their own
+# private series-name normalizer with different stripping rules (LOCG display
+# decoration, not Metron's). Named ``_normalize_metron_display_name`` (not the
+# generic ``_normalize_series_name`` those modules use) so a cross-module grep
+# doesn't turn up three same-named-but-different-behavior functions.
+_TRAILING_YEAR_RE = re.compile(r"\s*\(\d{4}\)\s*$")
+_LEADING_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
+
+
+def _normalize_metron_display_name(name: Any) -> str:
+    n = str(name or "").strip()
+    n = _TRAILING_YEAR_RE.sub("", n)
+    n = _LEADING_ARTICLE_RE.sub("", n)
+    return n.strip().casefold()
 
 
 def _is_connection_error(exc: BaseException) -> bool:
@@ -199,17 +230,34 @@ class MetronClient:
         return self._session
 
     @staticmethod
-    def _disambiguate_series(series_list: list[Any], year: Any) -> Optional[Any]:
+    def _disambiguate_series(
+        series_list: list[Any], year: Any, query: str
+    ) -> Optional[Any]:
         """Pick the series whose publication range includes ``year`` (BUI-32).
 
-        - exactly one candidate            -> use it (trust the sole match)
-        - multiple + ``year`` falls in exactly one ``[year_began, year_end]``
-          range (year_end ``None`` means ongoing) -> that one
-        - otherwise (no year, or still ambiguous) -> ``None`` so the caller
-          falls back to ``needs_manual_series_canonical``
+        - exactly one candidate            -> use it (trust the sole match,
+          UNFILTERED by name — Metron's own search already narrowed it, and
+          BUI-474 measured this population has no wrong picks here)
+        - otherwise, first narrow to candidates whose ``display_name``
+          EXACT-matches ``query`` (BUI-485; see ``_normalize_metron_display_name``)
+          — Metron's search is a substring match, so multiple candidates is not
+          evidence any of them are actually "on-topic" (e.g. "Batman" also
+          returns "Absolute Batman" and the Annual sibling, which a year
+          window alone can never separate since they share the run)
+        - then, of the exact-name survivors, ``year`` falling in exactly one
+          ``[year_began, year_end]`` range (year_end ``None`` means ongoing)
+          -> that one
+        - otherwise (no year, no exact-name survivor, or still ambiguous)
+          -> ``None`` so the caller falls back to ``needs_manual_series_canonical``
         """
         if len(series_list) == 1:
             return series_list[0]
+
+        query_norm = _normalize_metron_display_name(query)
+        exact_matches = [
+            s for s in series_list
+            if _normalize_metron_display_name(getattr(s, "display_name", None)) == query_norm
+        ]
 
         try:
             y = int(year) if year is not None else None
@@ -219,7 +267,7 @@ class MetronClient:
             return None
 
         matches = []
-        for s in series_list:
+        for s in exact_matches:
             began = getattr(s, "year_began", None)
             if began is None:
                 continue
@@ -234,10 +282,14 @@ class MetronClient:
     ) -> Optional[dict[str, Any]]:
         """Look up an issue by series name and number via the Metron API.
 
-        When the series name matches multiple series, ``year`` (the issue's
-        publication year from identify_data) disambiguates by publication range
-        (BUI-32). If it can't, the lookup returns None so the row is flagged for
-        manual series resolution rather than guessed.
+        Metron's series search is a substring match, so a common masthead
+        (e.g. "Batman") can return hundreds of candidates. When there is more
+        than one, they are first narrowed to an EXACT ``display_name`` match
+        against ``series_query`` (BUI-485), then ``year`` (the issue's
+        publication year from identify_data) disambiguates the survivors by
+        publication range (BUI-32). If either step can't narrow to one, the
+        lookup returns None so the row is flagged for manual series resolution
+        rather than guessed.
 
         Returns a dict with metron_id, cover_date, store_date,
         series_year_began, series_year_end, series_name, series_id — or None
@@ -253,7 +305,7 @@ class MetronClient:
             if not series_list:
                 return None
 
-            best_series = self._disambiguate_series(series_list, year)
+            best_series = self._disambiguate_series(series_list, year, series_query)
             if best_series is None:
                 logger.debug(
                     "Metron series ambiguous for %r (year=%r): %d candidates",
