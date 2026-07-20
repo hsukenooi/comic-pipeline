@@ -334,7 +334,8 @@ def _build_export_xlsx(path: Path, rows: list[dict[str, Any]]):
         ws.append([
             r["publisher"], r["series"], r["full_title"], r["release_date"],
             r.get("in_collection", 1), r.get("in_wish_list", 0), 0, None,
-            "Print", None, None, None, None, None, None, None, None,
+            "Print", r.get("price_paid"), r.get("date_purchased"),
+            None, None, None, None, None, None,
             None, None, None, None,
         ])
     wb.save(path)
@@ -514,10 +515,14 @@ def test_pending_agent_win_collision_with_owned_row_auto_healed(tmp_path):
     payload = cache.load()
 
     dd = [r for r in payload["comics"] if r["full_title"] == "Daredevil #181"]
-    # The redundant pending win is gone.
-    assert not any(r.get("gixen_item_id") == "99" for r in dd), "pending win must be healed away"
+    # The redundant pending win ROW is gone (BUI-462 carries its gixen_item_id
+    # onto the survivor, so identify the dropped row by its pending state).
+    assert not any(
+        r["source"] == "agent_win" and r["pushed_to_locg_at"] is None for r in dd
+    ), "pending win must be healed away"
     # The established owned row survives, still owned.
     owned_row = next(r for r in dd if r["source"] == "locg_export")
+    assert owned_row["gixen_item_id"] == "99", "the win's bid link is carried over"
     assert owned_row["in_collection"], "owned row survives owned"
     assert owned_row["pushed_to_locg_at"] is not None
     assert len(dd) == 1, "exactly one Daredevil #181 remains (no duplicate-identity pair)"
@@ -658,6 +663,639 @@ def test_clean_reconcile_no_collision_not_healed(tmp_path):
     assert row["source"] == "locg_export"
     assert result["reconciled"] >= 1
     assert result["auto_healed_duplicates"] == 0, "no collision → no heal"
+
+
+# ---------------------------------------------------------------------------
+# BUI-462: wish-twin reconciliation (extends the BUI-211 auto-heal)
+# ---------------------------------------------------------------------------
+
+def _make_export_row(
+    *,
+    publisher: str,
+    series: str,
+    full_title: str,
+    release_date: str,
+    in_collection: int,
+    in_wish_list: int,
+) -> dict[str, Any]:
+    """A settled locg_export cache row (from a prior import)."""
+    row = make_agent_win_row(
+        publisher=publisher,
+        series=series,
+        full_title=full_title,
+        release_date=release_date,
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    row["source"] = "locg_export"
+    row["in_collection"] = in_collection
+    row["in_wish_list"] = in_wish_list
+    return row
+
+
+def _audit_records(tmp_path: Path) -> list[dict[str, Any]]:
+    log = tmp_path / "import-history.jsonl"
+    if not log.exists():
+        return []
+    return [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
+
+
+def test_wish_twin_plus_pending_win_auto_healed(tmp_path):
+    """BUI-462 / the 2026-07-19 sync: a wished-THEN-won book has THREE rows in
+    play — the wish twin, the pending agent_win, and the incoming owned export
+    row. Pre-BUI-462 the twin's *pre-import* in_collection=0 failed the
+    established-owned test and all 27 such books were stranded as duplicates.
+
+    The twin holds the export row's identity exactly, so Phase 2 will own it;
+    the win must heal away, leaving a single owned row."""
+    from locg.collection_io import import_xlsx, make_identity
+
+    cache = make_cache(tmp_path)
+    wish_twin = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-02-14",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    wish_twin["my_rating"] = 8  # a user-managed value that must survive
+    # The win: no publisher (BUI-458), Jan-1 placeholder date (BUI-210).
+    win = make_agent_win_row(
+        publisher=None,
+        series="Marvel Tales",
+        full_title="Marvel Tales #223",
+        release_date="1989-01-01",
+        gixen_item_id="777",
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([wish_twin, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    # LOCG moved the book from the wish list into the collection on upload.
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",
+        "series": "Marvel Tales (1964 - 1994)",
+        "full_title": "Marvel Tales #223",
+        "release_date": "1989-02-14",
+        "in_collection": 1,
+        "in_wish_list": 0,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if r["full_title"] == "Marvel Tales #223"]
+    assert len(rows) == 1, "exactly one row remains — no duplicate-identity pair"
+    kept = rows[0]
+    # The owned locg_export copy is the one kept.
+    assert kept["source"] == "locg_export"
+    assert kept["in_collection"], "kept row is the owned copy"
+    assert kept["release_date"] == "1989-02-14", "LOCG's canonical identity kept"
+    assert kept["my_rating"] is None, "the kept row is the twin, refreshed from the export"
+    # The wish row settles from LOCG's own export, never from a local guess.
+    assert kept["in_wish_list"] == 0, "LOCG un-wished it; the twin mirrors that"
+    assert not any(
+        r["source"] == "agent_win" and r["pushed_to_locg_at"] is None
+        for r in payload["comics"]
+    ), "the redundant pending win is healed away"
+    assert kept["gixen_item_id"] == "777", "the win's bid link is carried, not lost"
+
+    assert result["auto_healed_duplicates"] == 1
+    assert result["possibly_removed"] == 0, "a dedup heal is not a removal"
+    assert not any("left pending" in w for w in result["warnings"])
+    idents = [make_identity(r) for r in payload["comics"]]
+    assert len(idents) == len(set(idents)), "no duplicate-identity rows"
+
+    # The drop is fully reconstructable from the append-only audit log.
+    healed = [a for a in _audit_records(tmp_path)
+              if a["type"] == "auto_healed_duplicate_win"]
+    assert len(healed) == 1
+    assert healed[0]["details"]["gixen_item_id"] == "777"
+    assert healed[0]["details"]["dropped_identity"][3] == "1989-01-01"
+
+
+def test_cross_volume_decoy_hold_survives_wish_twin_heal(tmp_path):
+    """BUI-462 safety invariant: an intentional cross-volume decoy hold — a
+    vintage grail wish-listed while a modern volume of the SAME masthead is
+    owned — must be untouched by the heal.
+
+    Both volumes normalize to the same series key, so the heal cannot be
+    passing for free on a series-name difference."""
+    from locg.collection_cache import _normalize_series_key
+    from locg.collection_io import import_xlsx, make_identity
+
+    assert (
+        _normalize_series_key("Ghost Rider (1973 - 1983)")
+        == _normalize_series_key("Ghost Rider (2022)")
+    ), "precondition: the two volumes must collapse to one normalized key"
+
+    cache = make_cache(tmp_path)
+    decoy_hold = _make_export_row(
+        publisher="Marvel Comics",
+        series="Ghost Rider (1973 - 1983)",
+        full_title="Ghost Rider #5",
+        release_date="1974-04-02",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    modern_owned = _make_export_row(
+        publisher="Marvel Comics",
+        series="Ghost Rider (2022)",
+        full_title="Ghost Rider #5",
+        release_date="2022-08-31",
+        in_collection=1,
+        in_wish_list=0,
+    )
+    # A pending win for the MODERN issue (placeholder date, no publisher).
+    win = make_agent_win_row(
+        publisher=None,
+        series="Ghost Rider",
+        full_title="Ghost Rider #5",
+        release_date="2022-01-01",
+        gixen_item_id="555",
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([decoy_hold, modern_owned, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel Comics", "series": "Ghost Rider (1973 - 1983)",
+         "full_title": "Ghost Rider #5", "release_date": "1974-04-02",
+         "in_collection": 0, "in_wish_list": 1},
+        {"publisher": "Marvel Comics", "series": "Ghost Rider (2022)",
+         "full_title": "Ghost Rider #5", "release_date": "2022-08-31",
+         "in_collection": 1, "in_wish_list": 0},
+    ])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    gr = [r for r in payload["comics"] if r["full_title"] == "Ghost Rider #5"]
+    assert len(gr) == 2, "the two volumes stay distinct; only the win is dropped"
+    hold = next(r for r in gr if r["series_name"] == "Ghost Rider (1973 - 1983)")
+    assert hold["in_wish_list"] == 1, "the decoy hold is still wish-listed"
+    assert hold["in_collection"] == 0, "the decoy hold is still not owned"
+    assert hold["release_date"] == "1974-04-02"
+
+    owned = next(r for r in gr if r["series_name"] == "Ghost Rider (2022)")
+    assert owned["in_collection"], "the modern owned copy is the one kept"
+    assert not any(
+        r["source"] == "agent_win" and r["pushed_to_locg_at"] is None
+        for r in payload["comics"]
+    ), "the modern win healed against the modern volume"
+    assert owned["gixen_item_id"] == "555", "healed against the MODERN row, not the hold"
+    assert hold["gixen_item_id"] is None, "nothing was carried onto the decoy hold"
+    assert result["auto_healed_duplicates"] == 1
+    idents = [make_identity(r) for r in payload["comics"]]
+    assert len(idents) == len(set(idents))
+
+
+def test_dateless_win_cannot_clear_against_wrong_volume(tmp_path):
+    """BUI-462 fail-closed era gate: `_reconcile_score`'s year compare fails
+    OPEN when either side is dateless, so a dateless win matches ANY era of a
+    masthead. That must never be enough to DROP the win as a duplicate of a
+    different volume — here the only candidate is a vintage decoy hold that
+    LOCG has just marked owned, and the win is really a modern issue."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    decoy_hold = _make_export_row(
+        publisher="Marvel Comics",
+        series="Ghost Rider (1973 - 1983)",
+        full_title="Ghost Rider #5",
+        release_date="1974-04-02",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    win = make_agent_win_row(
+        publisher=None,
+        series="Ghost Rider",
+        full_title="Ghost Rider #5",
+        release_date="",  # dateless — the era evidence is gone
+        gixen_item_id="556",
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([decoy_hold, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    # LOCG now reports the VINTAGE issue as owned — without the era gate this
+    # would make the vintage row an owned collision target and delete the win.
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Ghost Rider (1973 - 1983)",
+        "full_title": "Ghost Rider #5", "release_date": "1974-04-02",
+        "in_collection": 1, "in_wish_list": 0,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    win_row = next(r for r in payload["comics"] if r.get("gixen_item_id") == "556")
+    assert win_row["pushed_to_locg_at"] is None, "the win survives, still pending"
+    assert result["auto_healed_duplicates"] == 0, "no heal without era evidence"
+    assert any("left pending" in w for w in result["warnings"])
+    # Prove the ERA gate is what declined it, not some earlier bail.
+    reasons = [a["details"].get("reason") for a in _audit_records(tmp_path)
+               if a["type"] == "ambiguous_reconciliation"]
+    assert "heal_declined_win_has_no_year" in reasons
+
+
+def test_wish_twin_not_healed_when_export_still_unowned(tmp_path):
+    """BUI-462 negative: the twin only counts as owned because the INCOMING
+    export row says so. A book still merely wish-listed on LOCG is not an owned
+    collision target — keep the leave-pending behavior."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    wish_twin = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-02-14",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    win = make_agent_win_row(
+        publisher=None,
+        series="Marvel Tales",
+        full_title="Marvel Tales #223",
+        release_date="1989-01-01",
+        gixen_item_id="778",
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([wish_twin, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+        "full_title": "Marvel Tales #223", "release_date": "1989-02-14",
+        "in_collection": 0, "in_wish_list": 1,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    win_row = next(r for r in payload["comics"] if r.get("gixen_item_id") == "778")
+    assert win_row["pushed_to_locg_at"] is None, "still pending — nothing owns it"
+    assert result["auto_healed_duplicates"] == 0
+    assert any("left pending" in w for w in result["warnings"])
+    twin = next(r for r in payload["comics"] if r.get("gixen_item_id") is None
+                and r["full_title"] == "Marvel Tales #223")
+    assert twin["in_wish_list"] == 1, "the wish row is untouched"
+
+
+def test_row_carrying_wish_state_is_never_dropped_by_the_heal(tmp_path):
+    """BUI-462 structural invariant: the heal may only ever drop a row that
+    carries NO wish state. Today record-win never writes `in_wish_list=1` on a
+    win, so this is unreachable through the normal producers — it is pinned
+    here so the invariant survives a future producer change rather than
+    depending on one. This is what makes "the decoy holds cannot be deleted" a
+    property of the drop itself, not of what happens to feed it."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    owned = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-02-14",
+        in_collection=1,
+        in_wish_list=0,
+    )
+    win = make_agent_win_row(
+        publisher=None,
+        series="Marvel Tales",
+        full_title="Marvel Tales #223",
+        release_date="1989-01-01",
+        gixen_item_id="779",
+        pushed=None,
+    )
+    win["in_wish_list"] = 1  # carries wish state → structurally undroppable
+
+    def add_rows(payload):
+        payload["comics"].extend([owned, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+        "full_title": "Marvel Tales #223", "release_date": "1989-02-14",
+        "in_collection": 1, "in_wish_list": 0,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    assert any(r.get("gixen_item_id") == "779" for r in payload["comics"]), \
+        "a wish-bearing row must never be dropped by the heal"
+    assert result["auto_healed_duplicates"] == 0
+    assert any("left pending" in w for w in result["warnings"])
+
+
+def test_healed_win_purchase_provenance_survives_on_the_kept_row(tmp_path):
+    """BUI-462: the heal must be a dedup, not a data loss. A wish twin has by
+    definition never carried a purchase price, and Phase 2 blanks price_paid /
+    date_purchased from the export — so the dropped win's local-only provenance
+    has to land on the survivor (and the whole row in the audit log)."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    wish_twin = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-02-14",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    win = make_agent_win_row(
+        publisher=None,
+        series="Marvel Tales",
+        full_title="Marvel Tales #223",
+        release_date="1989-01-01",
+        gixen_item_id="777",
+        pushed=None,
+    )
+    win["price_paid"] = 850.0
+    win["date_purchased"] = "2026-07-12"
+    win["metron_id"] = 55512
+
+    def add_rows(payload):
+        payload["comics"].extend([wish_twin, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+        "full_title": "Marvel Tales #223", "release_date": "1989-02-14",
+        "in_collection": 1, "in_wish_list": 0,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    kept = next(r for r in payload["comics"] if r["full_title"] == "Marvel Tales #223")
+    assert kept["price_paid"] == 850.0, "the $850 purchase price must survive the heal"
+    assert kept["date_purchased"] == "2026-07-12"
+    assert kept["gixen_item_id"] == "777", "the link back to the bid survives"
+    assert kept["metron_id"] == 55512
+    assert result["auto_healed_duplicates"] == 1
+
+    # The full dropped row is in the append-only log, so a wrong drop is reversible.
+    healed = next(a for a in _audit_records(tmp_path)
+                  if a["type"] == "auto_healed_duplicate_win")
+    assert healed["details"]["dropped_row"]["price_paid"] == 850.0
+    # And the deletion is not a silent success.
+    assert any("auto-healed away" in w for w in result["warnings"])
+
+
+def test_carry_never_clobbers_a_value_the_kept_row_already_holds(tmp_path):
+    """BUI-462: the provenance carry-over only fills empty fields — it must not
+    overwrite a price LOCG (or a prior round-trip) already supplied."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    owned = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-02-14",
+        in_collection=1,
+        in_wish_list=0,
+    )
+    win = make_agent_win_row(
+        publisher=None, series="Marvel Tales", full_title="Marvel Tales #223",
+        release_date="1989-01-01", gixen_item_id="777", pushed=None,
+    )
+    win["price_paid"] = 850.0
+
+    def add_rows(payload):
+        payload["comics"].extend([owned, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+        "full_title": "Marvel Tales #223", "release_date": "1989-02-14",
+        "in_collection": 1, "in_wish_list": 0, "price_paid": 12.5,
+    }])
+
+    import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    kept = next(r for r in payload["comics"] if r["full_title"] == "Marvel Tales #223")
+    assert kept["price_paid"] == 12.5, "LOCG's own value wins; the carry only fills gaps"
+
+
+def test_healed_row_indices_retracted_so_no_export_row_is_lost(tmp_path):
+    """BUI-462: a healed row's stale identity/partial index entries stay live
+    through Phase 2 unless retracted — long enough for the R67 rename path to
+    claim the doomed row as a rename target for an UNRELATED export row, which
+    then vanishes with it. Every export row must survive the import."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    wish_twin = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-02-14",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    # Publisher + series + release_date here form the PARTIAL identity that the
+    # rename path keys on; the #224 export row below shares it exactly.
+    win = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-01-01",
+        gixen_item_id="777",
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([wish_twin, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+         "full_title": "Marvel Tales #223", "release_date": "1989-02-14",
+         "in_collection": 1, "in_wish_list": 0},
+        # Shares (publisher, series, release_date) with the healed win.
+        {"publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+         "full_title": "Marvel Tales #224", "release_date": "1989-01-01",
+         "in_collection": 1, "in_wish_list": 0},
+    ])
+
+    import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    titles = {r["full_title"] for r in payload["comics"]}
+    assert "Marvel Tales #223" in titles
+    assert "Marvel Tales #224" in titles, \
+        "an owned export row must never be consumed by a row that is then dropped"
+
+
+def test_text_typed_in_collection_cell_cannot_authorize_a_drop(tmp_path):
+    """BUI-462: `parse_xlsx` does no type coercion and `bool("0")` is True. An
+    export row saying NOT owned must not authorize retiring a win."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    wish_twin = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-02-14",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    win = make_agent_win_row(
+        publisher=None, series="Marvel Tales", full_title="Marvel Tales #223",
+        release_date="1989-01-01", gixen_item_id="801", pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([wish_twin, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+        "full_title": "Marvel Tales #223", "release_date": "1989-02-14",
+        "in_collection": "0", "in_wish_list": "1",  # text-formatted cells
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    assert any(r.get("gixen_item_id") == "801" for r in payload["comics"]), \
+        "a text '0' In Collection cell must not read as ownership"
+    assert result["auto_healed_duplicates"] == 0
+
+
+def test_dateless_trade_win_still_heals(tmp_path):
+    """BUI-462 no-regression: `_reconcile_score`'s TPB/HC/OGN branch matches on
+    the full_title itself and never compares years, so requiring a year there
+    would newly strand dateless trade wins that BUI-211 healed."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    owned = _make_export_row(
+        publisher="DC Comics",
+        series="Watchmen (1986 - 1987)",
+        full_title="Watchmen HC",
+        release_date="2013-11-05",
+        in_collection=1,
+        in_wish_list=0,
+    )
+    win = make_agent_win_row(
+        publisher=None, series="Watchmen", full_title="Watchmen HC",
+        release_date="",  # trades routinely land dateless
+        gixen_item_id="900", pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([owned, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics", "series": "Watchmen (1986 - 1987)",
+        "full_title": "Watchmen HC", "release_date": "2013-11-05",
+        "in_collection": 1, "in_wish_list": 0,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    assert result["auto_healed_duplicates"] == 1, "no issue token → no volume ambiguity"
+    assert not any(r.get("gixen_item_id") == "900" and r["source"] == "agent_win"
+                   for r in payload["comics"])
+
+
+def test_era_decline_warning_names_the_side_that_lacks_the_year(tmp_path):
+    """BUI-462: telling the operator to backfill a date that is already present
+    strands the row forever across every subsequent sync."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    wish_twin = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    win = make_agent_win_row(
+        publisher=None, series="Marvel Tales", full_title="Marvel Tales #223",
+        release_date="1989-02-14",  # the win's date is FINE
+        gixen_item_id="902", pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([wish_twin, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+        "full_title": "Marvel Tales #223", "release_date": "",
+        "in_collection": 1, "in_wish_list": 0,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+
+    assert result["auto_healed_duplicates"] == 0
+    warning = next(w for w in result["warnings"] if "left pending" in w)
+    assert "incoming export row carries no release date" in warning
+    assert "backfill its release_date" not in warning, \
+        "must not send the operator after a date that is already correct"
+    reasons = [a["details"].get("reason") for a in _audit_records(tmp_path)
+               if a["type"] == "ambiguous_reconciliation"]
+    assert "heal_declined_export_has_no_year" in reasons
+
+
+def test_era_confirmed_requires_a_real_year_on_both_sides():
+    """BUI-462: the heal's era gate fails CLOSED — the complement of
+    `_reconcile_score`'s fail-open year compare."""
+    from locg.collection_io import _era_confirmed
+
+    def row(date):
+        return {"release_date": date}
+
+    assert _era_confirmed(row("1989-01-01"), row("1989-02-14"))
+    assert not _era_confirmed(row(""), row("1974-04-02"))
+    assert not _era_confirmed(row(None), row("1974-04-02"))
+    assert not _era_confirmed(row("1989-02-14"), row(""))
+    assert not _era_confirmed(row("n/a"), row("n/a")), "unparseable is not a year"
+    assert not _era_confirmed(row("1989-02-14"), row("2022-08-31"))
 
 
 def test_pending_agent_win_ambiguous_left_pending(tmp_path):

@@ -152,6 +152,176 @@ def _series_normalized_matches(a: str, b: str) -> bool:
     return _normalize_series_key(a) == _normalize_series_key(b)
 
 
+_YEAR4_RE = re.compile(r"\d{4}")
+
+
+def _release_year(row: dict[str, Any]) -> str:
+    """The 4-digit release-date year of a row, or "" when absent/unparseable."""
+    year = (row.get("release_date") or "")[:4].strip()
+    return year if _YEAR4_RE.fullmatch(year) else ""
+
+
+def _era_confirmed(cache_row: dict[str, Any], xlsx_row: dict[str, Any]) -> bool:
+    """Positive same-era evidence for the *destructive* auto-heal branch (BUI-462).
+
+    ``_reconcile_score``'s year compare fails **OPEN** — it only rejects when
+    *both* sides name a year and they differ, so a dateless (or Jan-1
+    placeholder-blanked) row matches any era. That is the right call for the
+    non-destructive paths, which only ever rewrite a row's identity. It is the
+    wrong call for the auto-heal branch, which *retires* a row: the same
+    fail-open lets a modern win fuzzy-match a vintage volume of the same
+    masthead (``_normalize_series_key`` strips the ``(YYYY - YYYY)`` /
+    ``(Vol. N)`` decoration, so two volumes of one masthead normalize to the
+    SAME key) and be folded into a book it is not.
+
+    Confirmed by either:
+
+    * **Same 4-digit year on both sides.** ``_reconcile_score`` already rejects
+      a year *disagreement* on its issue-numbered branch, so on that branch this
+      is exactly the fail-closed complement — requiring *presence*. A dateless
+      win is never healed; it is left pending for the operator (visible
+      non-clear over silent wrong drop) until its release_date is backfilled
+      (BUI-210 / BUI-461).
+    * **Identical full_title with no issue token on either side** — the
+      TPB/HC/OGN branch, where ``_reconcile_score`` matches on the title string
+      itself and never compares years at all. There is no ``#N``-across-volumes
+      ambiguity for a year to resolve there, so requiring a year would have
+      newly stranded dateless trade wins that BUI-211 healed. This clause keeps
+      that branch's behavior exactly as it was.
+
+    What this deliberately does NOT prove: that the win's year is *correct*. A
+    Jan-1 placeholder (BUI-105) carries a real identified cover year, and the
+    record-win no-year misresolution class can stamp a wrong volume's real year.
+    That residual is what the provenance carry-over
+    (:func:`_carry_win_provenance`) and the full-row audit trail exist to make
+    survivable rather than fatal — a mis-fired heal costs a row merge that the
+    append-only log can reverse, never local-only purchase data.
+    """
+    cache_year = _release_year(cache_row)
+    if cache_year and cache_year == _release_year(xlsx_row):
+        return True
+
+    cache_title = (cache_row.get("full_title") or "").strip()
+    xlsx_title = (xlsx_row.get("full_title") or "").strip()
+    return (
+        bool(cache_title)
+        and cache_title.lower() == xlsx_title.lower()
+        and _issue_token(cache_title) is None
+        and _issue_token(xlsx_title) is None
+    )
+
+
+def _era_decline_reason(
+    cache_row: dict[str, Any], xlsx_row: dict[str, Any]
+) -> tuple[str, str]:
+    """``(audit reason, operator-facing detail)`` for a declined heal (BUI-462).
+
+    :func:`_era_confirmed` fails for three different reasons and the operator
+    acts on the message: telling them to backfill a release_date that is already
+    present sends them after nothing and strands the row on every subsequent
+    sync, so name the side that actually lacks the evidence.
+    """
+    win_year = _release_year(cache_row)
+    export_year = _release_year(xlsx_row)
+    if not win_year:
+        return (
+            "heal_declined_win_has_no_year",
+            "the pending win carries no release-date year, so its era cannot "
+            "be confirmed — backfill its release_date",
+        )
+    if not export_year:
+        return (
+            "heal_declined_export_has_no_year",
+            "the incoming export row carries no release date, so the era "
+            "cannot be confirmed — fix the date on LOCG",
+        )
+    return (
+        "heal_declined_year_conflict",
+        f"the release years disagree ({win_year} vs {export_year})",
+    )
+
+
+def _is_owned(row: dict[str, Any]) -> bool:
+    """Strict read of ``in_collection`` (a copy count, not a flag).
+
+    ``parse_xlsx`` stores raw openpyxl cell values with no coercion, so a
+    text-formatted "In Collection" cell arrives as a ``str`` — and ``bool("0")``
+    is ``True``. A truthiness read is harmless in ``_apply_locg_columns_held``,
+    where the only consequence is an over-conservative ownership *hold* (the
+    safe direction). On the auto-heal branch the same cell authorizes retiring
+    a row, so it is parsed strictly: anything that does not resolve to a count
+    >= 1 is not ownership.
+    """
+    value = row.get("in_collection")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value >= 1
+    try:
+        return float(str(value).strip()) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
+# Local-only provenance an agent_win row carries that a LOCG export row never
+# supplies (LOCG has no idea what you paid or which eBay item it came from).
+_WIN_PROVENANCE_FIELDS: tuple[str, ...] = (
+    "price_paid",
+    "date_purchased",
+    "gixen_item_id",
+    "metron_id",
+)
+
+
+def _carry_win_provenance(
+    dropped: dict[str, Any],
+    kept: dict[str, Any],
+    now: str,
+    audit_records: list[dict[str, Any]],
+) -> None:
+    """Move an auto-healed win's local-only provenance onto the row that
+    survives it (BUI-462).
+
+    Without this the heal is a genuine data *loss*, not a dedup: the wish twin
+    that survives a wished-then-won book has by definition never carried a
+    purchase price, and ``price_paid`` / ``date_purchased`` are LOCG columns
+    that Phase 2 blanks from the export. That put the auto-heal on the wrong
+    side of the module's own rule (``commands.py``: "a win stuck pending is
+    recoverable; a win dropped on import is not"), and it is what makes it
+    acceptable for an LOCG-sourced ``In Collection`` to authorize the drop at
+    all — nothing irreversible rides on it.
+
+    **Must run after** :func:`_standard_merge_phase`: that phase overwrites every
+    ``LOCG_COLUMNS`` value on the kept row from the export, which would clobber
+    a carry-over done during reconciliation.
+
+    Only fills fields the kept row leaves empty — it never overwrites a value
+    LOCG supplied or one the kept row already held.
+    """
+    carried: dict[str, Any] = {}
+    for field in _WIN_PROVENANCE_FIELDS:
+        value = dropped.get(field)
+        if value is None or value == "":
+            continue
+        existing = kept.get(field)
+        if existing is not None and existing != "":
+            continue
+        kept[field] = value
+        carried[field] = value
+
+    if carried:
+        audit_records.append({
+            "type": "auto_healed_win_provenance_carried",
+            "ts": now,
+            "command": "import",
+            "details": {
+                "full_title": kept.get("full_title"),
+                "kept_identity": list(make_identity(kept)),
+                "carried": carried,
+            },
+        })
+
+
 def _vol_annotation_differs(a: str, b: str) -> bool:
     """True if the (Vol. N) annotations are both present but differ, or only one has one."""
     va = _VOL_ANNOTATION_RE.search(a or "")
@@ -355,7 +525,7 @@ def _reconcile_phase(
     xlsx_rows: list[dict[str, Any]],
     identity_to_idx: dict[tuple, int],
     partial_to_idx: dict[tuple, int],
-    healed_drop: set[int],
+    healed_drop: dict[int, int],
     audit_records: list[dict[str, Any]],
     summary: dict[str, Any],
     now: str,
@@ -440,25 +610,67 @@ def _reconcile_phase(
             # BUI-211: auto-heal the safe case (folds in cleanup_duplicates.py
             # class 1 — same-book/different-identity dup wins). If the collision
             # target is an *established owned* row (locg_export or already
-            # pushed, AND in_collection) and THIS row is a pending agent_win,
-            # the two are the same owned book: the win is a redundant leftover
-            # that record-win's dedup missed (the owned copy was usually
-            # imported after the win was recorded). Drop the pending win, keep
-            # the established owned row — no "left pending" warning needed.
+            # pushed, AND owned) and THIS row is a pending agent_win, the two
+            # are the same owned book: the win is a redundant leftover that
+            # record-win's dedup missed (the owned copy was usually imported
+            # after the win was recorded). Drop the pending win, keep the
+            # established owned row — no "left pending" warning needed.
+            #
+            # BUI-462: ownership is read POST-import, not pre-import. The
+            # collision target holds `target_identity` == make_identity(xlsx_row)
+            # *exactly*, so Phase 2 will apply this same export row's LOCG
+            # columns to it; and `_apply_locg_columns_held` only ever holds an
+            # ownership DOWNGRADE, never a downgrade-to-owned. So the target is
+            # owned after this import iff it is owned now OR the export row says
+            # owned — no heuristic involved. That is the wish-twin case: a
+            # wished-then-won book's twin sits at in_collection=0 until Phase 2
+            # flips it, which made the pre-import read bail to "left pending" and
+            # strand every one of the 27 collisions on the 2026-07-19 sync.
             target_row = comics[collide]
-            target_established_owned = (
-                (
-                    target_row.get("source") == "locg_export"
-                    or bool(target_row.get("pushed_to_locg_at"))
-                )
-                and bool(target_row.get("in_collection"))
+            target_established = (
+                target_row.get("source") == "locg_export"
+                or bool(target_row.get("pushed_to_locg_at"))
             )
+            target_owned_after_import = _is_owned(target_row) or _is_owned(xlsx_row)
+            # The dropped row is ALWAYS the pending win, never the collision
+            # target — so no wish row in the store can be removed by this
+            # branch. `not in_wish_list` makes that a syntactic property of the
+            # drop itself rather than an inference about what record-win writes:
+            # a row carrying wish state is structurally ineligible to be
+            # dropped, which is what keeps the intentional cross-volume decoy
+            # holds (owned under one volume, deliberately wished under another)
+            # safe by construction. wish-list.json is not touched at all (BUI-208).
             cache_row_pending_win = (
                 cache_row.get("source") == "agent_win"
                 and cache_row.get("pushed_to_locg_at") is None
+                and not cache_row.get("in_wish_list")
             )
-            if target_established_owned and cache_row_pending_win:
-                healed_drop.add(ci)
+            if target_established and target_owned_after_import and cache_row_pending_win:
+                # BUI-462: the era must be PROVED before deleting anything —
+                # see _era_confirmed. Without it a dateless win can fuzzy-match
+                # a different volume of the same masthead and be dropped.
+                if not _era_confirmed(cache_row, xlsx_row):
+                    reason, detail = _era_decline_reason(cache_row, xlsx_row)
+                    audit_records.append({
+                        "type": "ambiguous_reconciliation",
+                        "ts": now,
+                        "command": "import",
+                        "details": {
+                            "full_title": cache_row.get("full_title"),
+                            "reason": reason,
+                            "gixen_item_id": cache_row.get("gixen_item_id"),
+                            "win_release_date": cache_row.get("release_date"),
+                            "export_release_date": xlsx_row.get("release_date"),
+                        },
+                    })
+                    summary["warnings"].append(
+                        f"Reconciliation collision for '{cache_row.get('full_title')}' "
+                        f"— a row with that identity already exists; left pending "
+                        f"({detail}; not safe to retire it as a duplicate)"
+                    )
+                    continue
+
+                healed_drop[ci] = collide
                 summary["auto_healed_duplicates"] += 1
                 audit_records.append({
                     "type": "auto_healed_duplicate_win",
@@ -467,10 +679,33 @@ def _reconcile_phase(
                     "details": {
                         "full_title": cache_row.get("full_title"),
                         "kept_identity": list(target_identity),
+                        "dropped_identity": list(make_identity(cache_row)),
+                        "gixen_item_id": cache_row.get("gixen_item_id"),
+                        # The WHOLE dropped row, so this append-only log alone
+                        # is genuinely enough to reconstruct it — the identity
+                        # tuple omits exactly the local-only fields (price_paid,
+                        # date_purchased, condition, ...) that make a wrong drop
+                        # unrecoverable.
+                        "dropped_row": dict(cache_row),
                     },
                 })
+                # BUI-462: retract the healed row's index entries. It is about
+                # to disappear, but its pre-heal identity/partial entries would
+                # otherwise stay live for all of Phase 2 — long enough for the
+                # R67 rename path to claim `ci` as the rename target for an
+                # unrelated export row, apply that row's columns to it, and then
+                # have the whole thing removed by the post-phase filter. The
+                # export row would then exist nowhere: an owned book silently
+                # lost from the store (the R11 direction). Retracting them makes
+                # such a row fall through to a genuine insert instead.
+                healed_identity = make_identity(cache_row)
+                if identity_to_idx.get(healed_identity) == ci:
+                    del identity_to_idx[healed_identity]
+                healed_partial = _partial_identity(cache_row)
+                if partial_to_idx.get(healed_partial) == ci:
+                    del partial_to_idx[healed_partial]
                 # Skip the rest of this iteration (like the leave-pending path):
-                # do NOT rewrite identity or touch indices for a dropped row.
+                # do NOT rewrite identity for a dropped row.
                 continue
 
             # Not an established-owned collision (e.g. two pending rows): keep
@@ -712,6 +947,9 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # BUI-211: pending agent_win rows auto-healed away because the book is
         # already owned under an established locg_export identity (folds in
         # cleanup_duplicates.py class 1 — same-book/different-identity dup wins).
+        # BUI-462 extends this to the wish-twin case (the identity is owned by
+        # the *incoming* export row rather than already owned in the store) and
+        # gates the drop on confirmed-era evidence (_era_confirmed).
         "auto_healed_duplicates": 0,
         # BUI-412: owned rows with no release_date, post-import. Non-blocking —
         # a data-quality count only, never used to reject/alter/drop a row.
@@ -730,7 +968,9 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # duplicates of an established owned row). We cannot delete from `comics`
         # mid-loop — indices feed identity_to_idx, Phase 2, and possibly-removed
         # — so we collect them here and filter once, after all phases complete.
-        healed_drop: set[int] = set()
+        # BUI-462: {dropped index -> index of the row kept in its place}, so the
+        # dropped win's local-only provenance can be carried onto the survivor.
+        healed_drop: dict[int, int] = {}
 
         # Full identity index: (publisher, series, full_title, release_date) → idx
         identity_to_idx: dict[tuple, int] = {}
@@ -772,8 +1012,30 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # agent_win (pushed_to_locg_at is None), so it can never satisfy the
         # possibly-removed predicate below — it is a dedup heal, not a removal.
         if healed_drop:
+            # BUI-462: carry each dropped win's local-only provenance onto the
+            # row kept in its place FIRST — Phase 2 has just overwritten the
+            # kept row's LOCG columns from the export, so this has to run after
+            # it or price_paid/date_purchased would be clobbered right back to
+            # the export's blanks. Phase 2 only ever appends, so both indices
+            # are still valid here.
+            for dropped_idx, kept_idx in healed_drop.items():
+                _carry_win_provenance(
+                    comics[dropped_idx], comics[kept_idx], now, audit_records
+                )
             comics = [r for i, r in enumerate(comics) if i not in healed_drop]
             payload["comics"] = comics
+            # Deleting rows from the collection must never be a silent success.
+            # `possibly_removed` deliberately excludes healed drops, and a
+            # shrinking row_count reads as "no duplicates inserted" to the sync
+            # runbook's safety check — so say it out loud where the operator
+            # already looks.
+            summary["warnings"].append(
+                f"{len(healed_drop)} pending win row(s) auto-healed away as "
+                "duplicates of an owned LOCG row (BUI-211/BUI-462). Purchase "
+                "provenance was carried onto the kept rows; the full dropped "
+                "rows are recorded in import-history.jsonl "
+                "(type=auto_healed_duplicate_win) if any needs reversing."
+            )
 
         # ----- Possibly-removed rows ------------------------------------------
         for row in comics:
