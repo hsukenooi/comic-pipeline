@@ -405,6 +405,9 @@ class TestComicIdentifyAnnualAdjacency:
         data = json.loads(capsys.readouterr().out)
         assert data["edition"] == "annual"
         assert data["issue"] == "1"
+        # BUI-460: the "No." separator token must not survive into the series
+        # text — it's classifier residue, not part of the series name.
+        assert data["series"] == "Amazing Spider-Man"
 
     def test_genuine_annual_no_dot_missing_dot_separator(self, capsys):
         """The dot is optional — 'Annual No 1' classifies too."""
@@ -412,18 +415,23 @@ class TestComicIdentifyAnnualAdjacency:
         data = json.loads(capsys.readouterr().out)
         assert data["edition"] == "annual"
         assert data["issue"] == "1"
+        assert data["series"] == "Amazing Spider-Man"
 
     def test_genuine_annual_colon_separator(self, capsys):
         comic_identify.main(["X-Men Annual: 1"])
         data = json.loads(capsys.readouterr().out)
         assert data["edition"] == "annual"
         assert data["issue"] == "1"
+        # BUI-460: was "X-Men :" before the trailing-separator strip.
+        assert data["series"] == "X-Men"
 
     def test_genuine_annual_hyphen_hash_separator(self, capsys):
         comic_identify.main(["Avengers Annual-#5"])
         data = json.loads(capsys.readouterr().out)
         assert data["edition"] == "annual"
         assert data["issue"] == "5"
+        # BUI-460: was "Avengers -" before the trailing-separator strip.
+        assert data["series"] == "Avengers"
 
     def test_stray_word_after_separator_is_still_regular(self, capsys):
         """The number is still REQUIRED after the broadened separator — a colon
@@ -431,3 +439,115 @@ class TestComicIdentifyAnnualAdjacency:
         comic_identify.main(["X-Men Annual: Special Issue"])
         data = json.loads(capsys.readouterr().out)
         assert data["edition"] == "single-issue"
+
+
+class TestComicIdentifyAnnualSeparatorStrip:
+    """BUI-460: BUI-456 broadened the annual separator to accept "No.", ":",
+    "-" so these titles now correctly classify edition="annual" — but the
+    separator itself was left dangling on the series text once the word
+    "annual" is stripped ("X-Men Annual: 1" -> series "X-Men :"). This matters
+    because collection_cache._normalize_series_key (packages/locg-cli) only
+    strips year/vol/article decoration, not stray punctuation, so the
+    un-cleaned series would thread to the wrong norm_key ("x-men :" instead of
+    "x-men") and miss the local series_name_index, falling through to
+    Metron/manual resolution instead. See
+    test_normalize_series_key_does_not_strip_stray_punctuation in
+    packages/locg-cli/tests/test_collection_cache.py for the locg-side half
+    of this contract.
+    """
+
+    # --- the three example titles from the ticket, exact cleaned series ----
+    def test_colon_separator_series_is_clean(self, capsys):
+        comic_identify.main(["X-Men Annual: 1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["series"] == "X-Men"
+        assert data["issue"] == "1"
+        assert data["edition"] == "annual"
+
+    def test_hyphen_hash_separator_series_is_clean(self, capsys):
+        comic_identify.main(["Avengers Annual-#5"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["series"] == "Avengers"
+        assert data["issue"] == "5"
+        assert data["edition"] == "annual"
+
+    def test_no_dot_separator_series_is_clean(self, capsys):
+        """'Annual No. 1' left the weak stray 'No.' token before the fix."""
+        comic_identify.main(["Amazing Spider-Man Annual No. 1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["series"] == "Amazing Spider-Man"
+        assert data["issue"] == "1"
+        assert data["edition"] == "annual"
+
+    # --- threaded norm_key ---------------------------------------------------
+    def test_cleaned_series_normalizes_to_expected_key(self, capsys):
+        """The cleaned series string threads to the SAME norm_key a plain
+        "X-Men Annual #1"-style listing would produce — no stray-punctuation
+        drift. This mirrors locg.collection_cache._normalize_series_key
+        inline (apps/ebay is not a workspace member and cannot import
+        packages/locg-cli — same boundary noted near comic_identity.py's
+        series_year_range, "Series-volume (era) disambiguation" section)
+        since only strip/lower is needed to observe the pre-fix vs. post-fix
+        key difference; the full contract (that _normalize_series_key itself
+        does no punctuation stripping) is locked on the locg side in
+        test_normalize_series_key_does_not_strip_stray_punctuation.
+        """
+
+        def normalize_series_key(series_name: str) -> str:
+            return series_name.strip().lower()
+
+        for title, expected_key in [
+            ("X-Men Annual: 1", "x-men"),
+            ("Avengers Annual-#5", "avengers"),
+            ("Amazing Spider-Man Annual No. 1", "amazing spider-man"),
+        ]:
+            comic_identify.main([title])
+            data = json.loads(capsys.readouterr().out)
+            assert normalize_series_key(data["series"]) == expected_key
+
+    # --- non-regression: the accepted BUI-129/BUI-456 non-goal --------------
+    def test_bare_number_before_annual_unaffected(self, capsys):
+        """'ASM 252 annual 2024' (no '#') is a DELIBERATE accepted non-goal —
+        distinguishing a bare issue number from a bare volume/promo year would
+        reintroduce the BUI-129 hazard. This fix is confined to punctuation
+        cleanup and must not change which edition/issue this resolves to."""
+        comic_identify.main(["ASM 252 annual 2024"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["series"] == "ASM"
+        assert data["issue"] == "252"
+        assert data["edition"] == "annual"
+
+    # --- adversarial: a real trailing "No"/"no" word in the series name -----
+    # Caught in review: an earlier draft stripped separator-looking characters
+    # from wherever the series text happened to END, with no anchor to the
+    # word "annual" itself. That is ambiguous — after "annual" is deleted, a
+    # real word "No" that PRECEDES "annual" in the title (part of the actual
+    # series name) and a genuine "No."/"No" separator that FOLLOWS "annual"
+    # (real residue, as in "Annual No. 1") look identical from the end of the
+    # string alone. The fix anchors the strip to "\bannual\b" and only
+    # extends forward, so a real trailing "No" is never touched.
+    def test_series_legitimately_ending_in_no_is_preserved(self, capsys):
+        comic_identify.main(["Just Say No Annual #1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["series"] == "Just Say No"
+        assert data["issue"] == "1"
+        assert data["edition"] == "annual"
+
+    def test_one_word_series_no_is_not_wiped(self, capsys):
+        """A one-word series that IS 'No' must not be erased entirely."""
+        comic_identify.main(["NO Annual #1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["series"] == "NO"
+        assert data["issue"] == "1"
+        assert data["edition"] == "annual"
+
+    def test_double_annual_mention_still_fully_stripped(self, capsys):
+        """A pathological double mention of 'annual' — the trailing-anchored
+        pass only reaches the LAST occurrence, so the word-only strip must
+        still run afterward to catch the other one, matching pre-BUI-460
+        (global-strip) behavior rather than narrowing it."""
+        comic_identify.main(["X-Men Annual Annual #1"])
+        data = json.loads(capsys.readouterr().out)
+        assert data["series"] == "X-Men"
+        assert data["issue"] == "1"
+        assert data["edition"] == "annual"
