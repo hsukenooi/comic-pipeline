@@ -16,15 +16,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="$(dirname "$SCRIPT_DIR")"               # packages/gixen-cli
 MONOREPO_ROOT="$(cd "$PKG_DIR/../.." && pwd)"    # monorepo root (uv workspace)
 VENV="$MONOREPO_ROOT/.venv"                      # shared workspace venv
-# BUI-220: fresh installs use the canonical comics-server names
-# (com.comics.server / ~/.comics-server). If the Mini has not yet run
-# docs/runbooks/comics-server-dir-migration.md, its live LaunchAgent label and
-# data dir may still be the pre-migration com.gixen.server / ~/.gixen-server
-# (BUI-411: verify with `launchctl list | grep -E 'com\.(comics|gixen)\.server'`
-# before relying on either name). Re-running this script does NOT perform that
-# migration — doing so on an unmigrated Mini would point at a fresh empty DB.
-SERVER_DIR="$HOME/.comics-server"
-PLIST="$HOME/Library/LaunchAgents/com.comics.server.plist"
+# BUI-459: deliberately scoped BACK to the pre-migration name
+# com.gixen.server / ~/.gixen-server — this is NOT drift, do not "fix" it to
+# com.comics.server. The BUI-220 comics-server rename has NOT actually been
+# performed on the Mac Mini yet: the live LaunchAgent label is PID-confirmed
+# com.gixen.server and the data dir is still ~/.gixen-server (BUI-411/BUI-457
+# grounding). A prior version of this script wrote the post-migration name
+# (com.comics.server / ~/.comics-server); now that the label would match the
+# live job, that combination is actively dangerous to run, not just
+# aspirational: server/db.py's resolve_server_dir() prefers ~/.comics-server
+# the instant it exists (even freshly created and empty), and this script's
+# generated .env pins DB_PATH to it explicitly (see server/main.py's
+# `_db_path` comment) — so `launchctl kickstart -k gui/$(id -u)/com.gixen.server`
+# would take over the REAL running job and repoint it at an empty database.
+# Running the real migration (docs/runbooks/comics-server-dir-migration.md) is
+# tracked separately and intentional, not something this script should do as
+# a side effect of a routine re-deploy.
+SERVER_DIR="$HOME/.gixen-server"
+PLIST="$HOME/Library/LaunchAgents/com.gixen.server.plist"
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "error: uv is not installed. See https://docs.astral.sh/uv/ to install it." >&2
@@ -40,7 +49,7 @@ if [ ! -f "$SERVER_DIR/.env" ]; then
   cat > "$SERVER_DIR/.env" <<ENV
 GIXEN_USERNAME=your_username_here
 GIXEN_PASSWORD=your_password_here
-DB_PATH=$HOME/.comics-server/db.sqlite
+DB_PATH=$SERVER_DIR/db.sqlite
 ENV
   chmod 600 "$SERVER_DIR/.env"
   echo "    Edit $SERVER_DIR/.env before starting the server."
@@ -57,7 +66,7 @@ cat > "$PLIST" <<PLIST
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.comics.server</string>
+    <string>com.gixen.server</string>
     <key>ProgramArguments</key>
     <array>
         <string>$VENV/bin/uvicorn</string>
@@ -111,7 +120,7 @@ launchctl load -w "$PLIST"
 # `load -w` registers the job but on modern macOS does not reliably (re)start the
 # process when reloading in-place — RunAtLoad can be skipped, leaving the job
 # "loaded but not running". Force a fresh start so the deploy actually serves.
-launchctl kickstart -k "gui/$(id -u)/com.comics.server" 2>/dev/null || true
+launchctl kickstart -k "gui/$(id -u)/com.gixen.server" 2>/dev/null || true
 
 echo ""
 echo "Done. Server starting on port 8080 from the monorepo workspace venv."
