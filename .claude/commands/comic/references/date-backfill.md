@@ -44,7 +44,7 @@ its real on-sale date instead of being discarded as a reprint. This doc is the
   `Uncanny X-Men #300 = 1993-05-01` ⇒ #301 `1993-06-01`, #302 `1993-07-01`, #303
   `1993-08-01`. Works only where issues are genuinely monthly and consecutive — verify
   the anchor and spot-check the last issue.
-- **Metron** (`packages/locg-cli/src/locg/metron.py`, creds in `~/.gixen-server/.env`):
+- **Metron** (`packages/locg-cli/src/locg/metron.py`, creds in `~/.comics-server/.env`):
   reliable **only** when the series name + year you pass match Metron's catalog. A naive
   `lookup_issue("The X-Men","59",1970)` returned a **2005 reprint** — pass the correct
   year and expect misses on vintage/aliased series. Rate-limited to ~20 req/min.

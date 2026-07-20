@@ -1,5 +1,16 @@
 # Runbook: migrate the comics-server data dir `~/.gixen-server` → `~/.comics-server` (BUI-220)
 
+> **EXECUTED 2026-07-20 (BUI-463).** This migration has been run on the Mac Mini and verified:
+> LaunchAgent label is `com.comics.server` (PID confirmed running), data dir is `~/.comics-server`,
+> `.env` `DB_PATH` points at `/Users/hsukenooi/.comics-server/db.sqlite`, and served row counts
+> (bids=500, comics=683, fmv=779, bid_fmvs=487, collection row_count=2870) matched the
+> pre-migration backup at `~/comics-server-migration-backup-20260720/` on the Mini. `install.sh`
+> (`packages/gixen-cli/server/install.sh`) was updated post-execution to write the
+> `com.comics.server` LaunchAgent going forward (see the step 4 correction below — at execution
+> time it still wrote the pre-migration name due to a since-reverted BUI-459 scoping, so the
+> plist was written by hand instead). This doc is kept for historical reference and in case the
+> migration ever needs to be re-run on another machine.
+
 **Run this on the Mac Mini only.** It is the live half of BUI-220 Tier 3 and is intentionally **not** done by merging the PR — the code ships a safe fallback so nothing breaks until you run these steps deliberately.
 
 ## Background
@@ -34,10 +45,18 @@ mv ~/.gixen-server ~/.comics-server
 #    To:      DB_PATH=$HOME/.comics-server/db.sqlite
 $EDITOR ~/.comics-server/.env
 
-# 4. Re-deploy: install.sh now writes the com.comics.server LaunchAgent and starts it.
+# 4. Re-deploy: as of BUI-463, install.sh writes the com.comics.server LaunchAgent and starts it.
 #    It will NOT clobber the existing .env (it only generates one when absent), so your
 #    creds + corrected DB_PATH survive.
+#    (Historical note: at the time this runbook was executed on 2026-07-20, install.sh had been
+#    deliberately scoped BACK to the pre-migration com.gixen.server name by BUI-459 — the rename
+#    below hadn't landed yet — so this step was done by hand: write the com.comics.server plist,
+#    `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.comics.server.plist`, then load it.)
 cd <repo>/packages/gixen-cli/server && ./install.sh
+
+# 4b. `launchctl bootstrap` registers the job but does not reliably start it — expect `runs = 0`
+#     in `launchctl print gui/$(id -u)/com.comics.server` until you force a start:
+launchctl kickstart -k "gui/$(id -u)/com.comics.server"
 
 # 5. Remove the old LaunchAgent file (install.sh added the new one but left the old)
 rm -f ~/Library/LaunchAgents/com.gixen.server.plist
@@ -67,7 +86,9 @@ Once `~/.gixen-server` is gone and everything is confirmed working, the few rema
 
 - `CLAUDE.md` (one-time server-seed note), `.claude/commands/comic/collection-sync.md` (backup path), `.claude/commands/comic/references/date-backfill.md` (`~/.gixen-server/.env`), `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
-The resolver's `~/.gixen-server` fallback branch in `server/db.py` (and the inline one in `cleanup_duplicates.py`) can also be removed once no machine has the legacy dir — but it's harmless to leave.
+Done as of BUI-463 (2026-07-20) — all four were updated to `~/.comics-server` / `com.comics.server` once the migration was confirmed live on the Mini.
+
+The resolver's `~/.gixen-server` fallback branch in `server/db.py` (and the inline one in `cleanup_duplicates.py`) is deliberately left alone — it's now dead on the Mini but harmless, and protects any other machine that hasn't migrated yet.
 
 ## Rollback
 
