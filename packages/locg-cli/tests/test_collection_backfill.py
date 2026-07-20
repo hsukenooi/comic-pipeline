@@ -49,6 +49,7 @@ def _row(
     in_wish_list: int = 0,
     metron_id: Optional[int] = None,
     pushed_to_locg_at: Optional[str] = None,
+    local_added_at: str = "2026-07-16T00:00:00.000000Z",
 ) -> dict[str, Any]:
     return {
         "publisher_name": publisher_name,
@@ -72,7 +73,7 @@ def _row(
         "slabbing": 0,
         "grading": None,
         "grading_company": None,
-        "local_added_at": "2026-07-16T00:00:00.000000Z",
+        "local_added_at": local_added_at,
         "local_added_seq": 1,
         "pushed_to_locg_at": pushed_to_locg_at,
         "last_seen_in_export_at": None,
@@ -224,6 +225,112 @@ def test_genuine_january_date_on_a_metron_backed_row_is_never_a_target(tmp_path)
     assert metron.detail_calls == [777]
 
 
+# --------------------------------------------------------------------------
+# BUI-471 residual #3: legacy hand-remediated `YYYY-01-02` dodge dates
+# --------------------------------------------------------------------------
+
+
+def test_hand_remediated_dash_01_02_date_is_a_target_and_gets_corrected(tmp_path):
+    """The 2026-07-19 manual backfill wrote `YYYY-01-02` to dodge the export's
+    placeholder regex. With no metron_id, that date is positively identifiable
+    as the dodge (record-win's own placeholder is hardcoded to `-01-01`, and
+    any Metron-sourced date carries a metron_id the moment it's accepted) —
+    the backfill now retargets it and replaces it with the real cover date."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(
+            full_title="The Amazing Spider-Man #89",
+            series_name="The Amazing Spider-Man (1963 - 1998)",
+            release_date="1970-01-02",  # hand-remediated dodge date
+            gixen_item_id="win-1",
+        ),
+    ])
+    metron = FakeMetron(
+        issues={("The Amazing Spider-Man", "89"): {
+            "metron_id": 5001, "cover_date": "1970-10-01", "store_date": "1970-07-14",
+        }},
+        details={5001: {"publisher": "Marvel Comics", "variants": [], "credits": []}},
+    )
+
+    result = _run(cache, metron, apply=True)
+
+    assert result["status"] == "ok"
+    assert result["updated_count"] == 1
+    row = _by_title(cache, "The Amazing Spider-Man #89")
+    assert row["release_date"] == "1970-07-14"
+    assert row["metron_id"] == 5001
+    assert row["publisher_name"] == "Marvel Comics"
+
+
+def test_hand_remediated_date_with_a_metron_miss_is_left_alone(tmp_path):
+    """Never blank a date it cannot replace with a real one: a Metron miss on
+    a `-01-02` dodge row leaves the fabricated day exactly as it was."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(
+            full_title="The X-Men #59",
+            series_name="The X-Men (1963 - 1981)",
+            release_date="1969-01-02",
+        ),
+    ])
+    metron = FakeMetron(issues={})  # no match
+
+    result = _run(cache, metron, apply=True)
+
+    assert result["planned_count"] == 0
+    row = _by_title(cache, "The X-Men #59")
+    assert row["release_date"] == "1969-01-02"
+    assert row["metron_id"] is None
+
+
+def test_dash_01_02_date_with_an_existing_metron_id_is_never_a_target(tmp_path):
+    """A `-01-02` row that ALREADY carries a metron_id (however unlikely — a
+    genuine confirmed Jan-2 cover date) is not the dodge signature and must
+    never be touched."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(
+            full_title="Batman #240",
+            series_name="Batman (1940 - 2011)",
+            release_date="1972-01-02",
+            metron_id=777,
+            publisher_name="DC Comics",
+        ),
+    ])
+    metron = FakeMetron()
+
+    result = _run(cache, metron, apply=True)
+
+    assert result["candidate_count"] == 0
+    row = _by_title(cache, "Batman #240")
+    assert row["release_date"] == "1972-01-02"
+    assert row["metron_id"] == 777
+
+
+def test_dash_01_02_date_on_a_locg_export_row_is_never_touched(tmp_path):
+    """The safety envelope's source==agent_win gate applies to the dodge-date
+    retarget exactly as it does everywhere else in this command."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(
+            full_title="Daredevil #168",
+            series_name="Daredevil (1964 - 1998)",
+            release_date="1981-01-02",
+            source="locg_export",
+        ),
+    ])
+    metron = FakeMetron(
+        issues={("Daredevil", "168"): {"metron_id": 3, "cover_date": "1981-01-01", "store_date": None}},
+    )
+
+    result = _run(cache, metron, apply=True)
+
+    assert result["candidate_count"] == 0
+    row = _by_title(cache, "Daredevil #168")
+    assert row["release_date"] == "1981-01-02"
+    assert row["metron_id"] is None
+
+
 def test_newsstand_variant_title_parses_its_issue_number(tmp_path):
     cache = make_cache(tmp_path)
     _seed(cache, [
@@ -302,12 +409,16 @@ def test_wish_twin_is_never_touched(tmp_path):
 
 
 def test_already_pushed_row_is_never_touched(tmp_path):
+    """Genuinely pushed and never re-pended: local_added_at (T0) predates
+    pushed_to_locg_at (T1), so the row is not pending under either the
+    export's or the backfill's (BUI-471-widened) target-set definition."""
     cache = make_cache(tmp_path)
     _seed(cache, [
         _row(
             full_title="Daredevil #168",
             series_name="Daredevil (1964 - 1998)",
             release_date="1981-01-01",
+            local_added_at="2026-06-01T00:00:00.000000Z",
             pushed_to_locg_at="2026-07-01T00:00:00.000000Z",
         ),
     ])
@@ -319,6 +430,40 @@ def test_already_pushed_row_is_never_touched(tmp_path):
 
     assert result["candidate_count"] == 0
     assert _by_title(cache, "Daredevil #168")["metron_id"] is None
+
+
+def test_re_pended_row_after_a_push_is_now_a_target(tmp_path):
+    """BUI-471 residual #1: a row pushed once (pushed_to_locg_at=T0) and then
+    RE-PENDED (local_added_at=T1 > T0 — e.g. a record-win retry rebuilt it) is
+    exported again by `_pending_push_rows`, and the backfill's target set must
+    match that so the row doesn't reach LOCG dateless/publisher-less forever."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(
+            full_title="Daredevil #168",
+            series_name="Daredevil (1964 - 1998)",
+            release_date="1981-01-01",  # BUI-105 placeholder (metron_id is None)
+            local_added_at="2026-07-10T00:00:00.000000Z",
+            pushed_to_locg_at="2026-07-01T00:00:00.000000Z",  # pushed BEFORE the re-pend
+        ),
+    ])
+    metron = FakeMetron(
+        issues={("Daredevil", "168"): {
+            "metron_id": 3, "cover_date": "1981-04-01", "store_date": "1981-01-14",
+        }},
+        details={3: {"publisher": "Marvel Comics"}},
+    )
+
+    result = _run(cache, metron, apply=True)
+
+    assert result["candidate_count"] == 1
+    assert result["updated_count"] == 1
+    row = _by_title(cache, "Daredevil #168")
+    assert row["publisher_name"] == "Marvel Comics"
+    assert row["release_date"] == "1981-01-14"
+    # pushed_to_locg_at itself is never touched by the backfill — only the
+    # export re-computes pending-ness; the backfill just fixes the fields.
+    assert row["pushed_to_locg_at"] == "2026-07-01T00:00:00.000000Z"
 
 
 def test_identity_and_copy_count_are_never_mutated(tmp_path):
@@ -484,6 +629,84 @@ def test_dateless_row_with_no_year_makes_no_lookup(tmp_path):
     assert result["planned_count"] == 0
     assert "no year" in result["unresolved"][0]["reason"]
     assert _by_title(cache, "The X-Men #12")["release_date"] is None
+
+
+# --------------------------------------------------------------------------
+# BUI-471: a dateless row can adopt its OWN stored series_name's era window
+# (BUI-464's series_range mechanism) as a substitute for a real year.
+# --------------------------------------------------------------------------
+
+
+def test_dateless_row_resolves_via_its_own_series_range(tmp_path):
+    """A genuinely dateless row has no year, but its stored series_name
+    ("Weird Book (1975 - 1976)") is already a canonical, resolved volume — an
+    independent (begin, end) window that gates a Metron hit the same way a
+    real year would, so the row is no longer stuck reporting "no year"."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(full_title="Weird Book #1", series_name="Weird Book (1975 - 1976)", release_date=None),
+    ])
+    metron = FakeMetron(
+        issues={("Weird Book", "1"): {
+            "metron_id": 70, "cover_date": "1975-06-01", "store_date": "1975-04-02",
+        }},
+        details={70: {"publisher": "Marvel Comics"}},
+    )
+
+    result = _run(cache, metron, apply=True)
+
+    assert metron.lookup_calls == [("Weird Book", "1", None)]
+    assert result["updated_count"] == 1
+    row = _by_title(cache, "Weird Book #1")
+    assert row["release_date"] == "1975-04-02"
+    assert row["metron_id"] == 70
+    assert row["publisher_name"] == "Marvel Comics"
+
+
+def test_dateless_row_series_range_still_rejects_an_out_of_era_hit(tmp_path):
+    """The era gate still applies with series_range in place of a real year —
+    a hit decades outside the row's own series window is dropped whole."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(full_title="Weird Book #1", series_name="Weird Book (1975 - 1976)", release_date=None),
+    ])
+    metron = FakeMetron(
+        issues={("Weird Book", "1"): {
+            "metron_id": 999, "cover_date": "2005-01-01", "store_date": "2004-10-01",
+        }},
+    )
+
+    result = _run(cache, metron, apply=True)
+
+    assert result["planned_count"] == 0
+    row = _by_title(cache, "Weird Book #1")
+    assert row["release_date"] is None
+    assert row["metron_id"] is None
+
+
+def test_dateless_row_with_existing_metron_id_still_never_re_searches(tmp_path):
+    """A row that already carries a metron_id must never re-search by name for
+    a date, even with a usable series_range — "an existing metron_id is
+    exact" applies to the date fetch the same way it applies to publisher."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(
+            full_title="Weird Book #1",
+            series_name="Weird Book (1975 - 1976)",
+            release_date=None,
+            metron_id=70,
+        ),
+    ])
+    metron = FakeMetron(details={70: {"publisher": "Marvel Comics"}})
+
+    result = _run(cache, metron, apply=True)
+
+    assert metron.lookup_calls == []
+    assert metron.detail_calls == [70]
+    row = _by_title(cache, "Weird Book #1")
+    assert row["release_date"] is None
+    assert row["publisher_name"] == "Marvel Comics"
+    assert row["metron_id"] == 70
 
 
 def test_metron_without_a_publisher_leaves_publisher_null(tmp_path):
@@ -1122,3 +1345,173 @@ def test_negative_cadence_and_limit_are_refused(tmp_path):
     assert cmd_collection_backfill(
         cache=cache, metron=FakeMetron(), cadence=0, limit=-1
     )["status"] == "invalid_request"
+
+
+# --------------------------------------------------------------------------
+# BUI-471 residual #2: chunked resolve+write bounds a crash's blast radius
+# --------------------------------------------------------------------------
+
+
+class CrashingMetron(FakeMetron):
+    """Raises on the Nth `lookup_issue` call — a stand-in for an unexpected
+    (uncaught) exception mid-run, as opposed to a MetronCredentialError or a
+    rate-limit trip, both of which this command already handles gracefully."""
+
+    def __init__(self, *, crash_after: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.crash_after = crash_after
+
+    def lookup_issue(self, series_query: str, issue_number: Any, year: Any = None):
+        if len(self.lookup_calls) >= self.crash_after:
+            raise RuntimeError("simulated Metron crash")
+        return super().lookup_issue(series_query, issue_number, year)
+
+
+def _bulk_rows(n: int) -> list[dict[str, Any]]:
+    return [
+        _row(
+            full_title=f"Bulk Book {i} #1",
+            series_name=f"Bulk Book {i} (1970 - 1971)",
+            release_date="1970-01-01",  # BUI-105 placeholder
+            gixen_item_id=f"bulk-{i}",
+        )
+        for i in range(n)
+    ]
+
+
+def _bulk_metron(n: int, **kwargs: Any) -> dict[str, Any]:
+    issues = {
+        (f"Bulk Book {i}", "1"): {
+            "metron_id": 1000 + i, "cover_date": "1970-06-01", "store_date": f"1970-0{(i % 6) + 1}-15",
+        }
+        for i in range(n)
+    }
+    details = {1000 + i: {"publisher": "Marvel Comics"} for i in range(n)}
+    return {"issues": issues, "details": details}
+
+
+def test_chunked_run_commits_each_chunk_durably(tmp_path):
+    """30 rows -> 2 chunks (25 + 5) at RECORD_WIN_CHUNK_SIZE. Both chunks
+    resolve and commit cleanly; chunk_count/chunks_committed reflect it."""
+    cache = make_cache(tmp_path)
+    _seed(cache, _bulk_rows(30))
+    metron = FakeMetron(**_bulk_metron(30))
+
+    result = _run(cache, metron, apply=True)
+
+    assert result["status"] == "ok"
+    assert result["chunk_count"] == 2
+    assert result["chunks_committed"] == 2
+    assert result["updated_count"] == 30
+    for i in range(30):
+        row = _by_title(cache, f"Bulk Book {i} #1")
+        assert row["metron_id"] == 1000 + i
+        assert row["publisher_name"] == "Marvel Comics"
+
+
+def test_crash_mid_second_chunk_leaves_the_first_chunk_durably_written(tmp_path):
+    """BUI-471 residual #2's core claim: an unexpected exception mid-run must
+    only discard the IN-FLIGHT chunk's Metron work, never the whole backlog.
+    30 rows (2 chunks of 25 + 5); the crash lands on the 26th `lookup_issue`
+    call — the first row of chunk 2 — after chunk 1 has already resolved AND
+    committed (each row here needs exactly one lookup_issue call before its
+    detail fetch, so call #26 is chunk 2's first row)."""
+    cache = make_cache(tmp_path)
+    _seed(cache, _bulk_rows(30))
+    metron = CrashingMetron(crash_after=25, **_bulk_metron(30))
+
+    with pytest.raises(RuntimeError, match="simulated Metron crash"):
+        _run(cache, metron, apply=True)
+
+    # Chunk 1 (rows 0-24) committed durably before the crash.
+    for i in range(25):
+        row = _by_title(cache, f"Bulk Book {i} #1")
+        assert row["metron_id"] == 1000 + i, f"row {i} should have been committed"
+        assert row["publisher_name"] == "Marvel Comics"
+
+    # Chunk 2 (rows 25-29) never got a chance to resolve or write — untouched.
+    for i in range(25, 30):
+        row = _by_title(cache, f"Bulk Book {i} #1")
+        assert row["metron_id"] is None, f"row {i} should NOT have been touched"
+        assert row["publisher_name"] is None
+
+    # A durable audit record exists for the committed chunk.
+    records = [json.loads(line) for line in cache.audit_path.read_text().splitlines() if line.strip()]
+    backfills = [r for r in records if r["type"] == "collection_backfill"]
+    assert len(backfills) == 1
+    assert backfills[0]["details"]["updated_count"] == 25
+
+
+def test_chunked_dry_run_never_writes_across_chunk_boundaries(tmp_path):
+    """A dry run over > 1 chunk's worth of candidates still writes nothing."""
+    cache = make_cache(tmp_path)
+    _seed(cache, _bulk_rows(30))
+    metron = FakeMetron(**_bulk_metron(30))
+
+    result = _run(cache, metron, apply=False)
+
+    assert result["status"] == "preview"
+    assert result["chunk_count"] == 2
+    assert result["planned_count"] == 30
+    for i in range(30):
+        row = _by_title(cache, f"Bulk Book {i} #1")
+        assert row["metron_id"] is None
+
+
+# --------------------------------------------------------------------------
+# BUI-471 residual #5: refuse a default (LOCG_DATA_DIR-unset) store
+# --------------------------------------------------------------------------
+
+
+def test_no_explicit_cache_and_no_locg_data_dir_is_refused(monkeypatch):
+    """The wrong-store trap: without an explicit cache= (the real CLI path)
+    and without LOCG_DATA_DIR set, this must refuse rather than silently fall
+    back to whatever locg.config._cache_dir() resolves to."""
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+
+    result = cmd_collection_backfill(metron=FakeMetron())
+
+    assert result["status"] == "explicit_store_required"
+    assert "LOCG_DATA_DIR" in result["error"]
+
+
+def test_explicit_cache_bypasses_the_locg_data_dir_guard(tmp_path, monkeypatch):
+    """Tests (and any caller that already knows which store it means) pass
+    cache= explicitly and are never subject to the env-var guard."""
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    cache = make_cache(tmp_path)
+    _seed(cache, [])
+
+    result = cmd_collection_backfill(cache=cache, metron=FakeMetron())
+
+    assert result["status"] != "explicit_store_required"
+
+
+# --------------------------------------------------------------------------
+# BUI-471 residual #6: legacy metron_unavailable provenance is reported
+# --------------------------------------------------------------------------
+
+
+def test_legacy_rows_missing_metron_unavailable_are_counted_not_acted_on(tmp_path):
+    """Rows written before BUI-465 carry no metron_unavailable field at all —
+    this command tallies that population (legacy_unknown_availability_count)
+    but does not change targeting or resolution based on it."""
+    cache = make_cache(tmp_path)
+
+    def mutate(payload: dict[str, Any]) -> None:
+        rows = _bulk_rows(3)
+        rows[0]["metron_unavailable"] = True  # BUI-465-era: known never-asked
+        rows[1]["metron_unavailable"] = False  # BUI-465-era: known asked-and-missed
+        # rows[2]: legacy — field absent entirely
+        payload["comics"] = rows
+        payload["last_full_import"] = "2026-06-01T00:00:00.000000Z"
+
+    cache.apply(mutate, command="test-seed")
+    metron = FakeMetron(**_bulk_metron(3))
+
+    result = _run(cache, metron, apply=True)
+
+    assert result["legacy_unknown_availability_count"] == 1
+    # All three still resolved and backfilled identically — the field is
+    # reporting-only, never a targeting or retry signal (see the docstring).
+    assert result["updated_count"] == 3

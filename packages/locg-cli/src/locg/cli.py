@@ -169,9 +169,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Audit an already-exported wins CSV for data-quality issues before uploading to LOCG (read-only)",
         epilog=(
             "Flags missing publisher/series/full_title, a decorated full_title "
-            "((Vol.)/year), and the YYYY-01-01 placeholder date, plus a dateless "
-            "summary (count, titles, all_dateless) and a ready-to-surface "
-            "dateless_warning. Read-only — never mutates the store or the CSV. "
+            "((Vol.)/year), and a YYYY-01-01 date, plus a dateless summary "
+            "(count, titles, all_dateless) and a ready-to-surface "
+            "dateless_warning. BUI-466: a YYYY-01-01 date is cross-checked "
+            "against the collection store (source=agent_win + no metron_id) "
+            "before it hard-stops — a confirmed BUI-105 placeholder lands in "
+            "flagged_rows/flagged_count, a confirmed-genuine or unconfirmable "
+            "January cover date is demoted to advisory_rows/advisory_count and "
+            "does not hard-stop. Read-only — never mutates the store or the CSV. "
             "Pass the path from a prior `collection export`; do not re-export "
             "before auditing (re-exporting re-blanks placeholder dates)."
         ),
@@ -202,15 +207,24 @@ def create_parser() -> argparse.ArgumentParser:
         help="Backfill publisher_name/release_date on ALREADY-STORED pending agent_win rows (dry-run by default)",
         epilog=(
             "Remediates rows the record-win producer wrote before BUI-458/BUI-210 "
-            "(null publisher, YYYY-01-01 placeholder date). Targets ONLY pending "
-            "agent_win rows (source=agent_win, in_collection>=1, never pushed) — "
-            "never an locg_export row or a wish twin — and writes ONLY "
+            "(null publisher, YYYY-01-01 placeholder date), and legacy hand-"
+            "remediated YYYY-01-02 dodge dates (BUI-471). Targets ONLY pending "
+            "agent_win rows (source=agent_win, in_collection>=1, pending push — "
+            "matches the export's own pending definition, BUI-471) — never an "
+            "locg_export row or a wish twin — and writes ONLY "
             "publisher_name/release_date/metron_id, never identity or copy counts. "
-            "Dry-run is the DEFAULT and writes nothing; --apply takes a durable "
-            "backup first and refuses to write if it captured zero rows. A Metron "
-            "miss leaves the field alone (never a fabricated publisher or date); a "
-            "dateless row has no year to era-gate a lookup with and is reported for "
-            "the documented web fallback. Re-running is a no-op."
+            "Dry-run is the DEFAULT and writes nothing; --apply resolves and writes "
+            "in chunks of 25, taking a durable backup once before the first chunk "
+            "with anything to write (refusing if it captured zero rows) — a crash "
+            "mid-run loses at most the in-flight chunk, never the whole backlog. A "
+            "Metron miss leaves the field alone (never a fabricated publisher or "
+            "date); a dateless row has no year to era-gate a lookup with and is "
+            "reported for the documented web fallback. Re-running is a no-op. "
+            "IMPORTANT: requires LOCG_DATA_DIR to be set explicitly (BUI-471) — "
+            "this command refuses to guess which collection store you mean rather "
+            "than risk silently remediating the wrong one. On the Mac Mini the "
+            "server-owned store is: LOCG_DATA_DIR=$HOME/.comics-server/"
+            "collection-store locg collection backfill [--apply]"
         ),
     )
     p_backfill.add_argument("--series", help="Only rows whose series_name contains this text (case-insensitive)")

@@ -1326,12 +1326,28 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
 # CSV export (Unit 3)
 # ---------------------------------------------------------------------------
 
+def _is_pending_push_row(row: dict[str, Any]) -> bool:
+    """True when a row is pending push to LOCG: pushed_to_locg_at IS NULL OR
+    local_added_at > pushed_to_locg_at (a re-pend after an earlier push).
+
+    The single definition of "pending" — shared by :func:`_pending_push_rows`
+    (the export's row set) and, since BUI-471,
+    ``locg.commands._is_backfill_target`` (the backfill's target set). The two
+    used to diverge (backfill required the stricter ``pushed_to_locg_at IS
+    NULL``), so a row re-pended after a push was exported but silently never
+    remediated. Sharing this predicate makes the two provably match.
+    """
+    pushed = row.get("pushed_to_locg_at")
+    added = row.get("local_added_at") or ""
+    return pushed is None or bool(added and added > pushed)
+
+
 def _pending_push_rows(
     payload: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Partition pending-push rows into (ready, manual_variant, manual_series_canonical).
 
-    Pending: pushed_to_locg_at IS NULL OR local_added_at > pushed_to_locg_at.
+    Pending: :func:`_is_pending_push_row`.
     Ready: pending AND not flagged.
     Manual: pending AND flagged (excluded from CSV).
     """
@@ -1340,10 +1356,7 @@ def _pending_push_rows(
     manual_series: list[dict[str, Any]] = []
 
     for row in payload.get("comics", []):
-        pushed = row.get("pushed_to_locg_at")
-        added = row.get("local_added_at") or ""
-        is_pending = pushed is None or (added and added > pushed)
-        if not is_pending:
+        if not _is_pending_push_row(row):
             continue
 
         if row.get("needs_manual_variant"):

@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
+from locg.collection_cache import CollectionCache
 from locg.commands import cmd_collection_audit_pending
 
 # The 21-column LOCG CSV header (collection_io.LOCG_XLSX_HEADERS) — only the
@@ -53,6 +54,54 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
         writer.writeheader()
         writer.writerows(rows)
     return path
+
+
+def _make_cache(tmp_path: Path, name: str = "collection") -> CollectionCache:
+    return CollectionCache(
+        path=tmp_path / f"{name}.json",
+        lock_path=tmp_path / f"{name}.lock",
+        audit_path=tmp_path / f"{name}-history.jsonl",
+    )
+
+
+def _seed_store_row(
+    cache: CollectionCache,
+    *,
+    series_name: str,
+    full_title: str,
+    release_date: str,
+    metron_id: Optional[int] = None,
+    source: str = "agent_win",
+) -> None:
+    """Seed one pending store row (BUI-466 store-correlation tests).
+
+    Fields mirror what ``_row_to_csv_dict`` reads and what
+    ``_is_placeholder_release_date`` gates on: ``source`` and ``metron_id``
+    decide the placeholder's INTENT, ``series_name``/``full_title`` are the
+    correlation key, ``pushed_to_locg_at is None`` keeps it in the "ready to
+    push" set the audit's store lookup draws from.
+    """
+    def mutate(payload: dict[str, Any]) -> None:
+        payload["comics"].append({
+            "publisher_name": "Marvel Comics",
+            "series_name": series_name,
+            "full_title": full_title,
+            "release_date": release_date,
+            "in_collection": 1,
+            "in_wish_list": 0,
+            "marked_read": 0,
+            "my_rating": None,
+            "media_format": "Print",
+            "price_paid": 10.0,
+            "date_purchased": "2026-07-01",
+            "source": source,
+            "gixen_item_id": "w-1",
+            "needs_review": None,
+            "metron_id": metron_id,
+            "pushed_to_locg_at": None,
+            "local_added_at": "2026-07-01T00:00:00.000000Z",
+        })
+    cache.apply(mutate, command="test-seed")
 
 
 # ---------------------------------------------------------------------------
@@ -149,15 +198,73 @@ def test_audit_undecorated_full_title_with_parenthesized_non_year_not_flagged(tm
     assert result["flagged_count"] == 0
 
 
-def test_audit_flags_jan1_placeholder_date(tmp_path):
-    csv_path = _write_csv(tmp_path / "wins.csv", [
-        _row(release_date="1988-01-01"),
-    ])
-    result = cmd_collection_audit_pending(str(csv_path))
+def test_audit_confirmed_placeholder_stays_hard_stop(tmp_path):
+    """BUI-466: a store row that is source=agent_win with no metron_id confirms
+    the shape match as a genuine BUI-105 placeholder — it must still hard-stop
+    (flagged_count), since that IS the case the flag exists to catch."""
+    cache = _make_cache(tmp_path)
+    _seed_store_row(
+        cache,
+        series_name="Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #300",
+        release_date="1988-01-01",
+        metron_id=None,
+    )
+    csv_path = _write_csv(tmp_path / "wins.csv", [_row(release_date="1988-01-01")])
 
+    result = cmd_collection_audit_pending(str(csv_path), cache=cache)
+
+    assert result["flagged_count"] == 1
+    assert result["advisory_count"] == 0
     flagged = result["flagged_rows"][0]
     assert flagged["placeholder_date"] is True
-    assert any("Jan-1 placeholder date" in i for i in flagged["issues"])
+    assert flagged["placeholder_date_confirmed"] is True
+    assert any("confirmed BUI-105 placeholder" in i for i in flagged["issues"])
+
+
+def test_audit_confirmed_genuine_january_date_is_advisory_not_hard_stop(tmp_path):
+    """BUI-466 acceptance criterion: a pending set whose only anomaly is a
+    genuine January cover date (store row carries a metron_id) must NOT
+    hard-stop the sync — demoted to advisory, excluded from flagged_count."""
+    cache = _make_cache(tmp_path)
+    _seed_store_row(
+        cache,
+        series_name="Amazing Spider-Man (1963 - 1998)",
+        full_title="Amazing Spider-Man #300",
+        release_date="1988-01-01",
+        metron_id=5001,
+    )
+    csv_path = _write_csv(tmp_path / "wins.csv", [_row(release_date="1988-01-01")])
+
+    result = cmd_collection_audit_pending(str(csv_path), cache=cache)
+
+    assert result["flagged_count"] == 0
+    assert result["flagged_rows"] == []
+    assert result["advisory_count"] == 1
+    advisory = result["advisory_rows"][0]
+    assert advisory["placeholder_date"] is True
+    assert advisory["placeholder_date_confirmed"] is False
+    assert any("genuine cover date" in i for i in advisory["issues"])
+
+
+def test_audit_unconfirmable_placeholder_is_advisory_not_hard_stop(tmp_path):
+    """BUI-466: no matching store row (0 or >1 matches, or an unreadable/never
+    -imported store) can't confirm intent either way. Must still NOT hard-stop
+    — a genuine BUI-105 placeholder is always blanked before it reaches the
+    CSV, so an unconfirmed non-blank Jan-1 date is, by construction, almost
+    always a real date. The row is still surfaced (advisory_rows), just not
+    blocking."""
+    empty_cache = _make_cache(tmp_path, name="never-imported")  # store file never written
+    csv_path = _write_csv(tmp_path / "wins.csv", [_row(release_date="1988-01-01")])
+
+    result = cmd_collection_audit_pending(str(csv_path), cache=empty_cache)
+
+    assert result["flagged_count"] == 0
+    assert result["advisory_count"] == 1
+    advisory = result["advisory_rows"][0]
+    assert advisory["placeholder_date"] is True
+    assert advisory["placeholder_date_confirmed"] is None
+    assert any("could not be matched" in i for i in advisory["issues"])
 
 
 def test_audit_non_jan1_date_not_flagged_as_placeholder(tmp_path):
@@ -181,6 +288,10 @@ def test_audit_blank_date_not_flagged_as_placeholder(tmp_path):
 
 
 def test_audit_row_with_multiple_issues_lists_all(tmp_path):
+    """The unconfirmable Jan-1 date is demoted to advisory (BUI-466), but the
+    row still lands in flagged_rows because of its OTHER hard-stop issues —
+    and its issues list still carries all 4 messages (3 hard-stop + the
+    advisory placeholder note)."""
     csv_path = _write_csv(tmp_path / "wins.csv", [
         _row(publisher="", series="", full_title="Fantastic Four (Vol. 3) #1", release_date="1998-01-01"),
     ])
@@ -191,6 +302,7 @@ def test_audit_row_with_multiple_issues_lists_all(tmp_path):
     assert flagged["missing_series"] is True
     assert flagged["decorated_full_title"] is True
     assert flagged["placeholder_date"] is True
+    assert flagged["placeholder_date_confirmed"] is None
     assert len(flagged["issues"]) == 4
 
 

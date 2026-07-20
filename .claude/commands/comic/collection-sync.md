@@ -154,14 +154,23 @@ locg collection audit-pending "$CSV" --pretty
 
 Read `row_count`, `flagged_count`, and `flagged_rows` (each entry has
 `full_title` and a human-readable `issues` list — missing
-publisher/series/full_title, decorated full_title, or a Jan-1 placeholder
-date) from the JSON response.
+publisher/series/full_title, decorated full_title, or a **confirmed**
+BUI-105 placeholder date) from the JSON response.
 
 **If `flagged_count` is non-zero, STOP and fix each flagged row at the source**
 (re-run `record-win` with a canonical series + exact full_title + accurate
 release date) before uploading. Partial or wrong rows import as "Not Found";
 an all-dateless batch hangs. **Rows must be complete and exact: publisher +
 canonical series + exact full_title (no decoration) + accurate release date.**
+
+**BUI-466: a Jan-1 date no longer hard-stops the sync by shape alone.** The
+audit reads the collection store to tell a genuine BUI-105 placeholder
+(`source == agent_win`, no `metron_id`) apart from a real January cover date
+(same string, but `metron_id` set or store-unconfirmable) — only a *confirmed*
+placeholder counts toward `flagged_count`. A confirmed-genuine or
+unconfirmable Jan-1 date instead appears in `advisory_count`/`advisory_rows` —
+review it, but **never "correct" it by overwriting the date**; a real January
+cover date must be kept exactly as-is.
 
 **If `dateless_count` is non-zero, backfill those rows' Release Date before
 uploading** — do **not** upload a dateless batch (`all_dateless: true` is the
