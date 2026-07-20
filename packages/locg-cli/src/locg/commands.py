@@ -24,6 +24,7 @@ from locg.collection_cache import (
     _normalize_series_key,
     _utcnow_iso,
     base_full_title,
+    base_series_name,
     owned_match_keys,
     resolve_series_for_win,
     series_year_range,
@@ -4641,4 +4642,550 @@ def cmd_collection_remediate_set_copies(
         "row": outcome["previous_row"],
         "previous_in_collection": outcome["current_in_collection"],
         "new_in_collection": outcome["new_in_collection"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# BUI-461: backfill publisher_name / release_date on ALREADY-STORED pending wins
+# ---------------------------------------------------------------------------
+#
+# BUI-458 and BUI-210 fix the PRODUCER (`_build_win_row`) so newly recorded wins
+# carry a real publisher and a real Metron date. Neither touches the rows already
+# sitting in the store, and on 2026-07-19 that was 77/78 pending `agent_win` rows
+# with a null publisher and 58 carrying the BUI-105 `{year}-01-01` placeholder —
+# remediated by three hand-written, untested one-off scripts. This is that
+# remediation as tested code, and a standing safety net for any future producer
+# regression.
+#
+# It is deliberately NOT a second producer: it never re-derives identity
+# (series_name / full_title / in_collection / gixen_item_id / price / source are
+# never written), only the two fields the audit blocks a sync on.
+
+
+def _backfill_needs_publisher(row: dict[str, Any]) -> bool:
+    """True when the row carries no usable publisher_name."""
+    return not str(row.get("publisher_name") or "").strip()
+
+
+def _backfill_needs_date(row: dict[str, Any]) -> bool:
+    """True when the row will reach LOCG dateless: blank, or a BUI-105 placeholder.
+
+    The placeholder test is ``collection_io._is_placeholder_release_date``
+    itself, imported rather than re-expressed. Parity is load-bearing in the
+    unsafe direction: this predicate decides which stored dates this command may
+    OVERWRITE, so a local copy that drifted wider than the export's would let a
+    backfill destroy a genuine cover date the export was happily keeping. That
+    helper is an INTENT check (``metron_id is None``), not a shape check, so a
+    real January date on a Metron-backed row is correctly not a target here.
+    """
+    from locg.collection_io import _is_placeholder_release_date
+
+    if not str(row.get("release_date") or "").strip():
+        return True
+    return _is_placeholder_release_date(row)
+
+
+def _is_placeholder_shaped(release_date: Any) -> bool:
+    """True for the bare ``YYYY-01-01`` SHAPE, ignoring intent.
+
+    Shares the export's compiled pattern rather than re-typing it, for the same
+    reason :func:`_backfill_needs_date` shares its predicate: if the placeholder
+    shape ever widens, a hand-copied literal here would silently stop matching
+    and the safety guard built on it would quietly stop firing. Distinct from
+    ``_is_placeholder_release_date`` — that one needs a whole row to judge
+    INTENT; this asks only about a date string, which is all the write-time
+    guard has once it is deciding whether a metron_id may bless it.
+    """
+    from locg.collection_io import _PLACEHOLDER_DATE_RE
+
+    return bool(_PLACEHOLDER_DATE_RE.match(str(release_date or "")))
+
+
+def _is_backfill_target(row: dict[str, Any]) -> bool:
+    """True for a pending win row this command is allowed to touch.
+
+    The safety envelope, all four conditions required:
+
+    * ``source == "agent_win"`` — an ``locg_export`` row's publisher/date came
+      from LOCG itself and is authoritative; overwriting it with a Metron guess
+      would corrupt the reconciliation baseline.
+    * ``in_collection >= 1`` — a tracked-but-not-owned row (BUI-249/250/251) is
+      not part of the pending upload.
+    * ``pushed_to_locg_at is None`` — already-pushed rows are LOCG's copy now;
+      editing them locally silently desynchronizes the two sides.
+    * ``in_wish_list`` falsy — never a wish twin. (Redundant with the
+      ``in_collection`` gate for rows this codebase writes, kept explicit
+      because a wish twin is the BUI-122 data-loss shape and the cost of the
+      extra check is zero.)
+
+    ...and at least one of the two backfillable fields must actually be empty,
+    so a re-run is a no-op rather than a rewrite (idempotence).
+    """
+    if row.get("source") != "agent_win":
+        return False
+    if (row.get("in_collection") or 0) < 1:
+        return False
+    if row.get("pushed_to_locg_at") is not None:
+        return False
+    if row.get("in_wish_list"):
+        return False
+    return _backfill_needs_publisher(row) or _backfill_needs_date(row)
+
+
+def _backfill_row_matches_filters(
+    row: dict[str, Any], series: Optional[str], full_title: Optional[str]
+) -> bool:
+    """Case-insensitive substring filters on series_name / full_title.
+
+    Substring, not exact: these are SELECTION filters for narrowing a run
+    ("just the X-Men rows"), never row identity — identity resolution under the
+    write lock goes through :func:`_stable_identity_candidates`, which is exact.
+    """
+    if series:
+        if series.strip().lower() not in str(row.get("series_name") or "").lower():
+            return False
+    if full_title:
+        if full_title.strip().lower() not in str(row.get("full_title") or "").lower():
+            return False
+    return True
+
+
+def _backfill_row_identity(row: dict[str, Any]) -> dict[str, Any]:
+    """The stable identity used to re-find this row under the write lock."""
+    return {
+        "gixen_item_id": (str(row.get("gixen_item_id") or "").strip() or None),
+        "full_title": row.get("full_title"),
+        "release_date": row.get("release_date"),
+        "source": row.get("source"),
+    }
+
+
+def _backfill_resolve_row(
+    row: dict[str, Any],
+    metron: Any,
+    metron_disabled: bool,
+) -> dict[str, Any]:
+    """Resolve one row's publisher/date from Metron. No writes, no lock.
+
+    Returns ``{"fields": {name: {"from", "to"}}, "reason": str|None,
+    "metron_disabled": bool, "metron_calls": int}``.
+
+    Resolution rules, and why each is the conservative one:
+
+    * **The year gate needs a year.** ``_metron_release_date`` returns its
+      candidate UNGATED when it has no 4-digit year to compare against, and an
+      ungated ``lookup_issue`` is exactly the reprint trap (a naive
+      ``lookup_issue("The X-Men", "59", None)`` can return a 2005 collected
+      edition). The row's own ``release_date`` year is the only year available
+      here, and on a BUI-105 placeholder that year is REAL — only the month/day
+      are fabricated. So a placeholder row is fully resolvable; a genuinely
+      DATELESS row has no year, gets no lookup, and is reported for the
+      documented web fallback (``references/date-backfill.md``) instead of
+      being guessed at.
+    * **One accept test, shared with the producer.** A hit is trusted only when
+      ``_metron_release_date`` yields a date for it — byte-identical to the
+      test ``_build_win_row`` applies at its own date-only lookup. A hit whose
+      date the era guard rejects is dropped WHOLE (id and publisher too): they
+      all came from the same possibly-wrong issue match, and a reprint under a
+      different imprint would otherwise contribute a wrong publisher that
+      imports to LOCG silently.
+    * **An existing metron_id is exact.** A row that already carries one needs
+      no re-resolution for its publisher — ``lookup_issue_detail(id)`` is an
+      unambiguous fetch by primary key, and it costs one call instead of two.
+    * **Misses leave the field alone.** Never a fabricated publisher, never a
+      fabricated date. A null publisher is the intended ``audit-pending``
+      backstop; a wrong one imports silently.
+    """
+    from locg.metron import MetronCredentialError
+
+    fields: dict[str, dict[str, Any]] = {}
+    reasons: list[str] = []
+    metron_calls = 0
+
+    needs_publisher = _backfill_needs_publisher(row)
+    needs_date = _backfill_needs_date(row)
+    existing_metron_id = row.get("metron_id")
+
+    series_query = base_series_name(str(row.get("series_name") or "")).strip()
+    _, issue_num = _split_full_title(str(row.get("full_title") or ""))
+    year = _coerce_year(row.get("release_date"))
+    year_str = str(year) if year is not None else None
+
+    resolved: Optional[dict[str, Any]] = None
+    # A fresh issue resolution is needed for a date, and for a publisher on a
+    # row with no metron_id to fetch detail by.
+    wants_lookup = needs_date or (needs_publisher and existing_metron_id is None)
+
+    if wants_lookup and not metron_disabled:
+        if year_str is None:
+            reasons.append(
+                "no year available to era-gate a Metron lookup (dateless row) — "
+                "resolve via the documented web fallback"
+            )
+        elif not issue_num:
+            reasons.append("no issue number in full_title")
+        elif not series_query:
+            reasons.append("no series_name to search Metron with")
+        else:
+            try:
+                metron_calls += 1
+                looked_up = metron.lookup_issue(series_query, issue_num, year_str)
+                if looked_up and _metron_release_date(looked_up, year_str) is not None:
+                    resolved = looked_up
+                else:
+                    reasons.append(
+                        "Metron returned no era-compatible issue match "
+                        f"({series_query} #{issue_num}, {year_str})"
+                    )
+            except MetronCredentialError:
+                metron_disabled = True
+                reasons.append("Metron credentials not configured")
+            else:
+                metron_disabled = _check_metron_degraded(metron, metron_disabled)
+    elif wants_lookup:
+        reasons.append("Metron disabled for this run")
+
+    # The date Metron backs for this row, whether or not it differs from what is
+    # stored. Non-None exactly when a hit was accepted (accepting `resolved`
+    # REQUIRES this call to have produced a date), so it doubles as "Metron
+    # confirmed this row's date" for the invariant guard below — a placeholder
+    # that happens to coincide with the genuine cover date (Fantastic Four #16:
+    # stamped 1963-01-01, and 1963-01-01 really is the cover date) is confirmed,
+    # not merely unchanged.
+    metron_date = _metron_release_date(resolved, year_str) if resolved is not None else None
+    if needs_date and metron_date and metron_date != (row.get("release_date") or None):
+        fields["release_date"] = {"from": row.get("release_date"), "to": metron_date}
+
+    # Carrying the metron_id is what makes a genuine January cover date survive
+    # export: `_is_placeholder_release_date` blanks a `YYYY-01-01` date only
+    # while `metron_id is None`, so a Metron-backed January row keeps its real
+    # date with no fabricated `-01-02` day needed. Only ever set alongside a
+    # Metron date — see the invariant guard below.
+    if resolved is not None and existing_metron_id is None and resolved.get("metron_id"):
+        fields["metron_id"] = {"from": None, "to": resolved["metron_id"]}
+
+    detail_id = resolved.get("metron_id") if resolved else existing_metron_id
+    if needs_publisher and detail_id is not None and not metron_disabled:
+        try:
+            metron_calls += 1
+            detail = metron.lookup_issue_detail(detail_id)
+            publisher = (detail or {}).get("publisher")
+            if isinstance(publisher, str) and publisher.strip():
+                fields["publisher_name"] = {
+                    "from": row.get("publisher_name"),
+                    "to": publisher.strip(),
+                }
+            else:
+                reasons.append(f"Metron has no publisher on issue {detail_id}")
+        except MetronCredentialError:
+            metron_disabled = True
+            reasons.append("Metron credentials not configured")
+        else:
+            metron_disabled = _check_metron_degraded(metron, metron_disabled)
+    elif needs_publisher and not reasons:
+        # Invariant: every publisher we decline to fetch gets a reason. Reaching
+        # here with none already recorded means the breaker tripped between a
+        # usable metron_id (freshly accepted, or the row's own) and the detail
+        # call — otherwise that row silently gains a date but no publisher, and
+        # the run reports nothing to retry. Every other way of arriving without
+        # a publisher (no year, no issue number, no series, no era-compatible
+        # match, missing credentials) has already recorded its own reason above.
+        reasons.append("Metron unavailable before the publisher fetch")
+
+    # INVARIANT (defensive): a metron_id must never land on a row whose Jan-1
+    # date Metron did not confirm. Setting one flips
+    # `_is_placeholder_release_date` to False, so the export would ship a
+    # FABRICATED Jan-1 date to LOCG instead of blanking it — turning a merely
+    # dateless row into a wrongly-dated one, which is the more expensive
+    # mistake. Unreachable as written (a metron_id is only planned alongside an
+    # accepted hit, and accepting one requires `_metron_release_date` to have
+    # produced the very date being kept), and kept anyway because it is the one
+    # way this command could corrupt data rather than just fail to improve it.
+    if "metron_id" in fields:
+        final_date = str(
+            fields.get("release_date", {}).get("to", row.get("release_date")) or ""
+        )
+        if _is_placeholder_shaped(final_date) and final_date != (metron_date or ""):
+            del fields["metron_id"]
+            reasons.append(
+                "withheld metron_id: row would keep an unconfirmed Jan-1 placeholder "
+                "the export must still blank"
+            )
+
+    return {
+        "fields": fields,
+        "metron_date": metron_date,
+        "reason": "; ".join(reasons) if reasons else None,
+        "metron_disabled": metron_disabled,
+        "metron_calls": metron_calls,
+    }
+
+
+def _backfill_backup_dir(cache: CollectionCache, backup_dir: Optional[str]) -> Path:
+    """Destination for the pre-write durable snapshot.
+
+    Defaults to a timestamped subdir of ``<store>-backups/`` — the SAME sibling
+    root the BUI-433 backup endpoint uses, deliberately outside the store so
+    ``CollectionCache._rotate_backups``' 3-deep ``.bak.0/1/2`` ring can never
+    evict it. A bulk multi-row write needs a snapshot that survives however many
+    writes happen before someone decides to restore it.
+    """
+    if backup_dir:
+        return Path(backup_dir)
+    store_dir = cache.path.parent
+    root = store_dir.parent / f"{store_dir.name}-backups"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    return root / f"backfill-{ts}"
+
+
+def cmd_collection_backfill(
+    *,
+    series: Optional[str] = None,
+    full_title: Optional[str] = None,
+    apply: bool = False,
+    cadence: float = 3.0,
+    limit: Optional[int] = None,
+    backup_dir: Optional[str] = None,
+    cache: Optional[CollectionCache] = None,
+    metron: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Backfill publisher_name / release_date on stored pending wins (BUI-461).
+
+    Read-only by default: ``apply=False`` resolves every candidate against
+    Metron and prints the exact field diff, writing NOTHING. ``apply=True``
+    takes a durable ``backup_store`` snapshot first and refuses to write if that
+    snapshot captured zero rows, then applies every planned change in ONE
+    ``CollectionCache.apply`` cycle — locked, ``.bak``-rotated, atomic, so a
+    crash mid-run leaves the store either fully un-backfilled or fully
+    backfilled, never half.
+
+    Only ``publisher_name``, ``release_date`` and ``metron_id`` are ever
+    written, and only onto rows passing :func:`_is_backfill_target`. Identity
+    and copy counts are never touched. Re-running is a no-op: a row whose
+    fields are now populated no longer matches the target predicate.
+
+    Every network resolution happens BEFORE the lock is taken — a Metron batch
+    can run for minutes at ``cadence`` and must not hold an exclusive flock the
+    comics server also needs (``apply``'s own timeout is 30s).
+
+    ``cadence`` seconds are slept per Metron call spent (default 3.0 — Metron
+    allows ~20 req/min, so ~3s per call). Per CALL, not per row: a row needing
+    both a date and a publisher costs TWO calls, and pacing per row would run a
+    backlog of those at double the intended rate — straight into the rate limit
+    whose one trip latches Metron off for the rest of the run (BUI-465).
+    Once Metron trips its degraded breaker (BUI-255) the remaining rows make no
+    further calls and are reported unresolved; ``metron_degraded`` in the result
+    says the run was partial, so a follow-up run picks up what was left. Pair
+    with ``limit`` to work through a large backlog across consecutive runs.
+
+    Returns ``{status, applied, candidate_count, planned_count, updated_count,
+    changes, unresolved, skipped_at_write, metron_degraded, backup}``. ``status``
+    is ``"preview"`` for a dry run, ``"ok"`` after a write (or an ``--apply`` run
+    that found no work), ``"invalid_request"``, ``"not_imported"`` (R11) or
+    ``"backup_failed"`` when it refused to run. ``candidate_count`` counts every
+    row matching the filters BEFORE ``limit``, so a chunked run still reports the
+    size of the remaining backlog.
+    """
+    from locg.metron import MetronClient
+
+    if cadence < 0:
+        return {"status": "invalid_request", "error": "cadence must be >= 0"}
+    if limit is not None and limit < 0:
+        return {"status": "invalid_request", "error": "limit must be >= 0"}
+
+    if cache is None:
+        cache = CollectionCache()
+    if metron is None:
+        metron = MetronClient()
+
+    payload = cache.load()
+    if payload.get("last_full_import") is None:
+        return _not_imported_error()
+
+    candidates = [
+        row
+        for row in payload.get("comics", [])
+        if _is_backfill_target(row) and _backfill_row_matches_filters(row, series, full_title)
+    ]
+    candidate_count = len(candidates)
+    if limit is not None:
+        candidates = candidates[:limit]
+
+    plans: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    metron_disabled = False
+    calls_since_sleep = 0
+
+    for row in candidates:
+        if calls_since_sleep and cadence > 0 and not metron_disabled:
+            time.sleep(cadence * calls_since_sleep)
+        outcome = _backfill_resolve_row(row, metron, metron_disabled)
+        metron_disabled = outcome["metron_disabled"]
+        calls_since_sleep = outcome["metron_calls"]
+        if outcome["fields"]:
+            plans.append({
+                "identity": _backfill_row_identity(row),
+                "full_title": row.get("full_title"),
+                "series_name": row.get("series_name"),
+                "fields": outcome["fields"],
+                # Carried so the write can re-run the metron_id invariant against
+                # the row as it ACTUALLY is under the lock, not as it looked when
+                # this plan was made. See _mutate.
+                "metron_date": outcome["metron_date"],
+            })
+        if outcome["reason"]:
+            unresolved.append({
+                "full_title": row.get("full_title"),
+                "gixen_item_id": row.get("gixen_item_id"),
+                "reason": outcome["reason"],
+            })
+
+    changes = [
+        {
+            "full_title": p["full_title"],
+            "series_name": p["series_name"],
+            "gixen_item_id": p["identity"]["gixen_item_id"],
+            "fields": p["fields"],
+        }
+        for p in plans
+    ]
+    base_result: dict[str, Any] = {
+        "applied": False,
+        "candidate_count": candidate_count,
+        "planned_count": len(plans),
+        "updated_count": 0,
+        "changes": changes,
+        "unresolved": unresolved,
+        "skipped_at_write": [],
+        "metron_degraded": metron_disabled,
+        "backup": None,
+    }
+
+    if not plans:
+        # `preview` means "this was a dry run", never "there was nothing to do" —
+        # an --apply run with an empty plan completed successfully and simply had
+        # no work, so it reports ok. No backup is taken for a zero-row write.
+        return {"status": "ok" if apply else "preview", **base_result}
+    if not apply:
+        return {"status": "preview", **base_result}
+
+    dest = _backfill_backup_dir(cache, backup_dir)
+    try:
+        backup = cache.backup_store(dest)
+    except (RuntimeError, OSError) as exc:
+        return {
+            "status": "backup_failed",
+            "error": f"backup to {dest} failed: {exc} — refusing to write",
+            **base_result,
+        }
+    if backup["comics_count"] == 0 and backup["wish_list_count"] == 0:
+        return {
+            "status": "backup_failed",
+            "error": (
+                f"backup at {backup['backup_path']} captured zero rows — an empty "
+                "backup is indistinguishable from a broken one; refusing to write"
+            ),
+            **base_result,
+        }
+    base_result["backup"] = backup
+
+    applied_changes: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    def _mutate(locked_payload: dict[str, Any]) -> None:
+        comics = locked_payload.get("comics", [])
+        for plan in plans:
+            identity = plan["identity"]
+            idxs = _stable_identity_candidates(comics, **identity)
+            if len(idxs) != 1:
+                # Re-resolved under the lock (BUI-417 TOCTOU precedent): the row
+                # moved, vanished, or now collides. Skip it — the next run will
+                # pick it up if it still needs backfilling.
+                skipped.append({
+                    "full_title": plan["full_title"],
+                    "reason": f"{len(idxs)} rows match the identity under the write lock",
+                })
+                continue
+            locked_row = comics[idxs[0]]
+            if not _is_backfill_target(locked_row):
+                skipped.append({
+                    "full_title": plan["full_title"],
+                    "reason": "row no longer a pending agent_win backfill target under the lock",
+                })
+                continue
+            written: dict[str, dict[str, Any]] = {}
+            for field, delta in plan["fields"].items():
+                if field == "metron_id":
+                    continue  # deferred below, once release_date has settled
+                if (locked_row.get(field) or None) != (delta["from"] or None):
+                    # A concurrent writer already changed this exact field —
+                    # theirs wins; never clobber a fresher value with a value
+                    # resolved before the lock.
+                    continue
+                locked_row[field] = delta["to"]
+                written[field] = delta
+
+            # The metron_id invariant, re-run against the row AS IT IS under the
+            # lock. Checking it only at plan time is not enough: a plan can carry
+            # a metron_id and NO release_date (the row had a real date when it
+            # was resolved), and a concurrent record-win retry can meanwhile
+            # rebuild that row by gixen_item_id and downgrade its date back to a
+            # `{year}-01-01` placeholder — the exact regression
+            # `_dedup_era_compatible` documents. The per-field staleness check
+            # cannot catch it, because metron_id's own `from` (None) is still
+            # accurate. Writing it then would flip
+            # `_is_placeholder_release_date` to False and ship that FABRICATED
+            # date to LOCG. Only a date Metron actually confirmed may be blessed.
+            metron_id_delta = plan["fields"].get("metron_id")
+            if metron_id_delta is not None and (locked_row.get("metron_id") or None) is None:
+                locked_date = locked_row.get("release_date")
+                if not _is_placeholder_shaped(locked_date) or str(locked_date or "") == str(
+                    plan["metron_date"] or ""
+                ):
+                    locked_row["metron_id"] = metron_id_delta["to"]
+                    written["metron_id"] = metron_id_delta
+                else:
+                    skipped.append({
+                        "full_title": plan["full_title"],
+                        "reason": (
+                            "withheld metron_id under the write lock: the row now "
+                            f"carries an unconfirmed {locked_date} placeholder the "
+                            "export must still blank"
+                        ),
+                    })
+            if written:
+                applied_changes.append({
+                    "full_title": plan["full_title"],
+                    "series_name": plan["series_name"],
+                    "gixen_item_id": identity["gixen_item_id"],
+                    "fields": written,
+                })
+            else:
+                skipped.append({
+                    "full_title": plan["full_title"],
+                    "reason": "all planned fields changed under the lock; nothing written",
+                })
+
+    cache.apply(_mutate, command="collection-backfill")
+
+    cache.append_audit({
+        "type": "collection_backfill",
+        "ts": _utcnow_iso(),
+        "command": "collection-backfill",
+        "details": {
+            "filters": {"series": series, "full_title": full_title, "limit": limit},
+            "backup_path": backup["backup_path"],
+            "updated_count": len(applied_changes),
+            "changes": applied_changes,
+            "skipped_at_write": skipped,
+        },
+    })
+
+    return {
+        "status": "ok",
+        **base_result,
+        "applied": True,
+        "updated_count": len(applied_changes),
+        "changes": applied_changes,
+        "skipped_at_write": skipped,
     }
