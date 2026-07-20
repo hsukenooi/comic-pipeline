@@ -1484,6 +1484,118 @@ def test_record_win_series_from_index(tmp_path):
     assert row["metron_id"] is None
 
 
+def _seed_index_for(cache, series: str, full_title: str):
+    """Seed one locg_export row and rebuild series_name_index off it, so a win
+    for `series` resolves via the index with no Metron series call."""
+    from locg.collection_cache import rebuild_series_name_index
+
+    _seed_cache(cache, [{
+        **_agent_win_row(series=series, full_title=full_title),
+        "source": "locg_export",
+    }])
+
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+    return cache
+
+
+def _dated_metron(store_date: str, *, metron_id: int = 77):
+    from unittest.mock import MagicMock
+
+    m = MagicMock()
+    m.lookup_issue.return_value = {
+        "metron_id": metron_id,
+        "cover_date": None,
+        "store_date": store_date,
+        "series_year_began": 1963,
+        "series_year_end": 1981,
+        "series_name": "X-Men",
+        "series_id": 5,
+    }
+    m.format_series_name.return_value = "X-Men (1963 - 1981)"
+    m.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": "Marvel Comics",
+    }
+    m.degraded = False
+    return m
+
+
+def test_record_win_null_year_dates_from_series_range(tmp_path):
+    """BUI-464 AC: a win comic-identify could not date at all ("X-Men 109 - 1st
+    Weapon Alpha VG/Fine Cond" carries no year) no longer ships dateless. The
+    index-resolved volume's own window supplies the era evidence the win lacks,
+    so the BUI-210 date-only lookup may run and its hit is gated on that window."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = _seed_index_for(
+        make_cache(tmp_path), "The X-Men (Vol. 1) (1963 - 1981)", "The X-Men #1"
+    )
+    metron = _dated_metron("1977-11-08")
+
+    cmd_collection_record_win(
+        [_make_win(series="X-Men", issue="109", year=None, item_id="NY1")],
+        cache=cache, metron=metron,
+    )
+
+    metron.lookup_issue.assert_called_once()
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "The X-Men (Vol. 1) (1963 - 1981)"
+    assert row["release_date"] == "1977-11-08"
+    assert row["metron_id"] == 77
+    assert row["publisher_name"] == "Marvel Comics"
+
+
+def test_record_win_null_year_rejects_out_of_era_hit(tmp_path):
+    """The guard is real, not a rubber stamp: a null-year win whose Metron hit
+    is a modern reprint of the same masthead keeps its correct index-resolved
+    series but takes NO date, id, or publisher from the wrong-era hit (BUI-467's
+    drop applied on era evidence that is not the win's own year)."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = _seed_index_for(
+        make_cache(tmp_path), "The X-Men (Vol. 1) (1963 - 1981)", "The X-Men #1"
+    )
+    metron = _dated_metron("2005-03-09")
+
+    cmd_collection_record_win(
+        [_make_win(series="X-Men", issue="109", year=None, item_id="NY2")],
+        cache=cache, metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "The X-Men (Vol. 1) (1963 - 1981)"
+    assert row["release_date"] is None
+    assert row["metron_id"] is None
+    # A loud null beats a quiet wrong value (BUI-458) — a reprint under another
+    # imprint must never import its publisher onto a vintage row.
+    assert row["publisher_name"] is None
+
+
+def test_record_win_null_year_no_era_evidence_makes_no_metron_call(tmp_path):
+    """Unchanged where there is nothing to guard with: a null-year win whose
+    series is NOT in the index has no independent era evidence, so BUI-464 must
+    not open the ungated lookup for it. It stays dateless and manual — never
+    auto-dated against a guessed volume."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    metron = _null_metron()
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn Directors Cut", issue="1", year=None, item_id="NY3")],
+        cache=cache, metron=metron,
+    )
+
+    assert result["manual_series_count"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["needs_manual_series_canonical"] is True
+    assert row["release_date"] is None
+    # No placeholder is fabricated from the volume's start year — that would
+    # stamp a wrong, undeletable date (a placeholder fails _reconcile_score
+    # open, so a wrong one silently drops the win).
+
+
 def test_record_win_index_path_found_by_year_gated_check(tmp_path, monkeypatch):
     """Acceptance (BUI-105): a record-win resolved via series_name_index is
     reported in_collection by a subsequent year-gated collection-check."""
@@ -3108,10 +3220,45 @@ def test_metron_release_date_input_shapes():
     assert _metron_release_date({"cover_date": "1969-11-10"}, 1970) is None
     assert _metron_release_date({"cover_date": "1971-03-01"}, 1970) is None
 
-    # Not a clean 4-digit year → nothing to guard against, candidate returned
-    # ungated (the R36 series-resolution path's long-standing behavior).
+    # Not a clean 4-digit year AND no series_range → nothing to guard against,
+    # candidate returned ungated (the R36 series-resolution path's long-standing
+    # behavior).
     for bad_year in (None, "", "197", "19700", "n/a"):
         assert _metron_release_date({"store_date": "2005-03-09"}, bad_year) == "2005-03-09"
+
+
+def test_metron_release_date_series_range_gates_a_null_year():
+    """BUI-464: with no identify year, the LOCG volume's own publication window
+    stands in as the era guard — so a null year is no longer ungated."""
+    from locg.commands import _metron_release_date
+
+    xmen_vol1 = (1963, 1981)
+
+    # In-window store_date for a genuinely 1977 X-Men #109 — accepted.
+    assert _metron_release_date({"store_date": "1977-11-08"}, None, xmen_vol1) == "1977-11-08"
+    # The reprint/collected-edition trap BUI-268 exists to catch. Before this
+    # change a null year returned it ungated and poisoned the row.
+    assert _metron_release_date({"store_date": "2005-03-09"}, None, xmen_vol1) is None
+    # A modern-volume hit for the same masthead is likewise out of era.
+    assert _metron_release_date({"cover_date": "2019-10-01"}, None, xmen_vol1) is None
+
+    # store_date gets one year of slack at each edge: a volume's January-cover
+    # first issue shipped the previous November.
+    assert _metron_release_date({"store_date": "1962-11-05"}, None, xmen_vol1) == "1962-11-05"
+    assert _metron_release_date({"store_date": "1961-11-05"}, None, xmen_vol1) is None
+    # cover_date gets none — a cover date is by definition inside the run.
+    assert _metron_release_date({"cover_date": "1962-11-05"}, None, xmen_vol1) is None
+    assert _metron_release_date({"cover_date": "1963-09-01"}, None, xmen_vol1) == "1963-09-01"
+
+    # An open-ended "(1980 - Present)" window still rejects a pre-run date.
+    assert _metron_release_date({"cover_date": "2030-01-01"}, None, (1980, 9999)) == "2030-01-01"
+    assert _metron_release_date({"cover_date": "1975-01-01"}, None, (1980, 9999)) is None
+
+    # An undated candidate cannot be gated, so it is not accepted.
+    assert _metron_release_date({"store_date": "not-a-date"}, None, xmen_vol1) is None
+
+    # A clean year still wins outright — series_range never loosens it.
+    assert _metron_release_date({"store_date": "1977-11-08"}, 1970, xmen_vol1) is None
 
 
 def test_record_win_genuine_january_metron_date_survives_export(tmp_path):

@@ -3450,7 +3450,11 @@ def _dedup_variant_compatible(variant_text: str, candidate_suffix: Optional[str]
     return known_win_suffix == known_candidate_suffix
 
 
-def _metron_release_date(metron_data: Optional[dict[str, Any]], year_raw: Any) -> Optional[str]:
+def _metron_release_date(
+    metron_data: Optional[dict[str, Any]],
+    year_raw: Any,
+    series_range: Optional[tuple[int, int]] = None,
+) -> Optional[str]:
     """The trustworthy ``release_date`` for a win from a Metron lookup, or None.
 
     ONE helper for the whole record-win date decision, so the site that decides
@@ -3500,10 +3504,33 @@ def _metron_release_date(metron_data: Optional[dict[str, Any]], year_raw: Any) -
       whole result. Widening it would admit UK/foreign reprint editions and
       one-year Metron data-entry slips for nothing in return.
 
-    When ``year_raw`` is not a clean 4-digit year there is nothing to guard
-    against either way, so the candidate is returned ungated — unchanged
-    behavior for the R36 series-resolution path, which is the only caller that
-    can reach here without a validated year.
+    When ``year_raw`` is not a clean 4-digit year, ``series_range`` (BUI-464)
+    is the substitute era evidence: the ``(begin, end)`` publication window
+    parsed off the LOCG canonical series name that
+    :func:`resolve_series_for_win` matched this win to (e.g. ``"The X-Men
+    (Vol. 1) (1963 - 1981)"`` -> ``(1963, 1981)``). That window is INDEPENDENT
+    of the Metron hit being judged — it comes from the local collection's own
+    ``series_name_index`` — which is what makes it a real guard rather than a
+    tautology. Pass it ONLY when it has that independent provenance; a range
+    derived from the same hit (``metron.format_series_name``) would gate the
+    candidate against itself and always pass.
+
+    The store_date/cover_date asymmetry above is preserved against the window:
+    a ``store_date`` may sit one year outside it (a volume's first issue with a
+    January cover shipped the previous November), a ``cover_date`` may not — a
+    cover date is by definition inside its own volume's run.
+
+    Known, deliberate: a bare single-year decoration (``"The Amazing
+    Spider-Man (1963)"``) parses to the degenerate one-year window
+    ``(1963, 1963)``, so a genuine 1988 issue's date is rejected. The outcome
+    is a dateless row — exactly what a null year produced before this
+    parameter existed — so the failure is a missed improvement, never a wrong
+    date written.
+
+    With neither a clean year nor a ``series_range`` there is nothing to guard
+    against, so the candidate is returned ungated — unchanged behavior for the
+    R36 series-resolution path, which is the only caller that can reach here
+    with no era evidence of any kind.
     """
     if not metron_data:
         return None
@@ -3517,7 +3544,15 @@ def _metron_release_date(metron_data: Optional[dict[str, Any]], year_raw: Any) -
 
     year_str = str(year_raw).strip() if year_raw is not None else ""
     if not re.fullmatch(r"\d{4}", year_str):
-        return candidate
+        if series_range is None:
+            return candidate
+        candidate_year = _coerce_year(candidate)
+        if candidate_year is None:
+            return None
+        begin, end = series_range
+        if store_date:
+            begin, end = begin - 1, end + 1
+        return candidate if begin <= candidate_year <= end else None
     if store_date:
         return candidate if _year_gate_accepts(year_str, candidate) else None
     return candidate if candidate.startswith(year_str) else None
@@ -3799,8 +3834,26 @@ def _build_win_row(
     resolved_series = resolve_series_for_win(
         norm_key, issue_num, year_raw, series_name_index, volume_candidates
     )
+    # BUI-464: era evidence for a win comic-identify could not date at all.
+    # Most eBay comic titles carry no year ("X-Men 109 - 1st Weapon Alpha
+    # (Vindicator) VG/Fine Cond"), so `year_raw` is null and BOTH the BUI-210
+    # date-only lookup and the BUI-105 placeholder stamp — each of which
+    # demands a clean 4-digit year — are skipped, shipping the row dateless.
+    # But when the win resolved through `series_name_index`, the LOCG canonical
+    # name it matched carries the volume's own publication window, and THAT is
+    # era evidence the win itself lacks. It is independent of anything Metron
+    # is about to say, so it can gate a Metron hit (see _metron_release_date).
+    # Captured only on the index path: the Metron step-2 fallback below derives
+    # its series name from the very hit we would be judging, so its range would
+    # be circular and is deliberately left None.
+    index_series_range: Optional[tuple[int, int]] = None
     if resolved_series is not None:
         canonical_series = resolved_series
+        # Captured exactly when the win's own year gate is inactive — the SAME
+        # `\d{4}` test _metron_release_date applies, so the two are strictly
+        # complementary and no row is judged by both or by neither.
+        if not re.fullmatch(r"\d{4}", str(year_raw).strip() if year_raw is not None else ""):
+            index_series_range = series_year_range(resolved_series)
     elif not metron_disabled:
         try:
             metron_attempted += 1
@@ -3896,13 +3949,21 @@ def _build_win_row(
     # is byte-identical, so re-asking spends two more requests to be told "no" a
     # second time. (Step-2 doesn't run at all on the common index-resolved path,
     # which is the path this block exists to serve.)
+    #
+    # BUI-464: a null year no longer blocks this lookup outright — it blocks it
+    # only when there is no era evidence at all. `index_series_range` is that
+    # evidence when the series resolved through series_name_index, and it gates
+    # the hit in the clean year's place, so the "no era guard whatsoever"
+    # trap this block's year requirement existed to avoid never opens. The
+    # request weight is charged in the same place as before, so BUI-465's
+    # pacing already covers the extra lookups this admits.
     if metron_data is None and issue_num and not metron_disabled and not issue_lookup_done:
         year_str = str(year_raw).strip() if year_raw is not None else ""
-        if re.fullmatch(r"\d{4}", year_str):
+        if re.fullmatch(r"\d{4}", year_str) or index_series_range is not None:
             try:
                 metron_attempted += 1
                 looked_up = metron.lookup_issue(series_raw, issue_num, year_raw)
-                if looked_up and _metron_release_date(looked_up, year_raw) is not None:
+                if looked_up and _metron_release_date(looked_up, year_raw, index_series_range) is not None:
                     metron_succeeded += 1
                     metron_data = looked_up
             except MetronCredentialError:
@@ -3939,7 +4000,11 @@ def _build_win_row(
     # date at all is not evidence of a wrong issue — it stays and the row
     # ships dateless, same as before).
     has_candidate_date = bool(metron_data and (metron_data.get("store_date") or metron_data.get("cover_date")))
-    if metron_data is not None and has_candidate_date and _metron_release_date(metron_data, year_raw) is None:
+    if (
+        metron_data is not None
+        and has_candidate_date
+        and _metron_release_date(metron_data, year_raw, index_series_range) is None
+    ):
         metron_data = None
 
     # BUI-458: capture the issue's publisher (e.g. "Marvel Comics") from
@@ -4038,7 +4103,7 @@ def _build_win_row(
     # 2022 reprint hit, which then made a year-gated collection-check reject
     # the genuinely-owned 1991 copy as a mismatched era.)
     #
-    release_date: Optional[str] = _metron_release_date(metron_data, year_raw)
+    release_date: Optional[str] = _metron_release_date(metron_data, year_raw, index_series_range)
 
     # BUI-105: when no Metron data backs this win (the series_name_index
     # path, or the bare-series manual fallback), there is no Metron date,
