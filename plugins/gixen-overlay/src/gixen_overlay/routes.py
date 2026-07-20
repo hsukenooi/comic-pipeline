@@ -1551,7 +1551,27 @@ async def api_collection_import(file: UploadFile = File(...)):
                         ),
                     )
                 tmp.write(chunk)
-        return cmd_collection_import(tmp_path)
+        import_result = cmd_collection_import(tmp_path)
+        if import_result.get("status") == "explicit_store_required":
+            # BUI-476 backstop, symmetric with api_record_win_commit's. Also
+            # unreachable (`_ensure_collection_store()` above sets
+            # LOCG_DATA_DIR, outside this try), but a refusal served as a 200
+            # would slip past `/comic:collection-sync`'s `curl -sf` check and
+            # read as a successful reconcile that in fact imported nothing.
+            # HTTPException is not in the except tuple below, so this escapes.
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    **import_result,
+                    "error": "explicit_store_required",
+                    "refusal_detail": import_result.get("error"),
+                    "message": (
+                        "import refused to resolve a collection store; "
+                        "nothing was imported"
+                    ),
+                },
+            )
+        return import_result
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
     except (InvalidFileException, zipfile.BadZipFile, ValueError, KeyError) as exc:
@@ -1628,6 +1648,33 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
                 "exception": f"{type(exc).__name__}: {exc}",
             },
         ) from exc
+
+    if result.get("status") == "explicit_store_required":
+        # BUI-476 backstop. `_ensure_collection_store()` above guarantees
+        # LOCG_DATA_DIR is set, so record-win's store guard is unreachable from
+        # here — but the mark-seen below keys off `merged_wins`, NOT off what
+        # was actually written, so a refusal that slipped through would mark
+        # every win seen having recorded none of them, and BUI-121's seen-set
+        # makes that unrecoverable by re-running. Raise before mark-seen rather
+        # than trust the reachability argument to survive a future refactor.
+        raise HTTPException(
+            status_code=500,
+            detail={
+                # `result` is spread FIRST: the refusal payload carries its own
+                # `error` (the explanatory sentence), and the endpoint's own
+                # `error` is the machine-readable code the caller branches on,
+                # so ours must win the key collision — but its text is the only
+                # thing that says WHICH var is unset and how to set it, so keep
+                # it under a non-colliding key rather than dropping it.
+                **result,
+                "error": "explicit_store_required",
+                "refusal_detail": result.get("error"),
+                "message": (
+                    "record-win refused to resolve a collection store; nothing "
+                    "was recorded and nothing was marked seen"
+                ),
+            },
+        )
 
     if result.get("partial_failure"):
         # BUI-137: some chunk failed to commit partway through. Raised BEFORE

@@ -1476,3 +1476,180 @@ def test_remove_conflicts_endpoint_never_removes_printing_decoy(client):
     assert len(body["printing_conflicts"]) == 1
     names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
     assert names == {"Absolute Martian Manhunter #1"}
+
+
+# ===========================================================================
+# BUI-476: the mutating locg-cli commands (import, record-win) now REFUSE with
+# `explicit_store_required` when called with no cache= and no LOCG_DATA_DIR.
+# The server must never be able to trigger that — `_ensure_collection_store()`
+# sets LOCG_DATA_DIR before every collection call. These tests prove the
+# invariant against the real endpoints with LOCG_DATA_DIR genuinely UNSET in
+# the process env, which the `client` fixture above cannot show (it sets the
+# var itself, so it would pass the guard even if _ensure_collection_store were
+# deleted).
+# ===========================================================================
+
+
+@pytest.fixture
+def server_default_store_client(tmp_path, monkeypatch):
+    """A client with LOCG_DATA_DIR UNSET — the store is resolved solely by
+    `_ensure_collection_store()` from DB_PATH, exactly as on the Mac Mini."""
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    store = tmp_path / "collection-store"
+    store.mkdir()
+    _seed_collection(store, _OWNED)
+    _seed_wish_list(store, _WISH)
+
+    _install_real_plugin(monkeypatch)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
+    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
+    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
+    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
+    with patch("server.main.GixenClient", return_value=_mock_gixen()):
+        from server.main import app
+
+        with TestClient(app) as c:
+            c.store = store
+            yield c
+
+
+def test_record_win_commit_survives_the_bui476_guard_with_locg_data_dir_unset(
+    server_default_store_client,
+):
+    """THE BUI-476 SAFETY INVARIANT. With LOCG_DATA_DIR unset in the process
+    env, `POST /api/comics/collection/record-win/commit` must still record and
+    mark seen — `_ensure_collection_store()` sets the var before
+    `cmd_collection_record_win` sees it, so the new guard cannot fire. A guard
+    that 500s this endpoint is far worse than the bug it fixes.
+    """
+    client = server_default_store_client
+    # Seed the index so series resolution needs no Metron call, and stub the
+    # client outright so the remaining date lookup cannot reach the network —
+    # this test is about the store guard, not about Metron availability.
+    _reseed_with_index(client.store, _ASM_INDEX)
+    win = {
+        "item_id": "115500047601",
+        "current_bid": "12.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "310", "year": "1988"},
+    }
+    offline_metron = MagicMock()
+    offline_metron.lookup_issue.return_value = None
+    offline_metron.degraded = False
+    with patch("locg.metron.MetronClient", return_value=offline_metron):
+        r = client.post(
+            "/api/comics/collection/record-win/commit",
+            json={"wins": [win], "resolved_reviews": []},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("status") != "explicit_store_required"
+    assert body["rows_written"] == 1
+    assert body["committed_item_ids"] == ["115500047601"]
+    assert body["marked_seen"] == 1
+
+
+def test_collection_import_survives_the_bui476_guard_with_locg_data_dir_unset(
+    server_default_store_client,
+):
+    """Same invariant for the other guarded mutating command:
+    `POST /api/comics/collection/import` reaches `cmd_collection_import` with
+    no cache=, relying entirely on `_ensure_collection_store()`. A real xlsx
+    that genuinely imports (and is then readable back) is the proof — a
+    refusal would return a 200 whose body has `status: explicit_store_required`
+    and no `added`.
+    """
+    import io
+    import openpyxl
+    from locg.collection_io import LOCG_XLSX_HEADERS
+
+    client = server_default_store_client
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(list(LOCG_XLSX_HEADERS))
+    ws.append([
+        "Marvel", "X-Men", "X-Men #1", "1963-09-01",
+        1, 0, 0, None, "Print", None, None, None, None,
+        None, None, None, None, None, None, None, None,
+    ])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    r = client.post(
+        "/api/comics/collection/import",
+        files={"file": ("import.xlsx", buf.getvalue(),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("status") != "explicit_store_required"
+    assert body.get("added", 0) >= 1
+
+    chk = client.get(
+        "/api/comics/collection/check", params={"series": "X-Men", "issue": "1", "year": "1963"}
+    )
+    assert chk.json()["match_status"] == "in_collection"
+
+
+def test_record_win_commit_refusal_marks_nothing_seen(client):
+    """Defense in depth (BUI-476): the guard is unreachable from here, but the
+    mark-seen set is derived from the REQUEST, not from what was written — so
+    a refusal that ever did slip through would mark every win seen having
+    recorded none, and BUI-121's seen-set makes that unrecoverable by re-run.
+    Assert the backstop 500s instead.
+    """
+    refusal = {"status": "explicit_store_required", "error": "LOCG_DATA_DIR is not set"}
+    win = {
+        "item_id": "115500047602",
+        "current_bid": "10.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "402", "year": "1995"},
+    }
+    with patch("gixen_overlay.routes.cmd_collection_record_win", return_value=refusal):
+        r = client.post(
+            "/api/comics/collection/record-win/commit",
+            json={"wins": [win], "resolved_reviews": []},
+        )
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"]["error"] == "explicit_store_required"
+
+    seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
+    assert "115500047602" not in seen
+
+
+def test_collection_import_refusal_returns_500_not_a_misleading_200(client):
+    """Defense in depth (BUI-476), symmetric with the record-win backstop: a
+    refusal served as a 200 would slip past `/comic:collection-sync`'s
+    `curl -sf` check and read as a successful reconcile that imported nothing.
+    The refusal's own explanatory text must survive under `refusal_detail`.
+    """
+    refusal = {"status": "explicit_store_required", "error": "LOCG_DATA_DIR is not set"}
+    with patch("gixen_overlay.routes.cmd_collection_import", return_value=refusal):
+        r = client.post(
+            "/api/comics/collection/import",
+            files={"file": ("import.xlsx", b"anything", "application/octet-stream")},
+        )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "explicit_store_required"
+    assert detail["refusal_detail"] == "LOCG_DATA_DIR is not set"
+
+
+def test_record_win_commit_refusal_preserves_the_explanatory_text(client):
+    """The 500 detail must keep the refusal's own sentence — it is the only
+    part that says WHICH env var is unset and how to set it, and this branch
+    only fires when the reachability argument has already failed."""
+    refusal = {
+        "status": "explicit_store_required",
+        "error": "LOCG_DATA_DIR is not set — set it to $HOME/.comics-server/collection-store",
+    }
+    with patch("gixen_overlay.routes.cmd_collection_record_win", return_value=refusal):
+        r = client.post(
+            "/api/comics/collection/record-win/commit",
+            json={"wins": [], "resolved_reviews": []},
+        )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "explicit_store_required"
+    assert "$HOME/.comics-server/collection-store" in detail["refusal_detail"]
