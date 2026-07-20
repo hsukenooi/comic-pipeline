@@ -642,6 +642,29 @@ def build_volume_candidates(payload: dict[str, Any]) -> dict[str, list[str]]:
     return multi
 
 
+def collection_backups_root(store_dir: Path) -> Path:
+    """Directory holding durable named snapshots of the collection store at ``store_dir``.
+
+    A sibling of the store directory itself (``<store>-backups/``), never
+    inside it — so a snapshot here can NEVER be touched by
+    :meth:`CollectionCache._rotate_backups`'s in-store ``.bak.0/1/2`` ring,
+    which every :meth:`CollectionCache.apply` write cycles through and evicts
+    after 3 generations. A durable backup (BUI-433's collection-store
+    endpoint, ``locg collection backfill``'s pre-write snapshot, BUI-471) needs
+    to survive however many writes happen between "I took this backup" and
+    "something looked wrong, restore it" — the 3-deep rotating ring cannot
+    promise that, this directory can.
+
+    BUI-471: this formula used to be hand-duplicated in two places —
+    ``plugins/gixen-overlay/src/gixen_overlay/routes.py``'s
+    ``_collection_backups_root`` (server-owned store) and
+    ``locg.commands._backfill_backup_dir`` (CLI-invoked backfill) — which
+    cannot share code the other direction (the overlay depends on locg-cli,
+    never the reverse), so this is the one place both can import it from.
+    """
+    return store_dir.parent / f"{store_dir.name}-backups"
+
+
 def _write_atomic(dest: Path, content: str) -> None:
     """Write a string to dest atomically via tempfile + os.replace."""
     atomic_write(dest, content, tmp_prefix=".bak-")

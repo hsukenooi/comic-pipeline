@@ -5,6 +5,7 @@ import getpass
 import json
 import logging
 import math
+import os
 import re
 import stat
 import time
@@ -25,6 +26,7 @@ from locg.collection_cache import (
     _utcnow_iso,
     base_full_title,
     base_series_name,
+    collection_backups_root,
     owned_match_keys,
     resolve_series_for_win,
     series_year_range,
@@ -3693,6 +3695,18 @@ def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]
 
 RECORD_WIN_CHUNK_SIZE = 25
 
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    """Split ``items`` into consecutive slices of at most ``size``.
+
+    Shared by ``cmd_collection_record_win`` and ``cmd_collection_backfill``
+    (BUI-471) — both commit a Metron-heavy batch in chunks of
+    ``RECORD_WIN_CHUNK_SIZE`` so a crash mid-run only rolls back the in-flight
+    chunk, and both need the exact same slicing.
+    """
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 # BUI-465: how a record-win batch survives a transient Metron trip.
 #
 # The breaker below is per-batch and monotonic by design (BUI-255) — but the
@@ -4421,10 +4435,7 @@ def cmd_collection_record_win(
     # nonsense and must not become a negative sleep).
     seconds_per_request = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
 
-    chunks = [
-        wins[i : i + RECORD_WIN_CHUNK_SIZE]
-        for i in range(0, len(wins), RECORD_WIN_CHUNK_SIZE)
-    ]
+    chunks = _chunked(wins, RECORD_WIN_CHUNK_SIZE)
 
     for chunk in chunks:
         built_rows: list[dict[str, Any]] = []
@@ -5014,8 +5025,40 @@ def _backfill_needs_publisher(row: dict[str, Any]) -> bool:
     return not str(row.get("publisher_name") or "").strip()
 
 
+# BUI-471 residual #3: the 2026-07-19 manual backfill (three hand-written,
+# untested scripts — see the BUI-461 block comment above) dodged the export's
+# `YYYY-01-01` placeholder regex by writing `YYYY-01-02` instead. That day is
+# fabricated, exactly the thing this whole command exists to never do (see the
+# metron_id invariant in `_backfill_resolve_row` below) — it just predates the
+# metron_id mechanism that makes it unnecessary. `-01-02` is a SAFE shape to
+# retarget: record-win's own placeholder stamp is hardcoded to `-01-01`
+# (`collection_io`'s BUI-105 block), and any Metron-sourced date always
+# carries a metron_id the moment it's accepted (see `_backfill_resolve_row`),
+# so the only way a row reaches `metron_id is None` AND a literal `-01-02`
+# date is exactly this manual dodge (or an equivalent hand-edit) — never the
+# normal record-win/backfill pipeline. That makes the shape itself a positive
+# identification, not a guess.
+_HAND_REMEDIATED_DATE_RE = re.compile(r"^\d{4}-01-02$")
+
+
+def _is_hand_remediated_date(row: dict[str, Any]) -> bool:
+    """True for the BUI-471 legacy `YYYY-01-02` dodge-date signature.
+
+    Same source/metron_id intent gate as ``_is_placeholder_release_date`` —
+    only a row still carrying no ``metron_id`` needs correcting; one that
+    already has a real Metron-confirmed `-01-02` (a genuine cover date, however
+    unlikely) is left alone.
+    """
+    if row.get("source") != "agent_win":
+        return False
+    if row.get("metron_id") is not None:
+        return False
+    return bool(_HAND_REMEDIATED_DATE_RE.match(str(row.get("release_date") or "")))
+
+
 def _backfill_needs_date(row: dict[str, Any]) -> bool:
-    """True when the row will reach LOCG dateless: blank, or a BUI-105 placeholder.
+    """True when the row will reach LOCG dateless, a BUI-105 placeholder, or a
+    legacy hand-remediated `-01-02` dodge date (BUI-471 residual #3).
 
     The placeholder test is ``collection_io._is_placeholder_release_date``
     itself, imported rather than re-expressed. Parity is load-bearing in the
@@ -5024,12 +5067,19 @@ def _backfill_needs_date(row: dict[str, Any]) -> bool:
     backfill destroy a genuine cover date the export was happily keeping. That
     helper is an INTENT check (``metron_id is None``), not a shape check, so a
     real January date on a Metron-backed row is correctly not a target here.
+
+    Widening this to also retarget a confirmed `_is_hand_remediated_date` row
+    is safe in the same way: resolution below never blanks or guesses, it only
+    writes a date Metron itself confirmed, so a Metron miss just leaves the
+    fabricated `-01-02` day in place — no worse than before, never a new loss.
     """
     from locg.collection_io import _is_placeholder_release_date
 
     if not str(row.get("release_date") or "").strip():
         return True
-    return _is_placeholder_release_date(row)
+    if _is_placeholder_release_date(row):
+        return True
+    return _is_hand_remediated_date(row)
 
 
 def _is_placeholder_shaped(release_date: Any) -> bool:
@@ -5058,8 +5108,16 @@ def _is_backfill_target(row: dict[str, Any]) -> bool:
       would corrupt the reconciliation baseline.
     * ``in_collection >= 1`` — a tracked-but-not-owned row (BUI-249/250/251) is
       not part of the pending upload.
-    * ``pushed_to_locg_at is None`` — already-pushed rows are LOCG's copy now;
-      editing them locally silently desynchronizes the two sides.
+    * pending push (:func:`locg.collection_io._is_pending_push_row`) — the
+      SAME "pushed_to_locg_at IS NULL OR local_added_at > pushed_to_locg_at"
+      test the export uses to build its row set (BUI-471). This used to be the
+      stricter ``pushed_to_locg_at is None`` alone, which silently orphaned a
+      row RE-PENDED after an earlier push: the export would ship it dateless
+      or publisher-less, but the backfill's narrower target set would never
+      pick it up to remediate. Widening this to match the export closes that
+      gap; an already-pushed, never-re-pended row is still excluded (LOCG is
+      that row's copy of record now — editing it locally would desync the
+      two sides).
     * ``in_wish_list`` falsy — never a wish twin. (Redundant with the
       ``in_collection`` gate for rows this codebase writes, kept explicit
       because a wish twin is the BUI-122 data-loss shape and the cost of the
@@ -5068,11 +5126,13 @@ def _is_backfill_target(row: dict[str, Any]) -> bool:
     ...and at least one of the two backfillable fields must actually be empty,
     so a re-run is a no-op rather than a rewrite (idempotence).
     """
+    from locg.collection_io import _is_pending_push_row
+
     if row.get("source") != "agent_win":
         return False
     if (row.get("in_collection") or 0) < 1:
         return False
-    if row.get("pushed_to_locg_at") is not None:
+    if not _is_pending_push_row(row):
         return False
     if row.get("in_wish_list"):
         return False
@@ -5119,16 +5179,20 @@ def _backfill_resolve_row(
 
     Resolution rules, and why each is the conservative one:
 
-    * **The year gate needs a year.** ``_metron_release_date`` returns its
-      candidate UNGATED when it has no 4-digit year to compare against, and an
-      ungated ``lookup_issue`` is exactly the reprint trap (a naive
-      ``lookup_issue("The X-Men", "59", None)`` can return a 2005 collected
-      edition). The row's own ``release_date`` year is the only year available
-      here, and on a BUI-105 placeholder that year is REAL — only the month/day
-      are fabricated. So a placeholder row is fully resolvable; a genuinely
-      DATELESS row has no year, gets no lookup, and is reported for the
-      documented web fallback (``references/date-backfill.md``) instead of
-      being guessed at.
+    * **The year gate needs a year — or the row's own series_range.**
+      ``_metron_release_date`` returns its candidate UNGATED when it has
+      neither, and an ungated ``lookup_issue`` is exactly the reprint trap (a
+      naive ``lookup_issue("The X-Men", "59", None)`` can return a 2005
+      collected edition). The row's own ``release_date`` year is the primary
+      era evidence, and on a BUI-105 placeholder that year is REAL — only the
+      month/day are fabricated. A genuinely DATELESS row has no such year, but
+      (BUI-471, adopting BUI-464's mechanism) its STORED ``series_name`` is
+      already the canonical, resolved volume the row belongs to — an
+      independent ``(begin, end)`` publication window
+      (:func:`series_year_range`) that gates the candidate the same way a real
+      year would, without a second lookup. Only when NEITHER is available is
+      the row reported for the documented web fallback
+      (``references/date-backfill.md``) instead of being guessed at.
     * **One accept test, shared with the producer.** A hit is trusted only when
       ``_metron_release_date`` yields a date for it — byte-identical to the
       test ``_build_win_row`` applies at its own date-only lookup. A hit whose
@@ -5163,8 +5227,26 @@ def _backfill_resolve_row(
     # row with no metron_id to fetch detail by.
     wants_lookup = needs_date or (needs_publisher and existing_metron_id is None)
 
+    # BUI-471: independent era evidence for a row with no year at all — the
+    # row's OWN series_name was already resolved and stored at record-win
+    # time, so this needs no extra lookup (unlike record-win's
+    # series_name_index consult). Scoped to existing_metron_id is None: a row
+    # that already carries an id should never re-search by NAME for a date —
+    # "An existing metron_id is exact" above applies to a date fetch the same
+    # way it applies to the publisher fetch. (In practice this scoping is the
+    # only thing standing between year_str is None and a real lookup ever
+    # firing for such a row: needs_date + an existing metron_id is only ever a
+    # genuinely BLANK dateless row, since a placeholder or `-01-02` shape both
+    # require metron_id is None by construction — see
+    # _is_placeholder_release_date / _is_hand_remediated_date.) Computed only
+    # when it might actually be consulted (a year-bearing row never reaches
+    # the no-year branch that would use it).
+    series_range: Optional[tuple[int, int]] = None
+    if wants_lookup and year_str is None and existing_metron_id is None:
+        series_range = series_year_range(str(row.get("series_name") or ""))
+
     if wants_lookup and not metron_disabled:
-        if year_str is None:
+        if year_str is None and series_range is None:
             reasons.append(
                 "no year available to era-gate a Metron lookup (dateless row) — "
                 "resolve via the documented web fallback"
@@ -5177,12 +5259,13 @@ def _backfill_resolve_row(
             try:
                 metron_calls += 1
                 looked_up = metron.lookup_issue(series_query, issue_num, year_str)
-                if looked_up and _metron_release_date(looked_up, year_str) is not None:
+                if looked_up and _metron_release_date(looked_up, year_str, series_range) is not None:
                     resolved = looked_up
                 else:
+                    era_evidence = year_str if year_str is not None else f"series_range={series_range}"
                     reasons.append(
                         "Metron returned no era-compatible issue match "
-                        f"({series_query} #{issue_num}, {year_str})"
+                        f"({series_query} #{issue_num}, {era_evidence})"
                     )
             except MetronCredentialError:
                 metron_disabled = True
@@ -5199,7 +5282,9 @@ def _backfill_resolve_row(
     # that happens to coincide with the genuine cover date (Fantastic Four #16:
     # stamped 1963-01-01, and 1963-01-01 really is the cover date) is confirmed,
     # not merely unchanged.
-    metron_date = _metron_release_date(resolved, year_str) if resolved is not None else None
+    metron_date = (
+        _metron_release_date(resolved, year_str, series_range) if resolved is not None else None
+    )
     if needs_date and metron_date and metron_date != (row.get("release_date") or None):
         fields["release_date"] = {"from": row.get("release_date"), "to": metron_date}
 
@@ -5272,122 +5357,28 @@ def _backfill_backup_dir(cache: CollectionCache, backup_dir: Optional[str]) -> P
     """Destination for the pre-write durable snapshot.
 
     Defaults to a timestamped subdir of ``<store>-backups/`` — the SAME sibling
-    root the BUI-433 backup endpoint uses, deliberately outside the store so
-    ``CollectionCache._rotate_backups``' 3-deep ``.bak.0/1/2`` ring can never
+    root the BUI-433 backup endpoint uses (``collection_backups_root``,
+    BUI-471 — previously hand-duplicated here), deliberately outside the store
+    so ``CollectionCache._rotate_backups``' 3-deep ``.bak.0/1/2`` ring can never
     evict it. A bulk multi-row write needs a snapshot that survives however many
     writes happen before someone decides to restore it.
     """
     if backup_dir:
         return Path(backup_dir)
-    store_dir = cache.path.parent
-    root = store_dir.parent / f"{store_dir.name}-backups"
+    root = collection_backups_root(cache.path.parent)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     return root / f"backfill-{ts}"
 
 
-def cmd_collection_backfill(
-    *,
-    series: Optional[str] = None,
-    full_title: Optional[str] = None,
-    apply: bool = False,
-    cadence: float = 3.0,
-    limit: Optional[int] = None,
-    backup_dir: Optional[str] = None,
-    cache: Optional[CollectionCache] = None,
-    metron: Optional[Any] = None,
-) -> dict[str, Any]:
-    """Backfill publisher_name / release_date on stored pending wins (BUI-461).
+def _backfill_plan_changes(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The pre-lock ``changes`` shape for a list of resolved plans.
 
-    Read-only by default: ``apply=False`` resolves every candidate against
-    Metron and prints the exact field diff, writing NOTHING. ``apply=True``
-    takes a durable ``backup_store`` snapshot first and refuses to write if that
-    snapshot captured zero rows, then applies every planned change in ONE
-    ``CollectionCache.apply`` cycle — locked, ``.bak``-rotated, atomic, so a
-    crash mid-run leaves the store either fully un-backfilled or fully
-    backfilled, never half.
-
-    Only ``publisher_name``, ``release_date`` and ``metron_id`` are ever
-    written, and only onto rows passing :func:`_is_backfill_target`. Identity
-    and copy counts are never touched. Re-running is a no-op: a row whose
-    fields are now populated no longer matches the target predicate.
-
-    Every network resolution happens BEFORE the lock is taken — a Metron batch
-    can run for minutes at ``cadence`` and must not hold an exclusive flock the
-    comics server also needs (``apply``'s own timeout is 30s).
-
-    ``cadence`` seconds are slept per Metron call spent (default 3.0 — Metron
-    allows ~20 req/min, so ~3s per call). Per CALL, not per row: a row needing
-    both a date and a publisher costs TWO calls, and pacing per row would run a
-    backlog of those at double the intended rate — straight into the rate limit
-    whose one trip latches Metron off for the rest of the run (BUI-465).
-    Once Metron trips its degraded breaker (BUI-255) the remaining rows make no
-    further calls and are reported unresolved; ``metron_degraded`` in the result
-    says the run was partial, so a follow-up run picks up what was left. Pair
-    with ``limit`` to work through a large backlog across consecutive runs.
-
-    Returns ``{status, applied, candidate_count, planned_count, updated_count,
-    changes, unresolved, skipped_at_write, metron_degraded, backup}``. ``status``
-    is ``"preview"`` for a dry run, ``"ok"`` after a write (or an ``--apply`` run
-    that found no work), ``"invalid_request"``, ``"not_imported"`` (R11) or
-    ``"backup_failed"`` when it refused to run. ``candidate_count`` counts every
-    row matching the filters BEFORE ``limit``, so a chunked run still reports the
-    size of the remaining backlog.
+    Shared by every place ``cmd_collection_backfill`` needs to describe
+    planned-but-not-yet-written intent: the base preview/backup-failed result
+    and, before BUI-471 chunked the write path, the single post-resolution
+    report — all three used to hand-roll this same 5-line comprehension.
     """
-    from locg.metron import MetronClient
-
-    if cadence < 0:
-        return {"status": "invalid_request", "error": "cadence must be >= 0"}
-    if limit is not None and limit < 0:
-        return {"status": "invalid_request", "error": "limit must be >= 0"}
-
-    if cache is None:
-        cache = CollectionCache()
-    if metron is None:
-        metron = MetronClient()
-
-    payload = cache.load()
-    if payload.get("last_full_import") is None:
-        return _not_imported_error()
-
-    candidates = [
-        row
-        for row in payload.get("comics", [])
-        if _is_backfill_target(row) and _backfill_row_matches_filters(row, series, full_title)
-    ]
-    candidate_count = len(candidates)
-    if limit is not None:
-        candidates = candidates[:limit]
-
-    plans: list[dict[str, Any]] = []
-    unresolved: list[dict[str, Any]] = []
-    metron_disabled = False
-    calls_since_sleep = 0
-
-    for row in candidates:
-        if calls_since_sleep and cadence > 0 and not metron_disabled:
-            time.sleep(cadence * calls_since_sleep)
-        outcome = _backfill_resolve_row(row, metron, metron_disabled)
-        metron_disabled = outcome["metron_disabled"]
-        calls_since_sleep = outcome["metron_calls"]
-        if outcome["fields"]:
-            plans.append({
-                "identity": _backfill_row_identity(row),
-                "full_title": row.get("full_title"),
-                "series_name": row.get("series_name"),
-                "fields": outcome["fields"],
-                # Carried so the write can re-run the metron_id invariant against
-                # the row as it ACTUALLY is under the lock, not as it looked when
-                # this plan was made. See _mutate.
-                "metron_date": outcome["metron_date"],
-            })
-        if outcome["reason"]:
-            unresolved.append({
-                "full_title": row.get("full_title"),
-                "gixen_item_id": row.get("gixen_item_id"),
-                "reason": outcome["reason"],
-            })
-
-    changes = [
+    return [
         {
             "full_title": p["full_title"],
             "series_name": p["series_name"],
@@ -5396,52 +5387,27 @@ def cmd_collection_backfill(
         }
         for p in plans
     ]
-    base_result: dict[str, Any] = {
-        "applied": False,
-        "candidate_count": candidate_count,
-        "planned_count": len(plans),
-        "updated_count": 0,
-        "changes": changes,
-        "unresolved": unresolved,
-        "skipped_at_write": [],
-        "metron_degraded": metron_disabled,
-        "backup": None,
-    }
 
-    if not plans:
-        # `preview` means "this was a dry run", never "there was nothing to do" —
-        # an --apply run with an empty plan completed successfully and simply had
-        # no work, so it reports ok. No backup is taken for a zero-row write.
-        return {"status": "ok" if apply else "preview", **base_result}
-    if not apply:
-        return {"status": "preview", **base_result}
 
-    dest = _backfill_backup_dir(cache, backup_dir)
-    try:
-        backup = cache.backup_store(dest)
-    except (RuntimeError, OSError) as exc:
-        return {
-            "status": "backup_failed",
-            "error": f"backup to {dest} failed: {exc} — refusing to write",
-            **base_result,
-        }
-    if backup["comics_count"] == 0 and backup["wish_list_count"] == 0:
-        return {
-            "status": "backup_failed",
-            "error": (
-                f"backup at {backup['backup_path']} captured zero rows — an empty "
-                "backup is indistinguishable from a broken one; refusing to write"
-            ),
-            **base_result,
-        }
-    base_result["backup"] = backup
+def _backfill_write_chunk(
+    cache: CollectionCache,
+    chunk_plans: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply one chunk's worth of resolved plans under a single lock cycle.
 
+    Returns ``(applied_changes, skipped)`` for JUST this chunk. Identical
+    per-row logic to the original single-cycle ``_mutate`` (TOCTOU
+    re-resolution, per-field staleness check, the metron_id invariant
+    re-checked under the lock) — only the SCOPE changed (BUI-471 residual #2):
+    one chunk's plans instead of the whole backlog's, so a chunk boundary is
+    where a crash's blast radius stops.
+    """
     applied_changes: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
     def _mutate(locked_payload: dict[str, Any]) -> None:
         comics = locked_payload.get("comics", [])
-        for plan in plans:
+        for plan in chunk_plans:
             identity = plan["identity"]
             idxs = _stable_identity_candidates(comics, **identity)
             if len(idxs) != 1:
@@ -5514,25 +5480,293 @@ def cmd_collection_backfill(
                 })
 
     cache.apply(_mutate, command="collection-backfill")
+    return applied_changes, skipped
 
-    cache.append_audit({
-        "type": "collection_backfill",
-        "ts": _utcnow_iso(),
-        "command": "collection-backfill",
-        "details": {
-            "filters": {"series": series, "full_title": full_title, "limit": limit},
-            "backup_path": backup["backup_path"],
-            "updated_count": len(applied_changes),
-            "changes": applied_changes,
-            "skipped_at_write": skipped,
-        },
-    })
 
+def cmd_collection_backfill(
+    *,
+    series: Optional[str] = None,
+    full_title: Optional[str] = None,
+    apply: bool = False,
+    cadence: float = 3.0,
+    limit: Optional[int] = None,
+    backup_dir: Optional[str] = None,
+    cache: Optional[CollectionCache] = None,
+    metron: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Backfill publisher_name / release_date on stored pending wins (BUI-461).
+
+    Read-only by default: ``apply=False`` resolves every candidate against
+    Metron and prints the exact field diff, writing NOTHING.
+
+    ``apply=True`` resolves and writes in chunks of ``RECORD_WIN_CHUNK_SIZE``
+    (BUI-471 residual #2 — mirrors ``cmd_collection_record_win``'s chunking,
+    same rationale): a durable ``backup_store`` snapshot is taken once, before
+    the FIRST chunk that has anything to write, and refused if that snapshot
+    captured zero rows. Each chunk is then resolved and committed in its own
+    ``CollectionCache.apply`` cycle — locked, ``.bak``-rotated, atomic per
+    CHUNK. This bounds a crash's blast radius: every chunk committed before
+    the crash stays durably backfilled, and only the in-flight (uncommitted)
+    chunk's Metron work is lost — never the whole backlog, as a single-cycle
+    write would. A chunk whose write raises is logged and skipped; later
+    chunks still get a chance (mirrors ``cmd_collection_record_win``'s
+    per-chunk try/except).
+
+    Only ``publisher_name``, ``release_date`` and ``metron_id`` are ever
+    written, and only onto rows passing :func:`_is_backfill_target`. Identity
+    and copy counts are never touched. Re-running is a no-op: a row whose
+    fields are now populated no longer matches the target predicate.
+
+    Every network resolution happens BEFORE that chunk's lock is taken — a
+    Metron batch can run for minutes at ``cadence`` and must not hold an
+    exclusive flock the comics server also needs (``apply``'s own timeout is
+    30s per chunk).
+
+    ``cadence`` seconds are slept per Metron call spent (default 3.0 — Metron
+    allows ~20 req/min, so ~3s per call). Per CALL, not per row: a row needing
+    both a date and a publisher costs TWO calls, and pacing per row would run a
+    backlog of those at double the intended rate — straight into the rate limit
+    whose one trip latches Metron off for the rest of the run (BUI-465). The
+    pacing state (``cadence`` debt and the Metron degraded breaker) carries
+    ACROSS chunk boundaries — chunking only changes when work is committed,
+    never how Metron traffic is paced.
+    Once Metron trips its degraded breaker (BUI-255) the remaining rows make no
+    further calls and are reported unresolved; ``metron_degraded`` in the result
+    says the run was partial, so a follow-up run picks up what was left. Pair
+    with ``limit`` to work through a large backlog across consecutive runs.
+
+    BUI-471 residual #5: when ``cache`` is not passed explicitly (i.e. the
+    caller wants the REAL store, not a test double), this refuses to run
+    unless ``LOCG_DATA_DIR`` is explicitly set in the environment. Silently
+    defaulting to ``locg.config._cache_dir()``'s resolution order
+    (``LOCG_DATA_DIR`` → ``<repo>/data/locg`` → ``~/.cache/locg``) is the
+    "wrong-store trap": on an empty local store this hard-fails harmlessly
+    (R11 ``not_imported``), but on a NON-EMPTY local store it would silently
+    remediate the wrong collection — the server-owned store lives elsewhere
+    (see ``LOCG_DATA_DIR=$HOME/.comics-server/collection-store`` below).
+
+    BUI-471 residual #6: ``metron_unavailable`` (BUI-465) tells a row that was
+    never successfully asked apart from one Metron genuinely missed, but only
+    on rows written from that commit forward — every earlier row simply lacks
+    the field ("unknown" provenance, not "asked and missed"). This command
+    does NOT retry those differently; ``legacy_unknown_availability_count`` in
+    the result reports how many of this run's candidates are from that unknown
+    population, so a caller can decide knowingly rather than this command
+    silently guessing.
+
+    BUI-471 (adopting BUI-464): a genuinely DATELESS candidate (no
+    ``release_date`` at all — as opposed to a BUI-105 placeholder, which
+    already has a real year) is no longer automatically unresolvable. Its
+    stored ``series_name`` is already the canonical, resolved volume the row
+    belongs to, so :func:`_backfill_resolve_row` uses that name's own
+    ``(begin, end)`` publication window as era evidence in place of a missing
+    year — the same mechanism BUI-464 gave record-win, needing no extra
+    lookup here since the row already carries its resolved series_name. Only
+    applies when the row has no ``metron_id`` yet (a row that already has one
+    never re-searches by name for a date — see ``_backfill_resolve_row``'s
+    "An existing metron_id is exact").
+
+    Returns ``{status, applied, candidate_count, planned_count, updated_count,
+    changes, unresolved, skipped_at_write, metron_degraded, backup,
+    legacy_unknown_availability_count, chunk_count, chunks_committed}``.
+    ``status`` is ``"preview"`` for a dry run, ``"ok"`` after a write (or an
+    ``--apply`` run that found no work), ``"invalid_request"``,
+    ``"not_imported"`` (R11), ``"explicit_store_required"`` (BUI-471) or
+    ``"backup_failed"`` when it refused to run. ``candidate_count`` counts
+    every row matching the filters BEFORE ``limit``, so a chunked run still
+    reports the size of the remaining backlog.
+    """
+    from locg.metron import MetronClient
+
+    if cadence < 0:
+        return {"status": "invalid_request", "error": "cadence must be >= 0"}
+    if limit is not None and limit < 0:
+        return {"status": "invalid_request", "error": "limit must be >= 0"}
+
+    if cache is None:
+        # BUI-471 residual #5: never silently fall back to whatever
+        # locg.config._cache_dir() resolves to — that can be a non-empty LOCAL
+        # store on the very machine (e.g. the Mac Mini) whose SERVER-owned
+        # store is what actually needs remediating. Require the caller to say
+        # which store they mean.
+        if not os.environ.get("LOCG_DATA_DIR", "").strip():
+            return {
+                "status": "explicit_store_required",
+                "error": (
+                    "LOCG_DATA_DIR is not set — refusing to default to "
+                    "locg.config._cache_dir()'s resolution, which may be a "
+                    "different (and possibly non-empty) store than the one you "
+                    "mean to remediate. Set it explicitly, e.g. on the Mac Mini: "
+                    "LOCG_DATA_DIR=$HOME/.comics-server/collection-store locg "
+                    "collection backfill [--apply]"
+                ),
+            }
+        cache = CollectionCache()
+    if metron is None:
+        metron = MetronClient()
+
+    payload = cache.load()
+    if payload.get("last_full_import") is None:
+        return _not_imported_error()
+
+    candidates = [
+        row
+        for row in payload.get("comics", [])
+        if _is_backfill_target(row) and _backfill_row_matches_filters(row, series, full_title)
+    ]
+    candidate_count = len(candidates)
+    if limit is not None:
+        candidates = candidates[:limit]
+
+    # BUI-471 residual #6: tally, don't act on. See the docstring.
+    legacy_unknown_availability_count = sum(
+        1 for row in candidates if "metron_unavailable" not in row
+    )
+
+    chunks = _chunked(candidates, RECORD_WIN_CHUNK_SIZE)
+
+    plans: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    applied_changes: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    metron_disabled = False
+    calls_since_sleep = 0
+    backup: Optional[dict[str, Any]] = None
+    chunks_committed = 0
+
+    for chunk in chunks:
+        chunk_plans: list[dict[str, Any]] = []
+        for row in chunk:
+            if calls_since_sleep and cadence > 0 and not metron_disabled:
+                time.sleep(cadence * calls_since_sleep)
+            outcome = _backfill_resolve_row(row, metron, metron_disabled)
+            metron_disabled = outcome["metron_disabled"]
+            calls_since_sleep = outcome["metron_calls"]
+            if outcome["fields"]:
+                chunk_plans.append({
+                    "identity": _backfill_row_identity(row),
+                    "full_title": row.get("full_title"),
+                    "series_name": row.get("series_name"),
+                    "fields": outcome["fields"],
+                    # Carried so the write can re-run the metron_id invariant
+                    # against the row as it ACTUALLY is under the lock, not as
+                    # it looked when this plan was made. See _mutate.
+                    "metron_date": outcome["metron_date"],
+                })
+            if outcome["reason"]:
+                unresolved.append({
+                    "full_title": row.get("full_title"),
+                    "gixen_item_id": row.get("gixen_item_id"),
+                    "reason": outcome["reason"],
+                })
+        plans.extend(chunk_plans)
+
+        if not apply or not chunk_plans:
+            continue
+
+        # The durable pre-write snapshot: taken exactly once, right before the
+        # FIRST chunk that actually has something to write — never for a
+        # chunk (or a whole run) with nothing to commit.
+        if backup is None:
+
+            def _backup_failed_result(error: str) -> dict[str, Any]:
+                # Plans resolved SO FAR (this chunk and any earlier ones) —
+                # the pre-lock intent, since nothing has been written yet.
+                return {
+                    "status": "backup_failed",
+                    "error": error,
+                    "applied": False,
+                    "candidate_count": candidate_count,
+                    "planned_count": len(plans),
+                    "updated_count": 0,
+                    "changes": _backfill_plan_changes(plans),
+                    "unresolved": unresolved,
+                    "skipped_at_write": [],
+                    "metron_degraded": metron_disabled,
+                    "backup": None,
+                    "legacy_unknown_availability_count": legacy_unknown_availability_count,
+                    "chunk_count": len(chunks),
+                    "chunks_committed": 0,
+                }
+
+            dest = _backfill_backup_dir(cache, backup_dir)
+            try:
+                backup = cache.backup_store(dest)
+            except (RuntimeError, OSError) as exc:
+                return _backup_failed_result(f"backup to {dest} failed: {exc} — refusing to write")
+            if backup["comics_count"] == 0 and backup["wish_list_count"] == 0:
+                return _backup_failed_result(
+                    f"backup at {backup['backup_path']} captured zero rows — an "
+                    "empty backup is indistinguishable from a broken one; "
+                    "refusing to write"
+                )
+
+        try:
+            chunk_applied, chunk_skipped = _backfill_write_chunk(cache, chunk_plans)
+        except Exception as exc:  # noqa: BLE001 — chunked write: log and let later chunks try
+            logger.error("collection-backfill: chunk commit failed: %s", exc)
+            continue
+
+        applied_changes.extend(chunk_applied)
+        skipped.extend(chunk_skipped)
+        chunks_committed += 1
+        cache.append_audit({
+            "type": "collection_backfill",
+            "ts": _utcnow_iso(),
+            "command": "collection-backfill",
+            "details": {
+                "filters": {"series": series, "full_title": full_title, "limit": limit},
+                "backup_path": backup["backup_path"],
+                "updated_count": len(chunk_applied),
+                "changes": chunk_applied,
+                "skipped_at_write": chunk_skipped,
+            },
+        })
+
+    base_result: dict[str, Any] = {
+        "candidate_count": candidate_count,
+        "planned_count": len(plans),
+        "changes": _backfill_plan_changes(plans),
+        "unresolved": unresolved,
+        "metron_degraded": metron_disabled,
+        "legacy_unknown_availability_count": legacy_unknown_availability_count,
+        "chunk_count": len(chunks),
+    }
+
+    if not apply:
+        # `preview` means "this was a dry run" — no chunk write was ever
+        # attempted, so `backup` stays None and nothing was applied.
+        return {
+            "status": "preview",
+            "applied": False,
+            "updated_count": 0,
+            "skipped_at_write": [],
+            "backup": None,
+            "chunks_committed": 0,
+            **base_result,
+        }
+
+    # `ok` covers both "found no work" (backup stays None — no chunk ever had
+    # anything to write) and "wrote at least one chunk". `changes` here
+    # reports what was ACTUALLY written (applied_changes, post-lock) rather
+    # than base_result's pre-lock plan — the two can differ per-field (a
+    # concurrent writer can win a field the plan intended to touch; see
+    # _backfill_write_chunk's staleness check), and the post-write response
+    # should describe reality, not the pre-lock intent.
+    #
+    # `applied` mirrors the pre-chunking contract: True whenever a write CYCLE
+    # was attempted (chunks_committed > 0), not whether any row survived to be
+    # written — a chunk that ran to completion but had every row raced out
+    # from under it (see test_row_that_left_the_target_set_under_the_lock_is_
+    # skipped_whole) still counts as "applied", same as the single-cycle
+    # write this replaced always reported once it got that far.
     return {
         "status": "ok",
-        **base_result,
-        "applied": True,
+        "applied": chunks_committed > 0,
         "updated_count": len(applied_changes),
-        "changes": applied_changes,
         "skipped_at_write": skipped,
+        "backup": backup,
+        "chunks_committed": chunks_committed,
+        **base_result,
+        "changes": applied_changes,
     }

@@ -67,7 +67,7 @@ from server.main import (
 # write paths) behind /api/comics/* instead of porting any of it to SQL. These
 # imports prove the locg workspace dependency resolves (exercised by the
 # workspace-imports canary).
-from locg.collection_cache import CollectionCache
+from locg.collection_cache import CollectionCache, collection_backups_root
 from locg.collection_io import MAX_XLSX_BYTES
 from locg.commands import (
     _decrement_or_remove,
@@ -130,19 +130,14 @@ def _ensure_collection_store() -> None:
 def _collection_backups_root() -> Path:
     """Directory holding durable named collection-store snapshots (BUI-433).
 
-    A sibling of the store directory itself (``<store>-backups/``), never
-    inside it — so a snapshot here can NEVER be touched by
-    ``CollectionCache._rotate_backups``'s in-store ``.bak.0/1/2`` ring, which
-    every ``apply()`` write cycles through and evicts after 3 generations. A
-    `/comic:collection-sync` operator needs a backup that survives however
-    many writes happen between "I took this backup" and "something looked
-    wrong, restore it" — the 3-deep rotating ring cannot promise that, this
-    directory can (nothing here is ever overwritten or rotated out
-    automatically; each backup call adds one new timestamped subdirectory).
+    Formula lifted into ``locg.collection_cache.collection_backups_root``
+    (BUI-471) — it used to be hand-duplicated here and in
+    ``locg.commands._backfill_backup_dir``. Can only be shared in this
+    direction (the overlay depends on locg-cli as a workspace package, never
+    the reverse), so locg-cli is where the shared formula lives.
     """
     _ensure_collection_store()
-    store_dir = Path(os.environ["LOCG_DATA_DIR"])
-    return store_dir.parent / f"{store_dir.name}-backups"
+    return collection_backups_root(Path(os.environ["LOCG_DATA_DIR"]))
 
 
 @router.get("/comics")
