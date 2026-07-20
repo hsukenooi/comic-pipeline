@@ -1,8 +1,9 @@
 ---
 title: "A reopened ticket's premise may already be stale — verify it against the code before implementing"
 date: 2026-07-20
+last_updated: 2026-07-20
 category: conventions
-module: "general (Linear ticket handling, any package) — this batch: locg-cli, gixen-cli"
+module: "general (Linear ticket handling, any package) — these batches: locg-cli, gixen-cli"
 problem_type: convention
 component: development_workflow
 severity: medium
@@ -10,14 +11,20 @@ applies_when:
   - "Picking up a reopened Linear ticket, or a ticket filed as a review residual / follow-up from an earlier fix"
   - "A ticket's description asserts a specific root cause or names a specific fix ('add a YYYY-01-02 day', 'rename X to Y')"
   - "The ticket references code, a deployed label, or a data shape that may have changed since it was filed"
+  - "A ticket cites a statistic or row count as evidence for its diagnosis"
+  - "A ticket attributes a gap to a named component, or suggests a concrete optimisation ('cache X per Y')"
 tags:
   - process
   - linear
   - reopened-ticket
   - premise-verification
+  - evidence-verification
   - bui-210
   - bui-459
   - bui-461
+  - bui-464
+  - bui-465
+  - bui-470
 related_docs:
   - "docs/solutions/design-patterns/guard-strictness-must-match-consequence.md"
 ---
@@ -88,7 +95,7 @@ around a check that had been intent-based (not shape-based) since a fix a month 
 BUI-459's ticket named the post-BUI-220-rename identifiers (`com.comics.server` label,
 `~/.comics-server` data dir) as the correct values for `install.sh`. Checking the live
 Mac Mini (not just the docs) showed the rename had only ever been done in
-documentation (BUI-425) — the running LaunchAgent is still PID-confirmed
+documentation (BUI-425) — at that time the running LaunchAgent was PID-confirmed
 `com.gixen.server` against `~/.gixen-server`. Implementing the ticket's specified label
 as written would have made a routine re-deploy bootstrap a same-labeled job that hijacks
 the real server (see the sibling doc's pattern 5 for the mechanism:
@@ -96,6 +103,92 @@ the real server (see the sibling doc's pattern 5 for the mechanism:
 `install.sh` creates it via `mkdir -p`). The correct fix was a revert to match deployed
 reality, with a comment explaining that this is deliberate, not drift — not the rename
 the ticket asked for.
+
+> **Since resolved (BUI-463, 2026-07-20).** The migration was subsequently performed
+> deliberately: the Mini now runs `com.comics.server` from `~/.comics-server`, and
+> `install.sh` was moved forward to match. The lesson is unchanged and the sequencing is
+> the point — the ticket's target state was *eventually* correct, just not yet true when
+> it was filed. "Right eventually" and "right now" are different claims, and a deploy
+> script must encode the second.
+
+## The second failure mode: the premise is *partly* true, but mis-attributed
+
+The three examples above are all "the specified fix would be wrong." A later batch
+(BUI-463..471) surfaced a distinct and subtler mode: the ticket describes a **real**
+problem, but its *evidence*, its *attribution*, or its *suggested direction* is wrong.
+These do not announce themselves — the ticket reads as coherent, and the fix it asks for
+looks reasonable. Only checking the claim against real data separates them.
+
+### Example 4 — the cited statistic was not evidence (BUI-465)
+
+BUI-465 claimed a whole-batch Metron breaker latch, citing both "58 of 78 rows carry a
+placeholder date" and "77 of 78 rows had a null publisher." The headline claim was
+correct — but **the publisher figure was not evidence for it.** BUI-458 added the
+publisher fetch *after* nearly every one of those rows was written; the nulls meant
+nothing had fetched a publisher, not that a fetch had failed.
+
+The real evidence came from replaying the actual store backup and grouping rows by the
+run that wrote them: 40 of the 58 placeholders came from a single 41-row run, monotone
+after row 1 (row 1 carried a `metron_id`; rows 2–41 carried none). That ordering *is* the
+latch signature. The other 18 sat in runs whose good and bad rows interleaved — those runs
+never latched, and were correctly excluded from the fix.
+
+**A ticket citing two numbers is not citing two independent confirmations.** Check when
+each quantity started being recorded before treating it as evidence of anything.
+
+### Example 5 — the gap was real but lived in a different component (BUI-470)
+
+BUI-470 asserted that a newsstand/variant distinction is "invisible to the reconciler."
+The described gap is real — but it belongs to record-win's *coarse* `(series, issue)`-keyed
+`owned_index` lookup, which BUI-267 had already fixed. The reconciler's own collision key
+is **finer**: `make_identity` carries the raw `full_title`, and `_reconcile_score` requires
+an identical trailing issue token with nothing after it, or an exact case-insensitive
+`full_title` match, before a row is even a heal candidate. Both already force suffix
+agreement, so the failure mode was structurally unreachable there.
+
+The right response was neither to skip the work nor to fake a passing end-to-end test: the
+unification shipped as genuine defense-in-depth, covered by a **direct unit test** of the
+new predicate rather than an end-to-end test that would have implied a live bug that does
+not exist. **Where a test lives is itself a claim about where the bug is.**
+
+### Example 6 — two of three premises were dead, killed by fixes days earlier (BUI-464)
+
+BUI-464 asserted that a null identify year (a) falls through to the newest Metron volume
+and (b) is not gated by `needs_review`. Both were false. `_disambiguate_series` returns
+`None` on multiple candidates with no year, and **BUI-421 Fix A** had already removed the
+last-writer index guess; **BUI-422**, merged *two days before the ticket was filed*, added
+the null-year review gate.
+
+Most instructive: the ticket's three named examples (FF #16, ASM #89, Batman #240) were
+in the store **correctly resolved, carrying real years**. They were a different bug class
+— BUI-465's placeholder rows — conflated with the one being reported. A ticket naming
+specific records as proof is making a checkable claim; check those records.
+
+### The corollary: find the independent evidence, don't drop the guard
+
+When a premise turns out to be stale, the tempting fix is to relax whatever is blocking
+progress. BUI-464 is the counter-example worth copying. The ticket admitted a null year
+leaves "no era guard at all" and demanded era evidence "from somewhere else" — and it
+already existed: when a win resolves through `series_name_index`, the LOCG canonical name
+carries the volume's publication window (`"The X-Men (Vol. 1) (1963 - 1981)"`), which is
+independent of the Metron hit being judged.
+
+The anti-pattern it avoided is the sharper lesson. Metron's own `format_series_name`
+also yields a range — but it derives from **the very hit under judgement**, so gating the
+candidate against it would always pass. That is a *tautological guard*: it has the shape
+of a check, passes review, and validates nothing. When adding a guard, name the source of
+its evidence and confirm that source is independent of the thing being checked.
+
+### And: a real problem can carry an unimplementable suggestion
+
+BUI-465 suggested "cache the detail fetch per series so a multi-issue run of one series
+costs one call." The problem was real, but the suggestion cannot work: `lookup_issue_detail`
+is keyed by per-issue `metron_id`, so a run of issues from one series has all-distinct ids
+and such a cache gets **zero** hits. The genuine saving is elsewhere — `lookup_issue`'s
+`series_list` half *is* per-series and reusable (filed as BUI-473).
+
+Record *why* a suggested direction was rejected. Otherwise the next agent reads the same
+plausible sentence and re-attempts it.
 
 ## Why This Matters
 
@@ -137,4 +230,21 @@ Before implementing any ticket that:
 | BUI-210 (a) | Placeholder date ships rows dateless to LOCG | Export already blanks it; removing it deletes wins via a reconcile fail-open | Declined, reverted, `DO NOT REMOVE` comment added |
 | BUI-210 (c) | A guard from an earlier finding is still unfixed | Already fixed a month earlier (commit `9384176`, BUI-199 finding 5) | No-op, documented as already-fixed rather than re-implemented |
 | BUI-461 | Need a fabricated `YYYY-01-02` day to survive the placeholder check | `_is_placeholder_release_date` is intent-based (`metron_id is None`), not shape-based | Not implemented; real `metron_id` alone suffices |
-| BUI-459 | `install.sh` should use the post-rename `com.comics.server` label | Live Mac Mini never had the BUI-220 rename actually performed | Reverted to match deployed reality, not "fixed" to the ticket's spec |
+| BUI-459 | `install.sh` should use the post-rename `com.comics.server` label | Live Mac Mini had not yet had the BUI-220 rename performed | Reverted to match deployed reality; migration later done deliberately in BUI-463 |
+| BUI-465 | "77/78 rows had a null publisher" proves the breaker latched | BUI-458 added the publisher fetch *after* those rows were written — not evidence | Claim upheld on different evidence (run-grouped placeholder ordering); figure corrected |
+| BUI-470 | A variant/newsstand distinction is invisible to the reconciler | Reconciler's key is `full_title`-exact; the gap was record-win's coarser lookup, fixed in BUI-267 | Shipped as defense-in-depth with a *unit* test, not a misleading end-to-end one |
+| BUI-464 | Null year → newest volume; `needs_review` doesn't gate it | Both killed by BUI-421 Fix A and BUI-422; the named examples were correctly resolved | Only the third premise implemented; evidence sourced from the LOCG series window |
+
+## Practical checklist
+
+When the ticket is a reopen or a review residual, before writing code:
+
+1. **Re-read the named function**, not the ticket's paraphrase of it.
+2. **Check when each cited quantity started being recorded** before treating it as evidence.
+3. **Look up the specific records a ticket names as proof** — they are a checkable claim.
+4. **Search for fixes merged since the filing date** in the same area (`git log --since`).
+5. **For any deployed name, path, or label, check the live system**, not the docs.
+6. **If you add a guard, name its evidence source** and confirm it is independent of the
+   thing being guarded.
+7. **When the premise is wrong, say so in the PR and the ticket** — and put the test where
+   the bug actually is, not where the ticket said it was.

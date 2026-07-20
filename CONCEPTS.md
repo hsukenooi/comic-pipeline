@@ -36,6 +36,9 @@ Win-sourced entries carry a publisher when the issue could be resolved (record-w
 ### Import-Sourced Entry
 A Collection entry that originated from — or has round-tripped through — a LOCG export. *Known in code and tickets as:* `locg_export`. The counterpart to a Win-Sourced Entry.
 
+### Copy Count
+How many copies of an issue the Collection holds — **a count, not an ownership flag**. *Known in code as:* `in_collection`, where `0` means tracked-but-not-owned, `1` is the common case, and `2+` is a genuine duplicate (a second copy, or a condition upgrade held alongside the original). Treating it as a boolean is a recurring trap in both directions: reading it as truthy makes a text-formatted `"0"` from a LOCG export mean *owned* (`bool("0")` is `True`, BUI-469), while writing it as a flag silently discards a second copy when two entries are merged (BUI-470). Any read must coerce to `int` and compare, and any merge of two genuinely distinct copies must **increment** the survivor rather than drop the loser.
+
 ### Pending Push
 A Collection entry that has been recorded locally but not yet confirmed present on LOCG. Clearing pending entries is the goal of a Collection Sync; an entry stays pending until it reappears in a LOCG export and reconciles.
 
@@ -51,6 +54,11 @@ The ownership-matcher state where a queried issue number is owned under more tha
 
 ### Cover Year
 The publication year printed on an issue's cover, used as the **per-issue** key the matcher's year gate compares against a stored release date (within a small tolerance for cover-vs-onsale skew). Distinct from a series' **start year** (`year_began`): feeding a series start year into the per-issue gate is the wrong-year error that hides owned books, whereas the correct per-issue Cover Year disambiguates volumes without that risk.
+
+### Era Evidence
+Whatever independently establishes *which era* — and therefore which volume — a book belongs to, so a lookup result can be accepted or rejected. Usually the listing's Cover Year; when that is missing, the volume publication window carried by the matched LOCG canonical series name (`"The X-Men (Vol. 1) (1963 - 1981)"`) can stand in.
+
+The defining requirement is **independence**: the evidence must not derive from the same lookup hit it is being used to judge. A range taken from the hit's own series decoration would gate the candidate against itself and always pass — a *tautological guard*, which has the shape of a check and validates nothing (BUI-464). With no independent evidence at all there is no era guard, which is why a book whose era cannot be established is left undated rather than dated by guess: a wrong date is silent, a missing one is loud.
 
 ### Printing
 A specific press run of an issue — the base (first) printing, or a numbered reprint ("2nd Printing", "3rd Printing", a bare "Reprint", …). **Printings are distinct collectibles, not variants of one book**: owning a reprint is not owning the base printing, and vice versa (confirmed incident, BUI-364 — an owned "2nd Printing" of *Absolute Martian Manhunter #1* satisfied a check for the base printing, hiding the fact that the base was explicitly wish-listed and still unowned). The ownership matcher's series+issue core deliberately ignores everything after the issue token, so it can conflate printings unless a caller reads the mechanical `printing_conflict` flag (plus the `printing_candidates` list, each carrying a `printing_ordinal`) that every collection-check verdict, the `POST /api/comics/wish-list` 409, and the wish-list conflicts audit all carry (BUI-364/BUI-372/BUI-373) — advisory only (R11): the flag qualifies a verdict, it never flips one, and the conflicts audit keeps a printing-conflict match out of its removable set entirely rather than risk it being swept as a genuine duplicate.
