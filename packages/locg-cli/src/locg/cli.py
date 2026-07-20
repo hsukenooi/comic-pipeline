@@ -22,6 +22,7 @@ from locg.commands import (
     cmd_check_lists,
     cmd_collection,
     cmd_collection_audit_pending,
+    cmd_collection_backfill,
     cmd_collection_check,
     cmd_collection_doctor,
     cmd_collection_export,
@@ -193,6 +194,36 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Path to a JSON file containing wins (use '-' to read from stdin)",
     )
+
+    # collection backfill — publisher/date remediation for stored pending wins (BUI-461)
+    p_backfill = coll_sub.add_parser(
+        "backfill",
+        parents=[common],
+        help="Backfill publisher_name/release_date on ALREADY-STORED pending agent_win rows (dry-run by default)",
+        epilog=(
+            "Remediates rows the record-win producer wrote before BUI-458/BUI-210 "
+            "(null publisher, YYYY-01-01 placeholder date). Targets ONLY pending "
+            "agent_win rows (source=agent_win, in_collection>=1, never pushed) — "
+            "never an locg_export row or a wish twin — and writes ONLY "
+            "publisher_name/release_date/metron_id, never identity or copy counts. "
+            "Dry-run is the DEFAULT and writes nothing; --apply takes a durable "
+            "backup first and refuses to write if it captured zero rows. A Metron "
+            "miss leaves the field alone (never a fabricated publisher or date); a "
+            "dateless row has no year to era-gate a lookup with and is reported for "
+            "the documented web fallback. Re-running is a no-op."
+        ),
+    )
+    p_backfill.add_argument("--series", help="Only rows whose series_name contains this text (case-insensitive)")
+    p_backfill.add_argument("--full-title", dest="full_title", help="Only rows whose full_title contains this text (case-insensitive)")
+    p_backfill.add_argument("--apply", action="store_true", help="Write the changes (default is a read-only dry run)")
+    p_backfill.add_argument(
+        "--cadence",
+        type=float,
+        default=3.0,
+        help="Seconds to sleep between rows that spend a Metron call (default: 3.0; Metron allows ~20 req/min). 0 disables.",
+    )
+    p_backfill.add_argument("--limit", type=int, help="Process at most N candidate rows (for consecutive runs against a large backlog)")
+    p_backfill.add_argument("--backup-dir", dest="backup_dir", help="Where --apply writes its durable pre-write snapshot (default: <store>-backups/backfill-<ts>)")
 
     # collection remediate-delete — matcher-bypassing single-row delete (BUI-427)
     p_rem_del = coll_sub.add_parser(
@@ -498,7 +529,7 @@ def main() -> None:
     # Collection cache subcommands are purely local — skip Playwright browser launch.
     _LOCAL_COLLECTION_SUBCMDS = {
         "import", "export", "status", "check", "doctor", "record-win", "audit-pending",
-        "remediate-delete", "remediate-set-copies",
+        "remediate-delete", "remediate-set-copies", "backfill",
     }
     _collection_sub = (
         getattr(args, "collection_command", None)
@@ -584,6 +615,18 @@ def main() -> None:
                 if not isinstance(wins, list):
                     die("JSON input must be a list of win objects", code=2)
                 result = cmd_collection_record_win(wins)
+            elif sub_cmd == "backfill":
+                result = cmd_collection_backfill(
+                    series=getattr(args, "series", None),
+                    full_title=getattr(args, "full_title", None),
+                    apply=getattr(args, "apply", False),
+                    cadence=getattr(args, "cadence", 3.0),
+                    limit=getattr(args, "limit", None),
+                    backup_dir=getattr(args, "backup_dir", None),
+                )
+                if result.get("status") not in ("ok", "preview"):
+                    output(result, pretty=args.pretty, fields=fields)
+                    sys.exit(1)
             elif sub_cmd == "remediate-delete":
                 result = cmd_collection_remediate_delete(
                     gixen_item_id=getattr(args, "gixen_item_id", None),
