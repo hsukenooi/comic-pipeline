@@ -3574,6 +3574,39 @@ def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]
 
 RECORD_WIN_CHUNK_SIZE = 25
 
+# BUI-465: how a record-win batch survives a transient Metron trip.
+#
+# The breaker below is per-batch and monotonic by design (BUI-255) — but the
+# batch driver used to have no way to tell WHY it tripped, so a single 429
+# partway through downgraded every remaining win to a `{year}-01-01` placeholder
+# and a null publisher. Forensics on the 2026-07-19 store: of the 58 placeholder
+# rows, 40 came from ONE 41-row run whose first row carried a metron_id and whose
+# other 40 carried none — including four more issues of a series the first row
+# had just resolved. That is the latch, not a data miss.
+#
+# Two changes close it, and they are ordered: PREVENT, then RECOVER.
+#
+#   * Prevent — `cmd_collection_record_win` paces itself to
+#     ``METRON_REQUESTS_PER_MINUTE`` HTTP requests per minute (Metron's
+#     documented burst budget), counting requests rather than calls because
+#     `lookup_issue` spends two of them. Nothing throttled the batch before;
+#     at ~3 requests per win it blew the budget after ~7 wins.
+#   * Recover — a trip that is NOT a credential error earns a cooldown and a
+#     reset, up to ``METRON_MAX_TRANSIENT_TRIPS`` times. Past that the breaker
+#     latches for the rest of the batch, which is what preserves BUI-255's real
+#     protection: a genuinely unreachable Metron must not buy a fresh capped
+#     sleep on every one of 44 remaining rows.
+#
+# A `MetronCredentialError` is exempt from recovery on purpose. It is not
+# transient — the credentials are absent from the process environment and will
+# still be absent on the next row — so it latches immediately and permanently.
+METRON_REQUESTS_PER_MINUTE = 20.0
+METRON_MAX_TRANSIENT_TRIPS = 3
+# One full rate window, so the burst allowance has actually refilled before the
+# next win asks. The client's own retry already slept once (capped at 60s) before
+# tripping, so this is the SECOND wait, not the first.
+METRON_TRANSIENT_COOLDOWN_SEC = 60.0
+
 
 def _check_metron_degraded(metron: Any, metron_disabled: bool) -> bool:
     """BUI-255: trip the per-batch Metron breaker on throttle/timeout.
@@ -3582,12 +3615,20 @@ def _check_metron_degraded(metron: Any, metron_disabled: bool) -> bool:
     exhausted a single capped rate-limit retry; BUI-342, exhausted a single
     capped 5xx retry) or by a connection-error ``ApiError`` — i.e. Metron itself
     signaling "this call failed because I'm throttled/unreachable/erroring",
-    never a genuine, exception-free "no match". Once
-    tripped, the caller stops calling Metron for the rest of the batch (same
-    fallback ``MetronCredentialError`` already uses) instead of repeating a
-    capped-but-still-real sleep on every remaining row — a 44-row batch could
+    never a genuine, exception-free "no match". Once tripped, the caller stops
+    calling Metron for the rest of THIS win instead of repeating a
+    capped-but-still-real sleep on every remaining lookup — a 44-row batch could
     otherwise stack dozens of 60s sleeps and wedge the single-worker server
     that runs this synchronously (see BUI-247's record-win incident).
+
+    BUI-465 narrowed the blast radius from the batch to the win. This trip is
+    transient by construction — throttled, unreachable, erroring — so
+    ``cmd_collection_record_win`` now cools down and reopens the breaker rather
+    than condemning every later win to a placeholder date and a null publisher.
+    The "stop asking" protection above survives as a cap: after
+    ``METRON_MAX_TRANSIENT_TRIPS`` trips the batch stops reopening it. A
+    ``MetronCredentialError`` is still a permanent, immediate latch — it is the
+    one cause that cannot clear itself between rows.
 
     ``is True`` (identity, not truthiness) so an unconfigured ``MagicMock``
     metron stub in a test — whose ``.degraded`` auto-vivifies as a truthy
@@ -3688,13 +3729,26 @@ def _build_win_row(
       - "skip_detail": dict | None — present when skipped
       - "row": dict | None — the built collection row, present when not skipped
       - "metron_disabled": bool — updated metron_disabled flag to thread into the next call
+      - "metron_credential_error": bool — the breaker tripped on missing credentials.
+        BUI-465: the caller needs the CAUSE, not just the flag. A credential error is
+        permanent for the process and must latch for the whole batch; a throttle/outage
+        trip is transient and must not.
+      - "metron_requests": int — HTTP requests this win spent against Metron's
+        per-minute budget (BUI-465), weighted per lookup by the constants in
+        ``locg.metron``. The caller paces the batch on this.
       - "metron_attempted" / "metron_succeeded" / "manual_series" / "manual_variant" /
         "variant_detail_attempted" / "variant_matches": int deltas for this win
     """
-    from locg.metron import MetronCredentialError
+    from locg.metron import (
+        REQUESTS_LOOKUP_ISSUE,
+        REQUESTS_LOOKUP_ISSUE_DETAIL,
+        MetronCredentialError,
+    )
 
     metron_attempted = 0
     metron_succeeded = 0
+    metron_requests = 0
+    metron_credential_error = False
     manual_series = 0
     manual_variant = 0
     variant_detail_attempted = 0
@@ -3731,6 +3785,13 @@ def _build_win_row(
     canonical_series: Optional[str] = None
     needs_manual_series = False
     metron_data: Optional[dict[str, Any]] = None
+    # BUI-465: has `lookup_issue(series_raw, issue_num, year_raw)` — this row's
+    # ONE possible issue query — already been asked? The R36 step-2 resolution
+    # below and the BUI-210 date-only lookup further down issue byte-identical
+    # calls, so on a step-2 miss the second one re-asked a question Metron had
+    # just answered "no" to and spent a quarter of the batch's request budget
+    # doing it. Every pending win in the 2026-07-19 backlog was on that path.
+    issue_lookup_done = False
 
     # BUI-199: resolve the canonical series by issue-number boundary
     # (the LOCG X-Men split) and by year/era (the right volume), not by
@@ -3744,13 +3805,20 @@ def _build_win_row(
         try:
             metron_attempted += 1
             metron_data = metron.lookup_issue(series_raw, issue_num, year_raw)
+            issue_lookup_done = True
             if metron_data:
                 metron_succeeded += 1
                 canonical_series = metron.format_series_name(metron_data)
         except MetronCredentialError:
             metron_disabled = True
+            metron_credential_error = True
             logger.warning("Metron credentials not configured; falling back to manual series resolution.")
         else:
+            # BUI-465: charged in the no-exception branch only. A
+            # MetronCredentialError is raised by `_get_session()` before any HTTP
+            # request leaves the process, so charging it would make the batch pace
+            # itself against traffic Metron never saw.
+            metron_requests += REQUESTS_LOOKUP_ISSUE
             metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
     if canonical_series is None:
@@ -3792,6 +3860,8 @@ def _build_win_row(
             },
             "row": None,
             "metron_disabled": metron_disabled,
+            "metron_credential_error": metron_credential_error,
+            "metron_requests": metron_requests,
             "metron_attempted": metron_attempted,
             "metron_succeeded": metron_succeeded,
             "manual_series": manual_series,
@@ -3820,7 +3890,13 @@ def _build_win_row(
     # On THIS path a rejected hit drops the whole metron_data, not just its
     # date — the id, series and (BUI-458) publisher all came from the same
     # possibly-wrong issue match.
-    if metron_data is None and issue_num and not metron_disabled:
+    #
+    # BUI-465: skipped when the R36 step-2 lookup above already issued this exact
+    # query. It only reaches here having produced no metron_data, and the query
+    # is byte-identical, so re-asking spends two more requests to be told "no" a
+    # second time. (Step-2 doesn't run at all on the common index-resolved path,
+    # which is the path this block exists to serve.)
+    if metron_data is None and issue_num and not metron_disabled and not issue_lookup_done:
         year_str = str(year_raw).strip() if year_raw is not None else ""
         if re.fullmatch(r"\d{4}", year_str):
             try:
@@ -3831,10 +3907,12 @@ def _build_win_row(
                     metron_data = looked_up
             except MetronCredentialError:
                 metron_disabled = True
+                metron_credential_error = True
                 logger.warning(
                     "Metron credentials not configured; falling back to placeholder release date."
                 )
             else:
+                metron_requests += REQUESTS_LOOKUP_ISSUE
                 metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
     # BUI-467: the R36 step-2 lookup above (used when series_name_index has
@@ -3888,10 +3966,12 @@ def _build_win_row(
                 publisher_name = issue_detail.get("publisher") or None
         except MetronCredentialError:
             metron_disabled = True
+            metron_credential_error = True
             logger.warning(
                 "Metron credentials not configured; skipping publisher/variant resolution."
             )
         else:
+            metron_requests += REQUESTS_LOOKUP_ISSUE_DETAIL
             metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
     # R32: variant handling
@@ -4038,6 +4118,16 @@ def _build_win_row(
         "metron_id": metron_data.get("metron_id") if metron_data else None,
         "gixen_item_id": item_id or None,
         "previous_full_title": None,
+        # BUI-465: WHY this row lacks Metron data — "we never asked" vs "we asked
+        # and missed". True only when something Metron-sourced is actually absent
+        # AND the breaker was off/down at the time, so a row that resolved fully
+        # despite a late trip is not falsely flagged. `audit-pending` and the
+        # BUI-461 backfill can then tell a retryable never-asked row apart from a
+        # genuine Metron miss instead of re-deriving it forensically from the
+        # ordering of `local_added_seq` (which is how BUI-465 was diagnosed at
+        # all). Absent on rows written before BUI-465, which reads as "unknown".
+        "metron_unavailable": bool(metron_disabled)
+        and (metron_data is None or publisher_name is None),
     }
 
     return {
@@ -4045,6 +4135,8 @@ def _build_win_row(
         "skip_detail": None,
         "row": row,
         "metron_disabled": metron_disabled,
+        "metron_credential_error": metron_credential_error,
+        "metron_requests": metron_requests,
         "metron_attempted": metron_attempted,
         "metron_succeeded": metron_succeeded,
         "manual_series": manual_series,
@@ -4058,6 +4150,7 @@ def cmd_collection_record_win(
     wins: list[dict[str, Any]],
     cache: Optional[Any] = None,
     metron: Optional[Any] = None,
+    requests_per_minute: float = METRON_REQUESTS_PER_MINUTE,
 ) -> dict[str, Any]:
     """Record a batch of Gixen auction wins into the local collection cache.
 
@@ -4076,6 +4169,14 @@ def cmd_collection_record_win(
     every row submitted to write_wins, while rows_inserted counts only the
     ones that added a genuinely new row (rows_overwritten replaced an existing
     row sharing its gixen_item_id and added none).
+
+    ``requests_per_minute`` is the BUI-465 pacing budget (default: Metron's
+    documented 20/min burst); ``0`` disables pacing, which is only appropriate
+    for tests and for a caller that has already metered the traffic itself.
+    The sleeps are real, so a long batch is slow on purpose — the record-win
+    endpoint runs this off the event loop via ``asyncio.to_thread`` (BUI-428)
+    precisely so a Metron wait cannot stall the single-worker comics server.
+    See ``METRON_REQUESTS_PER_MINUTE`` for the pace/recover rationale.
     """
     from datetime import datetime, timezone
     from locg.collection_cache import (
@@ -4149,7 +4250,27 @@ def cmd_collection_record_win(
     metron_variant_lookups_attempted = 0
     metron_variant_matches = 0
     partial_failure = False
+    # BUI-465: three distinct pieces of Metron state, where there used to be one
+    # bool doing all three jobs.
+    #   metron_disabled       — the breaker as _build_win_row sees it, now RESET
+    #                           after a recovered transient trip.
+    #   credentials_missing   — permanent; once set the breaker never reopens.
+    #   transient_trips       — how many throttle/outage trips this batch has
+    #                           already forgiven, capped at
+    #                           METRON_MAX_TRANSIENT_TRIPS.
     metron_disabled = False
+    metron_credentials_missing = False
+    metron_transient_trips = 0
+    metron_requests_spent = 0
+    metron_unavailable_rows = 0
+    # Requests spent on the previous win, i.e. what the next win must pay for
+    # before it may ask Metron anything. Charged BEFORE the win rather than
+    # after, so a batch whose last win needed Metron does not end on a pointless
+    # sleep.
+    pending_paced_requests = 0
+    # A non-positive budget means "don't pace" (0 opts out; a negative value is
+    # nonsense and must not become a negative sleep).
+    seconds_per_request = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
 
     chunks = [
         wins[i : i + RECORD_WIN_CHUNK_SIZE]
@@ -4166,6 +4287,15 @@ def cmd_collection_record_win(
         chunk_variant_matches = 0
 
         for win in chunk:
+            # Pace: pay for the previous win's Metron traffic before spending any
+            # more. Skipped while the breaker is shut, because a shut breaker
+            # spends nothing — the only wait a disabled row deserves is the
+            # cooldown below.
+            if pending_paced_requests and seconds_per_request and not metron_disabled:
+                time.sleep(seconds_per_request * pending_paced_requests)
+            pending_paced_requests = 0
+
+            breaker_open_before = metron_disabled
             result = _build_win_row(
                 win,
                 series_name_index=series_name_index,
@@ -4176,6 +4306,45 @@ def cmd_collection_record_win(
                 metron_disabled=metron_disabled,
             )
             metron_disabled = result["metron_disabled"]
+            pending_paced_requests = result["metron_requests"]
+            metron_requests_spent += result["metron_requests"]
+            if result["metron_credential_error"]:
+                metron_credentials_missing = True
+            if (result["row"] or {}).get("metron_unavailable"):
+                metron_unavailable_rows += 1
+
+            # BUI-465: a transient trip must not silently downgrade the rest of
+            # the batch. Wait out one rate window and reopen the breaker, up to
+            # METRON_MAX_TRANSIENT_TRIPS times; past that, treat Metron as
+            # genuinely down and keep it shut (BUI-255). A credential error is
+            # never forgiven — it cannot fix itself between rows.
+            #
+            # Gated on the breaker having been CLOSED before this win, so this
+            # runs once per trip: an exhausted budget leaves the breaker open, and
+            # on every later win `breaker_open_before` is then True, which both
+            # silences the log and stops the trip counter from running away.
+            if metron_disabled and not breaker_open_before and not metron_credentials_missing:
+                if metron_transient_trips < METRON_MAX_TRANSIENT_TRIPS:
+                    metron_transient_trips += 1
+                    logger.warning(
+                        "Metron breaker tripped mid-batch (trip %d/%d); cooling down "
+                        "%.0fs and retrying rather than downgrading the remaining wins.",
+                        metron_transient_trips, METRON_MAX_TRANSIENT_TRIPS,
+                        METRON_TRANSIENT_COOLDOWN_SEC,
+                    )
+                    time.sleep(METRON_TRANSIENT_COOLDOWN_SEC)
+                    metron_disabled = False
+                    # The cooldown is a whole rate window — far more than the pace
+                    # debt this win ran up — so the next win owes nothing further.
+                    pending_paced_requests = 0
+                else:
+                    logger.warning(
+                        "Metron tripped %d times in this batch; leaving it disabled for "
+                        "the remaining wins, which record without a publisher or a real "
+                        "release date (metron_unavailable=True on each such row).",
+                        metron_transient_trips,
+                    )
+
             chunk_metron_attempted += result["metron_attempted"]
             chunk_metron_succeeded += result["metron_succeeded"]
             chunk_manual_series += result["manual_series"]
@@ -4229,6 +4398,14 @@ def cmd_collection_record_win(
         "metron_lookups_succeeded": metron_lookups_succeeded,
         "metron_variant_lookups_attempted": metron_variant_lookups_attempted,
         "metron_variant_matches": metron_variant_matches,
+        # BUI-465: batch-level Metron health, so a downgraded run is visible in
+        # the response instead of only in the server log. `metron_degraded` uses
+        # the same key name cmd_collection_backfill already reports.
+        "metron_degraded": metron_disabled,
+        "metron_credentials_missing": metron_credentials_missing,
+        "metron_transient_trips": metron_transient_trips,
+        "metron_requests_spent": metron_requests_spent,
+        "metron_unavailable_rows": metron_unavailable_rows,
         "partial_failure": partial_failure,
     }
 
