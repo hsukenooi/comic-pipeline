@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import stat
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ from locg.config import wish_list_cache_path
 from locg.parsing import trailing_issue_token
 
 from locg.collection_cache import (
+    LOCG_BOOLEAN_COLUMNS,
     LOCG_COLUMNS,
     USER_MANAGED_COLUMNS,
     CollectionCache,
@@ -67,6 +68,64 @@ LOCG_XLSX_HEADERS: tuple[str, ...] = (
 # Map from Excel header to snake_case field name
 _HEADER_TO_FIELD: dict[str, str] = dict(zip(LOCG_XLSX_HEADERS, LOCG_COLUMNS))
 
+# Columns holding a date: openpyxl returns a date-formatted cell as a
+# `datetime`/`date` object rather than a string (BUI-469).
+_DATE_COLUMNS: frozenset[str] = frozenset({"release_date", "date_purchased"})
+
+
+def _coerce_date_cell(value: Any) -> Any:
+    """Normalize a raw date-column cell to a ``YYYY-MM-DD`` string.
+
+    openpyxl returns date-formatted cells as ``datetime``/``date`` objects, but
+    every downstream consumer (``_reconcile_score``, ``_release_year``,
+    ``make_identity``'s identity tuple, ...) expects a string or ``None`` —
+    ``(row.get("release_date") or "")[:4]`` raises ``TypeError`` on a
+    ``datetime``. Text-formatted date cells already arrive as plain strings
+    (or ``None`` for a blank cell) and pass through unchanged.
+    """
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+def _coerce_count_cell(value: Any, *, field: str | None = None) -> int:
+    """Normalize a raw ``LOCG_BOOLEAN_COLUMNS`` cell to ``int`` — never ``bool``.
+
+    ``in_collection`` is a copies-owned COUNT (0, 1, 2+), not a flag, so this
+    must land on ``int`` rather than collapse to ``bool`` (see the
+    collection-store composition convention). Without this, a text-formatted
+    cell arrives as a ``str`` — and ``bool("0")`` is ``True``, which is
+    dangerous wherever an ownership read authorizes deleting a row (BUI-469).
+
+    Handles native ``int``/``float``/``bool`` cells (a checkbox-styled column
+    can come back as ``bool``) and text-formatted numeric strings — routing
+    every non-bool, non-``None`` shape through the same ``float(str(...))``
+    parse (rather than trusting ``int()`` directly on a raw ``float``) so a
+    stray ``NaN``/``inf`` cell hits the ``except`` below instead of raising
+    ``ValueError``/``OverflowError`` out of ``int()`` uncaught. Blank
+    (``None``) or unparseable input reads as ``0`` — the same "not present"
+    value these columns already use — and, when ``field`` is given (the
+    ``parse_xlsx`` ingest path, not the in-memory ``_is_owned`` read), an
+    unparseable non-blank cell logs a warning: silently defaulting a garbled
+    ownership cell to "not owned" is the R11-dangerous direction (a hidden
+    duplicate-buy risk), so the anomaly must stay visible rather than
+    disappear into a 0.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if value is None:
+        return 0
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError, OverflowError):
+        if field is not None:
+            logger.warning(
+                "parse_xlsx: unparseable %s cell %r — defaulting to 0", field, value
+            )
+        return 0
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -75,8 +134,14 @@ _HEADER_TO_FIELD: dict[str, str] = dict(zip(LOCG_XLSX_HEADERS, LOCG_COLUMNS))
 def parse_xlsx(path: Path) -> list[dict[str, Any]]:
     """Parse a LOCG Excel export into a list of row dicts.
 
-    Validates file size and header row before reading any data.
-    Returns rows with LOCG_COLUMNS keys and raw cell values.
+    Validates file size and header row before reading any data. Each cell is
+    coerced to its declared type on the way in (BUI-469): date columns
+    (``release_date``, ``date_purchased``) normalize to ``YYYY-MM-DD``
+    strings, and ``LOCG_BOOLEAN_COLUMNS`` (``in_collection``, ``in_wish_list``,
+    ``marked_read``, ``signature``, ``slabbing``) normalize to ``int`` — never
+    ``bool``, since ``in_collection`` is a copies-owned count, not a flag.
+    Every other column keeps its raw openpyxl cell value. Returns rows with
+    LOCG_COLUMNS keys.
     """
     path = Path(path)
     if not path.exists():
@@ -111,7 +176,12 @@ def parse_xlsx(path: Path) -> list[dict[str, Any]]:
             row: dict[str, Any] = {}
             for header, field in _HEADER_TO_FIELD.items():
                 idx = LOCG_XLSX_HEADERS.index(header)
-                row[field] = raw[idx] if idx < len(raw) else None
+                value = raw[idx] if idx < len(raw) else None
+                if field in _DATE_COLUMNS:
+                    value = _coerce_date_cell(value)
+                elif field in LOCG_BOOLEAN_COLUMNS:
+                    value = _coerce_count_cell(value, field=field)
+                row[field] = value
             rows.append(row)
     finally:
         wb.close()
@@ -244,23 +314,19 @@ def _era_decline_reason(
 def _is_owned(row: dict[str, Any]) -> bool:
     """Strict read of ``in_collection`` (a copy count, not a flag).
 
-    ``parse_xlsx`` stores raw openpyxl cell values with no coercion, so a
-    text-formatted "In Collection" cell arrives as a ``str`` — and ``bool("0")``
-    is ``True``. A truthiness read is harmless in ``_apply_locg_columns_held``,
-    where the only consequence is an over-conservative ownership *hold* (the
-    safe direction). On the auto-heal branch the same cell authorizes retiring
-    a row, so it is parsed strictly: anything that does not resolve to a count
+    ``parse_xlsx`` coerces ``in_collection`` to ``int`` on ingest (BUI-469),
+    so a fresh xlsx row is already safe to read with plain truthiness. This
+    stays strict as a defense-in-depth backstop for any row this coercion
+    doesn't cover — one constructed in-process rather than parsed, or one
+    already persisted to the on-disk cache from an import that predates
+    BUI-469 and still carries a raw ``str`` (where ``bool("0")`` is ``True``).
+    A truthiness read is harmless in ``_apply_locg_columns_held``, where the
+    only consequence is an over-conservative ownership *hold* (the safe
+    direction). On the auto-heal branch the same cell authorizes retiring a
+    row, so it is parsed strictly: anything that does not resolve to a count
     >= 1 is not ownership.
     """
-    value = row.get("in_collection")
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value >= 1
-    try:
-        return float(str(value).strip()) >= 1
-    except (TypeError, ValueError):
-        return False
+    return _coerce_count_cell(row.get("in_collection")) >= 1
 
 
 # Local-only provenance an agent_win row carries that a LOCG export row never
@@ -1149,7 +1215,6 @@ def _format_price(value: Any) -> str:
 
 def _format_date(value: Any) -> str:
     """Return value as an ISO date string (first 10 chars). Falls back to today."""
-    from datetime import date
     if value is None:
         return date.today().isoformat()
     s = str(value)

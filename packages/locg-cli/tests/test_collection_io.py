@@ -341,6 +341,182 @@ def _build_export_xlsx(path: Path, rows: list[dict[str, Any]]):
     wb.save(path)
 
 
+# ---------------------------------------------------------------------------
+# parse_xlsx — cell type coercion (BUI-469): openpyxl returns raw cell values
+# with no type coercion, so a date-formatted cell arrives as a datetime and a
+# text-formatted boolean/count cell arrives as a str. Both classes share one
+# root cause and are fixed by the same coercion step in parse_xlsx.
+# ---------------------------------------------------------------------------
+
+def test_parse_xlsx_coerces_datetime_release_date_cell_to_iso_string(tmp_path):
+    """A date-formatted 'Release Date' cell comes back from openpyxl as a
+    datetime; parse_xlsx must normalize it to the same 'YYYY-MM-DD' string
+    shape every other release_date in the codebase uses."""
+    from datetime import datetime as dt
+    from locg.collection_io import parse_xlsx
+
+    xlsx = tmp_path / "dated.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics", "series": "Watchmen (1986 - 1987)",
+        "full_title": "Watchmen #1", "release_date": dt(1986, 9, 2),
+    }])
+
+    rows = parse_xlsx(xlsx)
+    assert rows[0]["release_date"] == "1986-09-02"
+    assert isinstance(rows[0]["release_date"], str)
+
+
+def test_parse_xlsx_coerces_text_in_collection_to_int_preserving_count(tmp_path):
+    """A text-formatted 'In Collection' cell must coerce to int, never bool —
+    bool("0") is True, and in_collection is a copies-owned count (0/1/2+),
+    not a flag, so the distinct values must survive coercion."""
+    from locg.collection_io import parse_xlsx
+
+    xlsx = tmp_path / "text_counts.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel", "series": "Daredevil", "full_title": "Daredevil #1",
+         "release_date": "1964-04-01", "in_collection": "0"},
+        {"publisher": "Marvel", "series": "Daredevil", "full_title": "Daredevil #2",
+         "release_date": "1964-06-01", "in_collection": "2"},
+    ])
+
+    rows = parse_xlsx(xlsx)
+    by_title = {r["full_title"]: r for r in rows}
+
+    assert by_title["Daredevil #1"]["in_collection"] == 0
+    assert isinstance(by_title["Daredevil #1"]["in_collection"], int)
+    assert by_title["Daredevil #2"]["in_collection"] == 2, \
+        "copy count must survive coercion, not collapse to a bool"
+    assert isinstance(by_title["Daredevil #2"]["in_collection"], int)
+
+
+def test_coerce_count_cell_handles_nan_and_inf_without_raising():
+    """A stray NaN/Infinity cell (e.g. a formula error openpyxl surfaces as a
+    float) must default to 0, not raise. int(float("nan")) raises ValueError
+    and int(float("inf")) raises OverflowError — both must be caught."""
+    from locg.collection_io import _coerce_count_cell
+
+    assert _coerce_count_cell(float("nan")) == 0
+    assert _coerce_count_cell(float("inf")) == 0
+    assert _coerce_count_cell(float("-inf")) == 0
+
+
+def test_parse_xlsx_warns_on_unparseable_in_collection_cell(tmp_path, caplog):
+    """An unparseable 'In Collection' cell must default to 0 (never raise) but
+    log a warning — silently reading a garbled ownership cell as "not owned"
+    is the R11-dangerous direction (a hidden duplicate-buy risk), so the
+    anomaly must stay visible rather than disappear."""
+    import logging
+    from locg.collection_io import parse_xlsx
+
+    xlsx = tmp_path / "garbled.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel", "series": "Daredevil", "full_title": "Daredevil #1",
+        "release_date": "1964-04-01", "in_collection": "N/A",
+    }])
+
+    with caplog.at_level(logging.WARNING, logger="locg"):
+        rows = parse_xlsx(xlsx)
+
+    assert rows[0]["in_collection"] == 0
+    assert isinstance(rows[0]["in_collection"], int)
+    assert any("in_collection" in r.message and "N/A" in r.message for r in caplog.records)
+
+
+def test_import_xlsx_with_date_formatted_release_date_does_not_raise(tmp_path):
+    """BUI-469 acceptance: reproduces the exact pre-fix crash site.
+    _reconcile_score's year compare runs `(row.get("release_date") or "")[:4]`
+    on the xlsx row, which raises TypeError on a raw datetime — and it runs
+    first, during reconciliation of an unflagged pending agent_win row."""
+    from datetime import datetime as dt
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Amazing Spider-Man",
+        full_title="Amazing Spider-Man #309",
+        release_date="1988-01-01",  # agent stamped Jan 1
+        needs_manual_series=False,  # unflagged pending path (BUI-122)
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Amazing Spider-Man",
+        "full_title": "Amazing Spider-Man #309",
+        "release_date": dt(1988, 2, 11),  # date-formatted cell, not text
+    }])
+
+    result = import_xlsx(xlsx, cache)  # must not raise
+    payload = cache.load()
+
+    row = next(r for r in payload["comics"] if r["full_title"] == "Amazing Spider-Man #309")
+    assert row["release_date"] == "1988-02-11"
+    assert result["reconciled"] >= 1
+
+
+def test_import_xlsx_text_in_collection_cell_correct_on_new_insert(tmp_path):
+    """BUI-469 acceptance: a text-formatted 'In Collection' cell must read
+    with correct ownership EVERYWHERE, not just the _is_owned branch BUI-462
+    hardened. A brand-new row (Phase 2's plain-insert path, which never calls
+    _is_owned) must still land a real int — the string "0" would read truthy
+    (bool("0") is True) at every later touch point that checks ownership."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    xlsx = tmp_path / "export.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics", "series": "Batman", "full_title": "Batman #1",
+        "release_date": "1940-04-25", "in_collection": "0",  # text, not owned
+    }])
+
+    import_xlsx(xlsx, cache)
+    payload = cache.load()
+    row = next(r for r in payload["comics"] if r["full_title"] == "Batman #1")
+
+    assert row["in_collection"] == 0
+    assert isinstance(row["in_collection"], int)
+    assert bool(row["in_collection"]) is False
+
+
+def test_import_xlsx_text_in_collection_cell_preserves_copy_count_on_update(tmp_path):
+    """A text-formatted multi-copy count ('2') must survive the standard-merge
+    update path (_apply_locg_columns_held) as the int 2, not collapse to a
+    bool — losing the 0/1/2+ distinction would misreport how many copies are
+    actually owned."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    existing = _make_export_row(
+        publisher="Marvel Comics", series="Daredevil", full_title="Daredevil #1",
+        release_date="1964-04-01", in_collection=0, in_wish_list=1,
+    )
+
+    def seed(payload):
+        payload["comics"].append(existing)
+
+    cache.apply(seed, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Daredevil", "full_title": "Daredevil #1",
+        "release_date": "1964-04-01", "in_collection": "2",  # text-formatted
+    }])
+
+    import_xlsx(xlsx, cache)
+    payload = cache.load()
+    row = next(r for r in payload["comics"] if r["full_title"] == "Daredevil #1")
+
+    assert row["in_collection"] == 2, "copy count must survive, not collapse to a bool"
+    assert isinstance(row["in_collection"], int)
+
+
 def test_pending_agent_win_reconciled_on_within_year_date_shift(tmp_path):
     """BUI-122: an unflagged pending agent_win row whose export counterpart has
     the same year but a different Release Date reconciles instead of duplicating."""
