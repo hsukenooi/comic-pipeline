@@ -13,7 +13,7 @@ open gap). Behavior here was verified 2026-06-13 (BUI-122) against the code in
 
 - **The comics server (on the Mac Mini) is the source of truth**, not
   `data/locg/`. The canonical store lives on the server host at
-  `~/.gixen-server/collection-store/`
+  `~/.comics-server/collection-store/`
   (`collection.json` + rotating `.bak.0/1/2`, `wish-list.json`). `data/locg/` is
   now a gitignored local working cache, not repo-versioned.
 - All sync goes through the server API (`/api/comics/collection/*`,
@@ -33,7 +33,7 @@ open gap). Behavior here was verified 2026-06-13 (BUI-122) against the code in
 Run the skill; it performs the whole round-trip with a backup and a post-import
 safety check. The steps it drives (and you can do by hand against the API):
 
-1. **Backup** the server store (`~/.gixen-server/collection-store.bak.<ts>`).
+1. **Backup** the server store (`~/.comics-server/collection-store.bak.<ts>`).
    Mandatory; the skill hard-stops if it fails.
 2. **Export** (`GET /api/comics/collection/export`) → CSV + `.notes.md` in
    `~/Downloads`. Read-only; resolve anything in `.notes.md` first.
@@ -203,7 +203,7 @@ Clean up once, backup-gated — manual, not automated:
 
 ```bash
 # On the server host. Back up first.
-cp -r ~/.gixen-server/collection-store ~/.gixen-server/collection-store.bak.dedup.$(date +%Y%m%d-%H%M%S)
+cp -r ~/.comics-server/collection-store ~/.comics-server/collection-store.bak.dedup.$(date +%Y%m%d-%H%M%S)
 # After a sync, inspect the store's import-history.jsonl for ambiguous_reconciliation
 # records and `locg collection status --verbose` for the residual pending count.
 # For each duplicate, drop the pending (pushed_to_locg_at == null, source=agent_win)
@@ -220,7 +220,7 @@ already-owned dedup so they stop accumulating.
 
 ## Recovery if something goes wrong
 
-- **Restore the store:** copy the most recent `~/.gixen-server/collection-store.bak.<ts>`
+- **Restore the store:** copy the most recent `~/.comics-server/collection-store.bak.<ts>`
   back over `collection-store/`. The skill makes one before every sync.
 - **Uploaded the same CSV twice:** LOCG Bulk Import is keyed by title/series, so
   duplicates usually collapse on LOCG's side; verify in the LOCG UI and delete
