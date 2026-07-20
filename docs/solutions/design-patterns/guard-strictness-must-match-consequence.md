@@ -223,7 +223,7 @@ def resolve_server_dir() -> Path:
 This is a reasonable migration-safety resolver on its own. The danger appeared when
 `server/install.sh` was edited to use the post-migration names (`com.comics.server` /
 `~/.comics-server`) even though the BUI-220 rename had only been done in docs (BUI-425),
-never actually run on the live Mac Mini — which is still `com.gixen.server` /
+never actually run on the live Mac Mini — which at that point was still `com.gixen.server` /
 `~/.gixen-server`. `install.sh` does `mkdir -p "$SERVER_DIR"` as a normal part of a
 routine re-deploy. The instant that line ran with `SERVER_DIR=~/.comics-server`, the
 directory would exist — empty — and `resolve_server_dir()` would prefer it on the very
@@ -234,6 +234,14 @@ back to the pre-migration names and left a comment explaining that this is delib
 not drift — the real BUI-220 data-dir migration stays a separate, intentional runbook
 (`docs/runbooks/comics-server-dir-migration.md`), never a side effect of a routine
 install-script run.
+
+> **Migration since performed (BUI-463, 2026-07-20).** The Mini now runs
+> `com.comics.server` from `~/.comics-server`, and `install.sh` has moved forward to
+> match. The pattern is unchanged and is now *more* relevant, not less: the resolver still
+> prefers `~/.comics-server` the instant it exists, so the hazard simply points the other
+> way (never let a script create the *legacy* path either). The general rule stands — an
+> eager "prefer the new path if it exists" resolver must never share a code path with
+> something that creates that path as a side effect.
 
 **Trap:** a "prefer the new path if it exists" resolver is only as safe as every script
 that can *cause* the new path to exist. `mkdir -p` looks inert; next to an
