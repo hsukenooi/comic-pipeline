@@ -1474,6 +1474,161 @@ def test_era_confirmed_requires_a_real_year_on_both_sides():
     assert not _era_confirmed(row("1989-02-14"), row("2022-08-31"))
 
 
+# ---------------------------------------------------------------------------
+# BUI-470: same-book test unified with record-win's own dedup pair
+# (_dedup_era_compatible / _dedup_variant_compatible, BUI-267), and
+# in_collection treated as a copy COUNT rather than a flag on heal.
+# ---------------------------------------------------------------------------
+
+def test_same_book_confirmed_rejects_variant_mismatch():
+    """BUI-470: `_same_book_confirmed` must decline a base win against an
+    owned Newsstand/Direct/Facsimile copy of the same issue+year — exactly
+    what stops record-win's own dedup (_dedup_variant_compatible, BUI-267)
+    from treating them as the same book.
+
+    This is a DIRECT unit test of the gate rather than an end-to-end
+    `import_xlsx` reproduction: `make_identity` includes the raw `full_title`
+    verbatim, and `_reconcile_score` (which selects the single xlsx_row a
+    flagged win is compared against before this gate ever runs) requires
+    either an identical trailing issue token with nothing after it, or an
+    EXACT case-insensitive full_title match — both already imply
+    suffix-agreement between `cache_row` and `xlsx_row`, so a genuine
+    variant/printing MISMATCH between those two specific rows can never reach
+    this gate via `import_xlsx` today (verified empirically: `_reconcile_score`
+    returns 0 for every base-vs-suffixed or suffix-vs-different-suffix pair
+    tried). This test locks in the gate's own correctness as a defense-in-depth
+    invariant — belt-and-suspenders parity with record-win's dedup, and a
+    safety net if `_reconcile_score`'s matching is ever loosened later."""
+    from locg.collection_io import _same_book_confirmed
+
+    base_win = {
+        "full_title": "Uncanny X-Men #201",
+        "release_date": "1986-01-01",
+    }
+    owned_newsstand = {
+        "full_title": "Uncanny X-Men #201 Newsstand Edition",
+        "release_date": "1986-01-01",
+    }
+    confirmed, reason, detail = _same_book_confirmed(base_win, owned_newsstand)
+    assert not confirmed
+    assert reason == "heal_declined_variant_mismatch"
+    assert "distinct editions" in detail
+
+    # Same suffix on both sides is still the same book.
+    same_newsstand = {
+        "full_title": "Uncanny X-Men #201 Newsstand Edition",
+        "release_date": "1986-01-01",
+    }
+    confirmed2, _reason2, _detail2 = _same_book_confirmed(owned_newsstand, same_newsstand)
+    assert confirmed2, "identical suffixes on both sides must still confirm"
+
+
+def test_pending_agent_win_collision_credits_genuine_second_copy(tmp_path):
+    """BUI-470: `in_collection` is a copy COUNT, not a flag. A pending win
+    that collides with a book ALREADY owned independently of this win (an
+    established row that was owned before this win ever existed) represents
+    a genuine second physical copy, not a redundant duplicate record of the
+    same transition. The heal must credit it onto the survivor's
+    in_collection rather than silently dropping it and trusting whatever
+    count the export happens to still carry (which, absent a manual LOCG
+    update, is still 1)."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    # Already-owned canonical row — established from a genuinely separate
+    # purchase/import BEFORE this second win ever existed.
+    owned = make_agent_win_row(
+        publisher="Marvel Comics", series="Daredevil",
+        full_title="Daredevil #181", release_date="1982-04-10",
+        gixen_item_id=None, pushed="2024-01-01T00:00:00.000000Z",
+    )
+    owned["source"] = "locg_export"
+    # A SEPARATE win for a second physical copy of the SAME book — record-win's
+    # own dedup missed it (as in the BUI-211 production scenario: no publisher
+    # + a placeholder date at write time), so it exists as a distinct pending
+    # row with its own gixen_item_id (a distinct eBay purchase).
+    second_copy_win = make_agent_win_row(
+        publisher=None, series="Daredevil", full_title="Daredevil #181",
+        release_date="1982-01-01", gixen_item_id="200", pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([owned, second_copy_win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    # LOCG's own export still reports only ONE copy — the user hasn't (yet)
+    # told LOCG about the second physical copy.
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Daredevil",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+        "in_collection": 1,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    dd = [r for r in payload["comics"] if r["full_title"] == "Daredevil #181"]
+    assert len(dd) == 1, "still a single row for the identity — no duplicate-identity pair"
+    kept = dd[0]
+    assert kept["in_collection"] == 2, "the second copy must be credited, not dropped"
+    assert kept["gixen_item_id"] == "200", "the win's bid link is still carried over"
+    assert result["auto_healed_duplicates"] == 1
+    assert result["second_copies_credited"] == 1
+
+    credited = [a for a in _audit_records(tmp_path) if a["type"] == "second_copy_credited"]
+    assert len(credited) == 1
+    assert credited[0]["details"]["in_collection_before"] == 1
+    assert credited[0]["details"]["in_collection_after"] == 2
+    assert credited[0]["details"]["credited"] == 1
+    assert any("credited as genuine extra copies" in w for w in result["warnings"])
+
+
+def test_wish_twin_heal_still_not_credited_as_second_copy(tmp_path):
+    """BUI-470 no-regression: the ORIGINAL wish-twin case (BUI-462) must NOT be
+    credited as a second copy — the target was NOT independently owned before
+    this win (in_collection=0, wish-only), so the fold IS the ownership
+    transition itself. Crediting it on top of the export's own in_collection=1
+    would double-count a book that was only ever bought once."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    wish_twin = _make_export_row(
+        publisher="Marvel Comics",
+        series="Marvel Tales (1964 - 1994)",
+        full_title="Marvel Tales #223",
+        release_date="1989-02-14",
+        in_collection=0,
+        in_wish_list=1,
+    )
+    win = make_agent_win_row(
+        publisher=None, series="Marvel Tales", full_title="Marvel Tales #223",
+        release_date="1989-01-01", gixen_item_id="777", pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([wish_twin, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Marvel Tales (1964 - 1994)",
+        "full_title": "Marvel Tales #223", "release_date": "1989-02-14",
+        "in_collection": 1, "in_wish_list": 0,
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    kept = next(r for r in payload["comics"] if r["full_title"] == "Marvel Tales #223")
+    assert kept["in_collection"] == 1, "wish-becomes-owned is ONE copy, not credited as a second"
+    assert result["auto_healed_duplicates"] == 1
+    assert result["second_copies_credited"] == 0
+    assert not any("credited as genuine extra copies" in w for w in result["warnings"])
+
+
 def test_pending_agent_win_ambiguous_left_pending(tmp_path):
     """When a pending agent_win row (no exact match) year-matches multiple export
     rows, it is left pending with an ambiguous_reconciliation audit/warning rather

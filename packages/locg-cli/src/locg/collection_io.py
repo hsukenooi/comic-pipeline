@@ -25,6 +25,7 @@ from locg.collection_cache import (
     LOCG_COLUMNS,
     USER_MANAGED_COLUMNS,
     CollectionCache,
+    _coerce_year,
     _next_seq,
     _normalize_series_key,
     _utcnow_iso,
@@ -34,6 +35,18 @@ from locg.collection_cache import (
     verified_copy_bytes,
 )
 from locg.parsing import normalize_issue_key, split_series_issue_for_ownership
+
+# BUI-470: the reconciler's destructive auto-heal must judge "same book" by
+# the SAME test record-win's own dedup uses (BUI-267), not a narrower local
+# one — a variant/newsstand distinction record-win treats as a DIFFERENT book
+# must not be invisible here. Safe to import at module load: commands.py
+# never imports collection_io at its own top level (only inside function
+# bodies, deferred), so this is a one-directional dependency, not a cycle.
+from locg.commands import (
+    _dedup_era_compatible,
+    _dedup_variant_compatible,
+    _owned_row_variant_suffix,
+)
 
 logger = logging.getLogger("locg")
 
@@ -309,6 +322,64 @@ def _era_decline_reason(
         "heal_declined_year_conflict",
         f"the release years disagree ({win_year} vs {export_year})",
     )
+
+
+def _same_book_confirmed(
+    cache_row: dict[str, Any], xlsx_row: dict[str, Any]
+) -> tuple[bool, str, str]:
+    """``(confirmed, audit reason, operator-facing detail)`` for the
+    destructive auto-heal branch (BUI-470).
+
+    Unifies the reconciler's same-book judgment with record-win's own dedup
+    test (:func:`locg.commands._dedup_era_compatible` /
+    :func:`locg.commands._dedup_variant_compatible`, BUI-267) so a
+    newsstand/variant distinction record-win treats as a DIFFERENT book is no
+    longer invisible here — the reconciler could otherwise retire a row
+    record-win deliberately kept distinct.
+
+    This only ADDS conditions to :func:`_era_confirmed`'s existing fail-closed
+    gate; it never replaces or loosens it (BUI-462's own hard requirement).
+    :func:`_era_confirmed` stays the primary, first-checked gate because it is
+    already STRICTER than record-win's own era test: it requires an EXACT
+    4-digit-year match (or the TPB/HC/OGN identical-title branch), where
+    :func:`_dedup_era_compatible` allows record-win's ±1 window and treats an
+    unparseable win year as permissive (the right bias for record-win, which
+    only ever *creates* a row — the wrong one for a branch that *retires*
+    one). Layering :func:`_dedup_era_compatible` on top after
+    :func:`_era_confirmed` already passed adds one thing it does not check —
+    a series' own declared ``(YYYY - YYYY)`` year range — without ever being
+    able to accept something :func:`_era_confirmed` rejected.
+    :func:`_dedup_variant_compatible` closes the actual gap this ticket exists
+    for: a base win must not heal against an owned Newsstand/Direct/Facsimile
+    copy (or a different print run) of the same issue, matching exactly what
+    stops record-win from deduping them at write time.
+    """
+    if not _era_confirmed(cache_row, xlsx_row):
+        reason, detail = _era_decline_reason(cache_row, xlsx_row)
+        return (False, reason, detail)
+
+    win_suffix = _owned_row_variant_suffix(cache_row.get("full_title") or "")
+    candidate_suffix = _owned_row_variant_suffix(xlsx_row.get("full_title") or "")
+    if not _dedup_variant_compatible((win_suffix or "").lower(), candidate_suffix):
+        return (
+            False,
+            "heal_declined_variant_mismatch",
+            f"the win's print/variant edition ({win_suffix or 'base, no suffix'}) "
+            f"and the export row's ({candidate_suffix or 'base, no suffix'}) are "
+            "distinct editions per record-win's own dedup test — not the same book",
+        )
+
+    win_year = _coerce_year(cache_row.get("release_date"))
+    if not _dedup_era_compatible(win_year, xlsx_row):
+        return (
+            False,
+            "heal_declined_era_range_mismatch",
+            f"the win's year ({win_year}) falls outside the export row's own "
+            "declared series year range per record-win's own dedup test — not "
+            "the same book",
+        )
+
+    return (True, "", "")
 
 
 def _is_owned(row: dict[str, Any]) -> bool:
@@ -592,6 +663,7 @@ def _reconcile_phase(
     identity_to_idx: dict[tuple, int],
     partial_to_idx: dict[tuple, int],
     healed_drop: dict[int, int],
+    second_copy_credits: dict[int, int],
     audit_records: list[dict[str, Any]],
     summary: dict[str, Any],
     now: str,
@@ -602,10 +674,18 @@ def _reconcile_phase(
     See import_xlsx's docstring for the two-phase pipeline this implements.
 
     Mutates `comics` row dicts, `identity_to_idx` / `partial_to_idx`,
-    `healed_drop`, `audit_records`, and `summary` in place (same containers
-    do_merge already builds/holds) — no return value, matching do_merge's
-    existing mutate-in-place style. Must run before _standard_merge_phase,
-    which relies on the identity rewrites and index updates made here.
+    `healed_drop`, `second_copy_credits`, `audit_records`, and `summary` in
+    place (same containers do_merge already builds/holds) — no return value,
+    matching do_merge's existing mutate-in-place style. Must run before
+    _standard_merge_phase, which relies on the identity rewrites and index
+    updates made here.
+
+    `second_copy_credits` (BUI-470): {kept row index -> copies to add to
+    in_collection}, keyed by the SURVIVING row's index (never a dropped
+    index — mirrors `healed_drop`'s values, not its keys). do_merge must
+    apply these to `comics` AFTER _standard_merge_phase (Phase 2), which
+    overwrites the survivor's in_collection wholesale from the export row —
+    applying any earlier would be silently clobbered.
     """
     # ----- Phase 1: Reconciliation ----------------------------------------
     # Manually-flagged best-guess rows always get the relaxed (exact-year)
@@ -712,11 +792,14 @@ def _reconcile_phase(
                 and not cache_row.get("in_wish_list")
             )
             if target_established and target_owned_after_import and cache_row_pending_win:
-                # BUI-462: the era must be PROVED before deleting anything —
-                # see _era_confirmed. Without it a dateless win can fuzzy-match
-                # a different volume of the same masthead and be dropped.
-                if not _era_confirmed(cache_row, xlsx_row):
-                    reason, detail = _era_decline_reason(cache_row, xlsx_row)
+                # BUI-462/BUI-470: same-book must be PROVED before deleting
+                # anything — see _same_book_confirmed. Without it a dateless
+                # win can fuzzy-match a different volume of the same masthead,
+                # or a base win can fuzzy-match a distinct print/variant
+                # edition record-win itself would never have deduped, and
+                # either gets dropped as if it were a duplicate.
+                confirmed, reason, detail = _same_book_confirmed(cache_row, xlsx_row)
+                if not confirmed:
                     audit_records.append({
                         "type": "ambiguous_reconciliation",
                         "ts": now,
@@ -738,6 +821,28 @@ def _reconcile_phase(
 
                 healed_drop[ci] = collide
                 summary["auto_healed_duplicates"] += 1
+                # BUI-470: `in_collection` is a copy COUNT, not a flag — a
+                # pending agent_win row is always created with in_collection=1
+                # (one gixen win == one physical copy), so a heal that drops
+                # it without crediting the survivor silently loses a genuine
+                # second copy or condition upgrade whenever the target's own
+                # ownership is independent of THIS win. The first fold onto a
+                # target that was NOT already owned pre-import is the
+                # ownership transition itself (a wish becoming owned via this
+                # exact win, or a previously-unrecorded win becoming the
+                # export's first reflection of it) and must not be
+                # double-counted on top of the export's own in_collection;
+                # every fold beyond that — including any fold onto a target
+                # that WAS already owned before this win existed — is
+                # evidence of a distinct physical copy. `target_row` is never
+                # itself mutated during Phase 1, so re-checking `_is_owned`
+                # here always reads the same pre-import value regardless of
+                # how many prior wins already folded into this same `collide`
+                # target this phase.
+                if _is_owned(target_row) or collide in second_copy_credits:
+                    second_copy_credits[collide] = second_copy_credits.get(collide, 0) + 1
+                else:
+                    second_copy_credits.setdefault(collide, 0)
                 audit_records.append({
                     "type": "auto_healed_duplicate_win",
                     "ts": now,
@@ -747,6 +852,7 @@ def _reconcile_phase(
                         "kept_identity": list(target_identity),
                         "dropped_identity": list(make_identity(cache_row)),
                         "gixen_item_id": cache_row.get("gixen_item_id"),
+                        "second_copy_credited": second_copy_credits[collide] > 0,
                         # The WHOLE dropped row, so this append-only log alone
                         # is genuinely enough to reconstruct it — the identity
                         # tuple omits exactly the local-only fields (price_paid,
@@ -989,7 +1095,8 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
 
     Returns a summary dict: {added, updated, untouched, reconciled,
     possibly_removed, ownership_downgrades_held, behavioral_drift_count,
-    auto_healed_duplicates, null_release_date_owned, warnings}.
+    auto_healed_duplicates, second_copies_credited, null_release_date_owned,
+    warnings}.
 
     `null_release_date_owned` (BUI-412) is a non-blocking data-quality count of
     owned rows (`in_collection` truthy) whose `release_date` is null/empty,
@@ -1015,8 +1122,14 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # cleanup_duplicates.py class 1 — same-book/different-identity dup wins).
         # BUI-462 extends this to the wish-twin case (the identity is owned by
         # the *incoming* export row rather than already owned in the store) and
-        # gates the drop on confirmed-era evidence (_era_confirmed).
+        # gates the drop on confirmed same-book evidence (_same_book_confirmed,
+        # BUI-470 — era AND print/variant edition, unified with record-win's
+        # own dedup test).
         "auto_healed_duplicates": 0,
+        # BUI-470: of the auto-healed duplicates above, how many were credited
+        # as a genuine extra physical copy — in_collection incremented on the
+        # surviving row rather than silently dropped along with the win.
+        "second_copies_credited": 0,
         # BUI-412: owned rows with no release_date, post-import. Non-blocking —
         # a data-quality count only, never used to reject/alter/drop a row.
         "null_release_date_owned": 0,
@@ -1037,6 +1150,10 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # BUI-462: {dropped index -> index of the row kept in its place}, so the
         # dropped win's local-only provenance can be carried onto the survivor.
         healed_drop: dict[int, int] = {}
+        # BUI-470: {kept row index -> copies to credit onto in_collection} —
+        # see _reconcile_phase's docstring for why this is keyed by survivor,
+        # not by dropped index, and why it must be applied after Phase 2.
+        second_copy_credits: dict[int, int] = {}
 
         # Full identity index: (publisher, series, full_title, release_date) → idx
         identity_to_idx: dict[tuple, int] = {}
@@ -1052,6 +1169,7 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
             identity_to_idx,
             partial_to_idx,
             healed_drop,
+            second_copy_credits,
             audit_records,
             summary,
             now,
@@ -1088,6 +1206,33 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 _carry_win_provenance(
                     comics[dropped_idx], comics[kept_idx], now, audit_records
                 )
+            # BUI-470: credit each survivor's in_collection for the genuine
+            # extra copies folded into it — for the SAME reason as the
+            # provenance carry above, this must run after Phase 2, which has
+            # just overwritten in_collection wholesale from the export row
+            # (_apply_locg_columns_held); crediting any earlier would be
+            # silently clobbered right back down.
+            credited_copies = 0
+            for kept_idx, credit in second_copy_credits.items():
+                if credit <= 0:
+                    continue
+                row = comics[kept_idx]
+                before = _coerce_count_cell(row.get("in_collection"))
+                row["in_collection"] = before + credit
+                credited_copies += credit
+                audit_records.append({
+                    "type": "second_copy_credited",
+                    "ts": now,
+                    "command": "import",
+                    "details": {
+                        "identity": list(make_identity(row)),
+                        "full_title": row.get("full_title"),
+                        "in_collection_before": before,
+                        "in_collection_after": row["in_collection"],
+                        "credited": credit,
+                    },
+                })
+            summary["second_copies_credited"] += credited_copies
             comics = [r for i, r in enumerate(comics) if i not in healed_drop]
             payload["comics"] = comics
             # Deleting rows from the collection must never be a silent success.
@@ -1102,6 +1247,13 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 "rows are recorded in import-history.jsonl "
                 "(type=auto_healed_duplicate_win) if any needs reversing."
             )
+            if credited_copies:
+                summary["warnings"].append(
+                    f"{credited_copies} of those healed win(s) were credited as "
+                    "genuine extra copies (BUI-470) — in_collection was "
+                    "incremented on the kept row rather than silently dropped; "
+                    "see import-history.jsonl (type=second_copy_credited)."
+                )
 
         # ----- Possibly-removed rows ------------------------------------------
         for row in comics:
