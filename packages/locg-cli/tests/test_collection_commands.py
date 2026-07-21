@@ -3935,6 +3935,170 @@ def test_record_win_pacing_counts_requests_not_calls(tmp_path):
     assert hit["metron_requests_spent"] == REQUESTS_LOOKUP_ISSUE + REQUESTS_LOOKUP_ISSUE_DETAIL
 
 
+# ---------------------------------------------------------------------------
+# cmd_collection_record_win — BUI-473 per-series reuse (real MetronClient)
+#
+# Unlike _null_metron/_metron_hit above (a bare MagicMock standing in for the
+# WHOLE MetronClient), these wire a REAL MetronClient to a mocked mokkari
+# session — the only way to exercise the actual resolve_series/issue_in_series
+# split and its per-instance cache, rather than a stub that always answers the
+# same canned dict regardless of what "series" was asked.
+# ---------------------------------------------------------------------------
+
+def _real_metron_with_mock_session(series_list=None, issues_list=None, issue_detail=None):
+    """A real ``MetronClient`` wired to a mocked ``mokkari`` session."""
+    from unittest.mock import MagicMock
+    from locg.metron import MetronClient
+
+    client = MetronClient()
+    session = MagicMock()
+    session.series_list.return_value = series_list if series_list is not None else []
+    session.issues_list.return_value = issues_list if issues_list is not None else []
+    detail = issue_detail
+    if detail is None:
+        detail = MagicMock()
+        detail.variants = []
+        detail.credits = []
+        detail.publisher = None
+    session.issue.return_value = detail
+    client._session = session
+    return client, session
+
+
+def test_record_win_same_series_batch_spends_one_series_list_call(tmp_path):
+    """BUI-473's acceptance criterion, end-to-end: N wins of the SAME series
+    (none seeded in series_name_index, so all fall to the manual/Metron path
+    where the whole pending backlog sits) spend exactly ONE series_list
+    request against a real MetronClient, not N."""
+    from datetime import date
+    from unittest.mock import MagicMock
+    from locg.commands import cmd_collection_record_win
+
+    issue = MagicMock()
+    issue.id = 100
+    issue.cover_date = date(1963, 1, 1)
+    issue.store_date = None
+
+    series = MagicMock()
+    series.id = 1
+    series.display_name = "Fantastic Four"
+    series.year_began = 1961
+    series.year_end = 1996
+
+    metron, session = _real_metron_with_mock_session(series_list=[series], issues_list=[issue])
+    cache = make_cache(tmp_path)
+    wins = [
+        _make_win(item_id=str(i), series="Fantastic Four", issue=str(i), year=1963)
+        for i in range(1, 6)
+    ]
+
+    result = cmd_collection_record_win(wins, cache=cache, metron=metron)
+
+    assert result["rows_written"] == 5
+    session.series_list.assert_called_once_with({"name": "Fantastic Four"})
+    assert session.issues_list.call_count == 5
+
+
+def test_record_win_same_series_batch_pacing_counter_reflects_reuse(tmp_path, metron_sleeps):
+    """BUI-473: the pacing counter must charge the amortized cost, not the
+    flat per-call constant, so a same-series run actually finishes faster —
+    otherwise the real network saving above never turns into a wall-clock one.
+
+    5 wins of one series: win 1 pays REQUESTS_LOOKUP_ISSUE (series miss) +
+    REQUESTS_LOOKUP_ISSUE_DETAIL; wins 2-5 each pay only
+    REQUESTS_ISSUE_IN_SERIES (series already cached) + REQUESTS_LOOKUP_ISSUE_DETAIL.
+    """
+    from datetime import date
+    from unittest.mock import MagicMock
+    from locg.commands import cmd_collection_record_win
+    from locg.metron import (
+        REQUESTS_ISSUE_IN_SERIES,
+        REQUESTS_LOOKUP_ISSUE,
+        REQUESTS_LOOKUP_ISSUE_DETAIL,
+    )
+
+    issue = MagicMock()
+    issue.id = 100
+    issue.cover_date = date(1963, 1, 1)
+    issue.store_date = None
+
+    series = MagicMock()
+    series.id = 1
+    series.display_name = "Fantastic Four"
+    series.year_began = 1961
+    series.year_end = 1996
+
+    metron, _ = _real_metron_with_mock_session(series_list=[series], issues_list=[issue])
+    cache = make_cache(tmp_path)
+    wins = [
+        _make_win(item_id=str(i), series="Fantastic Four", issue=str(i), year=1963)
+        for i in range(1, 6)
+    ]
+
+    result = cmd_collection_record_win(wins, cache=cache, metron=metron)
+
+    expected = (
+        (REQUESTS_LOOKUP_ISSUE + REQUESTS_LOOKUP_ISSUE_DETAIL)
+        + 4 * (REQUESTS_ISSUE_IN_SERIES + REQUESTS_LOOKUP_ISSUE_DETAIL)
+    )
+    assert result["metron_requests_spent"] == expected
+    # Strictly less than the old flat-cost total (5 x 3 = 15) — the whole
+    # point of the ticket.
+    assert expected < 5 * (REQUESTS_LOOKUP_ISSUE + REQUESTS_LOOKUP_ISSUE_DETAIL)
+
+
+def test_record_win_distinct_series_batch_still_pays_full_cost_each(tmp_path):
+    """Control case: wins from genuinely DIFFERENT series must each pay their
+    own series_list request — the cache must never falsely collapse them."""
+    from datetime import date
+    from unittest.mock import MagicMock
+    from locg.commands import cmd_collection_record_win
+    from locg.metron import REQUESTS_LOOKUP_ISSUE, REQUESTS_LOOKUP_ISSUE_DETAIL
+
+    def _series(id_, name, began, end):
+        s = MagicMock()
+        s.id = id_
+        s.display_name = name
+        s.year_began = began
+        s.year_end = end
+        return s
+
+    def _issue(id_, cover_year):
+        i = MagicMock()
+        i.id = id_
+        i.cover_date = date(cover_year, 1, 1)
+        i.store_date = None
+        return i
+
+    metron, session = _real_metron_with_mock_session()
+    session.series_list.side_effect = [
+        [_series(1, "Fantastic Four", 1961, 1996)],
+        [_series(2, "Daredevil", 1964, 1998)],
+        [_series(3, "Iron Man", 1968, 1996)],
+    ]
+    # Each issue's cover_date matches ITS win's year so every hit clears the
+    # era gate (_metron_release_date) and reaches the detail fetch — the
+    # request-count assertion below isolates series_list reuse, not the
+    # unrelated date-gate accept/reject decision.
+    session.issues_list.side_effect = [
+        [_issue(101, 1963)],
+        [_issue(102, 1964)],
+        [_issue(103, 1968)],
+    ]
+
+    cache = make_cache(tmp_path)
+    wins = [
+        _make_win(item_id="1", series="Fantastic Four", issue="1", year=1963),
+        _make_win(item_id="2", series="Daredevil", issue="1", year=1964),
+        _make_win(item_id="3", series="Iron Man", issue="1", year=1968),
+    ]
+
+    result = cmd_collection_record_win(wins, cache=cache, metron=metron)
+
+    assert session.series_list.call_count == 3
+    assert result["metron_requests_spent"] == 3 * (REQUESTS_LOOKUP_ISSUE + REQUESTS_LOOKUP_ISSUE_DETAIL)
+
+
 def test_record_win_does_not_repeat_an_identical_issue_lookup(tmp_path):
     """BUI-465: one issue query per win, not two identical ones.
 

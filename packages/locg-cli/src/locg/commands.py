@@ -4088,6 +4088,40 @@ def _check_metron_degraded(metron: Any, metron_disabled: bool) -> bool:
     return False
 
 
+def _metron_lookup_issue_cost(metron: Any, series_query: str, year: Any) -> int:
+    """How many Metron HTTP requests the upcoming ``lookup_issue`` call will
+    actually spend (BUI-473).
+
+    Asks the real ``MetronClient``'s own ``lookup_issue_request_cost`` —
+    which knows whether this (masthead-mapped) series+year has already been
+    resolved and cached this batch (see ``MetronClient.resolve_series``) — so
+    a run of N wins from the SAME series paces itself on what will really hit
+    the network (``REQUESTS_ISSUE_IN_SERIES`` on a cache hit) rather than the
+    flat, always-pessimistic ``REQUESTS_LOOKUP_ISSUE``.
+
+    Must be called BEFORE the paired ``metron.lookup_issue(...)`` — the
+    prediction reads the cache as it stands right now, and that call is what
+    populates it for the next win.
+
+    Falls back to ``REQUESTS_LOOKUP_ISSUE`` when ``metron`` doesn't expose
+    this (any test double that isn't the real client). ``isinstance(..., int)``
+    — not a truthiness/callability check — is the guard, for the same reason
+    ``_check_metron_degraded`` above uses ``is True`` rather than truthiness:
+    a bare, unconfigured ``MagicMock`` auto-vivifies ANY attribute access as a
+    fresh, callable, truthy ``Mock``, so both ``hasattr`` and ``callable``
+    would be satisfied by a stub that never actually costed anything — only a
+    real ``int`` return proves the client really answered.
+    """
+    from locg.metron import REQUESTS_LOOKUP_ISSUE
+
+    get_cost = getattr(metron, "lookup_issue_request_cost", None)
+    if callable(get_cost):
+        predicted = get_cost(series_query, year)
+        if isinstance(predicted, int):
+            return predicted
+    return REQUESTS_LOOKUP_ISSUE
+
+
 def _resolve_price(raw: Any) -> Optional[float]:
     """Parse price from a float or a '12.50 USD' string."""
     if raw is None:
@@ -4181,7 +4215,6 @@ def _build_win_row(
         "variant_detail_attempted" / "variant_matches": int deltas for this win
     """
     from locg.metron import (
-        REQUESTS_LOOKUP_ISSUE,
         REQUESTS_LOOKUP_ISSUE_DETAIL,
         MetronCredentialError,
     )
@@ -4271,6 +4304,10 @@ def _build_win_row(
     elif not metron_disabled:
         try:
             metron_attempted += 1
+            # BUI-473: predicted BEFORE the call — it reads the series cache
+            # as it stands right now, and lookup_issue is what populates it
+            # for the next win of this series.
+            lookup_cost = _metron_lookup_issue_cost(metron, series_raw, year_raw)
             metron_data = metron.lookup_issue(series_raw, issue_num, year_raw)
             issue_lookup_done = True
             if metron_data:
@@ -4285,7 +4322,10 @@ def _build_win_row(
             # MetronCredentialError is raised by `_get_session()` before any HTTP
             # request leaves the process, so charging it would make the batch pace
             # itself against traffic Metron never saw.
-            metron_requests += REQUESTS_LOOKUP_ISSUE
+            # BUI-473: `lookup_cost` (not the flat REQUESTS_LOOKUP_ISSUE) so a
+            # series already resolved earlier in this batch is charged only
+            # for the issue lookup it actually spent.
+            metron_requests += lookup_cost
             metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
     if canonical_series is None:
@@ -4376,6 +4416,11 @@ def _build_win_row(
         if re.fullmatch(r"\d{4}", year_str) or index_series_range is not None:
             try:
                 metron_attempted += 1
+                # BUI-473: predicted BEFORE the call, same as the R36 step-2
+                # lookup above — a series already resolved earlier in this
+                # batch (by this lookup or step-2's, same cache) costs only
+                # the issue half here.
+                lookup_cost = _metron_lookup_issue_cost(metron, series_raw, year_raw)
                 looked_up = metron.lookup_issue(series_raw, issue_num, year_raw)
                 if looked_up and _metron_release_date(looked_up, year_raw, index_series_range) is not None:
                     metron_succeeded += 1
@@ -4387,7 +4432,7 @@ def _build_win_row(
                     "Metron credentials not configured; falling back to placeholder release date."
                 )
             else:
-                metron_requests += REQUESTS_LOOKUP_ISSUE
+                metron_requests += lookup_cost
                 metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
     # BUI-467: the R36 step-2 lookup above (used when series_name_index has

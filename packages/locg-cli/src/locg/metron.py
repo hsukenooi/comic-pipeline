@@ -42,8 +42,21 @@ _SERVER_ERROR_RETRY_SLEEP = 1.0
 # `lookup_issue_detail` is one (`session.issue`). These live here, next to the
 # methods whose request counts they describe, so a lookup that grows a third
 # request can't silently leave a caller's pacing maths behind.
+#
+# BUI-473: `lookup_issue`'s two requests are now individually addressable —
+# `REQUESTS_RESOLVE_SERIES` (the `series_list` half, spent by `resolve_series`)
+# and `REQUESTS_ISSUE_IN_SERIES` (the `issues_list` half, spent by
+# `issue_in_series`) — because `resolve_series` is now genuinely reusable
+# across every issue of the same series in a batch (see `MetronClient`'s
+# per-instance series cache), while `issue_in_series` never is. A caller that
+# still wants the combined, one-call cost (anything still calling plain
+# `lookup_issue` without reusing a resolved series) keeps using the composed
+# `REQUESTS_LOOKUP_ISSUE`, which is defined FROM the two halves so it can
+# never silently drift out of sync with them.
 REQUESTS_PER_MINUTE = 20
-REQUESTS_LOOKUP_ISSUE = 2
+REQUESTS_RESOLVE_SERIES = 1
+REQUESTS_ISSUE_IN_SERIES = 1
+REQUESTS_LOOKUP_ISSUE = REQUESTS_RESOLVE_SERIES + REQUESTS_ISSUE_IN_SERIES
 REQUESTS_LOOKUP_ISSUE_DETAIL = 1
 
 
@@ -280,6 +293,20 @@ class MetronClient:
         # batch caller checks this to disable Metron for the rest of a batch
         # instead of retrying (and sleeping) on every remaining row.
         self.degraded = False
+        # BUI-473: per-instance series-resolution cache, keyed by
+        # ``(masthead-mapped series_query, coerced year)`` -> the
+        # `_disambiguate_series` result for that key (a series handle, or
+        # ``None`` for a genuine no-match/ambiguous result — see
+        # `resolve_series`). One `MetronClient` lives for the whole of a
+        # record-win batch (`cmd_collection_record_win` constructs or is
+        # handed exactly one), so this makes a run of N issues from the same
+        # series spend the `series_list` request ONCE rather than N times,
+        # without either `lookup_issue`'s callers or its return shape
+        # changing. Deliberately NOT a cache on `lookup_issue_detail` (keyed
+        # by per-issue `metron_id`, which is all-distinct within one series —
+        # BUI-465 already measured that shape gets zero hits); BUI-473 is
+        # scoped to the series half only.
+        self._series_cache: dict[tuple[str, Optional[int]], Optional[Any]] = {}
 
     def _get_session(self) -> Any:
         if self._session is not None:
@@ -344,7 +371,157 @@ class MetronClient:
                 matches.append(s)
         return matches[0] if len(matches) == 1 else None
 
+    @staticmethod
+    def _cache_year_key(year: Any) -> Optional[int]:
+        """Normalize ``year`` the same way ``_disambiguate_series`` does.
+
+        Used to build the ``_series_cache`` key so "1988" and 1988 collapse
+        to the SAME entry instead of silently missing a hit on what is, to
+        ``_disambiguate_series``, an identical query.
+        """
+        try:
+            return int(year) if year is not None else None
+        except (TypeError, ValueError):
+            return None
+
     @_retry_once_on_rate_limit
+    def resolve_series(self, series_query: str, year: Any = None) -> Optional[Any]:
+        """Resolve a series name to a Metron series handle (BUI-473).
+
+        This is the per-series HALF of :meth:`lookup_issue`'s two HTTP
+        requests, split out so a batch resolving N issues from the SAME
+        series can call this ONCE and reuse the returned handle across N
+        :meth:`issue_in_series` calls, instead of paying a fresh
+        ``series_list`` request per issue. :meth:`lookup_issue` itself is
+        reimplemented in terms of this method plus :meth:`issue_in_series`,
+        so its own behavior is unchanged — this just makes the reusable half
+        independently callable.
+
+        Checks (and, on a miss, populates) this instance's ``_series_cache``
+        keyed on ``(masthead-mapped series_query, coerced year)`` — the SAME
+        inputs ``_disambiguate_series`` bases its own decision on, so a cache
+        hit can never reuse one query's resolution for a differently-spelled
+        or differently-dated one. Only a GENUINE outcome is cached — a
+        resolved series, or a clean "no match"/"ambiguous" from
+        ``_disambiguate_series``. A transient failure (rate limit exhausted,
+        connection error, 5xx exhausted) is deliberately NOT cached: caching
+        it would let one throttled call permanently condemn every later issue
+        of the same series for the rest of the batch, even after
+        ``cmd_collection_record_win``'s own BUI-465 cooldown reopens the
+        breaker — so a fresh attempt is always allowed to compete for a real
+        answer after any error.
+
+        Applies the BUI-487 masthead translation (``_map_annual_masthead``),
+        searches Metron's ``series_list``, and disambiguates via
+        :meth:`_disambiguate_series` (BUI-32/BUI-474/BUI-485) — this method's
+        body IS that half of the original ``lookup_issue``, unchanged.
+
+        Returns the mokkari series object Metron resolved, or ``None`` on no
+        match, an ambiguous result, rate limit, network error, or missing
+        credentials. MetronCredentialError is re-raised so callers can
+        disable Metron for the rest of a batch rather than retrying on every
+        win.
+        """
+        # Computed first, before anything that can raise, so it's always
+        # bound for the blanket-exception log below (BUI-487) — mirrors the
+        # original lookup_issue's own ordering.
+        metron_query = _map_annual_masthead(series_query)
+        cache_key = (metron_query, self._cache_year_key(year))
+        if cache_key in self._series_cache:
+            return self._series_cache[cache_key]
+
+        try:
+            session = self._get_session()
+            series_list = session.series_list({"name": metron_query})
+            if not series_list:
+                self._series_cache[cache_key] = None
+                return None
+
+            best_series = self._disambiguate_series(series_list, year, metron_query)
+            if best_series is None:
+                logger.debug(
+                    "Metron series ambiguous for %r (mapped from %r, year=%r): %d candidates",
+                    metron_query, series_query, year, len(series_list),
+                )
+            self._series_cache[cache_key] = best_series
+            return best_series
+        except MetronCredentialError:
+            raise
+        except RateLimitError:
+            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
+        except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip enrichment
+            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
+            # for one capped retry + a ``degraded`` trip; a data-shape/404
+            # ApiError does NOT (it stays a silent None, same as before).
+            # NOT cached (see docstring) — a transient miss must not poison
+            # every later issue of this series.
+            if _is_server_error(exc):
+                raise
+            if _is_connection_error(exc):
+                self.degraded = True
+            logger.debug(
+                "Metron series resolution failed for %r (mapped from %r): %s",
+                metron_query, series_query, exc,
+            )
+            return None
+
+    @_retry_once_on_rate_limit
+    def issue_in_series(self, series: Any, issue_number: str | int) -> Optional[dict[str, Any]]:
+        """Look up one issue within an already-resolved Metron series (BUI-473).
+
+        The per-issue HALF of :meth:`lookup_issue`'s two HTTP requests,
+        paired with :meth:`resolve_series`: given a series handle that method
+        already returned (fresh or cached), spends the ``issues_list``
+        request and returns the SAME dict shape :meth:`lookup_issue` returns
+        — metron_id, cover_date, store_date, series_year_began,
+        series_year_end, series_name, series_id. Deliberately uncached — an
+        issue number within a series is genuinely per-issue, and a
+        multi-issue run of one series has all-distinct issue numbers, so a
+        cache here would get zero hits (BUI-465's own finding, reaffirmed by
+        BUI-473's ticket).
+
+        Returns ``None`` on no match, rate limit, network error, or missing
+        credentials. MetronCredentialError is re-raised, same contract as
+        :meth:`lookup_issue`.
+        """
+        try:
+            session = self._get_session()
+            issues = session.issues_list(
+                {"series_id": series.id, "number": str(issue_number)}
+            )
+            if not issues:
+                return None
+
+            issue = issues[0]
+            cover = issue.cover_date.isoformat() if issue.cover_date else None
+            store = issue.store_date.isoformat() if issue.store_date else None
+            return {
+                "metron_id": issue.id,
+                "cover_date": cover,
+                "store_date": store,
+                "series_year_began": series.year_began,
+                "series_year_end": series.year_end,
+                "series_name": series.display_name,
+                "series_id": series.id,
+            }
+        except MetronCredentialError:
+            raise
+        except RateLimitError:
+            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
+        except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip enrichment
+            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
+            # for one capped retry + a ``degraded`` trip; a data-shape/404
+            # ApiError does NOT (it stays a silent None, same as before).
+            if _is_server_error(exc):
+                raise
+            if _is_connection_error(exc):
+                self.degraded = True
+            logger.debug(
+                "Metron issue lookup failed for series id %s #%s: %s",
+                getattr(series, "id", None), issue_number, exc,
+            )
+            return None
+
     def lookup_issue(
         self, series_query: str, issue_number: str | int, year: Any = None
     ) -> Optional[dict[str, Any]]:
@@ -373,59 +550,58 @@ class MetronClient:
 
         MetronCredentialError is re-raised so callers can disable Metron for
         the rest of a batch rather than retrying on every win.
+
+        BUI-473: reimplemented as :meth:`resolve_series` (the per-series
+        half — map + ``series_list`` + disambiguate, cached across calls on
+        this instance) followed by :meth:`issue_in_series` (the per-issue
+        ``issues_list`` half). This method's own signature and return shape
+        are UNCHANGED — it stays the convenience one-call entry point every
+        existing caller already uses. A batch resolving N issues from the
+        same series should call :meth:`resolve_series` once and
+        :meth:`issue_in_series` per issue directly (or rely on
+        :meth:`lookup_issue_request_cost` to pace itself honestly) to
+        actually realize the savings, rather than switching away from this
+        method.
         """
-        try:
-            # Computed first, before anything that can raise, so it's always
-            # bound for the blanket-exception log below (BUI-487).
-            metron_query = _map_annual_masthead(series_query)
-            session = self._get_session()
-            series_list = session.series_list({"name": metron_query})
-            if not series_list:
-                return None
-
-            best_series = self._disambiguate_series(series_list, year, metron_query)
-            if best_series is None:
-                logger.debug(
-                    "Metron series ambiguous for %r (mapped from %r, year=%r): %d candidates",
-                    metron_query, series_query, year, len(series_list),
-                )
-                return None
-
-            issues = session.issues_list(
-                {"series_id": best_series.id, "number": str(issue_number)}
-            )
-            if not issues:
-                return None
-
-            issue = issues[0]
-            cover = issue.cover_date.isoformat() if issue.cover_date else None
-            store = issue.store_date.isoformat() if issue.store_date else None
-            return {
-                "metron_id": issue.id,
-                "cover_date": cover,
-                "store_date": store,
-                "series_year_began": best_series.year_began,
-                "series_year_end": best_series.year_end,
-                "series_name": best_series.display_name,
-                "series_id": best_series.id,
-            }
-        except MetronCredentialError:
-            raise
-        except RateLimitError:
-            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
-        except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip enrichment
-            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
-            # for one capped retry + a ``degraded`` trip; a data-shape/404
-            # ApiError does NOT (it stays a silent None, same as before).
-            if _is_server_error(exc):
-                raise
-            if _is_connection_error(exc):
-                self.degraded = True
-            logger.debug(
-                "Metron lookup failed for %r (mapped from %r) #%s: %s",
-                metron_query, series_query, issue_number, exc,
-            )
+        best_series = self.resolve_series(series_query, year)
+        if best_series is None:
             return None
+        return self.issue_in_series(best_series, issue_number)
+
+    def lookup_issue_request_cost(self, series_query: str, year: Any = None) -> int:
+        """How many HTTP requests the NEXT ``lookup_issue(series_query, ...,
+        year)`` call will actually spend (BUI-473).
+
+        Three cases, mirroring exactly what ``lookup_issue`` (resolve_series
+        then issue_in_series) will do:
+
+        - Not yet resolved this batch -> ``REQUESTS_LOOKUP_ISSUE`` (both
+          halves will run).
+        - Already cached with a REAL series handle -> ``REQUESTS_ISSUE_IN_SERIES``
+          (the series_list half is free; issue_in_series still runs).
+        - Already cached as ``None`` (a genuine no-match/ambiguous result for
+          this exact series+year) -> ``0``. ``lookup_issue`` returns ``None``
+          the instant ``resolve_series`` does, WITHOUT ever calling
+          ``issue_in_series`` — so charging ``REQUESTS_ISSUE_IN_SERIES`` here
+          would over-count. This is exactly the shape of the manual-series
+          backlog this ticket targets: repeated issues of a series Metron
+          can't resolve, once that series' first miss is cached.
+
+        A batch caller (``cmd_collection_record_win``'s ``_build_win_row``)
+        calls this BEFORE ``lookup_issue`` and charges its per-minute pacing
+        budget with the result, instead of the flat constant, so a run of N
+        issues from one series paces itself on what Metron will actually be
+        asked rather than what a single, uncached lookup would cost. Reading
+        the cache here does not itself resolve anything (or mutate the
+        cache) — it is a snapshot of what ``resolve_series`` would do right
+        now, so it must be called BEFORE the paired ``lookup_issue``, not
+        after (by which point the cache may already reflect this call).
+        """
+        metron_query = _map_annual_masthead(series_query)
+        cache_key = (metron_query, self._cache_year_key(year))
+        if cache_key not in self._series_cache:
+            return REQUESTS_LOOKUP_ISSUE
+        return REQUESTS_ISSUE_IN_SERIES if self._series_cache[cache_key] is not None else 0
 
     @_retry_once_on_rate_limit
     def lookup_issue_detail(self, metron_id: int) -> Optional[dict[str, Any]]:
