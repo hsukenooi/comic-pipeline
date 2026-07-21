@@ -629,6 +629,13 @@ def main() -> None:
                     sys.exit(1)
             elif sub_cmd == "export":
                 result = cmd_collection_export(getattr(args, "out_path", None))
+                # BUI-489: a never-touched store must not exit 0 with a
+                # silently empty CSV — same "a chained caller reads exit 0 as
+                # success" rationale as the explicit_store_required refusals
+                # above, applied to export's narrower not-imported signal.
+                if result.get("status") == "not_imported":
+                    output(result, pretty=args.pretty)
+                    sys.exit(1)
             elif sub_cmd == "status":
                 result = cmd_collection_status(verbose=args.verbose)
             elif sub_cmd == "check":
@@ -725,11 +732,23 @@ def main() -> None:
                 else:
                     # BUI-387: --year stamps the entry's per-issue cover year.
                     result = cmd_wish_list_add(args.title, year=getattr(args, "year", None))
+                # BUI-489: the store refusal must exit NON-ZERO — same
+                # rationale as import/record-win above (a chained caller
+                # reads exit 0 as "added").
+                if result.get("status") == "explicit_store_required":
+                    output(result, pretty=args.pretty)
+                    sys.exit(1)
             elif getattr(args, "wish_list_command", None) == "remove":
                 result = cmd_wish_list_remove(args.title)
+                if result.get("status") == "explicit_store_required":
+                    output(result, pretty=args.pretty)
+                    sys.exit(1)
             elif getattr(args, "wish_list_command", None) == "set-year":
                 # BUI-387 backfill: stamp a per-issue cover year on an existing entry.
                 result = cmd_wish_list_set_year(args.title, args.year)
+                if result.get("status") == "explicit_store_required":
+                    output(result, pretty=args.pretty)
+                    sys.exit(1)
             elif getattr(args, "wish_list_command", None) == "migrate-source":
                 result = cmd_wish_list_migrate_source()
             elif _wish_list_cached:

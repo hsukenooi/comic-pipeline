@@ -6519,6 +6519,12 @@ def test_cli_exits_nonzero_on_the_store_refusal(argv, tmp_path, monkeypatch, cap
         "locg collection import <path>",
         "locg collection record-win --from-gixen-json <path>",
         "locg collection backfill [--apply]",
+        # BUI-489
+        "locg collection remediate-delete --gixen-item-id <id>",
+        "locg collection remediate-set-copies --gixen-item-id <id> --in-collection 0",
+        "locg wish-list add <title>",
+        "locg wish-list remove <title>",
+        "locg wish-list set-year <title> <year>",
     ],
 )
 def test_refusal_suggests_an_invocation_argparse_actually_accepts(invocation):
@@ -6535,6 +6541,65 @@ def test_refusal_suggests_an_invocation_argparse_actually_accepts(invocation):
     argv = [tok for tok in invocation.split()[1:] if not tok.startswith("[")]
     argv = ["value" if tok.startswith("<") else tok for tok in argv]
     create_parser().parse_args(argv)
+
+
+def _no_default_wish_list_store(monkeypatch):
+    """BUI-489: the wish-list writers don't go through CollectionCache — they
+    resolve wish_list_cache_path() directly — so a guard regression needs its
+    OWN stub, distinct from `_no_default_store`'s CollectionCache patch."""
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("BUI-489 guard regressed: default wish-list path resolved")
+
+    monkeypatch.setattr("locg.commands.wish_list_cache_path", _boom)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["locg", "collection", "remediate-delete", "--gixen-item-id", "99"],
+        ["locg", "collection", "remediate-set-copies", "--gixen-item-id", "99", "--in-collection", "0"],
+        ["locg", "wish-list", "add", "Amazing Spider-Man #300"],
+        ["locg", "wish-list", "remove", "Amazing Spider-Man #300"],
+        ["locg", "wish-list", "set-year", "The X-Men #1", "1963"],
+    ],
+)
+def test_cli_exits_nonzero_on_the_store_refusal_bui489(argv, monkeypatch, capsys):
+    """BUI-489: same non-zero-exit contract `test_cli_exits_nonzero_on_the_
+    store_refusal` established for import/record-win, extended to the
+    remaining guarded mutators (remediate-delete/set-copies, the wish-list
+    writers)."""
+    import locg.cli as cli
+
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    _no_default_store(monkeypatch)
+    _no_default_wish_list_store(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "explicit_store_required" in capsys.readouterr().out
+
+
+def test_cli_exits_nonzero_on_export_not_imported(monkeypatch, capsys):
+    """BUI-489 Part 2: cmd_collection_export's distinct not-imported signal
+    must also exit non-zero — a chained caller (`... && upload-to-locg`,
+    `set -e`) reading exit 0 as "exported" is exactly the false-success this
+    signal exists to prevent. The autouse _isolate_cache_dir fixture already
+    points LOCG_DATA_DIR at a fresh, genuinely-empty per-test tmp_path, so no
+    explicit env manipulation is needed to hit the never-touched-store case.
+    """
+    import locg.cli as cli
+
+    monkeypatch.setattr("sys.argv", ["locg", "collection", "export"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "not_imported" in capsys.readouterr().out
 
 
 def test_unexpanded_locg_data_dir_is_refused(tmp_path, monkeypatch):

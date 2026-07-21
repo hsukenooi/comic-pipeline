@@ -718,7 +718,7 @@ def _wish_list_add_to_items(
     return {"status": "ok", "added": entry, "items": len(items)}
 
 
-def _read_wish_list_cache_items() -> list[dict[str, Any]]:
+def _read_wish_list_cache_items(path: Optional[Path] = None) -> list[dict[str, Any]]:
     """Read the wish-list cache's ``items`` list from disk, or ``[]`` if the
     cache file does not exist yet.
 
@@ -728,6 +728,11 @@ def _read_wish_list_cache_items() -> list[dict[str, Any]]:
     same read logic rather than each hand-rolling the ``path.exists()`` +
     ``json.load`` dance.
 
+    ``path`` defaults to :func:`wish_list_cache_path` (env/cwd-governed) when
+    omitted; BUI-489's guarded writers pass an explicit path derived from a
+    caller-supplied ``cache`` so the read and the eventual write always agree
+    on which store they mean (see :func:`_resolve_wish_list_path`).
+
     Deliberately does NOT catch ``json.JSONDecodeError``: this is the
     pre-write read, so a corrupt cache must fail loudly here rather than be
     silently treated as empty — degrading to ``[]`` and then writing would
@@ -736,7 +741,7 @@ def _read_wish_list_cache_items() -> list[dict[str, Any]]:
     tolerate a corrupt cache (BUI-313): degrading to "dedup against nothing"
     is safe there because nothing on disk gets overwritten as a result.
     """
-    path = wish_list_cache_path()
+    path = path if path is not None else wish_list_cache_path()
     if not path.exists():
         return []
     with open(path) as f:
@@ -744,7 +749,7 @@ def _read_wish_list_cache_items() -> list[dict[str, Any]]:
     return payload.get("items") or []
 
 
-def _write_wish_list_cache(items: list[dict[str, Any]]) -> Path:
+def _write_wish_list_cache(items: list[dict[str, Any]], path: Optional[Path] = None) -> Path:
     """Atomically write ``items`` as the wish-list cache.
 
     Uses :func:`locg._atomic.atomic_write_json` (tempfile + os.replace +
@@ -753,8 +758,11 @@ def _write_wish_list_cache(items: list[dict[str, Any]]) -> Path:
     :func:`cmd_wish_list_add_creator_run` (BUI-325: the whole run's entries
     in one call), so there is exactly one atomic write per call site rather
     than a bespoke copy of the tempfile dance at each.
+
+    ``path`` defaults to :func:`wish_list_cache_path` when omitted — see
+    :func:`_read_wish_list_cache_items`'s matching note.
     """
-    path = wish_list_cache_path()
+    path = path if path is not None else wish_list_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     new_payload = {
@@ -772,8 +780,26 @@ def _write_wish_list_cache(items: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _resolve_wish_list_path(cache: Optional[CollectionCache]) -> Path:
+    """Resolve the wish-list cache path, honoring an explicitly-passed store.
+
+    BUI-489: ``CollectionCache``'s own directory convention already treats
+    ``collection.json`` and ``wish-list.json`` as co-located in ONE store
+    directory (see ``CollectionCache.backup_store``/``restore_from_backup``,
+    and the one-time server seed in CLAUDE.md that copies both files
+    together) — so a ``cache`` passed to redirect the collection store
+    redirects the wish-list store identically: ``cache.path.parent``. Falls
+    back to :func:`wish_list_cache_path` (env/cwd-governed) when ``cache`` is
+    ``None``, matching every other read/write in this module.
+    """
+    if cache is not None:
+        return cache.path.parent / "wish-list.json"
+    return wish_list_cache_path()
+
+
 def cmd_wish_list_add(
-    title: str, force: bool = False, year: Optional[str] = None
+    title: str, force: bool = False, year: Optional[str] = None,
+    cache: Optional[CollectionCache] = None,
 ) -> dict[str, Any]:
     """Append a manual entry to the local wish-list cache.
 
@@ -781,6 +807,15 @@ def cmd_wish_list_add(
     ``data/locg/wish-list.json`` using the same atomic write pattern as the rest
     of the wish-list cache writers (tempfile + os.replace + chmod 600, via
     :func:`_write_wish_list_cache`).
+
+    BUI-489: refuses with ``{"status": "explicit_store_required"}`` when no
+    ``cache`` is passed and ``LOCG_DATA_DIR`` is unset/unexpanded — see
+    :func:`_needs_explicit_store`. Same wrong-store trap as
+    ``cmd_collection_import``/``cmd_collection_record_win`` (BUI-476):
+    ``LOCG_DATA_DIR`` governs the WHOLE store directory (both
+    ``collection.json`` and ``wish-list.json``), so a bare default on a box
+    where that resolves to a different, possibly non-empty store would
+    silently append into the wrong wish-list.
 
     BUI-387: ``year`` is the optional per-issue **Cover Year** stamped on the
     new entry (a separate ``year`` field, never encoded into ``name``). It lets
@@ -807,13 +842,17 @@ def cmd_wish_list_add(
     escape hatch the endpoint exposes via ``WishListAddRequest.force`` for a
     genuinely distinct printing/variant that shares series + issue).
     """
-    items = _read_wish_list_cache_items()
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error("locg wish-list add <title>")
+
+    path = _resolve_wish_list_path(cache)
+    items = _read_wish_list_cache_items(path)
 
     result = _wish_list_add_to_items(title, items, force=force, year=year)
     if "error" in result or result.get("status") == "exists":
         return result
 
-    written_path = _write_wish_list_cache(items)
+    written_path = _write_wish_list_cache(items, path)
     result["path"] = str(written_path)
     return result
 
@@ -1095,18 +1134,28 @@ def cmd_creator_run_lookup(
     }
 
 
-def cmd_wish_list_remove(title: str) -> dict[str, Any]:
+def cmd_wish_list_remove(title: str, cache: Optional[CollectionCache] = None) -> dict[str, Any]:
     """Remove the first matching entry from the local wish-list cache.
 
     Matches on exact ``name`` field. Writes via the shared atomic writer
     :func:`_write_wish_list_cache` (tempfile + os.replace + chmod 600), the
     same one every other wish-list write path uses (BUI-329).
+
+    BUI-489: same wrong-store guard as :func:`cmd_wish_list_add` — refuses
+    with ``{"status": "explicit_store_required"}`` when no ``cache`` is
+    passed and ``LOCG_DATA_DIR`` is unset/unexpanded (see
+    :func:`_needs_explicit_store`). A wrong-store REMOVE is the worse
+    direction: it can silently drop an entry the caller never meant to touch
+    while leaving the (different) store they actually intended untouched.
     """
     title = (title or "").strip()
     if not title:
         return {"error": "wish-list remove: title must be non-empty"}
 
-    path = wish_list_cache_path()
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error("locg wish-list remove <title>")
+
+    path = _resolve_wish_list_path(cache)
     if not path.exists():
         return {
             "error": (
@@ -1130,7 +1179,7 @@ def cmd_wish_list_remove(title: str) -> dict[str, Any]:
     if removed is None:
         return {"error": f"wish-list remove: '{title}' not found in cache"}
 
-    written_path = _write_wish_list_cache(new_items)
+    written_path = _write_wish_list_cache(new_items, path)
 
     return {
         "status": "ok",
@@ -1441,7 +1490,26 @@ def cmd_wish_list_remove_conflicts(names: Optional[list[str]] = None) -> dict[st
     removed, purely informational) so a caller sees what was excluded and why.
 
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
+
+    BUI-489: refuses with ``{"status": "explicit_store_required"}`` when
+    ``LOCG_DATA_DIR`` is unset/unexpanded (see :func:`_needs_explicit_store`),
+    checked BEFORE re-deriving the conflict audit so a refusal never spends
+    that work first. Unlike the other wish-list writers this does NOT accept
+    a ``cache`` override: its audit half (:func:`cmd_wish_list_conflicts`,
+    unguarded per BUI-476/489 scope — it's a read) has no such override
+    either, so threading one through only the removal half here would let the
+    audit and the removals silently disagree on which store they mean — a
+    worse trap than the one being closed. The only escape is
+    ``LOCG_DATA_DIR``, which is what the comics server always sets before
+    this call anyway (``routes._ensure_collection_store()``).
     """
+    if _needs_explicit_store(None):
+        return _explicit_store_required_error(
+            "<no CLI form for remove-conflicts — set LOCG_DATA_DIR before "
+            "calling cmd_wish_list_remove_conflicts() or POST "
+            "/api/comics/wish-list/remove-conflicts>"
+        )
+
     audit = cmd_wish_list_conflicts()
     conflicts_by_name: dict[str, dict[str, Any]] = {c["name"]: c for c in audit["conflicts"]}
     printing_conflicts_by_name: dict[str, dict[str, Any]] = {
@@ -1516,7 +1584,9 @@ def cmd_wish_list_remove_conflicts(names: Optional[list[str]] = None) -> dict[st
     }
 
 
-def cmd_wish_list_set_year(name: str, year: str) -> dict[str, Any]:
+def cmd_wish_list_set_year(
+    name: str, year: str, cache: Optional[CollectionCache] = None
+) -> dict[str, Any]:
     """Stamp a per-issue **Cover Year** onto an existing wish-list entry (BUI-387).
 
     The one-time backfill primitive for the 33 permanent cross-volume decoy
@@ -1542,6 +1612,11 @@ def cmd_wish_list_set_year(name: str, year: str) -> dict[str, Any]:
     Returns ``{status, name, year, matched}`` on success (``matched`` = rows
     stamped, 0 if the name isn't present) or ``{error}`` for a blank name, a
     non-4-digit year, or a missing cache.
+
+    BUI-489: refuses with ``{"status": "explicit_store_required"}`` when no
+    ``cache`` is passed and ``LOCG_DATA_DIR`` is unset/unexpanded — same
+    wrong-store guard as :func:`cmd_wish_list_add`/:func:`cmd_wish_list_remove`
+    (see :func:`_needs_explicit_store`).
     """
     name = (name or "").strip()
     if not name:
@@ -1556,7 +1631,10 @@ def cmd_wish_list_set_year(name: str, year: str) -> dict[str, Any]:
     if year is None:
         return {"error": "wish-list set-year: year is required (a 4-digit Cover Year)."}
 
-    path = wish_list_cache_path()
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error("locg wish-list set-year <title> <year>")
+
+    path = _resolve_wish_list_path(cache)
     if not path.exists():
         return {
             "error": (
@@ -1578,7 +1656,7 @@ def cmd_wish_list_set_year(name: str, year: str) -> dict[str, Any]:
     if matched == 0:
         return {"error": f"wish-list set-year: '{name}' not found in cache"}
 
-    written_path = _write_wish_list_cache(items)
+    written_path = _write_wish_list_cache(items, path)
     return {
         "status": "ok",
         "name": name,
@@ -2233,13 +2311,30 @@ def _needs_explicit_store(cache: Optional[Any]) -> bool:
     "Usable" means non-blank AND actually expanded — see
     :func:`_unexpanded_store_path`.
 
-    **Scope (BUI-476, deliberate):** only ``import``, ``record-win`` and
-    ``backfill`` consult this. The read commands (``check``, ``status``,
-    ``export``) are unguarded on purpose so legitimate local-store CLI use
-    still works. The other mutators — ``remediate-delete``,
-    ``remediate-set-copies`` and the ``wish-list`` writers — are NOT yet
-    guarded; their absence here is an open gap, not a judgement that they are
-    safe. Do not read this list as coverage.
+    **Scope (BUI-476 + BUI-489):** every collection/wish-list MUTATOR now
+    consults this — ``import``, ``record-win``, ``backfill``,
+    ``remediate-delete``, ``remediate-set-copies``, and the wish-list writers
+    ``wish-list add``/``remove``/``set-year`` (the wish-list writers pass
+    ``cache`` straight through to this same check even though they resolve
+    their OWN path via :func:`_resolve_wish_list_path`, not a
+    ``CollectionCache`` — ``LOCG_DATA_DIR`` governs the whole store
+    directory, collection AND wish-list alike, so one check covers both).
+    ``cmd_wish_list_remove_conflicts`` also consults this (called with
+    ``cache=None`` always — see its own docstring for why it does not accept
+    a ``cache`` override: its audit half has none either, and a partial
+    override would let the audit and the removal it drives silently disagree
+    on which store they mean).
+
+    The read commands (``check``, ``status``, ``export``) are unguarded on
+    purpose so legitimate local-store CLI use still works — ``export``
+    instead gets its OWN, narrower not-imported signal (BUI-489, see
+    :func:`cmd_collection_export`) for the read-appropriate version of this
+    problem: a silently empty result rather than a refused write.
+
+    ``cmd_wish_list_add_creator_run`` is the one remaining mutator that does
+    NOT consult this (out of BUI-489's scope — flagged, not fixed). Do not
+    read the absence of a name from this docstring as a judgement that it is
+    safe.
     """
     if cache is not None:
         return False
@@ -2341,7 +2436,33 @@ def cmd_collection_export(
     only path that includes the local-only wish adds.
 
     Returns {csv_path, notes_md_path, ready_count, manual_variant_count,
-    manual_series_count, wish_list_count, oldest_pending_days, pushed_wishes}.
+    manual_series_count, wish_list_count, oldest_pending_days, pushed_wishes}
+    — or the BUI-489 not-imported signal below instead, when the store looks
+    genuinely untouched.
+
+    BUI-489: export is a READ (BUI-476 left `check`/`status`/`export`
+    unguarded on purpose, so legitimate local-store CLI use keeps working),
+    so this does NOT consult `_needs_explicit_store` / refuse a bare default
+    store the way the mutators do. What it DOES refuse is silently reporting
+    a fabricated zero-row "success" when the store is genuinely untouched —
+    the R11 "silence read as truth" shape: on the wrong (or a fresh, never-
+    seeded) store this would otherwise write a technically-valid, empty CSV
+    and exit 0, which reads exactly like "nothing new to push" and invites
+    uploading it to LOCG believing wins were included.
+
+    The signal fires ONLY when the store is empty on EVERY axis — zero
+    comics, zero wish-list entries, AND no completed full import
+    (`last_full_import is None`) — never merely "zero rows pending right
+    now" (a legitimately-imported store can genuinely have nothing new) and
+    never merely "`last_full_import` is None" alone: the record-win-only
+    workflow (`/comic:collection-add` records wins via
+    `cmd_collection_record_win` and exports before any `collection import`
+    has ever run — see `test_audit_integrates_with_real_export_headers`,
+    which documents this as "the real export pipeline") and a local-only
+    wish add on a never-imported collection (push_wishes=True) both populate
+    real, exportable data with `last_full_import` still `None`. Using that
+    field alone would refuse both of those legitimate, already-tested flows.
+    A store with real rows anywhere is not the wrong-store trap this closes.
     """
     from datetime import datetime
     from pathlib import Path as _Path
@@ -2349,6 +2470,38 @@ def cmd_collection_export(
 
     cache = CollectionCache()
     payload = cache.load()
+
+    if not payload.get("comics") and payload.get("last_full_import") is None:
+        # Cheap enough to always check regardless of push_wishes: a
+        # wish-only store (never-imported collection, but real local wish
+        # adds) is also legitimate — see the docstring above.
+        #
+        # This is a pure presence PROBE, not the write path — unlike
+        # _read_wish_list_cache_items's other (write-side) callers, a corrupt
+        # wish-list.json here must NOT raise. A corrupt file is itself
+        # evidence the store isn't the genuinely-untouched "nothing here"
+        # case this check exists to catch, so treat "can't tell" the same as
+        # "assume real data" and fall through to the normal export path,
+        # which reads wish-list.json again (only when push_wishes=True) via
+        # collection_io's tolerant loader — the same corrupt-file tolerance
+        # every other wish-list READ path in this module already has.
+        try:
+            wish_list_has_items = bool(_read_wish_list_cache_items())
+        except json.JSONDecodeError:
+            wish_list_has_items = True
+        if not wish_list_has_items:
+            return {
+                "status": "not_imported",
+                "error": (
+                    "collection store is empty and has never been imported "
+                    "(no comics, no wish-list entries, no last_full_import) — "
+                    "refusing to export a silently empty CSV that could be "
+                    "mistaken for 'nothing pending' (R11). If you expect real "
+                    "data here, this is probably the wrong store — check "
+                    "LOCG_DATA_DIR."
+                ),
+            }
+
     ready, manual_variant, manual_series = _pending_push_rows(payload)
     # BUI-122: only push local-only wish adds that aren't already owned. Re-dumping
     # the whole wish list re-uploaded LOCG-derived wishes and, because wish rows
@@ -4976,10 +5129,25 @@ def cmd_collection_remediate_delete(
     data-quality problem surfaced rather than guessed at. On success:
     `{"status": "ok"|"preview", "action": "removed"|"decremented"|
     "would_remove"|"would_decrement", "removed"|"row", "remaining_copies"}`.
+
+    BUI-489: refuses with `{"status": "explicit_store_required"}` when no
+    `cache` is passed and `LOCG_DATA_DIR` is unset/unexpanded — see
+    `_needs_explicit_store`. Checked BEFORE `dry_run` is even consulted (same
+    shape as `cmd_collection_backfill`'s guard): a `dry_run=True` preview
+    against the WRONG store would look believable and confirm a delete that,
+    run for real, lands on a different collection entirely. BUI-424 flagged
+    this command as the single highest-risk case in the module — a wrong-store
+    delete on a volume-mis-filed row can't be told apart from a correct one
+    without independently checking which store answered.
     """
     error = _validate_remediation_identity(gixen_item_id, full_title)
     if error:
         return {"status": "invalid_request", "error": error}
+
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error(
+            "locg collection remediate-delete --gixen-item-id <id>"
+        )
 
     if cache is None:
         cache = CollectionCache()
@@ -5099,6 +5267,11 @@ def cmd_collection_remediate_set_copies(
     (`invalid_request`, `not_imported`, `not_found`, `ambiguous`); on success:
     `{"status": "ok"|"preview", "row", "previous_in_collection"|
     "current_in_collection", "new_in_collection"}`.
+
+    BUI-489: same wrong-store guard as `cmd_collection_remediate_delete` —
+    refuses with `{"status": "explicit_store_required"}` when no `cache` is
+    passed and `LOCG_DATA_DIR` is unset/unexpanded (see
+    `_needs_explicit_store`), checked before `dry_run` is consulted.
     """
     error = _validate_remediation_identity(gixen_item_id, full_title)
     if error:
@@ -5110,6 +5283,11 @@ def cmd_collection_remediate_set_copies(
         }
     if in_collection is not None and in_collection < 0:
         return {"status": "invalid_request", "error": "in_collection must be >= 0"}
+
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error(
+            "locg collection remediate-set-copies --gixen-item-id <id> --in-collection 0"
+        )
 
     if cache is None:
         cache = CollectionCache()
