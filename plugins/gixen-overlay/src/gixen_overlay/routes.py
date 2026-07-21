@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 
 from gixen_overlay.db import (
@@ -118,6 +119,23 @@ def _ensure_collection_store() -> None:
     LOCG"). An explicitly-set ``LOCG_DATA_DIR`` always wins, so the Mac Mini
     launch env and the tests (which point it at a tmp dir) both override this
     default.
+
+    BUI-490: the early return below never re-derives the store from a changed
+    ``DB_PATH`` once ``LOCG_DATA_DIR`` is set — this is safe because ``DB_PATH``
+    is immutable for the life of a server process. ``server.main.lifespan()``
+    reads ``os.getenv("DB_PATH", ...)`` exactly once at startup into the
+    module-global ``_db_path`` (see BUI-408's comment there), and no request
+    handler anywhere in this codebase ever writes ``os.environ["DB_PATH"]`` —
+    it is read-only after process start (confirmed via
+    ``grep -rn "DB_PATH"`` across the workspace: every non-test write site is
+    the one-time lifespan assignment; all others are reads). A single server
+    process therefore only ever resolves one store directory, computed on the
+    first collection request and reused for the rest of the process's life —
+    there is no "mid-process DB_PATH change" for this function to miss. (Test
+    suites use ``monkeypatch.setenv``/``delenv``, which pytest scopes to one
+    test and reverts afterward — never a live mutation visible to a running
+    app instance.) A future multi-DB or config-reload mode would need to
+    revisit this.
     """
     if os.environ.get("LOCG_DATA_DIR", "").strip():
         return
@@ -1559,9 +1577,13 @@ async def api_collection_import(file: UploadFile = File(...)):
             # would slip past `/comic:collection-sync`'s `curl -sf` check and
             # read as a successful reconcile that in fact imported nothing.
             # HTTPException is not in the except tuple below, so this escapes.
+            # BUI-491: jsonable_encoder guards against a future non-JSON value
+            # (Path/datetime) landing in import_result and raising TypeError at
+            # response-render time — which would abort the response instead of
+            # delivering this 500 body.
             raise HTTPException(
                 status_code=500,
-                detail={
+                detail=jsonable_encoder({
                     **import_result,
                     "error": "explicit_store_required",
                     "refusal_detail": import_result.get("error"),
@@ -1569,7 +1591,7 @@ async def api_collection_import(file: UploadFile = File(...)):
                         "import refused to resolve a collection store; "
                         "nothing was imported"
                     ),
-                },
+                }),
             )
         return import_result
     except RuntimeError as exc:
@@ -1659,13 +1681,17 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
         # than trust the reachability argument to survive a future refactor.
         raise HTTPException(
             status_code=500,
-            detail={
-                # `result` is spread FIRST: the refusal payload carries its own
-                # `error` (the explanatory sentence), and the endpoint's own
-                # `error` is the machine-readable code the caller branches on,
-                # so ours must win the key collision — but its text is the only
-                # thing that says WHICH var is unset and how to set it, so keep
-                # it under a non-colliding key rather than dropping it.
+            # `result` is spread FIRST: the refusal payload carries its own
+            # `error` (the explanatory sentence), and the endpoint's own
+            # `error` is the machine-readable code the caller branches on,
+            # so ours must win the key collision — but its text is the only
+            # thing that says WHICH var is unset and how to set it, so keep
+            # it under a non-colliding key rather than dropping it.
+            # BUI-491: jsonable_encoder guards against a future non-JSON value
+            # (Path/datetime) landing in result and raising TypeError at
+            # response-render time — an aborted response instead of this 500
+            # body.
+            detail=jsonable_encoder({
                 **result,
                 "error": "explicit_store_required",
                 "refusal_detail": result.get("error"),
@@ -1673,7 +1699,7 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
                     "record-win refused to resolve a collection store; nothing "
                     "was recorded and nothing was marked seen"
                 ),
-            },
+            }),
         )
 
     if result.get("partial_failure"):
@@ -1681,16 +1707,19 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
         # any mark-seen call below — never mark seen on a partial commit, so a
         # later re-run still sees these item_ids as unprocessed and retries
         # them rather than silently skipping lost wins.
+        # BUI-491: jsonable_encoder guards against a future non-JSON value
+        # (Path/datetime) landing in result and raising TypeError at
+        # response-render time — an aborted response instead of this 500 body.
         raise HTTPException(
             status_code=500,
-            detail={
+            detail=jsonable_encoder({
                 "error": "partial_failure",
                 "message": (
                     "one or more chunks failed to commit; some wins were NOT "
                     "recorded — nothing was marked seen"
                 ),
                 **result,
-            },
+            }),
         )
 
     # Full success only past this point. The committed set is exactly the

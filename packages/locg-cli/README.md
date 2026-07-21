@@ -80,11 +80,19 @@ Output per row:
 
 Resolved IDs are cached to disk at `<repo>/data/locg/ids.json` and reused on subsequent runs — repeat lookups skip the API entirely (`from_cache: true`). Pass `--no-cache` to bypass for both reads and writes. Manage the cache with `locg cache stats` and `locg cache clear`.
 
-The cache directory (which also holds `collection.json`, `wish-list.json`, and `import-history.jsonl`) is resolved with this precedence:
+The cache directory (which also holds `collection.json`, `wish-list.json`, and `import-history.jsonl`) is resolved, **for reads**, with this precedence:
 
 1. **`LOCG_DATA_DIR`** — if set, used verbatim. Point a specific checkout or worktree at its own cache here.
 2. **`<repo>/data/locg`** — the default. The repo root is found by walking up from the installed package source, which works because `locg` is installed `--editable` (see `scripts/install.sh`). These files are versioned, so the collection and wish-list travel with the repo across machines (BUI-84).
 3. **`~/.cache/locg`** — fallback only when no repo root is found (a non-editable / wheel install).
+
+**As of BUI-476, this fallback is reads-only.** The mutating commands — `collection import` and record-win (the write path behind the comics server's `/api/comics/collection/record-win/commit` endpoint) — refuse to run against a default-resolved store: `LOCG_DATA_DIR` must be set explicitly, e.g. on the Mac Mini:
+
+```bash
+LOCG_DATA_DIR=$HOME/.comics-server/collection-store locg collection import <export.xlsx>
+```
+
+A call with no `LOCG_DATA_DIR` and no explicit `cache` returns `{"status": "explicit_store_required"}` instead of silently writing to whichever store the 3-tier precedence above happened to resolve.
 
 Series matching prefers the canonical run (exact name, then preferred publisher, then oldest start year, then highest issue count), so `"Batman"` resolves to the 1940 DC run instead of a recent one-shot. If a series or issue can't be resolved, that row gets an `"error"` field; the rest of the batch still completes.
 
