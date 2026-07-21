@@ -52,11 +52,19 @@ intersects the result with your collection to populate `in_collection`.
 Resolved IDs are cached to `<repo>/data/locg/ids.json` and reused on
 subsequent runs — repeat lookups skip the API entirely (`from_cache: true`
 in the result). Pass `--no-cache` to bypass; use `locg cache stats` and
-`locg cache clear` to manage. The cache dir is resolved by `config._cache_dir`
-with precedence `LOCG_DATA_DIR` env → `<repo>/data/locg` → `~/.cache/locg`
-fallback (BUI-84); it also holds `collection.json` and `wish-list.json`, which
-are a local-only working cache, gitignored since BUI-87/93 — the comics server
-on the Mac Mini is the source of truth for collection and wish-list state.
+`locg cache clear` to manage. For reads, the cache dir is resolved by
+`config._cache_dir` with precedence `LOCG_DATA_DIR` env → `<repo>/data/locg` →
+`~/.cache/locg` fallback (BUI-84); it also holds `collection.json` and
+`wish-list.json`, which are a local-only working cache, gitignored since
+BUI-87/93 — the comics server on the Mac Mini is the source of truth for
+collection and wish-list state. **As of BUI-476, `collection import` and
+record-win (the mutating commands) no longer honor that fallback** — they
+require `LOCG_DATA_DIR` set explicitly (e.g.
+`LOCG_DATA_DIR=$HOME/.comics-server/collection-store locg collection import
+<export.xlsx>` on the Mac Mini) and return
+`{"status": "explicit_store_required"}` rather than silently writing to
+whichever store the read-side precedence would have resolved. The
+`<repo>/data/locg` fallback now applies to reads only.
 
 Note on the 140-issue limit: `locg series <id>` returns at most 140 issues
 per call (date-desc by default). For series with more than 140 issues, the

@@ -8,7 +8,9 @@ test_gixen_overlay_routes.py but adds the seeded collection/wish-list store.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from importlib.metadata import EntryPoint
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -661,6 +663,29 @@ def _reseed_with_index(store, index):
 _ASM_INDEX = {"amazing spider-man": "The Amazing Spider-Man"}
 
 
+@pytest.fixture
+def offline_metron():
+    """Stub `locg.metron.MetronClient` so the record-win suite is hermetic
+    regardless of exported METRON_USERNAME/METRON_PASSWORD (BUI-492).
+
+    Without this, a test that reaches the real `cmd_collection_record_win`
+    (i.e. doesn't mock the function itself) instantiates a REAL MetronClient
+    — with live credentials in the environment that means real network calls
+    and a possible 60s rate-limit sleep. `lookup_issue` returning None mirrors
+    the offline/degraded behavior these tests actually exercise (series
+    resolution comes from the seeded `series_name_index` via
+    `_reseed_with_index`, not from Metron), so this is a network-isolation
+    stub, not a weakened assertion. Mirrors the inline pattern
+    `test_record_win_commit_survives_the_bui476_guard_with_locg_data_dir_unset`
+    used before this fixture existed.
+    """
+    m = MagicMock()
+    m.lookup_issue.return_value = None
+    m.degraded = False
+    with patch("locg.metron.MetronClient", return_value=m):
+        yield m
+
+
 # BUI-453: the standalone `POST /api/comics/collection/record-win` endpoint
 # (and its dedicated tests: appends-and-is-readable, skips-already-owned,
 # partial-failure-returns-non-200, non-runtime-error-returns-useful-500) was
@@ -679,7 +704,7 @@ _ASM_INDEX = {"amazing spider-man": "The Amazing Spider-Man"}
 # /comic:collection-add Steps 3/3b/5 into one call.
 # ===========================================================================
 
-def test_record_win_commit_merges_and_marks_exactly_the_committed_set(client):
+def test_record_win_commit_merges_and_marks_exactly_the_committed_set(client, offline_metron):
     """The mark-seen set must equal the set the server actually merged and
     submitted to cmd_collection_record_win — the core BUI-428 fix. Verified
     directly by reading back GET .../record-win/seen, not by trusting the
@@ -714,7 +739,7 @@ def test_record_win_commit_merges_and_marks_exactly_the_committed_set(client):
     assert set(seen) == {"115500010001", "115500010002"}
 
 
-def test_record_win_commit_skipped_already_owned_is_still_marked_seen(client):
+def test_record_win_commit_skipped_already_owned_is_still_marked_seen(client, offline_metron):
     """A win that matches an already-owned row (BUI-34) is fully processed —
     just not re-written — so it belongs in the committed/seen set too, or a
     future run would re-POST it forever.
@@ -790,6 +815,38 @@ def test_record_win_commit_partial_failure_returns_500_and_marks_nothing_seen(cl
     assert "115500019999" not in seen
 
 
+def test_record_win_commit_partial_failure_with_non_json_value_still_renders_500(client):
+    """BUI-491: a non-JSON-native value (e.g. a Path) landing in the
+    partial_failure result dict must not abort the response with a
+    render-time TypeError — jsonable_encoder must convert it so the 500 body
+    still renders, carrying the coerced value.
+    """
+    partial = {
+        "rows_written": 25,
+        "partial_failure": True,
+        "manual_variant_count": 0,
+        "manual_series_count": 0,
+        "metron_lookups_succeeded": 0,
+        "skipped_already_owned": 0,
+        "store_path": Path("/tmp/some-store"),
+    }
+    win = {
+        "item_id": "115500019998",
+        "current_bid": "10.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "402", "year": "1995"},
+    }
+    with patch("gixen_overlay.routes.cmd_collection_record_win", return_value=partial):
+        r = client.post(
+            "/api/comics/collection/record-win/commit",
+            json={"wins": [win], "resolved_reviews": []},
+        )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "partial_failure"
+    assert detail["store_path"] == "/tmp/some-store"
+
+
 def test_record_win_commit_unhandled_exception_marks_nothing_seen(client):
     """BUI-184/BUI-428: an unhandled mid-batch exception must 500 (commit
     state uncertain) and must not mark the attempted item_ids seen — the
@@ -817,7 +874,7 @@ def test_record_win_commit_unhandled_exception_marks_nothing_seen(client):
     assert "115500018888" not in seen
 
 
-def test_record_win_commit_dedups_item_id_shared_across_wins_and_reviews(client):
+def test_record_win_commit_dedups_item_id_shared_across_wins_and_reviews(client, offline_metron):
     """A lot expanding into multiple entries (or the same item_id appearing in
     both lists for any other reason) shares one item_id — the committed/seen
     set must dedup it, not double-count.
@@ -1515,7 +1572,7 @@ def server_default_store_client(tmp_path, monkeypatch):
 
 
 def test_record_win_commit_survives_the_bui476_guard_with_locg_data_dir_unset(
-    server_default_store_client,
+    server_default_store_client, offline_metron,
 ):
     """THE BUI-476 SAFETY INVARIANT. With LOCG_DATA_DIR unset in the process
     env, `POST /api/comics/collection/record-win/commit` must still record and
@@ -1524,9 +1581,10 @@ def test_record_win_commit_survives_the_bui476_guard_with_locg_data_dir_unset(
     that 500s this endpoint is far worse than the bug it fixes.
     """
     client = server_default_store_client
-    # Seed the index so series resolution needs no Metron call, and stub the
-    # client outright so the remaining date lookup cannot reach the network —
-    # this test is about the store guard, not about Metron availability.
+    # Seed the index so series resolution needs no Metron call — the
+    # `offline_metron` fixture stubs the remaining date lookup so it cannot
+    # reach the network either; this test is about the store guard, not about
+    # Metron availability.
     _reseed_with_index(client.store, _ASM_INDEX)
     win = {
         "item_id": "115500047601",
@@ -1534,14 +1592,10 @@ def test_record_win_commit_survives_the_bui476_guard_with_locg_data_dir_unset(
         "end_date_iso": "2026-06-04T18:00:00Z",
         "identify_data": {"series": "Amazing Spider-Man", "issue": "310", "year": "1988"},
     }
-    offline_metron = MagicMock()
-    offline_metron.lookup_issue.return_value = None
-    offline_metron.degraded = False
-    with patch("locg.metron.MetronClient", return_value=offline_metron):
-        r = client.post(
-            "/api/comics/collection/record-win/commit",
-            json={"wins": [win], "resolved_reviews": []},
-        )
+    r = client.post(
+        "/api/comics/collection/record-win/commit",
+        json={"wins": [win], "resolved_reviews": []},
+    )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body.get("status") != "explicit_store_required"
@@ -1618,6 +1672,33 @@ def test_record_win_commit_refusal_marks_nothing_seen(client):
     assert "115500047602" not in seen
 
 
+def test_record_win_commit_refusal_with_non_json_value_still_renders_500(client):
+    """BUI-491: same non-JSON-native guard as the partial_failure case, for the
+    explicit_store_required refusal — a datetime landing in the refusal
+    payload must not abort the response with a render-time TypeError.
+    """
+    refusal = {
+        "status": "explicit_store_required",
+        "error": "LOCG_DATA_DIR is not set",
+        "attempted_at": datetime(2026, 7, 21, 12, 0, 0),
+    }
+    win = {
+        "item_id": "115500047603",
+        "current_bid": "10.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "Amazing Spider-Man", "issue": "402", "year": "1995"},
+    }
+    with patch("gixen_overlay.routes.cmd_collection_record_win", return_value=refusal):
+        r = client.post(
+            "/api/comics/collection/record-win/commit",
+            json={"wins": [win], "resolved_reviews": []},
+        )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "explicit_store_required"
+    assert detail["attempted_at"] == "2026-07-21T12:00:00"
+
+
 def test_collection_import_refusal_returns_500_not_a_misleading_200(client):
     """Defense in depth (BUI-476), symmetric with the record-win backstop: a
     refusal served as a 200 would slip past `/comic:collection-sync`'s
@@ -1634,6 +1715,27 @@ def test_collection_import_refusal_returns_500_not_a_misleading_200(client):
     detail = r.json()["detail"]
     assert detail["error"] == "explicit_store_required"
     assert detail["refusal_detail"] == "LOCG_DATA_DIR is not set"
+
+
+def test_collection_import_refusal_with_non_json_value_still_renders_500(client):
+    """BUI-491: same guard as the record-win refusal, for api_collection_import's
+    explicit_store_required backstop — a datetime landing in import_result must
+    not abort the response with a render-time TypeError.
+    """
+    refusal = {
+        "status": "explicit_store_required",
+        "error": "LOCG_DATA_DIR is not set",
+        "attempted_at": datetime(2026, 7, 21, 12, 0, 0),
+    }
+    with patch("gixen_overlay.routes.cmd_collection_import", return_value=refusal):
+        r = client.post(
+            "/api/comics/collection/import",
+            files={"file": ("import.xlsx", b"anything", "application/octet-stream")},
+        )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "explicit_store_required"
+    assert detail["attempted_at"] == "2026-07-21T12:00:00"
 
 
 def test_record_win_commit_refusal_preserves_the_explanatory_text(client):
