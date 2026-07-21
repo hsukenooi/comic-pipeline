@@ -191,7 +191,7 @@ else
   # A real HTTP error code WITH a body from the server is a genuine,
   # unambiguous failure: non-2xx never reaches the server's mark-seen step
   # (BUI-428/137), so nothing was marked seen — nothing to undo, just report.
-  echo "record-win/commit FAILED (HTTP $code) — STOP. Nothing was recorded or marked seen."
+  echo "record-win/commit FAILED (HTTP $code) — STOP. Nothing was marked seen — some rows may have been written; read \`rows_written\` from the body below."
   python3 -c "import json; d=json.load(open('$SCRATCH/commit_response.json')); det=d.get('detail', d); \
     print('error:', det.get('error'), '| rows_written (committed before failure):', det.get('rows_written'))" 2>/dev/null \
     || echo "(HTTP $code but no parseable response body — treat as ambiguous, see Step 3b, rather than assuming failure)"
