@@ -138,7 +138,9 @@ client re-derivation), and — only on full success — folds in a fresh
 `pending_push_count`/`oldest_pending_days` read. On a partial or failed
 commit it marks nothing seen at all. This removed `/tmp/wins.json` and
 `/tmp/record_win_response.json` from the skill entirely and collapsed what
-used to be Steps 3/3b/5 into one Step 3.
+used to be Steps 3/3b/5 into one Step 3.[^1]
+
+[^1]: BUI-472 later added a new Step 3b for timeout disambiguation (connection-cut-after-server-started-work cases) — not a revival of the old BUI-428-era mark-seen sub-step.
 
 ## Related
 
