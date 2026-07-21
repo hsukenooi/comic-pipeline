@@ -33,6 +33,11 @@ A Collection entry created by recording a won eBay auction, before it has round-
 
 Win-sourced entries carry a publisher when the issue could be resolved (record-win captures it from the issue's full detail record), but the publisher is null on a lookup miss and the release date is often a best-guess — which is why reconciling them against a LOCG export must still tolerate a missing publisher and match on year rather than exact date.
 
+### Placeholder Date
+A sentinel release date stamped on a [[Win-Sourced Entry]] when the record-win lookup cannot establish the issue's real date — conventionally the first of January of the identify year. It marks the entry as *dated-unknown*, a distinct state from a genuinely dateless entry.
+
+Detected by **intent, not shape**: an entry is a placeholder only when it is win-sourced and carries no resolved issue identity, never by the date's calendar value alone — so a real January-first cover date is never mistaken for one. The export blanks it to an empty cell, so a placeholder and a truly dateless entry reach LOCG identically (this is *how* a book with no [[Era Evidence]] is "left undated" downstream despite carrying a sentinel internally). It **must not be deleted**: the year it carries is the only discriminator reconcile has between two undecorated volumes of the same [[Masthead]], so removing it makes a dateless win fail open into a wrong-volume match and be silently healed away. A missing date is loud; a wrong one is silent.
+
 ### Import-Sourced Entry
 A Collection entry that originated from — or has round-tripped through — a LOCG export. *Known in code and tickets as:* `locg_export`. The counterpart to a Win-Sourced Entry.
 

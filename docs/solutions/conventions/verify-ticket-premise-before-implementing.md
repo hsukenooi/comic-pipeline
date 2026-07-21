@@ -1,7 +1,7 @@
 ---
 title: "A reopened ticket's premise may already be stale — verify it against the code before implementing"
 date: 2026-07-20
-last_updated: 2026-07-20
+last_updated: 2026-07-21
 category: conventions
 module: "general (Linear ticket handling, any package) — these batches: locg-cli, gixen-cli"
 problem_type: convention
@@ -190,6 +190,65 @@ and such a cache gets **zero** hits. The genuine saving is elsewhere — `lookup
 Record *why* a suggested direction was rejected. Otherwise the next agent reads the same
 plausible sentence and re-attempts it.
 
+## The third failure mode: the premise names code that does not exist there
+
+Examples 1–3 are "the specified fix would be wrong"; 4–6 are "the problem is real but
+mis-attributed." A later batch (BUI-472..476) surfaced the sharpest version yet: a ticket
+whose named code target **is not where the ticket says, and in one case does not exist at
+all in the named package.** These fail a `grep` in seconds — but only if you run it before
+you start implementing rather than after.
+
+### Example 7 — the premise named the wrong package entirely (BUI-475)
+
+BUI-475 asked to change `needs_review` gating in `_build_win_row`
+(`packages/locg-cli/src/locg/commands.py`), replacing BUI-422's `$25` price threshold with
+an era-evidence gate keyed on `index_series_range`. Three independent facts, each found by
+reading rather than trusting:
+
+1. **The `$25` gate is not in `_build_win_row`, and not in `locg-cli` at all.**
+   `MISSING_YEAR_PRICE_THRESHOLD` / `REASON_MISSING_YEAR` live in
+   `packages/gixen-cli/record_win_prep.py`. `grep -r needs_review packages/locg-cli/src`
+   returns **nothing** — the concept the ticket said to edit does not exist in the named
+   package.
+2. **The two signals sit on opposite sides of an HTTP boundary.** `record_win_prep` runs
+   client-side *before* the POST; `index_series_range` is computed server-side *inside*
+   `cmd_collection_record_win`. The correlation the ticket wanted cannot happen at one site
+   because the two quantities never coexist in one process.
+3. The ticket's *intent* was sound and the risk was real — but building it requires a design
+   decision (a new endpoint vs a server-side hold that changes the record-win contract) the
+   ticket never made.
+
+The right move was a no-code **stop-and-report**: re-ground the ticket in the actual code,
+record the two viable designs, and escalate the choice — not ship a speculative
+cross-package change against a premise that named a symbol that isn't there. A disciplined
+stop is a success, not a failure. **The one-command check** — `grep` for the named symbol
+in the named package — would have flagged this before any design time was spent.
+
+### Example 8 — the hypothesis was right, its named mechanism never executed, and the implied fix was backwards (BUI-474)
+
+BUI-474 hypothesised "Metron series ambiguity" and named two specific defects:
+`_disambiguate_series` "blindly trusts a sole name-search hit," and `lookup_issue` takes
+`issues_list()[0]` "unfiltered." Replaying the 18 failing rows against live Metron showed
+the hypothesis was correct **in substance** and wrong **in mechanism**: not one of the two
+named defects executed. Every row died earlier, at `_disambiguate_series` returning `None`
+over an over-permissive candidate set — Metron's substring search returns 433 series for
+`"Batman"`, and `year_end is None` was read as "ongoing," so the year window could never
+narrow them. The `len == 1` sole-hit branch never fired (smallest candidate set was 32),
+and `issues_list` was never reached.
+
+This inverts the fix direction. The named defects imply "trust less at the point of
+selection"; the actual bug is over-permissiveness at the point of *candidate admission*,
+and it produces **misses (placeholder dates), not wrong writes**. The shipped fix (BUI-485)
+adds a name-exactness pre-filter that can only narrow *toward* `None` — the opposite of
+tightening a trusted pick. A literal executor who "tightened the sole-hit branch" as the
+ticket implied would have hardened a code path that never runs, and left the real one
+untouched.
+
+**When a diagnostic ticket proposes a fix direction, measure which code path actually
+executes on the failing data before building.** A confirmed hypothesis is not a confirmed
+mechanism, and the fix for a *miss* (widen/redirect) is the reverse of the fix for a
+*wrong write* (tighten) — see `guard-strictness-must-match-consequence.md`.
+
 ## Why This Matters
 
 - **A reopened ticket or a review residual is exactly where the filer's model is most
@@ -234,17 +293,27 @@ Before implementing any ticket that:
 | BUI-465 | "77/78 rows had a null publisher" proves the breaker latched | BUI-458 added the publisher fetch *after* those rows were written — not evidence | Claim upheld on different evidence (run-grouped placeholder ordering); figure corrected |
 | BUI-470 | A variant/newsstand distinction is invisible to the reconciler | Reconciler's key is `full_title`-exact; the gap was record-win's coarser lookup, fixed in BUI-267 | Shipped as defense-in-depth with a *unit* test, not a misleading end-to-end one |
 | BUI-464 | Null year → newest volume; `needs_review` doesn't gate it | Both killed by BUI-421 Fix A and BUI-422; the named examples were correctly resolved | Only the third premise implemented; evidence sourced from the LOCG series window |
+| BUI-475 | Edit `needs_review`/`$25` gate in `_build_win_row` (`locg-cli`) | Gate lives in `gixen-cli/record_win_prep.py`; `needs_review` grep-absent from `locg-cli/src`; signals span an HTTP boundary | Stopped, re-grounded, design choice escalated — no speculative code |
+| BUI-474 | `_disambiguate_series` trusts a sole hit; `issues_list()[0]` unfiltered | Neither path executed; all 18 died at `_disambiguate_series` returning None over a 433-wide candidate set — a *miss*, not a wrong write | Fix direction inverted: name-exactness pre-filter that narrows toward None (BUI-485) |
 
 ## Practical checklist
 
 When the ticket is a reopen or a review residual, before writing code:
 
-1. **Re-read the named function**, not the ticket's paraphrase of it.
-2. **Check when each cited quantity started being recorded** before treating it as evidence.
-3. **Look up the specific records a ticket names as proof** — they are a checkable claim.
-4. **Search for fixes merged since the filing date** in the same area (`git log --since`).
-5. **For any deployed name, path, or label, check the live system**, not the docs.
-6. **If you add a guard, name its evidence source** and confirm it is independent of the
+1. **Grep for the named symbol in the named package first** — before reading, before
+   designing. A ticket can name the wrong file or the wrong package outright (BUI-475:
+   `needs_review` was grep-absent from the package the ticket said to edit it in). One
+   command decides whether the premise is even locatable.
+2. **Re-read the named function**, not the ticket's paraphrase of it.
+3. **Check when each cited quantity started being recorded** before treating it as evidence.
+4. **Look up the specific records a ticket names as proof** — they are a checkable claim.
+5. **When a ticket names the mechanism, measure which code path actually executes** on the
+   failing data — a confirmed hypothesis is not a confirmed mechanism (BUI-474), and the fix
+   for a *miss* is the reverse of the fix for a *wrong write*.
+6. **Search for fixes merged since the filing date** in the same area (`git log --since`).
+7. **For any deployed name, path, or label, check the live system**, not the docs.
+8. **If you add a guard, name its evidence source** and confirm it is independent of the
    thing being guarded.
-7. **When the premise is wrong, say so in the PR and the ticket** — and put the test where
-   the bug actually is, not where the ticket said it was.
+9. **When the premise is wrong, say so in the PR and the ticket** — and put the test where
+   the bug actually is, not where the ticket said it was. A well-reasoned no-code
+   stop-and-report is a successful outcome, not a failure to deliver.
