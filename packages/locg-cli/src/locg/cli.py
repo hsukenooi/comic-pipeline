@@ -142,7 +142,18 @@ def create_parser() -> argparse.ArgumentParser:
     p_has.add_argument("title_query", help="Title to search for (case-insensitive substring match)")
 
     # collection import — local cache
-    p_import = coll_sub.add_parser("import", parents=[common], help="Import a LOCG Excel export into the local collection cache")
+    p_import = coll_sub.add_parser(
+        "import",
+        parents=[common],
+        help=(
+            "Import a LOCG Excel export into the local collection cache. "
+            "IMPORTANT: requires LOCG_DATA_DIR to be set explicitly (BUI-476) — "
+            "this command rewrites the WHOLE collection and refuses to guess "
+            "which store you mean. On the Mac Mini the server-owned store is: "
+            "LOCG_DATA_DIR=$HOME/.comics-server/collection-store locg collection "
+            "import <path>"
+        ),
+    )
     p_import.add_argument("path", help="Path to a LOCG Excel export (.xlsx)")
 
     # collection export — local cache
@@ -190,7 +201,12 @@ def create_parser() -> argparse.ArgumentParser:
         help=(
             "Record Gixen auction wins into the local collection cache. "
             "Reads a JSON list from stdin or --from-gixen-json. "
-            "Commits in batches of 25; large batches scale with Metron rate limit."
+            "Commits in batches of 25; large batches scale with Metron rate limit. "
+            "IMPORTANT: requires LOCG_DATA_DIR to be set explicitly (BUI-476) — "
+            "this command refuses to guess which collection store you mean rather "
+            "than risk silently writing wins into the wrong one. On the Mac Mini "
+            "the server-owned store is: LOCG_DATA_DIR=$HOME/.comics-server/"
+            "collection-store locg collection record-win --from-gixen-json <path>"
         ),
     )
     p_rw.add_argument(
@@ -598,6 +614,19 @@ def main() -> None:
                 result = cmd_collection_has(client, args.title_query)
             elif sub_cmd == "import":
                 result = cmd_collection_import(args.path)
+                # BUI-476: the store refusal must exit NON-ZERO. Every caller
+                # that chains (`... && next-step`, `set -e`, a skill branching
+                # on $?) reads exit 0 as "imported"; the refusal recorded
+                # nothing, so a zero exit would recreate the exact
+                # "operator believes it worked" failure the guard exists to
+                # prevent. Mirrors backfill/remediate-* below.
+                if result.get("status") == "explicit_store_required":
+                    # No `fields=`: --fields would filter the payload down to
+                    # `{}` (it has only status/error, never a key a caller
+                    # narrows to), leaving an unexplained exit 1 with no
+                    # remediation text anywhere.
+                    output(result, pretty=args.pretty)
+                    sys.exit(1)
             elif sub_cmd == "export":
                 result = cmd_collection_export(getattr(args, "out_path", None))
             elif sub_cmd == "status":
@@ -629,6 +658,15 @@ def main() -> None:
                 if not isinstance(wins, list):
                     die("JSON input must be a list of win objects", code=2)
                 result = cmd_collection_record_win(wins)
+                # BUI-476: see the identical note on `import` above — a refusal
+                # recorded zero wins and must not exit 0.
+                if result.get("status") == "explicit_store_required":
+                    # No `fields=`: --fields would filter the payload down to
+                    # `{}` (it has only status/error, never a key a caller
+                    # narrows to), leaving an unexplained exit 1 with no
+                    # remediation text anywhere.
+                    output(result, pretty=args.pretty)
+                    sys.exit(1)
             elif sub_cmd == "backfill":
                 result = cmd_collection_backfill(
                     series=getattr(args, "series", None),

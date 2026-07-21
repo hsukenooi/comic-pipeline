@@ -621,7 +621,10 @@ def cmd_wish_list_from_cache(title: Optional[str] = None) -> list[dict[str, Any]
     """
     path = wish_list_cache_path()
     if not path.exists():
-        raise FileNotFoundError(f"Wish-list cache not found: {path}. Run: locg collection import")
+        raise FileNotFoundError(
+            f"Wish-list cache not found: {path}. "
+            f"Run: {SERVER_STORE_EXPORT_HINT} && locg collection import <export.xlsx>"
+        )
     with open(path) as f:
         data = json.load(f)
     items: list[dict[str, Any]] = data.get("items", [])
@@ -873,7 +876,8 @@ def cmd_wish_list_add_creator_run(
                 "Collection cache never imported — refusing to wish-list a creator "
                 "run, because every issue would falsely check as 'not owned' (R11) "
                 "and an owned-but-wished book is deleted from the collection on the "
-                "next sync (BUI-122). Run `locg collection import <export.xlsx>` "
+                "next sync (BUI-122). Run `" + SERVER_STORE_EXPORT_HINT + " && locg "
+                "collection import <export.xlsx>` "
                 "first, or point the store at the gixen server (LOCG_DATA_DIR), "
                 "then retry."
             )
@@ -1104,7 +1108,12 @@ def cmd_wish_list_remove(title: str) -> dict[str, Any]:
 
     path = wish_list_cache_path()
     if not path.exists():
-        return {"error": f"Wish-list cache not found: {path}. Run: locg collection import"}
+        return {
+            "error": (
+                f"Wish-list cache not found: {path}. "
+                f"Run: {SERVER_STORE_EXPORT_HINT} && locg collection import <export.xlsx>"
+            )
+        }
 
     with open(path) as f:
         payload = json.load(f)
@@ -1549,7 +1558,12 @@ def cmd_wish_list_set_year(name: str, year: str) -> dict[str, Any]:
 
     path = wish_list_cache_path()
     if not path.exists():
-        return {"error": f"Wish-list cache not found: {path}. Run: locg collection import"}
+        return {
+            "error": (
+                f"Wish-list cache not found: {path}. "
+                f"Run: {SERVER_STORE_EXPORT_HINT} && locg collection import <export.xlsx>"
+            )
+        }
 
     with open(path) as f:
         payload = json.load(f)
@@ -2166,16 +2180,117 @@ def cmd_cache_clear(_client: Optional[LOCGClient] = None) -> dict[str, Any]:
 # Collection cache commands (Unit 4)
 # ---------------------------------------------------------------------------
 
-def cmd_collection_import(path_str: str) -> dict[str, Any]:
-    """Import a LOCG Excel export into the local collection cache."""
+# BUI-476: the store every mutating collection command must be pointed at on
+# the Mac Mini. Prefixed onto the remediation line in the refusal payload AND
+# onto the user-facing "run this next" instructions (cmd_collection_doctor's
+# walkthrough, the wish-list-cache-missing errors), which would otherwise hand
+# the operator an `import` invocation the guard now refuses.
+SERVER_STORE_ENV_PREFIX = "LOCG_DATA_DIR=$HOME/.comics-server/collection-store"
+
+# The same store as a SESSION export. Use this — not the one-shot prefix — in
+# any multi-step instruction: `VAR=val cmd` scopes to one command, so a
+# walkthrough that prefixes only its write step would import into the server
+# store and then verify the default one, reporting "cache is empty" right after
+# a successful import. Reads are deliberately unguarded (BUI-476 scope), so
+# nothing would catch that split.
+SERVER_STORE_EXPORT_HINT = f"export {SERVER_STORE_ENV_PREFIX}"
+
+
+def _unexpanded_store_path(value: str) -> bool:
+    """True if ``value`` still contains a shell variable a shell never expanded.
+
+    ``SERVER_STORE_ENV_PREFIX`` is written for a human to paste into a shell,
+    where ``$HOME`` expands. A caller that copies it MECHANICALLY instead —
+    into ``os.environ``, a ``subprocess`` env dict, or a quoted heredoc — gets
+    the literal string, and ``CollectionCache`` would happily ``mkdir -p`` a
+    directory named ``$HOME`` under the cwd and report a full-collection import
+    into it as a success. That is precisely the wrong-store write this guard
+    exists to refuse, so treat an unexpanded value as "no store named".
+    """
+    return "$" in value
+
+
+def _needs_explicit_store(cache: Optional[Any]) -> bool:
+    """True when a MUTATING collection command has no idea which store to write.
+
+    BUI-471 (backfill) / BUI-476 (import, record-win): a command that only ever
+    read could fall back to ``locg.config._cache_dir()``'s resolution
+    (``LOCG_DATA_DIR`` env → ``<repo>/data/locg`` → ``~/.cache/locg``) and at
+    worst report a misleading "nothing here". A command that WRITES cannot: run
+    bare on the Mac Mini, that fallback lands on the repo's local ``data/locg``
+    — a *different* store from the server-owned one at
+    ``$HOME/.comics-server/collection-store`` that actually holds the
+    collection. An empty local store hard-fails loudly (R11's not-imported
+    guard), but a NON-empty one silently mutates the wrong data, which is the
+    failure mode worth refusing outright.
+
+    Two escapes, both of which are the caller explicitly naming a store:
+    an explicitly-passed ``cache`` (how the tests and any in-process caller
+    work) or a usable ``LOCG_DATA_DIR``. The comics server always satisfies
+    the second — ``routes._ensure_collection_store()`` sets ``LOCG_DATA_DIR``
+    before every collection call — so this never fires on a server path.
+
+    "Usable" means non-blank AND actually expanded — see
+    :func:`_unexpanded_store_path`.
+
+    **Scope (BUI-476, deliberate):** only ``import``, ``record-win`` and
+    ``backfill`` consult this. The read commands (``check``, ``status``,
+    ``export``) are unguarded on purpose so legitimate local-store CLI use
+    still works. The other mutators — ``remediate-delete``,
+    ``remediate-set-copies`` and the ``wish-list`` writers — are NOT yet
+    guarded; their absence here is an open gap, not a judgement that they are
+    safe. Do not read this list as coverage.
+    """
+    if cache is not None:
+        return False
+    value = os.environ.get("LOCG_DATA_DIR", "").strip()
+    return not value or _unexpanded_store_path(value)
+
+
+def _explicit_store_required_error(invocation: str) -> dict[str, Any]:
+    """The BUI-471/BUI-476 refusal payload. ``invocation`` is the working
+    command line to suggest, e.g. ``"locg collection backfill [--apply]"``."""
+    return {
+        "status": "explicit_store_required",
+        "error": (
+            "LOCG_DATA_DIR is not set (or still holds an unexpanded '$VAR') — "
+            "refusing to default to locg.config._cache_dir()'s resolution, "
+            "which may be a different (and possibly non-empty) store than the "
+            "one you mean to write to. Set it explicitly, e.g. on the Mac "
+            f"Mini: {SERVER_STORE_ENV_PREFIX} {invocation} — or, for a "
+            f"multi-step session (the reads are unguarded and would otherwise "
+            f"resolve a different store): {SERVER_STORE_EXPORT_HINT}"
+        ),
+    }
+
+
+def cmd_collection_import(
+    path_str: str, cache: Optional[Any] = None
+) -> dict[str, Any]:
+    """Import a LOCG Excel export into the local collection cache.
+
+    BUI-476: refuses with ``{"status": "explicit_store_required"}`` when no
+    ``cache`` is passed and ``LOCG_DATA_DIR`` is unset — see
+    :func:`_needs_explicit_store`. This is a full-collection rewrite (identity
+    upsert, rename detection, agent_win reconciliation, wish-list rebuild), so
+    running it against a store the caller did not mean is the single most
+    destructive wrong-store outcome in this module.
+    """
     from pathlib import Path as _Path
     from locg.collection_io import import_xlsx
 
+    # Argument validation first: a bad path is a caller error that is true of
+    # every store, so it keeps raising FileNotFoundError rather than being
+    # masked by the store refusal. Both are checked before any write.
     path = _Path(path_str)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    cache = CollectionCache()
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error("locg collection import <path>")
+
+    if cache is None:
+        cache = CollectionCache()
     # Pre-flight load triggers crash detection (migration_in_progress guard)
     # before we start parsing the xlsx. Raises RuntimeError on corrupt state.
     cache.load()
@@ -4340,6 +4455,15 @@ def cmd_collection_record_win(
     endpoint runs this off the event loop via ``asyncio.to_thread`` (BUI-428)
     precisely so a Metron wait cannot stall the single-worker comics server.
     See ``METRON_REQUESTS_PER_MINUTE`` for the pace/recover rationale.
+
+    BUI-476: refuses with ``{"status": "explicit_store_required"}`` when no
+    ``cache`` is passed and ``LOCG_DATA_DIR`` is unset — see
+    :func:`_needs_explicit_store`. The refusal is returned BEFORE any Metron
+    traffic or any write, and it is the ONLY return shape that carries a
+    ``status`` key, so a caller can tell it apart from a real run's metrics
+    without inspecting counters. The comics server cannot reach it:
+    ``routes.api_record_win_commit`` calls ``_ensure_collection_store()``
+    first, which guarantees ``LOCG_DATA_DIR`` is set.
     """
     from datetime import datetime, timezone
     from locg.collection_cache import (
@@ -4349,6 +4473,17 @@ def cmd_collection_record_win(
     )
     from locg.metron import MetronClient
 
+    # BUI-476: refuse before spending a single Metron call or touching a store
+    # the caller never named. record-win WRITES new owned rows, so the
+    # wrong-store outcome here is silently seeding a local cache with wins the
+    # real collection never learns about — and (worse) the operator believing
+    # they were recorded.
+    if _needs_explicit_store(cache):
+        # The suggested line must be one argparse actually accepts: `record-win`
+        # has no positional path, only --from-gixen-json.
+        return _explicit_store_required_error(
+            "locg collection record-win --from-gixen-json <path>"
+        )
     if cache is None:
         cache = CollectionCache()
     if metron is None:
@@ -4579,7 +4714,23 @@ def cmd_collection_doctor() -> dict[str, Any]:
 
     steps = [
         {
+            # BUI-476: an EXPORT, not a one-shot `VAR=val cmd` prefix. The
+            # prefix form scopes to a single command, which would import into
+            # the server store and then verify the DEFAULT one — the walkthrough
+            # would report "cache is empty" straight after a successful import
+            # and loop forever. Exporting once makes every later step (import,
+            # status, and anything the operator runs next) name the same store.
             "step": 1,
+            "title": "Point the CLI at your collection store",
+            "instruction": (
+                f"Run: {SERVER_STORE_EXPORT_HINT}  "
+                "(the comics server on the Mac Mini owns this store; the "
+                "mutating commands refuse to guess it. Skip only if you "
+                "deliberately mean a different, local store.)"
+            ),
+        },
+        {
+            "step": 2,
             "title": "Export your collection from LOCG",
             "instruction": (
                 "Go to https://leagueofcomicgeeks.com/profile (logged in) "
@@ -4587,19 +4738,20 @@ def cmd_collection_doctor() -> dict[str, Any]:
             ),
         },
         {
-            "step": 2,
+            "step": 3,
             "title": "Import the Excel file",
             "instruction": (
-                "Run: locg collection import ~/Downloads/<ComicGeeks-YYYY-MM-DD-HH-MM-SS>.xlsx"
+                "Run: locg collection import "
+                "~/Downloads/<ComicGeeks-YYYY-MM-DD-HH-MM-SS>.xlsx"
             ),
         },
         {
-            "step": 3,
+            "step": 4,
             "title": "Verify the import",
             "instruction": "Run: locg collection status --pretty",
         },
         {
-            "step": 4,
+            "step": 5,
             "title": "(Optional) Set up Metron credentials for series name resolution",
             "instruction": (
                 "Add METRON_USERNAME and METRON_PASSWORD to ~/.config/locg/.env "
@@ -4610,7 +4762,10 @@ def cmd_collection_doctor() -> dict[str, Any]:
 
     if status["last_full_import"] is None:
         next_action = (
-            "Cache is empty. Start with Step 1: export your collection from LOCG."
+            "Cache is empty. Start with Step 1: point the CLI at your "
+            "collection store — an empty cache here often just means "
+            "LOCG_DATA_DIR is unset and this read resolved a DIFFERENT store "
+            "than the one you imported into (BUI-476)."
         )
         ready = False
     elif (status["cache_age_days"] or 0) > 14:
@@ -5583,24 +5738,14 @@ def cmd_collection_backfill(
     if limit is not None and limit < 0:
         return {"status": "invalid_request", "error": "limit must be >= 0"}
 
+    # BUI-471 residual #5: never silently fall back to whatever
+    # locg.config._cache_dir() resolves to — that can be a non-empty LOCAL
+    # store on the very machine (e.g. the Mac Mini) whose SERVER-owned
+    # store is what actually needs remediating. Require the caller to say
+    # which store they mean. Shared with import/record-win since BUI-476.
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error("locg collection backfill [--apply]")
     if cache is None:
-        # BUI-471 residual #5: never silently fall back to whatever
-        # locg.config._cache_dir() resolves to — that can be a non-empty LOCAL
-        # store on the very machine (e.g. the Mac Mini) whose SERVER-owned
-        # store is what actually needs remediating. Require the caller to say
-        # which store they mean.
-        if not os.environ.get("LOCG_DATA_DIR", "").strip():
-            return {
-                "status": "explicit_store_required",
-                "error": (
-                    "LOCG_DATA_DIR is not set — refusing to default to "
-                    "locg.config._cache_dir()'s resolution, which may be a "
-                    "different (and possibly non-empty) store than the one you "
-                    "mean to remediate. Set it explicitly, e.g. on the Mac Mini: "
-                    "LOCG_DATA_DIR=$HOME/.comics-server/collection-store locg "
-                    "collection backfill [--apply]"
-                ),
-            }
         cache = CollectionCache()
     if metron is None:
         metron = MetronClient()

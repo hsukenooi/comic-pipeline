@@ -6074,3 +6074,333 @@ def test_record_win_dedup_base_not_conflated_with_owned_bare_reprint(tmp_path):
 
     assert result["skipped_already_owned"] == 0
     assert result["rows_written"] == 1
+
+
+# ---------------------------------------------------------------------------
+# BUI-476: the wrong-store guard on the MUTATING commands (import, record-win)
+#
+# Same semantics as BUI-471's guard on `backfill`: fire only when `cache` is
+# None AND LOCG_DATA_DIR is unset/blank. Read-only commands (check, status,
+# export) are deliberately NOT guarded — that scope was declined.
+#
+# Every test below that unsets LOCG_DATA_DIR also installs `_no_default_store`.
+# The autouse `_isolate_cache_dir` fixture (conftest.py) is what normally keeps
+# a test off the REAL repo store, and `delenv` removes exactly that protection:
+# if the guard ever regresses, `_cache_dir()` falls through to
+# `<repo>/data/locg` and these tests would write the developer's live working
+# cache *before* failing. The stub turns that into a loud AssertionError.
+# ---------------------------------------------------------------------------
+
+
+def _no_default_store(monkeypatch):
+    """Make constructing the DEFAULT CollectionCache a hard failure.
+
+    Both names must be patched: `cmd_collection_import` uses the module-global
+    `commands.CollectionCache`, while `cmd_collection_record_win` re-imports it
+    function-locally from `locg.collection_cache` (which shadows the global), so
+    patching only one leaves the other live.
+    """
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "BUI-476 guard regressed: the default store was constructed"
+        )
+
+    monkeypatch.setattr("locg.commands.CollectionCache", _boom)
+    monkeypatch.setattr("locg.collection_cache.CollectionCache", _boom)
+
+
+def test_record_win_no_explicit_cache_and_no_locg_data_dir_is_refused(monkeypatch):
+    """Run bare (the real CLI path) with no LOCG_DATA_DIR, record-win must
+    refuse rather than silently write wins into whatever
+    locg.config._cache_dir() resolves to."""
+    from locg.commands import cmd_collection_record_win
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    _no_default_store(monkeypatch)
+
+    result = cmd_collection_record_win([_make_win()])
+
+    assert result["status"] == "explicit_store_required"
+    assert "LOCG_DATA_DIR" in result["error"]
+
+
+def test_record_win_explicit_cache_bypasses_the_locg_data_dir_guard(tmp_path, monkeypatch):
+    """An explicitly-passed cache= is the caller naming its store, so the env
+    guard must not fire — this is the shape every in-process caller uses."""
+    from locg.commands import cmd_collection_record_win
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    cache = make_cache(tmp_path)
+    _no_default_store(monkeypatch)
+
+    result = cmd_collection_record_win(
+        [_make_win()], cache=cache, metron=_null_metron()
+    )
+
+    assert "status" not in result
+    assert result["rows_written"] == 1
+
+
+def test_record_win_blank_locg_data_dir_is_refused(monkeypatch):
+    """A whitespace-only LOCG_DATA_DIR (`export LOCG_DATA_DIR="$DIR "` with an
+    unset DIR) resolves to nothing useful — treat it as unset, matching
+    config._cache_dir's own blank handling."""
+    from locg.commands import cmd_collection_record_win
+
+    monkeypatch.setenv("LOCG_DATA_DIR", "   ")
+    _no_default_store(monkeypatch)
+
+    result = cmd_collection_record_win([_make_win()])
+
+    assert result["status"] == "explicit_store_required"
+
+
+def test_record_win_guard_refuses_before_spending_any_metron_call(monkeypatch):
+    """The refusal must come before resolution starts, not after a batch of
+    Metron traffic has already been paid for."""
+    from locg.commands import cmd_collection_record_win
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    _no_default_store(monkeypatch)
+    metron = _null_metron()
+
+    result = cmd_collection_record_win([_make_win()], metron=metron)
+
+    assert result["status"] == "explicit_store_required"
+    metron.lookup_issue.assert_not_called()
+
+
+def test_record_win_locg_data_dir_set_still_runs(tmp_path, monkeypatch):
+    """The SERVER-shaped call: no cache= is passed, so the store is resolved
+    SOLELY from LOCG_DATA_DIR — exactly what routes._ensure_collection_store()
+    guarantees before every record-win. The guard must NOT fire; a guard that
+    500s /api/comics/collection/record-win/commit is worse than the bug it
+    fixes.
+
+    Points LOCG_DATA_DIR at a dir the autouse fixture did NOT pick, so the
+    write landing there proves the env var is what resolved the store.
+    """
+    from locg.commands import cmd_collection_record_win
+
+    store = tmp_path / "server-owned"
+    store.mkdir()
+    monkeypatch.setenv("LOCG_DATA_DIR", str(store))
+
+    result = cmd_collection_record_win([_make_win()], metron=_null_metron())
+
+    assert "status" not in result
+    assert result["rows_written"] == 1
+    assert (store / "collection.json").exists()
+
+
+def test_import_no_explicit_cache_and_no_locg_data_dir_is_refused(monkeypatch):
+    """import rewrites the WHOLE collection, so the wrong-store outcome is the
+    most destructive one in the module — refuse rather than guess."""
+    import locg.commands as cmds
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    _no_default_store(monkeypatch)
+
+    result = cmds.cmd_collection_import(str(SAMPLE_XLSX))
+
+    assert result["status"] == "explicit_store_required"
+    assert "LOCG_DATA_DIR" in result["error"]
+
+
+def test_import_guard_does_not_write_to_the_default_store(tmp_path, monkeypatch):
+    """The point of the refusal: the store it would otherwise have resolved to
+    is left untouched."""
+    import locg.commands as cmds
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    would_be_store = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: would_be_store)
+
+    result = cmds.cmd_collection_import(str(SAMPLE_XLSX))
+
+    assert result["status"] == "explicit_store_required"
+    assert not (tmp_path / "collection.json").exists()
+
+
+def test_import_explicit_cache_bypasses_the_locg_data_dir_guard(tmp_path, monkeypatch):
+    """cache= is the caller naming its store; the env guard must not fire."""
+    import locg.commands as cmds
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    cache = make_cache(tmp_path)
+    _no_default_store(monkeypatch)
+
+    result = cmds.cmd_collection_import(str(SAMPLE_XLSX), cache=cache)
+
+    assert result.get("status") != "explicit_store_required"
+    assert result["added"] > 0
+
+
+def test_import_locg_data_dir_set_still_runs(tmp_path, monkeypatch):
+    """The SERVER-shaped call: routes._ensure_collection_store() sets
+    LOCG_DATA_DIR and passes no cache=, so /api/comics/collection/import must
+    keep working. Uses a dir the autouse fixture did not pick, so the written
+    collection.json proves the env var resolved the store."""
+    import locg.commands as cmds
+
+    store = tmp_path / "server-owned"
+    store.mkdir()
+    monkeypatch.setenv("LOCG_DATA_DIR", str(store))
+
+    result = cmds.cmd_collection_import(str(SAMPLE_XLSX))
+
+    assert result.get("status") != "explicit_store_required"
+    assert result["added"] > 0
+    assert (store / "collection.json").exists()
+
+
+def test_import_bad_path_still_raises_regardless_of_store_guard(tmp_path, monkeypatch):
+    """Argument validation is checked first: a nonexistent path is a caller
+    error true of every store, so it must not be masked by the store refusal."""
+    import locg.commands as cmds
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    _no_default_store(monkeypatch)
+
+    with pytest.raises(FileNotFoundError):
+        cmds.cmd_collection_import(str(tmp_path / "does_not_exist.xlsx"))
+
+
+def test_read_only_collection_commands_are_not_guarded(tmp_path, monkeypatch):
+    """BUI-476 scope boundary: only the MUTATING commands are guarded. status
+    (and the other read paths) must keep working bare so legitimate local-store
+    CLI use is not broken — that scope was explicitly declined."""
+    import locg.commands as cmds
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: make_cache(tmp_path))
+
+    result = cmds.cmd_collection_status()
+
+    assert result.get("status") != "explicit_store_required"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["locg", "collection", "import", "IGNORED"],
+        ["locg", "collection", "record-win", "--from-gixen-json", "IGNORED"],
+    ],
+)
+def test_cli_exits_nonzero_on_the_store_refusal(argv, tmp_path, monkeypatch, capsys):
+    """The refusal must exit NON-ZERO. A caller that chains (`... && next`,
+    `set -e`, a skill branching on $?) reads exit 0 as "it worked" — and the
+    refusal recorded nothing, which is exactly the false-success the guard
+    exists to prevent. Backfill already exits 1; import/record-win must match.
+    """
+    import locg.cli as cli
+
+    payload = tmp_path / "payload.json"
+    payload.write_text("[]")
+    argv = [a if a != "IGNORED" else str(payload) for a in argv]
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    _no_default_store(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "explicit_store_required" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "locg collection import <path>",
+        "locg collection record-win --from-gixen-json <path>",
+        "locg collection backfill [--apply]",
+    ],
+)
+def test_refusal_suggests_an_invocation_argparse_actually_accepts(invocation):
+    """The refusal's whole value is the working command line it hands the
+    operator — an invocation argparse rejects (e.g. `record-win <path>`, which
+    has no positional) is worse than no suggestion at all.
+    """
+    from locg.cli import create_parser
+    from locg.commands import _explicit_store_required_error
+
+    error = _explicit_store_required_error(invocation)
+    assert invocation in error["error"]
+
+    argv = [tok for tok in invocation.split()[1:] if not tok.startswith("[")]
+    argv = ["value" if tok.startswith("<") else tok for tok in argv]
+    create_parser().parse_args(argv)
+
+
+def test_unexpanded_locg_data_dir_is_refused(tmp_path, monkeypatch):
+    """A literal, unexpanded `$HOME/...` is NOT a store the caller named.
+
+    The refusal's remediation line is written for a shell, where `$HOME`
+    expands. A caller that copies it mechanically — into os.environ, a
+    subprocess env dict, or a quoted heredoc — gets the literal string, and
+    CollectionCache would happily mkdir a directory named `$HOME` under the cwd
+    and report a full-collection import into it as success. That is the exact
+    wrong-store write this guard exists to refuse.
+    """
+    import locg.commands as cmds
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LOCG_DATA_DIR", "$HOME/.comics-server/collection-store")
+    _no_default_store(monkeypatch)
+
+    result = cmds.cmd_collection_import(str(SAMPLE_XLSX))
+
+    assert result["status"] == "explicit_store_required"
+    assert not (tmp_path / "$HOME").exists()
+
+
+def test_cli_refusal_is_not_erased_by_fields_filtering(tmp_path, monkeypatch, capsys):
+    """`--fields added,updated` must not filter the refusal down to `{}`.
+
+    The refusal carries only status/error — never a key a caller narrows to —
+    so field-filtering it leaves an unexplained exit 1 with no remediation text
+    on stdout or stderr, discarding the guard's entire value.
+    """
+    import locg.cli as cli
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["locg", "collection", "import", str(SAMPLE_XLSX), "--fields", "added,updated"],
+    )
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    _no_default_store(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "explicit_store_required" in out
+    assert "LOCG_DATA_DIR" in out
+
+
+def test_doctor_walkthrough_steps_all_name_the_same_store(tmp_path, monkeypatch):
+    """The walkthrough must not tell the operator to WRITE to one store and
+    then VERIFY another.
+
+    A one-shot `LOCG_DATA_DIR=... locg collection import` prefix scopes to that
+    single command, so the following `locg collection status` — deliberately
+    unguarded — would resolve the DEFAULT store and report "cache is empty"
+    immediately after a successful import, looping the walkthrough forever.
+    An `export` is what makes every later step name the same store.
+    """
+    import locg.commands as cmds
+
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: make_cache(tmp_path))
+
+    steps = cmds.cmd_collection_doctor()["setup_steps"]
+    instructions = [s["instruction"] for s in steps]
+
+    assert any(cmds.SERVER_STORE_EXPORT_HINT in i for i in instructions)
+    # No step may carry the one-shot prefix form, which is what splits the
+    # write store from the read store.
+    assert not any(
+        f"{cmds.SERVER_STORE_ENV_PREFIX} locg" in i for i in instructions
+    )
+    assert [s["step"] for s in steps] == list(range(1, len(steps) + 1))
