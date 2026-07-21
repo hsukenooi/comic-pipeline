@@ -3695,26 +3695,38 @@ def _metron_release_date(
       genuine 1969-11-10 a reprint and discarded the whole hit, leaving the
       row dateless and (since BUI-458) publisher-less too. A real reprint is
       decades away, so ±1 still rejects it.
-    * ``cover_date`` gets an EXACT year match. It is the same quantity as
-      ``year_raw`` — both are cover dates — so there is no skew to forgive
-      here, and a one-year disagreement is not skew but evidence that
-      ``lookup_issue`` matched a different book. This matters because
-      ``lookup_issue`` trusts a sole name-search hit with no year check of its
-      own (``_disambiguate_series``) and takes ``issues_list()[0]`` unfiltered,
-      which on vintage/aliased series makes this gate the only era check on the
-      whole result. Widening it would admit UK/foreign reprint editions and
-      one-year Metron data-entry slips for nothing in return.
+    * ``cover_date`` gets an EXACT year match, with ONE window-gated exception
+      (BUI-486). ``year_raw`` is NOT reliably the same quantity as
+      ``cover_date``: it may be a printed cover year, but it may equally be a
+      seller-supplied ERA claim lifted off an eBay title (*"Batman #427 DC 1989
+      … A Death in the Family"*), and cover-dating convention (books cover-dated
+      ahead of on-sale) makes such a claim systematically ±1 off the printed
+      cover year. So a one-year gap is sometimes skew, not a wrong-book signal.
+      It still must not be forgiven blindly: ``lookup_issue`` trusts a sole
+      name-search hit with no year check of its own (``_disambiguate_series``)
+      and takes ``issues_list()[0]`` unfiltered, which on vintage/aliased series
+      makes this gate the only era check on the whole result, and a bare ±1
+      window would admit UK/foreign reprint editions and one-year Metron
+      data-entry slips. The exception is therefore gated on the INDEPENDENT
+      volume window (below): a cover_date one year off ``year_raw`` is accepted
+      only when it also lands inside the resolved volume's own ``series_range``.
+      The ±1 bound is what rejects a decades-off reprint the wide window would
+      otherwise contain (a 2005 collected edition of a 1989 book is 16 years off
+      ``year_raw``); the window is what rejects a ±1 candidate the resolver could
+      not actually place.
 
-    When ``year_raw`` is not a clean 4-digit year, ``series_range`` (BUI-464)
-    is the substitute era evidence: the ``(begin, end)`` publication window
+    ``series_range`` (BUI-464) is the ``(begin, end)`` publication window
     parsed off the LOCG canonical series name that
     :func:`resolve_series_for_win` matched this win to (e.g. ``"The X-Men
-    (Vol. 1) (1963 - 1981)"`` -> ``(1963, 1981)``). That window is INDEPENDENT
-    of the Metron hit being judged — it comes from the local collection's own
-    ``series_name_index`` — which is what makes it a real guard rather than a
-    tautology. Pass it ONLY when it has that independent provenance; a range
-    derived from the same hit (``metron.format_series_name``) would gate the
-    candidate against itself and always pass.
+    (Vol. 1) (1963 - 1981)"`` -> ``(1963, 1981)``). It serves two gates: it is
+    the substitute era evidence when ``year_raw`` is not a clean 4-digit year,
+    AND (BUI-486) it is the containment gate for the clean-year cover_date ±1
+    exception above. That window is INDEPENDENT of the Metron hit being judged —
+    it comes from the local collection's own ``series_name_index`` — which is
+    what makes it a real guard rather than a tautology. Pass it ONLY when it has
+    that independent provenance; a range derived from the same hit
+    (``metron.format_series_name``) would gate the candidate against itself and
+    always pass.
 
     The store_date/cover_date asymmetry above is preserved against the window:
     a ``store_date`` may sit one year outside it (a volume's first issue with a
@@ -3756,7 +3768,35 @@ def _metron_release_date(
         return candidate if begin <= candidate_year <= end else None
     if store_date:
         return candidate if _year_gate_accepts(year_str, candidate) else None
-    return candidate if candidate.startswith(year_str) else None
+    # cover_date, clean year.
+    if candidate.startswith(year_str):
+        return candidate
+    # BUI-486: ``year_raw`` may be a seller-supplied ERA claim lifted off an
+    # eBay title rather than a printed cover year, and cover-dating convention
+    # (books cover-dated ahead of on-sale) skews such a claim systematically ±1
+    # off the printed cover date. So a one-year gap here is sometimes that skew,
+    # not a wrong-book signal. Accept a cover_date exactly one year off
+    # ``year_raw`` ONLY when it also sits inside the resolved volume's INDEPENDENT
+    # publication window. Both bounds carry weight: the ±1 rejects a decades-off
+    # reprint even when the window is wide enough to contain it (a 2005 collected
+    # edition of a 1989 Batman is 16 years off ``year_raw``, yet 2005 is inside
+    # ``Batman (1940 - 2011)``), and the window rejects a ±1 candidate the
+    # resolver could not actually place (a degenerate one-year window). On the
+    # clean-year path ``resolve_series_for_win`` already picked this volume USING
+    # ``year_raw``, so a non-degenerate window is guaranteed to contain
+    # ``year_raw`` — meaning the ±1 bound is the operative reprint guard here and
+    # the window's discriminating power is confined to its edges. A cover_date is
+    # never given the store_date's edge-widening — it is by definition inside its
+    # own volume's run.
+    if series_range is not None:
+        candidate_year = _coerce_year(candidate)
+        if (
+            candidate_year is not None
+            and abs(candidate_year - int(year_str)) == 1
+            and series_range[0] <= candidate_year <= series_range[1]
+        ):
+            return candidate
+    return None
 
 
 def _dedup_era_compatible(win_year: Optional[int], candidate_row: dict[str, Any]) -> bool:
@@ -4062,11 +4102,19 @@ def _build_win_row(
     index_series_range: Optional[tuple[int, int]] = None
     if resolved_series is not None:
         canonical_series = resolved_series
-        # Captured exactly when the win's own year gate is inactive — the SAME
-        # `\d{4}` test _metron_release_date applies, so the two are strictly
-        # complementary and no row is judged by both or by neither.
-        if not re.fullmatch(r"\d{4}", str(year_raw).strip() if year_raw is not None else ""):
-            index_series_range = series_year_range(resolved_series)
+        # BUI-464 + BUI-486: thread the resolved volume's own publication window
+        # whenever the win resolved through series_name_index, for BOTH gates in
+        # _metron_release_date. When year_raw is not a clean 4-digit year it is
+        # the sole era guard (BUI-464). When year_raw IS a clean year it is the
+        # containment gate for the cover_date ±1 exception (BUI-486) — where
+        # year_raw may be a seller ERA claim skewed one year off the printed
+        # cover date, so the clean year no longer captures the window's job on
+        # its own. (Formerly captured only on the non-clean branch, when the two
+        # gates were mutually exclusive; BUI-486 makes them cooperate on the
+        # clean-year cover_date path.) Captured ONLY on the index path: the
+        # Metron step-2 fallback below derives its series name from the very hit
+        # we would be judging, so its range would be circular and stays None.
+        index_series_range = series_year_range(resolved_series)
     elif not metron_disabled:
         try:
             metron_attempted += 1

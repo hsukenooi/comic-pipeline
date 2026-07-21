@@ -2852,14 +2852,19 @@ def test_record_win_metron_no_dates_blank_release_date(tmp_path):
 
 # --- BUI-210: real release date on the series_name_index path ---
 
-def _index_seeded_cache(tmp_path):
+def _index_seeded_cache(
+    tmp_path,
+    *,
+    series="The X-Men (1963 - 1981)",
+    full_title="The X-Men #1",
+):
     """Cache with a locg_export row so the series resolves via series_name_index
     (the no-Metron-for-series path) — the BUI-210 scenario."""
     from locg.collection_cache import rebuild_series_name_index
 
     cache = make_cache(tmp_path)
     _seed_cache(cache, [{
-        **_agent_win_row(series="The X-Men (1963 - 1981)", full_title="The X-Men #1"),
+        **_agent_win_row(series=series, full_title=full_title),
         "source": "locg_export",
     }])
     cache.apply(
@@ -2947,6 +2952,127 @@ def test_record_win_index_path_rejects_reprint_year_mismatch(tmp_path):
     # metron_data is dropped: the id/publisher came from the same suspect
     # issue match, so none of it is trustworthy on its own.
     assert row["release_date"] == "1970-01-01"
+    assert row["metron_id"] is None
+    assert row["publisher_name"] is None
+
+
+def test_record_win_clean_year_cover_date_seller_era_skew_accepted(tmp_path):
+    """BUI-486 (threading): a CLEAN-year win resolved via series_name_index now
+    receives the resolved volume's INDEPENDENT window, so a cover_date one year
+    off a seller-supplied era claim is accepted instead of thrown away.
+
+    Batman #427 ("… DC 1989 … A Death in the Family") is cover-dated 1988-12,
+    with no store_date (vintage). Before this change the clean year 1989 meant
+    index_series_range was never computed, the exact cover_date gate rejected
+    1988 vs 1989, the whole hit was dropped, and the row shipped a 1989-01-01
+    placeholder. Now the window Batman (1940 - 2011) contains 1988, so the real
+    date is kept."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(
+        tmp_path, series="Batman (1940 - 2011)", full_title="Batman #1"
+    )
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 427,
+        "cover_date": "1988-12-01",
+        "store_date": None,  # vintage: forces the cover_date gate to run
+        "series_year_began": 1940,
+        "series_year_end": 2011,
+        "series_name": "Batman",
+        "series_id": 42,
+    }
+    metron.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": "DC Comics"
+    }
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Batman (1940 - 2011)", issue="427", year=1989)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    # Real cover date kept (not the 1989-01-01 placeholder), metron_id + the
+    # BUI-458 publisher survive because the hit was accepted, not dropped.
+    assert row["release_date"] == "1988-12-01"
+    assert row["metron_id"] == 427
+    assert row["publisher_name"] == "DC Comics"
+
+
+def test_record_win_clean_year_cover_date_reprint_still_rejected(tmp_path):
+    """BUI-486 safety: threading the window on the clean-year path must NOT
+    weaken the reprint guard. A 2005 collected edition of a 1989 Batman is
+    rejected even though 2005 sits INSIDE Batman (1940 - 2011) — the ±1 bound
+    (16 years off year_raw), not the window, is what rejects it, and the
+    placeholder is kept."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = _index_seeded_cache(
+        tmp_path, series="Batman (1940 - 2011)", full_title="Batman #1"
+    )
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 999,
+        "cover_date": "2005-03-09",  # reprint year, inside the wide window
+        "store_date": None,
+        "series_year_began": 1940,
+        "series_year_end": 2011,
+        "series_name": "Batman",
+        "series_id": 42,
+    }
+
+    cmd_collection_record_win(
+        [_make_win(series="Batman (1940 - 2011)", issue="427", year=1989)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["release_date"] == "1989-01-01"  # placeholder kept
+    assert row["metron_id"] is None  # whole hit dropped
+    assert row["publisher_name"] is None
+
+
+def test_record_win_step2_metron_path_does_not_fire_pm1_exception(tmp_path):
+    """BUI-486 anti-circularity guard (black-box): the ±1 cover_date exception
+    must fire ONLY against an INDEPENDENT volume window. On the step-2 path —
+    where the series is NOT in series_name_index and the volume is resolved from
+    the very Metron hit being judged — index_series_range stays None, so a clean
+    year gets the EXACT gate and a ±1-off cover_date is rejected, not adopted.
+
+    The hit here even carries series_year_began/end = 1940/2011 (a window that
+    WOULD contain 1988): if a future refactor sourced the window from the hit,
+    the exception would fire and this row would wrongly keep 1988-12-01 + a
+    metron_id. That regression fails this test."""
+    from locg.commands import cmd_collection_record_win
+    from unittest.mock import MagicMock
+
+    cache = make_cache(tmp_path)  # empty index -> series never resolves locally
+    metron = MagicMock()
+    metron.lookup_issue.return_value = {
+        "metron_id": 427,
+        "cover_date": "1988-12-01",
+        "store_date": None,
+        "series_year_began": 1940,  # would-be circular window, must be ignored
+        "series_year_end": 2011,
+        "series_name": "Batman",
+        "series_id": 42,
+    }
+    metron.format_series_name.return_value = "Batman (1940 - 2011)"
+
+    cmd_collection_record_win(
+        [_make_win(series="Batman", issue="427", year=1989)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    # No independent window -> exact gate -> ±1-off hit dropped -> placeholder.
+    assert row["release_date"] == "1989-01-01"
     assert row["metron_id"] is None
     assert row["publisher_name"] is None
 
@@ -3140,18 +3266,26 @@ def test_record_win_retry_does_not_downgrade_a_prior_year_dated_row(tmp_path):
     assert row["publisher_name"] == "Marvel Comics"
 
 
-def test_record_win_off_by_one_cover_date_never_reaches_the_csv(tmp_path):
-    """BUI-210 (reopen), the worst case the ±1 window must not create.
+def test_record_win_off_by_one_cover_date_in_window_now_accepted(tmp_path):
+    """BUI-486 supersedes the BUI-210-reopen exact-cover_date guard for the
+    in-window ±1 case.
 
-    A wrong-book hit with ``cover_date=1969-01-01`` against a 1970 win: if the
-    era gate forgave that year, the hit would be adopted, ``metron_id`` would
-    be set, and the export would ship the literal ``1969-01-01`` — a
-    WRONG-YEAR date wearing the exact Jan-1 shape the export exists to blank,
-    and un-blankable precisely because ``metron_id`` is now set. LOCG reads a
-    wrong-year date as "Not Found".
+    This row is structurally IDENTICAL to Batman #427 (cover_date one year off a
+    clean ``year_raw``, no store_date, inside the resolved volume window): the
+    old exact gate rejected it and kept the placeholder, but ``year_raw`` may be
+    a seller era claim skewed one year off the printed cover date, so BUI-486
+    now accepts the hit when the cover year lands inside the resolved volume's
+    INDEPENDENT window (1963-1981 contains 1969). There is no year-based test
+    that could accept Batman #427 while rejecting this row — they are the same
+    shape.
 
-    Gating ``cover_date`` on an exact year keeps that row on the placeholder
-    path, so it exports blank and still imports by title+series."""
+    Tradeoff recorded deliberately: the residual "a genuinely wrong-book hit one
+    year off is now adopted" risk this used to guard is accepted, exactly as it
+    already is on the ±1 store_date path (BUI-210) — a real reprint is decades
+    off, which the ±1 bound still rejects (see
+    test_record_win_clean_year_cover_date_reprint_still_rejected). The date is
+    now Metron-backed (``metron_id`` set), so it survives export rather than
+    being blanked as a placeholder."""
     import csv as _csv
     from locg.collection_io import generate_csv
     from locg.commands import cmd_collection_record_win
@@ -3179,15 +3313,18 @@ def test_record_win_off_by_one_cover_date_never_reaches_the_csv(tmp_path):
     )
 
     row = cache.load()["comics"][-1]
-    assert row["release_date"] == "1970-01-01"  # placeholder, not 1969-01-01
-    assert row["metron_id"] is None
-    assert row["publisher_name"] is None  # wrong-book publisher not adopted
+    # Accepted: the real cover date is kept, the hit's metron_id + publisher come
+    # with it (the whole hit is trusted, not dropped).
+    assert row["release_date"] == "1969-01-01"
+    assert row["metron_id"] == 999
+    assert row["publisher_name"] == "Marvel UK"
 
     out = tmp_path / "wins.csv"
     generate_csv([row], out)
     with out.open(newline="") as f:
         exported = list(_csv.DictReader(f))
-    assert exported[0]["Release Date"] == ""
+    # Metron-backed, so it survives export (not blanked as a placeholder shape).
+    assert exported[0]["Release Date"] == "1969-01-01"
 
 
 def test_metron_release_date_input_shapes():
@@ -3257,8 +3394,75 @@ def test_metron_release_date_series_range_gates_a_null_year():
     # An undated candidate cannot be gated, so it is not accepted.
     assert _metron_release_date({"store_date": "not-a-date"}, None, xmen_vol1) is None
 
-    # A clean year still wins outright — series_range never loosens it.
+    # A clean year on the store_date path still wins outright — series_range
+    # never loosens the ±1 store_date gate. (The cover_date path DOES consult it
+    # for the BUI-486 exception; see test_metron_release_date_seller_era_claim.)
     assert _metron_release_date({"store_date": "1977-11-08"}, 1970, xmen_vol1) is None
+
+
+def test_metron_release_date_seller_era_claim():
+    """BUI-486: on the clean-year cover_date path, ``year_raw`` may be a
+    seller-supplied ERA claim skewed ±1 off the printed cover date. A candidate
+    one year off is accepted ONLY when it also sits inside the resolved volume's
+    INDEPENDENT publication window — never by widening cover_date to a bare ±1.
+    """
+    from locg.commands import _metron_release_date
+
+    batman = (1940, 2011)  # Batman (1940 - 2011), from series_name_index
+    thor = (1966, 1996)  # Thor (1966 - 1996)
+
+    # (a) The two measured BUI-474 rows: a correct hit one year off a seller
+    # era claim, inside the resolved volume window — ACCEPTED (was rejected).
+    assert _metron_release_date({"cover_date": "1988-12-01"}, 1989, batman) == "1988-12-01"
+    assert _metron_release_date({"cover_date": "1979-06-01"}, 1978, thor) == "1979-06-01"
+    # Skew in the other direction (cover year one AFTER the seller claim) is the
+    # same cover-dating skew and is likewise accepted when in-window.
+    assert _metron_release_date({"cover_date": "1990-01-01"}, 1989, batman) == "1990-01-01"
+
+    # (b) Reprint protection is NOT weakened. A 2005 collected edition of a 1970
+    # book stays rejected. Crucially this holds even when the window is WIDE
+    # enough to CONTAIN 2005 — the ±1 bound, not the window, is what rejects it,
+    # proving the bound is load-bearing (Batman #427 -> a 2005 reprint would sit
+    # inside Batman (1940 - 2011)).
+    assert _metron_release_date({"cover_date": "2005-03-09"}, 1970, (1963, 2011)) is None
+    # And when the window also excludes it, still rejected (both bounds fail).
+    assert _metron_release_date({"cover_date": "2005-03-09"}, 1970, (1963, 1981)) is None
+    # A two-year gap is not cover-dating skew — rejected even inside the window.
+    assert _metron_release_date({"cover_date": "1991-01-01"}, 1989, batman) is None
+
+    # (c) A degenerate one-year window (a bare start-year decoration parsed to
+    # (Y, Y)) cannot confirm a ±1-off candidate, so the row stays DATELESS — a
+    # missed improvement, never a wrong date written. Here the resolver placed
+    # the volume at only (1989, 1989), so a genuine 1988 cover is not accepted.
+    assert _metron_release_date({"cover_date": "1988-12-01"}, 1989, (1989, 1989)) is None
+    # With NO window at all the exact gate still governs — no ±1 slack, so the
+    # off-by-one cover_date is rejected exactly as before BUI-486.
+    assert _metron_release_date({"cover_date": "1988-12-01"}, 1989) is None
+    assert _metron_release_date({"cover_date": "1988-12-01"}, 1989, None) is None
+
+    # An exact-year cover_date still wins with no window consulted (unchanged).
+    assert _metron_release_date({"cover_date": "1989-05-01"}, 1989, batman) == "1989-05-01"
+    assert _metron_release_date({"cover_date": "1989-05-01"}, 1989) == "1989-05-01"
+
+    # Window edges are INCLUSIVE, and the boundary is the one place the window
+    # (not the ±1 bound) actually discriminates on the clean-year path — so pin
+    # both bounds against a silent `<=` -> `<` regression that would discard a
+    # genuine first/last-year-of-run issue.
+    xmen = (1963, 1981)
+    assert _metron_release_date({"cover_date": "1981-06-01"}, 1982, xmen) == "1981-06-01"  # upper edge in
+    assert _metron_release_date({"cover_date": "1982-06-01"}, 1983, xmen) is None          # upper edge + 1 out
+    assert _metron_release_date({"cover_date": "1963-06-01"}, 1962, xmen) == "1963-06-01"  # lower edge in
+    assert _metron_release_date({"cover_date": "1962-06-01"}, 1961, xmen) is None          # lower edge - 1 out
+
+    # An open-ended "(YYYY - Present)" window (end sentinel 9999) accepts a ±1
+    # clean-year skew, and the ±1 bound still rejects a decades-off reprint that
+    # the unbounded upper edge would otherwise admit.
+    assert _metron_release_date({"cover_date": "2030-06-01"}, 2031, (1980, 9999)) == "2030-06-01"
+    assert _metron_release_date({"cover_date": "2030-01-01"}, 1985, (1980, 9999)) is None
+
+    # An undated/uncoercible cover_date on the ±1 branch cannot be placed, so it
+    # is rejected even with a window present (never a wrong date).
+    assert _metron_release_date({"cover_date": "not-a-date"}, 1989, batman) is None
 
 
 def test_record_win_genuine_january_metron_date_survives_export(tmp_path):
