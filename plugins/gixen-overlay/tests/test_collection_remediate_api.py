@@ -408,3 +408,99 @@ def test_set_copies_logs_to_audit_trail(client):
     set_records = [r for r in records if r["type"] == "collection_remediate_set_copies"]
     assert len(set_records) == 1
     assert set_records[0]["details"]["new_in_collection"] == 4
+
+
+# ---------------------------------------------------------------------------
+# BUI-489: the wrong-store guard's server-side backstop. `_ensure_collection_
+# store()` sets LOCG_DATA_DIR before every collection call, so
+# `cmd_collection_remediate_delete`/`set_copies`'s new BUI-489 guard is
+# unreachable from these endpoints in practice — but a refusal slipping
+# through must 500, not read as a plain 200 success or fall through to some
+# other status code. Mirrors `test_record_win_commit_refusal_marks_nothing_
+# seen` in test_collection_api.py (mocks the underlying cmd_* function
+# directly, since making the real guard fire through _ensure_collection_
+# store() isn't possible from here).
+# ---------------------------------------------------------------------------
+
+_REFUSAL = {
+    "status": "explicit_store_required",
+    "error": "LOCG_DATA_DIR is not set",
+}
+
+
+def test_delete_backstop_500s_on_explicit_store_required(client):
+    with patch("gixen_overlay.routes.cmd_collection_remediate_delete", return_value=_REFUSAL):
+        r = client.post(
+            "/api/comics/collection/remediate/delete",
+            json={"gixen_item_id": "thor-127"},
+        )
+    assert r.status_code == 500, r.text
+    # _remediation_response passes the refusal dict through as `detail`
+    # verbatim (no reshaping the way api_collection_import's backstop does),
+    # so it's `status`, not `error`, that carries the machine-readable code.
+    assert r.json()["detail"]["status"] == "explicit_store_required"
+
+
+@pytest.fixture
+def server_default_store_client(tmp_path, monkeypatch):
+    """A client with LOCG_DATA_DIR UNSET — the store is resolved solely by
+    `_ensure_collection_store()` from DB_PATH, exactly as on the Mac Mini.
+    Mirrors test_collection_api.py's fixture of the same name; kept local to
+    this file per its documented ownership-split convention."""
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    store = tmp_path / "collection-store"
+    store.mkdir()
+    _seed_collection(store, _THOR_TWINS + _BATMAN_DUPLICATE_TWINS)
+
+    _install_real_plugin(monkeypatch)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
+    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
+    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
+    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
+    with patch("server.main.GixenClient", return_value=_mock_gixen()):
+        from server.main import app
+
+        with TestClient(app) as c:
+            c.store = store
+            yield c
+
+
+def test_delete_survives_the_bui489_guard_with_locg_data_dir_unset(
+    server_default_store_client,
+):
+    """THE BUI-489 SAFETY INVARIANT for remediate-delete — the command BUI-424
+    flagged as the single highest-risk case in this module (identity-based
+    delete, alias/cross-volume ambiguity). With LOCG_DATA_DIR genuinely unset
+    in the process env, POST /api/comics/collection/remediate/delete must
+    still delete — _ensure_collection_store() sets the var before
+    cmd_collection_remediate_delete sees it, so the guard cannot fire. A guard
+    that 500s this endpoint would be worse than the wrong-store bug it fixes.
+    """
+    client = server_default_store_client
+    r = client.post(
+        "/api/comics/collection/remediate/delete",
+        json={"gixen_item_id": "mighty-thor-127"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("status") == "ok"
+    assert body["action"] == "removed"
+
+    remaining = json.loads((client.store / "collection.json").read_text())["comics"]
+    assert [c["gixen_item_id"] for c in remaining] == ["thor-127", "win-1", "export-1"]
+
+
+def test_set_copies_backstop_500s_on_explicit_store_required(client):
+    with patch(
+        "gixen_overlay.routes.cmd_collection_remediate_set_copies", return_value=_REFUSAL
+    ):
+        r = client.post(
+            "/api/comics/collection/remediate/set-copies",
+            json={"gixen_item_id": "thor-127", "in_collection": 4},
+        )
+    assert r.status_code == 500, r.text
+    # _remediation_response passes the refusal dict through as `detail`
+    # verbatim (no reshaping the way api_collection_import's backstop does),
+    # so it's `status`, not `error`, that carries the machine-readable code.
+    assert r.json()["detail"]["status"] == "explicit_store_required"

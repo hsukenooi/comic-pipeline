@@ -2444,9 +2444,9 @@ def test_creator_run_batches_into_a_single_read_and_write(tmp_path, monkeypatch)
     write_calls: list[list[dict]] = []
     original_write = cmds._write_wish_list_cache
 
-    def spy_write(items):
+    def spy_write(items, path=None):
         write_calls.append([dict(it) for it in items])
-        return original_write(items)
+        return original_write(items, path)
 
     monkeypatch.setattr(cmds, "_write_wish_list_cache", spy_write)
 

@@ -1755,3 +1755,116 @@ def test_record_win_commit_refusal_preserves_the_explanatory_text(client):
     detail = r.json()["detail"]
     assert detail["error"] == "explicit_store_required"
     assert "$HOME/.comics-server/collection-store" in detail["refusal_detail"]
+
+
+# ===========================================================================
+# BUI-489: extends the BUI-476 guard invariant to the wish-list writers, and
+# gives cmd_collection_export a distinct not-imported signal instead of a
+# silent zero-row "success". _ensure_collection_store() sets LOCG_DATA_DIR
+# before every collection call, so the wish-list writers' new guard is
+# unreachable from these endpoints in practice — the backstop tests mock the
+# underlying cmd_* function directly (mirrors test_record_win_commit_refusal_
+# marks_nothing_seen above); the "survives" test proves the real endpoint
+# still works with LOCG_DATA_DIR genuinely unset (mirrors test_record_win_
+# commit_survives_the_bui476_guard_with_locg_data_dir_unset).
+# ===========================================================================
+
+_BUI489_REFUSAL = {
+    "status": "explicit_store_required",
+    "error": "LOCG_DATA_DIR is not set",
+}
+
+
+def test_wish_list_add_backstop_500s_on_explicit_store_required(client):
+    with patch("gixen_overlay.routes.cmd_wish_list_add", return_value=_BUI489_REFUSAL):
+        r = client.post("/api/comics/wish-list", json={"title": "Daredevil #1"})
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"]["error"] == "explicit_store_required"
+
+
+def test_wish_list_add_batch_backstop_500s_on_explicit_store_required(client):
+    """Found in BUI-489 code review: unlike the single-item add endpoint,
+    the batch loop's plain `"error" in result` branch would otherwise fold
+    a store refusal into an ordinary per-item {"status": "error", ...}
+    entry inside a 200 overall response — indistinguishable from a mundane
+    per-item validation failure. Must 500 the whole batch instead."""
+    with patch("gixen_overlay.routes.cmd_wish_list_add", return_value=_BUI489_REFUSAL):
+        r = client.post(
+            "/api/comics/wish-list/batch",
+            json={"items": [{"title": "Daredevil #1"}, {"title": "X-Men #1"}]},
+        )
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"]["error"] == "explicit_store_required"
+
+
+def test_wish_list_remove_backstop_500s_on_explicit_store_required(client):
+    with patch("gixen_overlay.routes.cmd_wish_list_remove", return_value=_BUI489_REFUSAL):
+        r = client.delete("/api/comics/wish-list", params={"title": "X-Men #1"})
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"]["error"] == "explicit_store_required"
+
+
+def test_wish_list_remove_conflicts_backstop_500s_on_explicit_store_required(client):
+    with patch(
+        "gixen_overlay.routes.cmd_wish_list_remove_conflicts", return_value=_BUI489_REFUSAL
+    ):
+        r = client.post(
+            "/api/comics/wish-list/remove-conflicts",
+            json={"names": ["Fantastic Four #48"]},
+        )
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"]["error"] == "explicit_store_required"
+
+    # The unscoped confirm=true path goes through the same _checked() wrapper.
+    with patch(
+        "gixen_overlay.routes.cmd_wish_list_remove_conflicts", return_value=_BUI489_REFUSAL
+    ):
+        r = client.post("/api/comics/wish-list/remove-conflicts", json={"confirm": True})
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"]["error"] == "explicit_store_required"
+
+
+def test_wish_list_add_survives_the_bui489_guard_with_locg_data_dir_unset(
+    server_default_store_client,
+):
+    """THE BUI-489 SAFETY INVARIANT for the wish-list writers, mirroring
+    test_record_win_commit_survives_the_bui476_guard_with_locg_data_dir_unset:
+    with LOCG_DATA_DIR unset in the process env, POST /api/comics/wish-list
+    must still add — _ensure_collection_store() sets the var before
+    cmd_wish_list_add sees it, so the guard cannot fire. A guard that 500s
+    this endpoint is far worse than the bug it fixes.
+    """
+    client = server_default_store_client
+    r = client.post("/api/comics/wish-list", json={"title": "Daredevil #1"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("status") != "explicit_store_required"
+
+    names = {i["name"] for i in client.get("/api/comics/wish-list").json()}
+    assert "Daredevil #1" in names
+
+
+def test_collection_export_returns_409_on_not_imported_signal(client):
+    """BUI-489 Part 2: cmd_collection_export's distinct not-imported signal
+    must 409, not be read as `result["csv_path"]` (which the not-imported
+    branch never populates — an unconditional read would 500 with a
+    KeyError instead of this clean, documented refusal)."""
+    not_imported = {
+        "status": "not_imported",
+        "error": "collection store is empty and has never been imported",
+    }
+    with patch("gixen_overlay.routes.cmd_collection_export", return_value=not_imported):
+        r = client.get("/api/comics/collection/export")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["status"] == "not_imported"
+
+
+def test_collection_export_normal_store_still_exports_200(client):
+    """The common case must be unaffected: a real, seeded store exports
+    normally with the csv/notes_md contents, no 409."""
+    r = client.get("/api/comics/collection/export")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("status") != "not_imported"
+    assert "csv" in body
+    assert "notes_md" in body

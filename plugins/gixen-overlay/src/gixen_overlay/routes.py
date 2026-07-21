@@ -1304,6 +1304,41 @@ def _require_imported_collection() -> None:
         )
 
 
+def _raise_if_explicit_store_required(result: dict[str, Any], action: str) -> None:
+    """BUI-489 backstop, shared by every wish-list write endpoint added/
+    touched in this ticket (``api_wish_list_add``, ``api_wish_list_add_
+    batch``, ``api_wish_list_remove``, ``api_wish_list_remove_conflicts``).
+
+    ``_ensure_collection_store()`` sets ``LOCG_DATA_DIR`` before every one of
+    these calls, so the underlying ``cmd_wish_list_*`` guard this checks for
+    is unreachable from here in practice — but a refusal served as a plain
+    200 (or folded into a generic per-item/per-title error branch) would read
+    as "nothing to report" instead of "the store couldn't be resolved,
+    nothing was written". ``action`` is a short present-tense clause
+    describing what was refused, e.g. ``"add"``/``"remove"``/``"remove
+    conflicts"`` — folded into the 500 detail's ``message``.
+
+    Kept separate from ``_REMEDIATION_STATUS_CODES``/``_remediation_
+    response``: the remediation endpoints pass the refusal dict through as
+    ``detail`` VERBATIM (a caller reads ``detail["status"]``), while this
+    helper reshapes it (a caller reads ``detail["error"]``) — an established,
+    pre-existing shape difference (see ``api_collection_import``'s and
+    ``api_record_win_commit``'s identical reshaping, BUI-476) this helper
+    only consolidates, not unifies across both families.
+    """
+    if result.get("status") != "explicit_store_required":
+        return
+    raise HTTPException(
+        status_code=500,
+        detail=jsonable_encoder({
+            **result,
+            "error": "explicit_store_required",
+            "refusal_detail": result.get("error"),
+            "message": f"wish-list {action} refused to resolve a store; nothing was written",
+        }),
+    )
+
+
 @router.get("/api/comics/wish-list/conflicts")
 async def api_wish_list_conflicts():
     """Audit the wish-list for items already in the collection (BUI-130, Part 1).
@@ -1391,13 +1426,21 @@ async def api_wish_list_remove_conflicts(payload: dict = Body(default={})):
         raise HTTPException(status_code=422, detail="'names' must be a list of strings")
     confirm = bool(payload.get("confirm", False))
 
+    def _checked(result: dict[str, Any]) -> dict[str, Any]:
+        # cmd_wish_list_remove_conflicts checks LOCG_DATA_DIR only (no
+        # cache= override — see its docstring); _raise_if_explicit_store_
+        # required 500s rather than letting a refusal read as "nothing was
+        # a conflict".
+        _raise_if_explicit_store_required(result, "remove-conflicts")
+        return result
+
     try:
         if names:
-            return cmd_wish_list_remove_conflicts(names=names)
+            return _checked(cmd_wish_list_remove_conflicts(names=names))
         if not confirm:
             audit = cmd_wish_list_conflicts()
             return {**audit, "dry_run": True, "removed": [], "removed_count": 0}
-        return cmd_wish_list_remove_conflicts()
+        return _checked(cmd_wish_list_remove_conflicts())
     except FileNotFoundError:
         return {
             "removed": [],
@@ -1422,7 +1465,16 @@ async def api_collection_export(push_wishes: bool = False):
 
     Wins-only by default — the default export can never emit ``In Collection=0``
     (the LOCG-delete trigger). ``push_wishes=true`` is the opt-in, owned-safe
-    wish mirror (deferred per BUI-208 OQ-3)."""
+    wish mirror (deferred per BUI-208 OQ-3).
+
+    BUI-489: 409s when ``cmd_collection_export`` reports its distinct
+    not-imported signal (a store empty on every axis — no comics, no
+    wish-list entries, no completed import) rather than reading
+    ``result["csv_path"]`` unconditionally, which the not-imported branch
+    never populates. Never fires for a legitimately-imported store, nor for
+    the record-win-only or wish-only-add flows (both populate real,
+    exportable data with ``last_full_import`` still unset) — see
+    ``cmd_collection_export``'s own docstring for the exact condition."""
     _ensure_collection_store()
     with tempfile.TemporaryDirectory() as tmp:
         csv_path = Path(tmp) / "locg-bulk-import.csv"
@@ -1430,6 +1482,8 @@ async def api_collection_export(push_wishes: bool = False):
             result = cmd_collection_export(out_path=str(csv_path), push_wishes=push_wishes)
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+        if result.get("status") == "not_imported":
+            raise HTTPException(status_code=409, detail=result)
         csv_text = Path(result["csv_path"]).read_text()
         notes_path = Path(result["notes_md_path"])
         notes_text = notes_path.read_text() if notes_path.exists() else ""
@@ -2016,6 +2070,12 @@ _REMEDIATION_STATUS_CODES: dict[str, int] = {
     "not_imported": 409,
     "not_found": 404,
     "ambiguous": 409,
+    # BUI-489 backstop, symmetric with api_collection_import's /
+    # api_record_win_commit's explicit_store_required handling. Also
+    # "unreachable" — _ensure_collection_store() above sets LOCG_DATA_DIR
+    # before either remediation call — but a refusal served as a 200 would
+    # read as a successful delete/set-copies that in fact touched nothing.
+    "explicit_store_required": 500,
 }
 
 
@@ -2181,6 +2241,11 @@ async def api_wish_list_add(req: WishListAddRequest):
     # modern volume every audit. req.year is None for an issue with no cover date
     # → an unstamped, year-blind entry (today's behavior, unchanged).
     result = cmd_wish_list_add(req.title, force=req.force, year=req.year)
+    # BUI-489 backstop: _ensure_collection_store() above sets LOCG_DATA_DIR
+    # before this call, making the guard unreachable from here — but a
+    # refusal served as a 200 (or folded into the generic 422 below) would
+    # read as a successful add that in fact wrote nothing.
+    _raise_if_explicit_store_required(result, "add")
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])
     return result
@@ -2260,6 +2325,16 @@ async def api_wish_list_add_batch(req: WishListAddBatchRequest):
                     continue
 
         result = cmd_wish_list_add(item.title, force=item.force, year=item.year)
+        # BUI-489 backstop. Found in code review: unlike every other guarded
+        # call site, the plain `"error" in result` branch below would have
+        # folded a refusal into an ordinary per-item `{"status": "error",
+        # ...}` entry, indistinguishable from e.g. a malformed year — losing
+        # the loud "the store couldn't be resolved, nothing was written"
+        # signal. Every item in the batch would refuse identically (the
+        # guard is a function of env state, not per-item), so this raises
+        # once for the whole request rather than reporting N duplicate
+        # per-item failures.
+        _raise_if_explicit_store_required(result, "batch add")
         if "error" in result:
             results.append({"title": item.title, "status": "error", "error": result["error"]})
         elif result.get("status") == "exists":
@@ -2297,6 +2372,11 @@ async def api_wish_list_remove(title: str | None = None):
     """
     _ensure_collection_store()
     result = cmd_wish_list_remove(title or "")
+    # BUI-489 backstop. Checked BEFORE the generic "error" in result branch
+    # below: that check's blank-vs-not-found split would otherwise misfile
+    # this as a plain 404 "not found", which reads as "no such wish", not
+    # "the store couldn't be resolved".
+    _raise_if_explicit_store_required(result, "remove")
     if "error" in result:
         # A blank title is a malformed request (422); every other error here
         # means the title — or the wish-list cache itself — wasn't found (404).
