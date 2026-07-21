@@ -560,6 +560,252 @@ def test_lookup_issue_gives_up_after_second_rate_limit(caplog):
 
 
 # ---------------------------------------------------------------------------
+# resolve_series / issue_in_series — BUI-473 per-series reuse
+#
+# lookup_issue's two HTTP requests (series_list, then issues_list) are split
+# so a batch resolving N issues from the SAME series can call resolve_series
+# ONCE and reuse the handle across N issue_in_series calls. These tests pin:
+# (1) resolve_series alone reproduces lookup_issue's resolution semantics
+#     (masthead mapping BUI-487, exact-name filter BUI-485, sole-candidate
+#     trust BUI-474) unchanged; (2) the per-instance cache actually collapses
+#     N calls to ONE series_list request; (3) the cache is faithful — it
+#     never amplifies a wrong/ambiguous resolution, never collapses two
+#     genuinely different (series, year) queries, and never poisons itself
+#     on a transient failure.
+# ---------------------------------------------------------------------------
+
+def test_resolve_series_returns_series_handle():
+    client, session = _make_client_with_session(
+        series_list=[_mock_series(id=7, display_name="Fantastic Four", year_began=1961, year_end=1996)],
+    )
+    result = client.resolve_series("Fantastic Four", year=1963)
+    assert result is not None
+    assert result.id == 7
+    session.series_list.assert_called_once_with({"name": "Fantastic Four"})
+
+
+def test_resolve_series_applies_masthead_mapping():
+    """BUI-487: the Annual masthead translation still applies inside resolve_series."""
+    client, session = _make_client_with_session(
+        series_list=[_mock_series(id=42, display_name="X-Men Annual (1970)", year_began=1970, year_end=2007)],
+    )
+    result = client.resolve_series("Uncanny X-Men Annual", year=1982)
+    assert result is not None
+    assert result.id == 42
+    session.series_list.assert_called_once_with({"name": "X-Men Annual"})
+
+
+def test_resolve_series_exact_name_filter_still_applies():
+    """BUI-485: a year window alone can't separate Batman from Batman Annual —
+    resolve_series must still narrow by exact display_name first."""
+    client, _ = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Batman (1940)", year_began=1940, year_end=2011),
+            _mock_series(id=2, display_name="Batman Annual (1961)", year_began=1961, year_end=2011),
+        ],
+    )
+    result = client.resolve_series("Batman", year=1972)
+    assert result is not None
+    assert result.id == 1
+
+
+def test_resolve_series_trusts_sole_candidate_unfiltered_by_name():
+    """BUI-474: a single series_list candidate is trusted even when year doesn't fit."""
+    client, _ = _make_client_with_session(
+        series_list=[_mock_series(id=9, year_began=1961, year_end=1996)],
+    )
+    result = client.resolve_series("Fantastic Four", year=2050)
+    assert result is not None
+    assert result.id == 9
+
+
+def test_resolve_series_ambiguous_returns_none():
+    client, _ = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Amazing Spider-Man", year_began=1963, year_end=1998),
+            _mock_series(id=2, display_name="Amazing Spider-Man", year_began=1999, year_end=2012),
+        ],
+    )
+    assert client.resolve_series("Amazing Spider-Man") is None
+
+
+def test_resolve_series_caches_one_series_list_for_n_issues():
+    """The core BUI-473 saving: N resolve_series calls for the SAME (mapped
+    series, year) spend exactly ONE series_list request."""
+    client, session = _make_client_with_session(
+        series_list=[_mock_series(id=1, display_name="Fantastic Four", year_began=1961, year_end=1996)],
+    )
+    for _ in range(5):
+        result = client.resolve_series("Fantastic Four", year=1963)
+        assert result is not None
+        assert result.id == 1
+    session.series_list.assert_called_once_with({"name": "Fantastic Four"})
+
+
+def test_resolve_series_cache_faithfully_reuses_ambiguous_none():
+    """A None (ambiguous / no exact-name survivor) result is cached too — a
+    repeat query for the SAME series+year must not re-hit the network AND
+    must not silently resolve to a guess on the second attempt (a cached
+    WRONG resolution would amplify across every issue of the series)."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Amazing Spider-Man", year_began=1963, year_end=1998),
+            _mock_series(id=2, display_name="Amazing Spider-Man", year_began=1999, year_end=2012),
+        ],
+    )
+    assert client.resolve_series("Amazing Spider-Man") is None
+    assert client.resolve_series("Amazing Spider-Man") is None
+    session.series_list.assert_called_once_with({"name": "Amazing Spider-Man"})
+
+
+def test_resolve_series_cache_does_not_collapse_different_series():
+    """Different series names must NOT share a cache entry."""
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = [
+        [_mock_series(id=1, display_name="Fantastic Four", year_began=1961, year_end=1996)],
+        [_mock_series(id=2, display_name="Daredevil", year_began=1964, year_end=1998)],
+    ]
+    a = client.resolve_series("Fantastic Four", year=1963)
+    b = client.resolve_series("Daredevil", year=1970)
+    assert a.id == 1
+    assert b.id == 2
+    assert session.series_list.call_count == 2
+
+
+def test_resolve_series_cache_keys_on_year_not_just_name():
+    """Same series NAME, different year — e.g. two distinct volumes — must
+    not collapse onto one cache entry (a wrong-era reuse is exactly the
+    amplified-bad-resolution risk BUI-473 must avoid)."""
+    client, session = _make_client_with_session()
+    candidates = [
+        _mock_series(id=1, display_name="Daredevil", year_began=1964, year_end=1998),
+        _mock_series(id=2, display_name="Daredevil", year_began=2019, year_end=None),
+    ]
+    session.series_list.side_effect = [candidates, candidates]
+    old = client.resolve_series("Daredevil", year=1970)
+    new = client.resolve_series("Daredevil", year=2023)
+    assert old.id == 1
+    assert new.id == 2
+    assert session.series_list.call_count == 2
+
+
+def test_resolve_series_does_not_cache_after_transient_rate_limit_failure():
+    """A throttled/exhausted resolution must NOT poison the cache — the next
+    attempt for the SAME series gets a fresh, real retry (BUI-465 recovery),
+    not a cached None."""
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = RateLimitError("rate limited", retry_after=90)
+
+    with patch("locg.metron.time.sleep"):
+        assert client.resolve_series("Fantastic Four", year=1963) is None
+    assert session.series_list.call_count == 2  # one retry, both failed, not cached
+
+    # A fresh, healthy attempt for the SAME series must actually hit the
+    # network again, not serve a poisoned None from the cache.
+    session.series_list.side_effect = None
+    session.series_list.return_value = [_mock_series(id=1, year_began=1961, year_end=1996)]
+    result = client.resolve_series("Fantastic Four", year=1963)
+    assert result is not None
+    assert session.series_list.call_count == 3
+
+
+def test_issue_in_series_returns_lookup_issue_shape():
+    client, session = _make_client_with_session(
+        issues_list=[_mock_issue(id=100, cover_date="1963-01-01", store_date=None)],
+    )
+    series = _mock_series(id=1, display_name="Fantastic Four", year_began=1961, year_end=1996)
+    result = client.issue_in_series(series, "1")
+    assert result == {
+        "metron_id": 100,
+        "cover_date": "1963-01-01",
+        "store_date": None,
+        "series_year_began": 1961,
+        "series_year_end": 1996,
+        "series_name": "Fantastic Four",
+        "series_id": 1,
+    }
+    session.issues_list.assert_called_once_with({"series_id": 1, "number": "1"})
+
+
+def test_issue_in_series_no_match_returns_none():
+    client, _ = _make_client_with_session(issues_list=[])
+    assert client.issue_in_series(_mock_series(id=1), "999") is None
+
+
+def test_lookup_issue_request_cost_predicts_full_cost_before_resolution():
+    from locg.metron import REQUESTS_LOOKUP_ISSUE
+    client, _ = _make_client_with_session(series_list=[_mock_series(id=1)])
+    assert client.lookup_issue_request_cost("Fantastic Four", year=1963) == REQUESTS_LOOKUP_ISSUE
+
+
+def test_lookup_issue_request_cost_drops_to_issue_only_after_resolve():
+    from locg.metron import REQUESTS_ISSUE_IN_SERIES
+    client, _ = _make_client_with_session(series_list=[_mock_series(id=1)])
+    client.resolve_series("Fantastic Four", year=1963)
+    assert client.lookup_issue_request_cost("Fantastic Four", year=1963) == REQUESTS_ISSUE_IN_SERIES
+
+
+def test_lookup_issue_request_cost_applies_masthead_mapping():
+    """The cost prediction must key on the MAPPED query, same as resolve_series
+    itself, or it would silently disagree with what actually happened."""
+    from locg.metron import REQUESTS_ISSUE_IN_SERIES
+    client, _ = _make_client_with_session(
+        series_list=[_mock_series(id=42, display_name="X-Men Annual (1970)", year_began=1970, year_end=2007)],
+    )
+    client.resolve_series("Uncanny X-Men Annual", year=1982)
+    assert client.lookup_issue_request_cost("Uncanny X-Men Annual", year=1982) == REQUESTS_ISSUE_IN_SERIES
+
+
+def test_lookup_issue_request_cost_is_zero_for_cached_ambiguous_none():
+    """A cached genuine no-match/ambiguous result costs NOTHING on repeat —
+    lookup_issue returns None the instant resolve_series does, without ever
+    calling issue_in_series, so charging REQUESTS_ISSUE_IN_SERIES here would
+    over-count. This is exactly the manual-series-backlog shape: repeated
+    issues of a series Metron can't resolve."""
+    client, _ = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Amazing Spider-Man", year_began=1963, year_end=1998),
+            _mock_series(id=2, display_name="Amazing Spider-Man", year_began=1999, year_end=2012),
+        ],
+    )
+    assert client.resolve_series("Amazing Spider-Man") is None
+    assert client.lookup_issue_request_cost("Amazing Spider-Man") == 0
+
+
+def test_lookup_issue_repeated_ambiguous_series_spends_one_series_list_and_no_issues_list():
+    """N issues of a series that resolve_series can never disambiguate spend
+    ONE series_list request total and ZERO issues_list requests — lookup_issue
+    short-circuits to None before issue_in_series ever runs, for every one of
+    them after the first caches the ambiguous result."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Amazing Spider-Man", year_began=1963, year_end=1998),
+            _mock_series(id=2, display_name="Amazing Spider-Man", year_began=1999, year_end=2012),
+        ],
+    )
+    for issue_num in ("1", "2", "3"):
+        assert client.lookup_issue("Amazing Spider-Man", issue_num) is None
+    session.series_list.assert_called_once_with({"name": "Amazing Spider-Man"})
+    session.issues_list.assert_not_called()
+
+
+def test_lookup_issue_still_spends_one_series_list_per_batch_of_n_issues():
+    """End-to-end via lookup_issue itself — the ticket's acceptance
+    criterion, exercised at the public entry point every existing caller
+    still uses: N issues of ONE series spend ONE series_list request and N
+    issues_list requests."""
+    client, session = _make_client_with_session(
+        series_list=[_mock_series(id=1, display_name="Fantastic Four", year_began=1961, year_end=1996)],
+        issues_list=[_mock_issue(id=100)],
+    )
+    for issue_num in ("1", "2", "3", "4", "5"):
+        assert client.lookup_issue("Fantastic Four", issue_num, year=1963) is not None
+    session.series_list.assert_called_once_with({"name": "Fantastic Four"})
+    assert session.issues_list.call_count == 5
+
+
+# ---------------------------------------------------------------------------
 # MetronClient.degraded — throttle/timeout signal for batch callers (BUI-255)
 # ---------------------------------------------------------------------------
 
