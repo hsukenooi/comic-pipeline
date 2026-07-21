@@ -305,6 +305,167 @@ def test_lookup_issue_no_exact_name_match_returns_none_not_a_guess():
 
 
 # ---------------------------------------------------------------------------
+# lookup_issue — Annual/Giant-Size/Special masthead mapping (BUI-487)
+#
+# Metron sometimes files an Annual under a masthead our data doesn't use --
+# "Uncanny X-Men Annual" is Metron's "X-Men Annual (1970)". _ANNUAL_MASTHEAD_TO_METRON
+# must translate the query BEFORE both the series_list search and the
+# BUI-485 exact-name filter, and a missing/wrong mapping must never resolve
+# to a different real volume -- only fail closed to None.
+# ---------------------------------------------------------------------------
+
+def test_lookup_issue_maps_annual_masthead_to_metron_naming():
+    """Uncanny X-Men Annual #6 must resolve to Metron's X-Men Annual (1970),
+    not come back empty just because our masthead differs from Metron's."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=42, display_name="X-Men Annual (1970)",
+                year_began=1970, year_end=2007,
+            ),
+            _mock_series(
+                id=99, display_name="Astonishing X-Men Annual (2005)",
+                year_began=2005, year_end=2005,
+            ),
+        ],
+        issues_list=[_mock_issue(id=600)],
+    )
+    result = client.lookup_issue("Uncanny X-Men Annual", "6", year=1982)
+
+    assert result is not None
+    assert result["series_id"] == 42
+    assert result["series_name"] == "X-Men Annual (1970)"
+    # The mapped name -- not the literal query -- is what must reach Metron,
+    # both for the search itself and (via the decoy above sharing the
+    # "X-Men Annual" substring) for the exact-name filter to pick correctly.
+    session.series_list.assert_called_once_with({"name": "X-Men Annual"})
+    session.issues_list.assert_called_once_with({"series_id": 42, "number": "6"})
+
+
+def test_lookup_issue_annual_masthead_mapping_is_case_insensitive():
+    """identify_data casing isn't guaranteed; the table lookup must not be
+    defeated by it."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=42, display_name="X-Men Annual (1970)",
+                year_began=1970, year_end=2007,
+            ),
+        ],
+        issues_list=[_mock_issue(id=600)],
+    )
+    result = client.lookup_issue("UNCANNY x-men ANNUAL", "6", year=1982)
+
+    assert result is not None
+    assert result["series_id"] == 42
+    session.series_list.assert_called_once_with({"name": "X-Men Annual"})
+
+
+def test_lookup_issue_annual_masthead_mapping_strips_leading_article():
+    """identify_data isn't guaranteed to omit a leading article either --
+    "The Uncanny X-Men Annual" must hit the same table entry as the bare
+    "Uncanny X-Men Annual" key (_map_annual_masthead normalizes via
+    _normalize_metron_display_name, not a raw casefold)."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=42, display_name="X-Men Annual (1970)",
+                year_began=1970, year_end=2007,
+            ),
+        ],
+        issues_list=[_mock_issue(id=600)],
+    )
+    result = client.lookup_issue("The Uncanny X-Men Annual", "6", year=1982)
+
+    assert result is not None
+    assert result["series_id"] == 42
+    session.series_list.assert_called_once_with({"name": "X-Men Annual"})
+
+
+def test_lookup_issue_mapped_masthead_single_correct_candidate_resolves():
+    """Pins the intended (common) interaction between the mapping and
+    _disambiguate_series's pre-existing len(series_list) == 1 shortcut: when
+    Metron's live search for the MAPPED name returns exactly one candidate
+    and it genuinely is the right one, the lookup still resolves it (via
+    that shortcut, same as any other single-candidate query already would).
+
+    This is deliberately NOT a test of the shortcut's known, pre-existing,
+    out-of-scope risk (a single WRONG candidate would also be trusted
+    unfiltered by name/year -- see the code comment above
+    _ANNUAL_MASTHEAD_TO_METRON) -- that risk belongs to _disambiguate_series
+    itself (a separately measured BUI-474/BUI-485 decision this ticket does
+    not revisit), not to the mapping table this ticket adds."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=42, display_name="X-Men Annual (1970)",
+                year_began=1970, year_end=2007,
+            ),
+        ],
+        issues_list=[_mock_issue(id=600)],
+    )
+    result = client.lookup_issue("Uncanny X-Men Annual", "6", year=1982)
+
+    assert result is not None
+    assert result["series_id"] == 42
+    session.series_list.assert_called_once_with({"name": "X-Men Annual"})
+
+
+def test_lookup_issue_unmapped_masthead_divergence_fails_closed():
+    """A masthead with NO table entry is searched verbatim (pass-through).
+    Metron's real substring search can return more than one in-window
+    candidate for it (hence the second decoy below -- with only one
+    candidate, ``_disambiguate_series`` trusts it unfiltered by name, which
+    would mask the very failure mode this test targets); the un-translated
+    query must fail the exact-name filter against both -- None, never a
+    guessed volume."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=1, display_name="X-Men Annual (1970)",
+                year_began=1970, year_end=2007,
+            ),
+            _mock_series(
+                id=2, display_name="Giant-Size X-Men (1975)",
+                year_began=1975, year_end=1975,
+            ),
+        ],
+        issues_list=[_mock_issue(id=1)],
+    )
+    assert client.lookup_issue("Giant-Size X-Men Annual", "1", year=1975) is None
+    session.series_list.assert_called_once_with({"name": "Giant-Size X-Men Annual"})
+
+
+def test_lookup_issue_wrong_masthead_mapping_fails_closed_not_wrong_volume():
+    """Even a WRONG table entry can't cause a wrong-volume resolve (AC):
+    it only changes what string is searched/exact-matched, and a mapped
+    name that doesn't line up with any real candidate's display_name still
+    fails the exact-name filter -- None, not series_id 1. (Two candidates,
+    same reasoning as above: a lone candidate would bypass the name filter
+    entirely and this test wouldn't be exercising the mapping's fail-closed
+    behavior at all.)"""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=1, display_name="X-Men Annual (1970)",
+                year_began=1970, year_end=2007,
+            ),
+            _mock_series(
+                id=2, display_name="Something Else Entirely (1970)",
+                year_began=1970, year_end=2007,
+            ),
+        ],
+        issues_list=[_mock_issue(id=1)],
+    )
+    with patch.dict(
+        "locg.metron._ANNUAL_MASTHEAD_TO_METRON",
+        {"uncanny x-men annual": "Totally Wrong Series"},
+    ):
+        assert client.lookup_issue("Uncanny X-Men Annual", "6", year=1982) is None
+    session.series_list.assert_called_once_with({"name": "Totally Wrong Series"})
+
+
+# ---------------------------------------------------------------------------
 # lookup_issue — no-match cases return None
 # ---------------------------------------------------------------------------
 

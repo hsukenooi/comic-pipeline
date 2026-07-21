@@ -77,6 +77,74 @@ def _normalize_metron_display_name(name: Any) -> str:
     return n.strip().casefold()
 
 
+# BUI-487: an Annual/Giant-Size/Special sometimes ships under a different
+# masthead than the parent ongoing series uses for it — e.g. Marvel's own
+# indicia says "Uncanny X-Men Annual", but Metron files the book under the
+# ongoing's ORIGINAL (pre-"Uncanny") masthead: "X-Men Annual (1970)". The
+# BUI-485 exact-name filter above is correct and necessary but not
+# sufficient here — it makes a masthead mismatch fail cleanly (zero exact
+# survivors -> None), but it can't discover that "Uncanny X-Men Annual" and
+# "X-Men Annual" are the same in-universe book. This table is that missing
+# link: a plain data mapping from OUR masthead to METRON'S, consulted before
+# both the ``series_list`` search and the exact-name filter (see
+# ``_map_annual_masthead`` / ``lookup_issue``).
+#
+# A masthead with NO entry here passes through unchanged — this is the
+# ordinary case for the vast majority of series, not a failure. A WRONG or
+# missing entry changes only what string gets searched/exact-matched; it does
+# NOT add a new way to guess. When ``series_list`` comes back with 2+
+# candidates, the existing exact-name-filter pipeline still fails closed
+# (None) on a mapped name that doesn't line up with any real candidate —
+# reviewed and pinned by tests below. The one case this table cannot make any
+# promise about is ``_disambiguate_series``'s pre-existing ``len(series_list)
+# == 1`` branch (this file, above), which trusts a SOLE live candidate
+# UNFILTERED by name — a separately measured, deliberate BUI-474/BUI-485
+# decision this table does not (and per BUI-487's own scope, must not)
+# revisit. In the rare case a mapped/mistyped value happens to collapse
+# Metron's live substring search down to exactly one hit, that hit is
+# trusted the same way any other single-candidate query already is; this is
+# a pre-existing, bounded, and known risk of the singleton shortcut itself,
+# not something this table introduces. Adding a newly discovered divergence
+# is a new key here, never a new branch in ``lookup_issue`` or
+# ``_disambiguate_series``.
+#
+# Sibling precedent: ``collection_cache.py``'s ``_MASTHEAD_ALIAS_PAIRS``
+# (BUI-197) is the same shape of table for the LOCG-side collection matcher
+# (e.g. "mighty thor" <-> "thor"). This table is intentionally separate —
+# it encodes Metron's OWN catalog naming, a distinct source of truth from
+# LOCG's catalog spelling — but a new entry here should still be verified
+# against Metron's actual ``display_name`` before merging, the same
+# discipline that table documents for its own pairs.
+#
+# Keys are matched via ``_normalize_metron_display_name`` (see
+# ``_map_annual_masthead``) — casefolded, with a leading "The"/"A"/"An" and
+# any trailing " (YYYY)" stripped, same as the exact-name filter uses on the
+# candidate side; values are Metron's ``display_name`` before its own
+# trailing " (YYYY)" decoration.
+_ANNUAL_MASTHEAD_TO_METRON: dict[str, str] = {
+    "uncanny x-men annual": "X-Men Annual",
+}
+
+
+def _map_annual_masthead(series_query: str) -> str:
+    """Translate ``series_query`` via ``_ANNUAL_MASTHEAD_TO_METRON``, else pass through.
+
+    Looks the query up by ``_normalize_metron_display_name`` (not a raw
+    ``.casefold()``) so a leading article or an incidental trailing year
+    decoration on the INCOMING query — e.g. "The Uncanny X-Men Annual" —
+    still hits the table entry keyed on the bare masthead; identify_data's
+    series naming isn't guaranteed to omit either.
+
+    A miss (no key matches) returns ``series_query`` verbatim: the caller's
+    existing substring search + exact-name filter already fail closed on an
+    unmapped masthead divergence, so "no mapping found" needs no special
+    handling of its own.
+    """
+    return _ANNUAL_MASTHEAD_TO_METRON.get(
+        _normalize_metron_display_name(series_query), series_query
+    )
+
+
 def _is_connection_error(exc: BaseException) -> bool:
     return isinstance(exc, ApiError) and str(exc).startswith(_CONNECTION_ERROR_PREFIX)
 
@@ -291,6 +359,13 @@ class MetronClient:
         lookup returns None so the row is flagged for manual series resolution
         rather than guessed.
 
+        Before either of those steps, ``series_query`` is translated through
+        ``_ANNUAL_MASTHEAD_TO_METRON`` (BUI-487) so an Annual/Giant-Size/
+        Special filed under a masthead Metron doesn't use (e.g. "Uncanny
+        X-Men Annual") is searched — and exact-matched — under the masthead
+        Metron actually uses ("X-Men Annual"). A query with no table entry
+        passes through unchanged.
+
         Returns a dict with metron_id, cover_date, store_date,
         series_year_began, series_year_end, series_name, series_id — or None
         on any failure (no match, ambiguous series, rate limit, network error,
@@ -300,16 +375,19 @@ class MetronClient:
         the rest of a batch rather than retrying on every win.
         """
         try:
+            # Computed first, before anything that can raise, so it's always
+            # bound for the blanket-exception log below (BUI-487).
+            metron_query = _map_annual_masthead(series_query)
             session = self._get_session()
-            series_list = session.series_list({"name": series_query})
+            series_list = session.series_list({"name": metron_query})
             if not series_list:
                 return None
 
-            best_series = self._disambiguate_series(series_list, year, series_query)
+            best_series = self._disambiguate_series(series_list, year, metron_query)
             if best_series is None:
                 logger.debug(
-                    "Metron series ambiguous for %r (year=%r): %d candidates",
-                    series_query, year, len(series_list),
+                    "Metron series ambiguous for %r (mapped from %r, year=%r): %d candidates",
+                    metron_query, series_query, year, len(series_list),
                 )
                 return None
 
@@ -343,7 +421,10 @@ class MetronClient:
                 raise
             if _is_connection_error(exc):
                 self.degraded = True
-            logger.debug("Metron lookup failed for %r #%s: %s", series_query, issue_number, exc)
+            logger.debug(
+                "Metron lookup failed for %r (mapped from %r) #%s: %s",
+                metron_query, series_query, issue_number, exc,
+            )
             return None
 
     @_retry_once_on_rate_limit
