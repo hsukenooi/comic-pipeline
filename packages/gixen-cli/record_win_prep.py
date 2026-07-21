@@ -24,19 +24,25 @@ BUI-354: the automated "ask the user" gates are a null series/issue and an
 unparseable lot — comic-identify's baseline confidence of 0.5 on every
 cleanly-parsed title made a numeric confidence threshold fire on nearly every
 title, so this deliberately never looks at `confidence` as a gate. BUI-422
-adds one more: a null `year` on a win priced at/above
-`MISSING_YEAR_PRICE_THRESHOLD` also gates to needs_review, because a null
-year correlates with the ALL-CAPS/vintage-key titles most prone to
-mis-resolving to the wrong volume downstream (see `resolve_series_for_win`,
-BUI-421) — exactly the highest-value wins most worth a human check before
-they're auto-recorded and auto-marked-seen with no way to recover by
-re-running (BUI-121's seen-set).
+added a price-gated version of one more: a null `year` on a win priced at/above
+a threshold gated to needs_review, on the theory that a null year correlates
+with the ALL-CAPS/vintage-key titles most prone to mis-resolving to the wrong
+volume downstream (see `resolve_series_for_win`, BUI-421). BUI-475 replaces
+that price gate: the original plan was a server-side era-evidence endpoint
+(Option A) to auto-resolve which volume a null-year win belongs to, but that
+endpoint fails open — a null-year win with no competing same-title volume in
+the collection auto-records under the sole owned (and possibly wrong-era)
+volume, reproducing the BUI-421 mis-file BUI-422 was meant to prevent. Since
+a win's era genuinely cannot be confirmed without a year, and price is not a
+reliable proxy for that (a cheap null-year win is exactly as unconfirmable as
+an expensive one), every null-year win now gates to needs_review
+unconditionally, regardless of price. See BUI-475 and the redesign follow-up
+BUI-498.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 from typing import Callable, Protocol
@@ -58,50 +64,15 @@ DEFAULT_IDENTIFY_CMD = ["comic-identify", "--batch"]
 # drift on a typo in the literal.
 REASON_NULL_SERIES_OR_ISSUE = "series or issue is null"
 REASON_UNPARSEABLE_LOT = "lot with unparseable contents"
-# BUI-422: a null `year` from comic-identify correlates with the ALL-CAPS /
-# oddly formatted vintage-key titles ("FANTASTIC FOUR", "AMAZING SPIDER-MAN")
-# that later mis-resolve to the wrong Metron volume (see BUI-421 /
-# resolve_series_for_win) — exactly the highest-value wins most worth a human
-# check before they're auto-recorded and auto-marked-seen with no way to
-# recover by re-running (BUI-121's seen-set).
+# BUI-475: a null `year` from comic-identify means the win's era can't be
+# confirmed at all — the ALL-CAPS/vintage-key titles most prone to
+# mis-resolving to the wrong Metron volume (see BUI-421 /
+# resolve_series_for_win) are exactly the ones comic-identify can't date, and
+# a server-side attempt to auto-resolve the era from collection evidence
+# (Option A) was proven to fail open (see BUI-475). So every null-year win
+# gates to needs_review unconditionally — there is no price threshold below
+# which it's safe to auto-record without a year.
 REASON_MISSING_YEAR = "year is null (vintage-key volume-mis-resolution risk)"
-
-# BUI-422: price threshold (in the win's currency, USD in practice) above
-# which a null year gates to needs_review instead of sailing through. Below
-# this, a null year is far more often a cheap modern filler/reprint where
-# auto-recording without `year` is the existing, desired behavior — gating
-# it would just be review friction with no mis-resolution cost to justify
-# it. $25 sits comfortably above typical modern cover price (so it doesn't
-# flag routine current-year purchases) while sitting well below where a
-# vintage key's winning price starts to reflect real scarcity — the
-# mis-resolution cost scales with price, so the gate should trip well before
-# a win gets expensive rather than only at true-grail prices.
-MISSING_YEAR_PRICE_THRESHOLD = 25.0
-
-_PRICE_DIGITS_RE = re.compile(r"[\d.]+")
-
-
-def _price_meets_missing_year_threshold(win: dict) -> bool:
-    """True if `win`'s price is at/above MISSING_YEAR_PRICE_THRESHOLD, OR the
-    price is missing/unparseable. BUI-422 fail-safe: a missing or unparseable
-    `current_bid` must NEVER let a null-year win read as "below threshold" —
-    that would let exactly the untrustworthy case (no price signal at all)
-    bypass the gate it's supposed to trigger. `current_bid` may be a float,
-    an int, or a string in a handful of observed shapes ("233.0", "$233.00",
-    "10.00 USD"); commas are stripped so "$1,233.00" also parses."""
-    current_bid = win.get("current_bid")
-    if isinstance(current_bid, (int, float)) and not isinstance(current_bid, bool):
-        return float(current_bid) >= MISSING_YEAR_PRICE_THRESHOLD
-    if isinstance(current_bid, str):
-        match = _PRICE_DIGITS_RE.search(current_bid.replace(",", ""))
-        if match:
-            try:
-                return float(match.group()) >= MISSING_YEAR_PRICE_THRESHOLD
-            except ValueError:
-                return True
-        return True
-    # None, or any other unparseable shape — fail safe to "above threshold".
-    return True
 
 
 class RecordWinPrepError(Exception):
@@ -302,10 +273,10 @@ def entries_for_win(win: dict, identity: dict) -> tuple[list[dict], dict | None]
     """Turn one (win, comic-identify result) pair into either ready wins
     entries or a single needs_review entry. BUI-354: a null series/issue (or,
     for a lot, unparseable/empty constituent_issues) gates — no confidence
-    check. BUI-422: a null `year` also gates, but only when the win's price
-    is at/above `MISSING_YEAR_PRICE_THRESHOLD` (or unparseable/missing,
-    fail-safe) — a cheap null-year win still auto-records without `year`,
-    same as before BUI-422."""
+    check. BUI-475: a null `year` also gates, always — its era can't be
+    confirmed without a year, regardless of price (this replaces BUI-422's
+    price-gated version, after the server-side era-evidence redesign, Option
+    A, was proven to fail open; see BUI-475 and the follow-up BUI-498)."""
     if identity.get("error"):
         return [], _build_review_entry(win, identity, f"comic-identify error: {identity['error']}")
 
@@ -319,10 +290,11 @@ def entries_for_win(win: dict, identity: dict) -> tuple[list[dict], dict | None]
         valid_constituents = [c for c in raw_constituents if c]
         if not series or not raw_constituents or len(valid_constituents) != len(raw_constituents):
             return [], _build_review_entry(win, identity, REASON_UNPARSEABLE_LOT)
-        # BUI-422: a null year on a lot is the same volume-mis-resolution risk
-        # as the non-lot case — gate it the same way before expanding into
+        # BUI-475: a null year on a lot is the same volume-mis-resolution risk
+        # as the non-lot case — its era can't be confirmed without a year, so
+        # gate it unconditionally (no price threshold) before expanding into
         # per-issue win entries.
-        if identity.get("year") is None and _price_meets_missing_year_threshold(win):
+        if identity.get("year") is None:
             return [], _build_review_entry(win, identity, REASON_MISSING_YEAR)
         # De-duplicate while preserving order: a title with a literal repeated
         # issue number (e.g. a seller typo like "100, 100, 101") must not
@@ -334,10 +306,11 @@ def entries_for_win(win: dict, identity: dict) -> tuple[list[dict], dict | None]
     if not identity.get("series") or not identity.get("issue"):
         return [], _build_review_entry(win, identity, REASON_NULL_SERIES_OR_ISSUE)
 
-    # BUI-422: a null year correlates with the ALL-CAPS/vintage-key titles
-    # most prone to mis-resolving to the wrong volume downstream (BUI-421) —
-    # gate high-value ones for a human check instead of auto-recording.
-    if identity.get("year") is None and _price_meets_missing_year_threshold(win):
+    # BUI-475: a null year correlates with the ALL-CAPS/vintage-key titles
+    # most prone to mis-resolving to the wrong volume downstream (BUI-421),
+    # and its era can't be confirmed without a year — gate unconditionally
+    # (no price threshold) for a human check instead of auto-recording.
+    if identity.get("year") is None:
         return [], _build_review_entry(win, identity, REASON_MISSING_YEAR)
 
     return [_build_win_entry(win, identity, issue=identity["issue"])], None
