@@ -230,6 +230,29 @@ def test_add_one_row_minimal_success():
     })]
 
 
+def test_add_one_row_carries_title_through_to_result(): # BUI-506
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    result = add_one_row(_row("1", title="Invincible #1"), server_request=server)
+    assert result.title == "Invincible #1"
+    assert result.to_dict()["title"] == "Invincible #1"
+    # display-only: never part of the POST /api/bids payload
+    assert "title" not in server.calls[0][2]
+
+
+def test_add_one_row_absent_title_defaults_to_none_backward_compatible():
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    result = add_one_row(_row("1"), server_request=server)
+    assert result.title is None
+
+
+def test_add_one_row_validation_failure_still_carries_title():
+    # A row that fails validation before any network call must still surface
+    # its title, so a failed-row table entry is legible.
+    result = add_one_row({"item_id": "1", "title": "Invincible #1"}, server_request=_FakeServer({}))
+    assert result.status == STATUS_FAILED
+    assert result.title == "Invincible #1"
+
+
 def test_add_one_row_updated_when_created_false():
     server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": False}, None)})
     result = add_one_row(_row("1"), server_request=server)
@@ -372,6 +395,19 @@ def test_run_batch_halts_and_reports_not_attempted_when_server_down():
     # rows 3 and 4 never triggered a network call at all
     add_calls = [c for c in server.calls if c[1] == "/api/bids"]
     assert len(add_calls) == 2
+
+
+def test_run_batch_not_attempted_rows_still_carry_title():
+    server = _FakeServer({
+        ("post", "/api/bids"): [
+            (True, {"item_id": "1", "created": True}, None),
+            (False, None, "Server unreachable. Is the comics server running?"),
+        ],
+    })
+    rows = [_row("1", title="First"), _row("2", title="Second"), _row("3", title="Third")]
+    outcome = run_batch(rows, server_request=server, health_check=lambda: False)
+    assert [r.title for r in outcome.rows] == ["First", "Second", "Third"]
+    assert outcome.rows[2].status == STATUS_NOT_ATTEMPTED
 
 
 def test_run_batch_never_calls_health_check_when_nothing_fails():
@@ -588,6 +624,28 @@ def test_build_batch_rows_happy_path_merges_all_three_sources():
     }]
     assert result.skipped == []
     assert result.unlinked == []
+
+
+# ---------------------------------------------------------------------------
+# build_batch_rows — title threading (BUI-506)
+# ---------------------------------------------------------------------------
+
+
+def test_build_batch_rows_carries_title_from_working_list():
+    brief = [_brief("1", comic_id=42, max_bid=800)]
+    working_list = [_wl_row("1", grade=9.2, title="Invincible #1")]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows[0]["title"] == "Invincible #1"
+
+
+def test_build_batch_rows_absent_title_omits_key_backward_compatible():
+    """No `title` on the working-list row must produce exactly the same
+    output row as before this field existed — no null placeholder key."""
+    brief = [_brief("1", comic_id=None, max_bid=50)]
+    working_list = [_wl_row("1")]
+    result = build_batch_rows(brief, working_list)
+    assert "title" not in result.rows[0]
+    assert result.rows[0] == {"item_id": "1", "max_bid": 50.0}
 
 
 def test_build_batch_rows_never_drops_comic_id_when_present():

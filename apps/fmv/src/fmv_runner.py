@@ -1129,7 +1129,7 @@ def _brief_row(r: dict) -> dict:
     """BUI-362: project one result row down to the linkage + pricing fields an
     orchestrator (/comic:buy Step 3→5) actually threads forward. The full
     `--out` row is dominated by `queries_used` and `trimmed_pool`; this is the
-    ~6-field subset that used to be extracted from it after the fact.
+    ~9-field subset that used to be extracted from it after the fact.
 
     Field sources:
       - item_id            → the row's input echo.
@@ -1137,17 +1137,36 @@ def _brief_row(r: dict) -> dict:
         response ids); a cached row has no top-level keys — its ids live on the
         GET /api/comics `db_row` as `id` / `fmv_id`, so fall back there. A row
         that never upserted (source == "error") projects null for both.
-      - max_bid / flag_reason / confidence → the row's `fmv` dict (null when
-        `fmv` itself is null, e.g. an error row).
+      - max_bid / flag_reason / confidence / fmv_low / fmv_high → the row's
+        `fmv` dict (null when `fmv` itself is null, e.g. an error row).
+      - fmv_notes (BUI-505) → the haircut/range explanation string. A fresh (or
+        cgc-proxy) row's `db_row` is the bare `comics` table row (the POST
+        /api/comics response) — it has no `fmv_notes` column, since that lives
+        on the separate `fmv` table, which only the GET endpoint joins. So for
+        those rows, rebuild the identical string `_upsert_fmv` already sent the
+        server, straight from this same in-memory `fmv` dict: `_build_notes` is
+        a pure function of it, so there's no drift from what was persisted. A
+        cached row's `db_row` (the GET /api/comics join) already carries the
+        real persisted `fmv_notes` verbatim, so read it directly instead.
+        `_build_notes` reads a few `fmv` keys (`cv_pct`/`confidence`) directly
+        rather than via `.get`; a real fmv dict (from `compute_fmv`/
+        `cgc_proxy_fmv`) always has them, but a caller passing a partial dict
+        (e.g. a test double) shouldn't crash the whole projection over one
+        cosmetic field, so a KeyError there degrades to a null note instead.
     """
     fmv = r.get("fmv") or {}
     db_row = r.get("db_row") or {}
     if "comic_id" in r:
         comic_id = r.get("comic_id")
         fmv_id = r.get("fmv_id")
+        try:
+            fmv_notes = _build_notes(fmv) if fmv else None
+        except KeyError:
+            fmv_notes = None
     else:
         comic_id = db_row.get("id")
         fmv_id = db_row.get("fmv_id")
+        fmv_notes = db_row.get("fmv_notes")
     return {
         "item_id": (r.get("input") or {}).get("item_id"),
         "comic_id": comic_id,
@@ -1155,6 +1174,9 @@ def _brief_row(r: dict) -> dict:
         "max_bid": fmv.get("max_bid"),
         "flag_reason": fmv.get("flag_reason"),
         "confidence": fmv.get("confidence"),
+        "fmv_low": fmv.get("fmv_low"),
+        "fmv_high": fmv.get("fmv_high"),
+        "fmv_notes": fmv_notes,
     }
 
 

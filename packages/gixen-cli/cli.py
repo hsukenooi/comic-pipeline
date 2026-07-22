@@ -461,17 +461,33 @@ def _add_batch_status_cell(row: dict) -> str:
     return label
 
 
+_ADD_BATCH_TITLE_WIDTH = 28
+
+
+def _add_batch_title_cell(title: str | None) -> str:
+    """BUI-506: truncate a long title to keep the table's columns aligned
+    rather than blowing out the row width; a missing title renders as the
+    same '—' placeholder every other absent field in this table uses."""
+    if not title:
+        return "—"
+    if len(title) <= _ADD_BATCH_TITLE_WIDTH:
+        return title
+    return title[: _ADD_BATCH_TITLE_WIDTH - 1] + "…"
+
+
 def _print_add_batch_table(rows: list[dict]) -> None:
     click.echo(
-        f"{'#':<4}{'Item ID':<16}{'Grade':<8}{'Max Bid':<12}{'Status'}"
+        f"{'#':<4}{'Item ID':<16}{'Title':<{_ADD_BATCH_TITLE_WIDTH + 1}}"
+        f"{'Grade':<8}{'Max Bid':<12}{'Status'}"
     )
-    click.echo("-" * 80)
+    click.echo("-" * 100)
     for i, row in enumerate(rows, start=1):
         grade = row.get("grade")
         max_bid = row.get("max_bid")
         click.echo(
             f"{i:<4}"
             f"{(row.get('item_id') or '—'):<16}"
+            f"{_add_batch_title_cell(row.get('title')):<{_ADD_BATCH_TITLE_WIDTH + 1}}"
             f"{(f'{grade:g}' if grade is not None else '—'):<8}"
             f"{(_format_bid(max_bid) if max_bid is not None else '—'):<12}"
             f"{_add_batch_status_cell(row)}"
@@ -499,7 +515,9 @@ def add_batch_cmd(rows_file: str, verify: bool, json_out: str | None):
     ROWS_FILE is a JSON list of rows (or an object with a top-level "rows"
     list). Required per row: item_id (str), max_bid (number). Optional:
     comic_id (int), grade (number), seller (str), seller_grade (number),
-    photo_grade (number), group (int, default 0), offset (int, default 6).
+    photo_grade (number), group (int, default 0), offset (int, default 6),
+    title (str, BUI-506 — display-only, echoed back in the human table and
+    JSON summary; never sent to the server).
     item_id must be unique across rows in one file (the server upserts on
     item_id, so a duplicate would collapse into one bid). Reuses the same
     server-mode request path as `gixen add` (POST /api/bids, then POST
@@ -663,8 +681,11 @@ def build_batch_cmd(
     list/`{"rows": [...]}`, or the raw stdout (human table + one JSON object
     per line — non-JSON lines are ignored, but a line that looks like JSON
     and fails to parse is a hard error). WORKING_LIST_FILE is a JSON list of
-    working-list rows: {item_id, grade?, listing_type?/type?, seller?,
-    seller_grade?, photo_grade?, group?}.
+    working-list rows: {item_id, title?, grade?, listing_type?/type?,
+    seller?, seller_grade?, photo_grade?, group?}. `title` (BUI-506), when
+    present, is carried straight into the built row and on through
+    `add-batch`'s human table and JSON rows — display-only, never sent to
+    the server. Absent `title` is fully backward-compatible.
 
     Prints the resulting rows JSON (feed straight into `gixen add-batch`),
     and reports skipped (BIN / user-skip) and unlinked (null comic_id) rows

@@ -1508,18 +1508,21 @@ class TestCgcProxyNotesAndTable:
 # ─── --brief projection (BUI-362) ─────────────────────────────────────────────
 
 class TestBriefProjection:
-    """`_brief_row` must project the six linkage/pricing fields under exactly
+    """`_brief_row` must project the nine linkage/pricing fields under exactly
     the names /comic:buy's Step 3 documents — item_id, comic_id, fmv_id,
-    max_bid, flag_reason, confidence — across all three row sources."""
+    max_bid, flag_reason, confidence, fmv_low, fmv_high, fmv_notes (BUI-505)
+    — across all three row sources."""
 
     BRIEF_KEYS = {"item_id", "comic_id", "fmv_id", "max_bid",
-                  "flag_reason", "confidence"}
+                  "flag_reason", "confidence", "fmv_low", "fmv_high",
+                  "fmv_notes"}
 
     def test_fresh_row_projects_top_level_ids(self):
         row = {
             "input": {"item_id": "111", "title": "X", "issue": "1", "grade": 9.0},
             "fmv": {"max_bid": 80, "flag_reason": None, "confidence": "HIGH",
-                    "fmv_low": 90, "fmv_high": 100, "trimmed_pool": [1, 2, 3]},
+                    "fmv_low": 90, "fmv_high": 100, "trimmed_pool": [1, 2, 3],
+                    "cv_pct": "10%", "bid_factor": 0.80},
             "comp_count_total": 5, "queries_used": [{"tier": "base"}],
             "db_row": {"id": 42, "comic_id": 42, "fmv_id": 7},
             "comic_id": 42, "fmv_id": 7, "source": "fresh",
@@ -1528,21 +1531,47 @@ class TestBriefProjection:
         assert set(brief) == self.BRIEF_KEYS
         assert brief == {"item_id": "111", "comic_id": 42, "fmv_id": 7,
                          "max_bid": 80, "flag_reason": None,
-                         "confidence": "HIGH"}
+                         "confidence": "HIGH", "fmv_low": 90, "fmv_high": 100,
+                         "fmv_notes": "window=n/a | cv=10% | label=HIGH"}
+
+    def test_fresh_row_fmv_notes_matches_upsert_notes(self):
+        # BUI-505: the brief line's fmv_notes must be exactly what
+        # `_upsert_fmv` sent the server for this row (same fmv dict, same pure
+        # `_build_notes` call) — no drift between the two.
+        fmv = {"max_bid": 48, "flag_reason": None, "confidence": "LOW",
+               "fmv_low": 90, "fmv_high": 100, "cv_pct": "n/a",
+               "bid_factor": 0.60, "grade_confidence": "low"}
+        row = {
+            "input": {"item_id": "999", "title": "X", "issue": "1"},
+            "fmv": fmv, "db_row": {"id": 1, "comic_id": 1, "fmv_id": 1},
+            "comic_id": 1, "fmv_id": 1, "source": "fresh",
+        }
+        brief = fmv_runner._brief_row(row)
+        assert brief["fmv_notes"] == fmv_runner._build_notes(fmv)
+        assert "bid_haircut=0.60" in brief["fmv_notes"]
 
     def test_cached_row_falls_back_to_db_row_ids(self):
         # A cached _stitch row has NO top-level comic_id/fmv_id — its ids live
         # on the GET /api/comics db_row as `id` / `fmv_id`.
         row = {
             "input": {"item_id": "222", "title": "X", "issue": "1"},
-            "fmv": {"max_bid": 60, "flag_reason": None, "confidence": "MEDIUM"},
-            "db_row": {"id": 5, "fmv_id": 9, "fmv_low": 60, "fmv_high": 75},
+            "fmv": {"max_bid": 60, "flag_reason": None, "confidence": "MEDIUM",
+                    "fmv_low": 60, "fmv_high": 75},
+            "db_row": {"id": 5, "fmv_id": 9, "fmv_low": 60, "fmv_high": 75,
+                       "fmv_notes": "window=±0.5 | cv=20% | label=MEDIUM"},
             "source": "cached",
         }
         brief = fmv_runner._brief_row(row)
         assert brief["comic_id"] == 5
         assert brief["fmv_id"] == 9
         assert brief["max_bid"] == 60
+        assert brief["fmv_low"] == 60
+        assert brief["fmv_high"] == 75
+        # Cached path reads the persisted fmv_notes verbatim off db_row rather
+        # than recomputing it (the reconstructed cached fmv dict is a lossy
+        # projection missing fields like first_party_count — see
+        # _fmv_from_db_row — so recomputing could drop tokens the original had).
+        assert brief["fmv_notes"] == "window=±0.5 | cv=20% | label=MEDIUM"
 
     def test_error_row_projects_nulls_not_missing_keys(self):
         # A _stitch error row (no comps, no cache) has neither top-level ids
@@ -1564,7 +1593,7 @@ class TestBriefProjection:
         row = {
             "input": {"item_id": "444", "title": "X", "issue": "1"},
             "fmv": {"max_bid": None, "flag_reason": "one_sided",
-                    "confidence": "LOW"},
+                    "confidence": "LOW", "cv_pct": "n/a"},
             "db_row": {"id": 8, "comic_id": 8, "fmv_id": 3},
             "comic_id": 8, "fmv_id": 3, "source": "fresh",
         }
@@ -1572,6 +1601,22 @@ class TestBriefProjection:
         assert brief["comic_id"] == 8
         assert brief["max_bid"] is None
         assert brief["flag_reason"] == "one_sided"
+        assert brief["fmv_low"] is None
+        assert brief["fmv_high"] is None
+        assert "manual_review=one_sided" in brief["fmv_notes"]
+
+    def test_partial_fmv_dict_degrades_notes_to_none_instead_of_crashing(self):
+        # `_build_notes` reads a couple of fmv keys directly (not via .get) —
+        # a partial fmv dict (e.g. a lightweight test double, or any future
+        # caller that doesn't build the full compute_fmv/cgc_proxy_fmv shape)
+        # must not blow up the whole brief projection over a cosmetic field.
+        row = {
+            "input": {"item_id": "1"}, "fmv": {"max_bid": 10},
+            "db_row": None, "comic_id": 1, "fmv_id": 2, "source": "fresh",
+        }
+        brief = fmv_runner._brief_row(row)
+        assert brief["max_bid"] == 10
+        assert brief["fmv_notes"] is None
 
     def test_print_brief_emits_one_json_line_per_row(self, capsys):
         rows = [

@@ -73,6 +73,14 @@ class RowResult:
     error: str | None = None
     link_error: str | None = None
     verify: dict | None = None
+    # BUI-506: display-only — the comic's title, threaded through from the
+    # row (which build_batch_rows populated from the working list, or a
+    # hand-written add-batch ROWS_FILE that includes it directly). Never sent
+    # to the server (POST /api/bids has no such field); it exists purely so
+    # add-batch's human table and JSON summary can show a name instead of a
+    # bare item_id, replacing the /comic:buy Step 5 orchestrator's old
+    # in-context "reformat with the comic names ... joined by item_id" pass.
+    title: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +94,7 @@ class RowResult:
             "error": self.error,
             "link_error": self.link_error,
             "verify": self.verify,
+            "title": self.title,
         }
 
 
@@ -242,6 +251,10 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
     POST .../link-fmv), but returns a RowResult instead of printing +
     sys.exit'ing, so the batch loop can keep going after a row fails."""
     item_id = row.get("item_id")
+    # BUI-506: display-only, never part of the POST /api/bids payload — read
+    # unconditionally (no validation) so it survives even a row that fails
+    # validation before reaching the network.
+    title = row.get("title")
 
     try:
         item_id = _require(row, "item_id")
@@ -267,7 +280,7 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         seller_grade = _optional_float(row, "seller_grade")
         photo_grade = _optional_float(row, "photo_grade")
     except _RowValidationError as e:
-        return RowResult(item_id=item_id, status=STATUS_FAILED, error=str(e))
+        return RowResult(item_id=item_id, status=STATUS_FAILED, error=str(e), title=title)
 
     payload = build_bid_payload(
         item_id, bid, offset, group,
@@ -278,14 +291,14 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
     if not ok:
         return RowResult(
             item_id=item_id, status=STATUS_FAILED, max_bid=float(bid),
-            grade=grade, error=err,
+            grade=grade, error=err, title=title,
         )
 
     created = created_from_response(resp)
     status = STATUS_ADDED if created else STATUS_UPDATED
     result = RowResult(
         item_id=item_id, status=status, max_bid=float(bid), grade=grade,
-        created=created,
+        created=created, title=title,
     )
 
     link_attempted = grade is not None and comic_id is not None
@@ -325,7 +338,8 @@ def run_batch(
     for row in rows:
         if halted:
             results.append(
-                RowResult(item_id=row.get("item_id"), status=STATUS_NOT_ATTEMPTED)
+                RowResult(item_id=row.get("item_id"), status=STATUS_NOT_ATTEMPTED,
+                          title=row.get("title"))
             )
             continue
 
@@ -563,12 +577,19 @@ def build_batch_rows(
         one dict per item_id with {item_id, comic_id, fmv_id, max_bid,
         flag_reason, confidence}.
       - `working_list` — the buy-flow working list, one dict per surviving
-        comic: {item_id, grade?, listing_type?/type?, seller?,
+        comic: {item_id, title?, grade?, listing_type?/type?, seller?,
         seller_grade?, photo_grade?, group?}. `grade`/`seller_grade`/
         `photo_grade` may be numeric or a CGC letter grade (e.g. "NM-").
         `group` here is the Step 2 bid-group-candidate default. A row whose
         `listing_type`/`type` is "BIN" (case-insensitive) is skipped
-        entirely — Gixen is for auctions only.
+        entirely — Gixen is for auctions only. `title` (BUI-506), when
+        present, is carried straight into the output row unchanged and
+        purely for display — it lets `add-batch` show the comic's name in
+        its human table and JSON summary instead of a bare item_id, closing
+        the /comic:buy Step 5 orchestrator's old in-context "reformat with
+        the comic names ... joined by item_id" pass. Absent `title` is fully
+        backward-compatible: the output row simply omits the key, exactly as
+        it did before this field existed.
       - `overrides` — optional {item_id: {"max_bid": ..., "group": ...,
         "skip": bool}}, the Step 4 user-approval gate's per-row overrides.
         A present, non-null `max_bid`/`group` here always wins over the
@@ -661,6 +682,10 @@ def build_batch_rows(
             )
 
         out_row: dict[str, Any] = {"item_id": item_id, "max_bid": max_bid}
+
+        title = row.get("title")
+        if title is not None:
+            out_row["title"] = title
 
         comic_id = brief_row.get("comic_id")
         if comic_id is not None:
