@@ -93,7 +93,7 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 - **Not-cheap books → 1 grader each, first pass**, run in parallel (separate agents).
 - **Escalation (both kinds).** After the first pass, any book that tripped a gate (Step 2 triggers) gets the **remaining 2** graders as separate, independent agents — dispatched together in one parallel batch. A batched cheap book's first grade counts as grader A; pull it out and add B + C. (The grader prompt and criteria are identical across passes so the panel grades stay independent and comparable.)
 - **Batching guardrails:** keep each book's images and OUTPUT FORMAT block fully separate in the batched prompt; never let one book's defects bleed into another's grade; if a batch would exceed `BATCH_MAX`, open another agent. When in doubt about a specific cheap book (e.g. it looks near a cap), grade it on its own rather than in the batch.
-- **Anti-anchoring (batched grades must not drift):** grade every book against the **absolute** CGC/Overstreet scale, exactly as if it were the only book in front of you. Do **not** let the overall quality of the batch raise or lower any single grade — a clean book in a batch of beaters is not a 9.6, and a rough book among clean ones is not a 2.0. A measured drift toward higher point grades on clean books was seen when batching vs. one-agent-each (BUI-81 U9 validation); counter it by re-anchoring each book on its own visible defects before naming a number.
+- **Anti-anchoring:** batched grades must not drift toward the batch's overall quality. The `comic-grader` agent def owns this rule (grade each book on the **absolute** CGC scale; BUI-81 U9) and its own guard enforces it — nothing to restate here.
 
 **Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, range wide but coverage-driven at MEDIUM-LOW)` or `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. The user must be able to see where rigor was and wasn't spent.
 
@@ -111,7 +111,7 @@ The OUTPUT FORMAT block the agent returns (`GRADE`, `GRADE RANGE`, `CONFIDENCE`,
 - **SELLER-STATED GRADE** — from the listing title/description if present, else `none stated`
 - **Item id label** — so batched output blocks are traceable
 
-For a **batched cheap-book agent** (see Dispatch mechanics), hand it the per-comic block above for each book in the group (up to `BATCH_MAX`) and tell it to grade each independently and return one OUTPUT FORMAT block per book, labelled by item id. The agent's own anti-anchoring guard keeps batched grades on the absolute scale.
+For a **batched cheap-book agent** (see Dispatch mechanics), hand it the per-comic block above for each book in the group (up to `BATCH_MAX`) and tell it to grade each independently and return one OUTPUT FORMAT block per book, labelled by item id. The agent's own anti-anchoring guard keeps those batched grades on the absolute scale (§ Step 2 pointer above).
 
 ## Step 3: Synthesize Consensus
 

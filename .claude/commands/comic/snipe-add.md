@@ -244,9 +244,8 @@ Useful when FMV analysis shows an existing bid is too low.
 
 | Mistake | Fix |
 |---|---|
-| Running Gixen adds in parallel | Run sequentially — Gixen session is stateful |
 | Attempting to snipe a BIN listing | Skip — Gixen is for auctions only |
 | Max bid = FMV top | Use 80% × top — leaves margin for bidder competition |
 | Odd number bids ($137.43) | Round to clean numbers — doesn't materially change outcomes |
-| Sniping only the earliest-ending copy when 2+ listings of the same comic are approved | Add all copies with the same `--group N` — Gixen cancels the rest after one wins (BUI-363); skip grouping only when end times are within ~2 minutes |
-| Leaving a group's cancelled siblings on Gixen after a win | No longer a safety risk (BUI-371/BUI-381 classify them `REMOVED` regardless of purge timing) — run `gixen purge` anyway to keep the live Gixen list and dashboard tidy |
+| Sniping only the earliest-ending copy when 2+ listings of the same comic are approved | Add all copies with the same `--group N` (§ Bid groups owns the rules) |
+| Leaving a group's cancelled siblings on Gixen after a win | Not a safety risk — `gixen purge` is optional hygiene (§ Bid groups) |

@@ -10,6 +10,20 @@ pipeline, or doing a manual fallback computation.
 For the default path (how to invoke `comic-fmv`, its flags, and the
 load-bearing warnings), see `.claude/commands/comic/fmv.md`.
 
+## Stale install check (`comic-fmv --version`, BUI-305)
+
+`apps/fmv` is `uv tool install`-managed, not a workspace member kept current by
+`uv sync` — same category of risk as the eBay tools' stale-wrapper issue
+(BUI-27, documented in `scripts/install.sh` and `CLAUDE.md`). A `comic-fmv`
+binary that's behind the repo silently runs old pricing logic (missing safety
+guards, bugfixes, etc.) with no error to signal it. If pricing looks off, or
+after pulling changes to `apps/fmv/src/`, run `comic-fmv --version` and compare
+the git SHA/date to `git log -1 --format='%h %cd' --date=short` (the build hook
+stamps whole-repo HEAD, not just `apps/fmv/`, so compare against unfiltered HEAD
+— a path-scoped `-- apps/fmv/src` comparison will false-positive on every
+unrelated commit elsewhere in the monorepo); if they don't match, re-run
+`./scripts/install.sh`.
+
 ## Manual fallback (only if the CLI is broken)
 
 If `comic-fmv` is unavailable, you can run the steps below by hand. SerpApi
