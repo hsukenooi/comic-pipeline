@@ -9,9 +9,9 @@ Walks the bid → bid_fmvs → fmv → comics chain for each comic in a working 
 
 This is a **warn-only** verification — it doesn't fix anything, just surfaces gaps so you (or future-you next session) can act.
 
-## How to read this file (BUI-361)
+## How to read this file (BUI-361, updated BUI-507)
 
-**EXECUTOR CONTRACT** = run it; **ORCHESTRATOR NOTES** = the verdict ladder + guidance that `/comic:buy` Step 6 reads directly (no executor dispatched there since BUI-360). Standalone `/comic:verify` runs: do both, in order.
+**EXECUTOR CONTRACT** = run it; **ORCHESTRATOR NOTES** = the verdict ladder (meanings only — the endpoint returns the guidance text itself as of BUI-507, so `/comic:buy` Step 6 no longer reads this file at all). Standalone `/comic:verify` runs: do both, in order.
 
 ---
 
@@ -96,14 +96,18 @@ The endpoint returns:
 {
   "summary": {"total": 3, "fully_linked": 2, "issues": 1},
   "results": [
-    {"item_id": "...", "verdict": "fully_linked", "missing": [], ...},
-    {"item_id": "...", "verdict": "fmv_stub", "missing": ["fmv.low", "fmv.high"], ...}
+    {"item_id": "...", "verdict": "fully_linked", "missing": [], "guidance": "", ...},
+    {"item_id": "...", "verdict": "fmv_stub", "missing": ["fmv.low", "fmv.high"],
+     "guidance": "Run `/comic:fmv` for this comic at the missing grade(s).", ...}
   ]
 }
 ```
 
 Each result's `verdict` is one of the ladder values defined in ORCHESTRATOR
-NOTES § Verdict ladder (the single copy — don't restate it here).
+NOTES § Verdict ladder (the single copy — don't restate it here). Each result
+also carries a `guidance` string (BUI-507) — the endpoint's own one-line advice
+for that verdict (empty for `fully_linked`). Render it verbatim; don't re-derive
+your own per-verdict text.
 
 ### Presentation
 
@@ -118,11 +122,8 @@ Surface a table for the user. Use the verdict column to scan for issues:
 | 4 | 666666666 | (unknown) | 9.0 | ❌ no_bid | bids row |
 ```
 
-If `summary.issues > 0`, after the table give the user one-line guidance per
-verdict from ORCHESTRATOR NOTES § Per-verdict guidance — as the executing agent
-you have the full file in context; the ladder is shelved there because
-`/comic:buy` Step 6 interprets `add-batch --verify` verdicts without dispatching
-an executor.
+If `summary.issues > 0`, after the table print each issue row's `guidance`
+string from the response, one line per row.
 
 ---
 
@@ -144,16 +145,9 @@ Verdicts (ladder — first failure wins):
 
 `bids.fmv_id` mismatch with the matched fmv shows up as `partial` — this is the PER-90 footgun (denormalized pointer drifted from the canonical primary row).
 
-### Per-verdict guidance
-
-One line per non-`fully_linked` verdict:
-
-- `needs_manual` → "This book is flagged `needs_manual` (reason: `<flag_reason>`) — its comp pool can't be auto-priced. Hand-price it via grade-curve interpolation or the CGC proxy (see `docs/conventions/fmv-math-spec.md` §7/§7a), or skip. Do NOT re-run `/comic:fmv` — it will just re-flag it."
-- `fmv_stub` → "Run `/comic:fmv` for this comic at the missing grade(s)."
-- `no_fmv_at_grade` → "The bid's grade doesn't have an FMV row yet. Run `/comic:fmv` at this grade."
-- `no_comic` → "No comic linked. Run `POST /api/extract-comics` or re-run `/comic:snipe-add` with `--locg-id` set."
-- `partial` → "Junction or `bids.fmv_id` is out of sync. Surface to user for manual reconciliation."
-- `no_bid` → "Snipe never landed in the DB. Confirm `COMICS_SERVER_URL` was set during `/comic:snipe-add` and the snipe is on Gixen."
+**Per-verdict guidance (BUI-507):** no longer duplicated here — the endpoint
+returns a `guidance` string on every result (see EXECUTOR CONTRACT § Output).
+Both this skill and `/comic:buy` Step 6 render that string directly.
 
 ### Never report a false all-clear
 
@@ -166,9 +160,9 @@ call is "verification failed", never "nothing to flag" (BUI-169).
 ### When to invoke
 
 - **End of `/comic:buy`** — Step 6. Since BUI-360 the verify call itself rides
-  along with Step 5 (`gixen add-batch --verify`); Step 6 interprets each row's
-  embedded `verify` verdict using the ladder + guidance above. No executor
-  dispatch, no second call.
+  along with Step 5 (`gixen add-batch --verify`); since BUI-507 each row's
+  embedded `verify.guidance` is server-provided, so Step 6 reads it straight
+  off the JSON without opening this file. No executor dispatch, no second call.
 - **After ad-hoc backfills** — when reconciling history (PER-70-style cleanup), pass the patched item_ids in to confirm.
 - **Sanity-check before `/comic:collection-add`** — if the FMV side is broken, the LOCG collection write is going to be confused too.
 
