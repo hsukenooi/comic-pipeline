@@ -292,11 +292,11 @@ If any rows shared a `group` (BUI-363), also remind the user:
 
 ## Step 6: Verify
 
-Step 5's `--verify` already appended a `verify` verdict to every landed row in its JSON output — this step is now just **interpreting that data**, not making another call. Read **only the ORCHESTRATOR NOTES section** of `~/Projects/comic-pipeline/.claude/commands/comic/verify.md` — it carries the verdict ladder, the per-verdict guidance, and the no-false-all-clear rule (BUI-361; no executor dispatch, the contract half is for standalone runs) — and apply them here:
+Step 5's `--verify` already appended a `verify` verdict — and, as of BUI-507, a server-provided `guidance` string — to every landed row in its JSON output. This step is now just **interpreting that data**: no second call, and no need to read `verify.md`.
 
-- **`rows[].verify` is null** — either the row didn't land (`failed`/`not_attempted`, nothing to verify) or it landed without a `grade` (add-batch's `--verify` only submits landed rows that carry a grade, since verify.md's endpoint needs one to match an `fmv` row). Treat a gradeless landed row as **unverified**, not as an implicit `fully_linked` — say so rather than staying silent.
-- **`rows[].verify.verdict != "fully_linked"`** — surface the row in a table plus its one-line guidance from `verify.md`'s per-verdict mapping (`needs_manual`, `fmv_stub`, `no_fmv_at_grade`, `no_comic`, `partial`, `no_bid`).
-- **top-level `verify_error` is non-null** — the `/api/comics/verify` call itself failed (server hiccup after the adds already landed). Do **not** report an all-clear for verification in this case — say verification could not be confirmed for the landed rows and point at `/comic:verify` as a manual follow-up.
+- **`rows[].verify` is null** — either the row didn't land (`failed`/`not_attempted`, nothing to verify) or it landed without a `grade` (add-batch's `--verify` only submits landed rows that carry a grade). Treat a gradeless landed row as **unverified**, not as an implicit `fully_linked` — say so rather than staying silent.
+- **`rows[].verify.verdict != "fully_linked"`** — surface the row in a table plus its `rows[].verify.guidance` string, verbatim.
+- **top-level `verify_error` is non-null** — the `/api/comics/verify` call itself failed (server hiccup after the adds already landed). Do **not** report an all-clear for verification in this case — say verification could not be confirmed for the landed rows and point at `/comic:verify` as a manual follow-up. A failed call is "verification failed", never "nothing to flag" (BUI-169).
 
 Warn-only — don't block. The pipeline is done; the goal is to tell the user *now* about gaps so they don't discover them when the auction ends and `/comic:collection-add` chokes (PER-70 cascade). Origin (PER-99) and full context: `docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md`.
 

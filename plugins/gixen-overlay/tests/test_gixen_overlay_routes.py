@@ -2201,6 +2201,8 @@ def test_verify_fully_linked(api):
     assert row["comic_id"] > 0
     assert row["fmv_id"] > 0
     assert row["bid_fmv_id"] == row["fmv_id"]
+    # BUI-507: fully_linked carries no guidance — nothing to act on.
+    assert row["guidance"] == ""
 
 
 def test_verify_resolves_newest_bid_not_oldest(api):
@@ -2254,6 +2256,10 @@ def test_verify_no_bid(api):
     row = r.json()["results"][0]
     assert row["verdict"] == "no_bid"
     assert row["missing"] == ["bids row"]
+    assert row["guidance"] == (
+        "Snipe never landed in the DB. Confirm `COMICS_SERVER_URL` was set "
+        "during `/comic:snipe-add` and the snipe is on Gixen."
+    )
 
 
 def test_verify_no_comic_when_bid_has_no_links(api):
@@ -2267,6 +2273,10 @@ def test_verify_no_comic_when_bid_has_no_links(api):
     row = r.json()["results"][0]
     assert row["verdict"] == "no_comic"
     assert "bid_fmvs junction" in row["missing"]
+    assert row["guidance"] == (
+        "No comic linked. Run `POST /api/extract-comics` or re-run "
+        "`/comic:snipe-add` with `--locg-id` set."
+    )
 
 
 def test_verify_no_comic_when_locg_id_unknown(api):
@@ -2280,6 +2290,10 @@ def test_verify_no_comic_when_locg_id_unknown(api):
     row = r.json()["results"][0]
     assert row["verdict"] == "no_comic"
     assert "comics row" in row["missing"]
+    assert row["guidance"] == (
+        "No comic linked. Run `POST /api/extract-comics` or re-run "
+        "`/comic:snipe-add` with `--locg-id` set."
+    )
 
 
 def test_verify_fmv_stub(api):
@@ -2297,6 +2311,7 @@ def test_verify_fmv_stub(api):
     assert row["verdict"] == "fmv_stub"
     assert "fmv.low" in row["missing"]
     assert "fmv.high" in row["missing"]
+    assert row["guidance"] == "Run `/comic:fmv` for this comic at the missing grade(s)."
 
 
 def test_verify_needs_manual_flagged_book_is_distinct_from_fmv_stub(api):
@@ -2316,6 +2331,14 @@ def test_verify_needs_manual_flagged_book_is_distinct_from_fmv_stub(api):
     assert row["verdict"] == "needs_manual"
     assert row["flag_reason"] == "one_sided"
     assert row["missing"] == []
+    # BUI-507: guidance is templated with the row's own flag_reason.
+    assert row["guidance"] == (
+        "This book is flagged `needs_manual` (reason: `one_sided`) — its "
+        "comp pool can't be auto-priced. Hand-price it via grade-curve "
+        "interpolation or the CGC proxy (see "
+        "`docs/conventions/fmv-math-spec.md` §7/§7a), or skip. Do NOT re-run "
+        "`/comic:fmv` — it will just re-flag it."
+    )
 
 
 def test_verify_no_fmv_at_grade(api):
@@ -2332,6 +2355,10 @@ def test_verify_no_fmv_at_grade(api):
     row = r.json()["results"][0]
     assert row["verdict"] == "no_fmv_at_grade"
     assert row["missing"] == ["fmv row at grade 9.8"]
+    assert row["guidance"] == (
+        "The bid's grade doesn't have an FMV row yet. Run `/comic:fmv` at "
+        "this grade."
+    )
 
 
 def test_verify_partial_when_bids_fmv_id_missing(api):
@@ -2352,6 +2379,10 @@ def test_verify_partial_when_bids_fmv_id_missing(api):
     row = r.json()["results"][0]
     assert row["verdict"] == "partial"
     assert "bids.fmv_id" in row["missing"]
+    assert row["guidance"] == (
+        "Junction or `bids.fmv_id` is out of sync. Surface to user for "
+        "manual reconciliation."
+    )
 
 
 def test_verify_partial_when_bids_fmv_id_mismatches(api):
@@ -2373,6 +2404,10 @@ def test_verify_partial_when_bids_fmv_id_mismatches(api):
     row = r.json()["results"][0]
     assert row["verdict"] == "partial"
     assert any("bids.fmv_id" in m for m in row["missing"])
+    assert row["guidance"] == (
+        "Junction or `bids.fmv_id` is out of sync. Surface to user for "
+        "manual reconciliation."
+    )
 
 
 def test_verify_locg_id_mismatch_is_partial(api):
@@ -2396,6 +2431,10 @@ def test_verify_locg_id_mismatch_is_partial(api):
     row = r.json()["results"][0]
     assert row["verdict"] == "partial"
     assert any("locg_id" in m for m in row["missing"])
+    assert row["guidance"] == (
+        "Junction or `bids.fmv_id` is out of sync. Surface to user for "
+        "manual reconciliation."
+    )
 
 
 def test_verify_summary_counts(api):
@@ -2422,6 +2461,35 @@ def test_verify_summary_counts(api):
     assert body["summary"] == {"total": 3, "fully_linked": 1, "issues": 2}
     verdicts = [r["verdict"] for r in body["results"]]
     assert verdicts == ["fully_linked", "fmv_stub", "no_bid"]
+
+
+def test_verify_every_verdict_has_guidance(api):
+    """BUI-507 coverage guard: every verdict `_verify_one` can emit must map to
+    a non-None `guidance` string in the response — no KeyError, no silent
+    `None` hole for a future verdict added without updating the mapping.
+    `fully_linked` is deliberately `""` (nothing to act on); every other
+    verdict here must be a non-empty string."""
+    from gixen_overlay.routes import _VERDICT_GUIDANCE, _guidance_for
+
+    all_verdicts = [
+        "fully_linked", "needs_manual", "fmv_stub",
+        "partial", "no_fmv_at_grade", "no_comic", "no_bid",
+    ]
+    for verdict in all_verdicts:
+        guidance = _guidance_for(verdict, flag_reason="one_sided")
+        assert guidance is not None, f"{verdict} has no guidance"
+        if verdict == "fully_linked":
+            assert guidance == ""
+        else:
+            assert guidance != "", f"{verdict} has empty guidance"
+
+    # Every static (non-templated) verdict is present in the dict directly —
+    # guards the "no KeyError hole" requirement independent of _guidance_for's
+    # branching logic.
+    for verdict in all_verdicts:
+        if verdict == "needs_manual":
+            continue
+        assert verdict in _VERDICT_GUIDANCE
 
 
 # ---------------------------------------------------------------------------

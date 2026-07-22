@@ -570,7 +570,12 @@ async def api_verify(req: VerifyRequest, request: Request):
       - `fully_linked`   — all five checks pass
 
     `missing` lists the specific failed checks so callers don't have to map
-    verdict → user-visible message themselves.
+    verdict → user-visible message themselves. Likewise (BUI-507) each result
+    carries a `guidance` string — the one-line, per-verdict advice that used
+    to live only in `verify.md`'s ORCHESTRATOR NOTES — so callers (the
+    standalone `/comic:verify` skill and `/comic:buy` Step 6 via add-batch's
+    `--verify`) can surface it without reading that file or re-deriving their
+    own copy of the mapping.
     """
     db = request.app.state.db
     results = []
@@ -585,6 +590,52 @@ async def api_verify(req: VerifyRequest, request: Request):
         "issues": sum(1 for r in results if r["verdict"] != "fully_linked"),
     }
     return {"summary": summary, "results": results}
+
+
+# BUI-507: single source of truth for per-verdict guidance. Previously this
+# mapping was duplicated in verify.md's ORCHESTRATOR NOTES § Per-verdict
+# guidance for /comic:buy Step 6 to read; now the endpoint emits it directly
+# and both /comic:buy Step 6 and standalone /comic:verify render the same
+# server-provided string instead of maintaining their own copy.
+_VERDICT_GUIDANCE: dict[str, str] = {
+    "fmv_stub": "Run `/comic:fmv` for this comic at the missing grade(s).",
+    "no_fmv_at_grade": (
+        "The bid's grade doesn't have an FMV row yet. Run `/comic:fmv` at "
+        "this grade."
+    ),
+    "no_comic": (
+        "No comic linked. Run `POST /api/extract-comics` or re-run "
+        "`/comic:snipe-add` with `--locg-id` set."
+    ),
+    "partial": (
+        "Junction or `bids.fmv_id` is out of sync. Surface to user for "
+        "manual reconciliation."
+    ),
+    "no_bid": (
+        "Snipe never landed in the DB. Confirm `COMICS_SERVER_URL` was set "
+        "during `/comic:snipe-add` and the snipe is on Gixen."
+    ),
+    "fully_linked": "",
+}
+
+
+def _guidance_for(verdict: str, flag_reason: str | None = None) -> str:
+    """Return the one-line guidance string for a verdict.
+
+    `needs_manual` is templated (it embeds the row's `flag_reason`), so it's
+    built here rather than stored in `_VERDICT_GUIDANCE`. Every other verdict
+    `_verify_one` can emit — including `fully_linked`, which maps to `""` —
+    has a static entry in that dict; there is no verdict this function can
+    silently return `None` for.
+    """
+    if verdict == "needs_manual":
+        return (
+            f"This book is flagged `needs_manual` (reason: `{flag_reason}`) — "
+            "its comp pool can't be auto-priced. Hand-price it via grade-curve "
+            "interpolation or the CGC proxy (see `docs/conventions/fmv-math-spec.md` "
+            "§7/§7a), or skip. Do NOT re-run `/comic:fmv` — it will just re-flag it."
+        )
+    return _VERDICT_GUIDANCE[verdict]
 
 
 def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> dict:
@@ -614,7 +665,8 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
         (item_id,),
     ).fetchone()
     if bid is None:
-        return {**base, "verdict": "no_bid", "missing": ["bids row"]}
+        return {**base, "verdict": "no_bid", "missing": ["bids row"],
+                "guidance": _guidance_for("no_bid")}
 
     # All comics linked to this bid via the junction, plus optional grade filter.
     fmv_query = (
@@ -651,14 +703,16 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
             if comic_exists is None:
                 missing = ["comics row", "fmv row", "bid_fmvs junction"]
         return {**base, "verdict": "no_comic", "missing": missing,
-                "bid_fmv_id": bid["fmv_id"]}
+                "bid_fmv_id": bid["fmv_id"],
+                "guidance": _guidance_for("no_comic")}
 
     # We have a candidate comic. Did we match on grade?
     if grade is not None and match["grade"] != grade:
         return {**base, "verdict": "no_fmv_at_grade",
                 "missing": [f"fmv row at grade {grade}"],
                 "comic_id": match["comic_id"],
-                "bid_fmv_id": bid["fmv_id"]}
+                "bid_fmv_id": bid["fmv_id"],
+                "guidance": _guidance_for("no_fmv_at_grade")}
 
     # fmv exists at the right grade. Is it an intentionally-unpriceable book?
     # BUI-132: a needs_manual book (BUI-86) carries a structured flag_reason and
@@ -672,7 +726,8 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
                 "flag_reason": match["flag_reason"],
                 "comic_id": match["comic_id"],
                 "fmv_id": match["fmv_id"],
-                "bid_fmv_id": bid["fmv_id"]}
+                "bid_fmv_id": bid["fmv_id"],
+                "guidance": _guidance_for("needs_manual", match["flag_reason"])}
 
     # fmv exists at the right grade. Is it stubbed?
     if match["low"] is None or match["high"] is None:
@@ -685,7 +740,8 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
                 "missing": missing,
                 "comic_id": match["comic_id"],
                 "fmv_id": match["fmv_id"],
-                "bid_fmv_id": bid["fmv_id"]}
+                "bid_fmv_id": bid["fmv_id"],
+                "guidance": _guidance_for("fmv_stub")}
 
     # fmv populated. Check bids.fmv_id agrees with the matched fmv. The
     # junction row is implicit (the match came from bid_fmvs), but
@@ -708,12 +764,14 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
                 "missing": partial_missing,
                 "comic_id": match["comic_id"],
                 "fmv_id": match["fmv_id"],
-                "bid_fmv_id": bid["fmv_id"]}
+                "bid_fmv_id": bid["fmv_id"],
+                "guidance": _guidance_for("partial")}
 
     return {**base, "verdict": "fully_linked",
             "comic_id": match["comic_id"],
             "fmv_id": match["fmv_id"],
-            "bid_fmv_id": bid["fmv_id"]}
+            "bid_fmv_id": bid["fmv_id"],
+            "guidance": _guidance_for("fully_linked")}
 
 
 def _parse_current_bid(value: str | None) -> float | None:
