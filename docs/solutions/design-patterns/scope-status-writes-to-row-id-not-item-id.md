@@ -1,6 +1,7 @@
 ---
 title: "Scope status-transition writes to row id, not item_id, on tables where item_id isn't unique"
 date: 2026-07-17
+last_updated: 2026-07-22
 category: design-patterns
 module: "gixen-cli (server/main.py, server/db.py — bids table status writes: _run_ebay_fallback, _sync_gixen, update_bid_status)"
 problem_type: design_pattern
@@ -49,6 +50,8 @@ Point-fixing "the write that broke this time" has not closed the class; each tic
 **Anchor every status-transition write on row identity.** Carry the row's `id` through the processing loop and write `WHERE id = ?` — for `update_bid_status`, pass `only_id=row["id"]`. Never key a lifecycle transition on `item_id` alone; that implicitly assumes "one row per listing," which is false for this table *by design*.
 
 **Detection heuristic (for reviews and audits):** grep status-writing SQL for `WHERE item_id` (and `update_bid_status(...)` calls missing `only_id=`), and for each hit ask: *is this table actually unique per item_id?* For `bids` the answer is no, so every hit is a finding, not a style nit — this exact shape has three prior incidents.
+
+**Sibling instance on the collection store (BUI-500, 2026-07-22).** The same "an id you'd assume unique isn't" class also lives on the *collection* side, in a different package and operation: a `comics`-row remediation "keyed on `gixen_item_id`" (via `CollectionCache.apply`) is unsafe because a run/lot bought as ONE eBay purchase shares one `gixen_item_id` across every constituent issue — Godzilla: The Half-Century War #1/#2 + an `agent_win` "Full Run #1" all carried `168397474507` (1 id, 3 rows). A `mutate_fn` keyed on `gixen_item_id` silently hits all three. Remediation must key on a genuinely-unique field (`metron_id` there) **or assert exactly-one-match on a full-identity predicate** (`full_title` + `source` + the field being changed) before writing, aborting on any mismatch. Same lesson, different table: never key a mutation on an id whose uniqueness you have not proven.
 
 **Companion rule — permanent negative-result caches only on dead rows.** BUI-382's first draft stamped its `ebay_no_price_at` cache ("eBay confirmed no usable price") on live `PENDING`/`ENDED` rows too. Review rolled that back: a permanent stamp on a live row forecloses a genuine WON if eBay's price data simply hadn't settled at check time, violating the never-gate-the-WON-inference invariant (see the evidence-layer doc under Related). The shipped rule: the permanent stamp goes only on already-tombstoned (`REMOVED`/`PURGED`) rows — already known dead, already inside a bounded 7-day re-scan window — while live rows keep unbounded retry as documented accepted risk.
 
