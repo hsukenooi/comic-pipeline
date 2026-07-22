@@ -77,7 +77,12 @@ Labels each item comic-1, comic-2, ... in input order (matches the
 item:
 
     comic-1: FETCH FAILED — <error>
-    comic-1: <title> — <N> images — current bid $12.34 (3 bids)
+    comic-1: <title> — <N> images — current bid $12.34 (3 bids) — tier: cheap
+
+BUI-511: the trailing `tier: cheap|not-cheap` is this script's value-gate
+verdict (see VALUE_THRESHOLD below) — cheap when current_price is below the
+threshold or unknown, not-cheap when at/above it. grade.md's Step 2 reads
+this field directly rather than re-deriving the split from current_price.
 
 BUI-440: when --workdir is not given, each run gets its own fresh directory
 under /tmp/comic-grading (via tempfile.mkdtemp) instead of writing straight
@@ -136,6 +141,15 @@ _DOWNLOAD_TIMEOUT_SECONDS = 15
 # inlined in main()) so tests can monkeypatch it to a tmp_path instead of
 # touching the real /tmp.
 _DEFAULT_WORKDIR_ROOT = Path("/tmp/comic-grading")
+
+# BUI-511: this script is the single owner of the value-gate threshold.
+# grade.md's Step 2 used to re-derive the cheap/not-cheap split from prose
+# comparing `current_price` against a `VALUE_THRESHOLD` restated in the doc;
+# now main() prints the tier directly (see the per-comic line below) and
+# grade.md just reads it. cheap = current_price below this, OR unknown
+# (current_price is None); not-cheap = current_price at/above this. Keep this
+# in sync with grade.md's escalation value trigger if it ever changes.
+VALUE_THRESHOLD = 25.0
 
 
 class TokenExpiredError(RuntimeError):
@@ -400,7 +414,14 @@ def main(argv=None):
         consecutive_post_refresh_401s = 0
         price = result["current_price"]
         price_str = f"${price:.2f}" if price is not None else "n/a"
-        print(f"{label}: {result['title']} — {result['image_count']} images — current bid {price_str} ({result['bid_count']} bids)")
+        # BUI-511: cheap = below VALUE_THRESHOLD or unknown price; not-cheap =
+        # at/above it. Printed so grade.md's Step 2 value gate reads the tier
+        # directly instead of re-deriving the split from current_price itself.
+        tier = "cheap" if price is None or price < VALUE_THRESHOLD else "not-cheap"
+        print(
+            f"{label}: {result['title']} — {result['image_count']} images — "
+            f"current bid {price_str} ({result['bid_count']} bids) — tier: {tier}"
+        )
     return 0
 
 

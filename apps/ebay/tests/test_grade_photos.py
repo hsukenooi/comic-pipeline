@@ -368,7 +368,9 @@ class TestMainStdoutContract:
                     with patch("grade_photos._download_image"):
                         grade_photos.main(["123", "--workdir", str(tmp_path)])
         out = capsys.readouterr().out
-        assert out.strip() == "comic-1: Fantastic Four #52 — 1 images — current bid $5.00 (1 bids)"
+        assert out.strip() == (
+            "comic-1: Fantastic Four #52 — 1 images — current bid $5.00 (1 bids) — tier: cheap"
+        )
 
     def test_fetch_failed_line_format(self, tmp_path, capsys):
         """BUI-147: a fetch failure must print FETCH FAILED, never a
@@ -404,6 +406,59 @@ class TestMainStdoutContract:
                     with patch("grade_photos._download_image"):
                         grade_photos.main(["111", "222", "--workdir", str(tmp_path)])
         assert mock_get_token.call_count == 1
+
+
+# ============================================================
+# BUI-511: printed value tier — grade.md reads this instead of
+# re-deriving the cheap/not-cheap split from current_price itself
+# ============================================================
+
+
+class TestValueTier:
+    def _item_with_price(self, value):
+        return {
+            "title": "Fantastic Four #52",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "currentBidPrice": {"value": str(value)},
+            "bidCount": 1,
+        }
+
+    def _run(self, tmp_path, item, capsys):
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", return_value="fake-token"):
+                with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
+                    with patch("grade_photos._download_image"):
+                        grade_photos.main(["123", "--workdir", str(tmp_path)])
+        return capsys.readouterr().out.strip()
+
+    def test_price_below_threshold_is_cheap(self, tmp_path, capsys):
+        out = self._run(tmp_path, self._item_with_price("5.00"), capsys)
+        assert out.endswith("— tier: cheap")
+
+    def test_price_at_threshold_is_not_cheap(self, tmp_path, capsys):
+        """The gate is inclusive at the boundary: current_price >= VALUE_THRESHOLD
+        is not-cheap, matching grade.md's escalation trigger 1 ("at or above")."""
+        assert grade_photos.VALUE_THRESHOLD == 25.0
+        out = self._run(tmp_path, self._item_with_price("25.00"), capsys)
+        assert out.endswith("— tier: not-cheap")
+
+    def test_price_above_threshold_is_not_cheap(self, tmp_path, capsys):
+        out = self._run(tmp_path, self._item_with_price("42.50"), capsys)
+        assert out.endswith("— tier: not-cheap")
+
+    def test_unknown_price_is_cheap(self, tmp_path, capsys):
+        """No price field at all (current_price is None) counts as cheap,
+        same as a below-threshold price (BUI-165's "absent = below threshold"
+        rule, now expressed as the printed tier instead of doc prose)."""
+        item = {
+            "title": "Fantastic Four #52",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+        }
+        out = self._run(tmp_path, item, capsys)
+        assert "current bid n/a" in out
+        assert out.endswith("— tier: cheap")
 
 
 # ============================================================
