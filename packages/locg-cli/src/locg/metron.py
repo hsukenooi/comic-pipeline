@@ -58,6 +58,10 @@ REQUESTS_RESOLVE_SERIES = 1
 REQUESTS_ISSUE_IN_SERIES = 1
 REQUESTS_LOOKUP_ISSUE = REQUESTS_RESOLVE_SERIES + REQUESTS_ISSUE_IN_SERIES
 REQUESTS_LOOKUP_ISSUE_DETAIL = 1
+# BUI-501: `lookup_issue_by_id`'s one request (`session.issue(metron_id)`,
+# the SAME call `lookup_issue_detail` makes — see that method's request
+# count above this one).
+REQUESTS_LOOKUP_ISSUE_BY_ID = 1
 
 
 # BUI-485: Metron's ``series_list({"name": q})`` is a substring (icontains)
@@ -685,6 +689,57 @@ class MetronClient:
             if _is_connection_error(exc):
                 self.degraded = True
             logger.debug("Metron issue-detail lookup failed for id %s: %s", metron_id, exc)
+            return None
+
+    @_retry_once_on_rate_limit
+    def lookup_issue_by_id(self, metron_id: int) -> Optional[dict[str, Any]]:
+        """Fetch the book Metron actually has at a KNOWN metron_id (BUI-501).
+
+        The reverse direction from :meth:`lookup_issue`/:meth:`issue_in_series`
+        (series NAME + issue number -> id): given a ``metron_id`` already
+        stamped on a collection row, this asks Metron what that id actually
+        IS, so a caller can check whether the id agrees with the row's own
+        evidence (its ``release_date``) — the wrong-metron_id-on-correct-date
+        class BUI-500 uncovered, where a live, well-formed, but WRONG id can
+        pass every LOCAL, date-only predicate (BUI-493) undetected.
+
+        Deliberately separate from :meth:`lookup_issue_detail` (also an
+        id -> data fetch via the same ``session.issue(metron_id)`` call, but
+        scoped to variant/credit/publisher ENRICHMENT for an id already
+        trusted) — this one is scoped to the identity fields a trust
+        VERIFICATION predicate needs (cover date + series), not enrichment.
+
+        Returns ``{"metron_id", "cover_date", "series_id", "series_name"}`` —
+        ``cover_date`` is an ISO date string (or ``None`` if Metron has none),
+        mirroring :meth:`issue_in_series`'s shape — or ``None`` on any
+        failure (id not found, rate limit, network error, missing creds).
+        ``MetronCredentialError`` re-raises so a batch caller can disable
+        Metron for the rest of a run rather than retry per row.
+        """
+        try:
+            session = self._get_session()
+            issue = session.issue(metron_id)
+            cover = issue.cover_date.isoformat() if getattr(issue, "cover_date", None) else None
+            series = getattr(issue, "series", None)
+            return {
+                "metron_id": metron_id,
+                "cover_date": cover,
+                "series_id": getattr(series, "id", None),
+                "series_name": getattr(series, "name", None),
+            }
+        except MetronCredentialError:
+            raise
+        except RateLimitError:
+            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
+        except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None so the caller skips this row (BUI-501: fail-closed, no verdict from an uncertain call)
+            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
+            # for one capped retry + a ``degraded`` trip; a data-shape/404
+            # ApiError does NOT (it stays a silent None, same as before).
+            if _is_server_error(exc):
+                raise
+            if _is_connection_error(exc):
+                self.degraded = True
+            logger.debug("Metron issue-by-id lookup failed for id %s: %s", metron_id, exc)
             return None
 
     @staticmethod

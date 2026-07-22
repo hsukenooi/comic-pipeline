@@ -5195,6 +5195,164 @@ def _resolve_null_year_window(
     return series_year_range(resolved)
 
 
+# BUI-501: the wrong-metron_id-on-correct-date class a BUI-500 remediation
+# uncovered — a follow-up complementing (not replacing) BUI-493's
+# `cmd_collection_audit_unscoped_lookup` above.
+_METRON_MISMATCH_REMEDIATION_RULE = (
+    "Remediate a CONFIRMED flagged row via CollectionCache.apply, keyed on a "
+    "GENUINELY UNIQUE field with an exactly-one-match assertion. NEVER the "
+    "DELETE API (BUI-424: unsafe under alias/cross-volume ambiguity). NEVER "
+    "key on gixen_item_id (BUI-500: one item_id matched three rows — a "
+    "lot/run bought together shares an item_id across issues)."
+)
+
+
+def cmd_collection_audit_metron_mismatch(
+    cache: Optional[Any] = None,
+    metron: Optional[Any] = None,
+    series: Optional[str] = None,
+    limit: Optional[int] = None,
+    year_tolerance: int = 1,
+    requests_per_minute: float = METRON_REQUESTS_PER_MINUTE,
+) -> dict[str, Any]:
+    """Read-only audit: a row's stamped ``metron_id`` resolves (live, via
+    Metron) to a book whose cover year is far from the ROW'S OWN
+    ``release_date`` (BUI-501, a BUI-500 follow-up).
+
+    Complements :func:`cmd_collection_audit_unscoped_lookup` (BUI-493) rather
+    than replacing it. That audit's predicate is purely LOCAL and date-only:
+    it flags a row whose ``release_date`` year falls outside its resolved
+    series' publication window. It is therefore blind to the class BUI-500
+    uncovered — a row can carry a live, well-formed, but WRONG ``metron_id``
+    while its OWN ``release_date`` is perfectly correct and in-window
+    (Godzilla: The Half-Century War #1 — metron_id 52529 pointed at a
+    different book entirely, but the row's 2012-08-08 date was correct and
+    inside the series' 2012-2013 window, so BUI-493's local predicate never
+    fired on it). The only way to catch THIS class is to ask Metron what book
+    its ``metron_id`` actually names, and compare that book's own cover year
+    against the row's own date — hence the live lookup, and the separate,
+    heavier command (mind BUI-465 pacing, right below this one).
+
+    A row is ELIGIBLE only when it has both a ``metron_id`` and a parseable
+    ``release_date`` year; either missing means there's nothing local to
+    compare Metron's answer against, so the row is silently skipped — never
+    flagged (an audit that cannot judge stays silent, same philosophy as
+    :func:`_is_unscoped_lookup_mismatch`). A Metron miss, an unparseable
+    ``cover_date``, or a transient failure for an eligible row is likewise
+    skipped, never flagged (fail-closed: no verdict from an uncertain call).
+    A credential error or a degraded client (BUI-255/BUI-465 discipline)
+    latches ``metron_disabled`` and stops the sweep early rather than
+    hammering an unreachable/throttled Metron for every remaining row.
+
+    ``series`` (optional; matched via the same :func:`_normalize_series_key`
+    every owned-filter in this module uses) and ``limit`` (optional; caps the
+    number of ELIGIBLE rows actually sent to Metron, applied AFTER the series
+    filter — a negative limit is nonsense and is ignored rather than
+    silently emptying the run) bound a practical run: a full-collection live
+    sweep is slow, and this command never runs one on its own initiative.
+
+    One ``MetronClient`` (or the caller's test double) for the whole sweep,
+    paced at ``requests_per_minute`` (BUI-465) — id lookups are all-distinct,
+    so there is no BUI-473 per-series cache to reuse here the way
+    :func:`cmd_collection_record_win_era_evidence` (right below) does;
+    pacing is therefore a flat per-lookup sleep rather than that function's
+    cost-aware one.
+
+    READ-ONLY: only ever reads the store and calls Metron — never mutates the
+    collection store, never calls a remediation API. Remediation of a
+    CONFIRMED flagged row must go through ``CollectionCache.apply`` keyed on
+    a GENUINELY UNIQUE field with an exactly-one-match assertion — NEVER the
+    DELETE API (BUI-424: unsafe under alias/cross-volume ambiguity) and NEVER
+    keyed on ``gixen_item_id`` (BUI-500: one item_id matched THREE rows — a
+    lot/run bought together shares an item_id across issues). ``metron_id``
+    itself (globally unique per Metron book) is the field BUI-500 used, once
+    independently confirmed. This rule is also echoed in the returned
+    ``remediation_rule`` so a CLI caller sees it without reading this
+    docstring.
+
+    Returns ``{row_count, eligible_count, checked_count, flagged_count,
+    flagged_rows, remediation_rule}`` — each flagged row is ``{full_title,
+    series_name, metron_id, release_date, metron_cover_year, delta_years,
+    gixen_item_id}``.
+    """
+    store = cache if cache is not None else CollectionCache()
+    payload = store.load()
+    comics = payload.get("comics", [])
+    row_count = len(comics)
+
+    series_key = _normalize_series_key(series) if series else None
+
+    eligible: list[dict[str, Any]] = []
+    for row in comics:
+        if series_key is not None and _normalize_series_key(
+            str(row.get("series_name") or "")
+        ) != series_key:
+            continue
+        if not row.get("metron_id"):
+            continue
+        if _coerce_year(row.get("release_date")) is None:
+            continue
+        eligible.append(row)
+
+    eligible_count = len(eligible)
+    if limit is not None and limit >= 0:
+        eligible = eligible[:limit]
+
+    from locg.metron import MetronClient, MetronCredentialError
+
+    if metron is None:
+        metron = MetronClient()
+
+    seconds_per_request = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
+    metron_disabled = False
+    checked_count = 0
+    flagged_rows: list[dict[str, Any]] = []
+
+    for i, row in enumerate(eligible):
+        if metron_disabled:
+            break
+        if i and seconds_per_request:
+            time.sleep(seconds_per_request)
+
+        try:
+            detail = metron.lookup_issue_by_id(row["metron_id"])
+        except MetronCredentialError:
+            metron_disabled = True
+            break
+
+        checked_count += 1
+        metron_disabled = _check_metron_degraded(metron, metron_disabled)
+        if detail is None:
+            continue
+
+        metron_year = _coerce_year(detail.get("cover_date"))
+        if metron_year is None:
+            continue
+
+        row_year = _coerce_year(row.get("release_date"))
+        # row_year is not None here — eligibility (above) already verified it.
+        delta_years = abs(metron_year - row_year)
+        if delta_years > year_tolerance:
+            flagged_rows.append({
+                "full_title": row.get("full_title"),
+                "series_name": row.get("series_name"),
+                "metron_id": row.get("metron_id"),
+                "release_date": row.get("release_date"),
+                "metron_cover_year": metron_year,
+                "delta_years": delta_years,
+                "gixen_item_id": row.get("gixen_item_id"),
+            })
+
+    return {
+        "row_count": row_count,
+        "eligible_count": eligible_count,
+        "checked_count": checked_count,
+        "flagged_count": len(flagged_rows),
+        "flagged_rows": flagged_rows,
+        "remediation_rule": _METRON_MISMATCH_REMEDIATION_RULE,
+    }
+
+
 def cmd_collection_record_win_era_evidence(
     items: list[dict[str, Any]],
     cache: Optional[Any] = None,

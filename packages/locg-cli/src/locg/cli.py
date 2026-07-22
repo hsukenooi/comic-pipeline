@@ -21,6 +21,7 @@ from locg.commands import (
     cmd_cache_stats,
     cmd_check_lists,
     cmd_collection,
+    cmd_collection_audit_metron_mismatch,
     cmd_collection_audit_pending,
     cmd_collection_audit_unscoped_lookup,
     cmd_collection_backfill,
@@ -243,6 +244,46 @@ def create_parser() -> argparse.ArgumentParser:
             "`collection remediate-delete`/`remediate-set-copies` or a "
             "fresh record-win."
         ),
+    )
+
+    # collection audit-metron-mismatch — read-only, LIVE Metron cross-check
+    # for the wrong-metron_id-on-correct-date class BUI-493's local, date-only
+    # predicate can't see (BUI-501, a BUI-500 follow-up).
+    p_audit_metron = coll_sub.add_parser(
+        "audit-metron-mismatch",
+        parents=[common],
+        help=(
+            "Audit the collection store for rows whose metron_id resolves "
+            "(live, via Metron) to a book far from the row's own "
+            "release_date (read-only; complements audit-unscoped-lookup)"
+        ),
+        epilog=(
+            "For each row carrying a metron_id AND a parseable release_date, "
+            "fetches that metron_id's book from Metron and flags a delta "
+            "beyond --year-tolerance between the row's own release_date year "
+            "and Metron's cover year for that id — the wrong-metron_id-on-"
+            "correct-date class BUI-493's local-only predicate cannot see "
+            "(the date is in-window; only the id is wrong). A LIVE Metron "
+            "call per eligible row, so a full sweep is slow — use --series "
+            "and/or --limit for a practical run. Read-only — never mutates "
+            "the store. Remediate a CONFIRMED flagged row via "
+            "CollectionCache.apply keyed on a GENUINELY UNIQUE field with an "
+            "exactly-one-match assertion; NEVER the DELETE API (BUI-424); "
+            "NEVER key on gixen_item_id (BUI-500: one item_id matched three "
+            "rows)."
+        ),
+    )
+    p_audit_metron.add_argument(
+        "--series", help="Restrict the sweep to one series (normalized name match)"
+    )
+    p_audit_metron.add_argument(
+        "--limit", type=int, help="Cap the number of ELIGIBLE rows actually sent to Metron"
+    )
+    p_audit_metron.add_argument(
+        "--year-tolerance",
+        type=int,
+        default=1,
+        help="Flag only when the delta exceeds this many years (default: 1)",
     )
 
     # collection record-win — agent win recording
@@ -609,11 +650,13 @@ def main() -> None:
 
     # Collection subcommands that need no Playwright browser launch: the local
     # cache ones, plus `check-batch` (BUI-504) which talks to the comics server
-    # over HTTP (its own `requests` client), never Chrome.
+    # over HTTP (its own `requests` client), never Chrome, and
+    # `audit-metron-mismatch` (BUI-501) which talks to Metron (mokkari's own
+    # HTTP client), also never Chrome.
     _LOCAL_COLLECTION_SUBCMDS = {
         "import", "export", "status", "check", "check-batch", "doctor", "record-win",
-        "audit-pending", "audit-unscoped-lookup", "remediate-delete",
-        "remediate-set-copies", "backfill",
+        "audit-pending", "audit-unscoped-lookup", "audit-metron-mismatch",
+        "remediate-delete", "remediate-set-copies", "backfill",
     }
     _collection_sub = (
         getattr(args, "collection_command", None)
@@ -737,6 +780,12 @@ def main() -> None:
                 result = cmd_collection_audit_pending(args.csv_path)
             elif sub_cmd == "audit-unscoped-lookup":
                 result = cmd_collection_audit_unscoped_lookup()
+            elif sub_cmd == "audit-metron-mismatch":
+                result = cmd_collection_audit_metron_mismatch(
+                    series=getattr(args, "series", None),
+                    limit=getattr(args, "limit", None),
+                    year_tolerance=getattr(args, "year_tolerance", 1),
+                )
             elif sub_cmd == "record-win":
                 import json as _json
                 import sys as _sys

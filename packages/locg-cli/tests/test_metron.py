@@ -1342,6 +1342,69 @@ def test_lookup_issue_detail_publisher_null_on_miss_never_guesses():
 
 
 # ---------------------------------------------------------------------------
+# lookup_issue_by_id — id -> book identity, for the BUI-501 mismatch detector
+# ---------------------------------------------------------------------------
+
+def _mock_issue_series(id: int, name: str) -> MagicMock:
+    s = MagicMock()
+    s.id = id
+    s.name = name
+    return s
+
+
+def test_lookup_issue_by_id_returns_cover_date_and_series():
+    """The reverse of issue_in_series: given a KNOWN metron_id, fetch what
+    Metron actually has at that id (BUI-501's detector needs this to check a
+    row's stamped id against its own release_date)."""
+    from datetime import date
+
+    client = MetronClient()
+    session = MagicMock()
+    issue = MagicMock()
+    issue.cover_date = date(2022, 9, 14)
+    issue.series = _mock_issue_series(10, "Something Else (2022)")
+    session.issue.return_value = issue
+    client._session = session
+
+    result = client.lookup_issue_by_id(52529)
+    assert result == {
+        "metron_id": 52529,
+        "cover_date": "2022-09-14",
+        "series_id": 10,
+        "series_name": "Something Else (2022)",
+    }
+    session.issue.assert_called_once_with(52529)
+
+
+def test_lookup_issue_by_id_null_cover_date_never_guesses():
+    client = MetronClient()
+    session = MagicMock()
+    issue = MagicMock()
+    issue.cover_date = None
+    issue.series = _mock_issue_series(10, "Something Else (2022)")
+    session.issue.return_value = issue
+    client._session = session
+
+    assert client.lookup_issue_by_id(1)["cover_date"] is None
+
+
+def test_lookup_issue_by_id_swallows_exception():
+    client = MetronClient()
+    session = MagicMock()
+    session.issue.side_effect = ConnectionError("down")
+    client._session = session
+    assert client.lookup_issue_by_id(5) is None
+
+
+def test_lookup_issue_by_id_raises_credential_error(monkeypatch):
+    monkeypatch.delenv("METRON_USERNAME", raising=False)
+    monkeypatch.delenv("METRON_PASSWORD", raising=False)
+    client = MetronClient()
+    with pytest.raises(MetronCredentialError):
+        client.lookup_issue_by_id(5)
+
+
+# ---------------------------------------------------------------------------
 # Credits extraction + creator-run resolver (BUI-134)
 # ---------------------------------------------------------------------------
 
