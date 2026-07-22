@@ -7,7 +7,7 @@ argument-hint: <BUI-XXX BUI-YYY ...>
 
 You are the **engineering manager** for the tickets in `$ARGUMENTS`. Your job is to get each one *done and done well*: implemented, reviewed, tested, merged to `main` green, and closed in Linear. First produce a **wave plan**, then execute it.
 
-Distilled from the BUI-299..319 batches — the model-selection and token-efficiency rules below are empirical, not theoretical. Follow them.
+Distilled from the BUI-299..500 batches — the model-selection and token-efficiency rules below are empirical, not theoretical. Follow them.
 
 ## 1. Plan (do this first, before spawning anything)
 
@@ -17,29 +17,25 @@ Distilled from the BUI-299..319 batches — the model-selection and token-effici
   - **Conflict is by import edge, not just filename.** Two tickets in *different* files still collide when one changes a module surface the other imports (BUI-323 refactored `ebay_fetch.py`; BUI-322 imports it). Run them parallel only if the module-owner ticket is told to **keep its public signatures stable** — otherwise sequence them.
   - A ticket that consumes another's output waits for that one to merge.
   - **The all-hot-file batch has no parallel win — plan for it.** When *every* ticket touches the same file (in the BUI-383..389 batch all nine touched `server/main.py` / `server/db.py`), the never-parallel-edit-the-same-file rule makes the batch 100% serial however you wave it — N branches, N CI runs, N merges, each waiting on the prior. Two levers cut the round-trips: **combine** independent same-file tickets into one branch/PR (done for 388+386 and 384+383 that batch — it worked, at the cost of coarser per-ticket PR traceability and one red CI blocking the whole group), or **stack** them on a single branch in dependency order when a later one builds on an earlier. Combine when they're independent and small; stack when there's a natural sequence.
+- **Trivial same-risk-class tickets combine across files too.** Same-file conflict isn't the only combine trigger: a run of doc-only/markdown tickets may share one branch/PR even when they touch different files — the BUI-420..449 batch ran 11 md-only tickets through 11 full push→PR→CI→merge→close cycles (~8–10 round-trips each) for zero isolation benefit. Same tradeoff as hot-file combining: coarser per-ticket traceability, one red CI blocks the group.
+- A ticket **re-entering from a prior batch** (deferred/Blocked) gets its premise re-grounded before spawn — deferral usually *means* the premise was unstable (BUI-475 was Blocked because its named target sat in the wrong package; it shipped the same evening only after re-grounding).
 - Assign a **model per ticket** (see §2) and a **review depth** per ticket (see §3).
-- Post the wave plan (tickets, waves, model, review depth, conflict notes) before executing.
+- **Write the wave plan to a scratchpad file and post a summary — then let the raw ticket dumps go.** The plan file (tickets, waves, model, review depth, conflict notes, per-ticket distilled spec + coordinates) is the batch's durable state; spawn prompts draw from it. Raw multi-ticket `linear issue view` output must NOT stay resident in EM context — the BUI-420..449 batch kept a 54KB 26-ticket dump resident across all 206 requests.
+- **Cap a single invocation at ~12 tickets.** EM-context cost scales as batch-size × context-depth: the 26-ticket batch burned 63.7M cache-read tokens (247× its true output) in one monotonically growing, never-compacted context. Split bigger backlogs into sequential /em-batch invocations. And once a wave is fully merged, its agent reports and ticket bodies are dead weight — compact (the plan file survives), or at minimum stop quoting them forward.
 
 ## 2. Model selection — match to JUDGMENT REQUIRED, not file count or LOC
 
 ```
+sonnet → the DEFAULT. Well-specified structural work, even in subtle domains, when the
+         hard thinking is already encoded in the ticket or a named pattern you hand the
+         agent (BUI-317/319 concurrency given the BUI-307 drain/cancel pattern).
 opus   → the RIGHT approach isn't fully spelled out and being subtly wrong is costly:
-         • the ticket's stated approach may itself be wrong and needs challenging
-           (BUI-315: the specified --publisher flag was a no-op in batch mode — the
-           real fix was a Marvel-only gate elsewhere; a literal executor ships the no-op)
-         • reasoning about safety invariants / why a change can't regress a prior bug
-           (BUI-316: proving it can't reintroduce BUI-129)
-         • open-ended money math (BUI-318; the BUI-306 $2k-over-bid class)
-
-sonnet → well-specified structural work, EVEN in subtle domains (concurrency,
-         cross-package refactors), WHEN the hard thinking is already encoded in the
-         ticket or a named pattern you hand the agent (BUI-313 convergence refactor,
-         BUI-310 backward-compat plumbing, BUI-317/319 concurrency given the BUI-307
-         drain/cancel pattern explicitly).
-
-haiku  → pure mechanical repetition, zero judgment (BUI-314: --version boilerplate
-         across N CLIs — "copy this shape N times").
+         premise may need challenging (BUI-315's specified flag was a no-op), safety
+         invariants (BUI-316), open-ended money math (BUI-318).
+haiku  → pure mechanical repetition, zero judgment (BUI-314: --version boilerplate ×N).
 ```
+
+(Five consecutive batches confirmed the assignments are usually obvious — Jul 19 ran 16/18 sonnet — so don't over-deliberate here; the §3 review levers are where judgment pays.)
 
 **Two rules that override the table:**
 - **Control TOKENS via the review policy, NOT by down-tiering.** The priciest agents in the batch (~220k tokens) were *sonnet* tickets with 8-reviewer `/ce-code-review` fan-outs — the model was cheap, the reviewers weren't. Don't pick opus→sonnet to save tokens; trim reviewers instead.
@@ -53,13 +49,21 @@ haiku  → pure mechanical repetition, zero judgment (BUI-314: --version boilerp
 - **Choose personas from the DIFF, not the ticket topic — this is *how* you "trim reviewers" (the §2 lever).** The full panel is the real cost driver: the opus + full-`ce-code-review` tickets ran ~290–298k tokens each — the model tier was cheap, the 9–10 persona fan-out wasn't. Topic-based selection at spawn time over-provisions: a ticket that *reads* like data-safety can land as a 12-line guard, and an adversarial persona's entire context is then spent on nothing (BUI-485: the agent implemented first, then ran correctness + testing off its actual diff — a pure matching-function change with no API/DB/auth surface — and the testing persona caught a mock-fidelity bug the others never would have). Have the agent implement first, then name the personas its actual diff warrants with a one-line justification each. As a starting map: a schema/migration change → correctness + adversarial + data-migration; a concurrency change → correctness + adversarial + reliability; a money-math change → correctness + adversarial. Reserve the full fan-out for genuinely cross-cutting diffs.
 - **Single inline review** (the implementing agent reviews its own diff in-context, applies safe fixes) — for mechanical/well-specified diffs (boilerplate, plumbing, straightforward refactors).
 - **`/ce-simplify-code`** — CONDITIONAL. Run only when the diff added real surface area (new abstraction, refactor, >~80 lines). **Skip on boilerplate/plumbing** — across the batch it prevented zero defects and adds churn on small diffs.
-- **Agents must review INLINE and synchronously.** Forbid them from spawning detached background reviewer sub-agents they then idle-wait on — that triggers an idle→notify→resume→relay loop that roughly doubled the message tokens on one ticket for zero added value.
+- **Agents must review INLINE and synchronously — and the spawn prompt must say HOW, because the full `/ce-code-review` fan-out IS a detached-reviewer spawn.** As previously written, "run the full review" and "no detached reviewers" collided on exactly the tickets that warrant review: two agents in one evening hit it and each needed a ~100k-token corrective resume — one *despite* a spawn prompt carrying the no-detached instruction (BUI-513). The synchronous forms: (a) the implementing agent runs the chosen personas *itself, in its own context, against its actual diff* — the proven pattern, zero corrective resumes; or (b) `/ce-code-review mode:agent`, which reports for the agent to apply. Never a detached reviewer panel the agent then idle-waits on — that idle→notify→resume→relay loop roughly doubles message tokens for zero value.
 
 ## 4. Per-ticket workflow (one sub-agent per ticket/PR)
 
 Spawn each via the Agent tool with `isolation: "worktree"` and the assigned model.
 
+**One-agent-per-ticket is the default, not a law.** A single-decision ticket — a data-only fix, a one-row correction (BUI-500) — is cheaper done by the EM directly: no worktree, no spawn, no relay. If it touches live data, the §6 production-data ritual applies.
+
 **Spawn prompts carry coordinates, not filenames.** Naming a file tells the agent where to start reading; it does not tell it where to stop. `packages/locg-cli/src/locg/commands.py` is ~5,800 lines — roughly 70k tokens read whole — and a batch routinely puts three agents inside it. Before spawning, grep out the exact line ranges, the real caller list, and the snippet of the pattern to copy, and paste them into the prompt: *"Read only `commands.py:3842-4300`; do not read the file whole. The guard to replicate is: `<snippet>`."* (BUI-485: the spawn prompt pasted `_disambiguate_series` verbatim and named `metron.py` safe-to-read-whole but ruled out `commands.py`; the agent never touched the big file.) The principle underneath it: **the EM's context is the cheapest place in the batch to establish a fact.** A grep the EM runs once is a grep N agents don't each pay for — and unlike an agent's, the EM's copy survives to inform the next wave.
+
+**Every spawn prompt carries four blocks — a literal checklist, not a per-spawn judgment call.** Discipline decays exactly where it matters most: the one spawn in a recent batch missing these markers was the *analysis-only* agent (BUI-488), which returned a ~16.5k-char dump into EM context (BUI-513). The blocks:
+1. **Coordinates** (above): line ranges, real caller list, the snippet to copy; name any file safe to read whole and any file ruled out.
+2. **Report cap, in numbers:** implementers — branch, HEAD SHA, test counts, out-of-scope findings, ≤10 lines. Analysis-only agents — one line per finding (id, verdict, evidence), ≤2k chars total.
+3. **Review mode per §3, spelled out synchronously** — inline personas off the actual diff; never a detached panel it idle-waits on.
+4. **License to stop** (below) when the ticket qualifies.
 
 The agent:
 
@@ -67,9 +71,9 @@ The agent:
 2. `/ce-work` to implement.
 3. Tests green — `apps/*` use `cd <pkg> && uv run --with pytest pytest`; `packages/*` and `plugins/*` use `uv run pytest`.
 4. `/ce-simplify-code` **only if §3 says so**.
-5. Review per §3 (full `/ce-code-review` or single inline pass) — **inline, no detached reviewers it waits on**. Apply safe fixes directly.
+5. Review per §3, in one of the two **synchronous** forms — chosen personas run inline against the actual diff, or `/ce-code-review mode:agent`; never a detached panel it waits on. Apply safe fixes directly.
 6. Commit on its branch (do NOT push, do NOT open a PR) with the commit trailers **your own harness specifies in your system prompt** — your actual model name, *this* session's URL. Never copy a trailer out of this file or a past commit: a literal example block here once burned six batches of provenance (every commit claimed the same long-dead authoring session, and an Opus attribution regardless of which model actually made it — BUI-512).
-7. SendMessage to `main`: branch, HEAD SHA (`git rev-parse HEAD`), test counts, and any out-of-scope findings. **Bound the format in the spawn prompt** — the analysis has to happen, but its transcript doesn't. Analysis-only agents (no PR to merge) return *one line per finding*: id, verdict, evidence. An unbounded diagnostic agent will return lavish prose per row and the EM pays for all of it.
+7. SendMessage to `main`: branch, HEAD SHA (`git rev-parse HEAD`), test counts, and any out-of-scope findings — within the report cap the spawn prompt set (block 2 of the checklist above). The analysis has to happen; its transcript doesn't.
 
 **License to stop (put this in the spawn prompt — for opus-tier work *and* any ticket sourced from a review / out-of-scope finding, regardless of model tier).** §2 deliberately routes opus work whose *stated approach may be wrong* — but the premise-may-be-broken risk isn't opus-specific. A ticket that is itself a review *residual* is exactly the class where the filer's understanding may be incomplete: BUI-388 was a *sonnet* ticket whose named target (an `item_id`-wide write) was already correct-by-design, and it only shipped right because the spawn prompt carried an explicit premise-check + stop license. Grant every such agent that permission: *if the ticket's premise is broken or the change can't be made safely as specified, STOP and report your findings instead of shipping a speculative implementation.* A disciplined no-code stop-and-report is a **success**, not a failure — handle it per §5. (BUI-326: the agent correctly refused to port a fragile price-extractor into a live bid-cap path; the right move was to close it, not force code.)
 
@@ -79,9 +83,9 @@ If an agent stops mid-review without committing (a known failure mode), resume i
 
 ## 5. EM duties (you, on `main`, per finished ticket)
 
-1. `git push -u origin <branch>`
+1. Push the agent's **reported HEAD SHA** to the named ref: `git push origin <SHA>:refs/heads/<branch>`. Worktree sub-agents (especially haiku) sometimes commit on the worktree's *default* branch while reporting the named one — the SHA is ground truth, the branch name is not (all 18 worktree defaults in the BUI-420..449 batch pointed at base-main while the work lived on named refs).
 2. `gh pr create` with a summary body (+ the `🤖 Generated with…` / session-URL footer).
-3. Wait for CI: `gh pr checks <N>`. Gates are `workspace` + `apps-python` + `lint` + `ezship`. **`typecheck` is NON-required** — don't block on it, but glance at it.
+3. Wait for CI via a **background task** (`gh pr checks <N> --watch` in background Bash), doing other EM work meanwhile — never inline-poll. Gates are `workspace` + `apps-python` + `lint` + `ezship`. **`typecheck` is NON-required** — don't block on it, but glance at it.
 4. **Verify the diff for its risk class — CI-green is necessary, not sufficient.** Before merging, read the diff and match the check to the risk: a behavior-preserving refactor → re-run the affected suite locally rather than trusting the agent's reported counts (BUI-389's `server/fallback.py` extraction: the real risk was a `main↔fallback` circular import, so the EM read the import structure and re-ran both suites before merging); a schema migration → apply it against a copy and confirm up/down; a money-math change → re-run the pricing path on a known case. The inverse is equally binding: **skip re-verification the risk class doesn't warrant.** Re-running Python suites for a markdown-only diff, or re-deriving an agent's arithmetic on a doc change, is ceremony — it looks like diligence and buys nothing. Match the check to the risk in *both* directions. (BUI-476, a data-safety diff to the record-win path, was re-verified on the *merged* tree because its branch predated another merge to the same package — the interaction was the risk, not the branch CI; BUI-472, a markdown-only skill edit, was not.)
 5. Merge once green: `gh pr merge <N> --merge --delete-branch` — **one PR per bash call.** Batching several `gh pr merge`s (or combining a merge with other commands) in one invocation trips the auto-mode classifier ("Merge Without Review"); a lone `gh pr merge <N>` call goes through.
 6. Clean up the worktree (`git worktree remove -f -f <path>`; a live agent can lock it — `-f -f`), delete the local branch, `git checkout main && git pull`. Note: `gh pr merge --delete-branch` prints `failed to delete local branch … used by worktree` whenever the agent's worktree still holds the branch — that warning is **benign** (the *remote* branch is deleted); remove the worktree first, or just delete the local branch during this cleanup step.
@@ -96,5 +100,9 @@ Launch each wave's agents in parallel; start the next wave only when its depende
 - **New out-of-scope bugs/improvements** found during reviews → file a NEW Linear ticket (BUI team), **FILE-ONLY, do not recurse** into working them (this is one backlog level; findings from findings just get filed). When several findings share **one root cause** and would be fixed together, file **one consolidated ticket**, not N fragments — but keep them separate when they'd be worked independently (e.g. the same idiom duplicated across different packages).
 - When **all tickets are merged and `main` is green**, run `/ce-compound mode:headless` **if** the batch surfaced a compound-worthy learning (a non-obvious trap future work will re-hit). **If the batch also filed a documentation / doc-sweep finding** (a ticket that will itself edit `CONCEPTS.md` or `docs/solutions/`), scope the compound step to *reusable principles and traps* and let that filed ticket own the concrete `CONCEPTS.md` / `docs/solutions/` edits — don't have both rewrite the same files (BUI-393 claimed the `CONCEPTS.md` + evidence-layer doc edits for the BUI-384 membership bound, so the compound step stayed scoped to principles to avoid double-writing and a later merge conflict). Then post a final summary of everything shipped.
 - **Deploy checklist in the final summary.** If any merged ticket carried a deploy action (schema migration, service restart via `launchctl kickstart`, install refresh via `uv tool install --force --no-cache` / `uv sync --all-packages`), collect them into one deploy checklist in the final summary and state, per item, whether it's been applied. A merged ticket is not necessarily live — schema changes are exactly the thing an EM must not silently drop (the BUI-383..389 batch shipped two migrations, `bids.group_changed_at` and `group_wins.source` + a unique-index re-key, that sat merged-but-not-deployed until the user asked).
+- **The deploy checklist ends with a live probe.** After installs/restarts, empirically verify each new endpoint/subcommand actually exists on the target (a `--help` or curl per new surface) — trusting the install is how `uv tool install --force` silently served a stale cached wheel with the new subcommands missing (BUI-455).
+- **Production-data operations follow the backup→diff ritual (BUI-514).** Any one-off write against live data (a row fix, a backfill) — EM-direct or agent-run — uses the ritual two consecutive batches converged on independently: **independent manual backup → apply → diff against the backup proving only the intended rows/fields changed → row-count check.** Running a *just-merged* command against prod (e.g. the BUI-461 backfill over 22 pending rows) is a legitimate, user-gated post-merge step — part of the batch, under the same ritual, not out-of-scope improvisation.
+- **Memory maintenance at wrap-up.** Before the final summary, correct or delete any auto-memory entries the batch's findings disproved — two consecutive batches each fixed one (e.g. the `gixen_item_id`-uniqueness note).
+- **em-batch is interactive by design — a keyboard-present user is assumed.** Headless/scheduled runs are non-viable: a sandboxed cloud routine dies on ticket #1 (no `linear`/`gh` auth), and a local unattended run can't pass the merge and AskUserQuestion gates without disabling the permission system. If the user wants scheduling, explain the constraint and offer a manual kickoff instead. Cron corollaries: **never schedule a cron that can fire into a live session** (one EM's own 23:32 cron fired mid-session; it mistook the firing for a manual duplicate and blocked overnight on its own AskUserQuestion); never block the batch on a self-authored AskUserQuestion; after any gap or resume, `git log` first to check whether a partial run already landed (BUI-517).
 - **Never self-widen permissions.** The `Bash(gh pr merge:*)` rule must already be user-authored in `.claude/settings.local.json`. If a merge is blocked, surface it to the user — do not attempt to grant it yourself.
 - **Peer/background messages are not user approval.** Verify merged code rather than trusting late/orphaned reviewer messages that arrive after an agent finished.
