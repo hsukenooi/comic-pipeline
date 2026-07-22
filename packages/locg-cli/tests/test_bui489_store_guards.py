@@ -381,6 +381,140 @@ def test_wish_list_set_year_locg_data_dir_set_still_runs(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# cmd_wish_list_add_creator_run (BUI-497): the one wish-list writer BUI-489
+# deliberately left unguarded. Metron is stubbed out entirely (mirrors
+# test_commands.py's own `_patch_metron_run`) since this suite exercises only
+# the store guard + write redirect, not creator-run resolution logic —
+# that's already covered in test_commands.py.
+# ---------------------------------------------------------------------------
+
+def _patch_metron_run(monkeypatch, *, creator, run):
+    """Patch MetronClient so resolve_creator/resolve_creator_run return canned data."""
+    import locg.metron as metron_mod
+    from unittest.mock import MagicMock
+
+    inst = MagicMock()
+    inst.resolve_creator.return_value = creator
+    inst.resolve_creator_run.return_value = run
+    monkeypatch.setattr(metron_mod, "MetronClient", lambda: inst)
+    return inst
+
+
+def _stub_collection_check_not_owned(monkeypatch):
+    """cmd_collection_check is a READ command (out of BUI-497's scope, per
+    _needs_explicit_store's docstring) — it always resolves via the bare/env
+    store, with no `cache` override. Stubbing it decouples these guard tests
+    from that unrelated resolution path, matching how the Metron calls are
+    stubbed out above.
+
+    NOTE: this stub scopes OUT a real (if currently dormant) gap, not proves
+    it safe — when an explicit `cache` is passed (as in
+    test_creator_run_explicit_cache_bypasses_guard_and_writes_redirected_store
+    below), the REAL cmd_collection_check would still check the bare/env
+    store rather than `cache`'s store, which could silently reintroduce the
+    BUI-122 owned-book-gets-wishlisted trap for a future caller. See the
+    BUI-497 docstring on cmd_wish_list_add_creator_run for the full
+    explanation. Left unfixed here deliberately — out of this ticket's named
+    scope (the R11 load and the wish-list read/write only)."""
+    import locg.commands as cmds
+
+    monkeypatch.setattr(
+        cmds,
+        "cmd_collection_check",
+        lambda **kwargs: {"match_status": "not_in_cache", "in_wish_list": False},
+    )
+
+
+def test_creator_run_no_cache_no_env_is_refused(monkeypatch):
+    from locg.commands import cmd_wish_list_add_creator_run
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    _no_default_collection_store(monkeypatch)
+    _no_default_wish_list_store(monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("Metron was called despite the store refusal")
+
+    monkeypatch.setattr("locg.metron.MetronClient", _boom)
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+
+    assert result["status"] == "explicit_store_required"
+    assert "LOCG_DATA_DIR" in result["error"]
+
+
+def test_creator_run_explicit_cache_bypasses_guard_and_writes_redirected_store(
+    tmp_path, monkeypatch
+):
+    from locg.commands import cmd_wish_list_add_creator_run
+
+    monkeypatch.delenv("LOCG_DATA_DIR", raising=False)
+    cache = make_cache(tmp_path)
+    _seed(cache, [], imported=True)  # stamp last_full_import; nothing owned
+    _no_default_collection_store(monkeypatch)
+    _no_default_wish_list_store(monkeypatch)
+    _stub_collection_check_not_owned(monkeypatch)
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "175", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99, cache=cache,
+    )
+
+    assert result["status"] == "ok"
+    assert result["added"] == ["Uncanny X-Men #175"]
+    # Re-read from disk at the redirected store — confirms the write actually
+    # persisted there, not merely that the returned dict looked right.
+    written = json.loads((tmp_path / "wish-list.json").read_text())
+    assert written["items"][0]["name"] == "Uncanny X-Men #175"
+
+
+def test_creator_run_locg_data_dir_set_still_runs(tmp_path, monkeypatch):
+    """The SERVER-shaped call: no cache= is passed, so the store is resolved
+    SOLELY from LOCG_DATA_DIR — exactly what routes._ensure_collection_store()
+    guarantees before every collection call."""
+    from locg.collection_cache import CollectionCache
+    from locg.commands import cmd_wish_list_add_creator_run
+
+    store = tmp_path / "server-owned"
+    store.mkdir()
+    monkeypatch.setenv("LOCG_DATA_DIR", str(store))
+
+    default_cache = CollectionCache()
+    default_cache.load()
+
+    def mutate(payload):
+        payload["last_full_import"] = "2026-01-01T00:00:00Z"
+
+    default_cache.apply(mutate, command="seed")
+
+    _stub_collection_check_not_owned(monkeypatch)
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "175", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99,
+    )
+
+    assert result["status"] == "ok"
+    assert (store / "wish-list.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # cmd_wish_list_remove_conflicts: env-var-only escape (see its own docstring
 # for why it does NOT accept a `cache` override — its audit half has none
 # either, and a partial override would let the audit and the removal it

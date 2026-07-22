@@ -863,6 +863,7 @@ def cmd_wish_list_add_creator_run(
     series_id: int,
     role: str = "penciller",
     year: Optional[str] = None,
+    cache: Optional[CollectionCache] = None,
 ) -> dict[str, Any]:
     """Resolve a creator's run on a series from Metron and wish-list the gaps (BUI-134).
 
@@ -887,6 +888,31 @@ def cmd_wish_list_add_creator_run(
     LOCG-searchable form). ``series_id`` is the Metron series id (resolved by the
     caller / skill). Returns added / skipped breakdowns plus any low-confidence
     warnings for issues Metron had no credits for.
+
+    BUI-497: refuses with ``{"status": "explicit_store_required"}`` when no
+    ``cache`` is passed and ``LOCG_DATA_DIR`` is unset/unexpanded — see
+    :func:`_needs_explicit_store`. Same wrong-store trap as the other wish-list
+    writers (BUI-489): run bare on the Mac Mini, the store falls back to the
+    repo's local ``data/locg`` instead of the server-owned
+    ``$HOME/.comics-server/collection-store``. The refusal is returned BEFORE
+    any Metron traffic (mirroring ``cmd_collection_record_win``'s BUI-476
+    guard) — this run can fan out to dozens of Metron calls, so a wrong-store
+    refusal must not wait until after all of them complete. When ``cache`` IS
+    passed, it redirects BOTH the R11 collection-imported check and the
+    wish-list dedup-read/write to the SAME store (via
+    :func:`_resolve_wish_list_path`), so those always agree on which store
+    they mean. It does NOT redirect the per-issue owned-filter
+    (:func:`cmd_collection_check`, called once per candidate issue below) —
+    that function has no ``cache`` override and stays on the bare/env-resolved
+    store, same as every other read command (see :func:`_needs_explicit_store`'s
+    docstring). This is harmless for the one caller that exists today
+    (``cli.py`` never passes ``cache``, so every read/write in this function
+    resolves the same ambient store) but is a real, currently-dormant gap for
+    a FUTURE caller that passes an explicit ``cache``: the owned-filter could
+    then silently check a different collection than R11/the write agreed on,
+    which is exactly the BUI-122 failure mode this guard exists to prevent.
+    Out of scope for BUI-497 (which named only the R11 load and the wish-list
+    read/write as the spots to fix) — flagged here, not fixed.
     """
     from locg.metron import MetronClient
 
@@ -898,6 +924,18 @@ def cmd_wish_list_add_creator_run(
     if not creator:
         return {"error": "wish-list add: --creator must be non-empty"}
 
+    # BUI-497: refuse before spending a single Metron call or touching a store
+    # the caller never named — same rationale as record-win's BUI-476 guard.
+    # This must come before the R11 load just below: that load itself reads a
+    # store, and on a wrong-store box it would read (and pass) R11 against a
+    # DIFFERENT collection than the one the eventual write would target.
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error(
+            "locg wish-list add <series> --creator <name> --series-id <id>"
+        )
+
+    wish_list_path = _resolve_wish_list_path(cache)
+
     # R11 guard (BUI-122 footgun): the owned filter below treats a `not_in_cache`
     # verdict as "not owned → safe to wish-list". On an uninitialized collection
     # cache (`last_full_import` null), `cmd_collection_check` answers `not_in_cache`
@@ -907,8 +945,11 @@ def cmd_wish_list_add_creator_run(
     # store is uninitialized (the gixen server is the source of truth), so this is
     # the common case there. Refuse the write rather than silently mis-filter,
     # mirroring the server endpoint's 409 never-imported guard
-    # (routes.py /api/comics/collection/check, R11).
-    coll_payload = CollectionCache().load()
+    # (routes.py /api/comics/collection/check, R11). Uses the SAME `cache` the
+    # write will target (BUI-497) — reading the default store here while
+    # writing a redirected one would let R11 pass or fail against the wrong
+    # collection entirely.
+    coll_payload = (cache or CollectionCache()).load()
     if coll_payload.get("last_full_import") is None:
         return {
             "error": (
@@ -955,9 +996,12 @@ def cmd_wish_list_add_creator_run(
     # OR corrupt cache degrades to an empty list (BUI-313: same tolerance the
     # overlay's wish-list reads apply — a bad cache shouldn't crash the run, and
     # dedup against "nothing" is safe; the owned-guard is the real safety net).
+    # BUI-497: reads via `wish_list_path` (the SAME redirected path the write
+    # below targets), not the unguarded default — otherwise a redirected write
+    # could dedup against a completely different store's contents.
     try:
-        existing = cmd_wish_list_from_cache()
-    except (FileNotFoundError, json.JSONDecodeError):
+        existing = _read_wish_list_cache_items(wish_list_path)
+    except json.JSONDecodeError:
         existing = []
 
     to_add: list[dict[str, Any]] = []
@@ -1014,8 +1058,10 @@ def cmd_wish_list_add_creator_run(
         # `cmd_wish_list_add` uses, so per-issue added/skipped accounting
         # matches the serial path exactly. The atomic tempfile+os.replace
         # write happens exactly once, at the end, via `_write_wish_list_cache`
-        # — never a partial/torn file, and never once per issue.
-        write_items = _read_wish_list_cache_items()
+        # — never a partial/torn file, and never once per issue. BUI-497:
+        # reads/writes `wish_list_path` (the same redirected store the guard
+        # above resolved), not the unguarded default.
+        write_items = _read_wish_list_cache_items(wish_list_path)
 
         for item in to_add:
             result = _wish_list_add_to_items(
@@ -1033,7 +1079,7 @@ def cmd_wish_list_add_creator_run(
                 added.append(item["title"])
 
         if added:
-            _write_wish_list_cache(write_items)
+            _write_wish_list_cache(write_items, wish_list_path)
 
     return {
         "status": "ok" if not errors else "partial",
@@ -2311,14 +2357,21 @@ def _needs_explicit_store(cache: Optional[Any]) -> bool:
     "Usable" means non-blank AND actually expanded — see
     :func:`_unexpanded_store_path`.
 
-    **Scope (BUI-476 + BUI-489):** every collection/wish-list MUTATOR now
-    consults this — ``import``, ``record-win``, ``backfill``,
+    **Scope (BUI-476 + BUI-489 + BUI-497):** every collection/wish-list
+    MUTATOR now consults this — ``import``, ``record-win``, ``backfill``,
     ``remediate-delete``, ``remediate-set-copies``, and the wish-list writers
-    ``wish-list add``/``remove``/``set-year`` (the wish-list writers pass
-    ``cache`` straight through to this same check even though they resolve
-    their OWN path via :func:`_resolve_wish_list_path`, not a
-    ``CollectionCache`` — ``LOCG_DATA_DIR`` governs the whole store
+    ``wish-list add``/``remove``/``set-year``/``add --creator`` (the
+    wish-list writers pass ``cache`` straight through to this same check even
+    though they resolve their OWN path via :func:`_resolve_wish_list_path`,
+    not a ``CollectionCache`` — ``LOCG_DATA_DIR`` governs the whole store
     directory, collection AND wish-list alike, so one check covers both).
+    ``cmd_wish_list_add_creator_run`` (BUI-497) additionally threads the same
+    ``cache`` into its R11 never-imported check, so that read and the write
+    it gates always agree on which store they mean. It does NOT thread
+    ``cache`` into that function's separate per-issue owned-filter
+    (``cmd_collection_check``, a read command with no ``cache`` override at
+    all) — see that function's own docstring for the dormant-but-real gap
+    this leaves for a future caller that passes an explicit ``cache``.
     ``cmd_wish_list_remove_conflicts`` also consults this (called with
     ``cache=None`` always — see its own docstring for why it does not accept
     a ``cache`` override: its audit half has none either, and a partial
@@ -2330,11 +2383,6 @@ def _needs_explicit_store(cache: Optional[Any]) -> bool:
     instead gets its OWN, narrower not-imported signal (BUI-489, see
     :func:`cmd_collection_export`) for the read-appropriate version of this
     problem: a silently empty result rather than a refused write.
-
-    ``cmd_wish_list_add_creator_run`` is the one remaining mutator that does
-    NOT consult this (out of BUI-489's scope — flagged, not fixed). Do not
-    read the absence of a name from this docstring as a judgement that it is
-    safe.
     """
     if cache is not None:
         return False
