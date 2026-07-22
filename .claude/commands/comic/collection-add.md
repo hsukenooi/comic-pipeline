@@ -87,16 +87,19 @@ failure or other unexpected status is a hard stop (BUI-352).
 > future `/comic:buy` integration): skip this step and hand-build
 > `{"wins": [...]}` yourself in the shape above.
 
-## Step 2: Resolve `needs_review` entries (BUI-354, BUI-422)
+## Step 2: Resolve `needs_review` entries (BUI-354, BUI-422, BUI-475)
 
 `needs_review` is the **only** gate. An entry lands here when
 `comic-identify` returned a null `series`/`issue`, an `"error"`, a lot with
-empty/unparseable `constituent_issues`, **or** a null `year` on a win priced
-at/above $25 (`REASON_MISSING_YEAR`, BUI-422 — vintage no-year titles are
-disproportionately prone to a downstream volume mis-resolution). There is
-deliberately no confidence threshold — `comic-identify`'s baseline confidence
-(0.5) would fire on nearly every real title (BUI-354; rationale doc has the
-full story of both).
+empty/unparseable `constituent_issues`, **or** a null `year` — unconditionally,
+regardless of price (`REASON_MISSING_YEAR`, BUI-422/BUI-475 — a win's era
+can't be confirmed without a year, and vintage no-year titles are
+disproportionately prone to a downstream volume mis-resolution; BUI-422's
+original `$25` price threshold was removed in BUI-475 after the server-side
+auto-resolve it was meant to lean on was shown to fail open — see the
+rationale doc). There is deliberately no confidence threshold —
+`comic-identify`'s baseline confidence (0.5) would fire on nearly every real
+title (BUI-354; rationale doc has the full story of both).
 
 Resolve the same scratch dir Step 1 used:
 
@@ -364,6 +367,6 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Assuming `$COMICS_SERVER_URL` (or the scratch dir) carries over between Steps | Re-source `scripts/comics-server.sh` and call `comics_resolve_server`/`comics_scratch_dir` in every block that needs them (BUI-352, BUI-430) |
 | Re-deriving the ENDED+WON filter / dedup / seen-subtract / positional-identify-mapping by hand | Use `gixen record-win-prep` (BUI-353) — it owns that join in one tested place |
 | Asking the user "if confidence is low" | Not a real gate — baseline confidence is 0.5 for every clean parse; `needs_review` (Step 2) is the only gate (BUI-354) |
-| Assuming `needs_review` only covers null series/issue/lot parsing | It also gates a null `year` at/above $25 (`REASON_MISSING_YEAR`, BUI-422 — vintage-key mis-resolution risk) |
+| Assuming `needs_review` only covers null series/issue/lot parsing | It also gates a null `year` unconditionally, regardless of price (`REASON_MISSING_YEAR`, BUI-422/BUI-475 — vintage-key mis-resolution risk; the original `$25` price threshold was removed in BUI-475) |
 | Invoking Step 3's Bash block without an explicit long timeout | It can legitimately run several minutes (BUI-465 pacing); set the tool call's timeout to 600000ms (the harness max) or it may hit the harness's own default timeout mid-write (BUI-472). Same-series batches finish faster in practice (BUI-473 reuses one series resolution per series), but the worst-case bound — and so the 600000ms recommendation — is unchanged: it assumes no reuse |
 | Reporting "nothing to do" right after a Step 3 timeout / code-000 response | That is ambiguous, not confirmed failure — BUI-428 marks seen only on full success, so the timed-out call may have already landed; run Step 3b before saying anything (BUI-472) |

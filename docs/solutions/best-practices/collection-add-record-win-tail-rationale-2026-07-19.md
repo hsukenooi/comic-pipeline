@@ -109,9 +109,20 @@ empty/unparseable `constituent_issues`.
 at or above $25 — because vintage, no-year titles are disproportionately
 prone to a downstream volume mis-resolution. That gate is unrelated to the
 confidence clause BUI-354 removed; it's a narrow, price-scoped addition, not
-a return of "ask if confidence is low." See the skill body's own gate list
-for the authoritative current set — this doc is history, not the source of
-truth for what gates today.)
+a return of "ask if confidence is low." BUI-475 later dropped the price
+scoping entirely: the server-side auto-resolve it depended on (an
+era-evidence endpoint over the collection) was built and shown to fail
+open — a null-year win with no competing same-title volume auto-recorded
+under the sole owned (possibly wrong-era) volume, reproducing the exact
+mis-file BUI-422 existed to prevent. Since a win's era genuinely can't be
+confirmed without a year, and price was never a reliable proxy for that,
+every null-year win now gates unconditionally (`MISSING_YEAR_PRICE_THRESHOLD`
+and the `$25` gate are gone from `record_win_prep.py`; only
+`REASON_MISSING_YEAR` remains). A safe auto-record path for a *resolved*
+null-year win is tracked separately as future work (BUI-498, gated on the
+issue's own Metron cover year). See the skill body's own gate list for the
+authoritative current set — this doc is history, not the source of truth for
+what gates today.)
 
 ## The record-win/commit consolidation (BUI-428)
 

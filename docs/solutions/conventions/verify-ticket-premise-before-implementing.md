@@ -1,7 +1,7 @@
 ---
 title: "A reopened ticket's premise may already be stale — verify it against the code before implementing"
 date: 2026-07-20
-last_updated: 2026-07-21
+last_updated: 2026-07-22
 category: conventions
 module: "general (Linear ticket handling, any package) — these batches: locg-cli, gixen-cli"
 problem_type: convention
@@ -206,9 +206,9 @@ an era-evidence gate keyed on `index_series_range`. Three independent facts, eac
 reading rather than trusting:
 
 1. **The `$25` gate is not in `_build_win_row`, and not in `locg-cli` at all.**
-   `MISSING_YEAR_PRICE_THRESHOLD` / `REASON_MISSING_YEAR` live in
+   `MISSING_YEAR_PRICE_THRESHOLD` / `REASON_MISSING_YEAR` lived in
    `packages/gixen-cli/record_win_prep.py`. `grep -r needs_review packages/locg-cli/src`
-   returns **nothing** — the concept the ticket said to edit does not exist in the named
+   returned **nothing** — the concept the ticket said to edit did not exist in the named
    package.
 2. **The two signals sit on opposite sides of an HTTP boundary.** `record_win_prep` runs
    client-side *before* the POST; `index_series_range` is computed server-side *inside*
@@ -223,6 +223,20 @@ record the two viable designs, and escalate the choice — not ship a speculativ
 cross-package change against a premise that named a symbol that isn't there. A disciplined
 stop is a success, not a failure. **The one-command check** — `grep` for the named symbol
 in the named package — would have flagged this before any design time was spent.
+
+> **Case study, not current code (BUI-475, shipped 2026-07-21).** The escalated Option A —
+> a server-side era-evidence endpoint over `resolve_series_for_win`/`series_year_range` — was
+> then built and proven to **fail open**: a null-year win with no competing same-title
+> volume in the collection auto-recorded under the sole owned (and possibly wrong-era)
+> volume, reproducing the exact BUI-421 mis-file BUI-422's price gate was meant to prevent.
+> The owner chose the safe fallback instead: `MISSING_YEAR_PRICE_THRESHOLD` and the `$25`
+> gate were removed outright, and every null-year win now holds for review
+> unconditionally, regardless of price (`REASON_MISSING_YEAR` is the only symbol that
+> survives, still in `packages/gixen-cli/record_win_prep.py`). The `MISSING_YEAR_PRICE_THRESHOLD`
+> symbol named above no longer exists anywhere in the codebase — treat this example as a
+> record of the reasoning that led to that outcome, not as a description of the gate as it
+> stands today. A safe auto-record path for a *resolved* null-year win is tracked separately
+> as future work (BUI-498, gated on the issue's own Metron cover year).
 
 ### Example 8 — the hypothesis was right, its named mechanism never executed, and the implied fix was backwards (BUI-474)
 
@@ -293,7 +307,7 @@ Before implementing any ticket that:
 | BUI-465 | "77/78 rows had a null publisher" proves the breaker latched | BUI-458 added the publisher fetch *after* those rows were written — not evidence | Claim upheld on different evidence (run-grouped placeholder ordering); figure corrected |
 | BUI-470 | A variant/newsstand distinction is invisible to the reconciler | Reconciler's key is `full_title`-exact; the gap was record-win's coarser lookup, fixed in BUI-267 | Shipped as defense-in-depth with a *unit* test, not a misleading end-to-end one |
 | BUI-464 | Null year → newest volume; `needs_review` doesn't gate it | Both killed by BUI-421 Fix A and BUI-422; the named examples were correctly resolved | Only the third premise implemented; evidence sourced from the LOCG series window |
-| BUI-475 | Edit `needs_review`/`$25` gate in `_build_win_row` (`locg-cli`) | Gate lives in `gixen-cli/record_win_prep.py`; `needs_review` grep-absent from `locg-cli/src`; signals span an HTTP boundary | Stopped, re-grounded, design choice escalated — no speculative code |
+| BUI-475 | Edit `needs_review`/`$25` gate in `_build_win_row` (`locg-cli`) | Gate lived in `gixen-cli/record_win_prep.py`; `needs_review` grep-absent from `locg-cli/src`; signals span an HTTP boundary | Stopped, re-grounded, design choice escalated; the escalated option (server-side era-evidence endpoint) was then built and shown to fail open, so BUI-475 shipped instead as an unconditional null-year hold with the `$25` gate removed entirely |
 | BUI-474 | `_disambiguate_series` trusts a sole hit; `issues_list()[0]` unfiltered | Neither path executed; all 18 died at `_disambiguate_series` returning None over a 433-wide candidate set — a *miss*, not a wrong write | Fix direction inverted: name-exactness pre-filter that narrows toward None (BUI-485) |
 
 ## Practical checklist
