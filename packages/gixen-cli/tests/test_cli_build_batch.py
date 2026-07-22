@@ -49,6 +49,46 @@ def test_build_batch_happy_path_prints_rows_json(tmp_path):
     assert '"grade": 9.2' in result.output
 
 
+def test_build_batch_carries_title_from_working_list_into_rows_json(tmp_path):
+    """BUI-506: a working-list row's `title` lands in the built rows.json
+    unchanged, ready for `add-batch` to echo in its table/JSON output."""
+    from cli import cli
+
+    brief_file = _write_json(tmp_path, "brief.json", [_brief_row("1", max_bid=800)])
+    wl_file = _write_json(
+        tmp_path, "wl.json",
+        [{"item_id": "1", "grade": 9.2, "title": "Invincible #1"}],
+    )
+    out_file = tmp_path / "rows_out.json"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["build-batch", brief_file, wl_file, "--out", str(out_file)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert '"title": "Invincible #1"' in result.output
+    written = json.loads(out_file.read_text())
+    assert written[0]["title"] == "Invincible #1"
+
+
+def test_build_batch_absent_title_omits_key_from_rows_json(tmp_path):
+    """No `title` on the working-list row must produce exactly the same
+    rows.json as before this field existed (BUI-506 backward compat)."""
+    from cli import cli
+
+    brief_file = _write_json(tmp_path, "brief.json", [_brief_row("1", max_bid=50)])
+    wl_file = _write_json(tmp_path, "wl.json", [{"item_id": "1"}])
+    out_file = tmp_path / "rows_out.json"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["build-batch", brief_file, wl_file, "--out", str(out_file)])
+
+    assert result.exit_code == 0, result.output
+    written = json.loads(out_file.read_text())
+    assert "title" not in written[0]
+
+
 def test_build_batch_writes_out_file_as_bare_rows_list(tmp_path):
     from cli import cli
 

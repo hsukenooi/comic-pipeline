@@ -483,6 +483,54 @@ def test_add_batch_human_table_shows_link_error_detail(tmp_path):
     assert "FMV link failed: Server returned 500: boom" in result.output
 
 
+def test_add_batch_prints_title_in_human_table_and_json_rows(tmp_path):
+    """BUI-506: a row carrying an optional `title` (e.g. from `gixen
+    build-batch`'s rows.json) must show the comic's name in both the human
+    table and the JSON summary rows, instead of a bare item_id."""
+    from cli import cli
+
+    rows_file = _write_rows(
+        tmp_path, [{"item_id": "1", "max_bid": 10, "title": "Invincible #1"}]
+    )
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 0, result.output
+    assert "Invincible #1" in result.output
+    payload = _extract_json(result.output)
+    assert payload["rows"][0]["title"] == "Invincible #1"
+
+
+def test_add_batch_absent_title_renders_placeholder_not_none(tmp_path):
+    """A row with no `title` (every pre-BUI-506 rows.json) must render the
+    same '—' placeholder the table already uses for other absent fields,
+    not the literal string "None"."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [{"item_id": "1", "max_bid": 10}])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 0, result.output
+    assert "None" not in result.output
+    payload = _extract_json(result.output)
+    assert payload["rows"][0]["title"] is None
+
+
 def test_add_batch_verify_failure_recorded_but_does_not_change_exit_code(tmp_path):
     """--verify is a warn-only wrap step (mirrors verify.md) — a failed
     verify call must not flip an otherwise-successful add-batch to a
