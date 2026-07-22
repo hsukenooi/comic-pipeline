@@ -1868,3 +1868,88 @@ def test_collection_export_normal_store_still_exports_200(client):
     assert body.get("status") != "not_imported"
     assert "csv" in body
     assert "notes_md" in body
+
+
+# ===========================================================================
+# BUI-498: POST /api/comics/collection/record-win/era-evidence — null-year
+# era confirmation for the auto-record gate. Fails closed onto BUI-475's
+# hold-all whenever the Metron cover year can't place the issue in-era.
+# ===========================================================================
+
+
+def test_era_evidence_empty_wins_returns_empty_results(client):
+    r = client.post("/api/comics/collection/record-win/era-evidence", json={"wins": []})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"results": []}
+
+
+def test_era_evidence_confirms_null_year_win_in_window(client):
+    """End to end through the endpoint + the real cmd function: a null-year win
+    whose Metron cover year lands inside the resolved volume's window confirms."""
+    _reseed_with_index(client.store, {"ghost rider": "Ghost Rider (1990 - 1998)"})
+    m = MagicMock()
+    m.lookup_issue.return_value = {"cover_date": "1992-05-01", "store_date": None}
+    m.lookup_issue_request_cost.return_value = 2
+    m.degraded = False
+    with patch("locg.metron.MetronClient", return_value=m):
+        r = client.post(
+            "/api/comics/collection/record-win/era-evidence",
+            json={"wins": [{"item_id": "gr25", "series": "Ghost Rider", "issue": "25"}]},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"results": [{"item_id": "gr25", "era_confirmed": True}]}
+
+
+def test_era_evidence_holds_when_metron_unavailable(client, offline_metron):
+    """Fail closed: Metron offline (lookup returns None) holds even a locally
+    resolvable null-year win — the BUI-475 fallback."""
+    _reseed_with_index(client.store, {"ghost rider": "Ghost Rider (1990 - 1998)"})
+    r = client.post(
+        "/api/comics/collection/record-win/era-evidence",
+        json={"wins": [{"item_id": "gr25", "series": "Ghost Rider", "issue": "25"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"results": [{"item_id": "gr25", "era_confirmed": False}]}
+
+
+def test_era_evidence_holds_sole_owned_wrong_era(client):
+    """The BUI-421 case through the endpoint: the collection owns only a modern
+    Fantastic Four volume, but the win is the vintage FF #16 — Metron's 1963
+    cover year is outside the sole owned volume's window, so it HOLDS."""
+    _reseed_with_index(
+        client.store, {"fantastic four": "Fantastic Four (Vol. 3) (1998 - 2003)"}
+    )
+    m = MagicMock()
+    m.lookup_issue.return_value = {"cover_date": "1963-07-01", "store_date": None}
+    m.lookup_issue_request_cost.return_value = 2
+    m.degraded = False
+    with patch("locg.metron.MetronClient", return_value=m):
+        r = client.post(
+            "/api/comics/collection/record-win/era-evidence",
+            json={"wins": [{"item_id": "ff16", "series": "Fantastic Four", "issue": "16"}]},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"results": [{"item_id": "ff16", "era_confirmed": False}]}
+
+
+def test_era_evidence_endpoint_threads_identity_and_returns_verbatim(client):
+    """Contract: the endpoint model_dumps each win (preserving item_id / series /
+    issue / edition) into the cmd function and returns its output unchanged."""
+    captured = {}
+
+    def fake(items):
+        captured["items"] = items
+        return {"results": [{"item_id": "x", "era_confirmed": True}]}
+
+    with patch(
+        "gixen_overlay.routes.cmd_collection_record_win_era_evidence", side_effect=fake
+    ):
+        r = client.post(
+            "/api/comics/collection/record-win/era-evidence",
+            json={"wins": [{"item_id": "x", "series": "S", "issue": "1", "edition": "annual"}]},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"results": [{"item_id": "x", "era_confirmed": True}]}
+    assert captured["items"] == [
+        {"item_id": "x", "series": "S", "issue": "1", "edition": "annual"}
+    ]

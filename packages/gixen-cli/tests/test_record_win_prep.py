@@ -15,8 +15,10 @@ from record_win_prep import (
     REASON_NULL_SERIES_OR_ISSUE,
     REASON_UNPARSEABLE_LOT,
     RecordWinPrepError,
+    _needs_era_check,
     build_payload,
     entries_for_win,
+    fetch_era_evidence,
     fetch_seen_ids,
     filter_ended_won,
     identify_titles,
@@ -126,6 +128,14 @@ class _FakeSession:
         self._exc = exc
 
     def get(self, url, timeout=None):
+        if self._exc is not None:
+            raise self._exc
+        return self._response
+
+    def post(self, url, json=None, timeout=None):
+        # Records the last POST so era-evidence tests can assert the request
+        # shape (which wins were sent).
+        self.posted = {"url": url, "json": json}
         if self._exc is not None:
             raise self._exc
         return self._response
@@ -601,3 +611,252 @@ def test_build_payload_propagates_hard_stop_from_fetch_seen():
     with pytest.raises(RecordWinPrepError):
         build_payload(snipes, "http://example.test", fetch_seen=failing_fetch,
                        identify=lambda titles: [])
+
+
+# ---------------------------------------------------------------------------
+# BUI-498: null-year era-confirmation gate (era_confirmed threads the
+# server's Metron-cover-year verdict into entries_for_win / build_payload)
+# ---------------------------------------------------------------------------
+
+
+def test_entries_for_win_null_year_records_when_era_confirmed():
+    """A null-year regular win auto-records ONLY when the server confirmed its
+    era. The recorded entry carries no `year` (there wasn't one) — the commit
+    resolves the volume from series+issue and stamps the in-era Metron date."""
+    win = _snipe("1", current_bid="14.50 USD")
+    identity = _identity(series="Uncanny X-Men", issue="257", year=None)
+    entries, review = entries_for_win(win, identity, era_confirmed=True)
+    assert review is None
+    assert len(entries) == 1
+    assert entries[0]["item_id"] == "1"
+    assert entries[0]["identify_data"] == {"series": "Uncanny X-Men", "issue": "257"}
+    assert "year" not in entries[0]["identify_data"]
+
+
+def test_entries_for_win_null_year_holds_when_era_not_confirmed():
+    win = _snipe("1")
+    identity = _identity(series="Fantastic Four", issue="16", year=None)
+    entries, review = entries_for_win(win, identity, era_confirmed=False)
+    assert entries == []
+    assert review is not None
+    assert review["reason"] == REASON_MISSING_YEAR
+
+
+def test_entries_for_win_null_year_holds_by_default_fail_closed():
+    """No era_confirmed passed at all -> hold. This is the BUI-475 hold-all
+    fallback: any caller that can't produce the signal holds."""
+    win = _snipe("1")
+    identity = _identity(series="Fantastic Four", issue="16", year=None)
+    entries, review = entries_for_win(win, identity)
+    assert entries == []
+    assert review["reason"] == REASON_MISSING_YEAR
+
+
+def test_entries_for_win_null_year_lot_holds_even_when_confirmed():
+    """era_confirmed never releases a lot — per-issue era confirmation is out of
+    BUI-498's scope, so a null-year lot always holds."""
+    win = _snipe("1")
+    identity = _identity(series="X-Men", issue=None, year=None,
+                         is_lot=True, constituent_issues=["1", "2", "3"])
+    entries, review = entries_for_win(win, identity, era_confirmed=True)
+    assert entries == []
+    assert review["reason"] == REASON_MISSING_YEAR
+
+
+def test_entries_for_win_year_present_records_regardless_of_era_confirmed():
+    win = _snipe("1")
+    identity = _identity(series="Ghost Rider", issue="25", year=1992)
+    entries, review = entries_for_win(win, identity, era_confirmed=False)
+    assert review is None
+    assert len(entries) == 1
+    assert entries[0]["identify_data"]["year"] == 1992
+
+
+# ---- _needs_era_check ------------------------------------------------------
+
+
+def test_needs_era_check_true_only_for_null_year_regular_win():
+    assert _needs_era_check(_identity(series="Ghost Rider", issue="25", year=None)) is True
+
+
+def test_needs_era_check_false_when_year_present():
+    assert _needs_era_check(_identity(series="Ghost Rider", issue="25", year=1992)) is False
+
+
+def test_needs_era_check_false_for_lot():
+    assert _needs_era_check(
+        _identity(series="X-Men", issue=None, year=None, is_lot=True,
+                  constituent_issues=["1", "2"])
+    ) is False
+
+
+def test_needs_era_check_false_for_null_series_or_issue():
+    assert _needs_era_check(_identity(series=None, issue=None, year=None)) is False
+
+
+def test_needs_era_check_false_for_error_row():
+    assert _needs_era_check(_identity(error="bad parse")) is False
+
+
+# ---- fetch_era_evidence (fail-closed HTTP client) --------------------------
+
+
+def test_fetch_era_evidence_empty_items_makes_no_call():
+    session = _FakeSession(exc=requests.ConnectionError("should not be called"))
+    assert fetch_era_evidence("http://example.test", [], session=session) == {}
+
+
+def test_fetch_era_evidence_maps_results_and_sends_wins():
+    body = {"results": [
+        {"item_id": "a", "era_confirmed": True},
+        {"item_id": "b", "era_confirmed": False},
+    ]}
+    session = _FakeSession(response=_FakeResponse(200, body))
+    items = [{"item_id": "a", "series": "GR", "issue": "1"}]
+    result = fetch_era_evidence("http://example.test", items, session=session)
+    assert result == {"a": True, "b": False}
+    # The endpoint contract is {"wins": [...]}, matching EraEvidenceRequest.
+    assert session.posted["json"] == {"wins": items}
+    assert session.posted["url"].endswith("/api/comics/collection/record-win/era-evidence")
+
+
+def test_fetch_era_evidence_connection_error_fails_closed():
+    session = _FakeSession(exc=requests.ConnectionError("refused"))
+    items = [{"item_id": "a", "series": "GR", "issue": "1"}]
+    assert fetch_era_evidence("http://example.test", items, session=session) == {}
+
+
+def test_fetch_era_evidence_non_200_fails_closed():
+    session = _FakeSession(response=_FakeResponse(404))
+    items = [{"item_id": "a", "series": "GR", "issue": "1"}]
+    assert fetch_era_evidence("http://example.test", items, session=session) == {}
+
+
+def test_fetch_era_evidence_unparseable_body_fails_closed():
+    session = _FakeSession(response=_FakeResponse(200, body={"oops": 1}))
+    items = [{"item_id": "a", "series": "GR", "issue": "1"}]
+    assert fetch_era_evidence("http://example.test", items, session=session) == {}
+
+
+def test_fetch_era_evidence_skips_result_row_without_item_id():
+    body = {"results": [{"era_confirmed": True}, {"item_id": "b", "era_confirmed": True}]}
+    session = _FakeSession(response=_FakeResponse(200, body))
+    items = [{"item_id": "b", "series": "GR", "issue": "1"}]
+    assert fetch_era_evidence("http://example.test", items, session=session) == {"b": True}
+
+
+# ---- build_payload threads era-evidence ------------------------------------
+
+
+def test_build_payload_null_year_confirmed_records_unconfirmed_holds():
+    snipes = [
+        _snipe("1", title="Uncanny X-Men #257"),
+        _snipe("2", title="Fantastic Four #16"),
+    ]
+
+    def fake_identify(titles):
+        return [
+            _identity(series="Uncanny X-Men", issue="257", year=None),
+            _identity(series="Fantastic Four", issue="16", year=None),
+        ]
+
+    era_calls = []
+
+    def fake_era(url, items):
+        era_calls.append(items)
+        # Server confirms #257's era, holds #16 (the BUI-421 wrong-era case).
+        return {"1": True, "2": False}
+
+    payload = build_payload(
+        snipes, "http://example.test",
+        fetch_seen=lambda url: set(), identify=fake_identify,
+        fetch_era=fake_era,
+    )
+    assert [w["item_id"] for w in payload["wins"]] == ["1"]
+    assert [r["item_id"] for r in payload["needs_review"]] == ["2"]
+    assert payload["needs_review"][0]["reason"] == REASON_MISSING_YEAR
+    # Both null-year wins were sent for era-evidence, exactly once.
+    assert len(era_calls) == 1
+    assert {i["item_id"] for i in era_calls[0]} == {"1", "2"}
+
+
+def test_build_payload_only_null_year_wins_are_sent_for_era_evidence():
+    snipes = [
+        _snipe("1", title="Ghost Rider #25"),       # year present -> not sent
+        _snipe("2", title="Fantastic Four #16"),    # null year -> sent
+        _snipe("3", title="???"),                   # null series -> not sent
+    ]
+
+    def fake_identify(titles):
+        return [
+            _identity(series="Ghost Rider", issue="25", year=1992),
+            _identity(series="Fantastic Four", issue="16", year=None),
+            _identity(series=None, issue=None, year=None),
+        ]
+
+    seen_items = []
+
+    def fake_era(url, items):
+        seen_items.extend(items)
+        return {"2": True}
+
+    payload = build_payload(
+        snipes, "http://example.test",
+        fetch_seen=lambda url: set(), identify=fake_identify,
+        fetch_era=fake_era,
+    )
+    # Only the null-year regular win (#2) is era-checked; the year-bearing and
+    # null-series wins never spend a Metron call.
+    assert [i["item_id"] for i in seen_items] == ["2"]
+    # #1 records on its own year; #2 records because era was confirmed; #3 holds.
+    assert {w["item_id"] for w in payload["wins"]} == {"1", "2"}
+    assert [r["item_id"] for r in payload["needs_review"]] == ["3"]
+
+
+def test_build_payload_no_era_call_when_no_null_year_wins():
+    snipes = [_snipe("1", title="Ghost Rider #25")]
+
+    def boom(url, items):
+        raise AssertionError("fetch_era_evidence must not be called with no null-year wins")
+
+    payload = build_payload(
+        snipes, "http://example.test",
+        fetch_seen=lambda url: set(),
+        identify=lambda titles: [_identity(series="Ghost Rider", issue="25", year=1992)],
+        fetch_era=boom,
+    )
+    assert [w["item_id"] for w in payload["wins"]] == ["1"]
+
+
+# ---- fetch_era_evidence — fail-closed against a divergent/stale server ------
+# (review hardening: the "never raises" + "never confirm from uncertainty"
+#  contract must survive ANY 200 body shape, not just the ones json() rejects.)
+
+
+def test_fetch_era_evidence_non_list_results_fails_closed():
+    session = _FakeSession(response=_FakeResponse(200, body={"results": "x"}))
+    items = [{"item_id": "a", "series": "S", "issue": "1"}]
+    assert fetch_era_evidence("http://example.test", items, session=session) == {}
+
+
+def test_fetch_era_evidence_non_dict_rows_are_skipped_not_raised():
+    body = {"results": [1, None, "oops", {"item_id": "b", "era_confirmed": True}]}
+    session = _FakeSession(response=_FakeResponse(200, body))
+    items = [{"item_id": "b", "series": "S", "issue": "1"}]
+    # No AttributeError escapes; the malformed rows are dropped and the one
+    # well-formed confirmation survives.
+    assert fetch_era_evidence("http://example.test", items, session=session) == {"b": True}
+
+
+def test_fetch_era_evidence_truthy_non_true_confirmed_is_not_trusted():
+    # A stale/divergent server returning a truthy non-True era_confirmed (the
+    # JSON string "false", or 1) must NOT auto-record — only a real `true` does.
+    body = {"results": [
+        {"item_id": "s", "era_confirmed": "false"},
+        {"item_id": "n", "era_confirmed": 1},
+        {"item_id": "t", "era_confirmed": True},
+    ]}
+    session = _FakeSession(response=_FakeResponse(200, body))
+    items = [{"item_id": "s"}, {"item_id": "n"}, {"item_id": "t"}]
+    result = fetch_era_evidence("http://example.test", items, session=session)
+    assert result == {"s": False, "n": False, "t": True}

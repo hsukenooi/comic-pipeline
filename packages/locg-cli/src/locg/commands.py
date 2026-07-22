@@ -5144,6 +5144,170 @@ def cmd_collection_record_win(
     }
 
 
+def _resolve_null_year_window(
+    series_raw: str,
+    issue_num: str,
+    series_name_index: dict[str, str],
+    volume_candidates: Any,
+) -> Optional[tuple[int, int]]:
+    """The LOCAL half of the BUI-498 null-year era gate.
+
+    Resolve a null-year win to a SINGLE local volume and return that volume's
+    INDEPENDENT publication window (parsed off the LOCG ``series_name_index``),
+    or ``None`` when the era cannot be locally anchored:
+
+    * empty series/issue,
+    * ``resolve_series_for_win`` returns ``None`` — an unknown series, OR
+      multiple owned volumes that no year can disambiguate (the BUI-421 Fix A
+      ambiguous case) — this clause is LOAD-BEARING: it is exactly the
+      "multiple candidate volumes it can't disambiguate -> HELD" requirement,
+      and without it the ambiguous win would slip through to Metron's own
+      ungated step-2 date (BUI-464/BUI-488),
+    * the resolved volume carries no parseable ``(YYYY - YYYY)`` window.
+
+    A ``None`` here means HOLD regardless of what Metron says: with no
+    INDEPENDENT window there is nothing to gate the Metron cover year against,
+    and a window derived from the Metron hit itself would be tautological
+    (the BUI-496 anti-tautology invariant). Passing ``year=None`` to
+    ``resolve_series_for_win`` is deliberate — this is the null-year path, and
+    the sole-owned-volume result it returns is precisely the fail-open the
+    Metron gate below exists to close (BUI-421 / BUI-475).
+    """
+    if not series_raw or not issue_num:
+        return None
+    norm_key = _normalize_series_key(series_raw)
+    resolved = resolve_series_for_win(
+        norm_key, issue_num, None, series_name_index, volume_candidates
+    )
+    if resolved is None:
+        return None
+    return series_year_range(resolved)
+
+
+def cmd_collection_record_win_era_evidence(
+    items: list[dict[str, Any]],
+    cache: Optional[Any] = None,
+    metron: Optional[Any] = None,
+    requests_per_minute: float = METRON_REQUESTS_PER_MINUTE,
+) -> dict[str, Any]:
+    """Per-null-year-win era confirmation for the BUI-498 auto-record gate.
+
+    ``record_win_prep`` (gixen-cli, client-side) holds EVERY null-year win for
+    review by default (BUI-475): a win whose ``comic-identify`` parse produced
+    no year cannot have its era confirmed from local collection evidence alone,
+    because the collection's own volume resolution fails OPEN for a null year
+    (``resolve_series_for_win`` returns the sole owned — possibly wrong-era —
+    volume unconditionally; the BUI-421 mis-file). This endpoint-backing helper
+    recovers the safe auto-record path by consulting the ONE signal that CAN
+    confirm a null-year win's era: the issue's actual Metron cover year.
+
+    For each ``item`` (``{item_id, series, issue, edition?}``) it returns
+    ``era_confirmed=True`` IFF BOTH hold:
+
+      1. ``_resolve_null_year_window`` anchors the win to a SINGLE local volume
+         with a parseable INDEPENDENT window (see that helper — the
+         load-bearing ambiguity/unknown-series guard lives there), AND
+      2. ``_metron_release_date(<lookup_issue hit>, None, window) is not None``
+         — the canonical containment gate: Metron's date for the issue lands
+         inside that volume's window. This is the SAME function the record-win
+         commit uses to decide whether to stamp the date, so an era-confirmed
+         win here is exactly a win the commit will file in-era there (and one
+         that fails here would get a dateless, audit-pending row there — never
+         a wrong-era file). Passing ``year_raw=None`` forces its
+         ``series_range`` branch; the non-None ``window`` keeps that branch off
+         its ungated ``series_range is None`` fall-through.
+
+    Everything else fails CLOSED to ``era_confirmed=False`` (HOLD): unknown or
+    ambiguous series, unparseable window, a Metron miss, a throttled/unreachable
+    Metron, or missing credentials. That is the BUI-475 hold-all fallback the
+    client degrades onto, mirroring the collection-check R11 discipline (never
+    emit a positive verdict from an uncertain call).
+
+    Unlike ``cmd_collection_record_win`` this is READ-ONLY (no store write, so
+    no BUI-476 explicit-store guard — a wrong/empty store resolves nothing and
+    holds, the safe direction) and does NOT fight to keep Metron alive: a
+    transient trip simply holds this and every later win (all safe), so the
+    BUI-465 transient-trip cooldown/retry machinery is deliberately absent —
+    holding is the correct response to Metron being down, and the commit will
+    retry Metron properly if the held win is later resolved by a human.
+
+    Pacing (BUI-465): one MetronClient for the whole batch, so its per-series
+    ``_series_cache`` is reused (BUI-473); each real lookup is paced off the
+    previous one's honest request cost. Returns
+    ``{"results": [{"item_id", "era_confirmed"}, ...]}`` in input order; a
+    caller treats any item absent from ``results`` as HOLD.
+    """
+    if not items:
+        return {"results": []}
+
+    from locg.collection_cache import build_volume_candidates
+    from locg.metron import MetronClient, MetronCredentialError
+
+    if cache is None:
+        cache = CollectionCache()
+    if metron is None:
+        metron = MetronClient()
+
+    payload = cache.load()
+    series_name_index: dict[str, str] = payload.get("series_name_index", {})
+    volume_candidates = build_volume_candidates(payload)
+
+    # A non-positive budget means "don't pace" (0 opts out; a negative value is
+    # nonsense and must not become a negative sleep) — same guard as
+    # cmd_collection_record_win.
+    seconds_per_request = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
+    metron_disabled = False
+    # Requests the LAST Metron lookup spent, paid off before the NEXT one so a
+    # run of same-series null-year wins paces on what Metron is actually asked
+    # (BUI-473 reuse) rather than a flat per-issue cost, and a batch that ends
+    # on a lookup does not sleep after its final call.
+    pending_paced_requests = 0
+
+    results: list[dict[str, Any]] = []
+    for item in items:
+        item_id = str(item.get("item_id") or "").strip()
+        series_raw = _edition_qualified_series(
+            str(item.get("series") or "").strip(),
+            str(item.get("edition") or ""),
+        )
+        issue_num = str(item.get("issue") or "").strip()
+
+        window = _resolve_null_year_window(
+            series_raw, issue_num, series_name_index, volume_candidates
+        )
+
+        era_confirmed = False
+        if window is not None and not metron_disabled:
+            # Pace off the previous lookup before spending another (BUI-465).
+            if pending_paced_requests and seconds_per_request:
+                time.sleep(seconds_per_request * pending_paced_requests)
+            # Charge the honest cost BEFORE the call (BUI-473) — a same-series
+            # run pays the series_list request once. Read the cost first: it is
+            # a snapshot of what resolve_series would do right now and must be
+            # taken before lookup_issue mutates the cache.
+            pending_paced_requests = metron.lookup_issue_request_cost(series_raw, None)
+            try:
+                metron_data = metron.lookup_issue(series_raw, issue_num, None)
+            except MetronCredentialError:
+                # Permanent for this process — hold this and every later win.
+                metron_disabled = True
+                metron_data = None
+            else:
+                # Latch a transient throttle/outage trip so the rest of the
+                # batch holds too (BUI-465), only on the exception-free path —
+                # matching _build_win_row. The credential branch above already
+                # latched, so this else changes no behavior, only clarity.
+                metron_disabled = _check_metron_degraded(metron, metron_disabled)
+            if metron_data is not None:
+                era_confirmed = (
+                    _metron_release_date(metron_data, None, window) is not None
+                )
+
+        results.append({"item_id": item_id, "era_confirmed": era_confirmed})
+
+    return {"results": results}
+
+
 def cmd_collection_doctor() -> dict[str, Any]:
     """Return first-run walkthrough and current cache status.
 
