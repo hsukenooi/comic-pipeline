@@ -401,21 +401,21 @@ def _patch_metron_run(monkeypatch, *, creator, run):
 
 
 def _stub_collection_check_not_owned(monkeypatch):
-    """cmd_collection_check is a READ command (out of BUI-497's scope, per
-    _needs_explicit_store's docstring) — it always resolves via the bare/env
-    store, with no `cache` override. Stubbing it decouples these guard tests
-    from that unrelated resolution path, matching how the Metron calls are
-    stubbed out above.
+    """cmd_collection_check's own matcher logic isn't under test here — that's
+    covered in test_collection_commands.py. Stubbing it decouples these guard
+    tests from the real matcher, matching how the Metron calls are stubbed
+    out above.
 
-    NOTE: this stub scopes OUT a real (if currently dormant) gap, not proves
-    it safe — when an explicit `cache` is passed (as in
-    test_creator_run_explicit_cache_bypasses_guard_and_writes_redirected_store
-    below), the REAL cmd_collection_check would still check the bare/env
-    store rather than `cache`'s store, which could silently reintroduce the
-    BUI-122 owned-book-gets-wishlisted trap for a future caller. See the
-    BUI-497 docstring on cmd_wish_list_add_creator_run for the full
-    explanation. Left unfixed here deliberately — out of this ticket's named
-    scope (the R11 load and the wish-list read/write only)."""
+    BUI-502 gave cmd_collection_check its own `cache` override and threaded
+    it from cmd_wish_list_add_creator_run's per-issue owned-filter call, so
+    R11, the owned-filter, and the write now all agree on one store (see the
+    BUI-502 note on cmd_wish_list_add_creator_run's docstring) — closing the
+    gap this stub used to have to scope around. The stub still accepts
+    arbitrary kwargs (including the `cache` it's now called with) since its
+    only job is to fake a plausible not-owned verdict shape; see
+    test_creator_run_threads_cache_into_owned_filter below for the test that
+    proves the threading itself.
+    """
     import locg.commands as cmds
 
     monkeypatch.setattr(
@@ -475,6 +475,46 @@ def test_creator_run_explicit_cache_bypasses_guard_and_writes_redirected_store(
     # persisted there, not merely that the returned dict looked right.
     written = json.loads((tmp_path / "wish-list.json").read_text())
     assert written["items"][0]["name"] == "Uncanny X-Men #175"
+
+
+def test_creator_run_threads_cache_into_owned_filter(tmp_path, monkeypatch):
+    """BUI-502: the per-issue owned-filter (cmd_collection_check) must receive
+    the SAME `cache` that R11 and the write already agree on — closing the
+    dormant gap BUI-497 flagged but left unfixed (a future caller passing an
+    explicit `cache` would otherwise have let the owned-filter silently check
+    a DIFFERENT collection than R11/the write, reintroducing the BUI-122
+    owned-book-gets-wishlisted trap)."""
+    from locg.commands import cmd_wish_list_add_creator_run
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    _seed(cache, [], imported=True)  # stamp last_full_import; nothing owned
+    _no_default_collection_store(monkeypatch)
+    _no_default_wish_list_store(monkeypatch)
+
+    seen_kwargs: list[dict[str, Any]] = []
+
+    def fake_check(**kwargs):
+        seen_kwargs.append(kwargs)
+        return {"match_status": "not_in_cache", "in_wish_list": False}
+
+    monkeypatch.setattr(cmds, "cmd_collection_check", fake_check)
+    _patch_metron_run(
+        monkeypatch,
+        creator={"id": 355, "name": "John Romita Jr."},
+        run={
+            "issues": [{"number": "175", "metron_id": 1, "cover_date": "1983-11-01"}],
+            "warnings": [],
+        },
+    )
+
+    result = cmd_wish_list_add_creator_run(
+        series="Uncanny X-Men", creator="John Romita Jr.", series_id=99, cache=cache,
+    )
+
+    assert result["status"] == "ok"
+    assert len(seen_kwargs) == 1
+    assert seen_kwargs[0]["cache"] is cache
 
 
 def test_creator_run_locg_data_dir_set_still_runs(tmp_path, monkeypatch):

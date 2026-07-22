@@ -898,21 +898,22 @@ def cmd_wish_list_add_creator_run(
     any Metron traffic (mirroring ``cmd_collection_record_win``'s BUI-476
     guard) — this run can fan out to dozens of Metron calls, so a wrong-store
     refusal must not wait until after all of them complete. When ``cache`` IS
-    passed, it redirects BOTH the R11 collection-imported check and the
+    passed, it redirects the R11 collection-imported check and the
     wish-list dedup-read/write to the SAME store (via
-    :func:`_resolve_wish_list_path`), so those always agree on which store
-    they mean. It does NOT redirect the per-issue owned-filter
-    (:func:`cmd_collection_check`, called once per candidate issue below) —
-    that function has no ``cache`` override and stays on the bare/env-resolved
-    store, same as every other read command (see :func:`_needs_explicit_store`'s
-    docstring). This is harmless for the one caller that exists today
-    (``cli.py`` never passes ``cache``, so every read/write in this function
-    resolves the same ambient store) but is a real, currently-dormant gap for
-    a FUTURE caller that passes an explicit ``cache``: the owned-filter could
-    then silently check a different collection than R11/the write agreed on,
-    which is exactly the BUI-122 failure mode this guard exists to prevent.
-    Out of scope for BUI-497 (which named only the R11 load and the wish-list
-    read/write as the spots to fix) — flagged here, not fixed.
+    :func:`_resolve_wish_list_path`).
+
+    BUI-502: the per-issue owned-filter (:func:`cmd_collection_check`, called
+    once per candidate issue below) is now ALSO passed this same ``cache`` —
+    :func:`cmd_collection_check` grew its own ``cache`` override for exactly
+    this purpose. R11, the owned-filter, and the write therefore always agree
+    on one store, closing the dormant gap BUI-497 flagged but left unfixed: a
+    FUTURE caller that passes an explicit ``cache`` would otherwise have let
+    the owned-filter silently check a DIFFERENT collection than R11/the write
+    agreed on — exactly the BUI-122 failure mode this whole guard family
+    exists to prevent. Today's one caller (``cli.py``) never passes ``cache``,
+    so this is a fail-safe alignment, not a behavior change: every read/write
+    in this function still resolves the same ambient store when ``cache`` is
+    ``None``.
     """
     from locg.metron import MetronClient
 
@@ -1017,7 +1018,9 @@ def cmd_wish_list_add_creator_run(
         cover = issue.get("cover_date") or ""
         cover_year = cover[:4] if cover else None
 
-        owned = cmd_collection_check(series=series, issue=str(number), year=cover_year)
+        owned = cmd_collection_check(
+            series=series, issue=str(number), year=cover_year, cache=cache,
+        )
         # BUI-284: ambiguous_cross_volume (owned under >1 volume, no year to
         # disambiguate) counts as owned — skip it rather than wish-list an owned
         # book (BUI-122). cover_year is None when Metron has no cover date.
@@ -2367,11 +2370,11 @@ def _needs_explicit_store(cache: Optional[Any]) -> bool:
     directory, collection AND wish-list alike, so one check covers both).
     ``cmd_wish_list_add_creator_run`` (BUI-497) additionally threads the same
     ``cache`` into its R11 never-imported check, so that read and the write
-    it gates always agree on which store they mean. It does NOT thread
+    it gates always agree on which store they mean. It also threads that same
     ``cache`` into that function's separate per-issue owned-filter
-    (``cmd_collection_check``, a read command with no ``cache`` override at
-    all) — see that function's own docstring for the dormant-but-real gap
-    this leaves for a future caller that passes an explicit ``cache``.
+    (``cmd_collection_check``, which grew its own ``cache`` override in
+    BUI-502) — so R11, the owned-filter, and the write all agree on one
+    store; see that function's own docstring.
     ``cmd_wish_list_remove_conflicts`` also consults this (called with
     ``cache=None`` always — see its own docstring for why it does not accept
     a ``cache`` override: its audit half has none either, and a partial
@@ -3546,6 +3549,7 @@ def cmd_collection_check(
     issue: str,
     variant: Optional[str] = None,
     year: Optional[str] = None,
+    cache: Optional[CollectionCache] = None,
 ) -> dict[str, Any]:
     """Check whether a comic is in the local collection cache.
 
@@ -3590,8 +3594,15 @@ def cmd_collection_check(
     all printings with its owned/wish state. ADVISORY ONLY: match_status is
     unchanged (the reprint IS owned), so every owned-guard consumer behaves
     exactly as before; the caller flags, the user decides (R11).
+
+    BUI-502: accepts an optional `cache` override so a caller that already
+    manages its own `CollectionCache` (e.g. `cmd_wish_list_add_creator_run`'s
+    R11 load and wish-list read/write) can pin THIS read to that exact same
+    store, rather than resolving a separate bare/env-default one. Additive
+    only — every existing caller passes no `cache` and keeps resolving the
+    ambient store exactly as before (`cache or CollectionCache()`).
     """
-    cache = CollectionCache()
+    cache = cache or CollectionCache()
     payload = cache.load()
     cache_age = _cache_age_days(payload.get("last_full_import"))
     comics = payload.get("comics", [])
