@@ -148,7 +148,12 @@ VIEW → WHAT IT LETS YOU ASSESS (and what you CANNOT confirm without it):
 - Staples (close-up): exterior rust, popped or replaced staples
 - Interior / centerfold spread: centerfold attachment, staple rust MIGRATION staining, interior tears/writing
 - Page edge (close-up): paper tanning/browning, brittleness
-Without a raking-light spine shot you CANNOT confirm spine stress lines; without an interior shot you CANNOT confirm centerfold attachment or staple migration; without a page-edge shot you CANNOT confirm paper brittleness/tanning. List each missing-view gap as un-assessed in PHOTO LIMITATIONS.
+Without a raking-light spine shot you CANNOT confirm spine stress lines (and may miss subtle color-breaking creases visible only under angled light); without an interior shot you CANNOT confirm centerfold attachment or staple migration; without a page-edge shot you CANNOT confirm paper brittleness/tanning; without a staple close-up you CANNOT confirm staple rust either way. List each missing-view gap as un-assessed in PHOTO LIMITATIONS.
+
+STANDING CAVEATS — state these in PHOTO LIMITATIONS every time, regardless of coverage (structural limits no listing photo can overcome):
+- Paper brittleness can only be confirmed by a physical flex test; even a clear page-edge shot gives tanning/color evidence only, not a confirmed flex result.
+- Color touch and restoration are only conclusively ruled out under black light, which no listing photo provides — note this even when 0–1 restoration red flags fired above (2+ red flags still additionally escalate to "possible restoration").
+- Any photo-based grade carries an inherent ±0.5 gap versus an in-hand CGC assessment; an undetected restoration would drop the real grade further still. Never claim CGC-in-hand accuracy from photos alone.
 
 CONFIDENCE LEVELS (assign exactly one, anchored to coverage):
 - HIGH — front + back + spine, plus at least one of {raking-light spine, interior/centerfold, page edge}, all clear and in focus. Enough coverage to see where high-grade defects hide.

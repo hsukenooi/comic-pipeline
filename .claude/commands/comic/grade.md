@@ -26,10 +26,10 @@ Item IDs are labeled `comic-1`, `comic-2`, ... in the order given. **BUI-440:** 
 ```
 WORKDIR: /tmp/comic-grading/run-a1b2c3
 comic-1: FETCH FAILED — <error>
-comic-1: Fantastic Four #48 (1966) 9.0 VF/NM — 8 images — current bid $42.50 (5 bids)
+comic-1: Fantastic Four #48 (1966) 9.0 VF/NM — 8 images — current bid $42.50 (5 bids) — tier: not-cheap
 ```
 
-The printed current-bid figure per comic is the **value signal for the Step 2 value gate** — record it alongside the item id from the printed line so escalation can branch on listing value. It is the auction's current bid or, for a fixed-price (BIN) listing, its Buy-It-Now price — **both count toward the value gate** (a $40 BIN is a high-value lot and escalates the same as a $40 auction). It is `None` only when no price field is present at all; treat a genuinely absent value as "below threshold" (single grader) unless other signals say otherwise (BUI-165).
+The printed **tier** (`cheap` / `not-cheap`) is the **value signal for the Step 2 value gate** — record it alongside the item id from the printed line so escalation can branch on listing value without re-deriving anything. `grade_photos.py` owns the threshold and computes the tier from the auction's current bid or, for a fixed-price (BIN) listing, its Buy-It-Now price — both count the same way (a $40 BIN prints `not-cheap` just like a $40 auction). A listing with no price field at all prints `cheap` (BUI-165).
 
 **A `FETCH FAILED` line is not an image-less listing (BUI-147).** If the download script prints `FETCH FAILED` for a comic (a down/429/404 eBay API), do **not** feed it to the triage pre-pass or drop it as "un-gradeable" — that's an API failure, not a photo-quality verdict. Re-run that item (the script retries 429 automatically); surface the failure to the user rather than silently grading 0 images.
 
@@ -73,22 +73,22 @@ Run **one** cheap agent over the whole candidate list (title + first image + pho
 Don't fan out 3 graders for every comic — most listings in a seller scan are cheap, and 3-per-comic burns agents where 1 will do. **Run 1 grader first, then escalate to a 3-grader panel only when the comic earns it.** Each grader is the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`) — it carries the full grading persona, criteria, and OUTPUT FORMAT contract, scoped read-only (`Read, Bash`) so a grader can never write. You only pass it the dynamic inputs (see [Grader Agent](#grader-agent) below); the persona is identical whether you run 1 or 3, so panel grades stay independent and comparable.
 
 **Tunable gate constants** (stated here so they're easy to adjust):
-- `VALUE_THRESHOLD = $25` — `current_price` (from Step 1) at or above this always gets the full 3-grader panel; an expensive book justifies the rigor.
+- **Value tier** — `grade_photos.py` (Step 1) owns `VALUE_THRESHOLD` ($25) and prints `tier: cheap|not-cheap` per comic. Read the printed tier directly; don't re-derive the split from `current_price` here. A `not-cheap` tier always gets the full 3-grader panel; an expensive book justifies the rigor.
 - `CAP_BAND = 0.5` — if the single grader's grade sits within this many points of a grade-capping threshold (the spine-split / missing-piece / detached-cover ceilings), treat it as boundary-ambiguous.
-- `BATCH_MAX = 5` — how many sub-threshold (cheap) books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
+- `BATCH_MAX = 5` — how many cheap-tier books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
 - `CAP_DECISION_TOLERANCE = 10%` — in the decision-sensitivity gate (below), two bid caps computed at the ends of a grade range count as "the same decision" if they're within this much of each other (and the buy/no-buy call doesn't flip).
 
 **Escalate the single-grader result to a full 3-grader panel when ANY of these hold:**
-1. **Value:** `current_price ≥ VALUE_THRESHOLD` (or the listing is a known key regardless of current bid).
+1. **Value:** the printed tier is `not-cheap` (or the listing is a known key regardless of tier).
 2. **Boundary-ambiguous grade:** the grader identified a grade-capping defect (`GRADE CAP` ≠ none) and the grade sits within `CAP_BAND` of that ceiling — or is unsure whether a capping defect is present — OR a possible-restoration flag fired, OR the grader gave a wide GRADE RANGE (≥1.5 pts) **at MEDIUM confidence or higher**. (Proximity to a round grade with `GRADE CAP: none` is **not** a near-cap trigger — the cap must be an observed/suspected *defect*, not a number.) A wide range only escalates when it signals disagreement over *visible* evidence that more graders can resolve. A wide range at MEDIUM-LOW/LOW confidence is **coverage-driven** — the photos can't show the deciding surfaces (spine stress, interior, page edge), so adding graders cannot narrow it; it does **not** escalate on its own. (Near-cap and restoration still escalate regardless of coverage, since a second look can confirm a *visible* capping defect.)
 3. **Decision-relevant:** a half-grade swing would plausibly cross the buy/no-buy line the user cares about (if known at grade time).
 
-**Stay at the single grader when** the auction is below `VALUE_THRESHOLD`, no cap/restoration flag fired, and any wide range is coverage-driven (see trigger 2 above). Unknown `current_price` counts as below-threshold. The common case: a cheap 2-cover-photo lot hits exactly that coverage-driven case — expected MEDIUM-LOW output, not an escalation signal. Escalating it would burn 3 graders on photos that structurally can't resolve the spread (the failure mode that negates the value gate on a typical thin-photo seller scan).
+**Stay at the single grader when** the printed tier is `cheap`, no cap/restoration flag fired, and any wide range is coverage-driven (see trigger 2 above). The common case: a cheap 2-cover-photo lot hits exactly that coverage-driven case — expected MEDIUM-LOW output, not an escalation signal. Escalating it would burn 3 graders on photos that structurally can't resolve the spread (the failure mode that negates the value gate on a typical thin-photo seller scan).
 
 **Decision-sensitivity gate (optional — suppresses escalation when the grade can't change the buy).** When grading inside a flow that knows the auction's current price and can compute FMV (e.g. `/comic:buy`), a book that tripped an escalation trigger above can still **stay at 1 grader** if a tighter grade wouldn't change the decision. Before escalating, probe FMV at the **endpoints of the grade RANGE** (low and high) and compute the bid cap at each (same `grade_confidence` haircut at both). If **both** endpoints give the **same buy/no-buy call** against the current price **and** bid caps within `CAP_DECISION_TOLERANCE` of each other, the extra grader precision cannot move the outcome → do **not** escalate; report e.g. `1 grader (decision-insensitive: bid cap $34–$37 across 6.0–7.5, same buy call)`. Escalate only when the range straddles a decision boundary — the buy/no-buy call flips, or the bid-cap swing exceeds the tolerance. This is the highest-leverage skip on a value-gated scan: it stops a 3-grader panel from pinning a grade whose imprecision doesn't reach the bid. (The value trigger still escalates a high-value book whose decision *is* sensitive; the gate only suppresses escalation that provably can't matter.)
 
 **Dispatch mechanics:**
-- Split the candidates into **cheap** (`current_price < VALUE_THRESHOLD`, or unknown price) and **not-cheap** (≥ `VALUE_THRESHOLD`, or a known key).
+- Split the candidates by the printed **tier** from Step 1 (`cheap` / `not-cheap`) — a known key always counts as not-cheap regardless of its printed tier.
 - **Cheap books → batch them (U9).** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
 - **Not-cheap books → 1 grader each, first pass**, run in parallel (separate agents).
 - **Escalation (both kinds).** After the first pass, any book that tripped a gate (Step 2 triggers) gets the **remaining 2** graders as separate, independent agents — dispatched together in one parallel batch. A batched cheap book's first grade counts as grader A; pull it out and add B + C. (The grader prompt and criteria are identical across passes so the panel grades stay independent and comparable.)
@@ -128,22 +128,11 @@ After all agents return for a given comic (1 grader if not escalated — see Ste
 6. **Consensus GRADE RANGE** is the union of the graders' ranges, widened (not narrowed) by any epistemic disagreement.
 7. Combine the defect lists (union, deduplicated) to produce a master defect summary.
 
-### Consensus Table
-
-```
-| Grader | Grade | Range | Confidence |
-|--------|-------|-------|------------|
-| A      | X.X   | X.X–X.X | … |
-| B      | X.X   | X.X–X.X | … |
-| C      | X.X   | X.X–X.X | … |
-| **Consensus** | **X.X (label)** | **X.X–X.X** | **HIGH/MEDIUM/MEDIUM-LOW/LOW** |
-```
-
-(Single-grader case: one row + the consensus row carrying that grader's grade, range, and coverage-capped confidence.)
+Report the result per comic using the single table format under **Output** below — there is no separate consensus-only table; that same block *is* the consensus report.
 
 ## Output
 
-Present one block per comic:
+One format, used for every comic. Present one block per comic:
 
 ```
 ### Comic Title (Year) — Item ID
@@ -155,10 +144,12 @@ Present one block per comic:
 
 Key defects: [2-3 sentence summary of the most important ones]
 Positives: [brief]
-Caveats: [what photos couldn't show]
+Caveats: [pulled from the graders' PHOTO LIMITATIONS — what the photos couldn't show]
 ```
 
-Then a summary table at the end:
+(Single-grader case: one row + the consensus row carrying that grader's grade, range, and coverage-capped confidence — same table, no separate spec.)
+
+After every comic's block, compile their **Consensus** rows into one final list — this is the input for `/comic:fmv`:
 
 ```
 | # | Comic | Item ID | Consensus Grade | Range | Confidence |
@@ -167,26 +158,15 @@ Then a summary table at the end:
 | 2 | ASM #300 (1988) | 123456789 | 8.5 VF+ | 8.5 | HIGH |
 ```
 
-The summary table is the input for `/comic:fmv`. **Carry the Confidence column forward** — `comic-fmv` consumes it (as `grade_confidence`) to haircut the bid cap when grade confidence is low. Map the label to lowercase, preserving all four levels: `HIGH → high`, `MEDIUM → medium`, `MEDIUM-LOW → medium-low`, `LOW → low`. (Don't collapse MEDIUM-LOW into `low` — they haircut differently: MEDIUM-LOW → 0.70, LOW → 0.60.)
+**Carry the Confidence column forward** — `comic-fmv` consumes it (as `grade_confidence`) to haircut the bid cap when grade confidence is low. Map the label to lowercase, preserving all four levels: `HIGH → high`, `MEDIUM → medium`, `MEDIUM-LOW → medium-low`, `LOW → low`. (Don't collapse MEDIUM-LOW into `low` — they haircut differently: MEDIUM-LOW → 0.70, LOW → 0.60.)
+
+Structural photo-based caveats (staple rust, brittleness, restoration, the inherent ±0.5 CGC gap, etc.) are the `comic-grader` subagent's job to always state in its PHOTO LIMITATIONS field (`.claude/agents/comic-grader.md`) — this skill's Caveats line above just passes that field through.
 
 ## Integration with /comic:buy
 
 `/comic:buy` accepts grades from this skill. After running `/comic:grade`, pass the consensus grade column directly into the FMV step:
 
 > "Using these grades, for these URLs" → triggers `/comic:buy` to skip Step 1's seller-stated grade and use the photo-assessed grades instead.
-
-## Caveats to Always State
-
-These are structural limitations of any photo-based assessment:
-
-- No close-up of staple shanks → rust unknown
-- No centerfold spread photo → attachment confidence only
-- No raking-light shot → subtle color-breaking creases may be missed
-- No flex test → brittleness unknown
-- No black-light → color touch / restoration not detectable
-- Actual CGC grade could land ±0.5 from this assessment; restoration discovery would drop it more
-
-Always note these. Do not claim CGC accuracy.
 
 ## Common Mistakes
 
