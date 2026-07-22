@@ -24,37 +24,21 @@ this context.
 
 ## Output
 
-The subagent returns the identification table directly. Present it to the user:
+The subagent returns a fully-formatted identification table — columns `# | Comic
+| Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends |
+Notes`, with the `#` cell linking to the eBay listing. The per-column derivation
+contract (confidence-gating, Ends computation, grade signals, no extra API call
+for price/bids) is owned by `.claude/agents/comic-identifier.md`. Present the
+table as-is; two columns carry weight downstream:
 
-```
-| # | Comic | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | $102.50 | 12 | beatlebluecat | 2d | — |
-| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | $5.00 | 0 | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
-| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | $250.00 | — | someseller | — | ⚠️ Buy It Now |
-```
+- **Year** — forward it verbatim into `/comic:collection-check` (blank stays
+  blank, never backfill a guess). It's a confidence-gated per-issue cover year
+  (BUI-316); collection-check.md § Input shape owns the BUI-316/BUI-129
+  forwarding rule.
+- **Current Price / Bids** — carried forward for `/comic:buy` Steps 4–5; Step 4
+  owns the no-re-fetch rule (BUI-359).
 
-- The `#` column links directly to the eBay listing (`https://www.ebay.com/itm/{item_id}`).
-  No separate Item ID column.
-- **Year** is the confidence-gated per-issue cover year (BUI-316). It's populated only
-  when the title's parenthesized year and eBay's item-specifics `Publication Year`
-  corroborate each other (and the listing isn't a facsimile/reprint) — otherwise `—`.
-  A blank is the common, safe case. `/comic:collection-check` forwards this exact value
-  as the per-issue `year` (see its EXECUTOR CONTRACT § Input for the full
-  BUI-316/BUI-129 forwarding rule); a blank stays year-agnostic there too.
-- **Current Price** and **Bids** (BUI-359) come straight from the fetch the subagent
-  already made (`current_price` / `bid_count` in the `ebay_fetch.py` JSON — no extra
-  API call). Current Price is the current bid for an auction, the buy price for a BIN;
-  Bids is the auction bid count (`—` for BIN). Carry both forward — `/comic:buy`
-  Steps 4–5 use them for the current-bid-vs-max pre-flight and urgency context
-  instead of re-fetching or re-asking this subagent mid-flow.
-- **Ends** shows time remaining, not the end date: `<60 min → "47m"`, `<24h → "18h"`,
-  `≥1 day → "2d"`. Mark with ⚠️ in the Ends cell if under 24h.
-- Flag Buy It Now listings — they're skipped at the Gixen step.
-- Carry the `seller` username, the stated `grade`, and the **Year** forward —
-  `/comic:buy` uses the seller for its reliability advisory (Step 1) and stores both
-  the seller grade and (if graded) the photo grade on the snipe; the Year flows into
-  `/comic:collection-check` as the per-issue cover year (BUI-316).
+Flag Buy It Now listings — they're skipped at the Gixen step.
 
 **Ask user to confirm identifications are correct.**
 
@@ -70,9 +54,7 @@ printing?", "what does the description say about the variant?"), SendMessage
 the **same named** agent (§ Step 1 — naming it at spawn is the precondition
 that makes this addressable) rather than dispatching a fresh one — the answer
 is one tool call from JSON it already holds; a fresh spawn re-fetches and
-re-parses everything (in the 2026-07-16 run: 1 tool call vs 9). Current Price
-and Bids never need a follow-up — they are already columns in the table
-(BUI-359).
+re-parses everything (in the 2026-07-16 run: 1 tool call vs 9).
 
 ## Common Mistakes
 

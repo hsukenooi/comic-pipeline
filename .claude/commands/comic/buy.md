@@ -13,42 +13,28 @@ Each leaf skill is also usable standalone. Use this when the user provides eBay 
 
 ## Execution Pattern
 
-Leaf skills split into **EXECUTOR CONTRACT** (self-contained sub-agent
-instructions) and **ORCHESTRATOR NOTES** (gates, decision guidance) — BUI-361.
-Dispatch a step as:
-
-> Read `<skill path>` and execute its EXECUTOR CONTRACT with this
-> input: \<the step's working-list input\>
-
-Use the full path (e.g.
-`~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md`), not a
-bare filename. As orchestrator, read only the dispatched skill's ORCHESTRATOR
-NOTES yourself — never its EXECUTOR CONTRACT, and never re-serialize the skill
-body into the dispatch prompt.
-
-Steps without a sub-agent dispatch stay inline: read the skill file and follow
-it (`identify.md`, `grade.md`), or call the CLI directly (Steps 3 and 5).
-`verify.md` is dispatched neither way at Step 6 — see Step 6 below for how
-its ORCHESTRATOR NOTES get read without a matching executor call.
+Each step either reads a leaf skill inline and follows it (`identify.md` at
+Step 1, `grade.md` at Step 2.5) or calls a CLI directly and interprets its
+output (Steps 2, 3, 5, 6). No step dispatches a leaf skill's executor contract
+to a sub-agent: post-BUI-504 the collection check is one CLI call, and
+post-BUI-507 verification rides along in Step 5's output and is read as JSON at
+Step 6. Leaf skills stay usable standalone — some (e.g. `verify.md`) still carry
+a self-contained executor contract for that case; the buy flow just doesn't
+route through it. Use full skill paths (e.g.
+`~/Projects/comic-pipeline/.claude/commands/comic/grade.md`), not bare filenames.
 
 At each step, present results to the user and wait for approval before proceeding.
 
 ### Sub-agent reuse — SendMessage, not respawn (BUI-366)
 
-Route follow-up work that lands on data an already-spawned agent holds to that
-agent via `SendMessage({to: <name>, message: ...})` instead of spawning fresh
-— this only works if the agent was named at spawn (Steps 1 and 2 do this).
-Reuse targets:
-
-- **Identifier agent (Step 1)** — holds the full `ebay_fetch.py` JSON (item
-  specifics, description text, printing/variant evidence). Route follow-ups
-  like "is item N a first print?" to it; see identify.md § Follow-ups.
-- **Collection-check executor (Step 2)** — holds its EXECUTOR CONTRACT and
-  verdicts. A comic added mid-run = SendMessage it the new row, not a respawn.
-
-There is no snipe-add sub-agent to reuse (Step 5 is inline). Reuse never skips
-a gate — routed work still goes through the same approvals as first-pass work.
-Full BUI-361/BUI-366 rationale: `docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md`.
+The one long-lived sub-agent in this flow is the **identifier agent (Step 1)** —
+named at spawn, it holds the full `ebay_fetch.py` JSON (item specifics,
+description text, printing/variant evidence). Route follow-ups like "is item N a
+first print?" to it via `SendMessage({to: <name>, message: ...})` rather than
+respawning; see identify.md § Follow-ups. There is no snipe-add sub-agent to
+reuse (Step 5 is inline). Reuse never skips a gate — routed work still goes
+through the same approvals as first-pass work. Full BUI-361/BUI-366 rationale:
+`docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md`.
 
 ---
 
@@ -74,9 +60,7 @@ Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow i
 **Input:** eBay URLs from the user.
 **Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**).
 
-Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step.
-
-**Keep the Current Price and Bids columns in the working list (BUI-359)** — Steps 4–5 need them for the current-bid-vs-max pre-flight and urgency context; they're already in the Step 1 fetch, so don't re-ask the identifier subagent for prices mid-flow.
+Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step. The table's **Current Price** and **Bids** columns carry forward for Steps 4–5 (Step 4 owns the no-re-fetch rule, BUI-359).
 
 ### Seller reliability advisory (BUI-78)
 
@@ -100,9 +84,9 @@ When `sample_size >= 1`, surface a line before the grade (Step 2.5) / bid-aggres
 
 The check is **one CLI call** (BUI-504) — no executor sub-agent. Build
 `items.json` from the working list (one entry per comic: `series`, `issue`, the
-Step 1 **Year column exactly as emitted** — a blank stays blank, never backfill
-it; the CLI owns the BUI-316/BUI-129 cover-year forwarding rule — and `variant`
-when present), then:
+Step 1 **Year column verbatim** — blank stays blank, never backfill it
+(collection-check.md § Input shape owns the BUI-316/BUI-129 forwarding rule) —
+and `variant` when present), then:
 
 ```bash
 locg collection check-batch items.json --table
@@ -132,17 +116,12 @@ Remove skipped comics from the working list before Step 2.5.
 ### Duplicate listings of the same comic → Gixen bid group (BUI-363)
 
 When the working list has **2+ listings of the same comic** and the user wants
-**at most one copy**, keep every copy in the working list (don't drop
-later-ending ones) and mark them a bid-group candidate — each copy still flows
-through grade/FMV individually (per-copy max bids may legitimately differ by
-grade). At Step 5, give every copy the same `"group": N`; omit it if the user
-genuinely wants multiple copies (distinct variants, intentional multi-buy).
-
-The four bid-group rules (picking N, the ~2 min end-time caveat, and why
-`gixen purge` is hygiene rather than the safety net) live in `snipe-add.md`
-§ Bid groups and `docs/solutions/conventions/bid-group-purge-is-hygiene-not-safety-net.md`
-— this section only carries the buy-flow-specific part: candidates surface
-here at Step 2, get applied at Step 5.
+**at most one copy**, keep every copy (don't drop later-ending ones), let each
+still flow through grade/FMV individually (per-copy max bids may differ by
+grade), and mark them a bid-group candidate to apply as a shared `"group": N` at
+Step 5 (omit it if the user genuinely wants multiple copies). The rules for safe
+grouping are owned by `snipe-add.md` § Bid groups — this step only surfaces the
+candidates.
 
 ---
 
@@ -184,7 +163,7 @@ comic-fmv --batch <working_list.json> --out <results.json> --brief
 
 **Input:** Working list JSON: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Pass `publisher` for non-Marvel/DC titles and `variant` for non-base editions — both feed FMV accuracy (BUI-161). Include `grade_confidence` (`high`|`medium`|`medium-low`|`low` — all four levels; fmv.md owns the haircut each applies) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
 
-**Output:** Human FMV table to stdout, followed by one compact JSON line per row (`--brief`, BUI-362): `{item_id, comic_id, fmv_id, max_bid, flag_reason, confidence}`. The full structured JSON still lands at `--out`, but **do not read the `--out` file into context** — it's dominated by `queries_used`/`trimmed_pool` (~6k tokens for 7 rows). The brief lines carry everything Steps 4–5 need; keep `--out` on disk for deep dives only (e.g. inspecting the comp pool when CV >100%).
+**Output:** Human FMV table to stdout, followed by one compact JSON line per row (`--brief`, BUI-362; `fmv_low`/`fmv_high`/`fmv_notes` added BUI-505): `{item_id, comic_id, fmv_id, max_bid, fmv_low, fmv_high, fmv_notes, flag_reason, confidence}`. The full structured JSON still lands at `--out`, but **do not read the `--out` file into context** — it's dominated by `queries_used`/`trimmed_pool` (~6k tokens for 7 rows). The brief lines carry everything Steps 4–5 need; keep `--out` on disk for deep dives only (e.g. inspecting the comp pool when CV >100%).
 
 Each brief line includes the internal `comic_id` (and `fmv_id`) returned by `POST /api/comics`. These IDs are how `bids.comic_id` / `bids.fmv_id` get populated downstream — capture them now so Step 5 can thread them into `gixen add-batch` (via `gixen build-batch`, BUI-435). A row with `comic_id: null` means the DB upsert was skipped (no FMV computed, e.g. `n=0`) — that row will not be linkable; flag it before the user approves a max bid. Full rationale for why this capture matters (PER-140): `docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md`.
 
@@ -209,7 +188,7 @@ If the CLI fails, fall back to the manual procedure in `~/Projects/comic-pipelin
 
 ## Step 4: Compute Max Bids
 
-The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is `0.80` by default; fmv.md §6 owns the haircut logic that lowers it when grade or comp confidence is low (see Step 2.5 for where `grade_confidence` comes from). When a haircut applied, the row's Notes carry `bid_haircut=…` — that notes string lives only in the `--out` JSON (`db_row.fmv_notes`), so when the brief line's `max_bid` is visibly below 80% of the table's FMV high, extract just that row's notes from the `--out` file (one-line python/jq) rather than reading the whole file. Present the proposed bids:
+The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is `0.80` by default; fmv.md §6 owns the haircut logic that lowers it when grade or comp confidence is low (see Step 2.5 for where `grade_confidence` comes from). When a haircut applied, the row carries `bid_haircut=…` in its `fmv_notes` — read it straight off the brief line (BUI-505 emits `fmv_notes` there); no `--out` read needed. Present the proposed bids:
 
 ```
 | # | Comic | Grade | FMV Range | Max Bid | Notes |
@@ -242,7 +221,7 @@ This step calls `gixen add-batch` inline (BUI-360) instead of dispatching `snipe
 
 If `gixen` isn't found, install the monorepo CLIs first: `./scripts/install.sh`.
 
-**1. Bid sanity check:** same rule as `snipe-add.md`'s pre-flight — compare each approved auction's current bid against its proposed max bid using the Step 1 Current Price column (BUI-359), don't re-fetch. If current bid ≥ max bid, surface it and ask whether to raise the max or skip before proceeding.
+**1. Bid sanity check:** same rule as `snipe-add.md`'s pre-flight — compare each approved auction's current bid (Step 1 Current Price column; no re-fetch, see Step 4) against its proposed max bid. If current bid ≥ max bid, surface it and ask whether to raise the max or skip before proceeding.
 
 **2. Build the rows JSON with `gixen build-batch`** (BUI-435) — a tested,
 deterministic transform, not a hand-merge:
@@ -276,9 +255,9 @@ neither an override nor `skip`. Fix the input and re-run rather than patching
 gixen add-batch <rows.json> --verify --json-out <results.json>
 ```
 
-Adds run strictly sequentially inside the CLI (Gixen sessions are stateful — parallel adds fail; this is now enforced in code, not by agent discipline). `--verify` POSTs every landed row **that carries a grade** to `/api/comics/verify` and appends a verdict per row (see Step 6) in the same call — this is what collapses the old separate Step 6 sub-agent into this one invocation.
+Adds run strictly sequentially inside the CLI — enforced in code, not by agent discipline (snipe-add.md owns the sequential-adds rule and its rationale). `--verify` POSTs every landed row **that carries a grade** to `/api/comics/verify` and appends a verdict per row (see Step 6) in the same call — this is what collapses the old separate Step 6 sub-agent into this one invocation.
 
-A non-zero exit code means at least one row did not land (failed or was left not-attempted after a mid-batch halt) — **read the JSON, don't treat non-zero as total failure.** Present the human table the CLI printed (or reformat it with the comic names from Steps 1–4, joined by `item_id`, for readability) and call out any `failed`/`not_attempted` rows explicitly.
+A non-zero exit code means at least one row did not land (failed or was left not-attempted after a mid-batch halt) — **read the JSON, don't treat non-zero as total failure.** Present the human table the CLI printed (it now includes comic titles, BUI-506) and call out any `failed`/`not_attempted` rows explicitly.
 
 **Output:** the add-batch JSON (also at `--json-out`): `{"summary": {...}, "halted": bool, "verify_error": ..., "rows": [{"item_id", "status", "max_bid", "grade", "created", "link_attempted", "link_ok", "error", "link_error", "verify"}, ...]}`. `error` is set only when the row itself failed to add (`status: "failed"`); `link_error` is a separate field set when the add landed but the FMV link call failed (`status` stays `"added"`/`"updated"`) — don't conflate the two when scanning for failures.
 
