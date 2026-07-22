@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# BUI-510: comics-api <METHOD> <path> [curl args...]
+#
+# One-line replacement for the source-comics-server.sh + comics_resolve_server +
+# comics_health_gate + comics_curl preamble every /comic:* skill bash block used
+# to repeat (BUI-172, BUI-375) — Bash tool calls don't share shell state
+# (BUI-352), so every fenced block re-paid that four-line tax just to make one
+# server call. This wrapper is an installed executable: it resolves the comics
+# server itself, health-gates it, and issues the call through the SAME
+# comics_curl helper (scripts/comics-server.sh) skills already relied on — so a
+# non-200 or unreachable server is ALWAYS a loud non-zero exit with the error
+# body printed on stderr. Never a silent empty-host curl, never a swallowed
+# failure that reads as a false "no results" (the BUI-352/BUI-375 trap class).
+#
+# Usage:
+#   comics-api GET  /health
+#   comics-api GET  /api/comics/collection/status
+#   comics-api POST /api/comics/wish-list -H 'Content-Type: application/json' -d @body.json
+#   comics-api GET  /api/comics/collection/export -o /tmp/export.json
+#
+# <path> is a server-relative path (leading '/') — it is joined onto the
+# resolved COMICS_SERVER_URL internally; never pass a full URL. Any arguments
+# after <path> are forwarded verbatim to curl (headers, -d, -o, query strings
+# baked into <path>, ...).
+#
+# Deliberately NOT `set -e` (see below): this script sources
+# scripts/comics-server.sh, whose comics_curl does `body="$(curl ...)"` then
+# inspects `$?` on the next line to decide whether to print the error body.
+# Under `set -e`, a failing command-substitution assignment that is not the
+# tested condition of an if/while/&&/|| aborts the shell immediately, at the
+# assignment itself — which would skip comics_curl's own diagnostic-printing
+# code and silently exit on the raw curl code instead. That is exactly the
+# "swallowed failure" class this wrapper exists to kill, so don't add `set -e`
+# here without re-verifying that interaction.
+set -uo pipefail
+
+# Resolve this script's real location even if invoked through a symlink (the
+# installed copy on PATH is a symlink back into this checkout — see
+# scripts/install.sh) so it can find its sibling comics-server.sh regardless of
+# the caller's cwd. Portable to macOS's bash 3.2 (no `readlink -f`).
+resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  while [ -h "$src" ]; do
+    local dir
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
+if [ ! -f "$SCRIPT_DIR/comics-server.sh" ]; then
+  echo "comics-api: cannot find comics-server.sh next to this script (looked in $SCRIPT_DIR) — is the install/symlink intact? Re-run scripts/install.sh." >&2
+  exit 1
+fi
+# shellcheck source=./comics-server.sh
+source "$SCRIPT_DIR/comics-server.sh"
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: comics-api <METHOD> <path> [curl args...]" >&2
+  echo "  e.g. comics-api GET /api/comics/collection/status" >&2
+  exit 1
+fi
+
+# Uppercase defensively (tr, not \${var^^} — bash 3.2 on macOS lacks case
+# expansion) so a skill author's lowercase "get"/"post" doesn't silently send
+# a method most servers won't route.
+method="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+path="$2"
+shift 2
+
+case "$path" in
+  http://*|https://*)
+    echo "comics-api: <path> must be a server-relative path (e.g. /api/health), not a full URL: $path" >&2
+    exit 1
+    ;;
+  /*)
+    ;;
+  *)
+    echo "comics-api: <path> must start with '/' (got '$path')" >&2
+    exit 1
+    ;;
+esac
+
+comics_resolve_server || exit 1
+comics_health_gate || exit 1
+
+comics_curl -X "$method" "${COMICS_SERVER_URL}${path}" "$@"
+exit $?

@@ -72,29 +72,24 @@ warning. Migrate to `COMICS_SERVER_URL`.
 
 ## Run the report
 
-Per the shared comics-server call convention (BUI-172,
+Per the shared comics-server call convention (BUI-172/BUI-510,
 `docs/conventions/comics-server-call.md`) — don't hand-roll URL resolution or
-the health check here:
+the health check here, just call `comics-api`:
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_health_gate     || exit 1
-
-comics_get "$COMICS_SERVER_URL/api/comics/calibration" || exit 1
+comics-api GET /api/comics/calibration || exit 1
 ```
 
-**If either resolve/health-gate step or the `comics_get` call fails: STOP and
-report the error** — a failed call must never render as "nothing to
-re-price" (a hard-fail-loud rule shared with every other `/comic:*` server
-call). A genuine "no calibration signal" result is the JSON array `[]` with
-exit 0.
+**If the call fails: STOP and report the error** — a failed call must never
+render as "nothing to re-price" (a hard-fail-loud rule shared with every
+other `/comic:*` server call). A genuine "no calibration signal" result is
+the JSON array `[]` with exit 0.
 
 Optional `days` query param (default 180 — matches the recency window
 `/api/comics/outcomes` uses for first-party comps):
 
 ```bash
-comics_get "$COMICS_SERVER_URL/api/comics/calibration?days=90"
+comics-api GET "/api/comics/calibration?days=90" || exit 1
 ```
 
 Optional `min_losses` query param (default 2 — a book must have lost at least
@@ -102,7 +97,7 @@ this many times in-window to surface; see "The one rule that must never be
 'fixed'" above for why a single loss doesn't count):
 
 ```bash
-comics_get "$COMICS_SERVER_URL/api/comics/calibration?min_losses=3"
+comics-api GET "/api/comics/calibration?min_losses=3" || exit 1
 ```
 
 ## Response shape
@@ -179,7 +174,7 @@ concern like `/comic:wishlist-sellers` has. A steady-state run that returns
 |---|---|
 | Treating a high `loss_count` as the signal | It isn't — see "The one rule that must never be 'fixed'" above. |
 | Sorting or filtering by `contested_win_margin` | It's context only — see "The one rule that must never be 'fixed'" above. |
-| Rendering an empty table on a failed `comics_get` call | STOP and report the error instead — the hard-fail-loud rule this skill shares with every other `/comic:*` server call. |
+| Rendering an empty table on a failed `comics-api` call | STOP and report the error instead — the hard-fail-loud rule this skill shares with every other `/comic:*` server call. |
 | Assuming this report writes anything | It never does. `fmv_high` only changes when you explicitly re-run `/comic:fmv` afterward. |
 
 ---

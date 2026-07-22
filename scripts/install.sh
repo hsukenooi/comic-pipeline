@@ -10,6 +10,7 @@
 #   - comic-fmv   -> comic-fmv                                   (apps/fmv)
 #   - gixen-cli   -> gixen                                       (packages/gixen-cli, editable)
 #   - locg        -> locg                                        (packages/locg-cli, editable)
+#   - comics-api  -> comics-api (symlink, not uv-managed)         (scripts/comics-api, BUI-510)
 #
 # comic-fmv shells out to the `ebay-sold-comps` console script at runtime, so
 # both apps must be installed for the FMV pipeline to work end to end. The
@@ -81,6 +82,22 @@ uv tool install --reinstall --editable "$REPO_ROOT/packages/gixen-cli"
 echo "Installing locg (packages/locg-cli)..."
 uv tool install --reinstall --editable "$REPO_ROOT/packages/locg-cli"
 
+bin_dir="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
+
+# comics-api (BUI-510) is a plain bash script, not a uv-managed console script
+# — symlink it into the SAME bin_dir the uv tool installs above use, so it's
+# already on PATH with no separate setup step. The script resolves its own
+# real location through the symlink (see resolve_script_dir in the script
+# itself) to find its sibling comics-server.sh, so re-running this (e.g. after
+# a `git pull`) just re-points the same symlink at the current source — no
+# re-copy needed, unlike the uv tool installs above which DO go stale (see the
+# BUI-365/BUI-455 notes at the top of this file). `ln -sf` is safe to re-run:
+# it only ever replaces this one symlink, never anything else in bin_dir.
+echo "Installing comics-api (server call wrapper for /comic:* skills, BUI-510)..."
+chmod +x "$REPO_ROOT/scripts/comics-api"
+mkdir -p "$bin_dir"
+ln -sf "$REPO_ROOT/scripts/comics-api" "$bin_dir/comics-api"
+
 # Remove stale hand-rolled wrappers pinned to python@3.14. Only delete files we
 # positively identify as the broken wrappers, never anything else on PATH.
 # (The pre-merge locg install was exactly this python@3.14 wrapper.)
@@ -93,9 +110,8 @@ for name in comic-fmv ebay-fetch ebay-sold-comps seller-scan comic-identify wish
   fi
 done
 
-bin_dir="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
 echo
 echo "Done. CLIs installed via uv into $bin_dir:"
-for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers gixen locg; do
+for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers gixen locg comics-api; do
   printf '  %-16s -> %s\n' "$name" "$(command -v "$name" 2>/dev/null || echo 'NOT ON PATH — add '"$bin_dir"' to PATH')"
 done
