@@ -41,6 +41,7 @@ from gixen_overlay.models import (
     WishListAddRequest,
     WishListAddBatchRequest,
     RecordWinCommitRequest,
+    EraEvidenceRequest,
     CollectionRestoreRequest,
     CollectionRemediateDeleteRequest,
     CollectionRemediateSetCopiesRequest,
@@ -78,6 +79,7 @@ from locg.commands import (
     cmd_collection_export,
     cmd_collection_import,
     cmd_collection_record_win,
+    cmd_collection_record_win_era_evidence,
     cmd_collection_remediate_delete,
     cmd_collection_remediate_set_copies,
     cmd_collection_series_names,
@@ -1802,6 +1804,36 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
         "pending_push_count": status.get("pending_push_count"),
         "oldest_pending_days": status.get("oldest_pending_days"),
     }
+
+
+@router.post("/api/comics/collection/record-win/era-evidence")
+async def api_record_win_era_evidence(req: EraEvidenceRequest):
+    """BUI-498: confirm a null-year win's era before auto-recording it.
+
+    ``record_win_prep`` holds EVERY null-year win for review by default
+    (BUI-475) because a null-year win's era cannot be confirmed from local
+    collection evidence (``resolve_series_for_win`` fails open to the sole
+    owned volume — the BUI-421 mis-file). This read-only endpoint recovers the
+    safe auto-record path: for each null-year win it returns ``era_confirmed``
+    from the ONLY signal that can confirm the era — the issue's Metron cover
+    year vs the resolved volume's INDEPENDENT window (see
+    ``cmd_collection_record_win_era_evidence``). The client moves an
+    era-confirmed win from ``needs_review`` into ``wins``; an unconfirmed one
+    stays held.
+
+    Runs off the event loop via ``asyncio.to_thread`` (BUI-255/BUI-428): the
+    Metron lookups it makes can sleep on the BUI-465 pacer, and blocking this
+    coroutine would stall the single-worker comics server.
+
+    Fails CLOSED end to end: this handler never fabricates a confirmation, and
+    ``cmd_collection_record_win_era_evidence`` returns ``era_confirmed=False``
+    on every ambiguous/failed path, so a stale Mini (this route absent -> 404),
+    an unreachable server, or a Metron outage all degrade to the client's
+    hold-all default rather than to a wrong-era auto-record.
+    """
+    _ensure_collection_store()
+    items = [w.model_dump() for w in req.wins]
+    return await asyncio.to_thread(cmd_collection_record_win_era_evidence, items)
 
 
 def _is_pinned_collection_row(

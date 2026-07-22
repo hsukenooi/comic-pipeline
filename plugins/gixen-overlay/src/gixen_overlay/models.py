@@ -223,6 +223,32 @@ class RecordWinCommitRequest(BaseModel):
     resolved_reviews: list[dict] = Field(default_factory=list)
 
 
+class EraEvidenceItem(BaseModel):
+    """One null-year win to era-check (BUI-498). Only the identity fields the
+    server needs to resolve the volume + look up the issue on Metron — the
+    same shape ``record_win_prep`` already carries per win. ``item_id`` is
+    echoed back so the client can map verdicts, ``edition`` re-attaches the
+    Annual/Treasury qualifier ``comic-identify`` strips (BUI-426) so the
+    resolver keys off the same series text the record-win commit will."""
+
+    item_id: str | None = None
+    series: str | None = None
+    issue: str | None = None
+    edition: str | None = None
+
+
+class EraEvidenceRequest(BaseModel):
+    """POST /api/comics/collection/record-win/era-evidence — per-null-year-win
+    era confirmation for the BUI-498 auto-record gate (see
+    ``cmd_collection_record_win_era_evidence``). Provider-neutral name.
+
+    ``wins`` defaults to empty so a call with nothing to check is a no-op that
+    returns ``{"results": []}``. Every input win maps to one result; the client
+    treats any win absent from ``results`` as HOLD (fail closed)."""
+
+    wins: list[EraEvidenceItem] = Field(default_factory=list)
+
+
 class CollectionRestoreRequest(BaseModel):
     """POST /api/comics/collection/restore — restore the collection store
     from a named backup (BUI-433).

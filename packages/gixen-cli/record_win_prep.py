@@ -27,17 +27,22 @@ title, so this deliberately never looks at `confidence` as a gate. BUI-422
 added a price-gated version of one more: a null `year` on a win priced at/above
 a threshold gated to needs_review, on the theory that a null year correlates
 with the ALL-CAPS/vintage-key titles most prone to mis-resolving to the wrong
-volume downstream (see `resolve_series_for_win`, BUI-421). BUI-475 replaces
-that price gate: the original plan was a server-side era-evidence endpoint
-(Option A) to auto-resolve which volume a null-year win belongs to, but that
-endpoint fails open — a null-year win with no competing same-title volume in
-the collection auto-records under the sole owned (and possibly wrong-era)
-volume, reproducing the BUI-421 mis-file BUI-422 was meant to prevent. Since
-a win's era genuinely cannot be confirmed without a year, and price is not a
-reliable proxy for that (a cheap null-year win is exactly as unconfirmable as
-an expensive one), every null-year win now gates to needs_review
-unconditionally, regardless of price. See BUI-475 and the redesign follow-up
-BUI-498.
+volume downstream (see `resolve_series_for_win`, BUI-421). BUI-475 replaced
+that price gate: the FIRST era-evidence endpoint (Option A) gated on LOCAL
+collection evidence and fails open — a null-year win with no competing
+same-title volume in the collection auto-records under the sole owned (and
+possibly wrong-era) volume, reproducing the BUI-421 mis-file. So BUI-475
+shipped the safe interim of holding EVERY null-year win, regardless of price.
+
+BUI-498 recovers the safe auto-record path using the ONE signal that can
+confirm a null-year win's era: the issue's Metron cover year. A null-year
+regular win is now era-checked against the server (`fetch_era_evidence` ->
+`POST /api/comics/collection/record-win/era-evidence`, backed by
+`cmd_collection_record_win_era_evidence`): it auto-records ONLY when Metron's
+cover year lands inside the resolved volume's independent publication window,
+and HOLDS otherwise. The check fails CLOSED at every layer — an unknown/
+ambiguous resolution, a Metron miss, or an unreachable/stale server all
+degrade to BUI-475's hold-all. See BUI-475 and BUI-498.
 """
 
 from __future__ import annotations
@@ -57,21 +62,30 @@ class _HTTPGetter(Protocol):
 
     def get(self, url: str, *, timeout: float) -> requests.Response: ...
 
+
+class _HTTPPoster(Protocol):
+    """Structural type for `fetch_era_evidence`'s `session` param — anything
+    with a `requests`-shaped `post(url, json=..., timeout=...)`."""
+
+    def post(self, url: str, *, json: dict, timeout: float) -> requests.Response: ...
+
 SEEN_ENDPOINT = "/api/comics/collection/record-win/seen"
+ERA_EVIDENCE_ENDPOINT = "/api/comics/collection/record-win/era-evidence"
 DEFAULT_IDENTIFY_CMD = ["comic-identify", "--batch"]
 
 # BUI-354 needs_review reasons — named so source and tests can't silently
 # drift on a typo in the literal.
 REASON_NULL_SERIES_OR_ISSUE = "series or issue is null"
 REASON_UNPARSEABLE_LOT = "lot with unparseable contents"
-# BUI-475: a null `year` from comic-identify means the win's era can't be
-# confirmed at all — the ALL-CAPS/vintage-key titles most prone to
-# mis-resolving to the wrong Metron volume (see BUI-421 /
-# resolve_series_for_win) are exactly the ones comic-identify can't date, and
-# a server-side attempt to auto-resolve the era from collection evidence
-# (Option A) was proven to fail open (see BUI-475). So every null-year win
-# gates to needs_review unconditionally — there is no price threshold below
-# which it's safe to auto-record without a year.
+# BUI-475/BUI-498: a null `year` from comic-identify means the win's era can't
+# be confirmed from the parse — the ALL-CAPS/vintage-key titles most prone to
+# mis-resolving to the wrong Metron volume (see BUI-421 / resolve_series_for_win)
+# are exactly the ones comic-identify can't date. Such a win holds under this
+# reason UNLESS the server's Metron-cover-year check (BUI-498) positively places
+# the issue inside the resolved volume's window; the first collection-evidence
+# attempt (Option A) failed open, so the confirming signal is Metron's cover
+# year, never local evidence. Lots always hold under this reason (per-issue era
+# confirmation is out of scope).
 REASON_MISSING_YEAR = "year is null (vintage-key volume-mis-resolution risk)"
 
 
@@ -154,6 +168,89 @@ def fetch_seen_ids(
         raise RecordWinPrepError(
             f"unparseable seen-set response from {server_url}: {exc}"
         ) from exc
+
+
+def fetch_era_evidence(
+    server_url: str,
+    items: list[dict],
+    *,
+    timeout: float = 120.0,
+    session: _HTTPPoster = requests,
+) -> dict[str, bool]:
+    """POST null-year wins to the BUI-498 era-evidence endpoint and return
+    ``{item_id: era_confirmed}``.
+
+    Unlike :func:`fetch_seen_ids`, this NEVER raises / hard-stops. Every
+    failure mode — unreachable server, timeout, a stale Mini without this route
+    (404), a non-200, an unparseable body, a Metron outage the server reports —
+    returns an empty (or partial) map, so the affected null-year wins fall back
+    to HOLD (the BUI-475 hold-all default). Holding is always safe here (a
+    null-year win that isn't auto-recorded is merely reviewed by a human),
+    whereas hard-stopping the whole run on a soft signal would be strictly
+    worse. This mirrors the collection-check R11 discipline in the safe
+    direction: never emit ``era_confirmed=True`` from a failed/uncertain call.
+
+    A confirmation is trusted ONLY when the server explicitly returns
+    ``era_confirmed`` true for that item_id; any item missing from the response
+    (or with a false/absent flag) reads as HOLD via the caller's
+    ``.get(item_id, False)``.
+    """
+    if not items:
+        return {}
+    url = f"{server_url.rstrip('/')}{ERA_EVIDENCE_ENDPOINT}"
+    try:
+        resp = session.post(url, json={"wins": items}, timeout=timeout)
+    except requests.RequestException as exc:
+        print(
+            f"warning: era-evidence call to {server_url} failed ({exc}) — "
+            "holding all null-year wins for review (BUI-498 fail-closed)",
+            file=sys.stderr,
+        )
+        return {}
+    if resp.status_code != 200:
+        print(
+            f"warning: era-evidence returned HTTP {resp.status_code} from "
+            f"{server_url} — holding all null-year wins for review "
+            "(BUI-498 fail-closed)",
+            file=sys.stderr,
+        )
+        return {}
+    try:
+        data = resp.json()
+        results = data["results"]
+    except (ValueError, KeyError, TypeError) as exc:
+        print(
+            f"warning: unparseable era-evidence response from {server_url} "
+            f"({exc}) — holding all null-year wins for review (BUI-498 fail-closed)",
+            file=sys.stderr,
+        )
+        return {}
+    # The "never raises" promise must survive ANY 200 body shape, not just the
+    # ones json()/["results"] happen to reject above: a non-list `results`, or a
+    # non-dict / null element, would make `row.get(...)` raise AttributeError
+    # and hard-stop the whole record-win-prep run — the exact "strictly worse"
+    # outcome this fail-closed function exists to avoid. Validate the shape and
+    # skip anything malformed instead.
+    if not isinstance(results, list):
+        print(
+            f"warning: era-evidence response from {server_url} had a non-list "
+            "'results' — holding all null-year wins for review (BUI-498 fail-closed)",
+            file=sys.stderr,
+        )
+        return {}
+    out: dict[str, bool] = {}
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        item_id = row.get("item_id")
+        if item_id is not None:
+            # Trust a confirmation ONLY on a real JSON `true` (identity, not
+            # truthiness). A divergent/stale server returning a truthy non-True
+            # value (e.g. the string "false", or 1) must never flip a HOLD into
+            # a wrong-era auto-record — that would be the BUI-421 mis-file. This
+            # mirrors _check_metron_degraded's deliberate `is True` guard.
+            out[item_id] = row.get("era_confirmed") is True
+    return out
 
 
 def subtract_seen(ended_won: list[dict], seen_ids: set[str]) -> list[dict]:
@@ -269,14 +366,25 @@ def _build_win_entry(win: dict, identity: dict, *, issue: str) -> dict:
     }
 
 
-def entries_for_win(win: dict, identity: dict) -> tuple[list[dict], dict | None]:
+def entries_for_win(
+    win: dict, identity: dict, *, era_confirmed: bool = False
+) -> tuple[list[dict], dict | None]:
     """Turn one (win, comic-identify result) pair into either ready wins
     entries or a single needs_review entry. BUI-354: a null series/issue (or,
     for a lot, unparseable/empty constituent_issues) gates — no confidence
-    check. BUI-475: a null `year` also gates, always — its era can't be
-    confirmed without a year, regardless of price (this replaces BUI-422's
-    price-gated version, after the server-side era-evidence redesign, Option
-    A, was proven to fail open; see BUI-475 and the follow-up BUI-498)."""
+    check.
+
+    BUI-475/BUI-498: a null `year` on a regular (non-lot) win HOLDS unless
+    ``era_confirmed`` is True. ``era_confirmed`` is the server's Metron-cover-
+    year verdict (BUI-498): the issue's Metron cover year sits inside the
+    resolved volume's independent window, so the era the parse couldn't supply
+    is externally confirmed and the win is safe to auto-record. It defaults
+    False and is consulted ONLY on the regular null-year path, so the flow
+    fails closed — an unknown/failed/ambiguous signal, a lot, or any caller
+    that passes nothing all hold exactly as BUI-475's unconditional hold-all
+    did (which is what replaced BUI-422's fail-open price gate). A lot with a
+    null year always holds regardless of ``era_confirmed`` (per-issue era
+    confirmation is out of BUI-498's scope)."""
     if identity.get("error"):
         return [], _build_review_entry(win, identity, f"comic-identify error: {identity['error']}")
 
@@ -292,8 +400,11 @@ def entries_for_win(win: dict, identity: dict) -> tuple[list[dict], dict | None]
             return [], _build_review_entry(win, identity, REASON_UNPARSEABLE_LOT)
         # BUI-475: a null year on a lot is the same volume-mis-resolution risk
         # as the non-lot case — its era can't be confirmed without a year, so
-        # gate it unconditionally (no price threshold) before expanding into
-        # per-issue win entries.
+        # gate it unconditionally before expanding into per-issue win entries.
+        # BUI-498's Metron-cover-year confirmation is per SINGLE issue and does
+        # not extend to lots (each constituent would need its own cover-year
+        # check), so a null-year lot always holds — `era_confirmed` is not
+        # consulted here (and `_needs_era_check` never requests it for a lot).
         if identity.get("year") is None:
             return [], _build_review_entry(win, identity, REASON_MISSING_YEAR)
         # De-duplicate while preserving order: a title with a literal repeated
@@ -306,14 +417,35 @@ def entries_for_win(win: dict, identity: dict) -> tuple[list[dict], dict | None]
     if not identity.get("series") or not identity.get("issue"):
         return [], _build_review_entry(win, identity, REASON_NULL_SERIES_OR_ISSUE)
 
-    # BUI-475: a null year correlates with the ALL-CAPS/vintage-key titles
-    # most prone to mis-resolving to the wrong volume downstream (BUI-421),
-    # and its era can't be confirmed without a year — gate unconditionally
-    # (no price threshold) for a human check instead of auto-recording.
-    if identity.get("year") is None:
+    # BUI-475/BUI-498: a null year correlates with the ALL-CAPS/vintage-key
+    # titles most prone to mis-resolving to the wrong volume downstream
+    # (BUI-421), and its era can't be confirmed from the parse alone. It HOLDS
+    # unless the server's Metron-cover-year check positively places the issue
+    # inside the resolved volume's independent window (`era_confirmed`, BUI-498).
+    # Fails closed: `era_confirmed` defaults False, so an unknown/failed/
+    # ambiguous signal — or any caller that doesn't pass one — holds exactly as
+    # BUI-475's unconditional hold-all did.
+    if identity.get("year") is None and not era_confirmed:
         return [], _build_review_entry(win, identity, REASON_MISSING_YEAR)
 
     return [_build_win_entry(win, identity, issue=identity["issue"])], None
+
+
+def _needs_era_check(identity: dict) -> bool:
+    """True iff this win's record/hold decision turns on the BUI-498 era
+    signal: a regular (non-lot) win that parsed cleanly to a series + issue but
+    with NO year. Those are exactly the wins :func:`entries_for_win` would
+    otherwise hold on ``REASON_MISSING_YEAR`` and that an in-window Metron cover
+    year can safely release. Errors, lots, and null-series/issue wins hold for
+    reasons the era signal can't lift, so they never spend a Metron call — this
+    predicate mirrors ``entries_for_win``'s gate ORDER exactly (error -> lot ->
+    null series/issue -> null year) so it is True precisely for the wins whose
+    outcome ``era_confirmed`` changes."""
+    if identity.get("error") or identity.get("is_lot"):
+        return False
+    if not identity.get("series") or not identity.get("issue"):
+        return False
+    return identity.get("year") is None
 
 
 def build_payload(
@@ -322,9 +454,11 @@ def build_payload(
     *,
     fetch_seen: Callable[[str], set[str]] = fetch_seen_ids,
     identify: Callable[[list[str]], list[dict]] = identify_titles,
+    fetch_era: Callable[[str, list[dict]], dict[str, bool]] = fetch_era_evidence,
 ) -> dict:
     """The single entry point: gixen-list (already fetched by the caller as
-    `snipes`) -> filter ENDED+WON+dedup -> subtract seen -> identify -> build.
+    `snipes`) -> filter ENDED+WON+dedup -> subtract seen -> identify ->
+    era-check null-year wins (BUI-498) -> build.
 
     Returns a dict with:
       - wins: POST-ready entries for /api/comics/collection/record-win
@@ -333,6 +467,14 @@ def build_payload(
         subtracting the seen-set (lets the caller distinguish "no wins at
         all" from "all wins already processed")
       - new_win_count: count after subtracting the seen-set
+
+    BUI-498: null-year regular wins (see :func:`_needs_era_check`) are
+    era-checked in ONE batched server call BEFORE the build loop, so the
+    server resolves them against a single MetronClient (reusing its per-series
+    cache, BUI-473) and paces once (BUI-465). A win the server confirms
+    in-era auto-records; every other null-year win — and every win at all if
+    the era-evidence call fails, since :func:`fetch_era_evidence` returns an
+    empty map on any error — holds for review (the BUI-475 fallback).
     """
     ended_won = filter_ended_won(snipes)
     seen_ids = fetch_seen(server_url)
@@ -350,8 +492,25 @@ def build_payload(
     titles = [w.get("title") or "" for w in new_wins]
     identities = identify(titles)
 
+    # BUI-498: gather the null-year regular wins whose hold/record decision the
+    # Metron-cover-year signal can flip, and resolve them all in ONE server
+    # call. Keyed by item_id; a win absent from the map (or explicitly not
+    # confirmed) holds via `.get(item_id, False)` — fail closed.
+    era_requests = [
+        {
+            "item_id": win.get("item_id"),
+            "series": identity.get("series"),
+            "issue": identity.get("issue"),
+            "edition": identity.get("edition"),
+        }
+        for win, identity in zip(new_wins, identities)
+        if _needs_era_check(identity)
+    ]
+    era_map = fetch_era(server_url, era_requests) if era_requests else {}
+
     for win, identity in zip(new_wins, identities):
-        entries, review = entries_for_win(win, identity)
+        era_confirmed = era_map.get(win.get("item_id"), False)
+        entries, review = entries_for_win(win, identity, era_confirmed=era_confirmed)
         result["wins"].extend(entries)
         if review is not None:
             result["needs_review"].append(review)
