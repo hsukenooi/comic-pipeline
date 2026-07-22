@@ -45,12 +45,12 @@ Flags:
 - `--max-age-days N` (default 7): reuse FMVs already in the comics server's DB if `fmv_updated_at` is within N days
 - `--force`: bypass both the SerpApi cache and the DB cache and recompute everything
 - `--grade-window N` (default 2.0): raise or lower the comp-pool widening ceiling — does **not** bypass the one-sided/too-wide guards (a guarded book still flags `needs_manual`)
-- `--brief`: after the table, print one compact JSON object per row (`item_id`, `comic_id`, `fmv_id`, `max_bid`, `flag_reason`, `confidence`) — the linkage fields to carry forward, without re-reading the full `--out` file
+- `--brief`: after the table, print one compact JSON object per row (`item_id`, `comic_id`, `fmv_id`, `max_bid`, `flag_reason`, `confidence`, `fmv_low`, `fmv_high`, `fmv_notes` — BUI-505) — the linkage + pricing fields to carry forward, without re-reading the full `--out` file
 - `--quiet`: suppress the human table on stdout (combine with `--brief` for JSON lines only)
 - `--server-url URL`: override `COMICS_SERVER_URL`/`GIXEN_SERVER_URL` for this run
 - `--version`: print the installed version plus the git SHA/date the binary was built from, then exit
 
-The CLI prints a human-readable table to stdout and writes the full structured result to `--out` on disk. Present the table to the user. **Carry the `--brief` JSON lines forward to Step 4 of `/comic:buy`** (`item_id`, `comic_id`, `fmv_id`, `max_bid`, `flag_reason`, `confidence`) — don't re-read the full `--out` JSON for linkage; the `--out` file on disk stays available if you need a full row (`queries_used`, `trimmed_pool`, etc.) for debugging.
+The CLI prints a human-readable table to stdout and writes the full structured result to `--out` on disk. Present the table to the user. **Carry the `--brief` JSON lines forward to Step 4 of `/comic:buy`** (`item_id`, `comic_id`, `fmv_id`, `max_bid`, `flag_reason`, `confidence`, plus `fmv_low`/`fmv_high`/`fmv_notes` for the range + haircut presentation, BUI-505) — don't re-read the full `--out` JSON for linkage; the `--out` file on disk stays available if you need a full row (`queries_used`, `trimmed_pool`, etc.) for debugging.
 
 **`fetch-err` ≠ `n/a` (BUI-143):** a row whose FMV column reads `fetch-err` (and the loud post-table warning) means the **SerpApi fetch failed** for that book — quota exhausted or an outage — **not** that the book has no comps. Treat a `fetch-err` row (or a whole batch that comes back all `fetch-err`/`n/a`) as a SerpApi failure: check the `SERPAPI_KEY`/quota and re-run. Never tell the user these books are illiquid or bid on them as if priced.
 
