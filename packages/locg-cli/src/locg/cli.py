@@ -22,6 +22,7 @@ from locg.commands import (
     cmd_check_lists,
     cmd_collection,
     cmd_collection_audit_pending,
+    cmd_collection_audit_unscoped_lookup,
     cmd_collection_backfill,
     cmd_collection_check,
     cmd_collection_doctor,
@@ -193,6 +194,28 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     p_audit.add_argument("csv_path", help="Path to the already-exported wins CSV (from `collection export`)")
+
+    # collection audit-unscoped-lookup — read-only BUI-256 mis-stamp fingerprint audit (BUI-493)
+    coll_sub.add_parser(
+        "audit-unscoped-lookup",
+        parents=[common],
+        help="Audit the collection store for agent_win rows carrying the BUI-256 unscoped-lookup mis-stamp (read-only)",
+        epilog=(
+            "Flags agent_win rows whose release_date year falls outside the "
+            "resolved series' publication window (series_year_range ±1) AND "
+            "carry a metron_id — the exact fingerprint of the pre-BUI-256 "
+            "unscoped-lookup bug (lookup_issue silently degraded to an "
+            "unscoped Metron-wide search, stamping a wrong-but-live "
+            "metron_id/release_date while series_name stayed correct). "
+            "Scoped to source=agent_win, which also excludes LOCG's own "
+            "legitimate reprint rows (Facsimile/HC/TP/Deluxe/Nth "
+            "Printing/Compendium editions, metron_id=null) with no "
+            "title-keyword logic needed. Read-only — never mutates the "
+            "store; remediate flagged rows manually via "
+            "`collection remediate-delete`/`remediate-set-copies` or a "
+            "fresh record-win."
+        ),
+    )
 
     # collection record-win — agent win recording
     p_rw = coll_sub.add_parser(
@@ -559,7 +582,7 @@ def main() -> None:
     # Collection cache subcommands are purely local — skip Playwright browser launch.
     _LOCAL_COLLECTION_SUBCMDS = {
         "import", "export", "status", "check", "doctor", "record-win", "audit-pending",
-        "remediate-delete", "remediate-set-copies", "backfill",
+        "audit-unscoped-lookup", "remediate-delete", "remediate-set-copies", "backfill",
     }
     _collection_sub = (
         getattr(args, "collection_command", None)
@@ -649,6 +672,8 @@ def main() -> None:
                 result = cmd_collection_doctor()
             elif sub_cmd == "audit-pending":
                 result = cmd_collection_audit_pending(args.csv_path)
+            elif sub_cmd == "audit-unscoped-lookup":
+                result = cmd_collection_audit_unscoped_lookup()
             elif sub_cmd == "record-win":
                 import json as _json
                 import sys as _sys

@@ -2730,6 +2730,110 @@ def cmd_collection_audit_pending(
     }
 
 
+# BUI-493: the BUI-256 unscoped-lookup mis-stamp fingerprint (BUI-488 finding).
+#
+# Pre-BUI-256, `lookup_issue` queried mokkari with the wrong param key
+# (`{"series": id}` instead of `{"series_id": id}`), which mokkari silently
+# ignored — degrading the issue query to an UNSCOPED `number=N` search across
+# all of Metron. `issues[0]` then came from a wrong, unrelated book:
+# `series_name` stayed correct (it came from LOCAL series resolution, not from
+# the Metron hit) but `metron_id`/`release_date` were stamped from whatever
+# unrelated issue #N Metron happened to return first. The bug is fixed
+# (BUI-256), but rows written before the fix are latent — and because the
+# mis-stamped `metron_id` is a LIVE Metron id (just for the wrong book), no
+# placeholder-hunting audit (e.g. audit-pending) catches them.
+def _is_unscoped_lookup_mismatch(row: dict[str, Any]) -> bool:
+    """True for an agent_win row carrying the BUI-256 unscoped-lookup fingerprint.
+
+    All three required (validated zero-false-positive against the 2026-07-19
+    backup, BUI-488):
+
+    * ``source == "agent_win"`` — an ``locg_export`` row's publisher/date/id
+      came from LOCG itself, never from this bug. This scoping is also what
+      excludes LOCG's own legitimate reprint rows (Facsimile / HC / TP /
+      Deluxe / Nth Printing / Compendium editions LOCG files under the
+      ORIGINAL masthead with a later release_date, ``metron_id=null``) —
+      title-keyword logic is deliberately NOT needed; the source scope alone
+      is the clean signal.
+    * ``metron_id`` present — the bug's exact fingerprint. A row with no
+      metron_id never went through the unscoped lookup that stamped one (or
+      never resolved a Metron hit at all), so it cannot carry this defect.
+    * the row's ``release_date`` year falls OUTSIDE the resolved series'
+      publication window (:func:`series_year_range` on ``series_name``) by
+      more than the standard ±1 tolerance. A row whose series window can't be
+      parsed (unparseable or absent decoration) can't be judged either way and
+      is NOT flagged — an audit that cannot tell should stay silent rather
+      than guess. Same for a row with no parseable release_date year.
+    """
+    if row.get("source") != "agent_win":
+        return False
+    if not row.get("metron_id"):
+        return False
+    window = series_year_range(str(row.get("series_name") or ""))
+    if window is None:
+        return False
+    year = _coerce_year(row.get("release_date"))
+    if year is None:
+        return False
+    begin, end = window
+    return not (begin - 1 <= year <= end + 1)
+
+
+def cmd_collection_audit_unscoped_lookup(cache: Optional[CollectionCache] = None) -> dict[str, Any]:
+    """Read-only audit: agent_win rows carrying the BUI-256 unscoped-lookup
+    mis-stamp fingerprint (BUI-493, a BUI-488 follow-up).
+
+    BUI-256 fixed a bug where `lookup_issue` degraded to an UNSCOPED
+    Metron-wide `number=N` search whenever mokkari silently dropped a
+    malformed series filter — `issues[0]` then came from a wrong, unrelated
+    book. Rows written before the fix carry a live-but-wrong `metron_id` and
+    `release_date`, with `series_name` still correct (it came from local
+    resolution, not the bad hit) — see :func:`_is_unscoped_lookup_mismatch`
+    for the exact fingerprint this flags.
+
+    Read-only: only a ``cache.load()`` (or a supplied test double). Never
+    writes to the collection store. Remediation is manual (e.g.
+    ``collection remediate-delete`` / ``remediate-set-copies``, or a fresh
+    ``record-win``) — this command only surfaces candidates.
+
+    Returns ``{row_count, agent_win_count, flagged_count, flagged_rows}``,
+    where each flagged row is ``{full_title, series_name, metron_id,
+    release_date, delta_years, gixen_item_id}`` — ``delta_years`` is the
+    row's release_date year's distance outside the series window (e.g. a
+    window of ``(1991, 1991)`` and a release_date year of 2022 reports 31).
+    """
+    store = cache if cache is not None else CollectionCache()
+    payload = store.load()
+    comics = payload.get("comics", [])
+    agent_win_count = sum(1 for r in comics if r.get("source") == "agent_win")
+
+    flagged_rows: list[dict[str, Any]] = []
+    for row in comics:
+        if not _is_unscoped_lookup_mismatch(row):
+            continue
+        window = series_year_range(str(row.get("series_name") or ""))
+        year = _coerce_year(row.get("release_date"))
+        # Both non-None here: _is_unscoped_lookup_mismatch already verified it.
+        assert window is not None and year is not None
+        begin, end = window
+        delta_years = (begin - year) if year < begin else (year - end)
+        flagged_rows.append({
+            "full_title": row.get("full_title"),
+            "series_name": row.get("series_name"),
+            "metron_id": row.get("metron_id"),
+            "release_date": row.get("release_date"),
+            "delta_years": delta_years,
+            "gixen_item_id": row.get("gixen_item_id"),
+        })
+
+    return {
+        "row_count": len(comics),
+        "agent_win_count": agent_win_count,
+        "flagged_count": len(flagged_rows),
+        "flagged_rows": flagged_rows,
+    }
+
+
 def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
     """Return cache status metrics.
 
@@ -4181,6 +4285,38 @@ def _edition_qualified_series(series_raw: str, edition: str) -> str:
     return f"{series_raw} {qualifier}"
 
 
+def _assert_independent_series_range(
+    *, step2_resolved: bool, series_range: Optional[tuple[int, int]]
+) -> None:
+    """BUI-496 source-level canary for the anti-tautology invariant documented
+    on :func:`_metron_release_date`.
+
+    Both the BUI-486 ±1 ``cover_date`` exception and the BUI-464 non-clean-year
+    era gate inside ``_metron_release_date`` depend on the ``series_range`` it
+    is given having INDEPENDENT provenance — sourced from the local
+    ``series_name_index`` (via :func:`series_year_range` /
+    :func:`resolve_series_for_win`), never derived from the Metron hit being
+    judged. ``step2_resolved`` is true exactly when the win's series was NOT
+    found in ``series_name_index``, so Metron's own
+    ``lookup_issue``/``format_series_name`` supplied ``canonical_series`` (the
+    "R36 step-2" fallback) — on that path a ``series_range`` computed from
+    that same hit would gate the candidate against itself and ALWAYS pass,
+    silently turning both guards into dead code (see the production incident
+    in ``_build_win_row``'s release_date comment: Infinity Gauntlet #1
+    stamped 2022-09-14 from a 2022 reprint hit, BUI-488).
+
+    This must never fire. If it does, a new caller or a refactor threaded a
+    window derived from the judged hit into the step-2 path.
+    """
+    assert not (step2_resolved and series_range is not None), (
+        "BUI-496: series_range must be None on the Metron step-2 path (series "
+        "resolved from the very Metron hit being judged) — a non-None value "
+        "here would make _metron_release_date's era gates tautological. See "
+        "_metron_release_date's docstring for the independent-provenance "
+        "contract."
+    )
+
+
 def _build_win_row(
     win: dict[str, Any],
     *,
@@ -4327,6 +4463,15 @@ def _build_win_row(
             # for the issue lookup it actually spent.
             metron_requests += lookup_cost
             metron_disabled = _check_metron_degraded(metron, metron_disabled)
+
+    # BUI-496: index_series_range is fixed from here on (set at most once,
+    # above) and is what every downstream _metron_release_date call in this
+    # function (the BUI-210 date-only lookup, the step-2 hit re-check, and the
+    # final release_date assignment) receives. Check the anti-tautology
+    # invariant exactly once, here, rather than at each call site.
+    _assert_independent_series_range(
+        step2_resolved=issue_lookup_done, series_range=index_series_range
+    )
 
     if canonical_series is None:
         canonical_series = series_raw
