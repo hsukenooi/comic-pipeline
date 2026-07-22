@@ -11,6 +11,7 @@ import requests
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from record_win_prep import (
+    ERA_EVIDENCE_CHUNK_SIZE,
     REASON_MISSING_YEAR,
     REASON_NULL_SERIES_OR_ISSUE,
     REASON_UNPARSEABLE_LOT,
@@ -126,6 +127,11 @@ class _FakeSession:
     def __init__(self, response=None, exc=None):
         self._response = response
         self._exc = exc
+        # Every POST this session sees, in order — lets BUI-503 chunking tests
+        # assert how many separate calls were made and what each contained,
+        # while `self.posted` (below) keeps the pre-BUI-503 "last call" shape
+        # existing single-chunk tests already rely on.
+        self.all_posted = []
 
     def get(self, url, timeout=None):
         if self._exc is not None:
@@ -136,6 +142,7 @@ class _FakeSession:
         # Records the last POST so era-evidence tests can assert the request
         # shape (which wins were sent).
         self.posted = {"url": url, "json": json}
+        self.all_posted.append(self.posted)
         if self._exc is not None:
             raise self._exc
         return self._response
@@ -738,13 +745,6 @@ def test_fetch_era_evidence_unparseable_body_fails_closed():
     assert fetch_era_evidence("http://example.test", items, session=session) == {}
 
 
-def test_fetch_era_evidence_skips_result_row_without_item_id():
-    body = {"results": [{"era_confirmed": True}, {"item_id": "b", "era_confirmed": True}]}
-    session = _FakeSession(response=_FakeResponse(200, body))
-    items = [{"item_id": "b", "series": "GR", "issue": "1"}]
-    assert fetch_era_evidence("http://example.test", items, session=session) == {"b": True}
-
-
 # ---- build_payload threads era-evidence ------------------------------------
 
 
@@ -846,6 +846,125 @@ def test_fetch_era_evidence_non_dict_rows_are_skipped_not_raised():
     # No AttributeError escapes; the malformed rows are dropped and the one
     # well-formed confirmation survives.
     assert fetch_era_evidence("http://example.test", items, session=session) == {"b": True}
+
+
+def test_fetch_era_evidence_skips_result_row_without_item_id():
+    body = {"results": [{"era_confirmed": True}, {"item_id": "b", "era_confirmed": True}]}
+    session = _FakeSession(response=_FakeResponse(200, body))
+    items = [{"item_id": "b", "series": "GR", "issue": "1"}]
+    assert fetch_era_evidence("http://example.test", items, session=session) == {"b": True}
+
+
+# ---- fetch_era_evidence — BUI-503 chunking ---------------------------------
+# The fixed 120s client timeout vs unbounded server-side Metron pacing meant a
+# large batch (empirically >~22 distinct series) could exceed the timeout and
+# hold EVERY null-year win, wasting the ones the server had already resolved.
+# Chunking bounds each POST's item count so no single call's pacing cost can
+# approach the timeout, and isolates a chunk's failure to just its own items.
+
+
+class _SequencedSession:
+    """A POST double whose response/exception varies PER CALL, in order —
+    needed to make one chunk succeed while another fails in the same
+    `fetch_era_evidence` invocation."""
+
+    def __init__(self, side_effects):
+        self._side_effects = list(side_effects)
+        self.all_posted = []
+
+    def post(self, url, json=None, timeout=None):
+        self.all_posted.append({"url": url, "json": json, "timeout": timeout})
+        effect = self._side_effects.pop(0)
+        if isinstance(effect, BaseException):
+            raise effect
+        return effect
+
+
+def _era_response(item_ids, confirmed=True):
+    return _FakeResponse(200, {
+        "results": [{"item_id": i, "era_confirmed": confirmed} for i in item_ids]
+    })
+
+
+def test_fetch_era_evidence_default_chunk_size_splits_large_batch():
+    """A batch bigger than ERA_EVIDENCE_CHUNK_SIZE is split into multiple
+    POSTs using the default chunk size — the caller doesn't have to opt in."""
+    n = ERA_EVIDENCE_CHUNK_SIZE + 5  # forces exactly two chunks
+    items = [{"item_id": str(i), "series": "S", "issue": str(i)} for i in range(n)]
+    ids = [it["item_id"] for it in items]
+    session = _SequencedSession([
+        _era_response(ids[:ERA_EVIDENCE_CHUNK_SIZE]),
+        _era_response(ids[ERA_EVIDENCE_CHUNK_SIZE:]),
+    ])
+    result = fetch_era_evidence("http://example.test", items, session=session)
+    assert len(session.all_posted) == 2
+    assert len(session.all_posted[0]["json"]["wins"]) == ERA_EVIDENCE_CHUNK_SIZE
+    assert len(session.all_posted[1]["json"]["wins"]) == 5
+    assert result == {i: True for i in ids}
+
+
+def test_fetch_era_evidence_chunks_large_batch_into_bounded_posts():
+    """An explicit small chunk_size bounds every single POST's item count —
+    the mechanism that keeps a single call's Metron pacing cost from
+    approaching the client timeout."""
+    items = [{"item_id": str(i), "series": "S", "issue": str(i)} for i in range(25)]
+    session = _SequencedSession([
+        _era_response([str(i) for i in range(10)]),
+        _era_response([str(i) for i in range(10, 20)]),
+        _era_response([str(i) for i in range(20, 25)]),
+    ])
+    result = fetch_era_evidence("http://example.test", items, session=session, chunk_size=10)
+    assert [len(p["json"]["wins"]) for p in session.all_posted] == [10, 10, 5]
+    assert result == {str(i): True for i in range(25)}
+
+
+def test_fetch_era_evidence_failing_chunk_holds_only_its_own_items():
+    """Chunk 1 succeeds, chunk 2 times out. Chunk 1's items must still
+    auto-record (era_confirmed=True survives); chunk 2's items must be
+    ABSENT from the map entirely (not present-and-False) so the caller's
+    `.get(item_id, False)` holds exactly them — the whole batch must not be
+    penalized for one chunk's failure."""
+    items = [
+        {"item_id": "a", "series": "S", "issue": "1"},
+        {"item_id": "b", "series": "S", "issue": "2"},
+        {"item_id": "c", "series": "S", "issue": "3"},
+        {"item_id": "d", "series": "S", "issue": "4"},
+    ]
+    session = _SequencedSession([
+        _era_response(["a", "b"], confirmed=True),
+        requests.Timeout("chunk 2 timed out"),
+    ])
+    result = fetch_era_evidence("http://example.test", items, session=session, chunk_size=2)
+    assert len(session.all_posted) == 2
+    assert result == {"a": True, "b": True}
+    assert "c" not in result
+    assert "d" not in result
+
+
+def test_fetch_era_evidence_total_failure_across_all_chunks_holds_all():
+    """Every chunk fails (server fully unreachable) -> the merged map is
+    still empty, matching the pre-BUI-503 hold-all fallback for a genuinely
+    dead server — chunking must not change this outcome."""
+    items = [{"item_id": str(i), "series": "S", "issue": str(i)} for i in range(4)]
+    session = _SequencedSession([
+        requests.ConnectionError("refused"),
+        requests.ConnectionError("refused"),
+    ])
+    result = fetch_era_evidence("http://example.test", items, session=session, chunk_size=2)
+    assert len(session.all_posted) == 2
+    assert result == {}
+
+
+def test_fetch_era_evidence_nonpositive_chunk_size_falls_back_to_one_chunk():
+    """A nonsense chunk_size (<=0) must not become a zero-length `range` step
+    (infinite loop) or a divide-by-zero — it degrades to one big chunk, the
+    pre-BUI-503 behavior."""
+    items = [{"item_id": str(i), "series": "S", "issue": str(i)} for i in range(3)]
+    session = _SequencedSession([_era_response(["0", "1", "2"])])
+    result = fetch_era_evidence("http://example.test", items, session=session, chunk_size=0)
+    assert len(session.all_posted) == 1
+    assert len(session.all_posted[0]["json"]["wins"]) == 3
+    assert result == {"0": True, "1": True, "2": True}
 
 
 def test_fetch_era_evidence_truthy_non_true_confirmed_is_not_trusted():

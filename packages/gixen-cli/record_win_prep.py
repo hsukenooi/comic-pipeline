@@ -43,6 +43,15 @@ cover year lands inside the resolved volume's independent publication window,
 and HOLDS otherwise. The check fails CLOSED at every layer — an unknown/
 ambiguous resolution, a Metron miss, or an unreachable/stale server all
 degrade to BUI-475's hold-all. See BUI-475 and BUI-498.
+
+BUI-503: `fetch_era_evidence`'s fixed 120s client timeout vs the server's
+unbounded per-call Metron pacing (BUI-465) meant one oversized null-year
+batch (empirically >~22 distinct series) could exceed the timeout and hold
+EVERY null-year win, wasting the ones the server had already resolved. The
+fix is client-side chunking: `items` is split into bounded groups POSTed as
+separate calls, merged into one map, so a single call's pacing cost can't
+approach the timeout and a chunk that DOES fail only holds its own slice.
+See `fetch_era_evidence` and `ERA_EVIDENCE_CHUNK_SIZE`.
 """
 
 from __future__ import annotations
@@ -72,6 +81,17 @@ class _HTTPPoster(Protocol):
 SEEN_ENDPOINT = "/api/comics/collection/record-win/seen"
 ERA_EVIDENCE_ENDPOINT = "/api/comics/collection/record-win/era-evidence"
 DEFAULT_IDENTIFY_CMD = ["comic-identify", "--batch"]
+
+# BUI-503: the server paces Metron calls one MetronClient per era-evidence
+# call (BUI-465), and a single call's wall-clock cost scales with the number
+# of DISTINCT series in the request (empirically, >~22 distinct series can
+# exceed the fixed CLIENT timeout below). Before this chunking existed, that
+# meant one oversized batch could blow the whole request's timeout and hold
+# EVERY null-year win — including ones the server had already resolved before
+# the client gave up. Bounding each POST to at most this many items bounds the
+# worst-case per-call pacing cost to one chunk's worth, so a timeout only
+# holds that chunk; every other chunk still lands its own results normally.
+ERA_EVIDENCE_CHUNK_SIZE = 10
 
 # BUI-354 needs_review reasons — named so source and tests can't silently
 # drift on a typo in the literal.
@@ -176,6 +196,7 @@ def fetch_era_evidence(
     *,
     timeout: float = 120.0,
     session: _HTTPPoster = requests,
+    chunk_size: int = ERA_EVIDENCE_CHUNK_SIZE,
 ) -> dict[str, bool]:
     """POST null-year wins to the BUI-498 era-evidence endpoint and return
     ``{item_id: era_confirmed}``.
@@ -194,23 +215,59 @@ def fetch_era_evidence(
     ``era_confirmed`` true for that item_id; any item missing from the response
     (or with a false/absent flag) reads as HOLD via the caller's
     ``.get(item_id, False)``.
+
+    BUI-503: ``items`` is split into ``chunk_size``-sized groups POSTed as
+    SEPARATE calls, and the per-chunk maps are merged. Each chunk's failure
+    is independent — :func:`_post_era_evidence_chunk` never raises, so one
+    chunk timing out (or 404ing, or returning garbage) yields an empty map for
+    JUST that chunk's items, which fall back to HOLD via the caller's
+    ``.get(item_id, False)`` exactly as a total failure always has. Every
+    OTHER chunk's results are unaffected — this is what turns "one oversized
+    batch holds everything" into "one oversized batch holds at most a
+    `chunk_size` slice of itself." A total failure across every chunk still
+    yields an empty overall map, so the pre-BUI-503 hold-all behavior for a
+    genuinely unreachable server is unchanged. ``chunk_size <= 0`` is nonsense
+    (not "no limit") and is treated as one chunk containing all items, the
+    pre-BUI-503 behavior — never as a zero-length step that would loop
+    forever or divide by zero.
     """
     if not items:
         return {}
+    size = chunk_size if chunk_size and chunk_size > 0 else len(items)
+    out: dict[str, bool] = {}
+    for start in range(0, len(items), size):
+        chunk = items[start : start + size]
+        out.update(
+            _post_era_evidence_chunk(server_url, chunk, timeout=timeout, session=session)
+        )
+    return out
+
+
+def _post_era_evidence_chunk(
+    server_url: str,
+    items: list[dict],
+    *,
+    timeout: float,
+    session: _HTTPPoster,
+) -> dict[str, bool]:
+    """One POST for one chunk of the BUI-498 era-evidence request. NEVER
+    raises: every failure mode returns an empty map, so only THIS chunk's
+    item_ids fall back to HOLD — see :func:`fetch_era_evidence` for the full
+    fail-closed contract this preserves at chunk granularity."""
     url = f"{server_url.rstrip('/')}{ERA_EVIDENCE_ENDPOINT}"
     try:
         resp = session.post(url, json={"wins": items}, timeout=timeout)
     except requests.RequestException as exc:
         print(
             f"warning: era-evidence call to {server_url} failed ({exc}) — "
-            "holding all null-year wins for review (BUI-498 fail-closed)",
+            "holding this chunk's null-year wins for review (BUI-498 fail-closed)",
             file=sys.stderr,
         )
         return {}
     if resp.status_code != 200:
         print(
             f"warning: era-evidence returned HTTP {resp.status_code} from "
-            f"{server_url} — holding all null-year wins for review "
+            f"{server_url} — holding this chunk's null-year wins for review "
             "(BUI-498 fail-closed)",
             file=sys.stderr,
         )
@@ -221,7 +278,7 @@ def fetch_era_evidence(
     except (ValueError, KeyError, TypeError) as exc:
         print(
             f"warning: unparseable era-evidence response from {server_url} "
-            f"({exc}) — holding all null-year wins for review (BUI-498 fail-closed)",
+            f"({exc}) — holding this chunk's null-year wins for review (BUI-498 fail-closed)",
             file=sys.stderr,
         )
         return {}
@@ -234,7 +291,7 @@ def fetch_era_evidence(
     if not isinstance(results, list):
         print(
             f"warning: era-evidence response from {server_url} had a non-list "
-            "'results' — holding all null-year wins for review (BUI-498 fail-closed)",
+            "'results' — holding this chunk's null-year wins for review (BUI-498 fail-closed)",
             file=sys.stderr,
         )
         return {}
@@ -469,12 +526,16 @@ def build_payload(
       - new_win_count: count after subtracting the seen-set
 
     BUI-498: null-year regular wins (see :func:`_needs_era_check`) are
-    era-checked in ONE batched server call BEFORE the build loop, so the
-    server resolves them against a single MetronClient (reusing its per-series
-    cache, BUI-473) and paces once (BUI-465). A win the server confirms
-    in-era auto-records; every other null-year win — and every win at all if
-    the era-evidence call fails, since :func:`fetch_era_evidence` returns an
-    empty map on any error — holds for review (the BUI-475 fallback).
+    era-checked in batched server call(s) BEFORE the build loop, so each call
+    resolves its chunk against a single MetronClient (reusing its per-series
+    cache, BUI-473) and paces once per chunk (BUI-465). BUI-503: a batch
+    larger than :data:`ERA_EVIDENCE_CHUNK_SIZE` is split into multiple bounded
+    calls so no single call's Metron pacing cost can approach the client
+    timeout — a chunk that fails only holds ITS OWN null-year wins, not the
+    whole batch (see :func:`fetch_era_evidence`). A win the server confirms
+    in-era auto-records; every other null-year win — including every win in a
+    chunk whose era-evidence call fails, since that chunk contributes nothing
+    to the merged map — holds for review (the BUI-475 fallback).
     """
     ended_won = filter_ended_won(snipes)
     seen_ids = fetch_seen(server_url)
