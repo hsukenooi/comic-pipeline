@@ -98,26 +98,34 @@ When `sample_size >= 1`, surface a line before the grade (Step 2.5) / bid-aggres
 
 ## Step 2: Collection Check
 
-Dispatch a sub-agent, naming it at spawn (e.g. `collection-checker`, BUI-366)
-so it stays addressable for incremental follow-up checks:
+The check is **one CLI call** (BUI-504) — no executor sub-agent. Build
+`items.json` from the working list (one entry per comic: `series`, `issue`, the
+Step 1 **Year column exactly as emitted** — a blank stays blank, never backfill
+it; the CLI owns the BUI-316/BUI-129 cover-year forwarding rule — and `variant`
+when present), then:
 
-> Read `~/Projects/comic-pipeline/.claude/commands/comic/collection-check.md`
-> and execute its EXECUTOR CONTRACT with this input: \<the working list — one
-> row per comic: series, issue, the Step 1 Year column exactly as emitted (a
-> blank stays blank — never backfill it; see collection-check.md's EXECUTOR
-> CONTRACT § Input for the full BUI-316/BUI-129 forwarding rule), and variant
-> when present\>
+```bash
+locg collection check-batch items.json --table
+```
 
-Read only that skill's **ORCHESTRATOR NOTES** yourself — they carry the
-dispatch input shape, the hard-STOP rule, and the Step 4 decision gate. Do not
-ingest its EXECUTOR CONTRACT.
+`items.json` is `{"items":[{"series","issue","year"?,"variant"?}]}`. The CLI
+resolves the comics server, health-gates it, runs the batch check, applies the
+stale-cache downgrade, and computes the advisory false-match flags (Patterns
+A / C / D / D2 / D3 / E) in the `Notes` column. Present the `--table` output —
+collection membership from the server-side cache (may lag LOCG by up to N days,
+shown as "Cache Age").
 
-**Input:** Comic identification table from Step 1.
-**Output:** the executor returns the skill's Step 3 table + status banners — collection membership from the server-side cache. Cache may lag LOCG by up to N days (shown as "Cache age" in the results).
+**Hard STOP (R11) is the exit code:** a **non-zero exit** means the check
+failed (unreachable server, non-200, timeout, never-imported 409) and rendered
+NO verdicts. Halt the run at this step and tell the user — never treat a
+non-zero exit as "not in collection", and never proceed to bidding without real
+verdicts (a `0` exit).
 
-**Hard STOP (R11):** if the executor reports it STOPPED, halt the run at this step — never treat a STOP as "not in collection" and never proceed to bidding without real verdicts. Full STOP conditions and the incremental-reuse blast radius are collection-check.md's ORCHESTRATOR NOTES § Hard STOP (R11); this is a pointer, not a restatement.
-
-Gate: user decides whether to skip duplicates or continue (condition upgrades are legitimate). Route stale-cache rows, R42 canonical-match rows (`✅ In collection (canonical)` — the listing's specific variant wasn't in cache but the canonical edition is), and disambiguator-flagged rows (Patterns A–E in the executor's Notes column) through collection-check.md's ORCHESTRATOR NOTES § Step 4: Decision gate — the user resolves each; never act on the raw verdict.
+Gate: user decides whether to skip duplicates or continue (condition upgrades
+are legitimate). Route stale-cache rows and flagged rows (Patterns A / C / D /
+D2 / D3 / E in the `Notes` column) through collection-check.md's § Step 4
+decision gate — the user resolves each; the flags FLAG, never DECIDE, so never
+act on the raw verdict of a flagged row.
 
 Remove skipped comics from the working list before Step 2.5.
 

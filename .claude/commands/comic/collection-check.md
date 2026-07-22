@@ -5,207 +5,84 @@ description: Check if identified comics are already in your collection via the c
 
 # Comic Collection Check
 
-Check whether identified comics are already in your collection by querying the
-comics server's collection API (`/api/comics/collection/*`). The server is the
-single source of truth across machines (BUI-87), so both the MacBook and the Mac
-Mini see the same answer.
+Check whether identified comics are already in your collection. As of BUI-504
+the whole check is **one CLI call** — `locg collection check-batch` mechanizes
+what used to be a ~450-line prose executor (server resolve → health gate →
+status → batch check → stale-cache downgrade → the false-match flags). The
+skill is now just the input shape, the decision gate, and carry-forward.
 
-> **Hard-fail rule (R11):** if the server is unreachable or any check call fails,
-> **STOP** and tell the user — never render "Not in collection" from a failed
-> call. A silent miss buys a duplicate. This is the whole point of the check.
+> **Hard-fail rule (R11) is enforced by the exit code.** `check-batch` exits
+> **non-zero** on ANY failure — unreachable server, non-200, timeout, or the
+> never-imported 409 — and renders NO verdicts. **A non-zero exit is a STOP:**
+> tell the user and halt; never treat it as "not in collection" (a silent miss
+> buys a duplicate). Do not re-derive "not owned" from a failed call.
 
-## How to read this file (BUI-361)
-
-This skill is split into two sections:
-
-- **EXECUTOR CONTRACT** — everything the agent performing the check must do,
-  self-contained. `/comic:buy` dispatches a sub-agent with *"Read this file and
-  execute its EXECUTOR CONTRACT with this input: \<working list\>"*; the
-  executor reads the whole file and follows the contract.
-- **ORCHESTRATOR NOTES** — what a dispatching orchestrator reads *instead of*
-  the contract: dispatch input, hard-STOP handling, the Step 4 decision gate,
-  and carry-forward. The orchestrator never needs to ingest the contract body.
-
-**Standalone invocation** (`/comic:collection-check` run directly, no
-orchestrator): you are both roles — execute the EXECUTOR CONTRACT, then apply
-the ORCHESTRATOR NOTES yourself (present the table and run the Step 4 decision
-gate with the user).
-
----
-
-## EXECUTOR CONTRACT
-
-### Input
-
-A list of identified comics (series + issue, optionally variant and year). Either
-from the `/comic:identify` output table or provided directly by the user.
-
-**The `/comic:identify` table's Year column is a confidence-gated per-issue cover
-year (BUI-316):** it's populated only when the listing title's parenthesized year and
-eBay's item-specifics `Publication Year` corroborate each other within ±1 (and the
-listing isn't a facsimile/reprint). When that Year is present, **forward it as `year=`
-in Step 1** — it's a trustworthy per-issue cover year, so it safely disambiguates
-volumes (the whole point of BUI-316: it lets the matcher's year gate reject a match
-against the wrong volume of a rebootable masthead). When the Year column is blank,
-**omit `year`** — a blank means the identify step was *not* confident, so forwarding a
-guessed year would risk the BUI-129 false-negative. Never fabricate a year to fill a
-blank; the blank is the safe, year-agnostic default.
-
-### Step 0: Resolve the server + bootstrap guard
-
-Resolve and health-gate the comics server through the **shared comics-server
-call convention** (BUI-172, `docs/conventions/comics-server-call.md`) — don't
-hand-roll URL resolution or the health check here:
+## Run the check
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
-comics_health_gate     || exit 1   # the server must answer
+locg collection check-batch items.json --table
 ```
 
-**If either step fails: STOP immediately** — the collection cannot be checked,
-so do not proceed to bidding. Do not report any comic as "not in collection".
+- `--table` prints the human-facing table + status banners (present this to the
+  user). Omit `--table` for the structured JSON (per-row `verdict` + `flags`).
+- Reads `items.json` (or stdin with `-`). Exit 1 = STOP; only a `0` exit
+  carries real verdicts.
 
-> **Editor note — fenced blocks don't share shell state (BUI-375):** each
-> fenced bash block below runs in its own fresh shell — a freshly-spawned
-> executor invokes them as separate Bash tool calls, so `$COMICS_SERVER_URL`
-> and the sourced `comics_*` functions from Step 0 do **not** carry forward.
-> Every later block that touches `$COMICS_SERVER_URL` re-sources
-> `comics-server.sh` and re-runs `comics_resolve_server` at its own top —
-> keep that pattern on any block you add. This is the exact BUI-352 trap: an
-> un-resourced block curls an empty host, and a swallowing fallback can turn
-> that into a silent false "not owned" (R11).
+### Input shape
 
-Then read collection status:
+`items.json` is `{"items": [{"series", "issue", "year"?, "variant"?}]}` — one
+entry per comic in the working list:
 
-```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
-```
-
-**If the status call fails:** STOP immediately — same rule as above.
-
-**If `last_full_import` is null:** Stop with:
-> Collection empty on the server — run a full LOCG import (`/comic:collection-add`
-> import flow) before checking.
-
-Save `cache_age_days`, `pending_push_count`, and `oldest_pending_days` from the
-response — you need them for output banners.
-
-### Step 1: Check each comic against the server
-
-Build one request covering the whole working list, not one call per comic —
-the batch endpoint (`POST /api/comics/collection/check/batch`, BUI-204) runs
-the exact same matcher the single-item `GET .../collection/check` endpoint
-does per pair, so the verdicts are identical; it just collapses N round-trips
-into one call and cuts the per-issue `curl` token cost.
-
-**`year` is a per-issue cover year, not a series start year — pass it only when
-you have the cover date of *this exact issue*, and NEVER forward Metron's
-`year_began` / the series' first-published year (BUI-129).** The server gates
-a match on `release_date.startswith(year)`, so
-passing a long-running series' start year (e.g. `1963` for *Uncanny X-Men*, whose
-issues actually shipped 1975–1991) filters out every owned row and returns a
-false `not_in_cache` for the whole run. When all you have is the series start
-year, **omit `year`** — a correct ownership verdict beats the year-gated extras.
-
-When you *do* have the right per-issue year, it disambiguates volumes and enables
-the masthead-alias fallback (BUI-46): e.g. a listing identified as "The Mighty
-Thor #154" with that issue's cover year (1968) resolves to the owned catalog
-entry "Thor #154". Without a year that fallback is suppressed (to avoid colliding
-with same-masthead reboots like *The Mighty Thor* Vol. 3) — an acceptable trade
-versus the false-negative-for-the-whole-series risk of passing the wrong year.
-
-Build the request body as a list of `{series, issue, year?, variant?}` items —
-one entry per comic in the working list, `year` present only when the Input
-section's forwarding rule applies (omitted otherwise), `variant` present only
-when the listing is a variant (each `year` below is the **cover year of that
-specific issue** — ASM #300 shipped 1988, Uncanny X-Men #179 shipped 1984):
-
-```bash
-# Build items.json from the working list, e.g.:
-#   {"items":[{"series":"Amazing Spider-Man","issue":"300","year":"1988"},
-#             {"series":"Uncanny X-Men","issue":"179","year":"1984","variant":"Newsstand"}]}
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
-  -H 'content-type: application/json' \
-  -d @items.json
-```
-
-The batch call returns one entry per input item, echoing its `series`/`issue`
-so you can correlate by key (don't rely on order) — otherwise each result is
-the exact same verdict shape the single-item endpoint returns (see the
-fallback at the end of this step); the batch is a fan-out, not a
-reimplementation:
 ```json
-{
-  "count": 2,
-  "results": [
-    {
-      "series": "Amazing Spider-Man",
-      "issue": "300",
-      "match_status": "in_collection",
-      "full_title_matched": "Amazing Spider-Man #300",
-      "matched_series_name": "The Amazing Spider-Man (1963 - 1998)",
-      "matched_release_date": "1988-05-01",
-      "match_kind": "exact",
-      "in_wish_list": false,
-      "printing_conflict": false,
-      "cache_age_days": 3
-    },
-    {
-      "series": "Uncanny X-Men",
-      "issue": "179",
-      "match_status": "not_in_cache",
-      "full_title_matched": null,
-      "matched_series_name": null,
-      "matched_release_date": null,
-      "match_kind": null,
-      "in_wish_list": false,
-      "printing_conflict": false,
-      "cache_age_days": 3
-    }
-  ]
-}
+{"items":[{"series":"Amazing Spider-Man","issue":"300","year":"1988"},
+          {"series":"Uncanny X-Men","issue":"179","variant":"Newsstand"}]}
 ```
 
-`matched_series_name`/`matched_release_date`/`match_kind` are the matched row's
-provenance (BUI-249): `matched_series_name` is the LOCG catalog's *decorated*
-series name (carries volume + year), `matched_release_date` is that row's stored
-date, and `match_kind` is `"exact"` (series key matched directly) or `"alias"`
-(matched only via the cross-masthead fallback, e.g. Thor ↔ The Mighty Thor). All
-three are `null` when `match_status` is `not_in_cache`. See Step 2.5 Pattern D.
+**`year` is a per-issue COVER year, never a series start year (BUI-129).** The
+server gates a match on `release_date.startswith(year)`, so a long-running
+series' first-published year (e.g. `1963` for *Uncanny X-Men*, whose issues
+shipped 1975–1991) filters out every owned row and false-negatives the whole
+run. Forward the `/comic:identify` **Year column exactly as emitted** — present
+means a confidence-gated per-issue cover year (BUI-316), safe to disambiguate
+volumes; **blank means omit `year`** (never backfill a guess). A correct
+verdict beats year-gated extras.
 
-`in_wish_list` (BUI-250) is always a plain boolean, present on every verdict.
-`match_status: "not_in_cache"` conflates two different states — a genuinely
-untracked issue, and a row that exists but is catalogued with zero owned copies
-(on the wish list / pull list / read list). `in_wish_list: true` on a
-`not_in_cache` result means the second case: **treat it as "already on your
-wish list, not owned" in the output table, not as "untracked."** This is a
-direct field read, not a heuristic — it needs no Step 2.5 disambiguation.
+### What the flags mean
 
-> **If the batch call fails (curl non-zero / connection error / non-200 —
-> including the 409 the store returns when it was never imported): STOP
-> the entire check.** The 409 is the same R11 refusal the single-item endpoint
-> makes, lifted to the whole batch — the server is declining to answer for
-> every item, not just some. Report the server error to the user and render NO
-> verdicts — not even for comics whose row would otherwise have looked fine. A
-> partial run invites a "not in collection" misread on comics that never got a
-> real answer (R11).
+The `Notes` column carries advisory flags the CLI computes — Pattern **A**
+(Giant-Size/Annual/King-Size conflation), **C** (unrecognized series spelling),
+**D** (masthead-alias, unconfirmed volume), **D2** (cross-volume ambiguity),
+**D3** (no-year rebootable-masthead match), **E** (printing conflict). Flag
+semantics live in `packages/locg-cli/src/locg/check_batch.py`. **Flags FLAG,
+they never DECIDE (R11)** — the CLI never flips a verdict or invents ownership;
+the user resolves each flagged row at the decision gate below.
 
-**Variant flag-through (R42):** If the listing has a variant (e.g. "Newsstand")
-but the batch result for its `variant=` item comes back `not_in_cache`, re-run
-that row without `variant` to check the canonical entry. If the canonical
-matches, record the verdict as `✅ In collection (canonical)` and add the note
-`⚠️ canonical match — listing variant not disambiguated`.
+## Step 4: Decision gate
 
-**Fallback — single-comic check:** for a one-off check outside the full
-working-list flow (spot-checking a single book), the single-item `GET`
-endpoint still works and returns the same verdict shape shown above minus the
-echoed `series`/`issue`. Use `curl -sf -G --data-urlencode` so series names
-with spaces are encoded and a non-200 makes curl exit non-zero:
+Present the table, then ask the user how to handle results:
+
+- **Skip** comics already in collection (`✅`, most common).
+- **Continue anyway** — condition upgrade; they want a better copy.
+- **Wishlisted-not-owned (`📋`)** — not a duplicate risk; proceed like any
+  `not_in_cache` comic, but worth a callout (already flagged as wanted).
+- **Stale-cache rows** (`⚠️ Not in cache … stale`) — surface separately so the
+  user can manually verify on LOCG before bidding.
+- **Flagged rows (A / C / D / D2 / D3 / E)** — surface separately and do **not**
+  act on the raw verdict: an A/E possible-false-positive should not be
+  auto-skipped, and a C/D/D2/D3 flag should not be auto-bid. Let the user
+  resolve each before the row leaves this skill.
+
+## Carry-forward
+
+Remove skipped comics from the working list before passing it to `/comic:fmv`.
+Kept rows carry forward their identify-emitted fields plus this step's flags so
+whoever reads the row next (grading, FMV) can see why it's still in play.
+
+## Single-item spot check (fallback)
+
+For a one-off ownership check outside the working-list flow, hit the single-item
+endpoint directly (same matcher, same verdict shape). Same R11 rule: a failed
+call is a hard STOP, never a silent "not owned".
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
@@ -216,237 +93,7 @@ curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
   --data-urlencode "year=1988"
 ```
 
-Same R11 rule applies here too: a failed call is a hard STOP, never a silent
-"not owned".
-
-### Step 2: Apply stale-cache verdict downgrade
-
-**When `cache_age_days > 14` AND `match_status == "not_in_cache"`:** downgrade the
-verdict from confident "Not in collection" to:
-
-> ⚠️ Not in cache (cache N days stale — manual LOCG check recommended before bidding)
-
-A stale import may be missing recently added comics. This prevents a snipe going
-through on a comic you already own.
-
-### Step 2.5: Disambiguate known false-match patterns (advisory only)
-
-The matcher has documented blind spots that produce **false positives** (reports
-owned when it isn't → you skip a book you wanted) and **false negatives** (reports
-not-owned when you do own it → you snipe a duplicate). Before rendering the table,
-scan the verdicts for the patterns below and **flag** the suspect rows.
-
-> **This pass is advisory — it FLAGS, it never DECIDES (R11).** It must NEVER:
-> - invent ownership or flip a verdict on its own — only the user resolves a flag;
-> - turn a `not_in_cache` into "owned" (or vice-versa) automatically;
-> - weaken the Step 1 hard-fail. If any re-query call below is unreachable / non-200,
->   that is an R11 **STOP**, not a fallback to "not owned" — abort the whole check.
-> A flag changes how the row is *presented*, not what was found.
-
-**Pattern A — Giant-Size / Annual / King-Size conflation (false positive).**
-When a row returns `in_collection` AND the series is a *distinct line that shares a
-masthead* with a base/annual series — `Giant-Size Fantastic Four`, `… Annual`,
-`King-Size …`, `… Special` — the cache may have matched the wrong series (incident
-history: `docs/solutions/ui-bugs/collection-check-alias-and-printing-false-positives.md`).
-**Do not auto-skip it.** Flag:
-> ⚠️ possible false positive — "Giant-Size/Annual" line may be conflated with the base/annual series; confirm before skipping
-
-**Pattern C — ambiguous / unrecognized series name (wrong-volume, silent-miss, or
-spelling-drift risk).**
-A series name that isn't the LOCG catalog's exact spelling — punctuation,
-abbreviation, or Metron-vs-LOCG word-choice drift, but **never** a leading
-`The`/`A`/`An` (the matcher's `_normalize_series_key` already strips a leading
-article from both the query and every owned row, so toggling it recomputes an
-identical key — no re-query needed for that case; BUI-444, was Pattern B) — can
-yield a silent `not_in_cache` even when owned (BUI-129/171). When a `not_in_cache`
-row's series name is short/generic, could be the wrong volume, or looks like a
-Metron-style name, resolve it against the catalog (BUI-449) — this returns a scalar
-per name, never the full catalog array. Batch every suspect row's series name into
-one call:
-
-```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/series-names/resolve" \
-  -H 'content-type: application/json' \
-  -d '{"names": ["Uncanny X-Men (Vol. 1)", "<other suspect series names>"]}'
-```
-
-The response is `{"results": [{"query", "resolved", "match_kind"}, ...]}` in
-request order — `match_kind` is `"exact"`, `"fuzzy"`, or `null` ("no confident
-match", `resolved` is also `null`). If `resolved` is non-null and differs from
-the row's original series name, the `not_in_cache` is suspect — flag and
-recommend re-checking under the resolved catalog spelling:
-> ⚠️ ambiguous/unrecognized series — "Uncanny X-Men (Vol. 1)" is not the catalog spelling; did you mean "Uncanny X-Men"? Re-check under the catalog name before trusting this verdict
-
-If `resolved` is `null`, there is no confident catalog spelling to reconcile
-against — leave the verdict as-is.
-
-**Pattern D — masthead-alias match, unconfirmed volume (false positive, BUI-249).**
-Mechanized: when a row returns `in_collection` AND `match_kind == "alias"`, the
-query's masthead (e.g. "The Mighty Thor") only matched via
-`_MASTHEAD_ALIAS_PAIRS`'s cross-masthead fallback to a differently-named owned
-row ("Thor") — the fallback has no notion of *which* volume/era, so it can land
-on the wrong run (incident history:
-`docs/solutions/ui-bugs/collection-check-alias-and-printing-false-positives.md`).
-Read the volume/year straight off the response and flag:
-> ⚠️ alias match — matched "{matched_series_name}" ({matched_release_date}); confirm this is the same volume as the listing before skipping
-
-Treat an obviously-wrong era (e.g. a 1966 match against a 2015-era query) as a
-likely false positive; if ambiguous, still flag. `match_kind == "exact"` needs no
-alias flag (but see Pattern D3 for the no-year exact residual).
-
-**Pattern D2 — cross-volume ambiguity, no year given (false-positive guard, BUI-284).**
-Mechanized: `match_status == "ambiguous_cross_volume"` (`match_kind ==
-"cross_volume"`) means the issue is owned under **more than one volume of the
-same masthead** and no `year` was supplied, so the matcher refused to guess.
-This is NEITHER owned nor not-owned — do **not** skip and do **not** buy on it.
-Read the colliding volumes off `candidates` and re-check WITH the listing's
-per-issue cover `year` (`?year=<YYYY>`), which resolves it via the release-date
-gate:
-> ⚠️ cross-volume ambiguity — "{series} #{issue}" is owned in multiple volumes ({candidate series_names}); re-check with the listing's cover year before deciding
-
-Never pick a volume yourself — supply the year and let the matcher decide.
-
-**Pattern D3 — single-owned-wrong-volume (false positive, BUI-308 → fixed by BUI-316).**
-When a masthead has multiple volumes but you own the queried issue in only
-**one** of them, a no-`year` query returns a confident `in_collection`/`exact`
-even when that's the wrong volume — no detectable ambiguity (unlike D2) → a
-**missed purchase**. Always forward the identify Year when present (Input +
-Step 1); the year gate then rejects the wrong volume before this reaches the
-table. Only a *blank* Year leaves a residual: on long-running rebootable
-mastheads (Fantastic Four, Amazing/Uncanny X-Men, Avengers, Thor, Iron Man,
-Hulk, Captain America, Batman, Superman, Wonder Woman, …), don't trust a no-year
-`in_collection`/`exact` blindly — eyeball **Matched Volume** against the
-listing's era and re-check with `?year=<YYYY>` if you can source one. Full
-rationale:
-`docs/solutions/best-practices/collection-check-cover-year-forwarding-vs-bui129.md`.
-
-**Pattern E — printing conflict (false positive, BUI-364).**
-Mechanized: when a row returns `in_collection` AND `printing_conflict: true`,
-the match was satisfied by a different printing than the query asked for (`2nd
-Printing`, `Third Printing`, …) — printings are distinct collectibles, so
-owning a reprint is NOT owning the base printing (confirmed-incident history:
-`docs/solutions/ui-bugs/collection-check-alias-and-printing-false-positives.md`).
-Read `printing_candidates` (every same-era printing with its own owned/wish
-state and a `printing_ordinal`: `1` = base, `2+` = numbered reprint, `null` =
-bare "Reprint"/"Re-Print" — BUI-373) to describe the listing's own printing in
-the flag, rather than re-parsing `full_title`:
-> ⚠️ printing conflict — matched "{full_title_matched}", a different printing than the listing; the listing's printing is {wishlisted / not owned / untracked} per printing_candidates; confirm before skipping
-
-Do **not** auto-flip the verdict to "not owned" (R11) — the matched printing
-genuinely is owned; only the user decides whether the listing's printing
-matters. Same rule in reverse (a `2nd Printing` listing matched only by the
-owned base row).
-
-Carry every flag into the Notes column of the Step 3 table and surface flagged rows
-separately at the Step 4 decision gate (ORCHESTRATOR NOTES). The user decides; the
-disambiguator only makes the ambiguity visible.
-
-### Step 3: Output table
-
-```
-| # | Comic | In Cache? | Full Title Matched | Matched Volume | Cache Age | Notes |
-|---|---|---|---|---|---|---|
-| 1 | Amazing Spider-Man #300 | ❌ Not in collection | — | — | 3 days | |
-| 2 | Invincible #1 | ✅ In collection | Invincible #1 | Invincible (2021) | 3 days | |
-| 3 | Uncanny X-Men #179 (Newsstand) | ✅ In collection (canonical) | Uncanny X-Men #179 | Uncanny X-Men (1981) | 3 days | ⚠️ canonical match — listing variant not disambiguated |
-| 4 | Batman #608 | ⚠️ Not in cache | — | — | 16 days | cache stale — manual LOCG check recommended |
-| 5 | The Mighty Thor #5 | ✅ In collection | Thor #5 | Thor (Vol. 1) (1966 - 1996) | 3 days | ⚠️ alias match — confirm same volume as listing |
-| 6 | Hulk (Vol. 5) #9 | 📋 Wishlisted (not owned) | — | — | 3 days | |
-```
-
-**Matched Volume** is `matched_series_name` (falls back to `—` when `not_in_cache`)
-— it's the decorated catalog name (carries volume + year), so a Pattern D flag is
-visible right in the table without opening the raw response.
-
-**In Cache?** has four renderings, not two (BUI-250, BUI-284): `✅ In collection`
-for `match_status: "in_collection"`, `📋 Wishlisted (not owned)` for
-`match_status: "not_in_cache"` with `in_wish_list: true`, `❌ Not in
-collection` for `match_status: "not_in_cache"` with `in_wish_list: false`, and
-`⚠️ Ambiguous (cross-volume)` for `match_status: "ambiguous_cross_volume"` — the
-issue is owned under more than one volume and no year was given (Step 2.5 Pattern
-D2). Row 6 is untracked at Full Title Matched / Matched Volume regardless — those
-columns only ever come from an `in_collection` match.
-
-Cache age is the same value for every row (it's a property of the import date,
-not the comic).
-
-**Status banners** (below the table):
-
-- If `cache_age_days > 14`: `⚠️ Cache is N days old — consider re-importing from LOCG (leagueofcomicgeeks.com → My Comics → Export).`
-- Pending push: `N rows pending push to LOCG; oldest pending = X days.` Escalate tone when `oldest_pending_days > 21` or `pending_push_count > 25`.
-
-### What to return to the caller
-
-When dispatched by an orchestrator, return the Step 3 table + status banners
-(flags included in the Notes column). If you hit an R11 STOP anywhere above,
-return the STOP report instead — state explicitly that **no verdicts were
-produced** and why (server unreachable / failed call / never-imported 409).
-Never return a partial table.
-
-### Common Mistakes
-
-| Mistake | Fix |
-|---|---|
-| Treating an unreachable server (or a failed check call) as "not in collection" | **STOP** — never render a "not owned" verdict from a failed call (R11 — see the callout at the top of this skill) |
-| Passing the series start year (`year_began`) as `year` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`. Forwarding a series' first-published year (e.g. `1963` for *Uncanny X-Men*) filters out every owned issue and returns a false `not_in_cache` for the whole run (BUI-129). Pass `year` only with this issue's actual cover year; otherwise omit it |
-| Auto-skipping a `Giant-Size`/`Annual` book that came back `in_collection` | Step 2.5 Pattern A — a confirmed, repeating false-positive (Giant-Size Fantastic Four vs. an owned Fantastic Four Annual); flag and let the user confirm, don't silently skip |
-| Letting the disambiguator flip a verdict on its own | It's advisory — it flags ambiguity for the user, it never invents ownership or overrides the hard-fail (R11) |
-
----
-
-## ORCHESTRATOR NOTES
-
-### Dispatch input
-
-Pass the working list — one row per comic: `series`, `issue`,
-the `/comic:identify` table's **Year exactly as emitted** (a blank Year stays
-blank — never backfill it with a guessed or series-start year; the executor's
-contract owns the BUI-316/BUI-129 forwarding rule), and `variant` when the
-listing is a variant. The executor resolves the server, runs the batch check,
-applies the stale-cache downgrade and the Step 2.5 disambiguation scan (Patterns A, C–E), and
-returns the Step 3 table + status banners.
-
-### Executor reuse (BUI-366)
-
-The executor stays addressable for the rest of
-the run — for an incremental check (a comic added to the working list mid-run),
-SendMessage the same executor the new `{series, issue, year?, variant?}` row
-instead of respawning one that re-reads this contract from scratch (see buy.md
-§ Sub-agent reuse).
-
-### Hard STOP (R11)
-
-If the executor reports it STOPPED (server unreachable,
-failed/non-200 check call, or the never-imported 409), the check produced **no
-verdicts** — halt the flow at this step and tell the user. Never reinterpret a
-STOP as "not in collection", and never proceed to bidding without real verdicts.
-A partial or missing answer is a stop, not a "not owned".
-
-**Blast radius during incremental reuse (BUI-366):** if a SendMessage'd
-follow-up row (a comic added to the working list mid-run — § Executor reuse
-above) hits this STOP, it invalidates only that new row's verdict. Verdicts
-already rendered from the original batch dispatch stand — they came from a
-successful earlier call and don't need to be re-litigated. Halt only the
-addition of the new row (tell the user its verdict couldn't be produced)
-rather than discarding or re-running the table already presented.
-
-### Step 4: Decision gate
-
-Ask the user how to handle results:
-
-- **Skip** comics already in collection (most common)
-- **Continue anyway** (condition upgrade — they want a better copy)
-- **Wishlisted-not-owned (`📋`)**: not a duplicate risk — proceed like any other `not_in_cache` comic — but worth a callout since the user has already flagged it as wanted
-- **Stale-cache cases**: surface separately so the user can manually verify before bidding
-- **Canonical-match rows (R42, Step 1)**: `✅ In collection (canonical)` means the listing's specific variant wasn't in cache but the canonical edition is — surface the `⚠️ canonical match — listing variant not disambiguated` note and let the user confirm the variant isn't a distinct wanted collectible before skipping
-- **Disambiguator-flagged cases (Step 2.5)**: surface separately and do **not** act on the raw verdict — a Pattern-A `⚠️ possible false positive` or Pattern-E printing conflict should not be auto-skipped, and a Pattern-C/D flag should not be auto-bid. Let the user resolve each before the row leaves this skill.
-
-### Carry-forward
-
-Remove skipped comics from the working list before passing it to `/comic:fmv`.
-Kept rows carry forward their identify-emitted fields plus this step's
-verdict-driven flags (the R42 canonical-match note, Patterns A, C–E notes) so
-whoever reads the row next (Step 2.5 grading, FMV) can see why it's still in
-play.
+> Never use the `locg collection check` CLI (no `-batch`) for ownership — it
+> reads the MacBook's local store, which is never seeded and always returns
+> `not_in_cache`. `check-batch` and the curl above both hit the Mac Mini's
+> authoritative store.
