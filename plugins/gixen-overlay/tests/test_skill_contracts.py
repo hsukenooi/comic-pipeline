@@ -291,10 +291,11 @@ def test_wishlist_add_resolves_server_via_shared_convention():
     """BUI-170: wishlist-add's Step 0 was comment-only — it never inferred/SET
     GIXEN_SERVER_URL when unset (missing the Mac Mini -> localhost mapping), so
     it aborted on the Mac Mini. Assert it routes through the shared convention
-    that actually does the inference."""
+    that actually does the inference — since BUI-510, that's `comics-api`,
+    which resolves + health-gates internally on every call rather than relying
+    on a once-per-skill export."""
     doc = (SKILLS_DIR / "wishlist-add.md").read_text()
-    assert "comics_resolve_server" in doc
-    assert "comics_health_gate" in doc
+    assert "comics-api" in doc
 
 
 def test_wishlist_add_reconciles_series_names():

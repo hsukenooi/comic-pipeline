@@ -85,9 +85,7 @@ endpoint directly (same matcher, same verdict shape). Same R11 rule: a failed
 call is a hard STOP, never a silent "not owned".
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-curl -sf -G "$COMICS_SERVER_URL/api/comics/collection/check" \
+comics-api GET /api/comics/collection/check -G \
   --data-urlencode "series=Amazing Spider-Man" \
   --data-urlencode "issue=300" \
   --data-urlencode "year=1988"

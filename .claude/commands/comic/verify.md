@@ -19,18 +19,16 @@ This is a **warn-only** verification — it doesn't fix anything, just surfaces 
 
 ### Pre-flight
 
-Resolve and health-gate the server through the shared comics-server convention
-(BUI-172, `docs/conventions/comics-server-call.md`):
+Resolve and health-gate the server via `comics-api` (BUI-510,
+`docs/conventions/comics-server-call.md`) — it resolves + health-gates +
+calls in one shot, so there's no shell-state to carry between blocks (the
+BUI-352/BUI-375 trap this structurally removes):
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_health_gate     || exit 1
+comics-api GET /health >/dev/null
 ```
 
-If either fails, stop with: "Cannot verify — the comics server isn't reachable. Skipping verification step."
-
-<!-- Editor note (BUI-375): fenced bash blocks below don't share shell state — each is a fresh shell, so Pre-flight's $COMICS_SERVER_URL / comics_* functions do not carry forward. The Call block re-sources comics-server.sh and re-runs comics_resolve_server at its own top; keep that pattern on any block you add that talks to the server (the BUI-352 trap: an un-resourced block curls an empty host, and a swallowing fallback can turn that into a silent false all-clear). Full writeup: docs/solutions/workflow-issues/multi-block-skill-shell-state-loss-fallback-swallow.md -->
+If that fails, stop with: "Cannot verify — the comics server isn't reachable. Skipping verification step."
 
 ### Input
 
@@ -65,15 +63,13 @@ Replace the example `items` array with this run's actual working list. Do this w
 
 ### Call
 
-Route the POST through `comics_curl` so a non-200 (a 422 on a malformed
+Route the POST through `comics-api` so a non-200 (a 422 on a malformed
 working list, a 500, or a server drop after the health check) **hard-fails and
 surfaces the error body** instead of silently returning an empty string
 (BUI-169):
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_curl -X POST "$COMICS_SERVER_URL/api/comics/verify" \
+comics-api POST /api/comics/verify \
   -H 'content-type: application/json' \
   -d @working_list.verify.json || {
     echo "Verification call failed — could not confirm linkage. Do NOT report all-clear." >&2

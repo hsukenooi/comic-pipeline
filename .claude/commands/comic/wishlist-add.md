@@ -40,16 +40,15 @@ source "$(git rev-parse --show-toplevel)/scripts/metron-curl.sh"
 ```
 
 Also resolve and health-gate the comics server (the wish-list now lives there)
-through the shared comics-server convention
-(`docs/conventions/comics-server-call.md`, BUI-172):
+via `comics-api` (BUI-510, `docs/conventions/comics-server-call.md`) — every
+call below is independently self-resolving, so this is just a fail-fast
+pre-flight check, not a shared env-var setup:
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_health_gate     || exit 1
+comics-api GET /health >/dev/null
 ```
 
-**If either fails:** Stop — adds can't be written to an unreachable server.
+**If that fails:** Stop — adds can't be written to an unreachable server.
 
 ## Step 1: Look up the series on Metron
 
@@ -126,9 +125,7 @@ catalog — the matcher-owned endpoint returns a scalar verdict, never the full
 catalog array:
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_post "$COMICS_SERVER_URL/api/comics/collection/series-names/resolve" \
+comics-api POST /api/comics/collection/series-names/resolve \
   -H 'content-type: application/json' \
   -d "$(python3 -c 'import json,sys; print(json.dumps({"names": [sys.argv[1]]}))' "<SERIES>")"
 ```
@@ -168,9 +165,7 @@ year (drop the key entirely for an issue with no `cover_date`):
 # Build items.json programmatically from your number→cover_year map, e.g.:
 #   {"items":[{"series":"Uncanny X-Men","issue":"185","year":"1984"},
 #             {"series":"Uncanny X-Men","issue":"186","year":"1984"}, ...]}
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_post "$COMICS_SERVER_URL/api/comics/collection/check/batch" \
+comics-api POST /api/comics/collection/check/batch \
   -H 'content-type: application/json' \
   -d @items.json
 ```
@@ -206,7 +201,7 @@ correlate by key (don't rely on order). Per item:
 - `{"match_status": "not_in_cache"}` → not owned, keep it.
 
 The batch call's HTTP status is the whole-batch signal. Because Step 3 now
-routes this through `comics_post` (above), a non-200 already exits non-zero
+routes this through `comics-api` (above), a non-200 already exits non-zero
 AND prints the response body to stderr for free (BUI-186's
 `--fail-with-body`) — no need to hand-roll `-o body -w '%{http_code}'` to
 recover it:
@@ -237,9 +232,7 @@ re-grepped per issue. A real wish-list is large (685 items in the motivating
 run); a per-issue grep over that payload is the redundant work this step removes.
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_curl "$COMICS_SERVER_URL/api/comics/wish-list" || exit 1
+comics-api GET /api/comics/wish-list || exit 1
 ```
 
 Parse the returned `[{name, id, ...}]` **once** into a set keyed by
@@ -321,9 +314,7 @@ never waives the guard for any other item in the same call.
 #     {"title": "Children of the Vault #2"},
 #     {"title": "Amazing Spider-Man #300 2nd Printing", "year": "1988", "force": true}
 #   ]}
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_post "$COMICS_SERVER_URL/api/comics/wish-list/batch" \
+comics-api POST /api/comics/wish-list/batch \
   -H 'content-type: application/json' \
   -d @batch_items.json
 ```
@@ -382,9 +373,7 @@ touches owned books. See
 so you no longer need to SSH into the Mac Mini to run `locg wish-list remove`:
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
-comics_curl -X DELETE -G "$COMICS_SERVER_URL/api/comics/wish-list" \
+comics-api DELETE /api/comics/wish-list -G \
   --data-urlencode "title=Children of the Vault #1"
 ```
 

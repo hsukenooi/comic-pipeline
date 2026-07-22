@@ -12,28 +12,28 @@ immediately — no git round-trip (R8). No Playwright, no live LOCG session need
 
 **Gixen CLI:** `gixen` (a uv-installed console script on PATH; run `./scripts/install.sh` if not found).
 
-**Every bash block below re-sources `scripts/comics-server.sh` and calls
-`comics_resolve_server` (and, per BUI-430, `comics_scratch_dir`) itself** —
+**Every bash block below that needs a scratch dir re-sources
+`scripts/comics-server.sh` and calls `comics_scratch_dir` itself (BUI-430)** —
 each `## Step` is a separate bash block with no shared shell state; don't
-skip this because an earlier step already ran it (BUI-352). Full history
-behind every inline warning in this skill:
+skip this because an earlier step already ran it (BUI-352). Server calls
+themselves route through `comics-api` (BUI-510), which resolves + health-gates
++ calls in one shot per invocation, so they carry no such dependency. Full
+history behind every inline warning in this skill:
 `docs/solutions/best-practices/collection-add-record-win-tail-rationale-2026-07-19.md`.
 
 ## Step 0: Resolve the server + bootstrap guard
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
-comics_health_gate     || exit 1   # the server must answer
+comics-api GET /health >/dev/null
 ```
 
-**If either step fails:** STOP — do not record wins against an unreachable
+**If that fails:** STOP — do not record wins against an unreachable
 server.
 
 Then read collection status:
 
 ```bash
-curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
+comics-api GET /api/comics/collection/status
 ```
 
 **If `last_full_import` is null:** Stop immediately with:
@@ -275,7 +275,7 @@ gixen record-win-prep --output "$SCRATCH/prep_recheck.json" \
 python3 -c "import json; d=json.load(open('$SCRATCH/prep_recheck.json')); \
   print(json.dumps({k: d[k] for k in ['total_ended_won','new_win_count']}))"
 
-curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
+comics-api GET /api/comics/collection/status
 ```
 
 Compare the recheck's `new_win_count` to Step 1's **original** `new_win_count`:
@@ -305,10 +305,9 @@ locally for the LOCG upload:
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1
 SCRATCH="$(comics_scratch_dir)" || exit 1
 
-curl -sf "$COMICS_SERVER_URL/api/comics/collection/export" -o "$SCRATCH/export.json"
+comics-api GET /api/comics/collection/export -o "$SCRATCH/export.json"
 ts=$(date +%Y-%m-%dT%H%M%S)
 python3 -c "import json,sys,os; d=json.load(open('$SCRATCH/export.json')); \
   base=os.path.expanduser(f'~/Downloads/locg-bulk-import-$ts'); \
@@ -364,7 +363,7 @@ Escalate the pending-push message when `oldest_pending_days > 21` or `pending_pu
 | Re-deriving the mark-seen item_id set from a client-side file (e.g. `wins.json`) | The commit endpoint marks seen exactly what it merged and committed itself (BUI-428) |
 | Confusing `oldest_pending_days` with "days since last sync" | `oldest_pending_days` = age of oldest uncleared item; use `last_full_import` from status for sync recency |
 | Re-fetching `/api/comics/collection/status` after the Step 4 export | Not needed — Step 3's response already has fresh `pending_push_count`/`oldest_pending_days` (BUI-428) |
-| Assuming `$COMICS_SERVER_URL` (or the scratch dir) carries over between Steps | Re-source `scripts/comics-server.sh` and call `comics_resolve_server`/`comics_scratch_dir` in every block that needs them (BUI-352, BUI-430) |
+| Assuming the scratch dir carries over between Steps | Re-source `scripts/comics-server.sh` and call `comics_scratch_dir` in every block that needs it (BUI-430); server calls themselves don't have this problem — `comics-api` (BUI-510) resolves fresh per invocation |
 | Re-deriving the ENDED+WON filter / dedup / seen-subtract / positional-identify-mapping by hand | Use `gixen record-win-prep` (BUI-353) — it owns that join in one tested place |
 | Asking the user "if confidence is low" | Not a real gate — baseline confidence is 0.5 for every clean parse; `needs_review` (Step 2) is the only gate (BUI-354) |
 | Assuming `needs_review` only covers null series/issue/lot parsing | It also gates a null `year` unconditionally, regardless of price (`REASON_MISSING_YEAR`, BUI-422/BUI-475 — vintage-key mis-resolution risk; the original `$25` price threshold was removed in BUI-475) |

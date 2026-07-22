@@ -37,19 +37,17 @@ and `docs/solutions/integration-issues/locg-sync-unified-model-2026-06-22.md`.
 
 ## Step 0: Resolve the server + bootstrap guard
 
-Resolve and health-gate the server through the **shared comics-server call
-convention** (BUI-172, `docs/conventions/comics-server-call.md`) — never
-hand-roll URL resolution or `curl` error handling here:
+Resolve and health-gate the server through `comics-api` (BUI-510,
+`docs/conventions/comics-server-call.md`) — never hand-roll URL resolution or
+`curl` error handling here:
 
 ```bash
-source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
-comics_health_gate     || exit 1   # the process is up
-comics_curl "$COMICS_SERVER_URL/api/comics/collection/status" \
+comics-api GET /api/comics/collection/status \
   || { echo "status check failed"; exit 1; }   # BUI-157: /health alone doesn't prove the store is healthy
 ```
 
-**If the health gate or status call fails:** STOP — never sync against an
+`comics-api` health-gates `/health` internally before making this call, so
+one line covers both checks. **If it fails:** STOP — never sync against an
 unreachable or erroring server. (Why the status read needs its own hard-fail,
 not just `/health`: BUI-157 in `docs/audit/2026-06-15-seam-audit.md`.)
 
@@ -57,7 +55,7 @@ not just `/health`: BUI-157 in `docs/audit/2026-06-15-seam-audit.md`.)
 > Collection empty on the server — run a full LOCG import before syncing.
 
 (Assert the field is *present* and non-null — a 500 body has no `last_full_import`
-key at all, which `comics_curl`'s hard-fail already catches above.)
+key at all, which `comics-api`'s hard-fail already catches above.)
 
 Record `row_count` and `pending_push_count` from the status response as
 `ROWS_BEFORE` and `PENDING_BEFORE` — the post-import safety check (Step 6) needs
@@ -72,7 +70,7 @@ works identically whether you're running from the Mac Mini or the MacBook:
 
 ```bash
 BACKUP_JSON="$(mktemp -t collection-backup.XXXXXX)"
-comics_post "$COMICS_SERVER_URL/api/comics/collection/backup" -o "$BACKUP_JSON" \
+comics-api POST /api/comics/collection/backup -o "$BACKUP_JSON" \
   || { echo "backup failed — do not proceed without a backup"; exit 1; }
 BACKUP_PATH="$(python3 -c "import json; print(json.load(open('$BACKUP_JSON'))['backup_path'])")"
 python3 -c "import json; d=json.load(open('$BACKUP_JSON')); \
@@ -82,7 +80,7 @@ python3 -c "import json; d=json.load(open('$BACKUP_JSON')); \
 **If the backup fails: STOP.** The endpoint itself hard-fails (non-2xx)
 rather than reporting success on an empty or unverifiable copy — a backup
 that captured zero rows across `collection.json`/`wish-list.json` is
-indistinguishable from a broken one, so `comics_post` never treats it as
+indistinguishable from a broken one, so `comics-api` never treats it as
 success. Do not proceed to Step 2 without a completed backup.
 
 Keep `$BACKUP_PATH` for the rest of the run — Steps 3/3b's abort path restores
@@ -96,7 +94,7 @@ pushed) and returns the file contents; save them locally for the upload:
 ```bash
 # BUI-138: fresh temp file per run + hard-fail before the parse (never reuse stale data)
 EXPORT_JSON="$(mktemp -t sync-export.XXXXXX)"
-comics_curl "$COMICS_SERVER_URL/api/comics/collection/export" -o "$EXPORT_JSON" \
+comics-api GET /api/comics/collection/export -o "$EXPORT_JSON" \
   || { echo "export failed — not generating a CSV from stale data"; exit 1; }
 ts=$(date +%Y-%m-%dT%H%M%S)
 CSV="$HOME/Downloads/locg-bulk-import-$ts.csv"   # BUI-158: bind for Step 3's split
@@ -186,7 +184,7 @@ wish-list itself so no owned-but-wished entry survives to be pushed in Step 3b:
 
 ```bash
 # BUI-130: dry-run audit — conflicts carry matched-owned-row provenance (BUI-249/266)
-comics_curl "$COMICS_SERVER_URL/api/comics/wish-list/conflicts"
+comics-api GET /api/comics/wish-list/conflicts
 ```
 
 **Review each conflict's provenance before removing anything (BUI-266) — the
@@ -227,7 +225,7 @@ Then remove **only the reviewed genuine conflicts**, scoped by their exact
 
 ```bash
 # BUI-266: scoped removal, each name re-checked against a FRESH audit
-comics_curl -X POST "$COMICS_SERVER_URL/api/comics/wish-list/remove-conflicts" \
+comics-api POST /api/comics/wish-list/remove-conflicts \
   -H 'Content-Type: application/json' \
   -d '{"names": ["<exact name from the audit>", "..."]}'
 ```
@@ -262,7 +260,7 @@ upload it alone. LOCG shows an import **preview/result** — read it row by row:
   restore the Step 1 backup (BUI-433 — the owned-safe export regressed):
 
 ```bash
-comics_post "$COMICS_SERVER_URL/api/comics/collection/restore" \
+comics-api POST /api/comics/collection/restore \
   -H 'Content-Type: application/json' \
   -d "{\"backup_path\": \"$BACKUP_PATH\"}"
 ```
@@ -298,7 +296,7 @@ Generate the owned-safe wishes CSV with the **opt-in** export — the only path 
 emits `In Collection=0` (the machine gate otherwise refuses it):
 
 ```bash
-comics_curl "$COMICS_SERVER_URL/api/comics/collection/export?push_wishes=true" -o "$EXPORT_JSON" \
+comics-api GET "/api/comics/collection/export?push_wishes=true" -o "$EXPORT_JSON" \
   || { echo "wish export failed"; exit 1; }
 python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \
   p=os.path.expanduser(f'~/Downloads/locg-wishes-$ts.csv'); \
@@ -313,7 +311,7 @@ Probe it the same way (≤5 rows), reading LOCG's preview:
   if a deletion already landed, restore the Step 1 backup (BUI-433):
 
 ```bash
-comics_post "$COMICS_SERVER_URL/api/comics/collection/restore" \
+comics-api POST /api/comics/collection/restore \
   -H 'Content-Type: application/json' \
   -d "{\"backup_path\": \"$BACKUP_PATH\"}"
 ```
@@ -336,7 +334,7 @@ BUI-122), sets `pushed_to_locg_at`, and re-appends local-only wish adds:
 
 ```bash
 # Replace <XLSX> with the path from Step 4.
-curl -sf -X POST "$COMICS_SERVER_URL/api/comics/collection/import" \
+comics-api POST /api/comics/collection/import \
   -F "file=@<XLSX>"
 ```
 
@@ -372,7 +370,7 @@ not report success; the backup from Step 1 is intact.
 Re-read status and compare against the Step 0 snapshot:
 
 ```bash
-curl -sf "$COMICS_SERVER_URL/api/comics/collection/status"
+comics-api GET /api/comics/collection/status
 ```
 
 Assert all of:
@@ -403,7 +401,7 @@ Assert all of:
   can't account for. Restore the Step 1 backup if needed (BUI-433):
 
 ```bash
-comics_post "$COMICS_SERVER_URL/api/comics/collection/restore" \
+comics-api POST /api/comics/collection/restore \
   -H 'Content-Type: application/json' \
   -d "{\"backup_path\": \"$BACKUP_PATH\"}"
 ```

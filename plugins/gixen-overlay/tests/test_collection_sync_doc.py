@@ -32,19 +32,17 @@ def test_export_does_not_reuse_fixed_stale_temp_file(text):
 def test_export_hard_fails_before_parsing(text):
     """BUI-138: the export call must hard-fail (and stop) before the python parse,
     so a failed fetch can't fall through to building a CSV."""
-    assert 'comics_curl "$COMICS_SERVER_URL/api/comics/collection/export"' in text
+    assert "comics-api GET /api/comics/collection/export" in text
     # the export line chains a failure guard that exits before the parse
     assert "not generating a CSV from stale data" in text
 
 
 def test_step0_routes_through_shared_server_convention(text):
-    """BUI-157 (+ BUI-172 adoption): Step 0 resolves/health-gates via the shared
-    convention and reads status through comics_curl so a 500 hard-fails rather
-    than slipping past the null-import gate."""
-    assert "scripts/comics-server.sh" in text
-    assert "comics_resolve_server" in text
-    assert "comics_health_gate" in text
-    assert 'comics_curl "$COMICS_SERVER_URL/api/comics/collection/status"' in text
+    """BUI-157 (+ BUI-172/BUI-510 adoption): Step 0 resolves/health-gates and
+    reads status through `comics-api` (which health-gates internally before
+    every call) so a 500 hard-fails rather than slipping past the null-import
+    gate."""
+    assert "comics-api GET /api/comics/collection/status" in text
 
 
 def test_no_dangling_csv_variable(text):
@@ -68,7 +66,7 @@ def test_step1_backup_has_no_hostname_ssh_branching(text):
 
 def test_step1_backup_is_one_server_call(text):
     """BUI-433: Step 1 becomes a single POST to the backup endpoint."""
-    assert 'comics_post "$COMICS_SERVER_URL/api/comics/collection/backup"' in text
+    assert "comics-api POST /api/comics/collection/backup" in text
     assert "BACKUP_PATH=" in text
     assert "do not proceed without a backup" in text
 
@@ -77,5 +75,5 @@ def test_abort_paths_reference_restore_endpoint(text):
     """BUI-433: Steps 3/3b/6's abort instructions must reference the
     executable restore endpoint, not just prose ("restore from the Step 1
     backup" with no command)."""
-    assert text.count('"$COMICS_SERVER_URL/api/comics/collection/restore"') >= 3
+    assert text.count("comics-api POST /api/comics/collection/restore") >= 3
     assert "backup_path" in text

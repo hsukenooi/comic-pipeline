@@ -19,12 +19,12 @@ Before running, ensure `SERPAPI_KEY` is set — source the canonical env file if
 set -a && source ~/Projects/comic-pipeline/apps/ebay/.env && set +a
 ```
 
-Then resolve and health-gate the comics server — **every run, on this default path, not just as a manual fallback** (BUI-439: `comic-fmv` reads `COMICS_SERVER_URL` from env only and hard-fails "must be set" if it's unset — a Mac Mini/MacBook shell that hasn't exported it needs the hostname fallback below, or the CLI dies before it ever queries anything). Use the shared comics-server call convention (BUI-172, `docs/conventions/comics-server-call.md`) — don't hand-roll URL resolution or the health check:
+Then resolve and health-gate the comics server — **every run, on this default path, not just as a manual fallback** (BUI-439: `comic-fmv` reads `COMICS_SERVER_URL` from env only and hard-fails "must be set" if it's unset — a Mac Mini/MacBook shell that hasn't exported it needs the hostname fallback below, or the CLI dies before it ever queries anything). `comic-fmv` is a **child process**, not an HTTP call this shell makes itself, so it needs the var actually exported into this shell's env (not just resolved inside a one-off `comics-api` subprocess) — `comics_resolve_server` still does that part. Route the health-check itself through `comics-api` (BUI-510) rather than the raw `comics_health_gate` call, so it shares the exact same call path every other skill's server check uses:
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
-comics_resolve_server || exit 1   # COMICS_SERVER_URL (env var, hostname fallback)
-comics_health_gate     || exit 1   # the server must answer
+comics_resolve_server || exit 1   # exports COMICS_SERVER_URL for comic-fmv below
+comics-api GET /health >/dev/null || exit 1   # the server must answer
 ```
 
 If either step fails, **stop immediately** — the comics server is unreachable or the machine is unrecognised, so FMV data cannot be saved. Do not proceed with any queries.
