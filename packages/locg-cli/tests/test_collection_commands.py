@@ -409,6 +409,33 @@ def test_check_miss_returns_not_in_cache(tmp_path, monkeypatch):
     assert result["full_title_matched"] is None
 
 
+def test_check_explicit_cache_override_wins_over_ambient_store(tmp_path, monkeypatch):
+    """BUI-502: an explicit `cache` pins which store cmd_collection_check
+    reads, even when the (patched) ambient CollectionCache() default would
+    answer differently — the fail-safe alignment BUI-502 exists to enable for
+    a caller that manages its own cache (e.g. cmd_wish_list_add_creator_run's
+    per-issue owned-filter, BUI-497)."""
+    import locg.commands as cmds
+
+    ambient = make_cache(tmp_path / "ambient")  # empty — "not owned"
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: ambient)
+
+    pinned = make_cache(tmp_path / "pinned")
+    _seed_cache(pinned, [_agent_win_row()])
+
+    # No cache kwarg -> resolves via CollectionCache() -> the ambient/empty store.
+    ambient_result = cmds.cmd_collection_check(series="Amazing Spider-Man", issue="300")
+    assert ambient_result["match_status"] == "not_in_cache"
+
+    # Explicit cache kwarg -> the pinned store, regardless of what the
+    # (patched) ambient CollectionCache() default would have answered.
+    pinned_result = cmds.cmd_collection_check(
+        series="Amazing Spider-Man", issue="300", cache=pinned,
+    )
+    assert pinned_result["match_status"] == "in_collection"
+    assert pinned_result["full_title_matched"] == "Amazing Spider-Man #300"
+
+
 def test_check_year_is_per_issue_cover_year_not_series_start(tmp_path, monkeypatch):
     """`year` gates on the issue's release_date, so passing a long-running
     series' start year (year_began) wrongly filters out owned mid-run issues.
