@@ -68,11 +68,7 @@ The agent:
 3. Tests green — `apps/*` use `cd <pkg> && uv run --with pytest pytest`; `packages/*` and `plugins/*` use `uv run pytest`.
 4. `/ce-simplify-code` **only if §3 says so**.
 5. Review per §3 (full `/ce-code-review` or single inline pass) — **inline, no detached reviewers it waits on**. Apply safe fixes directly.
-6. Commit on its branch (do NOT push, do NOT open a PR) with the repo trailers:
-   ```
-   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
-   Claude-Session: https://claude.ai/code/session_01SnSpPjeQfifLR71DY1FigJ
-   ```
+6. Commit on its branch (do NOT push, do NOT open a PR) with the commit trailers **your own harness specifies in your system prompt** — your actual model name, *this* session's URL. Never copy a trailer out of this file or a past commit: a literal example block here once burned six batches of provenance (every commit claimed the same long-dead authoring session, and an Opus attribution regardless of which model actually made it — BUI-512).
 7. SendMessage to `main`: branch, HEAD SHA (`git rev-parse HEAD`), test counts, and any out-of-scope findings. **Bound the format in the spawn prompt** — the analysis has to happen, but its transcript doesn't. Analysis-only agents (no PR to merge) return *one line per finding*: id, verdict, evidence. An unbounded diagnostic agent will return lavish prose per row and the EM pays for all of it.
 
 **License to stop (put this in the spawn prompt — for opus-tier work *and* any ticket sourced from a review / out-of-scope finding, regardless of model tier).** §2 deliberately routes opus work whose *stated approach may be wrong* — but the premise-may-be-broken risk isn't opus-specific. A ticket that is itself a review *residual* is exactly the class where the filer's understanding may be incomplete: BUI-388 was a *sonnet* ticket whose named target (an `item_id`-wide write) was already correct-by-design, and it only shipped right because the spawn prompt carried an explicit premise-check + stop license. Grant every such agent that permission: *if the ticket's premise is broken or the change can't be made safely as specified, STOP and report your findings instead of shipping a speculative implementation.* A disciplined no-code stop-and-report is a **success**, not a failure — handle it per §5. (BUI-326: the agent correctly refused to port a fragile price-extractor into a live bid-cap path; the right move was to close it, not force code.)
