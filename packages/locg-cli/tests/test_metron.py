@@ -102,7 +102,7 @@ def test_lookup_issue_returns_expected_dict():
 
 def test_lookup_issue_with_store_date():
     client, _ = _make_client_with_session(
-        series_list=[_mock_series(year_end=None)],
+        series_list=[_mock_series(display_name="Spawn", year_end=None)],
         issues_list=[_mock_issue(cover_date="1992-05-01", store_date="1992-03-15")],
     )
     result = client.lookup_issue("Spawn", "1")
@@ -112,7 +112,7 @@ def test_lookup_issue_with_store_date():
 
 def test_lookup_issue_no_cover_date():
     client, _ = _make_client_with_session(
-        series_list=[_mock_series()],
+        series_list=[_mock_series(display_name="Something")],
         issues_list=[_mock_issue(cover_date=None, store_date=None)],
     )
     result = client.lookup_issue("Something", "1")
@@ -193,8 +193,12 @@ def test_lookup_issue_ambiguous_year_in_two_ranges_returns_none():
     assert client.lookup_issue("Uncanny X-Men", "200", year=2005) is None
 
 
-def test_lookup_issue_single_series_ignores_year_mismatch():
-    """A sole series match is trusted even if year is outside its range."""
+def test_lookup_issue_single_series_out_of_window_still_resolves_on_exact_name():
+    """A sole series match whose year is outside its range still resolves —
+    but (post-BUI-494) only because its display_name EXACT-matches the query
+    ("Fantastic Four"). The exact-name acceptor stands in for the failed year
+    window; a sole candidate matching NEITHER now fails closed (see the
+    BUI-494 singleton-guard tests)."""
     client, _ = _make_client_with_session(
         series_list=[_mock_series(id=7, year_began=1961, year_end=1996)],
         issues_list=[_mock_issue(id=100)],
@@ -202,6 +206,168 @@ def test_lookup_issue_single_series_ignores_year_mismatch():
     result = client.lookup_issue("Fantastic Four", "1", year=2050)
     assert result is not None
     assert result["series_id"] == 7
+
+
+# ---------------------------------------------------------------------------
+# _disambiguate_series — singleton-path name/year guard (BUI-494)
+#
+# The len(series_list) == 1 fast path used to trust the sole live candidate
+# UNFILTERED by name or year (BUI-474 measured that population had no wrong
+# picks). BUI-487's masthead mapping can collapse Metron's substring search to
+# a single WRONG hit, so the shortcut now fails closed unless the sole
+# candidate clears a name/year gate: trust iff its display_name exact-matches
+# the (mapped) query OR the win's year falls in its [year_began, year_end]
+# window; otherwise None -> needs_manual_series. This OR is deliberately more
+# lenient than the multi-candidate branch (exact-name AND a unique in-window
+# survivor) so a genuine single-and-on-era candidate keeps resolving. A null
+# win-year (or a candidate missing year_began) can't evaluate the window, so it
+# falls back to exact-name-ONLY. These call the static method directly with an
+# ALREADY-mapped query (resolve_series maps before calling it).
+# ---------------------------------------------------------------------------
+
+def test_disambiguate_singleton_wrong_name_out_of_window_returns_none():
+    """(a) The core BUI-494 fix: a sole candidate that neither exact-name-
+    matches the mapped query NOR covers the year is NOT trusted (fail closed)."""
+    sole = _mock_series(
+        id=1, display_name="Some Other Series (1990)", year_began=1990, year_end=1995,
+    )
+    assert MetronClient._disambiguate_series([sole], 1975, "Fantastic Four") is None
+
+
+def test_disambiguate_singleton_exact_name_trusted_even_out_of_window():
+    """(b) A sole exact-name match is trusted even when the year is outside its
+    window — the exact-name acceptor stands alone (no year-window regression on
+    the BUI-474 population, which is genuinely single-and-on-name)."""
+    sole = _mock_series(
+        id=1, display_name="Fantastic Four (1961)", year_began=1961, year_end=1996,
+    )
+    assert MetronClient._disambiguate_series([sole], 2050, "Fantastic Four") is sole
+
+
+def test_disambiguate_singleton_in_window_non_exact_name_trusted():
+    """(c) A sole candidate whose name does NOT exact-match but whose window
+    COVERS the year is trusted — the year-window acceptor stands alone, so an
+    aliased/typo'd query that collapses to the right-era volume still resolves
+    (the leniency the ticket requires to avoid regressing BUI-474)."""
+    sole = _mock_series(
+        id=1, display_name="Fantastic Four (1961)", year_began=1961, year_end=1996,
+    )
+    # "Fantastic 4" normalizes to "fantastic 4" != "fantastic four" -> not
+    # exact; but 1975 is inside [1961, 1996].
+    assert MetronClient._disambiguate_series([sole], 1975, "Fantastic 4") is sole
+
+
+def test_disambiguate_singleton_null_year_non_exact_name_returns_none():
+    """(d) Null win-year can't evaluate the window, so a sole candidate that
+    does NOT exact-match must fail closed — never trusted on the window it
+    can't check."""
+    sole = _mock_series(
+        id=1, display_name="Fantastic Four (1961)", year_began=1961, year_end=1996,
+    )
+    assert MetronClient._disambiguate_series([sole], None, "Fantastic 4") is None
+
+
+def test_disambiguate_singleton_null_year_exact_name_trusted():
+    """(e) Null win-year + sole exact-name match -> trusted (exact-name-only
+    path). A batch issue with no supplied year of a genuinely-named series must
+    still resolve."""
+    sole = _mock_series(
+        id=1, display_name="Fantastic Four (1961)", year_began=1961, year_end=1996,
+    )
+    assert MetronClient._disambiguate_series([sole], None, "Fantastic Four") is sole
+
+
+def test_disambiguate_singleton_missing_year_began_relies_on_exact_name():
+    """A candidate with no year_began can't have its window evaluated even when
+    a win-year is supplied: a non-matching name fails closed, an exact-name
+    match is still trusted."""
+    no_window_wrong_name = _mock_series(
+        id=1, display_name="Fantastic Four (1961)", year_began=None, year_end=None,
+    )
+    assert (
+        MetronClient._disambiguate_series([no_window_wrong_name], 1975, "Fantastic 4")
+        is None
+    )
+    no_window_exact = _mock_series(
+        id=2, display_name="Fantastic Four", year_began=None, year_end=None,
+    )
+    assert (
+        MetronClient._disambiguate_series([no_window_exact], 1975, "Fantastic Four")
+        is no_window_exact
+    )
+
+
+def test_disambiguate_singleton_non_int_year_treated_as_null_year():
+    """A non-coercible year (e.g. "n/a") collapses to the null-year rule —
+    window unevaluable, so a non-matching sole candidate fails closed."""
+    sole = _mock_series(
+        id=1, display_name="Fantastic Four (1961)", year_began=1961, year_end=1996,
+    )
+    assert MetronClient._disambiguate_series([sole], "n/a", "Fantastic 4") is None
+    # ...but the same bad year still resolves a sole EXACT-name candidate.
+    assert MetronClient._disambiguate_series([sole], "n/a", "Fantastic Four") is sole
+
+
+def test_disambiguate_sole_vs_multi_non_exact_in_window_flips_on_decoy():
+    """Pins the deliberate OR-vs-AND asymmetry: a non-exact-name but in-window
+    candidate is TRUSTED as the sole hit (lenient OR floor, avoids regressing
+    BUI-474) yet REJECTED the moment a second candidate joins it — the
+    multi-candidate branch requires exact-name AND uniqueness, so the
+    non-matching name is filtered out and nothing survives. Guards a future
+    refactor from silently collapsing the two branches into one rule (the
+    safety-inversion the adversarial review flagged)."""
+    wrong_in_window = _mock_series(
+        id=1, display_name="Fantastic Four (1961)", year_began=1961, year_end=1996,
+    )
+    # Sole hit, name mismatch, year in window -> trusted via the OR floor.
+    assert (
+        MetronClient._disambiguate_series([wrong_in_window], 1975, "Fantastic 4")
+        is wrong_in_window
+    )
+    # Add ANY second candidate -> multi-candidate branch: the exact-name filter
+    # drops the non-matching name, leaving zero survivors -> None (fail closed).
+    decoy = _mock_series(
+        id=2, display_name="Fantastic Force (1994)", year_began=1994, year_end=1996,
+    )
+    assert (
+        MetronClient._disambiguate_series([wrong_in_window, decoy], 1975, "Fantastic 4")
+        is None
+    )
+
+
+def test_disambiguate_multi_candidate_branch_unchanged():
+    """(f) Regression guard: the multi-candidate branch is unchanged — exact-
+    name filter, then a UNIQUE in-window survivor; no year, or two in-window
+    survivors, is still None."""
+    a = _mock_series(id=1, display_name="Amazing Spider-Man", year_began=1963, year_end=1998)
+    b = _mock_series(id=2, display_name="Amazing Spider-Man", year_began=1999, year_end=2012)
+    decoy = _mock_series(
+        id=3, display_name="Spectacular Spider-Man", year_began=1976, year_end=1998,
+    )
+    # Year picks the single in-window exact-name survivor (decoy is filtered by name).
+    assert MetronClient._disambiguate_series([a, b, decoy], 1975, "Amazing Spider-Man") is a
+    # No year -> ambiguous among exact-name survivors -> None.
+    assert MetronClient._disambiguate_series([a, b, decoy], None, "Amazing Spider-Man") is None
+    # Year in BOTH survivors' windows -> still ambiguous -> None.
+    overlap = _mock_series(id=4, display_name="Amazing Spider-Man", year_began=1990, year_end=2000)
+    assert MetronClient._disambiguate_series([a, overlap], 1995, "Amazing Spider-Man") is None
+
+
+def test_resolve_series_singleton_wrong_name_out_of_window_fails_closed_and_caches_none():
+    """BUI-494 end-to-end at the caller: resolve_series returns None (not the
+    wrong volume) for a sole candidate matching neither the mapped name nor the
+    year, and caches that None so every later issue of the batch stays
+    consistent (one series_list request, never a second guess)."""
+    client, session = _make_client_with_session(
+        series_list=[
+            _mock_series(
+                id=99, display_name="Wrong Volume (1990)", year_began=1990, year_end=1995,
+            ),
+        ],
+    )
+    assert client.resolve_series("Fantastic Four", year=1975) is None
+    assert client.resolve_series("Fantastic Four", year=1975) is None
+    session.series_list.assert_called_once_with({"name": "Fantastic Four"})
 
 
 # ---------------------------------------------------------------------------
@@ -389,12 +555,11 @@ def test_lookup_issue_mapped_masthead_single_correct_candidate_resolves():
     and it genuinely is the right one, the lookup still resolves it (via
     that shortcut, same as any other single-candidate query already would).
 
-    This is deliberately NOT a test of the shortcut's known, pre-existing,
-    out-of-scope risk (a single WRONG candidate would also be trusted
-    unfiltered by name/year -- see the code comment above
-    _ANNUAL_MASTHEAD_TO_METRON) -- that risk belongs to _disambiguate_series
-    itself (a separately measured BUI-474/BUI-485 decision this ticket does
-    not revisit), not to the mapping table this ticket adds."""
+    Here the sole candidate exact-name-matches the mapped query AND covers
+    the year, so it clears the BUI-494 singleton gate either way. The single
+    WRONG-candidate risk this shortcut once carried is now closed by that gate
+    (see the BUI-494 singleton-guard tests) — it is not the concern of the
+    mapping table BUI-487 adds."""
     client, session = _make_client_with_session(
         series_list=[
             _mock_series(
@@ -414,11 +579,11 @@ def test_lookup_issue_mapped_masthead_single_correct_candidate_resolves():
 def test_lookup_issue_unmapped_masthead_divergence_fails_closed():
     """A masthead with NO table entry is searched verbatim (pass-through).
     Metron's real substring search can return more than one in-window
-    candidate for it (hence the second decoy below -- with only one
-    candidate, ``_disambiguate_series`` trusts it unfiltered by name, which
-    would mask the very failure mode this test targets); the un-translated
-    query must fail the exact-name filter against both -- None, never a
-    guessed volume."""
+    candidate for it (hence the second decoy below -- a lone in-window
+    candidate would clear the BUI-494 year-window acceptor and resolve, which
+    would mask the exact-name failure mode this test targets); the
+    un-translated query must fail the exact-name filter against both -- None,
+    never a guessed volume."""
     client, session = _make_client_with_session(
         series_list=[
             _mock_series(
@@ -441,9 +606,9 @@ def test_lookup_issue_wrong_masthead_mapping_fails_closed_not_wrong_volume():
     it only changes what string is searched/exact-matched, and a mapped
     name that doesn't line up with any real candidate's display_name still
     fails the exact-name filter -- None, not series_id 1. (Two candidates,
-    same reasoning as above: a lone candidate would bypass the name filter
-    entirely and this test wouldn't be exercising the mapping's fail-closed
-    behavior at all.)"""
+    same reasoning as above: a lone in-window candidate would clear BUI-494's
+    year-window acceptor and resolve, so this test wouldn't be exercising the
+    mapping's fail-closed behavior at all.)"""
     client, session = _make_client_with_session(
         series_list=[
             _mock_series(
@@ -567,7 +732,8 @@ def test_lookup_issue_gives_up_after_second_rate_limit(caplog):
 # ONCE and reuse the handle across N issue_in_series calls. These tests pin:
 # (1) resolve_series alone reproduces lookup_issue's resolution semantics
 #     (masthead mapping BUI-487, exact-name filter BUI-485, sole-candidate
-#     trust BUI-474) unchanged; (2) the per-instance cache actually collapses
+#     exact-name-OR-year-window gate BUI-474/BUI-494) unchanged; (2) the
+#     per-instance cache actually collapses
 #     N calls to ONE series_list request; (3) the cache is faithful — it
 #     never amplifies a wrong/ambiguous resolution, never collapses two
 #     genuinely different (series, year) queries, and never poisons itself
@@ -609,8 +775,12 @@ def test_resolve_series_exact_name_filter_still_applies():
     assert result.id == 1
 
 
-def test_resolve_series_trusts_sole_candidate_unfiltered_by_name():
-    """BUI-474: a single series_list candidate is trusted even when year doesn't fit."""
+def test_resolve_series_trusts_sole_exact_name_candidate_out_of_window():
+    """BUI-474/BUI-494: a single series_list candidate whose year doesn't fit
+    is still trusted WHEN its display_name exact-matches the query — the
+    exact-name acceptor covers the failed year window. (A sole candidate that
+    matches neither name nor window now fails closed — see the BUI-494
+    singleton-guard tests.)"""
     client, _ = _make_client_with_session(
         series_list=[_mock_series(id=9, year_began=1961, year_end=1996)],
     )
