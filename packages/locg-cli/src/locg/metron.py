@@ -108,18 +108,21 @@ def _normalize_metron_display_name(name: Any) -> str:
 # NOT add a new way to guess. When ``series_list`` comes back with 2+
 # candidates, the existing exact-name-filter pipeline still fails closed
 # (None) on a mapped name that doesn't line up with any real candidate —
-# reviewed and pinned by tests below. The one case this table cannot make any
-# promise about is ``_disambiguate_series``'s pre-existing ``len(series_list)
-# == 1`` branch (this file, above), which trusts a SOLE live candidate
-# UNFILTERED by name — a separately measured, deliberate BUI-474/BUI-485
-# decision this table does not (and per BUI-487's own scope, must not)
-# revisit. In the rare case a mapped/mistyped value happens to collapse
-# Metron's live substring search down to exactly one hit, that hit is
-# trusted the same way any other single-candidate query already is; this is
-# a pre-existing, bounded, and known risk of the singleton shortcut itself,
-# not something this table introduces. Adding a newly discovered divergence
-# is a new key here, never a new branch in ``lookup_issue`` or
-# ``_disambiguate_series``.
+# reviewed and pinned by tests below. The rare case where a mapped/mistyped
+# value collapses Metron's live substring search down to exactly one hit was
+# BUI-487's out-of-scope residual: ``_disambiguate_series``'s
+# ``len(series_list) == 1`` branch (this file, above) used to trust that SOLE
+# candidate UNFILTERED by name or year (a BUI-474/BUI-485 measurement this
+# table deliberately did not revisit). BUI-494 tightened that residual — the
+# singleton branch now fails closed (None -> needs_manual_series) on a sole
+# candidate that neither exact-name-matches the mapped query NOR covers the
+# win's year, so a mapped value collapsing to a single OUT-of-era WRONG hit is
+# no longer trusted. (An in-era wrong sole hit can still pass the year-window
+# acceptor — the lenient OR floor BUI-494 chose to avoid regressing legitimate
+# on-era single candidates — so a new table value must still be verified
+# against Metron's real display_name to keep even that path honest.) Adding a
+# newly discovered divergence is a new key here, never a new branch in
+# ``lookup_issue`` or ``_disambiguate_series``.
 #
 # Sibling precedent: ``collection_cache.py``'s ``_MASTHEAD_ALIAS_PAIRS``
 # (BUI-197) is the same shape of table for the LOCG-side collection matcher
@@ -330,9 +333,25 @@ class MetronClient:
     ) -> Optional[Any]:
         """Pick the series whose publication range includes ``year`` (BUI-32).
 
-        - exactly one candidate            -> use it (trust the sole match,
-          UNFILTERED by name — Metron's own search already narrowed it, and
-          BUI-474 measured this population has no wrong picks here)
+        - exactly one candidate -> trust it ONLY IF it clears a name/year gate
+          (BUI-494): accept iff its ``display_name`` EXACT-matches ``query``
+          (``_normalize_metron_display_name``, BUI-485) OR ``year`` falls
+          inside its ``[year_began, year_end]`` window (BUI-32); otherwise
+          ``None`` so the caller fails closed to ``needs_manual_series``. A
+          null ``year`` (or a candidate with no ``year_began``) can't evaluate
+          the window, so the sole candidate is then trusted on an exact-name
+          match alone. This OR is deliberately MORE LENIENT than the
+          multi-candidate branch below (which requires exact-name AND a unique
+          in-window survivor) — the leniency keeps the genuine
+          single-and-on-era BUI-474 population resolving instead of regressing
+          it to manual review. (Previously the sole candidate was trusted
+          UNFILTERED by name or year: BUI-474 measured that population had no
+          wrong picks, but BUI-487's masthead mapping can collapse Metron's
+          substring search to a single WRONG hit. The gate now fails closed on
+          such a collapse when the wrong hit is OUT of era; an in-era wrong
+          sole hit still slips through the year-window acceptor — the accepted
+          floor of the OR, since requiring exact-name here would regress
+          legitimate on-era single candidates.)
         - otherwise, first narrow to candidates whose ``display_name``
           EXACT-matches ``query`` (BUI-485; see ``_normalize_metron_display_name``)
           — Metron's search is a substring match, so multiple candidates is not
@@ -345,30 +364,44 @@ class MetronClient:
         - otherwise (no year, no exact-name survivor, or still ambiguous)
           -> ``None`` so the caller falls back to ``needs_manual_series_canonical``
         """
-        if len(series_list) == 1:
-            return series_list[0]
-
         query_norm = _normalize_metron_display_name(query)
-        exact_matches = [
-            s for s in series_list
-            if _normalize_metron_display_name(getattr(s, "display_name", None)) == query_norm
-        ]
 
         try:
             y = int(year) if year is not None else None
         except (TypeError, ValueError):
             y = None
+
+        def _exact_name(s: Any) -> bool:
+            return (
+                _normalize_metron_display_name(getattr(s, "display_name", None))
+                == query_norm
+            )
+
+        def _in_window(s: Any) -> bool:
+            # A null win-year or a candidate missing ``year_began`` leaves the
+            # window unevaluable -> treat as not-satisfied (fall back to the
+            # exact-name acceptor), never as a pass.
+            if y is None:
+                return False
+            began = getattr(s, "year_began", None)
+            if began is None:
+                return False
+            end = getattr(s, "year_end", None)
+            return began <= y and (end is None or y <= end)
+
+        if len(series_list) == 1:
+            # BUI-494: no longer an unconditional trust — accept the sole
+            # candidate iff it exact-name-matches OR is in-window (a lenient OR
+            # floor; the multi-candidate branch below is stricter — exact-name
+            # AND a unique in-window survivor).
+            sole = series_list[0]
+            return sole if (_exact_name(sole) or _in_window(sole)) else None
+
+        exact_matches = [s for s in series_list if _exact_name(s)]
         if y is None:
             return None
 
-        matches = []
-        for s in exact_matches:
-            began = getattr(s, "year_began", None)
-            if began is None:
-                continue
-            end = getattr(s, "year_end", None)
-            if began <= y and (end is None or y <= end):
-                matches.append(s)
+        matches = [s for s in exact_matches if _in_window(s)]
         return matches[0] if len(matches) == 1 else None
 
     @staticmethod
