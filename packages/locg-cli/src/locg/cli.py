@@ -171,6 +171,34 @@ def create_parser() -> argparse.ArgumentParser:
     p_check.add_argument("--variant", help="Optional variant text to match in title")
     p_check.add_argument("--year", help="Optional publication year filter (e.g. 1988)")
 
+    # collection check-batch — mechanized collection-check executor (BUI-504).
+    # Hits the COMICS SERVER (never the local cache), health-gates, batch-checks,
+    # applies the stale downgrade + advisory false-match flags, and hard-fails
+    # (exit 1) on any server error (R11 — never renders "not owned" from a failed
+    # call). Replaces the ~450-line collection-check.md prose executor.
+    p_cb = coll_sub.add_parser(
+        "check-batch",
+        parents=[common],
+        help="Batch-check a working list against the comics server (mechanized "
+             "collection-check executor, BUI-504)",
+    )
+    p_cb.add_argument(
+        "items_path",
+        nargs="?",
+        default="-",
+        help="Path to items.json ({\"items\":[{series,issue,year?,variant?}]} or a "
+             "bare list); '-' or omitted reads stdin",
+    )
+    p_cb.add_argument(
+        "--table",
+        action="store_true",
+        help="Render the human-facing markdown table + status banners instead of JSON",
+    )
+    p_cb.add_argument(
+        "--server-url",
+        help="Override the comics server URL (default: COMICS_SERVER_URL / hostname inference)",
+    )
+
     # collection doctor — local cache
     coll_sub.add_parser("doctor", parents=[common], help="Print first-run setup walkthrough and cache status")
 
@@ -579,10 +607,13 @@ def main() -> None:
 
     logger = logging.getLogger("locg")
 
-    # Collection cache subcommands are purely local — skip Playwright browser launch.
+    # Collection subcommands that need no Playwright browser launch: the local
+    # cache ones, plus `check-batch` (BUI-504) which talks to the comics server
+    # over HTTP (its own `requests` client), never Chrome.
     _LOCAL_COLLECTION_SUBCMDS = {
-        "import", "export", "status", "check", "doctor", "record-win", "audit-pending",
-        "audit-unscoped-lookup", "remediate-delete", "remediate-set-copies", "backfill",
+        "import", "export", "status", "check", "check-batch", "doctor", "record-win",
+        "audit-pending", "audit-unscoped-lookup", "remediate-delete",
+        "remediate-set-copies", "backfill",
     }
     _collection_sub = (
         getattr(args, "collection_command", None)
@@ -668,6 +699,38 @@ def main() -> None:
                     variant=getattr(args, "variant", None),
                     year=getattr(args, "year", None),
                 )
+            elif sub_cmd == "check-batch":
+                # BUI-504: mechanized collection-check executor. Hits the comics
+                # server (never the local cache) and HARD-FAILS (exit 1) on any
+                # server error so a failed call can never render "not owned"
+                # (R11). Imported lazily so `requests` only loads for this path.
+                from locg.check_batch import (
+                    CheckBatchError,
+                    parse_items_file,
+                    render_table,
+                    run_check_batch,
+                )
+                items_path = getattr(args, "items_path", None) or "-"
+                try:
+                    if items_path == "-":
+                        raw = sys.stdin.read()
+                    else:
+                        import pathlib as _pathlib
+                        raw = _pathlib.Path(items_path).read_text()
+                    items = parse_items_file(raw)
+                    payload = run_check_batch(
+                        items, server_url=getattr(args, "server_url", None)
+                    )
+                except OSError as exc:
+                    die(f"cannot read items file '{items_path}': {exc}", code=1)
+                except CheckBatchError as exc:
+                    # R11: any failure is a hard non-zero exit, NO verdicts.
+                    die(str(exc), code=1)
+                if getattr(args, "table", False):
+                    print(render_table(payload))
+                    result = None
+                else:
+                    result = payload
             elif sub_cmd == "doctor":
                 result = cmd_collection_doctor()
             elif sub_cmd == "audit-pending":

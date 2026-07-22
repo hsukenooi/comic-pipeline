@@ -444,6 +444,7 @@ dependencies = [
     { name = "openpyxl" },
     { name = "playwright" },
     { name = "python-dotenv" },
+    { name = "requests" },
 ]
 
 [package.optional-dependencies]
@@ -461,6 +462,7 @@ requires-dist = [
     { name = "playwright", specifier = ">=1.40.0" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "requests", specifier = ">=2.31" },
 ]
 provides-extras = ["test"]
 
