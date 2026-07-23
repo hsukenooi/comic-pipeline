@@ -1,6 +1,16 @@
-/* Shared chrome for the v2 dashboard family — /v2 (snipes), /v2/comics, /v2/bids.
-   Page-specific styles (inline edit, remove button, refresh bar, etc.) stay
-   inline in the page that uses them. */
+/* Shared chrome for the comic-pipeline dashboard family — / (snipes),
+   /comics, /v2/bids. Direction 1 ("elevate the terminal look"): the same
+   Tokyo Night / JetBrains Mono identity, refined. Page-specific styles
+   (inline edit, remove button, refresh sweep, flags) stay inline in the page
+   that uses them.
+
+   MOTION NOTE: these dashboards replace their table innerHTML roughly every
+   1s (countdown repaint) and every 30s (full refresh). So this file uses NO
+   load-time entrance or continuous keyframe animations on re-rendered nodes
+   (panels, rows, pills, badges) — they would restart on every repaint and
+   strobe. Motion here is limited to hover/press transitions and the stable,
+   never-re-rendered topbar + keybar. (This is emil's own rule: something the
+   user sees repaint constantly should not animate.) */
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -9,38 +19,61 @@
   --fg: #c0caf5; --fg-dim: #565f89; --fg-mute: #3b4261; --line: #2a2e44;
   --blue: #7aa2f7; --cyan: #7dcfff; --green: #9ece6a; --yellow: #e0af68;
   --orange: #ff9e64; --red: #f7768e; --magenta: #bb9af7;
+
+  /* Custom easing — the CSS built-ins are too weak for intentional motion. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
 }
 
 html, body { height: 100%; }
 
 body {
-  background: var(--bg); color: var(--fg);
+  background:
+    radial-gradient(1200px 600px at 78% -10%, rgba(122,162,247,0.06), transparent 60%),
+    var(--bg);
+  color: var(--fg);
   font-family: "JetBrains Mono", ui-monospace, Menlo, monospace;
-  font-size: 13px; line-height: 1.5; padding: 0 0 28px 0;
+  font-size: 13px; line-height: 1.5;
+  padding: 0 0 44px 0;
+  -webkit-font-smoothing: antialiased;
 }
 
-a { color: var(--cyan); text-decoration: none; }
+a { color: var(--cyan); text-decoration: none; transition: color 140ms var(--ease-out); }
 a:hover { color: var(--blue); text-decoration: underline; }
 
-/* topbar */
+/* topbar — translucent, sticky; content scrolls underneath it */
 .topbar {
+  position: sticky; top: 0; z-index: 40;
   display: flex; align-items: stretch;
-  background: var(--bg-alt); border-bottom: 1px solid var(--line);
-  font-size: 12px; height: 28px;
+  height: 32px; font-size: 12px;
+  background: rgba(26,27,38,0.72);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-bottom: 1px solid var(--line);
 }
-.topbar .seg { display: flex; align-items: center; padding: 0 12px; }
-.topbar .seg.brand { background: var(--magenta); color: var(--bg); font-weight: 700; letter-spacing: 0.04em; }
+.topbar .seg { display: flex; align-items: center; padding: 0 13px; }
+.topbar .seg.brand {
+  background: linear-gradient(180deg, #c8b3fb, var(--magenta));
+  color: var(--bg); font-weight: 700; letter-spacing: 0.02em;
+}
 .topbar .seg.crumb { color: var(--fg-dim); }
 .topbar .seg.active { color: var(--blue); font-weight: 500; }
-.topbar a.nav { color: var(--fg-dim); text-decoration: none; }
-.topbar a.nav:hover { color: var(--fg); background: var(--bg-hover); }
+.topbar a.nav {
+  color: var(--fg-dim); text-decoration: none; position: relative;
+  transition: color 140ms var(--ease-out), background 140ms var(--ease-out);
+}
+.topbar a.nav:hover { color: var(--fg); background: rgba(255,255,255,0.03); text-decoration: none; }
 .topbar a.nav.active { color: var(--blue); font-weight: 500; }
+.topbar a.nav.active::after {
+  content: ""; position: absolute; left: 13px; right: 13px; bottom: -1px;
+  height: 2px; background: var(--blue); border-radius: 2px 2px 0 0;
+}
 .topbar .spacer { flex: 1; }
 .topbar .seg.host { color: var(--fg-dim); }
-.topbar .seg.clock { color: var(--green); }
+.topbar .seg.clock { color: var(--green); font-variant-numeric: tabular-nums; }
 
 /* layout */
-.wrap { padding: 18px 22px; max-width: 1500px; margin: 0 auto; }
+.wrap { padding: 20px 24px; max-width: 1500px; margin: 0 auto; }
 
 /* session line */
 .session { color: var(--fg-dim); font-size: 12px; margin-bottom: 16px; }
@@ -53,18 +86,26 @@ a:hover { color: var(--blue); text-decoration: underline; }
 /* panel */
 .panel {
   background: var(--bg-panel); border: 1px solid var(--line);
-  border-radius: 6px; margin-bottom: 18px; overflow: hidden;
+  border-radius: 10px; margin-bottom: 20px; overflow: hidden;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 24px -18px rgba(0,0,0,0.9);
 }
 .panel-head {
   display: flex; align-items: center; gap: 12px;
-  padding: 8px 14px; background: var(--bg-alt);
+  padding: 10px 16px; background: rgba(255,255,255,0.015);
   border-bottom: 1px solid var(--line); font-size: 12px;
 }
-.panel-head .label { color: var(--blue); font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+.panel-head .label { color: var(--blue); font-weight: 700; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
 .panel-head .count { color: var(--fg-dim); font-size: 11px; }
+/* right-aligned status chip (kept class name `badge` for the existing markup) */
 .panel-head .badge {
-  margin-left: auto; padding: 1px 8px; border-radius: 3px;
-  background: var(--bg-hover); color: var(--fg-dim); font-size: 11px;
+  margin-left: auto; padding: 2px 9px; border-radius: 999px;
+  background: var(--bg-hover); color: var(--fg-dim); font-size: 10.5px; letter-spacing: 0.02em;
+}
+.panel-head .badge.live { color: var(--green); }
+.panel-head .badge.live::before {
+  content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 7px var(--green);
+  margin-right: 6px; vertical-align: middle;
 }
 
 /* tables */
@@ -72,15 +113,15 @@ a:hover { color: var(--blue); text-decoration: underline; }
 table { width: 100%; border-collapse: collapse; }
 thead th {
   text-align: left; color: var(--fg-dim); font-weight: 500;
-  padding: 8px 14px; background: var(--bg-alt);
+  padding: 9px 16px; background: var(--bg-alt);
   border-bottom: 1px solid var(--line);
-  font-size: 11px; text-transform: uppercase;
-  letter-spacing: 0.05em; white-space: nowrap;
+  font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.06em; white-space: nowrap;
 }
-tbody tr { border-bottom: 1px solid var(--line); }
+tbody tr { border-bottom: 1px solid var(--line); transition: background 130ms var(--ease-out); }
 tbody tr:last-child { border-bottom: 0; }
-tbody tr:hover { background: var(--bg-hover); }
-td { padding: 8px 14px; vertical-align: top; white-space: nowrap; }
+@media (hover: hover) and (pointer: fine) { tbody tr:hover { background: var(--bg-hover); } }
+td { padding: 9px 16px; vertical-align: middle; white-space: nowrap; }
 td.wrap { white-space: normal; max-width: 320px; line-height: 1.4; }
 .right { text-align: right; }
 .num { font-variant-numeric: tabular-nums; }
@@ -91,28 +132,31 @@ td.wrap { white-space: normal; max-width: 320px; line-height: 1.4; }
 .mute { color: var(--fg-mute); font-style: italic; }
 
 /* status pills */
-.pill { display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 11px; font-weight: 500; letter-spacing: 0.03em; }
-.pill.won { background: rgba(158,206,106,0.18); color: var(--green); }
-.pill.lost { background: rgba(86,95,137,0.25); color: var(--fg-dim); }
+.pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.02em; }
+.pill.won { background: rgba(158,206,106,0.16); color: var(--green); }
+.pill.lost { background: rgba(86,95,137,0.22); color: var(--fg-dim); }
 .pill.err { background: rgba(247,118,142,0.18); color: var(--red); }
-.pill.pending { background: rgba(224,175,104,0.18); color: var(--yellow); }
-.pill.conf-high { background: rgba(158,206,106,0.18); color: var(--green); }
-.pill.conf-medium { background: rgba(224,175,104,0.18); color: var(--yellow); }
+.pill.pending { background: rgba(224,175,104,0.16); color: var(--yellow); }
+.pill.conf-high { background: rgba(158,206,106,0.16); color: var(--green); }
+.pill.conf-medium { background: rgba(224,175,104,0.16); color: var(--yellow); }
 .pill.conf-low { background: rgba(247,118,142,0.18); color: var(--red); }
 
 .empty { color: var(--fg-mute); padding: 14px; font-style: italic; font-size: 12px; }
 
-/* keybar (bottom status / shortcuts) */
+/* keybar (bottom status / shortcuts) — translucent, matches the topbar */
 .keybar {
-  position: fixed; bottom: 0; left: 0; right: 0;
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
   display: flex; align-items: center; gap: 18px;
-  background: var(--bg-alt); border-top: 1px solid var(--line);
-  padding: 6px 22px; font-size: 11px; color: var(--fg-dim); z-index: 50;
+  background: rgba(26,27,38,0.72);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border-top: 1px solid var(--line);
+  padding: 7px 24px; font-size: 11px; color: var(--fg-dim);
 }
 .keybar kbd {
-  display: inline-block; padding: 1px 6px; border-radius: 3px;
+  display: inline-block; padding: 1px 6px; border-radius: 5px; margin-right: 5px;
   background: var(--bg-hover); color: var(--fg);
-  font-family: inherit; font-size: 11px; margin-right: 4px;
+  font-family: inherit; font-size: 10.5px; box-shadow: 0 1px 0 rgba(0,0,0,0.4);
 }
 .keybar .spacer { flex: 1; }
 .keybar .stat { color: var(--fg-dim); }
@@ -125,3 +169,8 @@ td.wrap { white-space: normal; max-width: 320px; line-height: 1.4; }
 .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
 .dot.loading { background: var(--yellow); }
 .dot.err { background: var(--red); }
+
+/* reduced motion — kill movement, keep instantaneous state changes legible */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition-duration: 60ms !important; }
+}

@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>gixen ▸ comics</title>
+<title>comic-pipeline ▸ comics</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/v2.css">
 <style>
   /* v2-tui (comics dashboard) — page-specific styles. Shared chrome in v2.css.
@@ -35,6 +35,12 @@
   .warn-cell { color: var(--red); font-weight: 700; }
   .urgent-cell { color: var(--orange); font-weight: 700; }
 
+  /* condition grade chip (Direction 1) */
+  .grade { font-size: 11px; padding: 1px 7px; border-radius: 5px; background: var(--bg-hover); color: var(--fg-dim); letter-spacing: 0.02em; }
+  .grade.hi { color: var(--green); background: rgba(158,206,106,0.13); }
+  .grade.mid { color: var(--yellow); background: rgba(224,175,104,0.12); }
+  .grade.lo { color: var(--orange); background: rgba(255,158,100,0.12); }
+
   .lot-badge {
     display: inline-block;
     font-size: 10px;
@@ -52,10 +58,12 @@
   /* inline-edit max_bid */
   .editable-max {
     cursor: pointer;
+    display: inline-block;
     border-bottom: 1px dotted transparent;
-    transition: border-color 0.15s, background 0.15s;
+    transition: border-color 0.15s var(--ease-out), background 0.15s var(--ease-out), transform 0.12s var(--ease-out);
   }
   .editable-max:hover { border-bottom-color: var(--fg-dim); }
+  .editable-max:active { transform: scale(0.97); }
   .editable-max.editing { cursor: text; }
   .editable-max.saving {
     color: var(--yellow);
@@ -87,57 +95,51 @@
 
   /* per-row remove control */
   .remove-btn {
-    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
     margin-left: 8px;
     padding: 0 6px;
     background: transparent;
     border: 1px solid var(--line);
     color: var(--fg-dim);
-    border-radius: 3px;
+    border-radius: 5px;
     cursor: pointer;
     font: inherit;
     font-size: 11px;
     line-height: 18px;
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    transition: opacity 0.13s var(--ease-out), background 0.13s var(--ease-out),
+                color 0.13s var(--ease-out), border-color 0.13s var(--ease-out),
+                transform 0.12s var(--ease-out);
   }
-  tbody tr:hover .remove-btn { visibility: visible; }
+  tbody tr:hover .remove-btn { opacity: 1; pointer-events: auto; }
   .remove-btn:hover {
     color: var(--red);
     border-color: var(--red);
     background: rgba(247,118,142,0.1);
   }
+  .remove-btn:active { transform: scale(0.94); }
   .remove-btn.confirming {
-    visibility: visible;
+    opacity: 1;
+    pointer-events: auto;
     color: var(--red);
     border-color: var(--red);
     background: rgba(247,118,142,0.18);
     font-weight: 600;
   }
-  tbody tr.removing { opacity: 0.4; transition: opacity 0.25s; }
-
-  /* keybar 'r' refresh button */
-  .keybar .key-action {
-    background: none;
-    border: none;
-    color: inherit;
-    font: inherit;
-    cursor: pointer;
-    padding: 0;
-  }
-  .keybar .key-action:hover { color: var(--fg); }
+  tbody tr.removing { opacity: 0.4; transition: opacity 0.25s var(--ease-out); }
 
   /* top-of-page refresh sweep — visible only while a fetch is in flight */
   .refresh-bar {
     position: fixed;
-    top: 28px;
+    top: 32px;
     left: 0; right: 0;
     height: 2px;
-    background: var(--bg-alt);
+    background: transparent;
     overflow: hidden;
     pointer-events: none;
     z-index: 60;
     opacity: 0;
-    transition: opacity 0.15s;
+    transition: opacity 0.15s var(--ease-out);
   }
   .refresh-bar.is-active { opacity: 1; }
   .refresh-bar::after {
@@ -146,7 +148,7 @@
     inset: 0;
     background: linear-gradient(90deg, transparent, var(--blue), transparent);
     transform: translateX(-100%);
-    animation: refresh-sweep 1.1s ease-in-out infinite;
+    animation: refresh-sweep 1.25s var(--ease-in-out) infinite;
   }
   @keyframes refresh-sweep {
     0% { transform: translateX(-100%); }
@@ -157,37 +159,21 @@
 <body>
 
 <div class="topbar">
-  <div class="seg brand">▎ gixen</div>
-  <a class="seg nav" href="/">snipes</a>
-  <div id="nav-tabs"></div>
+  <div class="seg brand">▎ comic-pipeline</div>
   <div class="spacer"></div>
   <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
-  <div class="seg clock" id="clock">--:--:--</div>
 </div>
 <div class="refresh-bar" id="refresh-bar"></div>
 
 <div class="wrap">
-  <div class="session" id="session">
-    <span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--comics</span> <span class="ok">▸ ready</span>
-  </div>
-
   <div id="active-section"></div>
   <div id="ended-section"></div>
-</div>
-
-<div class="keybar">
-  <button class="key-action" id="refresh-btn" type="button"><kbd>r</kbd>refresh</button>
-  <span><kbd>s</kbd>snipes</span>
-  <span><kbd>b</kbd>bids</span>
-  <span class="spacer"></span>
-  <span class="stat is-loading" id="status"><span class="dot loading"></span><span id="status-text">connecting…</span></span>
 </div>
 
 <script>
 const REFRESH_MS = 30000;
 const SNIPES_URL = "/api/comics/snipes";
 const HISTORY_URL = "/api/comics/history";
-const TABS_URL = "/api/dashboard-tabs";
 const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
 
 // ---- Helpers (mirrors gixen-cli's index.html; copied not shared) ------------
@@ -271,9 +257,19 @@ function displayTitle(r) {
 
 // ---- Comic-enrichment cell renderers ----------------------------------------
 
+// Grade → chip color tier (Direction 1): NM/VF green, mid amber, low orange.
+function gradeCls(g) {
+  const n = parseFloat(g);
+  if (isNaN(n)) return "";
+  if (n >= 8.5) return "hi";
+  if (n >= 5.0) return "mid";
+  return "lo";
+}
+
 function fmtCond(r) {
   if (r.cond_grade == null) return '<span class="seller">—</span>';
-  return gradeLabel(parseFloat(r.cond_grade)) || String(r.cond_grade);
+  const label = gradeLabel(parseFloat(r.cond_grade)) || String(r.cond_grade);
+  return `<span class="grade ${gradeCls(r.cond_grade)}">${escapeHtml(label)}</span>`;
 }
 
 // Strip the eBay feedback count from seller strings: "modernkeyz (542)" -> "modernkeyz"
@@ -343,7 +339,7 @@ function renderActive(snipes) {
   const el = document.getElementById("active-section");
   if (!active.length) {
     el.innerHTML = `<div class="panel">
-      <div class="panel-head"><span class="label">active</span><span class="count">0 rows</span><span class="badge">live</span></div>
+      <div class="panel-head"><span class="label">active</span><span class="count">0 rows</span></div>
       <div class="empty">// no active snipes</div>
     </div>`;
     return;
@@ -383,7 +379,7 @@ function renderActive(snipes) {
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel">
-    <div class="panel-head"><span class="label">active</span><span class="count">${active.length} rows</span><span class="badge">live</span></div>
+    <div class="panel-head"><span class="label">active</span><span class="count">${active.length} rows</span></div>
     <div class="scroll"><table><thead><tr>
       <th>item</th><th>title</th><th>cond</th>
       <th class="right">current</th><th class="right">max</th>
@@ -431,78 +427,20 @@ function renderEnded(history) {
   </div>`;
 }
 
-// ---- Dynamic nav (filter current page by pathname, not literal string) ------
-
-async function renderNavTabs() {
-  try {
-    const resp = await fetch(TABS_URL);
-    if (!resp.ok) return;
-    const tabs = await resp.json();
-    const el = document.getElementById("nav-tabs");
-    const here = window.location.pathname;
-    const html = tabs.map(t => t.path === here
-      ? `<a class="seg nav active" href="${t.path}">▸ ${escapeHtml(t.label)}</a>`
-      : `<a class="seg nav" href="${t.path}">${escapeHtml(t.label)}</a>`
-    ).join("");
-    el.innerHTML = html;
-  } catch (_) {
-    // Nav is best-effort; failures don't block the dashboard.
-  }
-}
-
-// ---- Status pill + clock ----------------------------------------------------
-
-function setStatus(state, text) {
-  const el = document.getElementById("status");
-  const t = document.getElementById("status-text");
-  el.classList.remove("is-loading","is-error","is-ok");
-  el.classList.add("is-"+state);
-  el.querySelector(".dot").className = "dot " + (state === "ok" ? "ok" : state === "error" ? "err" : "loading");
-  t.textContent = text;
-}
-
-function tickClock() { document.getElementById("clock").textContent = new Date().toLocaleTimeString(); }
-setInterval(tickClock, 1000); tickClock();
-
-// ---- Fetch + repaint loop ---------------------------------------------------
+// ---- Fetch + refresh loop ---------------------------------------------------
 
 let _lastSnipes = null;
-let _lastHistory = null;
-let _lastSyncedAt = null;
 let _inFlight = false;
-let suppressRefresh = false;
 
 function renderAll(snipes, history) {
   if (!snipes) return;
   renderActive(snipes);
   renderEnded(history || []);
-
-  let cacheTag = '';
-  const newest = snipes.reduce((acc, r) => {
-    if (!r.cached_at) return acc;
-    const t = new Date(r.cached_at).getTime();
-    return t > acc ? t : acc;
-  }, 0);
-  if (newest > 0) {
-    const ageS = Math.max(0, Math.floor((Date.now() - newest) / 1000));
-    const ageStr = ageS < 90 ? `${ageS}s ago` : `${Math.floor(ageS/60)}m ago`;
-    cacheTag = ` <span class="arg">· cache ${ageStr}</span>`;
-  } else if (snipes.length > 0) {
-    cacheTag = ` <span class="err">· cache empty (warming up)</span>`;
-  }
-  const syncedAtStr = _lastSyncedAt
-    ? `synced ${_lastSyncedAt.toLocaleTimeString()}`
-    : 'never synced';
-  document.getElementById("session").innerHTML =
-    `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="arg">--comics</span> `
-    + `<span class="ok">▸ ${snipes.length} rows · ${syncedAtStr}</span>${cacheTag} `
-    + `<span class="arg">· press r to refresh</span>`;
 }
 
 async function load() {
   if (_inFlight) return;
   _inFlight = true;
-  setStatus("loading", "syncing…");
   document.getElementById("refresh-bar").classList.add("is-active");
   try {
     const [snipes, history] = await Promise.all([
@@ -510,14 +448,9 @@ async function load() {
       fetch(HISTORY_URL).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
     ]);
     _lastSnipes = snipes;
-    _lastHistory = history;
-    _lastSyncedAt = new Date();
     renderAll(snipes, history);
-    setStatus("ok", `${snipes.length} rows`);
   } catch (e) {
-    setStatus("error", e.message);
-    document.getElementById("session").innerHTML =
-      `<span class="prompt">$</span> <span class="cmd">gixen</span> <span class="err">▸ ${escapeHtml(e.message)}</span>`;
+    console.error("comics dashboard refresh failed:", e);
   } finally {
     document.getElementById("refresh-bar").classList.remove("is-active");
     _inFlight = false;
@@ -566,9 +499,8 @@ async function saveMaxBid(cell, newMax) {
   cell.classList.remove("editing");
   cell.classList.add("saving");
   cell.innerHTML = `$${newMax.toFixed(2)}`;
-  suppressRefresh = true;
 
-  // Bound the PATCH so a hung call can't strand suppressRefresh=true.
+  // Bound the PATCH so a hung call can't hang the save indefinitely.
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 30000);
 
@@ -595,7 +527,6 @@ async function saveMaxBid(cell, newMax) {
     cell.classList.add("saved");
     cell.dataset.currentMax = String(newMax);
     setTimeout(() => cell.classList.remove("saved"), 1200);
-    suppressRefresh = false;
     load();
   } catch (e) {
     clearTimeout(timer);
@@ -609,7 +540,6 @@ async function saveMaxBid(cell, newMax) {
       cell.classList.remove("save-error");
       cell.title = "click to edit";
     }, 3500);
-    suppressRefresh = false;
   }
 }
 
@@ -629,9 +559,8 @@ async function confirmRemove(btn) {
   const tr = btn.closest("tr");
   if (!tr) return;
   tr.classList.add("removing");
-  suppressRefresh = true;
-  // Clear the row from our cached snapshot so the next 1s repaint doesn't
-  // revive it before load() returns.
+  // Optimistically drop the row from the cached snapshot so it can't
+  // reappear before load() re-fetches.
   if (_lastSnipes) {
     _lastSnipes = _lastSnipes.filter(r => r.item_id !== itemId);
   }
@@ -643,14 +572,13 @@ async function confirmRemove(btn) {
       throw new Error(detail);
     }
     tr.style.opacity = "0";
-    setTimeout(() => { suppressRefresh = false; load(); }, 250);
+    setTimeout(() => { load(); }, 250);
   } catch (e) {
     tr.classList.remove("removing");
     btn.classList.remove("confirming");
     btn.textContent = "✕";
     btn.title = `remove failed: ${e.message}`;
     setTimeout(() => { btn.title = "remove snipe"; }, 3500);
-    suppressRefresh = false;
   }
 }
 
@@ -691,30 +619,10 @@ document.addEventListener("click", e => {
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
   if (e.key === "r" || e.key === "R") { e.preventDefault(); load(); }
-  if (e.key === "s") location.href = "/";
-  if (e.key === "c") location.href = "/comics";
-  if (e.key === "b") location.href = "/v2/bids";
-});
-document.getElementById("refresh-btn").addEventListener("click", e => {
-  e.preventDefault();
-  load();
 });
 
-// ---- 1s repaint tick — countdowns + cache-age, no network ------------------
-
-function repaint() {
-  if (suppressRefresh) return;
-  if (!_lastSnipes) return;
-  if (document.querySelector(".editable-max.editing, .editable-max.saving")) return;
-  if (document.querySelector(".remove-btn.confirming")) return;
-  if (document.querySelector("tr.removing")) return;
-  renderAll(_lastSnipes, _lastHistory);
-}
-
-renderNavTabs();
 load();
 setInterval(load, REFRESH_MS);
-setInterval(repaint, 1000);
 </script>
 </body>
 </html>
