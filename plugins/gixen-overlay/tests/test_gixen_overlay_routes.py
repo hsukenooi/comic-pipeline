@@ -137,11 +137,10 @@ def test_comics_returns_html(api):
     assert "text/html" in r.headers["content-type"]
 
 
-def test_comics_page_references_new_endpoints_and_dynamic_tabs(api):
+def test_comics_page_references_new_endpoints(api):
     body = api.get("/comics").text
     assert "/api/comics/snipes" in body
     assert "/api/comics/history" in body
-    assert "/api/dashboard-tabs" in body
 
 
 def test_comics_page_has_no_stale_v2_comics_urls(api):

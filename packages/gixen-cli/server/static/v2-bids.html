@@ -3,18 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>gixen ▸ bids</title>
+<title>comic-pipeline ▸ bids</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/v2.css">
 </head>
 <body>
 
 <div class="topbar">
-  <div class="seg brand">▎ gixen</div>
-  <a class="seg nav" href="/">snipes</a>
-  <a class="seg nav active" href="/v2/bids">▸ bids</a>
+  <div class="seg brand">▎ comic-pipeline</div>
   <div class="spacer"></div>
   <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
   <div class="seg clock" id="clock">--:--:--</div>
@@ -22,16 +20,14 @@
 
 <div class="wrap">
   <div class="session" id="session">
-    <span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">bids</span> <span class="ok">▸ ready</span>
+    <span class="prompt">$</span> <span class="cmd">comic-pipeline-db</span> <span class="arg">--table</span> <span class="arg">bids</span> <span class="ok">▸ ready</span>
   </div>
   <div id="bids-section"></div>
 </div>
 
 <div class="keybar">
   <span><kbd>r</kbd>refresh</span>
-  <span><kbd>s</kbd>snipes</span>
   <span><kbd>c</kbd>comics</span>
-  <span><kbd>b</kbd>bids</span>
   <span class="spacer"></span>
   <span class="stat is-loading" id="status"><span class="dot loading"></span><span id="status-text">connecting…</span></span>
 </div>
@@ -141,19 +137,18 @@ async function load() {
     renderBids(bids);
     const now = new Date().toLocaleTimeString();
     document.getElementById("session").innerHTML =
-      `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="arg">--table</span> <span class="arg">bids</span> <span class="ok">▸ ${bids.length} rows · loaded ${now}</span>`;
+      `<span class="prompt">$</span> <span class="cmd">comic-pipeline-db</span> <span class="arg">--table</span> <span class="arg">bids</span> <span class="ok">▸ ${bids.length} rows · loaded ${now}</span>`;
     setStatus("ok", `${bids.length} rows`);
   } catch (e) {
     setStatus("error", e.message);
-    document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">gixen-db</span> <span class="err">▸ ${e.message}</span>`;
+    document.getElementById("session").innerHTML = `<span class="prompt">$</span> <span class="cmd">comic-pipeline-db</span> <span class="err">▸ ${e.message}</span>`;
   }
 }
 
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
   if (e.key === "r") load();
-  if (e.key === "s") location.href = "/";
-  if (e.key === "b") location.href = "/v2/bids";
+  if (e.key === "c") location.href = "/comics";
 });
 
 load();
