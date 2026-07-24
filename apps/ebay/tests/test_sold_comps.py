@@ -1112,6 +1112,157 @@ class TestGatedPagination:
         assert sc._has_next_page({"serpapi_pagination": {"current": 1, "next": "url"}}) is True
 
 
+# ─── Conditional inclusive tier (BUI-524) ────────────────────────────────────
+#
+# A 4th tier that fires ONLY for a vintage book whose raw pool is still thin
+# after tiers 1-3, re-querying without the graded excludes so ONE extra query
+# serves both raw and slab needs (feeding BUI-529's cross-check). Same posture
+# as TestGatedPagination above: every test here pins a money invariant (spend
+# gate + raw-pool purity), not just an output shape.
+
+class TestIsSlabComp:
+    def test_true_for_cgc_or_cbcs_with_grade_and_price(self):
+        assert sc._is_slab_comp(
+            {"grade": 6.5, "price": 100, "title": "ASM 50 CGC 6.5"})
+        assert sc._is_slab_comp(
+            {"grade": 6.0, "price": 100, "title": "ASM 50 CBCS 6.0"})
+
+    def test_false_for_raw_or_missing_fields(self):
+        assert not sc._is_slab_comp(
+            {"grade": 6.5, "price": 100, "title": "ASM 50 FN raw, ungraded"})
+        assert not sc._is_slab_comp(
+            {"grade": None, "price": 100, "title": "ASM 50 CGC"})
+        assert not sc._is_slab_comp(
+            {"grade": 6.5, "price": None, "title": "ASM 50 CGC"})
+
+
+class TestInclusiveTier:
+    def _comp(self, pid, title="ASM #142 Marvel 1975", price=10.0):
+        return {
+            "product_id": pid,
+            "title": title,
+            "price": {"extracted": price},
+            "sold_date": "",
+            "buying_format": "auction",
+        }
+
+    def _wire(self, tmp_path, monkeypatch, results_per_query):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        calls = []
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+            calls.append(nkw)
+            idx = len(calls) - 1
+            results = results_per_query[idx] if idx < len(results_per_query) else []
+            return ({
+                "organic_results": results,
+                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+            }, False)
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        return calls
+
+    def test_fires_for_vintage_thin_book_and_splits_raw_vs_slab(self, tmp_path, monkeypatch):
+        results = [
+            [self._comp("r1"), self._comp("r2")],   # tier 1 base: thin (2 < 5)
+            [self._comp("r3")],                       # tier 2 broader: still thin
+            [                                          # tier 4 inclusive
+                self._comp("r4"),
+                self._comp("s1", title="ASM #142 CGC 6.5 1975", price=1200.0),
+                self._comp("s2", title="ASM #142 CBCS 7.0 1975", price=1800.0),
+            ],
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975}, "key",
+        )
+        assert len(calls) == 3  # base + broader + inclusive
+        raw_ids = {c["product_id"] for c in out["comps"]}
+        slab_ids = {c["product_id"] for c in out["slab_comps"]}
+        assert raw_ids == {"r1", "r2", "r3", "r4"}
+        assert slab_ids == {"s1", "s2"}
+        for t in ("-cgc", "-cbcs", "-graded", "-slab"):
+            assert t not in calls[2]  # the inclusive query itself
+
+    def test_does_not_fire_for_modern_book(self, tmp_path, monkeypatch):
+        # Thin raw pool, but modern — the 0.50-0.55 factor is vintage-only, so
+        # a slab ladder here would be actively misleading. Zero extra spend.
+        results = [
+            [self._comp("r1"), self._comp("r2")],
+            [self._comp("r3")],
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "X-Men", "issue": "1", "year": 2015}, "key",
+        )
+        tiers = {q["tier"] for q in out["queries_used"]}
+        assert "inclusive" not in tiers
+        assert len(calls) == 2  # base + broader only
+
+    def test_does_not_fire_when_raw_pool_healthy(self, tmp_path, monkeypatch):
+        # Vintage, but tier 1 alone already cleared the thin-pool threshold —
+        # the common "liquid vintage book" case must add ZERO extra searches
+        # and leave `comps` byte-identical to the pre-BUI-524 3-tier output.
+        results = [[self._comp(str(i)) for i in range(8)]]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975}, "key",
+        )
+        assert len(calls) == 1  # base only
+        tiers = {q["tier"] for q in out["queries_used"]}
+        assert "inclusive" not in tiers
+        assert out["slab_comps"] == []
+        assert len(out["comps"]) == 8
+
+    def test_does_not_fire_when_include_graded_already_set(self, tmp_path, monkeypatch):
+        # An explicit graded-only pass (BUI-348) already runs every tier
+        # inclusive — a 4th inclusive tier there is pure duplicate spend.
+        results = [[self._comp("r1"), self._comp("r2")]]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "include_graded": True},
+            "key",
+        )
+        tiers = {q["tier"] for q in out["queries_used"]}
+        assert "inclusive" not in tiers
+
+    def test_dedup_with_earlier_tiers(self, tmp_path, monkeypatch):
+        dup = self._comp("dup")
+        results = [
+            [dup],                              # tier 1 base: 1 raw (thin)
+            [],                                   # tier 2 broader: nothing new
+            [dup, self._comp("new")],            # tier 4 inclusive: dup + new
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975}, "key",
+        )
+        assert len(calls) == 3
+        ids = [c["product_id"] for c in out["comps"]]
+        assert len(ids) == len(set(ids))
+        assert set(ids) == {"dup", "new"}
+
+    def test_inclusive_query_keeps_vintage_hardening_and_drops_excludes(
+        self, tmp_path, monkeypatch,
+    ):
+        results = [
+            [self._comp("r1", title="Amazing Spider-Man 50 Marvel"),
+             self._comp("r2", title="Amazing Spider-Man 50 Marvel")],
+            [],
+            [],
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        sc.fetch_book_comps(
+            {"title": "Amazing Spider-Man", "issue": "50", "year": 1967}, "key",
+        )
+        inclusive_nkw = calls[2]
+        for t in ("-cgc", "-cbcs", "-graded", "-slab"):
+            assert t not in inclusive_nkw
+        for t in ("-variant", "-foil", "-virgin", "-reprint", "-facsimile",
+                  "-homage", "-timeless"):
+            assert t in inclusive_nkw, f"{t!r} missing from inclusive query: {inclusive_nkw}"
+
+
 # ─── End-to-end-ish: batch driver ────────────────────────────────────────────
 
 class TestBatch:

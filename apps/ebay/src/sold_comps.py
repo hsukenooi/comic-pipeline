@@ -634,6 +634,24 @@ def _has_next_page(data: dict) -> bool:
     return bool(pagination.get("next"))
 
 
+# A genuine slab listing names its certifier (CGC/CBCS) in the title. BUI-524's
+# inclusive tier drops the graded excludes, so its results are a MIX of raw and
+# slab listings; this is how the two are told apart afterward. Mirrors
+# apps/fmv/src/fmv_runner.py's `_SLAB_TITLE_RE`/`_slab_comps_only` — duplicated
+# across the package boundary rather than shared, per this repo's existing
+# convention (comic-fmv shells out to ebay-sold-comps rather than importing it;
+# see CLAUDE.md's "FMV pipeline shells out across package boundaries").
+_SLAB_TITLE_RE = re.compile(r"\b(?:cgc|cbcs)\b", re.IGNORECASE)
+
+
+def _is_slab_comp(comp: dict) -> bool:
+    """True for a genuine CGC/CBCS certified-slab comp: grade + price parsed
+    AND the certifier named in the title (BUI-524). A comp that merely carries
+    a grade token ("… FN 6.0 …") without a certifier name is raw, not a slab."""
+    return (comp.get("grade") is not None and comp.get("price") is not None
+            and bool(_SLAB_TITLE_RE.search(comp.get("title") or "")))
+
+
 # ─── Per-book pipeline (three-tier query strategy) ───────────────────────────
 
 def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
@@ -655,6 +673,21 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     — never has a next page, so it costs zero extra SerpApi searches. Capped
     at exactly one extra page (never page 3+) to bound spend against the
     250/month SerpApi quota.
+
+    BUI-524: after tiers 1-3, a conditional 4th "inclusive" tier fires ONLY for
+    a vintage book (pre-_VINTAGE_YEAR_CUTOFF) whose raw pool is still thin
+    (< THIN_RESULTS_THRESHOLD comps) on a normal (non-`include_graded`) call.
+    It re-queries WITHOUT the `-cgc -cbcs -graded -slab` excludes and splits the
+    results via `_is_slab_comp`: raw candidates join the same `comps` pool
+    everything else does, while genuine slab comps are kept separately in
+    `slab_comps` (never blended into `comps` — a slab price would drag the raw
+    pool's median up). This gets a vintage key BOTH its raw comps and a slab
+    ladder from ONE extra query — feeding BUI-529's always-on cross-check
+    without a dedicated second graded-only pass in the common case. The common
+    case (modern/liquid book, or a vintage book whose first three tiers already
+    found >= THIN_RESULTS_THRESHOLD raw comps) fires ZERO extra searches, so
+    `comps` composition is byte-identical to pre-BUI-524 output whenever this
+    tier doesn't fire.
     """
     title = book["title"]
     issue = str(book["issue"])
@@ -674,8 +707,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     if self_id:
         seen_ids.add(self_id)
     comps: list[dict] = []
+    # BUI-524: populated only when the tier-4 inclusive pass fires; a genuine
+    # CGC/CBCS slab comp lands here instead of `comps` (see `_is_slab_comp`).
+    slab_comps: list[dict] = []
 
-    def _run(tier: str, nkw: str, *, page: int = 1) -> dict:
+    def _run(tier: str, nkw: str, *, page: int = 1, route_slabs: bool = False) -> dict:
         try:
             if page == 1:
                 data, cache_hit = fetch(nkw, api_key, force=force, ttl_sec=ttl_sec)
@@ -701,6 +737,15 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             if hard_exclude(comp["title"]):
                 continue
             seen_ids.add(comp["product_id"])
+            # BUI-524: only the inclusive tier passes route_slabs=True — every
+            # other tier's behavior (add every non-excluded comp to `comps`) is
+            # byte-for-byte unchanged. A slab comp is counted toward `added`
+            # (queries_used stays an honest "how many new things this query
+            # found" signal) but never joins the raw `comps` pool.
+            if route_slabs and _is_slab_comp(comp):
+                slab_comps.append(comp)
+                added += 1
+                continue
             comps.append(comp)
             added += 1
         entry = {
@@ -753,6 +798,20 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                                     exclude_graded=exclude_graded)
             _run("grade-targeted", grade_nkw)
 
+    # Tier 4 — conditional inclusive pass (BUI-524). See the fetch_book_comps
+    # docstring for the full rationale. Gated tightly against the 250/month
+    # SerpApi quota: fires only for a vintage book (own cover year, not the
+    # query-text year tiers 2/3 may have dropped) whose raw pool is STILL thin
+    # after tiers 1-3, and only on a normal (non-`include_graded`) call — an
+    # explicit graded-only pass already runs every tier inclusive, so a 4th
+    # inclusive tier there would be pure duplicate spend.
+    is_vintage = isinstance(year, (int, float)) and year < _VINTAGE_YEAR_CUTOFF
+    if exclude_graded and is_vintage and len(comps) < THIN_RESULTS_THRESHOLD:
+        inclusive_nkw = build_query(title, issue, year=year, publisher=publisher,
+                                    variant=variant, exclude_graded=False,
+                                    vintage_year=year)
+        _run("inclusive", inclusive_nkw, route_slabs=True)
+
     out_input = {
         "item_id": self_id or None,
         "title": title,
@@ -772,6 +831,9 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         "input": out_input,
         "queries_used": queries_used,
         "comps": comps,
+        # BUI-524: always present (shape parity) — empty unless the tier-4
+        # inclusive pass fired and found genuine CGC/CBCS slab comps.
+        "slab_comps": slab_comps,
     }
 
 
