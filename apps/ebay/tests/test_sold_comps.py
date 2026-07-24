@@ -584,6 +584,27 @@ class TestCanonicalUrl:
         url2 = sc.canonical_serpapi_url('"X-Men 1"')
         assert url1 == url2
 
+    def test_page1_omits_pgn_param(self):
+        """BUI-523: page 1 (the default) must NOT gain a `_pgn` param — the
+        canonical URL (and therefore the cache key) stays byte-for-byte
+        identical to pre-BUI-523 output so the existing 7-day cache isn't
+        invalidated for the overwhelmingly common single-page case."""
+        assert "_pgn" not in sc.canonical_serpapi_url('"X-Men 1"')
+        assert "_pgn" not in sc.canonical_serpapi_url('"X-Men 1"', page=1)
+        assert sc.canonical_serpapi_url('"X-Men 1"') == sc.canonical_serpapi_url('"X-Men 1"', page=1)
+
+    def test_page2_includes_pgn_param(self):
+        """BUI-523 AC: the page param must join the canonical cache key."""
+        url = sc.canonical_serpapi_url('"X-Men 1"', page=2)
+        assert "_pgn=2" in url
+
+    def test_page1_and_page2_are_different_cache_keys(self):
+        """BUI-523 AC: each page caches independently under the same TTL —
+        this is what makes that true at the cache-path layer."""
+        url1 = sc.canonical_serpapi_url('"X-Men 1"', page=1)
+        url2 = sc.canonical_serpapi_url('"X-Men 1"', page=2)
+        assert sc._cache_path(url1) != sc._cache_path(url2)
+
 
 # ─── Cache layer ──────────────────────────────────────────────────────────────
 
@@ -703,6 +724,21 @@ class TestFetch:
                    return_value=self._mock_response(error="Invalid API key")):
             with pytest.raises(sc.SerpApiError, match="Invalid API key"):
                 sc.fetch("t", "key")
+
+    def test_page2_caches_independently_of_page1(self, tmp_path, monkeypatch):
+        """BUI-523 AC: page param joins the cache key so each page caches
+        independently under the same TTL. Money invariant: a repeat fetch of
+        either page within the TTL window must be a cache hit, not a re-bill."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
+        with patch("sold_comps.requests.get",
+                   return_value=self._mock_response(ebay_url=good_url)) as m:
+            sc.fetch("t", "key", page=1)
+            sc.fetch("t", "key", page=2)
+            assert m.call_count == 2, "page 2 must not be served from page 1's cache entry"
+            sc.fetch("t", "key", page=1)
+            sc.fetch("t", "key", page=2)
+            assert m.call_count == 2, "a repeat fetch of either page must be a cache hit"
 
 
 # ─── Tiered query strategy ────────────────────────────────────────────────────
@@ -915,6 +951,165 @@ class TestTieredStrategy:
         for term in ("-variant", "-foil", "-virgin", "-reprint", "-facsimile",
                      "-homage", "-timeless"):
             assert term in broader_nkw, f"{term!r} missing from broader query: {broader_nkw}"
+
+
+# ─── Gated pagination (BUI-523) ──────────────────────────────────────────────
+#
+# The gate is a spend protection against the 250/month SerpApi quota: page 2
+# of the base query may fire ONLY when SerpApi confirms page 1 was full (a
+# next page genuinely exists) AND the comp pool is still short on
+# grade-tagged comps. Every test below is really pinning a money invariant,
+# not just an output shape — a false-positive gate silently doubles SerpApi
+# spend on every liquid-book fetch.
+
+class TestGatedPagination:
+    def _comp(self, pid, title="ASM #142 Marvel 1975", price=10.0):
+        return {
+            "product_id": pid,
+            "title": title,
+            "price": {"extracted": price},
+            "sold_date": "",
+            "buying_format": "auction",
+        }
+
+    def _page(self, results, *, has_next=False):
+        body = {
+            "organic_results": results,
+            "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+        }
+        if has_next:
+            body["serpapi_pagination"] = {
+                "current": 1,
+                "next": "https://serpapi.com/search.json?engine=ebay&_nkw=x&_pgn=2",
+            }
+        return body
+
+    def test_page2_fires_when_full_and_grade_thin(self, tmp_path, monkeypatch):
+        """Page 1 full (SerpApi says a next page exists) + comp pool still
+        short on grade-tagged comps -> page 2 is fetched, reusing the exact
+        same base query text (only the page differs)."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        calls = []
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+            calls.append({"nkw": nkw, "page": page})
+            if page == 1:
+                # No grade tokens in the titles -> 0 grade-tagged, well under
+                # GRADE_TAGGED_THRESHOLD.
+                results = [self._comp(str(i)) for i in range(55)]
+                return self._page(results, has_next=True), False
+            results = [self._comp(str(100 + i)) for i in range(10)]
+            return self._page(results, has_next=False), False
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
+        )
+
+        page2_calls = [c for c in calls if c["page"] == 2]
+        assert len(page2_calls) == 1, f"expected exactly one page-2 fetch, got: {calls}"
+        assert page2_calls[0]["nkw"] == calls[0]["nkw"], (
+            "page 2 must reuse the SAME base query text as page 1 — a "
+            "different nkw would miss the intended cache key / query pairing"
+        )
+        assert len(out["comps"]) == 65  # 55 (page 1) + 10 (page 2)
+        page2_entries = [q for q in out["queries_used"] if q.get("page") == 2]
+        assert len(page2_entries) == 1
+        assert page2_entries[0]["tier"] == "base"
+
+    def test_page2_skipped_when_page1_not_full(self, tmp_path, monkeypatch):
+        """Money invariant: a thin vintage book (no next page) must NEVER
+        trigger a page-2 fetch — zero quota increase for it, regardless of
+        how few grade-tagged comps it has."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        calls = []
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+            calls.append(page)
+            assert page == 1, "must never request page 2 when page 1 wasn't full"
+            results = [self._comp(str(i)) for i in range(3)]
+            return self._page(results, has_next=False), False
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        sc.fetch_book_comps(
+            {"title": "X", "issue": "1", "year": 1965, "grade": 9.0}, "key",
+        )
+        assert 2 not in calls
+        assert all(p == 1 for p in calls)
+
+    def test_page2_skipped_when_grade_pool_already_thick(self, tmp_path, monkeypatch):
+        """Page 1 full (next page exists) but already >= GRADE_TAGGED_THRESHOLD
+        grade-tagged comps -> the extra page isn't worth the spend, skip it."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        calls = []
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+            calls.append(page)
+            n = sc.GRADE_TAGGED_THRESHOLD + 2  # comfortably >= threshold
+            results = [self._comp(str(i), title="ASM #142 NM Marvel 1975")
+                       for i in range(n)]
+            return self._page(results, has_next=True), False
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 9.2}, "key",
+        )
+        assert 2 not in calls, (
+            "grade-tagged pool already thick enough — page 2 must not fire "
+            "even though SerpApi says more pages exist"
+        )
+
+    def test_page2_dedup_via_seen_ids(self, tmp_path, monkeypatch):
+        """Cross-page dedup reuses the existing seen_ids set: product_ids
+        that reappear on page 2 must not be double-counted."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+            if page == 1:
+                results = [self._comp(str(i)) for i in range(55)]
+                return self._page(results, has_next=True), False
+            # 5 duplicates of page-1 ids + 5 genuinely new ones
+            dup = [self._comp(str(i)) for i in range(5)]
+            new = [self._comp(str(200 + i)) for i in range(5)]
+            return self._page(dup + new, has_next=False), False
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
+        )
+        ids = [c["product_id"] for c in out["comps"]]
+        assert len(ids) == len(set(ids)), "product_ids must be unique across pages"
+        assert len(out["comps"]) == 60  # 55 + 5 new (5 dupes correctly dropped)
+
+    def test_page2_fetch_error_recorded_not_crash(self, tmp_path, monkeypatch):
+        """A transient failure fetching page 2 must degrade gracefully:
+        page-1 comps are kept, the error is recorded, nothing crashes."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+            if page == 1:
+                results = [self._comp(str(i)) for i in range(55)]
+                return self._page(results, has_next=True), False
+            raise requests.ConnectionError("refused")
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
+        )
+        assert len(out["comps"]) == 55
+        page2_errors = [q for q in out["queries_used"]
+                        if q.get("page") == 2 and "error" in q]
+        assert len(page2_errors) == 1
+        assert "refused" in page2_errors[0]["error"]
+
+    def test_has_next_page_fails_closed_on_missing_pagination(self):
+        """No serpapi_pagination key at all (e.g. an unusual/edge-case
+        response) must resolve to 'no next page' — fail closed toward NOT
+        spending extra quota, never fail open toward spending it."""
+        assert sc._has_next_page({"organic_results": []}) is False
+        assert sc._has_next_page({"serpapi_pagination": {}}) is False
+        assert sc._has_next_page({"serpapi_pagination": {"next": None}}) is False
+        assert sc._has_next_page({"serpapi_pagination": {"current": 1, "next": "url"}}) is True
 
 
 # ─── End-to-end-ish: batch driver ────────────────────────────────────────────
