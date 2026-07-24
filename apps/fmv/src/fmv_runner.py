@@ -220,6 +220,16 @@ def run(*, batch_path: str | None, out_path: str | None,
             fresh_fmvs, books, server_url=server_url, force=force,
         )
 
+        # 3c. BUI-529: promote the CGC-proxy heuristic from rescue-only to an
+        # always-on cross-check — also runs on a vintage book that DID price,
+        # when the price is thin/uncertain (n<5 or LOW confidence). Never
+        # replaces a priced fmv; only flags a large raw-vs-slab divergence.
+        # Must run AFTER the rescue so a book the rescue just promoted
+        # (source == "cgc-proxy") is correctly skipped.
+        _apply_cgc_cross_check(
+            fresh_fmvs, books, server_url=server_url, force=force,
+        )
+
     # 4. Stitch cached + fresh in input order
     final = _stitch(books, cached, fresh_fmvs)
 
@@ -618,6 +628,11 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
         "queries_used": result.get("queries_used", []),
         "db_row": upserted, "comic_id": comic_id, "fmv_id": fmv_id,
         "source": "fresh",
+        # BUI-529: thread through any slab comps ebay-sold-comps' BUI-524
+        # inclusive tier already fetched (empty when that tier never fired),
+        # so the cross-check below can reuse them instead of a dedicated
+        # second graded-only fetch in the common case.
+        "slab_comps": result.get("slab_comps") or [],
     }
 
 
@@ -762,6 +777,129 @@ def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
         fresh_fmvs[idx]["fmv_id"] = fmv_id
 
 
+# ─── Step 3c — Always-on vintage cross-check (BUI-529) ────────────────────────
+
+def _is_thin_or_low_confidence_priced(result: dict) -> bool:
+    """True for a book the raw math DID price, but thinly (BUI-529): the
+    cross-check's ADDITIONAL candidate population beyond the rescue's
+    unpriced-raw candidates (``_is_unpriced_raw``) — the worst real misses in
+    the 2026-07-24 FMV review were exactly this shape: a confident-LOOKING
+    priced number the raw pool was actually too thin to earn (Ghost Rider #3
+    cleared 7.8x fmv_high, Moon Knight #12 5.3x, Thor #149 3.1x).
+
+    Deliberately excludes:
+      * an unpriced book (``fmv_high`` is None) — that's the rescue's job, so
+        the two candidate sets never overlap.
+      * an interpolated result — BUI-306 §7 is its own already-reduced-
+        confidence tier with its own guards, out of scope here.
+    """
+    fmv = result.get("fmv") or {}
+    if fmv.get("fmv_high") is None:
+        return False
+    if fmv.get("interpolated"):
+        return False
+    n = fmv.get("n")
+    confidence = fmv.get("confidence")
+    return (isinstance(n, (int, float)) and n < 5) or confidence == "LOW"
+
+
+def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
+                           server_url: str, force: bool) -> None:
+    """BUI-529: flag a large raw-vs-slab divergence on a vintage book that DID
+    price, but thinly (see ``_is_thin_or_low_confidence_priced``) — the
+    always-on promotion of the BUI-348 rescue tier from unpriced-only to a
+    validation cross-check.
+
+    Mutates ``fresh_fmvs`` in place, setting ``fmv["cgc_cross_check"]`` — never
+    ``fmv_low``/``fmv_high``/``max_bid``/``confidence``/``flag_reason``. This is
+    a FLAG, never a re-price (see ``fmv_math.cgc_cross_check``'s docstring for
+    why blending is out of scope): a cross-check that silently altered a
+    number the raw math already priced would itself become a new mis-pricing
+    vector, on a money path, with none of the rescue tier's own guards
+    re-derived for a blend. Re-upserts (best-effort) so the divergence token
+    reaches persisted ``fmv_notes`` for a downstream audit
+    (``/comic:calibration-report`` and a human reviewer).
+
+    Reuses the slab comps ebay-sold-comps' BUI-524 inclusive tier may already
+    have fetched (``fresh_fmvs[idx]["slab_comps"]``) — zero extra SerpApi spend
+    in the common case where that tier already fired. Falls back to a
+    dedicated graded-only fetch (mirroring ``_apply_cgc_proxy_rescue``'s own
+    second pass) only for a candidate BUI-524 didn't already supply a
+    sufficiently-sized ladder for (it didn't fire — raw pool wasn't thin at
+    fetch time even though the final priced pool ended up thin/LOW-confidence
+    — or it fired but found too few slab comps).
+
+    A book already rescued by ``_apply_cgc_proxy_rescue`` (``source ==
+    "cgc-proxy"``) is skipped — its price IS the slab ladder, so comparing it
+    against itself is meaningless. This function must therefore run AFTER the
+    rescue so it can see the promoted ``source``.
+    """
+    candidates = [idx for idx in fresh_fmvs
+                  if fresh_fmvs[idx].get("source") != "cgc-proxy"
+                  and _is_vintage(fresh_fmvs[idx])
+                  and _is_thin_or_low_confidence_priced(fresh_fmvs[idx])]
+    if not candidates:
+        return
+
+    # Split by whether BUI-524's inclusive tier already supplied a usable
+    # ladder — those candidates need no further fetch at all.
+    have_ladder: dict[int, list[dict]] = {}
+    need_fetch: list[int] = []
+    for idx in candidates:
+        slabs = fresh_fmvs[idx].get("slab_comps") or []
+        if len(slabs) >= fmv_math.CGC_PROXY_MIN_LADDER_COMPS:
+            have_ladder[idx] = slabs
+        else:
+            need_fetch.append(idx)
+
+    if need_fetch:
+        graded_books = [
+            {**books[idx], "_idx": idx, "include_graded": True}
+            for idx in need_fetch
+        ]
+        graded_results = _fetch_comps(graded_books, force=force, hard_fail=False)
+        if graded_results is None:  # soft fetch failure — leave un-cross-checked
+            click.echo(
+                "Note: CGC cross-check graded fetch failed; "
+                f"{len(need_fetch)} book(s) left un-cross-checked.",
+                err=True,
+            )
+            graded_results = []
+        by_id: dict[int, dict] = {}
+        for r in graded_results:
+            rid = (r.get("input") or {}).get("_req_id")
+            if isinstance(rid, int):
+                by_id[rid] = r
+        for idx in need_fetch:
+            result = by_id.get(idx)
+            if result is not None:
+                have_ladder[idx] = _slab_comps_only(result.get("comps") or [])
+
+    for idx, graded_comps in have_ladder.items():
+        inp = fresh_fmvs[idx].get("input") or {}
+        fmv = fresh_fmvs[idx]["fmv"]
+        check = fmv_math.cgc_cross_check(
+            graded_comps, target_grade=inp["grade"],
+            raw_median=fmv.get("median"),
+        )
+        if check is None:
+            continue  # ladder untrustworthy for a comparison — nothing to flag
+        fmv["cgc_cross_check"] = check
+        # Best-effort re-upsert: the divergence token is informational only
+        # (never changes fmv_low/high/max_bid/confidence), so a write failure
+        # here must not abort a run whose price already succeeded.
+        upserted = _upsert_fmv(server_url, inp, fmv, hard_fail=False)
+        if upserted is None:
+            click.echo(
+                f"Note: CGC cross-check notes update failed for "
+                f"{inp.get('title')} #{inp.get('issue')}; divergence flag "
+                "kept in-memory only.",
+                err=True,
+            )
+            continue
+        fresh_fmvs[idx]["db_row"] = upserted
+
+
 def _extract_ids(row: dict | None) -> tuple[int | None, int | None]:
     """Pull comic_id and fmv_id from a /api/comics response.
 
@@ -877,6 +1015,20 @@ def _build_notes(fmv: dict) -> str:
     if anchor:
         parts.append(
             f"ungraded_anchor=${anchor['median']:g} (n={anchor['n']} raw)")
+    # BUI-529: surface the always-on vintage cross-check's divergence signal.
+    # Informational only — this NEVER changes fmv_low/fmv_high/max_bid for a
+    # book the raw math already priced (see _apply_cgc_cross_check); a human
+    # (or /comic:calibration-report) reads DIVERGES as "look at this one",
+    # not as an instruction the pipeline itself already acted on.
+    cross_check = fmv.get("cgc_cross_check")
+    if cross_check:
+        verdict = "DIVERGES" if cross_check["diverges"] else "ok"
+        parts.append(
+            f"cgc_cross_check={verdict} slab_implied="
+            f"${cross_check['implied_raw']:g} vs raw_median="
+            f"${cross_check['raw_median']:g} "
+            f"({cross_check['divergence_pct'] * 100:.0f}%)"
+        )
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")
@@ -1113,6 +1265,11 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         # median/cv/trimmed_pool); the marker is enough for the table + bid cap.
         "cgc_proxy": cgc_proxy,
         "cgc_ladder": None,
+        # BUI-529: shape parity with compute_fmv. The cross-check result itself
+        # isn't persisted (no DB column — same lossy projection as median/cv),
+        # so a cache-reused row always reads as "not cross-checked" here; the
+        # key must still exist for downstream readers that iterate uniformly.
+        "cgc_cross_check": None,
     }
 
 

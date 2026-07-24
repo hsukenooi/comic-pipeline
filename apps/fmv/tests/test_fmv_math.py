@@ -1207,6 +1207,86 @@ class TestCgcProxyShapeParity:
         for key in raw:
             assert key in proxy, f"proxy dict missing key {key!r}"
 
+    def test_compute_fmv_carries_cgc_cross_check_none(self):
+        # BUI-529: compute_fmv never runs the cross-check itself (it has no
+        # graded ladder to compare against) — always None, key present for
+        # shape parity so downstream readers can iterate uniformly.
+        out = fm.compute_fmv([_comp(100, 9.2)], target_grade=9.2)
+        assert out["cgc_cross_check"] is None
+
+    def test_proxy_dict_carries_cgc_cross_check_none(self):
+        # A proxy band IS the slab-derived price already — comparing it
+        # against itself is meaningless, so this always stays None too.
+        proxy = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
+        assert proxy["cgc_cross_check"] is None
+
+
+# ─── Always-on vintage cross-check (BUI-529) ──────────────────────────────────
+
+class TestCgcCrossCheck:
+    def test_diverges_when_raw_median_far_below_slab_implied(self):
+        # Ghost Rider #3 / Moon Knight #12 / Thor #149 shape: a thin raw pool
+        # priced far below what the slab ladder implies.
+        out = fm.cgc_cross_check(_ASM50_LADDER, target_grade=6.5, raw_median=100.0)
+        assert out is not None
+        assert out["implied_raw"] == 625  # same 0.525 midpoint as cgc_proxy_fmv's median
+        assert out["diverges"] is True
+
+    def test_no_divergence_flag_when_raw_median_close(self):
+        out = fm.cgc_cross_check(_ASM50_LADDER, target_grade=6.5, raw_median=600.0)
+        assert out is not None
+        assert out["diverges"] is False
+
+    def test_divergence_boundary_is_strictly_greater_than(self):
+        # implied_raw=625; a raw_median making divergence_pct exactly the
+        # threshold must NOT flag (only strictly beyond the threshold does).
+        raw_median = 625 / (1 + fm.CGC_CROSS_CHECK_DIVERGENCE_PCT)
+        out = fm.cgc_cross_check(_ASM50_LADDER, target_grade=6.5,
+                                 raw_median=raw_median)
+        assert out["divergence_pct"] == pytest.approx(
+            fm.CGC_CROSS_CHECK_DIVERGENCE_PCT, abs=1e-6)
+        assert out["diverges"] is False
+
+    def test_none_when_raw_median_missing_or_zero(self):
+        assert fm.cgc_cross_check(_ASM50_LADDER, target_grade=6.5,
+                                  raw_median=None) is None
+        assert fm.cgc_cross_check(_ASM50_LADDER, target_grade=6.5,
+                                  raw_median=0.0) is None
+
+    def test_none_when_ladder_too_thin(self):
+        assert fm.cgc_cross_check([_slab(1200, 6.5)], target_grade=6.5,
+                                  raw_median=100.0) is None
+
+    def test_none_when_target_outside_ladder(self):
+        # No extrapolation past the observed range — same guard as cgc_proxy_fmv.
+        assert fm.cgc_cross_check(_ASM50_LADDER, target_grade=2.0,
+                                  raw_median=100.0) is None
+
+    def test_none_when_non_monotonic_ladder(self):
+        inverted = [_slab(636, 4.0), _slab(1500, 6.0), _slab(1550, 6.0),
+                    _slab(1200, 6.5), _slab(1250, 6.5)]
+        assert fm.cgc_cross_check(inverted, target_grade=6.5,
+                                  raw_median=100.0) is None
+
+    def test_no_value_floor_unlike_proxy_pricing(self):
+        # BUI-529's explicit "drop the $400 slab floor in cross-check mode":
+        # this exact ladder makes cgc_proxy_fmv return None (below the $400
+        # PRICING floor), but the cross-check must still compare — it's a
+        # read-only comparison, not a price, so the floor doesn't apply.
+        cheap = [_slab(300, 6.5), _slab(310, 6.5), _slab(305, 6.5)]
+        assert fm.cgc_proxy_fmv(cheap, target_grade=6.5) is None  # floor blocks pricing
+        out = fm.cgc_cross_check(cheap, target_grade=6.5, raw_median=150.0)
+        assert out is not None  # cross-check is NOT floor-gated
+        assert out["slab_price"] == 305.0
+
+    def test_result_shape(self):
+        out = fm.cgc_cross_check(_ASM50_LADDER, target_grade=6.5, raw_median=100.0)
+        for key in ("slab_price", "target_grade", "implied_raw", "raw_median",
+                    "divergence_pct", "diverges", "n", "ladder",
+                    "envelope_clamped"):
+            assert key in out, f"cgc_cross_check result missing key {key!r}"
+        assert out["n"] == len(_ASM50_LADDER)
+
 
 # ─── Ungraded-market anchor (BUI-522) ─────────────────────────────────────────
 

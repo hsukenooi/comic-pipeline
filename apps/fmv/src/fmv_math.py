@@ -823,6 +823,95 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
         # it carries no ungraded-market anchor. Key present (== None) for shape
         # parity with compute_fmv's output.
         "ungraded_anchor": None,
+        # BUI-529: the always-on cross-check only runs on a book the RAW math
+        # priced (see cgc_cross_check below) — a proxy band already IS the
+        # slab-derived price, so a raw-vs-slab comparison is meaningless here.
+        # Key present (== None) for shape parity with compute_fmv's output.
+        "cgc_cross_check": None,
+    }
+
+
+# ─── Always-on vintage cross-check (BUI-529) ─────────────────────────────────
+#
+# Promotes the CGC-proxy heuristic from a rescue tier (fires only when the raw
+# math produced NO number at all — cgc_proxy_fmv above) to a validation
+# cross-check that ALSO runs on a vintage book that DID price, when the price
+# is thin or uncertain (n<5 or LOW confidence — see fmv_runner's
+# _is_thin_or_low_confidence_priced). The worst real misses in the 2026-07-24
+# FMV review were exactly this shape: a confident-LOOKING raw number a slab
+# ladder would have flagged as way off (Ghost Rider #3 cleared 7.8x fmv_high,
+# Moon Knight #12 5.3x, Thor #149 3.1x).
+#
+# Unlike cgc_proxy_fmv, this NEVER replaces the priced fmv — it only computes
+# what the slab ladder implies and reports how far that sits from the raw
+# median, so the caller can surface a structured flag. Money-safety: a
+# cross-check that silently re-priced a book would itself become a new
+# mis-pricing vector with none of cgc_proxy_fmv's own guards (envelope clamp,
+# monotonicity, no-extrapolation) re-derived for a blend; flagging is the
+# ticket's explicit, unambiguous acceptance criterion, blending is not
+# specified, so this deliberately stops at "flag".
+#
+# The $400 CGC_PROXY_MIN_SLAB_PRICE floor is a PRICING guard (a proxy price
+# below it is too shaky to bid off) — a cross-check only compares two numbers
+# that already exist, so it does NOT apply that floor (BUI-529's explicit
+# "drop the $400 slab floor in cross-check mode" instruction). Every other
+# ladder-trust guard (min comp count, no extrapolation past the observed
+# range, no monotonicity violations) is reused unchanged from cgc_proxy_fmv's
+# own path, via the same shared `_cgc_ladder_price_and_clamp`.
+CGC_CROSS_CHECK_DIVERGENCE_PCT = 0.40
+
+
+def cgc_cross_check(graded_comps: list[dict], target_grade: float,
+                    raw_median: float | None) -> dict | None:
+    """Compare a priced vintage book's raw median against its CGC/CBCS ladder.
+
+    Returns None when there's nothing to compare (``raw_median`` is None/0) or
+    the ladder can't be trusted (fewer than ``CGC_PROXY_MIN_LADDER_COMPS``
+    graded comps, a non-monotonic ladder, or the target grade falls outside the
+    ladder's observed range — the proxy factor never extrapolates). Otherwise
+    returns::
+
+        {"slab_price": float, "target_grade": float, "implied_raw": float,
+         "raw_median": float, "divergence_pct": float, "diverges": bool,
+         "n": int, "ladder": dict, "envelope_clamped": bool}
+
+    ``implied_raw`` is the slab price at the midpoint of the 0.50-0.55 proxy
+    factor (matching cgc_proxy_fmv's ``median`` field). ``diverges`` is True
+    when ``implied_raw`` differs from ``raw_median`` by more than
+    ``CGC_CROSS_CHECK_DIVERGENCE_PCT``. This function never mutates or
+    replaces a priced fmv — the caller decides what (if anything) to do with
+    the result.
+    """
+    if not raw_median:
+        return None
+    ladder = bucket_medians(graded_comps)
+    counts = bucket_counts(graded_comps)
+    total = sum(counts.values())
+    if total < CGC_PROXY_MIN_LADDER_COMPS:
+        return None
+    # Same money guard as cgc_proxy_fmv: an inverted ladder is not safe evidence
+    # to compare against, even just for a flag.
+    if monotonicity_violations(ladder):
+        return None
+    slab, envelope_clamped = _cgc_ladder_price_and_clamp(
+        ladder, target_grade, counts=counts
+    )
+    if slab is None:
+        return None
+    implied_raw = clean_round(
+        slab * (CGC_PROXY_FACTOR_LOW + CGC_PROXY_FACTOR_HIGH) / 2
+    )
+    divergence_pct = abs(implied_raw - raw_median) / raw_median
+    return {
+        "slab_price": slab,
+        "target_grade": target_grade,
+        "implied_raw": implied_raw,
+        "raw_median": raw_median,
+        "divergence_pct": round(divergence_pct, 4),
+        "diverges": divergence_pct > CGC_CROSS_CHECK_DIVERGENCE_PCT,
+        "n": total,
+        "ladder": dict(sorted(ladder.items())),
+        "envelope_clamped": envelope_clamped,
     }
 
 
@@ -1122,4 +1211,10 @@ def compute_fmv(comps: list[dict], target_grade: float,
         # persisted), so _build_notes reads it via .get and the db-row shape
         # parity test exempts it (unlike the bid-affecting keys).
         "ungraded_anchor": anchor,
+        # BUI-529: populated by fmv_runner._apply_cgc_cross_check AFTER this
+        # function returns (it needs the graded ladder, which compute_fmv never
+        # fetches) — always None here. Key present for shape parity so every
+        # consumer of this dict can read `.get("cgc_cross_check")` uniformly
+        # whether or not the cross-check ran.
+        "cgc_cross_check": None,
     }
