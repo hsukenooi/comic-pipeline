@@ -371,17 +371,29 @@ def build_query(title: str, issue: str, year: int | None = None,
     return " ".join(parts)
 
 
-def canonical_serpapi_url(nkw: str) -> str:
+def canonical_serpapi_url(nkw: str, *, page: int = 1) -> str:
     """Build the SerpApi URL with deterministic param order (for cache key).
 
     Excludes api_key from the canonical form so we don't tie cache to a
     specific user's key. The actual request URL adds api_key separately.
+
+    BUI-523: `page` selects SerpApi's eBay-engine page-number param (`_pgn`).
+    It's omitted entirely for `page=1` — the default, and the only page any
+    pre-BUI-523 caller ever requested — so the canonical URL (and therefore
+    the cache key) is byte-for-byte unchanged for the common case; the
+    existing 7-day cache isn't invalidated by this change. Page 2+ appends
+    `_pgn` to the params, giving each page its own cache key so a page-2
+    fetch caches independently of page 1 under the same TTL (required so a
+    repeat FMV run within the TTL window doesn't re-bill SerpApi for a page
+    it already paid for).
     """
     params = {
         "engine": "ebay",
         "_nkw": nkw,
         "show_only": "Sold",
     }
+    if page and page > 1:
+        params["_pgn"] = page
     canonical = urllib.parse.urlencode(sorted(params.items()))
     return f"{SERPAPI_ENDPOINT}?{canonical}"
 
@@ -398,9 +410,14 @@ class SerpApiError(Exception):
 
 
 def fetch(nkw: str, api_key: str, *, force: bool = False,
-          ttl_sec: int = DEFAULT_CACHE_TTL_SEC) -> tuple[dict, bool]:
-    """Fetch a SerpApi response with caching. Returns (data, cache_hit)."""
-    canonical = canonical_serpapi_url(nkw)
+          ttl_sec: int = DEFAULT_CACHE_TTL_SEC, page: int = 1) -> tuple[dict, bool]:
+    """Fetch a SerpApi response with caching. Returns (data, cache_hit).
+
+    BUI-523: `page` (default 1) selects the SerpApi page — see
+    canonical_serpapi_url for why page 1 stays byte-for-byte identical to
+    pre-BUI-523 behavior and page 2+ gets its own cache entry.
+    """
+    canonical = canonical_serpapi_url(nkw, page=page)
     path = _cache_path(canonical)
 
     if not force:
@@ -601,6 +618,22 @@ def parse_comp(result: dict) -> dict | None:
     }
 
 
+def _has_next_page(data: dict) -> bool:
+    """True when SerpApi's response indicates a further result page exists.
+
+    BUI-523: SerpApi's eBay engine echoes both eBay's own `pagination` object
+    and its own `serpapi_pagination` mirror; the latter's `next` field is the
+    authoritative "is page 1 full, i.e. does page 2 exist" signal. This
+    trusts SerpApi's own pagination resolution rather than reverse-engineering
+    a "full page" guess from a raw result-count threshold (eBay's per-page
+    count isn't a fixed constant we control, since `_ipg` is left at its
+    default). A missing/empty pagination object fails CLOSED — no page-2
+    fetch, no extra SerpApi spend — rather than guessing there's more.
+    """
+    pagination = data.get("serpapi_pagination") or {}
+    return bool(pagination.get("next"))
+
+
 # ─── Per-book pipeline (three-tier query strategy) ───────────────────────────
 
 def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
@@ -612,6 +645,16 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     3. Grade-targeted (if <10 grade-tagged comps after parsing base): add grade label
 
     Tiers 2 and 3 are conditional. Most modern books need only tier 1.
+
+    BUI-523: after tier 1, a gated page-2 fetch of the SAME base query fires
+    ONLY when SerpApi confirms page 1 was full (a next page exists — see
+    _has_next_page) AND the comp pool is still short on grade-tagged comps
+    (< GRADE_TAGGED_THRESHOLD) — i.e. only when a liquid book's comp supply
+    is genuinely capped by the single-page fetch AND the extra page is
+    likely to help. A thin (non-full) page 1 — the common vintage-book case
+    — never has a next page, so it costs zero extra SerpApi searches. Capped
+    at exactly one extra page (never page 3+) to bound spend against the
+    250/month SerpApi quota.
     """
     title = book["title"]
     issue = str(book["issue"])
@@ -632,12 +675,22 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         seen_ids.add(self_id)
     comps: list[dict] = []
 
-    def _run(tier: str, nkw: str) -> int:
+    def _run(tier: str, nkw: str, *, page: int = 1) -> dict:
         try:
-            data, cache_hit = fetch(nkw, api_key, force=force, ttl_sec=ttl_sec)
+            if page == 1:
+                data, cache_hit = fetch(nkw, api_key, force=force, ttl_sec=ttl_sec)
+            else:
+                # BUI-523: only the gated page-2 fetch below ever passes
+                # page != 1 — kept as a separate branch (rather than always
+                # forwarding page=page) so every pre-BUI-523 call site here
+                # calls fetch() with the exact same args it always did.
+                data, cache_hit = fetch(nkw, api_key, force=force, ttl_sec=ttl_sec, page=page)
         except (SerpApiError, requests.RequestException) as e:
-            queries_used.append({"tier": tier, "nkw": nkw, "error": str(e)})
-            return 0
+            entry = {"tier": tier, "nkw": nkw, "error": str(e)}
+            if page != 1:
+                entry["page"] = page
+            queries_used.append(entry)
+            return {"added": 0, "has_next_page": False}
         added = 0
         for r in data.get("organic_results", []):
             comp = parse_comp(r)
@@ -650,20 +703,31 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             seen_ids.add(comp["product_id"])
             comps.append(comp)
             added += 1
-        queries_used.append({
+        entry = {
             "tier": tier,
             "nkw": nkw,
             "raw_results": len(data.get("organic_results", [])),
             "new_comps": added,
             "cached": cache_hit,
             "ebay_url": data.get("search_metadata", {}).get("ebay_url", ""),
-        })
-        return added
+        }
+        if page != 1:
+            entry["page"] = page
+        queries_used.append(entry)
+        return {"added": added, "has_next_page": _has_next_page(data)}
 
     # Tier 1 — base
     base_nkw = build_query(title, issue, year=year, publisher=publisher,
                            variant=variant, exclude_graded=exclude_graded)
-    _run("base", base_nkw)
+    base_result = _run("base", base_nkw)
+
+    # BUI-523: gated page-2 fetch of the SAME base query — see the
+    # fetch_book_comps docstring for the full spend-gate rationale. Placed
+    # here (before tiers 2/3) so any comps it adds are already in `comps`
+    # when tiers 2/3 recompute their own thin/grade-tagged counts below.
+    grade_tagged_after_base = sum(1 for c in comps if c["grade"] is not None)
+    if base_result["has_next_page"] and grade_tagged_after_base < GRADE_TAGGED_THRESHOLD:
+        _run("base", base_nkw, page=2)
 
     # Tier 2 — auto-broaden if thin. BUI-350: pass the real `vintage_year`
     # (even though the query text drops `year`) so a rebootable-masthead
@@ -769,7 +833,14 @@ def _print_human(results: list[dict]) -> None:
             continue
         n_total = len(r["comps"])
         n_graded = sum(1 for c in r["comps"] if c["grade"] is not None)
-        tiers = ",".join(q["tier"] for q in r["queries_used"])
+        # BUI-523: a page-2 entry shares its tier's name (e.g. "base") with
+        # its own page-1 entry — tag it "(pN)" here so a human skimming
+        # --quiet=false output can see the gated extra-page fetch fired,
+        # without changing the stored "tier"/"page" fields other consumers read.
+        tiers = ",".join(
+            f'{q["tier"]}(p{q["page"]})' if q.get("page") else q["tier"]
+            for q in r["queries_used"]
+        )
         cached = sum(1 for q in r["queries_used"] if q.get("cached"))
         print(f"  {label}: {n_total} comps ({n_graded} grade-tagged) "
               f"tiers=[{tiers}] cached={cached}/{len(r['queries_used'])}")
