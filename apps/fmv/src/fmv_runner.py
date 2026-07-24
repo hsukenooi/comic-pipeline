@@ -868,6 +868,15 @@ def _build_notes(fmv: dict) -> str:
     fp_count = fmv.get("first_party_count") or 0
     if fp_count:
         parts.append(f"first_party={fp_count}")
+    # BUI-522: surface the ungraded-market anchor — the median price of the
+    # grade-less comps build_pool drops, plus how many raw copies traded — as a
+    # cheap sanity check + liquidity signal beside the graded FMV. Informational
+    # only: it never entered the priced pool. `.get` tolerates its absence on a
+    # cached row (the raw comps aren't persisted, so it can't be reconstructed).
+    anchor = fmv.get("ungraded_anchor")
+    if anchor:
+        parts.append(
+            f"ungraded_anchor=${anchor['median']:g} (n={anchor['n']} raw)")
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")

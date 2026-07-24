@@ -9,7 +9,34 @@
     "max_bid": 100,
     "median": 120,
     "n": 5,
+    "ungraded_anchor": null,
     "window": 0.5
+  },
+  "collapsed_range_reopened": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM-LOW",
+    "flag_reason": null,
+    "fmv_high": 50,
+    "fmv_low": 40,
+    "grade_span": 0.0,
+    "max_bid": 40,
+    "median": 50,
+    "n": 3,
+    "ungraded_anchor": null,
+    "window": 2.0
+  },
+  "degenerate_identical_priced": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM-LOW",
+    "flag_reason": null,
+    "fmv_high": 50,
+    "fmv_low": 50,
+    "grade_span": 0.0,
+    "max_bid": 40,
+    "median": 50,
+    "n": 3,
+    "ungraded_anchor": null,
+    "window": 2.0
   },
   "grade_haircut_low_confidence": {
     "bid_factor": 0.6,
@@ -21,6 +48,7 @@
     "max_bid": 80,
     "median": 120,
     "n": 8,
+    "ungraded_anchor": null,
     "window": 0.5
   },
   "interpolated_thick_brackets": {
@@ -33,6 +61,7 @@
     "max_bid": 110,
     "median": 180,
     "n": 4,
+    "ungraded_anchor": null,
     "window": 2.0
   },
   "narrow_high": {
@@ -45,6 +74,7 @@
     "max_bid": 100,
     "median": 120,
     "n": 9,
+    "ungraded_anchor": null,
     "window": 0.5
   },
   "one_sided_flag": {
@@ -57,6 +87,7 @@
     "max_bid": null,
     "median": null,
     "n": 5,
+    "ungraded_anchor": null,
     "window": 1.0
   },
   "too_sparse_single_comp": {
@@ -69,6 +100,7 @@
     "max_bid": null,
     "median": null,
     "n": 1,
+    "ungraded_anchor": null,
     "window": 2.0
   },
   "too_wide_flag": {
@@ -81,6 +113,7 @@
     "max_bid": null,
     "median": null,
     "n": 3,
+    "ungraded_anchor": null,
     "window": 2.0
   },
   "two_comp_tight": {
@@ -93,6 +126,7 @@
     "max_bid": 40,
     "median": 50,
     "n": 2,
+    "ungraded_anchor": null,
     "window": 2.0
   },
   "two_comp_wild_outlier": {
@@ -105,6 +139,23 @@
     "max_bid": null,
     "median": null,
     "n": 2,
+    "ungraded_anchor": null,
+    "window": 2.0
+  },
+  "ungraded_anchor_from_dropped_comps": {
+    "bid_factor": 0.8,
+    "confidence": "MEDIUM-LOW",
+    "flag_reason": null,
+    "fmv_high": 110,
+    "fmv_low": 100,
+    "grade_span": 0.0,
+    "max_bid": 90,
+    "median": 100,
+    "n": 3,
+    "ungraded_anchor": {
+      "median": 50.0,
+      "n": 3
+    },
     "window": 2.0
   },
   "wide_window_caps_medium": {
@@ -117,6 +168,7 @@
     "max_bid": 100,
     "median": 120,
     "n": 9,
+    "ungraded_anchor": null,
     "window": 1.5
   }
 }

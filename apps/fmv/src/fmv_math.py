@@ -89,6 +89,33 @@ def _classify_pool(pool: list[dict], target_grade: float,
     return None, grade_span
 
 
+def ungraded_market_anchor(comps: Iterable[dict]) -> dict | None:
+    """Median price of the grade-less comps ``build_pool`` drops (BUI-522).
+
+    ``build_pool`` keeps only comps carrying a parsed numeric grade; the rest —
+    frequently the MAJORITY of a fetch — are silently discarded (they can't
+    anchor the grade-curve guards). Their price median is a cheap
+    ungraded-market sanity anchor + liquidity signal (``n`` = how many raw
+    copies actually traded), computed entirely from comps ALREADY fetched (zero
+    additional SerpApi calls, per BUI-522's first acceptance criterion).
+
+    Returns ``{"median": float, "n": int}`` or ``None`` when the fetch held no
+    grade-less priced comp. Purely INFORMATIONAL: this value does NOT enter the
+    priced pool and moves no guard (``too_sparse``/``one_sided``/``too_wide``
+    stay exactly as ``build_pool``/``_classify_pool`` computed them — the
+    low-weight-inclusion lever in the ticket is a separate, still-gated opt-in).
+    Only grade-less comps count; a comp with a parsed grade already priced the
+    graded pool, and first-party rows always carry a grade, so they never leak
+    into this ungraded signal.
+    """
+    prices = [float(c["price"]) for c in comps
+              if c.get("grade") is None
+              and isinstance(c.get("price"), (int, float))]
+    if not prices:
+        return None
+    return {"median": statistics.median(prices), "n": len(prices)}
+
+
 # ─── Grade buckets + grade-curve checks (§2, §5, §7 — BUI-306) ────────────────
 
 def bucket_medians(comps: Iterable[dict]) -> dict[float, float]:
@@ -518,14 +545,21 @@ def bid_factor(fmv_confidence: str | None, grade_confidence: str | None) -> floa
 
 # ─── Clean rounding ───────────────────────────────────────────────────────────
 
+def _clean_step(value: float) -> int:
+    """The clean-rounding step at ``value``: $5 below $50, $10 from $50–$200,
+    $25 above. Factored out of ``clean_round`` so the minimum-range-width guard
+    (BUI-528) can size its last-resort one-step nudge off the SAME step ladder
+    the rounding uses — the money-critical step definition stays in one place."""
+    if value < 50:
+        return 5
+    if value < 200:
+        return 10
+    return 25
+
+
 def clean_round(value: float) -> int:
     """Round to clean step: $5 below $50, $10 from $50–$200, $25 above."""
-    if value < 50:
-        step = 5
-    elif value < 200:
-        step = 10
-    else:
-        step = 25
+    step = _clean_step(value)
     return int(round(value / step) * step)
 
 
@@ -785,7 +819,94 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
             # `_cgc_ladder_price_and_clamp`'s docstring for when this fires.
             "envelope_clamped": envelope_clamped,
         },
+        # BUI-522: a proxy band is priced off the slab ladder, not raw comps, so
+        # it carries no ungraded-market anchor. Key present (== None) for shape
+        # parity with compute_fmv's output.
+        "ungraded_anchor": None,
     }
+
+
+# ─── Minimum range width on collapsed pools (BUI-528) ────────────────────────
+#
+# 118/862 persisted FMV rows have fmv_low == fmv_high — a point estimate off a
+# pool whose real dispersion was swallowed by clean_round, masquerading as a
+# range. Several of the worst real-outcome misses are exactly these: a $5/$5
+# book cleared $39, a $10/$10 cleared $28.50. A degenerate range makes
+# max_bid = 0.80 × point, which systematically under-bids.
+#
+# The fix is deliberately scoped to the actual harm — a ZERO-WIDTH range on a
+# non-degenerate pool — rather than a blanket floor on every pool. An earlier
+# always-widen version disturbed healthy pools sitting near a clean-round step
+# boundary and, worse, pushed a thin pool's fmv_high ABOVE its priciest real
+# comp (and erased the recency direction signal on 2-comp pools). So we only
+# act when clean_round has actually COLLAPSED fmv_low == fmv_high while the
+# pool's prices genuinely dispersed (cv > 0), and we bound the widened band by
+# the observed [min, max] so it never claims a value beyond a real sale. The
+# width we open is scaled by the pool's own uncertainty:
+#
+#   * CV     — a genuinely dispersed pool earns a wider split; a tight one less.
+#   * window — comps gathered across a wider grade window carry more
+#              grade-mismatch uncertainty, so widen a little per step.
+#   * n      — a thinner trimmed pool is less reliable, so widen a little per
+#              comp below the narrow-pool target.
+#
+# A GENUINELY DEGENERATE pool — a single comp (cv is None) or two+ identical
+# prices (cv == 0) — is left a true point: there is no dispersion to reveal and
+# fabricating one would be dishonest (the ticket's "unless the pool is genuinely
+# degenerate" carve-out, which falls out of the cv > 0 gate for free).
+MIN_RANGE_CV_COEF = 0.5          # half the CV becomes the min half-width fraction
+MIN_RANGE_WINDOW_COEF = 0.015    # + per ±0.5 grade-window step beyond the narrow default
+MIN_RANGE_THIN_COEF = 0.015      # + per comp the trimmed pool sits below MIN_NARROW_POOL
+MIN_RANGE_HALF_WIDTH_CAP = 0.30  # never open the band beyond ±30% of the median
+
+
+def _min_range_half_width_fraction(cv_value: float, window: float, n: int) -> float:
+    """Half-width, as a fraction of the median, to open a collapsed band to.
+
+    Combines the CV, grade-window, and thinness signals (see the section
+    comment) and caps the total so the split stays a sane fraction of median.
+    Caller guarantees ``cv_value`` is a real positive float (a degenerate pool
+    is filtered upstream), so the fraction is always ≥ the CV term > 0.
+    """
+    window_excess = max(0.0, (window - DEFAULT_GRADE_WINDOW) / GRADE_WINDOW_STEP)
+    thin_deficit = max(0, MIN_NARROW_POOL - n)
+    frac = (MIN_RANGE_CV_COEF * cv_value
+            + MIN_RANGE_WINDOW_COEF * window_excess
+            + MIN_RANGE_THIN_COEF * thin_deficit)
+    return min(frac, MIN_RANGE_HALF_WIDTH_CAP)
+
+
+def _widen_collapsed_range(
+    median: float, cv_value: float, window: float, n: int,
+    price_min: float, price_max: float,
+) -> tuple[int, int]:
+    """Split a clean-round-collapsed but non-degenerate priced band (BUI-528).
+
+    The weighted quartiles rounded to a single clean point, yet the pool's
+    prices genuinely dispersed (cv > 0). Reveal a real range: widen
+    symmetrically around ``median`` to the CV/window/n-scaled minimum half-width
+    (computed in raw dollars, i.e. before the final clean_round), BOUNDED by the
+    observed ``[price_min, price_max]`` so the band never claims a value beyond
+    a real sale. If a coarse price step still collapses the widened band, force
+    exactly one clean step of separation, toward the side with more observed
+    room — capped at the priciest observed comp on the up side, and defaulting
+    to the money-safe down side (which never lifts the bid cap). Guarantees the
+    returned fmv_low < fmv_high.
+    """
+    min_half = median * _min_range_half_width_fraction(cv_value, window, n)
+    fmv_low = clean_round(max(price_min, median - min_half))
+    fmv_high = clean_round(min(price_max, median + min_half))
+    if fmv_low < fmv_high:
+        return fmv_low, fmv_high
+    # Sub-one-step spread at a coarse price step: force one clean step apart.
+    v = fmv_high  # == fmv_low here
+    step = _clean_step(v)
+    up, down = v + step, v - step
+    if (price_max - median) > (median - price_min) and up <= clean_round(price_max):
+        return v, up            # dispersion sits above the median → reveal upside
+    if down >= 0:
+        return down, v          # money-safe: lower the low, bid cap unchanged
+    return v, up
 
 
 # ─── End-to-end: comps → FMV summary ─────────────────────────────────────────
@@ -856,6 +977,11 @@ def compute_fmv(comps: list[dict], target_grade: float,
     if max_window is None:
         max_window = MAX_GRADE_WINDOW
     pool, window = build_pool(comps, target_grade, max_window=max_window)
+
+    # BUI-522: the ungraded-market anchor is a read-only side signal off the
+    # grade-less comps build_pool just dropped — it never touches the priced
+    # pool or any guard below, only the returned dict (→ fmv_notes token).
+    anchor = ungraded_market_anchor(comps)
 
     # IQR-trim by price but keep the surviving comps as dicts (not just a
     # price list) so recency weighting (below) can still read their
@@ -946,9 +1072,21 @@ def compute_fmv(comps: list[dict], target_grade: float,
     elif flag_reason is not None or n == 0:
         fmv_low = fmv_high = med = max_bid = None
     else:
+        med_raw = weighted_median(trimmed, weights)
         fmv_low = clean_round(weighted_quartile(trimmed, weights, 0.25))
         fmv_high = clean_round(weighted_quartile(trimmed, weights, 0.75))
-        med = clean_round(weighted_median(trimmed, weights))
+        med = clean_round(med_raw)
+        # BUI-528: when clean_round has collapsed the range to a single point
+        # (fmv_low == fmv_high) but the pool's prices genuinely dispersed
+        # (cv > 0), open it back into a real range instead of emitting a point
+        # estimate that would set max_bid = 0.80 × point (the systematic
+        # under-bid — a $5/$5 book cleared $39). A genuinely degenerate pool
+        # (cv_val None → single comp, or == 0 → identical prices) is left a true
+        # point. Only ever touches an already-zero-width band; a pool with any
+        # real range is unchanged.
+        if cv_val is not None and cv_val > 0 and fmv_low == fmv_high:
+            fmv_low, fmv_high = _widen_collapsed_range(
+                med_raw, cv_val, window, n, min(trimmed), max(trimmed))
         max_bid = clean_round(fmv_high * factor)
 
     return {
@@ -978,4 +1116,10 @@ def compute_fmv(comps: list[dict], target_grade: float,
         # produced no bid-able number, replacing this dict wholesale.
         "cgc_proxy": False,
         "cgc_ladder": None,
+        # BUI-522: ungraded-market anchor ({median, n}) off the dropped
+        # grade-less comps, or None. Informational only — surfaced in fmv_notes,
+        # never priced. A cached row can't reconstruct it (the raw comps aren't
+        # persisted), so _build_notes reads it via .get and the db-row shape
+        # parity test exempts it (unlike the bid-affecting keys).
+        "ungraded_anchor": anchor,
     }
