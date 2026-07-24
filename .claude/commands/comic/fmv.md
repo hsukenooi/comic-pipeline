@@ -35,6 +35,8 @@ comic-fmv --batch <working_list.json> --out <results.json> --brief
 
 `--batch` JSON shape: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]`
 
+Literal example (build it directly — the shape is documented here, don't grep `apps/fmv` source for it): `[{"item_id": "115834720199", "title": "Fantastic Four", "issue": "16", "year": 1963, "publisher": "Marvel", "grade": "VG 4.0", "grade_confidence": "medium"}]`
+
 `publisher` and `variant` are optional but **load-bearing** (BUI-161): `ebay-sold-comps` appends `publisher` to the eBay search query — strongly recommended for non-Marvel/DC titles, where it's the primary noise filter that keeps trading cards / unrelated matches out of the comp pool — and `variant` (e.g. `Newsstand`, `Direct`) gives base vs variant editions distinct `comic_id`s (BUI-28), so omitting it conflates two sub-markets onto one comic.
 
 `grade_confidence` (optional, `high`|`medium`|`medium-low`|`low` — **four** levels, BUI-162) is the photo-coverage confidence from `/comic:grade`. When present and low, it haircuts the max bid — `medium-low` and `low` haircut **differently** (0.70 vs 0.60), so don't collapse them. Absent → standard 80% bid, no haircut (back-compat for seller-stated grades and manual runs).
@@ -43,7 +45,7 @@ comic-fmv --batch <working_list.json> --out <results.json> --brief
 
 Flags:
 - `--max-age-days N` (default 7): reuse FMVs already in the comics server's DB if `fmv_updated_at` is within N days
-- `--force`: bypass both the SerpApi cache and the DB cache and recompute everything
+- `--force`: bypass both the SerpApi cache and the DB cache and recompute everything. **It cannot clear a `one_sided`/`too_wide` flag** — it refetches the *same* market and re-flags identically. To move a flagged book, change the input (`title`/`publisher`/`year`) or widen `--grade-window`; a bare `--force` retry is a wasted no-op
 - `--grade-window N` (default 2.0): raise or lower the comp-pool widening ceiling — does **not** bypass the one-sided/too-wide guards (a guarded book still flags `needs_manual`)
 - `--brief`: after the table, print one compact JSON object per row (`item_id`, `comic_id`, `fmv_id`, `max_bid`, `flag_reason`, `confidence`, `fmv_low`, `fmv_high`, `fmv_notes` — BUI-505) — the linkage + pricing fields to carry forward, without re-reading the full `--out` file
 - `--quiet`: suppress the human table on stdout (combine with `--brief` for JSON lines only)
@@ -51,6 +53,16 @@ Flags:
 - `--version`: print the installed version plus the git SHA/date the binary was built from, then exit
 
 The CLI prints a human-readable table to stdout and writes the full structured result to `--out` on disk. Present the table to the user. **Carry the `--brief` JSON lines forward to Step 4 of `/comic:buy`** (`item_id`, `comic_id`, `fmv_id`, `max_bid`, `flag_reason`, `confidence`, plus `fmv_low`/`fmv_high`/`fmv_notes` for the range + haircut presentation, BUI-505) — don't re-read the full `--out` JSON for linkage; the `--out` file on disk stays available if you need a full row (`queries_used`, `trimmed_pool`, etc.) for debugging.
+
+**`--out` row schema** (one object per book; use these exact keys — do **not** guess `comp_pool`/`pool`/`prices`):
+- Top-level: `input`, `fmv`, `comp_count_total`, `queries_used`, `db_row`, `comic_id`, `fmv_id`, `source` (`fresh`|`cached`|`cgc-proxy`|`error`). `comic_id`/`fmv_id` are top-level on fresh/proxy rows; on `cached` rows read them off `db_row` (`id`/`fmv_id`).
+- The surviving comps are **nested** at `fmv.trimmed_pool`, alongside `fmv.median`/`fmv_low`/`fmv_high`/`max_bid`/`bid_factor`/`flag_reason`/`confidence`/`window`.
+
+When you do need a pool field, **project it in one shot — never Read the whole `--out` file** (it's dominated by `queries_used`/`trimmed_pool`):
+
+```bash
+python3 -c "import json; print([(x['input']['item_id'], (x.get('fmv') or {}).get('trimmed_pool'), x['queries_used']) for x in json.load(open('<results.json>'))])"
+```
 
 **`fetch-err` ≠ `n/a` (BUI-143):** a row whose FMV column reads `fetch-err` (and the loud post-table warning) means the **SerpApi fetch failed** for that book — quota exhausted or an outage — **not** that the book has no comps. Treat a `fetch-err` row (or a whole batch that comes back all `fetch-err`/`n/a`) as a SerpApi failure: check the `SERPAPI_KEY`/quota and re-run. Never tell the user these books are illiquid or bid on them as if priced.
 
@@ -68,6 +80,10 @@ The CLI prints a human-readable table to stdout and writes the full structured r
 - **CGC-proxy rows** — notes carry `CGC proxy: … n=<count> is graded-ladder comps, not raw-market depth`. Never read a proxy row's `N` as raw-market liquidity.
 
 When presenting the table to the user, always surface: the window the pool was built at, N and CV, whether the book flagged `needs_manual` (and why) vs. auto-priced, whether grade-curve interpolation was applied, suspect comps (with reason), and a hot-market signal if the current bid already exceeds the computed Q75.
+
+**Hot-market signal → flag only; never re-derive (BUI-530).** The signal fires when a live auction's current bid (from `/comic:identify`) already exceeds the computed Q75 (= `fmv.fmv_high`). The response is a **fixed rule, not a judgment call**: surface it to the user as a flag and leave `max_bid` exactly as `comic-fmv` computed it — **apply zero bid-factor adjustment**. Do **not** re-fetch comps and do **not** hand-rebuild or re-derive the comp pool to "justify" a bump — the pool `comic-fmv` already priced is the pool (the FF #16 run, 2026-07-16, burned ~11 tool calls re-deriving it by hand to nudge the bid factor 0.60→0.70, for zero change to the FMV). Bidding above the computed cap on a hot auction is the user's explicit call, never an automatic skill adjustment.
+
+**When to dig into a pool.** Open `fmv.trimmed_pool` / `queries_used` only when (a) `flag_reason` is set (`one_sided`/`too_wide`/`too_sparse`), or (b) the table numerically contradicts the live bid (the hot-market signal above — and even then, dig only to *report*, per the rule above, never to re-price). A `LOW` confidence **alone is not a reason to dig** — LOW is already `comic-fmv`'s verdict on that pool; reproducing the pool by hand won't change it.
 
 ## Save to DB
 
