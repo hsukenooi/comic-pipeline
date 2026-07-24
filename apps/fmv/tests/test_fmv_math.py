@@ -1206,3 +1206,101 @@ class TestCgcProxyShapeParity:
         # Every key compute_fmv emits must exist on the proxy dict (drop-in shape).
         for key in raw:
             assert key in proxy, f"proxy dict missing key {key!r}"
+
+
+# ─── Ungraded-market anchor (BUI-522) ─────────────────────────────────────────
+
+class TestUngradedMarketAnchor:
+    def test_median_and_count_of_gradeless_comps(self):
+        comps = [_comp(40, None), _comp(60, None), _comp(50, None)]
+        assert fm.ungraded_market_anchor(comps) == {"median": 50.0, "n": 3}
+
+    def test_none_when_every_comp_is_graded(self):
+        comps = [_comp(100, 9.0), _comp(110, 9.2)]
+        assert fm.ungraded_market_anchor(comps) is None
+
+    def test_ignores_graded_comps_and_missing_prices(self):
+        # Only grade-less, priced comps count: a graded comp already priced the
+        # graded pool, and a comp with no price can't anchor anything.
+        comps = [_comp(100, 9.0), _comp(40, None), _comp(60, None),
+                 {"grade": None, "price": None}, {"grade": None}]
+        assert fm.ungraded_market_anchor(comps) == {"median": 50.0, "n": 2}
+
+    def test_non_numeric_price_is_skipped(self):
+        # SerpApi text can leak a non-numeric price; it must not crash the anchor.
+        comps = [_comp(40, None), {"grade": None, "price": "n/a"}]
+        assert fm.ungraded_market_anchor(comps) == {"median": 40.0, "n": 1}
+
+    def test_surfaced_in_compute_fmv_output(self):
+        comps = [_comp(100, 9.0), _comp(105, 9.0), _comp(110, 9.0),
+                 _comp(40, None), _comp(50, None), _comp(60, None)]
+        out = fm.compute_fmv(comps, target_grade=9.0)
+        assert out["ungraded_anchor"] == {"median": 50.0, "n": 3}
+        # The anchor is informational: it did NOT enter the priced graded pool.
+        assert out["n"] == 3
+        assert out["trimmed_pool"] == [100, 105, 110]
+
+    def test_absent_anchor_is_none_in_output(self):
+        comps = [_comp(p, 9.0) for p in [100, 105, 110, 115, 120]]
+        out = fm.compute_fmv(comps, target_grade=9.0)
+        assert out["ungraded_anchor"] is None
+
+
+# ─── Minimum range width on collapsed pools (BUI-528) ─────────────────────────
+
+class TestMinRangeWidth:
+    def test_collapsed_nondegenerate_pool_is_reopened(self):
+        # [49,50,51] clean-rounds to a $50/$50 point, but the prices differ
+        # (cv>0), so it must NOT emit a zero-width range.
+        out = fm.compute_fmv([_comp(p, 9.0) for p in [49, 50, 51]],
+                             target_grade=9.0)
+        assert out["fmv_low"] < out["fmv_high"]
+        assert out["fmv_low"] is not None
+
+    def test_identical_prices_stay_a_true_point(self):
+        # Genuinely degenerate (cv==0): the carve-out — no fabricated range.
+        out = fm.compute_fmv([_comp(50, 9.0), _comp(50, 9.0), _comp(50, 9.0)],
+                             target_grade=9.0)
+        assert out["fmv_low"] == out["fmv_high"] == 50
+
+    def test_healthy_ranged_pool_is_untouched(self):
+        # A pool with a real (non-collapsed) range must be byte-identical to the
+        # pre-BUI-528 behavior — the guard only ever fires on a zero-width band.
+        out = fm.compute_fmv(
+            [_comp(p, 9.0) for p in [100, 105, 110, 115, 120, 125, 130]],
+            target_grade=9.0)
+        assert out["fmv_low"] < out["fmv_high"]          # a real, non-zero range
+        assert (out["fmv_low"], out["fmv_high"], out["max_bid"]) == (110, 120, 100)
+
+    def test_reopen_never_lifts_bid_cap_when_dispersion_is_below_median(self):
+        # thick_mild_skew shape: median sits near the TOP of the observed range,
+        # so the reopen lowers fmv_low and leaves fmv_high (→ max_bid) untouched.
+        low, high = fm._widen_collapsed_range(
+            median=223.0, cv_value=0.05, window=0.5, n=8,
+            price_min=200.0, price_max=230.0)
+        assert (low, high) == (200, 225)
+
+    def test_reopen_reveals_upside_when_dispersion_is_above_median(self):
+        # Ghost-Rider shape: a cheap median with pricier copies above it — the
+        # reopen lifts fmv_high toward the observed top, never past it.
+        low, high = fm._widen_collapsed_range(
+            median=5.0, cv_value=1.0, window=0.5, n=10,
+            price_min=2.0, price_max=12.0)
+        assert low < high
+        assert high <= fm.clean_round(12.0)   # never claims a value beyond a real sale
+
+    def test_reopen_stays_within_observed_prices(self):
+        # The widened band is bounded by [price_min, price_max] — fmv_high can
+        # never exceed the priciest real comp (money-safety: no invented upside).
+        low, high = fm._widen_collapsed_range(
+            median=100.0, cv_value=0.9, window=2.0, n=2,
+            price_min=90.0, price_max=110.0)
+        assert low >= 0
+        assert high <= fm.clean_round(110.0)
+
+    def test_reopened_max_bid_does_not_exceed_top_comp(self):
+        # End-to-end money-safety: even after a reopen, max_bid stays at or below
+        # the priciest observed comp.
+        prices = [49, 50, 51]
+        out = fm.compute_fmv([_comp(p, 9.0) for p in prices], target_grade=9.0)
+        assert out["max_bid"] <= max(prices)

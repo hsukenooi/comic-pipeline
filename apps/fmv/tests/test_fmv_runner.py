@@ -664,6 +664,22 @@ class TestFlaggedPresentation:
         notes = fmv_runner._build_notes(fmv)
         assert "manual_review" not in notes
 
+    def test_build_notes_carries_ungraded_anchor(self):
+        # BUI-522: the ungraded-market anchor (median + raw-copy count off the
+        # dropped grade-less comps) is surfaced as a fmv_notes token.
+        fmv = {"window": 0.5, "cv_pct": "20%", "confidence": "HIGH",
+               "flag_reason": None, "bid_factor": 0.80,
+               "ungraded_anchor": {"median": 50.0, "n": 3}}
+        notes = fmv_runner._build_notes(fmv)
+        assert "ungraded_anchor=$50 (n=3 raw)" in notes
+
+    def test_build_notes_omits_ungraded_anchor_when_absent(self):
+        # A fetch with no grade-less comp (or a cached row that can't
+        # reconstruct it) carries no anchor → no token, no crash.
+        fmv = {"window": 0.5, "cv_pct": "20%", "confidence": "HIGH",
+               "flag_reason": None, "bid_factor": 0.80, "ungraded_anchor": None}
+        assert "ungraded_anchor" not in fmv_runner._build_notes(fmv)
+
     def test_build_notes_no_bid_haircut_on_flagged_book(self):
         # A flagged book's forced-LOW label yields factor 0.60, but it has no
         # max bid — the bid_haircut token would be misleading, so it's suppressed.
@@ -1501,7 +1517,15 @@ class TestCgcProxyNotesAndTable:
         row = {"fmv_low": 100, "fmv_high": 150, "fmv_comps": 8,
                "fmv_confidence": "high", "fmv_notes": "window=±0.5 | cv=20%"}
         projected = fmv_runner._fmv_from_db_row(row)
+        # BUI-522: `ungraded_anchor` is the one compute_fmv key the cache-reuse
+        # projection legitimately CANNOT carry — it's the median of the dropped
+        # grade-less comps, which aren't persisted, so a cached row can't
+        # reconstruct it. Unlike the bid-affecting keys this parity test exists
+        # to guard (effective_n / cgc_proxy), it's purely informational and read
+        # via `.get`, so its absence on a cached row is correct, not drift.
         for key in computed:
+            if key == "ungraded_anchor":
+                continue
             assert key in projected, f"_fmv_from_db_row missing key {key!r}"
 
 

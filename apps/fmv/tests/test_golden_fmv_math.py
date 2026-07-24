@@ -24,10 +24,12 @@ import fmv_math
 BASELINE = Path(__file__).parent / "fixtures" / "fmv_math_golden.json"
 
 # The frozen keys (discrete / clean-rounded — no raw floats whose precision
-# would make the baseline brittle).
+# would make the baseline brittle). ungraded_anchor (BUI-522) is a small
+# {median, n} dict of clean values, frozen so the anchor is regression-guarded
+# alongside the priced range.
 _FROZEN = (
     "n", "window", "flag_reason", "grade_span", "fmv_low", "fmv_high",
-    "median", "max_bid", "confidence", "bid_factor",
+    "median", "max_bid", "confidence", "bid_factor", "ungraded_anchor",
 )
 
 
@@ -66,6 +68,21 @@ CASES = [
       (125, 9.0), (130, 9.0), (135, 9.0)], 9.0, None, "low"),
     ("bracketed_priced",
      [(100, 6.5), (110, 7.0), (120, 7.0), (130, 7.5), (140, 7.0)], 7.0, None, None),
+    # BUI-528: a non-degenerate pool whose quartiles clean-round to a single
+    # point ($50/$50) is reopened into a real range instead of a false point
+    # estimate. Prices differ (cv>0), so the range is split one clean step apart.
+    ("collapsed_range_reopened",
+     [(49, 9.0), (50, 9.0), (51, 9.0)], 9.0, None, None),
+    # BUI-528 carve-out: a GENUINELY degenerate pool (identical prices, cv==0) is
+    # left a true point — no dispersion to reveal, so no fabricated range.
+    ("degenerate_identical_priced",
+     [(50, 9.0), (50, 9.0), (50, 9.0)], 9.0, None, None),
+    # BUI-522: grade-less comps (grade None) are dropped from the priced pool but
+    # surface as the ungraded-market anchor ({median, n}); the graded pool prices
+    # normally off the (100,105,110) comps.
+    ("ungraded_anchor_from_dropped_comps",
+     [(100, 9.0), (105, 9.0), (110, 9.0),
+      (40, None), (50, None), (60, None)], 9.0, None, None),
 ]
 
 
