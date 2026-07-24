@@ -448,11 +448,11 @@ def _get_json_or_warn(url: str, *, params: dict, warn: str, default,
 # ─── Step 2b — First-party outcomes (BUI-286) ─────────────────────────────────
 
 # Recency window for pulling the user's own resolved auctions back in as
-# first-party comps. 180 days is a starting default (per the plan's KTD-2:
-# start unweighted, revisit once U2 lands time-decay) — long enough to catch
-# a slow-moving collector's last few relevant snipes, short enough that a
-# hammer price from years ago doesn't masquerade as "current."
-FIRST_PARTY_RECENCY_DAYS = 180
+# first-party comps. 365 days (BUI-526, up from the BUI-286 starting default
+# of 180): our own resolved clears are the highest-quality comps we have, and
+# the BUI-287 recency weighting (75-day half-life) already discounts the older
+# tail, so the wider window adds supply without letting stale prices dominate.
+FIRST_PARTY_RECENCY_DAYS = 365
 
 
 def _fetch_first_party_outcomes(server_url: str, *, target_grade: float,
