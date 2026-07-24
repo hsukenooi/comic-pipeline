@@ -1289,6 +1289,39 @@ class TestIsUnpricedRaw:
         assert fmv_runner._is_unpriced_raw(r) is False
 
 
+class TestIsThinOrLowConfidencePriced:
+    """BUI-529: the ADDITIONAL cross-check candidate population — a book the
+    raw math DID price, but thinly (n<5) or with LOW confidence. Disjoint from
+    _is_unpriced_raw's population by construction (fmv_high is None there)."""
+
+    def test_priced_thin_n_is_candidate(self):
+        r = {"fmv": {"fmv_high": 200, "n": 3, "confidence": "MEDIUM",
+                     "interpolated": False}}
+        assert fmv_runner._is_thin_or_low_confidence_priced(r) is True
+
+    def test_priced_low_confidence_is_candidate(self):
+        r = {"fmv": {"fmv_high": 200, "n": 8, "confidence": "LOW",
+                     "interpolated": False}}
+        assert fmv_runner._is_thin_or_low_confidence_priced(r) is True
+
+    def test_priced_healthy_is_not_candidate(self):
+        r = {"fmv": {"fmv_high": 200, "n": 8, "confidence": "MEDIUM-HIGH",
+                     "interpolated": False}}
+        assert fmv_runner._is_thin_or_low_confidence_priced(r) is False
+
+    def test_unpriced_is_not_candidate(self):
+        # That population belongs to _is_unpriced_raw / the rescue, not here.
+        r = {"fmv": {"fmv_high": None, "n": 0, "confidence": "LOW",
+                     "interpolated": False}}
+        assert fmv_runner._is_thin_or_low_confidence_priced(r) is False
+
+    def test_interpolated_is_not_candidate(self):
+        # BUI-306 §7 is its own already-reduced-confidence tier — out of scope.
+        r = {"fmv": {"fmv_high": 200, "n": 1, "confidence": "LOW",
+                     "interpolated": True}}
+        assert fmv_runner._is_thin_or_low_confidence_priced(r) is False
+
+
 class TestCgcProxyRescue:
     def test_sparse_high_value_book_is_rescued(self, server_url):
         books = [{"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
@@ -1438,6 +1471,181 @@ class TestCgcProxyRescue:
         assert fresh[0]["fmv"].get("cgc_proxy") is None  # never overwritten
 
 
+# ─── Always-on vintage cross-check (BUI-529) ──────────────────────────────────
+
+class TestCgcCrossCheckApply:
+    def test_flags_divergence_using_already_fetched_slab_comps(self, server_url):
+        # BUI-524's inclusive tier already supplied enough slab comps — zero
+        # extra fetch needed (the whole point of the two tickets feeding
+        # each other).
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": 200, "fmv_low": 150, "median": 100.0,
+                             "n": 3, "confidence": "MEDIUM-LOW",
+                             "interpolated": False},
+                     "source": "fresh",
+                     "slab_comps": _ASM50_SLABS}}
+        books = [{"title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 1, "fmv_id": 2}) as upsert_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, books, server_url=server_url, force=False)
+        fetch_mock.assert_not_called()  # no dedicated second fetch needed
+        check = fresh[0]["fmv"]["cgc_cross_check"]
+        assert check is not None
+        assert check["diverges"] is True  # raw median 100 vs slab-implied 625
+        # A flag, never a re-price — the priced number is untouched.
+        assert fresh[0]["fmv"]["fmv_high"] == 200
+        assert fresh[0]["fmv"]["fmv_low"] == 150
+        upsert_mock.assert_called_once()
+
+    def test_falls_back_to_dedicated_fetch_when_no_slab_comps(self, server_url):
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": 200, "fmv_low": 150, "median": 100.0,
+                             "n": 3, "confidence": "MEDIUM-LOW",
+                             "interpolated": False},
+                     "source": "fresh",
+                     "slab_comps": []}}
+        books = [{"title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]) as fetch_mock, \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 1, "fmv_id": 2}):
+            fmv_runner._apply_cgc_cross_check(
+                fresh, books, server_url=server_url, force=False)
+        graded_books = fetch_mock.call_args[0][0]
+        assert graded_books[0]["include_graded"] is True
+        assert graded_books[0]["_idx"] == 0
+        assert fresh[0]["fmv"]["cgc_cross_check"] is not None
+
+    def test_skips_book_already_rescued_by_proxy(self, server_url):
+        # n=3 (<5) would otherwise make this a candidate — the source guard
+        # must be what excludes it, not the thinness predicate.
+        fresh = {0: {"input": {"grade": 6.5, "year": 1967}, "source": "cgc-proxy",
+                     "fmv": {"fmv_high": 650, "n": 3, "confidence": "MEDIUM-LOW",
+                             "interpolated": False}}}
+        with patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, [{"grade": 6.5, "year": 1967}],
+                server_url=server_url, force=False)
+        fetch_mock.assert_not_called()
+        assert fresh[0]["fmv"].get("cgc_cross_check") is None
+
+    def test_healthy_priced_book_not_touched(self, server_url):
+        fresh = {0: {"input": {"grade": 9.2, "year": 1975}, "source": "fresh",
+                     "fmv": {"fmv_high": 200, "n": 8, "confidence": "MEDIUM-HIGH",
+                             "interpolated": False}}}
+        with patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, [{"grade": 9.2, "year": 1975}],
+                server_url=server_url, force=False)
+        fetch_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+
+    def test_modern_thin_book_not_touched(self, server_url):
+        # The 0.50-0.55 factor is vintage-calibrated — a modern book must
+        # never reach the cross-check even with a thin/LOW-confidence price.
+        fresh = {0: {"input": {"grade": 9.2, "year": 2015}, "source": "fresh",
+                     "fmv": {"fmv_high": 200, "n": 2, "confidence": "LOW",
+                             "interpolated": False}}}
+        with patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, [{"grade": 9.2, "year": 2015}],
+                server_url=server_url, force=False)
+        fetch_mock.assert_not_called()
+
+    def test_soft_fetch_failure_leaves_unflagged(self, server_url, capsys):
+        fresh = {0: {"input": {"grade": 6.5, "year": 1967}, "source": "fresh",
+                     "fmv": {"fmv_high": 200, "median": 100.0, "n": 2,
+                             "confidence": "LOW", "interpolated": False},
+                     "slab_comps": []}}
+        with patch("fmv_runner._fetch_comps", return_value=None), \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, [{"grade": 6.5, "year": 1967}],
+                server_url=server_url, force=False)
+        upsert_mock.assert_not_called()
+        assert fresh[0]["fmv"].get("cgc_cross_check") is None
+        assert "CGC cross-check graded fetch failed" in capsys.readouterr().err
+
+    def test_upsert_failure_keeps_flag_in_memory_only(self, server_url, capsys):
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": 200, "fmv_low": 150, "median": 100.0,
+                             "n": 3, "confidence": "MEDIUM-LOW",
+                             "interpolated": False},
+                     "source": "fresh",
+                     "slab_comps": _ASM50_SLABS,
+                     "db_row": {"comic_id": 1}}}
+        books = [{"title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv", return_value=None):
+            fmv_runner._apply_cgc_cross_check(
+                fresh, books, server_url=server_url, force=False)
+        fetch_mock.assert_not_called()
+        # The flag IS set in memory even though the best-effort persistence
+        # write failed — a write blip must not silently discard the finding.
+        assert fresh[0]["fmv"]["cgc_cross_check"] is not None
+        assert fresh[0]["db_row"] == {"comic_id": 1}  # unchanged, not clobbered
+        assert "CGC cross-check notes update failed" in capsys.readouterr().err
+
+    def test_thin_ladder_produces_no_flag(self, server_url):
+        fresh = {0: {"input": {"grade": 6.5, "year": 1967}, "source": "fresh",
+                     "fmv": {"fmv_high": 200, "median": 100.0, "n": 2,
+                             "confidence": "LOW", "interpolated": False},
+                     "slab_comps": []}}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, [_slab(1200, 6.5)])]) as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, [{"grade": 6.5, "year": 1967}],
+                server_url=server_url, force=False)
+        fetch_mock.assert_called_once()
+        upsert_mock.assert_not_called()
+        assert fresh[0]["fmv"].get("cgc_cross_check") is None
+
+    def test_rescue_pricing_for_unpriced_books_is_byte_identical(self, server_url):
+        """Hard invariant (BUI-529 spec): promoting the CGC-proxy heuristic to
+        an always-on cross-check must NOT alter the unpriced-book rescue's own
+        pricing in any way. `_apply_cgc_proxy_rescue` is untouched by this
+        ticket — this test locks that in by running the exact rescue fixture
+        from TestCgcProxyRescue.test_sparse_high_value_book_is_rescued and
+        pinning the identical output, so a future refactor that merges the two
+        functions can't silently drift the unpriced path."""
+        books = [{"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False,
+                             "flag_reason": None},
+                     "source": "fresh"}}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   side_effect=lambda *a, **k: {"comic_id": 7, "fmv_id": 9}):
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        assert fresh[0]["source"] == "cgc-proxy"
+        assert fresh[0]["fmv"]["cgc_proxy"] is True
+        assert 600 <= fresh[0]["fmv"]["fmv_low"] <= fresh[0]["fmv"]["fmv_high"] <= 680
+        assert fresh[0]["fmv"]["confidence"] == "MEDIUM-LOW"
+        # No $400-floor bypass leaked into the rescue path: cgc_proxy_fmv is
+        # untouched, so a below-floor ladder still refuses to price (unlike
+        # the cross-check, which explicitly drops that floor).
+        assert fmv_math.cgc_proxy_fmv(
+            [{"grade": 6.5, "price": 300, "title": "x CGC 6.5"},
+             {"grade": 6.5, "price": 310, "title": "x CGC 6.5"},
+             {"grade": 6.5, "price": 305, "title": "x CGC 6.5"}],
+            target_grade=6.5,
+        ) is None
+
+
 class TestCgcProxyNotesAndTable:
     def test_notes_carry_cgc_proxy_token(self):
         proxy = fmv_math.cgc_proxy_fmv(_ASM50_SLABS, target_grade=6.5)
@@ -1527,6 +1735,30 @@ class TestCgcProxyNotesAndTable:
             if key == "ungraded_anchor":
                 continue
             assert key in projected, f"_fmv_from_db_row missing key {key!r}"
+
+
+class TestCgcCrossCheckNotes:
+    def test_notes_carry_diverges_token(self):
+        fmv = {"cv_pct": "20%", "confidence": "MEDIUM-LOW",
+               "cgc_cross_check": {"implied_raw": 625, "raw_median": 100,
+                                   "divergence_pct": 5.25, "diverges": True}}
+        notes = fmv_runner._build_notes(fmv)
+        assert "cgc_cross_check=DIVERGES" in notes
+        assert "slab_implied=$625" in notes
+        assert "raw_median=$100" in notes
+        assert "(525%)" in notes
+
+    def test_notes_carry_ok_token_when_no_divergence(self):
+        fmv = {"cv_pct": "20%", "confidence": "MEDIUM",
+               "cgc_cross_check": {"implied_raw": 625, "raw_median": 600,
+                                   "divergence_pct": 0.0417, "diverges": False}}
+        notes = fmv_runner._build_notes(fmv)
+        assert "cgc_cross_check=ok" in notes
+
+    def test_notes_omit_token_when_absent(self):
+        fmv = {"cv_pct": "20%", "confidence": "HIGH"}
+        notes = fmv_runner._build_notes(fmv)
+        assert "cgc_cross_check" not in notes
 
 
 # ─── --brief projection (BUI-362) ─────────────────────────────────────────────
