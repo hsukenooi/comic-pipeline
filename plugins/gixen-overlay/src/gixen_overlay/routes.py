@@ -24,6 +24,7 @@ from gixen_overlay.db import (
     sweep_orphan_yearless_comics,
     get_seen_item_ids,
     mark_items_seen,
+    remove_seen_for_seller,
     get_collection_wins_seen,
     mark_collection_wins_seen,
     get_first_party_outcomes,
@@ -2504,6 +2505,21 @@ async def api_seller_scan_seen_add(request: Request, req: SellerScanSeenRequest)
     db = request.app.state.db
     inserted = mark_items_seen(db, req.item_ids, req.seller)
     return {"marked": inserted}
+
+
+@router.delete("/api/comics/seller-scan/seen")
+async def api_seller_scan_seen_remove(request: Request, seller: str):
+    """BUI-542: remove every seen entry for `seller` (seller_scan.py's
+    ``--forget``), so matches surfaced in a prior scan resurface. `seller` is
+    required (not optional like the GET above) — a targeted single-seller
+    recovery, never an accidental global wipe. Returns
+    ``{"removed": <deleted count>}``. Does not touch the BUI-301
+    rejected-candidate cache — that lives entirely client-side in
+    seller_scan.py and this endpoint never sees it.
+    """
+    db = request.app.state.db
+    removed = remove_seen_for_seller(db, seller)
+    return {"removed": removed}
 
 
 # ---------------------------------------------------------------------------

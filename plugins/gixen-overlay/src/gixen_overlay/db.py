@@ -1564,6 +1564,23 @@ def mark_items_seen(
     return inserted
 
 
+def remove_seen_for_seller(conn: sqlite3.Connection, seller: str) -> int:
+    """Remove every seller-scan seen entry for `seller` (BUI-542 `--forget`).
+
+    Returns the number of rows removed. Deliberately scoped to one seller —
+    there is no "forget everyone" call site; a targeted recovery for the
+    seller whose output was lost shouldn't have a blast radius covering every
+    other seller's seen-set too. Does not touch anything else: in particular
+    the BUI-301 rejected-candidate cache is a separate, client-side (JSON
+    file) system that this never sees.
+    """
+    cur = conn.execute(
+        "DELETE FROM seller_scan_seen WHERE seller=?", (seller,)
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Collection-wins seen-tracking (BUI-121)
 # ---------------------------------------------------------------------------

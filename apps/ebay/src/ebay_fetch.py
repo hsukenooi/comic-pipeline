@@ -763,7 +763,16 @@ def load_seller_aliases():
 
 
 def save_seller_alias(store, username):
-    """Add/update one store-name → username mapping and persist it."""
+    """Add/update one store-name → username mapping and persist it.
+
+    BUI-540: seller_aliases.json is a *tracked* file the skill tells you to
+    commit after an add, so its formatting is part of the repo's diff
+    surface. json.dump() alone leaves no trailing newline, which makes a
+    one-line addition look like a two-line change (the closing `}` line
+    flips from "no newline at end of file" to normal) — so every subsequent
+    add re-touches that line too. Writing the newline explicitly keeps the
+    file POSIX-text-file-shaped and the diff to exactly the changed key.
+    """
     aliases = {}
     if SELLER_ALIASES_FILE.exists():
         try:
@@ -775,6 +784,7 @@ def save_seller_alias(store, username):
     SELLER_ALIASES_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SELLER_ALIASES_FILE, "w") as f:
         json.dump(aliases, f, indent=2, sort_keys=True)
+        f.write("\n")
     return aliases
 
 
