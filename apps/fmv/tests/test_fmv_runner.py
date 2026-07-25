@@ -45,6 +45,15 @@ def _make_comp(price, grade, product_id="x"):
             "price": price, "grade": grade, "sold_date": "", "buying_format": ""}
 
 
+def _stale_hand_lookup(row):
+    """A `_db_lookup` side_effect: the normal freshness-gated lookup
+    (max_age_days=7 etc.) misses (simulating a stale/absent row), but the
+    BUI-533 any-age lookup (max_age_days=None) finds `row`."""
+    def _lookup(server, *, locg_id, grade, locg_variant_id=None, max_age_days):
+        return row if max_age_days is None else None
+    return _lookup
+
+
 # ─── _is_fetch_error / fetch-error vs no-comps (BUI-143) ──────────────────────
 
 class TestFetchErrorSignal:
@@ -92,15 +101,23 @@ class TestFetchErrorSignal:
 # ─── _split_by_db_cache ───────────────────────────────────────────────────────
 
 class TestSplitByDbCache:
-    def test_force_skips_lookup(self, server_url):
+    def test_force_skips_normal_cache_but_still_checks_hand_priced(self, server_url):
+        """BUI-533: --force always bypasses normal DB-cache reuse, but a single
+        age-unbounded lookup per eligible book is still required to detect (and
+        later echo) any hand-priced override it's about to overwrite — so
+        _db_lookup is no longer literally uncalled under --force."""
         books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
-        with patch("fmv_runner._db_lookup") as lookup:
-            cached, needs = fmv_runner._split_by_db_cache(
+        with patch("fmv_runner._db_lookup", return_value=None) as lookup:
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=True)
-            lookup.assert_not_called()
+            lookup.assert_called_once_with(
+                server_url, locg_id=100, grade=9.0, locg_variant_id=None,
+                max_age_days=None)
         assert cached == {}
         assert len(needs) == 1
         assert needs[0]["_idx"] == 0
+        assert skipped_hand == {}
+        assert force_notes == {}
 
     def test_book_without_locg_id_goes_to_compute(self, server_url):
         # BUI-153: the DB-FMV cache-skip requires a locg_id, so a title-derived
@@ -108,31 +125,308 @@ class TestSplitByDbCache:
         # which is why --max-age-days is inert in the orchestrated /comic:buy flow.
         books = [_make_book("1", "X", "1", 1990, 9.0)]
         with patch("fmv_runner._db_lookup") as lookup:
-            cached, needs = fmv_runner._split_by_db_cache(
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
             lookup.assert_not_called()
         assert cached == {}
         assert len(needs) == 1
+        assert skipped_hand == {}
+        assert force_notes == {}
 
     def test_cache_hit_returns_row(self, server_url):
         books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
         row = {"id": 1, "fmv_low": 50, "fmv_high": 75, "fmv_comps": 8,
                "fmv_confidence": "high", "fmv_updated_at": "2026-05-09T...",
                "title": "X", "issue": "1", "year": 1990, "grade": 9.0}
-        with patch("fmv_runner._db_lookup", return_value=row):
-            cached, needs = fmv_runner._split_by_db_cache(
+        with patch("fmv_runner._db_lookup", return_value=row) as lookup:
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         assert cached == {0: row}
         assert needs == []
+        assert skipped_hand == {}
+        # A fresh cache hit short-circuits before the hand-priced check runs —
+        # a fresh row is never recomputed regardless, so the extra lookup
+        # would be pure waste.
+        lookup.assert_called_once_with(
+            server_url, locg_id=100, grade=9.0, locg_variant_id=None,
+            max_age_days=7)
 
     def test_cache_miss_falls_through(self, server_url):
         books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
         with patch("fmv_runner._db_lookup", return_value=None):
-            cached, needs = fmv_runner._split_by_db_cache(
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         assert cached == {}
         assert len(needs) == 1
         assert needs[0]["_idx"] == 0
+        assert skipped_hand == {}
+        assert force_notes == {}
+
+
+# ─── Hand-priced row protection (BUI-533) ─────────────────────────────────────
+
+class TestIsHandPriced:
+    def test_hand_section_marker(self):
+        assert fmv_runner._is_hand_priced("hand § anchored on the 4.0 sale") is True
+
+    def test_hand_override_marker(self):
+        assert fmv_runner._is_hand_priced("hand OVERRIDE: rejecting CLI pool") is True
+
+    def test_plain_notes_not_hand_priced(self):
+        assert fmv_runner._is_hand_priced("window=±0.5 | cv=20% | label=HIGH") is False
+
+    def test_none_notes_not_hand_priced(self):
+        assert fmv_runner._is_hand_priced(None) is False
+
+    def test_marker_must_be_a_prefix_not_substring(self):
+        """A note that merely MENTIONS a hand override mid-string (e.g. an
+        automated note referencing why a book was NOT hand-priced) must not
+        false-positive — the marker is a provenance prefix, not a keyword."""
+        assert fmv_runner._is_hand_priced(
+            "window=±0.5 | cv=20% | see hand OVERRIDE policy doc") is False
+
+
+class TestSplitByDbCacheHandPriced:
+    def test_stale_hand_priced_row_is_skipped_not_recomputed(self, server_url):
+        """The exact 2026-07-24 incident this ticket exists for: a hand-priced
+        row old enough that normal cache logic would recompute it must still
+        be protected — the staleness must not defeat the protection."""
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100)]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+                   "fmv_confidence": "low",
+                   "fmv_notes": "hand § anchored on the lone 4.0 sale",
+                   "fmv_updated_at": "2020-01-01T00:00:00"}  # very stale
+
+        def _lookup(server, *, locg_id, grade, locg_variant_id, max_age_days):
+            # The normal (max_age_days=7) lookup misses (too stale); the
+            # any-age lookup (max_age_days=None) finds it.
+            if max_age_days is None:
+                return hand_row
+            return None
+
+        with patch("fmv_runner._db_lookup", side_effect=_lookup):
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert cached == {}
+        assert needs == []
+        assert skipped_hand == {0: hand_row}
+        assert force_notes == {}
+
+    def test_fresh_hand_priced_row_reused_via_normal_cache_path(self, server_url):
+        """A hand-priced row that's still FRESH is simply a normal cache hit —
+        it's never recomputed either way, so it's returned via `cached`, not
+        `skipped_hand` (no need for the extra any-age lookup at all)."""
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100)]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+                   "fmv_confidence": "low",
+                   "fmv_notes": "hand § anchored on the lone 4.0 sale",
+                   "fmv_updated_at": "2026-07-24T00:00:00"}
+        with patch("fmv_runner._db_lookup", return_value=hand_row) as lookup:
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert cached == {0: hand_row}
+        assert skipped_hand == {}
+        lookup.assert_called_once()  # only the normal fresh lookup, no extra call
+
+    def test_non_hand_priced_stale_row_still_recomputes(self, server_url):
+        """Sanity: the new any-age lookup must not accidentally protect every
+        stale row — only ones actually carrying the hand marker."""
+        books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
+        normal_row = {"id": 1, "fmv_low": 50, "fmv_high": 75, "fmv_comps": 8,
+                     "fmv_confidence": "high",
+                     "fmv_notes": "window=±0.5 | cv=20% | label=HIGH",
+                     "fmv_updated_at": "2020-01-01T00:00:00"}
+
+        def _lookup(server, *, locg_id, grade, locg_variant_id, max_age_days):
+            if max_age_days is None:
+                return normal_row
+            return None
+
+        with patch("fmv_runner._db_lookup", side_effect=_lookup):
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert cached == {}
+        assert skipped_hand == {}
+        assert len(needs) == 1
+        assert needs[0]["_idx"] == 0
+
+    def test_no_existing_row_at_all_recomputes_normally(self, server_url):
+        books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
+        with patch("fmv_runner._db_lookup", return_value=None):
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert skipped_hand == {}
+        assert len(needs) == 1
+
+    def test_force_overwrites_hand_priced_row_and_records_old_notes(self, server_url):
+        """BUI-533 acceptance: --force proceeds to recompute (book lands in
+        `needs`, not skipped), but the OLD hand notes are captured so the
+        caller can echo them before they're overwritten."""
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100)]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300,
+                   "fmv_notes": "hand § anchored on the lone 4.0 sale"}
+        with patch("fmv_runner._db_lookup", return_value=hand_row):
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=True)
+        assert skipped_hand == {}
+        assert len(needs) == 1  # proceeds to recompute, not skipped
+        assert force_notes == {0: "hand § anchored on the lone 4.0 sale"}
+
+    def test_force_on_non_hand_priced_row_records_nothing(self, server_url):
+        books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
+        normal_row = {"id": 1, "fmv_low": 50, "fmv_high": 75,
+                     "fmv_notes": "window=±0.5 | cv=20% | label=HIGH"}
+        with patch("fmv_runner._db_lookup", return_value=normal_row):
+            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=True)
+        assert force_notes == {}
+        assert len(needs) == 1
+
+
+class TestEchoHandOverrideNotes:
+    def test_echoes_old_notes_to_stderr(self, capsys):
+        books = [_make_book("1", "Batman", "251", 1972, 5.5)]
+        fmv_runner._echo_hand_override_notes(
+            {0: "hand § anchored on the lone 4.0 sale"}, books)
+        err = capsys.readouterr().err
+        assert "--force" in err
+        assert "Batman #251" in err
+        assert "hand § anchored on the lone 4.0 sale" in err
+
+    def test_no_op_when_empty(self, capsys):
+        fmv_runner._echo_hand_override_notes({}, [])
+        assert capsys.readouterr().err == ""
+
+
+class TestRunSkipsHandPricedRows:
+    def test_table_shows_skipped_source_and_untouched_values(self, server_url, capsys):
+        """With the human table on (not --quiet), the row must render with the
+        `skipped_hand_priced` source and the row's own untouched $250-$300
+        range — never a recomputed number."""
+        batch = [{"item_id": "1", "title": "Batman", "issue": "251",
+                 "year": 1972, "grade": 5.5, "locg_id": 100}]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+                   "fmv_confidence": "low",
+                   "fmv_notes": "hand § anchored on the lone 4.0 sale",
+                   "fmv_updated_at": "2020-01-01T00:00:00"}
+        with patch("fmv_runner._read_batch", return_value=batch), \
+             patch("fmv_runner._db_lookup", side_effect=_stale_hand_lookup(hand_row)), \
+             patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                          max_age_days=7, force=False, quiet=False,
+                          server_url=server_url)
+        fetch_mock.assert_not_called()
+        out = capsys.readouterr().out
+        assert "skipped_hand_priced" in out
+        assert "$250" in out and "$300" in out
+        assert "skipped 1 hand-priced row" in out
+
+
+    def test_default_run_skips_and_reports_count(self, server_url, capsys):
+        """End-to-end (mocked network): a hand-priced row is left completely
+        untouched by a default run, and the skip is reported unconditionally
+        (not gated by --quiet) so it surfaces even with --brief-only usage."""
+        batch = [{"item_id": "1", "title": "Batman", "issue": "251",
+                 "year": 1972, "grade": 5.5, "locg_id": 100}]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+                   "fmv_confidence": "low",
+                   "fmv_notes": "hand § anchored on the lone 4.0 sale",
+                   "fmv_updated_at": "2020-01-01T00:00:00",
+                   "title": "Batman", "issue": "251", "year": 1972,
+                   "grade": 5.5}
+        batch_path = "/tmp/_bui533_batch.json"
+        with patch("fmv_runner._read_batch", return_value=batch), \
+             patch("fmv_runner._db_lookup", side_effect=_stale_hand_lookup(hand_row)), \
+             patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner.run(batch_path=batch_path, out_path=None,
+                          max_age_days=7, force=False, quiet=True,
+                          server_url=server_url)
+        fetch_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+        out = capsys.readouterr().out
+        assert "skipped 1 hand-priced row" in out
+        assert "--force" in out
+
+    def test_quiet_still_reports_skip_summary(self, server_url, capsys):
+        """The skip-count message must not be suppressed by --quiet — an
+        operator using --brief --quiet must still learn rows were skipped."""
+        batch = [{"item_id": "1", "title": "Batman", "issue": "251",
+                 "year": 1972, "grade": 5.5, "locg_id": 100}]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300,
+                   "fmv_notes": "hand § anchored on the lone 4.0 sale",
+                   "fmv_updated_at": "2020-01-01T00:00:00"}
+        with patch("fmv_runner._read_batch", return_value=batch), \
+             patch("fmv_runner._db_lookup", side_effect=_stale_hand_lookup(hand_row)), \
+             patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                          max_age_days=7, force=False, quiet=True, brief=True,
+                          server_url=server_url)
+        fetch_mock.assert_not_called()
+        out = capsys.readouterr().out
+        assert "skipped 1 hand-priced row" in out
+        # --brief JSON line for the row is also present, unaffected.
+        assert '"item_id": "1"' in out
+
+
+class TestHandPricedAndFetchErrComposition:
+    """BUI-533 x BUI-536 composition: --force on a hand-priced row whose
+    fetch THEN errors out. The force-overwrite echo fires (it's a statement of
+    intent, printed before the fetch even runs), but the actual row must stay
+    completely untouched — the fetch-err guard always wins over --force."""
+
+    def test_force_plus_fetch_err_leaves_row_untouched(self, server_url, capsys):
+        batch = [{"item_id": "1", "title": "Batman", "issue": "251",
+                 "year": 1972, "grade": 5.5, "locg_id": 100}]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300,
+                   "fmv_notes": "hand § anchored on the lone 4.0 sale"}
+        # ebay-sold-comps result for the one needs_compute book: every tier
+        # errored (comps empty, queries_used all-error) — a fetch-err.
+        fetch_err_result = [{
+            "input": {"title": "Batman", "issue": "251", "year": 1972,
+                      "grade": 5.5, "_req_id": 0},
+            "comps": [],
+            "queries_used": [{"tier": "base", "error": "RateLimiter 10001"}],
+        }]
+        with patch("fmv_runner._read_batch", return_value=batch), \
+             patch("fmv_runner._db_lookup", return_value=hand_row), \
+             patch("fmv_runner._fetch_comps", return_value=fetch_err_result), \
+             patch("fmv_runner._upsert_fmv") as upsert_mock, \
+             patch("fmv_runner.requests.post") as post_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                          max_age_days=7, force=True, quiet=True,
+                          server_url=server_url)
+        # The force-echo DID fire (it's printed before the fetch even runs)...
+        err = capsys.readouterr().err
+        assert "--force: about to overwrite" in err
+        # ...but no write ever actually happened: the fetch-err guard in
+        # _compute_and_upsert_one takes priority over --force unconditionally.
+        upsert_mock.assert_not_called()
+        post_mock.assert_not_called()
+
+    def test_vintage_fetch_err_is_not_picked_up_by_proxy_rescue(self, server_url):
+        """The narrower regression this composition case exposed: a vintage
+        fetch-err result must not be treated as an `_is_unpriced_raw`
+        candidate for the CGC-proxy rescue — that side door would let the
+        rescue's own second fetch upsert a book BUI-536 said must stay
+        untouched."""
+        fresh_fmvs = {
+            0: {"input": {"title": "X-Men", "issue": "39", "year": 1967,
+                         "grade": 9.0},
+               "fmv": None, "comp_count_total": 0,
+               "queries_used": [{"tier": "base", "error": "outage"}],
+               "db_row": None, "comic_id": None, "fmv_id": None,
+               "source": "error", "error": "fetch-err: all tiers failed"},
+        }
+        assert fmv_runner._is_unpriced_raw(fresh_fmvs[0]) is False
+        books = [{"title": "X-Men", "issue": "39", "year": 1967, "grade": 9.0}]
+        with patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh_fmvs, books, server_url=server_url, force=False)
+        fetch_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+        assert fresh_fmvs[0]["source"] == "error"  # untouched
 
 
 # ─── _db_lookup ───────────────────────────────────────────────────────────────
@@ -537,6 +831,158 @@ class TestComputeOne:
         assert out["comic_id"] == 5
 
 
+# ─── fetch-err must never touch the fmv DB row (BUI-536) ─────────────────────
+
+class TestFetchErrDoesNotTouchDbRow:
+    def test_all_tiers_failed_never_upserts(self, server_url):
+        """The core regression test: every query tier ERRORED (mocked
+        all-tiers-fail fetch) — _upsert_fmv must never be called, no matter
+        whether a row already exists for this book."""
+        result = {
+            "input": {"title": "X-Men", "issue": "39", "year": 1967,
+                      "grade": 9.0},
+            "comps": [],
+            "queries_used": [{"tier": "base", "error": "RateLimiter 10001"},
+                             {"tier": "wide", "error": "RateLimiter 10001"}],
+        }
+        with patch("fmv_runner._upsert_fmv") as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X-Men", "issue": "39", "grade": 9.0},
+                server_url=server_url)
+            upsert_mock.assert_not_called()
+        assert out["source"] == "error"
+        assert "fetch-err" in out["error"]
+        assert out["fmv"] is None
+        assert out["db_row"] is None
+        assert out["comic_id"] is None
+        assert out["fmv_id"] is None
+        assert out["comp_count_total"] == 0
+        assert out["queries_used"] == result["queries_used"]
+
+    def test_all_tiers_failed_leaves_existing_row_byte_identical(self, server_url):
+        """BUI-536 acceptance: after a fetch-err on a book with an existing fmv
+        row, low/high/comps/confidence/notes/flag_reason/updated_at must be
+        byte-identical to pre-run. Simulated here by asserting the network POST
+        (the only way the row could change) is never even attempted — no
+        upsert call means the server-side row is untouched by construction."""
+        result = {
+            "input": {"title": "Fantastic Four", "issue": "46", "year": 1963,
+                      "grade": 8.0},
+            "comps": [],
+            "queries_used": [{"tier": "base", "error": "quota exceeded"}],
+        }
+        with patch("fmv_runner.requests.post") as post_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "Fantastic Four", "issue": "46", "grade": 8.0},
+                server_url=server_url)
+        post_mock.assert_not_called()
+        assert out["source"] == "error"
+
+    def test_all_tiers_failed_on_new_book_creates_nothing(self, server_url):
+        """BUI-536 acceptance: a fetch-err on a book with NO existing row must
+        create nothing either — same no-upsert path regardless of whether a
+        row already exists (the function never even looks one up here)."""
+        result = {
+            "input": {"title": "Brand New Comic", "issue": "1", "year": 2026,
+                      "grade": 9.8},
+            "comps": [],
+            "queries_used": [{"tier": "base", "error": "outage"}],
+        }
+        with patch("fmv_runner._upsert_fmv") as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "Brand New Comic", "issue": "1", "grade": 9.8},
+                server_url=server_url)
+            upsert_mock.assert_not_called()
+        assert out["comic_id"] is None
+        assert out["fmv_id"] is None
+
+    def test_partial_tier_failure_with_comps_still_upserts(self, server_url):
+        """Adversarial case: SOME tiers errored but at least one comp came
+        back — this must NOT be classified as fetch-err (comp_count_total > 0
+        takes priority in _is_fetch_error), so the normal BUI-44 upsert path
+        still runs."""
+        comps = [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": comps,
+            "queries_used": [{"tier": "base", "error": "partial outage"},
+                             {"tier": "wide", "nkw": 5}],
+        }
+        with patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 1, "fmv_id": 1}) as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        upsert_mock.assert_called_once()
+        assert out["source"] == "fresh"
+        assert out["fmv"]["n"] == 5
+
+    def test_mixed_error_and_clean_zero_result_queries_still_upserts(self, server_url):
+        """Adversarial edge case: comp_count_total is 0, but only SOME queries
+        carry an 'error' — one tier genuinely ran clean and found nothing. Per
+        the existing BUI-143 `_is_fetch_error` contract (ALL queries must
+        error), this is a genuine n=0, not a fetch-err — it must still upsert
+        the stub row, not be silently dropped as an error."""
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": [],
+            "queries_used": [{"tier": "base", "error": "one tier failed"},
+                             {"tier": "wide", "nkw": 3}],  # ran clean, 0 comps
+        }
+        with patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 1, "fmv_id": 1}) as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        upsert_mock.assert_called_once()
+        assert out["source"] == "fresh"
+        assert out["fmv"]["n"] == 0
+
+    def test_genuine_n0_with_error_free_queries_still_upserts(self, server_url):
+        """The critical distinction this ticket must preserve (BUI-44's own
+        acceptance criterion): a book that genuinely has zero comps ran its
+        queries CLEANLY (no 'error' key at all) — that must still upsert the
+        stub row unconditionally, never be misclassified as fetch-err."""
+        result = {
+            "input": {"title": "Godzilla: The Half-Century War", "issue": "1",
+                      "year": 2012, "grade": 9.8},
+            "comps": [],
+            "queries_used": [{"tier": "base", "nkw": 0}],
+        }
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"comic_id": 7, "fmv_id": 3, "id": 7}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result,
+                {"title": "Godzilla: The Half-Century War", "issue": "1",
+                 "grade": 9.8},
+                server_url=server_url)
+        post_mock.assert_called_once()
+        assert out["source"] == "fresh"
+        assert out["fmv"]["n"] == 0
+        assert out["fmv"]["fmv_low"] is None
+        assert out["comic_id"] == 7
+
+    def test_no_queries_used_key_at_all_is_not_fetch_error(self, server_url):
+        """A result dict missing `queries_used` entirely (e.g. an older
+        ebay-sold-comps version, or the BUI-44 no-comps stub fixture shape)
+        must not be misread as a fetch error — _is_fetch_error's own guard
+        (`if not queries: return False`) already covers this; pin it at the
+        _compute_and_upsert_one boundary too."""
+        result = {
+            "input": {"title": "X", "issue": "1", "grade": 9.0},
+            "comps": [],
+        }
+        with patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 5, "fmv_id": 2}) as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 9.0},
+                server_url=server_url)
+            upsert_mock.assert_called_once()
+        assert out["source"] == "fresh"
+
+
 # ─── _upsert_fmv ──────────────────────────────────────────────────────────────
 
 class TestUpsertFmv:
@@ -646,6 +1092,28 @@ class TestStitch:
         out = fmv_runner._stitch([book], cached, {})
         assert out[0]["fmv"]["bid_factor"] == fmv_runner.fmv_math.BASE_BID_FACTOR
         assert out[0]["fmv"]["max_bid"] == fmv_runner.fmv_math.clean_round(100 * 0.80)
+
+    def test_skipped_hand_row_reused_verbatim_with_distinct_source(self):
+        """BUI-533: a hand-priced skip is stitched exactly like a cache hit
+        (the row is reused, never recomputed) but tagged with a distinct
+        `source` so the table/summary can tell it apart from an ordinary
+        cache hit."""
+        book = _make_book("a", "A", "1", 1990, 9.0)
+        row = {"fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+               "fmv_confidence": "low",
+               "fmv_notes": "hand § anchored on the lone 4.0 sale",
+               "title": "A", "issue": "1", "year": 1990, "grade": 9.0}
+        out = fmv_runner._stitch([book], {}, {}, {0: row})
+        assert out[0]["source"] == "skipped_hand_priced"
+        assert out[0]["fmv"]["fmv_low"] == 250
+        assert out[0]["fmv"]["fmv_high"] == 300
+        assert out[0]["db_row"] == row
+
+    def test_skipped_hand_defaults_to_empty_when_omitted(self):
+        """Back-compat: existing callers that don't pass skipped_hand still work."""
+        books = [_make_book("a", "A", "1", 1990, 9.0)]
+        out = fmv_runner._stitch(books, {}, {})
+        assert out[0]["source"] == "error"
 
 
 # ─── Flagged-state presentation (BUI-86) ─────────────────────────────────────
@@ -1759,6 +2227,58 @@ class TestCgcCrossCheckNotes:
         fmv = {"cv_pct": "20%", "confidence": "HIGH"}
         notes = fmv_runner._build_notes(fmv)
         assert "cgc_cross_check" not in notes
+
+
+class TestAnchorDivergesNotes:
+    def test_notes_carry_token_when_diverges(self):
+        fmv = {"cv_pct": "20%", "confidence": "MEDIUM-LOW",
+               "ungraded_anchor": {"median": 224.8, "n": 36},
+               "anchor_diverges": True}
+        notes = fmv_runner._build_notes(fmv)
+        assert "ungraded_anchor=$224.8 (n=36 raw)" in notes
+        assert "anchor_diverges=1" in notes
+
+    def test_notes_omit_token_when_not_diverging(self):
+        fmv = {"cv_pct": "20%", "confidence": "HIGH",
+               "ungraded_anchor": {"median": 100.0, "n": 10},
+               "anchor_diverges": False}
+        notes = fmv_runner._build_notes(fmv)
+        assert "ungraded_anchor=$100 (n=10 raw)" in notes
+        assert "anchor_diverges" not in notes
+
+    def test_notes_omit_token_when_key_absent(self):
+        fmv = {"cv_pct": "20%", "confidence": "HIGH"}
+        notes = fmv_runner._build_notes(fmv)
+        assert "anchor_diverges" not in notes
+
+    def test_cached_row_recovers_flag_from_notes(self):
+        row = {"fmv_low": 400, "fmv_high": 425, "fmv_comps": 6,
+               "fmv_confidence": "medium-low",
+               "fmv_notes": ("window=±0.5 | cv=5% | label=MEDIUM-LOW | "
+                             "ungraded_anchor=$224.8 (n=36 raw) | "
+                             "anchor_diverges=1")}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["anchor_diverges"] is True
+
+    def test_cached_row_without_token_recovers_false(self):
+        row = {"fmv_low": 100, "fmv_high": 150, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5 | cv=20%"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["anchor_diverges"] is False
+
+    def test_db_row_shape_parity_carries_anchor_diverges(self):
+        """Unlike `ungraded_anchor` (genuinely unreconstructible on a cache
+        hit), `anchor_diverges` recovers from notes and so IS carried by
+        `_fmv_from_db_row` — the shared shape-parity fixture
+        (test_db_row_shape_parity_with_compute_fmv) already pins this since
+        it doesn't exempt this key."""
+        computed = fmv_math.compute_fmv([{"price": 100, "grade": 9.2}],
+                                        target_grade=9.2)
+        assert "anchor_diverges" in computed
+        row = {"fmv_low": 100, "fmv_high": 150, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5 | cv=20%"}
+        projected = fmv_runner._fmv_from_db_row(row)
+        assert "anchor_diverges" in projected
 
 
 # ─── --brief projection (BUI-362) ─────────────────────────────────────────────

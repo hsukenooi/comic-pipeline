@@ -116,6 +116,54 @@ def ungraded_market_anchor(comps: Iterable[dict]) -> dict | None:
     return {"median": statistics.median(prices), "n": len(prices)}
 
 
+# ─── Pool-vs-anchor divergence flag (BUI-534) ─────────────────────────────────
+#
+# The ungraded_anchor above proved itself on its very first live run
+# (2026-07-24, 64-book recompute): Batman #251 priced $400-425 off a
+# 5.0-6.0-grade pool while the anchor — the raw/ungraded median — read $224.8
+# off 36 raw sales. The graded pool was pricing a different market than the
+# bulk of actual raw trades: precisely the error class the July hand override
+# (BUI-533) corrected manually. Until now the anchor was informational only;
+# nothing surfaced unless a human happened to read the fmv_notes token. This
+# promotes it to an active (flag-only, never re-pricing) check.
+#
+# ANCHOR_DIVERGES_PCT = 0.5 (a ±50% band around the anchor median) is derived
+# from that incident: fmv_low $400 vs anchor $224.8 is a ~1.78x ratio (78%
+# over the anchor) — comfortably past a 1.5x (T=0.5) trip-wire — while still
+# leaving headroom for an ordinary, healthy grade premium (a high-grade
+# CGC-eligible copy commonly trades well above a raw/mixed-condition median
+# without that gap alone being an error). ANCHOR_DIVERGES_MIN_N = 8 mirrors
+# CGC_PROXY_MIN_LADDER_COMPS's philosophy: an anchor built on a handful of raw
+# sales is noise, not signal, so the check is skipped below this floor rather
+# than firing on a thin anchor.
+ANCHOR_DIVERGES_PCT = 0.5   # T: half-band the priced range may diverge from the anchor
+ANCHOR_DIVERGES_MIN_N = 8   # anchor n floor below which the check is skipped as noise
+
+
+def anchor_diverges(fmv_low: float | None, fmv_high: float | None,
+                    anchor: dict | None) -> bool:
+    """BUI-534: True when a priced range sits far outside the ungraded-market
+    anchor — ``fmv_low > anchor.median * (1 + T)`` or
+    ``fmv_high < anchor.median * (1 - T)``, T = ANCHOR_DIVERGES_PCT.
+
+    FLAG ONLY — same philosophy as BUI-529's cross-check and BUI-530's
+    hot-market rule: this never changes fmv_low/fmv_high/max_bid, and a caller
+    must never re-derive the comp pool to "resolve" it. Returns False when
+    there's nothing to compare (no priced range — a flagged/interpolated-only/
+    no-comps book — or no anchor at all) or the anchor is too thin to trust
+    (fewer than ANCHOR_DIVERGES_MIN_N raw sales).
+    """
+    if fmv_low is None or fmv_high is None or not anchor:
+        return False
+    if anchor.get("n", 0) < ANCHOR_DIVERGES_MIN_N:
+        return False
+    median = anchor.get("median")
+    if not median or median <= 0:
+        return False
+    return (fmv_low > median * (1 + ANCHOR_DIVERGES_PCT)
+            or fmv_high < median * (1 - ANCHOR_DIVERGES_PCT))
+
+
 # ─── Grade buckets + grade-curve checks (§2, §5, §7 — BUI-306) ────────────────
 
 def bucket_medians(comps: Iterable[dict]) -> dict[float, float]:
@@ -823,6 +871,9 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
         # it carries no ungraded-market anchor. Key present (== None) for shape
         # parity with compute_fmv's output.
         "ungraded_anchor": None,
+        # BUI-534: no anchor above → nothing to diverge from. Key present
+        # (== False) for shape parity with compute_fmv's output.
+        "anchor_diverges": False,
         # BUI-529: the always-on cross-check only runs on a book the RAW math
         # priced (see cgc_cross_check below) — a proxy band already IS the
         # slab-derived price, so a raw-vs-slab comparison is meaningless here.
@@ -1178,6 +1229,12 @@ def compute_fmv(comps: list[dict], target_grade: float,
                 med_raw, cv_val, window, n, min(trimmed), max(trimmed))
         max_bid = clean_round(fmv_high * factor)
 
+    # BUI-534: flag-only pool-vs-anchor divergence — computed from fields
+    # already resolved above (fmv_low/fmv_high, the anchor from BUI-522),
+    # never altering them. False for any flagged/no-comps book (fmv_low/high
+    # are None there) without a separate flag_reason check.
+    diverges = anchor_diverges(fmv_low, fmv_high, anchor)
+
     return {
         "n": n,
         "effective_n": effective_n,
@@ -1211,6 +1268,12 @@ def compute_fmv(comps: list[dict], target_grade: float,
         # persisted), so _build_notes reads it via .get and the db-row shape
         # parity test exempts it (unlike the bid-affecting keys).
         "ungraded_anchor": anchor,
+        # BUI-534: True when fmv_low/fmv_high sit far outside the anchor above
+        # (see anchor_diverges's docstring for the threshold + derivation).
+        # Flag only — never changes fmv_low/fmv_high/max_bid. Recovered from
+        # fmv_notes on a cache hit the same lossy way as ungraded_anchor
+        # itself, via _fmv_from_db_row / _anchor_diverges_from_notes.
+        "anchor_diverges": diverges,
         # BUI-529: populated by fmv_runner._apply_cgc_cross_check AFTER this
         # function returns (it needs the graded ladder, which compute_fmv never
         # fetches) — always None here. Key present for shape parity so every

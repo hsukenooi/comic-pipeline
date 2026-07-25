@@ -1326,6 +1326,119 @@ class TestUngradedMarketAnchor:
         assert out["ungraded_anchor"] is None
 
 
+# ─── Pool-vs-anchor divergence flag (BUI-534) ─────────────────────────────────
+
+class TestAnchorDivergesFunction:
+    """Direct unit tests of the pure `anchor_diverges` helper."""
+
+    def test_named_constants_exist(self):
+        assert fm.ANCHOR_DIVERGES_PCT == 0.5
+        assert fm.ANCHOR_DIVERGES_MIN_N == 8
+
+    def test_batman_251_numbers_diverge(self):
+        # The actual 2026-07-24 incident: pool $400-425, anchor $224.8 n=36.
+        anchor = {"median": 224.8, "n": 36}
+        assert fm.anchor_diverges(400, 425, anchor) is True
+
+    def test_healthy_priced_range_does_not_diverge(self):
+        # A normal grade premium over the anchor, comfortably inside T=0.5.
+        anchor = {"median": 200.0, "n": 20}
+        assert fm.anchor_diverges(220, 260, anchor) is False
+
+    def test_low_side_exactly_at_boundary_does_not_diverge(self):
+        anchor = {"median": 200.0, "n": 20}
+        assert fm.anchor_diverges(300, 320, anchor) is False  # 200*1.5 == 300
+
+    def test_low_side_just_past_boundary_diverges(self):
+        anchor = {"median": 200.0, "n": 20}
+        assert fm.anchor_diverges(300.01, 320, anchor) is True
+
+    def test_high_side_diverges_symmetrically(self):
+        # fmv_high sits far BELOW the anchor's lower band.
+        anchor = {"median": 1000.0, "n": 20}
+        assert fm.anchor_diverges(350, 400, anchor) is True  # 400 < 1000*0.5
+
+    def test_thin_anchor_below_min_n_is_skipped(self):
+        # Same wild ratio as the Batman #251 case, but n=7 < MIN_N=8 — must
+        # not fire; a thin anchor is noise, not signal.
+        anchor = {"median": 224.8, "n": 7}
+        assert fm.anchor_diverges(400, 425, anchor) is False
+
+    def test_anchor_at_exactly_min_n_is_checked(self):
+        anchor = {"median": 224.8, "n": 8}
+        assert fm.anchor_diverges(400, 425, anchor) is True
+
+    def test_no_anchor_never_diverges(self):
+        assert fm.anchor_diverges(400, 425, None) is False
+
+    def test_no_priced_range_never_diverges(self):
+        # A flagged/no-comps/interpolated-absent book has no fmv_low/high.
+        anchor = {"median": 224.8, "n": 36}
+        assert fm.anchor_diverges(None, None, anchor) is False
+        assert fm.anchor_diverges(400, None, anchor) is False
+        assert fm.anchor_diverges(None, 425, anchor) is False
+
+    def test_degenerate_zero_median_never_diverges(self):
+        assert fm.anchor_diverges(400, 425, {"median": 0, "n": 36}) is False
+
+
+class TestAnchorDivergesInComputeFmv:
+    def test_batman_251_shaped_pool_fires_in_compute_fmv(self):
+        # Graded pool (grades 5.0/6.0 bracket the 5.5 target, within the
+        # default ±0.5 window) pricing well above a raw/ungraded market.
+        graded = [_comp(390, 5.0), _comp(400, 5.0), _comp(405, 5.0),
+                  _comp(415, 6.0), _comp(425, 6.0), _comp(430, 6.0)]
+        grade_less = [_comp(220 + (i % 3) * 5) for i in range(36)]  # ~$220-230, n=36
+        out = fm.compute_fmv(graded + grade_less, target_grade=5.5)
+        assert out["ungraded_anchor"]["n"] == 36
+        assert out["fmv_low"] is not None and out["fmv_high"] is not None
+        assert out["anchor_diverges"] is True
+
+    def test_pricing_is_byte_identical_with_and_without_the_flag(self):
+        """BUI-534 acceptance: adding grade-less comps that push the anchor
+        far enough to trip the flag must NOT change fmv_low/fmv_high/max_bid
+        at all — same pure-flag philosophy as BUI-529/530."""
+        graded = [_comp(390, 5.0), _comp(400, 5.0), _comp(405, 5.0),
+                  _comp(415, 6.0), _comp(425, 6.0), _comp(430, 6.0)]
+        grade_less = [_comp(220 + (i % 3) * 5) for i in range(36)]
+        with_anchor = fm.compute_fmv(graded + grade_less, target_grade=5.5)
+        without_anchor = fm.compute_fmv(graded, target_grade=5.5)
+        assert with_anchor["anchor_diverges"] is True
+        assert without_anchor["anchor_diverges"] is False  # no anchor at all
+        assert with_anchor["fmv_low"] == without_anchor["fmv_low"]
+        assert with_anchor["fmv_high"] == without_anchor["fmv_high"]
+        assert with_anchor["max_bid"] == without_anchor["max_bid"]
+
+    def test_unchanged_healthy_book_does_not_flag(self):
+        # A normal priced book whose range sits close to its own raw anchor —
+        # must NOT flag, mirroring "the 46 unchanged books from the same run".
+        graded = [_comp(p, 9.0) for p in [100, 105, 110, 115, 120]]
+        grade_less = [_comp(90 + i) for i in range(10)]  # anchor ~ $94.5, n=10
+        out = fm.compute_fmv(graded + grade_less, target_grade=9.0)
+        assert out["ungraded_anchor"]["n"] == 10
+        assert out["anchor_diverges"] is False
+
+    def test_flagged_needs_manual_book_never_flags(self):
+        # A one-sided pool has no fmv_low/high at all — anchor_diverges must
+        # be False (nothing priced to compare), even with a wild anchor.
+        graded = [_comp(p, 9.0) for p in [100, 105, 110]]  # all one-sided
+        grade_less = [_comp(1000 + i) for i in range(10)]
+        out = fm.compute_fmv(graded, target_grade=8.0)
+        assert out["flag_reason"] is not None
+        assert out["fmv_low"] is None
+        assert out["anchor_diverges"] is False
+
+    def test_cgc_proxy_dict_never_flags(self):
+        # A proxy band has no ungraded_anchor at all (priced off the slab
+        # ladder, not raw comps) — anchor_diverges must default False, not
+        # raise, and shape-parity with compute_fmv's key must hold.
+        ladder_comps = ([_comp(1200, 6.5)] * 3 + [_comp(200, 5.0)] * 3
+                        + [_comp(2000, 7.0)] * 3)
+        proxy = fm.cgc_proxy_fmv(ladder_comps, target_grade=6.5)
+        assert proxy is not None
+        assert proxy["anchor_diverges"] is False
+
+
 # ─── Minimum range width on collapsed pools (BUI-528) ─────────────────────────
 
 class TestMinRangeWidth:
