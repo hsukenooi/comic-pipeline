@@ -300,6 +300,84 @@ def test_no_flags_on_clean_in_collection():
     assert flags == []
 
 
+def test_flag_r42_canonical_match_variant_not_disambiguated():
+    # Listing asks for a "2nd Printing" variant; the owned row that satisfied
+    # the match is the bare canonical title (variant is a soft preference,
+    # BUI-176) — R42 should fire.
+    r = _verdict_row(
+        "Absolute Martian Manhunter", "1", "in_collection", match_kind="exact",
+        full_title_matched="Absolute Martian Manhunter #1",
+    )
+    flags = compute_flags(
+        r,
+        {"series": "Absolute Martian Manhunter", "issue": "1", "variant": "2nd Printing"},
+        {},
+        3,
+    )
+    assert "R42" in _codes(flags)
+    msg = next(f["message"] for f in flags if f["pattern"] == "R42")
+    assert "2nd Printing" in msg and "not disambiguated" in msg
+    # Advisory only — never flips the verdict.
+    assert r["match_status"] == "in_collection"
+
+
+def test_flag_r42_not_flagged_when_variant_text_matched():
+    # The matched title DOES name the requested variant — no R42 (the
+    # specific variant, not just the canonical, is what's owned).
+    r = _verdict_row(
+        "Absolute Martian Manhunter", "1", "in_collection", match_kind="exact",
+        full_title_matched="Absolute Martian Manhunter #1 (2nd Printing)",
+    )
+    flags = compute_flags(
+        r,
+        {"series": "Absolute Martian Manhunter", "issue": "1", "variant": "2nd Printing"},
+        {},
+        3,
+    )
+    assert "R42" not in _codes(flags)
+
+
+def test_flag_r42_not_flagged_when_no_variant_requested():
+    # No variant text on the listing at all — nothing to disambiguate.
+    r = _verdict_row("Invincible", "1", "in_collection", match_kind="exact",
+                     full_title_matched="Invincible #1")
+    flags = compute_flags(r, {"series": "Invincible", "issue": "1"}, {}, 3)
+    assert "R42" not in _codes(flags)
+
+
+def test_flag_r42_not_flagged_when_not_owned():
+    # A not_in_cache row has no full_title_matched to compare against and no
+    # ownership to qualify — R42 only applies to in_collection verdicts.
+    r = _verdict_row("Absolute Martian Manhunter", "1", "not_in_cache")
+    flags = compute_flags(
+        r,
+        {"series": "Absolute Martian Manhunter", "issue": "1", "variant": "2nd Printing"},
+        {},
+        3,
+    )
+    assert "R42" not in _codes(flags)
+
+
+def test_flag_r42_not_flagged_on_ambiguous_cross_volume():
+    # ambiguous_cross_volume also carries a full_title_matched, but R42 is
+    # scoped to in_collection only — D2 (re-check with a year) is the right
+    # flag for this verdict, not a variant-disambiguation note.
+    r = _verdict_row(
+        "Fantastic Four", "18", "ambiguous_cross_volume", match_kind="cross_volume",
+        full_title_matched="Fantastic Four #18",
+        candidates=[
+            {"series_name": "Fantastic Four (Vol. 1)", "full_title": "Fantastic Four #18"},
+            {"series_name": "Fantastic Four (Vol. 7)", "full_title": "Fantastic Four #18"},
+        ],
+    )
+    flags = compute_flags(
+        r, {"series": "Fantastic Four", "issue": "18", "variant": "Newsstand"}, {}, 3
+    )
+    codes = _codes(flags)
+    assert "D2" in codes
+    assert "R42" not in codes
+
+
 # ---------------------------------------------------------------------------
 # End-to-end run_check_batch (happy paths)
 # ---------------------------------------------------------------------------
@@ -359,6 +437,22 @@ def test_run_pattern_c_end_to_end():
     resolve = [{"query": "Xmen", "resolved": "Uncanny X-Men", "match_kind": "fuzzy"}]
     payload, _ = _run(items, batch, resolve_results=resolve)
     assert "C" in {f["pattern"] for f in payload["results"][0]["flags"]}
+
+
+def test_run_pattern_r42_end_to_end():
+    items = [
+        {"series": "Absolute Martian Manhunter", "issue": "1", "variant": "2nd Printing"},
+    ]
+    batch = [
+        _verdict_row(
+            "Absolute Martian Manhunter", "1", "in_collection", match_kind="exact",
+            full_title_matched="Absolute Martian Manhunter #1",
+        ),
+    ]
+    payload, _ = _run(items, batch)
+    assert "R42" in {f["pattern"] for f in payload["results"][0]["flags"]}
+    # Advisory only — the rendered verdict is unaffected.
+    assert payload["results"][0]["verdict"] == "✅ In collection"
 
 
 # ---------------------------------------------------------------------------

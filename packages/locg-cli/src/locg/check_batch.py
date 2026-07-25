@@ -5,7 +5,7 @@ the deterministic replacement for the ~450-line ``collection-check.md`` prose
 program a sub-agent used to execute on every ``/comic:buy`` run: resolve the
 comics server, health-gate it, read collection status, POST the batch check,
 apply the stale-cache verdict downgrade, and compute the advisory
-false-match flags (Patterns A / C / D / D2 / D3 / E) the skill labels
+false-match flags (Patterns A / C / D / D2 / D3 / E / R42) the skill labels
 "Mechanized".
 
 R11 (in code, not prose): ANY failure — an unreachable server, a non-200, a
@@ -393,6 +393,26 @@ def compute_flags(
                     "a different printing than the listing"
                     + (f" (printings — {summary})" if summary else "")
                     + "; confirm before skipping"
+                ),
+            })
+
+        # R42 — canonical match, listing variant not disambiguated
+        # (2026-05-22 requirements doc line 181). The matcher's variant
+        # argument is a SOFT preference (BUI-176): when no owned row carries
+        # the requested variant's wording, an otherwise-matching canonical/
+        # bare-title row still satisfies the ownership check. That is exactly
+        # the "I own the canonical, the listing is an unconfirmed variant"
+        # case — advisory only, never downgrades match_status.
+        variant_text = str(item.get("variant") or "").strip()
+        full_title_matched = str(result.get("full_title_matched") or "")
+        if variant_text and variant_text.lower() not in full_title_matched.lower():
+            flags.append({
+                "pattern": "R42",
+                "message": (
+                    "canonical match — listing variant not disambiguated: "
+                    f'matched "{full_title_matched}", which does not name the '
+                    f'listing\'s "{variant_text}" variant; confirm this is the '
+                    "same printing/variant before treating it as a duplicate"
                 ),
             })
 
