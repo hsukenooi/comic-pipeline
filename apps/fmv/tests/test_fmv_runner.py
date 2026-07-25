@@ -76,6 +76,38 @@ class TestFetchErrorSignal:
              "queries_used": [{"tier": "base", "error": "x"}]}
         assert fmv_runner._is_fetch_error(r) is False
 
+    def test_bui537_shaped_all_error_entries_still_fetch_error(self):
+        """BUI-537 adversarial check: ebay-sold-comps now emits a fuller
+        attempt trail (page/outcome on every entry, including multiple
+        error entries per tier from retried attempts) — the extra fields and
+        extra rows must not change the fetch-err verdict for a book where
+        every attempt genuinely errored."""
+        r = {"comp_count_total": 0,
+             "queries_used": [
+                 {"tier": "base", "nkw": "x", "page": 1,
+                  "outcome": "error:ConnectionError", "error": "refused"},
+                 {"tier": "base", "nkw": "x", "page": 1,
+                  "outcome": "error:HTTPError", "error": "503"},
+             ]}
+        assert fmv_runner._is_fetch_error(r) is True
+
+    def test_bui537_shaped_success_entry_never_misclassified_as_fetch_error(self):
+        """BUI-537 adversarial check: the new 'page'/'outcome' fields added to
+        EVERY entry (including successes) must never cause a successful book
+        to be misread as fetch-err — a live/hit success entry has no 'error'
+        key regardless of the new fields, so `all(q.get('error') ...)` must
+        still be False the moment even one entry is a clean success, even
+        when earlier attempts for the SAME tier errored (retry-then-succeed)."""
+        r = {"comp_count_total": 3,
+             "queries_used": [
+                 {"tier": "base", "nkw": "x", "page": 1,
+                  "outcome": "error:HTTPError", "error": "503"},
+                 {"tier": "base", "nkw": "x", "raw_results": 3, "new_comps": 3,
+                  "cached": False, "ebay_url": "ok", "page": 1,
+                  "outcome": "live"},
+             ]}
+        assert fmv_runner._is_fetch_error(r) is False
+
     def test_table_renders_fetch_err_distinct_from_na(self, capsys):
         """The printed table must mark a fetch-failed book 'fetch-err', not the
         same 'n/a' a legitimately empty book gets, and warn loudly."""
@@ -981,6 +1013,91 @@ class TestFetchErrDoesNotTouchDbRow:
                 server_url=server_url)
             upsert_mock.assert_called_once()
         assert out["source"] == "fresh"
+
+
+# ─── BUI-535: breaker_tripped passthrough ─────────────────────────────────────
+
+class TestBreakerTrippedPassthrough:
+    """_compute_and_upsert_one must thread ebay-sold-comps' `breaker_tripped`
+    flag onto every return path — the field comic-fmv's own --out/stdout
+    surface to distinguish 'outage' from 'priced' (BUI-535)."""
+
+    def test_defaults_false_when_absent(self, server_url):
+        """Back-compat: an older ebay-sold-comps that never sends the field
+        must not crash and must default to False, not None/missing."""
+        result = {"input": {"title": "X", "issue": "1", "year": 1990,
+                            "grade": 8.0},
+                  "comps": [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]}
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        assert out["breaker_tripped"] is False
+
+    def test_true_on_fresh_priced_row(self, server_url):
+        comps = [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]
+        result = {"input": {"title": "X", "issue": "1", "year": 1990,
+                            "grade": 8.0},
+                  "comps": comps, "breaker_tripped": True}
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+        assert out["breaker_tripped"] is True
+        assert out["source"] == "fresh"
+
+    def test_true_on_no_grade_error_row(self, server_url):
+        result = {"input": {"title": "X", "issue": "1"}, "comps": [],
+                  "breaker_tripped": True}
+        out = fmv_runner._compute_and_upsert_one(
+            result, {"title": "X", "issue": "1"}, server_url=server_url)
+        assert out["breaker_tripped"] is True
+        assert out["source"] == "error"
+
+    def test_true_on_fetch_err_row(self, server_url):
+        """The fetch-err path (BUI-536) and the breaker-tripped flag (BUI-535)
+        are independent signals that both need to survive on the same row —
+        a breaker-skipped book IS a fetch-err (BUI-536's guard) AND carries
+        breaker_tripped=True (this ticket) simultaneously."""
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 8.0},
+            "comps": [],
+            "queries_used": [{"tier": "base", "page": 1,
+                              "outcome": "error:BreakerTrippedError",
+                              "error": "breaker tripped"}],
+            "breaker_tripped": True,
+        }
+        with patch("fmv_runner._upsert_fmv") as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                result, {"title": "X", "issue": "1", "grade": 8.0},
+                server_url=server_url)
+            upsert_mock.assert_not_called()
+        assert out["breaker_tripped"] is True
+        assert out["source"] == "error"
+        assert "fetch-err" in out["error"]
+
+    def test_stitch_defaults_false_for_cached_and_error_rows(self):
+        book = _make_book("a", "A", "1", 1990, 9.0)
+        cached = {0: {"fmv_low": 5, "fmv_high": 10, "fmv_comps": 5,
+                      "fmv_confidence": "low",
+                      "title": "A", "issue": "1", "year": 1990, "grade": 9.0}}
+        out = fmv_runner._stitch([book], cached, {})
+        assert out[0]["breaker_tripped"] is False
+
+        out_err = fmv_runner._stitch([book], {}, {})
+        assert out_err[0]["breaker_tripped"] is False
+
+    def test_print_table_surfaces_breaker_tripped_summary(self, capsys):
+        rows = [
+            {"input": {"title": "X", "issue": "1", "grade": 9.0},
+             "fmv": {"fmv_low": None}, "comp_count_total": 0,
+             "queries_used": [{"tier": "base", "error": "breaker tripped"}],
+             "source": "error", "breaker_tripped": True},
+        ]
+        fmv_runner._print_table(rows)
+        out = capsys.readouterr()
+        combined = out.out + out.err
+        assert "circuit breaker tripped" in combined.lower()
 
 
 # ─── _upsert_fmv ──────────────────────────────────────────────────────────────

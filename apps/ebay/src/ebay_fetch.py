@@ -172,6 +172,7 @@ def retry_request(
     retry_network_errors,
     network_error_context=None,
     status_retry_message=None,
+    on_attempt=None,
 ):
     """Drive the exponential-backoff retry loop shared by every network call
     in this module.
@@ -202,6 +203,16 @@ def retry_request(
       error rather than spending the retry budget on it; BUI-323 preserves
       that existing drift as-is rather than changing behavior beyond its one
       intended fix (fetch_item_with_status(), below).
+
+    BUI-537: `on_attempt(attempt, resp, exc)` (optional; default None, so
+    every pre-existing caller is unaffected) is called once for each attempt
+    that this loop is about to SUPERSEDE with a further attempt — i.e. every
+    charged-but-invisible-to-the-caller retry (a retryable-status response, or
+    a network exception about to be retried). It is deliberately NOT called
+    for the terminal attempt (the one ultimately returned or raised) — that
+    one is already visible to the caller via this function's normal return
+    value / raised exception, so calling the hook there too would double
+    report the same charge. Exactly one of `resp`/`exc` is non-None per call.
     """
     if retries < 1:
         raise ValueError("retries must allow at least one attempt")
@@ -214,6 +225,8 @@ def retry_request(
                 raise
             if attempt < retries - 1:
                 wait = 2 ** attempt
+                if on_attempt is not None:
+                    on_attempt(attempt, None, exc)
                 if network_error_context:
                     print(
                         f"Network error {network_error_context}: {exc}, "
@@ -229,6 +242,8 @@ def retry_request(
 
         if attempt < retries - 1:
             wait = 2 ** attempt
+            if on_attempt is not None:
+                on_attempt(attempt, resp, None)
             if status_retry_message:
                 print(
                     f"{status_retry_message(resp.status_code)}, retrying in {wait}s...",

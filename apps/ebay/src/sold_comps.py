@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,6 +65,16 @@ GRADE_TAGGED_THRESHOLD = 10    # add grade-targeted query if base returns fewer
 # ebay_fetch.retry_request() helper (BUI-333) — only the attempt count stays
 # a fetch()-local knob.
 FETCH_MAX_RETRIES = 3
+
+# BUI-535: consecutive LIVE (charged) SerpApi errors — since the last live
+# success, across the whole batch — before the circuit breaker trips and the
+# rest of the batch is served cache-only. Calibrated against the 2026-07-24
+# outage replay (~48 charged searches, every one erroring): tripping at 5
+# keeps total spend on a full-outage batch in the low tens rather than the
+# high forties. Some overshoot beyond exactly 5 is expected and fine — with
+# DEFAULT_MAX_WORKERS concurrent workers, several requests can already be in
+# flight before any of them observes the newly-tripped state.
+CIRCUIT_BREAKER_THRESHOLD = 5
 
 
 # ─── SERPAPI_KEY loader ──────────────────────────────────────────────────────
@@ -409,21 +420,167 @@ class SerpApiError(Exception):
     pass
 
 
+class BreakerTrippedError(SerpApiError):
+    """BUI-535: raised by fetch() when the batch circuit breaker has already
+    tripped and no cache entry covers this query. Subclasses SerpApiError so
+    every existing `except (SerpApiError, requests.RequestException)` site
+    (fetch_book_comps._run, in particular) keeps catching it unchanged — from
+    every caller's point of view this is an ordinary fetch failure, just one
+    that never actually reached SerpApi."""
+
+
+class _CircuitBreaker:
+    """BUI-535: batch-scoped SerpApi outage circuit breaker.
+
+    One instance is created per `run_batch()` call and threaded explicitly
+    into every `fetch_book_comps()`/`fetch()` call for that batch (via the
+    `breaker=` kwarg) — NOT a module-level singleton, so each fresh batch
+    starts clean regardless of what happened in a previous run.
+
+    "Consecutive" is defined globally across the whole batch, not per-thread
+    or per-book: K live (charged) SerpApi errors with no live success in
+    between, counted since the last live success (or since the batch began).
+    A cache hit neither trips nor resets it — only a genuine live SerpApi
+    round trip counts, whether it's the winning attempt of a `fetch()` call or
+    one of that call's own superseded internal retries (see `fetch()`'s
+    `record_attempt`/`on_attempt` wiring) — each one is a real SerpApi charge.
+
+    Thread-safety: every read/mutation of the counter and `tripped` happens
+    under one lock, so two threads whose live-errors land at the same instant
+    can't both independently conclude "I'm the one crossing the threshold" —
+    record_error() prints the one-time loud warning INSIDE the same locked
+    critical section that detects the crossing, so it is structurally
+    impossible for two threads to both print it.
+
+    Once tripped, stays tripped for the rest of this batch — it does not
+    un-trip if SerpApi recovers mid-batch (see record_success()). Recovery is
+    a fresh process/run_batch() call (a new, untripped breaker), matching the
+    "re-run later" guidance in the printed warning.
+    """
+
+    def __init__(self, threshold: int = CIRCUIT_BREAKER_THRESHOLD, *,
+                 total_books: int = 0):
+        self.threshold = threshold
+        self._lock = threading.Lock()
+        self._consecutive_errors = 0
+        self.tripped = False
+        self._total_books = total_books
+        self._completed_books = 0
+
+    def should_skip_live(self) -> bool:
+        with self._lock:
+            return self.tripped
+
+    def record_success(self) -> None:
+        """A genuine LIVE (charged) SerpApi call succeeded — resets the
+        streak. Does not clear `tripped`: once tripped, this batch stays
+        cache-only for the remainder (see class docstring)."""
+        with self._lock:
+            self._consecutive_errors = 0
+
+    def record_error(self) -> None:
+        """A genuine LIVE (charged) SerpApi call failed. Trips the breaker
+        and prints the one-time loud stderr warning the instant the
+        threshold is crossed — see class docstring for why this can only
+        ever fire once."""
+        with self._lock:
+            if self.tripped:
+                return
+            self._consecutive_errors += 1
+            if self._consecutive_errors >= self.threshold:
+                self.tripped = True
+                remaining = max(self._total_books - self._completed_books, 0)
+                print(
+                    "SerpApi appears down — "
+                    f"{self._consecutive_errors} consecutive errors, circuit "
+                    "breaker tripped (BUI-535). Skipping live fetches for "
+                    f"the remaining ~{remaining} book(s) in this batch "
+                    "(cache-only from here); re-run later.",
+                    file=sys.stderr,
+                )
+
+    def book_completed(self) -> None:
+        """Called once per book as its future finishes — feeds the `remaining
+        ~N book(s)` estimate above. Approximate by nature under concurrency
+        (several books may already be in flight when the trip happens), which
+        is fine for an informational warning, not a correctness signal."""
+        with self._lock:
+            self._completed_books += 1
+
+
 def fetch(nkw: str, api_key: str, *, force: bool = False,
-          ttl_sec: int = DEFAULT_CACHE_TTL_SEC, page: int = 1) -> tuple[dict, bool]:
+          ttl_sec: int = DEFAULT_CACHE_TTL_SEC, page: int = 1,
+          record_attempt=None, breaker: "_CircuitBreaker | None" = None,
+          ) -> tuple[dict, bool]:
     """Fetch a SerpApi response with caching. Returns (data, cache_hit).
 
     BUI-523: `page` (default 1) selects the SerpApi page — see
     canonical_serpapi_url for why page 1 stays byte-for-byte identical to
     pre-BUI-523 behavior and page 2+ gets its own cache entry.
+
+    BUI-537: `record_attempt`, when given, is called as
+    `record_attempt(outcome: str, detail: str)` once for every internal retry
+    attempt this call supersedes with a further attempt — i.e. every SerpApi
+    charge that would otherwise be invisible to the caller. It is NOT called
+    for the terminal attempt (the one this function ultimately returns/raises
+    for) — the caller already learns that outcome from the normal return
+    value / raised exception, so calling the hook there too would double-
+    count that one charge.
+
+    BUI-535: `breaker`, when given, gates every live (charged) attempt through
+    the batch-scoped circuit breaker (see `_CircuitBreaker`): every charged
+    attempt (interim retry or terminal) reports success/failure to it, and a
+    tripped breaker short-circuits this call to a cache-only lookup (raising
+    `BreakerTrippedError` on a miss) — even under `force=True`, which
+    otherwise means "bypass the cache," but does not mean "bypass the
+    breaker."
     """
     canonical = canonical_serpapi_url(nkw, page=page)
     path = _cache_path(canonical)
 
+    cache_checked = False
     if not force:
         cached = _cache_get(path, ttl_sec)
+        cache_checked = True
         if cached is not None:
             return cached, True
+
+    if breaker is not None and breaker.should_skip_live():
+        # BUI-535: the breaker overrides --force too — once tripped, no more
+        # live SerpApi charges for the rest of this batch. Still serve a
+        # cache hit if one exists ("breaker-tripped mode must still allow
+        # cache reads") — re-check here since the `not force` branch above
+        # may have skipped the cache lookup entirely (force=True).
+        if not cache_checked:
+            cached = _cache_get(path, ttl_sec)
+            if cached is not None:
+                return cached, True
+        raise BreakerTrippedError(
+            "SerpApi circuit breaker tripped (BUI-535) — no cache entry for "
+            "this query; skipping the live fetch for the rest of this batch."
+        )
+
+    def _on_retry_attempt(attempt, resp, exc):
+        # BUI-535: every physical charge (interim or terminal) reports to the
+        # breaker — retry_request only invokes this hook when about to retry,
+        # which by construction is always an error signal.
+        if breaker is not None:
+            breaker.record_error()
+        if record_attempt is None:
+            return
+        # BUI-537: translate this superseded attempt into a trail entry. A
+        # retryable-status response has no exception object yet (retry_request
+        # only inspects status_code, never calls raise_for_status() itself) —
+        # synthesize the same HTTPError raise_for_status() would raise so the
+        # recorded outcome/class matches exactly what the terminal path would
+        # have recorded had THIS attempt been the last one.
+        if exc is not None:
+            record_attempt(f"error:{type(exc).__name__}", str(exc))
+        else:
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.RequestException as http_exc:
+                record_attempt(f"error:{type(http_exc).__name__}", str(http_exc))
 
     # BUI-333: retry/backoff routed through the shared ebay_fetch.retry_request()
     # helper rather than the hand-rolled loop this used to have. retry_request()
@@ -445,33 +602,49 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
             retries=FETCH_MAX_RETRIES,
             is_retryable_status=lambda code: code == 429 or code >= 500,
             retry_network_errors=True,
+            on_attempt=_on_retry_attempt,
         )
     except RetryExhausted as exc:
         if exc.network_error is not None:
+            # BUI-535: this IS the terminal attempt (on_attempt above is never
+            # called for it) — record it here, exactly once, before re-raising.
+            if breaker is not None:
+                breaker.record_error()
             raise exc.network_error from exc
         # Retries exhausted on a persistently retryable (429/5xx) status —
         # fall through to the same raise_for_status() call below, which
         # raises the equivalent HTTPError (same status/message a caller
-        # would have seen from the original hand-rolled loop).
+        # would have seen from the original hand-rolled loop). breaker.
+        # record_error() for THIS terminal attempt happens there (not here)
+        # to avoid double-counting it.
         resp = exc.response
-    resp.raise_for_status()
 
-    data = resp.json()
+    try:
+        resp.raise_for_status()
 
-    if "error" in data:
-        raise SerpApiError(f"SerpApi error: {data['error']}")
+        data = resp.json()
 
-    # Verify the eBay URL actually has LH_Sold=1 — SerpApi silently drops
-    # LH_* params if you pass them directly, and a missing sold filter
-    # returns active listings (FMV will be wrong, typically far too low).
-    ebay_url = data.get("search_metadata", {}).get("ebay_url", "")
-    if "LH_Sold=1" not in ebay_url:
-        raise SerpApiError(
-            f"Sold filter not applied — eBay URL missing LH_Sold=1.\n"
-            f"  ebay_url={ebay_url}\n"
-            f"  query={nkw}\n"
-            "Use show_only=Sold (LH_Sold=1 / LH_Complete=1 are silently dropped)."
-        )
+        if "error" in data:
+            raise SerpApiError(f"SerpApi error: {data['error']}")
+
+        # Verify the eBay URL actually has LH_Sold=1 — SerpApi silently drops
+        # LH_* params if you pass them directly, and a missing sold filter
+        # returns active listings (FMV will be wrong, typically far too low).
+        ebay_url = data.get("search_metadata", {}).get("ebay_url", "")
+        if "LH_Sold=1" not in ebay_url:
+            raise SerpApiError(
+                f"Sold filter not applied — eBay URL missing LH_Sold=1.\n"
+                f"  ebay_url={ebay_url}\n"
+                f"  query={nkw}\n"
+                "Use show_only=Sold (LH_Sold=1 / LH_Complete=1 are silently dropped)."
+            )
+    except (SerpApiError, requests.RequestException):
+        if breaker is not None:
+            breaker.record_error()
+        raise
+
+    if breaker is not None:
+        breaker.record_success()
 
     _cache_put(path, data)
     return data, False
@@ -655,7 +828,8 @@ def _is_slab_comp(comp: dict) -> bool:
 # ─── Per-book pipeline (three-tier query strategy) ───────────────────────────
 
 def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
-                     ttl_sec: int = DEFAULT_CACHE_TTL_SEC) -> dict:
+                     ttl_sec: int = DEFAULT_CACHE_TTL_SEC,
+                     breaker: "_CircuitBreaker | None" = None) -> dict:
     """Run the three-tier query strategy for one book.
 
     1. Base query (always): "title issue" year publisher
@@ -688,153 +862,219 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     found >= THIN_RESULTS_THRESHOLD raw comps) fires ZERO extra searches, so
     `comps` composition is byte-identical to pre-BUI-524 output whenever this
     tier doesn't fire.
-    """
-    title = book["title"]
-    issue = str(book["issue"])
-    year = book.get("year")
-    publisher = book.get("publisher")
-    variant = book.get("variant")  # BUI-304: now a query keyword, not DB-only
-    self_id = str(book.get("item_id", ""))
-    # BUI-348: opt-in graded-comp fetch for the CGC-proxy tier. Default (field
-    # absent/falsy) keeps exclude_graded=True — every existing caller's queries
-    # stay byte-for-byte identical. Only a book explicitly tagged
-    # `include_graded: true` (comic-fmv's second, proxy-only pass) drops the
-    # `-cgc -cbcs -graded -slab` terms so the CGC/CBCS slab ladder surfaces.
-    exclude_graded = not bool(book.get("include_graded"))
 
+    BUI-537/535: every tier routes through the same `_run` closure, so every
+    fetch attempt — including retry attempts that fire *inside* `fetch()` and
+    the always-on cross-check/inclusive tier — gets the same trail recording
+    and the same circuit-breaker gating. The whole body below is wrapped in a
+    try/except so an unexpected exception (e.g. a malformed `book`) still
+    returns the partial `queries_used`/`comps`/`slab_comps` trail gathered so
+    far, tagged with `error`, instead of losing it — `run_batch()`'s own
+    per-book exception boundary used to zero this to `[]` because a raised
+    exception never reached this function's normal `return` below.
+    """
     queries_used: list[dict] = []
     seen_ids: set[str] = set()
-    if self_id:
-        seen_ids.add(self_id)
     comps: list[dict] = []
     # BUI-524: populated only when the tier-4 inclusive pass fires; a genuine
     # CGC/CBCS slab comp lands here instead of `comps` (see `_is_slab_comp`).
     slab_comps: list[dict] = []
 
-    def _run(tier: str, nkw: str, *, page: int = 1, route_slabs: bool = False) -> dict:
-        try:
-            if page == 1:
-                data, cache_hit = fetch(nkw, api_key, force=force, ttl_sec=ttl_sec)
-            else:
-                # BUI-523: only the gated page-2 fetch below ever passes
-                # page != 1 — kept as a separate branch (rather than always
-                # forwarding page=page) so every pre-BUI-523 call site here
-                # calls fetch() with the exact same args it always did.
-                data, cache_hit = fetch(nkw, api_key, force=force, ttl_sec=ttl_sec, page=page)
-        except (SerpApiError, requests.RequestException) as e:
-            entry = {"tier": tier, "nkw": nkw, "error": str(e)}
-            if page != 1:
-                entry["page"] = page
-            queries_used.append(entry)
-            return {"added": 0, "has_next_page": False}
-        added = 0
-        for r in data.get("organic_results", []):
-            comp = parse_comp(r)
-            if comp is None or not comp["product_id"]:
-                continue
-            if comp["product_id"] in seen_ids:
-                continue
-            if hard_exclude(comp["title"]):
-                continue
-            seen_ids.add(comp["product_id"])
-            # BUI-524: only the inclusive tier passes route_slabs=True — every
-            # other tier's behavior (add every non-excluded comp to `comps`) is
-            # byte-for-byte unchanged. A slab comp is counted toward `added`
-            # (queries_used stays an honest "how many new things this query
-            # found" signal) but never joins the raw `comps` pool.
-            if route_slabs and _is_slab_comp(comp):
-                slab_comps.append(comp)
+    def _breaker_tripped() -> bool:
+        return bool(breaker.tripped) if breaker is not None else False
+
+    try:
+        title = book["title"]
+        issue = str(book["issue"])
+        year = book.get("year")
+        publisher = book.get("publisher")
+        variant = book.get("variant")  # BUI-304: now a query keyword, not DB-only
+        self_id = str(book.get("item_id", ""))
+        # BUI-348: opt-in graded-comp fetch for the CGC-proxy tier. Default
+        # (field absent/falsy) keeps exclude_graded=True — every existing
+        # caller's queries stay byte-for-byte identical. Only a book explicitly
+        # tagged `include_graded: true` (comic-fmv's second, proxy-only pass)
+        # drops the `-cgc -cbcs -graded -slab` terms so the CGC/CBCS slab
+        # ladder surfaces.
+        exclude_graded = not bool(book.get("include_graded"))
+
+        if self_id:
+            seen_ids.add(self_id)
+
+        def _run(tier: str, nkw: str, *, page: int = 1, route_slabs: bool = False) -> dict:
+            def _record_retry_attempt(outcome: str, detail: str) -> None:
+                # BUI-537: a retry attempt this call's own fetch() call made
+                # internally and then superseded (a further attempt followed)
+                # — a real SerpApi charge that would otherwise be invisible.
+                queries_used.append({
+                    "tier": tier,
+                    "nkw": nkw,
+                    "page": page,
+                    "outcome": outcome,
+                    "error": detail,
+                })
+
+            try:
+                # BUI-523 note: page defaults to 1, so always forwarding
+                # page=page is byte-identical to the old page==1 branch that
+                # omitted the kwarg — collapsed now that this call also needs
+                # to thread record_attempt/breaker uniformly.
+                data, cache_hit = fetch(
+                    nkw, api_key, force=force, ttl_sec=ttl_sec, page=page,
+                    record_attempt=_record_retry_attempt, breaker=breaker,
+                )
+            except (SerpApiError, requests.RequestException) as e:
+                # BUI-537: page (int) and outcome are now always present,
+                # including on page-1 entries — tier/nkw/error unchanged for
+                # back-compat (BUI-536's _is_fetch_error keys on 'error').
+                queries_used.append({
+                    "tier": tier,
+                    "nkw": nkw,
+                    "page": page,
+                    "outcome": f"error:{type(e).__name__}",
+                    "error": str(e),
+                })
+                return {"added": 0, "has_next_page": False}
+            added = 0
+            for r in data.get("organic_results", []):
+                comp = parse_comp(r)
+                if comp is None or not comp["product_id"]:
+                    continue
+                if comp["product_id"] in seen_ids:
+                    continue
+                if hard_exclude(comp["title"]):
+                    continue
+                seen_ids.add(comp["product_id"])
+                # BUI-524: only the inclusive tier passes route_slabs=True —
+                # every other tier's behavior (add every non-excluded comp to
+                # `comps`) is byte-for-byte unchanged. A slab comp is counted
+                # toward `added` (queries_used stays an honest "how many new
+                # things this query found" signal) but never joins the raw
+                # `comps` pool.
+                if route_slabs and _is_slab_comp(comp):
+                    slab_comps.append(comp)
+                    added += 1
+                    continue
+                comps.append(comp)
                 added += 1
-                continue
-            comps.append(comp)
-            added += 1
-        entry = {
-            "tier": tier,
-            "nkw": nkw,
-            "raw_results": len(data.get("organic_results", [])),
-            "new_comps": added,
-            "cached": cache_hit,
-            "ebay_url": data.get("search_metadata", {}).get("ebay_url", ""),
+            queries_used.append({
+                "tier": tier,
+                "nkw": nkw,
+                "raw_results": len(data.get("organic_results", [])),
+                "new_comps": added,
+                "cached": cache_hit,
+                "ebay_url": data.get("search_metadata", {}).get("ebay_url", ""),
+                "page": page,
+                "outcome": "hit" if cache_hit else "live",
+            })
+            return {"added": added, "has_next_page": _has_next_page(data)}
+
+        # Tier 1 — base
+        base_nkw = build_query(title, issue, year=year, publisher=publisher,
+                               variant=variant, exclude_graded=exclude_graded)
+        base_result = _run("base", base_nkw)
+
+        # BUI-523: gated page-2 fetch of the SAME base query — see the
+        # fetch_book_comps docstring for the full spend-gate rationale. Placed
+        # here (before tiers 2/3) so any comps it adds are already in `comps`
+        # when tiers 2/3 recompute their own thin/grade-tagged counts below.
+        grade_tagged_after_base = sum(1 for c in comps if c["grade"] is not None)
+        if base_result["has_next_page"] and grade_tagged_after_base < GRADE_TAGGED_THRESHOLD:
+            _run("base", base_nkw, page=2)
+
+        # Tier 2 — auto-broaden if thin. BUI-350: pass the real `vintage_year`
+        # (even though the query text drops `year`) so a rebootable-masthead
+        # vintage key's broadened query keeps the BUI-347 exclusion terms —
+        # this applies to the CGC-proxy graded pass (`include_graded=True`)
+        # just as much as the ordinary raw pass, since both share this same
+        # tier.
+        if len(comps) < THIN_RESULTS_THRESHOLD and year:
+            broader_nkw = build_query(title, issue, year=None, publisher=publisher,
+                                      variant=variant, exclude_graded=exclude_graded,
+                                      vintage_year=year)
+            _run("broader", broader_nkw)
+
+        # Tier 3 — grade-targeted if too few grade-tagged comps in pool so far
+        target_grade = book.get("grade")
+        if isinstance(target_grade, str):
+            target_grade = parse_grade(target_grade)
+        grade_tagged = sum(1 for c in comps if c["grade"] is not None)
+        if target_grade is not None and grade_tagged < GRADE_TAGGED_THRESHOLD:
+            label = _grade_label_for_query(target_grade)
+            if label:
+                grade_nkw = build_query(title, issue, year=year, publisher=publisher,
+                                        variant=variant, grade_label=label,
+                                        exclude_graded=exclude_graded)
+                _run("grade-targeted", grade_nkw)
+
+        # Tier 4 — conditional inclusive pass (BUI-524). See the
+        # fetch_book_comps docstring for the full rationale. Gated tightly
+        # against the 250/month SerpApi quota: fires only for a vintage book
+        # (own cover year, not the query-text year tiers 2/3 may have
+        # dropped) whose raw pool is STILL thin after tiers 1-3, and only on
+        # a normal (non-`include_graded`) call — an explicit graded-only pass
+        # already runs every tier inclusive, so a 4th inclusive tier there
+        # would be pure duplicate spend.
+        is_vintage = isinstance(year, (int, float)) and year < _VINTAGE_YEAR_CUTOFF
+        if exclude_graded and is_vintage and len(comps) < THIN_RESULTS_THRESHOLD:
+            inclusive_nkw = build_query(title, issue, year=year, publisher=publisher,
+                                        variant=variant, exclude_graded=False,
+                                        vintage_year=year)
+            _run("inclusive", inclusive_nkw, route_slabs=True)
+
+        out_input = {
+            "item_id": self_id or None,
+            "title": title,
+            "issue": issue,
+            "year": year,
+            "publisher": publisher,
+            "grade": target_grade,
         }
-        if page != 1:
-            entry["page"] = page
-        queries_used.append(entry)
-        return {"added": added, "has_next_page": _has_next_page(data)}
-
-    # Tier 1 — base
-    base_nkw = build_query(title, issue, year=year, publisher=publisher,
-                           variant=variant, exclude_graded=exclude_graded)
-    base_result = _run("base", base_nkw)
-
-    # BUI-523: gated page-2 fetch of the SAME base query — see the
-    # fetch_book_comps docstring for the full spend-gate rationale. Placed
-    # here (before tiers 2/3) so any comps it adds are already in `comps`
-    # when tiers 2/3 recompute their own thin/grade-tagged counts below.
-    grade_tagged_after_base = sum(1 for c in comps if c["grade"] is not None)
-    if base_result["has_next_page"] and grade_tagged_after_base < GRADE_TAGGED_THRESHOLD:
-        _run("base", base_nkw, page=2)
-
-    # Tier 2 — auto-broaden if thin. BUI-350: pass the real `vintage_year`
-    # (even though the query text drops `year`) so a rebootable-masthead
-    # vintage key's broadened query keeps the BUI-347 exclusion terms — this
-    # applies to the CGC-proxy graded pass (`include_graded=True`) just as
-    # much as the ordinary raw pass, since both share this same tier.
-    if len(comps) < THIN_RESULTS_THRESHOLD and year:
-        broader_nkw = build_query(title, issue, year=None, publisher=publisher,
-                                  variant=variant, exclude_graded=exclude_graded,
-                                  vintage_year=year)
-        _run("broader", broader_nkw)
-
-    # Tier 3 — grade-targeted if too few grade-tagged comps in pool so far
-    target_grade = book.get("grade")
-    if isinstance(target_grade, str):
-        target_grade = parse_grade(target_grade)
-    grade_tagged = sum(1 for c in comps if c["grade"] is not None)
-    if target_grade is not None and grade_tagged < GRADE_TAGGED_THRESHOLD:
-        label = _grade_label_for_query(target_grade)
-        if label:
-            grade_nkw = build_query(title, issue, year=year, publisher=publisher,
-                                    variant=variant, grade_label=label,
-                                    exclude_graded=exclude_graded)
-            _run("grade-targeted", grade_nkw)
-
-    # Tier 4 — conditional inclusive pass (BUI-524). See the fetch_book_comps
-    # docstring for the full rationale. Gated tightly against the 250/month
-    # SerpApi quota: fires only for a vintage book (own cover year, not the
-    # query-text year tiers 2/3 may have dropped) whose raw pool is STILL thin
-    # after tiers 1-3, and only on a normal (non-`include_graded`) call — an
-    # explicit graded-only pass already runs every tier inclusive, so a 4th
-    # inclusive tier there would be pure duplicate spend.
-    is_vintage = isinstance(year, (int, float)) and year < _VINTAGE_YEAR_CUTOFF
-    if exclude_graded and is_vintage and len(comps) < THIN_RESULTS_THRESHOLD:
-        inclusive_nkw = build_query(title, issue, year=year, publisher=publisher,
-                                    variant=variant, exclude_graded=False,
-                                    vintage_year=year)
-        _run("inclusive", inclusive_nkw, route_slabs=True)
-
-    out_input = {
-        "item_id": self_id or None,
-        "title": title,
-        "issue": issue,
-        "year": year,
-        "publisher": publisher,
-        "grade": target_grade,
-    }
-    # BUI-174/187: echo back the caller's correlation id (when present) so a
-    # batch driver can map results to inputs by identity, not list position.
-    # A bare item_id is not reliable (may be absent or shared), so the id is a
-    # dedicated field threaded by the caller; standalone callers omit it.
-    req_id = book.get("_req_id")
-    if req_id is not None:
-        out_input["_req_id"] = req_id
-    return {
-        "input": out_input,
-        "queries_used": queries_used,
-        "comps": comps,
-        # BUI-524: always present (shape parity) — empty unless the tier-4
-        # inclusive pass fired and found genuine CGC/CBCS slab comps.
-        "slab_comps": slab_comps,
-    }
+        # BUI-174/187: echo back the caller's correlation id (when present) so
+        # a batch driver can map results to inputs by identity, not list
+        # position. A bare item_id is not reliable (may be absent or shared),
+        # so the id is a dedicated field threaded by the caller; standalone
+        # callers omit it.
+        req_id = book.get("_req_id")
+        if req_id is not None:
+            out_input["_req_id"] = req_id
+        return {
+            "input": out_input,
+            "queries_used": queries_used,
+            "comps": comps,
+            # BUI-524: always present (shape parity) — empty unless the
+            # tier-4 inclusive pass fired and found genuine CGC/CBCS slab
+            # comps.
+            "slab_comps": slab_comps,
+            # BUI-535: whether the batch-scoped breaker had tripped by the
+            # time this book finished — surfaced so callers (comic-fmv, a
+            # human skimming --out) can distinguish "outage" from "priced".
+            "breaker_tripped": _breaker_tripped(),
+        }
+    except Exception as e:  # noqa: BLE001 — BUI-537: preserve the partial
+        # trail rather than losing it; see the docstring above. `book.get(...)`
+        # throughout (not the local `title`/`issue`/... names) because those
+        # may never have been assigned if the exception fired before they
+        # were (e.g. a missing "title"/"issue" key).
+        out_input = {
+            "item_id": (str(book.get("item_id")) if book.get("item_id") else None),
+            "title": book.get("title"),
+            "issue": (str(book.get("issue")) if book.get("issue") is not None else None),
+            "year": book.get("year"),
+            "publisher": book.get("publisher"),
+            "grade": book.get("grade"),
+        }
+        req_id = book.get("_req_id")
+        if req_id is not None:
+            out_input["_req_id"] = req_id
+        return {
+            "input": out_input,
+            "queries_used": queries_used,
+            "comps": comps,
+            "slab_comps": slab_comps,
+            "breaker_tripped": _breaker_tripped(),
+            "error": str(e),
+        }
 
 
 def _grade_label_for_query(grade: float) -> str | None:
@@ -860,23 +1100,43 @@ def _grade_label_for_query(grade: float) -> str | None:
 def run_batch(books: list[dict], api_key: str, *, force: bool = False,
               ttl_sec: int = DEFAULT_CACHE_TTL_SEC,
               max_workers: int = DEFAULT_MAX_WORKERS) -> list[dict]:
-    """Fan out across books with a thread pool."""
+    """Fan out across books with a thread pool.
+
+    BUI-535: one `_CircuitBreaker` is created here and threaded explicitly
+    into every `fetch_book_comps()` call for this batch — scoped to this one
+    `run_batch()` call, not a module-level singleton, so a fresh invocation
+    (e.g. a re-run after "SerpApi appears down") always starts with a clean,
+    untripped breaker. `force` does not exempt a book from it (see fetch()).
+    """
     results: list[dict] = [None] * len(books)
+    breaker = _CircuitBreaker(CIRCUIT_BREAKER_THRESHOLD, total_books=len(books))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(fetch_book_comps, b, api_key, force=force, ttl_sec=ttl_sec): i
+            pool.submit(fetch_book_comps, b, api_key, force=force, ttl_sec=ttl_sec,
+                       breaker=breaker): i
             for i, b in enumerate(books)
         }
         for fut in as_completed(futures):
             i = futures[fut]
+            breaker.book_completed()
             try:
                 results[i] = fut.result()
             except Exception as e:  # noqa: BLE001  # batch boundary — capture per-book errors, continue
+                # BUI-537: fetch_book_comps() now catches its own exceptions
+                # internally and always returns a dict carrying whatever
+                # partial queries_used/comps trail it had gathered (see its
+                # docstring) — this branch should be effectively unreachable
+                # in normal operation. Kept only as a last-resort guard for a
+                # truly catastrophic failure that never even reached
+                # fetch_book_comps's own try/except (e.g. the future itself
+                # being cancelled) — there's no partial trail to recover here
+                # since it lives inside that function's local scope.
                 book = books[i]
                 results[i] = {
                     "input": book,
                     "queries_used": [],
                     "comps": [],
+                    "breaker_tripped": bool(breaker.tripped),
                     "error": str(e),
                 }
     return results
@@ -898,14 +1158,30 @@ def _print_human(results: list[dict]) -> None:
         # BUI-523: a page-2 entry shares its tier's name (e.g. "base") with
         # its own page-1 entry — tag it "(pN)" here so a human skimming
         # --quiet=false output can see the gated extra-page fetch fired,
-        # without changing the stored "tier"/"page" fields other consumers read.
+        # without changing the stored "tier"/"page" fields other consumers
+        # read. BUI-537 made `page` always present (including page 1) — only
+        # tag when it's not the implicit default, or every entry would show
+        # "(p1)".
         tiers = ",".join(
-            f'{q["tier"]}(p{q["page"]})' if q.get("page") else q["tier"]
+            f'{q["tier"]}(p{q["page"]})' if q.get("page", 1) != 1 else q["tier"]
             for q in r["queries_used"]
         )
         cached = sum(1 for q in r["queries_used"] if q.get("cached"))
+        breaker_note = " [breaker-tripped]" if r.get("breaker_tripped") else ""
         print(f"  {label}: {n_total} comps ({n_graded} grade-tagged) "
-              f"tiers=[{tiers}] cached={cached}/{len(r['queries_used'])}")
+              f"tiers=[{tiers}] cached={cached}/{len(r['queries_used'])}{breaker_note}")
+
+    # BUI-535: aggregate stdout visibility (distinct from the one-time stderr
+    # warning _CircuitBreaker.record_error() prints the instant it trips) —
+    # so a human skimming --quiet=false output sees the batch was affected
+    # even if they missed the stderr line.
+    n_breaker_tripped = sum(1 for r in results if r.get("breaker_tripped"))
+    if n_breaker_tripped:
+        print(
+            f"\n  SerpApi circuit breaker tripped during this batch — "
+            f"{n_breaker_tripped} book(s) served cache-only or fetch-err; "
+            "re-run later."
+        )
 
 
 def _read_batch(path: str) -> list[dict]:

@@ -657,13 +657,19 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     inp = {**inp, **overrides}
     comps = result.get("comps", [])
 
+    # BUI-535: whether the ebay-sold-comps circuit breaker had tripped by the
+    # time this book's fetch finished — threaded through every return path
+    # below so comic-fmv's own --out/stdout can surface it (see run()'s
+    # summary and _print_table).
+    breaker_tripped = bool(result.get("breaker_tripped"))
+
     target_grade = inp.get("grade")
     if target_grade is None:
         return {
             "input": inp, "fmv": None, "comp_count_total": len(comps),
             "queries_used": result.get("queries_used", []),
             "db_row": None, "comic_id": None, "fmv_id": None,
-            "source": "error",
+            "source": "error", "breaker_tripped": breaker_tripped,
             "error": "no target grade in input",
         }
     if isinstance(target_grade, str):
@@ -678,7 +684,7 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
                 "input": inp, "fmv": None, "comp_count_total": len(comps),
                 "queries_used": result.get("queries_used", []),
                 "db_row": None, "comic_id": None, "fmv_id": None,
-                "source": "error",
+                "source": "error", "breaker_tripped": breaker_tripped,
                 "error": f"unrecognized grade string: {target_grade!r}",
             }
         target_grade = coerced
@@ -701,7 +707,7 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
             "input": inp, "fmv": None, "comp_count_total": len(comps),
             "queries_used": result.get("queries_used", []),
             "db_row": None, "comic_id": None, "fmv_id": None,
-            "source": "error",
+            "source": "error", "breaker_tripped": breaker_tripped,
             "error": "fetch-err: all tiers failed; fmv DB row left "
                      "untouched (BUI-536)",
         }
@@ -746,7 +752,7 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
         "input": inp, "fmv": fmv, "comp_count_total": len(comps),
         "queries_used": result.get("queries_used", []),
         "db_row": upserted, "comic_id": comic_id, "fmv_id": fmv_id,
-        "source": "fresh",
+        "source": "fresh", "breaker_tripped": breaker_tripped,
         # BUI-529: thread through any slab comps ebay-sold-comps' BUI-524
         # inclusive tier already fetched (empty when that tier never fired),
         # so the cross-check below can reuse them instead of a dedicated
@@ -873,6 +879,13 @@ def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
         result = by_id.get(idx)
         if result is None:
             continue  # no graded result for this book — leave needs_manual
+        # BUI-535: this graded-only pass is its own separate ebay-sold-comps
+        # subprocess invocation with its own fresh circuit breaker — it can
+        # trip independently of the primary raw-pass breaker. OR it into the
+        # book's flag (never clear an already-True flag from the primary
+        # pass) so a trip on EITHER pass surfaces in the final result.
+        if result.get("breaker_tripped"):
+            fresh_fmvs[idx]["breaker_tripped"] = True
         graded_comps = _slab_comps_only(result.get("comps") or [])
         inp = fresh_fmvs[idx].get("input") or {}
         proxy = fmv_math.cgc_proxy_fmv(
@@ -1004,6 +1017,11 @@ def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
             result = by_id.get(idx)
             if result is not None:
                 have_ladder[idx] = _slab_comps_only(result.get("comps") or [])
+                # BUI-535: same rationale as _apply_cgc_proxy_rescue — this is
+                # its own separate ebay-sold-comps subprocess/breaker, OR it
+                # into the book's flag rather than overwrite.
+                if result.get("breaker_tripped"):
+                    fresh_fmvs[idx]["breaker_tripped"] = True
 
     for idx, graded_comps in have_ladder.items():
         inp = fresh_fmvs[idx].get("input") or {}
@@ -1263,6 +1281,7 @@ def _stitch(books: list[dict], cached: dict[int, dict],
                 "queries_used": [],
                 "db_row": row,
                 "source": "cached",
+                "breaker_tripped": False,
             })
         elif i in skipped_hand:
             row = skipped_hand[i]
@@ -1273,6 +1292,7 @@ def _stitch(books: list[dict], cached: dict[int, dict],
                 "queries_used": [],
                 "db_row": row,
                 "source": "skipped_hand_priced",
+                "breaker_tripped": False,
             })
         elif i in fresh:
             out.append(fresh[i])
@@ -1284,6 +1304,7 @@ def _stitch(books: list[dict], cached: dict[int, dict],
                 "queries_used": [],
                 "db_row": None,
                 "source": "error",
+                "breaker_tripped": False,
                 "error": "no comps fetched and no cache",
             })
     return out
@@ -1593,4 +1614,16 @@ def _print_table(rows: list[dict]) -> None:
             f"FAILED (quota exhausted or outage), NOT zero comps. Check the "
             f"SerpApi key/quota and re-run — do not treat these as illiquid.",
             err=True,
+        )
+
+    # BUI-535: surface a tripped ebay-sold-comps circuit breaker on STDOUT
+    # (distinct from that subprocess's own one-time stderr warning) so an
+    # operator reading only the human table/summary still learns the batch
+    # was affected — "outage", not "priced".
+    n_breaker_tripped = sum(1 for r in rows if r.get("breaker_tripped"))
+    if n_breaker_tripped:
+        click.echo(
+            f"\nSerpApi circuit breaker tripped during this run — "
+            f"{n_breaker_tripped} book(s) affected (served cache-only or "
+            "fetch-err). Re-run later once SerpApi recovers."
         )
