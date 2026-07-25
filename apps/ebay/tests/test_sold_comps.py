@@ -5,6 +5,7 @@ a mocked requests.get; no real SerpApi calls happen in CI.
 """
 
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -751,7 +752,7 @@ class TestTieredStrategy:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             calls.append(nkw)
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
@@ -991,7 +992,7 @@ class TestGatedPagination:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             calls.append({"nkw": nkw, "page": page})
             if page == 1:
                 # No grade tokens in the titles -> 0 grade-tagged, well under
@@ -1024,7 +1025,7 @@ class TestGatedPagination:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             calls.append(page)
             assert page == 1, "must never request page 2 when page 1 wasn't full"
             results = [self._comp(str(i)) for i in range(3)]
@@ -1043,7 +1044,7 @@ class TestGatedPagination:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             calls.append(page)
             n = sc.GRADE_TAGGED_THRESHOLD + 2  # comfortably >= threshold
             results = [self._comp(str(i), title="ASM #142 NM Marvel 1975")
@@ -1064,7 +1065,7 @@ class TestGatedPagination:
         that reappear on page 2 must not be double-counted."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             if page == 1:
                 results = [self._comp(str(i)) for i in range(55)]
                 return self._page(results, has_next=True), False
@@ -1086,7 +1087,7 @@ class TestGatedPagination:
         page-1 comps are kept, the error is recorded, nothing crashes."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             if page == 1:
                 results = [self._comp(str(i)) for i in range(55)]
                 return self._page(results, has_next=True), False
@@ -1150,7 +1151,7 @@ class TestInclusiveTier:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             calls.append(nkw)
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
@@ -1268,7 +1269,7 @@ class TestInclusiveTier:
 class TestBatch:
     def test_runs_all(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             return ({
                 "organic_results": [{
                     "product_id": "1",
@@ -1289,7 +1290,7 @@ class TestBatch:
 
     def test_records_errors_per_book(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             raise RuntimeError("kaboom")
         monkeypatch.setattr(sc, "fetch_book_comps",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -1455,7 +1456,7 @@ class TestFetchRetry:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
             raise requests.ConnectionError("refused")
 
         monkeypatch.setattr(sc, "fetch", fake_fetch)
@@ -1472,5 +1473,478 @@ class TestFetchRetry:
         errors = [q for q in out["queries_used"] if "error" in q]
         assert len(errors) >= 1
         assert "refused" in errors[0]["error"]
+
+
+# ─── BUI-537: full attempt trail (page/outcome, retry-attempt recording) ─────
+
+class TestAttemptTrail:
+    def _bad_503(self):
+        bad = MagicMock()
+        bad.status_code = 503
+        bad.raise_for_status = MagicMock(side_effect=requests.HTTPError(response=bad))
+        return bad
+
+    def _good(self, organic_results=None, ebay_url=None):
+        good = MagicMock()
+        good.status_code = 200
+        good.raise_for_status = MagicMock()
+        good.json = MagicMock(return_value={
+            "organic_results": organic_results or [],
+            "search_metadata": {"ebay_url": ebay_url or "ok&LH_Sold=1"},
+        })
+        return good
+
+    def test_success_entry_always_has_page_and_outcome(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get", return_value=self._good()):
+            out = sc.fetch_book_comps({"title": "X", "issue": "1"}, "key")
+        assert len(out["queries_used"]) == 1
+        entry = out["queries_used"][0]
+        assert entry["page"] == 1
+        assert entry["outcome"] == "live"
+
+    def test_cache_hit_entry_has_hit_outcome(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get", return_value=self._good()) as mock_get:
+            sc.fetch_book_comps({"title": "X", "issue": "1"}, "key")
+            out = sc.fetch_book_comps({"title": "X", "issue": "1"}, "key")
+        assert mock_get.call_count == 1, "second call should be a cache hit"
+        entry = out["queries_used"][0]
+        assert entry["outcome"] == "hit"
+        assert entry["page"] == 1
+
+    def test_error_entry_always_has_page_and_outcome(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        with patch("sold_comps.requests.get", side_effect=lambda *a, **k: self._bad_503()):
+            out = sc.fetch_book_comps({"title": "X", "issue": "1"}, "key")
+        assert len(out["queries_used"]) == sc.FETCH_MAX_RETRIES
+        for entry in out["queries_used"]:
+            assert entry["page"] == 1
+            assert entry["outcome"].startswith("error:")
+            assert "error" in entry
+
+    def test_fetch_err_book_records_full_attempt_trail(self, tmp_path, monkeypatch):
+        """BUI-537 acceptance: a fetch-err book shows its full attempt trail —
+        every physical SerpApi charge for the (only) tier that fires, not
+        just the last one. `title`/`issue` only (no year/grade) keeps tiers
+        2-4 from firing so the count is exactly FETCH_MAX_RETRIES."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        with patch("sold_comps.requests.get",
+                  side_effect=lambda *a, **k: self._bad_503()) as mock_get:
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+
+        assert out["comps"] == []
+        assert mock_get.call_count == sc.FETCH_MAX_RETRIES
+        # One queries_used entry per physical charge — no undercounting.
+        assert len(out["queries_used"]) == sc.FETCH_MAX_RETRIES
+        assert all(q["tier"] == "base" for q in out["queries_used"])
+        assert all("error" in q for q in out["queries_used"])
+
+    def test_retry_then_succeed_records_full_trail_no_double_count(
+        self, tmp_path, monkeypatch,
+    ):
+        """BUI-537 adversarial check: a query that fails twice then succeeds
+        must produce exactly 3 queries_used entries (2 error + 1 live) — one
+        per physical SerpApi charge, never double-counting the winning
+        (terminal) attempt via both the retry-attempt hook AND the normal
+        success path."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        call_count = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] <= 2:
+                return self._bad_503()
+            return self._good()
+
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            out = sc.fetch_book_comps({"title": "X", "issue": "1"}, "key")
+
+        assert call_count["n"] == 3
+        assert len(out["queries_used"]) == 3, out["queries_used"]
+        errors = [q for q in out["queries_used"] if "error" in q]
+        lives = [q for q in out["queries_used"] if q.get("outcome") == "live"]
+        assert len(errors) == 2
+        assert len(lives) == 1
+        assert all(q["page"] == 1 for q in out["queries_used"])
+
+    def test_record_attempt_only_fires_for_superseded_attempts(
+        self, tmp_path, monkeypatch,
+    ):
+        """Unit-level check directly on fetch(): record_attempt must be
+        called for the 503 that gets retried, but NOT for the eventual
+        successful (terminal) attempt — that one is reported via the normal
+        return value instead, so the caller (here, a plain collector) must
+        see exactly one call."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        calls = []
+
+        def fake_get(url, **kwargs):
+            if len(calls) == 0:
+                return self._bad_503()
+            return self._good()
+
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            data, cache_hit = sc.fetch(
+                "t", "key", record_attempt=lambda outcome, detail: calls.append((outcome, detail)),
+            )
+        assert cache_hit is False
+        assert len(calls) == 1
+        assert calls[0][0].startswith("error:")
+
+    def test_exhausted_retryable_status_not_double_recorded_by_run(
+        self, tmp_path, monkeypatch,
+    ):
+        """The terminal (exhausted) attempt inside fetch() is recorded ONCE
+        by _run's except-clause, not also by record_attempt — this test
+        exercises fetch_book_comps end to end (not fetch() directly) so both
+        recording paths are live simultaneously; a double-count bug would
+        show up as FETCH_MAX_RETRIES + 1 entries instead of exactly
+        FETCH_MAX_RETRIES."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        with patch("sold_comps.requests.get",
+                  side_effect=lambda *a, **k: self._bad_503()) as mock_get:
+            out = sc.fetch_book_comps({"title": "X", "issue": "1"}, "key")
+        assert mock_get.call_count == sc.FETCH_MAX_RETRIES
+        assert len(out["queries_used"]) == sc.FETCH_MAX_RETRIES
+
+
+# ─── BUI-535: batch circuit breaker ──────────────────────────────────────────
+
+class TestCircuitBreakerUnit:
+    def test_trips_after_threshold_consecutive_errors(self):
+        breaker = sc._CircuitBreaker(threshold=3)
+        breaker.record_error()
+        assert breaker.tripped is False
+        breaker.record_error()
+        assert breaker.tripped is False
+        breaker.record_error()
+        assert breaker.tripped is True
+        assert breaker.should_skip_live() is True
+
+    def test_success_resets_counter(self):
+        breaker = sc._CircuitBreaker(threshold=3)
+        breaker.record_error()
+        breaker.record_error()
+        breaker.record_success()  # reset — back to 0
+        breaker.record_error()
+        breaker.record_error()
+        assert breaker.tripped is False, "2 errors post-reset must not trip a threshold-3 breaker"
+        breaker.record_error()
+        assert breaker.tripped is True
+
+    def test_cache_hits_never_trip_or_reset(self, tmp_path, monkeypatch):
+        """Cache hits must not touch the breaker at all — fetch() should
+        never call record_error/record_success on a cache hit."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        breaker = sc._CircuitBreaker(threshold=1)
+        good = MagicMock()
+        good.status_code = 200
+        good.raise_for_status = MagicMock()
+        good.json = MagicMock(return_value={
+            "organic_results": [], "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+        })
+        with patch("sold_comps.requests.get", return_value=good) as mock_get:
+            sc.fetch("t", "key", breaker=breaker)  # live — resets/no-ops
+            sc.fetch("t", "key", breaker=breaker)  # cache hit
+        assert mock_get.call_count == 1
+        assert breaker.tripped is False
+
+    def test_warning_printed_exactly_once_on_crossing(self, capsys):
+        breaker = sc._CircuitBreaker(threshold=5)
+        for _ in range(5):
+            breaker.record_error()
+        # Further errors past the trip must not print again.
+        for _ in range(10):
+            breaker.record_error()
+        captured = capsys.readouterr()
+        assert captured.err.count("SerpApi appears down") == 1
+
+    def test_success_after_trip_does_not_untrip(self):
+        breaker = sc._CircuitBreaker(threshold=2)
+        breaker.record_error()
+        breaker.record_error()
+        assert breaker.tripped is True
+        breaker.record_success()
+        assert breaker.tripped is True, "breaker must not un-trip mid-batch"
+
+    def test_concurrent_errors_trip_exactly_once(self, capsys):
+        """Adversarial: many threads hammer record_error() concurrently —
+        the lock must ensure exactly one thread ever observes 'I just
+        crossed the threshold' and exactly one warning is printed, no matter
+        how the errors interleave."""
+        breaker = sc._CircuitBreaker(threshold=5)
+        barrier = threading.Barrier(20)
+
+        def hammer():
+            barrier.wait()
+            for _ in range(10):
+                breaker.record_error()
+
+        threads = [threading.Thread(target=hammer) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert breaker.tripped is True
+        captured = capsys.readouterr()
+        assert captured.err.count("SerpApi appears down") == 1
+
+    def test_concurrent_success_and_error_interleaving_stays_consistent(self):
+        """Adversarial: threads calling record_error() and record_success()
+        concurrently must never corrupt internal state or raise — this is an
+        invariant/fuzz check (exact tripped value is inherently racy), not a
+        deterministic-outcome check."""
+        breaker = sc._CircuitBreaker(threshold=10)
+        barrier = threading.Barrier(10)
+
+        def errors():
+            barrier.wait()
+            for _ in range(25):
+                breaker.record_error()
+
+        def successes():
+            barrier.wait()
+            for _ in range(25):
+                breaker.record_success()
+
+        threads = (
+            [threading.Thread(target=errors) for _ in range(5)]
+            + [threading.Thread(target=successes) for _ in range(5)]
+        )
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # No crash, and internal state stays sane regardless of the race.
+        assert isinstance(breaker.tripped, bool)
+        assert breaker._consecutive_errors >= 0
+
+
+class TestCircuitBreakerFetchIntegration:
+    def _bad_503(self):
+        bad = MagicMock()
+        bad.status_code = 503
+        bad.raise_for_status = MagicMock(side_effect=requests.HTTPError(response=bad))
+        return bad
+
+    def _good(self, ebay_url=None):
+        good = MagicMock()
+        good.status_code = 200
+        good.raise_for_status = MagicMock()
+        good.json = MagicMock(return_value={
+            "organic_results": [], "search_metadata": {"ebay_url": ebay_url or "ok&LH_Sold=1"},
+        })
+        return good
+
+    def test_tripped_breaker_serves_cache_without_live_call(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        breaker = sc._CircuitBreaker(threshold=1)
+        with patch("sold_comps.requests.get", return_value=self._good()) as mock_get:
+            sc.fetch("t", "key")  # populate cache (no breaker on this one)
+            assert mock_get.call_count == 1
+            breaker.record_error()  # trips immediately (threshold=1)
+            assert breaker.tripped is True
+            data, cache_hit = sc.fetch("t", "key", breaker=breaker)
+        assert cache_hit is True
+        assert mock_get.call_count == 1, "tripped breaker must not issue a live call on a cache hit"
+
+    def test_tripped_breaker_cache_miss_raises_without_live_call(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        breaker = sc._CircuitBreaker(threshold=1)
+        breaker.record_error()
+        assert breaker.tripped is True
+        with patch("sold_comps.requests.get", return_value=self._good()) as mock_get:
+            with pytest.raises(sc.BreakerTrippedError):
+                sc.fetch("uncached query", "key", breaker=breaker)
+        assert mock_get.call_count == 0, "no live charge for a breaker-tripped cache miss"
+
+    def test_force_does_not_bypass_tripped_breaker(self, tmp_path, monkeypatch):
+        """BUI-535 acceptance: --force must NOT bypass a tripped breaker."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        breaker = sc._CircuitBreaker(threshold=1)
+        with patch("sold_comps.requests.get", return_value=self._good()) as mock_get:
+            sc.fetch("t", "key")  # populate cache
+            assert mock_get.call_count == 1
+            breaker.record_error()
+            assert breaker.tripped is True
+            # force=True would normally bypass the cache and go live — the
+            # breaker must still win, serving the cache instead.
+            data, cache_hit = sc.fetch("t", "key", force=True, breaker=breaker)
+            assert cache_hit is True
+            assert mock_get.call_count == 1, "force must not buy a live call past a tripped breaker"
+            with pytest.raises(sc.BreakerTrippedError):
+                sc.fetch("uncached and forced", "key", force=True, breaker=breaker)
+            assert mock_get.call_count == 1, "force must not buy a live call on an uncached query either"
+
+    def test_breaker_tripped_field_on_fetch_book_comps_result(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        breaker = sc._CircuitBreaker(threshold=1)
+        breaker.record_error()
+        with patch("sold_comps.requests.get", return_value=self._good()):
+            out = sc.fetch_book_comps({"title": "X", "issue": "1"}, "key", breaker=breaker)
+        assert out["breaker_tripped"] is True
+        # Every entry for this book is a synthetic breaker-skip error.
+        assert all("error" in q for q in out["queries_used"])
+        assert all(q["outcome"] == "error:BreakerTrippedError" for q in out["queries_used"])
+
+    def test_breaker_trips_mid_book_between_tiers(self, tmp_path, monkeypatch):
+        """Adversarial: the breaker can trip (due to some OTHER concurrent
+        book's errors) in the gap between THIS book's own tier 1 (which
+        succeeds before the trip) and tier 2+ (which must then see
+        should_skip_live()=True and record a breaker-skip error — never
+        silently attempt a live call). The mock raises if a live call is
+        ever attempted after the simulated trip, so any regression that
+        re-checks the breaker too late (or not at all) fails loudly here."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        breaker = sc._CircuitBreaker(threshold=5)
+        call_state = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            call_state["n"] += 1
+            if call_state["n"] == 1:
+                # Tier 1 (base) succeeds but the pool stays thin (0 comps),
+                # so tier 2 (broader) is guaranteed to fire next. Simulate
+                # some OTHER concurrent book tripping the shared breaker in
+                # the gap between tier 1 and tier 2.
+                for _ in range(5):
+                    breaker.record_error()
+                good = MagicMock()
+                good.status_code = 200
+                good.raise_for_status = MagicMock()
+                good.json = MagicMock(return_value={
+                    "organic_results": [],
+                    "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+                })
+                return good
+            raise AssertionError(
+                "no live call should ever be attempted once the breaker is tripped"
+            )
+
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            out = sc.fetch_book_comps(
+                {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5},
+                "key", breaker=breaker,
+            )
+
+        assert breaker.tripped is True
+        tiers_seen = [q["tier"] for q in out["queries_used"]]
+        assert tiers_seen[0] == "base"
+        later_entries = [q for q in out["queries_used"] if q["tier"] != "base"]
+        assert later_entries, "expected at least one post-trip tier to fire"
+        assert all(q["outcome"] == "error:BreakerTrippedError" for q in later_entries)
+        assert out["breaker_tripped"] is True
+
+
+class TestCircuitBreakerBatchIntegration:
+    def _bad_503(self):
+        bad = MagicMock()
+        bad.status_code = 503
+        bad.raise_for_status = MagicMock(side_effect=requests.HTTPError(response=bad))
+        return bad
+
+    def _good(self):
+        good = MagicMock()
+        good.status_code = 200
+        good.raise_for_status = MagicMock()
+        good.json = MagicMock(return_value={
+            "organic_results": [], "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+        })
+        return good
+
+    def test_full_outage_trips_and_caps_spend(self, tmp_path, monkeypatch):
+        """BUI-535 acceptance: replay of a full-outage batch (every live call
+        errors) trips the breaker well before every book gets its full
+        FETCH_MAX_RETRIES worth of charges — total spend stays a small
+        fraction of the no-breaker cost."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        books = [{"title": "Book", "issue": str(i)} for i in range(20)]
+        no_breaker_cost = len(books) * sc.FETCH_MAX_RETRIES  # 60
+
+        with patch("sold_comps.requests.get",
+                  side_effect=lambda *a, **k: self._bad_503()) as mock_get:
+            results = sc.run_batch(books, "key", max_workers=5)
+
+        assert len(results) == len(books)
+        assert mock_get.call_count < no_breaker_cost / 2, (
+            f"expected the breaker to meaningfully cap spend below "
+            f"{no_breaker_cost / 2}, got {mock_get.call_count}"
+        )
+        assert any(r.get("breaker_tripped") for r in results)
+
+    def test_healthy_mixed_run_never_trips(self, tmp_path, monkeypatch):
+        """BUI-535 acceptance: a healthy run with occasional isolated
+        single-attempt errors (each immediately recovers on retry) must
+        never trip the breaker. max_workers=1 keeps call ordering
+        deterministic so the "isolated" failures are genuinely isolated."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        books = [{"title": "Book", "issue": str(i)} for i in range(20)]
+        # Every 7th physical call fails once, then the immediate retry (and
+        # every other call) succeeds — sporadic, not consecutive.
+        call_count = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] % 7 == 0:
+                return self._bad_503()
+            return self._good()
+
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            results = sc.run_batch(books, "key", max_workers=1)
+
+        assert len(results) == len(books)
+        assert not any(r.get("breaker_tripped") for r in results), (
+            "sporadic isolated errors among successes must never trip the breaker"
+        )
+
+    def test_tripped_breaker_does_not_recover_mid_batch(self, tmp_path, monkeypatch):
+        """Reliability: even if SerpApi 'recovers' partway through the batch
+        (later requests would succeed), once tripped this run_batch() call
+        stays cache-only for the remainder — no in-batch auto-heal. Recovery
+        is a fresh run (a new run_batch() call, a new breaker), matching the
+        printed warning's 're-run later' guidance. max_workers=1 keeps this
+        deterministic: the first several books exhaust their retries against
+        a persistent 503 (tripping the breaker), then later books' physical
+        calls would all succeed if attempted — the test's own mock instead
+        raises if any of THOSE later calls is ever actually made."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        books = [{"title": "Book", "issue": str(i)} for i in range(20)]
+        call_state = {"n": 0, "tripped_at": None}
+
+        def fake_get(url, **kwargs):
+            call_state["n"] += 1
+            # Once several books have exhausted retries the breaker will have
+            # tripped (threshold=5, single-tier books, no cache) — from that
+            # point on, fetch() must never even call this again for a live
+            # attempt (it should short-circuit to BreakerTrippedError first).
+            if call_state["n"] > sc.CIRCUIT_BREAKER_THRESHOLD * sc.FETCH_MAX_RETRIES:
+                raise AssertionError(
+                    "a live call was attempted long after the breaker should "
+                    "have tripped and stayed tripped — 'recovery' must not "
+                    "happen mid-batch"
+                )
+            return self._bad_503()
+
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            results = sc.run_batch(books, "key", max_workers=1)
+
+        assert len(results) == len(books)
+        assert any(r.get("breaker_tripped") for r in results)
+        # Every book after the trip is a fetch-err (every entry carries
+        # 'error') — none silently produced comps from a "recovered" call.
+        assert all(
+            all("error" in q for q in r["queries_used"])
+            for r in results if r.get("breaker_tripped")
+        )
 
 
