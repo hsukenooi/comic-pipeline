@@ -97,6 +97,28 @@ class TestSellerAliases:
         ebay_fetch.save_seller_alias("TunersComics", "tuners_comics_2011")
         assert ebay_fetch.load_seller_aliases() == {"tunerscomics": "tuners_comics_2011"}
 
+    def test_save_writes_trailing_newline(self, tmp_path, monkeypatch):
+        """BUI-540: without a trailing newline, a one-key addition to the
+        tracked seller_aliases.json shows up in `git diff` as a spurious
+        two-line change (the closing `}` gains "\\ No newline at end of
+        file")."""
+        f = tmp_path / "aliases.json"
+        monkeypatch.setattr(ebay_fetch, "SELLER_ALIASES_FILE", f)
+        ebay_fetch.save_seller_alias("TunersComics", "tuners_comics_2011")
+        assert f.read_text().endswith("\n")
+
+    def test_save_trailing_newline_survives_a_second_add(self, tmp_path, monkeypatch):
+        """A regression guard narrower than the one above: the newline isn't
+        an artifact of the file being freshly created — it still holds after
+        a second write to an already-existing file (the exact repeat-add
+        scenario BUI-540 was filed from)."""
+        f = tmp_path / "aliases.json"
+        monkeypatch.setattr(ebay_fetch, "SELLER_ALIASES_FILE", f)
+        ebay_fetch.save_seller_alias("TunersComics", "tuners_comics_2011")
+        ebay_fetch.save_seller_alias("Timemachinecomics", "timemachinecomics")
+        assert f.read_text().endswith("\n")
+        assert not f.read_text().endswith("\n\n")
+
     def test_corrupt_file_returns_empty(self, tmp_path, monkeypatch):
         f = tmp_path / "aliases.json"
         f.write_text("{not json")
@@ -716,6 +738,44 @@ class TestRecordItemsSeen:
             side_effect=seller_scan.requests.exceptions.ConnectionError("down"),
         ):
             seller_scan.record_items_seen(["111"], "tuners36")  # no exception
+
+
+class TestForgetSeenItems:
+    """BUI-542: forget_seen_items (--forget) — best-effort DELETE against the
+    same /api/comics/seller-scan/seen endpoint as fetch/record above, scoped
+    to one seller."""
+
+    def test_sends_delete_with_seller_param(self, monkeypatch, capsys):
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080/")
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"removed": 3}
+        with patch("seller_scan.requests.delete", return_value=resp) as delete:
+            seller_scan.forget_seen_items("tuners36")
+        assert delete.call_args[0][0] == (
+            "http://mac-mini.example:8080/api/comics/seller-scan/seen"
+        )
+        assert delete.call_args[1]["params"] == {"seller": "tuners36"}
+        assert "Forgot 3 seen item(s)" in capsys.readouterr().err
+
+    def test_noop_when_server_url_unset(self, monkeypatch, capsys):
+        monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
+        monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
+        with patch("seller_scan.requests.delete") as delete:
+            seller_scan.forget_seen_items("tuners36")
+        delete.assert_not_called()
+        assert "did nothing" in capsys.readouterr().err
+
+    def test_swallows_delete_failure(self, monkeypatch, capsys):
+        # Best-effort: a failed forget must not raise — the scan continues,
+        # already-seen matches just stay hidden as before.
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://mac-mini.example:8080")
+        with patch(
+            "seller_scan.requests.delete",
+            side_effect=seller_scan.requests.exceptions.ConnectionError("down"),
+        ):
+            seller_scan.forget_seen_items("tuners36")  # no exception
+        assert "could not forget" in capsys.readouterr().err.lower()
 
 
 # ─── BUI-184 robustness fixes ─────────────────────────────────────────────────
@@ -2958,6 +3018,255 @@ class TestSkippedCountAndForceReverify:
 
         assert code == 0
         assert seen_kwargs["use_rejected_cache"] is True
+
+
+class TestShowSeenAndNoRejectCacheSplit:
+    """BUI-542: --all used to force BOTH "show already-seen matches" and
+    "bypass the rejected-candidate cache" together, with no way to get just
+    one. --show-seen and --no-reject-cache are now independent flags; --all
+    remains a combined alias that does both (pinned by
+    TestSkippedCountAndForceReverify's --all tests above). Reuses
+    TestMainDroppedCandidatesExit's `_wire_main` via composition, like
+    TestSkippedCountAndForceReverify.
+    """
+
+    def _wire_main(self, *args, **kwargs):
+        return TestMainDroppedCandidatesExit()._wire_main(*args, **kwargs)
+
+    def test_show_seen_alone_skips_seen_filter_not_reject_cache(
+        self, monkeypatch, capsys
+    ):
+        recorded = {}
+        seen_kwargs = {}
+        seen_calls = []
+
+        def fake_verify(cands, **kwargs):
+            seen_kwargs.update(kwargs)
+            return list(cands), [], []
+
+        self._wire_main(
+            monkeypatch, verify_return_by_username={}, record_sink=recorded,
+        )
+        monkeypatch.setattr(seller_scan, "verify_with_claude", fake_verify)
+        monkeypatch.setattr(
+            seller_scan, "fetch_seen_item_ids",
+            lambda seller: seen_calls.append(seller) or set(),
+        )
+
+        code = seller_scan.main(["seller1", "--show-seen", "--json"])
+
+        assert code == 0
+        # --show-seen skips the already-seen filter entirely — its server
+        # fetch never runs.
+        assert seen_calls == []
+        # ...but does NOT also force-re-verify (that's --no-reject-cache).
+        assert seen_kwargs["use_rejected_cache"] is True
+
+    def test_no_reject_cache_alone_bypasses_cache_not_seen_filter(
+        self, monkeypatch, capsys
+    ):
+        recorded = {}
+        seen_kwargs = {}
+        seen_calls = []
+
+        def fake_verify(cands, **kwargs):
+            seen_kwargs.update(kwargs)
+            return list(cands), [], []
+
+        self._wire_main(
+            monkeypatch, verify_return_by_username={}, record_sink=recorded,
+        )
+        monkeypatch.setattr(seller_scan, "verify_with_claude", fake_verify)
+        monkeypatch.setattr(
+            seller_scan, "fetch_seen_item_ids",
+            lambda seller: seen_calls.append(seller) or set(),
+        )
+
+        code = seller_scan.main(["seller1", "--no-reject-cache", "--json"])
+
+        assert code == 0
+        assert seen_kwargs["use_rejected_cache"] is False
+        # --no-reject-cache does NOT also skip the already-seen filter — the
+        # filter's server fetch still runs.
+        assert seen_calls == ["seller1"]
+
+    def test_all_flag_still_skips_seen_filter_too(self, monkeypatch, capsys):
+        """--all is the combined alias — it must ALSO skip the already-seen
+        filter, not just bypass the rejected cache (that half is already
+        pinned by test_all_flag_passes_use_rejected_cache_false above)."""
+        recorded = {}
+        seen_calls = []
+
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "seller1": lambda cands: (list(cands), [], [])
+            },
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(
+            seller_scan, "fetch_seen_item_ids",
+            lambda seller: seen_calls.append(seller) or set(),
+        )
+
+        code = seller_scan.main(["seller1", "--all", "--json"])
+
+        assert code == 0
+        assert seen_calls == []
+
+    def test_neither_flag_keeps_baseline_behavior(self, monkeypatch, capsys):
+        """Baseline: no --show-seen/--no-reject-cache/--all → the seen filter
+        runs AND the rejected cache stays opt-in-active."""
+        recorded = {}
+        seen_kwargs = {}
+        seen_calls = []
+
+        def fake_verify(cands, **kwargs):
+            seen_kwargs.update(kwargs)
+            return list(cands), [], []
+
+        self._wire_main(
+            monkeypatch, verify_return_by_username={}, record_sink=recorded,
+        )
+        monkeypatch.setattr(seller_scan, "verify_with_claude", fake_verify)
+        monkeypatch.setattr(
+            seller_scan, "fetch_seen_item_ids",
+            lambda seller: seen_calls.append(seller) or set(),
+        )
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        assert code == 0
+        assert seen_calls == ["seller1"]
+        assert seen_kwargs["use_rejected_cache"] is True
+
+
+class TestForgetFlag:
+    """BUI-542: --forget removes a seller's seen entries server-side BEFORE
+    the scan runs, so matches hidden by a prior scan (or lost mid-transit by
+    the caller) resurface — in this run too, since forget runs before the
+    seen-filter's fetch. Reuses TestMainDroppedCandidatesExit's `_wire_main`
+    via composition, like TestSkippedCountAndForceReverify above.
+    """
+
+    def _wire_main(self, *args, **kwargs):
+        return TestMainDroppedCandidatesExit()._wire_main(*args, **kwargs)
+
+    def test_forget_rejects_multi_seller(self, monkeypatch, capsys):
+        """Like --username/--add-alias, --forget is single-seller only —
+        ambiguous across a batch."""
+        with pytest.raises(SystemExit) as exc:
+            seller_scan.main(["seller1", "seller2", "--forget"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "single seller" in err.lower() or "--forget" in err
+
+    def test_forget_calls_forget_seen_items_with_resolved_username(
+        self, monkeypatch, capsys
+    ):
+        recorded = {}
+        forgotten = []
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "realuser": lambda cands: (list(cands), [], [])
+            },
+            record_sink=recorded,
+        )
+        # Resolve the store-name arg to a DIFFERENT login username, so the
+        # test can pin that --forget uses the RESOLVED username, not the
+        # positional seller_arg (the seen-set is keyed by username).
+        monkeypatch.setattr(
+            seller_scan, "resolve_seller_username",
+            lambda seller, aliases, username_override=None: "realuser",
+        )
+        monkeypatch.setattr(
+            seller_scan, "forget_seen_items",
+            lambda seller: forgotten.append(seller),
+        )
+
+        code = seller_scan.main(["storename", "--forget", "--json"])
+
+        assert code == 0
+        assert forgotten == ["realuser"]
+
+    def test_forget_not_called_without_the_flag(self, monkeypatch, capsys):
+        recorded = {}
+        forgotten = []
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "seller1": lambda cands: (list(cands), [], [])
+            },
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(
+            seller_scan, "forget_seen_items",
+            lambda seller: forgotten.append(seller),
+        )
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        assert code == 0
+        assert forgotten == []
+
+    def test_forget_skipped_when_seller_unresolvable(self, monkeypatch, capsys):
+        """An unknown seller never resolves to a username, so there is
+        nothing to forget — forget_seen_items must not be called, and the
+        run still reports the ordinary unknown-seller error."""
+        recorded = {}
+        forgotten = []
+
+        def resolve(seller, aliases, username_override=None):
+            raise ebay_fetch.UnknownSellerError(seller)
+
+        self._wire_main(
+            monkeypatch, verify_return_by_username={}, record_sink=recorded,
+        )
+        monkeypatch.setattr(seller_scan, "resolve_seller_username", resolve)
+        monkeypatch.setattr(
+            seller_scan, "forget_seen_items",
+            lambda seller: forgotten.append(seller),
+        )
+
+        code = seller_scan.main(["unknownseller", "--forget", "--json"])
+
+        assert code == seller_scan._EXIT_SELLER_ERROR
+        assert forgotten == []
+
+    def test_forget_resurfaces_match_within_the_same_run(
+        self, monkeypatch, capsys
+    ):
+        """End-to-end within ONE invocation, not just a hypothetical future
+        one: a match already in the seen-set is hidden without --forget, but
+        shows up WITH --forget in this same run — because main() calls
+        forget_seen_items() before _scan_one_seller_impl's own
+        fetch_seen_item_ids() call, not just before some later scan."""
+        recorded = {}
+        # Shared mutable "server state" the two stubs below both see, so this
+        # pins the actual ordering rather than just each stub being called.
+        seen_store = {"seller1-A1"}
+
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "seller1": lambda cands: (list(cands), [], [])
+            },
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(
+            seller_scan, "fetch_seen_item_ids", lambda seller: set(seen_store)
+        )
+        monkeypatch.setattr(
+            seller_scan, "forget_seen_items", lambda seller: seen_store.clear()
+        )
+
+        code = seller_scan.main(["seller1", "--forget", "--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        item_ids = {m["item_id"] for m in payload["sellers"][0]["matches"]}
+        assert "seller1-A1" in item_ids
 
 
 class TestSellerLevelParallelism:

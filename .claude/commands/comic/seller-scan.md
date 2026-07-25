@@ -89,14 +89,34 @@ machine won't re-surface the same matches.
 
 - Only the genuine **matches** are recorded as seen (a handful of item_ids per
   run, not every listing).
-- `--all` shows every match again, including already-seen ones (it still records newly-surfaced matches — `--all` means "show me everything," not "forget"), **and bypasses the 14-day rejected-candidate cache** (BUI-317), force-re-verifying every candidate — use it to recheck a seller when you think a past rejection was wrong.
+- `--show-seen` shows every match again, including already-seen ones (it
+  still records newly-surfaced matches — `--show-seen` means "show me
+  everything," not "forget"). It does **not** touch the rejected-candidate
+  cache.
+- `--no-reject-cache` (BUI-317) bypasses the 14-day rejected-candidate cache,
+  force-re-verifying every candidate — use it to recheck a seller when you
+  think a past rejection was wrong. It does **not** show already-seen
+  matches.
+- `--all` (BUI-542: kept as a combined alias) does **both** at once —
+  equivalent to `--show-seen --no-reject-cache`.
+- `--forget` (BUI-542, single-seller only): before scanning, **permanently**
+  removes this seller's seen entries server-side, so previously-surfaced
+  matches resurface — in this run too, not just the next one. Use it to
+  recover a run whose output you lost (truncated `tail`, a dropped pipe, a
+  crashed client) without paying the full re-verify cost of `--no-reject-cache`.
+  Unlike `--show-seen`, which only *displays* seen matches without touching
+  the seen-set, `--forget` actually clears it — a one-time reset, not a
+  per-run display option. It does not touch the rejected-candidate cache.
 
 ```bash
-.venv/bin/python src/seller_scan.py <seller>          # only new matches
-.venv/bin/python src/seller_scan.py <seller> --all    # every match
+.venv/bin/python src/seller_scan.py <seller>                # only new matches
+.venv/bin/python src/seller_scan.py <seller> --show-seen    # every match, cache still active
+.venv/bin/python src/seller_scan.py <seller> --no-reject-cache  # only new matches, force re-verify
+.venv/bin/python src/seller_scan.py <seller> --all          # every match, force re-verify
+.venv/bin/python src/seller_scan.py <seller> --forget       # clear this seller's seen-set, then scan
 ```
 
-Seen-tracking is **best-effort**: if the comics server is unreachable, the scan warns and shows all matches rather than aborting. This is deliberately the opposite of the **wish-list fetch below, which hard-fails** — see `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why each side made the opposite choice.
+Seen-tracking is **best-effort**: if the comics server is unreachable, the scan warns and shows all matches rather than aborting. This is deliberately the opposite of the **wish-list fetch below, which hard-fails** — see `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why each side made the opposite choice. `--forget` follows the same best-effort posture (a failed removal just means already-seen matches stay hidden as before), but — since it's an explicit action rather than an automatic side effect — reports success or failure to stderr either way.
 
 ## Output
 
@@ -137,7 +157,7 @@ seller_scan.py <seller> 2>/dev/null
 }
 ```
 
-`sellers[*].skipped_cached_candidates` (BUI-317) counts candidates skipped entirely — no Claude CLI call — because that exact (listing, wish) pair was already rejected within the last 14 days. Always `0` when `--all` is passed (it bypasses the cache). See `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why a nonzero count here is expected/healthy rather than a problem.
+`sellers[*].skipped_cached_candidates` (BUI-317) counts candidates skipped entirely — no Claude CLI call — because that exact (listing, wish) pair was already rejected within the last 14 days. Always `0` when `--no-reject-cache` or `--all` is passed (either bypasses the cache; BUI-542 split `--all` into `--show-seen` + `--no-reject-cache` — `--show-seen` alone does NOT zero this out). See `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why a nonzero count here is expected/healthy rather than a problem.
 
 **Parse exit-code-first, then drill in:**
 
@@ -194,8 +214,8 @@ Exit-code-specific failure modes (usage errors, INCOMPLETE/exit 3, worker crashe
 | eBay rejected the seller filter | The resolved username isn't a valid eBay login username — re-check the `_ssn=` value and update the alias |
 | `Dropped N listing(s) from other sellers` | Safety net fired: eBay returned foreign sellers and they were filtered out. Usually means the alias points at the wrong/stale username |
 | 0 listings fetched | Seller may have no active auction listings; check their eBay page |
-| Expected a match but got nothing new | It was already surfaced in a prior scan and hidden by default. Re-run with `--all` to see every match |
-| `could not fetch/record seen item IDs` warning | Best-effort seen-tracking couldn't reach the server, so the scan showed all matches (safe fallback). Check `$COMICS_SERVER_URL` is reachable if you want only-new filtering back |
+| Expected a match but got nothing new | It was already surfaced in a prior scan and hidden by default. Re-run with `--show-seen` (or `--all`) to see every match without changing the seen-set, or `--forget` if the earlier run's output was lost and you want those matches to permanently resurface (BUI-542) |
+| `could not fetch/record/forget seen item IDs` warning | Best-effort seen-tracking couldn't reach the server, so the scan showed all matches (safe fallback) or `--forget` didn't remove anything. Check `$COMICS_SERVER_URL` is reachable if you want only-new filtering (or `--forget`) back |
 | Wish list empty | seller-scan fetches the wish-list from the comics server (`GET /api/comics/wish-list`), not a local `locg` call. Check `curl -sf "$COMICS_SERVER_URL/api/comics/wish-list"` returns items; if empty, run the LOCG import flow |
 | `COMICS_SERVER_URL is not set` | The wish-list fetch **hard-fails** without it (apps/ebay can't import locg, so it must reach the server over HTTP). Set `COMICS_SERVER_URL` (MacBook → `http://mac-mini.tail9b7fa5.ts.net:8080`) and re-run |
 | Rate limit error | Re-run after a few seconds; the Browse API allows retries |

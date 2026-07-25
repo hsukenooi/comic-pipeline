@@ -14,6 +14,7 @@ from gixen_overlay.db import (
     sweep_orphan_yearless_comics,
     get_seen_item_ids,
     mark_items_seen,
+    remove_seen_for_seller,
     get_collection_wins_seen,
     mark_collection_wins_seen,
 )
@@ -1102,6 +1103,33 @@ def test_mark_items_seen_preserves_first_seen_at(db):
     # INSERT OR IGNORE keeps the original timestamp and seller.
     assert row["first_seen_at"] == first
     assert row["seller"] == "tuners36"
+
+
+def test_remove_seen_for_seller_removes_only_that_seller(db):
+    """BUI-542 (--forget): scoped to one seller — a different seller's seen
+    entries must survive untouched."""
+    mark_items_seen(db, ["111", "222"], "tuners36")
+    mark_items_seen(db, ["333"], "beatlebluecat")
+    removed = remove_seen_for_seller(db, "tuners36")
+    assert removed == 2
+    assert get_seen_item_ids(db) == {"333"}
+    assert get_seen_item_ids(db, "tuners36") == set()
+    assert get_seen_item_ids(db, "beatlebluecat") == {"333"}
+
+
+def test_remove_seen_for_seller_returns_zero_when_nothing_to_remove(db):
+    assert remove_seen_for_seller(db, "nosuchseller") == 0
+
+
+def test_remove_seen_for_seller_is_reversible_by_a_later_scan(db):
+    """After a forget, a subsequent mark_items_seen for the same item_id
+    re-inserts it (not blocked by any leftover state) — this is the exact
+    "resurface, then get re-marked seen on the next genuine match" flow."""
+    mark_items_seen(db, ["111"], "tuners36")
+    remove_seen_for_seller(db, "tuners36")
+    assert get_seen_item_ids(db, "tuners36") == set()
+    mark_items_seen(db, ["111"], "tuners36")
+    assert get_seen_item_ids(db, "tuners36") == {"111"}
 
 
 # ---------------------------------------------------------------------------

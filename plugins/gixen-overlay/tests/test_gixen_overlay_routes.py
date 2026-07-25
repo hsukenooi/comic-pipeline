@@ -215,6 +215,40 @@ def test_seller_scan_seen_filters_by_seller(api):
     ).json() == {"item_ids": ["111"]}
 
 
+def test_seller_scan_seen_remove_deletes_only_that_seller(api):
+    """BUI-542 (--forget): DELETE removes one seller's seen entries and
+    leaves every other seller's untouched."""
+    api.post(
+        "/api/comics/seller-scan/seen",
+        json={"item_ids": ["111"], "seller": "tuners36"},
+    )
+    api.post(
+        "/api/comics/seller-scan/seen",
+        json={"item_ids": ["222"], "seller": "beatlebluecat"},
+    )
+    r = api.delete(
+        "/api/comics/seller-scan/seen", params={"seller": "tuners36"}
+    )
+    assert r.status_code == 200
+    assert r.json() == {"removed": 1}
+    assert api.get("/api/comics/seller-scan/seen").json() == {"item_ids": ["222"]}
+
+
+def test_seller_scan_seen_remove_returns_zero_when_nothing_to_remove(api):
+    r = api.delete(
+        "/api/comics/seller-scan/seen", params={"seller": "nosuchseller"}
+    )
+    assert r.status_code == 200
+    assert r.json() == {"removed": 0}
+
+
+def test_seller_scan_seen_remove_requires_seller_param(api):
+    """No default "forget everyone" — omitting `seller` is a 422, not a
+    global wipe."""
+    r = api.delete("/api/comics/seller-scan/seen")
+    assert r.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # BUI-121: collection-wins seen-tracking endpoints
 # ---------------------------------------------------------------------------

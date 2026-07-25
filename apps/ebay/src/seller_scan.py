@@ -165,6 +165,45 @@ def record_items_seen(item_ids, seller):
         print(f"Warning: could not record seen item IDs ({e})", file=sys.stderr)
 
 
+def forget_seen_items(seller):
+    """BUI-542: best-effort — remove every seen entry for `seller` server-side
+    (``--forget``), so matches surfaced in a lost/truncated prior run
+    resurface. main() calls this BEFORE the seen-filter fetch inside the scan
+    itself, so the removal is visible in THIS run too, not just future ones.
+
+    Deliberately does NOT touch the separate 14-day rejected-candidate cache
+    (see the module note near _REJECTED_CACHE_PATH below) — forgetting a
+    genuine surfaced match is not the same thing as forgetting a model
+    rejection, and the two systems must stay independent.
+
+    Same fail-open posture as fetch_seen_item_ids/record_items_seen above: a
+    failed call never aborts the scan, it just means already-seen matches
+    stay hidden as before. Unlike those two — silent side effects of an
+    ordinary scan — `--forget` is an explicit user action, so both success
+    and failure are reported to stderr (not just failure).
+    """
+    base = _server_base()
+    if not base:
+        print(
+            "Warning: COMICS_SERVER_URL not set; --forget did nothing (no "
+            "seen entries were removed)",
+            file=sys.stderr,
+        )
+        return
+    url = f"{base}/api/comics/seller-scan/seen"
+    try:
+        resp = requests.delete(url, params={"seller": seller}, timeout=10)
+        resp.raise_for_status()
+        removed = resp.json().get("removed", 0)
+        print(f"Forgot {removed} seen item(s) for '{seller}'", file=sys.stderr)
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(
+            f"Warning: could not forget seen item IDs for '{seller}' ({e}); "
+            "already-seen matches will still be hidden",
+            file=sys.stderr,
+        )
+
+
 # ─── Matching ─────────────────────────────────────────────────────────────────
 # BUI-253 Step 1: the deterministic title-parsing / reject helpers that used to
 # live here (grade-stripping, lot detection, edition patterns, era/volume
@@ -997,8 +1036,13 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
 
 
 def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
-                    max_results, show_all):
+                    max_results, show_seen, no_reject_cache=False):
     """Scan one seller — crash-isolating wrapper around `_scan_one_seller_impl`.
+
+    BUI-542: `show_seen` and `no_reject_cache` used to be a single `show_all`
+    bool (--all did both at once). They're now independent — `--show-seen`
+    only affects the already-seen filter below; `--no-reject-cache` only
+    affects the BUI-301 rejected-candidate cache; `--all` sets both.
 
     BUI-319: this runs as a ThreadPoolExecutor worker (see main()). Before
     this wrapper existed, any non-SystemExit exception raised inside the
@@ -1020,7 +1064,7 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
     try:
         return _scan_one_seller_impl(
             seller_arg, username, token, base_url, wish_items,
-            max_results, show_all,
+            max_results, show_seen, no_reject_cache,
         )
     except Exception as e:  # noqa: BLE001 — BUI-319: isolate a per-seller crash
         print(
@@ -1041,7 +1085,7 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
 
 
 def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
-                    max_results, show_all):
+                    max_results, show_seen, no_reject_cache=False):
     """Scan one seller's active listings against the (already-fetched) wish
     list and verify candidates with Claude. Returns a per-seller result dict:
 
@@ -1120,18 +1164,21 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
             "_release_year": wish.get("_release_year"),
         })
 
-    # BUI-113: drop matches already surfaced in a prior scan (default). --all
-    # skips the filter (and its server fetch); the short-circuit on an empty
-    # candidate list skips the fetch/Claude/record entirely. Seen-tracking is
-    # keyed by THIS seller's username — never merged across sellers in a batch.
-    if candidates and not show_all:
+    # BUI-113: drop matches already surfaced in a prior scan (default).
+    # BUI-542: --show-seen (or --all) skips the filter (and its server
+    # fetch); the short-circuit on an empty candidate list skips the
+    # fetch/Claude/record entirely. Seen-tracking is keyed by THIS seller's
+    # username — never merged across sellers in a batch.
+    if candidates and not show_seen:
         seen = fetch_seen_item_ids(username)
         before = len(candidates)
         candidates = [c for c in candidates if c["item_id"] not in seen]
         hidden = before - len(candidates)
         if hidden:
             print(
-                f"  {hidden} already-seen match(es) hidden (use --all to show)",
+                f"  {hidden} already-seen match(es) hidden (use --show-seen "
+                "or --all to show; --forget clears this seller's seen-set "
+                "so they resurface for good)",
                 file=sys.stderr,
             )
 
@@ -1139,14 +1186,15 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
         print(f"  {len(candidates)} candidate(s) — verifying with Claude...", file=sys.stderr)
         # BUI-301: seller-scan opts into the rejected-candidate cache so a
         # (listing, wish) pair Claude already rejected isn't re-verified (re-
-        # paying CLI cost) every run until the TTL expires. BUI-317: --all
-        # ("show me everything again") also bypasses this cache — a full
-        # force-re-verify for "recheck this seller, I think that rejection
-        # was wrong" — rather than leaving no way to override a stale/bad
-        # rejection short of waiting out the 14-day TTL.
+        # paying CLI cost) every run until the TTL expires. BUI-317/BUI-542:
+        # --no-reject-cache (or --all) ("show me everything again") also
+        # bypasses this cache — a full force-re-verify for "recheck this
+        # seller, I think that rejection was wrong" — rather than leaving no
+        # way to override a stale/bad rejection short of waiting out the
+        # 14-day TTL.
         verify_stats = {}
         matches, dropped, filtered = verify_with_claude(
-            candidates, use_rejected_cache=not show_all, stats=verify_stats
+            candidates, use_rejected_cache=not no_reject_cache, stats=verify_stats
         )
         skipped = verify_stats.get("skipped", 0)
     else:
@@ -1191,7 +1239,8 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
     # — marking them seen would suppress them on the next scan and silently
     # lose a real wish-list match (the BUI-297 bug). This must also never be
     # merged across sellers in a batch — each seller's seen-set is independent.
-    # Runs under --all too — --all means "show me everything again", not "forget".
+    # Runs under --show-seen/--all too — those mean "show me everything
+    # again", not "forget" (BUI-542 gave "forget" its own separate flag).
     if matches:
         record_items_seen([m["item_id"] for m in matches], username)
 
@@ -1261,16 +1310,42 @@ def main(argv=None):
              "see main()'s docstring / the skill doc for the shape)",
     )
     parser.add_argument(
-        "--all",
+        "--show-seen",
         action="store_true",
-        dest="show_all",
         help="Show every wish-list match, including ones surfaced in a prior "
              "scan. By default (BUI-113) already-seen matches are hidden. "
-             "Newly-surfaced matches are recorded as seen either way. BUI-317: "
-             "also force-re-verifies every candidate by bypassing the BUI-301 "
-             "rejected-candidate cache, for 'recheck this seller, I think "
-             "that rejection was wrong' — normal runs skip re-verifying a "
-             "pair Claude already rejected within the last 14 days.",
+             "Newly-surfaced matches are recorded as seen either way. "
+             "BUI-542: does NOT bypass the BUI-301 rejected-candidate cache "
+             "on its own — pair with --no-reject-cache (or use --all) for "
+             "that too.",
+    )
+    parser.add_argument(
+        "--no-reject-cache",
+        action="store_true",
+        help="Force-re-verify every candidate by bypassing the BUI-301 "
+             "rejected-candidate cache (BUI-317), for 'recheck this seller, "
+             "I think that rejection was wrong' — normal runs skip "
+             "re-verifying a (listing, wish) pair Claude already rejected "
+             "within the last 14 days. BUI-542: does NOT also show "
+             "already-seen matches on its own — pair with --show-seen (or "
+             "use --all) for that too.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="BUI-542: alias for --show-seen --no-reject-cache combined — "
+             "show every match AND force-re-verify every candidate. Kept for "
+             "the pre-split behavior; prefer the split flags when you only "
+             "want one of the two.",
+    )
+    parser.add_argument(
+        "--forget",
+        action="store_true",
+        help="BUI-542: before scanning, remove this seller's seen entries "
+             "server-side, so matches surfaced (and possibly lost) in a "
+             "prior scan resurface — including in this run. Does NOT touch "
+             "the rejected-candidate cache. Single-seller only, like "
+             "--username/--add-alias.",
     )
     parser.add_argument(
         "--max-results",
@@ -1286,14 +1361,21 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    # BUI-298: --username/--add-alias are single-seller conveniences (override
-    # or register ONE alias) — ambiguous across a multi-seller batch, so
-    # refuse rather than silently applying either to only the first seller.
-    if (args.username or args.add_alias) and len(args.sellers) > 1:
+    # BUI-542: --all is kept as a combined alias for the two split flags
+    # below, preserving the exact pre-split "show everything AND
+    # force-re-verify" behavior for anyone still passing --all.
+    show_seen = args.show_seen or args.all
+    no_reject_cache = args.no_reject_cache or args.all
+
+    # BUI-298/BUI-542: --username/--add-alias/--forget are single-seller
+    # conveniences (override or register ONE alias, or forget ONE seller's
+    # seen-set) — ambiguous across a multi-seller batch, so refuse rather
+    # than silently applying any of them to only the first seller.
+    if (args.username or args.add_alias or args.forget) and len(args.sellers) > 1:
         parser.error(
-            "--username/--add-alias apply to exactly one seller (applying "
-            "them across a multi-seller batch would be ambiguous) — pass a "
-            "single seller when using them"
+            "--username/--add-alias/--forget apply to exactly one seller "
+            "(applying them across a multi-seller batch would be "
+            "ambiguous) — pass a single seller when using them"
         )
 
     # BUI-298: persist a new --add-alias BEFORE loading the alias map, so the
@@ -1366,6 +1448,17 @@ def main(argv=None):
             continue
         resolvable.append((idx, seller_arg, username))
 
+    # BUI-542: --forget needs the RESOLVED username (seen-set is keyed by
+    # username, not by store name/seller_arg), so it runs here — after
+    # resolution, before the scan. Guarded single-seller above, so
+    # `resolvable` holds at most one entry; if the one seller was
+    # unresolvable there's nothing to forget (its error slot is already set).
+    # Running this before the scan starts means the removal is visible to
+    # THIS run's own seen-filter fetch below, not just future runs.
+    if args.forget and resolvable:
+        _, _, forget_username = resolvable[0]
+        forget_seen_items(forget_username)
+
     # BUI-307: scan resolvable sellers CONCURRENTLY, bounded to
     # _SELLER_SCAN_MAX_WORKERS. The old loop ran sellers strictly sequentially,
     # so one stuck 180s verify timeout blocked every seller behind it; a bounded
@@ -1394,7 +1487,7 @@ def main(argv=None):
         future_to_meta = {
             executor.submit(
                 _scan_one_seller, seller_arg, username, token, base_url,
-                wish_items, args.max_results, args.show_all,
+                wish_items, args.max_results, show_seen, no_reject_cache,
             ): (idx, seller_arg, username)
             for idx, seller_arg, username in resolvable
         }
