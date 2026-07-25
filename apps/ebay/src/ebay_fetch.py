@@ -1248,9 +1248,20 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
-    # Collect item args from CLI and stdin
+    # Collect item args from CLI, falling back to stdin only when none were
+    # given (BUI-538). Reading stdin whenever it merely isn't a TTY hung
+    # forever in every non-interactive caller — an agent shell, a `for` loop,
+    # CI, cron — because an inherited pipe never reaches EOF, so `for line in
+    # sys.stdin` blocked even though the item IDs were already in argv.
+    # isatty() answers "is this interactive?", which is not the question that
+    # matters here: whether the caller intended to pipe IDs in. Absence of
+    # positional args is that signal, and it's the same rule comic_identify.py
+    # already uses. Both supported invocations still work — `ebay-fetch <id>`
+    # (stdin untouched) and `echo <id> | ebay-fetch` (stdin read) — at the cost
+    # of combining args *and* piped IDs in one call, which was undocumented and
+    # unusable anyway since it hung wherever piping actually happens.
     raw_items = list(args.items) if args.items else []
-    if not sys.stdin.isatty():
+    if not raw_items and not sys.stdin.isatty():
         for line in sys.stdin:
             line = line.strip()
             if line:

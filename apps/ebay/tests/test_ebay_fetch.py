@@ -1853,6 +1853,104 @@ class TestIntegrationCLI:
         assert set(data[0].keys()) == {"item_id", "title"}
 
 
+# ─── BUI-538: stdin is a fallback, not an unconditional read ──────────────────
+
+
+class TestStdinIsOnlyAFallback:
+    """main() must not read stdin when positional items were given (BUI-538).
+
+    These are deliberately network-free: every case uses an argument that
+    fails extract_item_id(), so main() exits at the "No valid item IDs found"
+    guard before it ever loads config or requests a token. That keeps the
+    regression test fast and runnable offline while still exercising the exact
+    argv/stdin branch that hung.
+    """
+
+    # Generous enough to absorb interpreter startup on a loaded machine, far
+    # below the unbounded block the bug produced.
+    _TIMEOUT = 20
+
+    def _run_with_open_stdin(self, tmp_path, *args):
+        """Run the CLI with stdin held open as a pipe that never sees EOF.
+
+        This is the shape every non-interactive caller inherits (agent shell,
+        `for` loop, CI, cron) and the one the bug hung on.
+
+        Two details are load-bearing, and getting either wrong makes this test
+        silently pass against the buggy code:
+
+        * stdin must stay open. subprocess.run(input=...) and
+          Popen.communicate() both CLOSE stdin, which hands the child an
+          immediate EOF — exactly the workaround that hid this bug in
+          test_no_args_shows_help. So: Popen with stdin=PIPE, then wait(),
+          never communicate().
+        * stdout/stderr go to files, not pipes. With wait() nothing is draining
+          the pipes, so a pipe-buffered child could deadlock for a reason that
+          has nothing to do with stdin and look like the bug.
+        """
+        out_path = tmp_path / "stdout.txt"
+        err_path = tmp_path / "stderr.txt"
+        with open(out_path, "w") as out_f, open(err_path, "w") as err_f:
+            proc = subprocess.Popen(
+                [sys.executable, _MODULE, *args],
+                stdin=subprocess.PIPE,  # left open on purpose — never written, never closed
+                stdout=out_f,
+                stderr=err_f,
+                text=True,
+            )
+            try:
+                proc.wait(timeout=self._TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                pytest.fail(
+                    f"ebay-fetch {args!r} blocked on an open stdin pipe for "
+                    f"{self._TIMEOUT}s — it drained stdin despite being given "
+                    f"positional item IDs (BUI-538)"
+                )
+            finally:
+                proc.stdin.close()
+        return proc.returncode, out_path.read_text(), err_path.read_text()
+
+    def test_positional_arg_does_not_block_on_open_stdin(self, tmp_path):
+        """The regression: an item ID in argv must never wait on stdin."""
+        returncode, _stdout, stderr = self._run_with_open_stdin(tmp_path, "notanitemid")
+        # Reached the ID-extraction guard, which proves stdin was never read.
+        assert returncode == 1
+        assert "No valid item IDs found" in stderr
+
+    def test_flags_before_positional_arg_also_do_not_block(self, tmp_path):
+        """--json (etc.) must not change the argv-vs-stdin decision."""
+        returncode, _stdout, stderr = self._run_with_open_stdin(tmp_path, "--json", "notanitemid")
+        assert returncode == 1
+        assert "No valid item IDs found" in stderr
+
+    def test_stdin_still_read_when_no_positional_args(self):
+        """The pipeline invocation `echo <id> | ebay-fetch` keeps working.
+
+        Asserts on the ID-extraction error rather than the help text: reaching
+        that guard at all means stdin was read and produced a raw item, which
+        is what distinguishes "stdin consumed" from "fell through to help".
+        """
+        result = subprocess.run(
+            [sys.executable, _MODULE],
+            capture_output=True, text=True, timeout=self._TIMEOUT,
+            input="notanitemid\n",
+        )
+        assert result.returncode == 1
+        assert "No valid item IDs found" in result.stderr
+
+    def test_no_args_and_empty_stdin_still_shows_help(self):
+        """Closed, empty stdin and no args remains a help-and-exit-1."""
+        result = subprocess.run(
+            [sys.executable, _MODULE],
+            capture_output=True, text=True, timeout=self._TIMEOUT,
+            input="",
+        )
+        assert result.returncode == 1
+        assert "usage:" in (result.stdout + result.stderr).lower()
+
+
 # ─── BUI-229: get_item_aspects ────────────────────────────────────────────────
 
 
