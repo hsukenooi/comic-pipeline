@@ -164,10 +164,15 @@ def run(*, batch_path: str | None, out_path: str | None,
     for book in books:
         _normalize_book_title(book)
 
-    # 1. DB cache reuse (skipped if --force)
-    cached, needs_compute = _split_by_db_cache(
+    # 1. DB cache reuse (skipped if --force). Also separates out hand-priced
+    #    rows (BUI-533): a default run must skip them entirely (skipped_hand),
+    #    while a --force run proceeds but reports what it's about to overwrite
+    #    (force_overwrite_notes).
+    cached, needs_compute, skipped_hand, force_overwrite_notes = _split_by_db_cache(
         books, server_url=server_url, max_age_days=max_age_days, force=force,
     )
+    if force_overwrite_notes:
+        _echo_hand_override_notes(force_overwrite_notes, books)
 
     # 2. Fetch comps for the books that need fresh compute
     fresh_results: list[dict] = []
@@ -230,11 +235,21 @@ def run(*, batch_path: str | None, out_path: str | None,
             fresh_fmvs, books, server_url=server_url, force=force,
         )
 
-    # 4. Stitch cached + fresh in input order
-    final = _stitch(books, cached, fresh_fmvs)
+    # 4. Stitch cached + fresh + hand-priced-skipped in input order
+    final = _stitch(books, cached, fresh_fmvs, skipped_hand)
 
     if not quiet:
         _print_table(final)
+
+    # BUI-533: report the skip count unconditionally (not gated by --quiet) so
+    # it surfaces whether the caller reads the human table/summary or only
+    # consumes --brief — an operator relying on --brief alone must still learn
+    # that N hand-priced rows were left untouched, not silently dropped.
+    if skipped_hand:
+        click.echo(
+            f"skipped {len(skipped_hand)} hand-priced row(s) "
+            "(use --force to overwrite)"
+        )
 
     if brief:
         _print_brief(final)
@@ -243,37 +258,113 @@ def run(*, batch_path: str | None, out_path: str | None,
         _write_json(out_path, final)
 
 
+# ─── Hand-priced row protection (BUI-533) ─────────────────────────────────────
+
+# A hand-priced row's fmv_notes starts with one of these markers — the de-facto
+# provenance convention an operator already uses when overriding the CLI's own
+# comp-pool result (e.g. Batman #251, 2026-07-24: hand $250-300 anchored on the
+# lone real 4.0 sale, after the CLI's pooled $400-425 off 5.0-6.0 comps was
+# rejected as pricing the wrong market).
+_HAND_PRICE_MARKERS = ("hand §", "hand OVERRIDE")
+
+
+def _is_hand_priced(notes: str | None) -> bool:
+    """True when `notes` (a row's persisted fmv_notes) carries a hand-priced
+    provenance marker. A default batch run must never silently recompute over
+    a row this returns True for (see `_split_by_db_cache`)."""
+    return notes is not None and notes.startswith(_HAND_PRICE_MARKERS)
+
+
 # ─── Step 1 — DB cache reuse ──────────────────────────────────────────────────
 
 def _split_by_db_cache(books: list[dict], *, server_url: str,
                        max_age_days: float, force: bool
-                       ) -> tuple[dict[int, dict], list[dict]]:
-    """Bucket each book into (cached, needs_compute).
+                       ) -> tuple[dict[int, dict], list[dict],
+                                  dict[int, dict], dict[int, str]]:
+    """Bucket each book into (cached, needs_compute, skipped_hand, force_overwrite_notes).
 
-    Returns (cached_by_idx, needs_compute_list). cached_by_idx maps the
-    original input index → DB row dict. needs_compute_list preserves only
-    the books that need a fresh fetch+compute.
+    - cached_by_idx: original input index → a fresh (within max_age_days) DB row.
+    - needs_compute_list: books that need a fresh fetch+compute (carries `_idx`).
+    - skipped_hand_by_idx (BUI-533): original input index → the existing DB row
+      of a hand-priced book that a default (non-`--force`) run must leave
+      completely untouched — reused verbatim, like a cache hit, regardless of
+      how stale it is. A book only lands here when there was NO fresh
+      (max_age_days-eligible) row to reuse normally; a fresh cache hit is
+      already never recomputed, hand-priced or not, so it stays in `cached`.
+    - force_overwrite_notes_by_idx (BUI-533): original input index → the OLD
+      fmv_notes of a hand-priced row that `--force` is about to overwrite, so
+      the caller can echo them into the run log before they're lost.
     """
     cached: dict[int, dict] = {}
     needs: list[dict] = []
+    skipped_hand: dict[int, dict] = {}
+    force_overwrite_notes: dict[int, str] = {}
     for i, book in enumerate(books):
-        if force or not book.get("locg_id") or book.get("grade") is None:
+        eligible = bool(book.get("locg_id")) and book.get("grade") is not None
+        if not eligible:
             needs.append({"_idx": i, **book})
             continue
-        row = _db_lookup(server_url, locg_id=book["locg_id"],
-                         grade=book["grade"],
-                         locg_variant_id=book.get("locg_variant_id"),
-                         max_age_days=max_age_days)
-        if row:
-            cached[i] = row
-        else:
-            needs.append({"_idx": i, **book})
-    return cached, needs
+
+        if not force:
+            row = _db_lookup(server_url, locg_id=book["locg_id"],
+                             grade=book["grade"],
+                             locg_variant_id=book.get("locg_variant_id"),
+                             max_age_days=max_age_days)
+            if row:
+                cached[i] = row
+                continue
+
+        # Either --force (cache reuse always bypassed) or the fresh lookup
+        # above missed (no row yet, or the existing one is stale enough that
+        # normal logic would recompute). Before sending to compute, check
+        # whether an EXISTING row — regardless of age — is hand-priced: the
+        # protection must hold even on a stale row (that's precisely the
+        # 2026-07-24 incident: a batch refresh silently overwrote 10
+        # hand-priced rows), and a --force run still needs the OLD notes to
+        # echo even though it proceeds to overwrite.
+        existing = _db_lookup(server_url, locg_id=book["locg_id"],
+                              grade=book["grade"],
+                              locg_variant_id=book.get("locg_variant_id"),
+                              max_age_days=None)
+        if existing is not None:
+            existing_notes = existing.get("fmv_notes")
+            if existing_notes is not None and _is_hand_priced(existing_notes):
+                if force:
+                    force_overwrite_notes[i] = existing_notes
+                else:
+                    skipped_hand[i] = existing
+                    continue
+
+        needs.append({"_idx": i, **book})
+    return cached, needs, skipped_hand, force_overwrite_notes
+
+
+def _echo_hand_override_notes(force_overwrite_notes: dict[int, str],
+                              books: list[dict]) -> None:
+    """BUI-533: `--force` is allowed to overwrite a hand-priced row, but the
+    old hand notes must not be silently lost — echo them into the run log
+    (stderr, like the other loud BUI-143/529 signals) before the recompute
+    that follows replaces them.
+
+    Worded "about to overwrite", not "overwriting": this fires BEFORE the
+    fetch+compute step runs, so it's a statement of intent, not of fact. A
+    fetch-err on this same book (BUI-536) still leaves the row untouched
+    despite this message — the fetch-err guard in `_compute_and_upsert_one`
+    always wins, --force notwithstanding.
+    """
+    for i, old_notes in force_overwrite_notes.items():
+        book = books[i]
+        label = f"{book.get('title', '?')} #{book.get('issue', '?')}"
+        click.echo(
+            f"--force: about to overwrite hand-priced row for {label} "
+            f"(previous notes: {old_notes!r})",
+            err=True,
+        )
 
 
 def _db_lookup(server_url: str, *, locg_id: int, grade: float,
                locg_variant_id: int | None = None,
-               max_age_days: float) -> dict | None:
+               max_age_days: float | None) -> dict | None:
     """Return the freshest matching FMV row, or None if not cached/stale.
 
     Defensive verification: even if the server returns rows, re-check
@@ -287,6 +378,12 @@ def _db_lookup(server_url: str, *, locg_id: int, grade: float,
     A base cover (locg_variant_id=None) must reuse only a NULL-variant row, and
     a specific variant only its own — re-check it here because an absent query
     param can't express "NULL variant" to the server, only "no filter".
+
+    BUI-533: `max_age_days=None` disables the freshness filter entirely (the
+    `requests` library drops a None-valued param, so the server sees no
+    `max_age_days` at all and returns the row regardless of age) — used to
+    check an existing row's hand-priced marker even when it's too stale for
+    the normal cache-reuse path to consider.
     """
     params: dict = {"locg_id": locg_id, "grade": grade,
                     "max_age_days": max_age_days}
@@ -587,6 +684,28 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
         target_grade = coerced
         inp["grade"] = coerced
 
+    # BUI-536: a fetch-err (every tier ERRORED, not merely zero comps found)
+    # must NEVER touch the fmv DB row — no upsert, no partial field writes.
+    # Confirmed 2026-07-24: X-Men #39/FF #46/X-Men #104 kept their prior
+    # low/high/updated_at but had `comps` zeroed and `notes` overwritten with a
+    # stub (`window=±2.0 | cv=n/a | label=LOW`) by the unconditional BUI-44
+    # upsert below, destroying real provenance (including a hand-price marker).
+    # Reuses the exact BUI-143 signal (`_is_fetch_error`): comp_count_total==0
+    # AND every entry in queries_used carries an 'error' key. A GENUINE n=0
+    # (queries succeeded, zero comps found) has an empty/error-free
+    # queries_used and must still upsert unconditionally per BUI-44 — this
+    # check does not touch that path (see _is_fetch_error's own guards).
+    if _is_fetch_error({"comp_count_total": len(comps),
+                       "queries_used": result.get("queries_used", [])}):
+        return {
+            "input": inp, "fmv": None, "comp_count_total": len(comps),
+            "queries_used": result.get("queries_used", []),
+            "db_row": None, "comic_id": None, "fmv_id": None,
+            "source": "error",
+            "error": "fetch-err: all tiers failed; fmv DB row left "
+                     "untouched (BUI-536)",
+        }
+
     # BUI-286: merge the user's own resolved auctions in as first-party comps
     # (KTD-1 — the merge happens at the pool stage, right before compute_fmv,
     # never inside fmv_math's pure math). `comps` itself is left untouched so
@@ -679,7 +798,18 @@ def _is_unpriced_raw(result: dict) -> bool:
     (n=0, too_sparse/one_sided/too_wide with no §7 interpolation). A book that
     got ANY number — a real range, or a §7 interpolated point — is excluded, so
     the proxy tier can never change a book the raw math already priced.
+
+    BUI-536: also excludes ``source == "error"`` (a fetch-err row never even
+    ran ``compute_fmv`` — its ``fmv`` is ``None``, which would otherwise satisfy
+    ``fmv_high is None`` here just like a genuine thin-pool needs_manual book).
+    Without this, a vintage fetch-err book would still be handed to the rescue
+    tier's own second (graded-only) fetch — and, if THAT one happened to
+    succeed, upserted via it, defeating BUI-536's "no upsert at all" guarantee
+    through a side door the main fetch-err guard in
+    ``_compute_and_upsert_one`` doesn't cover.
     """
+    if result.get("source") == "error":
+        return False
     fmv = result.get("fmv") or {}
     grade = (result.get("input") or {}).get("grade")
     return (fmv.get("fmv_high") is None
@@ -1015,6 +1145,12 @@ def _build_notes(fmv: dict) -> str:
     if anchor:
         parts.append(
             f"ungraded_anchor=${anchor['median']:g} (n={anchor['n']} raw)")
+    # BUI-534: flag (never re-price) when fmv_low/fmv_high sit far outside the
+    # anchor above (fmv_math.anchor_diverges). Same philosophy as the
+    # cgc_cross_check token below — a human (or /comic:calibration-report)
+    # reads this as "look at this one", not as an instruction already acted on.
+    if fmv.get("anchor_diverges"):
+        parts.append("anchor_diverges=1")
     # BUI-529: surface the always-on vintage cross-check's divergence signal.
     # Informational only — this NEVER changes fmv_low/fmv_high/max_bid for a
     # book the raw math already priced (see _apply_cgc_cross_check); a human
@@ -1108,8 +1244,14 @@ def _build_notes(fmv: dict) -> str:
 # ─── Step 4 — Stitch + present ────────────────────────────────────────────────
 
 def _stitch(books: list[dict], cached: dict[int, dict],
-            fresh: dict[int, dict]) -> list[dict]:
-    """Combine cached and fresh results back into the input order."""
+            fresh: dict[int, dict],
+            skipped_hand: dict[int, dict] | None = None) -> list[dict]:
+    """Combine cached, fresh, and hand-priced-skipped results back into the
+    input order. `skipped_hand` (BUI-533) reuses the existing DB row exactly
+    like `cached` does (never recomputed), tagged with a distinct `source` so
+    the table/summary/--brief can tell a protected hand-priced row apart from
+    an ordinary cache hit."""
+    skipped_hand = skipped_hand or {}
     out: list[dict] = []
     for i, book in enumerate(books):
         if i in cached:
@@ -1121,6 +1263,16 @@ def _stitch(books: list[dict], cached: dict[int, dict],
                 "queries_used": [],
                 "db_row": row,
                 "source": "cached",
+            })
+        elif i in skipped_hand:
+            row = skipped_hand[i]
+            out.append({
+                "input": _input_summary(book),
+                "fmv": _fmv_from_db_row(row, book.get("grade_confidence")),
+                "comp_count_total": row.get("fmv_comps") or 0,
+                "queries_used": [],
+                "db_row": row,
+                "source": "skipped_hand_priced",
             })
         elif i in fresh:
             out.append(fresh[i])
@@ -1165,6 +1317,17 @@ def _cgc_proxy_from_notes(notes: str | None) -> bool:
     dedicated DB column — same lossy-projection recovery as `interpolated`.
     """
     return notes is not None and _CGC_PROXY_NOTE_TOKEN in notes
+
+
+def _anchor_diverges_from_notes(notes: str | None) -> bool:
+    """Recover the BUI-534 anchor-divergence flag from persisted fmv_notes.
+
+    The anchor itself (median/n) isn't reconstructible on a cache hit — same
+    lossy projection as `ungraded_anchor` (the raw grade-less comps aren't
+    persisted) — but `_build_notes` writes a plain `anchor_diverges=1` token
+    when the flag fired, so a re-served cached row can still surface it.
+    """
+    return notes is not None and "anchor_diverges=1" in notes
 
 
 def _window_from_notes(notes: str | None) -> float | None:
@@ -1265,6 +1428,11 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         # median/cv/trimmed_pool); the marker is enough for the table + bid cap.
         "cgc_proxy": cgc_proxy,
         "cgc_ladder": None,
+        # BUI-534: recover the flag (not the anchor itself, which isn't
+        # reconstructible — same lossy projection as ungraded_anchor) from the
+        # persisted `anchor_diverges=1` notes token, so a re-displayed /
+        # re-served cached row still surfaces the divergence signal.
+        "anchor_diverges": _anchor_diverges_from_notes(row.get("fmv_notes")),
         # BUI-529: shape parity with compute_fmv. The cross-check result itself
         # isn't persisted (no DB column — same lossy projection as median/cv),
         # so a cache-reused row always reads as "not cross-checked" here; the

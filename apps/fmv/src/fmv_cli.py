@@ -52,7 +52,10 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
                    "within N days. Default 7.")
 @click.option("--force", is_flag=True,
               help="Bypass both the SerpApi response cache and the DB FMV cache; "
-                   "recompute everything.")
+                   "recompute everything. Without --force, a hand-priced row "
+                   "(fmv_notes starting 'hand §' or 'hand OVERRIDE') is always "
+                   "skipped, even if stale (BUI-533); --force overwrites it and "
+                   "echoes the old notes to stderr.")
 @click.option("--grade-window", "grade_window", type=float, default=None,
               help="Max grade-window the comp pool may widen to (e.g. 2.5). "
                    "Default 2.0. Only changes how far widening reaches — it does "
