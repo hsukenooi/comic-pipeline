@@ -1738,8 +1738,150 @@ skip_integration = pytest.mark.skipif(
 )
 
 
+# ─── BUI-539: recorded-fixture replacements for the live-item integration
+# tests below. TestIntegrationFetch/TestIntegrationCLI pinned their assertions
+# to live eBay item 298217294954, which — like every eBay listing — has since
+# expired (404 as of BUI-539). The classes were never marked
+# `@pytest.mark.integration` at the class level, so pyproject.toml's default
+# `-m 'not integration'` gate never deselected them: only `skip_integration`
+# (skipif no credentials) applied, which means CI (no credentials) skipped
+# them and stayed green while every credentialed developer machine ran them
+# live and failed against the dead ID. The parse/CLI-plumbing behavior these
+# tests actually cared about doesn't need a live listing at all, so it's
+# re-asserted here against a frozen recorded response — these run
+# unconditionally (no marker, no credentials) and stay green forever.
+# ────────────────────────────────────────────────────────────────────────────
+
+_RECORDED_ITEM_ID = "298217294954"
+
+
+def _recorded_auction_response():
+    """A frozen snapshot of the Browse API getItem response eBay used to
+    return for item 298217294954 (an Amazing Spider-Man #300 auction) before
+    the listing expired. Shape mirrors TestParseItem's auction_response
+    fixture above, which was modeled on the same real listing."""
+    return {
+        "itemId": f"v1|{_RECORDED_ITEM_ID}|0",
+        "title": "AMAZING SPIDER-MAN # 300 - (NM-) -MCFARLANE-VENOM",
+        "buyingOptions": ["AUCTION"],
+        "currentBidPrice": {"value": "296.00", "currency": "USD"},
+        "price": {"value": "500.00", "currency": "USD"},
+        "bidCount": 35,
+        "itemEndDate": "2026-04-19T19:23:00.000Z",
+        "condition": "Like New",
+        "conditionId": "2750",
+        "localizedAspects": [
+            {"name": "Series Title", "value": "Amazing Spider-Man"},
+            {"name": "Issue Number", "value": "300"},
+        ],
+        "shortDescription": "First appearance of Venom",
+        "itemWebUrl": f"https://www.ebay.com/itm/{_RECORDED_ITEM_ID}",
+    }
+
+
+class TestFetchAndParseFromRecordedFixture:
+    """Offline replacement for TestIntegrationFetch::test_fetch_single_item /
+    test_fetch_and_parse (BUI-539). Same fetch_item()/parse_item() assertions,
+    against a recorded response instead of a live network call."""
+
+    def _mock_get(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = _recorded_auction_response()
+        return mock_resp
+
+    def test_fetch_single_item(self):
+        with patch("ebay_fetch.requests.get", return_value=self._mock_get()):
+            data = ebay_fetch.fetch_item(_RECORDED_ITEM_ID, "fake-token", ebay_fetch.PRODUCTION_BASE)
+        assert data is not None
+        assert "title" in data
+        assert "SPIDER-MAN" in data["title"].upper()
+
+    def test_fetch_and_parse(self):
+        with patch("ebay_fetch.requests.get", return_value=self._mock_get()):
+            data = ebay_fetch.fetch_item(_RECORDED_ITEM_ID, "fake-token", ebay_fetch.PRODUCTION_BASE)
+        parsed = ebay_fetch.parse_item(data)
+        assert parsed["item_id"] == _RECORDED_ITEM_ID
+        assert parsed["listing_type"] in ("Auction", "BIN")
+        assert parsed["current_price"].startswith("$")
+        assert parsed["grade"] is not None
+
+
+class TestCLIPlumbingFromRecordedFixture:
+    """Offline replacement for TestIntegrationCLI::test_table_output /
+    test_json_output / test_url_input / test_fields_filter (BUI-539).
+
+    Drives ebay_fetch.main() in-process rather than via subprocess, with
+    load_config()/get_token()/requests.get() mocked, so the real argparse,
+    JSON, table, and --fields code paths all run — deterministically, without
+    a live listing or credentials.
+    """
+
+    def _run_main(self, argv, capsys):
+        with patch(
+            "ebay_fetch.load_config",
+            return_value=("fake-id", "fake-secret", ebay_fetch.PRODUCTION_BASE),
+        ):
+            with patch("ebay_fetch.get_token", return_value="fake-token"):
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.json.return_value = _recorded_auction_response()
+                with patch("ebay_fetch.requests.get", return_value=mock_resp):
+                    ebay_fetch.main(argv)
+        return capsys.readouterr()
+
+    def test_table_output(self, capsys):
+        captured = self._run_main([_RECORDED_ITEM_ID], capsys)
+        assert "SPIDER-MAN" in captured.out.upper()
+        assert _RECORDED_ITEM_ID in captured.out
+
+    def test_json_output(self, capsys):
+        captured = self._run_main(["--json", _RECORDED_ITEM_ID], capsys)
+        data = json.loads(captured.out)
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["item_id"] == _RECORDED_ITEM_ID
+
+    def test_url_input(self, capsys):
+        captured = self._run_main(
+            ["--json", f"https://www.ebay.com/itm/{_RECORDED_ITEM_ID}"], capsys,
+        )
+        data = json.loads(captured.out)
+        assert data[0]["item_id"] == _RECORDED_ITEM_ID
+
+    def test_fields_filter(self, capsys):
+        captured = self._run_main(
+            ["--json", "--fields", "item_id,title", _RECORDED_ITEM_ID], capsys,
+        )
+        data = json.loads(captured.out)
+        assert set(data[0].keys()) == {"item_id", "title"}
+
+    def test_no_args_shows_help(self):
+        """No positional items and closed stdin: help-and-exit-1. Genuinely
+        network-free (main() exits at the "no raw_items" guard before ever
+        loading config), so this runs as a real subprocess rather than through
+        _run_main() — there's nothing to mock."""
+        result = subprocess.run(
+            [sys.executable, _MODULE],
+            capture_output=True, text=True, timeout=10,
+            input="",  # empty stdin
+        )
+        assert result.returncode != 0
+
+
+# ─── Genuinely-live integration tests: opt-in only ────────────────────────
+#
+# Everything below hits real eBay (OAuth + Browse API) and is gated by BOTH
+# `-m integration` (pyproject.toml's default addopts deselects it otherwise)
+# AND `skip_integration` (skipif no credentials are configured). Run
+# explicitly with `uv run --with pytest pytest -m integration` on a
+# credentialed machine.
+
+
 @skip_integration
 class TestIntegrationAuth:
+    pytestmark = pytest.mark.integration
+
     def test_get_token_real(self):
         client_id, client_secret, base_url = ebay_fetch.load_config()
         token = ebay_fetch.get_token(client_id, client_secret, base_url)
@@ -1749,6 +1891,8 @@ class TestIntegrationAuth:
 
 @skip_integration
 class TestIntegrationFetch:
+    pytestmark = pytest.mark.integration
+
     @pytest.fixture(scope="class")
     def auth(self):
         client_id, client_secret, base_url = ebay_fetch.load_config()
@@ -1776,7 +1920,6 @@ class TestIntegrationFetch:
         result = ebay_fetch.fetch_item("1", token, base_url)
         assert result is None
 
-    @pytest.mark.integration
     def test_fetch_multiple_items(self, auth):
         token, base_url = auth
         ids = ["298217294954", "298210880012", "306871783258"]
@@ -1792,6 +1935,8 @@ class TestIntegrationFetch:
 @skip_integration
 class TestIntegrationCLI:
     """Test the CLI end-to-end as a subprocess."""
+
+    pytestmark = pytest.mark.integration
 
     def test_table_output(self):
         result = subprocess.run(
@@ -1813,7 +1958,6 @@ class TestIntegrationCLI:
         assert len(data) == 1
         assert data[0]["item_id"] == "298217294954"
 
-    @pytest.mark.integration
     def test_multiple_items(self):
         result = subprocess.run(
             [sys.executable, _MODULE, "--json",
@@ -1833,14 +1977,6 @@ class TestIntegrationCLI:
         assert result.returncode == 0
         data = json.loads(result.stdout)
         assert data[0]["item_id"] == "298217294954"
-
-    def test_no_args_shows_help(self):
-        result = subprocess.run(
-            [sys.executable, _MODULE],
-            capture_output=True, text=True, timeout=10,
-            input="",  # empty stdin
-        )
-        assert result.returncode != 0
 
     def test_fields_filter(self):
         result = subprocess.run(
