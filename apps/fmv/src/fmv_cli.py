@@ -69,9 +69,13 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
 @click.option("--brief", is_flag=True,
               help="BUI-362: after the human table, print one compact JSON "
                    "object per row (item_id, comic_id, fmv_id, max_bid, "
-                   "flag_reason, confidence) — the linkage fields /comic:buy "
+                   "fmv_low, fmv_high, fmv_notes, flag_reason, confidence, "
+                   "source) on stdout — the linkage fields /comic:buy "
                    "threads into the snipe step, without reading the full "
-                   "--out file. Combine with --quiet for the JSON lines only.")
+                   "--out file. `source` (BUI-549) distinguishes a "
+                   "comics-server lookup-error skip (skipped_lookup_error) "
+                   "from an ordinary unpriced row. Combine with --quiet for "
+                   "the JSON lines only.")
 @click.option("--server-url", envvar=["COMICS_SERVER_URL", "GIXEN_SERVER_URL"], default=None,
               help="Comics server URL (reads COMICS_SERVER_URL, "
                    "falling back to the deprecated GIXEN_SERVER_URL).")
