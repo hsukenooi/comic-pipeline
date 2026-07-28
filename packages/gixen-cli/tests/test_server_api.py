@@ -904,10 +904,30 @@ def test_sync_gixen_inserts_web_added_snipe(api):
     # own uncommitted writes). Read back via a SEPARATE connection to prove
     # the insert actually reached disk.
     row = _dbconn().execute(
-        "SELECT status FROM bids WHERE item_id=?", ("777888999",)
+        "SELECT status, max_bid FROM bids WHERE item_id=?", ("777888999",)
     ).fetchone()
     assert row is not None
     assert row["status"] == "PENDING"
+    # BUI-555: the cap comes across intact. The old `float("30.00 USD")` raised
+    # and silently inserted the snipe at 0.00 — a row whose DB cap bore no
+    # relation to the one Gixen would actually bid.
+    assert row["max_bid"] == 30.0
+
+
+def test_web_added_snipe_with_unreadable_max_bid_still_inserts(api):
+    """BUI-555: a genuinely unreadable cap keeps the pre-existing conservative
+    0.0 fallback rather than skipping the insert — a snipe that exists on Gixen
+    must never be invisible locally. The mirror corrects it next cycle."""
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("555100010", status="SCHEDULED", time_to_end="2 h",
+                       max_bid="N/A"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    row = _dbconn().execute(
+        "SELECT status, max_bid FROM bids WHERE item_id=?", ("555100010",)
+    ).fetchone()
+    assert row["status"] == "PENDING"
+    assert row["max_bid"] == 0.0
 
 
 def test_sync_gixen_does_not_purge_vanished(api):
@@ -2214,6 +2234,185 @@ def test_web_added_bid_insert_survives_parse_miss_snipe_group(api):
     assert api.post("/api/sync").status_code == 200
     assert _read_db_row("383000002")["status"] == "PENDING"
     assert _read_col("383000002", "snipe_group") == 0
+
+
+# ---------------------------------------------------------------------------
+# BUI-555: the sync mirrors Gixen's max_bid; a failed edit-confirm self-corrects
+# ---------------------------------------------------------------------------
+
+def _set_col(item_id, col, value):
+    conn = _dbconn()
+    conn.execute(f"UPDATE bids SET {col}=? WHERE item_id=?", (value, item_id))
+    conn.commit()
+    conn.close()
+
+
+def test_sync_mirrors_gixen_max_bid_onto_pending_row(api):
+    """Every sync already read Gixen's authoritative max_bid and threw it away,
+    so a divergence — however caused — was permanent. Now it heals (BUI-555)."""
+    _seed_bid_row("555100001", max_bid=3.90)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("555100001", status="SCHEDULED", time_to_end="3 h",
+                       max_bid="12.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("555100001", "max_bid") == 12.00
+
+
+def test_sync_mirrors_a_lowered_cap_before_the_local_sniper_can_fire(api):
+    """The money case (item 147447605357): the cap was cut 80 -> 30 on Gixen
+    while the DB kept 80. _sniper_loop builds its bid list straight from
+    bids.max_bid, so assert through get_bids_ready_to_snipe — the exact read
+    that would have placed 80 of real money against a cap of 30."""
+    from datetime import datetime, timedelta, timezone
+    from server.db import get_bids_ready_to_snipe
+
+    _seed_bid_row("555100002", max_bid=80.0, auction_end_at=_iso_ago(hours=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("555100002", status="SCHEDULED", time_to_end="3 h",
+                       max_bid="30.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+
+    # The same sync also refreshes auction_end_at from Gixen's countdown, so
+    # ask the sniper query from past that end rather than from "now".
+    fire_time = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    conn = _dbconn()
+    try:
+        ready = get_bids_ready_to_snipe(conn, fire_time)
+        fired = {r["item_id"]: r["max_bid"] for r in ready}
+    finally:
+        conn.close()
+    assert fired["555100002"] == 30.0
+
+
+def test_sync_leaves_an_unreadable_max_bid_alone(api):
+    """A scrape quirk must never be coerced into a cap. The DB keeps what it
+    had — the same "None means unknown" contract BUI-383 established for
+    snipe_group, where a coerced 0 durably destroyed real state."""
+    _seed_bid_row("555100003", max_bid=42.0)
+    for bad in ("", "N/A", None, "0.00"):
+        api.mock_gixen.list_snipes.return_value = [
+            _gixen_listing("555100003", status="SCHEDULED", time_to_end="3 h",
+                           max_bid=bad),
+        ]
+        assert api.post("/api/sync").status_code == 200
+        assert _read_col("555100003", "max_bid") == 42.0
+
+
+def test_sync_does_not_rewrite_a_resolved_rows_max_bid(api):
+    """A resolved row records the cap the auction was actually bid at.
+    Repairing historic divergence is the one-time reconciliation's job
+    (scripts/reconcile_max_bid.py), never the sync's."""
+    _seed_bid_row("555100004", status="WON", max_bid=60.0, winning_bid=62.0,
+                  auction_end_at=_iso_ago(days=1), resolved_at=_iso_ago(days=1))
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("555100004", status="WON", time_to_end="ENDED",
+                       max_bid="335.00 USD", current_bid="62.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("555100004", "max_bid") == 60.0
+
+
+def test_sync_does_not_clobber_a_max_bid_written_after_the_scrape_began(api):
+    """The BUI-402 interleaving. _sync_loop scrapes WITHOUT _api_lock, so its
+    list can predate an edit that commits mid-scrape. A local write stamped at
+    or after the scrape start wins; reverting it would push the cap back UP to
+    a value the user had just lowered."""
+    _seed_bid_row("555100005", max_bid=30.0)
+    # Stamp far in the future: no scrape started in this test can predate it.
+    _set_col("555100005", "max_bid_changed_at", "2099-01-01T00:00:00+00:00")
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("555100005", status="SCHEDULED", time_to_end="3 h",
+                       max_bid="80.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("555100005", "max_bid") == 30.0
+
+
+def test_edit_whose_confirm_read_raises_reconciles_to_gixens_value(api):
+    """THE regression. modify_snipe POSTs first and confirms second, so a raise
+    out of it covers two worlds: the POST never landed, or it landed and only
+    the confirm READ failed. Pre-BUI-555 the handler assumed the first — 503,
+    update_bid skipped, Gixen-new/DB-old forever. Now the row is reconciled to
+    what Gixen actually holds, and the 503 says the POST may have applied."""
+    from gixen_client import GixenError
+    _seed_bid_row("555100006", max_bid=30.0)
+    api.mock_gixen.modify_snipe.side_effect = GixenError("read-back failed")
+    # The POST *did* land: Gixen now holds 80.
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("555100006", status="SCHEDULED", time_to_end="3 h",
+                       max_bid="80.00 USD"),
+    ]
+
+    r = api.patch("/api/bids/555100006", json={"max_bid": 80.0})
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert "MAY HAVE APPLIED" in detail
+    assert "80.0" in detail
+    assert _read_col("555100006", "max_bid") == 80.0
+
+
+def test_edit_503_does_not_invent_a_value_when_the_reread_also_fails(api):
+    """When Gixen is fully unreachable we know nothing, so the row must be left
+    untouched rather than guessed at — and the NEXT sync is what closes the
+    divergence. This is the ticket's acceptance criterion end to end."""
+    from gixen_client import GixenError
+    _seed_bid_row("555100007", max_bid=30.0)
+    api.mock_gixen.modify_snipe.side_effect = GixenError("read-back failed")
+    api.mock_gixen.list_snipes.side_effect = GixenError("gixen unreachable")
+
+    r = api.patch("/api/bids/555100007", json={"max_bid": 80.0})
+    assert r.status_code == 503
+    assert "MAY HAVE APPLIED" in r.json()["detail"]
+    assert _read_col("555100007", "max_bid") == 30.0   # nothing invented
+
+    # Gixen comes back and reveals the POST had in fact landed. The sync mirror
+    # is the durable backstop: no lasting DB<->Gixen disagreement.
+    api.mock_gixen.list_snipes.side_effect = None
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("555100007", status="SCHEDULED", time_to_end="3 h",
+                       max_bid="80.00 USD"),
+    ]
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("555100007", "max_bid") == 80.0
+
+
+def test_edit_not_found_is_still_a_plain_404(api):
+    """GixenSnipeNotFoundError comes from the PRE-POST lookup — nothing was
+    submitted, so there is no 'may have applied' ambiguity to reconcile and no
+    reason to spend a Gixen read."""
+    from gixen_client import GixenSnipeNotFoundError
+    _seed_bid_row("555100008", max_bid=30.0)
+    api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("nope")
+    api.mock_gixen.list_snipes.reset_mock()
+
+    r = api.patch("/api/bids/555100008", json={"max_bid": 80.0})
+    assert r.status_code == 404
+    assert api.mock_gixen.list_snipes.call_count == 0
+    assert _read_col("555100008", "max_bid") == 30.0
+
+
+def test_successful_edit_stamps_the_guard_the_mirror_reads(api):
+    """A successful PATCH must leave max_bid_changed_at set — that stamp is the
+    entire mechanism by which a stale concurrent scrape is made to stand down
+    (see test_sync_does_not_clobber_a_max_bid_written_after_the_scrape_began).
+    An edit that wrote the cap without the stamp would be silently clobberable.
+
+    The follow-on sync here carries the POST-edit list, which is what a
+    CONFIRMED modify means (BUI-115 verifies the new value went live before
+    returning), so the mirror correctly finds nothing to do."""
+    _seed_bid_row("555100009", max_bid=80.0)
+    api.mock_gixen.list_snipes.return_value = [
+        _gixen_listing("555100009", status="SCHEDULED", time_to_end="3 h",
+                       max_bid="30.00 USD"),
+    ]
+    assert api.patch("/api/bids/555100009", json={"max_bid": 30.0}).status_code == 200
+    assert _read_col("555100009", "max_bid") == 30.0
+    assert _read_col("555100009", "max_bid_changed_at") is not None
+
+    assert api.post("/api/sync").status_code == 200
+    assert _read_col("555100009", "max_bid") == 30.0
 
 
 def test_group_evidence_survives_winner_purge_with_failed_sibling_removal(api):

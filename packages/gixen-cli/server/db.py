@@ -182,6 +182,17 @@ _COLUMN_MIGRATIONS = [
     # predates its membership (the win postdates added_at but predates the
     # join — the late-join backdating false-REMOVED).
     "ALTER TABLE bids ADD COLUMN group_changed_at TEXT",
+    # BUI-555: when this row's max_bid was last written LOCALLY — by the edit
+    # path (update_bid) or by the per-sync Gixen mirror (mirror_gixen_max_bid).
+    # NULL until the first such write. Purely a write-ordering guard, with no
+    # evidence semantics of its own (unlike group_changed_at above): the sync
+    # mirror skips any row whose max_bid_changed_at is at or after the scrape's
+    # start, because that scrape may predate the local write and would clobber
+    # it with a stale value. _sync_loop deliberately runs WITHOUT _api_lock
+    # (BUI-402 note at _sync_client), so its scrape genuinely can overlap an
+    # in-flight PATCH — and bids.max_bid is what _sniper_loop fires real money
+    # from, so a stale-scrape clobber is not cosmetic.
+    "ALTER TABLE bids ADD COLUMN max_bid_changed_at TEXT",
     # BUI-385: provenance tag on the group_wins ledger (which writer recorded
     # a row) — a GROUP_WIN_SOURCES value, exposed over /api/group-wins for
     # forensics. Nullable on ADD; _apply_migrations stamps pre-column rows
@@ -220,7 +231,8 @@ _BIDS_TABLE_SQL = """
         dbidid              TEXT,
         gixen_vanished_at   TEXT,
         ebay_no_price_at    TEXT,
-        group_changed_at    TEXT
+        group_changed_at    TEXT,
+        max_bid_changed_at  TEXT
     )
 """
 
@@ -806,11 +818,19 @@ def update_bid(
     # re-stamp: that would narrow _group_won_before's evidence window and
     # weaken legitimate group-cancel evidence for no reason. A None snipe_group
     # skips its SET entirely, so group_changed_at is never touched then.
+    #
+    # max_bid_changed_at (BUI-555): stamped unconditionally, because max_bid is
+    # written unconditionally here. It records "the edit path last wrote this
+    # row's cap at T" so the per-sync mirror (mirror_gixen_max_bid) can refuse
+    # to overwrite it with a scrape that started before T. Unlike
+    # group_changed_at it is NOT change-gated: a no-op re-PATCH stamping the
+    # column only makes the mirror skip one extra cycle, whereas a missed stamp
+    # would let a stale scrape clobber a just-written cap.
     now = datetime.now(timezone.utc).isoformat()
     # Every fragment below is a static literal — only the bound values are
     # caller-supplied — so this dynamic assembly carries no injection surface.
-    set_clauses = ["max_bid=?"]
-    params: list = [max_bid]
+    set_clauses = ["max_bid=?", "max_bid_changed_at=?"]
+    params: list = [max_bid, now]
     if bid_offset is not None:
         set_clauses.append("bid_offset=?")
         params.append(bid_offset)
@@ -1099,6 +1119,84 @@ def refresh_snipe_group(
         (snipe_group, changed_at or datetime.now(timezone.utc).isoformat(),
          item_id, snipe_group),
     )
+
+
+# BUI-555: money values are 2dp, so anything under half a cent is float
+# representation noise, not a real divergence. Keeps the mirror from
+# re-stamping (and re-logging) an identical cap every sync cycle.
+_MAX_BID_EPSILON = 0.005
+
+
+def mirror_gixen_max_bid(
+    conn: sqlite3.Connection, item_id: str, max_bid: float,
+    *, observed_at: str, scrape_started_at: str,
+) -> tuple[float, float] | None:
+    """Mirror Gixen's listed max_bid onto the live (PENDING) row (BUI-555).
+
+    Returns ``(old, new)`` when a divergence was actually repaired, else None.
+
+    _sync_gixen already refreshes title/seller/current_bid/dbidid
+    (cache_gixen_data), snipe_group (refresh_snipe_group) and auction_end_at
+    from every scrape, but it read Gixen's authoritative max_bid and threw it
+    away. That made the BUI-115 "verify the modify" fix one-directional: a
+    modify_snipe whose POST lands and whose confirm READ then fails raises,
+    api_edit_bid maps it to 503, update_bid never runs, and Gixen-new/DB-old
+    became permanent — through resolution and into history. This mirror is the
+    compensating action: Gixen is the authority for the cap in both directions,
+    so the next scrape heals the row with no operator action.
+
+    This is deliberately NOT update_bid. update_bid clears gixen_vanished_at
+    (BUI-371 — justified only because every one of its callers runs right after
+    a first-party Gixen add/modify) and stamps group_changed_at (BUI-384).
+    A passive sync observation must inherit neither: it is not confirmation the
+    snipe was just (re-)armed, and it changes no group.
+
+    Guards, in order:
+
+    * ``status='PENDING'`` — resolved rows keep the cap they were bid at, and
+      the tombstone (TOMBSTONE_STATUSES_SQL) is strictly excluded by the same
+      filter. Historic divergence is the one-time reconciliation's job
+      (scripts/reconcile_max_bid.py), not the sync's.
+    * ``max_bid_changed_at < scrape_started_at`` — the write-ordering guard.
+      _sync_loop scrapes WITHOUT _api_lock (by design, so a slow scrape doesn't
+      block request handlers), so its list can be older than an edit that
+      committed while it was in flight. api_edit_bid stamps max_bid_changed_at
+      inside the same _api_lock acquisition that did the Gixen modify, and the
+      modify POST necessarily precedes that stamp — so if the stamp predates
+      the scrape's start, the scrape is guaranteed to have observed the
+      post-edit Gixen state and is safe to mirror. Anything at or after the
+      scrape start is refused: a cap the user just LOWERED must never be
+      reverted upward by a stale read, which is exactly the 80-vs-30 near-miss
+      on item 147447605357.
+    * an epsilon compare, so an unchanged cap writes nothing.
+
+    Caller must conn.commit() — hot-path inside the _sync_gixen loop where
+    commits are batched at the end of the cycle.
+    """
+    # id-targeted, like the BUI-390 terminal write: the partial unique index
+    # forbids a second PENDING row for the same item_id, so this IS the live
+    # row — but reading and writing the same id makes that independent of the
+    # index holding.
+    row = conn.execute(
+        "SELECT id, max_bid, max_bid_changed_at FROM bids "
+        "WHERE item_id=? AND status='PENDING' ORDER BY id DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    changed_at = row["max_bid_changed_at"]
+    # ISO-8601 UTC strings from datetime.isoformat() sort lexicographically.
+    if changed_at is not None and changed_at >= scrape_started_at:
+        return None
+    old = float(row["max_bid"])
+    if abs(old - max_bid) < _MAX_BID_EPSILON:
+        return None
+    conn.execute(
+        "UPDATE bids SET max_bid=?, max_bid_changed_at=? "
+        "WHERE id=? AND status='PENDING'",
+        (max_bid, observed_at, row["id"]),
+    )
+    return (old, max_bid)
 
 
 def set_auction_end_time(conn: sqlite3.Connection, item_id: str, end_time_iso: str) -> None:

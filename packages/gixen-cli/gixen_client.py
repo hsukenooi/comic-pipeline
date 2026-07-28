@@ -206,6 +206,39 @@ class GixenModifyNotConfirmedError(GixenError):
         )
 
 
+def parse_listed_max_bid(value: str | int | float | None) -> float | None:
+    """Parse a scraped snipe's max_bid to a POSITIVE float, or None when the
+    value is absent, blank, unparseable, or non-positive (BUI-555).
+
+    "None means unknown" — the same contract as server.fallback's
+    _parse_snipe_group, and for a sharper reason: the consumer
+    (server.db.mirror_gixen_max_bid) writes bids.max_bid, which _sniper_loop
+    fires real money from. Coercing a scrape quirk to 0 — or to any fallback
+    number — would durably rewrite the user's cap off a parse failure. A
+    blank/garbage cell means "we did not read a cap this cycle", so the DB
+    keeps whatever it already had.
+
+    Lives here, beside GixenClient._max_bid_matches, because the two must agree
+    on what counts as the same number: the same character strip tolerates the
+    currency suffix ("25.00 USD") and thousands separators Gixen renders.
+    """
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]", "", str(value).strip())
+    if cleaned in ("", ".", "-"):
+        return None
+    try:
+        parsed = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    # <= 0 is never a real cap — Gixen has no zero-bid snipe — so this is a
+    # parse artifact (e.g. a stray "-" surviving the strip), not a value to
+    # write. Zeroing a live row's cap would silently disarm the local sniper.
+    if parsed <= 0:
+        return None
+    return float(parsed)
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------

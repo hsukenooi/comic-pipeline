@@ -23,7 +23,7 @@ from pydantic import BaseModel, field_validator
 from gixen_client import (
     GixenClient, GixenError, GixenConnectionError, GixenSnipeNotFoundError,
     GixenAddNotConfirmedError, GixenModifyNotConfirmedError,
-    find_sibling_cleanup_targets,
+    find_sibling_cleanup_targets, parse_listed_max_bid,
 )
 from gixen.plugins import (
     load_plugins,
@@ -37,7 +37,7 @@ from server.db import (
     update_bid, update_bid_status, delete_bid, get_all_bids,
     mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
-    refresh_snipe_group,
+    refresh_snipe_group, mirror_gixen_max_bid,
     TOMBSTONE_STATUSES_SQL,
     write_transaction,
 )
@@ -611,9 +611,17 @@ def _insert_web_added_bids(
             snipe.get("status", ""), snipe.get("time_to_end", "")
         )
         if snipe["item_id"] not in existing_ids and snipe_terminal is None:
-            try:
-                max_bid = float(snipe.get("max_bid") or 0)
-            except (ValueError, TypeError):
+            # BUI-555: was `float(snipe.get("max_bid") or 0)`, which raises on
+            # any formatting Gixen actually renders — "25.00 USD", a thousands
+            # separator — and silently inserted the snipe at a cap of 0.00.
+            # parse_listed_max_bid reads those correctly and still returns None
+            # (-> 0.0, the pre-existing conservative fallback) for a genuinely
+            # unreadable cell, so a malformed row still inserts rather than
+            # vanishing. The row is inserted BELOW the per-snipe mirror loop
+            # above, so without this it would carry the wrong cap for a whole
+            # sync cycle before mirror_gixen_max_bid could repair it.
+            max_bid = parse_listed_max_bid(snipe.get("max_bid"))
+            if max_bid is None:
                 max_bid = 0.0
             # BUI-410: guard bid_offset the same way max_bid (above) and
             # snipe_group (below) already are. Before Stage 3, _insert_web_added_bids
@@ -842,6 +850,32 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
                 listed_group = _parse_snipe_group(snipe.get("snipe_group"))
                 if listed_group is not None:
                     refresh_snipe_group(wconn, iid, listed_group, changed_at=now)
+                # BUI-555: mirror the list's max_bid the same way. The scrape
+                # has always carried it; the sync just discarded it, so a
+                # modify that landed on Gixen but failed its confirm READ (503
+                # from api_edit_bid, update_bid skipped) diverged permanently.
+                # _sniper_loop fires the local backup bidder straight off
+                # bids.max_bid, so a stale cap is real money, not a display
+                # bug. Runs BEFORE the terminal loop below, so a snipe that
+                # resolves in this same cycle carries the corrected cap into
+                # history. mirror_gixen_max_bid owns the PENDING gate and the
+                # scrape-vs-local-write ordering guard; None here means the
+                # cell was blank/unparseable and the DB keeps its value.
+                listed_max_bid = parse_listed_max_bid(snipe.get("max_bid"))
+                if listed_max_bid is not None:
+                    repaired = mirror_gixen_max_bid(
+                        wconn, iid, listed_max_bid,
+                        observed_at=now, scrape_started_at=scrape_started_at,
+                    )
+                    if repaired is not None:
+                        # WARNING, not INFO: a divergence means an earlier
+                        # local write was lost, so each line is a defect
+                        # sighting on the money path — worth finding in a log.
+                        logger.warning(
+                            "_sync_gixen: max_bid for item=%s diverged from Gixen "
+                            "(local %s, Gixen %s) — mirrored Gixen's value (BUI-555)",
+                            iid, repaired[0], repaired[1],
+                        )
                 # Refresh auction_end_at from Gixen's relative time string on
                 # every sync (Gixen only gives "21 h, 30 m, 43 s") so the local
                 # sniper has a current end time without depending on eBay.
@@ -1801,6 +1835,99 @@ async def _remove_with_cache_fallback(db: sqlite3.Connection, item_id: str) -> N
             await asyncio.to_thread(_api_client.remove_snipe, item_id)  # dbidid=None
 
 
+async def _reconcile_after_unconfirmed_modify(
+    item_id: str, requested_max_bid: float, exc: Exception,
+) -> str:
+    """BUI-555: after a modify_snipe that raised, re-read Gixen and persist what
+    it ACTUALLY holds. Returns the 503 detail string for the caller to raise.
+
+    modify_snipe POSTs first and confirms second, so every GixenError out of it
+    covers two indistinguishable worlds: the POST never landed, or it landed and
+    only the confirm read failed. The pre-BUI-555 handler assumed the first —
+    it 503'd, skipped update_bid, and told the user the edit failed. When the
+    second world was the true one, Gixen held the new cap, the DB held the old
+    one, and nothing ever healed it.
+
+    So: take one bounded extra read (under _api_lock, like every other Gixen
+    call from a request handler) and write down the truth. Persisting Gixen's
+    value is safe in BOTH worlds — if the POST never landed, Gixen still holds
+    the pre-edit cap and the mirror is a no-op; if it did land, the DB stops
+    lying. It is also the safe direction for _sniper_loop, which should fire at
+    whatever cap the authoritative service holds.
+
+    The status code stays 503 either way. We did not confirm the edit through
+    the normal path, so claiming success would be the inverse lie — but the
+    detail now says the POST may have applied, and names Gixen's current value.
+    Every failure inside here is swallowed: the caller still gets its 503, and
+    _sync_gixen's per-cycle mirror is the durable backstop.
+    """
+    # GixenConnectionError embeds the request URL, which carries a live
+    # ?sessionid=<id>. This detail goes back over HTTP to the caller, so strip
+    # it — same redaction gixen_client._response_snippet applies to bodies.
+    # (Other 503 sites in this file still pass a raw str(e); see BUI-555's
+    # out-of-scope note.)
+    exc_text = re.sub(r"sessionid=\d+", "sessionid=REDACTED", str(exc))
+    logger.warning(
+        "api_edit_bid: modify for item=%s (requested max_bid=%s) did not confirm "
+        "(%s) — the POST MAY HAVE APPLIED on Gixen; re-reading to reconcile",
+        item_id, requested_max_bid, exc_text,
+    )
+    unconfirmed = (
+        f"Gixen edit for item {item_id} could not be confirmed and MAY HAVE "
+        f"APPLIED: {exc_text}"
+    )
+    read_started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        if _api_lock is None:  # lifespan never ran (shouldn't happen in-request)
+            raise RuntimeError("_api_lock unset")
+        async with _api_lock:
+            snipes = await asyncio.to_thread(_api_client.list_snipes)
+    except Exception:
+        logger.exception(
+            "api_edit_bid: reconciling re-read for item=%s also failed", item_id,
+        )
+        return (
+            f"{unconfirmed}. Gixen could not be re-read, so the local max_bid was "
+            f"left unchanged — the next Gixen sync will reconcile it."
+        )
+
+    listed = next((s for s in snipes if s.get("item_id") == str(item_id)), None)
+    actual = parse_listed_max_bid(listed.get("max_bid")) if listed else None
+    if actual is None:
+        return (
+            f"{unconfirmed}. Gixen re-read returned no usable max_bid for this "
+            f"item, so the local value was left unchanged — the next Gixen sync "
+            f"will reconcile it."
+        )
+
+    # scrape_started_at=read_started_at reuses the mirror's own ordering guard:
+    # a PATCH that committed while this read was in flight wins over it.
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                repaired = mirror_gixen_max_bid(
+                    wconn, item_id, actual,
+                    observed_at=now, scrape_started_at=read_started_at,
+                )
+    except Exception:
+        logger.exception(
+            "api_edit_bid: reconciling write for item=%s failed", item_id,
+        )
+        return f"{unconfirmed}. Gixen holds max_bid={actual} for this item."
+
+    if repaired is not None:
+        logger.warning(
+            "api_edit_bid: reconciled local max_bid for item=%s from %s to Gixen's "
+            "%s after an unconfirmed modify (BUI-555)",
+            item_id, repaired[0], repaired[1],
+        )
+    return (
+        f"{unconfirmed}. Gixen currently holds max_bid={actual} for this item "
+        f"and the local row now matches it."
+    )
+
+
 @app.patch("/api/bids/{item_id}")
 async def api_edit_bid(item_id: str, req: EditBidRequest):
     if not re.match(r"^\d+$", item_id):
@@ -1864,11 +1991,15 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                     update_bid(wconn, item_id, req.max_bid, req.bid_offset, req.snipe_group)
                     row = get_bid_by_item_id(wconn, item_id)
     except GixenSnipeNotFoundError as e:
+        # Nothing was POSTed — the pre-POST lookup found no such snipe — so
+        # there is no "may have applied" ambiguity to reconcile here.
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen") from e
-    except GixenError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
-    except requests.HTTPError as e:
-        raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}") from e
+    except (GixenError, requests.HTTPError) as e:
+        # BUI-555: both of these can be raised AFTER modify_snipe's POST has
+        # already mutated Gixen (the confirm read is what failed), so neither
+        # may be reported as a clean no-op failure. Reconcile, then 503.
+        detail = await _reconcile_after_unconfirmed_modify(item_id, req.max_bid, e)
+        raise HTTPException(status_code=503, detail=detail) from e
 
     if row is None:
         # Gixen accepted the modify, so this snipe lives there — but our DB
