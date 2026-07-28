@@ -1022,6 +1022,51 @@ class TestExceptionHierarchy:
         assert err.message == "Not found"
         assert "299" in str(err)
 
+    def test_gixen_error_str_redacts_sessionid(self):
+        """BUI-558: the base class redacts sessionid=<digits> out of str(),
+        so every subclass gets the protection without repeating the regex."""
+        err = GixenError("failed at ?sessionid=127104536873641522 during POST")
+        assert "127104536873641522" not in str(err)
+        assert "sessionid=REDACTED" in str(err)
+
+    def test_connection_error_redacts_sessionid_from_embedded_url(self):
+        """The realistic path: GixenConnectionError wraps a URL (via
+        _connection_error/_home_url) that carries a live session id."""
+        err = GixenConnectionError(
+            "Could not reach Gixen at "
+            "https://www.gixen.com/main/home_2.php?sessionid=999888777: "
+            "connection refused."
+        )
+        assert "999888777" not in str(err)
+        assert "sessionid=REDACTED" in str(err)
+
+    def test_gixen_error_str_redaction_does_not_break_args_or_repr(self):
+        """Overriding __str__ must not touch .args, chaining, or repr() —
+        those still carry the raw message; only the rendered string output
+        is redacted."""
+        raw = "boom at sessionid=123456"
+        err = GixenError(raw)
+        assert err.args == (raw,)
+        assert "sessionid=REDACTED" in str(err)
+        # repr() uses args, not __str__ — unaffected by the override.
+        assert "sessionid=123456" in repr(err)
+
+        # Exception chaining (`raise ... from e`) survives untouched.
+        try:
+            try:
+                raise err
+            except GixenError as e:
+                raise RuntimeError("wrapped") from e
+        except RuntimeError as outer:
+            assert outer.__cause__ is err
+            assert "sessionid=REDACTED" in str(outer.__cause__)
+
+    def test_gixen_error_str_does_not_recurse(self):
+        """A pathological message with no sessionid still renders once,
+        proving __str__ isn't calling itself."""
+        err = GixenError("plain message, no secrets here")
+        assert str(err) == "plain message, no secrets here"
+
 
 # ---------------------------------------------------------------------------
 # CLI: add duplicate detection
