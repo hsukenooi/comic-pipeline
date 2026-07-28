@@ -11,6 +11,7 @@ from server.db import (
     init_db, insert_bid, get_bid_by_item_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged, set_local_snipe_result,
+    mirror_gixen_max_bid,
 )
 
 
@@ -2197,3 +2198,187 @@ def test_db_read_connection_sets_busy_timeout(tmp_path):
         assert row[0] == 5000
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# BUI-555: mirror_gixen_max_bid — the per-sync max_bid mirror
+# ---------------------------------------------------------------------------
+
+def _seed_pending(db, item_id="555000001", max_bid=30.0, status="PENDING",
+                  max_bid_changed_at=None):
+    bid_id = insert_bid(db, item_id=item_id, max_bid=max_bid, bid_offset=6,
+                        snipe_group=0, seller=None)
+    db.execute(
+        "UPDATE bids SET status=?, max_bid_changed_at=? WHERE id=?",
+        (status, max_bid_changed_at, bid_id),
+    )
+    db.commit()
+    return bid_id
+
+
+def _max_bid_of(db, item_id):
+    return db.execute(
+        "SELECT max_bid FROM bids WHERE item_id=?", (item_id,)
+    ).fetchone()["max_bid"]
+
+
+def test_mirror_max_bid_repairs_divergent_pending_row(db):
+    """The headline case: Gixen holds the authoritative cap and the DB is
+    stale (a modify that landed but whose confirm read failed). The mirror
+    repairs it and reports old/new so the log can name the divergence."""
+    _seed_pending(db, "555000001", max_bid=3.90)
+    repaired = mirror_gixen_max_bid(
+        db, "555000001", 12.00,
+        observed_at="2026-07-28T12:00:00+00:00",
+        scrape_started_at="2026-07-28T11:59:00+00:00",
+    )
+    db.commit()
+    assert repaired == (3.90, 12.00)
+    assert _max_bid_of(db, "555000001") == 12.00
+
+
+def test_mirror_max_bid_lowers_a_cap_the_user_cut_on_gixen(db):
+    """The money direction (item 147447605357): the user cut the cap 80 -> 30
+    on Gixen while the DB kept 80. _sniper_loop fires the local backup bidder
+    off bids.max_bid, so the mirror MUST follow downward, not only upward."""
+    _seed_pending(db, "555000002", max_bid=80.0)
+    assert mirror_gixen_max_bid(
+        db, "555000002", 30.0,
+        observed_at="2026-07-28T12:00:00+00:00",
+        scrape_started_at="2026-07-28T11:59:00+00:00",
+    ) == (80.0, 30.0)
+    db.commit()
+    assert _max_bid_of(db, "555000002") == 30.0
+
+
+def test_mirror_max_bid_refuses_to_clobber_an_in_flight_edit(db):
+    """The BUI-402 lock-ordering hazard. _sync_loop scrapes WITHOUT _api_lock,
+    so its list can predate an edit that commits while the scrape is in
+    flight. A local write stamped at or after the scrape's start must win —
+    otherwise a cap the user just LOWERED is reverted upward by a stale read,
+    which is precisely the over-bid this ticket exists to prevent."""
+    _seed_pending(db, "555000003", max_bid=30.0,
+                  max_bid_changed_at="2026-07-28T12:00:05+00:00")
+    assert mirror_gixen_max_bid(
+        db, "555000003", 80.0,
+        observed_at="2026-07-28T12:00:10+00:00",
+        scrape_started_at="2026-07-28T12:00:00+00:00",  # scrape started FIRST
+    ) is None
+    db.commit()
+    assert _max_bid_of(db, "555000003") == 30.0
+
+
+def test_mirror_max_bid_applies_when_local_write_predates_the_scrape(db):
+    """Converse of the guard above: once the scrape starts after the local
+    write, the scrape is guaranteed to have observed the post-edit Gixen
+    state, so mirroring is safe. Without this the guard would wedge a row
+    permanently after its first-ever edit."""
+    _seed_pending(db, "555000004", max_bid=30.0,
+                  max_bid_changed_at="2026-07-28T11:00:00+00:00")
+    assert mirror_gixen_max_bid(
+        db, "555000004", 80.0,
+        observed_at="2026-07-28T12:00:10+00:00",
+        scrape_started_at="2026-07-28T12:00:00+00:00",
+    ) == (30.0, 80.0)
+
+
+def test_mirror_max_bid_stamps_provenance(db):
+    _seed_pending(db, "555000005", max_bid=30.0)
+    mirror_gixen_max_bid(
+        db, "555000005", 40.0,
+        observed_at="2026-07-28T12:00:00+00:00",
+        scrape_started_at="2026-07-28T11:00:00+00:00",
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT max_bid_changed_at FROM bids WHERE item_id='555000005'"
+    ).fetchone()
+    assert row["max_bid_changed_at"] == "2026-07-28T12:00:00+00:00"
+
+
+@pytest.mark.parametrize("status", ["WON", "LOST", "ENDED", "FAILED",
+                                    "REMOVED", "PURGED"])
+def test_mirror_max_bid_skips_non_pending_rows(db, status):
+    """Resolved rows keep the cap they were actually bid at, and the tombstone
+    is excluded by the same PENDING gate. Repairing history is the one-time
+    reconciliation's job, not the sync's."""
+    _seed_pending(db, "555000006", max_bid=30.0, status=status)
+    assert mirror_gixen_max_bid(
+        db, "555000006", 80.0,
+        observed_at="2026-07-28T12:00:00+00:00",
+        scrape_started_at="2026-07-28T11:00:00+00:00",
+    ) is None
+    db.commit()
+    assert _max_bid_of(db, "555000006") == 30.0
+
+
+def test_mirror_max_bid_is_a_noop_when_values_agree(db):
+    """No write, no log line, no re-stamp when nothing diverged — the common
+    case on every one of the ~100 snipes in every sync cycle."""
+    _seed_pending(db, "555000007", max_bid=25.0)
+    assert mirror_gixen_max_bid(
+        db, "555000007", 25.0,
+        observed_at="2026-07-28T12:00:00+00:00",
+        scrape_started_at="2026-07-28T11:00:00+00:00",
+    ) is None
+    db.commit()
+    row = db.execute(
+        "SELECT max_bid_changed_at FROM bids WHERE item_id='555000007'"
+    ).fetchone()
+    assert row["max_bid_changed_at"] is None
+
+
+def test_mirror_max_bid_ignores_sub_cent_float_noise(db):
+    _seed_pending(db, "555000008", max_bid=25.0)
+    assert mirror_gixen_max_bid(
+        db, "555000008", 25.001,
+        observed_at="2026-07-28T12:00:00+00:00",
+        scrape_started_at="2026-07-28T11:00:00+00:00",
+    ) is None
+
+
+def test_mirror_max_bid_with_no_matching_row_is_a_noop(db):
+    assert mirror_gixen_max_bid(
+        db, "555000099", 25.0,
+        observed_at="2026-07-28T12:00:00+00:00",
+        scrape_started_at="2026-07-28T11:00:00+00:00",
+    ) is None
+
+
+def test_mirror_max_bid_does_not_inherit_update_bid_side_effects(db):
+    """Why this is not update_bid. update_bid clears gixen_vanished_at
+    (BUI-371) because every one of ITS callers runs right after a first-party
+    Gixen add/modify. A passive sync observation is not that confirmation, and
+    wrongly clearing the stamp would weaken the cancelled-before-end evidence
+    that stops a phantom WON. It must not stamp group_changed_at (BUI-384)
+    either — it changes no group."""
+    _seed_pending(db, "555000009", max_bid=30.0)
+    db.execute("UPDATE bids SET gixen_vanished_at='2026-07-20T00:00:00+00:00' "
+               "WHERE item_id='555000009'")
+    db.commit()
+    mirror_gixen_max_bid(
+        db, "555000009", 80.0,
+        observed_at="2026-07-28T12:00:00+00:00",
+        scrape_started_at="2026-07-28T11:00:00+00:00",
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT gixen_vanished_at, group_changed_at FROM bids "
+        "WHERE item_id='555000009'"
+    ).fetchone()
+    assert row["gixen_vanished_at"] == "2026-07-20T00:00:00+00:00"
+    assert row["group_changed_at"] is None
+
+
+def test_update_bid_stamps_max_bid_changed_at(db):
+    """The edit path must stamp the provenance column, or the mirror's
+    ordering guard has nothing to compare against and a stale scrape can
+    clobber a cap the edit just wrote."""
+    _seed_pending(db, "555000010", max_bid=30.0)
+    update_bid(db, "555000010", 80.0, None, None)
+    db.commit()
+    row = db.execute(
+        "SELECT max_bid, max_bid_changed_at FROM bids WHERE item_id='555000010'"
+    ).fetchone()
+    assert row["max_bid"] == 80.0
+    assert row["max_bid_changed_at"] is not None

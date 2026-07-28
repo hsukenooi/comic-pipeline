@@ -24,6 +24,7 @@ from gixen_client import (
     GixenAddNotConfirmedError,
     GixenModifyNotConfirmedError,
     find_sibling_cleanup_targets,
+    parse_listed_max_bid,
 )
 
 
@@ -2469,3 +2470,37 @@ class TestCachedDbidid:
             with patch.object(client, "_post_home", return_value="<html>OK</html>"):
                 with pytest.raises(GixenError):
                     client.remove_snipe("111", dbidid="stale")
+
+
+class TestParseListedMaxBid:
+    """BUI-555. The consumer writes bids.max_bid, which _sniper_loop fires real
+    money from, so the "None means unknown" contract is load-bearing: a value
+    we can't read must leave the DB alone, never be coerced to a number."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("25.00 USD", 25.0),
+        ("25", 25.0),
+        ("25.00", 25.0),
+        ("  40.50  ", 40.5),
+        ("1,250.00 USD", 1250.0),   # thousands separator, like _max_bid_matches
+        ("$335.00", 335.0),
+        (12.5, 12.5),
+    ])
+    def test_reads_a_real_cap(self, raw, expected):
+        assert parse_listed_max_bid(raw) == expected
+
+    @pytest.mark.parametrize("raw", [
+        None, "", "   ", "N/A", "-", ".", "USD", "--",
+        "0", "0.00", "-5.00",           # never a real cap: parse artifacts
+        "1.2.3",                        # unparseable Decimal
+    ])
+    def test_unknown_or_nonsense_is_none(self, raw):
+        assert parse_listed_max_bid(raw) is None
+
+    def test_agrees_with_max_bid_matches_on_formatting_drift(self):
+        """The two helpers must not disagree about what the same number is —
+        one decides a modify is confirmed, the other decides whether to
+        rewrite the DB's cap off the very same scraped cell."""
+        for raw in ("40", "40.00", "40.00 USD", " 40.00 "):
+            assert GixenClient._max_bid_matches(raw, Decimal("40.00")) is True
+            assert parse_listed_max_bid(raw) == 40.0
