@@ -505,13 +505,21 @@ def canonical_sold_comps_url(nkw: str) -> str:
     header, never the URL, so unlike SerpApi there is no separate
     request_url() step. `sold=true` is their default but is pinned explicitly
     so the cache key documents the semantics it was fetched under (the
-    generalized LH_Sold=1 lesson). The endpoint host makes these sha256 cache
-    keys disjoint from every SerpApi entry — nothing pre-BUI-545 is
-    invalidated.
+    generalized LH_Sold=1 lesson). `includeCompleteListing=true` is pinned the
+    same way (BUI-557) — also their default, so this is no behavior change,
+    but BUI-552's evaluation showed the flag silently controls whether OBO
+    badge detection works at all: refetching with
+    `includeCompleteListing=false` flipped OBO detection from 73 items to 0,
+    while `soldPrice` stayed byte-identical across those 73 OBO items and 150
+    non-OBO controls. An unpinned vendor-side default flip would be a silent
+    drift risk, so pin it rather than rely on the default. The endpoint host
+    makes these sha256 cache keys disjoint from every SerpApi entry — nothing
+    pre-BUI-545 is invalidated.
     """
     params = {
         "count": SOLD_COMPS_COUNT,
         "daysToScrape": SOLD_COMPS_DAYS_TO_SCRAPE,
+        "includeCompleteListing": "true",
         "keyword": nkw,
         "sold": "true",
     }
@@ -1115,7 +1123,12 @@ def parse_comp_sold_comps(item: dict) -> dict | None:
     self-exclusion both work without translation; the URL regex is only a
     fallback. `soldPrice` (not totalPrice or bestOfferAccepted) matches
     SerpApi's price.extracted semantics — 66/70 exact matches in the BUI-545
-    fidelity test; using bestOfferAccepted is BUI-552's own evaluation.
+    fidelity test. `soldPrice` is the actual accepted amount, including on an
+    OBO sale — sold-comps.com's own documentation says so verbatim, and
+    BUI-552 confirmed it experimentally (OBO share ~22.3% of the sample, no
+    price bias measured). `bestOfferAccepted` is a boolean badge flag only;
+    the item schema has no separate accepted-amount field at all. BUI-552
+    closed that option — this is settled, not an open question.
     `endedAt` (ISO YYYY-MM-DD) passes through verbatim:
     fmv_math._parse_sold_date already accepts ISO-8601.
     """
