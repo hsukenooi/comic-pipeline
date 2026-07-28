@@ -92,6 +92,40 @@ Four raw, unnormalized, provider-supplied strings. Import matches on this tuple;
 
 The `(YYYY - Present)` → `(YYYY - YYYY)` transition fires for **every ongoing series the January after it ends**. This is a recurring annual duplicate generator, not a one-off.
 
+#### 2a. Fold only what the provider rewrites on its own — the obvious normalizer is too wide
+
+Two traps sit between "the key drifts" and a working fix. Both were hit live during BUI-554; the second was hit *by the plan*, and only caught because the implementer re-checked against real data.
+
+**Trap one: do not reuse `_normalize_series_key`.** It exists for the *ownership matcher*, where it deliberately widens so eBay's punctuation-stripped spelling can **meet** the catalog spelling. It also strips `(Vol. N)` and the leading article. Correct for lookup; catastrophic for identity — it collapses `X-Men (Vol. 1) #17` and `X-Men (Vol. 2) #17`, which are legitimately owned side by side. **Matcher normalization and identity normalization are different functions with opposite pressures**: one wants to find a match, the other wants to keep distinct things distinct.
+
+**Trap two: folding the whole year range is also too wide.** The tempting narrow fix — reuse `_YEAR_RANGE_RE`, which already matches both `(YYYY - YYYY)` and `(YYYY - Present)` — is still wrong, because **LOCG reuses a `Vol. N` label across genuinely different volumes**:
+
+| | |
+|---|---|
+| `X-Men (Vol. 2) (1991 - 2001)` | `X-Men (Vol. 2) (2001 - 2013)` |
+| `Spawn (1992 - Present)` | `Spawn (2012 - Present)` |
+
+`(Vol. N)` is not a unique volume discriminator, so the **start year is load-bearing**. Stripping the range merges both pairs.
+
+The shipped fold rewrites the **end year only**:
+
+```python
+# collection_cache.py — identity_series_key
+_YEAR_RANGE_CAPTURE_RE.sub(r"(\1 - )", series_name)   # (1992 - Present) -> (1992 - )
+```
+
+**The rule: fold exactly what the provider rewrites on its own, and nothing else.** Every other difference is still a different series. Verified against the live store — the fold collapsed exactly the 31 same-book groups and neither legitimate pair.
+
+Still uncovered, both live generators: a bare `(YYYY)` when a series starts and ends in one calendar year (`Knull (2026 - Present)` vs `Knull (2026)`, BUI-560), and `publisher_name` relabels (`DC Comics` vs `Panini Comics`, BUI-559).
+
+#### 2b. A key with tolerance is not a key
+
+The two duplicate classes in the table above look symmetrical and are not. The series relabel is a **pure tuple change** — normalize the field, done. Date-convention drift cannot be fixed that way: the correct comparison is *approximate* (`_release_dates_compatible` allows a ≤120-day cover-vs-on-sale gap), and **tolerance is not transitive and has no canonical form**, so it cannot back a dict lookup.
+
+Tolerant matching needs a **second pass**, not a wider key: drain exact identities first, then re-scan the leftovers with the tolerant predicate. Order matters — the exact pass must claim its rows before the tolerant one runs, or an approximate match steals a row that something else matched exactly.
+
+When an identity key "needs to be fuzzier," check first whether you are actually being asked for a *second matching stage*. Usually you are.
+
 ### 3. A rename detector must not share fields with the rename it detects
 
 ```python
@@ -139,25 +173,36 @@ dupes = [t for t, rows in groups.items()
 
 Using the module's own predicates matters: "the matcher should have caught this" and "this is a duplicate" stay the same judgment, so the audit cannot disagree with the code by accident.
 
-**A guard test that fails when the guard goes blind:**
+**A guard test that fails when the guard goes blind.** The shipped fix removed the `agent_win` partition entirely, so the check no longer *has* a partition that can empty — the strongest possible version of this guard. Where a partition is genuinely required, assert it is populated rather than assuming it:
 
 ```python
 def test_duplicate_check_can_still_fail(store):
-    """The counter is only meaningful while both partitions are populated."""
+    """A partition-scoped counter is only meaningful while its partition is populated."""
     owned = [r for r in store["comics"] if _is_owned(r)]
-    assert any(r.get("source") == "agent_win" for r in owned), (
-        "no agent_win rows remain — owned_duplicate_identities can no longer "
-        "detect anything and its 0 is vacuous"
+    assert len(owned) >= 2, (
+        "fewer than two owned rows — owned_duplicate_identities cannot detect "
+        "anything and its 0 is vacuous"
     )
 ```
+
+Note what changed between the original guard and this one: the first asserted a *specific source value* still existed, which tied the test to the very assumption that broke. Assert the **minimum condition under which a positive result is possible**, not the shape the data happened to have when you wrote it.
 
 **Distinguishing real duplicates from legitimate multi-row holdings.** 40 of the 100 multi-row title keys are genuine and must survive any cleanup — `X-Men #17` legitimately exists three times (Vol. 1 1965-12-02, Vol. 2 1992-12-15, Vol. 6 2021-01-27), and a [[Printing]] is a distinct collectible, so `Batman: The Dark Knight Returns #2` and `#2 3rd Printing` are two books. The date predicate is what separates these from the drift classes; a title-key match alone would sweep them.
 
 **If you clean this up:** it is production data, so use the backup → apply → diff → row-count ritual. The collection DELETE API is unsafe here (alias and cross-volume ambiguity); use `CollectionCache.apply` keyed on a genuinely unique field or asserting exactly-one-match. `gixen_item_id` is **not** unique — a lot bought together shares it across issues. And [[Copy Count]] is a count, not a flag: merging two genuine copies must increment the survivor, not drop the loser.
 
+**What the cleanup actually took** (BUI-556, 2026-07-28, all 60 groups). Three findings worth reusing:
+
+- **Choosing the survivor.** The live row is the one with the most recent `last_seen_in_export_at` — it equals the store's `last_full_import`, while its orphaned twin is stale by however long ago the key drifted. Do **not** sort by `local_added_seq`: it is a *within-import* counter, not a global ordering, and it selects the stale row in 35 of 60 groups.
+- **Copy count.** The rule above ("merging two genuine copies must increment") cuts both ways: these 60 were **one book recorded twice**, so the survivor kept `in_collection=1` and summing would have invented 60 phantom copies. Decide it from evidence, not from the row count — assert that no group holds two *different* non-null `gixen_item_id` or `price_paid` values, and abort if one does, because that is the signature of a real second copy.
+- **Merge fields, don't just delete.** 3 of the 60 carried purchase data (`price_paid`, `date_purchased`, `grading`, `purchase_store`, `gixen_item_id`) on one side only. A plain delete destroys it. Fold any field the survivor lacks from the twin, excluding per-row bookkeeping (`local_added_*`, `last_seen_in_export_at`, `pushed_to_locg_at`, `source`, `in_collection`).
+
 ## Related
 
-- BUI-554 — the filed fix for both defects (diagnosis verified, not yet shipped)
+- BUI-554 — shipped 2026-07-28 (PR #349): end-year-only fold, `source` partition removed, two-pass tolerant match
+- BUI-556 — the 60-row cleanup this doc's audit snippet found; shipped the same day
+- BUI-559 / BUI-560 — the two generators still uncovered (publisher relabel; bare-`(YYYY)` fold)
+- BUI-561 — a sibling instance: BUI-546 changed `_normalize_series_key` without rebuilding the persisted `series_name_index`, leaving 277/307 keys stale with no check able to notice
 - BUI-548 — added the counter; correct when written, outlived its partitioning assumption
 - `docs/solutions/architecture-patterns/durable-evidence-store-encode-unknowns-and-identity-precisely.md` — the sibling lesson that a UNIQUE key silently defines what counts as a duplicate, on the gixen-cli evidence ledger
 - `docs/solutions/design-patterns/guard-strictness-must-match-consequence.md` — guard design in the same reconcile path
