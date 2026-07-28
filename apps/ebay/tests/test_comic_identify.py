@@ -446,14 +446,19 @@ class TestComicIdentifyAnnualSeparatorStrip:
     "-" so these titles now correctly classify edition="annual" — but the
     separator itself was left dangling on the series text once the word
     "annual" is stripped ("X-Men Annual: 1" -> series "X-Men :"). This matters
-    because collection_cache._normalize_series_key (packages/locg-cli) only
-    strips year/vol/article decoration, not stray punctuation, so the
-    un-cleaned series would thread to the wrong norm_key ("x-men :" instead of
-    "x-men") and miss the local series_name_index, falling through to
-    Metron/manual resolution instead. See
-    test_normalize_series_key_does_not_strip_stray_punctuation in
-    packages/locg-cli/tests/test_collection_cache.py for the locg-side half
-    of this contract.
+    because collection_cache._normalize_series_key (packages/locg-cli) then
+    only stripped year/vol/article decoration, not stray punctuation, so the
+    un-cleaned series threaded to the wrong norm_key ("x-men :" instead of
+    "x-men") and missed the local series_name_index, falling through to
+    Metron/manual resolution instead.
+
+    BUI-546 UPDATE: _normalize_series_key now DOES fold punctuation, so a
+    dangling separator no longer forks the key — this cleanup fails safe
+    rather than failing wrong. It still earns its keep (a stray *word* like
+    "No" is key content that no amount of punctuation folding removes), so
+    these assertions stand unchanged. The locg-side half of the contract now
+    lives in test_normalize_series_key_folds_stray_punctuation in
+    packages/locg-cli/tests/test_collection_cache.py.
     """
 
     # --- the three example titles from the ticket, exact cleaned series ----
@@ -488,9 +493,16 @@ class TestComicIdentifyAnnualSeparatorStrip:
         packages/locg-cli — same boundary noted near comic_identity.py's
         series_year_range, "Series-volume (era) disambiguation" section)
         since only strip/lower is needed to observe the pre-fix vs. post-fix
-        key difference; the full contract (that _normalize_series_key itself
-        does no punctuation stripping) is locked on the locg side in
-        test_normalize_series_key_does_not_strip_stray_punctuation.
+        key difference.
+
+        NOTE (BUI-546): this local strip/lower is deliberately NOT a faithful
+        mirror any more — the real _normalize_series_key also folds
+        punctuation, so it yields "x men" / "amazing spider man" for these
+        inputs. That does not weaken the assertion (the pre-fix vs. post-fix
+        difference is still observable through strip/lower alone), but do not
+        read the expected keys below as the real norm_keys. The real contract
+        is locked on the locg side in
+        test_normalize_series_key_folds_stray_punctuation.
         """
 
         def normalize_series_key(series_name: str) -> str:

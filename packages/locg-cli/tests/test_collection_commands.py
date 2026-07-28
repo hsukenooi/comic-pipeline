@@ -718,8 +718,8 @@ def test_series_names_returns_sorted_canonical_names(tmp_path, monkeypatch):
 
     def mutate(payload):
         payload["series_name_index"] = {
-            "uncanny x-men": "Uncanny X-Men",
-            "amazing spider-man": "The Amazing Spider-Man",
+            "uncanny x men": "Uncanny X-Men",
+            "amazing spider man": "The Amazing Spider-Man",
             "batman": "Batman",
         }
     cache.apply(mutate, command="seed")
@@ -763,7 +763,7 @@ def test_resolve_exact_match_strips_vol_suffix(tmp_path, monkeypatch):
     fuzzy fallback needed."""
     import locg.commands as cmds
 
-    cache = _seed_series_name_index(tmp_path, {"uncanny x-men": "Uncanny X-Men"})
+    cache = _seed_series_name_index(tmp_path, {"uncanny x men": "Uncanny X-Men"})
     monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
 
     result = cmds.cmd_collection_series_names_resolve(["Uncanny X-Men (Vol. 1)"])
@@ -858,7 +858,7 @@ def test_resolve_multiple_names_preserves_order(tmp_path, monkeypatch):
 
     cache = _seed_series_name_index(
         tmp_path,
-        {"uncanny x-men": "Uncanny X-Men", "batman": "Batman"},
+        {"uncanny x men": "Uncanny X-Men", "batman": "Batman"},
     )
     monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
 
@@ -1876,7 +1876,7 @@ def test_record_win_xmen_split_early_issue(tmp_path):
     from locg.commands import cmd_collection_record_win
 
     cache = make_cache(tmp_path)
-    # The index happens to hold the LATE volume under the shared "x-men" key.
+    # The index happens to hold the LATE volume under the shared "x men" key.
     _seed_export_series(cache, ["Uncanny X-Men (Vol. 1) (1980 - 2011)"])
 
     cmd_collection_record_win(
@@ -2040,7 +2040,7 @@ def test_record_win_annual_falls_through_to_manual_when_unseeded(tmp_path):
 def test_record_win_annual_no_year_still_not_regular_claim(tmp_path):
     """Adversarial (BUI-426): even with NO year, an annual must never collapse
     into the classic X-Men issue-number split. The split keys off the exact
-    norm_key, which is now "uncanny x-men annual" (not a split key), so the
+    norm_key, which is now "uncanny x men annual" (not a split key), so the
     #<=141 boundary can't fire — no year needed. (record-win-prep's BUI-422
     gate separately reviews high-value null-year wins upstream; this asserts the
     resolver itself is safe if one reaches it.)"""
@@ -2737,6 +2737,140 @@ def test_record_win_dedup_newsstand_still_dedupes_newsstand(tmp_path):
 
     assert result["skipped_already_owned"] == 1
     assert result["rows_written"] == 0
+
+
+# --- BUI-546: punctuation-folded series key (widening safety) ---
+
+def test_record_win_dedup_punctuation_divergent_series_is_skipped(tmp_path):
+    """BUI-546: eBay strips punctuation, so the win pipeline sees "Doctor
+    Strange Sorcerer Supreme #44" while LOCG holds "Doctor Strange, Sorcerer
+    Supreme #44". Before punctuation folding the (series, issue) dedup key
+    never collided for exactly these rows, so the win was recorded a SECOND
+    time — four such duplicates were found and hand-deleted on 2026-07-27,
+    five weeks after BUI-211 shipped to eliminate that manual work."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache,
+        "Doctor Strange, Sorcerer Supreme (1988 - 1996)",
+        "Doctor Strange, Sorcerer Supreme #44",
+        release_date="1992-08-01",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Doctor Strange Sorcerer Supreme", issue="44", year=1992)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 1
+    assert result["rows_written"] == 0
+    assert result["skipped_already_owned_detail"][0]["matched_series_name"] == (
+        "Doctor Strange, Sorcerer Supreme (1988 - 1996)"
+    )
+
+
+def test_record_win_dedup_punctuation_collision_cross_era_not_skipped(tmp_path):
+    """ADVERSARIAL — the heart of BUI-546's safety case.
+
+    Widening the key makes MORE things collide, and record-win dedup errs
+    toward SKIPPING a win. BUI-184 deliberately chose the bias "never hide
+    ownership", so the BUI-267 era guard must still reject a
+    punctuation-normalized collision landing on a different era. Here a
+    vintage 1989 win and a modern 2016-2018 volume share one key ONLY because
+    BUI-546 folded the comma/colon apart — without the era guard the genuinely
+    new vintage win would be silently swallowed."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_owned_row(
+        cache,
+        "Doctor Strange: Sorcerer Supreme (2016 - 2018)",
+        "Doctor Strange: Sorcerer Supreme #10",
+        release_date="2017-10-01",
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Doctor Strange Sorcerer Supreme", issue="10", year=1989)],
+        cache=cache, metron=_null_metron(),
+    )
+
+    assert result["skipped_already_owned"] == 0
+    assert result["rows_written"] == 1
+
+
+def test_check_punctuation_divergent_query_finds_owned(tmp_path, monkeypatch):
+    """BUI-546: a punctuation-stripped eBay query finds the punctuated owned
+    row, so the buy path stops re-buying books already in the collection."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Godzilla: The Half-Century War (2012 - 2013)",
+        full_title="Godzilla: The Half-Century War #1",
+        release_date="2012-08-01",
+    )])
+
+    result = cmds.cmd_collection_check(
+        series="Godzilla The Half Century War", issue="1", year="2012"
+    )
+    assert result["match_status"] == "in_collection"
+    assert result["full_title_matched"] == "Godzilla: The Half-Century War #1"
+
+
+def test_check_punctuation_collision_wrong_era_not_owned(tmp_path, monkeypatch):
+    """ADVERSARIAL / R11: a false positive in collection-check means a book is
+    reported owned and NOT BOUGHT. BUI-546's wider key lets a vintage query
+    REACH a modern volume it could not reach before; the release-date year gate
+    is what must still reject it."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [_agent_win_row(
+        series="Doctor Strange: Sorcerer Supreme (2016 - 2018)",
+        full_title="Doctor Strange: Sorcerer Supreme #10",
+        release_date="2017-10-01",
+    )])
+
+    result = cmds.cmd_collection_check(
+        series="Doctor Strange, Sorcerer Supreme", issue="10", year="1989"
+    )
+    assert result["match_status"] == "not_in_cache"
+
+
+def test_check_punctuation_merged_cross_volume_is_ambiguous_not_owned(
+    tmp_path, monkeypatch
+):
+    """ADVERSARIAL / R11, no-year case: with punctuation folded, two owned
+    volumes that spell their subtitle differently now share ONE key. With no
+    year to disambiguate, BUI-284's cross-volume guard must surface an explicit
+    `ambiguous_cross_volume` verdict rather than silently picking one and
+    reporting `in_collection` — the wider key must not turn an unresolvable
+    question into a confident wrong answer."""
+    import locg.commands as cmds
+
+    cache = make_cache(tmp_path)
+    monkeypatch.setattr(cmds, "CollectionCache", lambda: cache)
+    _seed_cache(cache, [
+        _agent_win_row(
+            series="Doctor Strange, Sorcerer Supreme (1988 - 1996)",
+            full_title="Doctor Strange, Sorcerer Supreme #10",
+            release_date="1989-10-01",
+        ),
+        _agent_win_row(
+            series="Doctor Strange: Sorcerer Supreme (2016 - 2018)",
+            full_title="Doctor Strange: Sorcerer Supreme #10",
+            release_date="2017-10-01",
+        ),
+    ])
+
+    result = cmds.cmd_collection_check(
+        series="Doctor Strange Sorcerer Supreme", issue="10"
+    )
+    assert result["match_status"] == "ambiguous_cross_volume"
+    assert len(result["candidates"]) == 2
 
 
 def test_record_win_dedup_does_not_conflate_annual(tmp_path):

@@ -12,6 +12,9 @@ can't silently reopen one:
   omitting year (or passing the cover year) finds it.
 * BUI-175 — decimal/point issues (#1.MU) match without truncation.
 * BUI-176 — a variant-qualified query still finds the owned base issue.
+* BUI-546 — eBay strips punctuation out of listing titles, so a query that lost
+  a colon/comma/hyphen/apostrophe still finds the punctuated owned row, while a
+  distinct LINE separated by a qualifier word does not become a false positive.
 * the copies-owned gate (in_collection=0 is wish-list/read, not owned).
 """
 from __future__ import annotations
@@ -45,6 +48,21 @@ GOLDEN = [
     ("exact_owned",
      [_row("Amazing Spider-Man #300", "1988-05-01")],
      {"series": "Amazing Spider-Man", "issue": "300"}, "in_collection"),
+
+    # BUI-546: eBay hands comic-identify a punctuation-stripped series name.
+    ("punctuation_stripped_query_finds_owned",
+     [_row("Batman: The Dark Knight Returns #3", "1986-08-01")],
+     {"series": "Batman The Dark Knight Returns", "issue": "3"}, "in_collection"),
+
+    ("punctuation_hyphen_and_comma_query_finds_owned",
+     [_row("Godzilla: The Half-Century War #1", "2012-08-01")],
+     {"series": "Godzilla The Half Century War", "issue": "1"}, "in_collection"),
+
+    # BUI-546 adversarial: folding punctuation must NOT merge a distinct line
+    # into its parent run — that would report a book owned and skip the buy.
+    ("punctuation_fold_does_not_merge_giant_size_line",
+     [_row("X-Men #1", "1963-09-01")],
+     {"series": "Giant-Size X-Men", "issue": "1"}, "not_in_cache"),
 
     ("gsff_not_confused_with_ff_annual",
      [_row("Fantastic Four Annual #6", "1968-11-01")],
@@ -127,3 +145,28 @@ def test_normalize_series_key_strips_year_range_and_vol():
     assert _normalize_series_key("Uncanny X-Men (1963 - 2011)") == base
     assert _normalize_series_key("Uncanny X-Men (Vol. 1)") == base
     assert _normalize_series_key("Uncanny X-Men (2024)") == base
+
+
+@given(name=st.text(min_size=1, max_size=40))
+def test_normalize_series_key_is_idempotent(name):
+    """BUI-546: normalizing an already-normalized key is a no-op.
+
+    The function now runs several substitution passes (decoration strips,
+    punctuation delete, punctuation-to-space, whitespace collapse, article
+    strip), and the module's hardcoded key tables (_XMEN_SPLIT_KEYS,
+    _ALIAS_GROUPS) are stored as normalizer OUTPUT. If normalization were not
+    idempotent, those tables would silently fail to match their own keys."""
+    once = _normalize_series_key(name)
+    assert _normalize_series_key(once) == once
+
+
+@given(name=st.text(min_size=1, max_size=40))
+def test_normalize_series_key_emits_no_folded_punctuation(name):
+    """BUI-546: no folded punctuation character survives into a key, and no
+    key carries a doubled space or leading/trailing whitespace — otherwise two
+    spellings that should converge would still fork."""
+    key = _normalize_series_key(name)
+    for ch in ":,.-–—−'‘’":
+        assert ch not in key, f"{ch!r} survived into {key!r}"
+    assert "  " not in key
+    assert key == key.strip()
