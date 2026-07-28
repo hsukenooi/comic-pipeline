@@ -55,7 +55,11 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
                    "recompute everything. Without --force, a hand-priced row "
                    "(fmv_notes starting 'hand §' or 'hand OVERRIDE') is always "
                    "skipped, even if stale (BUI-533); --force overwrites it and "
-                   "echoes the old notes to stderr.")
+                   "echoes the old notes to stderr. If the comics-server lookup "
+                   "that answers 'is this hand-priced?' FAILS, the book is "
+                   "skipped and left untouched instead — reported separately "
+                   "from the hand-priced skips, and --force does not bypass it "
+                   "(BUI-544).")
 @click.option("--grade-window", "grade_window", type=float, default=None,
               help="Max grade-window the comp pool may widen to (e.g. 2.5). "
                    "Default 2.0. Only changes how far widening reaches — it does "

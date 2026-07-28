@@ -49,8 +49,23 @@ def _stale_hand_lookup(row):
     """A `_db_lookup` side_effect: the normal freshness-gated lookup
     (max_age_days=7 etc.) misses (simulating a stale/absent row), but the
     BUI-533 any-age lookup (max_age_days=None) finds `row`."""
-    def _lookup(server, *, locg_id, grade, locg_variant_id=None, max_age_days):
+    def _lookup(server, *, locg_id, grade, locg_variant_id=None, max_age_days,
+                strict=False):
         return row if max_age_days is None else None
+    return _lookup
+
+
+def _failing_provenance_lookup(fresh_row=None):
+    """A `_db_lookup` side_effect for BUI-544: the age-unbounded provenance
+    lookup (the `strict=True` one) FAILS, while the normal freshness-gated
+    lookup behaves as usual (returns `fresh_row`, a miss by default)."""
+    def _lookup(server, *, locg_id, grade, locg_variant_id=None, max_age_days,
+                strict=False):
+        if strict:
+            raise fmv_runner._DbLookupFailed(
+                f"comics-server FMV lookup failed for locg_id={locg_id} "
+                f"grade={grade}")
+        return fresh_row
     return _lookup
 
 
@@ -140,11 +155,12 @@ class TestSplitByDbCache:
         _db_lookup is no longer literally uncalled under --force."""
         books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
         with patch("fmv_runner._db_lookup", return_value=None) as lookup:
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=True)
             lookup.assert_called_once_with(
                 server_url, locg_id=100, grade=9.0, locg_variant_id=None,
-                max_age_days=None)
+                max_age_days=None, strict=True)
         assert cached == {}
         assert len(needs) == 1
         assert needs[0]["_idx"] == 0
@@ -157,7 +173,8 @@ class TestSplitByDbCache:
         # which is why --max-age-days is inert in the orchestrated /comic:buy flow.
         books = [_make_book("1", "X", "1", 1990, 9.0)]
         with patch("fmv_runner._db_lookup") as lookup:
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
             lookup.assert_not_called()
         assert cached == {}
@@ -171,7 +188,8 @@ class TestSplitByDbCache:
                "fmv_confidence": "high", "fmv_updated_at": "2026-05-09T...",
                "title": "X", "issue": "1", "year": 1990, "grade": 9.0}
         with patch("fmv_runner._db_lookup", return_value=row) as lookup:
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         assert cached == {0: row}
         assert needs == []
@@ -186,7 +204,8 @@ class TestSplitByDbCache:
     def test_cache_miss_falls_through(self, server_url):
         books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
         with patch("fmv_runner._db_lookup", return_value=None):
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         assert cached == {}
         assert len(needs) == 1
@@ -229,7 +248,8 @@ class TestSplitByDbCacheHandPriced:
                    "fmv_notes": "hand § anchored on the lone 4.0 sale",
                    "fmv_updated_at": "2020-01-01T00:00:00"}  # very stale
 
-        def _lookup(server, *, locg_id, grade, locg_variant_id, max_age_days):
+        def _lookup(server, *, locg_id, grade, locg_variant_id, max_age_days,
+                    strict=False):
             # The normal (max_age_days=7) lookup misses (too stale); the
             # any-age lookup (max_age_days=None) finds it.
             if max_age_days is None:
@@ -237,7 +257,8 @@ class TestSplitByDbCacheHandPriced:
             return None
 
         with patch("fmv_runner._db_lookup", side_effect=_lookup):
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         assert cached == {}
         assert needs == []
@@ -254,7 +275,8 @@ class TestSplitByDbCacheHandPriced:
                    "fmv_notes": "hand § anchored on the lone 4.0 sale",
                    "fmv_updated_at": "2026-07-24T00:00:00"}
         with patch("fmv_runner._db_lookup", return_value=hand_row) as lookup:
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         assert cached == {0: hand_row}
         assert skipped_hand == {}
@@ -269,13 +291,15 @@ class TestSplitByDbCacheHandPriced:
                      "fmv_notes": "window=±0.5 | cv=20% | label=HIGH",
                      "fmv_updated_at": "2020-01-01T00:00:00"}
 
-        def _lookup(server, *, locg_id, grade, locg_variant_id, max_age_days):
+        def _lookup(server, *, locg_id, grade, locg_variant_id, max_age_days,
+                    strict=False):
             if max_age_days is None:
                 return normal_row
             return None
 
         with patch("fmv_runner._db_lookup", side_effect=_lookup):
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         assert cached == {}
         assert skipped_hand == {}
@@ -285,7 +309,8 @@ class TestSplitByDbCacheHandPriced:
     def test_no_existing_row_at_all_recomputes_normally(self, server_url):
         books = [_make_book("1", "X", "1", 1990, 9.0, locg_id=100)]
         with patch("fmv_runner._db_lookup", return_value=None):
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         assert skipped_hand == {}
         assert len(needs) == 1
@@ -298,7 +323,8 @@ class TestSplitByDbCacheHandPriced:
         hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300,
                    "fmv_notes": "hand § anchored on the lone 4.0 sale"}
         with patch("fmv_runner._db_lookup", return_value=hand_row):
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=True)
         assert skipped_hand == {}
         assert len(needs) == 1  # proceeds to recompute, not skipped
@@ -309,9 +335,132 @@ class TestSplitByDbCacheHandPriced:
         normal_row = {"id": 1, "fmv_low": 50, "fmv_high": 75,
                      "fmv_notes": "window=±0.5 | cv=20% | label=HIGH"}
         with patch("fmv_runner._db_lookup", return_value=normal_row):
-            cached, needs, skipped_hand, force_notes = fmv_runner._split_by_db_cache(
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=True)
         assert force_notes == {}
+        assert len(needs) == 1
+
+
+class TestSplitByDbCacheLookupFailsClosed:
+    """BUI-544: the hand-priced provenance check fails CLOSED.
+
+    `_db_lookup`'s soft-fail posture made a FAILED lookup indistinguishable
+    from "no row exists", so a transient comics-server error let a default run
+    fall through and recompute — overwriting the hand-priced row the guard
+    exists to protect, if the server recovered by upsert time.
+    """
+
+    def test_lookup_failure_skips_instead_of_recomputing(self, server_url):
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100)]
+        with patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert needs == []          # never recomputed → never overwritten
+        assert cached == {}
+        assert list(lookup_err) == [0]
+        assert "lookup failed" in lookup_err[0]
+
+    def test_lookup_failure_is_not_counted_as_a_hand_priced_skip(self, server_url):
+        """The binding rider: an outage skip must be its OWN category. Folding
+        it into `skipped_hand` would let a transient failure under-compute a
+        batch while reporting it as normal hand-price protection."""
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100)]
+        with patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert skipped_hand == {}
+        assert force_notes == {}
+        assert len(lookup_err) == 1
+
+    def test_force_does_not_bypass_the_fail_closed_skip(self, server_url):
+        """`--force` may overwrite a hand-priced row, but BUI-533's contract is
+        'overwrite AND echo the old notes first'. With the lookup dead we
+        cannot echo, so the overwrite would destroy provenance unlogged."""
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100)]
+        with patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=True)
+        assert needs == []
+        assert force_notes == {}
+        assert list(lookup_err) == [0]
+
+    def test_only_the_failing_book_is_skipped(self, server_url):
+        """A per-book failure must not take the rest of the batch down with
+        it — the other books still price normally."""
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100),
+                 _make_book("2", "X-Men", "39", 1967, 9.0, locg_id=200)]
+
+        def _lookup(server, *, locg_id, grade, locg_variant_id=None,
+                    max_age_days, strict=False):
+            if strict and locg_id == 100:
+                raise fmv_runner._DbLookupFailed("comics-server lookup failed")
+            return None
+
+        with patch("fmv_runner._db_lookup", side_effect=_lookup):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert list(lookup_err) == [0]
+        assert [b["_idx"] for b in needs] == [1]
+
+    def test_fresh_lookup_failure_alone_still_protects_via_the_any_age_lookup(
+            self, server_url):
+        """The FIRST (freshness-gated) lookup keeps the soft-fail posture: when
+        only it fails, the age-unbounded lookup — a superset of the same rows —
+        still answers the hand-priced question correctly, so the row is
+        protected and nothing lands in the lookup-error bucket."""
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300,
+                    "fmv_notes": "hand § anchored on the lone 4.0 sale"}
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100)]
+
+        def _lookup(server, *, locg_id, grade, locg_variant_id=None,
+                    max_age_days, strict=False):
+            # strict (any-age) succeeds; the fresh one "fails" soft → None.
+            return hand_row if strict else None
+
+        with patch("fmv_runner._db_lookup", side_effect=_lookup):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert skipped_hand == {0: hand_row}
+        assert lookup_err == {}
+
+    def test_real_transport_failure_flows_all_the_way_to_a_skip(self, server_url):
+        """Seam-free: patch only the HTTP layer, so the real `_db_lookup` AND
+        the real call site both participate. The other tests in this class stub
+        `_db_lookup` itself, so they'd still pass if `strict=True` were dropped
+        from the provenance call on the default (non---force) path — this one
+        wouldn't."""
+        import requests
+        books = [_make_book("1", "Batman", "251", 1972, 5.5, locg_id=100)]
+        with patch("fmv_runner.requests.get",
+                   side_effect=requests.ConnectionError("server down")):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert needs == []
+        assert skipped_hand == {}
+        assert list(lookup_err) == [0]
+
+    def test_ineligible_book_never_reaches_the_lookup(self, server_url):
+        """A book with no locg_id can't be looked up by key at all, so it can't
+        target an existing row either — it must keep going to compute rather
+        than get caught by the new skip."""
+        books = [_make_book("1", "X", "1", 1990, 9.0)]
+        with patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()) as lookup:
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        lookup.assert_not_called()
+        assert lookup_err == {}
         assert len(needs) == 1
 
 
@@ -399,6 +548,113 @@ class TestRunSkipsHandPricedRows:
         assert "skipped 1 hand-priced row" in out
         # --brief JSON line for the row is also present, unaffected.
         assert '"item_id": "1"' in out
+
+
+class TestRunFailsClosedOnLookupError:
+    """BUI-544 end-to-end (mocked network): fail-closed turns a comics-server
+    outage into skipped books, so the skip has to be LOUD and impossible to
+    mistake for the hand-priced skip."""
+
+    def _batch(self):
+        return [{"item_id": "1", "title": "Batman", "issue": "251",
+                 "year": 1972, "grade": 5.5, "locg_id": 100}]
+
+    def test_nothing_is_fetched_or_written(self, server_url, capsys):
+        with patch("fmv_runner._read_batch", return_value=self._batch()), \
+             patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()), \
+             patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock, \
+             patch("fmv_runner.requests.post") as post_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        fetch_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+        post_mock.assert_not_called()
+
+    def test_warning_is_loud_and_not_confusable_with_a_hand_priced_skip(
+            self, server_url, capsys):
+        with patch("fmv_runner._read_batch", return_value=self._batch()), \
+             patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()), \
+             patch("fmv_runner._fetch_comps"):
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        cap = capsys.readouterr()
+        combined = cap.out + cap.err
+        assert "skipped 1 book(s)" in combined
+        assert "comics-server FMV lookup FAILED" in combined
+        assert "NOT because they were hand-priced" in combined
+        # The BUI-533 hand-priced count line must NOT fire — no book here was
+        # hand-priced; we simply couldn't tell. Matched on that line's exact
+        # phrasing, since the BUI-544 message legitimately says "hand-priced".
+        assert "hand-priced row(s) (use --force to overwrite)" not in combined
+
+    def test_warning_survives_quiet_and_force(self, server_url, capsys):
+        with patch("fmv_runner._read_batch", return_value=self._batch()), \
+             patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()), \
+             patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=True, quiet=True, brief=True,
+                           server_url=server_url)
+        fetch_mock.assert_not_called()
+        cap = capsys.readouterr()
+        assert "comics-server FMV lookup FAILED" in cap.err
+        # --brief still emits the row, so a machine consumer sees the book
+        # rather than it vanishing from the output entirely.
+        assert '"item_id": "1"' in cap.out
+
+    def test_table_marks_the_row_distinctly_not_n_a(self, server_url, capsys):
+        """Without its own token the row would print a bland 'n/a' and read as
+        'this book is illiquid' — the BUI-143 trap, one layer down."""
+        with patch("fmv_runner._read_batch", return_value=self._batch()), \
+             patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()), \
+             patch("fmv_runner._fetch_comps"):
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=False,
+                           server_url=server_url)
+        out = capsys.readouterr().out
+        assert "skip:db-err" in out
+        assert "skipped_lookup_error" in out
+        assert "n/a" not in out
+
+    def test_mixed_batch_reports_the_two_skips_separately(self, server_url,
+                                                          capsys):
+        """The rider, end to end: one genuinely hand-priced book and one
+        outage-skipped book in the same run must produce two distinct counts,
+        not one merged 'skipped 2'."""
+        batch = [{"item_id": "1", "title": "Batman", "issue": "251",
+                  "year": 1972, "grade": 5.5, "locg_id": 100},
+                 {"item_id": "2", "title": "X-Men", "issue": "39",
+                  "year": 1967, "grade": 9.0, "locg_id": 200}]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+                    "fmv_confidence": "low",
+                    "fmv_notes": "hand § anchored on the lone 4.0 sale",
+                    "fmv_updated_at": "2020-01-01T00:00:00"}
+
+        def _lookup(server, *, locg_id, grade, locg_variant_id=None,
+                    max_age_days, strict=False):
+            if not strict:
+                return None            # both are stale/absent for the fresh pass
+            if locg_id == 200:
+                raise fmv_runner._DbLookupFailed("comics-server lookup failed")
+            return hand_row
+
+        with patch("fmv_runner._read_batch", return_value=batch), \
+             patch("fmv_runner._db_lookup", side_effect=_lookup), \
+             patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        fetch_mock.assert_not_called()
+        cap = capsys.readouterr()
+        assert "skipped 1 hand-priced row(s)" in cap.out
+        assert "skipped 1 book(s) because the comics-server FMV lookup FAILED" \
+            in cap.err
 
 
 class TestHandPricedAndFetchErrComposition:
@@ -569,6 +825,74 @@ class TestDbLookup:
         assert row is None
         err = capsys.readouterr().err
         assert "Warning" in err and "invalid JSON" in err
+
+
+class TestDbLookupStrict:
+    """BUI-544: `strict=True` separates "the GET failed" from "no row found",
+    which the default soft-fail path collapses into the same None."""
+
+    def test_network_error_raises(self, server_url):
+        import requests
+        with patch("fmv_runner.requests.get",
+                   side_effect=requests.ConnectionError("nope")), \
+             pytest.raises(fmv_runner._DbLookupFailed):
+            fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                  max_age_days=None, strict=True)
+
+    def test_http_error_raises(self, server_url):
+        import requests
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = requests.HTTPError("503")
+        with patch("fmv_runner.requests.get", return_value=mock_resp), \
+             pytest.raises(fmv_runner._DbLookupFailed):
+            fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                  max_age_days=None, strict=True)
+
+    def test_malformed_json_raises(self, server_url):
+        """A non-JSON body is a failed lookup, not an empty one — it must not
+        be answerable as 'no hand-priced row here'."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = fmv_runner.requests.exceptions.JSONDecodeError(
+            "Expecting value", "", 0)
+        with patch("fmv_runner.requests.get", return_value=mock_resp), \
+             pytest.raises(fmv_runner._DbLookupFailed):
+            fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                  max_age_days=None, strict=True)
+
+    def test_genuine_empty_result_returns_none_without_raising(self, server_url):
+        """The whole point of the distinction: a SUCCESSFUL lookup that finds
+        nothing must still be a plain miss, or fail-closed would skip every
+        never-priced book."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = []
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            row = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                        max_age_days=None, strict=True)
+        assert row is None
+
+    def test_row_still_returned_normally(self, server_url):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = [
+            {"id": 1, "locg_id": 1, "grade": 9.0, "locg_variant_id": None,
+             "fmv_low": 50, "fmv_updated_at": "2026-07-01T00:00:00"}]
+        with patch("fmv_runner.requests.get", return_value=mock_resp):
+            row = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                        max_age_days=None, strict=True)
+        assert row["id"] == 1
+
+    def test_soft_path_unchanged_by_the_new_sentinel(self, server_url):
+        """Regression guard on the refactor: `_get_json_or_warn`'s default is
+        now a private sentinel rather than None, and it must never leak out —
+        the non-strict path still returns a plain None on failure."""
+        import requests
+        with patch("fmv_runner.requests.get",
+                   side_effect=requests.ConnectionError("nope")):
+            row = fmv_runner._db_lookup(server_url, locg_id=1, grade=9.0,
+                                        max_age_days=None, strict=False)
+        assert row is None
 
 
 # ─── _compute_and_upsert_one ──────────────────────────────────────────────────
@@ -1230,6 +1554,38 @@ class TestStitch:
         """Back-compat: existing callers that don't pass skipped_hand still work."""
         books = [_make_book("a", "A", "1", 1990, 9.0)]
         out = fmv_runner._stitch(books, {}, {})
+        assert out[0]["source"] == "error"
+
+    def test_lookup_error_skip_gets_its_own_source_and_no_price(self):
+        """BUI-544: a fail-closed skip has no row to reuse, so it carries no
+        price — and it must NOT borrow the hand-priced skip's source, or an
+        outage would render as successful protection."""
+        book = _make_book("a", "A", "1", 1990, 9.0)
+        out = fmv_runner._stitch([book], {}, {}, {},
+                                 {0: "comics-server FMV lookup failed"})
+        assert out[0]["source"] == "skipped_lookup_error"
+        assert out[0]["fmv"] is None
+        assert out[0]["db_row"] is None
+        assert "BUI-544" in out[0]["error"]
+        assert "comics-server FMV lookup failed" in out[0]["error"]
+
+    def test_both_skip_kinds_stay_distinct_in_one_batch(self):
+        """The two skips must remain separable per-row, not just in aggregate."""
+        books = [_make_book("a", "A", "1", 1990, 9.0),
+                 _make_book("b", "B", "2", 1990, 9.0)]
+        hand_row = {"fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+                    "fmv_confidence": "low",
+                    "fmv_notes": "hand § anchored on the lone 4.0 sale"}
+        out = fmv_runner._stitch(books, {}, {}, {0: hand_row}, {1: "boom"})
+        assert out[0]["source"] == "skipped_hand_priced"
+        assert out[0]["fmv"]["fmv_low"] == 250
+        assert out[1]["source"] == "skipped_lookup_error"
+        assert out[1]["fmv"] is None
+
+    def test_lookup_error_defaults_to_empty_when_omitted(self):
+        """Back-compat for the 4-arg callers that predate BUI-544."""
+        books = [_make_book("a", "A", "1", 1990, 9.0)]
+        out = fmv_runner._stitch(books, {}, {}, {})
         assert out[0]["source"] == "error"
 
 
