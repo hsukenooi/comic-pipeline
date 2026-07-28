@@ -1948,3 +1948,404 @@ class TestCircuitBreakerBatchIntegration:
         )
 
 
+
+
+# ─── BUI-545: secondary provider (sold-comps.com) failover ───────────────────
+
+def _sc_item(item_id="111", title="ASM #142 FN+ Marvel 1975", price=25.0,
+             ended="2026-07-25", listing_type="sold"):
+    """A sold-comps.com response item in the shape the live API returns."""
+    return {
+        "itemId": item_id,
+        "title": title,
+        "soldPrice": price,
+        "endedAt": ended,
+        "listingType": listing_type,
+        "buyingFormat": "auction",
+        "url": f"https://www.ebay.com/itm/{item_id}",
+    }
+
+
+def _sold_comps_good(items):
+    m = MagicMock()
+    m.status_code = 200
+    m.raise_for_status = MagicMock()
+    m.json = MagicMock(return_value={"items": items})
+    return m
+
+
+def _serpapi_down():
+    """SerpApi's post-login-wall failure mode: HTTP 200 with an error field."""
+    m = MagicMock()
+    m.status_code = 200
+    m.raise_for_status = MagicMock()
+    m.json = MagicMock(return_value={"error": "eBay hasn't returned any results"})
+    return m
+
+
+def _serpapi_good(results):
+    m = MagicMock()
+    m.status_code = 200
+    m.raise_for_status = MagicMock()
+    m.json = MagicMock(return_value={
+        "organic_results": results,
+        "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+    })
+    return m
+
+
+def _route(serpapi=None, sold_comps=None):
+    """A requests.get side_effect that answers each provider's endpoint with
+    its factory — and fails LOUDLY if a provider that shouldn't be called is
+    (factory left as None)."""
+    def fake_get(url, **kwargs):
+        if url.startswith(sc.SERPAPI_ENDPOINT):
+            assert serpapi is not None, f"unexpected SerpApi call: {url}"
+            return serpapi()
+        if url.startswith(sc.SOLD_COMPS_ENDPOINT):
+            assert sold_comps is not None, f"unexpected sold-comps.com call: {url}"
+            return sold_comps()
+        raise AssertionError(f"unexpected URL: {url}")
+    return fake_get
+
+
+class TestProviderOrder:
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(sc.PROVIDERS_ENV_VAR, raising=False)
+        assert sc._provider_order() == sc.DEFAULT_PROVIDER_ORDER
+
+    def test_override_reorders(self, monkeypatch):
+        monkeypatch.setenv(sc.PROVIDERS_ENV_VAR, "sold-comps.com")
+        assert sc._provider_order() == ("sold-comps.com",)
+
+    def test_unknown_name_fails_loudly(self, monkeypatch):
+        monkeypatch.setenv(sc.PROVIDERS_ENV_VAR, "serpapi,typo-provider")
+        with pytest.raises(ValueError, match="typo-provider"):
+            sc._provider_order()
+
+
+class TestParseCompSoldComps:
+    def test_maps_all_fields(self):
+        comp = sc.parse_comp_sold_comps(_sc_item())
+        assert comp == {
+            "product_id": "111",
+            "title": "ASM #142 FN+ Marvel 1975",
+            "price": 25.0,
+            "grade": 6.5,
+            "sold_date": "2026-07-25",  # ISO passthrough — fmv_math parses it
+            "buying_format": "auction",
+            "link": "https://www.ebay.com/itm/111",
+        }
+
+    def test_item_id_falls_back_to_url(self):
+        item = _sc_item()
+        item["itemId"] = None
+        assert sc.parse_comp_sold_comps(item)["product_id"] == "111"
+
+    def test_missing_price_returns_none(self):
+        assert sc.parse_comp_sold_comps(_sc_item(price=None)) is None
+
+    def test_price_bounds_apply(self):
+        # Same 0.50–50000 sanity bounds as the SerpApi parse path.
+        assert sc.parse_comp_sold_comps(_sc_item(price=0.25)) is None
+
+
+class TestFetchSoldComps:
+    def test_live_fetch_caches_and_keeps_key_out_of_url(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   return_value=_sold_comps_good([_sc_item()])) as m:
+            data, hit = sc.fetch_sold_comps("t", "sc_key")
+            assert hit is False and len(data["items"]) == 1
+            data2, hit2 = sc.fetch_sold_comps("t", "sc_key")
+            assert hit2 is True
+            assert m.call_count == 1, "second call must be a cache hit"
+        args, kwargs = m.call_args
+        assert "sc_key" not in args[0], "API key must never enter the URL"
+        assert kwargs["headers"]["Authorization"] == "Bearer sc_key"
+
+    def test_cache_key_disjoint_from_serpapi(self):
+        assert (sc._cache_path(sc.canonical_sold_comps_url("t"))
+                != sc._cache_path(sc.canonical_serpapi_url("t")))
+
+    def test_active_item_in_sold_response_is_provider_failure(self, tmp_path, monkeypatch):
+        """The generalized LH_Sold=1 trap: one active-shaped item in a
+        sold=true response fails the WHOLE response loudly — and nothing is
+        cached, so the bad payload can't be served later."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        items = [_sc_item(),
+                 _sc_item("222", price=None, ended=None, listing_type="active")]
+        breaker = sc._CircuitBreaker(threshold=1, provider_name="sold-comps.com")
+        with patch("sold_comps.requests.get", return_value=_sold_comps_good(items)):
+            with pytest.raises(sc.SoldCompsError, match="not sold-shaped"):
+                sc.fetch_sold_comps("t", "k", breaker=breaker)
+        assert breaker.tripped is True
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_interim_429_does_not_count_toward_breaker(self, tmp_path, monkeypatch):
+        """Terminal-failures-only accounting: a 429 that recovers on retry is
+        a rate-limit blip, not outage evidence — with threshold=1, ANY
+        counted error would trip."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+        calls = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                bad = MagicMock()
+                bad.status_code = 429
+                bad.raise_for_status = MagicMock(
+                    side_effect=requests.HTTPError(response=bad))
+                return bad
+            return _sold_comps_good([_sc_item()])
+
+        breaker = sc._CircuitBreaker(threshold=1, provider_name="sold-comps.com")
+        attempts = []
+        with patch("sold_comps.requests.get", side_effect=fake_get):
+            data, hit = sc.fetch_sold_comps(
+                "t", "k", breaker=breaker,
+                record_attempt=lambda o, d: attempts.append(o))
+        assert hit is False
+        assert breaker.tripped is False
+        # ...but the superseded 429 attempt IS still in the trail (BUI-537).
+        assert len(attempts) == 1 and attempts[0].startswith("error:")
+
+    def test_terminal_failure_counts_toward_breaker(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        bad = MagicMock()
+        bad.status_code = 403  # quota exhausted — non-retryable
+        bad.raise_for_status = MagicMock(
+            side_effect=requests.HTTPError("quota", response=bad))
+        breaker = sc._CircuitBreaker(threshold=1, provider_name="sold-comps.com")
+        with patch("sold_comps.requests.get", return_value=bad):
+            with pytest.raises(requests.HTTPError):
+                sc.fetch_sold_comps("t", "k", breaker=breaker)
+        assert breaker.tripped is True
+
+    def test_tripped_breaker_serves_cache_only(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   return_value=_sold_comps_good([_sc_item()])):
+            sc.fetch_sold_comps("t", "k")  # seed cache
+        breaker = sc._CircuitBreaker(threshold=1, provider_name="sold-comps.com")
+        breaker.record_error()
+        assert breaker.tripped is True
+        with patch("sold_comps.requests.get") as m:
+            data, hit = sc.fetch_sold_comps("t", "k", breaker=breaker)
+            assert hit is True
+            with pytest.raises(sc.BreakerTrippedError):
+                sc.fetch_sold_comps("uncached", "k", breaker=breaker)
+        assert m.call_count == 0, "no live call past a tripped breaker"
+
+
+class TestProviderFallback:
+    """End-to-end failover at the fetch_book_comps level, through
+    _fetch_with_fallback, with requests.get routed per endpoint."""
+
+    def test_default_order_serves_sold_comps_directly(self, tmp_path, monkeypatch):
+        """Default order is sold-comps.com FIRST (SerpApi's sold engine is
+        login-walled indefinitely): a healthy primary serves with ZERO
+        SerpApi calls — the router asserts none happen."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(sold_comps=lambda: _sold_comps_good([_sc_item()]))):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
+                                      sold_comps_key="sc_k")
+        assert len(out["comps"]) == 1
+        comp = out["comps"][0]
+        assert comp["product_id"] == "111"
+        assert comp["sold_date"] == "2026-07-25"
+        entries = out["queries_used"]
+        assert len(entries) == 1, entries
+        assert entries[0]["provider"] == "sold-comps.com"
+        assert entries[0]["outcome"] == "live"
+        assert "error" not in entries[0]
+
+    def test_sold_comps_failure_falls_back_to_serpapi(self, tmp_path, monkeypatch):
+        """Reverse failover under the default order: a sold-comps.com failure
+        falls through to SerpApi, with both attempts provider-tagged."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+
+        def sold_comps_403():
+            bad = MagicMock()
+            bad.status_code = 403
+            bad.raise_for_status = MagicMock(
+                side_effect=requests.HTTPError("quota", response=bad))
+            return bad
+
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(serpapi=lambda: _serpapi_good([{
+                       "product_id": "555",
+                       "title": "ASM #142 FN Marvel",
+                       "price": {"extracted": 20.0},
+                   }]), sold_comps=sold_comps_403)):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
+                                      sold_comps_key="sc_k")
+        assert [c["product_id"] for c in out["comps"]] == ["555"]
+        entries = out["queries_used"]
+        assert len(entries) == 2, entries
+        assert entries[0]["provider"] == "sold-comps.com"
+        assert "error" in entries[0]
+        assert entries[1]["provider"] == "serpapi"
+        assert entries[1]["outcome"] == "live"
+        assert "error" not in entries[1]
+
+    def test_explicit_serpapi_first_order_fails_over(self, tmp_path, monkeypatch):
+        """The pre-flip order still works when pinned explicitly (the
+        EBAY_SOLD_COMPS_PROVIDERS revert path if eBay drops the wall):
+        SerpApi errors → sold-comps.com serves, trail tagged in order."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(serpapi=_serpapi_down,
+                                      sold_comps=lambda: _sold_comps_good([_sc_item()]))):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
+                                      sold_comps_key="sc_k",
+                                      providers=("serpapi", "sold-comps.com"))
+        assert len(out["comps"]) == 1
+        entries = out["queries_used"]
+        assert len(entries) == 2, entries
+        assert entries[0]["provider"] == "serpapi"
+        assert "error" in entries[0]
+        assert entries[1]["provider"] == "sold-comps.com"
+        assert entries[1]["outcome"] == "live"
+
+    def test_both_fail_still_classifies_fetch_err(self, tmp_path, monkeypatch):
+        """BUI-545 AC: a batch where BOTH providers fail must keep the
+        BUI-536 fetch-err signal — zero comps AND every queries_used entry
+        carrying an 'error' key."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        def sold_comps_403():
+            bad = MagicMock()
+            bad.status_code = 403
+            bad.raise_for_status = MagicMock(
+                side_effect=requests.HTTPError("quota", response=bad))
+            return bad
+
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(serpapi=_serpapi_down,
+                                      sold_comps=sold_comps_403)):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
+                                      sold_comps_key="sc_k")
+        assert out["comps"] == []
+        assert out["queries_used"], "trail must not be empty"
+        assert all("error" in q for q in out["queries_used"])
+        assert ({q["provider"] for q in out["queries_used"]}
+                == {"serpapi", "sold-comps.com"})
+
+    def test_no_key_means_no_failover(self, tmp_path, monkeypatch):
+        """Absent SOLD_COMPS_KEY → byte-for-byte pre-BUI-545 behavior: the
+        SerpApi failure surfaces as the only trail entry and the router
+        asserts no sold-comps.com call was ever attempted."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(serpapi=_serpapi_down)):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+        assert out["comps"] == []
+        assert all("error" in q for q in out["queries_used"])
+        assert all(q["provider"] == "serpapi" for q in out["queries_used"])
+
+    def test_serpapi_breaker_tripped_goes_straight_to_secondary(self, tmp_path, monkeypatch):
+        """A tripped SerpApi breaker must not dead-end the query (the old
+        BreakerTrippedError path) — it should fail over with zero SerpApi
+        HTTP calls, and the output must still flag breaker_tripped."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        breaker = sc._CircuitBreaker(threshold=1)
+        breaker.record_error()
+        assert breaker.tripped is True
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(sold_comps=lambda: _sold_comps_good([_sc_item()]))):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
+                                      breaker=breaker, sold_comps_key="sc_k",
+                                      providers=("serpapi", "sold-comps.com"))
+        assert len(out["comps"]) == 1
+        assert out["breaker_tripped"] is True
+        assert "BreakerTrippedError" in out["queries_used"][0]["outcome"]
+        assert out["queries_used"][0]["provider"] == "serpapi"
+        assert out["queries_used"][1]["provider"] == "sold-comps.com"
+
+    def test_genuine_zero_results_does_not_failover(self, tmp_path, monkeypatch):
+        """BUI-536's error-vs-empty distinction survives the failover: a
+        200 with zero items from the primary is a genuine n=0, never a
+        second-provider probe (the router asserts no SerpApi call — and the
+        trail must show a real success entry, not a swallowed error)."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(sold_comps=lambda: _sold_comps_good([]))):
+            out = sc.fetch_book_comps({"title": "Obscurity", "issue": "1"}, "key",
+                                      sold_comps_key="sc_k")
+        assert "error" not in out, out.get("error")
+        assert out["comps"] == []
+        assert len(out["queries_used"]) == 1
+        entry = out["queries_used"][0]
+        assert entry["provider"] == "sold-comps.com"
+        assert entry["outcome"] == "hit" or entry["outcome"] == "live"
+        assert "error" not in entry
+
+    def test_provider_order_override_skips_serpapi(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(sold_comps=lambda: _sold_comps_good([_sc_item()]))):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
+                                      sold_comps_key="sc_k",
+                                      providers=("sold-comps.com",))
+        assert len(out["comps"]) == 1
+        assert all(q["provider"] == "sold-comps.com" for q in out["queries_used"])
+
+    def test_cross_provider_dedupe_shares_item_id_namespace(self, tmp_path, monkeypatch):
+        """SerpApi product_id and sold-comps.com itemId are both the eBay
+        /itm/ number: a comp served by SerpApi in tier 1 must dedupe the same
+        item served by sold-comps.com in a later tier."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        serpapi_calls = {"n": 0}
+
+        def serpapi_then_down():
+            serpapi_calls["n"] += 1
+            if serpapi_calls["n"] == 1:
+                return _serpapi_good([{
+                    "product_id": "111",
+                    "title": "ASM #142 FN Marvel",
+                    "price": {"extracted": 20.0},
+                }, {
+                    "product_id": "999",
+                    "title": "ASM #142 VG Marvel",
+                    "price": {"extracted": 8.0},
+                }])
+            return _serpapi_down()
+
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(serpapi=serpapi_then_down,
+                                      sold_comps=lambda: _sold_comps_good([_sc_item()]))):
+            # year present → tier 2 (broaden) fires because tier 1 found <5;
+            # SerpApi pinned first so tier 1 = SerpApi live, tier 2 = SerpApi
+            # down → sold-comps.com serves the overlapping item.
+            out = sc.fetch_book_comps(
+                {"title": "ASM", "issue": "142", "year": 1975}, "key",
+                sold_comps_key="sc_k",
+                providers=("serpapi", "sold-comps.com"))
+        ids = [c["product_id"] for c in out["comps"]]
+        assert ids.count("111") == 1, "same eBay item must not appear twice"
+        assert "999" in ids
+
+    def test_run_batch_threads_secondary_config(self, tmp_path, monkeypatch):
+        """run_batch resolves the key + default order itself — and under the
+        sold-comps-first default a healthy batch spends ZERO SerpApi calls
+        (the router asserts none happen)."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "load_sold_comps_key", lambda: "sc_k")
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(sold_comps=lambda: _sold_comps_good([_sc_item()]))):
+            results = sc.run_batch([{"title": "ASM", "issue": "142"}], "key",
+                                   max_workers=1)
+        assert len(results[0]["comps"]) == 1
+        assert results[0]["queries_used"][-1]["provider"] == "sold-comps.com"
+
+    def test_run_batch_without_key_warns_once(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(serpapi=lambda: _serpapi_good([]))):
+            sc.run_batch([{"title": "X", "issue": "1"}], "key", max_workers=1)
+        err = capsys.readouterr().err
+        assert err.count("SOLD_COMPS_KEY not set") == 1
