@@ -115,11 +115,70 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+# Dash variants LOCG/Metron use in year ranges: ASCII hyphen-minus, en-dash
+# (U+2013), em-dash (U+2014), and minus sign (U+2212). collection_io already
+# normalizes en-dashes on the input side, so a decorated string reaching these
+# regexes may carry any of them (BUI-199 finding 4).
+_DASH_CLASS = r"[-–—−]"
+
+# BUI-554: the series-name decoration's END year only — `(2025 - Present)` and
+# `(2025 - 2026)` both fold to `(2025 - )`, the START year kept verbatim.
+_SERIES_END_YEAR_RE = re.compile(
+    rf"\((\d{{4}})\s*{_DASH_CLASS}\s*(?:\d{{4}}|Present)\)", re.IGNORECASE
+)
+
+
+def identity_series_key(series_name: str) -> str:
+    """Fold the one part of a LOCG series name the provider rewrites on its own.
+
+    LOCG closes out an ongoing volume's decoration the January after it ends:
+    ``Absolute Martian Manhunter (2025 - Present)`` becomes
+    ``(2025 - 2026)``. Nothing about the book changed, but a raw-string
+    identity key changes with it, so the next import inserts a SECOND row
+    instead of updating the first — 37 of the live store's 60 duplicate
+    identities on 2026-07-28 (BUI-554). The transition fires for every ongoing
+    series every year, so this is a recurring generator, not a one-off.
+
+    Only the END year is folded, and this is emphatically NOT
+    :func:`_normalize_series_key`:
+
+    * ``(Vol. N)`` is **kept**. Dropping it would collapse ``X-Men (Vol. 1)
+      #17`` and ``X-Men (Vol. 2) #17`` into one identity — three volumes of
+      ``X-Men #17`` are legitimately owned side by side.
+    * The **START year is kept**, which ``_YEAR_RANGE_RE`` alone would not do.
+      Verified against the live store: stripping the whole range collapses
+      ``Spawn (1992 - Present)`` with ``Spawn (2012 - Present)``, and
+      ``X-Men (Vol. 2) (1991 - 2001)`` with ``X-Men (Vol. 2) (2001 - 2013)``
+      — LOCG reuses a ``Vol. N`` label across genuinely different volumes, so
+      the start year is the only thing telling those two apart.
+    * The leading article and punctuation are kept, because identity is not
+      the ownership matcher: ``_normalize_series_key`` folds those to make
+      eBay's punctuation-stripped spelling MEET the catalog spelling, a
+      widening that is correct for lookup and far too wide for identity.
+
+    Folding only what the provider rewrites on its own is the whole rule —
+    every other difference is still a different series.
+    """
+    return _SERIES_END_YEAR_RE.sub(r"(\1 - )", series_name or "").strip()
+
+
 def make_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
-    """Identity key: (publisher_name, series_name, full_title, release_date)."""
+    """Identity key: (publisher_name, series_name, full_title, release_date).
+
+    ``series_name`` passes through :func:`identity_series_key` (BUI-554) so a
+    volume's end-year relabel does not manufacture a duplicate row. The other
+    three components are raw: ``full_title`` carries the issue number and any
+    printing/variant suffix (two genuinely different books), and
+    ``release_date`` is what separates volumes sharing a masthead.
+
+    ``release_date`` is still compared by EQUALITY here, on purpose. A key with
+    tolerance is not a key — tolerance is not transitive and has no canonical
+    form, so it cannot be a dict lookup. The date-drift class is handled by a
+    second, tolerant pass in ``collection_io._standard_merge_phase`` instead.
+    """
     return (
         row.get("publisher_name") or "",
-        row.get("series_name") or "",
+        identity_series_key(row.get("series_name") or ""),
         row.get("full_title") or "",
         row.get("release_date") or "",
     )
@@ -137,13 +196,8 @@ def empty_payload() -> dict[str, Any]:
     }
 
 
-# Dash variants LOCG/Metron use in year ranges: ASCII hyphen-minus, en-dash
-# (U+2013), em-dash (U+2014), and minus sign (U+2212). collection_io already
-# normalizes en-dashes on the input side, so a decorated string reaching these
-# regexes may carry any of them (BUI-199 finding 4).
-_DASH_CLASS = r"[-–—−]"
-
 # Patterns stripped from series names to produce normalized index keys
+# (_DASH_CLASS is defined above, next to the identity key that also uses it).
 _YEAR_RANGE_RE = re.compile(
     rf"\s*\(\d{{4}}\s*{_DASH_CLASS}\s*(\d{{4}}|Present)\)", re.IGNORECASE
 )

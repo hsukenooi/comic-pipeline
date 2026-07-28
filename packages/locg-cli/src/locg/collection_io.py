@@ -30,6 +30,7 @@ from locg.collection_cache import (
     _normalize_series_key,
     _utcnow_iso,
     build_volume_candidates,
+    identity_series_key,
     make_identity,
     owned_match_keys,
     rebuild_series_name_index,
@@ -440,6 +441,21 @@ def _is_owned(row: dict[str, Any]) -> bool:
     return _coerce_count_cell(row.get("in_collection")) >= 1
 
 
+def _is_established_row(row: dict[str, Any]) -> bool:
+    """True when a row already exists on LOCG's side, not only in our store.
+
+    Either it came FROM an export, or it is a win we have already pushed. The
+    complement is a *pending* win — a row LOCG has never seen — which is the
+    reconciler's exclusive business (Phase 1), judged there with era and
+    print/variant evidence no other pass carries.
+
+    Shared by Phase 1's auto-heal collision guard and Phase 2's date-drift
+    detector (BUI-554) so the two cannot drift apart on what "established"
+    means; both would otherwise re-derive the same two-clause test inline.
+    """
+    return row.get("source") == "locg_export" or bool(row.get("pushed_to_locg_at"))
+
+
 # Local-only provenance an agent_win row carries that a LOCG export row never
 # supplies (LOCG has no idea what you paid or which eBay item it came from).
 _WIN_PROVENANCE_FIELDS: tuple[str, ...] = (
@@ -566,6 +582,28 @@ def _release_dates_compatible(cache_row: dict[str, Any], xlsx_row: dict[str, Any
         return False
     delta = (cache_date - xlsx_date).days
     return 0 <= delta <= _COVER_TO_ONSALE_MAX_DAYS
+
+
+def _release_dates_compatible_either_way(
+    row_a: dict[str, Any], row_b: dict[str, Any]
+) -> bool:
+    """:func:`_release_dates_compatible` with neither row cast as the win.
+
+    That function's tolerance is one-directional on purpose: it compares a
+    pending win (Metron's COVER date, later) against an export row (LOCG's
+    ON-SALE date, earlier), and a later export date is not that skew. Its
+    callers know which row is which.
+
+    The BUI-554 callers do not. Two ``locg_export`` rows imported under two
+    different date conventions are the same book with no win/export roles to
+    assign, and the live store holds the drift in both directions, so the
+    caller would otherwise get an answer that depended on row order in the
+    JSON file. Symmetric here, asymmetric there — the difference is whether the
+    caller can name which side is the cover date.
+    """
+    return _release_dates_compatible(row_a, row_b) or _release_dates_compatible(
+        row_b, row_a
+    )
 
 
 def _price_equal(a: Any, b: Any) -> bool:
@@ -733,15 +771,56 @@ def _user_column_checksum(row: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Partial identity for rename detection (R67)
+# Drift detectors: each holds steady the fields the other lets move
 # ---------------------------------------------------------------------------
+#
+# `make_identity` is (publisher, series, full_title, release_date), and LOCG is
+# free to relabel any of them. Each detector below drops exactly ONE of those
+# components and holds the rest, so a row whose single volatile field moved is
+# still recognized as the row it already is instead of inserting a twin
+# (BUI-554). Both use the SAME folded `series_name` the identity key does, so a
+# detector can never be defeated by the drift class the fold already absorbs.
+#
+#   _partial_identity  drops full_title    -> catches a title rename (R67)
+#   _title_identity    drops release_date  -> catches a date-convention change
+#
+# `publisher_name` is deliberately left in BOTH — a publisher relabel is a
+# third, rarer drift class (2 identities live on 2026-07-28: `Absolute Flash #3`
+# and `Absolute Green Lantern #3`, DC Comics vs Panini Comics) that neither
+# detector covers. Dropping it from a detector would leave a key of two
+# free-text fields, which is not enough to assert "same book". Filed as a
+# separate finding rather than widened here.
 
 def _partial_identity(row: dict[str, Any]) -> tuple[str, str, str]:
     """(publisher_name, series_name, release_date) — used to detect full_title renames."""
     return (
         row.get("publisher_name") or "",
-        row.get("series_name") or "",
+        identity_series_key(row.get("series_name") or ""),
         row.get("release_date") or "",
+    )
+
+
+def _title_identity(row: dict[str, Any]) -> tuple[str, str, str]:
+    """(publisher_name, series_name, full_title) — used to detect date drift.
+
+    The exact complement of :func:`_partial_identity`, and the reason the pair
+    is not redundant: a rename detector that shares a field with the rename it
+    detects fails in exactly the cases the identity key fails. When the field
+    that moved IS ``release_date`` — LOCG switching a run from cover date to
+    on-sale date, or rewriting a just-pushed row's date to its own canonical
+    value — ``_partial_identity`` moves with it and both guards miss the same
+    row. That produced 23 of the live store's 60 duplicate identities.
+
+    This key alone is NOT sufficient to merge on: it is the *candidate lookup*,
+    and :func:`_release_dates_compatible` still has to rule on the pair. Same
+    publisher + same volume + same ``full_title`` (issue number AND any
+    printing/variant suffix, verbatim) narrows the field to one book already;
+    the date predicate is what stops it reaching across eras.
+    """
+    return (
+        row.get("publisher_name") or "",
+        identity_series_key(row.get("series_name") or ""),
+        row.get("full_title") or "",
     )
 
 
@@ -1133,10 +1212,7 @@ def _reconcile_phase(
             # flips it, which made the pre-import read bail to "left pending" and
             # strand every one of the 27 collisions on the 2026-07-19 sync.
             target_row = comics[collide]
-            target_established = (
-                target_row.get("source") == "locg_export"
-                or bool(target_row.get("pushed_to_locg_at"))
-            )
+            target_established = _is_established_row(target_row)
             target_owned_after_import = _is_owned(target_row) or _is_owned(xlsx_row)
             # The dropped row is ALWAYS the pending win, never the collision
             # target — so no wish row in the store can be removed by this
@@ -1296,6 +1372,76 @@ def _reconcile_phase(
         })
 
 
+def _pick_date_drift_match(
+    xlsx_row: dict[str, Any],
+    comics: list[dict[str, Any]],
+    title_to_indices: dict[tuple, list[int]],
+    claimed: set[int],
+    pre_import_count: int,
+) -> int | None:
+    """Index of the pre-import row ``xlsx_row`` is a date-drifted twin of (BUI-554).
+
+    Two gates, both required: the row must share ``_title_identity`` (same
+    publisher, same volume, same ``full_title`` verbatim — issue number and any
+    printing/variant suffix included), and the pair must clear
+    :func:`_release_dates_compatible_either_way`. The title key alone would
+    sweep the three volumes of ``X-Men #17`` into one book; the date predicate
+    is what refuses that, and it is the reconciler's OWN predicate, so "the
+    matcher should have caught this" and "this is a duplicate" stay one
+    judgment.
+
+    Candidates already ``claimed`` this phase are skipped — an export row must
+    never be folded into a store row another export row has spoken for, which
+    would silently drop a book LOCG says exists. Post-import inserts (index
+    ``>= pre_import_count``) are skipped for the same reason rename detection
+    skips them: a row this import just created cannot be a pre-existing twin.
+
+    **Only ESTABLISHED rows are eligible** (``locg_export``, or an
+    ``agent_win`` already pushed) — the same predicate Phase 1's collision
+    guard uses. A *pending* win is Phase 1's business, and Phase 1 judges it
+    with gates this one does not have: era evidence, print/variant parity, and
+    an ambiguity check that deliberately leaves a win pending when two export
+    rows both plausibly match it. Letting this pass claim such a row would
+    silently overturn that decision with a weaker test. The duplicate class
+    BUI-554 exists for is export↔export; it has no business adjudicating wins.
+
+    When several candidates qualify the closest date wins, ties broken by the
+    lower index, so the choice never depends on dict iteration order. Several
+    candidates means the store ALREADY holds duplicates of this title; merging
+    into one of them is still strictly better than adding a third, and BUI-556
+    is what resolves the pre-existing pile.
+    """
+    candidates = title_to_indices.get(_title_identity(xlsx_row))
+    if not candidates:
+        return None
+
+    xlsx_date = _parse_iso_date(xlsx_row.get("release_date"))
+    best: tuple[int, int] | None = None
+    best_idx: int | None = None
+    for idx in candidates:
+        if idx >= pre_import_count or idx in claimed:
+            continue
+        existing = comics[idx]
+        if not _is_established_row(existing):
+            continue
+        if not _release_dates_compatible_either_way(existing, xlsx_row):
+            continue
+        existing_date = _parse_iso_date(existing.get("release_date"))
+        # A missing date on either side sorts last: it only reached here via
+        # the predicate's fail-open branch, so it is the weakest evidence in
+        # the set, not the strongest.
+        delta = (
+            abs((existing_date - xlsx_date).days)
+            if existing_date is not None and xlsx_date is not None
+            else 10**6
+        )
+        rank = (delta, idx)
+        if best is None or rank < best:
+            best = rank
+            best_idx = idx
+    return best_idx
+
+
 def _standard_merge_phase(
     comics: list[dict[str, Any]],
     xlsx_rows: list[dict[str, Any]],
@@ -1310,6 +1456,13 @@ def _standard_merge_phase(
     pre-import rows only. See import_xlsx's docstring for the two-phase
     pipeline this implements.
 
+    Runs in two passes (BUI-554). Pass A handles every export row whose
+    identity matches exactly; pass B handles the rest, trying — in order —
+    `full_title` rename detection, then release-date drift detection, then a
+    genuine insert. Exact matches drain first because both inexact paths CLAIM
+    a store row, and a claim is only safe once no export row can still match
+    that row exactly.
+
     Mutates `comics`, `identity_to_idx` / `partial_to_idx`, `audit_records`,
     and `summary` in place. Must run after _reconcile_phase (Phase 1), whose
     identity rewrites this phase's identity_to_idx lookups depend on. Returns
@@ -1323,24 +1476,162 @@ def _standard_merge_phase(
     pre_import_count = len(comics)
     xlsx_identities: set[tuple] = set()
 
+    # BUI-554: two passes, exact matches first. The inexact paths below (rename
+    # detection, date-drift detection) both CLAIM a pre-import row, and a claim
+    # is only safe once every row an export row matches EXACTLY is off the
+    # table — otherwise which row wins depends on the order LOCG happened to
+    # emit its spreadsheet. Draining the exact matches first also completes what
+    # the `partial_to_idx` retraction below was always reaching for: it used to
+    # protect a row only from *later* xlsx rows, so an earlier inexact row could
+    # still claim a row a later export row would have matched exactly.
+    exact_pairs: list[tuple[dict[str, Any], int]] = []
+    inexact_rows: list[dict[str, Any]] = []
     for xr in xlsx_rows:
         row_identity = make_identity(xr)
         xlsx_identities.add(row_identity)
+        ci = identity_to_idx.get(row_identity)
+        if ci is None:
+            inexact_rows.append(xr)
+        else:
+            exact_pairs.append((xr, ci))
 
-        if row_identity in identity_to_idx:
-            # Update existing row
-            ci = identity_to_idx[row_identity]
-            existing = comics[ci]
+    # Rows an exact match has already spoken for. The inexact passes must never
+    # merge into one of these: the exact row and the inexact row are two
+    # DIFFERENT rows in LOCG's export, so folding the second into the first
+    # would drop a book LOCG says exists (the R11 direction).
+    claimed: set[int] = {ci for _xr, ci in exact_pairs}
 
-            # Capture user-managed values BEFORE overwriting with xlsx data
-            pre_user_values = {col: existing.get(col) for col in USER_MANAGED_COLUMNS}
-            pre_checksum = _user_column_checksum(existing)
+    # ----- Pass A: exact identity ------------------------------------------
+    for xr, ci in exact_pairs:
+        row_identity = make_identity(xr)
+        # Update existing row
+        existing = comics[ci]
 
-            # Remove from partial_to_idx so it won't be found as a rename
-            # candidate by a later xlsx row with the same partial identity
+        # Capture user-managed values BEFORE overwriting with xlsx data
+        pre_user_values = {col: existing.get(col) for col in USER_MANAGED_COLUMNS}
+        pre_checksum = _user_column_checksum(existing)
+
+        # Remove from partial_to_idx so it won't be found as a rename
+        # candidate by a later xlsx row with the same partial identity
+        old_partial = _partial_identity(existing)
+        if partial_to_idx.get(old_partial) == ci:
+            del partial_to_idx[old_partial]
+
+        _apply_locg_columns_held(existing, xr, now, audit_records, summary)
+        existing["last_seen_in_export_at"] = now
+        existing["source"] = "locg_export"
+        if existing.get("pushed_to_locg_at") is None:
+            existing["pushed_to_locg_at"] = now
+
+        post_checksum = _user_column_checksum(existing)
+        if pre_checksum != post_checksum:
+            changed = [
+                col for col in USER_MANAGED_COLUMNS
+                if pre_user_values.get(col) != xr.get(col)
+            ]
+            if changed:
+                audit_records.append({
+                    "type": "behavioral_drift",
+                    "ts": now,
+                    "command": "import",
+                    "details": {
+                        "identity": list(row_identity),
+                        "columns_changed": changed,
+                    },
+                })
+                summary["behavioral_drift_count"] += 1
+
+        summary["updated"] += 1
+
+    # ----- Pass B: rename, then date drift, then insert ---------------------
+    # Candidate index for the date-drift detector, projected from the LIVE
+    # identity index rather than rebuilt from `comics`. That projection is what
+    # makes it correct by construction: Phase 1 retracts the index entries of
+    # every row it reconciled or auto-healed away, so a row the reconciler has
+    # already disowned can never be offered here as a merge target — a bug that
+    # a fresh scan of `comics` (which still physically holds the healed rows
+    # until do_merge filters them) would have reintroduced.
+    title_to_indices: dict[tuple, list[int]] = {}
+    for _identity, idx in identity_to_idx.items():
+        title_to_indices.setdefault(_title_identity(comics[idx]), []).append(idx)
+
+    for xr in inexact_rows:
+        # Check for rename: same (publisher, series, release_date), different
+        # full_title (R67) — only against pre-import rows, never new inserts
+        row_partial = _partial_identity(xr)
+        if row_partial in partial_to_idx:
+            ci = partial_to_idx[row_partial]
+            if ci < pre_import_count and ci not in claimed:
+                existing = comics[ci]
+                old_title = existing.get("full_title") or ""
+                new_title = xr.get("full_title") or ""
+                if old_title and new_title and old_title != new_title:
+                    old_identity = make_identity(existing)
+                    existing["previous_full_title"] = old_title
+
+                    pre_checksum = _user_column_checksum(existing)
+                    _apply_locg_columns_held(
+                        existing, xr, now, audit_records, summary
+                    )
+                    existing["last_seen_in_export_at"] = now
+                    existing["source"] = "locg_export"
+                    if existing.get("pushed_to_locg_at") is None:
+                        existing["pushed_to_locg_at"] = now
+                    post_checksum = _user_column_checksum(existing)
+
+                    if old_identity in identity_to_idx:
+                        del identity_to_idx[old_identity]
+                    identity_to_idx[make_identity(existing)] = ci
+                    claimed.add(ci)
+                    # Consume the partial slot so it won't match again
+                    del partial_to_idx[row_partial]
+
+                    if pre_checksum != post_checksum:
+                        changed = [
+                            col for col in USER_MANAGED_COLUMNS
+                            if existing.get(col) != xr.get(col)
+                        ]
+                        if changed:
+                            audit_records.append({
+                                "type": "behavioral_drift",
+                                "ts": now,
+                                "command": "import",
+                                "details": {
+                                    "identity": list(make_identity(existing)),
+                                    "columns_changed": changed,
+                                },
+                            })
+                            summary["behavioral_drift_count"] += 1
+
+                    audit_records.append({
+                        "type": "renamed_full_title",
+                        "ts": now,
+                        "command": "import",
+                        "details": {
+                            "old_title": old_title,
+                            "new_title": new_title,
+                            "identity": list(make_identity(existing)),
+                        },
+                    })
+                    summary["updated"] += 1
+                    continue
+
+        # BUI-554: same book, new date convention. LOCG rewrites release dates
+        # on its own — a run re-catalogued from cover date to on-sale date, or
+        # a just-pushed row snapped to LOCG's canonical value — and both the
+        # identity key and the rename detector above carry `release_date`, so
+        # both miss together and the row inserts as a twin. 23 of the live
+        # store's 60 duplicate identities are this. Runs LAST of the match
+        # paths: it only ever fires where the code would otherwise have
+        # inserted.
+        drift_ci = _pick_date_drift_match(
+            xr, comics, title_to_indices, claimed, pre_import_count
+        )
+        if drift_ci is not None:
+            existing = comics[drift_ci]
+            old_identity = make_identity(existing)
             old_partial = _partial_identity(existing)
-            if partial_to_idx.get(old_partial) == ci:
-                del partial_to_idx[old_partial]
+            old_release_date = existing.get("release_date")
 
             _apply_locg_columns_held(existing, xr, now, audit_records, summary)
             existing["last_seen_in_export_at"] = now
@@ -1348,102 +1639,49 @@ def _standard_merge_phase(
             if existing.get("pushed_to_locg_at") is None:
                 existing["pushed_to_locg_at"] = now
 
-            post_checksum = _user_column_checksum(existing)
-            if pre_checksum != post_checksum:
-                changed = [
-                    col for col in USER_MANAGED_COLUMNS
-                    if pre_user_values.get(col) != xr.get(col)
-                ]
-                if changed:
-                    audit_records.append({
-                        "type": "behavioral_drift",
-                        "ts": now,
-                        "command": "import",
-                        "details": {
-                            "identity": list(row_identity),
-                            "columns_changed": changed,
-                        },
-                    })
-                    summary["behavioral_drift_count"] += 1
+            # Re-key: `release_date` is a LOCG column, so it has just been
+            # overwritten and the row no longer lives under `old_identity`.
+            # The partial slot is retired without a replacement, matching the
+            # exact-match pass — a row this phase has already merged into must
+            # not stay eligible as a rename target.
+            if identity_to_idx.get(old_identity) == drift_ci:
+                del identity_to_idx[old_identity]
+            identity_to_idx[make_identity(existing)] = drift_ci
+            if partial_to_idx.get(old_partial) == drift_ci:
+                del partial_to_idx[old_partial]
+            claimed.add(drift_ci)
 
             summary["updated"] += 1
+            summary["release_date_drift_merged"] += 1
+            audit_records.append({
+                "type": "release_date_drift_merged",
+                "ts": now,
+                "command": "import",
+                "details": {
+                    "full_title": existing.get("full_title"),
+                    "old_release_date": old_release_date,
+                    "new_release_date": existing.get("release_date"),
+                    "identity": list(make_identity(existing)),
+                },
+            })
+            continue
 
-        else:
-            # Check for rename: same (publisher, series, release_date), different
-            # full_title (R67) — only against pre-import rows, never new inserts
-            row_partial = _partial_identity(xr)
-            if row_partial in partial_to_idx:
-                ci = partial_to_idx[row_partial]
-                if ci < pre_import_count:
-                    existing = comics[ci]
-                    old_title = existing.get("full_title") or ""
-                    new_title = xr.get("full_title") or ""
-                    if old_title and new_title and old_title != new_title:
-                        old_identity = make_identity(existing)
-                        existing["previous_full_title"] = old_title
-
-                        pre_checksum = _user_column_checksum(existing)
-                        _apply_locg_columns_held(
-                            existing, xr, now, audit_records, summary
-                        )
-                        existing["last_seen_in_export_at"] = now
-                        existing["source"] = "locg_export"
-                        if existing.get("pushed_to_locg_at") is None:
-                            existing["pushed_to_locg_at"] = now
-                        post_checksum = _user_column_checksum(existing)
-
-                        if old_identity in identity_to_idx:
-                            del identity_to_idx[old_identity]
-                        identity_to_idx[make_identity(existing)] = ci
-                        # Consume the partial slot so it won't match again
-                        del partial_to_idx[row_partial]
-
-                        if pre_checksum != post_checksum:
-                            changed = [
-                                col for col in USER_MANAGED_COLUMNS
-                                if existing.get(col) != xr.get(col)
-                            ]
-                            if changed:
-                                audit_records.append({
-                                    "type": "behavioral_drift",
-                                    "ts": now,
-                                    "command": "import",
-                                    "details": {
-                                        "identity": list(make_identity(existing)),
-                                        "columns_changed": changed,
-                                    },
-                                })
-                                summary["behavioral_drift_count"] += 1
-
-                        audit_records.append({
-                            "type": "renamed_full_title",
-                            "ts": now,
-                            "command": "import",
-                            "details": {
-                                "old_title": old_title,
-                                "new_title": new_title,
-                                "identity": list(make_identity(existing)),
-                            },
-                        })
-                        summary["updated"] += 1
-                        continue
-
-            # Genuine new row from LOCG — do NOT add to partial_to_idx to
-            # avoid triggering rename detection for subsequent xlsx rows
-            new_row: dict[str, Any] = dict(xr)
-            new_row["local_added_at"] = now
-            new_row["local_added_seq"] = _next_seq()
-            new_row["pushed_to_locg_at"] = now
-            new_row["last_seen_in_export_at"] = now
-            new_row["source"] = "locg_export"
-            new_row["needs_manual_variant"] = False
-            new_row["needs_manual_series_canonical"] = False
-            new_row["metron_id"] = None
-            new_row["gixen_item_id"] = None
-            new_row["previous_full_title"] = None
-            comics.append(new_row)
-            identity_to_idx[make_identity(new_row)] = len(comics) - 1
-            summary["added"] += 1
+        # Genuine new row from LOCG — do NOT add to partial_to_idx to
+        # avoid triggering rename detection for subsequent xlsx rows
+        new_row: dict[str, Any] = dict(xr)
+        new_row["local_added_at"] = now
+        new_row["local_added_seq"] = _next_seq()
+        new_row["pushed_to_locg_at"] = now
+        new_row["last_seen_in_export_at"] = now
+        new_row["source"] = "locg_export"
+        new_row["needs_manual_variant"] = False
+        new_row["needs_manual_series_canonical"] = False
+        new_row["metron_id"] = None
+        new_row["gixen_item_id"] = None
+        new_row["previous_full_title"] = None
+        comics.append(new_row)
+        identity_to_idx[make_identity(new_row)] = len(comics) - 1
+        summary["added"] += 1
 
     return xlsx_identities
 
@@ -1462,7 +1700,8 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
     Returns a summary dict: {added, updated, untouched, reconciled,
     possibly_removed, ownership_downgrades_held, behavioral_drift_count,
     auto_healed_duplicates, second_copies_credited, null_release_date_owned,
-    manual_series_flags_cleared, owned_duplicate_identities, warnings}.
+    manual_series_flags_cleared, owned_duplicate_identities,
+    release_date_drift_merged, warnings}.
 
     `null_release_date_owned` (BUI-412) is a non-blocking data-quality count of
     owned rows (`in_collection` truthy) whose `release_date` is null/empty,
@@ -1503,11 +1742,19 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # was re-checked and cleared because the series resolves now. One-way —
         # this pass never sets the flag.
         "manual_series_flags_cleared": 0,
-        # BUI-548: books left owned TWICE post-import — an unreconciled pending
-        # agent_win and a locg_export row claiming the same title. The semantic
+        # BUI-548: books left owned TWICE post-import — two owned rows claiming
+        # the same title on date-compatible release dates. The semantic
         # duplicate check the sync's row-count arithmetic structurally cannot
-        # make. Reported only; never alters or drops a row.
+        # make. Reported only; never alters or drops a row. BUI-554 dropped the
+        # win-vs-export partition that made this read a vacuous 0 once every
+        # win had round-tripped back as an export row.
         "owned_duplicate_identities": 0,
+        # BUI-554: export rows merged into an existing row whose release_date
+        # LOCG had rewritten (cover date vs on-sale date), instead of inserting
+        # a duplicate. Each one is a row NOT added, so the sync's
+        # `ROWS_BEFORE + added - auto_healed_duplicates` arithmetic still
+        # balances exactly — `added` is simply lower.
+        "release_date_drift_merged": 0,
         "warnings": [],
     }
 
@@ -1675,25 +1922,32 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 "on these rows."
             )
 
-        # ----- Semantic duplicate check: owned twins (BUI-548) -----------------
+        # ----- Semantic duplicate check: owned twins (BUI-548, BUI-554) --------
         # The sync's row-count arithmetic (ROWS_BEFORE + added -
         # auto_healed_duplicates) is exact and cannot see this: on 2026-07-27 it
         # balanced to the row while the import silently created a SECOND owned
-        # row for 28 books. A pending agent_win and a locg_export row that both
-        # claim the same owned book is the failure signature of a reconcile miss
-        # — the win was uploaded, LOCG handed it back, and nothing matched the
-        # two up. Counted, named, and surfaced so the sync can hard-stop on it
-        # rather than report clean. Non-destructive: this only reports.
-        owned_wins: dict[str, list[dict[str, Any]]] = {}
-        owned_exports: dict[str, list[dict[str, Any]]] = {}
+        # row for 28 books. Counted, named, and surfaced so the sync can
+        # hard-stop on it rather than report clean. Non-destructive: this only
+        # reports.
+        #
+        # BUI-554 removed the win-vs-export partition this used to require. It
+        # grouped owned rows by `source` and reported a title only when an
+        # `agent_win` and a `locg_export` row COLLIDED — which encoded the
+        # failure the author was chasing (a reconcile miss on a pushed win), not
+        # what makes two rows a violation. A [[Collection Sync]] later
+        # round-tripped every pending win back through LOCG as an export row,
+        # draining the `agent_win` partition to zero, and the cross-product
+        # silently started iterating nothing: the check reported 0 while 60
+        # identities collided, and the healthy reading and the blind reading
+        # were the same number. All-pairs now, with the predicate deciding.
+        owned_groups: dict[str, list[dict[str, Any]]] = {}
         for row in comics:
             if not _is_owned(row):
                 continue
             title = _duplicate_check_title_key(row.get("full_title") or "")
             if not title:
                 continue
-            target = owned_wins if row.get("source") == "agent_win" else owned_exports
-            target.setdefault(title, []).append(row)
+            owned_groups.setdefault(title, []).append(row)
         # Require date compatibility on the pair, not just a shared title: two
         # VOLUMES of one masthead spell the same issue identically (an
         # `X-Men #128` from 2002 and a `The X-Men #128` from 1979 are two books
@@ -1703,11 +1957,12 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # duplicate" stay the same judgment.
         owned_duplicates = sorted(
             title
-            for title, wins in owned_wins.items()
-            if any(
-                _release_dates_compatible(win, export)
-                for win in wins
-                for export in owned_exports.get(title, ())
+            for title, rows in owned_groups.items()
+            if len(rows) > 1
+            and any(
+                _release_dates_compatible_either_way(rows[i], other)
+                for i in range(len(rows))
+                for other in rows[i + 1:]
             )
         )
         summary["owned_duplicate_identities"] = len(owned_duplicates)
@@ -1715,11 +1970,24 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
             shown = ", ".join(owned_duplicates[:10])
             more = "" if len(owned_duplicates) <= 10 else f" (+{len(owned_duplicates) - 10} more)"
             summary["warnings"].append(
-                f"{len(owned_duplicates)} book(s) are now owned TWICE — an "
-                "unreconciled pending win and a LOCG export row both claim the "
-                f"same title (BUI-548): {shown}{more}. The row-count arithmetic "
-                "cannot see this; treat it as a failed reconcile, not a clean "
-                "sync."
+                f"{len(owned_duplicates)} book(s) are now owned TWICE — two "
+                "owned rows claim the same title and the reconciler's own date "
+                f"predicate says they are the same book (BUI-548/BUI-554): "
+                f"{shown}{more}. The row-count arithmetic cannot see this; "
+                "treat it as a failed reconcile, not a clean sync."
+            )
+        elif not owned_groups:
+            # Liveness assertion (BUI-554). A check that has lost the ability to
+            # fail is itself news, and its 0 is indistinguishable from a clean
+            # one — which is exactly how the pre-BUI-554 counter certified a
+            # store holding 60 collisions. Say so rather than let a vacuous 0
+            # satisfy the sync's `owned_duplicate_identities == 0` hard-stop.
+            summary["warnings"].append(
+                "owned_duplicate_identities is VACUOUS: no owned row with a "
+                "usable full_title survived this import, so the duplicate check "
+                "had nothing to compare and its 0 means 'unable to check', not "
+                "'clean' (BUI-554). Verify the import actually landed before "
+                "trusting any post-import counter."
             )
 
         # ----- Rebuild series_name_index --------------------------------------

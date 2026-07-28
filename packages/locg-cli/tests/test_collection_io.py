@@ -3493,3 +3493,354 @@ def test_duplicate_check_title_key_strips_the_article_word_safely():
     # An edition suffix is part of the key: a base issue and its printing are
     # two books, not a duplicate pair.
     assert key("Batman #2") != key("Batman #2 3rd Printing")
+
+
+# ---------------------------------------------------------------------------
+# BUI-554: the identity key manufactured duplicates, and the counter that was
+# supposed to catch them had gone vacuous. Two independent defects, one set of
+# regressions — plus the holdings that must survive both fixes.
+# ---------------------------------------------------------------------------
+
+# --- Must survive: legitimately distinct rows the fixes must NOT collapse ----
+
+def test_three_xmen_volumes_keep_three_identities():
+    """`X-Men #17` is legitimately owned three times. The end-year fold must
+    not touch what separates them.
+
+    These are the real store's rows (2026-07-28). Note volumes 1 and 2 differ
+    ONLY in the `(Vol. N)` token once the end year folds — which is exactly why
+    `identity_series_key` must not reuse `_normalize_series_key`, whose job is
+    ownership lookup and which strips `(Vol. N)` outright."""
+    from locg.collection_cache import make_identity
+
+    rows = [
+        {"publisher_name": "Marvel Comics", "series_name": "The X-Men (Vol. 1) (1963 - 1981)",
+         "full_title": "The X-Men #17", "release_date": "1965-12-02"},
+        {"publisher_name": "Marvel Comics", "series_name": "X-Men (Vol. 2) (1991 - 2001)",
+         "full_title": "X-Men #17", "release_date": "1992-12-15"},
+        {"publisher_name": "Marvel Comics", "series_name": "X-Men (Vol. 6) (2019 - 2021)",
+         "full_title": "X-Men #17", "release_date": "2021-01-27"},
+    ]
+    assert len({make_identity(r) for r in rows}) == 3
+
+
+def test_reused_vol_label_is_separated_by_the_start_year():
+    """LOCG reuses a `Vol. N` label across genuinely different volumes, so the
+    START year is sometimes the only thing telling two series apart.
+
+    Both pairs are live store rows. Stripping the whole `(YYYY - YYYY)` range —
+    the obvious reading of "fold the volume end year" — collapses both, which
+    is why `identity_series_key` folds the END year only."""
+    from locg.collection_cache import identity_series_key as key
+
+    assert key("X-Men (Vol. 2) (1991 - 2001)") != key("X-Men (Vol. 2) (2001 - 2013)")
+    assert key("Spawn (1992 - Present)") != key("Spawn (2012 - Present)")
+    # ...while the drift class it exists for does collapse.
+    assert (key("Absolute Martian Manhunter (2025 - Present)")
+            == key("Absolute Martian Manhunter (2025 - 2026)"))
+    assert key("Batman (Vol. 3) (2016 - Present)") == key("Batman (Vol. 3) (2016 - 2026)")
+    # A name with no range decoration is returned unchanged.
+    assert key("Batman (Vol. 3)") == "Batman (Vol. 3)"
+    assert key("") == ""
+
+
+def test_printings_and_similar_titles_are_not_duplicates():
+    """A printing is a distinct collectible, and a title that merely contains
+    another is a different book. Both must stay out of the duplicate count."""
+    from locg.collection_io import _duplicate_check_title_key as key
+
+    assert (key("Batman: The Dark Knight Returns #2")
+            != key("Batman: The Dark Knight Returns #2 3rd Printing"))
+    assert key("Death of the Silver Surfer #1") != key("Silver Surfer #1")
+
+
+def test_duplicate_check_spares_multi_volume_and_printing_holdings(tmp_path):
+    """End-to-end: the repaired all-pairs check must report ZERO against a
+    store holding only legitimately distinct books — three X-Men volumes, a
+    printing, and two same-numbered issues of different Silver Surfer titles.
+
+    The all-pairs widening is only safe because the date predicate still
+    rules; this is the test that would fail if a future change let a shared
+    title key alone flag a duplicate."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    xlsx = tmp_path / "export.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel Comics", "series": "The X-Men (Vol. 1) (1963 - 1981)",
+         "full_title": "The X-Men #17", "release_date": "1965-12-02"},
+        {"publisher": "Marvel Comics", "series": "X-Men (Vol. 2) (1991 - 2001)",
+         "full_title": "X-Men #17", "release_date": "1992-12-15"},
+        {"publisher": "Marvel Comics", "series": "X-Men (Vol. 6) (2019 - 2021)",
+         "full_title": "X-Men #17", "release_date": "2021-01-27"},
+        {"publisher": "DC Comics", "series": "Batman: The Dark Knight Returns (1986)",
+         "full_title": "Batman: The Dark Knight Returns #2", "release_date": "1986-03-25"},
+        {"publisher": "DC Comics", "series": "Batman: The Dark Knight Returns (1986)",
+         "full_title": "Batman: The Dark Knight Returns #2 3rd Printing",
+         "release_date": "1986-03-31"},
+        {"publisher": "Marvel Comics", "series": "Silver Surfer (Vol. 3) (1987 - 1998)",
+         "full_title": "Silver Surfer #1", "release_date": "1987-04-07"},
+        {"publisher": "Marvel Comics", "series": "Death of the Silver Surfer (1990)",
+         "full_title": "Death of the Silver Surfer #1", "release_date": "1990-06-05"},
+    ])
+
+    result = import_xlsx(xlsx, cache)
+    assert result["added"] == 7
+    assert result["owned_duplicate_identities"] == 0
+    assert len(cache.load()["comics"]) == 7
+
+
+# --- Cause A: the series end-year relabel (recurs every January) -------------
+
+def test_series_end_year_relabel_updates_instead_of_inserting(tmp_path):
+    """LOCG closes out an ongoing volume's decoration the January after it
+    ends. Nothing about the book changed, so the re-import must UPDATE the row
+    it already has, not add a twin."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "DC Comics", "series": "Absolute Martian Manhunter (2025 - Present)",
+         "full_title": "Absolute Martian Manhunter #2", "release_date": "2025-04-23"},
+    ])
+    import_xlsx(first, cache)
+
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "DC Comics", "series": "Absolute Martian Manhunter (2025 - 2026)",
+         "full_title": "Absolute Martian Manhunter #2", "release_date": "2025-04-23"},
+    ])
+    result = import_xlsx(second, cache)
+
+    payload = cache.load()
+    assert len(payload["comics"]) == 1, "the relabel must not manufacture a row"
+    assert result["added"] == 0
+    assert result["updated"] == 1
+    assert result["owned_duplicate_identities"] == 0
+    assert payload["comics"][0]["series_name"] == "Absolute Martian Manhunter (2025 - 2026)"
+
+
+def test_different_start_year_volumes_still_insert_separately(tmp_path):
+    """The complement of the test above: two volumes of one masthead that
+    differ in START year are two books and must both land."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "Image Comics", "series": "Spawn (1992 - Present)",
+         "full_title": "Spawn #1", "release_date": "1992-05-01"},
+    ])
+    import_xlsx(first, cache)
+
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "Image Comics", "series": "Spawn (2012 - Present)",
+         "full_title": "Spawn #1", "release_date": "2012-08-01"},
+    ])
+    result = import_xlsx(second, cache)
+
+    assert result["added"] == 1
+    assert len(cache.load()["comics"]) == 2
+
+
+# --- Cause B: the release-date convention change ----------------------------
+
+def test_release_date_drift_merges_instead_of_inserting(tmp_path):
+    """A run re-catalogued from cover date to on-sale date. `release_date` sits
+    in BOTH the identity key and the rename detector, so before BUI-554 both
+    guards missed together and the row inserted as a twin."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "DC Comics", "series": "Crisis on Infinite Earths (1985 - 1986)",
+         "full_title": "Crisis on Infinite Earths #1", "release_date": "1985-01-03"},
+    ])
+    import_xlsx(first, cache)
+
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "DC Comics", "series": "Crisis on Infinite Earths (1985 - 1986)",
+         "full_title": "Crisis on Infinite Earths #1", "release_date": "1984-12-11"},
+    ])
+    result = import_xlsx(second, cache)
+
+    payload = cache.load()
+    assert len(payload["comics"]) == 1
+    assert result["added"] == 0
+    assert result["release_date_drift_merged"] == 1
+    assert result["owned_duplicate_identities"] == 0
+    assert payload["comics"][0]["release_date"] == "1984-12-11", "re-keyed to LOCG's value"
+    # Idempotent: the merged row now matches exactly, so a repeat is a no-op.
+    repeat = import_xlsx(second, cache)
+    assert repeat["added"] == 0 and repeat["release_date_drift_merged"] == 0
+    assert len(cache.load()["comics"]) == 1
+
+
+def test_release_date_drift_beyond_tolerance_stays_a_separate_book(tmp_path):
+    """The tolerance is the reconciler's own. Two eras of one title are two
+    books, and no amount of title agreement may merge them."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "Marvel Comics", "series": "Fantastic Four (Vol. 1) (1961 - 2012)",
+         "full_title": "Fantastic Four #1", "release_date": "1961-08-08"},
+    ])
+    import_xlsx(first, cache)
+
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "Marvel Comics", "series": "Fantastic Four (Vol. 1) (1961 - 2012)",
+         "full_title": "Fantastic Four #1", "release_date": "1996-11-13"},
+    ])
+    result = import_xlsx(second, cache)
+
+    assert result["added"] == 1
+    assert result["release_date_drift_merged"] == 0
+    assert len(cache.load()["comics"]) == 2
+
+
+def test_date_drift_never_folds_two_export_rows_into_one(tmp_path):
+    """An export row that matches EXACTLY owns its row. A second export row
+    that only drifts onto it must insert instead of overwriting — folding it in
+    would drop a book LOCG says exists (the R11 direction)."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "DC Comics", "series": "Crisis on Infinite Earths (1985 - 1986)",
+         "full_title": "Crisis on Infinite Earths #1", "release_date": "1985-01-03"},
+    ])
+    import_xlsx(first, cache)
+
+    # Same export now carries BOTH dates. The exact match must win, and the
+    # drifted row must land as its own row rather than clobbering it.
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "DC Comics", "series": "Crisis on Infinite Earths (1985 - 1986)",
+         "full_title": "Crisis on Infinite Earths #1", "release_date": "1984-12-11"},
+        {"publisher": "DC Comics", "series": "Crisis on Infinite Earths (1985 - 1986)",
+         "full_title": "Crisis on Infinite Earths #1", "release_date": "1985-01-03"},
+    ])
+    result = import_xlsx(second, cache)
+
+    payload = cache.load()
+    dates = sorted(r["release_date"] for r in payload["comics"])
+    assert dates == ["1984-12-11", "1985-01-03"], "both export rows must survive"
+    assert result["release_date_drift_merged"] == 0
+
+
+def test_date_drift_pass_never_claims_a_pending_win(tmp_path):
+    """A pending win is Phase 1's business. Phase 1 judges it with era and
+    print/variant evidence the drift pass does not carry, so the drift pass
+    must leave every unpushed win alone."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Uncanny X-Men (Vol. 1) (1963 - 2011)",
+        full_title="Uncanny X-Men #179",
+        release_date="1983-12-06",
+        needs_manual_variant=True,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "export.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel Comics", "series": "Uncanny X-Men (Vol. 1) (1963 - 2011)",
+         "full_title": "Uncanny X-Men #179", "release_date": "1983-11-15"},
+    ])
+    result = import_xlsx(xlsx, cache)
+
+    assert result["release_date_drift_merged"] == 0, (
+        "the drift pass must not adjudicate a win"
+    )
+
+
+# --- The counter: it must be able to fail, whatever the rows are labelled ----
+
+@pytest.mark.parametrize("sources", [
+    ("agent_win", "locg_export"),
+    ("locg_export", "locg_export"),
+    ("agent_win", "agent_win"),
+])
+def test_duplicate_check_is_blind_to_the_source_label(tmp_path, sources):
+    """The guard test for a guard that went vacuous.
+
+    The shipped check partitioned owned rows on `source` and reported only a
+    win-vs-export collision. A collection sync round-tripped every win back as
+    an export row, draining that partition to zero, and the cross-product
+    silently began iterating nothing — 0 reported against 60 real collisions,
+    with the healthy reading and the blind reading the same number.
+
+    Parametrizing over the labels is what makes this test unable to go vacuous
+    the same way: whichever partition empties next, one of these cases still
+    forces the check to fire."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+
+    def seed(payload):
+        for i, src in enumerate(sources):
+            payload["comics"].append({
+                "publisher_name": "DC Comics",
+                "series_name": "Crisis on Infinite Earths (1985 - 1986)",
+                "full_title": "Crisis on Infinite Earths #1",
+                # Distinct dates keep the two rows distinct identities; they are
+                # 23 days apart, so the reconciler's own predicate calls them
+                # the same book.
+                "release_date": ["1985-01-03", "1984-12-11"][i],
+                "in_collection": 1,
+                "in_wish_list": 0,
+                "source": src,
+                "pushed_to_locg_at": "2026-01-01T00:00:00Z",
+                "local_added_at": "2026-01-01T00:00:00Z",
+                "local_added_seq": i,
+            })
+
+    cache.apply(seed, command="pre-import")
+
+    # An unrelated export, so the merge phases leave the seeded pair intact.
+    xlsx = tmp_path / "export.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel Comics", "series": "Daredevil (Vol. 1) (1964 - 2011)",
+         "full_title": "Daredevil #181", "release_date": "1982-01-05"},
+    ])
+    result = import_xlsx(xlsx, cache)
+
+    assert result["owned_duplicate_identities"] == 1, (
+        f"the duplicate must be reported whatever the rows are labelled {sources}"
+    )
+    assert any("owned TWICE" in w for w in result["warnings"])
+
+
+def test_duplicate_check_announces_when_it_cannot_check(tmp_path):
+    """A check that has lost the ability to fail is itself news. Against a
+    store with no owned rows the counter reads 0 for the wrong reason, and
+    that 0 must not silently satisfy the sync's hard-stop."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    xlsx = tmp_path / "export.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel Comics", "series": "Daredevil (Vol. 1) (1964 - 2011)",
+         "full_title": "Daredevil #181", "release_date": "1982-01-05",
+         "in_collection": 0, "in_wish_list": 1},
+    ])
+    result = import_xlsx(xlsx, cache)
+
+    assert result["owned_duplicate_identities"] == 0
+    assert any("VACUOUS" in w for w in result["warnings"]), (
+        "a 0 that means 'unable to check' must say so"
+    )
