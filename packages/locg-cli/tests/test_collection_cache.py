@@ -689,16 +689,16 @@ def test_series_name_index_locg_export_only(tmp_path):
                "series_name_index": {}, "comics": rows}
     index = rebuild_series_name_index(payload)
     # locg_export rows contribute
-    assert any("amazing spider-man" in k for k in index.keys())
+    assert any("amazing spider man" in k for k in index.keys())
     assert any("batman" in k for k in index.keys())
     # agent_win rows must NOT contribute
-    assert not any("x-men" in k for k in index.keys())
+    assert not any("x men" in k for k in index.keys())
 
 
 def test_series_name_index_normalizes_keys(tmp_path):
     """Index keys strip (Vol. N) and (YYYY - YYYY) from series names."""
     from locg.collection_cache import rebuild_series_name_index, _normalize_series_key
-    assert _normalize_series_key("Amazing Spider-Man (1963 - 1998)") == "amazing spider-man"
+    assert _normalize_series_key("Amazing Spider-Man (1963 - 1998)") == "amazing spider man"
     assert _normalize_series_key("Batman (Vol. 2)") == "batman"
     assert _normalize_series_key("Spawn (1992 - Present)") == "spawn"
     assert _normalize_series_key("1963 (1993)") == "1963"
@@ -719,34 +719,329 @@ def test_normalize_series_key_strips_leading_article():
     assert _normalize_series_key("Theater of War") == "theater of war"
 
 
-def test_normalize_series_key_does_not_strip_stray_punctuation():
-    """BUI-460: _normalize_series_key only strips year/vol/article decoration,
-    NOT stray punctuation — so a series string with a leftover separator (the
-    BUI-456 residual comic_identity.py's _finalize now cleans up before
-    threading it here) would resolve to the WRONG key. This locks the
-    contract from the locg side: apps/ebay/src/comic_identity.py must hand
-    this function a clean series string, because this function will not
-    clean it up itself.
+def test_normalize_series_key_folds_stray_punctuation():
+    """CONTRACT CHANGE (BUI-546) — this test previously asserted the OPPOSITE,
+    under the name test_normalize_series_key_does_not_strip_stray_punctuation.
 
-    Fixed inputs (what comic-identify now produces for "X-Men Annual: 1",
-    "Avengers Annual-#5", "Amazing Spider-Man Annual No. 1") thread to the
-    same key the local series_name_index uses for those series.
+    Until BUI-546 this function stripped ONLY year/vol/article decoration, so a
+    series string carrying a leftover separator (the BUI-456 residual that
+    apps/ebay/src/comic_identity.py's _finalize cleans up before threading it
+    here) resolved to a DIFFERENT, wrong key. This test locked that in as a
+    hazard: keep the caller honest, because this function will not clean up
+    after it.
+
+    BUI-546 folds punctuation into the key — eBay listing titles strip it and
+    comic-identify threads that stripped form straight through, so the SAME
+    book hashed two ways ("Batman The Dark Knight Returns" never met "Batman:
+    The Dark Knight Returns"). A happy side effect is that the BUI-460 residual
+    this test guarded becomes HARMLESS rather than merely absent: a trailing
+    ":" or "-" folds away instead of poisoning the key.
+
+    The BUI-460 upstream contract is NOT retired — comic_identity.py should
+    still hand this function a clean series string (a dirty one now merely
+    fails SAFE instead of failing wrong), and the last case below marks the
+    limit: a stray token that is a WORD ("No") is still key content, because
+    only the punctuation folds, never the word it was attached to.
     """
     from locg.collection_cache import _normalize_series_key
 
-    assert _normalize_series_key("X-Men") == "x-men"
+    assert _normalize_series_key("X-Men") == "x men"
     assert _normalize_series_key("Avengers") == "avengers"
-    assert _normalize_series_key("Amazing Spider-Man") == "amazing spider-man"
+    assert _normalize_series_key("Amazing Spider-Man") == "amazing spider man"
 
-    # The pre-fix (buggy) series strings prove the point: a stray separator
-    # produces a DIFFERENT, wrong key that would miss the local index.
-    assert _normalize_series_key("X-Men :") == "x-men :" != _normalize_series_key("X-Men")
-    assert _normalize_series_key("Avengers -") == "avengers -" != _normalize_series_key(
-        "Avengers"
+    # BUI-546: a leftover separator now folds away instead of forking the key.
+    assert _normalize_series_key("X-Men :") == _normalize_series_key("X-Men")
+    assert _normalize_series_key("Avengers -") == _normalize_series_key("Avengers")
+
+    # But only the PUNCTUATION folds. A stray WORD survives as key content, so
+    # the upstream cleanup in comic_identity.py still earns its keep.
+    assert _normalize_series_key("Amazing Spider-Man No.") == "amazing spider man no"
+    assert _normalize_series_key("Amazing Spider-Man No.") != _normalize_series_key(
+        "Amazing Spider-Man"
     )
-    assert _normalize_series_key(
-        "Amazing Spider-Man No."
-    ) == "amazing spider-man no." != _normalize_series_key("Amazing Spider-Man")
+
+
+# ---------------------------------------------------------------------------
+# BUI-546: punctuation folding
+# ---------------------------------------------------------------------------
+
+def test_normalize_series_key_folds_ebay_punctuation_stripping():
+    """The ticket's acceptance table: eBay strips punctuation out of listing
+    titles and comic-identify threads that stripped form into
+    identify_data.series, so the SAME book used to hash two ways. Each pair is
+    a real stuck row measured against the live store on 2026-07-27."""
+    from locg.collection_cache import _normalize_series_key as n
+
+    # colon
+    assert n("Batman The Dark Knight Returns") == n(
+        "Batman: The Dark Knight Returns (1986)"
+    )
+    assert n("Superman The Man of Steel") == n("Superman: The Man of Steel (1991 - 2003)")
+    # comma vs colon (the sharpest case: same book, one character)
+    assert n("Doctor Strange: Sorcerer Supreme") == n(
+        "Doctor Strange, Sorcerer Supreme (1988 - 1996)"
+    )
+    # colon + hyphen
+    assert n("Godzilla The Half Century War") == n(
+        "Godzilla: The Half-Century War (2012 - 2013)"
+    )
+    # leading article — already handled by BUI-45, still handled here.
+    assert n("Infinity Gauntlet") == n("The Infinity Gauntlet (Vol. 1) (1991)")
+
+
+def test_normalize_series_key_separators_become_space_not_deleted():
+    """Design lock: ``:``/``,``/dash map to a SPACE, never deletion.
+
+    Deleting them would fuse the words either side ("half-century" ->
+    "halfcentury") and MISS the unpunctuated eBay spelling — the exact failure
+    BUI-546 exists to fix. This asserts the token boundary survives."""
+    from locg.collection_cache import _normalize_series_key as n
+
+    # Note "The" survives: the article strip is anchored at the START of the
+    # name, so a mid-string article is key content, colon or no colon.
+    assert n("Godzilla: The Half-Century War") == "godzilla the half century war"
+    assert "halfcentury" not in n("Godzilla: The Half-Century War")
+    assert n("Doctor Strange, Sorcerer Supreme") == "doctor strange sorcerer supreme"
+    # En/em-dash and the minus sign fold the same as an ASCII hyphen.
+    assert n("Half–Century War") == n("Half-Century War") == "half century war"
+    assert n("Half—Century War") == n("Half Century War")
+
+
+def test_normalize_series_key_apostrophe_becomes_space_matching_ebay():
+    """Design lock: an apostrophe maps to a SPACE, not deletion — against the
+    linguistic instinct ("Director's" -> "directors").
+
+    eBay has ALREADY turned the apostrophe into a space by the time we see the
+    title ("Spawn Director s Cut"), so deleting ours would give "directors"
+    against eBay's "director s" and still miss. Spacing converges."""
+    from locg.collection_cache import _normalize_series_key as n
+
+    assert n("Director's Cut") == n("Director s Cut") == "director s cut"
+    # Typographic apostrophe folds identically to the ASCII one.
+    assert n("Director’s Cut") == n("Director's Cut")
+    assert n("‘Nuff Said") == "nuff said"
+    # The accepted cost, documented: a source that drops the apostrophe
+    # ENTIRELY (no space left behind) still misses. That is a false NEGATIVE —
+    # the safe direction for an ownership key.
+    assert n("Directors Cut") != n("Director's Cut")
+
+
+def test_normalize_series_key_period_is_deleted_not_spaced():
+    """Design lock: ``.`` is DELETED, not spaced.
+
+    A period carries no word boundary of its own. Where it separates words it
+    is already followed by a space (both treatments agree); where it does not,
+    it is an acronym and only deletion converges on the unpunctuated spelling.
+    Deleting also keeps a leading initial from decaying into a bare article
+    that the article strip would then eat."""
+    from locg.collection_cache import _normalize_series_key as n
+
+    assert n("Nick Fury, Agent of S.H.I.E.L.D.") == n("Nick Fury Agent of SHIELD")
+    assert n("S.H.I.E.L.D.") == "shield"
+    # Spacing would have given "s h i e l d", which meets nothing.
+    assert n("S.H.I.E.L.D.") != "s h i e l d"
+    # A.X.E. keeps its head: spacing would leave a leading "a " for the article
+    # strip to eat, yielding "x e judgment day".
+    assert n("A.X.E.: Judgment Day") == "axe judgment day"
+    # Where a period IS followed by a space, both treatments agree anyway.
+    assert n("Dr. Strange") == n("Dr Strange") == "dr strange"
+
+
+def test_normalize_series_key_preserves_intra_name_whitespace():
+    """SCOPE BOUNDARY (BUI-546): punctuation folds, whitespace BETWEEN words
+    does NOT.
+
+    The Dawnrunner class ("Dawn Runner" from eBay vs LOCG's "Dawnrunner", 5
+    duplicate owned rows on 2026-07-27) is deliberately NOT solved by widening
+    this key — stripping all whitespace is a far wider net that can merge two
+    genuinely distinct series. It is handled downstream by price/date
+    corroboration instead. These keys MUST stay distinct."""
+    from locg.collection_cache import _normalize_series_key as n
+
+    assert n("Dawn Runner") != n("Dawnrunner")
+    assert n("Super-Man") != n("Superman")
+    assert n("X-Men") != n("Xmen")
+    assert n("Spider-Man") != n("Spiderman")
+    # Collapsing a RUN of whitespace to one space is NOT the same thing, and is
+    # expected — it is what makes the separator folding above idempotent.
+    assert n("Amazing   Spider-Man") == n("Amazing Spider-Man")
+    assert n("Batman :  The Killing Joke") == n("Batman: The Killing Joke")
+
+
+def test_normalize_series_key_does_not_merge_distinct_lines():
+    """ADVERSARIAL: widening a key makes MORE things match, which is not
+    uniformly safe. A distinct LINE that merely shares punctuation-adjacent
+    wording with its parent run must keep its own key — a false merge here is
+    reported as owned and NOT BOUGHT (R11)."""
+    from locg.collection_cache import _normalize_series_key as n
+
+    # The known Giant-Size false-positive class: a distinct line, not the run.
+    assert n("Giant-Size X-Men") != n("X-Men")
+    assert n("Giant-Size Fantastic Four") != n("Fantastic Four")
+    # A year/decade qualifier is key content, not punctuation.
+    assert n("X-Men '92") != n("X-Men")
+    assert n("Spider-Man 2099") != n("Spider-Man")
+    # An Annual stays an Annual (the qualifier is a word, not punctuation).
+    assert n("X-Men Annual") != n("X-Men")
+
+
+def test_normalize_series_key_alone_does_not_expand_abbreviations():
+    """The normalizer stays CONSERVATIVE: folding "Dr." to "dr strange" is as
+    far as punctuation goes. Expanding it to "doctor strange" is a naming
+    equivalence, and lives in the auditable _MASTHEAD_ALIAS_PAIRS table (see
+    the next test) — never as a blanket rewrite here, which would be unbounded
+    and would also rewrite unrelated names."""
+    from locg.collection_cache import _normalize_series_key as n
+
+    assert n("Dr. Strange") == "dr strange"
+    assert n("Dr. Strange") != n("Doctor Strange")
+
+
+def test_owned_match_keys_dr_abbreviation_alias():
+    """BUI-546: "Dr. Strange" (what eBay hands us) and LOCG's canonical
+    "Doctor Strange (Vol. 2) (1974 - 1986)" are linked through the masthead
+    alias table, symmetrically."""
+    from locg.collection_cache import owned_match_keys
+
+    assert "doctor strange" in owned_match_keys("Dr. Strange", "6")
+    assert "dr strange" in owned_match_keys("Doctor Strange", "6")
+    assert "doctor strange" in owned_match_keys("Dr Strange", "6")
+    # Scoped to that one masthead: a subtitled sibling is its own exact key and
+    # is NOT swept in by the alias (it would need its own verified entry).
+    assert "doctor strange sorcerer supreme" not in owned_match_keys(
+        "Dr. Strange, Sorcerer Supreme", "44"
+    )
+
+
+def test_hardcoded_normalized_keys_are_derived_from_the_normalizer():
+    """DRIFT CANARY. Every hardcoded normalized key in this module must be a
+    FIXED POINT of _normalize_series_key.
+
+    This is the guard BUI-546 needed and did not have: the split keys and the
+    alias table were hand-written as "x-men"/"uncanny x-men", so folding the
+    hyphen to a space would have silently orphaned BOTH — no test would have
+    failed, and the classic X-Men split plus the entire masthead alias table
+    would have quietly stopped matching anything. Both are now derived by
+    calling the normalizer; this asserts they stay that way."""
+    from locg.collection_cache import (
+        _ALIAS_GROUPS,
+        _XMEN_SPLIT_KEYS,
+        _normalize_series_key,
+    )
+
+    for key in _XMEN_SPLIT_KEYS:
+        assert _normalize_series_key(key) == key, f"orphaned split key: {key!r}"
+    for key, group in _ALIAS_GROUPS.items():
+        assert _normalize_series_key(key) == key, f"orphaned alias key: {key!r}"
+        for member in group:
+            assert _normalize_series_key(member) == member, (
+                f"orphaned alias member: {member!r}"
+            )
+
+    # And they are still populated with the runs they are supposed to name —
+    # a fixed-point check alone would pass on an EMPTY table.
+    assert _XMEN_SPLIT_KEYS == {
+        _normalize_series_key("X-Men"),
+        _normalize_series_key("Uncanny X-Men"),
+    }
+    for name in ("Mighty Thor", "Incredible Hulk", "Invincible Iron Man",
+                 "Uncanny X-Men", "Dr. Strange", "Doctor Strange"):
+        assert _normalize_series_key(name) in _ALIAS_GROUPS, name
+
+
+def test_resolve_series_for_win_punctuation_divergent_subtitle():
+    """BUI-546 acceptance: resolve_series_for_win returned the correct volume
+    for "Doctor Strange, Sorcerer Supreme #10" and None for "Doctor Strange:
+    Sorcerer Supreme #10". Same book, one character."""
+    from locg.collection_cache import _normalize_series_key, resolve_series_for_win
+
+    canonical = "Doctor Strange, Sorcerer Supreme (1988 - 1996)"
+    candidates = {_normalize_series_key(canonical): [canonical]}
+
+    # The eBay spelling (colon) now resolves to LOCG's spelling (comma).
+    assert resolve_series_for_win(
+        _normalize_series_key("Doctor Strange: Sorcerer Supreme"),
+        "10", 1989, {}, candidates,
+    ) == canonical
+    # The fully-stripped eBay spelling resolves too.
+    assert resolve_series_for_win(
+        _normalize_series_key("Doctor Strange Sorcerer Supreme"),
+        "10", 1989, {}, candidates,
+    ) == canonical
+
+
+def test_resolve_series_for_win_punctuation_merge_still_era_gated():
+    """ADVERSARIAL: the wider key means a win can now REACH a volume it could
+    not before. BUI-421's year guard is what keeps it from being FILED there —
+    a punctuation-merged key whose only candidate volume cannot contain the
+    win's year still returns None (→ Metron / manual), never a wrong volume."""
+    from locg.collection_cache import _normalize_series_key, resolve_series_for_win
+
+    modern = "Doctor Strange, Sorcerer Supreme (2016 - 2018)"
+    candidates = {_normalize_series_key(modern): [modern]}
+    assert resolve_series_for_win(
+        _normalize_series_key("Doctor Strange: Sorcerer Supreme"),
+        "10", 1989, {}, candidates,
+    ) is None
+
+
+# BUI-211 auto-heal + BUI-462 era guard. These exercise collection_io's
+# _reconcile_score / _era_confirmed, but live in THIS file because the change
+# under test is _normalize_series_key — collection_io is untouched by BUI-546
+# and is being edited concurrently elsewhere.
+
+def _recon_row(series, full_title, release_date, publisher="Marvel Comics"):
+    return {
+        "publisher_name": publisher,
+        "series_name": series,
+        "full_title": full_title,
+        "release_date": release_date,
+    }
+
+
+def test_reconcile_score_matches_punctuation_divergent_pair():
+    """BUI-211's duplicate auto-heal is keyed on (normalized_series, issue), so
+    before BUI-546 it never collided for exactly the rows most likely to be
+    duplicated — four such pairs were found and hand-deleted on 2026-07-27,
+    five weeks after BUI-211 shipped to eliminate that manual work. This
+    mirrors the "Doctor Strange, Sorcerer Supreme #44" case."""
+    from locg.collection_io import _era_confirmed, _reconcile_score
+
+    win = _recon_row(
+        "Doctor Strange Sorcerer Supreme",
+        "Doctor Strange Sorcerer Supreme #44",
+        "1992-08-01",
+    )
+    owned = _recon_row(
+        "Doctor Strange, Sorcerer Supreme (1988 - 1996)",
+        "Doctor Strange, Sorcerer Supreme #44",
+        "1992-08-01",
+    )
+    assert _reconcile_score(win, owned) > 0
+    # BUI-462: the destructive auto-heal branch additionally requires POSITIVE
+    # same-era evidence, which a same-year pair supplies.
+    assert _era_confirmed(win, owned) is True
+
+
+def test_reconcile_score_punctuation_collision_still_era_rejected():
+    """ADVERSARIAL: the same punctuation merge, landing on a DIFFERENT era,
+    must NOT auto-heal. _reconcile_score's year compare rejects it, and
+    BUI-462's _era_confirmed independently declines the destructive branch —
+    both backstops still fire on the now-wider key."""
+    from locg.collection_io import _era_confirmed, _reconcile_score
+
+    vintage_win = _recon_row(
+        "Doctor Strange Sorcerer Supreme",
+        "Doctor Strange Sorcerer Supreme #10",
+        "1989-10-01",
+    )
+    modern_owned = _recon_row(
+        "Doctor Strange, Sorcerer Supreme (2016 - 2018)",
+        "Doctor Strange, Sorcerer Supreme #10",
+        "2017-10-01",
+    )
+    assert _reconcile_score(vintage_win, modern_owned) == 0
+    assert _era_confirmed(vintage_win, modern_owned) is False
 
 
 # ---------------------------------------------------------------------------
@@ -845,8 +1140,8 @@ def test_resolve_volume_closed_beats_open_present():
 def test_resolve_xmen_boundary_pair():
     """Paired boundary test: #141 -> early, #142 -> late (classic era)."""
     from locg.collection_cache import resolve_series_for_win
-    assert resolve_series_for_win("x-men", "141", 1980, {}, None) == "The X-Men (Vol. 1) (1963 - 1981)"
-    assert resolve_series_for_win("x-men", "142", 1981, {}, None) == "Uncanny X-Men (Vol. 1) (1980 - 2011)"
+    assert resolve_series_for_win("x men", "141", 1980, {}, None) == "The X-Men (Vol. 1) (1963 - 1981)"
+    assert resolve_series_for_win("x men", "142", 1981, {}, None) == "Uncanny X-Men (Vol. 1) (1980 - 2011)"
 
 
 def test_resolve_xmen_modern_relaunch_not_classic():
@@ -854,10 +1149,10 @@ def test_resolve_xmen_modern_relaunch_not_classic():
     candidate it returns None so the caller falls back to Metron."""
     from locg.collection_cache import resolve_series_for_win
     # Empty index/candidates: must not short-circuit into the classic split.
-    assert resolve_series_for_win("x-men", "1", 2019, {}, None) is None
+    assert resolve_series_for_win("x men", "1", 2019, {}, None) is None
     # With a modern candidate present, that volume is picked.
     modern = "X-Men (Vol. 5) (2019 - 2021)"
-    assert resolve_series_for_win("x-men", "1", 2019, {}, {"x-men": [modern]}) == modern
+    assert resolve_series_for_win("x men", "1", 2019, {}, {"x men": [modern]}) == modern
 
 
 def test_resolve_xmen_later_volume_not_collapsed_to_vol1():
@@ -867,8 +1162,8 @@ def test_resolve_xmen_later_volume_not_collapsed_to_vol1():
     over the hardcoded split (BUI-265)."""
     from locg.collection_cache import resolve_series_for_win
     vol2 = "X-Men (Vol. 2) (1991 - 2001)"
-    candidates = {"x-men": [vol2]}
-    assert resolve_series_for_win("x-men", "7", 1991, {}, candidates) == vol2
+    candidates = {"x men": [vol2]}
+    assert resolve_series_for_win("x men", "7", 1991, {}, candidates) == vol2
 
 
 def test_resolve_xmen_genuine_vol1_still_splits():
@@ -877,10 +1172,10 @@ def test_resolve_xmen_genuine_vol1_still_splits():
     fix must not disturb the original BUI-197/BUI-199/BUI-200 split)."""
     from locg.collection_cache import resolve_series_for_win
     vol1 = "The X-Men (Vol. 1) (1963 - 1981)"
-    candidates = {"x-men": [vol1]}
-    assert resolve_series_for_win("x-men", "107", 1979, {}, candidates) == vol1
+    candidates = {"x men": [vol1]}
+    assert resolve_series_for_win("x men", "107", 1979, {}, candidates) == vol1
     # And with no candidates at all, the hardcoded split still fires.
-    assert resolve_series_for_win("x-men", "107", 1979, {}, None) == vol1
+    assert resolve_series_for_win("x men", "107", 1979, {}, None) == vol1
 
 
 def test_resolve_unknown_key_returns_none():
@@ -988,27 +1283,27 @@ def test_resolve_alias_expansion_preserves_xmen_split():
     late = "Uncanny X-Men (Vol. 1) (1980 - 2011)"
     vol2 = "X-Men (Vol. 2) (1991 - 2001)"
     # Classic split still fires with no candidates.
-    assert resolve_series_for_win("x-men", "141", 1980, {}, None) == early
-    assert resolve_series_for_win("uncanny x-men", "142", 1981, {}, None) == late
+    assert resolve_series_for_win("x men", "141", 1980, {}, None) == early
+    assert resolve_series_for_win("uncanny x men", "142", 1981, {}, None) == late
     # BUI-265 later volume still wins over the split.
-    assert resolve_series_for_win("x-men", "7", 1991, {}, {"x-men": [vol2]}) == vol2
+    assert resolve_series_for_win("x men", "7", 1991, {}, {"x men": [vol2]}) == vol2
     # Genuine classic Vol. 1 issue still splits, alias notwithstanding.
     assert (
-        resolve_series_for_win("x-men", "107", 1979, {}, {"x-men": [early]}) == early
+        resolve_series_for_win("x men", "107", 1979, {}, {"x men": [early]}) == early
     )
 
 
 def test_resolve_modern_xmen_not_cross_filed_to_uncanny_alias():
-    """BUI-421 guard: a MODERN "x-men" win (year > 2011) must NOT be alias-
-    expanded onto a distinct modern "uncanny x-men" volume. The X-Men split
+    """BUI-421 guard: a MODERN "x men" win (year > 2011) must NOT be alias-
+    expanded onto a distinct modern "uncanny x men" volume. The X-Men split
     keys' cross-masthead equivalence is the CLASSIC split (owned by the split
     branch); in the modern era they are different relaunches, so candidate-
     gathering gathers from the exact key only. With only the Uncanny volume in
     the store, the win resolves to None (→ Metron), never to the Uncanny volume."""
     from locg.collection_cache import resolve_series_for_win
     uncanny_v5 = "Uncanny X-Men (Vol. 5) (2018 - 2019)"
-    store = {"uncanny x-men": [uncanny_v5]}
-    result = resolve_series_for_win("x-men", "1", 2019, {}, store)
+    store = {"uncanny x men": [uncanny_v5]}
+    result = resolve_series_for_win("x men", "1", 2019, {}, store)
     assert result is None
 
 
@@ -1029,8 +1324,8 @@ def test_owned_match_keys_masthead_alias_symmetric():
     assert "incredible hulk" in owned_match_keys("Hulk", "181")
     assert "iron man" in owned_match_keys("Invincible Iron Man", "1")
     assert "invincible iron man" in owned_match_keys("Iron Man", "1")
-    assert "x-men" in owned_match_keys("Uncanny X-Men", "200")
-    assert "uncanny x-men" in owned_match_keys("X-Men", "200")
+    assert "x men" in owned_match_keys("Uncanny X-Men", "200")
+    assert "uncanny x men" in owned_match_keys("X-Men", "200")
 
 
 def test_owned_match_keys_no_year_needed():
@@ -1054,7 +1349,7 @@ def test_owned_match_keys_xmen_split_still_works():
     #137 (<=141) cross-links to the early masthead too."""
     from locg.collection_cache import owned_match_keys, _normalize_series_key
     keys = owned_match_keys("Uncanny X-Men", "137")
-    assert "x-men" in keys
+    assert "x men" in keys
     assert _normalize_series_key("The X-Men (Vol. 1) (1963 - 1981)") in keys
 
 
@@ -1063,11 +1358,11 @@ def test_owned_match_keys_annual_alias_expansion():
     Annual qualifier re-applied: 'X-Men Annual' matches 'uncanny x-men annual'."""
     from locg.collection_cache import owned_match_keys
     keys = owned_match_keys("X-Men Annual", "9")
-    assert "x-men annual" in keys
-    assert "uncanny x-men annual" in keys
+    assert "x men annual" in keys
+    assert "uncanny x men annual" in keys
     # And the regular run key is NOT pulled in (annual stays an annual).
-    assert "x-men" not in keys
-    assert "uncanny x-men" not in keys
+    assert "x men" not in keys
+    assert "uncanny x men" not in keys
 
 
 def test_owned_match_keys_annual_plural_suffix():

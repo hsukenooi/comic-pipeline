@@ -155,18 +155,111 @@ _BARE_YEAR_RE = re.compile(r"\s*\(\d{4}\)")
 # /comic:identify is inconsistent about emitting it (BUI-45).
 _LEADING_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
 
+# --- Punctuation folding (BUI-546) -------------------------------------------
+#
+# eBay listing titles strip punctuation, and comic-identify threads that
+# stripped form straight into ``identify_data.series``. So every series whose
+# real LOCG title carries punctuation used to hash to a DIFFERENT key than the
+# same book bought off eBay — "Batman The Dark Knight Returns" never met
+# "Batman: The Dark Knight Returns (1986)", and BUI-211's duplicate auto-heal
+# (keyed on exactly this normalized series) therefore never fired for the rows
+# most likely to be duplicated. Folding punctuation here fixes it symmetrically:
+# BOTH the stored key and the lookup key go through this one function.
+#
+# The per-character treatment is NOT uniform. It is chosen so the two spellings
+# CONVERGE, which sometimes means "space" and sometimes means "delete":
+#
+#   ``:``  ``,``  ``-`` (and en/em-dash/minus)  ->  SPACE
+#       Separator-style: they sit ON a word boundary that the unpunctuated
+#       spelling keeps as a space. "Godzilla: The Half-Century War" -> "godzilla
+#       the half century war" == "Godzilla The Half Century War". DELETING them
+#       instead would yield "halfcentury war" and fail the exact case this
+#       ticket exists to fix.
+#
+#   ``'``  ``’``  ``‘``  ->  SPACE (deliberately NOT delete)
+#       An apostrophe is elision-style, so "delete" is the linguistically
+#       natural choice ("Director's" -> "directors"). We map it to a space
+#       anyway because of what eBay actually does to it: the observed listing
+#       form is "Spawn Director s Cut" — eBay has ALREADY turned the apostrophe
+#       into a space. Deleting ours would give "directors" against eBay's
+#       "director s" and still miss; spacing converges on "director s" from
+#       both sides. The cost is that a source spelling it "Directors" (no
+#       apostrophe at all) still misses — a false NEGATIVE, the safe direction
+#       for an ownership key.
+#
+#   ``.``  ->  DELETE (deliberately NOT space)
+#       A period never carries a word boundary of its own. Where it separates
+#       words it is already followed by a space, so both treatments agree
+#       ("Dr. Strange" -> "dr strange" either way). Where it does NOT, it is an
+#       acronym, and only deleting converges: "S.H.I.E.L.D." -> "shield" meets
+#       the unpunctuated "SHIELD", where spacing would give "s h i e l d" and
+#       meet nothing. Deleting is therefore >= spacing everywhere and strictly
+#       better on acronyms. It also keeps "A.X.E.: Judgment Day" from becoming a
+#       bare leading "a " that the article strip below would then eat.
+#
+# Parentheses are deliberately NOT folded — they carry the (Vol. N) /
+# (YYYY - YYYY) decoration stripped just above, and folding them would promote
+# an unrecognized decoration into key content.
+#
+# What this deliberately does NOT do: remove whitespace BETWEEN words. "Dawn
+# Runner" and "Dawnrunner" still produce DIFFERENT keys. That intra-name-space
+# class is real (5 duplicate Dawnrunner rows, 2026-07-27) but is handled by
+# price/date corroboration in the reconciler, NOT by widening this key — the
+# BUI-546 scope decision. Collapsing a RUN of whitespace to one space (below)
+# is not the same thing and is expected.
+_PUNCT_TO_SPACE_RE = re.compile(r"[:,'‘’]|" + _DASH_CLASS)
+_PUNCT_DELETE_RE = re.compile(r"\.")
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
 
 def _normalize_series_key(series_name: str) -> str:
     """Normalize a series name for series_name_index lookup.
 
     Strips (Vol. N), (YYYY - YYYY), (YYYY - Present), and bare (YYYY) suffixes,
-    a leading article (The/A/An), then lowercases.
+    folds punctuation (BUI-546), collapses whitespace runs, strips a leading
+    article (The/A/An), then lowercases.
+
+    Punctuation folding is per-character and asymmetric by design — the full
+    reasoning is on :data:`_PUNCT_TO_SPACE_RE` above. In short: ``:``, ``,``,
+    dashes and apostrophes become a SPACE (they sit on a word boundary the
+    unpunctuated eBay spelling preserves), while ``.`` is DELETED (it carries
+    no boundary, and deleting is what makes "S.H.I.E.L.D." meet "SHIELD").
+    Whitespace BETWEEN words is never removed, so "Dawn Runner" and
+    "Dawnrunner" remain distinct keys.
+
+    Every hardcoded normalized key in this module (:data:`_XMEN_SPLIT_KEYS`,
+    :data:`_MASTHEAD_ALIAS_PAIRS`) is derived by calling THIS function rather
+    than hand-written, so a future change here can never silently orphan them.
     """
     s = series_name.strip()
     s = _YEAR_RANGE_RE.sub("", s)
     s = _VOL_RE.sub("", s)
     s = _BARE_YEAR_RE.sub("", s)
-    s = _LEADING_ARTICLE_RE.sub("", s.strip())
+    # Punctuation folding runs AFTER the decoration strips (whose patterns
+    # contain a literal "." inside "(Vol. N)") and BEFORE the article strip, so
+    # a punctuation-attached article still folds ("The: Batman" -> "batman").
+    #
+    # The tradeoff that ordering buys, stated honestly: a name whose first token
+    # is a bare article joined by a dash now loses it — "A-Force" -> "force",
+    # "A-Next" -> "next" — so "A-Next" and "The Next" collide. Two reasons this
+    # is the right order anyway:
+    #   1. It is SYMMETRIC, which is the whole design. eBay hands us "A Force",
+    #      and the pre-existing article strip has ALWAYS mapped that to "force".
+    #      Stripping the article FIRST instead would leave the stored "A-Force"
+    #      on "a force" and the queried "A Force" on "force" — they would never
+    #      meet, which is exactly the bug this ticket exists to fix.
+    #   2. The collision is pre-existing in kind, not new in kind: the eBay side
+    #      already normalized to the article-less key. This change extends it to
+    #      the stored side, so both sides now agree rather than one silently
+    #      disagreeing.
+    # A genuinely-different era landing on such a collision is still rejected
+    # downstream by the release-date year gate (collection-check) and the
+    # BUI-267 era guard (record-win dedup); with no year, BUI-284 surfaces
+    # `ambiguous_cross_volume` rather than a confident wrong answer.
+    s = _PUNCT_DELETE_RE.sub("", s)
+    s = _PUNCT_TO_SPACE_RE.sub(" ", s)
+    s = _WHITESPACE_RUN_RE.sub(" ", s).strip()
+    s = _LEADING_ARTICLE_RE.sub("", s)
     return s.strip().lower()
 
 
@@ -257,7 +350,10 @@ def _coerce_year(year: Any) -> Optional[int]:
 # "The X-Men (Vol. 1) (1963 - 1981)" and #142+ under
 # "Uncanny X-Men (Vol. 1) (1980 - 2011)". /comic:identify emits either masthead
 # ("X-Men" or "Uncanny X-Men"), so both normalized keys are part of this split:
-# "x-men" (leading "The" stripped) and "uncanny x-men".
+# "x men" (leading "The" stripped, hyphen folded to a space by BUI-546) and
+# "uncanny x men". Both are DERIVED by calling _normalize_series_key rather than
+# hand-written — BUI-546's hyphen folding changed "x-men" to "x men", which
+# would have silently disabled this entire split had the keys stayed literal.
 #
 # These two classic volumes have OVERLAPPING year ranges (both contain 1980 and
 # 1981), so a year alone cannot disambiguate a boundary win. The issue-number
@@ -266,7 +362,9 @@ def _coerce_year(year: Any) -> Optional[int]:
 # a modern relaunch (e.g. 2019 X-Men #1) must NOT be forced into Vol. 1 — its
 # year falls outside both classic ranges, so it falls through to the normal
 # year/era candidate resolution (and to Metron when nothing matches).
-_XMEN_SPLIT_KEYS = frozenset({"x-men", "uncanny x-men"})
+_XMEN_SPLIT_KEYS = frozenset(
+    _normalize_series_key(name) for name in ("X-Men", "Uncanny X-Men")
+)
 _XMEN_SPLIT_BOUNDARY = 141
 _XMEN_EARLY_SERIES = "The X-Men (Vol. 1) (1963 - 1981)"
 _XMEN_LATE_SERIES = "Uncanny X-Men (Vol. 1) (1980 - 2011)"
@@ -298,11 +396,14 @@ def _xmen_classic_split(issue_num: Optional[str], year: Any) -> Optional[str]:
 # ``In Collection=0`` and LOCG DELETES the owned copy (the BUI-200 26-deleted
 # incident; the masthead-alias variant of it is what BUI-197 closes).
 #
-# Each entry maps two normalized series keys (post-:func:`_normalize_series_key`,
-# i.e. article + (Vol. N) + year decoration already stripped, lowercased) that
-# name the SAME run under different mastheads. The relation is made SYMMETRIC and
-# transitively closed below (:data:`_ALIAS_GROUPS`), so equivalence holds
-# regardless of which side the collection vs the query happens to hold.
+# Each entry maps two series names that name the SAME run under different
+# mastheads. Entries are written in DISPLAY form and run through
+# :func:`_normalize_series_key` when :data:`_ALIAS_GROUPS` is built below, so
+# the table can never drift out of sync with the normalizer (BUI-546: folding
+# punctuation turned "x-men" into "x men", which would have silently emptied
+# this table of its X-Men pair had the keys stayed hand-normalized). The
+# relation is made SYMMETRIC and transitively closed below, so equivalence
+# holds regardless of which side the collection vs the query happens to hold.
 #
 # This is consulted by :func:`owned_match_keys` — the single source of
 # cross-series equivalence for collection-check, the conflicts audit, AND the
@@ -318,10 +419,21 @@ def _xmen_classic_split(issue_num: Optional[str], year: Any) -> Optional[str]:
 # conservatively and verify the LOCG catalog spelling against the live
 # series-names endpoint before adding.
 _MASTHEAD_ALIAS_PAIRS: tuple[tuple[str, str], ...] = (
-    ("mighty thor", "thor"),
-    ("invincible iron man", "iron man"),
-    ("incredible hulk", "hulk"),
-    ("uncanny x-men", "x-men"),
+    ("Mighty Thor", "Thor"),
+    ("Invincible Iron Man", "Iron Man"),
+    ("Incredible Hulk", "Hulk"),
+    ("Uncanny X-Men", "X-Men"),
+    # BUI-546: the "Dr." abbreviation. Folding punctuation alone only gets
+    # "Dr. Strange" as far as "dr strange", which still does not meet LOCG's
+    # canonical "Doctor Strange (Vol. 2) (1974 - 1986)" — the expansion is a
+    # NAMING equivalence, not a punctuation one, so it belongs in this
+    # auditable per-masthead table rather than as a blanket "dr" -> "doctor"
+    # rewrite in the normalizer (which would also rewrite unrelated names, and
+    # is unbounded: every abbreviation would want the same privilege).
+    # Scoped to the ONE masthead the live store showed as stuck; a subtitled
+    # sibling ("Dr. Strange, Sorcerer Supreme") is an exact-key relation and
+    # would need its own verified entry.
+    ("Dr. Strange", "Doctor Strange"),
 )
 
 
@@ -357,16 +469,21 @@ def _build_alias_groups(
     return groups
 
 
-_ALIAS_GROUPS: dict[str, frozenset[str]] = _build_alias_groups(_MASTHEAD_ALIAS_PAIRS)
+_ALIAS_GROUPS: dict[str, frozenset[str]] = _build_alias_groups(
+    tuple(
+        (_normalize_series_key(a), _normalize_series_key(b))
+        for a, b in _MASTHEAD_ALIAS_PAIRS
+    )
+)
 
 # An "Annual" (or "Annuals") qualifier sits between the base series and the issue
 # token in the full_title ("X-Men Annual #9" -> series portion "X-Men Annual"),
-# so it normalizes to key "x-men annual" — outside both the split keys and the
+# so it normalizes to key "x men annual" — outside both the split keys and the
 # alias table, and annuals get missed (BUI-197). Strip a trailing Annual
 # qualifier to recover the base series key, then alias-expand THAT, so an annual
 # resolves to its base run's alias/split set. The stripped qualifier is re-applied
-# to every expanded key so "x-men annual" matches "uncanny x-men annual" (not the
-# regular run "uncanny x-men").
+# to every expanded key so "x men annual" matches "uncanny x men annual" (not the
+# regular run "uncanny x men").
 _ANNUAL_SUFFIX_RE = re.compile(r"\s+annuals?$", re.IGNORECASE)
 
 
@@ -403,22 +520,23 @@ def owned_match_keys(series: str, issue_num: Optional[str]) -> frozenset[str]:
     conflicts audit, and the owned-safe export all route through it, so they
     benefit identically and consistently. It returns the *set* of normalized keys
     (see :func:`_normalize_series_key`, which already folds leading article +
-    ``(Vol. N)`` + year-range / bare-year decoration) that an owned copy of this
+    ``(Vol. N)`` + year-range / bare-year decoration + punctuation) that an owned copy of this
     issue could legitimately appear under. A match against ANY key means owned.
 
     The set always includes the query's own normalized key, and adds:
 
-    * **The classic X-Men issue-number split** (BUI-199/BUI-200): ``x-men``
-      (LOCG ``The X-Men``) holds #1–141, ``uncanny x-men`` holds #142+. So a wish
+    * **The classic X-Men issue-number split** (BUI-199/BUI-200): ``x men``
+      (LOCG ``The X-Men``) holds #1–141, ``uncanny x men`` holds #142+. So a wish
       ``Uncanny X-Men #107`` (≤141) also matches an owned ``The X-Men #107``.
     * **Masthead aliases** (BUI-197, :data:`_MASTHEAD_ALIAS_PAIRS`): symmetric
       adjective-dropping equivalences (``incredible hulk``↔``hulk``,
       ``mighty thor``↔``thor``, ``invincible iron man``↔``iron man``,
-      ``uncanny x-men``↔``x-men``) covering the variants the issue-number split
-      can't — annuals, relaunches, and any issue outside the #141/#142 boundary.
+      ``uncanny x men``↔``x men``) covering the variants the issue-number split
+      can't — annuals, relaunches, and any issue outside the #141/#142 boundary,
+      plus the BUI-546 ``dr strange``↔``doctor strange`` abbreviation.
     * **Annual-aware keys**: a trailing ``Annual`` qualifier is stripped, its base
-      alias-expanded, and the qualifier re-applied, so ``x-men annual`` matches
-      ``uncanny x-men annual``.
+      alias-expanded, and the qualifier re-applied, so ``x men annual`` matches
+      ``uncanny x men annual``.
 
     Everything here works WITHOUT a year — the conflicts audit deliberately
     passes none (BUI-129) — because every relation is a pure series/issue-key
@@ -550,7 +668,7 @@ def resolve_series_for_win(
     # index entry; results are de-duplicated by decorated name so the same
     # volume filed under two aliases counts once.
     #
-    # EXCEPTION: the X-Men split keys ("x-men" ↔ "uncanny x-men") are ALSO an
+    # EXCEPTION: the X-Men split keys ("x men" ↔ "uncanny x men") are ALSO an
     # alias pair, but their cross-masthead equivalence is the CLASSIC Vol. 1
     # split, already resolved by the split branch above. Candidate-gathering is
     # only reached for them in the MODERN era (year > 2011), where "X-Men" and
@@ -609,7 +727,20 @@ def resolve_series_for_win(
 
 
 def rebuild_series_name_index(payload: dict[str, Any]) -> dict[str, str]:
-    """Rebuild series_name_index from source='locg_export' rows only (R61)."""
+    """Rebuild series_name_index from source='locg_export' rows only (R61).
+
+    NOTE (BUI-546): this index is PERSISTED in ``collection.json`` and is only
+    rebuilt on ``collection import``. Its keys are :func:`_normalize_series_key`
+    output, so any change to that function leaves the stored keys stale until
+    the next import. Nothing on a safety-critical path depends on it — the
+    ownership matcher (``cmd_collection_check``) normalizes each row's title
+    live, and ``resolve_series_for_win`` prefers :func:`build_volume_candidates`
+    (recomputed from the rows on every call, so a superset of this index's
+    keys). The one visible symptom is that the series-names *resolve* endpoint
+    returns ``resolved: None`` until a re-import, which fails SAFE (falls
+    through to Metron / manual). So: after shipping a normalizer change, run a
+    ``collection import`` — the tail of ``/comic:collection-sync`` already does.
+    """
     index: dict[str, str] = {}
     for row in payload.get("comics", []):
         if row.get("source") == "locg_export":

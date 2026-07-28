@@ -555,8 +555,8 @@ def test_series_names_returns_canonical_names(client):
     a caller can resolve an ambiguous query against (BUI-129)."""
     payload = json.loads((client.store / "collection.json").read_text())
     payload["series_name_index"] = {
-        "uncanny x-men": "Uncanny X-Men",
-        "amazing spider-man": "The Amazing Spider-Man",
+        "uncanny x men": "Uncanny X-Men",
+        "amazing spider man": "The Amazing Spider-Man",
     }
     (client.store / "collection.json").write_text(json.dumps(payload))
 
@@ -574,7 +574,7 @@ def test_series_names_resolve_exact_match(client):
     resolver (the one tested place the matching logic lives) and round-trips
     its response shape."""
     payload = json.loads((client.store / "collection.json").read_text())
-    payload["series_name_index"] = {"uncanny x-men": "Uncanny X-Men"}
+    payload["series_name_index"] = {"uncanny x men": "Uncanny X-Men"}
     (client.store / "collection.json").write_text(json.dumps(payload))
 
     r = client.post(
@@ -660,7 +660,7 @@ def _reseed_with_index(store, index):
     (store / "collection.json").write_text(json.dumps(payload))
 
 
-_ASM_INDEX = {"amazing spider-man": "The Amazing Spider-Man"}
+_ASM_INDEX = {"amazing spider man": "The Amazing Spider-Man"}
 
 
 @pytest.fixture
