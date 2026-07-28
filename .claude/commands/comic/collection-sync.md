@@ -339,8 +339,9 @@ comics-api POST /api/comics/collection/import \
 ```
 
 Surface `added` / `updated` / `reconciled` / `auto_healed_duplicates` /
-`second_copies_credited` from the response — all five are top-level summary
-counters already returned by the endpoint, not something to derive:
+`second_copies_credited` / `release_date_drift_merged` from the response — all
+six are top-level summary counters already returned by the endpoint, not
+something to derive:
 
 - **`auto_healed_duplicates`** — pending win rows the reconciler **deleted**
   because they were confirmed duplicates of an already-owned LOCG row
@@ -356,6 +357,13 @@ counters already returned by the endpoint, not something to derive:
   on a row that already existed, not the row set — but it's still a store
   mutation the operator didn't directly request, so surface it too. Logged as
   `type=second_copy_credited` in the same `import-history.jsonl`.
+- **`release_date_drift_merged`** — export rows folded into an existing row
+  whose `release_date` LOCG had rewritten (cover date vs on-sale date) rather
+  than inserted as a twin (BUI-554). Each one is a row **not** added, so the
+  Step 6 arithmetic still balances exactly — `added` is simply lower than it
+  would have been. Report it so a drop in `added` reads as the fix working
+  rather than as an export that came up short. Logged as
+  `type=release_date_drift_merged`.
 
 **If `warnings` is non-empty, surface every entry too** — each is a plain
 human-readable string (not a structured object with separate fields),
@@ -405,11 +413,15 @@ Assert all of:
   count balanced to the row (`2902 + 46 − 3 = 2945`, exact) while the import
   had silently created a *second* owned row for 28 books: every duplicate is
   one `added` row, so the arithmetic counts it as expected growth and reports
-  clean. `owned_duplicate_identities` counts titles left owned by BOTH an
-  unreconciled pending `agent_win` row and a `locg_export` row (matched
-  punctuation-, whitespace- and article-insensitively, and only when their
-  release dates are compatible so two genuine volumes of one masthead aren't
-  falsely paired). Non-zero means the reconciler missed — those rows stay
+  clean. `owned_duplicate_identities` counts titles carried by **two owned
+  rows of any kind** (matched punctuation-, whitespace- and
+  article-insensitively, and only when their release dates are compatible so
+  two genuine volumes of one masthead aren't falsely paired). BUI-554 removed
+  the `agent_win`-vs-`locg_export` partition this used to require: once a sync
+  had round-tripped every pending win back through LOCG as an export row, that
+  partition was empty and the check reported 0 while 60 identities collided —
+  a vacuous pass indistinguishable from a clean one. Non-zero means the
+  reconciler missed — those rows stay
   pending and the next sync re-uploads them, so it compounds. The warning
   names the affected titles.
 
@@ -433,6 +445,7 @@ Backup:           $BACKUP_PATH  (comics=N, wish_list=M — see Step 1)
 Exported (ready): N rows  (+ M withheld needs-manual-series — see .notes.md)
 Re-import:        added=A  updated=U  reconciled=R  auto_healed_duplicates=H  second_copies_credited=C
                   manual_series_flags_cleared=F  owned_duplicate_identities=D
+                  release_date_drift_merged=X
 Pending:          PENDING_BEFORE → PENDING_AFTER  (cleared ~N)
 Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = added - auto_healed_duplicates, verified two-sided in Step 6)
 Owned twice:      D  (must be 0 — Step 6 hard-stops otherwise)
