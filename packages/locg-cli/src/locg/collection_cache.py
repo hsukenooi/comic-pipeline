@@ -997,7 +997,79 @@ class CollectionCache:
         if payload.get("migration_in_progress"):
             self._handle_migration_flag(payload)
 
+        self._check_series_name_index_freshness(payload)
+
         return payload
+
+    def _check_series_name_index_freshness(self, payload: dict[str, Any]) -> None:
+        """Warn (never raise) when ``series_name_index`` predates the current
+        :func:`_normalize_series_key` (BUI-561).
+
+        ``series_name_index`` is only rebuilt by :func:`rebuild_series_name_index`,
+        which runs solely at the end of a ``collection import`` (see that
+        function's own BUI-546 note, and ``collection_io.py``'s call site). A
+        normalizer change in between — like BUI-546's punctuation fold — leaves
+        the on-disk keys built by the OLD normalizer, and nothing else notices:
+        the same vacuous-guard shape as BUI-554.
+
+        This is deliberately a WARN, not a raise. ``_resolve_volume`` only ever
+        consults this index as an optional hint (``elif key in
+        series_name_index:``) — a stale key just degrades that one lookup to
+        the slower fallback path (``build_volume_candidates``, recomputed live
+        from the rows every call), it can never return a WRONG volume. Hard
+        failing ``load()`` over a degraded hint would take down the comics
+        server for something that was never unsafe.
+
+        An empty or missing index is NOT a staleness signal — a never-imported
+        store looks exactly like a freshly-imported one with no locg_export
+        rows, so it is skipped rather than flagged.
+
+        Cost: measured against the live 307-key store on 2026-07-28,
+        re-normalizing every key and comparing averages ~0.6ms — about 7% on
+        top of the ~9ms already spent parsing the store's JSON off disk in this
+        same call. ``load()`` runs on essentially every ``/api/comics/*``
+        request (and several times over in a per-item loop like
+        ``collection/check/batch``), but at this cost that stays negligible,
+        so this checks every key rather than sampling a subset. Sampling would
+        risk a false "fresh" verdict: the index is replaced as one atomic unit
+        by ``rebuild_series_name_index``, but whether any INDIVIDUAL key's
+        entry actually changed under the new normalizer depends on whether
+        that key's own series name happens to contain punctuation the fold
+        touches — a name with none looks identical under both normalizer
+        versions, so a small sample can land entirely on unaffected keys and
+        miss real drift sitting in the rest of the index.
+        """
+        index = payload.get("series_name_index")
+        if not isinstance(index, dict) or not index:
+            return
+
+        stale = 0
+        total = 0
+        for key, series_name in index.items():
+            if not isinstance(series_name, str):
+                # Malformed entry — not what this check is for; skip rather
+                # than let a shape surprise turn a warning into a crash.
+                continue
+            total += 1
+            if _normalize_series_key(series_name) != key:
+                stale += 1
+
+        if stale:
+            logger.warning(
+                "series_name_index at %s is stale: %d/%d stored keys no "
+                "longer match what _normalize_series_key currently produces "
+                "(likely a normalizer change since the index was last built, "
+                "e.g. BUI-546's punctuation fold). Impact is bounded: "
+                "_resolve_volume only uses this index as an optional lookup "
+                "hint and falls back safely on a miss, so this cannot cause a "
+                "wrong match — but lookups against these %d keys are slower "
+                "until the index is rebuilt. Fix: re-import the collection "
+                "(run /comic:collection-sync, or `locg collection import "
+                "<export.xlsx>` against this store) — collection import "
+                "rebuilds series_name_index from the current locg_export "
+                "rows on every run.",
+                self.path, stale, total, stale,
+            )
 
     def _handle_migration_flag(self, payload: dict[str, Any]) -> None:
         """Resolve a migration_in_progress=True flag found on disk load.
