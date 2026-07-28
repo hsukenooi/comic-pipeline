@@ -497,16 +497,21 @@ class TestRunSkipsHandPricedRows:
                           max_age_days=7, force=False, quiet=False,
                           server_url=server_url)
         fetch_mock.assert_not_called()
-        out = capsys.readouterr().out
-        assert "skipped_hand_priced" in out
-        assert "$250" in out and "$300" in out
-        assert "skipped 1 hand-priced row" in out
+        cap = capsys.readouterr()
+        assert "skipped_hand_priced" in cap.out
+        assert "$250" in cap.out and "$300" in cap.out
+        # BUI-549: the skip-count summary is not part of the human table — it
+        # goes to stderr unconditionally, never stdout.
+        assert "skipped 1 hand-priced row" not in cap.out
+        assert "skipped 1 hand-priced row" in cap.err
 
 
     def test_default_run_skips_and_reports_count(self, server_url, capsys):
         """End-to-end (mocked network): a hand-priced row is left completely
         untouched by a default run, and the skip is reported unconditionally
-        (not gated by --quiet) so it surfaces even with --brief-only usage."""
+        (not gated by --quiet) so it surfaces even with --brief-only usage.
+        BUI-549: the report goes to stderr, since stdout is the machine-read
+        surface under --brief."""
         batch = [{"item_id": "1", "title": "Batman", "issue": "251",
                  "year": 1972, "grade": 5.5, "locg_id": 100}]
         hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
@@ -525,13 +530,16 @@ class TestRunSkipsHandPricedRows:
                           server_url=server_url)
         fetch_mock.assert_not_called()
         upsert_mock.assert_not_called()
-        out = capsys.readouterr().out
-        assert "skipped 1 hand-priced row" in out
-        assert "--force" in out
+        cap = capsys.readouterr()
+        assert cap.out == ""
+        assert "skipped 1 hand-priced row" in cap.err
+        assert "--force" in cap.err
 
     def test_quiet_still_reports_skip_summary(self, server_url, capsys):
         """The skip-count message must not be suppressed by --quiet — an
-        operator using --brief --quiet must still learn rows were skipped."""
+        operator using --brief --quiet must still learn rows were skipped.
+        BUI-549: the message is on stderr, and stdout under --brief is pure
+        JSON Lines (no human-readable preamble ahead of the row)."""
         batch = [{"item_id": "1", "title": "Batman", "issue": "251",
                  "year": 1972, "grade": 5.5, "locg_id": 100}]
         hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300,
@@ -544,10 +552,14 @@ class TestRunSkipsHandPricedRows:
                           max_age_days=7, force=False, quiet=True, brief=True,
                           server_url=server_url)
         fetch_mock.assert_not_called()
-        out = capsys.readouterr().out
-        assert "skipped 1 hand-priced row" in out
-        # --brief JSON line for the row is also present, unaffected.
-        assert '"item_id": "1"' in out
+        cap = capsys.readouterr()
+        assert "skipped 1 hand-priced row" not in cap.out
+        assert "skipped 1 hand-priced row" in cap.err
+        # --brief JSON line for the row is also present, unaffected, and
+        # stdout is nothing BUT that JSON line — every non-blank line parses.
+        lines = [ln for ln in cap.out.splitlines() if ln.strip()]
+        assert len(lines) == 1
+        assert json.loads(lines[0])["item_id"] == "1"
 
 
 class TestRunFailsClosedOnLookupError:
@@ -606,6 +618,14 @@ class TestRunFailsClosedOnLookupError:
         # --brief still emits the row, so a machine consumer sees the book
         # rather than it vanishing from the output entirely.
         assert '"item_id": "1"' in cap.out
+        # BUI-549: stdout is pure JSON Lines, and the row's `source` is how a
+        # --brief-only consumer tells this apart from an ordinary unpriced
+        # row (both have every pricing field null).
+        lines = [ln for ln in cap.out.splitlines() if ln.strip()]
+        assert len(lines) == 1
+        brief = json.loads(lines[0])
+        assert brief["source"] == "skipped_lookup_error"
+        assert brief["max_bid"] is None
 
     def test_table_marks_the_row_distinctly_not_n_a(self, server_url, capsys):
         """Without its own token the row would print a bland 'n/a' and read as
@@ -652,7 +672,10 @@ class TestRunFailsClosedOnLookupError:
                            server_url=server_url)
         fetch_mock.assert_not_called()
         cap = capsys.readouterr()
-        assert "skipped 1 hand-priced row(s)" in cap.out
+        # BUI-549: both skip-count lines are stderr-only now — stdout stays
+        # pure JSON Lines under --brief.
+        assert cap.out == ""
+        assert "skipped 1 hand-priced row(s)" in cap.err
         assert "skipped 1 book(s) because the comics-server FMV lookup FAILED" \
             in cap.err
 
@@ -2757,14 +2780,14 @@ class TestAnchorDivergesNotes:
 # ─── --brief projection (BUI-362) ─────────────────────────────────────────────
 
 class TestBriefProjection:
-    """`_brief_row` must project the nine linkage/pricing fields under exactly
+    """`_brief_row` must project the ten linkage/pricing fields under exactly
     the names /comic:buy's Step 3 documents — item_id, comic_id, fmv_id,
-    max_bid, flag_reason, confidence, fmv_low, fmv_high, fmv_notes (BUI-505)
-    — across all three row sources."""
+    max_bid, flag_reason, confidence, fmv_low, fmv_high, fmv_notes (BUI-505),
+    source (BUI-549) — across all row sources."""
 
     BRIEF_KEYS = {"item_id", "comic_id", "fmv_id", "max_bid",
                   "flag_reason", "confidence", "fmv_low", "fmv_high",
-                  "fmv_notes"}
+                  "fmv_notes", "source"}
 
     def test_fresh_row_projects_top_level_ids(self):
         row = {
@@ -2781,7 +2804,8 @@ class TestBriefProjection:
         assert brief == {"item_id": "111", "comic_id": 42, "fmv_id": 7,
                          "max_bid": 80, "flag_reason": None,
                          "confidence": "HIGH", "fmv_low": 90, "fmv_high": 100,
-                         "fmv_notes": "window=n/a | cv=10% | label=HIGH"}
+                         "fmv_notes": "window=n/a | cv=10% | label=HIGH",
+                         "source": "fresh"}
 
     def test_fresh_row_fmv_notes_matches_upsert_notes(self):
         # BUI-505: the brief line's fmv_notes must be exactly what
@@ -2816,6 +2840,7 @@ class TestBriefProjection:
         assert brief["max_bid"] == 60
         assert brief["fmv_low"] == 60
         assert brief["fmv_high"] == 75
+        assert brief["source"] == "cached"
         # Cached path reads the persisted fmv_notes verbatim off db_row rather
         # than recomputing it (the reconstructed cached fmv dict is a lossy
         # projection missing fields like first_party_count — see
@@ -2824,8 +2849,11 @@ class TestBriefProjection:
 
     def test_error_row_projects_nulls_not_missing_keys(self):
         # A _stitch error row (no comps, no cache) has neither top-level ids
-        # nor a db_row nor an fmv dict — every field except item_id is null,
+        # nor a db_row nor an fmv dict — every pricing/linkage field is null,
         # but every key must still exist for a uniform downstream reader.
+        # `source` is the deliberate exception (BUI-549): it carries the
+        # row's real source ("error") rather than null, precisely so a
+        # --brief consumer can tell rows like this apart from each other.
         row = {
             "input": {"item_id": "333", "title": "X", "issue": "1"},
             "fmv": None, "db_row": None, "source": "error",
@@ -2834,7 +2862,40 @@ class TestBriefProjection:
         brief = fmv_runner._brief_row(row)
         assert set(brief) == self.BRIEF_KEYS
         assert brief["item_id"] == "333"
-        assert all(brief[k] is None for k in self.BRIEF_KEYS - {"item_id"})
+        assert brief["source"] == "error"
+        assert all(brief[k] is None
+                   for k in self.BRIEF_KEYS - {"item_id", "source"})
+
+    def test_skipped_lookup_error_row_has_distinct_source(self):
+        # BUI-549: the whole point of adding `source` — a skipped_lookup_error
+        # row (comics-server lookup FAILED) must be distinguishable in
+        # --brief from an ordinary unpriced/error row, even though every
+        # pricing field is null in both cases.
+        row = {
+            "input": {"item_id": "555", "title": "X", "issue": "1"},
+            "fmv": None, "db_row": None, "source": "skipped_lookup_error",
+            "error": "BUI-544: skipped, hand-priced provenance unverifiable",
+        }
+        brief = fmv_runner._brief_row(row)
+        assert set(brief) == self.BRIEF_KEYS
+        assert brief["source"] == "skipped_lookup_error"
+        assert all(brief[k] is None
+                   for k in self.BRIEF_KEYS - {"item_id", "source"})
+
+    def test_skipped_hand_priced_row_has_distinct_source(self):
+        # A hand-priced skip (BUI-533) is NOT the same source as a
+        # lookup-error skip — the row is untouched in both cases, but for
+        # opposite reasons (protection vs. a failed check).
+        row = {
+            "input": {"item_id": "666", "title": "X", "issue": "1"},
+            "fmv": {"max_bid": 48, "flag_reason": None, "confidence": "LOW",
+                    "fmv_low": 40, "fmv_high": 50},
+            "db_row": {"id": 2, "fmv_id": 4,
+                       "fmv_notes": "hand § anchored"},
+            "source": "skipped_hand_priced",
+        }
+        brief = fmv_runner._brief_row(row)
+        assert brief["source"] == "skipped_hand_priced"
 
     def test_needs_manual_row_projects_flag_reason_with_real_comic_id(self):
         # BUI-86: a flagged book still upserts a stub (real comic_id) but has
@@ -2910,6 +2971,7 @@ class TestBriefProjection:
         assert brief["fmv_id"] == 7
         assert brief["max_bid"] is not None
         assert brief["confidence"]
+        assert brief["source"] == "fresh"
 
     def test_run_without_brief_prints_no_json_lines(self, tmp_path, server_url,
                                                     capsys):

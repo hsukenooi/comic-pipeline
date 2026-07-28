@@ -250,18 +250,22 @@ def run(*, batch_path: str | None, out_path: str | None,
     # it surfaces whether the caller reads the human table/summary or only
     # consumes --brief — an operator relying on --brief alone must still learn
     # that N hand-priced rows were left untouched, not silently dropped.
+    # BUI-549: stderr, not stdout — stdout is the machine-read JSON-Lines
+    # surface under --brief, and this line is not JSON.
     if skipped_hand:
         click.echo(
             f"skipped {len(skipped_hand)} hand-priced row(s) "
-            "(use --force to overwrite)"
+            "(use --force to overwrite)",
+            err=True,
         )
 
     # BUI-544: the OTHER skip — reported separately, and worded so it can never
     # be read as the hand-priced skip above. Fail-closed turns a comics-server
     # outage into skipped books; that has to be loud, or a transient failure
     # silently under-computes a batch while looking like normal protection.
-    # Goes to stderr (unconditional, like the count above): it is a failure,
-    # and stdout is the machine-read surface under --brief.
+    # Goes to stderr (unconditional, like the count above — both routed there
+    # since BUI-549 closed the gap on the count above): it is a failure, and
+    # stdout is the machine-read surface under --brief.
     if skipped_lookup_error:
         click.echo(
             f"⚠️  skipped {len(skipped_lookup_error)} book(s) because the "
@@ -1600,7 +1604,7 @@ def _brief_row(r: dict) -> dict:
     """BUI-362: project one result row down to the linkage + pricing fields an
     orchestrator (/comic:buy Step 3→5) actually threads forward. The full
     `--out` row is dominated by `queries_used` and `trimmed_pool`; this is the
-    ~9-field subset that used to be extracted from it after the fact.
+    ~10-field subset that used to be extracted from it after the fact.
 
     Field sources:
       - item_id            → the row's input echo.
@@ -1624,6 +1628,15 @@ def _brief_row(r: dict) -> dict:
         `cgc_proxy_fmv`) always has them, but a caller passing a partial dict
         (e.g. a test double) shouldn't crash the whole projection over one
         cosmetic field, so a KeyError there degrades to a null note instead.
+      - source (BUI-549) → the row's own `source` verbatim (`"fresh"`,
+        `"cached"`, `"cgc-proxy"`, `"skipped_hand_priced"`,
+        `"skipped_lookup_error"`, or `"error"`). Without this, a
+        `skipped_lookup_error` row (comics-server lookup FAILED — hand-priced
+        provenance unverifiable, row left completely untouched) projects
+        identically to an ordinary unpriced/no-comps row: both have every
+        pricing field null. A `--brief`-only consumer (no table, no summary)
+        otherwise has no way to tell "priced honestly, no comps" apart from
+        "the lookup failed" — see BUI-549.
     """
     fmv = r.get("fmv") or {}
     db_row = r.get("db_row") or {}
@@ -1648,6 +1661,7 @@ def _brief_row(r: dict) -> dict:
         "fmv_low": fmv.get("fmv_low"),
         "fmv_high": fmv.get("fmv_high"),
         "fmv_notes": fmv_notes,
+        "source": r.get("source"),
     }
 
 
