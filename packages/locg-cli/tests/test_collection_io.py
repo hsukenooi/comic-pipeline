@@ -3779,6 +3779,136 @@ def test_release_date_drift_beyond_tolerance_stays_a_separate_book(tmp_path):
     assert len(cache.load()["comics"]) == 2
 
 
+# --- Not cause C: the foreign licensed edition (BUI-559) --------------------
+
+def test_licensed_edition_twin_stays_two_books(tmp_path):
+    """A DC row and its Panini twin are two books, not one row that drifted.
+
+    BUI-559 was filed as a third drift class — "same series, same issue, same
+    release date, publisher relabelled" — and the store disagrees. All five
+    live pairs put Panini 147-211 days AFTER DC, always in that direction:
+    Panini DC Italia's Italian edition, its own LOCG catalog entry, its own
+    on-sale date. Nothing here may merge them, and the shape below is the one
+    that actually occurs, so this is the case to hold.
+    """
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "DC Comics", "series": "Absolute Flash (2025 - Present)",
+         "full_title": "Absolute Flash #10", "release_date": "2025-12-17",
+         "price_paid": "1.25", "date_purchased": "2026-06-06"},
+    ])
+    import_xlsx(first, cache)
+
+    # The next export carries BOTH: the round-trip pushed our win onto the
+    # Italian entry, so LOCG now reports the book owned twice. Our import must
+    # mirror that faithfully — the duplicate is LOCG's, and folding it here
+    # would neither be true nor survive the next export.
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "DC Comics", "series": "Absolute Flash (2025 - Present)",
+         "full_title": "Absolute Flash #10", "release_date": "2025-12-17",
+         "price_paid": "1.25", "date_purchased": "2026-06-06"},
+        {"publisher": "Panini Comics", "series": "Absolute Flash (2025 - Present)",
+         "full_title": "Absolute Flash #10", "release_date": "2026-06-04",
+         "price_paid": "1.25", "date_purchased": "2026-06-06"},
+    ])
+    result = import_xlsx(second, cache)
+
+    payload = cache.load()
+    assert len(payload["comics"]) == 2, "the licensed edition is its own book"
+    assert result["added"] == 1
+    assert result["release_date_drift_merged"] == 0
+    assert sorted(r["publisher_name"] for r in payload["comics"]) == [
+        "DC Comics", "Panini Comics",
+    ]
+    # An identical price_paid + date_purchased is NOT license to merge: it is
+    # the round-trip fingerprint of one push, which is exactly how the wrong
+    # entry got owned in the first place.
+    assert result["owned_duplicate_identities"] == 0, (
+        "known blind spot, asserted so it is not mistaken for a clean store: "
+        "the counter needs `_release_dates_compatible_either_way`, and a "
+        "year-crossing 169-day offset fails it. Three of the five live pairs "
+        "are invisible to the sync's duplicate hard-stop for this reason; the "
+        "two BUI-556 cleaned were only visible because they happened to land "
+        "in one calendar year."
+    )
+
+
+def test_same_year_licensed_twin_is_the_only_kind_the_counter_sees(tmp_path):
+    """Why BUI-559 counted two pairs when the store held five.
+
+    `owned_duplicate_identities` groups by title and then needs
+    `_release_dates_compatible_either_way` on the pair. A licensed edition
+    trails by ~5-7 months, so whether the operator ever hears about it turns on
+    the accident of which calendar year that lands in: the two `#3` pairs stayed
+    inside 2025 and were reported (and hand-cleaned by BUI-556), while
+    `Absolute Flash #10`, `Absolute Green Lantern #8` and `#9` cross into the
+    next year, fail the predicate, and are still owned twice with the sync
+    reporting clean.
+
+    Also the non-vacuity guard for the `== 0` above: the group demonstrably
+    forms, so that zero is the date predicate's ruling and not an empty bucket.
+    """
+    from locg.collection_io import _duplicate_check_title_key, import_xlsx
+
+    assert _duplicate_check_title_key("Absolute Flash #3") == "absoluteflash#3"
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "DC Comics", "series": "Absolute Flash (2025 - Present)",
+         "full_title": "Absolute Flash #3", "release_date": "2025-05-21"},
+    ])
+    import_xlsx(first, cache)
+
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "DC Comics", "series": "Absolute Flash (2025 - Present)",
+         "full_title": "Absolute Flash #3", "release_date": "2025-05-21"},
+        {"publisher": "Panini Comics", "series": "Absolute Flash (2025 - Present)",
+         "full_title": "Absolute Flash #3", "release_date": "2025-12-18"},
+    ])
+    result = import_xlsx(second, cache)
+
+    assert len(cache.load()["comics"]) == 2, "still two books; only the report differs"
+    assert result["owned_duplicate_identities"] == 1
+
+
+def test_publisher_only_relabel_is_still_uncovered(tmp_path):
+    """The drift class BUI-559 *described* — publisher moves, everything else
+    held — is genuinely uncovered, and stays that way because it has never
+    happened: zero rows in the live store or the pre-BUI-556 backup have this
+    shape. Pinned so the gap is executable rather than re-derived, not because
+    inserting is the desired end state. A future pass that merges this should
+    change this test, having first shown the shape occurs.
+    """
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "DC Comics", "series": "Absolute Flash (2025 - Present)",
+         "full_title": "Absolute Flash #3", "release_date": "2025-05-21"},
+    ])
+    import_xlsx(first, cache)
+
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "Panini Comics", "series": "Absolute Flash (2025 - Present)",
+         "full_title": "Absolute Flash #3", "release_date": "2025-05-21"},
+    ])
+    result = import_xlsx(second, cache)
+
+    assert result["added"] == 1
+    assert result["release_date_drift_merged"] == 0, (
+        "the date detector must not reach across publishers either"
+    )
+    assert len(cache.load()["comics"]) == 2
+
+
 def test_date_drift_never_folds_two_export_rows_into_one(tmp_path):
     """An export row that matches EXACTLY owns its row. A second export row
     that only drifts onto it must insert instead of overwriting — folding it in

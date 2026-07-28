@@ -784,12 +784,37 @@ def _user_column_checksum(row: dict[str, Any]) -> str:
 #   _partial_identity  drops full_title    -> catches a title rename (R67)
 #   _title_identity    drops release_date  -> catches a date-convention change
 #
-# `publisher_name` is deliberately left in BOTH — a publisher relabel is a
-# third, rarer drift class (2 identities live on 2026-07-28: `Absolute Flash #3`
-# and `Absolute Green Lantern #3`, DC Comics vs Panini Comics) that neither
-# detector covers. Dropping it from a detector would leave a key of two
-# free-text fields, which is not enough to assert "same book". Filed as a
-# separate finding rather than widened here.
+# `publisher_name` is deliberately left in BOTH. Dropping it from a detector
+# would leave a key of two free-text fields, which is not enough to assert "same
+# book" — and BUI-559 went looking for the publisher drift class that would have
+# justified paying that price, and found it does not exist.
+#
+# The pairs it was filed for do NOT share a `release_date`. Measured over the
+# 2026-07-28 store, all five of them:
+#
+#   Absolute Flash #3          DC 2025-05-21  vs  Panini 2025-12-18   (211d)
+#   Absolute Green Lantern #3  DC 2025-06-04  vs  Panini 2025-11-06   (155d)
+#   Absolute Flash #10         DC 2025-12-17  vs  Panini 2026-06-04   (169d)
+#   Absolute Green Lantern #8  DC 2025-11-05  vs  Panini 2026-04-01   (147d)
+#   Absolute Green Lantern #9  DC 2025-12-03  vs  Panini 2026-05-07   (155d)
+#
+# Panini trails DC by 147-211 days, every time, in the same direction. That is
+# not one row relabelled; it is Panini DC Italia's Italian licensed edition — a
+# genuinely different book with its own LOCG catalog entry — and the offset is
+# an order of magnitude past `_COVER_TO_ONSALE_MAX_DAYS`. So a third detector
+# gated on identical series + `full_title` + `release_date` with only the
+# publisher differing would have matched ZERO rows: that shape occurs nowhere in
+# the store, current or in the pre-BUI-556 backup. It was not built.
+#
+# What these rows are is a duplicate LOCG itself holds, which no import-side
+# detector can fix. Every Panini row carries our own `price_paid` +
+# `date_purchased` (and the same-generator `Kamite` row carries a
+# `gixen_item_id`), so by :func:`_same_copy_corroborated`'s own reasoning LOCG
+# knows them only because the record-win round-trip pushed them — and resolved
+# them onto the foreign edition's entry instead of the US one. Merging the twin
+# here would assert two different catalog entries are one book AND still not
+# help: LOCG holds both ownerships, so the twin returns on the next export. The
+# fix belongs at the push end, not in this matcher.
 
 def _partial_identity(row: dict[str, Any]) -> tuple[str, str, str]:
     """(publisher_name, series_name, release_date) — used to detect full_title renames."""
