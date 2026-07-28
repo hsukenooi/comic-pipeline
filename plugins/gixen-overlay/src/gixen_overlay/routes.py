@@ -252,23 +252,34 @@ async def api_comics_calibration(
     days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
     min_losses: int = DEFAULT_CALIBRATION_MIN_LOSSES,
 ):
-    """BUI-288 (Issue C): loss-vs-FMV calibration report — DIAGNOSTIC ONLY.
+    """BUI-288 (Issue C): calibration report — DIAGNOSTIC ONLY.
 
-    Ranks priced (comic, grade) books whose recent LOSSES are clearing above
-    `fmv.high`, so a human can decide which ones to recompute `comic-fmv` for.
+    Ranks priced (comic, grade) books with evidence that `fmv.high` is set
+    too low, so a human can decide which ones to recompute `comic-fmv` for.
     This endpoint performs **no writes** — it is a read-only aggregate over
     `get_first_party_outcomes`'s "a resolved auction" definition (see
     `calibration_report` in `db.py`) plus each book's own `fmv.high`.
 
-    **The ranking key is overshoot vs `fmv.high`, never raw win/loss rate** —
+    **Two independent admit paths (BUI-543), either one surfaces a row:**
+    win-based exceedance (`contested_win_margin > 1`, exact/uncensored — the
+    headline, admits regardless of loss history including zero losses) and
+    loss-based overshoot (`overshoot > 1` with >= `min_losses` losses — the
+    labeled secondary, censored/confounded). **Never raw win/loss rate** —
     losing is the intended outcome of the bid haircut, so a high loss count
-    alone is not surfaced; only *persistently clearing above fmv.high* is.
-    See `calibration_report`'s docstring for the full rationale (R4/R5 in the
+    alone is not surfaced on its own; only *persistently clearing above
+    fmv.high*, or *confirmed win-based exceedance*, is. See
+    `calibration_report`'s docstring for the full rationale (R4/R5 in the
     auction-outcome-feedback plan) before changing this endpoint's shape.
 
-    `min_losses` (default 2, FIX 3) requires a (comic, grade) to have lost at
-    least this many times in-window before it can surface at all — a single
-    high-overshoot loss is a bidding-war outlier, not a persistent pattern.
+    `min_losses` (default 2, FIX 3) governs only the loss-based path — a
+    (comic, grade) needs at least this many losses in-window before its
+    loss-based overshoot can surface it (a single high-overshoot loss is a
+    bidding-war outlier, not a persistent pattern). It never gates a row's
+    existence: a book with a qualifying win margin surfaces however many
+    losses it has, including none.
+
+    Each row carries `win_backed` / `loss_backed` booleans so a caller can
+    tell which admit path(s) fired without needing to know `min_losses`.
 
     Consumed by the `/comic:calibration-report` skill, which curls this
     endpoint and renders the ranked table — mirroring how `wishlist-sellers`

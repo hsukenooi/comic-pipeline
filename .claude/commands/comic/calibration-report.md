@@ -94,33 +94,45 @@ you are editing this skill or the server-side aggregate (`calibration_report`
 in `plugins/gixen-overlay/src/gixen_overlay/db.py`), re-read this section and
 the Problem Frame in
 `docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md` first.
-Note the `calibration_report` docstring and the plan's R4 text still describe
-the pre-BUI-532 "`overshoot` is the ranking key, `contested_win_margin` is
-context only" framing — that server-side documentation (and the server's own
-sort order and surfacing gate) predates this skill's rebase and was left
-unchanged by BUI-532 (doc-only ticket); this section is the current, correct
-read.
+The `calibration_report` docstring, sort order, and surfacing gate were
+brought in line with this section's framing by BUI-543 (BUI-532 was a
+doc-only ticket that rebased this skill's vocabulary but left the
+server-side aggregate's docstring/sort/gate on the pre-BUI-532
+"`overshoot`-is-the-ranking-key" framing — BUI-543 closed that gap). The
+plan's R4 text (`docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md`)
+predates both tickets and still reads as win/loss-*rate*-only; this section
+remains the current, correct read of how R4 interacts with win-based
+exceedance.
 
-A book with **only wins**, or **no resolved auctions at all**, never appears
-in this report — there is no loss to measure `overshoot` from, and the
-server-side gate (unchanged, and **independent** of the Confirmed/Unconfirmed
-split above) requires at least one qualifying loss regardless of how strong a
-book's win-based signal is. This is a real gap BUI-532 does not close: a book
-that wins every auction with `contested_win_margin > 1` several times, but
-never loses `min_losses` times, would never surface here even though that
-would be the strongest possible evidence of underpricing — flag it as a
-follow-up if it matters for your use case. A book whose losses all cleared at
-or below `fmv_high` — however many losses it has — is likewise never
-surfaced (the server-side R4 guard).
+**BUI-543 update:** a book with **only wins** now surfaces here whenever
+`contested_win_margin > 1` — the server admits a row on win-based exceedance
+alone, with **no loss requirement at all**. Before BUI-543 the server-side
+gate required at least one qualifying loss regardless of how strong a book's
+win-based signal was, which meant a book that won every auction with
+`contested_win_margin > 1` several times, but never lost `min_losses` times,
+never surfaced even though that would have been the strongest possible
+evidence of underpricing. That was a real gap; it is now closed. The only
+case that still never appears is a book with **no resolved auctions at
+all** (nothing to measure either signal from), or one whose losses all
+cleared at or below `fmv_high` **and** whose wins (if any) cleared at or
+below `fmv_high` too — i.e. neither admit path fired (the server-side R4
+guard, unchanged).
 
-**A book must have lost at least `min_losses` times in-window to surface at
-all (default 2).** A single loss — however far above `fmv_high` it cleared —
-is one bidding-war outlier, not a persistent pattern; the report suppresses
-it as noise rather than ranking a book on one data point. Pass `min_losses`
-as a query param to change the floor (e.g. `min_losses=3` for a stricter
-gate); it can never be used to relax the loss-count-is-not-the-signal rule
-above, only to raise or lower how many *qualifying* (above-`fmv_high`-median)
-losses are required before a row surfaces at all.
+**A book's *loss-based* signal still requires at least `min_losses` losses
+in-window before it counts (default 2)** — a single loss, however far above
+`fmv_high` it cleared, is one bidding-war outlier, not a persistent pattern,
+so the loss-based path suppresses it as noise rather than ranking a book on
+one data point. **`min_losses` governs only that loss-based signal, never
+whether a row surfaces at all (BUI-543):** a row with a qualifying win margin
+surfaces regardless of `min_losses`, including with zero losses. Pass
+`min_losses` as a query param to tighten or loosen the loss-based floor (e.g.
+`min_losses=3` for a stricter gate); it can never be used to relax the
+loss-count-is-not-the-signal rule above, and it never gates the win-based
+admit path.
+
+Each row carries `win_backed` / `loss_backed` booleans (see "Response shape"
+below) so you can tell which admit path fired without knowing the
+`min_losses` value the call used.
 
 ## Prerequisites
 
@@ -169,11 +181,13 @@ comics-api GET "/api/comics/calibration?min_losses=3" || exit 1
 
 ## Response shape
 
-One object per flagged `(issue, grade)`. The comics-server response itself is
-still ordered by loss-based `overshoot` descending (unchanged server-side
-behavior) — **do not present rows in that order.** Partition and re-sort per
-"Present the results" below; the API's own ordering is not the headline
-ranking as of BUI-532.
+One object per flagged `(issue, grade)`. As of BUI-543 the comics-server
+response itself is already ordered win-backed-first (each tier sorted by its
+own metric descending) — the API's own order now matches the headline
+ranking. You still need to **partition into two labeled tiers** for
+presentation (see "Present the results" below); use the `win_backed` /
+`loss_backed` booleans rather than re-deriving the split from
+`contested_win_margin`/`overshoot` thresholds.
 
 ```json
 {
@@ -188,7 +202,9 @@ ranking as of BUI-532.
   "above_fmv_loss_rate": 75.0,
   "overshoot": 1.2,
   "win_count": 1,
-  "contested_win_margin": 0.4
+  "contested_win_margin": 0.4,
+  "win_backed": false,
+  "loss_backed": true
 }
 ```
 
@@ -198,40 +214,49 @@ ranking as of BUI-532.
   for that row. A non-null value `<= 1` is not a counter-signal — see "The
   signal, and why it changed (BUI-532)" above — it just means treat the row
   as Unconfirmed, the same as a row where this field is `null`.
-- `overshoot` — `median(winning_bid / fmv_high)` over **losses**. A
-  **censored, confounded upper bound**, not a literal re-price factor — see
-  "The signal, and why it changed (BUI-532)" above. Only rows with
-  `overshoot > 1` appear at all (the server-side gate, unchanged).
-- `above_fmv_loss_rate` — % of losses where `winning_bid > fmv_high`. Context
-  only, subject to the same censoring/confound caveats as `overshoot` — never
-  re-sort by it.
+- `overshoot` — `median(winning_bid / fmv_high)` over **losses**, or `null`
+  when `loss_count` is 0. A **censored, confounded upper bound**, not a
+  literal re-price factor — see "The signal, and why it changed (BUI-532)"
+  above. Reported as context on every row; it is the row's *ranking* metric
+  only when `loss_backed` is `true`.
+- `above_fmv_loss_rate` — % of losses where `winning_bid > fmv_high`, or
+  `null` when `loss_count` is 0. Context only, subject to the same
+  censoring/confound caveats as `overshoot` — never re-sort by it.
 - `win_count` — how many resolved wins back `contested_win_margin`. `0` means
   this row has **no uncensored data at all**; its only evidence is the
   censored `overshoot`. A Confirmed row can rest on as few as one win — that
   number is exact (no floor/censoring uncertainty), but it's still one data
   point; weigh `win_count` the same way you'd already weigh a thin
   `loss_count`, rather than treating every Confirmed row as equally solid.
+- `win_backed` (bool, **BUI-543**) — `true` iff `contested_win_margin` is
+  non-null and `> 1`. This is the Confirmed/headline signal; equivalent to,
+  and simpler than, re-checking `contested_win_margin` yourself.
+- `loss_backed` (bool, **BUI-543**) — `true` iff the row independently clears
+  the loss-based gate (`loss_count >= min_losses` and `overshoot > 1`). At
+  least one of `win_backed` / `loss_backed` is always `true`; a row can have
+  both `true` at once (won convincingly *and* lost persistently above
+  `fmv_high`).
 
 ## Present the results
 
 Partition the response into two tiers and render **Confirmed first**:
 
-1. **Confirmed** — `contested_win_margin` is non-null **and** `> 1`. Sort by
-   `contested_win_margin` descending. This is the headline list (BUI-532):
-   real money actually cleared above `fmv_high`.
-2. **Unconfirmed (censored)** — everything else that still passed the
-   server's loss-based gate. Sort by `overshoot` descending (same ordering
-   the API already returns them in), but label the column so a reader never
-   mistakes it for a confirmed number.
+1. **Confirmed** — `win_backed` is `true`. Sort by `contested_win_margin`
+   descending (the server already returns this tier in this order as of
+   BUI-543, but sort defensively rather than depend on it). This is the
+   headline list (BUI-532/BUI-543): real money actually cleared above
+   `fmv_high`, whether or not the book has any qualifying losses.
+2. **Unconfirmed (censored)** — `win_backed` is `false` (every row remaining
+   here has `loss_backed: true`, since that's the only other way to be in
+   the response). Sort by `overshoot` descending, and label the column so a
+   reader never mistakes it for a confirmed number.
 
 A `jq` split to do this after the `comics-api` call above:
 
 ```bash
 comics-api GET /api/comics/calibration | jq '
-  { confirmed:   ([.[] | select(.contested_win_margin != null and .contested_win_margin > 1)]
-                  | sort_by(-.contested_win_margin)),
-    unconfirmed: ([.[] | select(.contested_win_margin == null or .contested_win_margin <= 1)]
-                  | sort_by(-.overshoot)) }'
+  { confirmed:   ([.[] | select(.win_backed)]  | sort_by(-.contested_win_margin)),
+    unconfirmed: ([.[] | select(.win_backed | not)] | sort_by(-.overshoot)) }'
 ```
 
 Render each tier as its own table, most urgent first within the tier:
@@ -275,9 +300,10 @@ concern like `/comic:wishlist-sellers` has. A steady-state run that returns
 | Mistake | Fix |
 |---|---|
 | Treating a high `loss_count` as the signal | It isn't — see "The signal, and why it changed (BUI-532)" above. |
-| Presenting rows in the API's own (loss-`overshoot`-sorted) order | Partition into Confirmed/Unconfirmed and re-sort per "Present the results" — the API order is not the headline ranking as of BUI-532. |
+| Rendering the raw API order without labeled tiers | The API returns win-backed-first order as of BUI-543, but still render Confirmed/Unconfirmed as separately labeled tables per "Present the results" — an unlabeled combined list still hides which rows are exact vs. censored evidence. |
+| Assuming a zero-loss book can never surface | Fixed in BUI-543 — a `win_backed: true` row surfaces regardless of `loss_count`, including 0. Only a book with no resolved auctions at all, or one where neither admit path fires, is omitted. |
 | Treating `overshoot` as a literal "raise `fmv_high` by this factor" number | It's a censored, confounded upper bound — see "The signal, and why it changed (BUI-532)" above. |
-| Ranking an Unconfirmed row above a Confirmed one | `contested_win_margin > 1` is always the more trustworthy signal, regardless of how large an Unconfirmed row's `overshoot` looks. |
+| Ranking an Unconfirmed row above a Confirmed one | `win_backed: true` (`contested_win_margin > 1`) is always the more trustworthy signal, regardless of how large an Unconfirmed row's `overshoot` looks. |
 | Rendering an empty table on a failed `comics-api` call | STOP and report the error instead — the hard-fail-loud rule this skill shares with every other `/comic:*` server call. |
 | Assuming this report writes anything | It never does. `fmv_high` only changes when you explicitly re-run `/comic:fmv` afterward. |
 
@@ -286,3 +312,6 @@ concern like `/comic:wishlist-sellers` has. A steady-state run that returns
 Plan: `docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md` — BUI-288 (Issue C).
 Metric rebase: BUI-532, evidenced by BUI-527's back-test
 (`apps/fmv/scripts/fmv_high_calibration.py`, PR #330).
+Server-side admit path + self-describing fields: BUI-543 (this file's framing was already
+current from BUI-532; the server-side gate/sort/docstring and this file's stale
+ordering/gap claims were brought into line with it).
