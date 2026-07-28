@@ -40,10 +40,18 @@ is fine.
 
 ## 1. Design decisions
 
-### D1. Failover is per-query, inside `fetch()` — reusing BUI-537 superseded-attempt semantics
+### D1. Failover is per-query, in a new `_fetch_with_fallback()` — reusing BUI-537 superseded-attempt semantics
 
-Rename the current SerpApi-specific `fetch()` body to `_fetch_serpapi()`; the
-new `fetch()` orchestrates providers in order:
+> *(As-built deviation: the draft renamed `fetch()` → `_fetch_serpapi()` and
+> made `fetch()` the orchestrator. Implementation instead left `fetch()` —
+> name, signature, 2-tuple return — completely untouched and added a private
+> `_fetch_with_fallback()` orchestrator that `fetch_book_comps._run` calls.
+> Reason: dozens of existing tests unpack `fetch()`'s 2-tuple or monkeypatch
+> `sc.fetch` with 2-tuple fakes; keeping the surface frozen preserved the
+> entire 192-test suite unmodified, which is itself the behavior-parity
+> evidence.)*
+
+`_fetch_with_fallback()` orchestrates providers in order:
 
 1. SerpApi cache → hit? return.
 2. SerpApi live (breaker-gated, existing retry policy) → success? return.
@@ -58,9 +66,9 @@ new `fetch()` orchestrates providers in order:
 6. Both failed → raise the secondary's exception chained `from` the primary's.
    `_run`'s existing except-branch records it as the terminal error entry.
 
-`fetch()` returns `(data, cache_hit, provider)` so `_run` can parse
-per-provider and tag the success entry. Failover triggers **on exception
-only** — a SerpApi 200 with 0 `organic_results` stays a genuine n=0 (BUI-536's
+It returns `(data, cache_hit, provider)` so `_run` can parse per-provider and
+tag the success entry. Failover triggers **on exception only** — a SerpApi
+200 with 0 `organic_results` stays a genuine n=0 (BUI-536's
 error-key-vs-empty distinction), never a second-provider probe; anything else
 double-spends on every legitimately thin vintage query.
 
