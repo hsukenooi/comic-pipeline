@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """ebay-sold-comps: fetch eBay sold listings for a comic.
 
-Wraps SerpApi's eBay engine (with show_only=Sold) as the primary provider,
-failing over per query to sold-comps.com (BUI-545) when SerpApi errors or its
-batch breaker has tripped. Caches responses per provider, dedupes by
-product_id, applies hard-excludes, parses grades, and returns clean comp
-lists. Consumed by comic-pipeline-fmv (apps/fmv) to compute fair market value.
+Runs each query through a provider chain (BUI-545): sold-comps.com is the
+default primary — eBay's 2026-07-23 login wall killed SerpApi's logged-out
+sold engine indefinitely — with SerpApi's eBay engine (show_only=Sold) as the
+fallback tier, failing over per query on error or a tripped breaker. Order is
+configurable via EBAY_SOLD_COMPS_PROVIDERS. Caches responses per provider,
+dedupes by product_id, applies hard-excludes, parses grades, and returns
+clean comp lists. Consumed by comic-pipeline-fmv (apps/fmv) to compute fair
+market value.
 
 Why this lives in apps/ebay (alongside ebay-fetch):
     All eBay data fetching — live (Browse API, ebay_fetch.py) and sold
@@ -86,9 +89,10 @@ CIRCUIT_BREAKER_THRESHOLD = 5
 # is the one provider with verified post-wall sold data (smoke-tested
 # 2026-07-28 against pre-wall cached SerpApi controls: 66/70 exact price
 # matches, post-wall endedAt dates, structurally distinct sold/active modes —
-# full trail on BUI-545). It serves as the failover tier behind
-# _fetch_with_fallback(): SerpApi stays primary; a per-query SerpApi failure
-# (or a tripped SerpApi breaker) falls through to it.
+# full trail on BUI-545). It is the DEFAULT PRIMARY provider behind
+# _fetch_with_fallback() (see DEFAULT_PROVIDER_ORDER below); SerpApi remains
+# in the chain as the fallback tier, taking a query only when sold-comps.com
+# errors or its breaker has tripped.
 SOLD_COMPS_ENDPOINT = "https://api.sold-comps.com/v1/scrape"
 # Their scrape is a live retrieval with observed latencies in the tens of
 # seconds — far above SerpApi's; sized to the smoke-test budget.
@@ -107,12 +111,16 @@ _SOLD_COMPS_SEMAPHORE = threading.Semaphore(_SOLD_COMPS_MAX_CONCURRENCY)
 
 PROVIDER_SERPAPI = "serpapi"
 PROVIDER_SOLD_COMPS = "sold-comps.com"
-DEFAULT_PROVIDER_ORDER = (PROVIDER_SERPAPI, PROVIDER_SOLD_COMPS)
-# Comma-ordered provider override, e.g. "sold-comps.com" alone to stop paying
-# ~CIRCUIT_BREAKER_THRESHOLD charged SerpApi errors per batch while the
-# SerpApi sold engine is known-dead indefinitely. The DEFAULT order is the
-# BUI-545 AC-conformant one: failover is driven by outage signals (breaker /
-# fetch-err), and a SerpApi recovery is picked up automatically.
+# sold-comps.com FIRST: with SerpApi's sold engine dead indefinitely behind
+# the login wall, a SerpApi-primary order would pay ~CIRCUIT_BREAKER_THRESHOLD
+# charged SerpApi errors at 30s+ apiece per batch before its breaker tripped.
+# SerpApi stays in the chain as the fallback tier, so failover remains
+# signal-driven in both directions (the BUI-545 AC); if eBay ever reverts the
+# wall, set EBAY_SOLD_COMPS_PROVIDERS=serpapi,sold-comps.com to restore
+# SerpApi primacy. (A no-key run still degrades to SerpApi-only.)
+DEFAULT_PROVIDER_ORDER = (PROVIDER_SOLD_COMPS, PROVIDER_SERPAPI)
+# Comma-ordered provider override — reorder ("serpapi,sold-comps.com") or
+# restrict to one ("sold-comps.com").
 PROVIDERS_ENV_VAR = "EBAY_SOLD_COMPS_PROVIDERS"
 
 
@@ -170,9 +178,10 @@ def load_sold_comps_key() -> str | None:
 
 
 def _provider_order() -> tuple[str, ...]:
-    """Resolve the provider order from PROVIDERS_ENV_VAR (default: SerpApi
-    primary, sold-comps.com secondary). Unknown names fail loudly — a typo
-    that silently dropped a provider would be an invisible config bug."""
+    """Resolve the provider order from PROVIDERS_ENV_VAR (default:
+    sold-comps.com primary, SerpApi fallback — see DEFAULT_PROVIDER_ORDER).
+    Unknown names fail loudly — a typo that silently dropped a provider
+    would be an invisible config bug."""
     raw = os.environ.get(PROVIDERS_ENV_VAR, "").strip()
     if not raw:
         return DEFAULT_PROVIDER_ORDER
@@ -891,9 +900,9 @@ def _fetch_with_fallback(nkw: str, api_key: str, *, force: bool = False,
     (data, cache_hit, provider): `provider` names who served, so the caller
     can parse the raw response with the right extractor and tag the trail.
 
-    Failover fires on EXCEPTION only — a SerpApi 200 with zero
-    organic_results is a genuine n=0 (BUI-536's error-vs-empty distinction),
-    never a second-provider probe: anything else would double-spend on every
+    Failover fires on EXCEPTION only — a 200 with zero results from either
+    provider is a genuine n=0 (BUI-536's error-vs-empty distinction), never
+    a second-provider probe: anything else would double-spend on every
     legitimately thin vintage query. A provider failure that a further
     provider supersedes is recorded through `record_attempt(outcome, detail,
     provider)` — exactly the BUI-537 superseded-attempt semantics, extended
@@ -1214,9 +1223,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     per-book exception boundary used to zero this to `[]` because a raised
     exception never reached this function's normal `return` below.
 
-    BUI-545: every tier also routes through `_fetch_with_fallback`, so a
-    per-query SerpApi failure falls through to sold-comps.com when
-    `sold_comps_key` is provided (see that function's docstring). Every
+    BUI-545: every tier also routes through `_fetch_with_fallback`, so each
+    query runs the provider chain — sold-comps.com primary by default (see
+    DEFAULT_PROVIDER_ORDER), SerpApi as the fallback tier — failing over
+    per query on error when `sold_comps_key` is provided (see that
+    function's docstring). Every
     `queries_used` entry now carries a `provider` tag; `breaker_tripped` in
     the output is the OR of both providers' breakers ("this book was affected
     by an outage" keeps its meaning for consumers). Default kwargs (no key,
@@ -1504,9 +1515,10 @@ def run_batch(books: list[dict], api_key: str, *, force: bool = False,
         )
     elif PROVIDER_SOLD_COMPS in providers:
         print(
-            "note: SOLD_COMPS_KEY not set — no secondary sold-comps provider "
-            "(BUI-545); a SerpApi outage will fetch-err instead of failing "
-            "over.",
+            "note: SOLD_COMPS_KEY not set — running without the "
+            "sold-comps.com provider (BUI-545). SerpApi's sold engine has "
+            "been login-walled since 2026-07-23, so expect fetch-errs until "
+            "a key is configured (apps/ebay/.env).",
             file=sys.stderr,
         )
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -1564,15 +1576,16 @@ def _print_human(results: list[dict]) -> None:
         # without changing the stored "tier"/"page" fields other consumers
         # read. BUI-537 made `page` always present (including page 1) — only
         # tag when it's not the implicit default, or every entry would show
-        # "(p1)". BUI-545: likewise tag entries a non-primary provider
-        # served (e.g. "base[sold-comps.com]") so a failover is visible at a
-        # glance; the primary stays untagged to keep the common case terse.
+        # "(p1)". BUI-545: likewise tag entries the non-default provider
+        # served (e.g. "base[serpapi]") so a failover is visible at a
+        # glance; the default primary stays untagged to keep the common
+        # case terse.
         def _tier_label(q: dict) -> str:
             label = q["tier"]
             if q.get("page", 1) != 1:
                 label += f'(p{q["page"]})'
             prov = q.get("provider")
-            if prov and prov != PROVIDER_SERPAPI:
+            if prov and prov != DEFAULT_PROVIDER_ORDER[0]:
                 label += f"[{prov}]"
             return label
 

@@ -169,17 +169,23 @@ batch; the semaphore plus the existing `retry_request` backoff (2/4/8s,
 429-retryable) rides the window out without a token-bucket. Deliberately
 crude — a real FMV run is 5–20 searches and rarely touches the limit at all.
 
-### D10. Provider order is env-overridable; the default satisfies the AC
+### D10. Provider order is env-overridable; default is sold-comps.com first
 
-`EBAY_SOLD_COMPS_PROVIDERS` (comma-ordered, default `serpapi,sold-comps.com`)
-selects and orders providers. The AC's "failover triggered by outage signals,
-not a manual flag alone" is satisfied by the default; the override exists
-because SerpApi's sold engine may be dead *indefinitely* — without it, every
-batch pays ~5 charged 32-second SerpApi errors before the breaker trips,
-forever. Setting `EBAY_SOLD_COMPS_PROVIDERS=sold-comps.com` on the Mini is an
-operational choice to make **after** watching a few real runs (documented in
-the ticket, not flipped in this PR). No auto-demotion/persistent-health state
-in v1 — cross-run state is complexity the env var defers.
+> *(As-built deviation: the draft kept `serpapi,sold-comps.com` as the
+> default and deferred the flip to a post-deploy operational choice. The
+> user decided 2026-07-28 — after the live validation showed each SerpApi
+> attempt costing charged errors at 30s+ apiece — to flip the in-code
+> default instead, since SerpApi's sold engine is dead indefinitely.)*
+
+`EBAY_SOLD_COMPS_PROVIDERS` (comma-ordered) selects and orders providers.
+**Default: `sold-comps.com,serpapi`** — sold-comps.com primary, SerpApi kept
+in the chain as the signal-driven fallback tier, so the AC's "failover
+triggered by outage signals, not a manual flag alone" holds in both
+directions and a healthy batch spends zero SerpApi calls. If eBay ever
+reverts the wall, `EBAY_SOLD_COMPS_PROVIDERS=serpapi,sold-comps.com`
+restores SerpApi primacy. A no-key run still degrades to SerpApi-only. No
+auto-demotion/persistent-health state in v1 — cross-run state is complexity
+the env var defers.
 
 ## 2. Implementation order (single PR on `hsukenooi/bui-545-sold-comps-provider-fallback`)
 
