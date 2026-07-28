@@ -1518,3 +1518,113 @@ def test_restore_from_partial_backup_skips_missing_file(tmp_path):
     # The live wish-list, absent from the backup, is left exactly as-is.
     live_wish = json.loads((tmp_path / "wish-list.json").read_text())["items"]
     assert {i["name"] for i in live_wish} == {"Untouched Wish #1"}
+
+
+# ---------------------------------------------------------------------------
+# BUI-560: identity_series_key must also fold the bare-year spelling
+# ("(2026)") to the same key as the range spellings ("(2026 - Present)",
+# "(2026 - 2026)") — LOCG's third rendering of a volume that opens and closes
+# within one calendar year. `series_year_range` already treats a bare year as
+# the one-year range (YYYY, YYYY), not open-ended, so this fold introduces no
+# new fact — it just teaches identity_series_key the third spelling of one it
+# already folds (BUI-554).
+# ---------------------------------------------------------------------------
+
+def test_bare_year_folds_to_same_key_as_open_and_closed_range():
+    """All three live LOCG spellings of one volume (BUI-560's Cyclops case)
+    must converge on one identity key."""
+    from locg.collection_cache import identity_series_key as key
+
+    present = key("Cyclops (Vol. 4) (2026 - Present)")
+    closed = key("Cyclops (Vol. 4) (2026 - 2026)")
+    bare = key("Cyclops (Vol. 4) (2026)")
+    assert present == closed == bare
+
+
+def test_bare_year_fold_output_matches_range_fold_spacing_exactly():
+    """The bare-year fold's output must be byte-identical to the range fold's
+    output, not merely stringwise-equal after some other normalization —
+    otherwise a genuinely-fine input never touched by either fold could still
+    diverge from a folded one on whitespace alone."""
+    from locg.collection_cache import identity_series_key as key
+
+    assert key("Knull (2026)") == "Knull (2026 - )"
+    assert key("Knull (2026 - Present)") == "Knull (2026 - )"
+
+
+def test_bare_year_fold_keeps_start_year_load_bearing():
+    """The bare-year fold must not widen into folding the start year too —
+    two one-shot-shaped volumes of the same masthead starting in different
+    years must stay distinct identities, exactly like the range fold's own
+    Spawn 1992-vs-2012 guarantee."""
+    from locg.collection_cache import identity_series_key as key
+
+    assert key("Cyclops (1992)") != key("Cyclops (2012)")
+    # And a bare year must still fold equal to a same-start-year range, not
+    # just leave both sides untouched.
+    assert key("Cyclops (1992)") == key("Cyclops (1992 - Present)")
+
+
+def test_bare_year_fold_preserves_vol_label():
+    """`(Vol. N)` must survive the bare-year fold exactly as it survives the
+    range fold — LOCG reuses Vol. N labels across genuinely different
+    volumes (BUI-554), so dropping it here would quietly re-open that hole
+    for every one-shot-shaped series."""
+    from locg.collection_cache import identity_series_key as key
+
+    assert key("Cyclops (Vol. 4) (2026)") == "Cyclops (Vol. 4) (2026 - )"
+    # Different Vol. label, same start year and same bare-year spelling, must
+    # NOT collapse into one identity.
+    assert key("Cyclops (Vol. 3) (2026)") != key("Cyclops (Vol. 4) (2026)")
+
+
+@pytest.mark.parametrize("dash", ["-", "–", "—", "−"])
+def test_bare_year_fold_matches_every_dash_variant_of_the_range_form(dash):
+    """Each dash LOCG/Metron use in a range (ASCII hyphen, en-dash, em-dash,
+    minus sign — `_DASH_CLASS`) must fold to the same key as the bare-year
+    spelling of the same one-year span."""
+    from locg.collection_cache import identity_series_key as key
+
+    ranged = key(f"Dungeon Crawler Carl Special Edition (2026 {dash} 2026)")
+    bare = key("Dungeon Crawler Carl Special Edition (2026)")
+    assert ranged == bare == "Dungeon Crawler Carl Special Edition (2026 - )"
+
+
+def test_bare_year_fold_ignores_non_year_parenthetical():
+    """A parenthetical that isn't a bare 4-digit year (e.g. `(Vol. 4)`) must
+    not be mistaken for one — only a lone `(YYYY)` group is folded."""
+    from locg.collection_cache import identity_series_key as key
+
+    assert key("Batman (Vol. 3)") == "Batman (Vol. 3)"
+    assert key("") == ""
+
+
+def test_bare_year_fold_does_not_double_fold_an_already_ranged_name():
+    """The range fold runs first and produces `(YYYY - )`; the bare-year
+    pattern must not then also match that output (its trailing text is
+    ` - )`, not a bare `)` right after the digits) and mangle it further."""
+    from locg.collection_cache import identity_series_key as key
+
+    assert key("Spawn (1992 - Present)") == "Spawn (1992 - )"
+
+
+def test_bare_year_fold_via_make_identity_merges_the_bui560_duplicate_pair():
+    """End-to-end through `make_identity` (BUI-554's dedup path): the live
+    Cyclops duplicate pair from BUI-560 — same publisher, full_title, and
+    release_date, differing only in the bare-vs-range series decoration —
+    must resolve to one identity."""
+    from locg.collection_cache import make_identity
+
+    row_present = {
+        "publisher_name": "Marvel Comics",
+        "series_name": "Cyclops (Vol. 4) (2026 - Present)",
+        "full_title": "Cyclops #1",
+        "release_date": "2026-01-07",
+    }
+    row_bare = {
+        "publisher_name": "Marvel Comics",
+        "series_name": "Cyclops (Vol. 4) (2026)",
+        "full_title": "Cyclops #1",
+        "release_date": "2026-01-07",
+    }
+    assert make_identity(row_present) == make_identity(row_bare)
