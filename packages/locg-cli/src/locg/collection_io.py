@@ -29,9 +29,11 @@ from locg.collection_cache import (
     _next_seq,
     _normalize_series_key,
     _utcnow_iso,
+    build_volume_candidates,
     make_identity,
     owned_match_keys,
     rebuild_series_name_index,
+    resolve_series_for_win,
     verified_copy_bytes,
 )
 from locg.parsing import normalize_issue_key, split_series_issue_for_ownership
@@ -216,16 +218,54 @@ _VOL_ANNOTATION_RE = re.compile(r"\(Vol\.\s*\d+\)", re.IGNORECASE)
 _issue_token = trailing_issue_token
 
 
+# Generic corporate words a publisher's trading name carries in one provider's
+# vocabulary and drops in another's (BUI-548). Metron says "Marvel"; LOCG says
+# "Marvel Comics" — same company, and the difference is pure boilerplate.
+_PUBLISHER_GENERIC_WORDS: frozenset[str] = frozenset({
+    "book", "books", "co", "comic", "comics", "company", "entertainment",
+    "group", "inc", "llc", "ltd", "media", "press", "productions",
+    "publication", "publications", "publishing", "studio", "studios",
+})
+
+
+def _normalize_publisher(name: str) -> str:
+    """Fold a publisher name to its distinguishing tokens (BUI-548).
+
+    Lowercases, drops punctuation, and removes the generic corporate words in
+    :data:`_PUBLISHER_GENERIC_WORDS`, so the SAME company named by two
+    providers lands on one key: ``"Marvel"`` / ``"Marvel Comics"`` -> ``marvel``,
+    ``"Boom! Studios"`` / ``"BOOM! Studios"`` -> ``boom``, ``"DC Comics"`` ->
+    ``dc``. Falls back to the punctuation-folded name when stripping the
+    generic words would empty it (a publisher genuinely called "Comics").
+
+    Deliberately NOT an imprint table: ``Skybound`` does not fold to ``Image
+    Comics`` here. An imprint relation is a fact about the world that a word
+    list cannot derive, so it is left to the corroboration path in
+    :func:`_reconcile_score` instead of guessed at.
+    """
+    folded = re.sub(r"[^0-9a-z]+", " ", (name or "").lower()).strip()
+    if not folded:
+        return ""
+    kept = [w for w in folded.split() if w not in _PUBLISHER_GENERIC_WORDS]
+    return " ".join(kept) if kept else folded
+
+
 def _publisher_matches(a: str, b: str) -> bool:
-    # A missing publisher on either side is a wildcard, not a mismatch. agent_win
-    # rows are written with publisher_name=None (record-win has no publisher), so
-    # a strict compare against LOCG's canonical "Marvel Comics" would score every
-    # such row 0 and block reconciliation entirely (BUI-122). Series + issue +
-    # year still gate the match, so the publisher wildcard can't merge across
-    # genuinely different books. Only reject when BOTH sides name a publisher and
-    # they differ.
-    na = (a or "").strip().lower()
-    nb = (b or "").strip().lower()
+    # A missing publisher on either side is a wildcard, not a mismatch. Series +
+    # issue + release date still gate the match, so the publisher wildcard can't
+    # merge across genuinely different books (BUI-122). Only reject when BOTH
+    # sides name a publisher and they differ.
+    #
+    # BUI-548: compare NORMALIZED names. Before BUI-458 an agent_win row carried
+    # publisher_name=None and took the wildcard; since BUI-458 record-win stamps
+    # Metron's publisher label, which uses a different vocabulary from LOCG's
+    # ("Marvel" vs "Marvel Comics"). That turned the wildcard into a hard
+    # mismatch and silently blocked reconciliation for 34 of the 41 pending wins
+    # in the 2026-07-27 sync — every one of them re-imported as a duplicate
+    # owned row. A provider naming the same company differently is not evidence
+    # of a different book.
+    na = _normalize_publisher(a)
+    nb = _normalize_publisher(b)
     if not na or not nb:
         return True
     return na == nb
@@ -459,15 +499,155 @@ def _carry_win_provenance(
         })
 
 
-def _vol_annotation_differs(a: str, b: str) -> bool:
-    """True if the (Vol. N) annotations are both present but differ, or only one has one."""
+def _vol_annotation_relation(a: str, b: str) -> tuple[bool, bool]:
+    """``(conflict, one_sided)`` for two series names' ``(Vol. N)`` annotations.
+
+    BUI-548 splits what was a single "differs" verdict, because the two halves
+    carry different weight and only one of them is negotiable:
+
+    * ``conflict`` — BOTH sides declare a volume and the two disagree
+      (``Silver Surfer (Vol. 3)`` vs ``The Silver Surfer (Vol. 4)``). Positive
+      evidence of different books; a hard mismatch under every widening.
+    * ``one_sided`` — exactly one side declares a volume. Merely missing
+      information: record-win writes the bare Metron masthead whenever
+      ``resolve_series_for_win`` misses, so absence is silence, not
+      disagreement. :func:`_reconcile_score` widens past this one, but only
+      with corroboration.
+    """
     va = _VOL_ANNOTATION_RE.search(a or "")
     vb = _VOL_ANNOTATION_RE.search(b or "")
-    if va is None and vb is None:
-        return False
     if va is None or vb is None:
+        return (False, va is not None or vb is not None)
+    return (va.group(0).lower() != vb.group(0).lower(), False)
+
+
+# LOCG stores a book's ON-SALE date; record-win stamps Metron's COVER date,
+# which the industry sets 2-3 months later. The skew is systematic and strictly
+# one-directional (LOCG earlier), so the tolerance is asymmetric. The widest gap
+# in the 2026-07-27 backlog was 91 days (Tales of Suspense #98: cover
+# 1968-02-01 vs on-sale 1967-11-02); 120 days keeps headroom while staying far
+# short of the ~180 days that would let two issues of a bimonthly title meet.
+_COVER_TO_ONSALE_MAX_DAYS = 120
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value or "")[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _release_dates_compatible(cache_row: dict[str, Any], xlsx_row: dict[str, Any]) -> bool:
+    """Do a pending win's release date and an export row's name the same issue?
+
+    Fails OPEN when either side has no date (unchanged from the original year
+    compare — a dateless win must still be reconcilable; the *destructive*
+    branch's fail-closed complement lives in :func:`_era_confirmed`).
+
+    Accepts on either signal:
+
+    * **Same 4-digit year** — the pre-BUI-548 rule, kept verbatim so nothing
+      that reconciled before stops reconciling.
+    * **LOCG's date earlier by at most** :data:`_COVER_TO_ONSALE_MAX_DAYS` —
+      the cover-vs-on-sale skew crossing a year boundary (BUI-548). Strictly
+      one-directional: an export date LATER than the win's is not this skew and
+      gets no tolerance at all.
+    """
+    cache_year = (cache_row.get("release_date") or "")[:4]
+    xlsx_year = (xlsx_row.get("release_date") or "")[:4]
+    if not cache_year or not xlsx_year:
         return True
-    return va.group(0).lower() != vb.group(0).lower()
+    if cache_year == xlsx_year:
+        return True
+
+    cache_date = _parse_iso_date(cache_row.get("release_date"))
+    xlsx_date = _parse_iso_date(xlsx_row.get("release_date"))
+    if cache_date is None or xlsx_date is None:
+        return False
+    delta = (cache_date - xlsx_date).days
+    return 0 <= delta <= _COVER_TO_ONSALE_MAX_DAYS
+
+
+def _price_equal(a: Any, b: Any) -> bool:
+    try:
+        fa, fb = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    return fa > 0 and round(fa, 2) == round(fb, 2)
+
+
+def _same_copy_corroborated(cache_row: dict[str, Any], xlsx_row: dict[str, Any]) -> str:
+    """Independent evidence that two rows describe the same physical copy.
+
+    Returns the name of the corroborating signal, or ``""`` for none — the name
+    lands in the ``reconciliation`` audit record, so a later "did this merge two
+    different books?" audit can go straight to the widened matches instead of
+    re-deriving which ones they were. Used by
+    :func:`_reconcile_score` to authorize the *widened* comparisons only
+    (BUI-548) — every widening must clear one of these before it fires, which is
+    why loosening the volume/publisher/series tests there cannot merge two books
+    that merely resemble each other.
+
+    * ``price+date_purchased`` — LOCG only knows what we paid and when because
+      THIS pipeline uploaded it on a previous sync. An exact agreement on both
+      is a round-trip fingerprint of one purchase, and it was identical across
+      every duplicate pair in the 2026-07-27 backlog. Far stronger same-copy
+      evidence than ``release_date``, which the providers disagree about by
+      construction. A zero/blank price is not evidence (the CSV writes ``0.00``
+      for a price-less win and LOCG echoes it back), so it never corroborates.
+    * ``release_date`` — an exact match on the very field the two providers
+      most often skew. When they nonetheless agree to the day, a whitespace or
+      volume-annotation difference in the name is a spelling difference, not a
+      different book (the ``Dawn Runner`` / ``Dawnrunner`` class).
+
+    Neither signal can bridge two different ISSUES: :func:`_reconcile_score`
+    still demands an exact issue-token match, which is what keeps a lot bought
+    in one purchase (identical price AND date across several books — BUI-500)
+    from cross-matching within itself.
+    """
+    if _price_equal(cache_row.get("price_paid"), xlsx_row.get("price_paid")):
+        cache_purchased = (cache_row.get("date_purchased") or "")[:10]
+        xlsx_purchased = (xlsx_row.get("date_purchased") or "")[:10]
+        if cache_purchased and cache_purchased == xlsx_purchased:
+            return "price+date_purchased"
+
+    cache_release = (cache_row.get("release_date") or "")[:10]
+    xlsx_release = (xlsx_row.get("release_date") or "")[:10]
+    if cache_release and cache_release == xlsx_release:
+        return "release_date"
+
+    return ""
+
+
+def _duplicate_check_title_key(full_title: str) -> str:
+    """Normalized ``full_title`` for the post-import owned-duplicate check.
+
+    Punctuation-, whitespace- and leading-article-insensitive, because that is
+    exactly the drift that produced the duplicate pairs (``Infinity Gauntlet
+    #2`` / ``The Infinity Gauntlet #2``, ``Dawn Runner #1`` / ``Dawnrunner
+    #1``). Deliberately keeps the ``#N`` token and any trailing edition suffix,
+    so a base issue and its ``3rd Printing`` are NOT reported as duplicates of
+    each other — they are two books, and flagging them would train the operator
+    to ignore this check.
+    """
+    # _normalize_title already lowercases, folds dashes and strips the leading
+    # article on the SPACED form — which is the order that matters, since
+    # stripping the article after collapsing whitespace would eat the first
+    # three letters of "Theatre #1".
+    return re.sub(r"[^0-9a-z#]+", "", _normalize_title(full_title))
+
+
+def _series_squash(series_name: str) -> str:
+    """:func:`_normalize_series_key` with intra-name whitespace removed.
+
+    ``"Dawn Runner"`` and ``"Dawnrunner"`` are the same book spelled two ways —
+    but BUI-546 deliberately did NOT widen ``_normalize_series_key`` to strip
+    inner whitespace, because that key also drives the ownership matcher, where
+    collapsing word boundaries would create false ``in_collection`` verdicts
+    (the R11 direction). So the squash lives HERE, in the reconciler, where it
+    is only ever consulted alongside :func:`_same_copy_corroborated`.
+    """
+    return re.sub(r"\s+", "", _normalize_series_key(series_name or ""))
 
 
 def _reconcile_score(cache_row: dict[str, Any], xlsx_row: dict[str, Any]) -> int:
@@ -475,21 +655,47 @@ def _reconcile_score(cache_row: dict[str, Any], xlsx_row: dict[str, Any]) -> int
 
     Returns -1 for hard mismatch (do not reconcile), 0 for no match,
     positive for a match (higher = stronger).
+
+    BUI-548 widens three of these tests, each gated on
+    :func:`_same_copy_corroborated` so that no widening can fire on name
+    resemblance alone:
+
+    * a **one-sided** ``(Vol. N)`` annotation (two DECLARED volumes that
+      disagree stay a hard ``-1`` regardless);
+    * a publisher naming disagreement that survives
+      :func:`_normalize_publisher` (the imprint case, e.g. Skybound / Image);
+    * a series name differing only by intra-word whitespace
+      (``Dawn Runner`` / ``Dawnrunner``).
+
+    The issue-token compare is deliberately NOT widened: it is what keeps two
+    printings or editions of one issue apart, since LOCG spells them as a
+    trailing suffix (``"... #2 3rd Printing"``, ``"... #196 Newsstand
+    Edition"``) that the end-anchored token extractor reads as "no token" —
+    so a base win scores 0 against them and cannot merge.
     """
-    if _vol_annotation_differs(
-        cache_row.get("series_name", ""), xlsx_row.get("series_name", "")
-    ):
+    cache_series = cache_row.get("series_name", "") or ""
+    xlsx_series = xlsx_row.get("series_name", "") or ""
+
+    vol_conflict, vol_one_sided = _vol_annotation_relation(cache_series, xlsx_series)
+    if vol_conflict:
         return -1  # Hard mismatch per R60
 
-    if not _publisher_matches(
+    publisher_agrees = _publisher_matches(
         cache_row.get("publisher_name", ""), xlsx_row.get("publisher_name", "")
-    ):
-        return 0
+    )
+    series_agrees = _series_normalized_matches(cache_series, xlsx_series)
 
-    if not _series_normalized_matches(
-        cache_row.get("series_name", ""), xlsx_row.get("series_name", "")
-    ):
-        return 0
+    if vol_one_sided or not publisher_agrees or not series_agrees:
+        # At least one comparison would have to be widened to match these two
+        # rows, so demand independent same-copy evidence first. Computed only on
+        # this branch: the scorer runs once per (pending row x export row) pair,
+        # and the overwhelming majority agree outright.
+        if not _same_copy_corroborated(cache_row, xlsx_row):
+            # Hard mismatch per R60 when a volume is declared on one side only.
+            return -1 if vol_one_sided else 0
+        if not series_agrees and _series_squash(cache_series) != _series_squash(xlsx_series):
+            # Corroborated, but the names differ by more than inner whitespace.
+            return 0
 
     cache_title = (cache_row.get("full_title") or "").strip()
     xlsx_title = (xlsx_row.get("full_title") or "").strip()
@@ -508,10 +714,9 @@ def _reconcile_score(cache_row: dict[str, Any], xlsx_row: dict[str, Any]) -> int
     if cache_token != xlsx_token:
         return 0
 
-    # Year must match if both present
-    cache_year = (cache_row.get("release_date") or "")[:4]
-    xlsx_year = (xlsx_row.get("release_date") or "")[:4]
-    if cache_year and xlsx_year and cache_year != xlsx_year:
+    # Release dates must be compatible if both present (BUI-548: same year, or
+    # LOCG's on-sale date earlier within the cover-date skew window)
+    if not _release_dates_compatible(cache_row, xlsx_row):
         return 0
 
     return 5
@@ -657,6 +862,136 @@ def migrate_wish_list_source() -> dict[str, Any]:
 # Main import orchestration
 # ---------------------------------------------------------------------------
 
+def _post_import_series_index(
+    comics: list[dict[str, Any]], xlsx_rows: list[dict[str, Any]]
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """The series index as it will exist AFTER this import (BUI-547).
+
+    ``import_xlsx`` rebuilds ``series_name_index`` at the very end, so the
+    stored index Phase 1 would otherwise see is the PREVIOUS import's — it
+    cannot know about a series arriving in the export being merged right now.
+    Reconciling against the stale index is what makes the manual-resolution
+    backlog monotonic: an operator adds the missing series to LOCG precisely to
+    unstick a flagged win, the import brings it back, and the flag still doesn't
+    clear because the series only lands in the index one import too late.
+
+    Both canonical builders already apply the ``source == "locg_export"``
+    filter (R61) themselves, so the store's rows are handed over whole rather
+    than pre-filtered here — restating that predicate in a second file is how
+    it drifts. The incoming export rows are LOCG-sourced by definition and are
+    synthesized with only the two fields those builders read.
+    """
+    index_payload = {
+        "comics": [
+            *comics,
+            *(
+                {"source": "locg_export", "series_name": xr.get("series_name")}
+                for xr in xlsx_rows
+            ),
+        ]
+    }
+    return (
+        rebuild_series_name_index(index_payload),
+        build_volume_candidates(index_payload),
+    )
+
+
+def _reresolve_manual_series_flags(
+    comics: list[dict[str, Any]],
+    flagged_indices: list[int],
+    identity_to_idx: dict[tuple, int],
+    partial_to_idx: dict[tuple, int],
+    series_name_index: dict[str, str],
+    volume_candidates: dict[str, list[str]],
+    audit_records: list[dict[str, Any]],
+    summary: dict[str, Any],
+    now: str,
+) -> None:
+    """Re-check stale ``needs_manual_series_canonical`` flags (BUI-547).
+
+    The flag is written once, by ``_build_win_row`` at record-win time, and is
+    a snapshot of what the collection knew at that instant. When the collection
+    LATER gains the data that would resolve the series — a new LOCG import, a
+    manual add, an alias-table change — nothing recomputes it, so the row stays
+    excluded from the CSV export and sits in ``pending_push_count`` forever.
+    Rows enter the manual bucket and never leave it.
+
+    **One-way on purpose: this only ever CLEARS the flag, never sets it.** A row
+    that stops resolving (an import drops a volume, a normalizer change reshapes
+    a key) must not be silently re-flagged out of the export — that is a
+    different failure with a different blast radius, and the export dropping
+    rows without saying so is the direction that loses data.
+
+    Runs BEFORE candidate scoring, and writes the resolved canonical
+    ``series_name`` onto the row, so a row that unsticks here can also reconcile
+    in the SAME import rather than waiting a cycle: the canonical name is what
+    carries LOCG's ``(Vol. N)`` decoration, which ``_reconcile_score``'s volume
+    test needs. ``flagged_indices`` is computed from the ORIGINAL flags and
+    passed in, so clearing a flag here can never remove a row from this phase's
+    own candidate set. Rewriting ``series_name`` changes a row's identity, so
+    ``identity_to_idx`` / ``partial_to_idx`` are re-keyed in step.
+
+    Chosen over the alternative BUI-547 floats — deriving the flag at export
+    time instead of storing it — because the "computed view" framing does not
+    survive contact: the export needs the resolved canonical ``series_name`` in
+    the CSV too, so a derive-at-export pass would still have to write, only from
+    a read path (``generate_csv`` runs from the server's export endpoint with no
+    cache lock held). It would also recompute in BOTH directions on every
+    export, which is exactly the silent re-flagging this ticket forbids.
+    """
+    for ci in flagged_indices:
+        row = comics[ci]
+        if not row.get("needs_manual_series_canonical"):
+            continue
+        if not _is_pending_push_row(row):
+            continue
+
+        series_name = row.get("series_name") or ""
+        if not series_name:
+            continue
+
+        resolved = resolve_series_for_win(
+            _normalize_series_key(series_name),
+            _issue_token(row.get("full_title") or ""),
+            _release_year(row) or None,
+            series_name_index,
+            volume_candidates,
+        )
+        if not resolved or resolved == series_name:
+            continue
+
+        # `series_name` is part of BOTH index keys, so re-key before anything
+        # reads them again — the scoring loop's collision guard and all of
+        # Phase 2 look rows up by identity. Leaving a stale entry behind would
+        # let a later export row claim this index slot as a rename target and
+        # apply its own columns to a row it has nothing to do with (the same
+        # hazard BUI-462 fixed for the auto-heal drop).
+        old_identity = make_identity(row)
+        old_partial = _partial_identity(row)
+
+        row["needs_manual_series_canonical"] = False
+        row["series_name"] = resolved
+
+        if identity_to_idx.get(old_identity) == ci:
+            del identity_to_idx[old_identity]
+        if partial_to_idx.get(old_partial) == ci:
+            del partial_to_idx[old_partial]
+        identity_to_idx[make_identity(row)] = ci
+        partial_to_idx[_partial_identity(row)] = ci
+
+        summary["manual_series_flags_cleared"] += 1
+        audit_records.append({
+            "type": "manual_series_flag_cleared",
+            "ts": now,
+            "command": "import",
+            "details": {
+                "full_title": row.get("full_title"),
+                "previous_series_name": series_name,
+                "resolved_series_name": resolved,
+            },
+        })
+
+
 def _reconcile_phase(
     comics: list[dict[str, Any]],
     xlsx_rows: list[dict[str, Any]],
@@ -686,6 +1021,15 @@ def _reconcile_phase(
     apply these to `comics` AFTER _standard_merge_phase (Phase 2), which
     overwrites the survivor's in_collection wholesale from the export row —
     applying any earlier would be silently clobbered.
+
+    Ordering within the phase (BUI-547 / BUI-548 meet here):
+    ``flagged_indices`` is computed first, from the flags as they stand on
+    entry; then :func:`_reresolve_manual_series_flags` clears the stale ones and
+    writes each row's resolved canonical series name; then candidate scoring
+    runs. That order is deliberate in both directions — computing the index set
+    first means clearing a flag can never drop a row out of this phase, and
+    re-resolving before scoring means a row that unsticks can reconcile in the
+    same import instead of exporting one more duplicate first.
     """
     # ----- Phase 1: Reconciliation ----------------------------------------
     # Manually-flagged best-guess rows always get the relaxed (exact-year)
@@ -710,6 +1054,22 @@ def _reconcile_phase(
             and make_identity(r) not in exact_ids
         )
     ]
+
+    # BUI-547: unstick rows whose series became resolvable since record-win
+    # stamped them. Runs against the index as it will exist AFTER this import,
+    # so a series arriving in THIS export counts.
+    series_name_index, volume_candidates = _post_import_series_index(comics, xlsx_rows)
+    _reresolve_manual_series_flags(
+        comics,
+        flagged_indices,
+        identity_to_idx,
+        partial_to_idx,
+        series_name_index,
+        volume_candidates,
+        audit_records,
+        summary,
+        now,
+    )
 
     for ci in flagged_indices:
         cache_row = comics[ci]
@@ -899,6 +1259,11 @@ def _reconcile_phase(
 
         old_identity = make_identity(cache_row)
         old_partial = _partial_identity(cache_row)
+        # BUI-548: which signal (if any) authorized a widened match, recorded
+        # before the identity rewrite destroys the evidence. A reconcile that
+        # fired on an exact agreement carries "", so an audit of "did this
+        # merge two different books?" can go straight to the widened ones.
+        corroboration = _same_copy_corroborated(cache_row, xlsx_row)
 
         cache_row["publisher_name"] = xlsx_row["publisher_name"]
         cache_row["series_name"] = xlsx_row["series_name"]
@@ -926,6 +1291,7 @@ def _reconcile_phase(
             "details": {
                 "old_identity": list(old_identity),
                 "new_identity": list(make_identity(cache_row)),
+                "corroboration": corroboration,
             },
         })
 
@@ -1096,7 +1462,7 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
     Returns a summary dict: {added, updated, untouched, reconciled,
     possibly_removed, ownership_downgrades_held, behavioral_drift_count,
     auto_healed_duplicates, second_copies_credited, null_release_date_owned,
-    warnings}.
+    manual_series_flags_cleared, owned_duplicate_identities, warnings}.
 
     `null_release_date_owned` (BUI-412) is a non-blocking data-quality count of
     owned rows (`in_collection` truthy) whose `release_date` is null/empty,
@@ -1133,6 +1499,15 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # BUI-412: owned rows with no release_date, post-import. Non-blocking —
         # a data-quality count only, never used to reject/alter/drop a row.
         "null_release_date_owned": 0,
+        # BUI-547: pending rows whose stale needs_manual_series_canonical flag
+        # was re-checked and cleared because the series resolves now. One-way —
+        # this pass never sets the flag.
+        "manual_series_flags_cleared": 0,
+        # BUI-548: books left owned TWICE post-import — an unreconciled pending
+        # agent_win and a locg_export row claiming the same title. The semantic
+        # duplicate check the sync's row-count arithmetic structurally cannot
+        # make. Reported only; never alters or drops a row.
+        "owned_duplicate_identities": 0,
         "warnings": [],
     }
 
@@ -1298,6 +1673,53 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 "release_date — this silently defeats the year-scoped wish-list "
                 "conflicts audit (BUI-412). Consider backfilling release_date "
                 "on these rows."
+            )
+
+        # ----- Semantic duplicate check: owned twins (BUI-548) -----------------
+        # The sync's row-count arithmetic (ROWS_BEFORE + added -
+        # auto_healed_duplicates) is exact and cannot see this: on 2026-07-27 it
+        # balanced to the row while the import silently created a SECOND owned
+        # row for 28 books. A pending agent_win and a locg_export row that both
+        # claim the same owned book is the failure signature of a reconcile miss
+        # — the win was uploaded, LOCG handed it back, and nothing matched the
+        # two up. Counted, named, and surfaced so the sync can hard-stop on it
+        # rather than report clean. Non-destructive: this only reports.
+        owned_wins: dict[str, list[dict[str, Any]]] = {}
+        owned_exports: dict[str, list[dict[str, Any]]] = {}
+        for row in comics:
+            if not _is_owned(row):
+                continue
+            title = _duplicate_check_title_key(row.get("full_title") or "")
+            if not title:
+                continue
+            target = owned_wins if row.get("source") == "agent_win" else owned_exports
+            target.setdefault(title, []).append(row)
+        # Require date compatibility on the pair, not just a shared title: two
+        # VOLUMES of one masthead spell the same issue identically (an
+        # `X-Men #128` from 2002 and a `The X-Men #128` from 1979 are two books
+        # legitimately owned side by side), and a check that cried duplicate on
+        # those would be trained away within a sync or two. Uses the reconciler's
+        # own predicate, so "the matcher should have caught this" and "this is a
+        # duplicate" stay the same judgment.
+        owned_duplicates = sorted(
+            title
+            for title, wins in owned_wins.items()
+            if any(
+                _release_dates_compatible(win, export)
+                for win in wins
+                for export in owned_exports.get(title, ())
+            )
+        )
+        summary["owned_duplicate_identities"] = len(owned_duplicates)
+        if owned_duplicates:
+            shown = ", ".join(owned_duplicates[:10])
+            more = "" if len(owned_duplicates) <= 10 else f" (+{len(owned_duplicates) - 10} more)"
+            summary["warnings"].append(
+                f"{len(owned_duplicates)} book(s) are now owned TWICE — an "
+                "unreconciled pending win and a LOCG export row both claim the "
+                f"same title (BUI-548): {shown}{more}. The row-count arithmetic "
+                "cannot see this; treat it as a failed reconcile, not a clean "
+                "sync."
             )
 
         # ----- Rebuild series_name_index --------------------------------------
