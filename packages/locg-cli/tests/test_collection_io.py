@@ -3680,6 +3680,80 @@ def test_release_date_drift_merges_instead_of_inserting(tmp_path):
     assert len(cache.load()["comics"]) == 1
 
 
+def test_release_date_drift_merge_reports_behavioral_drift(tmp_path):
+    """A drift merge overwrites LOCG's columns, and those include the
+    user-managed ones. Whichever path a row is matched on, a user-edited
+    `condition`/`notes`/`grading` that LOCG overwrites has to be reported —
+    otherwise the newest match path is the one place hand-entered data can
+    vanish unaudited."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "DC Comics", "series": "Crisis on Infinite Earths (1985 - 1986)",
+         "full_title": "Crisis on Infinite Earths #1", "release_date": "1985-01-03"},
+    ])
+    import_xlsx(first, cache)
+
+    def hand_edit(payload):
+        payload["comics"][0]["notes"] = "signed at con"
+
+    cache.apply(hand_edit, command="hand-edit")
+
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "DC Comics", "series": "Crisis on Infinite Earths (1985 - 1986)",
+         "full_title": "Crisis on Infinite Earths #1", "release_date": "1984-12-11"},
+    ])
+    result = import_xlsx(second, cache)
+
+    assert result["release_date_drift_merged"] == 1
+    assert result["behavioral_drift_count"] == 1, (
+        "the drift path must audit an overwritten user column like every other "
+        "match path"
+    )
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "import-history.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    drift = [r for r in records if r["type"] == "behavioral_drift"]
+    assert len(drift) == 1
+    assert drift[0]["details"]["columns_changed"] == ["notes"]
+
+
+def test_full_title_rename_reports_behavioral_drift(tmp_path):
+    """The same invariant on the rename path, which used to compare user
+    columns AFTER the overwrite had already made them equal — so its
+    `changed` list was always empty and this audit was never written."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    first = tmp_path / "first.xlsx"
+    _build_export_xlsx(first, [
+        {"publisher": "Marvel Comics", "series": "Nova (Vol. 1) (1976 - 1979)",
+         "full_title": "Nova #1", "release_date": "1976-05-01"},
+    ])
+    import_xlsx(first, cache)
+
+    def hand_edit(payload):
+        payload["comics"][0]["notes"] = "reader copy"
+
+    cache.apply(hand_edit, command="hand-edit")
+
+    second = tmp_path / "second.xlsx"
+    _build_export_xlsx(second, [
+        {"publisher": "Marvel Comics", "series": "Nova (Vol. 1) (1976 - 1979)",
+         "full_title": "Nova #1 Facsimile Edition", "release_date": "1976-05-01"},
+    ])
+    result = import_xlsx(second, cache)
+
+    payload = cache.load()
+    assert payload["comics"][0]["previous_full_title"] == "Nova #1", "rename path taken"
+    assert result["behavioral_drift_count"] == 1
+
+
 def test_release_date_drift_beyond_tolerance_stays_a_separate_book(tmp_path):
     """The tolerance is the reconciler's own. Two eras of one title are two
     books, and no amount of title agreement may merge them."""

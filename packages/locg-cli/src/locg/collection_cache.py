@@ -121,10 +121,14 @@ def _utcnow_iso() -> str:
 # regexes may carry any of them (BUI-199 finding 4).
 _DASH_CLASS = r"[-–—−]"
 
-# BUI-554: the series-name decoration's END year only — `(2025 - Present)` and
-# `(2025 - 2026)` both fold to `(2025 - )`, the START year kept verbatim.
-_SERIES_END_YEAR_RE = re.compile(
-    rf"\((\d{{4}})\s*{_DASH_CLASS}\s*(?:\d{{4}}|Present)\)", re.IGNORECASE
+# Year-range extraction for volume resolution: captures the begin year and the
+# end token (a 4-digit year or "Present") from a decorated series name. Lives
+# up here because two distant readers share it — :func:`series_year_range`
+# below reads both groups, and :func:`identity_series_key` rewrites the end
+# token off the front group. One pattern, so a new LOCG range spelling can
+# never teach one reader and miss the other.
+_YEAR_RANGE_CAPTURE_RE = re.compile(
+    rf"\((\d{{4}})\s*{_DASH_CLASS}\s*(\d{{4}}|Present)\)", re.IGNORECASE
 )
 
 
@@ -159,7 +163,7 @@ def identity_series_key(series_name: str) -> str:
     Folding only what the provider rewrites on its own is the whole rule —
     every other difference is still a different series.
     """
-    return _SERIES_END_YEAR_RE.sub(r"(\1 - )", series_name or "").strip()
+    return _YEAR_RANGE_CAPTURE_RE.sub(r"(\1 - )", series_name or "").strip()
 
 
 def make_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -357,13 +361,6 @@ def base_full_title(canonical_series: str, issue_num: Optional[str]) -> str:
 # Open-ended end sentinel — reserved for "(YYYY - Present)" ONLY. A bare single
 # year "(YYYY)" is a one-year range (YYYY, YYYY), not open-ended (finding 2).
 _OPEN_END = 9999
-
-# Year-range extraction for volume resolution: captures the begin year and the
-# end token (a 4-digit year or "Present") from a decorated series name.
-_YEAR_RANGE_CAPTURE_RE = re.compile(
-    rf"\((\d{{4}})\s*{_DASH_CLASS}\s*(\d{{4}}|Present)\)", re.IGNORECASE
-)
-
 
 def series_year_range(decorated: str) -> Optional[tuple[int, int]]:
     """Extract (begin_year, end_year) from a decorated series name, or None.

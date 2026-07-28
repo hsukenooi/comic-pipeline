@@ -445,7 +445,7 @@ Backup:           $BACKUP_PATH  (comics=N, wish_list=M — see Step 1)
 Exported (ready): N rows  (+ M withheld needs-manual-series — see .notes.md)
 Re-import:        added=A  updated=U  reconciled=R  auto_healed_duplicates=H  second_copies_credited=C
                   manual_series_flags_cleared=F  owned_duplicate_identities=D
-                  release_date_drift_merged=M
+                  release_date_drift_merged=X
 Pending:          PENDING_BEFORE → PENDING_AFTER  (cleared ~N)
 Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = added - auto_healed_duplicates, verified two-sided in Step 6)
 Owned twice:      D  (must be 0 — Step 6 hard-stops otherwise)

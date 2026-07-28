@@ -1372,6 +1372,63 @@ def _reconcile_phase(
         })
 
 
+def _apply_export_row(
+    existing: dict[str, Any],
+    xlsx_row: dict[str, Any],
+    now: str,
+    audit_records: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> None:
+    """Apply a matched export row onto its cache row, however it was matched.
+
+    All three of Phase 2's update paths — exact identity, ``full_title`` rename
+    (R67), and release-date drift (BUI-554) — end the same way: copy LOCG's
+    columns across (holding an ownership downgrade, BUI-124), stamp the
+    sighting, and report as ``behavioral_drift`` any user-managed column LOCG
+    just overwrote. They used to spell that out separately, and the copies had
+    already drifted apart in both directions:
+
+    * the rename path compared user columns AFTER the copy, where every one of
+      them necessarily equals the export's — so its ``changed`` list was always
+      empty and the audit record it meant to write was never written;
+    * the date-drift path had no drift check at all, so a hand-edited
+      ``condition`` or ``notes`` could be overwritten with nothing recorded.
+
+    One implementation, so all three paths audit identically and a fourth
+    cannot be added that quietly doesn't.
+    """
+    pre_user_values = {col: existing.get(col) for col in USER_MANAGED_COLUMNS}
+    pre_checksum = _user_column_checksum(existing)
+
+    _apply_locg_columns_held(existing, xlsx_row, now, audit_records, summary)
+    existing["last_seen_in_export_at"] = now
+    existing["source"] = "locg_export"
+    if existing.get("pushed_to_locg_at") is None:
+        existing["pushed_to_locg_at"] = now
+
+    if _user_column_checksum(existing) == pre_checksum:
+        return
+    # Compare each user column's PRE value against what the export carried.
+    # Reading `existing` here instead is what made the rename path's check
+    # vacuous: the copy above has already made them equal by construction.
+    changed = [
+        col for col in USER_MANAGED_COLUMNS
+        if pre_user_values.get(col) != xlsx_row.get(col)
+    ]
+    if not changed:
+        return
+    audit_records.append({
+        "type": "behavioral_drift",
+        "ts": now,
+        "command": "import",
+        "details": {
+            "identity": list(make_identity(existing)),
+            "columns_changed": changed,
+        },
+    })
+    summary["behavioral_drift_count"] += 1
+
+
 def _pick_date_drift_match(
     xlsx_row: dict[str, Any],
     comics: list[dict[str, Any]],
@@ -1503,13 +1560,7 @@ def _standard_merge_phase(
 
     # ----- Pass A: exact identity ------------------------------------------
     for xr, ci in exact_pairs:
-        row_identity = make_identity(xr)
-        # Update existing row
         existing = comics[ci]
-
-        # Capture user-managed values BEFORE overwriting with xlsx data
-        pre_user_values = {col: existing.get(col) for col in USER_MANAGED_COLUMNS}
-        pre_checksum = _user_column_checksum(existing)
 
         # Remove from partial_to_idx so it won't be found as a rename
         # candidate by a later xlsx row with the same partial identity
@@ -1517,30 +1568,7 @@ def _standard_merge_phase(
         if partial_to_idx.get(old_partial) == ci:
             del partial_to_idx[old_partial]
 
-        _apply_locg_columns_held(existing, xr, now, audit_records, summary)
-        existing["last_seen_in_export_at"] = now
-        existing["source"] = "locg_export"
-        if existing.get("pushed_to_locg_at") is None:
-            existing["pushed_to_locg_at"] = now
-
-        post_checksum = _user_column_checksum(existing)
-        if pre_checksum != post_checksum:
-            changed = [
-                col for col in USER_MANAGED_COLUMNS
-                if pre_user_values.get(col) != xr.get(col)
-            ]
-            if changed:
-                audit_records.append({
-                    "type": "behavioral_drift",
-                    "ts": now,
-                    "command": "import",
-                    "details": {
-                        "identity": list(row_identity),
-                        "columns_changed": changed,
-                    },
-                })
-                summary["behavioral_drift_count"] += 1
-
+        _apply_export_row(existing, xr, now, audit_records, summary)
         summary["updated"] += 1
 
     # ----- Pass B: rename, then date drift, then insert ---------------------
@@ -1569,39 +1597,15 @@ def _standard_merge_phase(
                     old_identity = make_identity(existing)
                     existing["previous_full_title"] = old_title
 
-                    pre_checksum = _user_column_checksum(existing)
-                    _apply_locg_columns_held(
-                        existing, xr, now, audit_records, summary
-                    )
-                    existing["last_seen_in_export_at"] = now
-                    existing["source"] = "locg_export"
-                    if existing.get("pushed_to_locg_at") is None:
-                        existing["pushed_to_locg_at"] = now
-                    post_checksum = _user_column_checksum(existing)
+                    _apply_export_row(existing, xr, now, audit_records, summary)
+                    new_identity = make_identity(existing)
 
                     if old_identity in identity_to_idx:
                         del identity_to_idx[old_identity]
-                    identity_to_idx[make_identity(existing)] = ci
+                    identity_to_idx[new_identity] = ci
                     claimed.add(ci)
                     # Consume the partial slot so it won't match again
                     del partial_to_idx[row_partial]
-
-                    if pre_checksum != post_checksum:
-                        changed = [
-                            col for col in USER_MANAGED_COLUMNS
-                            if existing.get(col) != xr.get(col)
-                        ]
-                        if changed:
-                            audit_records.append({
-                                "type": "behavioral_drift",
-                                "ts": now,
-                                "command": "import",
-                                "details": {
-                                    "identity": list(make_identity(existing)),
-                                    "columns_changed": changed,
-                                },
-                            })
-                            summary["behavioral_drift_count"] += 1
 
                     audit_records.append({
                         "type": "renamed_full_title",
@@ -1610,7 +1614,7 @@ def _standard_merge_phase(
                         "details": {
                             "old_title": old_title,
                             "new_title": new_title,
-                            "identity": list(make_identity(existing)),
+                            "identity": list(new_identity),
                         },
                     })
                     summary["updated"] += 1
@@ -1633,11 +1637,8 @@ def _standard_merge_phase(
             old_partial = _partial_identity(existing)
             old_release_date = existing.get("release_date")
 
-            _apply_locg_columns_held(existing, xr, now, audit_records, summary)
-            existing["last_seen_in_export_at"] = now
-            existing["source"] = "locg_export"
-            if existing.get("pushed_to_locg_at") is None:
-                existing["pushed_to_locg_at"] = now
+            _apply_export_row(existing, xr, now, audit_records, summary)
+            new_identity = make_identity(existing)
 
             # Re-key: `release_date` is a LOCG column, so it has just been
             # overwritten and the row no longer lives under `old_identity`.
@@ -1646,7 +1647,7 @@ def _standard_merge_phase(
             # not stay eligible as a rename target.
             if identity_to_idx.get(old_identity) == drift_ci:
                 del identity_to_idx[old_identity]
-            identity_to_idx[make_identity(existing)] = drift_ci
+            identity_to_idx[new_identity] = drift_ci
             if partial_to_idx.get(old_partial) == drift_ci:
                 del partial_to_idx[old_partial]
             claimed.add(drift_ci)
@@ -1661,7 +1662,7 @@ def _standard_merge_phase(
                     "full_title": existing.get("full_title"),
                     "old_release_date": old_release_date,
                     "new_release_date": existing.get("release_date"),
-                    "identity": list(make_identity(existing)),
+                    "identity": list(new_identity),
                 },
             })
             continue
