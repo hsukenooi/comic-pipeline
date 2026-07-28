@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import multiprocessing
 import os
 import stat
@@ -1628,3 +1629,101 @@ def test_bare_year_fold_via_make_identity_merges_the_bui560_duplicate_pair():
         "release_date": "2026-01-07",
     }
     assert make_identity(row_present) == make_identity(row_bare)
+
+
+# ---------------------------------------------------------------------------
+# series_name_index staleness check (BUI-561)
+# ---------------------------------------------------------------------------
+
+def _write_store(cache, *, series_name_index: dict[str, str]) -> None:
+    payload = {
+        "schema_version": 1,
+        "last_full_import": "2024-01-01T00:00:00Z",
+        "last_import_source": "test.xlsx",
+        "migration_in_progress": False,
+        "last_writer": None,
+        "series_name_index": series_name_index,
+        "comics": [],
+    }
+    cache.path.parent.mkdir(parents=True, exist_ok=True)
+    cache.path.write_text(json.dumps(payload))
+
+
+def test_stale_series_name_index_warns_on_load(tmp_path, caplog):
+    """A key built by the pre-BUI-546 normalizer (punctuation kept) no longer
+    matches what _normalize_series_key produces today (punctuation folded),
+    so load() must warn."""
+    cache = make_cache(tmp_path)
+    # Pre-BUI-546 spelling: colon kept, not folded to a space.
+    _write_store(cache, series_name_index={
+        "2001: a space odyssey": "2001: A Space Odyssey (1976)",
+    })
+
+    with caplog.at_level(logging.WARNING, logger="locg"):
+        cache.load()
+
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("series_name_index" in msg and "stale" in msg for msg in warnings)
+    # Actionable: must point at the fix, not just name the problem.
+    assert any("collection import" in msg or "collection-sync" in msg for msg in warnings)
+
+
+def test_fresh_series_name_index_does_not_warn_on_load(tmp_path, caplog):
+    """A key already built by the current normalizer must not trigger the
+    staleness warning."""
+    from locg.collection_cache import _normalize_series_key
+
+    cache = make_cache(tmp_path)
+    series_name = "2001: A Space Odyssey (1976)"
+    _write_store(cache, series_name_index={
+        _normalize_series_key(series_name): series_name,
+    })
+
+    with caplog.at_level(logging.WARNING, logger="locg"):
+        cache.load()
+
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert not any("series_name_index" in msg and "stale" in msg for msg in warnings)
+
+
+@pytest.mark.parametrize("series_name_index", [{}, None])
+def test_empty_or_missing_series_name_index_does_not_crash_or_warn(tmp_path, caplog, series_name_index):
+    """An empty index (never imported, or a fresh import with no locg_export
+    rows) is not a staleness signal — must not warn, and must not raise."""
+    cache = make_cache(tmp_path)
+    payload = {
+        "schema_version": 1,
+        "last_full_import": None,
+        "last_import_source": None,
+        "migration_in_progress": False,
+        "last_writer": None,
+        "comics": [],
+    }
+    if series_name_index is not None:
+        payload["series_name_index"] = series_name_index
+    cache.path.parent.mkdir(parents=True, exist_ok=True)
+    cache.path.write_text(json.dumps(payload))
+
+    with caplog.at_level(logging.WARNING, logger="locg"):
+        loaded = cache.load()  # must not raise
+
+    assert loaded["comics"] == []
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert not any("series_name_index" in msg for msg in warnings)
+
+
+def test_stale_series_name_index_warning_never_becomes_an_exception(tmp_path, caplog):
+    """A large, entirely-stale index (mirroring the live 277/307 drift) plus a
+    malformed entry thrown in must still only warn — never raise — proving
+    the check degrades to a log line under real and adversarial input alike."""
+    cache = make_cache(tmp_path)
+    stale_index = {f"stale key {i}": f"Stale: Series {i} (199{i % 10})" for i in range(50)}
+    stale_index["malformed"] = 12345  # type: ignore[dict-item]  # non-string value
+    _write_store(cache, series_name_index=stale_index)
+
+    with caplog.at_level(logging.WARNING, logger="locg"):
+        loaded = cache.load()  # must not raise
+
+    assert loaded["series_name_index"] == stale_index
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("stale" in msg for msg in warnings)
