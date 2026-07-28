@@ -33,7 +33,7 @@ On a proxy-auction *win*, `winning_bid` is the underbidder's max — but the set
 
 **2. Do NOT exempt first-party comps from IQR trimming — that is the deliberate seam between inline pricing and the calibration report (KTD-4).**
 
-A lone loss far above the comp pool is, from one data point, indistinguishable from a two-bidder war. Let the inline IQR trim bound it (so a single outlier can't spike a bid cap), and let the **calibration report** surface the *systematic* case across many auctions. The calibration report keys on **overshoot vs `fmv_high`** (`median(winning_bid / fmv_high)` over losses), **never raw win/loss rate** — losing is the *intended* outcome of the 80% haircut, so a high loss count is not a mispricing signal. Ranking on loss rate would chase FMV upward until you overpay, defeating the haircut.
+A lone loss far above the comp pool is, from one data point, indistinguishable from a two-bidder war. Let the inline IQR trim bound it (so a single outlier can't spike a bid cap), and let the **calibration report** surface the *systematic* case across many auctions. The calibration report's **headline** signal is confirmed **win-based exceedance** — `contested_win_margin` (`median(winning_bid / fmv_high)` over WINS), exact and uncensored, admits a row on its own regardless of loss count, including zero losses (BUI-532/BUI-543). Loss-based **overshoot** (`median(winning_bid / fmv_high)` over losses) is kept as a labeled, censored secondary signal. **Never raw win/loss rate, in either path** — losing is the *intended* outcome of the 80% haircut, so a high loss count is not a mispricing signal, and a low win margin is not a "safer" counter-signal either. Ranking on loss (or win) *rate* would chase FMV upward until you overpay, defeating the haircut; ranking on win-based *exceedance* does not have that failure mode, which is why BUI-543 draws that line precisely (see the R4 discussion in `.claude/commands/comic/calibration-report.md`).
 
 **3. Keep pure valuation math clock-free so its golden tests stay deterministic.**
 
@@ -70,7 +70,7 @@ def weighted_median(prices, weights):
     return weighted_quartile(prices, weights, 0.5)
 ```
 
-Calibration ranks on overshoot, gated on a minimum loss count so a single blowout is not "persistent" (note: at the default `min_losses=2`, `median` of two values is their mean, so the gate reduces but does not eliminate single-outlier influence — the human weighs `loss_count`, not `overshoot` alone).
+Calibration headlines on win-based `contested_win_margin > 1` (admits regardless of loss count) and keeps loss-based `overshoot` as the secondary, gated on a minimum loss count so a single blowout is not "persistent" (note: at the default `min_losses=2`, `median` of two values is their mean, so the gate reduces but does not eliminate single-outlier influence — the human weighs `loss_count`, not `overshoot` alone). `min_losses` governs only that secondary loss-based signal, never whether a row appears at all (BUI-543).
 
 ## Related
 

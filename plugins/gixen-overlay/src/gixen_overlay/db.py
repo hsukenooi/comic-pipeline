@@ -1362,24 +1362,53 @@ def calibration_report(
     days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
     min_losses: int = DEFAULT_CALIBRATION_MIN_LOSSES,
 ) -> list[dict[str, Any]]:
-    """DIAGNOSTIC-ONLY audit: rank priced (comic, grade) books whose LOSSES are
-    clearing above `fmv.high` — the honest "learn from losing" loop (Issue C
-    in the auction-outcome-feedback plan). Issues **zero writes** — this
-    function contains no INSERT/UPDATE/upsert of any kind, only a single
-    SELECT plus in-memory aggregation; it never touches the `fmv` table.
+    """DIAGNOSTIC-ONLY audit: rank priced (comic, grade) books with evidence
+    that `fmv.high` is set too low — the honest "learn from outcomes, without
+    learning the wrong lesson" loop (Issue C in the auction-outcome-feedback
+    plan; rebased BUI-532/BUI-543). Issues **zero writes** — this function
+    contains no INSERT/UPDATE/upsert of any kind, only a single SELECT plus
+    in-memory aggregation; it never touches the `fmv` table.
 
-    **The ranking key is OVERSHOOT vs `fmv.high`, never raw win/loss rate.**
-    Losing is the *intended* outcome of the 80% (or 60%, on low confidence)
-    bid haircut — you are designed to lose most auctions by bargain-hunting
-    below fair value, so a high loss *count* or *rate* is not a mispricing
-    signal. A book that loses every auction it enters is working exactly as
-    designed as long as those losses clear at or below `fmv.high`. The only
-    sound signal is where the losing hammer price lands *relative to*
-    `fmv.high`: persistently clearing above it means `fmv.high` itself is set
-    too low. **Do not "also surface high loss-rate books" or add a win-rate
-    metric here** — that reintroduces the deflation/mispricing trap this
-    report exists to avoid (R4 in the plan; see the Problem Frame in
-    docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md).
+    **Two independent admit paths; either one surfaces a row (BUI-543):**
+
+    1. **Win-based exceedance — the headline.** `contested_win_margin`
+       (`median(winning_bid / fmv_high)` over WINS) is exact, uncensored
+       evidence: a WON row's `winning_bid` is the literal price paid, no
+       estimation or floor involved. `contested_win_margin > 1` admits a row
+       **on its own, regardless of loss history — including a book with zero
+       losses.** Before BUI-543, `contested_win_margin` was computed but
+       never consulted for admission, so a book with strong confirmed
+       win-based exceedance and fewer than `min_losses` losses (including
+       none at all) never surfaced here no matter how strong its win
+       evidence — that gap is what BUI-543 closes.
+    2. **Loss-based overshoot — the labeled secondary, unchanged from
+       pre-BUI-543.** See the `min_losses`/`overshoot` gates below.
+
+    **`min_losses` governs only the loss-based signal — never a row's
+    existence.** A row with a qualifying win margin surfaces however many
+    losses it has, from zero up; the loss-based path still independently
+    requires >= `min_losses` losses before *its own* signal counts. Raising
+    or lowering `min_losses` only ever tightens or loosens the loss-based
+    gate — it can never suppress a row a qualifying win margin already
+    admitted, and it can never admit a row on loss count/rate alone.
+
+    **The ranking key for the loss-based path is OVERSHOOT vs `fmv.high`,
+    never raw win/loss rate.** Losing is the *intended* outcome of the 80%
+    (or 60%, on low confidence) bid haircut — you are designed to lose most
+    auctions by bargain-hunting below fair value, so a high loss *count* or
+    *rate* is not a mispricing signal. A book that loses every auction it
+    enters is working exactly as designed as long as those losses clear at or
+    below `fmv.high`. The only sound loss-based signal is where the losing
+    hammer price lands *relative to* `fmv.high`: persistently clearing above
+    it means `fmv.high` itself is set too low. **Do not "also surface high
+    loss-rate books" or add a win/loss RATE metric here** — that reintroduces
+    the deflation/mispricing trap this report exists to avoid (R4 in the
+    plan; see the Problem Frame in
+    docs/plans/2026-07-04-001-feat-fmv-auction-outcome-feedback-plan.md). R4
+    is about win/loss *rate*; it has never governed win-based *exceedance*
+    (a `> 1` margin on an exact, uncensored price) — BUI-543 admits on the
+    latter and still never ranks, filters, or promotes any row on a *low*
+    margin, a loss count, or a loss rate.
 
     Reuses the exact same "a resolved auction" predicate as
     `get_first_party_outcomes` — `_OUTCOME_STATUSES_SQL`, `_PRIMARY_LINK_CLAUSE`,
@@ -1397,43 +1426,66 @@ def calibration_report(
     price against, so it is excluded rather than dividing by zero/NULL.
 
     A (comic, grade) with **fewer than `min_losses` losses** (default
-    `DEFAULT_CALIBRATION_MIN_LOSSES` = 2) in-window is omitted entirely. A
-    single loss — however far above `fmv_high` it cleared — is indistinguishable
-    from a one-off bidding war; the report's "persistent" framing requires at
-    least `min_losses` independent losses before the overshoot is trusted as a
-    pattern rather than an outlier. (Losing at all is required to compute
-    overshoot in the first place; a book that has only won, or has no resolved
-    auctions at all, has no calibration signal to report.)
+    `DEFAULT_CALIBRATION_MIN_LOSSES` = 2) in-window does not get a loss-based
+    admit. A single loss — however far above `fmv_high` it cleared — is
+    indistinguishable from a one-off bidding war; the loss-based signal's
+    "persistent" framing requires at least `min_losses` independent losses
+    before the overshoot is trusted as a pattern rather than an outlier. A
+    row like this can still surface via the win-based path above — the
+    min_losses gate no longer decides whether the row exists at all (BUI-543).
 
     A (comic, grade) whose losses' median `winning_bid / fmv_high` is `<= 1`
-    is **also** omitted — those losses cleared at or below `fmv_high`, which
-    is the haircut doing its job, however many losses there are (R4: never
-    surface on loss *count*). The gate drops a row when the MEDIAN loss ratio
-    is `<= 1`. For n >= 3 the median is outlier-robust — a single high-ratio
-    loss (a bidding war) does not by itself drag it above 1 (e.g. ratios
-    `[0.5, 0.6, 5.0]` have median `0.6`, dropped, even though one ratio is
-    `5.0`; note this is NOT the same as every individual ratio being `<= 1`).
-    CAVEAT at the default `min_losses = 2`: median([a, b]) == (a + b) / 2, the
-    mean — so a single blowout is only half-tempered. A pair like `[1.02, 8.0]`
-    has median `4.51` and WILL surface at overshoot 4.51. The min_losses gate
-    suppresses lone single-loss noise but is NOT fully outlier-robust at n = 2;
-    the human reading the ranked list should weigh `loss_count` and the loss
+    does not get a loss-based admit either — those losses cleared at or below
+    `fmv_high`, which is the haircut doing its job, however many losses there
+    are (R4: never surface on loss *count*). The gate drops the loss-based
+    signal when the MEDIAN loss ratio is `<= 1`. For n >= 3 the median is
+    outlier-robust — a single high-ratio loss (a bidding war) does not by
+    itself drag it above 1 (e.g. ratios `[0.5, 0.6, 5.0]` have median `0.6`,
+    not admitted, even though one ratio is `5.0`; note this is NOT the same
+    as every individual ratio being `<= 1`). CAVEAT at the default
+    `min_losses = 2`: median([a, b]) == (a + b) / 2, the mean — so a single
+    blowout is only half-tempered. A pair like `[1.02, 8.0]` has median
+    `4.51` and WILL admit at overshoot 4.51. The min_losses gate suppresses
+    lone single-loss noise but is NOT fully outlier-robust at n = 2; the
+    human reading the ranked list should weigh `loss_count` and the loss
     spread, not `overshoot` alone. The gate is written against the median
     `overshoot`, not the rate, on purpose — so a future change to the rate
     metric can't accidentally start surfacing sub-1 medians again.
 
-    Returns one dict per (comic, grade) that clears the overshoot gate above,
+    A (comic, grade) with **no wins and no losses in-window at all** has no
+    calibration signal of any kind and is always omitted, regardless of
+    `min_losses`.
+
+    Returns one dict per (comic, grade) that clears either admit path above,
     each with:
       - `comic_id`, `title`, `issue`, `year`, `grade`, `fmv_high`
       - `loss_count`, `above_fmv_loss_count`, `above_fmv_loss_rate` (0-100,
-        the % of losses where `winning_bid > fmv_high`)
-      - `overshoot` — `median(winning_bid / fmv_high)` over losses. The
-        ranking key; sorted descending (highest overshoot first — the ranked
-        re-price list).
+        the % of losses where `winning_bid > fmv_high`; `above_fmv_loss_rate`
+        is `None` when `loss_count` is 0)
+      - `overshoot` — `median(winning_bid / fmv_high)` over losses, or `None`
+        when there are no losses. A **censored, confounded upper bound** (see
+        the `/comic:calibration-report` skill doc's "why it changed
+        (BUI-532)" section) — reported as context on every row, and the
+        ranking key only for rows whose `loss_backed` is `True`.
       - `win_count`, `contested_win_margin` — `median(winning_bid / fmv_high)`
-        over wins, or `None` if there were no wins. **Context only** (winning
-        far below `fmv_high` means a bargain, not a mispriced book) — never
-        used for ranking.
+        over wins, or `None` if there were no wins. Exact and uncensored —
+        reported as context on every row, and the ranking key (and headline
+        admit signal) for rows whose `win_backed` is `True`.
+      - `win_backed` (bool) — `True` iff `contested_win_margin` is non-null
+        and `> 1`: this row cleared the win-based admit gate by itself.
+      - `loss_backed` (bool) — `True` iff `loss_count >= min_losses` and
+        `overshoot` is non-null and `> 1`: this row independently clears the
+        (unchanged) loss-based admit gate. At least one of `win_backed` /
+        `loss_backed` is always `True` for a returned row; both can be `True`
+        at once. These two booleans make a row self-describing on the
+        payload alone — a caller never has to know the `min_losses` it
+        requested to tell a win-backed row from a loss-backed one.
+
+    Sorted with `win_backed` rows first (the headline — exact, uncensored
+    evidence), each tier then ordered by its own metric descending
+    (`contested_win_margin` within the win-backed tier, `overshoot` within
+    the loss-only tier). A win-backed row always outranks a loss-only row,
+    regardless of either metric's magnitude.
     """
     rows = conn.execute(
         f"""
@@ -1490,35 +1542,57 @@ def calibration_report(
     for group in groups.values():
         losses = group.pop("_losses")
         wins = group.pop("_wins")
-        if not losses:
-            continue  # no loss ⇒ no overshoot signal ⇒ nothing to report (R4)
-        if len(losses) < min_losses:
-            # FIX 3 (adversarial review): a single loss makes one bidding-war
-            # outlier rank #1, contradicting this report's "persistent"
-            # framing — require at least `min_losses` independent losses
-            # before an overshoot is trusted as a pattern, not noise.
-            continue
-        overshoot = median(losses)
-        if overshoot <= 1:
-            # R4 guard: losses clearing at/below fmv_high are the haircut
-            # working as designed, however many of them there are — do NOT
-            # surface the book just because it has a high loss count. The
-            # gate is written against the MEDIAN overshoot, not the rate —
-            # note that does NOT mean every individual ratio here is <= 1
-            # (see the docstring for the [0.5, 0.6, 5.0] counter-example) —
-            # gating on the median is what keeps this immune to a future
-            # "add win/loss rate" edit.
-            continue
-        above_fmv_loss_count = sum(1 for ratio in losses if ratio > 1)
-        group["loss_count"] = len(losses)
+
+        loss_count = len(losses)
+        overshoot = median(losses) if losses else None
+        above_fmv_loss_count = sum(1 for ratio in losses if ratio > 1) if losses else 0
+        above_fmv_loss_rate = (
+            above_fmv_loss_count / loss_count * 100 if loss_count else None
+        )
+
+        win_count = len(wins)
+        contested_win_margin = median(wins) if wins else None
+
+        # BUI-543: two independent admit paths — either one surfaces the row.
+        # Win-based: contested_win_margin is exact, uncensored evidence (a
+        # WON row's winning_bid is the literal price paid) — admits on its
+        # own, regardless of loss history, including a book with zero losses.
+        win_backed = contested_win_margin is not None and contested_win_margin > 1
+        # Loss-based: unchanged pre-BUI-543 gate (FIX 3 + R4) — requires
+        # >= min_losses qualifying losses AND a median overshoot > 1.
+        # min_losses governs ONLY this loss-based signal, never whether the
+        # row exists at all — that governance leak onto row existence was
+        # the BUI-543 bug (a zero-loss win-backed book never surfaced).
+        loss_backed = (
+            loss_count >= min_losses and overshoot is not None and overshoot > 1
+        )
+        if not (win_backed or loss_backed):
+            continue  # neither admit signal clears its bar (R4)
+
+        group["loss_count"] = loss_count
         group["above_fmv_loss_count"] = above_fmv_loss_count
-        group["above_fmv_loss_rate"] = above_fmv_loss_count / len(losses) * 100
+        group["above_fmv_loss_rate"] = above_fmv_loss_rate
         group["overshoot"] = overshoot
-        group["win_count"] = len(wins)
-        group["contested_win_margin"] = median(wins) if wins else None
+        group["win_count"] = win_count
+        group["contested_win_margin"] = contested_win_margin
+        group["win_backed"] = win_backed
+        group["loss_backed"] = loss_backed
         report.append(group)
 
-    report.sort(key=lambda g: g["overshoot"], reverse=True)
+    # BUI-543: win-backed rows headline (exact, uncensored evidence) — a
+    # loss-only row never outranks one, however large its overshoot. Within
+    # each tier, sort by that tier's own metric descending. Both branches of
+    # the ternary are guaranteed non-None for the rows that reach them (a
+    # win_backed row always has a numeric contested_win_margin; a row that
+    # falls to the `else` is only here because loss_backed admitted it, which
+    # requires a numeric overshoot).
+    report.sort(
+        key=lambda g: (
+            g["win_backed"],
+            g["contested_win_margin"] if g["win_backed"] else g["overshoot"],
+        ),
+        reverse=True,
+    )
     return report
 
 

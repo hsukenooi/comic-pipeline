@@ -1962,8 +1962,11 @@ def test_calibration_excludes_null_price_tombstone_and_unpriced_fmv(api):
 
 
 def test_calibration_win_context_not_ranked_and_win_only_book_excluded(api):
-    """A book won well below fmv_high is not reported as mispriced (no loss
-    -> no overshoot signal), and contested_win_margin is context only."""
+    """A book won well below fmv_high is not admitted (its win margin is
+    <= 1, so `win_backed` is False; BUI-543 only admits a zero-loss book when
+    the margin exceeds 1), and once losses arrive `contested_win_margin`
+    remains context only — it never affects the loss-based `overshoot`
+    ranking value."""
     db_path = os.environ["DB_PATH"]
     _, win_only_fmv = _create_comic_and_fmv(
         api, title="Batman", issue="1", year=1940, grade=9.0, fmv_high=500.0,
@@ -1990,6 +1993,123 @@ def test_calibration_win_context_not_ranked_and_win_only_book_excluded(api):
     assert row["overshoot"] == statistics.median([600.0 / 500.0, 650.0 / 500.0])
     assert row["win_count"] == 1
     assert row["contested_win_margin"] == 200.0 / 500.0
+    assert row["win_backed"] is False
+    assert row["loss_backed"] is True
+
+
+def test_calibration_zero_loss_high_win_margin_surfaces(api):
+    """BUI-543: the actual gap this ticket fixes — a book with ZERO losses
+    but a confirmed win-based exceedance (contested_win_margin > 1) must
+    surface, even though it never clears the loss-based min_losses gate."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Giant-Size X-Men", issue="1", year=1975, grade=9.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400080", fmv_id,
+                       status="WON", winning_bid=150.0)  # margin 1.5, no losses
+
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 1
+    row = report[0]
+    assert row["win_count"] == 1
+    assert row["contested_win_margin"] == 1.5
+    assert row["loss_count"] == 0
+    assert row["overshoot"] is None
+    assert row["above_fmv_loss_count"] == 0
+    assert row["above_fmv_loss_rate"] is None
+    assert row["win_backed"] is True
+    assert row["loss_backed"] is False
+
+
+def test_calibration_zero_loss_low_win_margin_does_not_surface(api):
+    """BUI-543: zero-loss admission requires the win margin to actually
+    exceed 1 — a below-fmv_high win with no losses is still a bargain, not
+    evidence of underpricing, and must not surface (mirrors the R4 guard on
+    the loss side: existence, not just a win, is not the signal)."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Giant-Size X-Men", issue="2", year=1975, grade=9.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400081", fmv_id,
+                       status="WON", winning_bid=60.0)  # margin 0.6, no losses
+
+    report = api.get("/api/comics/calibration").json()
+    assert report == []
+
+
+def test_calibration_win_backed_outranks_loss_backed_regardless_of_magnitude(api):
+    """BUI-543: win-backed rows headline unconditionally — a win-backed row
+    with a modest margin must still outrank a loss-only row with a much
+    bigger overshoot, since the win-based signal is exact/uncensored and the
+    loss-based one is a censored, confounded upper bound."""
+    db_path = os.environ["DB_PATH"]
+    _, win_backed_fmv = _create_comic_and_fmv(
+        api, title="Fantastic Four", issue="1", year=1961, grade=8.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400082", win_backed_fmv,
+                       status="WON", winning_bid=110.0)  # margin 1.1, zero losses
+
+    _, loss_backed_fmv = _create_comic_and_fmv(
+        api, title="Uncanny X-Men", issue="142", year=1980, grade=9.0,
+        fmv_high=100.0,
+    )
+    for i, price in enumerate((400.0, 450.0)):  # overshoot ~4.25, far bigger
+        _add_resolved_bid(api, db_path, f"40008{3 + i}", loss_backed_fmv,
+                           status="LOST", winning_bid=price)
+
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 2
+    assert report[0]["title"] == "Fantastic Four"
+    assert report[0]["win_backed"] is True
+    assert report[1]["title"] == "Uncanny X-Men"
+    assert report[1]["loss_backed"] is True
+
+
+def test_calibration_both_win_backed_and_loss_backed_true_when_both_qualify(api):
+    """BUI-543: a row can independently clear both admit gates at once — both
+    booleans reflect that rather than one suppressing the other."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Detective Comics", issue="27", year=1939, grade=6.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400090", fmv_id,
+                       status="WON", winning_bid=150.0)  # margin 1.5
+    _add_resolved_bid(api, db_path, "400091", fmv_id,
+                       status="LOST", winning_bid=120.0)
+    _add_resolved_bid(api, db_path, "400092", fmv_id,
+                       status="LOST", winning_bid=130.0)
+
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 1
+    assert report[0]["win_backed"] is True
+    assert report[0]["loss_backed"] is True
+
+
+def test_calibration_win_backed_with_subthreshold_loss_shows_context(api):
+    """BUI-543 covers not just zero losses but any count below min_losses —
+    a single (subthreshold) loss must still surface as context alongside a
+    qualifying win margin, without itself flipping loss_backed to True."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Detective Comics", issue="27", year=1939, grade=6.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "400095", fmv_id,
+                       status="WON", winning_bid=150.0)  # margin 1.5
+    _add_resolved_bid(api, db_path, "400096", fmv_id,
+                       status="LOST", winning_bid=110.0)  # 1 loss, below min_losses=2
+
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 1
+    row = report[0]
+    assert row["win_backed"] is True
+    assert row["loss_backed"] is False
+    assert row["loss_count"] == 1
+    assert row["overshoot"] == 110.0 / 100.0  # shown as context only
 
 
 def test_calibration_single_loss_below_min_losses_does_not_surface(api):
