@@ -129,7 +129,26 @@ HOME_URL = f"{GIXEN_BASE}/home_2.php"
 # ---------------------------------------------------------------------------
 
 class GixenError(Exception):
-    """Base exception for Gixen client errors."""
+    """Base exception for Gixen client errors.
+
+    BUI-558: redacts any live Gixen ``sessionid`` out of the message at the
+    source. The session id rides in the request URL (``_home_url``), so it
+    can land in any subclass's message that embeds a URL or a wrapped
+    lower-level exception — today that's ``GixenConnectionError`` via
+    ``_connection_error``, but nothing stops a future subclass from doing the
+    same. Redacting here, once, means every current and future ``str(e)``
+    sink — an HTTP 503 ``detail``, a ``logger.warning("%s", e)`` call — is
+    safe by construction; no call site has to remember to apply the regex
+    itself. Mirrors the redaction ``gixen_client._response_snippet`` already
+    applies to logged response bodies.
+
+    Overriding only ``__str__`` (not ``args``/``repr``) keeps exception
+    chaining, pickling, and ``repr()`` untouched — this changes what the
+    message renders as, not what the exception carries.
+    """
+
+    def __str__(self) -> str:
+        return re.sub(r"sessionid=\d+", "sessionid=REDACTED", super().__str__())
 
 
 class GixenLoginError(GixenError):

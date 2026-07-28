@@ -158,6 +158,26 @@ def test_add_bid_gixen_error_returns_503(api):
     assert r.status_code == 503
 
 
+def test_add_bid_connection_error_redacts_sessionid_in_503_detail(api):
+    """BUI-558: GixenConnectionError embeds the request URL, which carries a
+    live ?sessionid=<id>. That message becomes the 503 `detail` sent back
+    over HTTP, so a real session id must never appear in it — the redaction
+    now lives in GixenError.__str__ (gixen_client.py) rather than at this
+    call site (server/main.py's `except GixenError as e: ... detail=str(e)`),
+    so this exercises the sink end-to-end rather than the exception in
+    isolation."""
+    from gixen_client import GixenConnectionError
+    api.mock_gixen.add_snipe.side_effect = GixenConnectionError(
+        "Could not reach Gixen at https://www.gixen.com/main/home_2.php"
+        "?sessionid=127104536873641522: connection refused."
+    )
+    r = api.post("/api/bids", json={"item_id": "111222333", "max_bid": 50.0})
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert "127104536873641522" not in detail
+    assert "sessionid=REDACTED" in detail
+
+
 # --- BUI-67: add-endpoint upsert ----------------------------------------------
 
 def test_add_bid_new_item_created_true(api):

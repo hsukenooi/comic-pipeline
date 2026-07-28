@@ -1862,11 +1862,14 @@ async def _reconcile_after_unconfirmed_modify(
     _sync_gixen's per-cycle mirror is the durable backstop.
     """
     # GixenConnectionError embeds the request URL, which carries a live
-    # ?sessionid=<id>. This detail goes back over HTTP to the caller, so strip
-    # it — same redaction gixen_client._response_snippet applies to bodies.
-    # (Other 503 sites in this file still pass a raw str(e); see BUI-555's
-    # out-of-scope note.)
-    exc_text = re.sub(r"sessionid=\d+", "sessionid=REDACTED", str(exc))
+    # ?sessionid=<id>. This detail goes back over HTTP to the caller. BUI-555
+    # redacted it here with a local regex; BUI-558 moved the redaction into
+    # GixenError.__str__ itself, so str(exc) is already safe for every
+    # GixenError subclass — this site no longer needs its own copy. (`exc`
+    # can also be requests.HTTPError per the caller's except clause, but this
+    # client's curl-based transport never embeds the URL in that exception's
+    # message, so there is nothing left to strip.)
+    exc_text = str(exc)
     logger.warning(
         "api_edit_bid: modify for item=%s (requested max_bid=%s) did not confirm "
         "(%s) — the POST MAY HAVE APPLIED on Gixen; re-reading to reconcile",
