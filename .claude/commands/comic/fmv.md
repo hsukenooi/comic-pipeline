@@ -13,7 +13,7 @@ The full math spec — grade parsing, pool-building/widening, IQR trim, grade-cu
 
 **Default path: `comic-fmv`.** It handles fetch (via `ebay-sold-comps`), cache, dedup, hard-excludes, grade parsing, IQR + quartiles, confidence rubric, self-exclusion, and DB upsert.
 
-Before running, ensure `SERPAPI_KEY` is set — source the canonical env file if not:
+Before running, ensure `SOLD_COMPS_KEY` and `SERPAPI_KEY` are set (BUI-545: sold-comps.com is the default primary provider, SerpApi the fallback tier) — source the canonical env file if not:
 
 ```bash
 set -a && source ~/Projects/comic-pipeline/apps/ebay/.env && set +a
@@ -64,7 +64,7 @@ When you do need a pool field, **project it in one shot — never Read the whole
 python3 -c "import json; print([(x['input']['item_id'], (x.get('fmv') or {}).get('trimmed_pool'), x['queries_used']) for x in json.load(open('<results.json>'))])"
 ```
 
-**`fetch-err` ≠ `n/a` (BUI-143):** a row whose FMV column reads `fetch-err` (and the loud post-table warning) means the **SerpApi fetch failed** for that book — quota exhausted or an outage — **not** that the book has no comps. Treat a `fetch-err` row (or a whole batch that comes back all `fetch-err`/`n/a`) as a SerpApi failure: check the `SERPAPI_KEY`/quota and re-run. Never tell the user these books are illiquid or bid on them as if priced.
+**`fetch-err` ≠ `n/a` (BUI-143):** a row whose FMV column reads `fetch-err` (and the loud post-table warning) means the **sold-comps fetch failed** for that book — since BUI-545 that means **both providers** (sold-comps.com primary AND the SerpApi fallback) errored — **not** that the book has no comps. Treat a `fetch-err` row (or a whole batch that comes back all `fetch-err`/`n/a`) as a provider failure: check `SOLD_COMPS_KEY`/quota first (free tier is 100 req/mo), then SerpApi, and re-run. Never tell the user these books are illiquid or bid on them as if priced.
 
 ## Reading the output table
 
