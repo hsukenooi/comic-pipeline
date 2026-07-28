@@ -53,6 +53,13 @@ Two or more Collection entries that are the same book held once — distinct fro
 
 A count of these is only meaningful while entries of both sources are present. The check compares a [[Win-Sourced Entry]] against an [[Import-Sourced Entry]], so once a [[Collection Sync]] has converted every win-sourced entry it can no longer form a pair — and a reported zero then means "none findable" rather than "none present."
 
+Two entries differing only by publisher are **not** a duplicate by default — see [[Licensed Edition]].
+
+### Licensed Edition
+A foreign-market publication of a book already published domestically, carrying the same series and title but its own publisher and its own, later release date. It is a genuinely different edition, not a relabelling of the domestic one — which makes it the standing counterexample to reading a publisher difference as provider drift.
+
+The release-date gap is the discriminator and it is substantial and systematic: the foreign edition trails by months, consistently in one direction across a publisher's whole run. So a tolerant check that pairs entries by requiring an *identical* release date can never see these at all, and one that tolerates the gap risks merging two books that are legitimately held separately. When a licensed edition appears in the Collection unbidden, the cause is normally [[Record-Win]] resolving a win onto it instead of the domestic edition; such an entry carries the purchase fingerprint (a price and purchase date) that a genuinely-foreign holding lacks. Because the provider holds the ownership and re-emits it, deleting such an entry locally does not stick — and clearing it deliberately runs through the ownership-flag path that a [[Collection Sync]] reads as a removal instruction.
+
 ### Copy Count
 How many copies of an issue the Collection holds — **a count, not an ownership flag**. *Known in code as:* `in_collection`, where `0` means tracked-but-not-owned, `1` is the common case, and `2+` is a genuine duplicate (a second copy, or a condition upgrade held alongside the original). Treating it as a boolean is a recurring trap in both directions: reading it as truthy makes a text-formatted `"0"` from a LOCG export mean *owned* (`bool("0")` is `True`, BUI-469), while writing it as a flag silently discards a second copy when two entries are merged (BUI-470). Any read must coerce to `int` and compare, and any merge of two genuinely distinct copies must **increment** the survivor rather than drop the loser.
 
