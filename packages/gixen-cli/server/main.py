@@ -220,6 +220,30 @@ _sync_client: GixenClient | None = None
 SYNC_INTERVAL = int(os.getenv("GIXEN_SYNC_INTERVAL", "600"))  # 10 min default
 _SYNC_BACKOFF_MAX = 3600  # cap exponential backoff at 1 hour
 
+# BUI-562: how long to wait after the FIRST failure. The backoff was always
+# exponential, but its base was SYNC_INTERVAL, so the exponent effectively
+# started at 1 and the very first failure cost 2x the interval — 1200s. The
+# loop could never back off shorter than 20 minutes, even for a blip that
+# cleared in seconds. Since BUI-555 this loop is the self-healing mechanism for
+# bids.max_bid (what _sniper_loop fires real money from), so those 20 minutes
+# are a window where a stale max_bid goes uncorrected.
+#
+# Measured on ~/.comics-server/server.error.log (1418 sync attempts over 30d):
+# Gixen is a FLAPPING HOST, not a rate limiter. Conditioned on the previous
+# attempt succeeding, failure rate does not rise as our gap shrinks — it is
+# LOWEST (4.7%, n=149) at 30-60s spacing and HIGHEST (54%, n=39) after gaps
+# over an hour. And a retry within 30s of a failure recovered 100% of the time
+# (12/12, excluding the 2026-07-24 curl-28 timeout storm), where waiting the
+# current 1200s recovered only 50%. Retrying sooner is not punished.
+_SYNC_BACKOFF_FIRST = 30
+
+# The unexpected-exception class keeps the OLD schedule (1200s, 2400s, 3600s).
+# The evidence above is about Gixen connectivity only; an unexpected exception
+# is a bug on our side, with no reason to believe it clears in 30 seconds, and
+# retrying one fast just spins on a full traceback. SYNC_INTERVAL * 2 as the
+# first delay reproduces the pre-BUI-562 SYNC_INTERVAL * 2**n exactly.
+_SYNC_BACKOFF_FIRST_UNEXPECTED = SYNC_INTERVAL * 2
+
 
 def _get_db() -> sqlite3.Connection:
     assert _db is not None, "DB not initialized"
@@ -1035,12 +1059,34 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     return snipes
 
 
+def _sync_backoff_delay(consecutive_failures: int, *, first_delay: int) -> int:
+    """Seconds to sleep before the next sync attempt (BUI-562).
+
+    Zero failures is the healthy cadence, SYNC_INTERVAL — never the short
+    retry base, so a working loop can't spin hot. From the first failure on,
+    the delay is `first_delay` doubling per additional consecutive failure,
+    capped at _SYNC_BACKOFF_MAX. The exponent is `consecutive_failures - 1`,
+    so `first_delay` is literally the delay after the first failure and not
+    twice it — that off-by-one is the whole bug this fixes.
+    """
+    if consecutive_failures <= 0:
+        return SYNC_INTERVAL
+    # Clamp the exponent: consecutive_failures is unbounded (it has reached
+    # 177 historically) and nothing above the cap can change the result.
+    exponent = min(consecutive_failures - 1, 32)
+    return min(first_delay * (2 ** exponent), _SYNC_BACKOFF_MAX)
+
+
 # Background sync loop — primarily for the local sniper, which needs fresh
 # auction_end_at to fire bids at the right time. The dashboard does its own
 # pull-on-visit (_ensure_fresh_sync) and doesn't depend on this loop, but the
 # loop keeps state fresh enough that the sniper can act when nobody's looking.
 async def _sync_loop() -> None:
     consecutive_failures = 0
+    last_error: Exception | None = None
+    # Always reassigned by whichever except handler ran before it is read;
+    # initialized so the schedule has a defined base regardless.
+    first_delay = _SYNC_BACKOFF_FIRST
     while True:
         try:
             if _sync_client is not None:
@@ -1058,6 +1104,8 @@ async def _sync_loop() -> None:
             # don't also dump a full traceback here on every retry.
             consecutive_failures += 1
             last_error = e
+            # BUI-562: Gixen flaps; probe again in seconds, not 20 minutes.
+            first_delay = _SYNC_BACKOFF_FIRST
         except Exception as e:
             # BUI-410 (Stage 3 landed): the BUI-391 `_db.rollback()` that used
             # to live here is retired. _sync_gixen no longer batches DML on the
@@ -1071,9 +1119,13 @@ async def _sync_loop() -> None:
             logger.exception("_sync_loop: unexpected error, continuing")
             consecutive_failures += 1
             last_error = e
+            # A bug on our side, not a flapping host — keep the old, slower
+            # schedule rather than re-raising a traceback every 30 seconds.
+            first_delay = _SYNC_BACKOFF_FIRST_UNEXPECTED
 
-        # Exponential backoff: SYNC_INTERVAL, 2x, 4x, ..., capped at 1 hour
-        delay = min(SYNC_INTERVAL * (2 ** consecutive_failures), _SYNC_BACKOFF_MAX)
+        # Exponential backoff, capped at 1 hour. The base depends on which
+        # failure class we last saw — see _sync_backoff_delay (BUI-562).
+        delay = _sync_backoff_delay(consecutive_failures, first_delay=first_delay)
         if consecutive_failures:
             logger.warning(
                 "_sync_loop: %d consecutive failure(s) (%s: %s), sleeping %ds",
