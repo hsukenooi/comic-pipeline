@@ -607,6 +607,22 @@ class TestCanonicalUrl:
         assert sc._cache_path(url1) != sc._cache_path(url2)
 
 
+class TestCanonicalSoldCompsUrl:
+    def test_pins_sold_and_include_complete_listing(self):
+        """BUI-557: both `sold` and `includeCompleteListing` are pinned
+        explicitly even though `true` is sold-comps.com's default for each —
+        an unpinned vendor default is a silent-drift risk (BUI-552 showed
+        includeCompleteListing alone flips OBO badge detection 73->0)."""
+        url = sc.canonical_sold_comps_url('"X-Men 1"')
+        assert "sold=true" in url
+        assert "includeCompleteListing=true" in url
+
+    def test_deterministic(self):
+        url1 = sc.canonical_sold_comps_url('"X-Men 1"')
+        url2 = sc.canonical_sold_comps_url('"X-Men 1"')
+        assert url1 == url2
+
+
 # ─── Cache layer ──────────────────────────────────────────────────────────────
 
 class TestCache:
