@@ -41,6 +41,18 @@ Detected by **intent, not shape**: an entry is a placeholder only when it is win
 ### Import-Sourced Entry
 A Collection entry that originated from — or has round-tripped through — a LOCG export. *Known in code and tickets as:* `locg_export`. The counterpart to a Win-Sourced Entry.
 
+A [[Collection Sync]] converts a [[Win-Sourced Entry]] into one of these on reconcile, so the win-sourced population drains toward empty as syncs run and every entry converges on import-sourced. Any check whose logic depends on win-sourced entries still existing quietly loses its power as that happens — see [[Duplicate Identity]].
+
+### Identity Key
+The set of fields that decides whether an incoming import updates an existing Collection entry or inserts a new one: publisher, series name, full title, and release date, compared as stored.
+
+Every component is a provider-supplied string rather than a stable id, so ordinary upstream relabelling changes the key and makes an import insert a second entry for a book already held — a volume's end year closing when a series stops being current (which fires for every ongoing series the January after it ends), or a provider switching from cover date to on-sale date. The rename detector meant to catch this holds three of those same fields steady to spot a changed title, which leaves it blind in exactly the cases where one of the three is what drifted.
+
+### Duplicate Identity
+Two or more Collection entries that are the same book held once — distinct from a genuine second copy, which is a [[Copy Count]] of 2 on a single entry. Recognized as a shared title with release dates compatible within the reconciler's tolerance; the date agreement is what separates a real duplicate from two [[Masthead]] volumes that spell an issue identically, and from a base printing legitimately held alongside its later [[Printing]].
+
+A count of these is only meaningful while entries of both sources are present. The check compares a [[Win-Sourced Entry]] against an [[Import-Sourced Entry]], so once a [[Collection Sync]] has converted every win-sourced entry it can no longer form a pair — and a reported zero then means "none findable" rather than "none present."
+
 ### Copy Count
 How many copies of an issue the Collection holds — **a count, not an ownership flag**. *Known in code as:* `in_collection`, where `0` means tracked-but-not-owned, `1` is the common case, and `2+` is a genuine duplicate (a second copy, or a condition upgrade held alongside the original). Treating it as a boolean is a recurring trap in both directions: reading it as truthy makes a text-formatted `"0"` from a LOCG export mean *owned* (`bool("0")` is `True`, BUI-469), while writing it as a flag silently discards a second copy when two entries are merged (BUI-470). Any read must coerce to `int` and compare, and any merge of two genuinely distinct copies must **increment** the survivor rather than drop the loser.
 
@@ -81,7 +93,9 @@ A second, independent net (the server's already-owned check) sits behind it: a b
 ### Collection Sync
 The round-trip that mirrors the Collection up to LOCG and reconciles it back: export the pending entries to a bulk-import file, upload it to LOCG, re-export from LOCG, and re-import to clear pending.
 
-The export is **owned-safe**: it never instructs LOCG to un-collect a book you own. LOCG's bulk import treats an `In Collection=0` row as "remove from collection," so the export pushes only genuinely-new wishes you do not already own. The re-import is reconciliation-based: it matches a pending Win-Sourced Entry to its LOCG counterpart even when LOCG has canonicalized the publisher or release date, and never creates a duplicate-identity entry. As of BUI-208 the up-CSV is **wins-only by default** — the code refuses to emit any `In Collection=0` row unless an explicit owned-safe wish push is requested (a machine-enforced gate, on top of the human-reviewed LOCG import preview). There is **no row-count limit** on uploads; the importer hangs only on incomplete/dateless rows (the old "≤20 rows" advice was a misdiagnosis).
+The export is **owned-safe**: it never instructs LOCG to un-collect a book you own. LOCG's bulk import treats an `In Collection=0` row as "remove from collection," so the export pushes only genuinely-new wishes you do not already own. The re-import is reconciliation-based: it matches a pending Win-Sourced Entry to its LOCG counterpart even when LOCG has canonicalized the publisher or release date, and will not reconcile one onto an entry that already exists.
+
+That reconciliation covers **pending** entries only, so it is not a general guarantee against a [[Duplicate Identity]]. An entry that has already reconciled is matched on its [[Identity Key]] alone thereafter — so when LOCG later relabels the series or shifts the release date, the re-import inserts a second entry instead of updating the first, and the duplicate it creates is between two Import-Sourced Entries, where the pending-entry check cannot see it. As of BUI-208 the up-CSV is **wins-only by default** — the code refuses to emit any `In Collection=0` row unless an explicit owned-safe wish push is requested (a machine-enforced gate, on top of the human-reviewed LOCG import preview). There is **no row-count limit** on uploads; the importer hangs only on incomplete/dateless rows (the old "≤20 rows" advice was a misdiagnosis).
 
 ### Conflicts Audit
 The audit of the Wish List for entries you already own, so a Collection Sync's wish push can drop them before uploading (`GET /api/comics/wish-list/conflicts`, BUI-130). It is a **surfacing** layer, not a data-safety guard: it decides which wishes to *show*, and its removal half deletes only from the **Wish List**, never from the Collection.
