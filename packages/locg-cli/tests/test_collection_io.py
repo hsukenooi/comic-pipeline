@@ -282,8 +282,15 @@ def test_reconciliation_best_guess_row_resolved(tmp_path):
 
 
 def test_reconciliation_vol_mismatch_not_reconciled(tmp_path):
-    """A row with mismatching (Vol. N) annotation is NOT reconciled per R60."""
-    from locg.collection_cache import CollectionCache
+    """A row with mismatching (Vol. N) annotation is NOT reconciled per R60.
+
+    BUI-547: the row is deliberately NOT flagged needs_manual_series_canonical.
+    A flagged row now gets its series RE-RESOLVED before scoring (that is the
+    whole point of the flag — the stored name is a best guess), which would
+    rewrite the "(Vol. 2)" under test and stop exercising R60 at all. An
+    unflagged pending win still reaches the same scoring path via the BUI-122
+    clause, so this keeps testing exactly what it says it tests.
+    """
     from locg.collection_io import import_xlsx
 
     cache = make_cache(tmp_path)
@@ -293,22 +300,26 @@ def test_reconciliation_vol_mismatch_not_reconciled(tmp_path):
         series="Amazing Spider-Man (Vol. 2)",  # wrong vol
         full_title="Amazing Spider-Man #300",
         release_date="1988-05-10",
-        needs_manual_series=True,
+        needs_manual_series=False,
     )
 
     def add_row(payload):
         payload["comics"].append(bad_match)
 
     cache.apply(add_row, command="pre-import")
-    import_xlsx(SAMPLE_XLSX, cache)
+    result = import_xlsx(SAMPLE_XLSX, cache)
 
     payload = cache.load()
-    remaining_manual = [
+    unreconciled = [
         r for r in payload["comics"]
         if r.get("gixen_item_id") == "42"
-        and r.get("needs_manual_series_canonical") is True
     ]
-    assert len(remaining_manual) == 1, "Row should still be flagged needs_manual_series_canonical"
+    assert len(unreconciled) == 1
+    assert unreconciled[0]["series_name"] == "Amazing Spider-Man (Vol. 2)", (
+        "declared-volume conflict must not be rewritten"
+    )
+    assert unreconciled[0]["pushed_to_locg_at"] is None, "row stays pending"
+    assert result["reconciled"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2763,3 +2774,722 @@ def test_import_null_release_date_report_excludes_dated_and_wish_only_rows(tmp_p
 
     assert result["null_release_date_owned"] == 0
     assert not any("BUI-412" in w for w in result["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# BUI-548: the reconciler must survive the drift between what record-win writes
+# and what LOCG hands back — provider publisher vocabulary, cover-vs-on-sale
+# release dates, punctuation/article/whitespace in the name — without ever
+# merging two genuinely different books.
+#
+# Root cause of the 2026-07-27 incident (41 pending wins, only 13 matched):
+# BUI-458 started stamping Metron's publisher label on agent_win rows, and
+# `_publisher_matches` compared it verbatim against LOCG's. "Marvel" vs "Marvel
+# Comics" scored 0 and blocked 34 of the 41 outright.
+# ---------------------------------------------------------------------------
+
+def test_normalize_publisher_folds_provider_vocabulary():
+    """The same company named by Metron and by LOCG lands on one key."""
+    from locg.collection_io import _normalize_publisher, _publisher_matches
+
+    assert _normalize_publisher("Marvel") == _normalize_publisher("Marvel Comics")
+    assert _normalize_publisher("DC Comics") == "dc"
+    assert _normalize_publisher("Boom! Studios") == _normalize_publisher("BOOM! Studios")
+    assert _normalize_publisher("Dark Horse Comics") == "dark horse"
+    # A name that is ENTIRELY generic words must not fold to nothing.
+    assert _normalize_publisher("Comics") == "comics"
+    # Genuinely different publishers stay apart.
+    assert not _publisher_matches("Marvel", "DC Comics")
+    assert not _publisher_matches("Skybound", "Image Comics")
+    # A missing side is still a wildcard.
+    assert _publisher_matches(None, "Marvel Comics")
+
+
+def test_pending_win_reconciles_across_metron_vs_locg_publisher(tmp_path):
+    """BUI-548 regression, `The X-Men #14` from the 2026-07-27 sync: publisher
+    'Marvel' (Metron, via BUI-458) vs 'Marvel Comics' (LOCG), plus the
+    cover-date/on-sale skew 1965-11-01 -> 1965-09-02."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Marvel",  # what record-win stamps since BUI-458
+        series="The X-Men (Vol. 1) (1963 - 1981)",
+        full_title="The X-Men #14",
+        release_date="1965-11-01",  # Metron cover date
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",
+        "series": "The X-Men (Vol. 1) (1963 - 1981)",
+        "full_title": "The X-Men #14",
+        "release_date": "1965-09-02",  # LOCG on-sale date
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if r["full_title"] == "The X-Men #14"]
+    assert len(rows) == 1, "must reconcile in place, not create a second owned row"
+    assert rows[0]["pushed_to_locg_at"] is not None
+    assert rows[0]["publisher_name"] == "Marvel Comics"
+    assert result["reconciled"] == 1
+    assert result["added"] == 0
+    assert result["owned_duplicate_identities"] == 0
+
+
+def test_cover_date_skew_across_a_year_boundary_reconciles(tmp_path):
+    """BUI-548, `Tales of Suspense #98`: cover 1968-02-01 vs on-sale 1967-11-02.
+    Same issue, 91 days apart, different years — the old exact-year gate scored
+    it 0 and duplicated it."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Marvel",
+        series="Tales of Suspense (Vol. 1) (1958 - 1967)",
+        full_title="Tales of Suspense #98",
+        release_date="1968-02-01",
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",
+        "series": "Tales of Suspense (Vol. 1) (1958 - 1967)",
+        "full_title": "Tales of Suspense #98",
+        "release_date": "1967-11-02",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if r["full_title"] == "Tales of Suspense #98"]
+    assert len(rows) == 1
+    assert rows[0]["release_date"] == "1967-11-02"
+    assert result["reconciled"] == 1
+    assert result["added"] == 0
+
+
+def test_date_window_is_asymmetric_and_bounded():
+    """The cover-vs-on-sale window is one-directional (LOCG earlier) and short.
+
+    An export date LATER than the win's is not this skew and gets no tolerance
+    at all; a gap beyond the window is a different printing/volume, not a
+    re-dating."""
+    from locg.collection_io import _release_dates_compatible
+
+    def pair(win_date, export_date):
+        return _release_dates_compatible(
+            {"release_date": win_date}, {"release_date": export_date}
+        )
+
+    assert pair("1968-02-01", "1967-11-02"), "91 days earlier — the real skew"
+    assert not pair("1968-02-01", "1967-06-01"), "245 days is out of window"
+    assert not pair("1967-11-02", "1968-02-01"), "export LATER is never this skew"
+    assert pair("1965-11-01", "1965-09-02"), "same year still passes, as before"
+    assert pair("1987-01-01", None), "fails open when a side has no date"
+
+
+def test_reconcile_score_never_merges_a_base_issue_into_a_printing():
+    """BUI-548 hard guard, at the exact gate that enforces it.
+
+    `Batman: The Dark Knight Returns #2` and its `#2 3rd Printing` are distinct
+    collectibles and were both in the store at once. LOCG spells an edition as
+    text trailing the issue number, which the end-anchored token extractor reads
+    as "no token" — so a base win scores 0 against it. Asserted with the
+    STRONGEST corroboration the reconciler has (identical price, purchase date
+    AND release date) to prove no widening can reach past it.
+
+    Passes before BUI-548 too, by design: it pins behavior the widening must
+    NOT change, not behavior the widening adds."""
+    from locg.collection_io import _reconcile_score
+
+    base = {
+        "publisher_name": "DC Comics",
+        "series_name": "Batman: The Dark Knight Returns (1986)",
+        "full_title": "Batman: The Dark Knight Returns #2",
+        "release_date": "1986-03-31",
+        "price_paid": 22.5,
+        "date_purchased": "2026-06-05",
+    }
+    third_printing = dict(
+        base, full_title="Batman: The Dark Knight Returns #2 3rd Printing"
+    )
+    assert _reconcile_score(base, third_printing) == 0
+    # ...and a newsstand/direct edition, spelled the same way.
+    newsstand = {
+        "publisher_name": "Marvel",
+        "series_name": "The Avengers (Vol. 1) (1963 - 1996)",
+        "full_title": "The Avengers #196 Newsstand Edition",
+        "release_date": "1980-03-18",
+        "price_paid": 12.0,
+        "date_purchased": "2026-07-01",
+    }
+    base_avengers = dict(newsstand, full_title="The Avengers #196")
+    assert _reconcile_score(base_avengers, newsstand) == 0
+
+
+def test_different_printing_of_the_same_issue_never_merges(tmp_path):
+    """BUI-548 hard guard, end to end. Production dates: a reprint ships on its
+    own on-sale date (base 1986-03-25, 3rd printing 1986-03-31), and both rows
+    must survive the import as two books."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="DC Comics",
+        series="Batman: The Dark Knight Returns (1986)",
+        full_title="Batman: The Dark Knight Returns #2",
+        release_date="1986-03-25",
+        needs_manual_series=False,
+        pushed=None,
+    )
+    # Same purchase fingerprint on both sides — the strongest corroboration
+    # signal the reconciler has. It still must not merge two printings.
+    win["price_paid"] = 22.5
+    win["date_purchased"] = "2026-06-05"
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics",
+        "series": "Batman: The Dark Knight Returns (1986)",
+        "full_title": "Batman: The Dark Knight Returns #2 3rd Printing",
+        "release_date": "1986-03-31",
+        "price_paid": 22.5,
+        "date_purchased": "2026-06-05",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    titles = sorted(
+        r["full_title"] for r in payload["comics"]
+        if r["full_title"].startswith("Batman: The Dark Knight Returns #2")
+    )
+    assert titles == [
+        "Batman: The Dark Knight Returns #2",
+        "Batman: The Dark Knight Returns #2 3rd Printing",
+    ], "the two printings must remain two rows"
+    assert result["reconciled"] == 0
+    assert result["auto_healed_duplicates"] == 0
+    assert result["owned_duplicate_identities"] == 0, (
+        "a base issue and its 3rd printing are two books, not a duplicate pair"
+    )
+
+
+def test_two_declared_volumes_that_disagree_never_merge():
+    """BUI-548: corroboration widens a MISSING volume annotation, never a
+    contradicting one. `Silver Surfer (Vol. 3)` vs `The Silver Surfer (Vol. 4)`
+    is positive evidence of two books; it stays a hard -1 even with an identical
+    price + purchase date.
+
+    Passes before BUI-548 too, by design: it pins behavior the widening must
+    NOT change, not behavior the widening adds."""
+    from locg.collection_io import _reconcile_score
+
+    win = {
+        "publisher_name": "Marvel",
+        "series_name": "Silver Surfer (Vol. 3) (1987 - 1998)",
+        "full_title": "Silver Surfer #1",
+        "release_date": "1988-12-01",
+        "price_paid": 16.5,
+        "date_purchased": "2026-07-18",
+    }
+    export = {
+        "publisher_name": "Marvel Comics",
+        "series_name": "The Silver Surfer (Vol. 4) (1988)",
+        "full_title": "The Silver Surfer #1",
+        "release_date": "1988-12-01",
+        "price_paid": 16.5,
+        "date_purchased": "2026-07-18",
+    }
+    assert _reconcile_score(win, export) == -1
+
+
+def test_whitespace_only_series_drift_merges_only_with_corroboration():
+    """BUI-548 / BUI-546: `Dawn Runner` (eBay) vs `Dawnrunner` (LOCG) produced 5
+    duplicate owned rows. BUI-546 deliberately did NOT widen
+    `_normalize_series_key` to strip inner whitespace — that key also drives the
+    ownership matcher. So the squash lives in the reconciler and fires only when
+    an independent signal agrees; here the release dates match exactly."""
+    from locg.collection_io import _reconcile_score
+
+    win = {
+        "publisher_name": "Dark Horse Comics",
+        "series_name": "Dawn Runner",
+        "full_title": "Dawn Runner #1",
+        "release_date": "2024-03-20",
+    }
+    export = {
+        "publisher_name": "Dark Horse Comics",
+        "series_name": "Dawnrunner (2024)",
+        "full_title": "Dawnrunner #1",
+        "release_date": "2024-03-20",
+    }
+    assert _reconcile_score(win, export) > 0
+
+    # Same names, but nothing corroborates: different release dates, no shared
+    # purchase fingerprint. The whitespace squash must NOT fire on its own.
+    uncorroborated = dict(export, release_date="2024-06-20")
+    assert _reconcile_score(win, uncorroborated) == 0
+
+
+def test_punctuation_class_auto_heals_against_an_owned_row(tmp_path):
+    """BUI-548 + BUI-546, the `Doctor Strange, Sorcerer Supreme` class: the win
+    drops the comma, LOCG keeps it. With punctuation folded into the series key
+    the win now reaches the collision guard, and — the book being already
+    owned, same year, same base edition — BUI-211's auto-heal retires it."""
+    from locg.collection_io import import_xlsx, make_identity
+
+    cache = make_cache(tmp_path)
+    owned = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Doctor Strange, Sorcerer Supreme (1988 - 1996)",
+        full_title="Doctor Strange, Sorcerer Supreme #44",
+        release_date="1992-06-16",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    owned["source"] = "locg_export"
+    win = make_agent_win_row(
+        publisher="Marvel",
+        series="Doctor Strange Sorcerer Supreme",  # comma dropped
+        full_title="Doctor Strange Sorcerer Supreme #44",
+        release_date="1992-08-01",  # cover date
+        gixen_item_id="99",
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([owned, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",
+        "series": "Doctor Strange, Sorcerer Supreme (1988 - 1996)",
+        "full_title": "Doctor Strange, Sorcerer Supreme #44",
+        "release_date": "1992-06-16",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if "Sorcerer Supreme #44" in r["full_title"]]
+    assert len(rows) == 1, "the duplicate pair must collapse to one row"
+    assert rows[0]["source"] == "locg_export"
+    assert rows[0]["gixen_item_id"] == "99", "the win's bid link is carried over"
+    assert result["auto_healed_duplicates"] == 1
+    assert result["owned_duplicate_identities"] == 0
+    idents = [make_identity(r) for r in payload["comics"]]
+    assert len(idents) == len(set(idents))
+
+
+def test_widening_never_reaches_the_delete_path_across_a_year_boundary(tmp_path):
+    """BUI-548 blast-radius bound: the date window widens which rows the
+    reconciler MATCHES, but `_era_confirmed` (BUI-462) still demands an exact
+    same-year match before anything is deleted. A cross-year match that collides
+    with an owned row is left pending with a named warning — visible non-clear
+    over silent wrong drop."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    owned = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Fantastic Four (Vol. 1) (1961 - 1996)",
+        full_title="Fantastic Four #46",
+        release_date="1965-10-12",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    owned["source"] = "locg_export"
+    win = make_agent_win_row(
+        publisher="Marvel",
+        series="Fantastic Four (Vol. 1) (1961 - 1996)",
+        full_title="Fantastic Four #46",
+        release_date="1966-01-01",  # 81 days later, different year
+        gixen_item_id="99",
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([owned, win])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",
+        "series": "Fantastic Four (Vol. 1) (1961 - 1996)",
+        "full_title": "Fantastic Four #46",
+        "release_date": "1965-10-12",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    rows = [r for r in payload["comics"] if r["full_title"] == "Fantastic Four #46"]
+    assert len(rows) == 2, "nothing may be deleted on cross-year evidence"
+    assert result["auto_healed_duplicates"] == 0
+    assert any("release years disagree" in w for w in result["warnings"])
+    # ...and the semantic duplicate check names it rather than letting the sync
+    # report clean.
+    assert result["owned_duplicate_identities"] == 1
+
+
+# ---------------------------------------------------------------------------
+# BUI-548: post-import semantic duplicate check. The sync's row-count
+# arithmetic balanced EXACTLY on 2026-07-27 while 28 books quietly became owned
+# twice, because every duplicate is one `added` row.
+# ---------------------------------------------------------------------------
+
+def test_owned_duplicate_identities_flags_an_unreconciled_twin(tmp_path):
+    """A pending win and an export row claiming the same book, left unmatched,
+    must be counted and named — not absorbed into `added`."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher="Marvel",
+        # A DECLARED volume conflict — the one thing corroboration never widens,
+        # so this row genuinely cannot reconcile.
+        series="Strange Tales (Vol. 2) (1987 - 1988)",
+        full_title="Strange Tales #135",
+        release_date="1965-08-01",
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",
+        "series": "Strange Tales (Vol. 1) (1951 - 1976)",
+        "full_title": "Strange Tales #135",
+        "release_date": "1965-05-04",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+
+    assert result["added"] == 1, "the arithmetic sees only ordinary growth"
+    assert result["owned_duplicate_identities"] == 1
+    assert any("owned TWICE" in w for w in result["warnings"])
+    assert any("strangetales#135" in w for w in result["warnings"])
+
+
+def test_owned_duplicate_check_ignores_two_genuine_volumes(tmp_path):
+    """`X-Men #128` (Vol. 2, 2002) and `The X-Men #128` (Vol. 1, 1979) are two
+    books legitimately owned side by side. A title-only check would cry
+    duplicate on them and train the operator to ignore it, so the pair must also
+    be date-compatible before it counts."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    win = make_agent_win_row(
+        publisher=None,
+        series="X-Men (Vol. 2) (2001 - 2013)",
+        full_title="X-Men #128",
+        release_date="2002-01-01",
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_win(payload):
+        payload["comics"].append(win)
+
+    cache.apply(add_win, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics",
+        "series": "The X-Men (Vol. 1) (1963 - 1981)",
+        "full_title": "The X-Men #128",
+        "release_date": "1979-09-18",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+
+    assert result["reconciled"] == 0, "different volumes must not merge"
+    assert result["owned_duplicate_identities"] == 0, "and must not be reported as dupes"
+
+
+# ---------------------------------------------------------------------------
+# BUI-547: `needs_manual_series_canonical` is written once, at record-win time,
+# and nothing ever recomputes it — so rows enter the manual bucket and never
+# leave it, even after the collection gains the data that would resolve them.
+# ---------------------------------------------------------------------------
+
+def test_stale_manual_series_flag_clears_and_row_reconciles(tmp_path):
+    """BUI-547 acceptance, `Infinity Gauntlet #2`: flagged on 2026-07-02 when the
+    index had no entry for the key. `The Infinity Gauntlet #1` has since arrived
+    via import, so the key resolves — the flag must clear, the canonical name
+    must be written, and (BUI-548) the row must then reconcile in the SAME
+    import rather than exporting one more duplicate first."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    # An already-imported sibling issue — this is what puts the series in the index.
+    sibling = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="The Infinity Gauntlet (Vol. 1) (1991)",
+        full_title="The Infinity Gauntlet #1",
+        release_date="1991-05-21",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    sibling["source"] = "locg_export"
+    flagged = make_agent_win_row(
+        publisher="Marvel",
+        series="Infinity Gauntlet",          # bare Metron masthead
+        full_title="Infinity Gauntlet #2",   # no leading article
+        release_date="1991-08-01",           # cover date
+        gixen_item_id="99",
+        needs_manual_series=True,
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([sibling, flagged])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel Comics", "series": "The Infinity Gauntlet (Vol. 1) (1991)",
+         "full_title": "The Infinity Gauntlet #1", "release_date": "1991-05-21"},
+        {"publisher": "Marvel Comics", "series": "The Infinity Gauntlet (Vol. 1) (1991)",
+         "full_title": "The Infinity Gauntlet #2", "release_date": "1991-06-18"},
+    ])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    assert result["manual_series_flags_cleared"] == 1
+    issue2 = [r for r in payload["comics"] if r["full_title"] == "The Infinity Gauntlet #2"]
+    assert len(issue2) == 1, "must reconcile, not insert a second owned row"
+    assert issue2[0]["needs_manual_series_canonical"] is False
+    assert issue2[0]["series_name"] == "The Infinity Gauntlet (Vol. 1) (1991)"
+    assert issue2[0]["gixen_item_id"] == "99", "it is the same row, re-identified"
+    assert result["owned_duplicate_identities"] == 0
+    # A wrong clear must be reversible from the append-only log alone, so the
+    # record carries the name it replaced.
+    audit = [
+        json.loads(line)
+        for line in (tmp_path / "import-history.jsonl").read_text().splitlines()
+    ]
+    cleared = [r for r in audit if r["type"] == "manual_series_flag_cleared"]
+    assert len(cleared) == 1
+    assert cleared[0]["details"]["previous_series_name"] == "Infinity Gauntlet"
+    assert cleared[0]["details"]["resolved_series_name"] == (
+        "The Infinity Gauntlet (Vol. 1) (1991)"
+    )
+
+
+def test_manual_series_flag_clears_for_a_series_arriving_in_this_export(tmp_path):
+    """BUI-547: the operator adds the missing series to LOCG precisely to unstick
+    a flagged win. `import_xlsx` rebuilds `series_name_index` at the very END, so
+    resolving against the STORED index would still miss — the manual work would
+    not have worked. The pass resolves against the index as it will exist after
+    this import, which includes the incoming export."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    flagged = make_agent_win_row(
+        publisher="BOOM! Studios",
+        series="Rare Flavours",
+        full_title="Rare Flavours #7",
+        release_date="2024-08-28",
+        gixen_item_id="99",
+        needs_manual_series=True,
+        pushed=None,
+    )
+
+    def add_row(payload):
+        payload["comics"].append(flagged)
+
+    cache.apply(add_row, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    # The series arrives NOW, via a different issue. Nothing in the store knew it.
+    _build_export_xlsx(xlsx, [{
+        "publisher": "BOOM! Studios", "series": "Rare Flavours (2023 - 2024)",
+        "full_title": "Rare Flavours #1", "release_date": "2023-09-20",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    row = next(r for r in payload["comics"] if r["gixen_item_id"] == "99")
+    assert result["manual_series_flags_cleared"] == 1
+    assert row["needs_manual_series_canonical"] is False
+    assert row["series_name"] == "Rare Flavours (2023 - 2024)"
+    # Still pending (LOCG has no #7 yet) — but no longer withheld from the CSV.
+    assert row["pushed_to_locg_at"] is None
+
+
+def test_unresolvable_row_keeps_its_manual_series_flag(tmp_path):
+    """BUI-547 negative: a row whose series still doesn't resolve keeps its flag
+    and stays out of the CSV. No false clearing."""
+    from locg.collection_io import _pending_push_rows, import_xlsx
+
+    cache = make_cache(tmp_path)
+    flagged = make_agent_win_row(
+        publisher="Marvel",
+        series="Some Series Nobody Has Ever Heard Of",
+        full_title="Some Series Nobody Has Ever Heard Of #1",
+        release_date="1999-01-01",
+        gixen_item_id="99",
+        needs_manual_series=True,
+        pushed=None,
+    )
+
+    def add_row(payload):
+        payload["comics"].append(flagged)
+
+    cache.apply(add_row, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Daredevil (Vol. 1) (1964 - 1998)",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    row = next(r for r in payload["comics"] if r["gixen_item_id"] == "99")
+    assert result["manual_series_flags_cleared"] == 0
+    assert row["needs_manual_series_canonical"] is True
+    assert row["series_name"] == "Some Series Nobody Has Ever Heard Of"
+    _ready, _variant, manual_series = _pending_push_rows(payload)
+    assert [r["gixen_item_id"] for r in manual_series] == ["99"], "stays out of the CSV"
+
+
+def test_manual_series_pass_never_sets_the_flag(tmp_path):
+    """BUI-547 is one-way on purpose. An UNflagged row whose series no longer
+    resolves must not be silently re-flagged out of the export — that is a
+    different failure with a different blast radius."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    unflagged = make_agent_win_row(
+        publisher="Marvel",
+        series="A Series The Export No Longer Carries",
+        full_title="A Series The Export No Longer Carries #3",
+        release_date="1999-01-01",
+        gixen_item_id="99",
+        needs_manual_series=False,
+        pushed=None,
+    )
+
+    def add_row(payload):
+        payload["comics"].append(unflagged)
+
+    cache.apply(add_row, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "Marvel Comics", "series": "Daredevil (Vol. 1) (1964 - 1998)",
+        "full_title": "Daredevil #181", "release_date": "1982-04-10",
+    }])
+
+    import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    row = next(r for r in payload["comics"] if r["gixen_item_id"] == "99")
+    assert row["needs_manual_series_canonical"] is False, "never re-flagged"
+
+
+def test_flag_clear_rekeys_the_identity_indices(tmp_path):
+    """BUI-547 index hygiene: clearing a flag rewrites `series_name`, which is
+    part of BOTH index keys. A stale entry would let an unrelated export row
+    claim the row's slot as a rename target and apply its columns to it — the
+    hazard BUI-462 fixed for the auto-heal drop. Here the export carries a row
+    whose partial identity equals the flagged row's PRE-clear one; it must
+    insert cleanly instead of hijacking the win."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    seed = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Nova (Vol. 1) (1976 - 1979)",
+        full_title="Nova #1",
+        release_date="1976-06-01",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    seed["source"] = "locg_export"
+    flagged = make_agent_win_row(
+        publisher="Marvel Comics",
+        series="Nova",  # unresolved bare masthead — the PRE-clear series_name
+        full_title="Nova #99",
+        release_date="1976-06-01",  # same date as the decoy below
+        gixen_item_id="99",
+        needs_manual_series=True,
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([seed, flagged])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [
+        {"publisher": "Marvel Comics", "series": "Nova (Vol. 1) (1976 - 1979)",
+         "full_title": "Nova #1", "release_date": "1976-06-01"},
+        # Partial identity ("Marvel Comics", "Nova", "1976-06-01") — exactly the
+        # flagged row's key BEFORE the clear.
+        {"publisher": "Marvel Comics", "series": "Nova",
+         "full_title": "Nova #2", "release_date": "1976-06-01"},
+    ])
+
+    import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    win = next(r for r in payload["comics"] if r["gixen_item_id"] == "99")
+    assert win["series_name"] == "Nova (Vol. 1) (1976 - 1979)", "flag cleared + renamed"
+    assert win["full_title"] == "Nova #99", (
+        "the stale index slot must not let an unrelated export row rename this win"
+    )
+    assert win["previous_full_title"] is None
+
+
+def test_duplicate_check_title_key_strips_the_article_word_safely():
+    """`Theatre #1` must not become `atre#1` — the article strip runs on the
+    spaced form, before whitespace is collapsed."""
+    from locg.collection_io import _duplicate_check_title_key as key
+
+    assert key("Infinity Gauntlet #2") == key("The Infinity Gauntlet #2")
+    assert key("Dawn Runner #1") == key("Dawnrunner #1")
+    assert key("Theatre #1") == "theatre#1"
+    # An edition suffix is part of the key: a base issue and its printing are
+    # two books, not a duplicate pair.
+    assert key("Batman #2") != key("Batman #2 3rd Printing")

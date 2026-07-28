@@ -398,7 +398,22 @@ Assert all of:
   success. An over-large `added` relative to `ready_count` means the
   re-import failed to reconcile and inserted duplicates; a shrink beyond
   `auto_healed_duplicates` means rows were dropped for a reason this skill
-  can't account for. Restore the Step 1 backup if needed (BUI-433):
+  can't account for.
+- **No book is owned twice (BUI-548):** the Step 5 import response must carry
+  `owned_duplicate_identities == 0`. **This is a separate hard-stop, and the
+  arithmetic above cannot substitute for it.** On the 2026-07-27 sync the row
+  count balanced to the row (`2902 + 46 − 3 = 2945`, exact) while the import
+  had silently created a *second* owned row for 28 books: every duplicate is
+  one `added` row, so the arithmetic counts it as expected growth and reports
+  clean. `owned_duplicate_identities` counts titles left owned by BOTH an
+  unreconciled pending `agent_win` row and a `locg_export` row (matched
+  punctuation-, whitespace- and article-insensitively, and only when their
+  release dates are compatible so two genuine volumes of one masthead aren't
+  falsely paired). Non-zero means the reconciler missed — those rows stay
+  pending and the next sync re-uploads them, so it compounds. The warning
+  names the affected titles.
+
+Restore the Step 1 backup if needed (BUI-433):
 
 ```bash
 comics-api POST /api/comics/collection/restore \
@@ -406,7 +421,7 @@ comics-api POST /api/comics/collection/restore \
   -d "{\"backup_path\": \"$BACKUP_PATH\"}"
 ```
 
-**If either assertion fails**, report the discrepancy and the backup path; do not
+**If any assertion fails**, report the discrepancy and the backup path; do not
 proceed.
 
 ## Step 7: Report
@@ -417,8 +432,10 @@ proceed.
 Backup:           $BACKUP_PATH  (comics=N, wish_list=M — see Step 1)
 Exported (ready): N rows  (+ M withheld needs-manual-series — see .notes.md)
 Re-import:        added=A  updated=U  reconciled=R  auto_healed_duplicates=H  second_copies_credited=C
+                  manual_series_flags_cleared=F  owned_duplicate_identities=D
 Pending:          PENDING_BEFORE → PENDING_AFTER  (cleared ~N)
 Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = added - auto_healed_duplicates, verified two-sided in Step 6)
+Owned twice:      D  (must be 0 — Step 6 hard-stops otherwise)
 Wish-list:        unchanged (local-only adds preserved)
 Warnings:         W warning(s) from the re-import (see below) — or "none"
 ```
@@ -429,6 +446,12 @@ confirmed duplicates of an already-owned LOCG row. The reversal path is the
 server's `import-history.jsonl`, filtered to `type=auto_healed_duplicate_win`
 — each entry carries the WHOLE dropped row (not just its identity), so a
 wrong heal is fully reconstructable from that entry alone.
+
+**If `manual_series_flags_cleared` (F above) is non-zero, say so:** F pending
+rows had a stale `needs_manual_series_canonical` flag re-checked and cleared
+because their series resolves now (BUI-547) — they carry the resolved canonical
+`series_name` and will appear in the next CSV export instead of sitting in the
+manual bucket forever. The pass only ever clears; it never re-flags a row.
 
 **If `second_copies_credited` (C above) is non-zero, say so too:** C of those
 healed duplicates were folded in as a genuine extra copy rather than dropped
@@ -450,7 +473,10 @@ Warnings (2):
 These are advisories, not failures — they don't change Step 6's pass/fail
 assertions, but they flag real data-quality gaps (e.g. BUI-412's
 `null_release_date_owned`) or rows that need manual follow-up, so they must
-reach the operator rather than stay buried in the raw JSON.
+reach the operator rather than stay buried in the raw JSON. The one exception
+is the "owned TWICE" warning (BUI-548): it mirrors the
+`owned_duplicate_identities` counter, which Step 6 asserts on, so it IS a
+failure.
 
 Some pending rows may legitimately remain: wins for a book the collection
 **already owns** (under a different identity) are left pending and logged
@@ -469,6 +495,7 @@ win-records cleanup in
 | Syncing without a backup | Step 1 is mandatory and hard-stops on failure (`POST /api/comics/collection/backup`, BUI-433) |
 | Seeing "Deleted from Collection" on upload | A win/wish row should never delete (BUI-122/BUI-200) — STOP, do not upload the rest, report it, restore the Step 1 backup if a deletion landed (`POST /api/comics/collection/restore` with `backup_path=$BACKUP_PATH`, BUI-433) |
 | "Error: timeout" at 0% on small batches | LOCG's import backend is degraded (a `queue_import_comic` XHR shows `(canceled)`); wait and retry later — not a file problem |
+| Trusting the row-count arithmetic alone to prove the import reconciled | It structurally cannot (BUI-548). Each unreconciled duplicate is one `added` row, so the arithmetic balances exactly while books quietly become owned twice — that is precisely what happened on 2026-07-27 (`2902 + 46 - 3 = 2945`, exact, 28 books doubled). Step 6 also asserts `owned_duplicate_identities == 0` |
 | Claiming success without checking `row_count` against `added - auto_healed_duplicates` | Step 6's check is two-sided (BUI-468): `ROWS_AFTER` must equal `ROWS_BEFORE + added - auto_healed_duplicates` exactly. A large `added` means duplicates were inserted instead of reconciled; a shrink beyond `auto_healed_duplicates` means rows vanished for an unaccounted reason. Either way — STOP, investigate, restore the backup if needed (`POST /api/comics/collection/restore`) |
 | Treating `auto_healed_duplicates`/`second_copies_credited` as buried-in-warnings trivia | Both are top-level Step 5 summary counters — report them by name in Step 7, not just via the `warnings` string (BUI-468). `auto_healed_duplicates` deletes rows; `second_copies_credited` silently increments `in_collection` on a survivor. Both are reversible via `import-history.jsonl` (`type=auto_healed_duplicate_win` / `type=second_copy_credited`) |
 | Uploading the `.notes.md` rows | Only the `.csv` files go to LOCG; `.notes.md` lists rows withheld for manual resolution |
