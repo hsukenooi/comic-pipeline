@@ -131,6 +131,23 @@ _YEAR_RANGE_CAPTURE_RE = re.compile(
     rf"\((\d{{4}})\s*{_DASH_CLASS}\s*(\d{{4}}|Present)\)", re.IGNORECASE
 )
 
+# A THIRD spelling of the same fact the range regex above already folds
+# (BUI-560): when a volume both begins and ends within one calendar year,
+# LOCG doesn't render the closed range as "(YYYY - YYYY)" at all — it
+# collapses straight to a bare "(YYYY)". `series_year_range`'s own docstring
+# already establishes that a bare year IS a one-year range (YYYY, YYYY), not
+# open-ended, so this is not a new fact to fold — it's the same fact as the
+# range form, spelled a third way.
+#
+# Deliberately NOT `_BARE_YEAR_RE` (below, ~line 210): that pattern's leading
+# `\s*` is correct for the matcher's strip-to-nothing usage but would eat the
+# preceding space in a *substitution*, producing "Cyclops(2026 - )" instead of
+# "Cyclops (2026 - )" — spacing that would no longer match the range fold's
+# output byte-for-byte. This pattern captures only the year, matching
+# `_YEAR_RANGE_CAPTURE_RE`'s own group shape so the two folds land on
+# identical output.
+_BARE_YEAR_CAPTURE_RE = re.compile(r"\((\d{4})\)")
+
 
 def identity_series_key(series_name: str) -> str:
     """Fold the one part of a LOCG series name the provider rewrites on its own.
@@ -143,8 +160,19 @@ def identity_series_key(series_name: str) -> str:
     identities on 2026-07-28 (BUI-554). The transition fires for every ongoing
     series every year, so this is a recurring generator, not a one-off.
 
-    Only the END year is folded, and this is emphatically NOT
-    :func:`_normalize_series_key`:
+    A third spelling of the same transition (BUI-560): when a volume both
+    begins and ends within a single calendar year, LOCG doesn't render the
+    closed range as ``(2026 - 2026)`` — it collapses straight to a bare
+    ``(2026)``. This is not a different fact to fold; ``series_year_range``'s
+    own docstring already treats a bare year as the one-year range
+    ``(YYYY, YYYY)``, not open-ended, so the bare form is folded to the exact
+    same key as its range spellings: ``(2026)``, ``(2026 - Present)``, and
+    ``(2026 - 2026)`` all become ``(2026 - )``. 9 of the live store's 60
+    duplicate identities on 2026-07-28 were exactly this — e.g.
+    ``Cyclops (Vol. 4) (2026)`` vs ``Cyclops (Vol. 4) (2026 - Present)``.
+
+    Only the END year is folded (in either spelling), and this is emphatically
+    NOT :func:`_normalize_series_key`:
 
     * ``(Vol. N)`` is **kept**. Dropping it would collapse ``X-Men (Vol. 1)
       #17`` and ``X-Men (Vol. 2) #17`` into one identity — three volumes of
@@ -154,7 +182,9 @@ def identity_series_key(series_name: str) -> str:
       ``Spawn (1992 - Present)`` with ``Spawn (2012 - Present)``, and
       ``X-Men (Vol. 2) (1991 - 2001)`` with ``X-Men (Vol. 2) (2001 - 2013)``
       — LOCG reuses a ``Vol. N`` label across genuinely different volumes, so
-      the start year is the only thing telling those two apart.
+      the start year is the only thing telling those two apart. The bare-year
+      fold preserves this the same way: it only rewrites a lone year's own
+      trailing ``)``, never a start year that appears elsewhere in the name.
     * The leading article and punctuation are kept, because identity is not
       the ownership matcher: ``_normalize_series_key`` folds those to make
       eBay's punctuation-stripped spelling MEET the catalog spelling, a
@@ -163,7 +193,13 @@ def identity_series_key(series_name: str) -> str:
     Folding only what the provider rewrites on its own is the whole rule —
     every other difference is still a different series.
     """
-    return _YEAR_RANGE_CAPTURE_RE.sub(r"(\1 - )", series_name or "").strip()
+    folded = _YEAR_RANGE_CAPTURE_RE.sub(r"(\1 - )", series_name or "")
+    # Run second, not first: the range fold's own output "(YYYY - )" can never
+    # re-match this bare-year pattern (its trailing text is " - )", not ")"
+    # immediately after the digits), so there is no risk of the two folds
+    # interacting or double-substituting the same span.
+    folded = _BARE_YEAR_CAPTURE_RE.sub(r"(\1 - )", folded)
+    return folded.strip()
 
 
 def make_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
