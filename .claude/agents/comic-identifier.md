@@ -104,6 +104,10 @@ Return **only** the formatted identification table (plus any fetch-failure lines
 dropped items). Do not include raw JSON, intermediate reasoning, or parsing notes — the
 caller's context receives only this output.
 
+**Your final act is to send that table to `main` via `SendMessage`** — plain
+text you return does not reach the caller on its own; going idle without this
+call leaves the dispatcher with nothing to read (BUI-569).
+
 ```
 | # | Comic | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|

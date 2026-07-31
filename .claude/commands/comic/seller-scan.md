@@ -120,6 +120,12 @@ Seen-tracking is **best-effort**: if the comics server is unreachable, the scan 
 
 ## Output
 
+**If this skill is running as a dispatched sub-agent** (rather than inline in
+the caller's own context), your final act is to send this output — the
+human-readable table or the `--json` object — to the dispatching agent via
+`SendMessage`. A sub-agent's plain-text return does not reach the caller on
+its own (BUI-569).
+
 **Human-readable (default):**
 ```
 Listing Title                             Wish List Item               Price      Ends          URL
