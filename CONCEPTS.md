@@ -163,6 +163,13 @@ An upper bound applied when a price is read from a comp bucket too thin to be ou
 ### needs_manual
 The FMV verdict emitted when even the fallbacks can't defensibly price a book (raw sold comps too thin, target grade's bucket empty and interpolation unsupported). It is a deliberate **punt to a human/LLM**, not a failure — the book gets hand-priced with judgment inside the `/comic:fmv` skill rather than auto-bid on a shaky estimate. Automating away a `needs_manual` on a high-value key removes the human check exactly where a mistake costs the most.
 
+The verdict is a **withheld** price, not a missing one: the band and max bid are deliberately empty, so the row is not a stub to be re-run but a decision to be made. Which is why it is distinct from a [[Fetch Error]] (nothing looked) and from a genuine zero (nothing exists). Each verdict carries a structured **flag reason** naming *why* the pool couldn't be trusted — the pool was one-sided about the target grade, too wide across grades, too sparse to survive trimming, or measured a different edition than the one being priced (see [[Variant Drop]]).
+
+### Variant Drop
+The case where a book's **variant descriptor** — a collector/catalog term like "White Logo 1st Print" — appears in no actual listing title, so every query carrying it returns nothing and the pool can only be found by dropping it. What comes back then prices the **base cover**, not the variant.
+
+That is a defensible floor for most variants and a wrong anchor for a scarce few, which is a judgment the pipeline must not make silently. So a variant drop is recorded as its own [[needs_manual]] flag reason rather than being priced through: the book reaches a human with the comps attached and the bid cap withheld. Distinctive among the flag reasons in that it does not clear by re-running — the query was impossible, not unlucky — it clears by fixing or removing the input variant.
+
 ### Fetch Error
 A comp lookup that **failed** rather than one that found nothing — the sold-comps provider errored or was rate-limited, or the query crashed before it ever ran. *Known in code and in the results table as:* `fetch-err`.
 
