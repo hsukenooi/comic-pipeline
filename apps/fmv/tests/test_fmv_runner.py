@@ -3343,3 +3343,89 @@ class TestMastheadSwapSignal:
                 {"title": "Uncanny X-Men", "issue": "69", "grade": 5.0},
                 server_url=server_url)
         assert "masthead=" not in fmv_runner._build_notes(out["fmv"])
+
+
+# ─── Cross-grade inversion sweep (BUI-583) ────────────────────────────────────
+
+def _crow(comic_id, grade, low, high, title="X-Men", issue="83", year=None):
+    """One `GET /api/comics` row (comic joined to one of its fmv rows)."""
+    return {"id": comic_id, "title": title, "issue": issue, "year": year,
+            "grade": grade, "fmv_low": low, "fmv_high": high}
+
+
+class TestFetchInversions:
+    def _get(self, rows):
+        return patch("fmv_runner._get_json_or_warn", return_value=rows)
+
+    def test_reports_the_motivating_pair(self, server_url):
+        with self._get([_crow(812, 4.0, 35.0, 70.0), _crow(812, 7.0, 5.0, 45.0)]):
+            got = fmv_runner.fetch_inversions(server_url)
+        assert len(got) == 1
+        f = got[0]
+        assert (f["comic_id"], f["lower_grade"], f["higher_grade"]) == (812, 4.0, 7.0)
+        assert (f["lower_low"], f["lower_high"]) == (35.0, 70.0)
+        assert (f["higher_low"], f["higher_high"]) == (5.0, 45.0)
+
+    def test_clean_table_reports_nothing(self, server_url):
+        with self._get([_crow(1, 4.0, 30.0, 40.0), _crow(1, 7.0, 80.0, 100.0)]):
+            assert fmv_runner.fetch_inversions(server_url) == []
+
+    def test_groups_by_comic_id_not_title_issue_year(self, server_url):
+        """A base cover and its Newsstand variant are separate comics rows
+        sharing title/issue/year. They price differently and legitimately so —
+        grouping on those fields would manufacture an inversion between them."""
+        rows = [_crow(10, 9.0, 200.0, 240.0, title="Iron Man", issue="124", year=1979),
+                _crow(11, 4.0, 20.0, 30.0, title="Iron Man", issue="124", year=1979)]
+        with self._get(rows):
+            assert fmv_runner.fetch_inversions(server_url) == []
+
+    def test_unpriced_stub_rows_do_not_invert(self, server_url):
+        with self._get([_crow(5, 4.0, 35.0, 70.0), _crow(5, 9.0, None, None)]):
+            assert fmv_runner.fetch_inversions(server_url) == []
+
+    def test_rows_without_a_grade_are_ignored(self, server_url):
+        """A comics row with no fmv row at all LEFT JOINs to grade=None."""
+        with self._get([_crow(7, None, None, None), _crow(7, 6.0, 10.0, 20.0)]):
+            assert fmv_runner.fetch_inversions(server_url) == []
+
+    def test_failed_read_returns_none_not_empty(self, server_url):
+        """R11-shaped: a failed call must never render as 'no inversions'."""
+        with patch("fmv_runner._get_json_or_warn",
+                   return_value=fmv_runner._LOOKUP_FAILED):
+            assert fmv_runner.fetch_inversions(server_url) is None
+
+    def test_non_list_body_returns_none(self, server_url):
+        with self._get({"unexpected": "shape"}):
+            assert fmv_runner.fetch_inversions(server_url) is None
+
+
+class TestRunInversionSweep:
+    def test_missing_server_url_exits_1(self):
+        with pytest.raises(SystemExit) as e:
+            fmv_runner.run_inversion_sweep(server_url=None)
+        assert e.value.code == 1
+
+    def test_failed_read_exits_1_without_a_verdict(self, server_url, capsys):
+        with patch("fmv_runner.fetch_inversions", return_value=None):
+            with pytest.raises(SystemExit) as e:
+                fmv_runner.run_inversion_sweep(server_url=server_url)
+        assert e.value.code == 1
+        assert "no verdict rendered" in capsys.readouterr().err
+
+    def test_clean_sweep_reports_and_returns(self, server_url, capsys):
+        with patch("fmv_runner.fetch_inversions", return_value=[]):
+            fmv_runner.run_inversion_sweep(server_url=server_url)
+        assert "No cross-grade FMV inversions found." in capsys.readouterr().out
+
+    def test_findings_are_printed_with_both_bands(self, server_url, capsys):
+        finding = {"comic_id": 812, "title": "X-Men", "issue": "83", "year": None,
+                   "lower_grade": 4.0, "lower_low": 35.0, "lower_high": 70.0,
+                   "higher_grade": 7.0, "higher_low": 5.0, "higher_high": 45.0}
+        with patch("fmv_runner.fetch_inversions", return_value=[finding]):
+            fmv_runner.run_inversion_sweep(server_url=server_url)
+        out = capsys.readouterr().out
+        assert "1 cross-grade FMV inversion(s)" in out
+        assert "X-Men #83" in out
+        assert "$35-70" in out and "$5-45" in out
+        # The advisory contract must be stated wherever findings are shown.
+        assert "no price was changed" in out

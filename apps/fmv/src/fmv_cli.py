@@ -79,9 +79,17 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
 @click.option("--server-url", envvar=["COMICS_SERVER_URL", "GIXEN_SERVER_URL"], default=None,
               help="Comics server URL (reads COMICS_SERVER_URL, "
                    "falling back to the deprecated GIXEN_SERVER_URL).")
+@click.option("--inversion-sweep", is_flag=True,
+              help="BUI-583: report every cross-grade FMV inversion already in "
+                   "the DB (same book, a higher grade priced below a lower "
+                   "one) and exit without pricing anything. Reads existing "
+                   "rows only — zero provider requests, so it is safe to run "
+                   "any time. Advisory: nothing is written and no price "
+                   "changes. Ignores --batch.")
 def cli(batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool, grade_window: float | None,
-        quiet: bool, brief: bool, server_url: str | None) -> None:
+        quiet: bool, brief: bool, server_url: str | None,
+        inversion_sweep: bool) -> None:
     """Compute fair market value for a batch of comics.
 
     Pipeline per book:
@@ -108,6 +116,12 @@ def cli(batch_path: str | None, out_path: str | None,
             "warning: GIXEN_SERVER_URL is deprecated; use COMICS_SERVER_URL",
             err=True,
         )
+    # BUI-583: a read-only consistency report, not a pricing run — handled
+    # before run()'s --batch gate, which would otherwise reject the sweep for
+    # missing an input batch it does not use.
+    if inversion_sweep:
+        fmv_runner.run_inversion_sweep(server_url=server_url)
+        return
     fmv_runner.run(
         batch_path=batch_path,
         out_path=out_path,

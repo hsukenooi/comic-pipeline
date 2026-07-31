@@ -1908,3 +1908,103 @@ def _print_table(rows: list[dict]) -> None:
             f"{n_breaker_tripped} book(s) affected (served cache-only or "
             "fetch-err). Re-run later once SerpApi recovers."
         )
+
+
+# ─── Cross-grade inversion sweep (BUI-583) ────────────────────────────────────
+#
+# A consistency check over EXISTING `fmv` rows: same comic, higher grade priced
+# below a lower one. Costs zero provider requests — no sold-comps call, no
+# SerpApi quota, no rate-limit exposure — so unlike a re-price it is safe to run
+# over the whole table on demand.
+#
+# Rows are grouped by the comic_id the server returns (`id`), NOT by
+# title/issue/year. That is load-bearing, not incidental: a base cover and its
+# Newsstand variant are DISTINCT comics rows sharing all three of those fields,
+# and they legitimately price differently. Grouping on title/issue/year would
+# compare across them and manufacture inversions (in the live table 8
+# title/issue/year groups span two comic_ids, and 7 of the 8 are distinguished
+# only by `comics.variant` — a column `GET /api/comics` does not even return).
+# comic_id is the true identity, so grouping on it sidesteps the ambiguity
+# entirely rather than trying to reconstruct it.
+
+def fetch_inversions(server_url: str) -> list[dict] | None:
+    """Every cross-grade inversion currently persisted, or None if the read failed.
+
+    Returns one dict per offending pair: comic_id / title / issue / year, the
+    two grades, and each side's band. None (not []) on a failed server read, so
+    a caller never reports "no inversions" from a call that never landed.
+    """
+    rows = _get_json_or_warn(
+        f"{server_url}/api/comics", params={},
+        warn="cross-grade inversion sweep: /api/comics read failed",
+        default=_LOOKUP_FAILED,
+    )
+    if rows is _LOOKUP_FAILED or not isinstance(rows, list):
+        return None
+
+    by_comic: dict[int, list[dict]] = {}
+    for r in rows:
+        comic_id = r.get("id")
+        if comic_id is None or r.get("grade") is None:
+            continue
+        by_comic.setdefault(comic_id, []).append(r)
+
+    findings: list[dict] = []
+    for comic_id, group in sorted(by_comic.items()):
+        bands = {float(r["grade"]): r for r in group}
+        pairs = fmv_math.cross_grade_inversions(
+            (float(r["grade"]), r.get("fmv_low"), r.get("fmv_high")) for r in group
+        )
+        for g_lo, g_hi in pairs:
+            lo_row, hi_row = bands[g_lo], bands[g_hi]
+            findings.append({
+                "comic_id": comic_id,
+                "title": lo_row.get("title"),
+                "issue": lo_row.get("issue"),
+                "year": lo_row.get("year"),
+                "lower_grade": g_lo,
+                "lower_low": lo_row.get("fmv_low"),
+                "lower_high": lo_row.get("fmv_high"),
+                "higher_grade": g_hi,
+                "higher_low": hi_row.get("fmv_low"),
+                "higher_high": hi_row.get("fmv_high"),
+            })
+    return findings
+
+
+def run_inversion_sweep(*, server_url: str | None) -> None:
+    """Driver for `comic-fmv --inversion-sweep`. Prints and returns.
+
+    Exits 1 on a configuration or server failure — never a clean "0 inversions"
+    from a read that never landed. Reporting only: nothing is written back and
+    no price is altered.
+    """
+    if not server_url:
+        click.echo("Error: COMICS_SERVER_URL must be set. The inversion sweep "
+                   "reads existing FMV rows from the server.", err=True)
+        sys.exit(1)
+
+    findings = fetch_inversions(server_url)
+    if findings is None:
+        click.echo("Error: cross-grade inversion sweep failed to read the "
+                   "comics server; no verdict rendered.", err=True)
+        sys.exit(1)
+
+    if not findings:
+        click.echo("No cross-grade FMV inversions found.")
+        return
+
+    click.echo(f"{len(findings)} cross-grade FMV inversion(s) — a higher grade "
+               f"priced below a lower grade of the same book:\n")
+    for f in findings:
+        label = f"{f['title']} #{f['issue']}"
+        if f.get("year"):
+            label += f" ({f['year']})"
+        lo = f"{f['lower_grade']:g} ${f['lower_low']:g}-{f['lower_high']:g}"
+        hi = f"{f['higher_grade']:g} ${f['higher_low']:g}-{f['higher_high']:g}"
+        click.echo(f"{f['comic_id']:>6}  {label[:34]:<34} {lo:>18}  >  {hi}")
+    click.echo("\nAdvisory only: no price was changed. At least one pool in "
+               "each pair is suspect — decide by hand which, then re-run "
+               "`comic-fmv --force` on that book or hand-price the bad row. "
+               "Note the two grades may have been priced weeks apart, so check "
+               "the notes' dates before reading an inversion as a bad pool.")

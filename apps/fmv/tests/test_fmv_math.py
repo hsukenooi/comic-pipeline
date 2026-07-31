@@ -647,6 +647,77 @@ class TestMonotonicityViolations:
         assert fm.monotonicity_violations({7.0: 300, 8.5: 200}) == [(7.0, 8.5)]
 
 
+class TestCrossGradeInversions:
+    def test_motivating_case_x_men_83(self):
+        """BUI-583's own example: 4.0 = $35-70 (mid 52.5) vs 7.0 = $5-45
+        (mid 25). The bands OVERLAP, so only a midpoint comparison catches it."""
+        assert fm.cross_grade_inversions(
+            [(4.0, 35.0, 70.0), (7.0, 5.0, 45.0)]) == [(4.0, 7.0)]
+
+    def test_rising_prices_never_invert(self):
+        assert fm.cross_grade_inversions(
+            [(4.0, 35.0, 70.0), (7.0, 90.0, 140.0), (9.0, 200.0, 260.0)]) == []
+
+    def test_fewer_than_two_priced_rows(self):
+        assert fm.cross_grade_inversions([]) == []
+        assert fm.cross_grade_inversions([(7.0, 10.0, 20.0)]) == []
+
+    def test_unpriced_rows_are_skipped_not_treated_as_cheap(self):
+        """A needs-manual / n=0 stub has no price. An absent price must not
+        read as $0 and manufacture an inversion against every other grade."""
+        assert fm.cross_grade_inversions(
+            [(4.0, 35.0, 70.0), (7.0, None, None), (9.0, None, 45.0)]) == []
+
+    def test_rounding_noise_is_below_the_floor(self):
+        """Detective Comics #576 from the live table: 8.5 = $15-30 (mid 22.5)
+        vs 9.0 = $15-25 (mid 20). A $2.50 gap is one clean_round half-step —
+        exactly the artifact the absolute floor exists to drop."""
+        assert fm.cross_grade_inversions(
+            [(8.5, 15.0, 30.0), (9.0, 15.0, 25.0)]) == []
+
+    def test_absolute_floor_alone_is_not_enough(self):
+        """A $12 gap clears the $10 absolute floor but is only 6% of a $200
+        midpoint — under the relative floor, so it does not report."""
+        assert fm.cross_grade_inversions(
+            [(6.0, 180.0, 220.0), (7.0, 168.0, 208.0)]) == []
+
+    def test_relative_floor_alone_is_not_enough(self):
+        """A 40% shortfall on a $10 book is a $4 gap — under the absolute
+        floor, because at that price $4 is inside clean_round's $5 step."""
+        assert fm.cross_grade_inversions(
+            [(6.0, 5.0, 15.0), (7.0, 1.0, 11.0)]) == []
+
+    def test_reports_non_adjacent_pairs(self):
+        """Each adjacent step is sub-threshold, but 4.0 -> 9.0 inverts by 28%
+        / $28 end to end. Adjacent-only checking would miss this entirely."""
+        got = fm.cross_grade_inversions(
+            [(4.0, 90.0, 110.0), (6.0, 76.0, 94.0), (9.0, 62.0, 82.0)])
+        assert got == [(4.0, 9.0)]
+
+    def test_pairs_are_sorted_and_deduplicated_per_pair(self):
+        # Thor #127's live shape: 7.0 undercuts BOTH 5.5 and 6.5.
+        got = fm.cross_grade_inversions(
+            [(5.5, 40.0, 50.0), (6.5, 30.0, 50.0), (7.0, 25.0, 30.0)])
+        assert got == [(5.5, 7.0), (6.5, 7.0)]
+
+    def test_zero_priced_lower_grade_never_divides_by_zero(self):
+        assert fm.cross_grade_inversions(
+            [(4.0, 0.0, 0.0), (7.0, 0.0, 0.0)]) == []
+
+    def test_thresholds_are_overridable(self):
+        rows = [(8.5, 15.0, 30.0), (9.0, 15.0, 25.0)]
+        assert fm.cross_grade_inversions(rows) == []
+        assert fm.cross_grade_inversions(
+            rows, rel_floor=0.05, abs_floor=1.0) == [(8.5, 9.0)]
+
+    def test_advisory_contract_holds_no_price_is_returned(self):
+        """The function reports GRADES, never prices — it structurally cannot
+        alter or suppress a band, which is BUI-583's hard constraint."""
+        got = fm.cross_grade_inversions([(4.0, 35.0, 70.0), (7.0, 5.0, 45.0)])
+        assert all(isinstance(g, float) for pair in got for g in pair)
+        assert got == [(4.0, 7.0)]
+
+
 class TestInterpolateGradeCurve:
     def test_exact_linear_interpolation(self):
         # midpoint bracket: 100 + (6-4)/(8-4)*(200-100) = 150 exactly

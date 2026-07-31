@@ -223,6 +223,89 @@ def monotonicity_violations(
     ]
 
 
+# ─── Cross-grade FMV inversion (BUI-583) ──────────────────────────────────────
+#
+# `monotonicity_violations` above checks the grade curve WITHIN one comp pool.
+# This checks it ACROSS the persisted `fmv` rows of a single comic: same
+# comic_id, two grades, and the higher grade priced below the lower one. A 7.0
+# copy cannot be worth less than a 4.0 copy of the same book, so one of the two
+# pools is wrong. It is the first check that compares two priced ROWS against
+# each other, which is why the existing per-pool marks (one_sided / too_wide /
+# too_sparse / variant_dropped) structurally cannot catch it — measured over
+# the whole live `fmv` table (945 rows, 127 multi-grade comics), all 40
+# midpoint-inverted pairs carried flag_reason = NULL.
+#
+# DELIBERATELY NOT a reuse of `monotonicity_violations`. That function is on the
+# CGC-ladder money path (it gates `cgc_ladder_price`), takes a single value per
+# grade rather than a low/high band, compares only ADJACENT grades, and applies
+# NO magnitude threshold. Teaching it bands + thresholds would change ladder
+# pricing to serve an advisory check — so the two stay separate.
+#
+# THRESHOLDS (measured against the live table, 2026-07-31). An inversion counts
+# only when the higher grade's midpoint falls below the lower grade's by BOTH a
+# relative and an absolute margin. The two floors do different jobs:
+#
+#   REL = 0.25  kills trivial relative differences. A higher grade sitting a
+#               quarter below a lower grade of the same book is not explicable
+#               by ordinary comp noise.
+#   ABS = $10   kills ROUNDING noise. `clean_round` snaps to $5 below $50, so a
+#               midpoint (the mean of two snapped bounds) moves on a $2.50
+#               grid; a $10 gap is beyond what rounding alone can manufacture.
+#
+# Unthresholded, the sweep returns 40 pairs across 35 comics — dominated by
+# $2.50-on-$20 artifacts (Detective Comics #576 at 8.5 = $15-30 vs 9.0 =
+# $15-25). At these floors it returns 9 pairs across 8 comics (6.3% of the
+# multi-grade cohort), every one visibly implausible, and it still keeps the
+# motivating case (X-Men #83: 4.0 = $35-70 vs 7.0 = $5-45).
+#
+# ADVISORY ONLY. The caller must surface these as a notes token and MUST NOT
+# route them into `flag_reason` — `compute_fmv` nulls fmv_low/fmv_high/max_bid
+# for any book carrying a flag_reason, so using that slot would SUPPRESS a
+# price the ticket requires be left untouched. Which of the two rows is wrong
+# is not decided here; both grades are named so a human can compare them.
+CROSS_GRADE_INVERSION_REL = 0.25   # higher grade must sit this far below, relatively
+CROSS_GRADE_INVERSION_ABS = 10.0   # ...and this far below in dollars
+
+
+def cross_grade_inversions(
+    priced: Iterable[tuple[float, float | None, float | None]],
+    rel_floor: float = CROSS_GRADE_INVERSION_REL,
+    abs_floor: float = CROSS_GRADE_INVERSION_ABS,
+) -> list[tuple[float, float]]:
+    """(lower_grade, higher_grade) pairs of one comic whose prices invert.
+
+    `priced` is that comic's persisted rows as (grade, fmv_low, fmv_high). A row
+    missing either bound is unpriced (the BUI-44 n=0 stub, or a needs-manual
+    book) and is skipped rather than compared — an absent price is not a cheap
+    price. Grades are compared by MIDPOINT, so two overlapping bands still
+    invert when their centres do; that is what the motivating case needs, since
+    X-Men #83's 4.0 ($35-70) and 7.0 ($5-45) bands do overlap.
+
+    ALL pairs are compared, not just grade-adjacent ones: a chain whose every
+    adjacent step is individually sub-threshold can still invert end to end.
+    Returns pairs sorted by (lower_grade, higher_grade); an empty list means the
+    comic's priced rows rise monotonically with grade (or it has fewer than two).
+    """
+    mids: dict[float, float] = {}
+    for grade, low, high in priced:
+        if low is None or high is None:
+            continue
+        mids[float(grade)] = (float(low) + float(high)) / 2.0
+    grades = sorted(mids)
+    out: list[tuple[float, float]] = []
+    for i, g_lo in enumerate(grades):
+        mid_lo = mids[g_lo]
+        if mid_lo <= 0:
+            # A zero/negative lower midpoint can't be undercut by a real price,
+            # and would divide by zero in the relative test.
+            continue
+        for g_hi in grades[i + 1:]:
+            gap = mid_lo - mids[g_hi]
+            if gap >= abs_floor and (gap / mid_lo) >= rel_floor:
+                out.append((g_lo, g_hi))
+    return out
+
+
 def _bracket_interpolate(
     medians: dict[float, float], target_grade: float,
     counts: dict[float, int] | None = None,
