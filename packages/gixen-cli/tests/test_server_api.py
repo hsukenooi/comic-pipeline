@@ -39,6 +39,29 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("GIXEN_USERNAME", "testuser")
     monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
+    # BUI-573: disable both real background loops. Without this, lifespan
+    # startup fires an unsupervised _sync_loop tick (and _sniper_loop) on
+    # this test's own event loop. That first _sync_loop tick snapshots
+    # client.list_snipes() (typically []) before a test has seeded anything,
+    # then — because its gather phase genuinely awaits (asyncio.to_thread,
+    # eBay-evidence lookups) — doesn't apply that stale snapshot until real
+    # wall-clock time later. If a test seeds a PENDING row with a past
+    # auction_end_at in that window (e.g. test_sync_mirrors_a_lowered_cap_
+    # before_the_local_sniper_can_fire), _sync_gixen's vanished-ended sweep
+    # (server/main.py) reads the DB fresh but reasons from the stale
+    # gixen_item_ids snapshot, wrongly concludes the row "vanished from
+    # Gixen", and flips it straight to ENDED — racing ahead of the test's
+    # own explicit POST /api/sync. Rare and timing-dependent (worse under
+    # full-suite load, where the gather phase's awaits take longer), which
+    # is exactly BUI-573's "passes in isolation, flakes under full suite."
+    # Two other tests below (test_api_dashboard_tabs_*) already disable both
+    # vars for the same hermeticity reason; no test in this file drives
+    # either loop through this fixture (test_sniper_loop_commits_under_
+    # write_lock in test_server_api.py and the backoff-schedule tests in
+    # test_sync_backoff.py build their own bespoke setup instead), so this
+    # is a pure isolation fix, not a behavior change for any assertion here.
+    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
+    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
     mock = _make_mock_gixen()
     with patch("server.main.GixenClient", return_value=mock):
         from server.main import app
