@@ -69,3 +69,39 @@ def test_brief_flag_threads_through_to_runner(tmp_path, monkeypatch):
         cli, ["--batch", str(batch), "--server-url", "http://x"])
     assert result.exit_code == 0
     assert calls[1]["brief"] is False
+
+
+def test_inversion_sweep_short_circuits_the_pricing_run(monkeypatch):
+    """BUI-583: the sweep must reach run_inversion_sweep and NOT run(). If the
+    short-circuit ever regressed, a `--inversion-sweep` call would fall through
+    into a real pricing pass — spending provider requests the flag promises it
+    will not, and writing rows a read-only report must never write."""
+    import fmv_cli
+
+    swept, priced = [], []
+    monkeypatch.setattr(fmv_cli.fmv_runner, "run_inversion_sweep",
+                        lambda **kwargs: swept.append(kwargs))
+    monkeypatch.setattr(fmv_cli.fmv_runner, "run",
+                        lambda **kwargs: priced.append(kwargs))
+
+    result = CliRunner().invoke(
+        cli, ["--inversion-sweep", "--server-url", "http://x"])
+
+    assert result.exit_code == 0
+    assert swept == [{"server_url": "http://x"}]
+    assert priced == []
+
+
+def test_inversion_sweep_needs_no_batch(monkeypatch):
+    """The sweep reads existing rows, so it must not be gated on --batch the
+    way a pricing run is (run() exits 2 without one)."""
+    import fmv_cli
+
+    monkeypatch.setattr(fmv_cli.fmv_runner, "run_inversion_sweep",
+                        lambda **kwargs: None)
+
+    result = CliRunner().invoke(
+        cli, ["--inversion-sweep", "--server-url", "http://x"])
+
+    assert result.exit_code == 0
+    assert "--batch is required" not in result.output

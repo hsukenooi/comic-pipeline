@@ -197,6 +197,27 @@ On the chosen pool, drop values outside `Q1 − 1.5×IQR` to `Q3 + 1.5×IQR`. Do
 
 Bucket medians should rise monotonically with grade. If 4.0 median > 4.5 median, something's wrong — re-examine the data (likely a damaged 4.0 or graded 4.5 leaked through).
 
+This check is **within one comp pool**. Its cross-row counterpart is §5a.
+
+### 5a. Cross-grade FMV inversion sweep (BUI-583)
+
+The same monotonicity rule applied **across the persisted `fmv` rows of one comic**: a 7.0 copy cannot be worth less than a 4.0 copy of the same book, so if two grades of one `comic_id` price backwards, one of the two pools is wrong.
+
+```sh
+comic-fmv --inversion-sweep      # reads existing rows; zero provider requests
+```
+
+This is the first check that compares two priced **rows** against each other. Every other mark (`one_sided`, `too_wide`, `too_sparse`, `variant_dropped`) judges a single pool in isolation, which is why they structurally cannot catch it — measured over the whole live table, all 40 midpoint-inverted pairs carried `flag_reason = NULL`.
+
+- **Reported when** the higher grade's band midpoint falls below the lower grade's by **both** ≥25% and ≥$10. Both floors are load-bearing: the relative one drops trivial differences, the absolute one drops `clean_round` artifacts (midpoints move on a $2.50 grid below $50, so a $2.50 gap is rounding, not signal). Unthresholded the sweep returns 40 pairs / 35 comics; at these floors, 9 pairs / 8 comics.
+- **Midpoints, not bounds** — the motivating case (X-Men #83: 4.0 = $35–70 vs 7.0 = $5–45) has *overlapping* bands, so a disjoint-ranges test would miss it.
+- **All grade pairs, not just adjacent ones** — a chain whose every adjacent step is sub-threshold can still invert end to end.
+- **Grouped by `comic_id`**, never by title/issue/year: a base cover and its Newsstand variant are distinct comics rows sharing all three fields and legitimately price differently.
+
+**Known false-positive source: the two grades need not have been priced together.** The sweep compares whatever rows are currently persisted, and in the live table inverted pairs sit up to 84 days apart — so some part of a gap can be genuine market movement rather than a bad pool. The magnitude floors absorb ordinary drift (a 25%/$10 inversion is not a normal back-issue move), but check each row's `fmv_updated_at` before concluding a pool is wrong.
+
+**Advisory only, and deliberately NOT a `flag_reason`.** `compute_fmv` nulls `fmv_low`/`fmv_high`/`max_bid` for any book carrying a `flag_reason`, so routing an inversion there would *suppress* a price rather than annotate it. The sweep reports; it never writes, re-prices, or decides which of the pair is wrong. That last judgement is left to a human — both grades are named so the two can be compared.
+
 ### 6. Compute FMV range
 
 - **Median** = median of trimmed pool
