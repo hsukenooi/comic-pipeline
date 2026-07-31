@@ -17,6 +17,7 @@ from gixen_overlay.db import (
     remove_seen_for_seller,
     get_collection_wins_seen,
     mark_collection_wins_seen,
+    _normalize_comic_title,
 )
 
 
@@ -206,6 +207,104 @@ def test_upsert_comic_caps_insert_finds_canonical_yeared(db):
     id1 = upsert_comic(db, "Batman", "375", 1984)
     id2 = upsert_comic(db, "BATMAN", "375", 1984)
     assert id1 == id2
+
+
+# ---------------------------------------------------------------------------
+# upsert_comic — server-side title normalization (BUI-591)
+#
+# Mirrors the embedded-issue half of BUI-346's client-side normalizer
+# (apps/fmv/src/fmv_runner.py's _strip_embedded_issue), moved here so every
+# writer that reaches upsert_comic gets it, not just comic-fmv. Deliberately
+# does NOT mirror the leading-article half — see _normalize_comic_title's
+# docstring in db.py.
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_comic_strips_doubled_issue_number(db):
+    """The BUI-591 headline case: a writer that (unlike comic-fmv) never
+    normalized client-side used to persist the issue doubled into the title
+    (real incident: comics rows 640/642, 'X-Men #123'/'X-Men #127'). The
+    server must now strip it itself."""
+    cid = upsert_comic(db, "X-Men #123", "123", 1991)
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] == "X-Men"
+    assert row["issue"] == "123"
+
+
+def test_upsert_comic_strips_trailing_bare_issue_token(db):
+    cid = upsert_comic(db, "Amazing Spider-Man 300", "300", 1988)
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] == "Amazing Spider-Man"
+
+
+def test_upsert_comic_doubled_and_clean_titles_share_identity(db):
+    """A doubled-title write and a clean write for the same (issue, year)
+    must resolve to the SAME row — proof the normalization runs before the
+    identity lookup, not just on display."""
+    id1 = upsert_comic(db, "X-Men #123", "123", 1991)
+    id2 = upsert_comic(db, "X-Men", "123", 1991)
+    assert id1 == id2
+    assert db.execute("SELECT COUNT(*) FROM comics WHERE issue='123'").fetchone()[0] == 1
+
+
+def test_upsert_comic_clean_then_doubled_titles_share_identity(db):
+    """Reverse-order variant of the above: a clean row created FIRST must
+    still be found (not duplicated) by a later doubled-title write for the
+    same (issue, year) — proves the merge is symmetric, not order-dependent."""
+    id1 = upsert_comic(db, "X-Men", "123", 1991)
+    id2 = upsert_comic(db, "X-Men #123", "123", 1991)
+    assert id1 == id2
+    assert db.execute("SELECT COUNT(*) FROM comics WHERE issue='123'").fetchone()[0] == 1
+
+
+def test_upsert_comic_does_not_chew_into_longer_embedded_number(db):
+    """issue='99' must not eat the '2099' in a title like 'X-Men 2099' —
+    the (?<!\\d) guard mirrored from the client-side normalizer."""
+    cid = upsert_comic(db, "X-Men 2099", "99", 2023)
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] == "X-Men 2099"
+
+
+def test_upsert_comic_preserves_leading_article(db):
+    """Deliberately NOT mirroring _strip_leading_article (BUI-591 scope
+    decision) — a title that legitimately starts with 'The' keeps it when
+    there's no duplicated issue number to strip."""
+    cid = upsert_comic(db, "The Mighty Thor", "154", 1968)
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] == "The Mighty Thor"
+
+
+def test_upsert_comic_full_listing_title_not_fully_cleaned(db):
+    """Honest about what this fix does NOT close (BUI-591 EM warning): a
+    full eBay listing title stored verbatim only loses the embedded issue
+    token, not the rest of the junk. Closing this class would require a
+    listing-title parser, which is explicitly out of scope."""
+    cid = upsert_comic(
+        db,
+        "Iron Man #126 (Marvel Comics September 1979) VF Condition!",
+        "126",
+        1979,
+    )
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert "#126" not in row["title"]
+    # Still malformed — the rest of the listing text survives, unchanged.
+    assert row["title"] == "Iron Man (Marvel Comics September 1979) VF Condition!"
+
+
+def test_upsert_comic_normalization_fails_open_on_blank_issue(db):
+    """Fails open, matching fmv_runner.py's _normalize_book_title: an
+    un-normalizable title (no issue to key off of) is stored as-is, never
+    dropped or blanked."""
+    cid = upsert_comic(db, "Some Weird Title #1", "", 2020)
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] == "Some Weird Title #1"
+
+
+def test_normalize_comic_title_fails_open_on_none_issue():
+    """Unit-level check of the helper itself: issue=None (as opposed to the
+    empty-string case exercised above, which is the only value `upsert_comic`
+    can actually receive given its NOT NULL issue column) also fails open."""
+    assert _normalize_comic_title("Some Weird Title #1", None) == "Some Weird Title #1"
 
 
 # ---------------------------------------------------------------------------

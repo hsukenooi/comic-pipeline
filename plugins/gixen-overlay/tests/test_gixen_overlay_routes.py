@@ -381,6 +381,17 @@ def test_upsert_comic_creates_comic(api):
     assert rows[0]["fmv_confidence"] == "high"
 
 
+def test_upsert_comic_strips_doubled_issue_number(api):
+    """BUI-591: POST /api/comics used to store `title` verbatim, so any
+    writer that didn't normalize client-side (unlike comic-fmv, BUI-346)
+    could persist the issue doubled into the title (real incident: comics
+    rows 640/642, 'X-Men #123'/'X-Men #127'). The boundary must now strip it
+    itself, regardless of what the caller sent."""
+    r = api.post("/api/comics", json={"title": "X-Men #123", "issue": "123", "year": 1991})
+    assert r.status_code == 200
+    assert r.json()["title"] == "X-Men"
+
+
 def test_upsert_comic_twice_upserts(api):
     payload = {"title": "X-Men", "issue": "1", "year": 1963,
                "grade": 8.0, "fmv_low": 500.0, "fmv_high": 700.0,

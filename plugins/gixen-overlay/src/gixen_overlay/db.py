@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from statistics import median
@@ -716,6 +717,56 @@ def _migrate_lowercase_title_indexes(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _strip_embedded_issue(title: str, issue: str) -> str:
+    """Strip an embedded ``#<issue>`` (or a bare trailing issue token) from
+    *title* when it duplicates the separate `issue` field.
+
+    Server-side twin of `_strip_embedded_issue` in
+    `apps/fmv/src/fmv_runner.py` (BUI-346/BUI-591) — kept duplicated rather
+    than shared, same rationale as fmv_runner's own duplication note:
+    apps/fmv is not a workspace member and does not import this plugin. The
+    `(?<!\\d)` guard on the trailing-token strip prevents chewing into an
+    unrelated longer number (e.g. issue="99" must not touch the "2099" in
+    "X-Men 2099")."""
+    issue_str = str(issue).strip() if issue else ""
+    if not title or not issue_str:
+        return title
+    cleaned = re.sub(rf'#\s*{re.escape(issue_str)}\b', '', title, flags=re.IGNORECASE)
+    cleaned = re.sub(rf'(?<!\d){re.escape(issue_str)}\s*$', '', cleaned.strip())
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+def _normalize_comic_title(title: str, issue: str) -> str:
+    """Strip a duplicated issue number out of *title* before it becomes row
+    identity (BUI-591).
+
+    `POST /api/comics` used to store `title` verbatim, so any writer that
+    isn't `comic-fmv` (which normalizes client-side per BUI-346) could persist
+    a title with the issue number doubled into it, e.g. `"X-Men #123"` —
+    unreachable by any later (title, issue) lookup, including comic-fmv's own.
+    Moving the fix here — the single choke point every `upsert_comic` caller
+    goes through (`POST /api/comics`, the extract-comics auto-link path in
+    `_link_issue_to_bid`, and link-locg's auto-create) — means the server no
+    longer depends on a client having normalized first.
+
+    Fails OPEN: a title/issue that can't be normalized (blank/None) is
+    returned unchanged, never dropped — matching `fmv_runner.py`'s
+    `_normalize_book_title` behavior.
+
+    Deliberately does **not** mirror the leading-article half of BUI-346's
+    client-side normalizer (`_strip_leading_article`): many legitimate titles
+    intentionally keep "The" (e.g. "The Amazing Spider-Man"), and folding that
+    in here would change the identity key for a much wider, unmeasured set of
+    existing rows than BUI-591's blast-radius measurement (`title LIKE
+    '%#%'`) covered. This closes the **doubled-issue-number** malformed class
+    only (e.g. `"X-Men #123"` -> `"X-Men"`) — it does NOT close the **full
+    listing title** class (e.g. `"Iron Man #126 (Marvel Comics September
+    1979) VF Condition!"`, which still contains "Marvel"/"VF Condition!"
+    after this strip). Inventing a speculative listing-title parser at this
+    durable write boundary is out of scope for BUI-591 — see the ticket."""
+    return _strip_embedded_issue(title, issue)
+
+
 def upsert_comic(
     conn: sqlite3.Connection,
     title: str,
@@ -726,6 +777,9 @@ def upsert_comic(
     variant: str | None = None,
 ) -> int:
     """Upsert a comic identity row. Returns the comic id.
+
+    BUI-591: `title` is normalized (duplicated issue number stripped) before
+    it becomes row identity — see `_normalize_comic_title`.
 
     `variant` (BUI-28) is part of the row identity: a base cover and its
     Newsstand/Direct/etc. variant of the same (title, issue, year) get distinct
@@ -750,6 +804,11 @@ def upsert_comic(
     When multiple yeared rows exist for the same (title, issue) — pre-PER-98
     historical data — the one with locg_id set wins; ties broken by lowest id.
     """
+    # BUI-591: normalize before any identity query runs, so reconciliation
+    # below (and the yearless-promotion logic) all operate on the same
+    # cleaned title every caller would have seen.
+    title = _normalize_comic_title(title, issue)
+
     # BUI-28: normalize blank variant to NULL (base edition) and scope every
     # identity query to this variant so reconciliation never crosses variants.
     variant = (variant or "").strip() or None
