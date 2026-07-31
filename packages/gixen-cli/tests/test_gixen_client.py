@@ -49,9 +49,15 @@ LOGIN_FAILED_HTML = (
 
 def _make_snipe_row(item_id, dbidid, max_bid="10", title="Test Item",
                     current_bid="5.00 USD", status="SCHEDULED",
+                    status_mirror=None,
                     seller="testseller", time_to_end="1 h, 2 m, 3 s",
-                    offset="6", group="0"):
-    """Build HTML for one snipe row in the desktop table.
+                    offset="6", group="0", include_mobile_block=True):
+    """Build HTML for one snipe row: the labelled **mobile block** followed
+    by the positional **desktop table** — Gixen renders both for every
+    snipe (BUI-587). Previously this fixture rendered the desktop table
+    only, so the labelled block that `_parse_snipe_table` reads `status` /
+    `status_mirror` from never existed in any fixture, and those regexes
+    had zero test coverage.
 
     group=None omits the editsnipegroup hidden input entirely (a layout
     drift / parse-miss shape, BUI-383).
@@ -59,7 +65,18 @@ def _make_snipe_row(item_id, dbidid, max_bid="10", title="Test Item",
     A grouped snipe (group not in (None, "", "0")) renders its detail row's
     leading cell as `<td align="right">Group: N</td>` rather than the empty
     `<td></td>` an ungrouped one gets — the real Gixen shape that BUI-580's
-    positional parse tripped over."""
+    positional parse tripped over.
+
+    status_mirror defaults to `status` (Gixen's mirror bid usually reports
+    the same status as main); pass a distinct value to exercise the two
+    fields independently.
+
+    include_mobile_block=False omits the entire labelled block, simulating
+    the layout-drift regression the canary at gixen_client.py:1084-1087
+    exists to catch — status must parse to "" (loud) and the warning must
+    fire, never a silent value borrowed from elsewhere."""
+    if status_mirror is None:
+        status_mirror = status
     group_input = (
         f'<input name="editsnipegroup_{item_id}" type="hidden" '
         f'id="editsnipegroup" value="{group}" size="14" />\n'
@@ -69,7 +86,35 @@ def _make_snipe_row(item_id, dbidid, max_bid="10", title="Test Item",
         f'<td align="right">Group: {group}</td>'
         if group not in (None, "", "0") else '<td></td>'
     )
-    return (
+    group_display = group if group is not None else ""
+    # The mobile block: its OWN item anchor (distinct from the desktop
+    # table's anchor below), then labelled cells. BUI-580's span-bounding
+    # relies on there being two anchors per item on the real page — this is
+    # what stops a snipe's mobile_span from running on into its own desktop
+    # table, let alone the next snipe's block.
+    mobile_block = (
+        f'<tr class=d0>\n'
+        f'<td><img src="thumb.jpg" height="50px" width="50px"><br />'
+        f'<a target="_blank" href="http://www.ebay.com/itm/{item_id}">{item_id}</a></td>\n'
+        f'<td>{title} <i>(by <a target=_blank '
+        f'href="http://www.ebay.com/usr/{seller}/">{seller}</a>)</i></td>\n'
+        f'</tr>\n'
+        f'<tr class=d0>\n'
+        f'<td colspan=2>Group: {group_display}</td></tr>\n'
+        f'<tr class=d0>\n'
+        f'<td colspan=2>Time to end: {time_to_end}</td></tr>\n'
+        f'<tr class=d0>\n'
+        f'<td>Max bid: {max_bid} USD</td>\n'
+        f'<td>Current bid: {current_bid}</td>\n'
+        f'</tr><tr class=d0>\n'
+        f'<td colspan=2>Offset (main): {offset}</td></tr>\n'
+        f'<tr class=d0>\n'
+        f'<td>Status (main): </td><td>{status}</td>\n'
+        f'</tr><tr class=d0>\n'
+        f'<td>Status (mirror): </td><td>{status_mirror}</td>\n'
+        f'</tr>\n'
+    )
+    desktop_part = (
         f'<tr class=d1>\n'
         f'<td rowspan="2"><input type="checkbox" name="dbidid_{dbidid}" value="{dbidid}" /></td>'
         f'<td><img src="thumb.jpg" height="50px" width="50px"><br />'
@@ -98,6 +143,9 @@ def _make_snipe_row(item_id, dbidid, max_bid="10", title="Test Item",
         f'<td>{status}</td>\n'
         f'</tr>\n'
     )
+    if not include_mobile_block:
+        return desktop_part
+    return mobile_block + desktop_part
 
 
 def _wrap_table(*rows):
@@ -447,6 +495,71 @@ class TestListSnipes:
         assert by_id["111"]["time_to_end"] == "2 d, 11 h"
         assert by_id["222"]["current_bid"] == "9.65 USD"
         assert by_id["222"]["time_to_end"] == "2 d, 12 h"
+
+    def test_parse_status_and_status_mirror_from_labelled_block(self):
+        """BUI-587: `status`/`status_mirror` are read from Gixen's labelled
+        mobile block (`Status (main): ...` / `Status (mirror): ...`), not
+        the desktop table. Before this fixture rendered that block, these
+        regexes never matched anything and `status` always parsed to "" —
+        this is the first test that asserts a real parsed value, including
+        a mirror that differs from main.
+        """
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("111", "5001", status="SCHEDULED", status_mirror="WON"),
+        )
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        assert snipes[0]["status"] == "SCHEDULED"
+        assert snipes[0]["status_mirror"] == "WON"
+
+    def test_status_span_bounded_to_own_snipe(self):
+        """BUI-580's span-bounding must hold for status too: a snipe reads
+        its OWN 'Status (main)'/'Status (mirror)' row from its own mobile
+        block, never a neighbour's (BUI-587 acceptance criterion)."""
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("111", "5001", status="WON", status_mirror="WON"),
+            _make_snipe_row("222", "5002", status="SCHEDULED", status_mirror="LOST"),
+        )
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        by_id = {s["item_id"]: s for s in snipes}
+        assert by_id["111"]["status"] == "WON"
+        assert by_id["111"]["status_mirror"] == "WON"
+        assert by_id["222"]["status"] == "SCHEDULED"
+        assert by_id["222"]["status_mirror"] == "LOST"
+
+    def test_missing_mobile_block_logs_empty_status_warning(self, caplog):
+        """The canary itself needs coverage (BUI-587 acceptance criterion):
+        if Gixen's labelled block ever goes missing (a layout drift), status
+        must parse to "" — loud, never a value borrowed from elsewhere — and
+        the `_parse_snipe_table: no Status (main) row near edititemid_%s`
+        warning must fire so the regression is visible somewhere other than
+        a silently wrong `''`.
+        """
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("111", "5001", status="WON", include_mobile_block=False),
+        )
+
+        with caplog.at_level("WARNING"):
+            with patch.object(client, "_get_home_page", return_value=html):
+                snipes = client.list_snipes()
+
+        assert snipes[0]["status"] == ""
+        assert snipes[0]["status_mirror"] == ""
+        assert "no Status (main) row near edititemid_111" in caplog.text
 
     def test_unparseable_row_yields_empty_not_neighbour_values(self):
         """A row whose shape we don't recognize must fail loudly (empty), never
