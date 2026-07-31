@@ -1151,7 +1151,27 @@ def _reresolve_manual_series_flags(
     a read path (``generate_csv`` runs from the server's export endpoint with no
     cache lock held). It would also recompute in BOTH directions on every
     export, which is exactly the silent re-flagging this ticket forbids.
+
+    **BUI-586:** the plain lookup above is publisher-BLIND — the pool it draws
+    on (``volume_candidates``) holds every volume LOCG's export carries under a
+    key, including the foreign licensed editions our own record-win push put
+    there (BUI-564). This mirrors BUI-564's trigger-and-rescope, minus the
+    Metron fetch: the row's own ``publisher_name`` is already on hand, so no
+    network call is needed. ``series_publishers`` is built once from ``comics``
+    (the STORE's rows, passed in whole) rather than from the ``index_payload``
+    ``_post_import_series_index`` synthesizes — that payload carries only
+    ``source``/``series_name`` for xlsx rows and is not a publisher source.
+    Fail open throughout: a re-resolution is only ever ATTEMPTED when
+    ``series_publisher_conflicts`` shows a demonstrated disagreement between
+    the row's publisher and the unscoped answer, and a rescope that returns
+    ``None`` (empty scoped pool, or genuinely unresolvable) keeps the unscoped
+    answer rather than blanking it.
     """
+    # BUI-586: same population `build_volume_candidates` draws its volume
+    # names from (`comics` is the store's rows, handed over whole) — see the
+    # docstring above for why this is NOT built from `index_payload`.
+    series_publishers = build_series_publishers({"comics": comics})
+
     for ci in flagged_indices:
         row = comics[ci]
         if not row.get("needs_manual_series_canonical"):
@@ -1163,13 +1183,45 @@ def _reresolve_manual_series_flags(
         if not series_name:
             continue
 
+        norm_key = _normalize_series_key(series_name)
+        issue_token = _issue_token(row.get("full_title") or "")
+        release_year = _release_year(row) or None
+
         resolved = resolve_series_for_win(
-            _normalize_series_key(series_name),
-            _issue_token(row.get("full_title") or ""),
-            _release_year(row) or None,
+            norm_key,
+            issue_token,
+            release_year,
             series_name_index,
             volume_candidates,
         )
+
+        # BUI-586: trigger a publisher-scoped rescope only on a DEMONSTRATED
+        # conflict between the row's own publisher and the publisher(s) known
+        # for the volume the unscoped lookup just picked. A None `resolved`
+        # (nothing to rescope) or a missing/unknown publisher both leave
+        # `resolved` exactly as the unscoped lookup produced it.
+        publisher_name = row.get("publisher_name") or None
+        if (
+            resolved
+            and publisher_name
+            and series_publishers
+            and series_publisher_conflicts(resolved, publisher_name, series_publishers)
+        ):
+            rescoped = resolve_series_for_win(
+                norm_key,
+                issue_token,
+                release_year,
+                series_name_index,
+                publisher_scoped_volume_candidates(
+                    volume_candidates, series_publishers, publisher_name
+                ),
+            )
+            # A rescope that comes back None (empty scoped pool, or otherwise
+            # unresolvable) keeps the unscoped `resolved` — never blanks or
+            # downgrades an existing answer.
+            if rescoped:
+                resolved = rescoped
+
         if not resolved or resolved == series_name:
             continue
 
