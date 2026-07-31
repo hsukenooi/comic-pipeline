@@ -437,6 +437,7 @@ async def _gather_vanished_null_end(
     db: sqlite3.Connection,
     gixen_item_ids: set,
     now_dt: datetime,
+    snapshot_max_bid_id: int,
 ) -> list[tuple[str, int, dict | None]]:
     """BUI-410 gather half of the BUI-85 vanished-with-NULL-end resolver.
 
@@ -457,12 +458,23 @@ async def _gather_vanished_null_end(
     read returns exactly what the apply would have selected. Gated by the eBay
     cooldown and capped per sync to bound rate-limited I/O. Returns
     (item_id, row_id, ebay) tuples — row_id lets the apply id-target its write
-    (BUI-390), never stamping a sibling sharing the item_id."""
+    (BUI-390), never stamping a sibling sharing the item_id.
+
+    BUI-584: `snapshot_max_bid_id` restricts candidates to rows that already
+    existed when `gixen_item_ids` was snapshotted (before this same async
+    function's own eBay-fetch awaits, which can race a concurrent insert). A
+    row inserted mid-tick with a NULL auction_end_at has, by construction,
+    never been asked about on Gixen — `iid in gixen_item_ids` can only ever be
+    False for it, so without this filter it would always look "vanished" and
+    would be queued for an eBay lookup that could resolve it straight to
+    ENDED (via _apply_vanished_null_end) despite Gixen never having been
+    consulted."""
     if _ebay_fetch_bin() is None or now_dt.timestamp() < _ebay_cooldown_until:
         return []
     candidates = db.execute(
         "SELECT item_id, id FROM bids "
-        "WHERE status = 'PENDING' AND auction_end_at IS NULL"
+        "WHERE status = 'PENDING' AND auction_end_at IS NULL AND id <= ?",
+        (snapshot_max_bid_id,),
     ).fetchall()
     resolved: list[tuple[str, int, dict | None]] = []
     checked = 0
@@ -749,6 +761,21 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     # Captured before the scrape so vanish stamping can exclude rows added
     # while the (lockless) scrape was in flight — see _record_vanish_observations.
     scrape_started_at = datetime.now(timezone.utc).isoformat()
+    # BUI-584: snapshot the newest bids.id that exists at this same instant —
+    # before the scrape, and therefore before every await in the gather phase
+    # below (the listed-win-evidence loop and _gather_vanished_null_end's eBay
+    # fetches). `id` is an INTEGER PRIMARY KEY (SQLite ROWID), monotonically
+    # assigned on insert, so "this row existed when gixen_item_ids was
+    # snapshotted" is exactly "id <= snapshot_max_bid_id" — cheaper than
+    # re-scraping Gixen after the gather phase finishes, and immune to clock
+    # skew, unlike a timestamp comparison. Both the vanished-while-live sweep
+    # and _gather_vanished_null_end filter their candidate rows on it, so a
+    # row a concurrent request inserts mid-tick — for an auction whose
+    # auction_end_at happens to already be in the past — can never be judged
+    # "vanished from Gixen" purely from being absent from a snapshot taken
+    # before the row existed. Gixen was never even asked about it.
+    snapshot_row = db.execute("SELECT MAX(id) FROM bids").fetchone()
+    snapshot_max_bid_id = snapshot_row[0] if snapshot_row and snapshot_row[0] is not None else 0
     try:
         snipes = await asyncio.to_thread(client.list_snipes)
     except GixenConnectionError as e:
@@ -838,7 +865,9 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
 
     # BUI-85 vanished-with-NULL-end resolution (candidate set is write-
     # independent — see _gather_vanished_null_end).
-    vanished_null_end = await _gather_vanished_null_end(db, gixen_item_ids, now_dt)
+    vanished_null_end = await _gather_vanished_null_end(
+        db, gixen_item_ids, now_dt, snapshot_max_bid_id,
+    )
 
     # ---- APPLY PHASE (one write_transaction() under _write_lock, NO awaits) ----
     # BUI-410 + BUI-405: every write below lands on ONE short-lived connection
@@ -995,6 +1024,19 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
             # Vanished + ended → flip to ENDED. The eBay fallback then picks
             # these up (ENDED rows with NULL winning_bid). Read fresh on wconn
             # so it excludes rows this cycle already transitioned.
+            #
+            # BUI-584: `id <= snapshot_max_bid_id` restricts the candidate set
+            # to rows that already existed when `gixen_item_ids` was
+            # snapshotted, at the top of this tick. Without it, a row a
+            # concurrent request inserts during this tick's gather phase
+            # (after the snapshot, before this fresh read) — for an auction
+            # whose auction_end_at already happens to be in the past — is
+            # absent from gixen_item_ids purely because Gixen was never asked
+            # about it, not because it "vanished." The `iid in gixen_item_ids`
+            # check below can't tell those apart on its own; this filter
+            # removes the row from consideration entirely, deferring it to a
+            # later sync where the snapshot and the fresh read are both
+            # current.
             vanished_ended = wconn.execute(
                 """
                 SELECT item_id, id, auction_end_at, gixen_vanished_at, snipe_group,
@@ -1002,8 +1044,9 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
                 WHERE status = 'PENDING'
                   AND auction_end_at IS NOT NULL
                   AND auction_end_at <= ?
+                  AND id <= ?
                 """,
-                (now,),
+                (now, snapshot_max_bid_id),
             ).fetchall()
             for row in vanished_ended:
                 iid = row["item_id"]
