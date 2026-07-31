@@ -328,6 +328,76 @@ def test_add_one_row_server_failure_marks_failed_with_error_text():
 
 
 # ---------------------------------------------------------------------------
+# add_one_row — stale-listing guard (BUI-567)
+# ---------------------------------------------------------------------------
+
+
+def test_add_one_row_rejects_already_ended_auction_without_network():
+    server = _FakeServer({})
+    result = add_one_row(_row("1", end_date_iso="2020-01-01T00:00:00Z"), server_request=server)
+    assert result.status == STATUS_FAILED
+    assert "end_date_iso" in result.error
+    assert "already ended" in result.error
+    assert server.calls == []
+
+
+def test_add_one_row_rejects_already_ended_auction_naive_timestamp():
+    """A naive (no explicit offset) ISO timestamp is treated as UTC — same
+    convention `server/main.py`'s `iso_to_relative` effectively assumes for
+    every real end_date_iso value this codebase produces (always UTC, `Z`
+    suffix or `+00:00`)."""
+    server = _FakeServer({})
+    result = add_one_row(_row("1", end_date_iso="2020-01-01T00:00:00"), server_request=server)
+    assert result.status == STATUS_FAILED
+    assert "already ended" in result.error
+    assert server.calls == []
+
+
+def test_add_one_row_accepts_future_end_date_and_still_calls_server():
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    result = add_one_row(_row("1", end_date_iso="2099-01-01T00:00:00Z"), server_request=server)
+    assert result.status == STATUS_ADDED
+    assert server.calls != []
+
+
+def test_add_one_row_absent_end_date_iso_skips_guard_backward_compatible():
+    """No `end_date_iso` on the row at all — the pre-BUI-567 shape — must
+    behave exactly as before: no validation, straight to the network."""
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    result = add_one_row(_row("1"), server_request=server)
+    assert result.status == STATUS_ADDED
+    assert server.calls != []
+
+
+def test_add_one_row_rejects_unparseable_end_date_iso_without_network():
+    """A present-but-garbage end_date_iso must fail loudly, not be silently
+    treated as 'no end time known' — that would quietly defeat the guard
+    for any malformed upstream value."""
+    server = _FakeServer({})
+    result = add_one_row(_row("1", end_date_iso="not-a-date"), server_request=server)
+    assert result.status == STATUS_FAILED
+    assert "end_date_iso" in result.error
+    assert server.calls == []
+
+
+def test_add_one_row_rejects_non_string_end_date_iso_without_network():
+    server = _FakeServer({})
+    result = add_one_row(_row("1", end_date_iso=12345), server_request=server)
+    assert result.status == STATUS_FAILED
+    assert "end_date_iso" in result.error
+    assert server.calls == []
+
+
+def test_add_one_row_ended_auction_still_carries_title_for_failed_table():
+    result = add_one_row(
+        _row("1", end_date_iso="2020-01-01T00:00:00Z", title="Watchmen #12"),
+        server_request=_FakeServer({}),
+    )
+    assert result.status == STATUS_FAILED
+    assert result.title == "Watchmen #12"
+
+
+# ---------------------------------------------------------------------------
 # run_batch — sequential ordering + BUI-168 halt semantics
 # ---------------------------------------------------------------------------
 
@@ -646,6 +716,25 @@ def test_build_batch_rows_absent_title_omits_key_backward_compatible():
     result = build_batch_rows(brief, working_list)
     assert "title" not in result.rows[0]
     assert result.rows[0] == {"item_id": "1", "max_bid": 50.0}
+
+
+# ---------------------------------------------------------------------------
+# build_batch_rows — end_date_iso threading (BUI-567)
+# ---------------------------------------------------------------------------
+
+
+def test_build_batch_rows_carries_end_date_iso_from_working_list():
+    brief = [_brief("1", comic_id=42, max_bid=800)]
+    working_list = [_wl_row("1", grade=9.2, end_date_iso="2026-08-01T00:00:00Z")]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows[0]["end_date_iso"] == "2026-08-01T00:00:00Z"
+
+
+def test_build_batch_rows_absent_end_date_iso_omits_key_backward_compatible():
+    brief = [_brief("1", comic_id=None, max_bid=50)]
+    working_list = [_wl_row("1")]
+    result = build_batch_rows(brief, working_list)
+    assert "end_date_iso" not in result.rows[0]
 
 
 def test_build_batch_rows_never_drops_comic_id_when_present():
