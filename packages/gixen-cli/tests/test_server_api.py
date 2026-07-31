@@ -1077,6 +1077,58 @@ def test_sync_gixen_vanished_ended_write_spares_resolved_sibling_sharing_item_id
     assert live_row["winning_bid"] is None
 
 
+def test_sync_gixen_row_inserted_during_gather_not_flipped_ended(api):
+    """BUI-584 regression (TOCTOU): _sync_gixen snapshots gixen_item_ids
+    before the gather phase's awaits (the eBay-evidence lookups), then reads
+    the vanished-ended candidates FRESH afterward. A row inserted by a
+    concurrent writer in that window — one Gixen was never even asked about
+    — must not be judged "vanished from Gixen" purely from being absent from
+    the stale snapshot.
+
+    Reproduced exactly like BUI-573's discovery: list_snipes() itself is the
+    stand-in for "time passes during the lockless gather phase" — its mocked
+    side_effect inserts a PENDING row with an already-past auction_end_at via
+    a SEPARATE connection (a concurrent writer, e.g. a different request or
+    the local sniper loop, holds no lock the gather phase would block on)
+    AFTER _sync_gixen has already captured its snapshot_max_bid_id but BEFORE
+    the vanished-ended sweep's fresh read runs. Pre-fix, the row's absence
+    from the (necessarily empty) gixen_item_ids snapshot was read as "vanished
+    from Gixen and auction has ended" and silently flipped it to ENDED."""
+    import os, sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    db_path = os.environ["DB_PATH"]
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    def _racing_list_snipes():
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO bids (item_id, max_bid, status, auction_end_at, "
+            "bid_offset) VALUES ('584000001', 25.0, 'PENDING', ?, 6)",
+            (past,),
+        )
+        conn.commit()
+        conn.close()
+        return []
+
+    api.mock_gixen.list_snipes.side_effect = _racing_list_snipes
+    api.post("/api/sync")
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    row = raw.execute(
+        "SELECT status FROM bids WHERE item_id='584000001'"
+    ).fetchone()
+    raw.close()
+
+    assert row is not None, "the racing insert itself never landed — test is vacuous"
+    assert row["status"] == "PENDING", (
+        "row inserted mid-tick was classified from a stale gixen_item_ids "
+        "snapshot instead of being deferred to a later, contemporaneous sync "
+        "(BUI-584 TOCTOU)"
+    )
+
+
 def test_sync_gixen_terminal_transition_write_spares_resolved_sibling_sharing_item_id(api):
     """BUI-390: the terminal write in _sync_gixen's Gixen-status transition loop
     must target only the row being transitioned, not every row sharing its
