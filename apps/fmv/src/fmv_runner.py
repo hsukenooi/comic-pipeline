@@ -66,6 +66,41 @@ def _coerce_grade(value) -> float | None:
     return _LETTER_GRADE_MAP.get(s.upper())
 
 
+def _coerce_year(value) -> int | None:
+    """Return a cover year as an int, or None if the value isn't a usable year.
+
+    BUI-565: `/comic:identify` emits `year` as a STRING (`"1976"`), but every
+    year test downstream compares it against an int — `_is_vintage`'s
+    `isinstance(year, (int, float))` here, and `ebay-sold-comps`' vintage gate
+    in the subprocess. Duplicated from `apps/ebay/src/sold_comps.py` rather
+    than shared, since comic-fmv shells out to ebay-sold-comps rather than
+    importing it (same rationale as `_strip_leading_article` below).
+
+    Returns None on anything unreadable, matching `_coerce_grade`'s contract;
+    the caller (`_normalize_book_year`) decides what a None means.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):  # NaN / inf
+            return None
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
 # ─── BUI-346: title normalization at the buy→FMV handoff ─────────────────────
 #
 # The working-list `title` field is passed through from the eBay listing name
@@ -119,6 +154,27 @@ def _normalize_book_title(book: dict) -> None:
     book["title"] = _strip_embedded_issue(_strip_leading_article(title), issue)
 
 
+def _normalize_book_year(book: dict) -> None:
+    """Coerce `book["year"]` to an int in place (BUI-565).
+
+    Same handoff boundary, and same reasoning, as `_normalize_book_title`: the
+    working-list `year` is passed through from `/comic:identify`, which emits
+    it as a string. Normalizing here means every downstream consumer — the DB
+    cache split, the ebay-sold-comps subprocess payload, the `/api/comics`
+    upsert body, and `_is_vintage`'s CGC-proxy gate — sees one type.
+
+    A value that can't be read as a year is deliberately LEFT AS-IS rather
+    than dropped. ebay-sold-comps raises on it, and that raise now surfaces as
+    a per-book fetch error (see `_compute_and_upsert_one`) — a loud
+    needs-manual instead of a silently year-less, silently different search.
+    """
+    if book.get("year") is None:
+        return
+    coerced = _coerce_year(book["year"])
+    if coerced is not None:
+        book["year"] = coerced
+
+
 # ─── Public entry point ──────────────────────────────────────────────────────
 
 def _fail_mapping(detail: str) -> None:
@@ -161,8 +217,10 @@ def run(*, batch_path: str | None, out_path: str | None,
 
     # BUI-346: normalize each book's title at the handoff boundary, before
     # anything downstream (DB cache lookup, subprocess, DB upsert) sees it.
+    # BUI-565: same for `year` — /comic:identify emits it as a string.
     for book in books:
         _normalize_book_title(book)
+        _normalize_book_year(book)
 
     # 1. DB cache reuse (skipped if --force). Also separates out hand-priced
     #    rows (BUI-533): a default run must skip them entirely (skipped_hand),
@@ -759,6 +817,42 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # below so comic-fmv's own --out/stdout can surface it (see run()'s
     # summary and _print_table).
     breaker_tripped = bool(result.get("breaker_tripped"))
+
+    # BUI-565: ebay-sold-comps tags a per-book `error` when its fetch RAISED
+    # (sold_comps.py's broad BUI-537 handler) instead of completing its tiers.
+    # When the raise happens before any tier records a query — a malformed
+    # book, or the BUI-565 string-`year` TypeError — `queries_used` comes back
+    # EMPTY, and `_is_fetch_error`'s "no queries means nothing was attempted"
+    # guard reads that as a genuine no-comps book rather than a failure. So
+    # the BUI-536 bail below never fired, the book fell through to the BUI-44
+    # unconditional upsert, and it surfaced as a clean `n=0` carrying a real
+    # `comic_id` and a null `flag_reason` — invisible to BOTH of /comic:buy
+    # Step 3's guards, i.e. a silent wrong answer on a money path. Bail here
+    # the same way BUI-536 does: no upsert, `source: "error"`, null comic_id.
+    #
+    # Deliberately bails even when `comps` is non-empty: a raise mid-tier
+    # leaves a TRUNCATED pool of unknown size, and pricing off a pool that
+    # lost an unknown fraction of its comps is the same wrong answer, just
+    # quieter.
+    #
+    # `is not None`, not a truthiness test: sold_comps tags the key with
+    # `str(e)`, and an exception raised with no message stringifies to "" —
+    # which would fall straight back through to the very upsert this guard
+    # exists to prevent.
+    fetch_error = result.get("error")
+    if fetch_error is not None:
+        return {
+            "input": inp, "fmv": None, "comp_count_total": len(comps),
+            "queries_used": result.get("queries_used", []),
+            "db_row": None, "comic_id": None, "fmv_id": None,
+            "source": "error", "breaker_tripped": breaker_tripped,
+            # Explicit signal for `_is_fetch_error` — an empty `queries_used`
+            # cannot carry one, and sniffing the message text would be brittle
+            # (the other `source: "error"` returns below are NOT fetch errors).
+            "fetch_error": True,
+            "error": f"fetch-err: ebay-sold-comps failed for this book: "
+                     f"{fetch_error or '<no message>'}",
+        }
 
     target_grade = inp.get("grade")
     if target_grade is None:
@@ -1677,7 +1771,17 @@ def _is_fetch_error(r: dict) -> bool:
     identical, so without this an operator can mistake an API outage for "these
     books are illiquid" and bid blind. A fetch error leaves comps empty while
     every query in queries_used carries an 'error'; a real no-comps book ran its
-    queries cleanly (no 'error' key)."""
+    queries cleanly (no 'error' key).
+
+    BUI-565: a book whose fetch RAISED before any tier ran has an EMPTY
+    queries_used, which the `if not queries` guard below reads as "nothing was
+    attempted" — a genuine no-comps book. `_compute_and_upsert_one` sets an
+    explicit `fetch_error` flag on those rows precisely because the
+    queries_used trail cannot carry the signal; honour it first so they render
+    as 'fetch-err' and land in the run's fetch-err warning count rather than
+    as a bland 'n/a'."""
+    if r.get("fetch_error"):
+        return True
     if r.get("comp_count_total"):
         return False
     queries = r.get("queries_used") or []
@@ -1750,9 +1854,11 @@ def _print_table(rows: list[dict]) -> None:
     n_fetch_err = sum(1 for r in rows if _is_fetch_error(r))
     if n_fetch_err:
         click.echo(
-            f"\n⚠️  {n_fetch_err} book(s) marked 'fetch-err': the SerpApi fetch "
-            f"FAILED (quota exhausted or outage), NOT zero comps. Check the "
-            f"SerpApi key/quota and re-run — do not treat these as illiquid.",
+            f"\n⚠️  {n_fetch_err} book(s) marked 'fetch-err': the comp fetch "
+            f"FAILED (quota exhausted, outage, or — BUI-565 — a per-book error "
+            f"in ebay-sold-comps), NOT zero comps. Check each row's `error` "
+            f"plus the SerpApi key/quota and re-run — do not treat these as "
+            f"illiquid.",
             err=True,
         )
 

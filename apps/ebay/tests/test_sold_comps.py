@@ -573,6 +573,82 @@ class TestVintageKeyHardening:
                 )
 
 
+# ── BUI-565: `year` arrives as a STRING from /comic:identify ───────────────
+
+class TestStringYearCoercion:
+    """BUI-565: `year` is a documented `--batch` field and /comic:identify
+    emits it as a string ("1976"). Every year test in sold_comps compares
+    against the int `_VINTAGE_YEAR_CUTOFF`, so an uncoerced string raised
+    `TypeError: '<' not supported between instances of 'str' and 'int'` on the
+    FIRST tier — before any query ran. `fetch_book_comps`' broad handler
+    swallowed it into an empty `queries_used`, which comic-fmv then read as a
+    genuine no-comps book: a silent n=0 on a money path (two live X-Men #101
+    auctions, $291 and $127.50, came back unpriced in the 2026-07-31 buy run).
+    """
+
+    def test_string_year_builds_the_same_query_as_int_year(self):
+        # The literal reproduction from the ticket: this raised TypeError.
+        assert (sc.build_query("X-Men", "101", year="1976")
+                == sc.build_query("X-Men", "101", year=1976))
+
+    def test_string_year_is_not_only_a_vintage_problem(self):
+        # EVERY string year raised, not just vintage ones — the comparison
+        # itself is what blew up, and it runs before any cutoff logic.
+        assert (sc.build_query("Wolverine", "50", year="1992")
+                == sc.build_query("Wolverine", "50", year=1992))
+        assert (sc.build_query("Saga", "1", year="2012")
+                == sc.build_query("Saga", "1", year=2012))
+
+    def test_string_year_activates_the_vintage_hardening(self):
+        # Not merely "doesn't crash": the BUI-347 exclusion terms must fire,
+        # exactly as they do for the int form.
+        q = sc.build_query("X-Men", "101", year="1976")
+        for term in ("-variant", "-foil", "-virgin", "-reprint", "-facsimile",
+                     "-homage", "-timeless"):
+            assert term in q, f"{term!r} missing from string-year query: {q}"
+        assert "1976" in q
+
+    def test_string_vintage_year_kwarg_also_coerces(self):
+        # The broaden tier passes `year=None, vintage_year=<the book's year>`;
+        # that kwarg takes the same string and must gate identically.
+        assert (sc.build_query("X-Men", "101", year=None, vintage_year="1976")
+                == sc.build_query("X-Men", "101", year=None, vintage_year=1976))
+        assert "-variant" in sc.build_query("X-Men", "101", year=None,
+                                            vintage_year="1976")
+
+    def test_float_and_padded_string_years_coerce(self):
+        assert sc._coerce_year(1976.0) == 1976
+        assert sc._coerce_year("  1976  ") == 1976
+        assert sc._coerce_year("1976.0") == 1976
+
+    def test_absent_and_empty_years_stay_absent(self):
+        # `""` never crashed (falsy short-circuits the gate) — preserve that,
+        # and keep the query byte-for-byte equal to the no-year form.
+        assert sc._coerce_year(None) is None
+        assert sc._coerce_year("") is None
+        assert sc._coerce_year("   ") is None
+        assert (sc.build_query("X-Men", "101", year="")
+                == sc.build_query("X-Men", "101"))
+
+    def test_unparseable_year_raises_rather_than_being_dropped(self):
+        # Money-safety: a year-less query still returns comps, so silently
+        # dropping a garbage year would swap a loud failure for a quietly
+        # DIFFERENT search the operator never learns about. Raise instead —
+        # fetch_book_comps turns it into a per-book `error`.
+        for bad in ("n/a", "c. 1976", "nineteen seventy-six", [], {}, True):
+            with pytest.raises(ValueError):
+                sc._coerce_year(bad)
+
+    def test_int_year_output_is_byte_for_byte_unchanged(self):
+        # Acceptance: every pre-BUI-565 int caller's query is untouched.
+        assert (sc.build_query("Amazing Spider-Man", "50", year=1967)
+                == '"Amazing Spider-Man 50" 1967 -variant -foil -virgin '
+                   '-reprint -facsimile -homage -timeless '
+                   '-cgc -cbcs -graded -slab')
+        assert (sc.build_query("Amazing Spider-Man", "50", year=2018)
+                == '"Amazing Spider-Man 50" 2018 -cgc -cbcs -graded -slab')
+
+
 class TestCanonicalUrl:
     def test_excludes_api_key(self):
         url = sc.canonical_serpapi_url('"X-Men 1"')
@@ -797,6 +873,44 @@ class TestTieredStrategy:
                                   "key")
         assert len(calls) == 1
         assert len(out["comps"]) == 12
+
+    def test_string_year_runs_its_queries_end_to_end(self, tmp_path, monkeypatch):
+        """BUI-565 end-to-end, on the ticket's literal repro shape: a string
+        `year` must run the pipeline normally, not abort on tier 1 and return
+        an empty `queries_used` (which comic-fmv reads as a clean n=0)."""
+        results = [[self._comp(str(i), f"X-Men #101 NM {i}.0 Marvel 1976")
+                    for i in range(12)]]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"item_id": "800411934143", "title": "X-Men", "issue": "101",
+             "grade": 7.5, "year": "1976"},
+            "key",
+        )
+        assert "error" not in out
+        assert len(calls) == 1
+        assert len(out["comps"]) == 12
+        assert len(out["queries_used"]) == 1
+        # The BUI-347 vintage hardening must fire off the string year too.
+        assert "-variant" in calls[0]
+        # ...and the echoed input carries the coerced int, so downstream
+        # `isinstance(year, (int, float))` gates (comic-fmv's `_is_vintage`)
+        # see a year at all.
+        assert out["input"]["year"] == 1976
+
+    def test_unparseable_year_is_a_tagged_error_not_a_silent_zero(
+            self, tmp_path, monkeypatch):
+        """BUI-565: a year that can't be read must HARD-FAIL visibly. An empty
+        `queries_used` with no `error` is exactly the shape comic-fmv
+        misclassifies as a genuine no-comps book."""
+        calls = self._wire(tmp_path, monkeypatch, [])
+        out = sc.fetch_book_comps(
+            {"title": "X-Men", "issue": "101", "grade": 7.5, "year": "n/a"},
+            "key",
+        )
+        assert calls == []          # nothing was queried...
+        assert out["comps"] == []
+        assert "error" in out       # ...and the caller is TOLD that
+        assert "n/a" in out["error"]
 
     def test_broadens_when_thin(self, tmp_path, monkeypatch):
         # 2 base, then plenty when broader
@@ -1200,6 +1314,26 @@ class TestInclusiveTier:
         assert slab_ids == {"s1", "s2"}
         for t in ("-cgc", "-cbcs", "-graded", "-slab"):
             assert t not in calls[2]  # the inclusive query itself
+
+    def test_fires_for_a_string_vintage_year(self, tmp_path, monkeypatch):
+        """BUI-565: the tier-4 gate used to be
+        `isinstance(year, (int, float)) and year < CUTOFF`, which is silently
+        False for a string year — so this tier never fired for exactly the
+        vintage books it exists to rescue. (Same class of bug as the
+        build_query TypeError, but silent rather than raising.)"""
+        results = [
+            [self._comp("r1"), self._comp("r2")],   # tier 1 base: thin
+            [self._comp("r3")],                     # tier 2 broader: still thin
+            [self._comp("r4"),
+             self._comp("s1", title="ASM #142 CGC 6.5 1975", price=1200.0)],
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "ASM", "issue": "142", "year": "1975"}, "key",
+        )
+        assert {q["tier"] for q in out["queries_used"]} >= {"inclusive"}
+        assert len(calls) == 3
+        assert {c["product_id"] for c in out["slab_comps"]} == {"s1"}
 
     def test_does_not_fire_for_modern_book(self, tmp_path, monkeypatch):
         # Thin raw pool, but modern — the 0.50-0.55 factor is vintage-only, so
