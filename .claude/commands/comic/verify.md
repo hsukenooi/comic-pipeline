@@ -132,7 +132,7 @@ Verdicts (ladder — first failure wins):
 | Verdict | Meaning |
 |---|---|
 | `fully_linked` | All five checks pass — comic, fmv (with low+high), junction, bids.fmv_id |
-| `needs_manual` | Comic + fmv at grade exist but the fmv is **intentionally unpriceable** — flagged `needs_manual` (BUI-86) with a structured `flag_reason` (`one_sided` / `too_wide` / `too_sparse`). `fmv.low`/`fmv.high` are NULL *by design*; this is NOT a missing-FMV stub. Re-running `/comic:fmv` is a no-op — hand-price it. |
+| `needs_manual` | Comic + fmv at grade exist but the fmv is **intentionally unpriceable** — flagged `needs_manual` (BUI-86) with a structured `flag_reason` (`one_sided` / `too_wide` / `too_sparse` / `variant_dropped`). `fmv.low`/`fmv.high` are NULL *by design*; this is NOT a missing-FMV stub. Re-running `/comic:fmv` is a no-op — hand-price it. |
 | `fmv_stub` | Comic + fmv at grade exist but `fmv.low`/`fmv.high` are NULL and the row is NOT flagged — `/comic:fmv` never computed FMV |
 | `partial` | fmv populated but `bids.fmv_id` is null or mismatches the matched fmv |
 | `no_fmv_at_grade` | Comic linked, but no `fmv` row at the bid's grade |

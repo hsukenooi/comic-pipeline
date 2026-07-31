@@ -1053,7 +1053,8 @@ def _widen_collapsed_range(
 
 def compute_fmv(comps: list[dict], target_grade: float,
                 grade_confidence: str | None = None,
-                max_window: float | None = None) -> dict:
+                max_window: float | None = None,
+                forced_flag_reason: str | None = None) -> dict:
     """Take a deduped, hard-excluded comp list and return the FMV summary.
 
     `grade_confidence` (BUI-51) is the photo-coverage confidence from
@@ -1065,13 +1066,26 @@ def compute_fmv(comps: list[dict], target_grade: float,
     `max_window` (BUI-86) caps how far the pool widens; the caller threads
     `--grade-window` through here. It only changes reach, never the guards.
 
+    `forced_flag_reason` (BUI-588) is a needs-manual reason the POOL cannot
+    show, supplied by the caller: something about how the comps were FETCHED
+    makes them not directly comparable to the book being priced. The one such
+    reason today is `"variant_dropped"` — ebay-sold-comps found nothing until it
+    dropped the book's variant term, so the pool prices the base cover instead.
+    It applies only when the pool's own diagnostics found nothing (a real
+    `_classify_pool` reason is more actionable and keeps precedence), and from
+    there it flows through the ordinary flagged-book path, so the invariant
+    "flag_reason set ⇒ fmv_low/fmv_high/max_bid are None and confidence is LOW"
+    holds for it exactly as for one_sided/too_wide/too_sparse. None — every
+    existing caller — is byte-for-byte pre-BUI-588 behavior.
+
     Output shape:
     {
       "n": int,                        # trimmed pool size (raw count)
       "effective_n": float,            # sum of recency weights (BUI-287 U2);
                                         # == n when every comp has neutral weight
       "window": float,                 # window the pool was built at (≤ max_window)
-      "flag_reason": str | None,       # one_sided | too_wide | too_sparse | None (BUI-86)
+      "flag_reason": str | None,       # one_sided | too_wide | too_sparse (BUI-86)
+                                        # | variant_dropped (BUI-588) | None
       "grade_span": float | None,      # max(grade) - min(grade) over the pool
       "fmv_low": int | None,           # weighted Q25, clean-rounded (None if flagged/no-comps)
       "fmv_high": int | None,          # weighted Q75, clean-rounded
@@ -1150,6 +1164,14 @@ def compute_fmv(comps: list[dict], target_grade: float,
         if lo <= 0 or hi / lo > SMALL_POOL_MAX_RATIO:
             flag_reason = "too_sparse"
 
+    # BUI-588: the caller's fetch-level reason, applied only where the pool
+    # itself is clean. Set here — above the §7 interpolation gate below, which
+    # is scoped to one_sided/too_wide — so a forced flag can never be silently
+    # cleared by interpolating a price for a pool whose comparability, not whose
+    # shape, is the problem.
+    if flag_reason is None and forced_flag_reason:
+        flag_reason = forced_flag_reason
+
     # BUI-306 §5: check the grade-bucket median curve for monotonicity on the
     # widened grade-bearing pool. Violations are surfaced (SUSPECT) but never
     # alter the priced number for a monotonic pool — a non-monotonic pool keeps
@@ -1174,8 +1196,16 @@ def compute_fmv(comps: list[dict], target_grade: float,
     # BUI-318 thin-bracket guard: pass per-bucket comp counts so a bracket
     # anchored on a lone comp is suppressed (returns None → stays needs_manual)
     # rather than smearing a wild over-bid across the target.
+    # BUI-588: `forced_flag_reason` also SUPPRESSES §7. Interpolation is the one
+    # path that clears a flag and emits a bid-able number, and interpolating
+    # between buckets of a base-cover pool yields a base-cover price just the
+    # same — it would hand back exactly the unflagged variant-blind number this
+    # parameter exists to withhold. So a forced reason means no auto-price by
+    # any route, whether it won the `flag_reason` slot or lost it to a
+    # pool-shape reason above.
     interpolation = None
-    if flag_reason in ("one_sided", "too_wide") and n >= 3:
+    if (flag_reason in ("one_sided", "too_wide") and n >= 3
+            and not forced_flag_reason):
         interpolation = interpolate_grade_curve(curve, target_grade, counts=counts)
 
     label = confidence_label(effective_n, cv_val)

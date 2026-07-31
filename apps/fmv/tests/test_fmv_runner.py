@@ -3219,3 +3219,127 @@ class TestBriefProjection:
                            server_url=server_url)
 
         assert capsys.readouterr().out.strip() == ""
+
+
+# ─── BUI-588 / BUI-581: query-rewrite signals from ebay-sold-comps ────────────
+
+class TestVariantDroppedSignal:
+    """A pool that only exists because the book's variant term was dropped
+    prices the BASE cover. That trade must reach the caller, not be buried in a
+    clean-looking row (BUI-588)."""
+
+    def _priced_result(self, **extra):
+        result = {
+            "input": {"title": "Uncanny X-Men", "issue": "281", "year": 1991,
+                      "grade": 9.2},
+            "comps": [_make_comp(p, 9.2) for p in [20, 22, 24, 26, 28]],
+        }
+        result.update(extra)
+        return result
+
+    def _book(self):
+        return {"title": "Uncanny X-Men", "issue": "281", "grade": 9.2,
+                "variant": "White Logo 1st Print"}
+
+    def test_dropped_variant_becomes_a_needs_manual_flag(self, server_url):
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._priced_result(variant_dropped="White Logo 1st Print"),
+                self._book(), server_url=server_url)
+        assert out["fmv"]["flag_reason"] == "variant_dropped"
+        # /comic:buy Step 3 gates on flag_reason AND on the absent number.
+        assert out["fmv"]["max_bid"] is None
+        assert out["fmv"]["fmv_low"] is None
+
+    def test_absent_signal_prices_normally(self, server_url):
+        """The overwhelmingly common path must be untouched."""
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._priced_result(), self._book(), server_url=server_url)
+        assert out["fmv"]["flag_reason"] is None
+        assert out["fmv"]["max_bid"] is not None
+
+    def test_flag_reaches_the_db_row(self, server_url):
+        """`fmv_flag_reason` is the structured column /comic:verify and the
+        upsert's stale-price clearing both read — the notes token alone is not
+        enough."""
+        upsert = MagicMock(return_value={"id": 1})
+        with patch("fmv_runner._upsert_fmv", upsert):
+            fmv_runner._compute_and_upsert_one(
+                self._priced_result(variant_dropped="White Logo 1st Print"),
+                self._book(), server_url=server_url)
+        fmv_arg = upsert.call_args.args[2]
+        assert fmv_arg["flag_reason"] == "variant_dropped"
+
+    def test_notes_name_the_dropped_term(self, server_url):
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._priced_result(variant_dropped="White Logo 1st Print"),
+                self._book(), server_url=server_url)
+        notes = fmv_runner._build_notes(out["fmv"])
+        assert "variant_dropped=White Logo 1st Print" in notes
+        assert "manual_review=variant_dropped" in notes
+
+    def test_notes_keep_the_term_when_a_pool_reason_wins_the_flag(self, server_url):
+        """A shape reason takes the flag slot, but WHAT was traded away to get a
+        pool at all is still the thing a human needs in order to judge the
+        row — it must not be lost."""
+        one_sided = {
+            "input": {"title": "FF", "issue": "63", "year": 1967, "grade": 9.6},
+            "comps": [_make_comp(p, 9.0) for p in [40, 42, 44, 45, 41]],
+            "variant_dropped": "2nd Printing Gold Cover",
+        }
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                one_sided, {"title": "FF", "issue": "63", "grade": 9.6},
+                server_url=server_url)
+        assert out["fmv"]["flag_reason"] == "one_sided"
+        notes = fmv_runner._build_notes(out["fmv"])
+        assert "variant_dropped=2nd Printing Gold Cover" in notes
+
+    def test_notes_omit_the_token_when_nothing_was_dropped(self, server_url):
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._priced_result(), self._book(), server_url=server_url)
+        assert "variant_dropped" not in fmv_runner._build_notes(out["fmv"])
+
+
+class TestMastheadSwapSignal:
+    def _result(self, **extra):
+        result = {
+            "input": {"title": "Uncanny X-Men", "issue": "69", "year": 1970,
+                      "grade": 5.0},
+            "comps": [_make_comp(p, 5.0) for p in [12, 14, 15, 16, 18]],
+        }
+        result.update(extra)
+        return result
+
+    def test_swapped_masthead_is_named_in_the_notes(self, server_url):
+        """BUI-581: the comps came from the other name this series carried.
+        Saying so keeps the number auditable — a reader comparing the row's
+        title to the pool would otherwise have no way to know."""
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._result(masthead_swapped_to="X-Men"),
+                {"title": "Uncanny X-Men", "issue": "69", "grade": 5.0},
+                server_url=server_url)
+        assert "masthead=X-Men" in fmv_runner._build_notes(out["fmv"])
+
+    def test_a_swap_does_not_withhold_the_price(self, server_url):
+        """Unlike a dropped variant, the alias pool is the SAME book under its
+        other name — comparable, so it prices normally."""
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._result(masthead_swapped_to="X-Men"),
+                {"title": "Uncanny X-Men", "issue": "69", "grade": 5.0},
+                server_url=server_url)
+        assert out["fmv"]["flag_reason"] is None
+        assert out["fmv"]["max_bid"] is not None
+
+    def test_no_token_when_the_callers_masthead_was_used(self, server_url):
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._result(),
+                {"title": "Uncanny X-Men", "issue": "69", "grade": 5.0},
+                server_url=server_url)
+        assert "masthead=" not in fmv_runner._build_notes(out["fmv"])

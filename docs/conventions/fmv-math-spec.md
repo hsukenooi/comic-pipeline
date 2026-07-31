@@ -183,6 +183,7 @@ After widening, a pool is **not** auto-priced — it is flagged `needs_manual` �
 - **`too_sparse`** — fewer than 2 comps survive IQR trim. A lone comp is not a price.
 - **`one_sided`** — every comp sits strictly above OR strictly below the target grade (no bracket). Widening only reaches one direction, so the estimate would be biased (e.g. a NM+ 9.6 target whose comps top out at 9.0 — widening only drags it *down*). This is the case for hand-pricing via §7/§7a, not an automated number.
 - **`too_wide`** — the pool brackets the target but spans more than 2.0 grade points (e.g. comps at 5.0 and 9.0 for a 7.0 target). The median of a grade-smeared pool is meaningless because price is monotonic in grade.
+- **`variant_dropped`** — **(BUI-588)** not a pool *shape* problem: `ebay-sold-comps` found no comps at all until it dropped the book's variant term, so this pool prices the **base cover**, not the variant that was asked for. (A collector/catalog descriptor like `White Logo 1st Print` appears in no listing title and zeroes every query tier; `Newsstand` is real eBay vocabulary and narrows correctly.) The base-cover price is a defensible floor for most variants and a wrong anchor for a scarce few, so the call is left to a human. The dropped term is named in the notes as `variant_dropped=<text>`. Lowest precedence — a real shape reason above wins the `flag_reason`, and the notes token is written either way. `--force` will not clear this one; removing or correcting the `variant` on the input will.
 
 A flagged book emits no bid-able number; `comic-fmv` still writes the linked comic stub (so it's traceable) with `manual_review=<reason>` in the notes. **When you see `needs_manual`, either hand-price it via grade-curve interpolation (§7) or the CGC proxy (§7a), or leave it for manual review — do not invent a number from the smeared/one-sided pool.** Only a bracketed, bounded, ≥2-comp pool auto-prices.
 
@@ -312,7 +313,7 @@ Manual fallback: skip these unless you're explicitly recomputing — re-running 
 Always include:
 - The window the pool was built at
 - N and CV
-- Whether the book was flagged `needs_manual` (and the reason: `one_sided` / `too_wide` / `too_sparse`) vs. auto-priced
+- Whether the book was flagged `needs_manual` (and the reason: `one_sided` / `too_wide` / `too_sparse` / `variant_dropped`) vs. auto-priced
 - Whether grade-curve interpolation was applied
 - Suspect comps flagged (with reason)
 - Hot-market signal if current bid > Q75
@@ -343,7 +344,7 @@ curl -s -X POST $COMICS_SERVER_URL/api/comics \
 - `grade` — numeric only (e.g. `8.5`); omit or `null` if unknown
 - `fmv_confidence` — must be `"high"`, `"medium"`, or `"low"`
 - `fmv_comps` — **(BUI-286)** the comp-pool count `N`. This is no longer a pure SerpApi/eBay-sold count: it may include first-party comps folded in from your own resolved auctions (WON and LOST outcomes for this `(comic, grade)`, pulled from the comics server). If any of `N` came from your own auctions, `fmv_notes` carries a `first_party=<count>` token — check there to see the SerpApi-vs-first-party split rather than assuming `fmv_comps` is all SerpApi. **(BUI-350)** For a CGC-proxy row (§7a above), `fmv_comps`/`N` reflects the **graded slab-ladder** comp count, not raw-market liquidity — `fmv_notes` carries the `CGC proxy: … n=<count> is graded-ladder comps, not raw-market depth` token; a machine consumer must not read a proxy row's `N` as raw depth.
-- `fmv_flag_reason` — **(BUI-132)** set to the `needs_manual` reason (`"one_sided"`, `"too_wide"`, or `"too_sparse"`) when the book was flagged (§3); omit/`null` for an auto-priced book. This is now a **structured column**, not just a `manual_review=<reason>` token in `fmv_notes`. Posting it makes the row first-class `needs_manual`: `/comic:verify` reports it as `needs_manual` (not `fmv_stub`), and the upsert **clears any previously-cached price** for that comic+grade so a book that later flags can't keep a stale auto-priced number. (A plain n=0 no-comps stub posts with `fmv_flag_reason` omitted and so never wipes a real price.)
+- `fmv_flag_reason` — **(BUI-132)** set to the `needs_manual` reason (`"one_sided"`, `"too_wide"`, `"too_sparse"`, or `"variant_dropped"`) when the book was flagged (§3); omit/`null` for an auto-priced book. This is now a **structured column**, not just a `manual_review=<reason>` token in `fmv_notes`. Posting it makes the row first-class `needs_manual`: `/comic:verify` reports it as `needs_manual` (not `fmv_stub`), and the upsert **clears any previously-cached price** for that comic+grade so a book that later flags can't keep a stale auto-priced number. (A plain n=0 no-comps stub posts with `fmv_flag_reason` omitted and so never wipes a real price.)
 - `locg_id` — from the LOCG ID resolved in `/comic:collection-check`; omit entirely if unresolved (don't pass null)
 - `locg_variant_id` — include only if a separate variant entry was found on LOCG
 

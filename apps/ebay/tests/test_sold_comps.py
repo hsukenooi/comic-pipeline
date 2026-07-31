@@ -2499,3 +2499,372 @@ class TestProviderFallback:
             sc.run_batch([{"title": "X", "issue": "1"}], "key", max_workers=1)
         err = capsys.readouterr().err
         assert err.count("SOLD_COMPS_KEY not set") == 1
+
+
+# ─── BUI-581: masthead-rename probe ───────────────────────────────────────────
+
+class TestMastheadAlias:
+    """`_alias_masthead_title` is a pure NAME substitution — it must never imply
+    a claim about which issues carried which masthead (BUI-581)."""
+
+    def test_modern_masthead_maps_to_the_original(self):
+        assert sc._alias_masthead_title("Uncanny X-Men") == "X-Men"
+
+    def test_original_masthead_maps_to_the_modern_one(self):
+        assert sc._alias_masthead_title("X-Men") == "Uncanny X-Men"
+
+    def test_specific_name_wins_over_the_bare_one_it_contains(self):
+        """Pair order is load-bearing: matched against the bare "x-men" first,
+        "Uncanny X-Men" would rewrite to "Uncanny Uncanny X-Men"."""
+        assert sc._alias_masthead_title("uncanny x-men") == "X-Men"
+
+    def test_leading_article_is_stripped_before_matching(self):
+        assert sc._alias_masthead_title("The Uncanny X-Men") == "X-Men"
+
+    def test_trailing_issue_text_is_preserved(self):
+        assert sc._alias_masthead_title("Uncanny X-Men #69") == "X-Men #69"
+
+    def test_title_that_merely_contains_the_masthead_is_untouched(self):
+        """Anchored at the start: swapping mid-title produces a name no listing
+        ever carried ("Giant-Size Uncanny X-Men"), so it must not fire."""
+        assert sc._alias_masthead_title("Giant-Size X-Men") is None
+        assert sc._alias_masthead_title("Wolverine and the X-Men") is None
+
+    def test_masthead_must_be_a_whole_token(self):
+        assert sc._alias_masthead_title("X-Menace") is None
+
+    def test_unrelated_title_has_no_counterpart(self):
+        assert sc._alias_masthead_title("Amazing Spider-Man") is None
+        assert sc._alias_masthead_title("") is None
+
+    def test_rename_pairs_are_not_synced_with_the_reboot_list(self):
+        """The two tables answer different questions (substitution vs
+        exclusion). Pin that they're independent, so a future edit to
+        `_REBOOTABLE_MASTHEADS` (which locg-cli mirrors, BUI-577) doesn't get
+        "helpfully" propagated here."""
+        rename_names = {name for name, _ in sc._MASTHEAD_RENAME_PAIRS}
+        assert rename_names != set(sc._REBOOTABLE_MASTHEADS)
+
+
+class TestAltMastheadTier:
+    def _comp(self, pid, title="X-Men #69 FN 6.0 Marvel 1970", price=15.0):
+        return {
+            "product_id": pid,
+            "title": title,
+            "price": {"extracted": price},
+            "sold_date": "",
+            "buying_format": "auction",
+        }
+
+    def _wire(self, tmp_path, monkeypatch, results_per_query):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        calls = []
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+                       record_attempt=None, breaker=None):
+            calls.append(nkw)
+            idx = len(calls) - 1
+            results = results_per_query[idx] if idx < len(results_per_query) else []
+            return ({
+                "organic_results": results,
+                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+            }, False)
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        return calls
+
+    def test_deeper_alias_pool_replaces_a_collapsed_one(self, tmp_path, monkeypatch):
+        """BUI-581's live case: Uncanny X-Men #69 returns n=0 under the modern
+        masthead and a real pool under the original one."""
+        results = [
+            [],                                             # base (Uncanny): 0
+            [],                                             # broader: still 0
+            [self._comp(str(i)) for i in range(6)],         # alt-masthead: 6
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "69", "year": 1970, "grade": 5.0},
+            "key",
+        )
+        assert out["masthead_swapped_to"] == "X-Men"
+        assert len(out["comps"]) == 6
+        assert '"X-Men 69"' in calls[2]
+        # The echoed input still reports what the CALLER asked for.
+        assert out["input"]["title"] == "Uncanny X-Men"
+        assert "alt-masthead" in {q["tier"] for q in out["queries_used"]}
+
+    def test_shallower_alias_pool_is_discarded(self, tmp_path, monkeypatch):
+        """Fail-safe direction: the probe never costs comps. A thin-but-real
+        primary pool survives a worse alias probe untouched."""
+        results = [
+            [self._comp("p1"), self._comp("p2")],   # base under "X-Men": 2
+            [],                                     # broader: nothing new
+            [self._comp("a1")],                     # alt-masthead: only 1
+        ]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "X-Men", "issue": "69", "year": 1970}, "key",
+        )
+        assert out["masthead_swapped_to"] is None
+        assert {c["product_id"] for c in out["comps"]} == {"p1", "p2"}
+
+    def test_equal_depth_keeps_the_callers_masthead(self, tmp_path, monkeypatch):
+        """Strictly-greater, not >=: a tie is no evidence, so don't rewrite the
+        book's identity on one."""
+        results = [
+            [self._comp("p1")],   # base: 1
+            [],                   # broader
+            [self._comp("a1")],   # alt-masthead: also 1
+        ]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "X-Men", "issue": "69", "year": 1970}, "key",
+        )
+        assert out["masthead_swapped_to"] is None
+        assert {c["product_id"] for c in out["comps"]} == {"p1"}
+
+    def test_pools_are_never_merged(self, tmp_path, monkeypatch):
+        """The winning pool REPLACES the loser — blending the two mastheads
+        would quietly mix in same-numbered issues of the other volume."""
+        results = [
+            [self._comp("p1")],                                      # base: 1
+            [],                                                      # broader
+            [self._comp("a1"), self._comp("a2"), self._comp("a3")],  # alt: 3
+        ]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "69", "year": 1970}, "key",
+        )
+        assert {c["product_id"] for c in out["comps"]} == {"a1", "a2", "a3"}
+
+    def test_probe_pool_is_not_dedup_suppressed_by_the_primary(
+            self, tmp_path, monkeypatch):
+        """The two pools overlap heavily by construction (an eBay phrase match
+        on the shorter masthead also matches the longer one). If the probe were
+        deduped against the primary it would score ~0 and always lose."""
+        shared = [self._comp("s1"), self._comp("s2")]
+        results = [
+            shared,                                          # base: 2 (thin)
+            [],                                              # broader
+            shared + [self._comp("s3"), self._comp("s4")],   # alt: same 2 + 2
+        ]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "69", "year": 1970}, "key",
+        )
+        assert out["masthead_swapped_to"] == "X-Men"
+        assert {c["product_id"] for c in out["comps"]} == {"s1", "s2", "s3", "s4"}
+
+    def test_later_tiers_query_the_winning_masthead(self, tmp_path, monkeypatch):
+        """The point of probing before tiers 3/4 is that the rest of the ladder
+        stops spending queries on the dead name."""
+        results = [
+            [],                       # base (Uncanny)
+            [],                       # broader
+            [self._comp("a1")],       # alt-masthead → wins
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "69", "year": 1970, "grade": 5.0},
+            "key",
+        )
+        assert len(calls) > 3
+        for nkw in calls[3:]:
+            assert '"X-Men 69"' in nkw
+            assert "Uncanny" not in nkw
+
+    def test_healthy_pool_never_probes(self, tmp_path, monkeypatch):
+        results = [[self._comp(str(i)) for i in range(12)]]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "142", "year": 1981}, "key",
+        )
+        assert len(calls) == 1
+        assert out["masthead_swapped_to"] is None
+
+    def test_modern_book_never_probes(self, tmp_path, monkeypatch):
+        """Post-cutoff, "X-Men #1" and "Uncanny X-Men #1" are DIFFERENT books —
+        swapping there would price the wrong comic."""
+        calls = self._wire(tmp_path, monkeypatch, [[], []])
+        out = sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "1", "year": 2019}, "key",
+        )
+        assert "alt-masthead" not in {q["tier"] for q in out["queries_used"]}
+        assert out["masthead_swapped_to"] is None
+        for nkw in calls:
+            assert "Uncanny" in nkw
+
+    def test_year_less_book_never_probes(self, tmp_path, monkeypatch):
+        """Without a year there is no way to tell the vintage run from the
+        modern relaunch, so the probe stays off rather than guessing."""
+        calls = self._wire(tmp_path, monkeypatch, [[]])
+        out = sc.fetch_book_comps({"title": "Uncanny X-Men", "issue": "1"}, "key")
+        assert out["masthead_swapped_to"] is None
+        for nkw in calls:
+            assert "Uncanny" in nkw
+
+    def test_string_year_still_probes(self, tmp_path, monkeypatch):
+        """/comic:identify emits `year` as a string (BUI-565); the gate must
+        read it as vintage rather than silently disabling this tier."""
+        results = [[], [], [self._comp("a1"), self._comp("a2")]]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "69", "year": "1970"}, "key",
+        )
+        assert out["masthead_swapped_to"] == "X-Men"
+
+    def test_title_without_a_counterpart_never_probes(self, tmp_path, monkeypatch):
+        calls = self._wire(tmp_path, monkeypatch, [[], []])
+        out = sc.fetch_book_comps(
+            {"title": "Amazing Spider-Man", "issue": "142", "year": 1975}, "key",
+        )
+        assert "alt-masthead" not in {q["tier"] for q in out["queries_used"]}
+        assert out["masthead_swapped_to"] is None
+        assert calls  # sanity: the ladder did run
+
+    def test_probe_query_carries_the_year(self, tmp_path, monkeypatch):
+        """MONEY GUARD. Both names in a rename pair are also rebootable
+        mastheads, so an unyeared probe could win the depth comparison on the
+        OTHER volume's same-numbered issue — X-Men Vol.2 #1 (1991, a common $10
+        book) priced off Uncanny X-Men #1 (1963) comps is a four-figure
+        over-bid. The year is what keeps the two volumes apart, so the probe
+        must never broaden the way tier 2 does."""
+        results = [[], [], [self._comp("a1")]]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        sc.fetch_book_comps(
+            {"title": "X-Men", "issue": "1", "year": 1991}, "key",
+        )
+        alt_nkw = calls[2]
+        assert '"Uncanny X-Men 1"' in alt_nkw
+        assert "1991" in alt_nkw
+
+    def test_probe_query_keeps_the_vintage_exclusion_terms(self, tmp_path, monkeypatch):
+        """The alias is itself a rebootable masthead, so the BUI-347 hardening
+        has to survive the substitution — otherwise the probe could win on a
+        pool of modern variant/facsimile printings."""
+        results = [[], [], [self._comp("a1")]]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "69", "year": 1970}, "key",
+        )
+        for term in sc._VINTAGE_EXCLUSION_TERMS:
+            assert term in calls[2]
+
+
+# ─── BUI-588: variant-drop retry ──────────────────────────────────────────────
+
+class TestVariantDropRetry:
+    def _comp(self, pid, title="Uncanny X-Men #281 NM 9.2 Marvel", price=20.0):
+        return {
+            "product_id": pid,
+            "title": title,
+            "price": {"extracted": price},
+            "sold_date": "",
+            "buying_format": "auction",
+        }
+
+    def _wire(self, tmp_path, monkeypatch, results_per_query):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        calls = []
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+                       record_attempt=None, breaker=None):
+            calls.append(nkw)
+            idx = len(calls) - 1
+            results = results_per_query[idx] if idx < len(results_per_query) else []
+            return ({
+                "organic_results": results,
+                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+            }, False)
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        return calls
+
+    def test_dead_descriptor_is_dropped_and_reported(self, tmp_path, monkeypatch):
+        """BUI-588's confirmed case: "White Logo 1st Print" is a LOCG label no
+        seller types, so it zeroes 37 comps to 0 at every tier."""
+        results = [
+            [], [], [], [],       # base / broader / alt-masthead / inclusive
+            [self._comp(str(i)) for i in range(4)],    # no-variant retry
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "281", "year": 1991,
+             "variant": "White Logo 1st Print"},
+            "key",
+        )
+        assert out["variant_dropped"] == "White Logo 1st Print"
+        assert len(out["comps"]) == 4
+        assert "White Logo 1st Print" in calls[0]
+        assert "White Logo" not in calls[-1]
+        assert "no-variant" in {q["tier"] for q in out["queries_used"]}
+
+    def test_thin_but_nonempty_variant_pool_is_left_alone(self, tmp_path, monkeypatch):
+        """A valid variant term costs real depth even when it works (Newsstand:
+        32 comps → 13). Chasing depth by dropping it would trade
+        identity-correctness for apparent confidence, so the retry fires only on
+        an EXACTLY empty pool."""
+        results = [[self._comp("v1")], [], []]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Daredevil", "issue": "168", "year": 1981,
+             "variant": "Newsstand"},
+            "key",
+        )
+        assert out["variant_dropped"] is None
+        assert {c["product_id"] for c in out["comps"]} == {"v1"}
+        for nkw in calls:
+            assert "Newsstand" in nkw
+
+    def test_genuine_no_comps_book_is_not_blamed_on_its_variant(
+            self, tmp_path, monkeypatch):
+        """The retry also came back empty ⇒ the variant was not the cause. This
+        is a real illiquid book and must not be flagged as a variant problem."""
+        self._wire(tmp_path, monkeypatch, [])
+        out = sc.fetch_book_comps(
+            {"title": "Daredevil", "issue": "168", "year": 1981,
+             "variant": "Newsstand"},
+            "key",
+        )
+        assert out["comps"] == []
+        assert out["variant_dropped"] is None
+
+    def test_no_variant_book_never_retries(self, tmp_path, monkeypatch):
+        calls = self._wire(tmp_path, monkeypatch, [])
+        out = sc.fetch_book_comps(
+            {"title": "Daredevil", "issue": "168", "year": 1981}, "key",
+        )
+        assert out["variant_dropped"] is None
+        assert "no-variant" not in {q["tier"] for q in out["queries_used"]}
+        assert calls  # sanity: the ladder did run
+
+    def test_retry_composes_with_the_masthead_probe(self, tmp_path, monkeypatch):
+        """BUI-581 and BUI-588 compose in the only way they can: a masthead
+        probe that WINS leaves a non-empty pool, so the variant retry is
+        reached exactly when the probe found nothing either. It then re-queries
+        the masthead still in force, minus the variant."""
+        results = [
+            [], [],                # base + broader (Uncanny + variant)
+            [],                    # alt-masthead (X-Men + variant): also 0
+            [],                    # inclusive
+            [self._comp("a1")],    # no-variant retry
+        ]
+        calls = self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Uncanny X-Men", "issue": "69", "year": 1970,
+             "variant": "White Logo 1st Print"},
+            "key",
+        )
+        assert out["masthead_swapped_to"] is None   # probe tied at 0, no swap
+        assert out["variant_dropped"] == "White Logo 1st Print"
+        assert '"Uncanny X-Men 69"' in calls[-1]
+        assert "White Logo" not in calls[-1]
+
+    def test_both_signals_present_on_the_error_return(self, tmp_path, monkeypatch):
+        """Shape parity — a caller reading `.get("variant_dropped")` must see the
+        same keys on the BUI-537 partial-trail return."""
+        self._wire(tmp_path, monkeypatch, [])
+        out = sc.fetch_book_comps({"title": "X", "issue": "1", "year": "n/a"}, "key")
+        assert "error" in out
+        assert out["variant_dropped"] is None
+        assert out["masthead_swapped_to"] is None

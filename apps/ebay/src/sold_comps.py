@@ -408,6 +408,72 @@ def _is_rebootable_masthead(title: str) -> bool:
     return any(p.search(title or '') for p in _REBOOTABLE_MASTHEAD_RES)
 
 
+# BUI-581: masthead RENAME pairs — two names one long-running series carried at
+# different points in its own run, so the SAME physical book is listed under
+# either. X-Men Vol.1 is the documented case: the low issue numbers were
+# published as *X-Men* and the *Uncanny* masthead only appears from the rename
+# onward, so a query built from the modern name finds almost nothing on a
+# vintage issue and the near-empty pool is then priced as if the book were
+# illiquid. Measured on the live DB, the same five books 11 minutes apart:
+# #69 n=6→$15 as "X-Men" vs n=0 as "Uncanny X-Men"; #75 4 vs 0; #85 4 vs 1;
+# #93 4 vs 1; #97 30 vs 3.
+#
+# DELIBERATELY NOT a rename-ISSUE-NUMBER table. Which issue the masthead
+# actually changed on is not something this module can assert (BUI-581 flagged
+# its own "commonly cited around #114" as unverified), and a wrong cutoff would
+# silently route real books to the wrong name — the very failure this fixes.
+# So the pool decides instead of a hardcoded number: `fetch_book_comps` probes
+# the counterpart masthead and keeps whichever pool is DEEPER (see its
+# alt-masthead tier). A pair that doesn't apply to a given issue simply loses
+# that comparison and costs one query.
+#
+# Kept SEPARATE from `_REBOOTABLE_MASTHEADS` above on purpose — that list
+# answers "could this title's issue number collide with a modern relaunch's?"
+# (an EXCLUSION signal, mirrored in locg-cli and pinned by
+# test_rebootable_masthead_list_matches_sold_comps); this one answers "what else
+# was this exact run called?" (a SUBSTITUTION signal). Different judgment,
+# different consumers — do not merge or sync them.
+#
+# Only the pair BUI-581 measured is listed. Other renamed runs (Journey into
+# Mystery → Thor, Tales of Suspense → Iron Man, …) are plausible but unverified
+# here, and each unverified pair costs a real provider query on every thin
+# vintage pool for that masthead — add one only with pool evidence behind it.
+_MASTHEAD_RENAME_PAIRS = (
+    # Ordered longest-first: "uncanny x-men" must be tested before the bare
+    # "x-men" it contains, or the specific name would rewrite to itself.
+    ("uncanny x-men", "X-Men"),
+    ("x-men", "Uncanny X-Men"),
+)
+# Anchored at the START of the (article-stripped) title, with the BUI-351
+# boundary on the trailing edge. Anchoring keeps the substitution off titles
+# that merely CONTAIN the masthead ("Giant-Size X-Men", "Wolverine and the
+# X-Men") where swapping the name produces a title no listing ever carried.
+_MASTHEAD_RENAME_RES = tuple(
+    (re.compile(rf'^{re.escape(name)}(?![-\w])', re.IGNORECASE), replacement)
+    for name, replacement in _MASTHEAD_RENAME_PAIRS
+)
+
+
+def _alias_masthead_title(title: str) -> str | None:
+    """The same run's OTHER masthead for *title*, or None when it has no known
+    counterpart (BUI-581).
+
+    Purely a name substitution: it makes NO claim about which issues carried
+    which masthead. The caller decides whether the alias is the right name for
+    this book by comparing the two comp pools — see `_MASTHEAD_RENAME_PAIRS`.
+    """
+    base = _strip_leading_article(title or '')
+    for pattern, replacement in _MASTHEAD_RENAME_RES:
+        alias, hits = pattern.subn(replacement, base, count=1)
+        if not hits:
+            continue
+        alias = re.sub(r'\s+', ' ', alias).strip()
+        # A pair that rewrites a title to itself would burn a query on a
+        # byte-identical search.
+        return alias if alias.casefold() != base.casefold() else None
+    return None
+
+
 def _coerce_year(value: object) -> int | None:
     """Coerce a cover year to `int`, or None when there is no usable year.
 
@@ -1284,6 +1350,21 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     `comps` composition is byte-identical to pre-BUI-524 output whenever this
     tier doesn't fire.
 
+    BUI-581: between tiers 2 and 3 a vintage book whose masthead has a known
+    RENAME counterpart (see `_MASTHEAD_RENAME_PAIRS`) and whose pool is still
+    thin gets ONE probe under the other name; whichever pool is deeper is kept
+    (swapped wholesale, never merged) and tiers 3-5 then run against that
+    masthead. `masthead_swapped_to` names the winning alias, or is None when the
+    caller's own title was queried — which it always is for a modern book, a
+    year-less book, a title with no counterpart, or a pool that was never thin.
+
+    BUI-588: a LAST tier fires only when the pool is exactly empty and the book
+    carried a `variant` — it re-queries with the variant term dropped, because a
+    collector/catalog descriptor that appears in no listing title zeroes every
+    tier above and no amount of widening recovers it. Comps found this way price
+    the BASE cover, so `variant_dropped` reports the substitution rather than
+    letting a variant-blind number be written silently.
+
     BUI-537/535: every tier routes through the same `_run` closure, so every
     fetch attempt — including retry attempts that fire *inside* `fetch()` and
     the always-on cross-check/inclusive tier — gets the same trail recording
@@ -1310,6 +1391,10 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # BUI-524: populated only when the tier-4 inclusive pass fires; a genuine
     # CGC/CBCS slab comp lands here instead of `comps` (see `_is_slab_comp`).
     slab_comps: list[dict] = []
+    # BUI-581 / BUI-588: bound here (not inside the try) so the error return at
+    # the bottom carries the same keys as the success return.
+    masthead_swapped_to: str | None = None
+    variant_dropped: str | None = None
 
     def _breaker_tripped() -> bool:
         # BUI-545: OR of both providers' breakers — either one tripping means
@@ -1319,6 +1404,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
 
     try:
         title = book["title"]
+        # BUI-581: `title` is rebound below when the alt-masthead tier wins, so
+        # keep the caller's own string for the echoed `input` block — that field
+        # is a contract ("here is what you asked for"), not a record of which
+        # name we ended up querying (`masthead_swapped_to` is that record).
+        input_title = title
         issue = str(book["issue"])
         # BUI-565: coerce the batch envelope's `year` (a STRING out of
         # /comic:identify) to int|None once, here, so every tier below — and
@@ -1456,6 +1546,64 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                                       vintage_year=year)
             _run("broader", broader_nkw)
 
+        # BUI-565: `year` is int|None by here (coerced at the top of this try),
+        # so this gate reads a string-year vintage book correctly too. Hoisted
+        # above the BUI-581 tier, which shares it; tier 4 below reads the same
+        # name rather than recomputing it.
+        is_vintage = year is not None and year < _VINTAGE_YEAR_CUTOFF
+
+        # Tier 2.5 — alternate masthead (BUI-581). A vintage book whose series
+        # was RENAMED mid-run is listed under whichever masthead the issue
+        # actually carried, so querying the other one collapses the pool toward
+        # zero and the book gets priced as illiquid. Probe the counterpart name
+        # once and keep whichever pool is DEEPER — no rename-issue-number is
+        # asserted anywhere (see `_MASTHEAD_RENAME_PAIRS` for why that matters).
+        #
+        # Placed here, before tiers 3/4, so the rest of the ladder deepens the
+        # masthead that actually has comps instead of spending its queries on
+        # the dead one. Gated on the same thinness threshold as tier 2, so a
+        # book whose base query already found a real pool costs zero extra
+        # queries and its `comps` are byte-for-byte pre-BUI-581.
+        #
+        # A year-less book is deliberately NOT probed: without a year this
+        # cannot tell a vintage issue (where both names denote one run) from a
+        # modern relaunch (where "X-Men #1" and "Uncanny X-Men #1" are different
+        # books), and swapping there would price the wrong comic. Not probing
+        # leaves today's behavior exactly as it was.
+        alt_title = _alias_masthead_title(title) if is_vintage else None
+        if alt_title and len(comps) < THIN_RESULTS_THRESHOLD:
+            primary_comps, primary_seen = comps, seen_ids
+            # Give the probe its own accumulator so its depth is measured on its
+            # own merits rather than being dedup-suppressed by the pool it is
+            # competing against. `_run` resolves `comps`/`seen_ids` from this
+            # scope on every call (it only mutates them, never rebinds), so
+            # rebinding them here redirects it and restoring them undoes it.
+            comps = []
+            seen_ids = {self_id} if self_id else set()
+            # `year=year` is LOAD-BEARING, not cosmetic — do not drop it the way
+            # tier 2 drops it to broaden. Both names in a rename pair are also
+            # rebootable mastheads, so without the year an alias query can win
+            # the depth comparison on the OTHER volume's same-numbered issue and
+            # price the wrong book: X-Men Vol.2 #1 (1991, a common $10 book)
+            # would probe as "Uncanny X-Men 1" and, unyeared, could pull the
+            # 1963 key's comps into its pool — a four-figure over-bid. With the
+            # year in the query the alias probe for that book returns ~nothing
+            # and correctly loses. Year is the only thing that separates two
+            # volumes sharing an issue number (see `_publisher_qualifier`'s
+            # Marvel note), which is also why the tier is gated on having one.
+            alt_nkw = build_query(alt_title, issue, year=year,
+                                  publisher=publisher, variant=variant,
+                                  exclude_graded=exclude_graded)
+            _run("alt-masthead", alt_nkw)
+            if len(comps) > len(primary_comps):
+                # Swap, never MERGE: each pool is internally consistent about
+                # which masthead it searched, and blending them would quietly
+                # mix in same-numbered issues of the other volume.
+                masthead_swapped_to = alt_title
+                title = alt_title
+            else:
+                comps, seen_ids = primary_comps, primary_seen
+
         # Tier 3 — grade-targeted if too few grade-tagged comps in pool so far
         target_grade = book.get("grade")
         if isinstance(target_grade, str):
@@ -1478,19 +1626,50 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         # already runs every tier inclusive, so a 4th inclusive tier there
         # would be pure duplicate spend.
         # BUI-565: `year` is int|None by here (coerced at the top of this
-        # try), so this gate now fires for a string-year vintage book too — it
-        # silently never did before, quietly disabling the BUI-524 tier for
-        # exactly the vintage books that need it most.
-        is_vintage = year is not None and year < _VINTAGE_YEAR_CUTOFF
+        # try), so `is_vintage` (computed above tier 2.5) is True for a
+        # string-year vintage book too — it silently never was before, quietly
+        # disabling the BUI-524 tier for exactly the vintage books that need it
+        # most.
         if exclude_graded and is_vintage and len(comps) < THIN_RESULTS_THRESHOLD:
             inclusive_nkw = build_query(title, issue, year=year, publisher=publisher,
                                         variant=variant, exclude_graded=False,
                                         vintage_year=year)
             _run("inclusive", inclusive_nkw, route_slabs=True)
 
+        # Tier 5 — variant-drop retry (BUI-588). BUI-304 made `variant` a query
+        # keyword, which is right for text sellers actually put in listing
+        # titles ("Newsstand" narrows correctly, 32 comps → 13) and wrong for a
+        # collector/catalog descriptor they never use ("White Logo 1st Print"
+        # took 37 comps → 0). A dead term is carried through EVERY tier above,
+        # so the widening ladder cannot recover from it; the book lands as
+        # `comps=0` with no error, which reads downstream as "illiquid" rather
+        # than "our query was impossible".
+        #
+        # Fires only on an EXACTLY empty pool, where there is no pool depth left
+        # to trade away. Deliberately not on a merely thin one: a valid variant
+        # term costs real depth even when it works (that Newsstand book's fmv
+        # went 8 comps/MEDIUM-HIGH → 3 comps/LOW when the variant was applied),
+        # so dropping it to chase depth would swap identity-correctness for
+        # apparent confidence.
+        #
+        # The recovered comps price the BASE cover, not this variant — which is
+        # a defensible floor for most variants and a wrong anchor for a scarce
+        # few. That judgment is NOT made here: `variant_dropped` reports the
+        # substitution to the caller (comic-fmv turns it into a needs-manual
+        # `flag_reason`) instead of silently writing a variant-blind number.
+        if variant and not comps:
+            no_variant_nkw = build_query(title, issue, year=year,
+                                         publisher=publisher, variant=None,
+                                         exclude_graded=exclude_graded)
+            _run("no-variant", no_variant_nkw)
+            if comps:
+                variant_dropped = variant
+            # Still empty ⇒ the variant was not the cause; this is a genuine
+            # no-comps book and must not be flagged as a variant problem.
+
         out_input = {
             "item_id": self_id or None,
-            "title": title,
+            "title": input_title,
             "issue": issue,
             "year": year,
             "publisher": publisher,
@@ -1516,6 +1695,16 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # time this book finished — surfaced so callers (comic-fmv, a
             # human skimming --out) can distinguish "outage" from "priced".
             "breaker_tripped": _breaker_tripped(),
+            # BUI-581: the OTHER masthead these comps were actually found
+            # under, or None when the caller's own title was queried. Not a
+            # correction of `input.title` — a record that the pool describes
+            # the same book under a different name.
+            "masthead_swapped_to": masthead_swapped_to,
+            # BUI-588: the variant term that had to be DROPPED before any comp
+            # was found, or None. Non-None means this pool prices the base
+            # cover, not that variant — the caller must surface the trade, not
+            # bury it.
+            "variant_dropped": variant_dropped,
         }
     except Exception as e:  # noqa: BLE001 — BUI-537: preserve the partial
         # trail rather than losing it; see the docstring above. `book.get(...)`
@@ -1539,6 +1728,8 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             "comps": comps,
             "slab_comps": slab_comps,
             "breaker_tripped": _breaker_tripped(),
+            "masthead_swapped_to": masthead_swapped_to,
+            "variant_dropped": variant_dropped,
             "error": str(e),
         }
 

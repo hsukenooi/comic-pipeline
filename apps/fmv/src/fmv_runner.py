@@ -923,11 +923,30 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # haircut (back-compat for manual / already-graded books).
     # grade_window is None when --grade-window is omitted; compute_fmv treats
     # None as "use the default ceiling", so it threads straight through.
+    # BUI-588: ebay-sold-comps reports when it could only find comps by DROPPING
+    # this book's variant term — a collector/catalog descriptor ("White Logo 1st
+    # Print") that appears in no listing title zeroes every query tier, and the
+    # resulting `comps=0` / `flag_reason=NULL` row is invisible to both of
+    # /comic:buy Step 3's guards, reading as "illiquid" rather than "our query
+    # was impossible". Comps found after the drop price the BASE cover, which is
+    # a defensible floor for most variants and a wrong anchor for a scarce few —
+    # a judgment this pipeline must not make silently. Route it into the same
+    # needs-manual channel the pool-shape guards use, so the row lands in front
+    # of a human with a bid cap withheld instead of a variant-blind number.
+    dropped_variant = result.get("variant_dropped")
     fmv = fmv_math.compute_fmv(
         pool_comps, target_grade=target_grade,
         grade_confidence=inp.get("grade_confidence"),
         max_window=grade_window,
+        forced_flag_reason="variant_dropped" if dropped_variant else None,
     )
+    # Informational, for `_build_notes` only — never touches the priced number.
+    # `variant_dropped` is recorded even when a pool-shape guard already claimed
+    # `flag_reason`, so the notes still say WHICH pool was measured (BUI-588),
+    # and `masthead_swapped_to` records that BUI-581's alt-masthead probe priced
+    # this book under the other name its series carried.
+    fmv["variant_dropped"] = dropped_variant
+    fmv["masthead_swapped_to"] = result.get("masthead_swapped_to")
     # BUI-286: surface the first-party contribution on the returned dict so
     # `_build_notes` can mention it — informational only, fmv_math's output
     # shape is otherwise untouched.
@@ -1374,6 +1393,22 @@ def _build_notes(fmv: dict) -> str:
             f"${cross_check['raw_median']:g} "
             f"({cross_check['divergence_pct'] * 100:.0f}%)"
         )
+    # BUI-588: name the variant term that had to be dropped before any comp was
+    # found. The `manual_review=variant_dropped` token below says the row needs a
+    # human; this says WHAT was traded away to get a pool at all, which is the
+    # part a human needs to judge whether the base-cover price is a fair floor
+    # for this particular variant. Written even when a pool-shape guard won the
+    # flag, so the substitution is never lost.
+    dropped_variant = fmv.get("variant_dropped")
+    if dropped_variant:
+        parts.append(f"variant_dropped={dropped_variant}")
+    # BUI-581: name the masthead these comps actually came from when it isn't the
+    # title we were asked about — a renamed series (X-Men → Uncanny X-Men) lists
+    # its vintage issues under the ORIGINAL name, so a pool found under the other
+    # masthead is the same book, and saying so keeps the number auditable.
+    swapped = fmv.get("masthead_swapped_to")
+    if swapped:
+        parts.append(f"masthead={swapped}")
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")
