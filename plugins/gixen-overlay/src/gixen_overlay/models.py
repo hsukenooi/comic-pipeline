@@ -3,6 +3,24 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
+# Every needs_manual reason `comic-fmv` may post as `fmv_flag_reason` (BUI-593).
+#
+# This is a CROSS-PACKAGE CONTRACT with `apps/fmv/src/fmv_runner.py`, which is
+# the sole producer of these values. There is no import edge to enforce it:
+# apps/fmv is not a workspace member and reaches the server over HTTP, so a
+# producer-side addition cannot fail to compile here — it fails at runtime with
+# a 422 that discards the ENTIRE upsert, not just the flag.
+#
+# That is exactly how BUI-588 broke: it added `variant_dropped` on the producer
+# side and to every doc (comic/verify.md, comic/buy.md, comic/fmv.md,
+# fmv-math-spec.md) but not here, making every variant-dropped book unpriceable
+# — inverting the intent of the mark, which exists to surface such books for
+# hand-pricing rather than to block them.
+#
+# `tests/test_flag_reason_contract.py` is the canary. Anything added to
+# `forced_flag_reason=` in fmv_runner must be added here in the same commit.
+FMV_FLAG_REASONS = ("one_sided", "too_wide", "too_sparse", "variant_dropped")
+
 
 class UpsertComicRequest(BaseModel):
     title: str
@@ -33,9 +51,9 @@ class UpsertComicRequest(BaseModel):
         # to None (no flag) so callers can post "" to mean "not flagged".
         if v is not None and v.strip() == "":
             return None
-        if v is not None and v not in ("one_sided", "too_wide", "too_sparse"):
+        if v is not None and v not in FMV_FLAG_REASONS:
             raise ValueError(
-                "fmv_flag_reason must be one_sided, too_wide, or too_sparse"
+                "fmv_flag_reason must be one of: " + ", ".join(FMV_FLAG_REASONS)
             )
         return v
 
