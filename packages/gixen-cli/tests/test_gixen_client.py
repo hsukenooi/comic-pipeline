@@ -561,6 +561,32 @@ class TestListSnipes:
         assert snipes[0]["status_mirror"] == ""
         assert "no Status (main) row near edititemid_111" in caplog.text
 
+    def test_parse_status_mirror_na_when_no_mirror_snipe(self):
+        """BUI-589: literal vocabulary captured from a live, read-only fetch of
+        the real Gixen main page (2026-07-31, 32 live snipes). Every snipe's
+        `Status (main)` read "SCHEDULED" — no genuinely ENDED/WON/LOST snipe
+        was present on the page at capture time, so that finished-state
+        string remains unconfirmed and is deliberately NOT fixture-encoded
+        here (a guessed value would be worse than no fixture at all — see
+        BUI-587/BUI-589). One snipe (no mirror bid configured) DID show a new
+        literal for `Status (mirror)`: "N/A" — every other snipe's mirror
+        status mirrored its `SCHEDULED` main status. This locks in that real
+        value; it must parse as a plain string, not get coerced to "" or
+        None."""
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("111", "5001", status="SCHEDULED",
+                             status_mirror="N/A"),
+        )
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        assert snipes[0]["status"] == "SCHEDULED"
+        assert snipes[0]["status_mirror"] == "N/A"
+
     def test_unparseable_row_yields_empty_not_neighbour_values(self):
         """A row whose shape we don't recognize must fail loudly (empty), never
         silently borrow the next snipe's bid — the defect class behind BUI-580.
