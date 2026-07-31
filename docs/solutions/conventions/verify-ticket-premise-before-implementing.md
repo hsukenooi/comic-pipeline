@@ -18,6 +18,9 @@ applies_when:
   - "A ticket was filed from an incident post-mortem — written fast, under the incident's framing, and prone to blaming the most recently-touched component"
   - "A ticket claims some field or term disambiguates two things, or proposes an optimisation whose saving has not been sized"
   - "A ticket asks to share code across a package boundary, or to widen a check that currently blocks a pipeline"
+  - "A ticket prescribes a REMEDY that writes to production data (a repair command, a backfill, a sweep) rather than a code change"
+  - "A ticket supplies the SQL/predicate that identifies the affected rows — check what that predicate excludes"
+  - "A ticket proposes a detector or signal, justified by two or three named examples rather than a measured population"
 tags:
   - process
   - linear
@@ -38,8 +41,12 @@ tags:
   - bui-568
   - bui-570
   - bui-572
+  - bui-574
+  - bui-578
+  - bui-579
   - post-mortem-sourced
   - license-to-stop
+  - data-repair
 related_docs:
   - "docs/solutions/design-patterns/guard-strictness-must-match-consequence.md"
 ---
@@ -466,6 +473,66 @@ moved 9 of 2843 rows, all corrections.
 > as a **separate advisory counter** that reports without gating. Before widening a blocking
 > check, ask whether anyone can act on what it will now catch.
 
+## The sixth failure mode: the premise is wrong about the *remedy*, on a ticket that writes to production
+
+Modes 1–5 all concern the ticket's **diagnosis**. The BUI-573..579 batch surfaced the
+variant with the worst blast radius: a **data-repair** ticket whose diagnosis is wrong in a
+way that makes its prescribed remedy *actively harmful*. There is no code review to catch
+this — the remedy is a command, not a diff, and running it is the whole ticket.
+
+### Example 16 — the prescribed repair would have re-poisoned 4 of its own 5 rows (BUI-579)
+
+BUI-579 asked for `comic-fmv --force` on "roughly 6" FMV rows it attributed to a
+crash-stub bug (BUI-565) fixed days earlier. Three separate premise failures, found by
+querying before executing:
+
+1. **The count was wrong and its own criteria were too narrow.** The ticket's predicate
+   (`comps = 0 AND flag_reason IS NULL`) matched **3** of 71 rows that day — but two more
+   rows from the same bad pass carried `too_sparse` and one carried `one_sided`, so the
+   `flag_reason IS NULL` clause filtered out half the blast radius. **A ticket that supplies
+   the identifying query has also supplied a hypothesis about the failure's signature.
+   Check what that predicate excludes.**
+2. **The cause was different, so the remedy was backwards.** The rows came from a
+   *renamed-masthead query* — the pass searched `Uncanny X-Men` for X-Men Vol. 1 issues
+   published as `X-Men`. Re-running `--force` under the same title would have **re-poisoned**
+   them. Measured 11 minutes apart on the same books: n went 6→0, 4→0, 4→1, 4→1, 30→3.
+3. **The damage wasn't the rows named.** The bad pass had also forked **five duplicate
+   `comics` identity rows** shadowing correctly-priced twins. The ticket described the
+   mispricing and never saw the identity fork — so its remedy addressed the symptom it
+   could see while leaving the duplicates permanent.
+
+The correct repair (deleting duplicate identity rows) was materially different from, and
+riskier than, what the ticket authorized — so it was **escalated rather than executed**.
+Root cause filed as BUI-581; the one genuine re-price as BUI-585.
+
+**For a data-repair ticket, re-derive the cause from the data before running the remedy,
+and treat "the remedy the ticket names" as a hypothesis exactly as you would a code fix.**
+A wrong diff gets reverted; a wrong write to production may not be reversible at all. The
+BUI-514 ritual (independent `sqlite3 .backup` → apply → diff proving *only* the intended
+rows/fields changed → row-count check) is what makes the write safe **once the remedy is
+right** — it does nothing about a remedy that is confidently wrong.
+
+### Example 17 — the proposed signal was anti-correlated with the failure (BUI-578)
+
+BUI-578 proposed flagging comp-pool **dispersion** to catch collision-polluted pools.
+Measured over all 71 rows of the run rather than the 3 the ticket named, it inverts:
+best cutoff `cv > 75%` gives precision **0.53**, and the ticket's own three motivating rows
+had `comps = 0` — dispersion is *undefined* on them, so the proposed flag could not fire on
+any of its own evidence.
+
+The structural reason is the transferable part. A pool polluted by *total* substitution is
+a pool of modern issues — internally consistent, therefore **tight**. X-Men #97 @8.5 priced
+$5–20 against a $34.99 raw anchor off **30 graded comps at the narrow window**: `cv=75%`,
+`span=1.0`, no flag. **Dispersion is lowest exactly when substitution is total** — the
+detector is blindest in the worst case. The signal that does separate is pool **depth vs
+cohort median** (filed BUI-582), which is what the same evidence pointed at once measured.
+
+**A proposed detector is a quantitative claim about a population. Measure it against the
+whole population, not the examples that motivated it — and check that it can fire on those
+examples at all.** Sibling ticket BUI-574 failed the same way from the other direction: its
+"supply `year`" candidate was falsified by a book that *did* supply one and produced the
+run's worst pool.
+
 ## Why This Matters
 
 - **Post-mortem-sourced tickets are systematically premise-risky, and the rate is high enough
@@ -540,6 +607,8 @@ Before implementing any ticket that:
 | BUI-568 | Share one volume-collision detector between locg-cli and apps/fmv | `apps/*` are deliberately non-members of the uv workspace (`pyproject.toml:11-12`) — no importable shared module exists. Volume-**range** data exists nowhere in the repo, and without that gate the flag fires on ~60 of 66 books | Stop-and-report; split into a buildable drift fix (BUI-577) and a dispersion-signal investigation (BUI-578) |
 | BUI-564 | The record-win push is still generating foreign-edition rows | Generator closed by BUI-432 on 2026-07-19; all 6 rows predate it. Real live defect was **downstream**: those rows are `locg_export` rows → resolution candidates, so `resolve_series_for_win('spawn','224',2012)` returned the Kamite volume | Fixed the compounding loop instead (publisher tiebreak, fail-open); live sweep moved 9/2843 rows, all corrections |
 | BUI-563 | Widen `owned_duplicate_identities` to catch year-crossing twins | The counter is a sync **hard stop**, and the pairs have no local remedy (delete → LOCG re-emits; clear → BUI-122 data loss). Widening blocks every sync indefinitely | Shipped as a **separate advisory counter** that reports without gating |
+| BUI-579 | `comic-fmv --force` on ~6 crash-poisoned FMV rows | Count was 3 (its own `flag_reason IS NULL` predicate hid 3 more); cause was a *renamed-masthead query*, so `--force` under the same title **re-poisons**; and the pass had also forked 5 duplicate `comics` identity rows the ticket never saw | Escalated instead of executed; duplicates deleted under the BUI-514 ritual; cause filed BUI-581, residual re-price BUI-585 |
+| BUI-578 | Flag comp-pool **dispersion** to catch collision pollution | Anti-correlated: `cv>75%` → precision 0.53, and the 3 motivating rows have `comps=0` so the flag can't fire on its own evidence. Total substitution yields a *tight* pool (30 comps, `cv=75%`, `span=1.0`, no flag) | Canceled with measurements; the separating signal (pool **depth vs cohort**) filed as BUI-582 |
 
 ## Practical checklist
 
@@ -580,6 +649,17 @@ When the ticket is a reopen or a review residual, before writing code:
 5i. **Before widening a blocking check, ask whether anyone can act on what it will now catch**
    (BUI-563: the pairs had no local remedy, so widening the hard stop would have halted every
    sync indefinitely). Advisory counter over hard stop when the data is unfixable.
+5j. **On a data-repair ticket, re-derive the cause from the data before running the remedy**
+   (BUI-579: the prescribed `--force` would have re-poisoned 4 of its own 5 rows). Also
+   **check what the ticket's own identifying query excludes** — a supplied predicate is a
+   hypothesis about the failure's signature, and BUI-579's `flag_reason IS NULL` clause hid
+   half the blast radius. The BUI-514 backup→apply→diff→count ritual makes a *correct*
+   remedy safe; it does nothing about a confidently wrong one.
+5k. **Measure a proposed detector against the whole population, not its motivating examples
+   — and check it can fire on those examples at all** (BUI-578: the 3 named rows had
+   `comps=0`, so the dispersion flag was undefined on every case it was designed for).
+   Beware detectors whose signal *weakens* as the failure worsens: total substitution
+   produces an internally-consistent, therefore tight, pool.
 6. **Search for fixes merged since the filing date** in the same area (`git log --since`).
 7. **For any deployed name, path, or label, check the live system**, not the docs.
 8. **If you add a guard, name its evidence source** and confirm it is independent of the
