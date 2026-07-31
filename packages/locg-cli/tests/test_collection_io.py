@@ -4048,3 +4048,275 @@ def test_duplicate_check_announces_when_it_cannot_check(tmp_path):
     assert any("VACUOUS" in w for w in result["warnings"]), (
         "a 0 that means 'unable to check' must say so"
     )
+
+
+# ---------------------------------------------------------------------------
+# BUI-563: cross-edition owned twins — ADVISORY, never a sync hard stop.
+#
+# A foreign licensed edition trails its US original by 147-211 days, an order of
+# magnitude past _COVER_TO_ONSALE_MAX_DAYS, so the owned_duplicate_identities
+# date predicate structurally cannot see these pairs. They get their own counter
+# rather than being folded into the hard stop: the operator has no local remedy
+# (LOCG re-emits a deleted row, and clearing the ownership runs the BUI-122
+# In Collection=0 data-loss path), so blocking would stop every sync forever.
+# ---------------------------------------------------------------------------
+
+def _import_two_owned(tmp_path, left: dict, right: dict):
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [left, right])
+    return import_xlsx(xlsx, cache)
+
+
+def test_cross_edition_twin_is_advisory_not_a_hard_stop(tmp_path):
+    """The measured Panini shape: same issue, publishers differ, release dates
+    169 days apart, and the SAME price_paid + date_purchased — the round-trip
+    fingerprint proving our own push created the foreign row."""
+    result = _import_two_owned(
+        tmp_path,
+        {
+            "publisher": "DC Comics",
+            "series": "Absolute Flash (2025 - Present)",
+            "full_title": "Absolute Flash #10",
+            "release_date": "2025-12-17",
+            "price_paid": "1.25",
+            "date_purchased": "2026-06-06",
+        },
+        {
+            "publisher": "Panini Comics",
+            "series": "Absolute Flash (2025 - Present)",
+            "full_title": "Absolute Flash #10",
+            "release_date": "2026-06-04",
+            "price_paid": "1.25",
+            "date_purchased": "2026-06-06",
+        },
+    )
+
+    assert result["owned_duplicate_identities_cross_edition"] == 1
+    # The whole point of a separate counter: the sync's hard stop is untouched,
+    # so the sync still runs.
+    assert result["owned_duplicate_identities"] == 0
+    warning = next(w for w in result["warnings"] if "across editions" in w)
+    assert "ADVISORY (not a sync blocker)" in warning
+    assert "absoluteflash#10" in warning
+    assert "In Collection=0" in warning, "must name the BUI-122 trap it forbids"
+
+
+def test_cross_edition_check_ignores_a_masthead_reused_by_another_publisher(tmp_path):
+    """Marvel's `The Transformers` (1984) #13 and Image's `Transformers` (2023)
+    #13 are two genuinely different books, legitimately owned side by side. A
+    bare publisher-differs test flags them — measured over the live store, this
+    exact pair is 2 of its 8 hits — so the round-trip fingerprint is required,
+    and it drops them."""
+    result = _import_two_owned(
+        tmp_path,
+        {
+            "publisher": "Marvel Comics",
+            "series": "The Transformers (1984 - 1991)",
+            "full_title": "Transformers #13",
+            "release_date": "1985-10-22",
+        },
+        {
+            "publisher": "Image Comics",
+            "series": "Transformers (2023 - Present)",
+            "full_title": "Transformers #13",
+            "release_date": "2024-10-09",
+        },
+    )
+
+    assert result["owned_duplicate_identities_cross_edition"] == 0
+    assert result["owned_duplicate_identities"] == 0
+
+
+def test_cross_edition_check_requires_both_price_and_purchase_date(tmp_path):
+    """A shared price with a DIFFERENT date_purchased is two separate buys that
+    happened to cost the same, not one purchase filed twice."""
+    result = _import_two_owned(
+        tmp_path,
+        {
+            "publisher": "Marvel Comics",
+            "series": "X-Men (Vol. 2) (1991 - 2001)",
+            "full_title": "X-Men #59",
+            "release_date": "1996-12-01",
+            "price_paid": "56.00",
+            "date_purchased": "2026-06-12",
+        },
+        {
+            "publisher": "Panini Comics",
+            "series": "X-Men (Vol. 2) (2001 - 2013)",
+            "full_title": "X-Men #59",
+            "release_date": "2005-11-24",
+            "price_paid": "56.00",
+            "date_purchased": "2026-02-01",
+        },
+    )
+
+    assert result["owned_duplicate_identities_cross_edition"] == 0
+
+
+def test_cross_edition_check_ignores_a_same_publisher_pair(tmp_path):
+    """Two eras of one masthead under ONE publisher are the ordinary
+    two-volumes case, not a licensed edition — whatever else is true of them."""
+    result = _import_two_owned(
+        tmp_path,
+        {
+            "publisher": "Marvel Comics",
+            "series": "The X-Men (Vol. 1) (1963 - 1981)",
+            "full_title": "X-Men #128",
+            "release_date": "1979-09-18",
+            "price_paid": "10.00",
+            "date_purchased": "2026-06-06",
+        },
+        {
+            "publisher": "Marvel Comics",
+            "series": "X-Men (Vol. 2) (2001 - 2013)",
+            "full_title": "X-Men #128",
+            "release_date": "2002-01-15",
+            "price_paid": "10.00",
+            "date_purchased": "2026-06-06",
+        },
+    )
+
+    assert result["owned_duplicate_identities_cross_edition"] == 0
+
+
+def test_cross_edition_counter_is_disjoint_from_the_hard_stop(tmp_path):
+    """A title the hard stop already reports must not be counted twice — the two
+    numbers are read independently in the sync report."""
+    result = _import_two_owned(
+        tmp_path,
+        {
+            "publisher": "DC Comics",
+            "series": "Absolute Flash (2025 - Present)",
+            "full_title": "Absolute Flash #10",
+            "release_date": "2025-12-17",
+            "price_paid": "1.25",
+            "date_purchased": "2026-06-06",
+        },
+        {
+            # Same YEAR, so _release_dates_compatible_either_way accepts it and
+            # the existing hard stop owns this pair.
+            "publisher": "Panini Comics",
+            "series": "Absolute Flash (2025 - Present)",
+            "full_title": "Absolute Flash #10",
+            "release_date": "2025-12-30",
+            "price_paid": "1.25",
+            "date_purchased": "2026-06-06",
+        },
+    )
+
+    assert result["owned_duplicate_identities"] == 1
+    assert result["owned_duplicate_identities_cross_edition"] == 0
+
+
+# ---------------------------------------------------------------------------
+# BUI-564: publisher-scoped volume candidates, so a foreign licensed edition of
+# the same masthead cannot capture a win at resolution time.
+# ---------------------------------------------------------------------------
+
+_SPAWN_CANDIDATES = {"spawn": ["Spawn (1992 - Present)", "Spawn (2012 - Present)"]}
+_SPAWN_PUBLISHERS = {
+    "Spawn (1992 - Present)": {"image"},
+    "Spawn (2012 - Present)": {"kamite"},
+}
+
+
+def test_unscoped_resolution_picks_the_foreign_volume():
+    """Documents the defect this fix exists for. `_best_volume_by_year` prefers
+    the NARROWEST range containing the year, so the Kamite volume beats Image's
+    for every Spawn win from 2012 on — measured live on the 2026-07-28 store."""
+    from locg.collection_cache import resolve_series_for_win
+
+    assert resolve_series_for_win(
+        "spawn", "224", 2012, {}, _SPAWN_CANDIDATES
+    ) == "Spawn (2012 - Present)"
+
+
+def test_publisher_scoping_redirects_a_win_to_its_own_publishers_volume():
+    from locg.collection_cache import resolve_series_for_win
+    from locg.collection_io import publisher_scoped_volume_candidates
+
+    scoped = publisher_scoped_volume_candidates(
+        _SPAWN_CANDIDATES, _SPAWN_PUBLISHERS, "Image Comics"
+    )
+    assert scoped["spawn"] == ["Spawn (1992 - Present)"]
+    assert resolve_series_for_win(
+        "spawn", "224", 2012, {}, scoped
+    ) == "Spawn (1992 - Present)"
+
+
+def test_publisher_scoping_folds_provider_naming_drift():
+    """Metron says "Image", LOCG says "Image Comics" — BUI-548's exact trap.
+    _normalize_publisher must absorb it, or the scoping would drop the RIGHT
+    volume and make things worse."""
+    from locg.collection_io import publisher_scoped_volume_candidates
+
+    scoped = publisher_scoped_volume_candidates(
+        _SPAWN_CANDIDATES, _SPAWN_PUBLISHERS, "Image"
+    )
+    assert scoped["spawn"] == ["Spawn (1992 - Present)"]
+
+
+def test_publisher_scoping_fails_open_when_nothing_matches():
+    """A publisher no local volume names (an imprint, a rebrand) must NOT empty
+    the pool — that would stop the win resolving. The key keeps its full list
+    and behavior is exactly today's."""
+    from locg.collection_io import publisher_scoped_volume_candidates
+
+    scoped = publisher_scoped_volume_candidates(
+        _SPAWN_CANDIDATES, _SPAWN_PUBLISHERS, "Dark Horse Comics"
+    )
+    assert scoped["spawn"] == _SPAWN_CANDIDATES["spawn"]
+
+
+def test_publisher_scoping_keeps_a_volume_with_no_known_publisher():
+    from locg.collection_io import publisher_scoped_volume_candidates
+
+    scoped = publisher_scoped_volume_candidates(
+        _SPAWN_CANDIDATES, {"Spawn (2012 - Present)": {"kamite"}}, "Image Comics"
+    )
+    assert scoped["spawn"] == ["Spawn (1992 - Present)"]
+
+
+def test_series_publisher_conflicts_needs_positive_disagreement():
+    """The trigger fires only on evidence. An unknown publisher on either side
+    is not a conflict — treating it as one would rescope wins whose volume was
+    never in question."""
+    from locg.collection_io import series_publisher_conflicts
+
+    assert series_publisher_conflicts(
+        "Spawn (2012 - Present)", "Image Comics", _SPAWN_PUBLISHERS
+    )
+    assert not series_publisher_conflicts(
+        "Spawn (1992 - Present)", "Image Comics", _SPAWN_PUBLISHERS
+    )
+    # Volume LOCG left publisher-less.
+    assert not series_publisher_conflicts("Spawn (1999)", "Image Comics", _SPAWN_PUBLISHERS)
+    # Metron had no publisher for the issue.
+    assert not series_publisher_conflicts(
+        "Spawn (2012 - Present)", "", _SPAWN_PUBLISHERS
+    )
+
+
+def test_build_series_publishers_reads_only_locg_export_rows():
+    """R61: an agent_win row's publisher is our own guess and must never define
+    what a LOCG volume's publisher is."""
+    from locg.collection_io import build_series_publishers
+
+    payload = {"comics": [
+        {"source": "locg_export", "series_name": "Spawn (1992 - Present)",
+         "publisher_name": "Image Comics"},
+        {"source": "agent_win", "series_name": "Spawn (2012 - Present)",
+         "publisher_name": "Image Comics"},
+        {"source": "locg_export", "series_name": "Spawn (2012 - Present)",
+         "publisher_name": "Kamite"},
+        {"source": "locg_export", "series_name": "Spawn (1992 - Present)",
+         "publisher_name": None},
+    ]}
+
+    assert build_series_publishers(payload) == {
+        "Spawn (1992 - Present)": {"image"},
+        "Spawn (2012 - Present)": {"kamite"},
+    }

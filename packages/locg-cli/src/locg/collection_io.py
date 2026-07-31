@@ -272,6 +272,79 @@ def _publisher_matches(a: str, b: str) -> bool:
     return na == nb
 
 
+def build_series_publishers(payload: dict[str, Any]) -> dict[str, set[str]]:
+    """Map each canonical ``series_name`` -> the normalized publishers on its rows.
+
+    Drawn from ``source='locg_export'`` rows only (R61) — the SAME population
+    :func:`locg.collection_cache.build_volume_candidates` draws its volume names
+    from, so every candidate that resolver can return has an entry here (or
+    none at all, when LOCG left the publisher blank).
+
+    Values are :func:`_normalize_publisher` output rather than raw labels, so a
+    caller comparing against another provider's vocabulary ("Marvel" vs "Marvel
+    Comics") is not defeated by the naming drift BUI-548 already measured. A
+    series legitimately holds MORE than one publisher over its life (an imprint
+    move), hence a set and not a single value.
+    """
+    out: dict[str, set[str]] = {}
+    for row in payload.get("comics", []):
+        if row.get("source") != "locg_export":
+            continue
+        series = row.get("series_name") or ""
+        publisher = _normalize_publisher(row.get("publisher_name") or "")
+        if series and publisher:
+            out.setdefault(series, set()).add(publisher)
+    return out
+
+
+def series_publisher_conflicts(
+    series_name: str, publisher: str, series_publishers: dict[str, set[str]]
+) -> bool:
+    """True when every publisher known for ``series_name`` disagrees with ``publisher``.
+
+    Answers "is this volume someone else's edition of the book?" and nothing
+    more. Returns False — no conflict — whenever the question cannot be settled:
+    an unknown ``publisher``, or a volume LOCG left publisher-less. Positive
+    evidence of disagreement is the only thing that counts, which is what lets
+    callers use it as a trigger rather than a filter.
+    """
+    known = series_publishers.get(series_name) or set()
+    if not known or not publisher:
+        return False
+    return not any(_publisher_matches(publisher, name) for name in known)
+
+
+def publisher_scoped_volume_candidates(
+    volume_candidates: dict[str, list[str]],
+    series_publishers: dict[str, set[str]],
+    publisher: str,
+) -> dict[str, list[str]]:
+    """``volume_candidates`` with volumes of a DIFFERENT publisher dropped (BUI-564).
+
+    :func:`locg.collection_cache.resolve_series_for_win` picks a win's volume by
+    era alone. That is publisher-blind, and the pool it chooses from is whatever
+    LOCG's export holds — which includes the foreign licensed editions our own
+    record-win push put there. Handing it a pool already scoped to the win's
+    publisher lets every one of its era/alias/split rules run unchanged over
+    only the volumes that could actually be the book.
+
+    Fails OPEN, per key: when NO volume under a key agrees with ``publisher``
+    the key keeps its full list. A disagreement can mean "wrong volume", but it
+    can equally mean a publisher label :func:`_normalize_publisher` cannot fold
+    (an imprint, a rebrand), and this must never be the reason a win stops
+    resolving. A volume with no known publisher at all is likewise kept.
+    """
+    scoped: dict[str, list[str]] = {}
+    for key, names in volume_candidates.items():
+        kept = [
+            name
+            for name in names
+            if not series_publisher_conflicts(name, publisher, series_publishers)
+        ]
+        scoped[key] = kept or names
+    return scoped
+
+
 def _series_normalized_matches(a: str, b: str) -> bool:
     return _normalize_series_key(a) == _normalize_series_key(b)
 
@@ -673,6 +746,42 @@ def _duplicate_check_title_key(full_title: str) -> str:
     # stripping the article after collapsing whitespace would eat the first
     # three letters of "Theatre #1".
     return re.sub(r"[^0-9a-z#]+", "", _normalize_title(full_title))
+
+
+def _cross_edition_twin_signal(rows: list[dict[str, Any]]) -> str:
+    """Corroboration name for a foreign-licensed-edition twin in ``rows``, or ``""``.
+
+    The BUI-563 shape: two owned rows spelling the SAME issue, whose release
+    dates are far enough apart that :func:`_release_dates_compatible_either_way`
+    (and so the ``owned_duplicate_identities`` hard stop) cannot see them, and
+    that name DIFFERENT publishers. Panini DC Italia's Italian edition trails
+    the US original by 147-211 days — an order of magnitude past
+    :data:`_COVER_TO_ONSALE_MAX_DAYS`, and always in the same direction.
+
+    A differing publisher is NOT sufficient on its own, which is why this also
+    demands :func:`_same_copy_corroborated`. Measured over the 2026-07-28 store,
+    the publisher test alone returns 8 titles, two of which are false: ``The
+    Transformers (1984 - 1991) #13``/``#14`` (Marvel) against ``Transformers
+    (2023 - Present) #13``/``#14`` (Image) are a masthead a different publisher
+    picked up four decades later — two genuinely different books, legitimately
+    owned side by side. Requiring the round-trip fingerprint drops exactly those
+    two and keeps the six generated rows: a shared ``price_paid`` AND
+    ``date_purchased`` means LOCG only knows those values because THIS pipeline
+    uploaded them, so the pair is one purchase filed twice, not two purchases.
+    (``_same_copy_corroborated``'s other signal, an exact ``release_date``
+    match, cannot fire here by construction — these pairs are selected for
+    having incompatible dates.)
+    """
+    for i in range(len(rows)):
+        for other in rows[i + 1:]:
+            left = _normalize_publisher(rows[i].get("publisher_name") or "")
+            right = _normalize_publisher(other.get("publisher_name") or "")
+            if not (left and right) or left == right:
+                continue
+            signal = _same_copy_corroborated(rows[i], other)
+            if signal:
+                return signal
+    return ""
 
 
 def _series_squash(series_name: str) -> str:
@@ -2014,6 +2123,52 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
                 "had nothing to compare and its 0 means 'unable to check', not "
                 "'clean' (BUI-554). Verify the import actually landed before "
                 "trusting any post-import counter."
+            )
+
+        # ----- Cross-edition owned twins: ADVISORY, never a hard stop (BUI-563)
+        # The same "owned twice" fact as above, for the pairs the date predicate
+        # structurally cannot see: a foreign licensed edition trails the US
+        # original by 147-211 days, so `_release_dates_compatible_either_way`
+        # rejects every one of them and the hard-stop count reports 0 while six
+        # books are owned twice right now.
+        #
+        # Reported SEPARATELY and deliberately NOT folded into
+        # `owned_duplicate_identities`, because widening that counter would make
+        # `/comic:collection-sync` (which asserts it is 0) refuse to run — and
+        # unlike a failed reconcile, this is not fixable from here. LOCG holds
+        # both ownerships, so deleting the local row does not stick (it returns
+        # on the next export) and clearing the ownership deliberately runs the
+        # BUI-122 `In Collection=0` data-loss path. A hard stop over a condition
+        # the operator has no local remedy for would simply block every sync
+        # indefinitely; the generator is fixed upstream instead, in record-win
+        # (BUI-564). The two lists are kept disjoint — a title already reported
+        # as a hard-stop duplicate is not repeated here — so the counts can be
+        # read independently.
+        already_hard_stopped = set(owned_duplicates)
+        cross_edition_twins = sorted(
+            title
+            for title, rows in owned_groups.items()
+            if len(rows) > 1
+            and title not in already_hard_stopped
+            and _cross_edition_twin_signal(rows)
+        )
+        summary["owned_duplicate_identities_cross_edition"] = len(cross_edition_twins)
+        if cross_edition_twins:
+            shown = ", ".join(cross_edition_twins[:10])
+            more = (
+                ""
+                if len(cross_edition_twins) <= 10
+                else f" (+{len(cross_edition_twins) - 10} more)"
+            )
+            summary["warnings"].append(
+                f"ADVISORY (not a sync blocker): {len(cross_edition_twins)} book(s) "
+                "are owned TWICE across editions — a foreign licensed edition "
+                "carrying the same price_paid + date_purchased as its US twin, "
+                "which means our own record-win push created it (BUI-563/BUI-564): "
+                f"{shown}{more}. The release dates are months apart, so the "
+                "owned_duplicate_identities hard stop cannot see these. Do NOT "
+                "fix by deleting the local row — LOCG re-emits it, and clearing "
+                "the ownership runs the BUI-122 In Collection=0 data-loss path."
             )
 
         # ----- Rebuild series_name_index --------------------------------------

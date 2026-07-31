@@ -424,6 +424,18 @@ Assert all of:
   reconciler missed — those rows stay
   pending and the next sync re-uploads them, so it compounds. The warning
   names the affected titles.
+- **`owned_duplicate_identities_cross_edition` is ADVISORY — report it, never
+  block on it (BUI-563):** the same "owned twice" fact for pairs whose release
+  dates are months apart (a foreign licensed edition trails its US original by
+  147–211 days), which the hard-stop's date predicate structurally cannot see.
+  It is reported separately and is **not** a sync blocker, because the operator
+  has no local remedy: LOCG holds both ownerships, so deleting the local row
+  does not stick, and clearing the ownership deliberately runs the BUI-122
+  `In Collection=0` data-loss path. Blocking on it would stop every sync
+  indefinitely. The generator is fixed upstream in record-win (BUI-564); a
+  non-zero count here is a standing known-issue tally, not a regression signal,
+  and it should **fall over time, never rise**. A *rise* is the thing worth
+  investigating — it means a new mis-resolved push landed.
 
 Restore the Step 1 backup if needed (BUI-433):
 
@@ -449,6 +461,7 @@ Re-import:        added=A  updated=U  reconciled=R  auto_healed_duplicates=H  se
 Pending:          PENDING_BEFORE → PENDING_AFTER  (cleared ~N)
 Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = added - auto_healed_duplicates, verified two-sided in Step 6)
 Owned twice:      D  (must be 0 — Step 6 hard-stops otherwise)
+Owned twice (cross-edition): E  (advisory only — never blocks; must not RISE)
 Wish-list:        unchanged (local-only adds preserved)
 Warnings:         W warning(s) from the re-import (see below) — or "none"
 ```
