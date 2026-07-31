@@ -359,13 +359,16 @@ def _strip_embedded_issue(title: str, issue: str) -> str:
 
 # BUI-347: rebootable mastheads — long-running Marvel/DC titles whose numbering
 # (or a same-numbered modern relaunch) collides with a vintage issue's own
-# number. List mirrors the one already documented for the analogous
-# collection-check ambiguity (.claude/commands/comic/collection-check.md) so
-# the two "which titles are rebootable" judgment calls don't drift apart.
+# number. List mirrors the one used by locg-cli's analogous collection-check
+# ambiguity (packages/locg-cli/src/locg/check_batch.py's Pattern D3) so the
+# two "which titles are rebootable" judgment calls don't drift apart — kept
+# in sync by test_check_batch.py::test_rebootable_masthead_list_matches_sold_comps
+# (BUI-577). Update both lists together.
 _REBOOTABLE_MASTHEADS = (
-    "fantastic four", "amazing spider-man", "spider-man", "uncanny x-men",
-    "x-men", "avengers", "thor", "iron man", "incredible hulk", "hulk",
-    "captain america", "batman", "superman", "wonder woman",
+    "fantastic four", "amazing spider-man", "spider-man", "spiderman",
+    "uncanny x-men", "x-men", "avengers", "thor", "iron man",
+    "incredible hulk", "hulk", "captain america", "batman", "superman",
+    "wonder woman",
 )
 # BUI-351: plain `\b` treats a hyphen as a non-word char, so `\bhulk\b` matches
 # INSIDE "She-Hulk" (the boundary lands on the "-"). Anchor on a full
