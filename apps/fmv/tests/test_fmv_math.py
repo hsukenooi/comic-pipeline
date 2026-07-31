@@ -1497,3 +1497,68 @@ class TestMinRangeWidth:
         prices = [49, 50, 51]
         out = fm.compute_fmv([_comp(p, 9.0) for p in prices], target_grade=9.0)
         assert out["max_bid"] <= max(prices)
+
+
+class TestForcedFlagReason:
+    """BUI-588: a needs-manual reason the POOL cannot show — the comps are
+    fine-shaped but were fetched for a different thing than the book asked
+    about."""
+
+    def _healthy(self):
+        # Bracketed, tight, plenty deep: nothing here flags on its own.
+        return [_comp(p, g) for p, g in
+                [(100, 8.5), (105, 9.0), (110, 9.0), (108, 9.5), (112, 9.5)]]
+
+    def test_none_is_a_no_op(self):
+        comps = self._healthy()
+        assert (fm.compute_fmv(comps, target_grade=9.0, forced_flag_reason=None)
+                == fm.compute_fmv(comps, target_grade=9.0))
+
+    def test_forced_reason_withholds_the_bid_on_an_otherwise_clean_pool(self):
+        out = fm.compute_fmv(self._healthy(), target_grade=9.0,
+                             forced_flag_reason="variant_dropped")
+        assert out["flag_reason"] == "variant_dropped"
+        # The whole point: a flagged book emits NO bid-able number, so a
+        # variant-blind pool can't quietly set a bid cap.
+        assert out["fmv_low"] is None
+        assert out["fmv_high"] is None
+        assert out["median"] is None
+        assert out["max_bid"] is None
+        assert out["confidence"] == "LOW"
+
+    def test_a_real_pool_reason_keeps_precedence(self):
+        """one_sided/too_wide/too_sparse describe the comps themselves and are
+        more actionable, so they must not be masked."""
+        one_sided = [_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        out = fm.compute_fmv(one_sided, target_grade=9.6,
+                             forced_flag_reason="variant_dropped")
+        assert out["flag_reason"] == "one_sided"
+        assert out["max_bid"] is None
+
+    def test_forced_reason_suppresses_interpolation(self):
+        """§7 is the ONE path that clears a flag and emits a bid-able number.
+        Interpolating between buckets of a base-cover pool still yields a
+        base-cover price, so a forced reason must close that exit too —
+        including when a pool-shape reason won the `flag_reason` slot."""
+        # The TestInterpolationInComputeFmv too_wide-but-bracketed shape.
+        comps = [_comp(90, 4.0), _comp(110, 4.0), _comp(190, 8.0), _comp(210, 8.0)]
+        interpolated = fm.compute_fmv(comps, target_grade=6.0)
+        assert interpolated["interpolated"] is True
+        assert interpolated["flag_reason"] is None
+        assert interpolated["max_bid"] == 90
+
+        forced = fm.compute_fmv(comps, target_grade=6.0,
+                                forced_flag_reason="variant_dropped")
+        assert forced["interpolated"] is False
+        assert forced["flag_reason"] == "too_wide"
+        assert forced["fmv_low"] is None
+        assert forced["max_bid"] is None
+
+    def test_empty_pool_gains_a_reason_instead_of_a_silent_stub(self):
+        """The BUI-588 defect state: n=0 with a null flag_reason reads as
+        "illiquid" and is invisible to /comic:buy Step 3's guards."""
+        plain = fm.compute_fmv([], target_grade=9.0)
+        assert plain["flag_reason"] is None
+        forced = fm.compute_fmv([], target_grade=9.0,
+                                forced_flag_reason="variant_dropped")
+        assert forced["flag_reason"] == "variant_dropped"
