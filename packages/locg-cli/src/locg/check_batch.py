@@ -62,21 +62,40 @@ _KNOWN_MATCH_STATUSES = frozenset(
 
 # Pattern D3: long-running rebootable mastheads where a no-year exact match can
 # silently land on the wrong volume (collection-check.md Step 2.5 Pattern D3).
-# Matched as normalized substrings; advisory only, so a broad list is safe.
+# Matched as boundary-anchored regexes (BUI-577 — ported from the correct,
+# BUI-351-hardened implementation in apps/ebay/src/sold_comps.py); advisory
+# only, so a broad list is safe. Kept in sync with sold_comps.py's own
+# _REBOOTABLE_MASTHEADS — test_check_batch.py::test_rebootable_masthead_list_matches_sold_comps
+# fails if the two drift apart. Update both lists together.
 _REBOOTABLE_MASTHEADS = (
     "fantastic four",
+    "amazing spider-man",
     "spider-man",
     "spiderman",
+    "uncanny x-men",
     "x-men",
     "avengers",
     "thor",
     "iron man",
+    "incredible hulk",
     "hulk",
     "captain america",
     "batman",
     "superman",
     "wonder woman",
 )
+# BUI-351 (ported BUI-577): plain `\b` treats a hyphen as a non-word char, so
+# `\bhulk\b` matches INSIDE "She-Hulk" (the boundary lands on the "-").
+# Anchor on a full title-token match instead: forbid the masthead from being
+# immediately preceded or followed by a hyphen (or any other word char), so
+# it can't be a substring of a different hyphenated title (e.g. "Hulk-Buster",
+# "Batman-Adventures", "Thors"). A masthead's OWN internal hyphen (e.g.
+# "spider-man") is untouched — re.escape keeps it literal; only the match's
+# outer edges get the tightened boundary.
+_REBOOTABLE_MASTHEAD_RES = [
+    re.compile(rf'(?<![-\w]){re.escape(m)}(?![-\w])', re.IGNORECASE)
+    for m in _REBOOTABLE_MASTHEADS
+]
 
 
 class CheckBatchError(Exception):
@@ -291,8 +310,7 @@ def _resolve_series_names(
 
 
 def _is_rebootable_masthead(series: str) -> bool:
-    s = (series or "").lower()
-    return any(m in s for m in _REBOOTABLE_MASTHEADS)
+    return any(p.search(series or "") for p in _REBOOTABLE_MASTHEAD_RES)
 
 
 def _candidate_series_names(candidates: Any) -> str:

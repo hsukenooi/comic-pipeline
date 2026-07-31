@@ -6,8 +6,10 @@ advisory flags must FLAG the right rows without ever flipping a verdict.
 """
 from __future__ import annotations
 
+import ast
 import json
 import sys
+from pathlib import Path
 
 import pytest
 import requests
@@ -761,3 +763,47 @@ class _FakeStdin:
 
     def read(self):
         return self._data
+
+
+# ---------------------------------------------------------------------------
+# Cross-file drift guard (BUI-577)
+# ---------------------------------------------------------------------------
+#
+# apps/ebay/src/sold_comps.py carries its own, independently-maintained copy
+# of _REBOOTABLE_MASTHEADS. apps/* are deliberately excluded from the uv
+# workspace (pyproject.toml:3-12 — they interoperate over PATH, not imports),
+# so this suite cannot `import sold_comps` to compare the lists directly.
+# Tradeoff, stated per the ticket: this test reads the *other* package's
+# source file off disk (a same-repo, cross-package file-path reach, not an
+# import) and parses just the `_REBOOTABLE_MASTHEADS` assignment with `ast`
+# — no execution of eBay code, so it can't be tripped up by sold_comps.py's
+# own import-time side effects (env reads, etc.). It only pins the tuple's
+# *contents*; it can't catch the matcher logic itself diverging in some more
+# exotic way — that's what compute_flags' D3 tests above (in this file) and
+# sold_comps.py's own TestVintageKeyHardening pin instead.
+
+def _read_masthead_tuple_from_source(path: Path) -> tuple[str, ...]:
+    tree = ast.parse(path.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "_REBOOTABLE_MASTHEADS"
+            for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"_REBOOTABLE_MASTHEADS assignment not found in {path}")
+
+
+def test_rebootable_masthead_list_matches_sold_comps():
+    sold_comps_path = (
+        Path(__file__).resolve().parents[3] / "apps" / "ebay" / "src" / "sold_comps.py"
+    )
+    assert sold_comps_path.is_file(), f"expected to find {sold_comps_path}"
+
+    ebay_mastheads = set(_read_masthead_tuple_from_source(sold_comps_path))
+    locg_mastheads = set(cb._REBOOTABLE_MASTHEADS)
+    assert ebay_mastheads == locg_mastheads, (
+        "check_batch.py's _REBOOTABLE_MASTHEADS has drifted from "
+        "sold_comps.py's — update both lists together (BUI-577). "
+        f"locg-only: {locg_mastheads - ebay_mastheads}, "
+        f"ebay-only: {ebay_mastheads - locg_mastheads}"
+    )
