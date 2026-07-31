@@ -59,11 +59,14 @@ curl -s "https://serpapi.com/search.json?engine=ebay&_nkw=%22{title}+{issue}%22+
 
 - Always exclude graded copies with `-cgc -cbcs -graded -slab` — they sell at very different prices
 - **Do not include "raw" as a keyword** — most sellers don't use it and it drops comps to near zero
-- **For non-Marvel/DC publishers (Image, Dark Horse, Valiant, etc.), add the publisher name to the query.** Titles like "Invincible", "Spawn", "Saga" match sports cards, trucks, and trading card sets. Adding `image+comics` or `dark+horse` scopes results to actual comics and prevents FMV contamination.
+- **Add a publisher qualifier — the rule is per-publisher, not "indie only" (BUI-566).** The CLI applies this automatically via `_publisher_qualifier`; replicate it by hand as follows.
+  - **Indie (Image, Dark Horse, Valiant, …)** — add the publisher name. Titles like "Invincible", "Spawn", "Saga" match sports cards, trucks, and trading card sets; `image+comics` or `dark+horse` scopes results to actual comics and prevents FMV contamination.
+  - **Marvel** — add `marvel+comics` (BUI-315). It keeps a year-less query like `"X-Men 97"` off modern media merchandise that reuses the issue number. It does **not** separate two Marvel volumes sharing an issue number — only `year` does that.
+  - **DC (and DC/Marvel imprints: Vertigo, Wildstorm, Epic, …)** — add **nothing**. A two-token `dc+comics` measurably narrows recall (Batman #232: 34 comps → 12; Detective #400: 38 → 21), so DC deliberately gets no qualifier.
 
 **Tiered query strategy** (the CLI does this automatically; replicate it manually if falling back):
 
-1. **Base** — always run: `"{title} {issue}" {year} {publisher_if_indie} -cgc -cbcs -graded -slab` + `show_only=Sold`. Dedupe by `product_id`.
+1. **Base** — always run: `"{title} {issue}" {year} {publisher_qualifier} -cgc -cbcs -graded -slab` + `show_only=Sold`. Dedupe by `product_id`. (`{publisher_qualifier}` per the per-publisher rule above: the name for indie, `marvel+comics` for Marvel, empty for DC.)
 2. **Auto-broaden** — only if base returns <5 total results: re-run without the year (`"{title} {issue}"` only). Common for thin-trade modern keys and oddball one-shots.
 3. **Grade-targeted** — only if base returns <10 grade-tagged comps after parsing: add a grade-label query (`"{title} {issue}" VG` or `FN` etc.). For Silver/Bronze keys this surfaces extra comps; for Copper-and-newer it almost always overlaps the base query and is wasted spend.
 

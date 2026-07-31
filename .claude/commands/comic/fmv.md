@@ -37,7 +37,17 @@ comic-fmv --batch <working_list.json> --out <results.json> --brief
 
 Literal example (build it directly — the shape is documented here, don't grep `apps/fmv` source for it): `[{"item_id": "115834720199", "title": "Fantastic Four", "issue": "16", "year": 1963, "publisher": "Marvel", "grade": "VG 4.0", "grade_confidence": "medium"}]`
 
-`publisher` and `variant` are optional but **load-bearing** (BUI-161): `ebay-sold-comps` appends `publisher` to the eBay search query — strongly recommended for non-Marvel/DC titles, where it's the primary noise filter that keeps trading cards / unrelated matches out of the comp pool — and `variant` (e.g. `Newsstand`, `Direct`) gives base vs variant editions distinct `comic_id`s (BUI-28), so omitting it conflates two sub-markets onto one comic.
+`publisher` and `variant` are optional but **load-bearing** (BUI-161). `variant` (e.g. `Newsstand`, `Direct`) gives base vs variant editions distinct `comic_id`s (BUI-28), so omitting it conflates two sub-markets onto one comic.
+
+**Pass `publisher` whenever you know it — including Marvel and DC (BUI-566).** This corrects the older "only for non-Marvel/DC titles" advice, which silently disabled a shipped fix: `ebay-sold-comps` decides per-publisher what to do with the field in **one** place (`_publisher_qualifier`), so there is no publisher you should deliberately withhold.
+
+- **Marvel** → appends the canonical `marvel comics` (BUI-315). This is what keeps a **year-less** query like `"X-Men 97"` from pulling in non-comic merchandise (the 2024 *X-Men '97* show). Omitting `publisher` disables it with no warning.
+- **DC**, and DC/Marvel imprints (Vertigo, Wildstorm, Epic, …) → appends **nothing**. A two-token `dc comics` measurably narrows recall (Batman #232: 34 comps → 12; Detective #400: 38 → 21), so DC short-circuits to no qualifier at all (BUI-315/BUI-321). Passing `DC` is a safe no-op, not a regression — the query is byte-for-byte the same as omitting it.
+- **Indie** (Image, Dark Horse, Valiant, …) → appends the name verbatim. This is the primary noise filter that keeps trading cards, toys, and unrelated goods out of the pool (BUI-161).
+
+**Don't guess it, though.** An absent `publisher` is safe (the base query passes through untouched); a *wrong* one is not — a misattributed indie or Marvel name appends a term that narrows the pool to nothing or to the wrong market. Pass it when you actually know the publisher; leave it out when you don't.
+
+**What the Marvel qualifier does *not* do:** it cannot separate two *Marvel* volumes that share an issue number — X-Men Vol. 1 #85 and Vol. 2 #85 are both `marvel comics`. Only `year` disambiguates a same-publisher relaunch, so a **year-less** pre-2000 book on a relaunched masthead can still price off a pool polluted with cheap modern issues (the signature: a suspiciously low range and a LOW/degenerate confidence, while a sibling issue above the relaunch's issue ceiling prices cleanly and HIGH). Treat that as a signal to supply `year`, not as a reason to re-run. Also note BUI-315's recall measurements predate the BUI-545 provider switch — they were taken on SerpApi, and the qualifier's effect on sold-comps.com is unmeasured.
 
 `grade_confidence` (optional, `high`|`medium`|`medium-low`|`low` — **four** levels, BUI-162) is the photo-coverage confidence from `/comic:grade`. When present and low, it haircuts the max bid — `medium-low` and `low` haircut **differently** (0.70 vs 0.60), so don't collapse them. Absent → standard 80% bid, no haircut (back-compat for seller-stated grades and manual runs).
 
@@ -55,7 +65,7 @@ Flags:
 The CLI prints a human-readable table to stdout and writes the full structured result to `--out` on disk. Present the table to the user. **Carry the `--brief` JSON lines forward to Step 4 of `/comic:buy`** (`item_id`, `comic_id`, `fmv_id`, `max_bid`, `flag_reason`, `confidence`, plus `fmv_low`/`fmv_high`/`fmv_notes` for the range + haircut presentation (BUI-505) and `source` to tell a lookup-error skip apart from an ordinary unpriced row (BUI-549)) — don't re-read the full `--out` JSON for linkage; the `--out` file on disk stays available if you need a full row (`queries_used`, `trimmed_pool`, etc.) for debugging.
 
 **`--out` row schema** (one object per book; use these exact keys — do **not** guess `comp_pool`/`pool`/`prices`):
-- Top-level: `input`, `fmv`, `comp_count_total`, `queries_used`, `db_row`, `comic_id`, `fmv_id`, `source` (`fresh`|`cached`|`cgc-proxy`|`error`). `comic_id`/`fmv_id` are top-level on fresh/proxy rows; on `cached` rows read them off `db_row` (`id`/`fmv_id`).
+- Top-level: `input`, `fmv`, `comp_count_total`, `queries_used`, `db_row`, `comic_id`, `fmv_id`, `source` (`fresh`|`cached`|`cgc-proxy`|`error`), `breaker_tripped` (BUI-535, on rows that ran a live fetch — see § Provider request budget). `comic_id`/`fmv_id` are top-level on fresh/proxy rows; on `cached` rows read them off `db_row` (`id`/`fmv_id`).
 - The surviving comps are **nested** at `fmv.trimmed_pool`, alongside `fmv.median`/`fmv_low`/`fmv_high`/`max_bid`/`bid_factor`/`flag_reason`/`confidence`/`window`.
 
 When you do need a pool field, **project it in one shot — never Read the whole `--out` file** (it's dominated by `queries_used`/`trimmed_pool`):
@@ -65,6 +75,28 @@ python3 -c "import json; print([(x['input']['item_id'], (x.get('fmv') or {}).get
 ```
 
 **`fetch-err` ≠ `n/a` (BUI-143):** a row whose FMV column reads `fetch-err` (and the loud post-table warning) means the **sold-comps fetch failed** for that book — since BUI-545 that means **both providers** (sold-comps.com primary AND the SerpApi fallback) errored — **not** that the book has no comps. Treat a `fetch-err` row (or a whole batch that comes back all `fetch-err`/`n/a`) as a provider failure: check `SOLD_COMPS_KEY`/quota first (free tier is 100 req/mo), then SerpApi, and re-run. Never tell the user these books are illiquid or bid on them as if priced.
+
+## Provider request budget (BUI-570)
+
+The sold-comps providers are a **shared, finite budget**, and a batch spends far more than one request per book. Read this before running anything above ~50 books.
+
+**A book is not one request.** `ebay-sold-comps` runs a tiered strategy per book: a base query always, plus a gated page-2 fetch, a broadened (year-dropped) tier, a grade-targeted tier, and a vintage "inclusive" tier — each conditional, up to five live queries for a thin vintage book. Each of those can additionally cost **two** provider requests, since a failing sold-comps.com query fails over to SerpApi (BUI-545). A 66-book batch is a low-hundreds-of-requests batch, not a 66-request one.
+
+**The 7-day query cache is what makes a re-run cheap — but only for an *identical* query.** Re-running the same books inside 7 days is served from cache and costs nothing. Two things void that: `--force` bypasses the cache and re-spends the whole batch, every tier; and **changing any query input re-prices from scratch** — adding a `publisher`, filling in a `year`, or correcting a `title` builds a different query string, so it misses the cache by design. Budget a corrected batch as a full-price run, not a cheap retry. (Per the `--force` note above it also cannot clear a `one_sided`/`too_wide` flag, so a bare `--force` retry is a wasted no-op that drains the budget for nothing.)
+
+**Re-runs compound; the breaker resets.** The BUI-535 circuit breaker is scoped to **one** `ebay-sold-comps` invocation, so every fresh `comic-fmv` call starts with a clean, untripped breaker — but the providers' rate limit and monthly quota do **not** reset. This is the part that misleads operators: a new run re-arms the safety, not the budget. Four runs in a row can each pay the breaker's 5-consecutive-error trip cost on the way down while the quota drains straight through.
+
+**So don't chop a batch up, and don't probe-then-re-run.** Because the breaker is per-invocation, splitting 60 books into three runs of 20 re-arms the trip cost three times instead of paying it once. Run the full set in **one** `comic-fmv --batch` call and read the result. When investigating a suspected pricing problem, design that single pass to answer the question — a small probe followed by a large re-run is exactly what exhausts the budget.
+
+> **Incident (2026-07-31):** ~107 book-queries across four runs in a few minutes — a 66-book batch, a 6-book re-run, a 5-book hypothesis test, then a 30-book fetch — tripped **both** providers' breakers. The last fetch returned `comps=0` for 27 of 30 books (the three with data were cache hits), and 30 books were dropped from the run.
+
+**There is no `--max-workers` on `comic-fmv`.** That flag exists on `ebay-sold-comps`, which `comic-fmv` invokes with a fixed command line, so it cannot be set from this path — do not offer it to the user. Batch composition and `--force` discipline are the only levers here; concurrency is not one of them (and sold-comps.com is separately capped at 4 concurrent requests internally, so the knob would be near-inert for the default primary anyway).
+
+**A budget-exhausted zero looks exactly like an illiquid book.** A breaker-tripped fetch returns `comps=0` — shape-identical to a genuine no-comps book. After any large or repeated run, check `breaker_tripped` before telling the user a book is illiquid, and watch stderr for `<provider> appears down — N consecutive errors, circuit breaker tripped (BUI-535)`. Same discipline as the `fetch-err` ≠ `n/a` rule above.
+
+```bash
+python3 -c "import json; r=json.load(open('<results.json>')); print(sum(1 for x in r if x.get('breaker_tripped')), 'of', len(r), 'rows affected by a tripped breaker')"
+```
 
 ## Reading the output table
 

@@ -161,7 +161,7 @@ Run `comic-fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetc
 comic-fmv --batch <working_list.json> --out <results.json> --brief
 ```
 
-**Input:** Working list JSON: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). Pass `publisher` for non-Marvel/DC titles and `variant` for non-base editions — both feed FMV accuracy (BUI-161). Include `grade_confidence` (`high`|`medium`|`medium-low`|`low` — all four levels; fmv.md owns the haircut each applies) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
+**Input:** Working list JSON: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]` for the comics that survived collection check (with photo-assessed grades from Step 2.5 if applicable). **Pass `publisher` whenever you know it — including Marvel and DC (BUI-566)** — and `variant` for non-base editions; both feed FMV accuracy (BUI-161). This replaces the old "non-Marvel/DC only" rule, which disabled the BUI-315 Marvel qualifier on every Marvel book in the batch: `ebay-sold-comps` already applies per-publisher policy centrally (Marvel → `marvel comics`; DC and its imprints → nothing, a safe no-op; indie → the name verbatim), so withholding the field only ever loses signal. `fmv.md` owns the per-publisher detail and the limits of what the qualifier can disambiguate. Include `grade_confidence` (`high`|`medium`|`medium-low`|`low` — all four levels; fmv.md owns the haircut each applies) for comics graded from photos in Step 2.5; omit it for seller-stated grades — an absent `grade_confidence` means no bid haircut (standard 80% max bid).
 
 **Output:** Human FMV table to stdout, followed by one compact JSON line per row (`--brief`, BUI-362; `fmv_low`/`fmv_high`/`fmv_notes` added BUI-505; `source` added BUI-549): `{item_id, comic_id, fmv_id, max_bid, fmv_low, fmv_high, fmv_notes, flag_reason, confidence, source}`. (Any skip-count summary lines print to stderr, not stdout — BUI-549 — so stdout under `--brief` is pure JSON Lines.) The full structured JSON still lands at `--out`, but **do not read the `--out` file into context** — it's dominated by `queries_used`/`trimmed_pool` (~6k tokens for 7 rows). The brief lines carry everything Steps 4–5 need; keep `--out` on disk for deep dives only (e.g. inspecting the comp pool when CV >100%).
 
@@ -174,6 +174,18 @@ Each brief line includes the internal `comic_id` (and `fmv_id`) returned by `POS
 Flags worth knowing:
 - `--max-age-days N` (default 7) — reuses FMVs already in the comics server's DB if `fmv_updated_at` is recent; rarely engages inside `/comic:buy` since this flow never resolves a `locg_id` (BUI-153 — see the doc link above for why).
 - `--force` — bypasses both SerpApi and DB caches; use only when you suspect a stale comp pool
+
+**Provider request budget (BUI-570).** The sold-comps providers are a shared, finite budget, and this step is where a run spends it. Before a batch above ~50 books:
+
+- **A book is not one request.** `ebay-sold-comps` runs up to five conditional query tiers per book, and each can cost two provider requests when sold-comps.com fails over to SerpApi (BUI-545). A 66-book batch is a low-hundreds-of-requests batch.
+- **Run the whole surviving list in ONE `comic-fmv --batch` call.** The BUI-535 circuit breaker is scoped to a single invocation, so splitting the batch re-arms its 5-consecutive-error trip cost once per chunk instead of paying it once. There is **no `--max-workers` on `comic-fmv`** (it's an `ebay-sold-comps` flag this path can't set) — don't offer throttling that doesn't exist.
+- **Re-runs compound; the breaker resets but the quota does not.** A fresh run starting with an untripped breaker is not a fresh budget. Re-running identical books inside 7 days hits the query cache and is free — but **`--force`, or any changed query input (adding `publisher`, filling in `year`, fixing a `title`), misses the cache and re-spends the batch at full price.**
+- **Design one diagnostic pass.** If a price looks wrong, work out what would answer the question and ask it once over the full set. A small probe followed by a large re-run is what exhausted the budget on 2026-07-31: ~107 book-queries across four runs tripped both providers' breakers, and the final fetch returned `comps=0` for 27 of 30 books.
+- **A breaker-tripped zero is shape-identical to a genuine no-comps book.** Watch stderr for `<provider> appears down — N consecutive errors, circuit breaker tripped (BUI-535)`. Before reporting any book as illiquid after a large or repeated run, project the `breaker_tripped` count off `--out` (don't read the file into context, per the Output note above):
+
+```bash
+python3 -c "import json; r=json.load(open('<results.json>')); print(sum(1 for x in r if x.get('breaker_tripped')), 'of', len(r), 'rows breaker-affected')"
+```
 
 **Confidence rubric:** fmv.md §8 owns the n/CV thresholds and the wide-window MEDIUM cap. The CLI returns these labels directly (in the human table and on each brief line; the `window` used lives in the `--out` JSON) — surface them as-is in your presentation.
 
@@ -312,4 +324,4 @@ Warn-only — don't block. The pipeline is done; the goal is to tell the user *n
 
 ## Subagent Strategy (30+ books)
 
-`comic-fmv` fans out internally and caches hits, so one CLI call handles 50+ books in seconds — reach for subagents only if eBay identification itself is rate-limited/large, or you want the orchestrator's context tight above 50+ books. FMV always stays a single CLI call regardless (shared SerpApi cache) — parallelize identification, not FMV.
+`comic-fmv` fans out internally and caches hits, so one CLI call handles 50+ books — reach for subagents only if eBay identification itself is rate-limited/large, or you want the orchestrator's context tight above 50+ books. FMV always stays a single CLI call regardless — parallelize identification, not FMV. That single call is also the budget-cheapest shape: per Step 3's provider request budget (BUI-570), splitting the batch re-arms the BUI-535 breaker per chunk, and a large batch on the live provider takes minutes, not seconds.
