@@ -4385,6 +4385,7 @@ def _build_win_row(
     owned_index: dict[tuple[str, str], list[dict[str, Any]]],
     metron: Any,
     metron_disabled: bool,
+    series_publishers: Optional[dict[str, set[str]]] = None,
 ) -> dict[str, Any]:
     """Build one collection row for a single Gixen win.
 
@@ -4408,6 +4409,14 @@ def _build_win_row(
         ``locg.metron``. The caller paces the batch on this.
       - "metron_attempted" / "metron_succeeded" / "manual_series" / "manual_variant" /
         "variant_detail_attempted" / "variant_matches": int deltas for this win
+
+    ``series_publishers`` (BUI-564) is
+    :func:`locg.collection_io.build_series_publishers`' series_name -> publishers
+    map, used to re-resolve a locally-resolved volume against the win's OWN
+    Metron publisher so a foreign licensed edition of the same masthead cannot
+    capture the win. Optional and fail-open: omitted (or empty) simply skips the
+    re-resolution, which is why every existing caller and test keeps its
+    behavior unchanged.
     """
     from locg.metron import (
         REQUESTS_LOOKUP_ISSUE_DETAIL,
@@ -4702,6 +4711,82 @@ def _build_win_row(
             metron_requests += REQUESTS_LOOKUP_ISSUE_DETAIL
             metron_disabled = _check_metron_degraded(metron, metron_disabled)
 
+    # BUI-564: the local series resolution above is publisher-BLIND, and the
+    # candidate pool it draws on (`build_volume_candidates`) is built from
+    # whatever LOCG's export holds — including the foreign licensed editions our
+    # OWN record-win push put there. Measured on the 2026-07-28 store, the key
+    # `spawn` carries both `Spawn (1992 - Present)` (Image) and `Spawn (2012 -
+    # Present)` (Kamite, the Mexican edition); `_best_volume_by_year` prefers the
+    # NARROWEST range containing the year, so every Spawn win from 2012 on
+    # resolved onto the Kamite volume and would push the next one straight back
+    # at the foreign catalog entry — widening the hole that created it. The keys
+    # `spider man` and `x men` are poisoned the same way by Panini volumes.
+    #
+    # Metron's publisher for THIS issue (captured just above) is the independent
+    # signal that breaks the tie, so re-run the very same resolver over a pool
+    # scoped to it. Fail-open at every step — this may only ever REDIRECT a win
+    # to a sibling volume that agrees with its publisher, never block one that
+    # would otherwise flow:
+    #
+    #   * no Metron publisher (a miss, or the breaker is open) -> no-op;
+    #   * `resolved_series is None`, i.e. the name came from Metron's own
+    #     `format_series_name` -> no-op. Scoping that by the publisher taken
+    #     from the very same hit would gate the candidate against itself, the
+    #     circularity `_assert_independent_series_range` guards elsewhere;
+    #   * the resolved volume does NOT conflict with the win's publisher ->
+    #     no-op. Gating on a DEMONSTRATED conflict (rather than rescoping every
+    #     win and keeping whatever comes back) is what keeps the blast radius at
+    #     exactly the broken case. Without it, re-resolution perturbs answers
+    #     that were already publisher-correct: probing the live store, a
+    #     2005-dated `X-Men #59` moved from one volume to another purely because
+    #     dropping the Panini candidate left the `_xmen_classic_split` fallback
+    #     to answer instead. Both volumes agreed with Marvel, so there was
+    #     nothing to fix and nothing should have moved;
+    #   * a key whose volumes ALL conflict keeps its full list (see
+    #     `publisher_scoped_volume_candidates`), so publisher naming drift the
+    #     normalizer cannot fold degrades to today's answer instead of refusing;
+    #   * a re-resolution that comes back None keeps the original answer.
+    #
+    # Placed here — after the publisher fetch, before the variant block — so
+    # `base_full_title` below is derived from the corrected volume. Nothing
+    # already computed is invalidated: the BUI-34 dedup key normalizes the
+    # decoration away (`_normalize_series_key` maps BOTH Spawn volumes to
+    # `spawn`), and `index_series_range` is only ever an era GATE that the
+    # accepted date has already passed — a redirect can only widen it, so no
+    # date decision made above could have gone the other way.
+    #
+    # `volume_candidates` is checked explicitly: the signature admits None (a
+    # plain index lookup still resolves without it), and scoping a None pool
+    # would raise where today it simply resolves.
+    if publisher_name and resolved_series is not None and series_publishers and volume_candidates:
+        from locg.collection_io import (
+            publisher_scoped_volume_candidates,
+            series_publisher_conflicts,
+        )
+
+        rescoped = (
+            resolve_series_for_win(
+                norm_key,
+                issue_num,
+                year_raw,
+                series_name_index,
+                publisher_scoped_volume_candidates(
+                    volume_candidates, series_publishers, publisher_name
+                ),
+            )
+            if series_publisher_conflicts(
+                canonical_series, publisher_name, series_publishers
+            )
+            else None
+        )
+        if rescoped is not None and rescoped != canonical_series:
+            logger.info(
+                "BUI-564: re-resolved %r #%s from %r to %r on Metron publisher %r "
+                "(the original volume names a different publisher).",
+                series_raw, issue_num, canonical_series, rescoped, publisher_name,
+            )
+            canonical_series = rescoped
+
     # R32: variant handling
     needs_manual_variant = False
     # BUI-199 Cause 1: full_title must use the BASE series name, not the
@@ -4921,6 +5006,7 @@ def cmd_collection_record_win(
         _normalize_series_key,
         build_volume_candidates,
     )
+    from locg.collection_io import build_series_publishers
     from locg.metron import MetronClient
 
     # BUI-476: refuse before spending a single Metron call or touching a store
@@ -4945,6 +5031,11 @@ def cmd_collection_record_win(
     # onto whichever one was indexed last. Build the full per-key volume map so a
     # year-bearing win can be matched to the volume whose range contains its era.
     volume_candidates = build_volume_candidates(payload)
+    # BUI-564: publisher per canonical volume, so a win whose Metron publisher
+    # disagrees with the volume the era rules picked can be re-resolved against
+    # the volumes that DO agree — see _build_win_row's BUI-564 block. Built once
+    # per batch alongside volume_candidates, from the same locg_export rows.
+    series_publishers = build_series_publishers(payload)
     existing_titles: set[str] = {
         row.get("full_title", "") for row in payload.get("comics", [])
     }
@@ -5049,6 +5140,7 @@ def cmd_collection_record_win(
                 owned_index=owned_index,
                 metron=metron,
                 metron_disabled=metron_disabled,
+                series_publishers=series_publishers,
             )
             metron_disabled = result["metron_disabled"]
             pending_paced_requests = result["metron_requests"]

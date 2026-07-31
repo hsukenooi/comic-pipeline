@@ -6998,3 +6998,159 @@ def test_doctor_walkthrough_steps_all_name_the_same_store(tmp_path, monkeypatch)
         f"{cmds.SERVER_STORE_ENV_PREFIX} locg" in i for i in instructions
     )
     assert [s["step"] for s in steps] == list(range(1, len(steps) + 1))
+
+
+# ---------------------------------------------------------------------------
+# BUI-564: record-win must not resolve a win onto a foreign licensed edition.
+#
+# The candidate pool `resolve_series_for_win` draws on is built from LOCG's
+# export, which holds the foreign editions our OWN push put there. Measured on
+# the 2026-07-28 store, the key `spawn` carried both `Spawn (1992 - Present)`
+# (Image) and `Spawn (2012 - Present)` (Kamite), and `_best_volume_by_year`
+# prefers the narrowest range containing the year — so every Spawn win from 2012
+# on resolved onto the Kamite volume and would push the next one right back at
+# the foreign catalog entry. Metron's publisher for the issue breaks the tie.
+# ---------------------------------------------------------------------------
+
+def _two_publisher_spawn_cache(tmp_path):
+    """A store holding BOTH Spawn volumes as locg_export rows — Image's original
+    and the Kamite licensed edition our own push created."""
+    from locg.collection_cache import rebuild_series_name_index
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [
+        {
+            **_agent_win_row(
+                publisher="Image Comics",
+                series="Spawn (1992 - Present)",
+                full_title="Spawn #222",
+                release_date="2012-08-01",
+                gixen_item_id="900",
+            ),
+            "source": "locg_export",
+        },
+        {
+            **_agent_win_row(
+                publisher="Kamite",
+                series="Spawn (2012 - Present)",
+                full_title="Spawn #224",
+                release_date="2012-10-01",
+                gixen_item_id="901",
+            ),
+            "source": "locg_export",
+        },
+    ])
+
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+    return cache
+
+
+def _spawn_metron(publisher: str = "Image Comics"):
+    from unittest.mock import MagicMock
+
+    m = MagicMock()
+    m.lookup_issue.return_value = {
+        "metron_id": 55722,
+        "cover_date": None,
+        "store_date": "2012-10-24",
+        "series_year_began": 1992,
+        "series_year_end": None,
+        "series_name": "Spawn",
+        "series_id": 7,
+    }
+    m.format_series_name.return_value = "Spawn (1992 - Present)"
+    m.lookup_issue_detail.return_value = {
+        "variants": [], "credits": [], "publisher": publisher,
+    }
+    m.degraded = False
+    return m
+
+
+def test_record_win_does_not_file_a_win_under_a_foreign_edition(tmp_path):
+    """The live 2026-07-27 failure: Spawn #224, an Image book, resolved onto the
+    Kamite volume because it has the narrower year range."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = _two_publisher_spawn_cache(tmp_path)
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="223", year=2012, item_id="2001")],
+        cache=cache,
+        metron=_spawn_metron(),
+        requests_per_minute=0,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "Spawn (1992 - Present)", (
+        "the win's Metron publisher is Image; it must not be filed under Kamite"
+    )
+    assert row["publisher_name"] == "Image Comics"
+    # full_title is built from the BASE series name, so it is unaffected either
+    # way — the pushed `Series Name` column is what steers LOCG.
+    assert row["full_title"] == "Spawn #223"
+
+
+def test_record_win_publisher_scoping_is_a_noop_without_a_metron_publisher(tmp_path):
+    """No publisher (a Metron miss, or the breaker open) means no independent
+    signal, so resolution must be exactly what it was before this fix."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = _two_publisher_spawn_cache(tmp_path)
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="223", year=2012, item_id="2002")],
+        cache=cache,
+        metron=_spawn_metron(publisher=None),
+        requests_per_minute=0,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "Spawn (2012 - Present)"
+    assert row["publisher_name"] is None
+
+
+def test_record_win_leaves_a_publisher_consistent_resolution_untouched(tmp_path):
+    """The re-resolution is gated on a DEMONSTRATED conflict, so a win whose
+    resolved volume already agrees with its publisher must not move — even
+    though a sibling volume of the same masthead exists. Probing the live store
+    without this gate, a 2005-dated `X-Men #59` changed volumes for no reason:
+    both candidates were Marvel, so there was nothing to fix."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = _two_publisher_spawn_cache(tmp_path)
+    # A 2013 Spawn win whose Metron publisher is Kamite genuinely BELONGS to the
+    # licensed volume — the guard must leave it exactly where the era rules put it.
+    result = cmd_collection_record_win(
+        [_make_win(series="Spawn", issue="230", year=2013, item_id="2003")],
+        cache=cache,
+        metron=_spawn_metron(publisher="Kamite"),
+        requests_per_minute=0,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "Spawn (2012 - Present)"
+
+
+def test_record_win_publisher_scoping_leaves_an_unambiguous_series_alone(tmp_path):
+    """The overwhelmingly common case — one volume under the key — must be
+    untouched, publisher agreement or not."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_index_for(
+        cache, "Amazing Spider-Man (1963 - 1998)", "Amazing Spider-Man #1"
+    )
+
+    result = cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man", issue="300", year=1988)],
+        cache=cache,
+        metron=_metron_hit(),
+        requests_per_minute=0,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["series_name"] == "Amazing Spider-Man (1963 - 1998)"
