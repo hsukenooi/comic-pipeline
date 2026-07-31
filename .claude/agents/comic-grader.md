@@ -181,6 +181,7 @@ PROCEDURE:
 7. Apply the CGC scale; anchor on the enumerated physical defects first, use reflectivity only to confirm.
 8. Reconcile against the SELLER-STATED GRADE per the rule above; if a ≥2-grade gap remains, confirm a named defect justifies it.
 9. Be rigorous — do NOT inflate. Grade only what you can see, and let coverage cap your confidence.
+10. Send the OUTPUT FORMAT block(s) below to `main` via `SendMessage` — your final act. A sub-agent's plain-text return does not reach the caller on its own (BUI-569).
 
 OUTPUT FORMAT (exactly this, no preamble — one block per comic, labelled by item id when grading a batch):
 PHOTO MAP: img-01: [content type], img-02: [content type], ... (one line per image)

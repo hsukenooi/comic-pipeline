@@ -35,7 +35,7 @@ entry per comic in the working list:
 
 ```json
 {"items":[{"series":"Amazing Spider-Man","issue":"300","year":"1988"},
-          {"series":"Uncanny X-Men","issue":"179","variant":"Newsstand"}]}
+          {"series":"Uncanny X-Men","issue":"179"}]}
 ```
 
 **`year` is a per-issue COVER year, never a series start year (BUI-129).** The
@@ -46,6 +46,20 @@ run. Forward the `/comic:identify` **Year column exactly as emitted** — presen
 means a confidence-gated per-issue cover year (BUI-316), safe to disambiguate
 volumes; **blank means omit `year`** (never backfill a guess). A correct
 verdict beats year-gated extras.
+
+**Default: OMIT `variant` for ownership checks (BUI-571).** Passing `variant`
+narrows the match to one edition (Newsstand, Direct, Whitman, ...), which risks
+a false **not-owned** when the stored copy is a different edition of the same
+issue — that buys a duplicate, and a duplicate purchase can't be undone.
+Omitting `variant` asks the issue-level question instead; it risks the
+opposite, a false **owned**, but that only causes a skip the user can reverse
+at the Step 4 decision gate below — recoverable. Under R11 (never render a
+verdict that could cause a duplicate purchase), that asymmetry favors
+omitting: an earlier check on X-Force #19 passed no `variant` and still
+matched the stored `X-Force #19 Newsstand Edition`, correctly reporting it
+owned. Forward `/comic:identify`'s **Variant column** only when the user is
+deliberately hunting a specific edition as an upgrade, not as a default
+per-row pass-through.
 
 ### What the flags mean
 
