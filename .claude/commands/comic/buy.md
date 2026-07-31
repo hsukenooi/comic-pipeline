@@ -57,7 +57,7 @@ Without this, Step 1's seller-reliability advisory silently no-ops for the whole
 
 Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow it — name the identifier subagent (e.g. `comic-identifier`) at spawn time (BUI-366) so it stays addressable for follow-ups (§ Sub-agent reuse above; identify.md § Follow-ups).
 
-**Input:** eBay URLs from the user.
+**Input:** eBay URLs from the user, or a `seller-scan --json` blob (BUI-576) — pull each match's `item_id` and fetch it fresh exactly as for a bare URL; the blob is an item_id source only, never a data source (carrying forward its title/price/end-time is the BUI-572 staleness trap). `wish_name` and `match_score` may ride along as display context — never as anything a later step reads or decides on.
 **Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**).
 
 Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step. The table's **Current Price**, **Bids**, and **Ends** (raw `end_date_iso`) columns carry forward for Steps 4–5, together with the wall-clock time this table was captured (`identified_at`) — Step 4 owns the no-re-fetch rule and the data-age threshold that now conditions it (BUI-359/BUI-567).

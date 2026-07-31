@@ -203,6 +203,8 @@ Full rationale for why a second verifier is redundant, and why false positives l
 
 Copy the eBay URLs from the URL column (MATCH rows, plus any UNCERTAIN rows the user cleared) and pass them to `/comic:buy`. The buy workflow will identify, check your collection, calculate FMV, and add snipes.
 
+**Or skip the copy step (BUI-576):** `/comic:buy` Step 1 also accepts the raw `--json` blob directly — pass `sellers[*].matches` and it pulls the `item_id`s itself, still fetching each listing fresh (no reuse of this scan's title/price/end-time — see buy.md Step 4 for the data-age rule that governs freshness downstream).
+
 ## Matching algorithm
 
 - Fetches up to 1000 seller listings (override with `--max-results N`)
