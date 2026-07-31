@@ -517,7 +517,11 @@ def add_batch_cmd(rows_file: str, verify: bool, json_out: str | None):
     comic_id (int), grade (number), seller (str), seller_grade (number),
     photo_grade (number), group (int, default 0), offset (int, default 6),
     title (str, BUI-506 — display-only, echoed back in the human table and
-    JSON summary; never sent to the server).
+    JSON summary; never sent to the server), end_date_iso (str, BUI-567 —
+    ISO 8601 auction end time; a row whose end_date_iso has already elapsed
+    is rejected before the network call, surfaced as a failed row with the
+    reason in its error field; omitting it skips the check entirely, so
+    existing rows.json files without it behave exactly as before).
     item_id must be unique across rows in one file (the server upserts on
     item_id, so a duplicate would collapse into one bid). Reuses the same
     server-mode request path as `gixen add` (POST /api/bids, then POST
@@ -682,10 +686,12 @@ def build_batch_cmd(
     per line — non-JSON lines are ignored, but a line that looks like JSON
     and fails to parse is a hard error). WORKING_LIST_FILE is a JSON list of
     working-list rows: {item_id, title?, grade?, listing_type?/type?,
-    seller?, seller_grade?, photo_grade?, group?}. `title` (BUI-506), when
-    present, is carried straight into the built row and on through
-    `add-batch`'s human table and JSON rows — display-only, never sent to
-    the server. Absent `title` is fully backward-compatible.
+    seller?, seller_grade?, photo_grade?, group?, end_date_iso?}. `title`
+    (BUI-506), when present, is carried straight into the built row and on
+    through `add-batch`'s human table and JSON rows — display-only, never
+    sent to the server. `end_date_iso` (BUI-567), when present, is likewise
+    carried straight through unchanged so `add-batch`'s stale-listing guard
+    can see it. Absent `title`/`end_date_iso` is fully backward-compatible.
 
     Prints the resulting rows JSON (feed straight into `gixen add-batch`),
     and reports skipped (BIN / user-skip) and unlinked (null comic_id) rows

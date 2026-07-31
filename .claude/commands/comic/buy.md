@@ -60,7 +60,7 @@ Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow i
 **Input:** eBay URLs from the user.
 **Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**).
 
-Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step. The table's **Current Price** and **Bids** columns carry forward for Steps 4–5 (Step 4 owns the no-re-fetch rule, BUI-359).
+Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step. The table's **Current Price**, **Bids**, and **Ends** (raw `end_date_iso`) columns carry forward for Steps 4–5, together with the wall-clock time this table was captured (`identified_at`) — Step 4 owns the no-re-fetch rule and the data-age threshold that now conditions it (BUI-359/BUI-567).
 
 ### Seller reliability advisory (BUI-78)
 
@@ -205,13 +205,37 @@ Clean-number rounding: $5 step below $50, $10 step from $50–$200, $25 step abo
 
 A `needs-manual` row (`flag_reason` set) has no CLI-computed max bid. Present it without a proposed number; the user supplies a hand-derived max bid (via the `fmv.md` interpolation / CGC-proxy methods) or skips it. Don't fabricate a max from the absent FMV.
 
-**Current-price context (BUI-359):** the Step 1 table already carries each
-auction's **Current Price** and **Bids** — use those columns here, do **not**
-re-fetch listings or re-ask the identifier subagent for prices. Flag any row
-whose current price is already at or above the proposed max (the user should
-raise or skip — see Step 5's pre-flight), and pair Bids with the Ends column
-for urgency context (e.g. `12 bids, ends 18h` = contested; `0 bids` = the
-seller can still end the auction early).
+**Current-price context, conditional on data age (BUI-359/BUI-567):** the
+Step 1 table carries each auction's **Current Price**, **Bids**, and **Ends**
+(`end_date_iso`), stamped with when Step 1 captured them (`identified_at`).
+Compute the elapsed time between `identified_at` and now:
+
+- **Fresh run (elapsed < ~2h):** use those columns as-is here — do **not**
+  re-fetch listings or re-ask the identifier subagent for prices. This is
+  BUI-359's original rule, unchanged for the common case where the whole run
+  completes in minutes.
+- **Stale run (elapsed ≥ ~2h):** BUI-359's no-re-fetch rule no longer applies
+  as-is. Before presenting max bids, either:
+  1. **Re-fetch** `current_price` / `bid_count` / `end_date_iso` for every
+     surviving row (re-run identify.md's fetch for just those item_ids, or a
+     direct `ebay_fetch.py` call) and present the refreshed numbers below, or
+  2. If re-fetching isn't practical right now, present the table anyway but
+     **say so plainly** — e.g. "⚠️ using data captured 18h ago, NOT
+     re-fetched" — never silently present hours-old prices as if they were
+     current.
+
+  Do this **before** the gate below, and before Step 5's bid-sanity check —
+  an 18-hour-old price is exactly what let several already-outbid rows reach
+  a batch add undetected in the incident BUI-567 documents.
+
+Flag any row whose current price (fresh or explicitly labeled stale) is
+already at or above the proposed max (the user should raise or skip — see
+Step 5's pre-flight), and pair Bids with the Ends column for urgency context
+(e.g. `12 bids, ends 18h` = contested; `0 bids` = the seller can still end
+the auction early). **An `end_date_iso` already in the past means the
+auction is over — drop that row now, before Step 5.** (`gixen build-batch` /
+`add-batch` also hard-reject a row like that, BUI-567, but catching it here
+saves the user a wasted approval on a dead listing.)
 
 Gate: user approves or overrides each max bid.
 
@@ -223,7 +247,7 @@ This step calls `gixen add-batch` inline (BUI-360) instead of dispatching `snipe
 
 If `gixen` isn't found, install the monorepo CLIs first: `./scripts/install.sh`.
 
-**1. Bid sanity check:** same rule as `snipe-add.md`'s pre-flight — compare each approved auction's current bid (Step 1 Current Price column; no re-fetch, see Step 4) against its proposed max bid. If current bid ≥ max bid, surface it and ask whether to raise the max or skip before proceeding.
+**1. Bid sanity check:** same rule as `snipe-add.md`'s pre-flight — compare each approved auction's current bid (the Current Price column Step 4 used — freshly re-fetched if Step 4's data-age check found the run stale, BUI-567; otherwise the original Step 1 value) against its proposed max bid. If current bid ≥ max bid, surface it and ask whether to raise the max or skip before proceeding. Also re-check each row's `end_date_iso` against now and drop any row whose auction has already ended — `gixen build-batch`/`add-batch` hard-reject a row like that too (BUI-567), so a stale one that slips past this check still fails there instead of landing, but catching it here avoids spending a batch round-trip on a dead row.
 
 **2. Build the rows JSON with `gixen build-batch`** (BUI-435) — a tested,
 deterministic transform, not a hand-merge:
@@ -238,7 +262,10 @@ gixen build-batch fmv_brief.json working_list.json --overrides overrides.json --
   comic with `item_id`, `grade` (numeric, or a CGC letter grade like `NM-` —
   the builder converts it), `listing_type` (`Auction`/`BIN` from Step 1 —
   BIN rows are skipped automatically), `seller`/`seller_grade`/`photo_grade`
-  (Steps 1/2.5), and `group` (the Step 2 bid-group candidate, if any).
+  (Steps 1/2.5), `group` (the Step 2 bid-group candidate, if any), and
+  `end_date_iso` (Step 1's raw end time, refreshed by Step 4 if the run was
+  stale — BUI-567; the builder threads it straight into `rows.json` so
+  `add-batch`'s stale-listing guard has an end time to check).
 - `--overrides overrides.json` — only needed when Step 4's gate changed
   anything from the CLI-computed default: `{"<item_id>": {"max_bid": ...,
   "group": ..., "skip": true}}`. Omit the flag when nothing was overridden.

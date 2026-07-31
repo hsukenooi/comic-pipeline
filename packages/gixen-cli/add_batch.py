@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Protocol
 
@@ -210,6 +211,39 @@ def _optional_int(row: dict, field_name: str, default: int) -> int:
         raise _RowValidationError(f"invalid {field_name}: {value!r}") from None
 
 
+def _check_end_date_not_past(row: dict) -> None:
+    """BUI-567: reject a row whose auction has already ended, before it
+    consumes a Gixen session round-trip. `end_date_iso` is optional (older
+    callers/rows.json files never had it) — a row that omits it is not
+    validated here at all; the guard only fires when the caller actually
+    supplied an end time. Mirrors `_optional_float`'s "fail loud on garbage
+    input rather than silently pass it through" shape: a present but
+    unparseable `end_date_iso` is rejected too, not treated as "no end time
+    known" (that would silently defeat the guard for a malformed value,
+    exactly the failure mode BUI-567 exists to close)."""
+    value = row.get("end_date_iso")
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise _RowValidationError(
+            f"invalid end_date_iso: {value!r} (expected an ISO 8601 string)"
+        )
+    try:
+        end_dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        raise _RowValidationError(
+            f"invalid end_date_iso: {value!r} (not a parseable ISO 8601 timestamp)"
+        ) from None
+    if end_dt <= now:
+        raise _RowValidationError(
+            f"auction already ended (end_date_iso={value!r}) — a closed "
+            "listing cannot be sniped"
+        )
+
+
 def build_bid_payload(
     item_id: str,
     max_bid: Decimal | float,
@@ -279,6 +313,7 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         seller = row.get("seller")
         seller_grade = _optional_float(row, "seller_grade")
         photo_grade = _optional_float(row, "photo_grade")
+        _check_end_date_not_past(row)  # BUI-567: before the network, not after
     except _RowValidationError as e:
         return RowResult(item_id=item_id, status=STATUS_FAILED, error=str(e), title=title)
 
@@ -578,18 +613,24 @@ def build_batch_rows(
         flag_reason, confidence}.
       - `working_list` — the buy-flow working list, one dict per surviving
         comic: {item_id, title?, grade?, listing_type?/type?, seller?,
-        seller_grade?, photo_grade?, group?}. `grade`/`seller_grade`/
-        `photo_grade` may be numeric or a CGC letter grade (e.g. "NM-").
-        `group` here is the Step 2 bid-group-candidate default. A row whose
-        `listing_type`/`type` is "BIN" (case-insensitive) is skipped
-        entirely — Gixen is for auctions only. `title` (BUI-506), when
-        present, is carried straight into the output row unchanged and
+        seller_grade?, photo_grade?, group?, end_date_iso?}. `grade`/
+        `seller_grade`/`photo_grade` may be numeric or a CGC letter grade
+        (e.g. "NM-"). `group` here is the Step 2 bid-group-candidate default.
+        A row whose `listing_type`/`type` is "BIN" (case-insensitive) is
+        skipped entirely — Gixen is for auctions only. `title` (BUI-506),
+        when present, is carried straight into the output row unchanged and
         purely for display — it lets `add-batch` show the comic's name in
         its human table and JSON summary instead of a bare item_id, closing
         the /comic:buy Step 5 orchestrator's old in-context "reformat with
         the comic names ... joined by item_id" pass. Absent `title` is fully
         backward-compatible: the output row simply omits the key, exactly as
-        it did before this field existed.
+        it did before this field existed. `end_date_iso` (BUI-567), when
+        present, is likewise carried straight through unchanged — it is what
+        lets `add-batch`'s stale-listing guard (`add_one_row` /
+        `_check_end_date_not_past`) actually see an end time for a row built
+        this way; absent `end_date_iso` is fully backward-compatible (the
+        guard simply doesn't fire for that row, same as before this field
+        existed).
       - `overrides` — optional {item_id: {"max_bid": ..., "group": ...,
         "skip": bool}}, the Step 4 user-approval gate's per-row overrides.
         A present, non-null `max_bid`/`group` here always wins over the
@@ -686,6 +727,15 @@ def build_batch_rows(
         title = row.get("title")
         if title is not None:
             out_row["title"] = title
+
+        # BUI-567: passthrough only — never validated/parsed here. The
+        # actual stale-listing rejection happens later, in add_one_row via
+        # _check_end_date_not_past, so a malformed value from a working-list
+        # row surfaces as that row's FAILED result (with the real network
+        # call still skipped), not as a build-batch-time AddBatchError.
+        end_date_iso = row.get("end_date_iso")
+        if end_date_iso is not None:
+            out_row["end_date_iso"] = end_date_iso
 
         comic_id = brief_row.get("comic_id")
         if comic_id is not None:
