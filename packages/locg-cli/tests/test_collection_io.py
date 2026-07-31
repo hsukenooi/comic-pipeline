@@ -3482,6 +3482,241 @@ def test_flag_clear_rekeys_the_identity_indices(tmp_path):
     assert win["previous_full_title"] is None
 
 
+# ---------------------------------------------------------------------------
+# BUI-586: publisher-scope the volume pool `_reresolve_manual_series_flags`
+# draws on, so a re-resolution can't land on a same-named volume from the
+# wrong publisher (BUI-564's trigger-and-rescope pattern, minus the Metron
+# fetch — the row's own `publisher_name` is already on hand).
+# ---------------------------------------------------------------------------
+
+def test_reresolve_manual_series_no_conflict_keeps_unscoped_answer_bui586(tmp_path):
+    """Both known volumes under the key agree with the win's publisher, so
+    `series_publisher_conflicts` never fires and the rescope branch is never
+    entered — the outcome must be byte-identical to the pre-BUI-586 plain
+    era lookup (narrowest range wins)."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    older = make_agent_win_row(
+        publisher="Image Comics",
+        series="Spawn (1992 - Present)",
+        full_title="Spawn #1",
+        release_date="1992-05-01",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    older["source"] = "locg_export"
+    newer = make_agent_win_row(
+        publisher="Image Comics",
+        series="Spawn (2012 - Present)",
+        full_title="Spawn #224",
+        release_date="2012-10-01",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    newer["source"] = "locg_export"
+    flagged = make_agent_win_row(
+        publisher="Image Comics",
+        series="Spawn",  # bare masthead — unresolved
+        full_title="Spawn #250",
+        release_date="2015-01-01",
+        gixen_item_id="99",
+        needs_manual_series=True,
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([older, newer, flagged])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics", "series": "Batman (Vol. 3) (2016 - Present)",
+        "full_title": "Batman #1", "release_date": "2016-06-15",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    row = next(r for r in payload["comics"] if r["gixen_item_id"] == "99")
+    assert result["manual_series_flags_cleared"] == 1
+    assert row["needs_manual_series_canonical"] is False
+    # Narrowest range containing 2015 wins, exactly as the plain (unscoped)
+    # lookup would pick — no publisher redirect needed or applied.
+    assert row["series_name"] == "Spawn (2012 - Present)"
+
+
+def test_reresolve_manual_series_publisher_conflict_rescopes_to_correct_volume_bui586(tmp_path):
+    """BUI-564's own real-world example: `spawn` carries an Image volume AND a
+    foreign (Kamite) licensed edition our own record-win push created. The
+    plain era lookup prefers the narrower Kamite range and would misfile the
+    win there; the win's OWN publisher (Image Comics) demonstrably conflicts
+    with that answer, so the rescope must redirect it to the Image volume."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    image_volume = make_agent_win_row(
+        publisher="Image Comics",
+        series="Spawn (1992 - Present)",
+        full_title="Spawn #1",
+        release_date="1992-05-01",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    image_volume["source"] = "locg_export"
+    kamite_volume = make_agent_win_row(
+        publisher="Kamite",
+        series="Spawn (2012 - Present)",
+        full_title="Spawn #224",
+        release_date="2012-10-01",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    kamite_volume["source"] = "locg_export"
+    flagged = make_agent_win_row(
+        publisher="Image Comics",
+        series="Spawn",  # bare masthead — unresolved
+        full_title="Spawn #250",
+        release_date="2015-01-01",
+        gixen_item_id="99",
+        needs_manual_series=True,
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([image_volume, kamite_volume, flagged])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics", "series": "Batman (Vol. 3) (2016 - Present)",
+        "full_title": "Batman #1", "release_date": "2016-06-15",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    row = next(r for r in payload["comics"] if r["gixen_item_id"] == "99")
+    assert result["manual_series_flags_cleared"] == 1
+    assert row["needs_manual_series_canonical"] is False
+    assert row["series_name"] == "Spawn (1992 - Present)", (
+        "must land on the Image volume, not the narrower Kamite one, because "
+        "the win's own publisher demonstrably conflicts with Kamite"
+    )
+
+
+def test_reresolve_manual_series_conflict_with_empty_scoped_pool_falls_open_bui586(tmp_path):
+    """The ONLY known volume under the key disagrees with the win's publisher
+    (no sibling volume exists that agrees), so `publisher_scoped_volume_candidates`
+    fails open per-key and hands back the FULL unfiltered list — the rescope is
+    attempted, but it can only reproduce the plain lookup's answer. The row must
+    still clear its flag and pick up that (unscoped) answer; a conflict being
+    detected must never blank or downgrade an existing resolution."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    kamite_volume = make_agent_win_row(
+        publisher="Kamite",
+        series="Spawn (2012 - Present)",
+        full_title="Spawn #224",
+        release_date="2012-10-01",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    kamite_volume["source"] = "locg_export"
+    flagged = make_agent_win_row(
+        publisher="Image Comics",  # conflicts with the only known volume
+        series="Spawn",
+        full_title="Spawn #250",
+        release_date="2015-01-01",
+        gixen_item_id="99",
+        needs_manual_series=True,
+        pushed=None,
+    )
+
+    def add_rows(payload):
+        payload["comics"].extend([kamite_volume, flagged])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics", "series": "Batman (Vol. 3) (2016 - Present)",
+        "full_title": "Batman #1", "release_date": "2016-06-15",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    row = next(r for r in payload["comics"] if r["gixen_item_id"] == "99")
+    assert result["manual_series_flags_cleared"] == 1
+    assert row["needs_manual_series_canonical"] is False
+    # Same answer the plain (unscoped) lookup would have produced — a
+    # detected conflict with nowhere safe to redirect to is a no-op, not a
+    # refusal.
+    assert row["series_name"] == "Spawn (2012 - Present)"
+
+
+def test_reresolve_manual_series_null_publisher_degrades_to_todays_answer_bui586(tmp_path):
+    """A win row with a null `publisher_name` (the BUI-458 backfill class,
+    explicitly out of scope for BUI-586) never reaches the rescope branch at
+    all — `series_publisher_conflicts` fails open on a missing publisher, so
+    the row degrades to exactly today's (publisher-blind) answer."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    image_volume = make_agent_win_row(
+        publisher="Image Comics",
+        series="Spawn (1992 - Present)",
+        full_title="Spawn #1",
+        release_date="1992-05-01",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    image_volume["source"] = "locg_export"
+    kamite_volume = make_agent_win_row(
+        publisher="Kamite",
+        series="Spawn (2012 - Present)",
+        full_title="Spawn #224",
+        release_date="2012-10-01",
+        gixen_item_id=None,
+        pushed="2024-01-01T00:00:00.000000Z",
+    )
+    kamite_volume["source"] = "locg_export"
+    flagged = make_agent_win_row(
+        series="Spawn",
+        full_title="Spawn #250",
+        release_date="2015-01-01",
+        gixen_item_id="99",
+        needs_manual_series=True,
+        pushed=None,
+    )
+    flagged["publisher_name"] = None  # BUI-458 class: null, not missing-key
+
+    def add_rows(payload):
+        payload["comics"].extend([image_volume, kamite_volume, flagged])
+
+    cache.apply(add_rows, command="pre-import")
+
+    xlsx = tmp_path / "reexport.xlsx"
+    _build_export_xlsx(xlsx, [{
+        "publisher": "DC Comics", "series": "Batman (Vol. 3) (2016 - Present)",
+        "full_title": "Batman #1", "release_date": "2016-06-15",
+    }])
+
+    result = import_xlsx(xlsx, cache)
+    payload = cache.load()
+
+    row = next(r for r in payload["comics"] if r["gixen_item_id"] == "99")
+    assert result["manual_series_flags_cleared"] == 1
+    assert row["needs_manual_series_canonical"] is False
+    # No publisher on the row -> no trigger -> the plain era lookup's answer,
+    # narrowest range wins (Kamite) — the gap BUI-586 knowingly leaves open.
+    assert row["series_name"] == "Spawn (2012 - Present)"
+
+
 def test_duplicate_check_title_key_strips_the_article_word_safely():
     """`Theatre #1` must not become `atre#1` — the article strip runs on the
     spaced form, before whitespace is collapsed."""
