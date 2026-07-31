@@ -978,9 +978,49 @@ class GixenClient:
             snipes.append(snipe)
 
         # Now enrich with data from the table rows (title, current bid, status, etc.)
-        # These appear in the table cells around each item
+        # These appear in the table cells around each item.
+        #
+        # BUI-580: every scan below must be bounded to the item's OWN markup.
+        # Gixen renders each snipe twice — a mobile block (labelled cells:
+        # "Group: 1", "Time to end: ...", "Status (main): ...") and a desktop
+        # table (positional cells) — and an unbounded `.*?` under DOTALL does
+        # not fail when a row's shape is unexpected: it scans on and captures
+        # the NEXT snipe's cells instead. That is silent and wrong, which is
+        # strictly worse than an empty value. Two spans per item:
+        #   mobile  — its first anchor up to the next snipe's first anchor
+        #   desktop — its edit submit up to the next row's dbidid checkbox
+        # A row whose shape drifts now yields "" (loud) rather than a
+        # neighbour's data (silent).
+        #
+        # anchor_order holds EVERY item anchor on the page, both blocks — not
+        # just each item's first. That is what stops the last mobile row's span
+        # from running on through the whole desktop table below it.
+        mobile_start = {}
+        anchor_order = []
+        for s in snipes:
+            hits = [
+                m.start() for m in
+                re.finditer(rf'<a[^>]*>{re.escape(s["item_id"])}</a>', html)
+            ]
+            anchor_order.extend(hits)
+            mobile_start[s["item_id"]] = hits[0] if hits else html.find(s["item_id"])
+        anchor_order.sort()
+
         for snipe in snipes:
             iid = snipe["item_id"]
+
+            # This item's mobile block: up to the next item's anchor.
+            start = mobile_start[iid]
+            nxt = next((p for p in anchor_order if p > start), len(html))
+            mobile_span = html[start:nxt] if start >= 0 else ""
+
+            # This item's desktop rows: up to the next row's checkbox.
+            m_edit = re.search(rf'name="edit_{re.escape(iid)}"', html)
+            desktop_span = ""
+            if m_edit:
+                rest = html[m_edit.end():]
+                m_next_row = re.search(r'name="dbidid_', rest)
+                desktop_span = rest[:m_next_row.start()] if m_next_row else rest
 
             # Title — appears after the item link, before </td> or <i>
             # Pattern: item link followed by title text
@@ -994,18 +1034,27 @@ class GixenClient:
                 snipe["title"] = ""
 
             # Seller — appears in <a> tag linking to ebay.com/usr/
-            m = re.search(
-                rf'{re.escape(iid)}.*?ebay\.com/usr/([^/"]+)',
-                html, re.DOTALL,
-            )
+            m = re.search(r'ebay\.com/usr/([^/"]+)', mobile_span)
             snipe["seller"] = m.group(1) if m else ""
 
             # Current bid — "X.XX USD" pattern after max bid display
             # In the desktop table: <td>X.XX</td>\n<td>Y.YY USD
+            #
+            # BUI-580: the leading cell is empty ("<td></td>") only for an
+            # UNGROUPED snipe. A grouped one renders "<td align="right">Group:
+            # 1</td>", so a literal <td></td> here missed the item's own row
+            # and — before the span bound above — ran on into the next snipe's
+            # row, reporting its bid and its clock. Live: X-Men #101 (group 1)
+            # showed $9.65 / "2d 12h" borrowed from the #127 row beneath it
+            # while the real auction sat at $291 with 38 minutes less to run.
+            # Both fields are load-bearing (current_bid becomes winning_bid on
+            # WON/LOST; time_to_end sets auction_end_at, which the local sniper
+            # fires on), so match either shape rather than counting on the cell
+            # being empty.
             m = re.search(
-                rf'name="edit_{re.escape(iid)}".*?</tr>\s*<tr[^>]*>\s*<td></td>\s*'
-                rf'<td>([^<]*)</td>\s*<td>([^<]*)</td>\s*<td>([\d.]+ \w+)',
-                html, re.DOTALL,
+                r'</tr>\s*<tr[^>]*>\s*<td[^>]*>[^<]*</td>\s*'
+                r'<td>([^<]*)</td>\s*<td>([^<]*)</td>\s*<td>([\d.]+ \w+)',
+                desktop_span, re.DOTALL,
             )
             if m:
                 snipe["time_to_end"] = m.group(1).strip()
@@ -1017,16 +1066,16 @@ class GixenClient:
 
             # Status (main) and Status (mirror)
             # Gixen renders: <td>Status (main): </td><td>SCHEDULED</td>
-            # Find the item's anchor tag, then scan the next ~900 chars for
-            # both rows. (Took main's structural extraction over our keyword
-            # whitelist — both fix the original "175" bug, but main's reads
-            # the labelled cell directly which is more durable.)
-            m_anchor = re.search(rf'<a[^>]*>{re.escape(iid)}</a>', html)
-            anchor_pos = m_anchor.start() if m_anchor else html.find(iid)
-            chunk = html[anchor_pos:anchor_pos + 900] if anchor_pos >= 0 else ""
-            m = re.search(r'Status \(main\):\s*</td><td>([^<]+)', chunk)
+            # Read the labelled cell directly. (Took main's structural
+            # extraction over our keyword whitelist — both fix the original
+            # "175" bug, but main's reads the labelled cell directly which is
+            # more durable.) BUI-580 replaced the ~900-char scan window with
+            # the item's own span: a fixed character count is the same
+            # unbounded-scan hazard as the current-bid bug, just spelled with
+            # a magic number.
+            m = re.search(r'Status \(main\):\s*</td><td>([^<]+)', mobile_span)
             snipe["status"] = m.group(1).strip() if m else ""
-            m = re.search(r'Status \(mirror\):\s*</td><td>([^<]+)', chunk)
+            m = re.search(r'Status \(mirror\):\s*</td><td>([^<]+)', mobile_span)
             snipe["status_mirror"] = m.group(1).strip() if m else ""
             if not snipe["status"]:
                 # Status row absent — Gixen may have changed its desktop-table
