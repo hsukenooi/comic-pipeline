@@ -1,7 +1,7 @@
 ---
 title: "A reopened ticket's premise may already be stale — verify it against the code before implementing"
 date: 2026-07-20
-last_updated: 2026-07-28
+last_updated: 2026-07-31
 category: conventions
 module: "general (Linear ticket handling, any package) — these batches: locg-cli, gixen-cli"
 problem_type: convention
@@ -15,6 +15,9 @@ applies_when:
   - "A ticket attributes a gap to a named component, or suggests a concrete optimisation ('cache X per Y')"
   - "A ticket describes a CLASS of data problem inferred from one or two named examples, and proposes a detector or guard gated on a predicate"
   - "A ticket's diagnosis depends on a correlation where the thing being measured is both a candidate cause and a consequence of the outcome"
+  - "A ticket was filed from an incident post-mortem — written fast, under the incident's framing, and prone to blaming the most recently-touched component"
+  - "A ticket claims some field or term disambiguates two things, or proposes an optimisation whose saving has not been sized"
+  - "A ticket asks to share code across a package boundary, or to widen a check that currently blocks a pipeline"
 tags:
   - process
   - linear
@@ -29,6 +32,14 @@ tags:
   - bui-470
   - bui-559
   - bui-562
+  - bui-563
+  - bui-564
+  - bui-566
+  - bui-568
+  - bui-570
+  - bui-572
+  - post-mortem-sourced
+  - license-to-stop
 related_docs:
   - "docs/solutions/design-patterns/guard-strictness-must-match-consequence.md"
 ---
@@ -334,8 +345,149 @@ have been a coin-flip that happened to land right; the conditioning is what made
 decision. **When request rate is both a candidate cause and a consequence of the outcome,
 condition on the prior attempt succeeding before reading any correlation.**
 
+## The fifth failure mode: everything the premise names exists — the causal story just can't produce the effect
+
+Examples 1–3 are "the specified fix would be wrong"; 4–6 "the problem is real but
+mis-attributed"; 7–8 "the named code isn't there"; 9–10 "the named data class doesn't
+exist." The BUI-563..572 batch surfaced the subtlest variant yet: **every symbol the ticket
+names is real, the code target is real, the problem is real — and the proposed mechanism
+still cannot produce the claimed effect.** There is nothing missing to grep for. The story
+simply does not survive being stated precisely.
+
+This mode is worth its own heading because of the **rate**: five of ten tickets in one
+batch failed premise-check this way, and all ten came from a single incident post-mortem
+written hours earlier by a competent author. That is the pattern — see "Why This Matters."
+
+### Example 11 — the discriminator cannot discriminate (BUI-566)
+
+BUI-566 attributed a measured 3–5× underprice on year-less X-Men Vol. 1 issues to a Marvel
+publisher qualifier that the docs were telling callers to omit. The doc/code contradiction
+was **entirely real**: `_publisher_qualifier` emits `"marvel comics"` for Marvel, `fmv_runner`
+forwards `publisher` specifically so it can fire, and `buy.md`/`fmv.md` both said "pass
+`publisher` for non-Marvel/DC titles" — so a compliant caller silently disabled a shipped fix.
+
+But the qualifier **cannot** fix the underprice, because X-Men Vol. 1 #85 and Vol. 2 #85 are
+*both* `marvel comics`. A term both sides of a collision share is not a discriminator. What
+the qualifier actually removes is non-comic noise (2024 *X-Men '97* show merchandise) — real,
+but a different problem. Only `year` separates a same-publisher relaunch.
+
+The fix shipped (the contradiction deserved correcting on its own merits) with the limit
+documented, and the real defect filed separately (BUI-574). **Shipping it silently under the
+ticket's framing would have been the costly outcome** — the next reader sees "Marvel qualifier
+fixed" in the changelog and stops looking for the actual cause. Same hazard as the inert guard
+in Example 9, reached by a different route.
+
+**When a ticket claims X disambiguates A from B, check that X actually differs between A and B.**
+
+### Example 12 — the proposed knob isn't reachable, and the proposed remedy is backwards (BUI-570)
+
+BUI-570 asked to document throttling large `comic-fmv` batches via `--max-workers`. That flag
+is real — but it belongs to `ebay-sold-comps`, and `comic-fmv` invokes that subprocess with a
+**fixed command line**. `grep -rn "max_workers" apps/fmv/src/` returns nothing. The knob cannot
+be set from the path the ticket is about.
+
+Worse, the ticket's instinct — split a big batch into smaller runs — is **counter-indicated**.
+The BUI-535 circuit breaker is scoped to one invocation, so chunking 60 books into three runs
+of 20 re-arms the 5-consecutive-error trip cost three times instead of paying it once. The
+providers' quota, meanwhile, does not reset. A new run re-arms the *safety*, not the *budget*.
+
+The docs shipped saying the opposite of the ticket: run one pass, and there is no
+`--max-workers` here. **A remedy that sounds like standard practice ("throttle it," "chunk
+it") still has to be checked against the specific mechanism — the general principle can invert.**
+
+### Example 13 — the optimization's saving doesn't exist (BUI-572)
+
+BUI-572 proposed reusing `/comic:seller-scan`'s JSON in `/comic:buy` Step 1 to avoid re-fetching
+listings. The ticket itself said "size it before building" — and the sizing killed it.
+
+seller-scan is a **search-summary-only** consumer: it imports `parse_item_summary` /
+`search_seller_listings`, never `fetch_item`. Its data comes from `item_summary/search`, whose
+parser is explicitly documented as *"itemSummary differs from a full item detail: no
+localizedAspects."* Every field identification actually needs — `item_specifics`, `grade`,
+`variant`, `cover_year`, `bid_count`, `description_snippet` — derives from `localizedAspects`.
+So the buy flow still makes N per-item calls: **zero round-trips saved.**
+
+The fallback rationale ("at least we skip parsing") also fails: the reusable fields arrive in
+the *same* response body that must be parsed anyway. And it would have been net-negative,
+injecting scan-time staleness into a money path that a sibling ticket in the same batch
+(BUI-567) had just shipped a freshness rule to protect.
+
+**An optimization ticket is a quantitative claim. Size the saving before building, and be
+willing to close it at zero.** The genuine friction underneath was ergonomic, not
+network — hand-copying 77 URLs — and shipped as a separate, honestly-titled ticket (BUI-576).
+
+### Example 14 — the ask violates a deliberate architectural boundary (BUI-568)
+
+BUI-568 asked for "one shared place" consumed by both `packages/locg-cli` and `apps/fmv`.
+`pyproject.toml:11-12` sets `members = ["packages/*", "plugins/*"]`, and the comment above it
+states `apps/*` are **deliberately** excluded — they interoperate over PATH, not imports. A
+module importable by both does not exist as an option. The available workarounds (vendoring,
+codegen, symlinks) all defeat the boundary the exclusion exists to enforce.
+
+Two further findings only the premise-check surfaced. First, the FMV half needed volume-**range**
+data (X-Men Vol. 2 = #1–113) that exists **nowhere in the repo** — the nearest thing,
+`issue_count`, is a scraped count, not a range. Second, and decisively: **without that range
+gate the only implementable flag would have fired on ~60 of the 66 books** in the cited run,
+routing nearly the whole batch to needs-manual. The gate was not decoration; it was the thing
+that made the flag tolerable at all.
+
+**When a ticket asks you to share code across a boundary, check whether the boundary is
+accidental or load-bearing** — and when the ticket's design has a gate, ask what the flag
+does *without* it before assuming the gate is a detail.
+
+### Example 15 — the generator was already closed, and the real defect was downstream (BUI-564)
+
+BUI-564 asked to fix record-win's push so it stops resolving onto foreign licensed editions.
+Checking creation dates against fix dates killed the framing: all 6 Panini rows were pushed
+2026-05-23/06-17/06-23 with `publisher_name=null` and a placeholder date — 2 of 4 identity
+columns blank — and `cmd_collection_audit_pending`'s `missing_publisher` hard stop (BUI-432)
+closed that path on 2026-07-19. **Every bad row predates the fix.** (Example 6's lesson,
+now with a sharper instrument: compare the *generator's close date* against the *bad rows'
+creation dates* before accepting "it's still generating them.")
+
+The genuinely new finding is what the premise-check turned up instead. **Bad rows don't just
+sit there — they become inputs.** Those foreign rows are `locg_export` rows, which makes them
+*resolution candidates for future wins*. Verified live:
+`resolve_series_for_win('spawn', '224', 2012)` returned the **Kamite** (Mexican) volume,
+because `_best_volume_by_year` prefers the narrowest range containing the year. Every Spawn
+win from 2012 onward was about to be filed at the foreign edition; `spider man` and `x men`
+were poisoned the same way. Six bad rows were on track to generate more.
+
+**When bad data lands in a store that also feeds a resolver, the static row count is the
+lagging indicator. Ask what consumes the table.** The shipped fix re-resolves against the
+win's own Metron publisher — fail-open, gated on a *demonstrated* conflict — and a live sweep
+moved 9 of 2843 rows, all corrections.
+
+> **Corollary (BUI-563): a detector that halts the pipeline over unfixable data is worse than
+> the drift it reports.** The sibling ticket asked to widen `owned_duplicate_identities`, which
+> the sync asserts must be zero, to catch these pairs. But the pairs have **no local remedy** —
+> deleting makes LOCG re-emit them, and clearing ownership runs the BUI-122 `In Collection=0`
+> data-loss path. Widening the hard stop would have blocked every sync indefinitely. It shipped
+> as a **separate advisory counter** that reports without gating. Before widening a blocking
+> check, ask whether anyone can act on what it will now catch.
+
 ## Why This Matters
 
+- **Post-mortem-sourced tickets are systematically premise-risky, and the rate is high enough
+  to plan for.** All ten tickets in the BUI-563..572 batch came from one incident review
+  written hours earlier by a competent author with the evidence in hand. **Five failed
+  premise-check** — three shipped against their own stated cause, two shipped no code at all.
+  This is not carelessness; it is structural. A post-mortem is written under the incident's
+  framing, at speed, and naturally blames the component that was most recently touched or most
+  recently understood. Treat "filed from a post-mortem" as a premise-risk flag on par with
+  "reopened."
+- **The stated fix and the stated cause fail independently.** BUI-566's contradiction was real
+  and worth fixing *while its causal story was wrong*; BUI-564's target file was right *while
+  its generator was already closed*. Verifying that a ticket's named code exists and is
+  editable says nothing about whether the mechanism it describes can produce the effect it
+  claims. Check both.
+- **Grant an explicit license to stop, or the agent will route around the problem.** Two
+  tickets in this batch ended in a disciplined no-code stop-and-report, each converting a dead
+  ticket into buildable follow-ups (BUI-568 → BUI-577/578; BUI-572 → BUI-576). Both spawn
+  prompts said in as many words: *if the premise is broken, STOP and report instead of shipping
+  a speculative implementation.* Without that sentence the strong pressure is to satisfy the
+  literal wording — vendoring a module across a boundary that exists to prevent it, or shipping
+  an optimization that saves nothing.
 - **A reopened ticket or a review residual is exactly where the filer's model is most
   likely out of date.** The first pass already changed the code once; the ticket
   describing "what's still wrong" was written against a snapshot that a later commit
@@ -382,6 +534,12 @@ Before implementing any ticket that:
 | BUI-474 | `_disambiguate_series` trusts a sole hit; `issues_list()[0]` unfiltered | Neither path executed; all 18 died at `_disambiguate_series` returning None over a 433-wide candidate set — a *miss*, not a wrong write | Fix direction inverted: name-exactness pre-filter that narrows toward None (BUI-485) |
 | BUI-559 | A `publisher_name` drift class needs a third tolerant merge pass | The pairs never share a `release_date` (147–211d apart, monotone) — the proposed gate matches **zero** rows; they are licensed editions, not a relabel | No-fix stop-and-report; anticipatory comment replaced with the measured finding + pinning tests; real generator filed as BUI-563/564 |
 | BUI-562 | Sync backs off a flat 1200s; shorten it | Loop was already exponential (off-by-one + `SYNC_INTERVAL` base). Raw log reads as rate-limiting; conditioned on prior success it inverts — 4.7% failures at 30–60s vs 53.8% at >1hr | Shipped, but only after the conditioning proved a flapping host — the unconditioned reading would have made the fix harmful |
+| BUI-566 | The missing Marvel qualifier causes a 3–5× underprice on year-less X-Men Vol. 1 | Doc/code contradiction real, but X-Men Vol. 1 #85 and Vol. 2 #85 are **both** `marvel comics` — a shared term can't discriminate. Only `year` separates a same-publisher relaunch | Shipped the doc fix **with the limit documented**; real defect filed as BUI-574 rather than left implied-solved |
+| BUI-570 | Throttle large batches with `--max-workers` | Flag belongs to `ebay-sold-comps`; `comic-fmv` invokes a fixed command line (grep-absent from `apps/fmv/src/`). And chunking is *counter-indicated* — the breaker is per-invocation, so each chunk re-arms the 5-error trip cost | Documented the opposite of the ticket: one pass, no such knob |
+| BUI-572 | Reuse seller-scan JSON to save eBay fetches | seller-scan reads `item_summary/search`, which carries no `localizedAspects`; every field identification needs derives from it. Zero round-trips saved, and it injects the staleness BUI-567 just shipped a rule against | Closed Won't Do on the sizing; real (ergonomic) friction filed as BUI-576 |
+| BUI-568 | Share one volume-collision detector between locg-cli and apps/fmv | `apps/*` are deliberately non-members of the uv workspace (`pyproject.toml:11-12`) — no importable shared module exists. Volume-**range** data exists nowhere in the repo, and without that gate the flag fires on ~60 of 66 books | Stop-and-report; split into a buildable drift fix (BUI-577) and a dispersion-signal investigation (BUI-578) |
+| BUI-564 | The record-win push is still generating foreign-edition rows | Generator closed by BUI-432 on 2026-07-19; all 6 rows predate it. Real live defect was **downstream**: those rows are `locg_export` rows → resolution candidates, so `resolve_series_for_win('spawn','224',2012)` returned the Kamite volume | Fixed the compounding loop instead (publisher tiebreak, fail-open); live sweep moved 9/2843 rows, all corrections |
+| BUI-563 | Widen `owned_duplicate_identities` to catch year-crossing twins | The counter is a sync **hard stop**, and the pairs have no local remedy (delete → LOCG re-emits; clear → BUI-122 data loss). Widening blocks every sync indefinitely | Shipped as a **separate advisory counter** that reports without gating |
 
 ## Practical checklist
 
@@ -404,6 +562,24 @@ When the ticket is a reopen or a review residual, before writing code:
 5c. **If request rate is both a candidate cause and a consequence, condition on the prior
    attempt succeeding** before reading any correlation (BUI-562: the raw log looks like
    rate-limiting; conditioned, it inverts to a flapping host).
+5d. **When a ticket claims X disambiguates A from B, check that X actually differs between A
+   and B.** BUI-566's Marvel qualifier could not separate two *Marvel* volumes. A term both
+   sides share is not a discriminator.
+5e. **Check that a proposed knob is reachable from the path the ticket is about**, and that
+   the remedy isn't inverted by the specific mechanism (BUI-570: `--max-workers` is
+   grep-absent from `apps/fmv/`, and chunking re-arms a per-invocation breaker).
+5f. **Size an optimization's saving before building it, and be willing to close it at zero**
+   (BUI-572: the reusable source was a different API tier that omits every field needed).
+5g. **Before sharing code across a package boundary, check whether the boundary is deliberate**
+   (BUI-568: `pyproject.toml` members). And when the design has a gate, ask what the check does
+   *without* it — if that's intolerable, the gate is the feature, not a detail.
+5h. **Compare the generator's close date against the bad rows' creation dates** before
+   accepting "it's still producing them" (BUI-564: closed 12 days before the ticket was filed).
+   Then **ask what consumes the table** — bad rows in a store that feeds a resolver become
+   inputs, and the static row count is the lagging indicator.
+5i. **Before widening a blocking check, ask whether anyone can act on what it will now catch**
+   (BUI-563: the pairs had no local remedy, so widening the hard stop would have halted every
+   sync indefinitely). Advisory counter over hard stop when the data is unfixable.
 6. **Search for fixes merged since the filing date** in the same area (`git log --since`).
 7. **For any deployed name, path, or label, check the live system**, not the docs.
 8. **If you add a guard, name its evidence source** and confirm it is independent of the

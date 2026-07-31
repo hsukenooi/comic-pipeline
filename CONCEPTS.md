@@ -55,10 +55,14 @@ A count of these is only meaningful while entries of both sources are present. T
 
 Two entries differing only by publisher are **not** a duplicate by default — see [[Licensed Edition]].
 
+The count is a **blocking** check: a [[Collection Sync]] asserts it is zero before proceeding, on the reasoning that an unresolved duplicate would otherwise be pushed onward. That makes what the check admits a deliberate decision rather than a matter of accuracy — a duplicate class with **no local remedy** must not be folded into it, because a blocking check over unfixable data halts the pipeline indefinitely and teaches its operator to bypass it. Such classes are reported on a separate advisory count that gates nothing. Before widening any blocking check, ask whether anyone can act on what it will newly catch.
+
 ### Licensed Edition
 A foreign-market publication of a book already published domestically, carrying the same series and title but its own publisher and its own, later release date. It is a genuinely different edition, not a relabelling of the domestic one — which makes it the standing counterexample to reading a publisher difference as provider drift.
 
 The release-date gap is the discriminator and it is substantial and systematic: the foreign edition trails by months, consistently in one direction across a publisher's whole run. So a tolerant check that pairs entries by requiring an *identical* release date can never see these at all, and one that tolerates the gap risks merging two books that are legitimately held separately. When a licensed edition appears in the Collection unbidden, the cause is normally [[Record-Win]] resolving a win onto it instead of the domestic edition; such an entry carries the purchase fingerprint (a price and purchase date) that a genuinely-foreign holding lacks. Because the provider holds the ownership and re-emits it, deleting such an entry locally does not stick — and clearing it deliberately runs through the ownership-flag path that a [[Collection Sync]] reads as a removal instruction.
+
+**The population is self-amplifying, which is why the standing entry count understates the risk.** An import-sourced licensed edition is not inert: it joins the pool of volumes a later [[Record-Win]] chooses from, and because era matching prefers the volume whose publication window most tightly contains the win's year, a narrow foreign volume can beat the long-running domestic one outright. Every subsequent win on that [[Masthead]] in the foreign volume's era is then filed onto the foreign edition too. Reading the resolution against the win's own publisher — a signal independent of the candidate pool — is what breaks the loop; it must fail open and act only on a demonstrated publisher conflict, or it will perturb resolutions that were already correct.
 
 ### Copy Count
 How many copies of an issue the Collection holds — **a count, not an ownership flag**. *Known in code as:* `in_collection`, where `0` means tracked-but-not-owned, `1` is the common case, and `2+` is a genuine duplicate (a second copy, or a condition upgrade held alongside the original). Treating it as a boolean is a recurring trap in both directions: reading it as truthy makes a text-formatted `"0"` from a LOCG export mean *owned* (`bool("0")` is `True`, BUI-469), while writing it as a flag silently discards a second copy when two entries are merged (BUI-470). Any read must coerce to `int` and compare, and any merge of two genuinely distinct copies must **increment** the survivor rather than drop the loser.
@@ -158,6 +162,13 @@ An upper bound applied when a price is read from a comp bucket too thin to be ou
 
 ### needs_manual
 The FMV verdict emitted when even the fallbacks can't defensibly price a book (raw sold comps too thin, target grade's bucket empty and interpolation unsupported). It is a deliberate **punt to a human/LLM**, not a failure — the book gets hand-priced with judgment inside the `/comic:fmv` skill rather than auto-bid on a shaky estimate. Automating away a `needs_manual` on a high-value key removes the human check exactly where a mistake costs the most.
+
+### Fetch Error
+A comp lookup that **failed** rather than one that found nothing — the sold-comps provider errored or was rate-limited, or the query crashed before it ever ran. *Known in code and in the results table as:* `fetch-err`.
+
+The distinction carries weight because a fetch error and a genuinely illiquid book are **shape-identical**: both surface as zero comps. Reading the first as the second reports that a book has no market when in truth nothing ever looked — a [[Money Path]] error in the expensive direction, since it invites bidding blind or dismissing a book as worthless. A fetch error is a loud failure to be retried, never a price, and never a reason to call a book illiquid.
+
+What makes it treacherous is that the *evidence trail* is the only thing separating the two, so what an **empty** trail defaults to is load-bearing. A crash before any query runs leaves no trail at all, and a classifier reading "nothing was attempted" as "nothing was found" emits a confident zero for a book it never priced — invisible to every downstream guard, because the resulting row looks clean rather than broken. Before trusting a zero, ask what an absent evidence trail defaults to.
 
 ### CGC Proxy
 Pricing a book off graded-slab (CGC/CBCS) prices instead of raw sold comps, discounted to a raw-equivalent. Two distinct forms exist, and they must not be conflated:
