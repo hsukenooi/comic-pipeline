@@ -405,11 +405,59 @@ def _is_rebootable_masthead(title: str) -> bool:
     return any(p.search(title or '') for p in _REBOOTABLE_MASTHEAD_RES)
 
 
-def build_query(title: str, issue: str, year: int | None = None,
+def _coerce_year(value: object) -> int | None:
+    """Coerce a cover year to `int`, or None when there is no usable year.
+
+    BUI-565: `year` is a documented `--batch` field and `/comic:identify`
+    emits it as a **string** (`"1976"`), but every year test in this module
+    compares against the int `_VINTAGE_YEAR_CUTOFF`. An uncoerced string
+    therefore raised `TypeError: '<' not supported between instances of 'str'
+    and 'int'` inside `build_query`'s vintage gate — on the very first tier,
+    before any query ran. `fetch_book_comps`' broad handler caught it and
+    returned an EMPTY `queries_used`, which comic-fmv's `_is_fetch_error`
+    reads as a genuine no-comps book. Result: a silent `n=0` with no
+    `flag_reason` on a money path. Coerce once, here at the boundary, so a
+    string year is first-class input instead of a crash.
+
+    An empty/whitespace string means "no year" (that already worked — `""` is
+    falsy, so it short-circuited the gate rather than crashing) and is
+    preserved as None. Anything else that can't be read as a year **raises**
+    rather than being silently dropped: a year-less query still returns comps,
+    so dropping it would swap a loud failure for a quietly *different* search
+    that the operator never learns about. The raise surfaces as this book's
+    `error` (see `fetch_book_comps`), which the caller routes to needs-manual.
+    """
+    if value is None:
+        return None
+    # bool is an int subclass — `True` would otherwise sail through as year 1
+    # and put the literal "True" in the query text.
+    if isinstance(value, bool):
+        raise ValueError(f"year must be a number or numeric string, got {value!r}")
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):  # NaN / inf
+            raise ValueError(f"unparseable year {value!r}") from None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            return int(float(s))
+        except ValueError:
+            raise ValueError(f"unparseable year {value!r}") from None
+    raise ValueError(f"year must be a number or numeric string, got {value!r}")
+
+
+def build_query(title: str, issue: str, year: int | str | None = None,
                 publisher: str | None = None, variant: str | None = None,
                 grade_label: str | None = None,
                 exclude_graded: bool = True,
-                vintage_year: int | None = None) -> str:
+                vintage_year: int | str | None = None) -> str:
     """Build the _nkw search string. Returns the raw (unencoded) keyword string.
 
     `vintage_year` (BUI-350): the book's real cover year, used ONLY to gate the
@@ -421,7 +469,14 @@ def build_query(title: str, issue: str, year: int | None = None,
     the original year here while passing `year=None` for the query text.
     Defaults to `year` itself, so every existing caller that doesn't pass it
     keeps byte-for-byte pre-BUI-350 behavior.
+
+    BUI-565: `year`/`vintage_year` accept a numeric string (`"1976"`) as well
+    as an int — see `_coerce_year` for why that is the natural input and what
+    used to happen to it. An int caller's query is byte-for-byte unchanged.
     """
+    # BUI-565: coerce BEFORE anything compares against `_VINTAGE_YEAR_CUTOFF`.
+    year = _coerce_year(year)
+    vintage_year = _coerce_year(vintage_year)
     # BUI-346: normalize the title before it's ever quoted — strip a leading
     # article, then an embedded/trailing issue number that would otherwise
     # double up with the separate `issue` field below. Guarded on a truthy
@@ -1262,7 +1317,10 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     try:
         title = book["title"]
         issue = str(book["issue"])
-        year = book.get("year")
+        # BUI-565: coerce the batch envelope's `year` (a STRING out of
+        # /comic:identify) to int|None once, here, so every tier below — and
+        # the echoed `out_input["year"]` — sees one type. See `_coerce_year`.
+        year = _coerce_year(book.get("year"))
         publisher = book.get("publisher")
         variant = book.get("variant")  # BUI-304: now a query keyword, not DB-only
         self_id = str(book.get("item_id", ""))
@@ -1416,7 +1474,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         # a normal (non-`include_graded`) call — an explicit graded-only pass
         # already runs every tier inclusive, so a 4th inclusive tier there
         # would be pure duplicate spend.
-        is_vintage = isinstance(year, (int, float)) and year < _VINTAGE_YEAR_CUTOFF
+        # BUI-565: `year` is int|None by here (coerced at the top of this
+        # try), so this gate now fires for a string-year vintage book too — it
+        # silently never did before, quietly disabling the BUI-524 tier for
+        # exactly the vintage books that need it most.
+        is_vintage = year is not None and year < _VINTAGE_YEAR_CUTOFF
         if exclude_graded and is_vintage and len(comps) < THIN_RESULTS_THRESHOLD:
             inclusive_nkw = build_query(title, issue, year=year, publisher=publisher,
                                         variant=variant, exclude_graded=False,

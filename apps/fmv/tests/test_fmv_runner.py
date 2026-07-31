@@ -2171,6 +2171,232 @@ class TestRunNormalizesTitlesAtHandoff:
         assert upserted_input["title"] == "Amazing Spider-Man"
 
 
+# ─── BUI-565: string `year` at the handoff + surfacing the per-book error ────
+
+class TestYearCoercionHelpers:
+    def test_coerce_year_accepts_the_shapes_identify_emits(self):
+        assert fmv_runner._coerce_year("1976") == 1976
+        assert fmv_runner._coerce_year("  1976 ") == 1976
+        assert fmv_runner._coerce_year("1976.0") == 1976
+        assert fmv_runner._coerce_year(1976) == 1976
+        assert fmv_runner._coerce_year(1976.0) == 1976
+
+    def test_coerce_year_returns_none_for_unusable_values(self):
+        for bad in (None, "", "   ", "n/a", "c. 1976", [], {}, True, False):
+            assert fmv_runner._coerce_year(bad) is None, bad
+
+    def test_normalize_book_year_coerces_in_place(self):
+        book = {"title": "X-Men", "issue": "101", "year": "1976"}
+        fmv_runner._normalize_book_year(book)
+        assert book["year"] == 1976
+
+    def test_normalize_book_year_leaves_unparseable_values_alone(self):
+        """Deliberate: a garbage year must reach ebay-sold-comps so it raises
+        and becomes a VISIBLE per-book error. Silently dropping it would price
+        the book off a different (year-less) search with no announcement."""
+        book = {"title": "X-Men", "issue": "101", "year": "sometime in the 70s"}
+        fmv_runner._normalize_book_year(book)
+        assert book["year"] == "sometime in the 70s"
+
+    def test_normalize_book_year_is_a_noop_without_a_year(self):
+        book = {"title": "X-Men", "issue": "101"}
+        fmv_runner._normalize_book_year(book)
+        assert "year" not in book
+
+    def test_string_year_reaches_is_vintage_gate(self):
+        """`_is_vintage` tests `isinstance(year, (int, float))`, so a string
+        year silently read as "not vintage" and skipped the CGC-proxy rescue.
+        Normalizing at the handoff is what closes that."""
+        book = {"title": "X-Men", "issue": "101", "year": "1976"}
+        fmv_runner._normalize_book_year(book)
+        assert fmv_runner._is_vintage({"input": book}) is True
+
+
+class TestRunNormalizesYearAtHandoff:
+    def test_run_sends_an_int_year_to_fetch_comps(self, tmp_path, server_url):
+        """BUI-565 repro at the handoff: `/comic:identify` emits year as a
+        string, and the string is what crashed ebay-sold-comps' first tier."""
+        batch = [{"item_id": "800411934143", "title": "X-Men", "issue": "101",
+                  "year": "1976", "grade": 7.5}]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out.json"
+
+        fake_comps = [_make_comp(p, 7.5) for p in [400, 450, 500, 550, 600]]
+        fake_result = [{
+            "input": {"_req_id": 0, "title": "X-Men", "issue": "101",
+                      "year": 1976, "grade": 7.5, "item_id": "800411934143"},
+            "comps": fake_comps,
+            "queries_used": [{"tier": "base", "cached": False}],
+        }]
+        with patch("fmv_runner._fetch_comps", return_value=fake_result) as fetch_mock, \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}) as upsert:
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        assert fetch_mock.call_args[0][0][0]["year"] == 1976
+        # ...and the same int reaches the DB upsert body, so a re-run's
+        # cache/identity lookup can't split on "1976" vs 1976.
+        assert upsert.call_args[0][1]["year"] == 1976
+
+
+class TestSoldCompsErrorIsSurfaced:
+    """BUI-565's second half. `fetch_book_comps` already tags a per-book
+    `error` when its fetch RAISED, but when the raise beat every tier the
+    `queries_used` trail is EMPTY — and `_is_fetch_error`'s "no queries" guard
+    reads empty as a genuine no-comps book. So the row fell through to BUI-44's
+    unconditional upsert and came back as a clean n=0 with a real `comic_id`
+    and a null `flag_reason`: invisible to BOTH of /comic:buy Step 3's guards.
+    """
+
+    def _errored_result(self, **over):
+        result = {
+            "input": {"title": "X-Men", "issue": "101", "year": "1976",
+                      "grade": 7.5},
+            "comps": [],
+            "queries_used": [],
+            "error": "'<' not supported between instances of 'str' and 'int'",
+        }
+        result.update(over)
+        return result
+
+    def test_errored_result_does_not_upsert(self, server_url):
+        with patch("fmv_runner._upsert_fmv") as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                self._errored_result(),
+                {"title": "X-Men", "issue": "101", "grade": 7.5},
+                server_url=server_url)
+        upsert_mock.assert_not_called()
+        assert out["source"] == "error"
+        assert out["fmv"] is None
+
+    def test_errored_result_yields_a_null_comic_id(self, server_url):
+        """The load-bearing assertion: /comic:buy Step 3's `comic_id: null`
+        guard is what catches this book, so the row must NOT carry an id."""
+        with patch("fmv_runner._upsert_fmv") as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                self._errored_result(),
+                {"title": "X-Men", "issue": "101", "grade": 7.5},
+                server_url=server_url)
+        upsert_mock.assert_not_called()
+        assert out["comic_id"] is None
+        assert out["fmv_id"] is None
+
+    def test_errored_result_propagates_the_upstream_message(self, server_url):
+        with patch("fmv_runner._upsert_fmv"):
+            out = fmv_runner._compute_and_upsert_one(
+                self._errored_result(),
+                {"title": "X-Men", "issue": "101", "grade": 7.5},
+                server_url=server_url)
+        assert out["error"].startswith("fetch-err")
+        assert "'str' and 'int'" in out["error"]
+
+    def test_errored_result_classifies_as_fetch_err(self, server_url):
+        """It must RENDER as 'fetch-err' and join the run's fetch-err warning
+        count — not as a bland 'n/a' that reads as an illiquid book."""
+        with patch("fmv_runner._upsert_fmv"):
+            out = fmv_runner._compute_and_upsert_one(
+                self._errored_result(),
+                {"title": "X-Men", "issue": "101", "grade": 7.5},
+                server_url=server_url)
+        assert fmv_runner._is_fetch_error(out) is True
+
+    def test_partial_comps_alongside_an_error_still_bail(self, server_url):
+        """Adversarial: a raise PART WAY through the tiers leaves a truncated
+        pool of unknown size. Pricing off it is the same wrong answer, just
+        quieter — and `_is_fetch_error`'s `comp_count_total` short-circuit
+        would otherwise wave it straight through to the upsert."""
+        comps = [_make_comp(p, 7.5) for p in [10, 11, 12, 13, 14]]
+        with patch("fmv_runner._upsert_fmv") as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                self._errored_result(
+                    comps=comps,
+                    queries_used=[{"tier": "base", "nkw": 5}]),
+                {"title": "X-Men", "issue": "101", "grade": 7.5},
+                server_url=server_url)
+        upsert_mock.assert_not_called()
+        assert out["comic_id"] is None
+        assert out["source"] == "error"
+        assert fmv_runner._is_fetch_error(out) is True
+
+    def test_clean_result_is_untouched(self, server_url):
+        """Acceptance: a result WITHOUT an `error` key keeps the BUI-44
+        unconditional-upsert behavior byte-for-byte, n=0 included."""
+        with patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 3, "fmv_id": 4}) as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                {"input": {"title": "X-Men", "issue": "101", "year": 1976,
+                           "grade": 7.5},
+                 "comps": [], "queries_used": [{"tier": "base", "nkw": 0}]},
+                {"title": "X-Men", "issue": "101", "grade": 7.5},
+                server_url=server_url)
+        upsert_mock.assert_called_once()
+        assert out["source"] == "fresh"
+        assert out["comic_id"] == 3
+
+    def test_empty_error_message_still_bails(self, server_url):
+        """Adversarial: sold_comps tags the key with `str(e)`, and an exception
+        raised with no message stringifies to "". A truthiness test on that key
+        would drop this book straight back into the upsert path the guard
+        exists to prevent."""
+        with patch("fmv_runner._upsert_fmv") as upsert_mock:
+            out = fmv_runner._compute_and_upsert_one(
+                self._errored_result(error=""),
+                {"title": "X-Men", "issue": "101", "grade": 7.5},
+                server_url=server_url)
+        upsert_mock.assert_not_called()
+        assert out["comic_id"] is None
+        assert fmv_runner._is_fetch_error(out) is True
+
+    def test_end_to_end_errored_book_never_gets_a_comic_id(
+            self, tmp_path, server_url):
+        """The whole chain, on the ticket's repro: `_fetch_comps` returns the
+        subprocess JSON verbatim, so a per-book `error` reaches
+        `_compute_and_upsert_one` — and must land in the written out.json as a
+        row /comic:buy Step 3's `comic_id: null` guard will catch."""
+        batch = [{"item_id": "800411934143", "title": "X-Men", "issue": "101",
+                  "year": "1976", "grade": 7.5}]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out.json"
+
+        fake_result = [{
+            "input": {"_req_id": 0, "title": "X-Men", "issue": "101",
+                      "year": "1976", "grade": 7.5, "item_id": "800411934143"},
+            "comps": [], "queries_used": [], "slab_comps": [],
+            "breaker_tripped": False,
+            "error": "'<' not supported between instances of 'str' and 'int'",
+        }]
+        with patch("fmv_runner._fetch_comps", return_value=fake_result), \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        upsert_mock.assert_not_called()
+        rows = json.loads(out_path.read_text())
+        assert len(rows) == 1
+        assert rows[0]["comic_id"] is None
+        assert rows[0]["source"] == "error"
+        assert rows[0]["error"].startswith("fetch-err")
+        # Not the pre-fix shape: a clean n=0 with a real comic_id.
+        assert rows[0]["fmv"] is None
+
+    def test_other_error_sources_are_not_mislabelled_fetch_err(self, server_url):
+        """The `fetch_error` flag is deliberately narrower than
+        `source == "error"`: a book with no usable grade never attempted a
+        fetch, so labelling it 'fetch-err' would send an operator chasing an
+        API outage that never happened."""
+        out = fmv_runner._compute_and_upsert_one(
+            {"input": {"title": "X-Men", "issue": "101"}, "comps": [],
+             "queries_used": []},
+            {"title": "X-Men", "issue": "101"}, server_url=server_url)
+        assert out["source"] == "error"
+        assert "no target grade" in out["error"]
+        assert fmv_runner._is_fetch_error(out) is False
+
+
 # ─── BUI-346: malformed/doubled query is 0-results, never fetch-err ──────────
 
 class TestMalformedQueryIsNotFetchError:
