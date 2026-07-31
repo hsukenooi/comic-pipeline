@@ -54,11 +54,20 @@ def _make_snipe_row(item_id, dbidid, max_bid="10", title="Test Item",
     """Build HTML for one snipe row in the desktop table.
 
     group=None omits the editsnipegroup hidden input entirely (a layout
-    drift / parse-miss shape, BUI-383)."""
+    drift / parse-miss shape, BUI-383).
+
+    A grouped snipe (group not in (None, "", "0")) renders its detail row's
+    leading cell as `<td align="right">Group: N</td>` rather than the empty
+    `<td></td>` an ungrouped one gets — the real Gixen shape that BUI-580's
+    positional parse tripped over."""
     group_input = (
         f'<input name="editsnipegroup_{item_id}" type="hidden" '
         f'id="editsnipegroup" value="{group}" size="14" />\n'
         if group is not None else ''
+    )
+    group_cell = (
+        f'<td align="right">Group: {group}</td>'
+        if group not in (None, "", "0") else '<td></td>'
     )
     return (
         f'<tr class=d1>\n'
@@ -82,7 +91,7 @@ def _make_snipe_row(item_id, dbidid, max_bid="10", title="Test Item",
         f'</td>\n'
         f'</tr>\n'
         f'<tr class=d1>\n'
-        f'<td></td>\n'
+        f'{group_cell}\n'
         f'<td>{time_to_end}</td>\n'
         f'<td>{max_bid}</td>\n'
         f'<td>{current_bid}</td>\n'
@@ -406,6 +415,60 @@ class TestListSnipes:
             snipes = client.list_snipes()
 
         assert [s["snipe_group"] for s in snipes] == ["0", "3", ""]
+
+    def test_grouped_snipe_reads_its_own_bid_and_clock(self):
+        """BUI-580: a grouped row must not inherit the next row's cells.
+
+        Gixen renders a grouped snipe's detail row with `<td align="right">
+        Group: N</td>` where an ungrouped one has an empty `<td></td>`. The
+        positional parse required the empty cell, missed the grouped row, and
+        — scanning on unbounded — captured the FOLLOWING snipe's current bid
+        and time-to-end instead. Live, X-Men #101 (group 1) reported $9.65 and
+        its neighbour's clock while the real auction sat at $291.00 with 38
+        fewer minutes to run. Both fields are load-bearing: current_bid
+        becomes winning_bid on WON/LOST, and time_to_end sets auction_end_at,
+        which the local sniper fires on.
+        """
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("111", "5001", group="1",
+                            current_bid="291.00 USD", time_to_end="2 d, 11 h"),
+            _make_snipe_row("222", "5002", group="0",
+                            current_bid="9.65 USD", time_to_end="2 d, 12 h"),
+        )
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        by_id = {s["item_id"]: s for s in snipes}
+        assert by_id["111"]["current_bid"] == "291.00 USD"
+        assert by_id["111"]["time_to_end"] == "2 d, 11 h"
+        assert by_id["222"]["current_bid"] == "9.65 USD"
+        assert by_id["222"]["time_to_end"] == "2 d, 12 h"
+
+    def test_unparseable_row_yields_empty_not_neighbour_values(self):
+        """A row whose shape we don't recognize must fail loudly (empty), never
+        silently borrow the next snipe's bid — the defect class behind BUI-580.
+        """
+        client = _client()
+        client.session_id = "99887766"
+
+        broken = _make_snipe_row("111", "5001", current_bid="1.00 USD")
+        # Drop the detail row's leading cell entirely: an unmatched shape.
+        broken = broken.replace("<td></td>\n<td>1 h, 2 m, 3 s</td>", "")
+        html = _wrap_table(broken,
+                           _make_snipe_row("222", "5002",
+                                           current_bid="999.00 USD"))
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        by_id = {s["item_id"]: s for s in snipes}
+        assert by_id["111"]["current_bid"] == ""
+        assert by_id["111"]["time_to_end"] == ""
+        assert by_id["222"]["current_bid"] == "999.00 USD"
 
     def test_parse_multiple_snipes(self):
         client = _client()
