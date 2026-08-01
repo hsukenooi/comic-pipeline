@@ -1,7 +1,7 @@
 ---
 title: "A reopened ticket's premise may already be stale — verify it against the code before implementing"
 date: 2026-07-20
-last_updated: 2026-07-31
+last_updated: 2026-08-01
 category: conventions
 module: "general (Linear ticket handling, any package) — these batches: locg-cli, gixen-cli"
 problem_type: convention
@@ -21,6 +21,11 @@ applies_when:
   - "A ticket prescribes a REMEDY that writes to production data (a repair command, a backfill, a sweep) rather than a code change"
   - "A ticket supplies the SQL/predicate that identifies the affected rows — check what that predicate excludes"
   - "A ticket proposes a detector or signal, justified by two or three named examples rather than a measured population"
+  - "A ticket's premise IS the parting recommendation of an earlier ticket that was closed on measurement"
+  - "A ticket proposes tightening an existing threshold or constant rather than adding a new signal — tightening dilutes precision exactly like adding does"
+  - "A ticket describes an ordering, precedence, or gating defect — measure how often it actually fires before designing the remedy"
+  - "A ticket blames pollution or junk in a data pool — rank the junk by whether it can reach the output, not by how wrong it looks"
+  - "A ticket asks to remediate rows produced by a writer that has not itself been fixed"
 tags:
   - process
   - linear
@@ -44,9 +49,16 @@ tags:
   - bui-574
   - bui-578
   - bui-579
+  - bui-582
+  - bui-590
+  - bui-592
+  - bui-594
+  - bui-597
   - post-mortem-sourced
   - license-to-stop
   - data-repair
+  - measurement-first
+  - falsified-signal
 related_docs:
   - "docs/solutions/design-patterns/guard-strictness-must-match-consequence.md"
 ---
@@ -524,8 +536,14 @@ The structural reason is the transferable part. A pool polluted by *total* subst
 a pool of modern issues — internally consistent, therefore **tight**. X-Men #97 @8.5 priced
 $5–20 against a $34.99 raw anchor off **30 graded comps at the narrow window**: `cv=75%`,
 `span=1.0`, no flag. **Dispersion is lowest exactly when substitution is total** — the
-detector is blindest in the worst case. The signal that does separate is pool **depth vs
-cohort median** (filed BUI-582), which is what the same evidence pointed at once measured.
+detector is blindest in the worst case.
+
+> **Since resolved — do not read the next sentence as live guidance.** This example
+> originally closed by naming pool **depth vs cohort median** (filed BUI-582) as "the signal
+> that does separate." **BUI-582 was itself measured and Canceled** (precision 0.25–0.50,
+> recall 0.07–0.21; it fired on 1 of its own 6 motivating cases). It was the second of six
+> consecutive falsifications in this family — see the seventh failure mode below. There is no
+> surviving recommendation for a next pool-shape signal.
 
 **A proposed detector is a quantitative claim about a population. Measure it against the
 whole population, not the examples that motivated it — and check that it can fire on those
@@ -533,8 +551,96 @@ examples at all.** Sibling ticket BUI-574 failed the same way from the other dir
 "supply `year`" candidate was falsified by a book that *did* supply one and produced the
 run's worst pool.
 
+## The seventh failure mode: the premise is the *lesson learned* from the last falsification
+
+Modes 1–6 concern a single ticket's premise. This one is about a **family**. When a proposed
+signal is falsified, the natural next move is to write down what to do instead — and that
+surviving advice becomes the premise of the next ticket. It inherits none of the scrutiny
+that killed its predecessor, because it arrived wearing the authority of a measured result.
+
+Six consecutive pool-shape signals in the FMV area have now been Canceled on their own
+measurements. Twice, the doc you are reading was part of the problem: it recorded the dead
+ticket's parting recommendation as live guidance.
+
+| ticket | proposed signal | measured |
+|---|---|---|
+| BUI-578 | dispersion (`cv`) | precision 0.53 at best cutoff; couldn't fire on its own 3 cases |
+| BUI-582 | pool **depth** vs vintage-cohort median | precision 0.25–0.50, recall 0.07–0.21; fired on 1 of its own 6 |
+| BUI-590 | alt-masthead probe gate too tight | 0/10 books priced materially differently |
+| BUI-592 | high grade priced below its own raw anchor | precision 0.21, recall 0.50; 276-combination sweep found no viable band |
+| BUI-594 | nudge an existing threshold constant 0.5→0.45 | 0/3 new firings true — **and the arithmetic never supported it** |
+| BUI-597 | a tier-ordering defect suppressing a better tier | real, but fires on 2/13 books; the fix returns an identical pool |
+
+### Example 18 — the lesson from the last falsification was itself wrong (BUI-594)
+
+BUI-592 died, and its post-mortem produced what looked like the safe conclusion: *prefer
+tightening an existing precision-1.00 flag over adding a new one.* That became BUI-594 —
+nudge `ANCHOR_DIVERGES_PCT` from `0.5` to `0.45` so the existing `anchor_diverges` flag
+catches X-Men #97 @8.5. No new mark, no new vocabulary. It reads as the disciplined move.
+
+Three independent failures, all found before writing a line of code:
+
+1. **The arithmetic never supported the ticket.** The flag fires when
+   `fmv_high < median * (1 - T)`. #97 is `high=$20` against a `$34.99` anchor, so capture
+   requires `T < 1 - 20/34.99 = 0.4284`. **At the proposed `0.45` the band floor is `$19.24`
+   and the book still does not fire.** The ticket's "misses the band by $2.50" was a *dollar*
+   gap ($20 vs $17.50) — **exactly one step of the `$5` `clean_round` grid** — mistaken for a
+   threshold gap. A threshold tuned finer than the rounding grid measures the rounding.
+2. **Tightening dilutes exactly like adding.** Recomputed over the live table, firings go
+   24 → 27 at `0.45`, and **all three new ones are false positives**: two are sub-$10 gaps
+   inside the $5 grid (one where `$10` is the lowest rung above a `$6.70` anchor, so the band
+   *cannot* sit closer), one is a 1.47× grade premium sitting correctly above its own lower
+   grades. Precision on new surface: **0/3.**
+3. **The motivating book was already caught.** `comic-fmv --inversion-sweep` (BUI-583)
+   reports #97 today — gap $30, rel 0.71. The ticket bought nothing even in the world where
+   the arithmetic worked.
+
+**Do the arithmetic on the motivating case before filing, and check whether an existing
+report already covers it.** Both checks are minutes of work and either one would have closed
+this ticket at filing time.
+
+### Example 19 — the defect was real and fired on 2 of 13 (BUI-597)
+
+BUI-597 described a genuine ordering wart: a cheap tier that widens a comp pool by *relaxing*
+identity (dropping the year) runs before a better tier that widens by *correcting* identity
+(the era-correct masthead), and the junk it admits can push the pool past the thinness
+threshold that gates the better one. The argument is clean and the mechanism is real.
+
+Measured over 13 books via a cache-only replay harness (8 live queries, both tier orders):
+
+- **Trigger rate 2/13.** The first tier only fires when the base pool is thin; on 11 books it
+  never ran, so the defect cannot occur.
+- **On the one genuine case the fix is a no-op** — the probe returns 0 comps and loses,
+  yielding a byte-identical pool for one extra paid query. The book is *post*-rename, so the
+  "bad" tier had actually **corrected** a wrong-year query, inverting the ticket's own
+  "tier 2 relaxes identity, tier 2.5 corrects it" framing.
+- **On the other, the fix reproduces a result already rejected** — it swaps in a pool whose
+  prices are byte-identical to what the correctly-named book already produces, which is the
+  throughput gain BUI-590 was closed for.
+
+**Measure a claimed defect's trigger rate before designing its remedy.** A wart that cannot
+fire is a readability issue, not a bug — and the measurement that establishes the rate
+usually also reveals whether the remedy does anything.
+
+**The junk turned out to be the real thread, and not the visible junk.** The pool contained a
+fridge magnet and a metal sign, which are the memorable detail — and are **harmless**, because
+ungraded listings never enter a *priced* pool; they only inflate `len(comps)`, which gates
+*spend*, not price. The money-carrying junk was grade-tagged and unremarkable to look at: an
+`X-Men 94-300 FULL RUN` lot at `$6500` parses to grade 9.4, survives `hard_exclude`, and is
+the entire difference between "no bid" and a **$3825** bid cap on X-Men #94 @9.2. Filed as
+BUI-598. **When a pool contains junk, rank the junk by whether it can reach the price, not by
+how obviously wrong it looks.**
+
 ## Why This Matters
 
+- **A dead ticket's parting recommendation is an unmeasured hypothesis, and this document is
+  where it gets laundered into guidance.** Twice now a falsified ticket's "the signal that
+  *does* work is X" closed out an example here, and twice X was the next thing to die
+  (BUI-582 after BUI-578; BUI-594 after BUI-592). The write-up feels like the safe part of
+  the work — it is measured, it is honest about what failed — but the forward-looking
+  sentence carries none of that evidence. **When closing a falsification, state what was
+  measured and stop.** If a next direction is worth naming, name it as an untested guess and
+  file it as one.
 - **Post-mortem-sourced tickets are systematically premise-risky, and the rate is high enough
   to plan for.** All ten tickets in the BUI-563..572 batch came from one incident review
   written hours earlier by a competent author with the evidence in hand. **Five failed
@@ -608,7 +714,12 @@ Before implementing any ticket that:
 | BUI-564 | The record-win push is still generating foreign-edition rows | Generator closed by BUI-432 on 2026-07-19; all 6 rows predate it. Real live defect was **downstream**: those rows are `locg_export` rows → resolution candidates, so `resolve_series_for_win('spawn','224',2012)` returned the Kamite volume | Fixed the compounding loop instead (publisher tiebreak, fail-open); live sweep moved 9/2843 rows, all corrections |
 | BUI-563 | Widen `owned_duplicate_identities` to catch year-crossing twins | The counter is a sync **hard stop**, and the pairs have no local remedy (delete → LOCG re-emits; clear → BUI-122 data loss). Widening blocks every sync indefinitely | Shipped as a **separate advisory counter** that reports without gating |
 | BUI-579 | `comic-fmv --force` on ~6 crash-poisoned FMV rows | Count was 3 (its own `flag_reason IS NULL` predicate hid 3 more); cause was a *renamed-masthead query*, so `--force` under the same title **re-poisons**; and the pass had also forked 5 duplicate `comics` identity rows the ticket never saw | Escalated instead of executed; duplicates deleted under the BUI-514 ritual; cause filed BUI-581, residual re-price BUI-585 |
-| BUI-578 | Flag comp-pool **dispersion** to catch collision pollution | Anti-correlated: `cv>75%` → precision 0.53, and the 3 motivating rows have `comps=0` so the flag can't fire on its own evidence. Total substitution yields a *tight* pool (30 comps, `cv=75%`, `span=1.0`, no flag) | Canceled with measurements; the separating signal (pool **depth vs cohort**) filed as BUI-582 |
+| BUI-578 | Flag comp-pool **dispersion** to catch collision pollution | Anti-correlated: `cv>75%` → precision 0.53, and the 3 motivating rows have `comps=0` so the flag can't fire on its own evidence. Total substitution yields a *tight* pool (30 comps, `cv=75%`, `span=1.0`, no flag) | Canceled with measurements; its parting recommendation (pool **depth vs cohort**, BUI-582) was itself later Canceled |
+| BUI-582 | Pool **depth vs vintage-cohort median** is the signal that separates | Precision 0.25–0.50, recall 0.07–0.21; fired on **1 of its own 6** motivating cases | Canceled on measurement — the second of six in this family |
+| BUI-590 | The alt-masthead probe gate is too tight | Shallow wrong-masthead pools did **not** price materially differently: 0/10 books changed. Control: two *deep* pools of the same book differ 16%, the noise floor any signal must beat | Canceled; established the noise floor later used to kill BUI-597 |
+| BUI-592 | Flag a high grade priced below its own raw anchor | Precision 0.21, recall 0.50; a **276-combination sweep found no setting** reaching precision ≥0.80 at recall ≥0.50. 11 of 14 firings sat under the $10 floor BUI-583 already derived | Canceled; its parting advice ("tighten an existing flag instead") became BUI-594 and died too |
+| BUI-594 | Nudge `ANCHOR_DIVERGES_PCT` 0.5→0.45 to catch X-Men #97 | **The arithmetic never supported it** — #97 needs `T<0.4284`; at `0.45` the band floor is $19.24 vs `high=$20`, still no fire. The "misses by $2.50" was a *dollar* gap of one `$5` `clean_round` step. 0/3 new firings true. And #97 is already reported by `--inversion-sweep` (BUI-583) | Canceled; no code. Precision-1.00 preserved |
+| BUI-597 | A yearless-broaden tier suppresses the better alt-masthead tier | Real, but **trigger rate 2/13**. On the one genuine case the probe returns 0 and loses — identical pool, +1 paid query — because the "bad" tier had *corrected* a wrong-year query, inverting the ticket's framing | Canceled; the actual defect found was a grade-tagged **lot listing** manufacturing a $3825 bid cap (BUI-598) |
 
 ## Practical checklist
 
@@ -660,6 +771,24 @@ When the ticket is a reopen or a review residual, before writing code:
    `comps=0`, so the dispersion flag was undefined on every case it was designed for).
    Beware detectors whose signal *weakens* as the failure worsens: total substitution
    produces an internally-consistent, therefore tight, pool.
+5l. **Do the arithmetic on the motivating case before filing, and check whether an existing
+   report already catches it.** BUI-594's proposed `0.45` **could not capture its own
+   motivating book** (it needed `< 0.4284`), and that book was already reported by
+   `--inversion-sweep`. Two minutes of arithmetic and one grep close the ticket at filing
+   time. Watch for a *dollar* gap being read as a *threshold* gap — and never tune a
+   threshold finer than the rounding grid the values snap to.
+5m. **Measure a claimed defect's trigger rate before designing its remedy** (BUI-597: real,
+   but 2/13, and the fix returned a byte-identical pool). A wart that rarely fires is a
+   readability issue, not a bug. When the ticket's story is "cheap thing X degrades better
+   thing Y," verify X actually degrades — BUI-597's X had *corrected* the query.
+5n. **When a ticket blames pollution, rank the junk by whether it can reach the output.**
+   The memorable junk is rarely the dangerous junk: a fridge magnet in a comp pool is inert
+   (ungraded → never priced, only inflates a count that gates *spend*), while a plain
+   grade-tagged multi-issue lot silently manufactured a $3825 bid cap (BUI-598).
+5o. **Do not remediate rows while the writer still produces them.** BUI-596 classified 173
+   malformed rows and found **74** are shapes the writer fix (BUI-591) does not close — so
+   the cleanup would have recurred. Sequence the write-boundary fix first, or accept the
+   cleanup is a repeating chore and say so.
 6. **Search for fixes merged since the filing date** in the same area (`git log --since`).
 7. **For any deployed name, path, or label, check the live system**, not the docs.
 8. **If you add a guard, name its evidence source** and confirm it is independent of the
