@@ -23,6 +23,7 @@ from gixen_client import (
     GixenLoginError,
     GixenSnipeNotFoundError,
     find_sibling_cleanup_targets,
+    GIXEN_RAW_TERMINAL_STATUSES,
 )
 import ebay_bidder
 from record_win_prep import RecordWinPrepError, build_payload
@@ -1050,7 +1051,7 @@ def purge(dry_run: bool, yes: bool):
     completed_count = sum(
         1
         for s in snipes
-        if s.get("status") in ("WON", "LOST", "FAILED", "ENDED")
+        if s.get("status") in GIXEN_RAW_TERMINAL_STATUSES
     )
 
     click.echo(

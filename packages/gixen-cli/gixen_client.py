@@ -259,6 +259,48 @@ def parse_listed_max_bid(value: str | int | float | None) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Terminal-status vocabulary (BUI-595)
+# ---------------------------------------------------------------------------
+
+# Gixen reports many ended-auction states beyond the 4 "primary" statuses.
+# Map every raw Gixen status observed in production (as scraped by
+# list_snipes() — upper-cased, stripped) to the internal terminal status
+# {WON, LOST, FAILED, ENDED}.
+#
+# OUTBID and BID UNDER ASKING PRICE are both losses: in OUTBID Gixen placed
+# our bid but eBay's proxy revealed a higher standing max; in BID UNDER ASKING
+# PRICE the current price already exceeded our max at snipe time so Gixen
+# skipped the submission. Different mechanics, same outcome — we lost, and
+# current_bid is the price that beat us.
+#
+# This lives here (not server/main.py, where it originated) because
+# gixen_client.py owns the scrape/parse layer and carries no FastAPI
+# dependency — both server/main.py (the live WON/LOST/FAILED/ENDED
+# classification path) and cli.py's direct-mode `purge` command (a cosmetic
+# dry-run count of completed snipes) already import this module, so both can
+# share one copy of the vocabulary instead of each re-declaring it (BUI-595:
+# cli.py's purge count had drifted to a 4-status tuple missing OUTBID/BID
+# UNDER ASKING PRICE). server/main.py re-exports this under its original
+# name (`_GIXEN_TERMINAL_MAP`) for backward compatibility.
+GIXEN_TERMINAL_MAP: dict[str, str] = {
+    "WON": "WON",
+    "LOST": "LOST",
+    "OUTBID": "LOST",
+    "BID UNDER ASKING PRICE": "LOST",
+    "FAILED": "FAILED",
+    "ENDED": "ENDED",
+}
+
+# Raw Gixen status strings (as scraped by list_snipes(), before any mapping)
+# that represent a completed/terminal snipe — the key set of
+# GIXEN_TERMINAL_MAP. Consumers that only need "is this snipe done?" over the
+# raw scraped statuses (e.g. cli.py's purge dry-run count) should use this
+# rather than the internal 4-status set, since list_snipes() never maps
+# statuses itself.
+GIXEN_RAW_TERMINAL_STATUSES: frozenset[str] = frozenset(GIXEN_TERMINAL_MAP)
+
+
+# ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 

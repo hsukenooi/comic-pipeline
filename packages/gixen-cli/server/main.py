@@ -24,6 +24,7 @@ from gixen_client import (
     GixenClient, GixenError, GixenConnectionError, GixenSnipeNotFoundError,
     GixenAddNotConfirmedError, GixenModifyNotConfirmedError,
     find_sibling_cleanup_targets, parse_listed_max_bid,
+    GIXEN_TERMINAL_MAP,
 )
 from gixen.plugins import (
     load_plugins,
@@ -311,14 +312,15 @@ _TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "
 # PRICE the current price already exceeded our max at snipe time so Gixen
 # skipped the submission. Different mechanics, same outcome — we lost, and
 # current_bid is the price that beat us.
-_GIXEN_TERMINAL_MAP: dict[str, str] = {
-    "WON": "WON",
-    "LOST": "LOST",
-    "OUTBID": "LOST",
-    "BID UNDER ASKING PRICE": "LOST",
-    "FAILED": "FAILED",
-    "ENDED": "ENDED",
-}
+#
+# BUI-595: the map itself now lives in gixen_client.py (the scrape/parse
+# module both this server and cli.py's direct-mode `purge` command already
+# import, with no FastAPI dependency) so the two stop drifting apart — cli.py's
+# purge dry-run count previously re-listed a stale 4-status subset inline.
+# Re-exported here under the original name: this module's own
+# _map_terminal_status still reads it as `_GIXEN_TERMINAL_MAP`, and it stays
+# importable from `server.main` for any external caller/test expecting it here.
+_GIXEN_TERMINAL_MAP: dict[str, str] = GIXEN_TERMINAL_MAP
 
 # Gixen statuses that are positive evidence Gixen actually processed our bid:
 # OUTBID means our bid was placed and beaten; BID UNDER ASKING PRICE means
