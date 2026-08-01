@@ -1986,6 +1986,40 @@ class TestCliPurge:
         mock_client.purge_completed.assert_not_called()
         mock_client.remove_snipe.assert_not_called()
 
+    def test_dry_run_completed_count_includes_outbid_and_bid_under_asking(self):
+        """BUI-595: the dry-run completed count must match the same raw
+        terminal-status vocabulary as server/main.py's _GIXEN_TERMINAL_MAP —
+        not a re-listed 4-status tuple that drifts from it. OUTBID and BID
+        UNDER ASKING PRICE are real Gixen statuses for a lost auction and
+        must be counted alongside WON/LOST/FAILED/ENDED."""
+        from cli import cli
+
+        runner = CliRunner()
+        snipes = [
+            # Triggers the sibling-cleanup branch (this test's dry-run
+            # message only computes completed_count on that branch).
+            _snipe("111", status="WON", group="1"),
+            _snipe("222", status="SCHEDULED", group="1"),
+            # Terminal, but NOT in the old 4-status tuple.
+            _snipe("333", status="OUTBID", group="0"),
+            _snipe("444", status="BID UNDER ASKING PRICE", group="0"),
+        ]
+
+        with patch("cli._make_client") as mock_make, \
+             patch("cli._server_url", return_value=None):
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+
+            result = runner.invoke(cli, ["purge", "--dry-run"])
+
+        assert result.exit_code == 0
+        # 111 (WON), 333 (OUTBID), 444 (BID UNDER ASKING PRICE) == 3.
+        # Before the fix this echoed 1 (only WON counted).
+        assert "This will purge 3 completed snipe(s)" in result.output
+        mock_client.purge_completed.assert_not_called()
+        mock_client.remove_snipe.assert_not_called()
+
     def test_remove_failure_continues_and_exits_nonzero(self):
         from cli import cli
 
