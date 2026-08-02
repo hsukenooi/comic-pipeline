@@ -1,0 +1,685 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pyyaml>=6"]
+# ///
+"""solutions-lint — BUI-605: the executable half of docs/solutions/.
+
+A learning doc under `docs/solutions/` protects only the session that happens
+to re-read it. This runner is where a learning stops being a briefing note and
+becomes a check that runs on every commit. Two things live here:
+
+  1. The **mechanization contract** meta-lint (`solutions-frontmatter`), which
+     enforces that every learning doc answers "what part of this learning is a
+     check?" via its `mechanized_by:` frontmatter key. The contract itself is
+     specified in docs/solutions/conventions/mechanized-by-frontmatter-contract.md
+     — that doc is this lint's requirements document, and is itself subject to it.
+
+  2. The **pack** — the registry of individual lints that enforce specific
+     documented learnings (`WHERE item_id` non-unique-key mutations, the
+     `|| echo ""` fallback-swallow, forbidden skill idioms, …).
+
+Run it:
+
+    ./scripts/solutions-lint              # run the pack, exit 1 on any finding
+    ./scripts/solutions-lint --self-test  # prove every lint is able to fail
+    ./scripts/solutions-lint --list       # show the registered pack
+
+--------------------------------------------------------------------------
+REGISTRATION SEAM — read this before adding a lint (BUI-606 / BUI-607)
+--------------------------------------------------------------------------
+Append one `Lint(...)` to the `LINTS` tuple at the bottom of this file. A lint
+is four things:
+
+    id          stable kebab-case name; docs reference it by `lint: [<id>]`
+    summary     one line, printed by --list and in failure output
+    doc         repo-relative path of the docs/solutions doc it enforces
+                (must exist; a lint with no documented learning behind it has
+                no business being a merge gate)
+    check       callable `(root: Path) -> list[Finding]`
+
+`check` MUST take the tree root as an argument and resolve every path under it.
+It must never reach for the real repo via `__file__` or `os.getcwd()` — that is
+what makes it runnable against a fixture tree, which is what makes it testable.
+
+    self_test   `SelfTest(must_flag=(...), must_pass=(...))`
+
+Every lint ships fixtures: at least one `must_flag` tree it is required to
+produce a finding on, and at least one `must_pass` tree it is required to stay
+silent on. `--self-test` fails if either list is empty. This is deliberate — the
+failure mode of a lint pack is not a missing lint, it is a lint that quietly
+stopped firing (or one that never could), and trust in the pack is spent the
+first time either happens. A lint that cannot demonstrate its own failure does
+not ship.
+
+Why a standalone script and not pytest: the pack lints across package
+boundaries — packages/*, plugins/*, apps/* and docs/ in one pass — and no single
+package's suite owns that scope. Why Python in a bash-conventioned scripts/ dir:
+same reason `scripts/premise-check` is (YAML parsing and structured findings),
+and it keeps the same precedent. The CI job is modeled on the `lint:` ruff job in
+.github/workflows/ci.yml (BUI-185).
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import tempfile
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# --- the mechanization contract ------------------------------------------
+# Kept in sync with docs/solutions/conventions/mechanized-by-frontmatter-contract.md.
+SOLUTIONS_DIR = "docs/solutions"
+LEDGER_PATH = f"{SOLUTIONS_DIR}/UNMECHANIZED.txt"
+
+MECHANIZED_BY_VALUES = ("lint", "test", "advice-only")
+COMPANION_KEY = {
+    "lint": "lint",
+    "test": "enforced_by_test",
+    "advice-only": "advice_only_reason",
+}
+# An `advice-only` reason exists to make the author argue the case, so a
+# rubber-stamp ("n/a", "none") has to be rejected on length alone.
+MIN_ADVICE_REASON_CHARS = 20
+
+# Files under docs/solutions/ that are not learning docs and carry no contract.
+NON_DOC_FILENAMES = frozenset({"README.md"})
+
+
+# --- pack primitives ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One violation. `path` is relative to the tree the check was run against."""
+
+    path: str
+    line: int
+    message: str
+    hint: str = ""
+
+
+@dataclass(frozen=True)
+class Fixture:
+    """A throwaway tree a lint is run against during --self-test."""
+
+    name: str
+    files: dict[str, str]
+
+
+@dataclass(frozen=True)
+class SelfTest:
+    must_flag: tuple[Fixture, ...] = ()
+    must_pass: tuple[Fixture, ...] = ()
+
+
+@dataclass(frozen=True)
+class Lint:
+    id: str
+    summary: str
+    doc: str
+    check: Callable[[Path], list[Finding]] = field(repr=False)
+    self_test: SelfTest = field(repr=False, default_factory=SelfTest)
+
+
+# --- frontmatter helpers --------------------------------------------------
+
+
+@dataclass
+class Frontmatter:
+    data: dict | None
+    error: str | None
+    key_lines: dict[str, int]
+
+
+def _parse_frontmatter(text: str) -> Frontmatter:
+    """Parse a leading `---` YAML block. Fails closed: never returns a partial dict."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return Frontmatter(None, "file does not open with a `---` frontmatter block", {})
+
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return Frontmatter(None, "frontmatter block is never closed with `---`", {})
+
+    block = lines[1:end]
+    key_lines = {
+        m.group(1): i + 2
+        for i, raw in enumerate(block)
+        if (m := re.match(r"^([A-Za-z_][A-Za-z0-9_]*):", raw))
+    }
+    try:
+        data = yaml.safe_load("\n".join(block))
+    except yaml.YAMLError as exc:
+        return Frontmatter(None, f"frontmatter is not valid YAML: {exc}", key_lines)
+
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return Frontmatter(None, "frontmatter is not a YAML mapping", key_lines)
+    return Frontmatter(data, None, key_lines)
+
+
+def _as_list(value: object) -> list[str] | None:
+    """Normalize a scalar-or-list frontmatter value to a list of strings."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return list(value)
+    return None
+
+
+def _iter_solution_docs(root: Path) -> list[Path]:
+    base = root / SOLUTIONS_DIR
+    if not base.is_dir():
+        return []
+    return sorted(p for p in base.rglob("*.md") if p.name not in NON_DOC_FILENAMES)
+
+
+def _read_ledger(root: Path) -> tuple[dict[str, int], list[Finding]]:
+    """Read UNMECHANIZED.txt -> {repo-relative path: line no}. Absent file = empty."""
+    path = root / LEDGER_PATH
+    if not path.is_file():
+        return {}, []
+
+    entries: dict[str, int] = {}
+    findings: list[Finding] = []
+    for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
+        entry = raw.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        if entry in entries:
+            findings.append(
+                Finding(
+                    LEDGER_PATH,
+                    lineno,
+                    f"duplicate ledger entry `{entry}` (first listed on line {entries[entry]})",
+                )
+            )
+            continue
+        entries[entry] = lineno
+    return entries, findings
+
+
+# --- lint: solutions-frontmatter -----------------------------------------
+
+
+def _check_doc_contract(
+    relpath: str, fm: Frontmatter, root: Path, known_lint_ids: frozenset[str]
+) -> list[Finding]:
+    """Validate one doc's mechanization declaration."""
+    if fm.error is not None or fm.data is None:
+        return [
+            Finding(
+                relpath,
+                1,
+                fm.error or "frontmatter could not be read",
+                "every docs/solutions doc opens with a `---` YAML frontmatter block",
+            )
+        ]
+
+    data, at = fm.data, fm.key_lines
+    if "mechanized_by" not in data:
+        return [
+            Finding(
+                relpath,
+                1,
+                "missing required `mechanized_by:` — this doc does not say what part of "
+                "its learning is a check",
+                f"add one of {list(MECHANIZED_BY_VALUES)} (see {SOLUTIONS_DIR}/conventions/"
+                "mechanized-by-frontmatter-contract.md), or list this doc in "
+                f"{LEDGER_PATH} if it is a pre-contract doc awaiting classification",
+            )
+        ]
+
+    line = at.get("mechanized_by", 1)
+    raw_values = _as_list(data["mechanized_by"])
+    # Dedupe (order-preserving): `[lint, lint]` is an authoring slip, not two
+    # claims, and left as-is it would emit the same finding twice — or, for
+    # `[advice-only, advice-only]`, the misleading "cannot be combined" one.
+    values = list(dict.fromkeys(raw_values)) if raw_values is not None else None
+    if values is None:
+        return [
+            Finding(
+                relpath,
+                line,
+                "`mechanized_by:` must be a string or a list of strings",
+            )
+        ]
+    if not values:
+        return [Finding(relpath, line, "`mechanized_by:` is empty")]
+
+    findings: list[Finding] = []
+    unknown = [v for v in values if v not in MECHANIZED_BY_VALUES]
+    for value in unknown:
+        findings.append(
+            Finding(
+                relpath,
+                line,
+                f"unknown `mechanized_by:` value {value!r}",
+                f"the vocabulary is closed: {list(MECHANIZED_BY_VALUES)}",
+            )
+        )
+    if "advice-only" in values and len(values) > 1:
+        findings.append(
+            Finding(
+                relpath,
+                line,
+                "`advice-only` cannot be combined with `lint` or `test` — a learning that "
+                "is mechanized is not advice-only",
+            )
+        )
+
+    for value in values:
+        if value in unknown:
+            continue
+        key = COMPANION_KEY[value]
+        if key not in data:
+            findings.append(
+                Finding(
+                    relpath,
+                    line,
+                    f"`mechanized_by: {value}` requires the companion key `{key}:`",
+                )
+            )
+            continue
+        findings.extend(
+            _check_companion(relpath, key, data[key], at.get(key, line), root, known_lint_ids)
+        )
+
+    return findings
+
+
+def _check_companion(
+    relpath: str,
+    key: str,
+    value: object,
+    line: int,
+    root: Path,
+    known_lint_ids: frozenset[str],
+) -> list[Finding]:
+    if key == "advice_only_reason":
+        if not isinstance(value, str) or len(value.strip()) < MIN_ADVICE_REASON_CHARS:
+            return [
+                Finding(
+                    relpath,
+                    line,
+                    f"`advice_only_reason:` must be a sentence of at least "
+                    f"{MIN_ADVICE_REASON_CHARS} characters saying why this learning cannot "
+                    "be mechanized",
+                )
+            ]
+        return []
+
+    items = _as_list(value)
+    if items is None or not items:
+        return [Finding(relpath, line, f"`{key}:` must be a non-empty string or list of strings")]
+
+    findings: list[Finding] = []
+    if key == "lint":
+        for lint_id in items:
+            if lint_id not in known_lint_ids:
+                findings.append(
+                    Finding(
+                        relpath,
+                        line,
+                        f"`lint: {lint_id}` is not a registered lint",
+                        "register it in the LINTS tuple in scripts/solutions-lint, or point "
+                        f"at one of: {sorted(known_lint_ids)}",
+                    )
+                )
+        return findings
+
+    # key == "enforced_by_test": "<path>" or "<path>::<node>"
+    for ref in items:
+        target, _, node = ref.partition("::")
+        test_file = root / target
+        if not test_file.is_file():
+            findings.append(
+                Finding(
+                    relpath, line, f"`enforced_by_test:` does not resolve to a file: {target}"
+                )
+            )
+            continue
+        if not node:
+            continue
+        try:
+            source = test_file.read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            # Report rather than traceback: the path came from frontmatter and can
+            # point anywhere in the repo, including something unreadable.
+            findings.append(
+                Finding(relpath, line, f"`enforced_by_test:` file {target} is unreadable: {exc}")
+            )
+            continue
+        if node not in source:
+            findings.append(
+                Finding(
+                    relpath,
+                    line,
+                    f"`enforced_by_test:` names `{node}`, which does not appear in {target}",
+                    "a renamed or deleted test silently stops enforcing this learning",
+                )
+            )
+    return findings
+
+
+def check_solutions_frontmatter(root: Path) -> list[Finding]:
+    """Every learning doc declares how it is enforced; the ledger only shrinks."""
+    known_lint_ids = frozenset(lint.id for lint in LINTS)
+    ledger, findings = _read_ledger(root)
+    seen_in_ledger: set[str] = set()
+
+    for doc in _iter_solution_docs(root):
+        relpath = doc.relative_to(root).as_posix()
+        fm = _parse_frontmatter(doc.read_text())
+        declared = fm.data is not None and "mechanized_by" in fm.data
+
+        if relpath in ledger:
+            seen_in_ledger.add(relpath)
+            if declared:
+                # The ratchet: once classified, a doc leaves the ledger for good.
+                findings.append(
+                    Finding(
+                        LEDGER_PATH,
+                        ledger[relpath],
+                        f"{relpath} now declares `mechanized_by:` — remove this line",
+                        "the ledger is append-never: entries only ever leave it",
+                    )
+                )
+            continue
+
+        findings.extend(_check_doc_contract(relpath, fm, root, known_lint_ids))
+
+    for relpath, lineno in ledger.items():
+        if relpath not in seen_in_ledger:
+            findings.append(
+                Finding(
+                    LEDGER_PATH,
+                    lineno,
+                    f"ledger names {relpath}, which is not a docs/solutions doc "
+                    "(moved, renamed, or deleted?)",
+                )
+            )
+
+    return sorted(findings, key=lambda f: (f.path, f.line, f.message))
+
+
+# --- self-test fixtures ---------------------------------------------------
+
+_GOOD_DOC = """---
+title: "A learning"
+mechanized_by: advice-only
+advice_only_reason: "The judgment call is which of two volumes a book belongs to; no
+  textual check can decide it."
+---
+
+# A learning
+"""
+
+_FRONTMATTER_SELF_TEST = SelfTest(
+    must_flag=(
+        Fixture(
+            "undeclared doc",
+            {f"{SOLUTIONS_DIR}/bugs/undeclared.md": '---\ntitle: "x"\n---\n\n# x\n'},
+        ),
+        Fixture(
+            "unknown mechanized_by value",
+            {
+                f"{SOLUTIONS_DIR}/bugs/bad-value.md": (
+                    '---\ntitle: "x"\nmechanized_by: someday\n---\n\n# x\n'
+                )
+            },
+        ),
+        Fixture(
+            "lint arm naming an unregistered lint",
+            {
+                f"{SOLUTIONS_DIR}/bugs/ghost-lint.md": (
+                    '---\ntitle: "x"\nmechanized_by: lint\nlint:\n  - no-such-lint\n---\n\n# x\n'
+                )
+            },
+        ),
+        Fixture(
+            "advice-only with a rubber-stamp reason",
+            {
+                f"{SOLUTIONS_DIR}/bugs/rubber-stamp.md": (
+                    '---\ntitle: "x"\nmechanized_by: advice-only\n'
+                    'advice_only_reason: "n/a"\n---\n\n# x\n'
+                )
+            },
+        ),
+        Fixture(
+            "test arm pointing at a missing node id",
+            {
+                f"{SOLUTIONS_DIR}/bugs/ghost-test.md": (
+                    '---\ntitle: "x"\nmechanized_by: test\n'
+                    "enforced_by_test:\n  - tests/test_a.py::test_renamed_away\n---\n\n# x\n"
+                ),
+                "tests/test_a.py": "def test_still_here():\n    pass\n",
+            },
+        ),
+        Fixture(
+            "ledger naming a doc that has since been classified",
+            {
+                f"{SOLUTIONS_DIR}/bugs/classified.md": _GOOD_DOC,
+                LEDGER_PATH: f"{SOLUTIONS_DIR}/bugs/classified.md\n",
+            },
+        ),
+        Fixture(
+            "ledger naming a doc that no longer exists",
+            {LEDGER_PATH: f"{SOLUTIONS_DIR}/bugs/deleted.md\n"},
+        ),
+    ),
+    must_pass=(
+        Fixture("declared advice-only doc", {f"{SOLUTIONS_DIR}/bugs/ok.md": _GOOD_DOC}),
+        Fixture(
+            "lint + test arms, both resolving",
+            {
+                f"{SOLUTIONS_DIR}/bugs/ok-both.md": (
+                    '---\ntitle: "x"\nmechanized_by:\n  - lint\n  - test\n'
+                    "lint:\n  - solutions-frontmatter\n"
+                    "enforced_by_test:\n  - tests/test_a.py::test_here\n---\n\n# x\n"
+                ),
+                "tests/test_a.py": "def test_here():\n    pass\n",
+            },
+        ),
+        Fixture(
+            "undeclared doc that is on the ledger",
+            {
+                f"{SOLUTIONS_DIR}/bugs/legacy.md": '---\ntitle: "x"\n---\n\n# x\n',
+                LEDGER_PATH: (
+                    f"# comment\n\n{SOLUTIONS_DIR}/bugs/legacy.md  # trailing comment\n"
+                ),
+            },
+        ),
+        Fixture(
+            "README index is not a learning doc",
+            {f"{SOLUTIONS_DIR}/README.md": "# Index\n"},
+        ),
+        Fixture(
+            "test arm with no node id — the whole file is the enforcer",
+            {
+                f"{SOLUTIONS_DIR}/bugs/ok-file-only.md": (
+                    '---\ntitle: "x"\nmechanized_by: test\n'
+                    "enforced_by_test:\n  - tests/test_a.py\n---\n\n# x\n"
+                ),
+                "tests/test_a.py": "def test_here():\n    pass\n",
+            },
+        ),
+        Fixture(
+            "repeated mechanized_by value is one claim, not a conflict",
+            {
+                f"{SOLUTIONS_DIR}/bugs/ok-dupe.md": (
+                    '---\ntitle: "x"\nmechanized_by:\n  - advice-only\n  - advice-only\n'
+                    'advice_only_reason: "Which of two same-named volumes a book belongs '
+                    'to is a judgment call no predicate decides."\n---\n\n# x\n'
+                )
+            },
+        ),
+    ),
+)
+
+
+# --- the pack -------------------------------------------------------------
+#
+# Add lints here. See REGISTRATION SEAM in the module docstring.
+
+LINTS: tuple[Lint, ...] = (
+    Lint(
+        id="solutions-frontmatter",
+        summary="every docs/solutions doc declares how its learning is enforced",
+        doc=f"{SOLUTIONS_DIR}/conventions/mechanized-by-frontmatter-contract.md",
+        check=check_solutions_frontmatter,
+        self_test=_FRONTMATTER_SELF_TEST,
+    ),
+)
+
+
+# --- runner ---------------------------------------------------------------
+
+
+def _validate_registry() -> list[str]:
+    """Structural errors in the pack itself — not lint findings, wiring bugs.
+
+    Always resolved against REPO_ROOT, never the `--root` tree: the registry is a
+    property of this file, so a lint's `doc` pointer names a real repo doc even
+    when the pack is being run against a copy or a fixture tree.
+    """
+    errors: list[str] = []
+    seen: set[str] = set()
+    for lint in LINTS:
+        if lint.id in seen:
+            errors.append(f"duplicate lint id: {lint.id}")
+        seen.add(lint.id)
+        if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", lint.id):
+            errors.append(f"lint id must be kebab-case: {lint.id}")
+        if not (REPO_ROOT / lint.doc).is_file():
+            errors.append(f"lint {lint.id} points at a missing doc: {lint.doc}")
+    return errors
+
+
+def _write_fixture(fixture: Fixture, base: Path) -> None:
+    for relpath, content in fixture.files.items():
+        target = base / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
+
+def _print_findings(lint: Lint, findings: Iterable[Finding]) -> None:
+    print(f"\n{lint.id}: {lint.summary}")
+    print(f"  learning: {lint.doc}")
+    for f in findings:
+        print(f"  {f.path}:{f.line}: {f.message}")
+        if f.hint:
+            print(f"      -> {f.hint}")
+
+
+def run_pack(root: Path) -> int:
+    errors = _validate_registry()
+    if errors:
+        print("solutions-lint: the lint pack itself is misconfigured:", file=sys.stderr)
+        for err in errors:
+            print(f"  {err}", file=sys.stderr)
+        return 2
+
+    total = 0
+    for lint in LINTS:
+        findings = lint.check(root)
+        if findings:
+            total += len(findings)
+            _print_findings(lint, findings)
+
+    if total:
+        print(f"\nsolutions-lint: {total} finding(s) across {len(LINTS)} lint(s).")
+        return 1
+    print(f"solutions-lint: {len(LINTS)} lint(s), no findings.")
+    return 0
+
+
+def run_self_test() -> int:
+    """Prove every registered lint is able to fail, and able to stay quiet."""
+    failures: list[str] = _validate_registry()
+
+    for lint in LINTS:
+        st = lint.self_test
+        if not st.must_flag:
+            failures.append(f"{lint.id}: no must_flag fixture — a lint that cannot be shown "
+                            "to fail does not ship")
+        if not st.must_pass:
+            failures.append(f"{lint.id}: no must_pass fixture — a lint that is never shown "
+                            "to stay quiet does not ship")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for i, fixture in enumerate(st.must_flag):
+                # Index-prefixed: two fixture names that slugify alike would
+                # otherwise share a tree and mask each other.
+                sandbox = base / "flag" / f"{i:02d}-{re.sub(r'\W+', '-', fixture.name)}"
+                _write_fixture(fixture, sandbox)
+                if not lint.check(sandbox):
+                    failures.append(f"{lint.id}: must_flag fixture {fixture.name!r} produced "
+                                    "no finding")
+            for i, fixture in enumerate(st.must_pass):
+                sandbox = base / "pass" / f"{i:02d}-{re.sub(r'\W+', '-', fixture.name)}"
+                _write_fixture(fixture, sandbox)
+                found = lint.check(sandbox)
+                if found:
+                    detail = "; ".join(f"{f.path}:{f.line}: {f.message}" for f in found)
+                    failures.append(f"{lint.id}: must_pass fixture {fixture.name!r} produced "
+                                    f"{len(found)} finding(s): {detail}")
+
+    if failures:
+        print("solutions-lint --self-test: FAILED", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
+        return 1
+
+    checks = sum(len(x.self_test.must_flag) + len(x.self_test.must_pass) for x in LINTS)
+    print(f"solutions-lint --self-test: {len(LINTS)} lint(s), {checks} fixture(s), all OK.")
+    return 0
+
+
+def run_list() -> int:
+    for lint in LINTS:
+        st = lint.self_test
+        print(f"{lint.id}\n  {lint.summary}")
+        print(f"  learning: {lint.doc}")
+        print(f"  fixtures: {len(st.must_flag)} must-flag, {len(st.must_pass)} must-pass")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="solutions-lint",
+        description="Run the docs/solutions lint pack (BUI-605).",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run each lint against its own fixtures instead of the repo",
+    )
+    parser.add_argument("--list", action="store_true", help="list the registered lints")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=REPO_ROOT,
+        help="tree to lint (default: the repo this script lives in)",
+    )
+    args = parser.parse_args(argv)
+
+    if args.list:
+        return run_list()
+    if args.self_test:
+        return run_self_test()
+    return run_pack(args.root.resolve())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
