@@ -135,6 +135,40 @@
   .flags li { padding: 3px 0; font-size: 12px; color: var(--fg); }
   .flags li::before { content: "▲ "; color: var(--yellow); }
 
+  /* BUI-604 outcome watchdog. Red, where .flags above is amber: an overbid
+     flag is advice, a missing outcome is an auction whose result nobody can
+     account for. The .is-degraded variant drops back to amber for the case
+     where the watchdog itself is blind (our own Gixen sync is stale) — "I
+     cannot vouch for this" must never wear the same colour as "this is
+     broken". */
+  .watchdog {
+    background: linear-gradient(90deg, rgba(247,118,142,0.10), rgba(247,118,142,0.02));
+    border: 1px solid rgba(247,118,142,0.32);
+    border-left: 3px solid var(--red);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 18px;
+  }
+  .watchdog h3 {
+    color: var(--red);
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    margin-bottom: 7px;
+  }
+  .watchdog ul { list-style: none; }
+  .watchdog li { padding: 3px 0; font-size: 12px; color: var(--fg); }
+  .watchdog li::before { content: "✖ "; color: var(--red); }
+  .watchdog .sub { color: var(--fg-dim); }
+  .watchdog.is-degraded {
+    background: linear-gradient(90deg, rgba(224,175,104,0.09), rgba(224,175,104,0.02));
+    border-color: rgba(224,175,104,0.30);
+    border-left-color: var(--yellow);
+  }
+  .watchdog.is-degraded h3 { color: var(--yellow); }
+  .watchdog.is-degraded li::before { content: "▲ "; color: var(--yellow); }
+
   /* top-of-page refresh sweep — visible only while a Gixen pull is in flight */
   .refresh-bar {
     position: fixed;
@@ -179,6 +213,7 @@
     <span class="prompt">$</span> <span class="cmd">comic-pipeline</span> <span class="arg">--list</span> <span class="arg">--watch=30s</span> <span class="ok">▸ ready</span>
   </div>
 
+  <div id="watchdog-container"></div>
   <div id="flags-container"></div>
   <div id="active-section"></div>
   <div id="ended-section"></div>
@@ -413,6 +448,45 @@ function renderFlags(snipes) {
   el.innerHTML = flags.length ? `<div class="flags"><h3>attention required</h3><ul>${flags.map(f=>`<li>${escapeHtml(f)}</li>`).join("")}</ul></div>` : "";
 }
 
+// BUI-604: the outcome watchdog banner. `report` is /api/snipe-watchdog's
+// verdict, or null when the fetch failed — a failed fetch renders NOTHING
+// rather than a green "all clear", because a watchdog that reassures you when
+// it could not run is the bug class it exists to catch. It also never renders
+// an all-clear when there is nothing wrong: silence is the healthy state, and
+// a permanent green box is the thing people learn to stop seeing.
+function renderWatchdog(report) {
+  const el = document.getElementById("watchdog-container");
+  if (!report || !Array.isArray(report.alerts) || !report.alerts.length) {
+    el.innerHTML = "";
+    return;
+  }
+  const degraded = report.alerts.every(a => a.kind === "sync_stale");
+  const heading = degraded ? "watchdog blind" : "snipe outcome missing";
+  // A stuck snipe alerts for as long as it stays stuck — correctly, since the
+  // anomaly is what persists — so the banner is capped and the overflow
+  // counted. /api/snipe-watchdog still returns every alert; only the banner
+  // truncates, so nothing is lost, it just can't grow to fill the page.
+  const MAX_SHOWN = 8;
+  const items = report.alerts.slice(0, MAX_SHOWN).map(a => {
+    const titleSpan = a.title ? ` <span class="sub">${escapeHtml(a.title)}</span>` : "";
+    const who = a.item_id
+      ? `<a class="item-id" href="${ebayUrl(a.item_id)}" target="_blank">#${escapeHtml(a.item_id)}</a>`
+        + `${titleSpan} — `
+      : "";
+    return `<li>${who}${escapeHtml(a.detail || a.kind)}</li>`;
+  }).join("");
+  const notes = [];
+  if (report.alerts.length > MAX_SHOWN) {
+    notes.push(`${report.alerts.length - MAX_SHOWN} more — see /api/snipe-watchdog.`);
+  }
+  if (report.suppressed_alert_count) {
+    notes.push(`${report.suppressed_alert_count} per-snipe alert(s) withheld until the sync recovers.`);
+  }
+  const extra = notes.map(n => `<li><span class="sub">${escapeHtml(n)}</span></li>`).join("");
+  el.innerHTML = `<div class="watchdog${degraded ? " is-degraded" : ""}">`
+    + `<h3>${heading}</h3><ul>${items}${extra}</ul></div>`;
+}
+
 function setStatus(state, text) {
   const el = document.getElementById("status");
   const t = document.getElementById("status-text");
@@ -432,10 +506,12 @@ tickClock();
 // countdowns, edit/remove optimism) reuse this without re-hitting Gixen.
 let _lastSnipes = null;
 let _lastHistory = null;
+let _lastWatchdog = null;  // BUI-604: last /api/snipe-watchdog verdict, or null
 let _lastSyncedAt = null;  // local timestamp of the most recent successful fetch
 
 function renderAll(snipes, history) {
   if (!snipes) return;
+  renderWatchdog(_lastWatchdog);
   renderFlags(snipes);
   renderActive(snipes);
   renderEnded(history || []);
@@ -471,18 +547,26 @@ async function load() {
   setStatus("loading", DEMO ? "loading demo fixture…" : "syncing…");
   document.getElementById("refresh-bar").classList.add("is-active");
   try {
-    let snipes, history;
+    let snipes, history, watchdog = null;
     if (DEMO) {
       snipes = demoData();
       history = [];
     } else {
-      [snipes, history] = await Promise.all([
+      // BUI-604: the watchdog fetch is deliberately fault-tolerant (.catch ->
+      // null) and NOT part of the throwing pair. /api/snipe-watchdog is a pure
+      // DB read that triggers no Gixen work, so it costs the dashboard nothing
+      // — but an observer must never be able to take down the thing it
+      // observes. A failure leaves the banner unrendered (see renderWatchdog),
+      // never falsely reassuring.
+      [snipes, history, watchdog] = await Promise.all([
         fetch(SNIPES_URL).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
         fetch("/api/history").then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+        fetch("/api/snipe-watchdog").then(r => r.ok ? r.json() : null).catch(() => null),
       ]);
     }
     _lastSnipes = snipes;
     _lastHistory = history;
+    _lastWatchdog = watchdog;
     _lastSyncedAt = new Date();
     renderAll(snipes, history);
     setStatus("ok", `${snipes.length} rows${DEMO ? " · demo" : ""}`);

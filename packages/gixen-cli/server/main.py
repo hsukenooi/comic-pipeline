@@ -245,6 +245,23 @@ _SYNC_BACKOFF_FIRST = 30
 # first delay reproduces the pre-BUI-562 SYNC_INTERVAL * 2**n exactly.
 _SYNC_BACKOFF_FIRST_UNEXPECTED = SYNC_INTERVAL * 2
 
+# ---------------------------------------------------------------------------
+# BUI-604: per-snipe outcome watchdog state
+# ---------------------------------------------------------------------------
+# Wall-clock stamps the watchdog reads to decide whether it is entitled to an
+# opinion. NOTHING else in this server branches on them — see
+# _build_snipe_watchdog_report()'s docstring for why that is the whole safety
+# argument for this feature.
+#
+# _last_sync_ok_at is stamped at the very END of _sync_gixen, after its apply
+# phase committed and every terminal transition it was going to make has been
+# made. That is the same site the BUI-602 heartbeat contract nominates for the
+# (still unwired, follow-up-owned) `gixen-sync` ping — see
+# docs/reference/job-heartbeat-contract.md.
+_process_started_at: float = 0.0
+_last_sync_ok_at: float = 0.0
+_last_sync_snipe_count: int | None = None
+
 
 def _get_db() -> sqlite3.Connection:
     assert _db is not None, "DB not initialized"
@@ -1107,7 +1124,39 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
             # equivalent to reading it here on wconn.
             _insert_web_added_bids(wconn, snipes, existing_ids)
 
+    # BUI-604: a completed pass — the scrape reached the apply phase and the
+    # write transaction committed without raising. Stamped HERE, after every
+    # write above, so the watchdog can never claim "this snipe never resolved"
+    # from a cycle that died before it had the chance to resolve it. Both
+    # assignments are pure observer state: no code path in this server reads
+    # them except _build_snipe_watchdog_report(), so nothing about the
+    # WON-inference, the PENDING lifecycle, or the sniper changes shape here.
+    #
+    # Deliberately NOT stamped on the `return []` paths above — a
+    # GixenConnectionError/GixenError is exactly the case the watchdog must
+    # notice as "I am blind", not treat as a healthy observation.
+    #
+    # Placing anything after a committed apply phase invites the question "what
+    # if it raises here?" — an exception past the commit would leave the DML
+    # intact but turn a healthy cycle into a _sync_loop backoff / an api_sync
+    # 500. It cannot: _stamp_sync_observed only reads the clock, calls len() on
+    # a list, and assigns two module globals. No I/O, no parsing, no lookup that
+    # can miss. Keep it that way if it ever grows.
+    _stamp_sync_observed(len(snipes))
     return snipes
+
+
+def _stamp_sync_observed(snipe_count: int) -> None:
+    """Record that a full _sync_gixen pass completed (BUI-604).
+
+    A function rather than two inline assignments so `global` bookkeeping stays
+    out of _sync_gixen (whose body is the WON-inference path and should not
+    grow module-state mutation), and so tests can assert the stamp without
+    reaching into the sync internals.
+    """
+    global _last_sync_ok_at, _last_sync_snipe_count
+    _last_sync_ok_at = datetime.now(timezone.utc).timestamp()
+    _last_sync_snipe_count = snipe_count
 
 
 def _sync_backoff_delay(consecutive_failures: int, *, first_delay: int) -> int:
@@ -1250,6 +1299,257 @@ async def _sniper_loop() -> None:
             logger.exception("_sniper_loop: unexpected error, continuing")
         await asyncio.sleep(SNIPER_INTERVAL)
 
+
+# ---------------------------------------------------------------------------
+# Per-snipe outcome watchdog (BUI-604) — READ-ONLY
+# ---------------------------------------------------------------------------
+# Every window below is a multiple of SYNC_INTERVAL, not a round number of
+# minutes: the only thing that resolves a snipe is a completed _sync_gixen
+# pass (or the eBay fallback a sync's ENDED write arms), so "how long is too
+# long without an outcome" is measured in sync cycles by construction. At the
+# 600s default they land at 30/10/40/30 minutes.
+#
+# _WATCHDOG_PRE_END_WINDOW (3 cycles) — how close to its end a snipe has to be
+#   before its absence from Gixen is worth interrupting a human over. Three
+#   cycles is the smallest window that still contains at least two independent
+#   healthy scrapes after the one-cycle confirmation below, and BUI-562's
+#   measurement (a retry within 30s of a Gixen failure recovered 12/12) means a
+#   flapping host does NOT stretch a 3-cycle window into fewer observations.
+#
+# _WATCHDOG_VANISH_CONFIRM (1 cycle) — a vanish stamp younger than one cycle is
+#   not yet evidence. _record_vanish_observations clears the stamp the moment
+#   the row reappears, so a transient per-row scrape miss heals on the next
+#   pass; requiring the stamp to outlive a full cadence is what keeps a single
+#   glitch from becoming a banner. This is deliberately NOT "the stamp predates
+#   _last_sync_ok_at": the stamping sync sets that same variable a few
+#   milliseconds later, so such a check would pass after ONE observation and
+#   de-blip nothing.
+#
+# _WATCHDOG_POST_END_DEADLINE (4 cycles) — how long after its auction ends a
+#   snipe may stay PENDING before that silence is the alert. Sized from what
+#   the resolution machinery legitimately needs: one cycle to observe the end,
+#   one more for the deliberate BUI-417 one-cycle deferral, plus two cycles of
+#   slack for the documented flapping (the 30/60/120/240/480s backoff spends
+#   ~16 minutes on six consecutive failures).
+#
+# _WATCHDOG_SYNC_STALE_AFTER (3 cycles) — how old our newest observation may be
+#   before the watchdog stops vouching for anything. Strictly LESS than the
+#   post-end deadline, and that ordering is load-bearing: it makes "no outcome
+#   for 4 cycles" unstateable from observations older than 3, so the watchdog
+#   can never blame Gixen for a silence that is really our own sync being dead.
+_WATCHDOG_PRE_END_WINDOW = timedelta(seconds=3 * SYNC_INTERVAL)
+_WATCHDOG_VANISH_CONFIRM = timedelta(seconds=SYNC_INTERVAL)
+_WATCHDOG_POST_END_DEADLINE = timedelta(seconds=4 * SYNC_INTERVAL)
+_WATCHDOG_SYNC_STALE_AFTER = timedelta(seconds=3 * SYNC_INTERVAL)
+
+
+def _classify_watchdog_row(
+    row: sqlite3.Row, now_dt: datetime, uptime_floor_dt: datetime | None,
+) -> tuple[str, dict | None]:
+    """Bucket one PENDING bids row. Pure: no DB, no clock, no writes.
+
+    Returns ``(bucket, alert_or_None)`` where bucket is one of:
+
+    ``missing_outcome``
+        The auction ended and no terminal status arrived within the deadline.
+        THE ticket's alert: the absence of a transition, not an error.
+    ``vanished_before_end``
+        The auction is still live and inside the pre-end window, but the snipe
+        has been absent from a healthy Gixen list for at least one cycle.
+    ``unknown_end``
+        PENDING with no captured auction_end_at. Neither check can run — a
+        NULL-end row is exactly the BUI-85/BUI-417 deferral case, which is
+        *supposed* to sit PENDING for a cycle. Reported as context, never as an
+        alert; the row becomes judgeable the moment an end is captured.
+    ``ok``
+        Live, present on Gixen (or not yet near enough to its end to care).
+
+    `uptime_floor_dt` is when this process started. The overdue clock runs from
+    ``max(auction_end_at, uptime_floor)``, so an auction that ended while the
+    server was down does not alarm the instant it comes back: the resolution
+    machinery gets its full deadline of actual uptime to do its job first.
+    """
+    end_dt = _parse_iso_utc(row["auction_end_at"])
+    if end_dt is None:
+        return "unknown_end", None
+    base = {
+        "bid_id": row["id"],
+        "item_id": row["item_id"],
+        "title": row["ebay_title"],
+        "auction_end_at": row["auction_end_at"],
+        "local_snipe_result": row["local_snipe_result"],
+    }
+
+    if end_dt > now_dt:
+        vanished_dt = _parse_iso_utc(row["gixen_vanished_at"])
+        if (
+            vanished_dt is not None
+            and now_dt >= end_dt - _WATCHDOG_PRE_END_WINDOW
+            and now_dt - vanished_dt >= _WATCHDOG_VANISH_CONFIRM
+        ):
+            return "vanished_before_end", {
+                **base,
+                "kind": "vanished_before_end",
+                "gixen_vanished_at": row["gixen_vanished_at"],
+                "seconds_to_end": int((end_dt - now_dt).total_seconds()),
+                # Worded as evidence, not as a conclusion: what we actually
+                # know is that more than one healthy scrape has failed to list
+                # it. Telling a human "Gixen will not fire this" would invite
+                # them to tear down a snipe that a scrape hiccup only made look
+                # gone — the reverse of the mistake this is here to prevent.
+                "detail": (
+                    "absent from Gixen's list since "
+                    f"{row['gixen_vanished_at']} (more than one sync cycle) "
+                    "while its auction is still live. Gixen has nothing left "
+                    "to fire; the local backup bidder is now the only thing "
+                    "that will bid, and it bids off this PENDING row even if "
+                    "the snipe was cancelled on Gixen deliberately."
+                ),
+            }
+        return "ok", None
+
+    # Ended. The overdue clock starts at the later of the auction end and this
+    # process's start (see the docstring) — never earlier than we could have
+    # observed anything.
+    overdue_from = end_dt
+    if uptime_floor_dt is not None and uptime_floor_dt > overdue_from:
+        overdue_from = uptime_floor_dt
+    if now_dt - overdue_from <= _WATCHDOG_POST_END_DEADLINE:
+        return "ok", None
+    overdue_s = int((now_dt - end_dt).total_seconds())
+    return "missing_outcome", {
+        **base,
+        "kind": "missing_outcome",
+        "seconds_overdue": overdue_s,
+        "detail": (
+            f"auction ended {overdue_s // 60}m ago and the snipe is still "
+            "PENDING — no WON/LOST/ENDED/FAILED ever arrived. Check the "
+            "listing on eBay before assuming it was lost."
+        ),
+    }
+
+
+def _build_snipe_watchdog_report(
+    conn: sqlite3.Connection,
+    now_dt: datetime,
+    *,
+    process_started_at: float,
+    last_sync_ok_at: float,
+    last_sync_snipe_count: int | None,
+) -> dict:
+    """The BUI-604 watchdog verdict. READ-ONLY, by construction and on purpose.
+
+    This function issues exactly one statement against the DB — a SELECT — and
+    returns a dict derived from it. It writes no row, sets no status, opens no
+    write_transaction, takes no lock, and triggers no Gixen scrape (in
+    particular it must never call _ensure_fresh_sync/_spawn_fallback_task: an
+    observer that perturbs the thing it observes is not an observer, and a
+    dashboard poll must not be able to schedule work on the money path).
+
+    That is the entire safety argument, and it is why this ticket is allowed to
+    exist next to the eBay WON-inference:
+
+      * The alert is a PURE FUNCTION of current state. Nothing is stored, so
+        nothing can go stale, be missed on restart, or need acknowledging — and
+        an alert clears by the state changing, i.e. the moment the snipe
+        resolves, reappears on Gixen, or is removed. There is no dismiss button
+        to leave a real alarm permanently silenced.
+      * The candidate set is `status = 'PENDING'` only. Terminal rows are
+        excluded because they HAVE their outcome; the REMOVED/PURGED tombstones
+        are excluded by the same clause — a tombstone is not a terminal auction
+        outcome (BUI-49), and it is equally not a missing one, so it must
+        neither be counted as resolved evidence nor alerted on. No
+        TOMBSTONE_STATUSES_SQL filter is needed to get that right; it falls out.
+      * Nothing here can flip a row out of PENDING, so it cannot rob the local
+        sniper of a real bid (get_bids_ready_to_snipe fires on PENDING rows) nor
+        expose a stray one.
+
+    Blind spot, stated rather than hidden: _record_vanish_observations only
+    stamps gixen_vanished_at when Gixen returned a NON-empty list (BUI-85's
+    anti-glitch guard), so a scrape in which EVERY snipe disappeared at once
+    stamps nothing and the pre-end check stays silent. That case degrades to
+    the post-end `missing_outcome` check, which does not depend on the stamp.
+    `sync.last_snipe_count` is reported so a human can see a zero-snipe scrape
+    for what it is.
+    """
+    sync_age = None if last_sync_ok_at <= 0 else now_dt.timestamp() - last_sync_ok_at
+    if sync_age is None:
+        sync_state = "never"
+    elif sync_age > _WATCHDOG_SYNC_STALE_AFTER.total_seconds():
+        sync_state = "stale"
+    else:
+        sync_state = "ok"
+
+    uptime_floor_dt = (
+        datetime.fromtimestamp(process_started_at, timezone.utc)
+        if process_started_at > 0
+        else None
+    )
+
+    # The one statement this function issues. `WHERE status = 'PENDING'` is
+    # served by the BUI-67 partial unique index (bids(item_id) WHERE
+    # status='PENDING'), so this scans the live snipes, NOT the never-pruned
+    # bids history table — the cost BUI-418 moved a full get_all_bids() scan
+    # out of the write lock to avoid. Verified via EXPLAIN QUERY PLAN:
+    # "SCAN bids USING INDEX idx_bids_pending_item_id".
+    rows = conn.execute(
+        "SELECT id, item_id, ebay_title, auction_end_at, gixen_vanished_at, "
+        "local_snipe_result FROM bids WHERE status = 'PENDING'"
+    ).fetchall()
+
+    alerts: list[dict] = []
+    counts = {"ok": 0, "unknown_end": 0, "vanished_before_end": 0, "missing_outcome": 0}
+    for row in rows:
+        bucket, alert = _classify_watchdog_row(row, now_dt, uptime_floor_dt)
+        counts[bucket] += 1
+        if alert is not None:
+            alerts.append(alert)
+    alerts.sort(key=lambda a: (a["kind"], a["item_id"]))
+
+    # A watchdog that reports on snipes using observations it knows are stale
+    # is the fails-green bug it exists to prevent, so when our own sync is not
+    # healthy the per-snipe alerts are withheld and replaced by ONE alert about
+    # the sync. Their count is still reported (never silently dropped) so the
+    # information is de-escalated, not hidden.
+    suppressed = 0
+    if sync_state != "ok":
+        suppressed = len(alerts)
+        alerts = [{
+            "kind": "sync_stale",
+            "detail": (
+                "the comics server has not completed a Gixen sync "
+                + ("at all since it started" if sync_state == "never"
+                   else f"in {int(sync_age // 60)}m")
+                + " — snipe outcomes cannot be vouched for until it does."
+            ),
+        }]
+
+    return {
+        "generated_at": now_dt.isoformat(),
+        "healthy": not alerts,
+        "alerts": alerts,
+        "counts": counts,
+        "suppressed_alert_count": suppressed,
+        "pending_watched": len(rows),
+        "sync": {
+            "state": sync_state,
+            "last_ok_at": (
+                None if last_sync_ok_at <= 0
+                else datetime.fromtimestamp(last_sync_ok_at, timezone.utc).isoformat()
+            ),
+            "age_seconds": None if sync_age is None else int(sync_age),
+            "stale_after_seconds": int(_WATCHDOG_SYNC_STALE_AFTER.total_seconds()),
+            "last_snipe_count": last_sync_snipe_count,
+        },
+        "windows": {
+            "sync_interval_seconds": SYNC_INTERVAL,
+            "pre_end_window_seconds": int(_WATCHDOG_PRE_END_WINDOW.total_seconds()),
+            "vanish_confirm_seconds": int(_WATCHDOG_VANISH_CONFIRM.total_seconds()),
+            "post_end_deadline_seconds": int(_WATCHDOG_POST_END_DEADLINE.total_seconds()),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -1300,6 +1600,14 @@ def _spawn_fallback_task() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _db, _db_path, _api_client, _sync_client, _api_lock, _sync_lock, _write_lock, _ebay_fallback_lock, _bidder
+    global _process_started_at, _last_sync_ok_at, _last_sync_snipe_count
+    # BUI-604: the watchdog's uptime floor. Reset (not merely initialized) here
+    # so a restart genuinely restarts the grace window and does not inherit a
+    # previous run's "we synced fine" stamp from the same interpreter — which is
+    # exactly what a test suite booting the app twice would otherwise hand it.
+    _process_started_at = datetime.now(timezone.utc).timestamp()
+    _last_sync_ok_at = 0.0
+    _last_sync_snipe_count = None
     if env_file := os.getenv("ENV_FILE"):
         load_dotenv(env_file)
     # Resolve the eBay fallback binary now that the .env (EBAY_FETCH_BIN, PATH)
@@ -1783,6 +2091,24 @@ async def api_get_history():
     """).fetchall()
 
     return [_serialize_snipe_row(dict(row)) for row in rows]
+
+
+@app.get("/api/snipe-watchdog")
+async def api_snipe_watchdog():
+    """BUI-604: which PENDING snipes are missing an outcome they should have.
+
+    Pure DB read — deliberately no _ensure_fresh_sync() and no
+    _spawn_fallback_task(), unlike /api/snipes. This endpoint observes the
+    snipe lifecycle; it must not drive it. See
+    _build_snipe_watchdog_report()'s docstring for the full read-only argument.
+    """
+    return _build_snipe_watchdog_report(
+        _get_db(),
+        datetime.now(timezone.utc),
+        process_started_at=_process_started_at,
+        last_sync_ok_at=_last_sync_ok_at,
+        last_sync_snipe_count=_last_sync_snipe_count,
+    )
 
 
 @app.get("/api/bids")
