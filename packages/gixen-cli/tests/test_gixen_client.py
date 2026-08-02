@@ -649,9 +649,18 @@ class TestListSnipes:
         `<td>WON\\n</td>` — a trailing newline inside the cell, captured
         verbatim on 2026-08-02. The `[^<]+` capture takes the newline with
         it, so the `.strip()` at gixen_client.py:1120 is load-bearing, not
-        defensive tidiness: without it every downstream exact-match on
-        "WON" (`GIXEN_TERMINAL_MAP`, `filter_ended_won`, the purge count)
-        silently fails to match and a real win reads as unrecognized.
+        defensive tidiness.
+
+        Which consumers it actually protects, since they differ:
+
+        * `cli.py`'s purge dry-run count tests `s["status"] in
+          GIXEN_RAW_TERMINAL_STATUSES` (cli.py:1054) — exact membership, no
+          re-normalization of its own. "WON\\n" misses, and a completed snipe
+          goes uncounted. This one breaks.
+        * `_map_terminal_status` re-applies `.upper().strip()` before its
+          dict lookup, and `record_win_prep.filter_ended_won` uses a
+          substring test — both survive an unstripped value. They are not
+          the reason this strip exists.
 
         A fixture that rendered the value with no surrounding whitespace —
         the obvious thing to write from a guess — would pass whether or not
