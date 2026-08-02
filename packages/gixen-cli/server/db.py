@@ -1051,6 +1051,18 @@ def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     # Soft-delete tombstone. Renamed PURGED -> REMOVED in BUI-49; skip rows that
     # already carry either tombstone value so we don't re-stamp resolved_at.
     #
+    # non-unique-key-mutation: allow (BUI-606 review) — this is item_id-wide,
+    # unlike mark_bids_purged below it does NOT exclude PENDING. Both callers
+    # (api_remove_bid, api_purge's sibling-cleanup loop) invoke this only
+    # after confirming Gixen itself no longer has a live snipe for item_id, so
+    # the BUI-178 "live snipe silently vanishes" class does not apply here —
+    # whatever PENDING row exists for item_id IS the one just removed. What
+    # this does NOT guard against: an old resolved-but-not-yet-purged sibling
+    # sharing item_id (mark_bids_purged's own scenario) gets its resolved_at
+    # collaterally overwritten to `now` and re-tombstoned early. Narrower than
+    # a live-snipe loss, not independently reviewed here — worth a follow-up
+    # ticket to id-scope this the same way mark_bids_purged is guarded.
+    #
     # Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
     conn.execute(
         f"UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL})",
@@ -1079,6 +1091,16 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     # can have a live PENDING row alongside an old WON/LOST row sharing the
     # item_id. Without this filter the completed-sweep tombstones BOTH and the
     # live snipe silently vanishes. Only tombstone resolved (completed) rows.
+    #
+    # non-unique-key-mutation: allow (BUI-606 review) — item_id-wide, but the
+    # `NOT IN ('PENDING', ...)` filter above is exactly the row-scoping
+    # argument: at most one PENDING row can ever exist per item_id (the
+    # partial unique index), and this statement provably excludes it, so the
+    # only rows a shared item_id can additionally match are already-resolved
+    # siblings this sweep is meant to tombstone anyway. Regression-tested by
+    # test_mark_bids_purged_spares_live_pending_sharing_item_id in
+    # tests/test_server_db.py — seeds two rows sharing an item_id and asserts
+    # the live PENDING one survives.
     #
     # Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
     conn.execute(

@@ -20,6 +20,14 @@ symptoms:
   - "A snipe that should have fired never does, or a phantom result appears for an auction still live"
 root_cause: scope_issue
 resolution_type: code_fix
+mechanized_by:
+  - lint
+  - test
+lint:
+  - non-unique-key-mutation
+enforced_by_test:
+  - packages/gixen-cli/tests/test_ebay_fallback.py::test_fallback_won_write_spares_live_pending_sharing_item_id
+  - packages/gixen-cli/tests/test_server_db.py::test_mark_bids_purged_spares_live_pending_sharing_item_id
 tags:
   - "item-id-not-unique"
   - "status-write-scoping"

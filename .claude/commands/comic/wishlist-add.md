@@ -23,12 +23,15 @@ Metron requires credentials. They live in `~/.config/locg/.env` as
 
 ```bash
 set -a; . ~/.config/locg/.env 2>/dev/null; set +a
-[ -n "$METRON_USERNAME" ] && [ -n "$METRON_PASSWORD" ] && echo "metron creds ok" || echo "MISSING"
+if [ -z "$METRON_USERNAME" ] || [ -z "$METRON_PASSWORD" ]; then
+  echo "MISSING: Metron credentials not found. Add METRON_USERNAME and METRON_PASSWORD to ~/.config/locg/.env and retry."
+  exit 1
+fi
+echo "metron creds ok"
 ```
 
-**If `MISSING`:** Stop with:
-> Metron credentials not found. Add `METRON_USERNAME` and `METRON_PASSWORD` to
-> `~/.config/locg/.env` and retry.
+A non-zero exit here means credentials are missing — stop the skill and report
+the message above; do not proceed to Step 1.
 
 Also source the shared Metron call convention
 (`docs/conventions/metron-api-best-practices.md`, BUI-262) — every Metron call
