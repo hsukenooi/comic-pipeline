@@ -140,6 +140,12 @@ The soft-delete status for a snipe removed from the working set — written when
 ### Phantom WON
 The failure class where the system records a win on an auction it never actually bid: a snipe cancelled while live still has its auction end, and a final price under the snipe's max reads as a win to price-based outcome inference. The guard is evidence-layer disambiguation — a row with positive evidence of a pre-end cancel (it vanished from Gixen well before its auction end, or a [[Bid Group]] sibling already won within its lifetime) is tombstoned before inference runs. The inference itself stays permissive: requiring bid evidence would suppress the genuine wins it exists to recover.
 
+### Pre-Trade Check
+A policy check run at order entry — any write that sets or raises a snipe's max bid (a new add, a re-add upsert, an edit, a batch row) — before the Gixen write commits. It challenges out-of-policy commitments (a bid over FMV, a stale FMV, an unpriced entry, an ungrouped duplicate comic, aggregate pending exposure past a ceiling) but is advisory-first: v1 never blocks, and even a check later flipped to blocking honors an explicit, ledger-recorded bypass. Scoped to order entry only — outcome classification and the [[Phantom WON]] inference are never gated. (BUI-609.)
+
+### Decisions Ledger
+An append-only record, one row per accepted order-entry write, of what the system knew when money committed: the FMV inputs consulted (or their absence), the computed bid cap and the rule that set it, every [[Pre-Trade Check]] advisory raised, and any bypass. Retro disputes become row lookups instead of transcript archaeology. A ledger write failure never blocks the snipe — the audit trail must not become a new way to miss an auction. Distinct from [[Group-Win Evidence]], which records outcomes; this records commitments. (BUI-609.)
+
 ## FMV & Pricing
 
 ### Money Path
