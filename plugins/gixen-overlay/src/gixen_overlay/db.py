@@ -736,9 +736,120 @@ def _strip_embedded_issue(title: str, issue: str) -> str:
     return re.sub(r'\s+', ' ', cleaned).strip()
 
 
-def _normalize_comic_title(title: str, issue: str) -> str:
+# --- BUI-599: signals that make the class-B truncation below DECLINE. -------
+#
+# Every one of these is matched ONLY against the text that follows a confirmed
+# `#<own issue>` token — never against the series name that precedes it. That
+# anchoring is what makes a vocabulary test safe here: BUI-596's rule.md warns
+# that a whole-title vocabulary scan false-positives on genuine series names
+# (its scan flags `DC Comics Presents` purely for containing "DC Comics"), and
+# no series name can reach these patterns, because the series name is exactly
+# the part that is kept and never examined.
+
+# A multi-issue lot: `#18,19,20,21,22 ...` or `... lot of 5 ...` (class D).
+_LOT_RUN_RE = re.compile(r'\s*[,/&+]\s*\d')
+_LOT_PHRASE_RE = re.compile(r'\blot\s+of\s+\d', re.IGNORECASE)
+
+# An edition designation that belongs in the `variant` COLUMN (class C). The
+# printing/facsimile members are not present in BUI-596's measured 60 class-B
+# rows — they are here because a printing marker is a documented data-loss
+# class in this repo (BUI-364/372/373), and the cost of listing one that never
+# fires is zero while the cost of omitting one is a silent merge.
+_VARIANT_DESIGNATION_RE = re.compile(
+    r'\b(variants?|virgin|newsstand|foil|incentive|cover|1:\d+'
+    r'|facsimile|reprint|printing|ptg)\b',
+    re.IGNORECASE,
+)
+
+# Separators left dangling on the kept prefix once the tail is cut, e.g.
+# `FANTASTIC FOUR # 31 - (VG-) ...` would otherwise keep a trailing hyphen.
+_TRAILING_SEPARATORS = " \t-–—:,;|"
+
+
+def _strip_listing_tail(
+    title: str, issue: str, variant: str | None = None
+) -> str | None:
+    """Truncate *title* at its own ``#<issue>`` token, keeping only the series
+    text before it (BUI-599, the class-B "full listing title" shape).
+
+    Returns the truncated title, or ``None`` when the rule declines to fire —
+    the caller then falls back to BUI-591's issue-token strip.
+
+    Keyed on exactly the signal BUI-591 already trusts (the row's own issue
+    number, duplicated into its own title), so it inherits BUI-596's proof
+    that the signal has zero false positives on the live table: the `#<own
+    issue>` rule and the loose `title LIKE '%#%'` heuristic select the same
+    173 rows out of 808, i.e. there are no legitimate `#`-in-title rows to
+    damage. What changes is only what happens *after* the token is located:
+    BUI-591 deleted the token and kept the rest, which left
+    `"Iron Man #126 (Marvel Comics September 1979) VF Condition!"` as
+    `"Iron Man (Marvel Comics September 1979) VF Condition!"` — still
+    malformed, still unreachable. Truncating instead yields `"Iron Man"`,
+    which is also exactly the `proposed_new_title` BUI-596's own remediation
+    plan derives for these rows.
+
+    Declines in three cases, each a fail-open:
+
+    - **Nothing usable before the token** (``"#126 VF"``): there is no series
+      name to keep, so the title is left for BUI-591's strip.
+    - **A multi-issue lot** (class D, ``"Amazing Spider-man #18,19,20,21,22
+      lot of 5"``): truncating would produce a clean-looking `Amazing
+      Spider-man` #18 that silently asserts the lot *is* issue 18. Whether a
+      lot should produce a `comics` row at all is an open product decision;
+      declining preserves today's behaviour rather than pre-empting it.
+    - **A variant designation with no `variant` supplied** (class C,
+      ``"Absolute Flash #10 Nick Robles Cover"``, ``"Iron Man #125 Newsstand
+      Variant ..."``): `variant` is part of row identity (BUI-28), so cutting
+      a cover designation out of the title without moving it into that column
+      would merge a variant into its base edition — and merge distinct variant
+      siblings (`#20 Bermejo Variant` / `#20 Crain Variant`) into one row.
+      That is precisely the "silently collide two distinct books" failure this
+      write boundary must not have. When the caller *does* supply `variant`,
+      the designation is already recorded in its column and truncation is safe,
+      so the rule fires normally.
+    """
+    issue_str = str(issue).strip() if issue else ""
+    if not title or not issue_str:
+        return None
+    match = re.search(rf'#\s*{re.escape(issue_str)}\b', title, flags=re.IGNORECASE)
+    if match is None:
+        return None
+
+    tail = title[match.end():]
+    if _LOT_RUN_RE.match(tail) or _LOT_PHRASE_RE.search(tail):
+        logger.warning(
+            "upsert_comic: declining listing-title truncation — text after '#%s' "
+            "reads as a multi-issue lot, and one comics row cannot stand for "
+            "several books (BUI-599 class D, open). title=%r",
+            issue_str,
+            title,
+        )
+        return None
+    # `not variant`, not `variant is None`: `upsert_comic` already folds a
+    # blank variant to None before calling, but the helper must reach the same
+    # verdict when called directly with "" — a blank variant means the
+    # designation was NOT recorded, whichever spelling of blank arrives.
+    if not variant and _VARIANT_DESIGNATION_RE.search(tail):
+        logger.warning(
+            "upsert_comic: declining listing-title truncation — text after '#%s' "
+            "carries a variant designation but no `variant` was supplied; "
+            "truncating would merge this into the base edition (BUI-599 class C, "
+            "open; variant is row identity per BUI-28). title=%r",
+            issue_str,
+            title,
+        )
+        return None
+
+    prefix = title[: match.start()].strip().rstrip(_TRAILING_SEPARATORS).strip()
+    # Compose with BUI-591's strip so a prefix that itself ends in the bare
+    # issue token lands on its final form in ONE pass — without this, a second
+    # call would keep normalizing and the function would not be idempotent.
+    return _strip_embedded_issue(prefix, issue_str) or None
+
+
+def _normalize_comic_title(title: str, issue: str, variant: str | None = None) -> str:
     """Strip a duplicated issue number out of *title* before it becomes row
-    identity (BUI-591).
+    identity (BUI-591), and — since BUI-599 — the listing junk that followed it.
 
     `POST /api/comics` used to store `title` verbatim, so any writer that
     isn't `comic-fmv` (which normalizes client-side per BUI-346) could persist
@@ -758,13 +869,39 @@ def _normalize_comic_title(title: str, issue: str) -> str:
     intentionally keep "The" (e.g. "The Amazing Spider-Man"), and folding that
     in here would change the identity key for a much wider, unmeasured set of
     existing rows than BUI-591's blast-radius measurement (`title LIKE
-    '%#%'`) covered. This closes the **doubled-issue-number** malformed class
-    only (e.g. `"X-Men #123"` -> `"X-Men"`) — it does NOT close the **full
-    listing title** class (e.g. `"Iron Man #126 (Marvel Comics September
-    1979) VF Condition!"`, which still contains "Marvel"/"VF Condition!"
-    after this strip). Inventing a speculative listing-title parser at this
-    durable write boundary is out of scope for BUI-591 — see the ticket."""
-    return _strip_embedded_issue(title, issue)
+    '%#%'`) covered.
+
+    Two rules, tried in order:
+
+    1. **BUI-599** — `_strip_listing_tail` truncates at the `#<issue>` token,
+       so a whole eBay listing title collapses to its series name
+       (`"Iron Man #126 (Marvel Comics September 1979) VF Condition!"` ->
+       `"Iron Man"`). It declines on the two shapes where truncation would
+       destroy meaning rather than junk — a multi-issue lot and an unrecorded
+       variant designation; see its docstring.
+    2. **BUI-591** — otherwise, `_strip_embedded_issue` removes just the
+       duplicated issue token, which also covers the bare-trailing-token form
+       (`"Amazing Spider-Man 300"`) that carries no `#` for rule 1 to cut at.
+
+    Idempotent: rule 1 keeps only text preceding the *first* `#<issue>` and
+    composes BUI-591's strip into that prefix, so re-normalizing an
+    already-normalized title is a no-op — which matters because this runs on
+    every write to a durable identity column, not once at migration time.
+
+    Note the *result* of normalizing can equal an existing row's title. That
+    is the intended effect, not a collision: `upsert_comic`'s reconciliation
+    then resolves the write onto that existing row instead of inserting a
+    second, unreachable placeholder beside it. The unique indexes are never
+    reached with a duplicate key."""
+    truncated = _strip_listing_tail(title, issue, variant)
+    if truncated is not None:
+        return truncated
+    # `or title` completes the fail-open contract above. A title that is
+    # NOTHING but its own issue token ("#126") strips to the empty string, and
+    # BUI-591 stored that — `comics.title` is NOT NULL but '' satisfies NOT
+    # NULL, so a blank identity would have been written. Keep the original: a
+    # malformed title is recoverable, an empty one is not.
+    return _strip_embedded_issue(title, issue) or title
 
 
 def upsert_comic(
@@ -778,8 +915,11 @@ def upsert_comic(
 ) -> int:
     """Upsert a comic identity row. Returns the comic id.
 
-    BUI-591: `title` is normalized (duplicated issue number stripped) before
-    it becomes row identity — see `_normalize_comic_title`.
+    BUI-591/BUI-599: `title` is normalized before it becomes row identity — the
+    duplicated issue number and any listing junk trailing it are removed; see
+    `_normalize_comic_title`. A caller that posts a full eBay listing title
+    therefore resolves onto the clean row for that book (creating it if it does
+    not exist) rather than depositing a second, unreachable one beside it.
 
     `variant` (BUI-28) is part of the row identity: a base cover and its
     Newsstand/Direct/etc. variant of the same (title, issue, year) get distinct
@@ -804,14 +944,18 @@ def upsert_comic(
     When multiple yeared rows exist for the same (title, issue) — pre-PER-98
     historical data — the one with locg_id set wins; ties broken by lowest id.
     """
-    # BUI-591: normalize before any identity query runs, so reconciliation
-    # below (and the yearless-promotion logic) all operate on the same
-    # cleaned title every caller would have seen.
-    title = _normalize_comic_title(title, issue)
-
     # BUI-28: normalize blank variant to NULL (base edition) and scope every
     # identity query to this variant so reconciliation never crosses variants.
+    # BUI-599 moved this ABOVE the title normalization, which now needs to know
+    # whether a variant was supplied before it will cut a cover designation out
+    # of the title.
     variant = (variant or "").strip() or None
+
+    # BUI-591/BUI-599: normalize before any identity query runs, so
+    # reconciliation below (and the yearless-promotion logic) all operate on
+    # the same cleaned title every caller would have seen.
+    title = _normalize_comic_title(title, issue, variant)
+
     v_sql = "variant=?" if variant is not None else "variant IS NULL"
     v_param: tuple = (variant,) if variant is not None else ()
 
@@ -1056,10 +1200,13 @@ def upsert_fmv(
     - A freshly-PRICED book (incoming low/high set, no flag) stores the new price
       and CLEARS any prior flag — a book that used to be unpriceable but now
       prices cleanly is no longer needs_manual.
-    - A bare n=0 STUB (no price, no flag) COALESCE-preserves the existing price
-      and flag — this is the n=0 stub guard, and it is NOT weakened here: the
-      stub path is reached only when excluded.flag_reason IS NULL AND
-      excluded.low IS NULL, so it can never wipe a real price.
+    - A bare n=0 STUB (no price, no flag) preserves the existing row — this is
+      the n=0 stub guard, and it is NOT weakened here: the stub path is reached
+      only when excluded.flag_reason IS NULL AND excluded.low IS NULL, so it can
+      never wipe a real price. BUI-599 widened it from the price to the
+      metadata beside it (comps/confidence/notes), which a stub used to
+      overwrite because it carries them non-NULL (`fmv_comps: 0`, a confidence
+      label, notes) — leaving the contradictory `low=15 high=20 comps=0`.
     """
     if grade is None:
         raise ValueError("grade is required for upsert_fmv")
@@ -1081,7 +1228,16 @@ def upsert_fmv(
                                ELSE COALESCE(excluded.low,   low) END,
             high        = CASE WHEN excluded.flag_reason IS NOT NULL THEN NULL
                                ELSE COALESCE(excluded.high,  high) END,
+            -- BUI-599: extend the stub guard from the price to the metadata
+            -- beside it. A bare stub is not "empty" on the wire — fmv_runner
+            -- posts n=0 as `fmv_comps: 0` (not NULL) with a confidence label
+            -- and notes, so COALESCE alone let a failed lookup overwrite a
+            -- priced row's comps/confidence/notes and leave `low=15 high=20
+            -- comps=0` behind. When the incoming row is a stub (no flag, no
+            -- price) AND the stored row holds a real price, keep the stored
+            -- metadata: a failed lookup must not degrade a good answer.
             comps       = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.comps
+                               WHEN excluded.low IS NULL AND low IS NOT NULL THEN comps
                                ELSE COALESCE(excluded.comps, comps) END,
             -- A flagged incoming row also drops stale auto-price metadata: a
             -- flag-only POST ({grade, fmv_flag_reason}) carries NULL confidence
@@ -1089,8 +1245,10 @@ def upsert_fmv(
             -- priced row's confidence/notes — else a needs_manual book would
             -- surface the old auto-price's confidence='high'/notes on /comics.
             confidence  = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.confidence
+                               WHEN excluded.low IS NULL AND low IS NOT NULL THEN confidence
                                ELSE COALESCE(excluded.confidence, confidence) END,
             notes       = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.notes
+                               WHEN excluded.low IS NULL AND low IS NOT NULL THEN notes
                                ELSE COALESCE(excluded.notes,      notes) END,
             -- A flagged row stores its flag; a freshly-priced row clears any
             -- prior flag (incoming low set ⇒ no longer needs_manual); a bare

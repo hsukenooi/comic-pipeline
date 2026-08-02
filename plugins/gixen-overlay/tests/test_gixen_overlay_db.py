@@ -274,11 +274,13 @@ def test_upsert_comic_preserves_leading_article(db):
     assert row["title"] == "The Mighty Thor"
 
 
-def test_upsert_comic_full_listing_title_not_fully_cleaned(db):
-    """Honest about what this fix does NOT close (BUI-591 EM warning): a
-    full eBay listing title stored verbatim only loses the embedded issue
-    token, not the rest of the junk. Closing this class would require a
-    listing-title parser, which is explicitly out of scope."""
+def test_upsert_comic_full_listing_title_is_truncated_to_the_series(db):
+    """BUI-599 closes what BUI-591 left open. This test previously asserted the
+    *incomplete* result (`'Iron Man (Marvel Comics September 1979) VF
+    Condition!'`) — a title that had lost its issue token but was still
+    unreachable by any (title, issue) lookup. Truncating at the token instead of
+    deleting it leaves the series name alone, which is what every consumer
+    queries by."""
     cid = upsert_comic(
         db,
         "Iron Man #126 (Marvel Comics September 1979) VF Condition!",
@@ -286,9 +288,8 @@ def test_upsert_comic_full_listing_title_not_fully_cleaned(db):
         1979,
     )
     row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
-    assert "#126" not in row["title"]
-    # Still malformed — the rest of the listing text survives, unchanged.
-    assert row["title"] == "Iron Man (Marvel Comics September 1979) VF Condition!"
+    assert row["title"] == "Iron Man"
+    assert row["issue"] == "126"
 
 
 def test_upsert_comic_normalization_fails_open_on_blank_issue(db):
@@ -305,6 +306,232 @@ def test_normalize_comic_title_fails_open_on_none_issue():
     empty-string case exercised above, which is the only value `upsert_comic`
     can actually receive given its NOT NULL issue column) also fails open."""
     assert _normalize_comic_title("Some Weird Title #1", None) == "Some Weird Title #1"
+
+
+# ---------------------------------------------------------------------------
+# upsert_comic — listing-title truncation (BUI-599, BUI-596 class B)
+#
+# BUI-591 deleted the duplicated issue token and kept whatever followed it,
+# which closed only the "doubled issue and nothing else" shape (BUI-596 class
+# A, 99 rows). BUI-599 truncates AT the token instead, closing the "whole eBay
+# listing title" shape (class B, 60 rows) — and deliberately DECLINES on the
+# two shapes where cutting the tail would destroy meaning rather than junk:
+# a multi-issue lot (class D) and an unrecorded variant designation (class C).
+#
+# The shapes below are verbatim rows from BUI-596's frozen measurement
+# (docs/plans/bui-596-malformed-comic-titles/rows.tsv), not invented examples.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "title, issue, expected",
+    [
+        # Parenthesised publisher + month, then a grade and a condition shout.
+        (
+            "The Uncanny X-Men #212 (Marvel Comics December 1986) VF condition",
+            "212",
+            "The Uncanny X-Men",
+        ),
+        # Parenthesised grade, then a key-issue note.
+        (
+            "The Mighty Thor #127 (FN+) 1st App of Pluto & Hippolyta",
+            "127",
+            "The Mighty Thor",
+        ),
+        # Spaced `# 31`, and a dash left dangling on the kept prefix.
+        (
+            "FANTASTIC FOUR # 31 - (VG-) -THE MAD MENACE OF THE MACABRE MOLE MAN-THING-TORCH",
+            "31",
+            "FANTASTIC FOUR",
+        ),
+        # An apostrophe in the series name must survive the cut.
+        (
+            "WORLD'S FINEST # 186 - (FINE) -SUPERMAN/BATMAN-THE BAT-WITCH MUST BURN-HOT-ROD",
+            "186",
+            "WORLD'S FINEST",
+        ),
+        # No parentheses at all — bare trailing seller vocabulary.
+        ("X-men #58 Silver age Neal Adams 1st Havok Key", "58", "X-men"),
+        ("Amazing Spider-man #15 Dr. Doom NM Gem Wow", "15", "Amazing Spider-man"),
+        # Class A still lands where BUI-591 put it: truncation and deletion
+        # agree when there is no tail.
+        ("Thor #130", "130", "Thor"),
+    ],
+)
+def test_upsert_comic_truncates_listing_title_to_series(db, title, issue, expected):
+    cid = upsert_comic(db, title, issue)
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] == expected
+
+
+def test_upsert_comic_listing_title_lands_on_the_existing_clean_row(db):
+    """The point of the whole change, and the BUI-596 head-to-head in
+    miniature: comics 311 held the real `Iron Man` #126 with priced comps, and
+    a listing-titled write deposited placeholder 343 beside it ninety seconds
+    later. The clean row must now absorb that write instead."""
+    clean = upsert_comic(db, "Iron Man", "126", 1979)
+    listing = upsert_comic(
+        db,
+        "Iron Man #126 (Marvel Comics September 1979) VF Condition!",
+        "126",
+        1979,
+    )
+    assert listing == clean
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+
+def test_upsert_comic_listing_title_first_still_shares_identity(db):
+    """Order-independent: the listing-titled write arriving FIRST must create
+    the row under the clean title, so the later clean write finds it rather
+    than making a second one."""
+    listing = upsert_comic(
+        db, "Green Lantern #86 (VF) Neal Adams Anti-Drug Story", "86", 1971
+    )
+    clean = upsert_comic(db, "Green Lantern", "86", 1971)
+    assert listing == clean
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+
+def test_normalize_comic_title_is_idempotent():
+    """Hard requirement at a durable write boundary: this runs on every write,
+    not once at migration time, so normalizing an already-normalized title must
+    be a no-op. The composed `_strip_embedded_issue` call inside the truncation
+    is what makes a prefix that itself ends in the issue token settle in one
+    pass instead of eroding further on the next write."""
+    for title, issue in [
+        ("Iron Man #126 (Marvel Comics September 1979) VF Condition!", "126"),
+        ("THE MIGHTY THOR # 130 - (NM-) -HERCULES-PLUTO-THUNDER IN THE NETHERWORLD", "130"),
+        ("Amazing Spider-man #18,19,20,21,22 lot of 5 NM Gems Wow", "18"),
+        ("Absolute Flash #10 Nick Robles Cover", "10"),
+        ("Amazing Spider-Man 300", "300"),
+        ("X-Men 2099", "99"),
+        ("Thor 130 #130", "130"),
+    ]:
+        once = _normalize_comic_title(title, issue)
+        assert _normalize_comic_title(once, issue) == once, title
+        assert once.strip(), title
+
+
+def test_normalize_comic_title_never_blanks_a_title():
+    """Fails open when there is no series name to keep: a title that is nothing
+    BUT the issue token has no prefix to truncate to, so it falls back to
+    BUI-591 rather than being reduced to the empty string — `comics.title` is
+    NOT NULL and an empty identity would be worse than a malformed one."""
+    assert _normalize_comic_title("#126 VF Condition!", "126")
+    assert _normalize_comic_title("#126", "126")
+
+
+def test_normalize_comic_title_leaves_bui596_remediated_titles_alone():
+    """The property that lets this change and BUI-596's cleanup compose instead
+    of fighting: BUI-596 rewrites a malformed row to the text before its `#`,
+    which is the same string this normalizer produces. So a remediated row that
+    is written to again keeps its remediated title — if the two disagreed, every
+    post-cleanup write would drag rows back off the remediated value.
+
+    Titles below are verbatim `proposed_new_title` values from that plan."""
+    for title, issue in [
+        ("WORLD'S FINEST", "200"),
+        ("THE MIGHTY THOR", "130"),
+        ("Amazing Spider-man", "5"),
+        ("Giant Size X-men", "1"),
+        ("X-men", "12"),
+        ("Iron Man", "126"),
+    ]:
+        assert _normalize_comic_title(title, issue) == title
+
+
+def test_normalize_comic_title_declines_on_edition_markers():
+    """The decline vocabulary covers printings and facsimiles alongside cover
+    variants — all are edition distinctions that live in `variant`, and a
+    printing marker is a documented data-loss class here (BUI-364/372/373)."""
+    for title, issue in [
+        ("Amazing Spider-Man #300 2nd Printing NM", "300"),
+        ("Amazing Spider-Man #300 Facsimile Edition", "300"),
+        ("Amazing Spider-Man #300 2nd Ptg VF", "300"),
+    ]:
+        assert _normalize_comic_title(title, issue) != "Amazing Spider-Man"
+
+
+def test_upsert_comic_declines_truncation_for_multi_issue_lot(db):
+    """Class D stays open by design. Truncating would mint a clean-looking
+    `Amazing Spider-man` #18 that silently asserts a five-book lot IS issue 18,
+    and would merge it with the real single issue. Whether a lot should produce
+    a comics row at all is an unmade product decision, so this preserves
+    today's behaviour (BUI-591's strip) instead of pre-empting it."""
+    cid = upsert_comic(db, "Amazing Spider-man #18,19,20,21,22 lot of 5 NM Gems Wow", "18")
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] != "Amazing Spider-man"
+    assert "19,20,21,22" in row["title"]
+
+
+def test_upsert_comic_declines_truncation_for_space_separated_lot(db):
+    """The lot guard is not only the comma run — `lot of N` catches the same
+    shape written without the enumerated issue list."""
+    cid = upsert_comic(db, "Uncanny X-men #146 Bronze age Dr. Doom lot of 2 Wow", "146")
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] != "Uncanny X-men"
+
+
+def test_upsert_comic_declines_truncation_for_unrecorded_variant(db):
+    """Class C stays open by design, and this is the constraint that decides
+    it: `variant` is row identity (BUI-28), so cutting a cover designation out
+    of the title without moving it into that column would silently merge a
+    variant into its base edition."""
+    cid = upsert_comic(db, "Absolute Flash #10 Nick Robles Cover", "10")
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] != "Absolute Flash"
+    assert "Nick Robles Cover" in row["title"]
+
+
+def test_upsert_comic_variant_siblings_do_not_collide(db):
+    """The adversarial case this write boundary must not have: two DIFFERENT
+    cover variants of the same issue, neither carrying a `variant` value, must
+    not collapse into one row. Truncating both would key them identically on
+    (LOWER(title), issue, COALESCE(variant,'')) and silently merge two distinct
+    books — so the guard declines and they stay distinct."""
+    a = upsert_comic(db, "Amazing Spider-man #20 Bermejo Variant NM Gem Wow", "20")
+    b = upsert_comic(db, "Amazing Spider-man #20 Crain Variant NM Gem Wow", "20")
+    assert a != b
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 2
+
+
+def test_upsert_comic_truncates_when_the_variant_is_actually_recorded(db):
+    """The variant guard is about the designation being LOST, not about the
+    word appearing. A caller that puts the designation in its own column has
+    already preserved the distinction, so the title is safe to truncate — and
+    the two variants remain distinct rows via the variant column, which is
+    exactly where the distinction belongs."""
+    a = upsert_comic(
+        db, "Amazing Spider-man #20 Bermejo Variant NM Gem Wow", "20", variant="Bermejo"
+    )
+    b = upsert_comic(
+        db, "Amazing Spider-man #20 Crain Variant NM Gem Wow", "20", variant="Crain"
+    )
+    assert a != b
+    titles = {
+        r["title"] for r in db.execute("SELECT title FROM comics").fetchall()
+    }
+    assert titles == {"Amazing Spider-man"}
+
+
+def test_upsert_comic_truncation_respects_variant_scoping(db):
+    """A truncated variant write must not be absorbed by the base edition:
+    reconciliation is variant-scoped (BUI-28), and normalizing the title does
+    not weaken that."""
+    base = upsert_comic(db, "Amazing Spider-man", "20", 2022)
+    var = upsert_comic(
+        db, "Amazing Spider-man #20 Bermejo Variant NM Gem Wow", "20", 2022,
+        variant="Bermejo",
+    )
+    assert base != var
+
+
+def test_upsert_comic_truncation_does_not_chew_a_longer_number(db):
+    """`#99` must not match inside `#2099`, and the year-like token in the
+    series name must survive the cut."""
+    cid = upsert_comic(db, "X-Men 2099 #99 (VF) Some Key Note", "99")
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["title"] == "X-Men 2099"
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +747,85 @@ def test_upsert_fmv_n0_stub_does_not_wipe_real_price(db):
     assert row["high"] == 1000.0
     assert row["comps"] == 12
     assert row["flag_reason"] is None
+
+
+def test_upsert_fmv_n0_stub_does_not_zero_the_comps_of_a_priced_row(db):
+    """BUI-599 co-fix, and the reason it is not optional: routing listing-titled
+    writes onto their clean twin makes "a bare n=0 stub upserts over a priced
+    row" the MODAL event, not a rare one — BUI-596 measured 181 of 183 FMV rows
+    attached to malformed comics as empty shells. A stub is not empty on the
+    wire: fmv_runner posts n=0 as `fmv_comps: 0`, which is not NULL, so the old
+    COALESCE stored it and left the self-contradictory `low=15 high=20
+    comps=0`. The guard now covers the metadata beside the price."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(
+        db, cid, 8.0, low=15.0, high=20.0, comps=11, confidence="medium",
+        notes="11 comps",
+    )
+    upsert_fmv(db, cid, 8.0, comps=0, confidence="low", notes="0 comps")
+    row = db.execute(
+        "SELECT low, high, comps, confidence, notes FROM fmv WHERE id=?", (fid,)
+    ).fetchone()
+    assert row["low"] == 15.0
+    assert row["high"] == 20.0
+    assert row["comps"] == 11
+    assert row["confidence"] == "medium"
+    assert row["notes"] == "11 comps"
+
+
+def test_upsert_fmv_n0_stub_still_lands_on_an_unpriced_row(db):
+    """The guard is scoped to a stored row that holds a real price — it must
+    not freeze an unpriced row's metadata, or a first n=0 result could never
+    record that it found nothing."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(db, cid, 8.0, comps=0, confidence="low", notes="0 comps")
+    upsert_fmv(db, cid, 8.0, comps=0, confidence="low", notes="still 0 comps")
+    row = db.execute("SELECT comps, notes FROM fmv WHERE id=?", (fid,)).fetchone()
+    assert row["comps"] == 0
+    assert row["notes"] == "still 0 comps"
+
+
+def test_upsert_fmv_fresh_price_still_overwrites_metadata(db):
+    """The guard must not block a real re-price: an incoming row carrying a
+    price is not a stub, so its comps/confidence/notes replace the stored
+    ones."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(
+        db, cid, 8.0, low=15.0, high=20.0, comps=11, confidence="medium",
+        notes="11 comps",
+    )
+    upsert_fmv(
+        db, cid, 8.0, low=30.0, high=40.0, comps=25, confidence="high",
+        notes="25 comps",
+    )
+    row = db.execute(
+        "SELECT low, comps, confidence, notes FROM fmv WHERE id=?", (fid,)
+    ).fetchone()
+    assert row["low"] == 30.0
+    assert row["comps"] == 25
+    assert row["confidence"] == "high"
+    assert row["notes"] == "25 comps"
+
+
+def test_upsert_fmv_flagged_row_still_clears_a_priced_row(db):
+    """The flag branch outranks the stub guard: a newly-flagged book still
+    drops its stale auto-price AND its stale auto-price metadata (BUI-86
+    residual #2), even though its `low` is NULL like a stub's."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(
+        db, cid, 8.0, low=15.0, high=20.0, comps=11, confidence="medium",
+        notes="11 comps",
+    )
+    upsert_fmv(db, cid, 8.0, flag_reason="too_sparse")
+    row = db.execute(
+        "SELECT low, high, comps, confidence, notes, flag_reason FROM fmv WHERE id=?",
+        (fid,),
+    ).fetchone()
+    assert row["low"] is None
+    assert row["high"] is None
+    assert row["confidence"] is None
+    assert row["notes"] is None
+    assert row["flag_reason"] == "too_sparse"
 
 
 def test_upsert_fmv_fresh_price_clears_prior_flag(db):
