@@ -84,6 +84,45 @@ def create_tables(conn: sqlite3.Connection) -> None:
             first_seen_at  TEXT DEFAULT (datetime('now'))
         )
     """)
+    # BUI-601: the rejected-writes ledger. Every 4xx/5xx on a *mutating*
+    # overlay request lands here (see routes.LedgerRoute), so a write that the
+    # server refused is recorded somewhere instead of vanishing into the
+    # caller's stderr. BUI-593 is the motivating incident: an FMV fetch
+    # succeeded, the write 422'd, and the book was stored NOWHERE — BUI-585
+    # then sat blocked for days on the wrong theory because nothing had
+    # persisted the refusal. Standalone (no FK, no JOIN to comics/bids) — the
+    # same plain-additive pattern as seller_scan_seen / collection_wins_seen,
+    # so it needs none of the Python-memory rebuild machinery the comic tables
+    # require.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rejected_writes (
+            id          INTEGER PRIMARY KEY,
+            created_at  TEXT NOT NULL,
+            method      TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            query       TEXT,
+            status      INTEGER NOT NULL,
+            detail      TEXT,
+            payload     TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rejected_writes_created "
+        "ON rejected_writes(created_at)"
+    )
+    # BUI-602: job heartbeats. One row per job, overwritten on each successful
+    # run — this is a "when did this last WORK" table, not an event log, so it
+    # stays at exactly len(JOB_CONTRACTS) rows and never needs pruning. The
+    # cadence contract lives in JOB_CONTRACTS below; `heartbeat_report` joins
+    # the two into the watchdog verdict.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS heartbeats (
+            job              TEXT PRIMARY KEY,
+            last_success_at  TEXT NOT NULL,
+            detail           TEXT,
+            success_count    INTEGER NOT NULL DEFAULT 1
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS migration_state (
             migration TEXT PRIMARY KEY
@@ -1905,3 +1944,391 @@ def mark_collection_wins_seen(
         inserted += cur.rowcount
     conn.commit()
     return inserted
+
+
+# ---------------------------------------------------------------------------
+# Rejected-writes ledger (BUI-601)
+# ---------------------------------------------------------------------------
+
+# How long a rejection stays queryable. Long enough to cover "I ran the FMV
+# refresh some time last week and a book went missing" (the BUI-593 shape),
+# short enough that the table stays a diagnostic surface rather than an
+# archive. Pruned opportunistically on insert — there is no separate sweeper
+# job to forget to run (which would itself be a fails-green instance).
+REJECTED_WRITES_RETENTION_DAYS = 30
+
+# A second, independent bound. Retention alone is time-based, so a caller stuck
+# in a retry loop could still pile up unboundedly *within* the window — and a
+# retry loop against a rejecting endpoint is exactly the traffic this ledger
+# attracts. Capping on row id (an INTEGER PRIMARY KEY, so monotonic) keeps the
+# newest N and makes the delete an indexed range scan rather than a sort. The
+# cap is never allowed to be lossy for the recent past the dashboard reads:
+# 5000 rows is orders of magnitude more than the 50 the badge shows or the
+# handful a real incident produces.
+REJECTED_WRITES_MAX_ROWS = 5000
+
+# Default lookback for the /api/comics/health/rejections badge. A rejection
+# older than this is still in the table (see retention above) and reachable by
+# passing an explicit `hours`, it just doesn't light the dashboard up forever.
+DEFAULT_REJECTIONS_WINDOW_HOURS = 24.0
+
+_REJECTIONS_MAX_LIMIT = 500
+
+
+def record_rejected_write(
+    conn: sqlite3.Connection,
+    *,
+    method: str,
+    path: str,
+    status: int,
+    query: str | None = None,
+    detail: str | None = None,
+    payload: str | None = None,
+    at: str | None = None,
+) -> int:
+    """Append one refused mutating request to the ledger. Returns its row id.
+
+    Commit-free by design: the caller owns the transaction (routes.py writes
+    through `write_transaction()` under the app-wide write lock, per BUI-408).
+    `at` is injectable so tests can pin the clock; production passes None and
+    gets `datetime.now(timezone.utc).isoformat()`, matching every other
+    timestamp this module writes.
+    """
+    created_at = at or datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO rejected_writes "
+        "(created_at, method, path, query, status, detail, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (created_at, method, path, query, int(status), detail, payload),
+    )
+    _prune_rejected_writes(conn, now=created_at)
+    return int(cur.lastrowid or 0)
+
+
+def _prune_rejected_writes(conn: sqlite3.Connection, *, now: str) -> int:
+    """Enforce both ledger bounds — age and row count. Returns rows deleted.
+
+    An unparseable `now` skips only the age sweep rather than raising: pruning
+    is housekeeping, and letting it abort the INSERT it rides along with would
+    trade a slightly oversized table for a lost rejection — the one thing this
+    ledger must not do. The row cap still applies in that case.
+    """
+    deleted = 0
+    try:
+        parsed = datetime.fromisoformat(now)
+    except (TypeError, ValueError):
+        logger.warning("rejected_writes prune skipped: unparseable timestamp %r", now)
+    else:
+        cutoff = (parsed - timedelta(days=REJECTED_WRITES_RETENTION_DAYS)).isoformat()
+        deleted += conn.execute(
+            "DELETE FROM rejected_writes WHERE created_at < ?", (cutoff,)
+        ).rowcount
+    deleted += conn.execute(
+        "DELETE FROM rejected_writes WHERE id <= "
+        "(SELECT MAX(id) FROM rejected_writes) - ?",
+        (REJECTED_WRITES_MAX_ROWS,),
+    ).rowcount
+    return deleted
+
+
+def rejected_writes_report(
+    conn: sqlite3.Connection,
+    *,
+    hours: float = DEFAULT_REJECTIONS_WINDOW_HOURS,
+    limit: int = 50,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """The /api/comics/health/rejections payload: a count plus recent rows.
+
+    `count` is the total in the window; `rejections` is the newest `limit` of
+    them. Those are deliberately allowed to disagree — the dashboard badge
+    reads `count` (it must not under-report because the row list is capped),
+    while a human reads the rows.
+    """
+    ref = now or datetime.now(timezone.utc)
+    since = (ref - timedelta(hours=hours)).isoformat()
+    capped = max(1, min(int(limit), _REJECTIONS_MAX_LIMIT))
+    count = conn.execute(
+        "SELECT COUNT(*) FROM rejected_writes WHERE created_at >= ?", (since,)
+    ).fetchone()[0]
+    rows = conn.execute(
+        "SELECT id, created_at, method, path, query, status, detail, payload "
+        "FROM rejected_writes WHERE created_at >= ? "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        (since, capped),
+    ).fetchall()
+    return {
+        "count": int(count),
+        "window_hours": hours,
+        "since": since,
+        "limit": capped,
+        "retention_days": REJECTED_WRITES_RETENTION_DAYS,
+        "rejections": [dict(r) for r in rows],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Job heartbeats + cadence watchdog (BUI-602)
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# THE CONTRACT TABLE — job -> cadence -> success definition.
+#
+# This constant IS the design doc for the Silent-Failure Observability
+# project (BUI-601/BUI-602); there is no separate plan. Its prose twin lives
+# at docs/reference/job-heartbeat-contract.md and is pinned to this dict by
+# tests/test_heartbeat_contract_doc.py, so the two cannot drift.
+#
+# WHY THIS EXISTS: the repo's dominant trap class is "fails green" — a job
+# that dies, or silently no-ops, looks exactly like a healthy one. Error-based
+# alerting structurally cannot see it, because there is no error. The only
+# thing that distinguishes "ran and found nothing" from "did not run" is a
+# positive signal emitted on success. That is the heartbeat.
+#
+# Fields:
+#   cadence_hours  Expected interval between successes. A job whose last
+#                  success is older than cadence_hours * STALE_FACTOR is
+#                  flagged `stale`. Sized to the SLOWEST normal run, not the
+#                  average — a watchdog that cries wolf gets muted, and a
+#                  muted watchdog is another fails-green instance.
+#   success        What counts as a success. Deliberately narrow: a run that
+#                  completed but wrote nothing because its input was empty
+#                  still pings (it worked); a run that crashed, timed out, or
+#                  hard-failed its own exit-code gate must NOT ping.
+#   wired          True once the caller actually pings on success. False means
+#                  the contract is declared but NOT yet instrumented — such a
+#                  job reports `pending_instrumentation`, never `ok`. It is
+#                  never silently treated as healthy.
+#   ping           The exact call the caller must add to become wired.
+# ===========================================================================
+
+# A job is flagged only once it is this many cadences late, so ordinary jitter
+# (a scan that starts 20 minutes behind, a laptop asleep past its cron slot)
+# does not produce a false alarm.
+HEARTBEAT_STALE_FACTOR = 2.0
+
+JOB_CONTRACTS: dict[str, dict[str, Any]] = {
+    "gixen-sync": {
+        "cadence_hours": 1.0,
+        "success": (
+            "One completed pass of the comics server's background Gixen "
+            "snipe-sync loop (server.main._sync_gixen) that reached its write "
+            "phase without raising. GIXEN_SYNC_INTERVAL defaults to 600s, so "
+            "a healthy server pings ~6x/hour; the 1h cadence tolerates the "
+            "documented flapping/backoff (BUI-562) without alarming."
+        ),
+        "wired": False,
+        "ping": (
+            "server.main._sync_gixen, after the write phase commits. Owned by "
+            "packages/gixen-cli, which BUI-601/602 must not modify."
+        ),
+    },
+    "wishlist-sellers": {
+        "cadence_hours": 168.0,
+        "success": (
+            "A /comic:wishlist-sellers run that exited 0. Exit 3 (partial — "
+            "some candidates never verified) must NOT ping: the un-verified "
+            "books are exactly the ones that would silently stop surfacing. "
+            "Zero matching sellers on a clean run IS a success — 'ran and "
+            "found nothing' is the case this whole table exists to "
+            "distinguish from 'did not run'."
+        ),
+        "wired": False,
+        "ping": (
+            ".claude/commands/comic/wishlist-sellers.md, final step, guarded "
+            "on exit 0: comics-api POST /api/heartbeat/wishlist-sellers"
+        ),
+    },
+    "collection-sync": {
+        "cadence_hours": 336.0,
+        "success": (
+            "A /comic:collection-sync round-trip that completed its Step 6 "
+            "re-import and post-import safety check. An aborted sync (the "
+            "'Deleted from Collection.' probe tripping, the BUI-122 guard) "
+            "must NOT ping — an abort is the sync working correctly but NOT "
+            "having synced. Manual/user-invoked, hence the long cadence; the "
+            "signal being watched for is 'I have not synced in a month and "
+            "wins are piling up unpushed', not a missed tick."
+        ),
+        "wired": False,
+        "ping": (
+            ".claude/commands/comic/collection-sync.md, after the Step 6 "
+            "re-import reconciles: comics-api POST /api/heartbeat/collection-sync"
+        ),
+    },
+    "fmv-refresh": {
+        "cadence_hours": 168.0,
+        "success": (
+            "A comic-fmv batch that fetched sold comps AND persisted them — "
+            "the write must be confirmed, not just attempted. BUI-593 is "
+            "precisely a run where the fetch succeeded and the write 422'd, "
+            "so 'comic-fmv exited 0' alone is NOT the success definition; the "
+            "upsert response must have been accepted. Pairs with the BUI-601 "
+            "ledger: the heartbeat says the refresh ran, the ledger says what "
+            "it failed to store."
+        ),
+        "wired": False,
+        "ping": (
+            "apps/fmv's runner, after the /api/comics upsert returns 2xx: "
+            "comics-api POST /api/heartbeat/fmv-refresh"
+        ),
+    },
+}
+
+# THE OUTER LAYER — NOT WIRED. Read this before trusting the watchdog.
+#
+# Everything above is a PULL: something must ask
+# GET /api/comics/health/heartbeats for a stale job to be noticed. If the
+# comics server is down, or the Mac Mini is asleep, or launchd never restarted
+# the process, nobody asks — and the watchdog fails green in exactly the way
+# it was built to prevent. A watchdog with no outer ping is its own worst bug
+# class.
+#
+# Closing it needs a check OUTSIDE this machine (healthchecks.io, an uptime
+# pinger, a cloud /schedule agent) that polls the endpoint on a schedule and
+# alarms on a non-200 OR on any job not `ok`. Until that exists, the endpoint
+# reports this gap in its own response (`outer_ping: "unwired"`) rather than
+# implying a health it cannot vouch for. See
+# docs/reference/job-heartbeat-contract.md for the wiring recipe.
+HEARTBEAT_OUTER_PING_STATE = "unwired"
+
+# Watchdog verdicts, worst-first. `stale` and `never` are both actionable;
+# `pending_instrumentation` is a declared-but-unbuilt contract and is NOT a
+# claim of health.
+HEARTBEAT_STATUS_OK = "ok"
+HEARTBEAT_STATUS_STALE = "stale"
+HEARTBEAT_STATUS_NEVER = "never"
+HEARTBEAT_STATUS_PENDING = "pending_instrumentation"
+
+
+def record_heartbeat(
+    conn: sqlite3.Connection,
+    job: str,
+    *,
+    detail: str | None = None,
+    at: str | None = None,
+) -> dict[str, Any]:
+    """Record a successful run of `job`. Returns the stored row.
+
+    Upsert on the job name: one row per job, so the table never grows. The
+    ON CONFLICT branch keeps `success_count` monotonic, which is what tells
+    "pinged once during setup and never again" apart from "pinging steadily".
+
+    Commit-free — the caller owns the transaction (see record_rejected_write).
+    Unknown job names are accepted at this layer on purpose; the endpoint is
+    where the JOB_CONTRACTS allow-list is enforced, so this stays a plain
+    storage primitive.
+    """
+    ts = at or datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO heartbeats (job, last_success_at, detail, success_count) "
+        "VALUES (?, ?, ?, 1) "
+        "ON CONFLICT(job) DO UPDATE SET "
+        "  last_success_at = excluded.last_success_at, "
+        "  detail = excluded.detail, "
+        "  success_count = heartbeats.success_count + 1",
+        (job, ts, detail),
+    )
+    row = conn.execute(
+        "SELECT job, last_success_at, detail, success_count FROM heartbeats WHERE job=?",
+        (job,),
+    ).fetchone()
+    return dict(row)
+
+
+def _heartbeat_age_hours(last_success_at: str, ref: datetime) -> float | None:
+    """Hours since `last_success_at`, or None if the stored value is unparseable.
+
+    A corrupt timestamp must not read as "recent" — callers treat None as
+    unknown-and-therefore-not-ok, never as fresh.
+    """
+    try:
+        seen = datetime.fromisoformat(last_success_at)
+    except (TypeError, ValueError):
+        return None
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return (ref - seen).total_seconds() / 3600.0
+
+
+def heartbeat_report(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """The watchdog verdict for every job in the contract table.
+
+    Iterates JOB_CONTRACTS, not the heartbeats table — a job that has NEVER
+    pinged is the single most important thing this can report, and iterating
+    stored rows would render it as absence (i.e. as nothing wrong at all).
+    Heartbeat rows for jobs not in the contract are surfaced separately under
+    `unknown_jobs` rather than dropped, so a typo'd ping is visible instead of
+    looking like a job that never ran.
+    """
+    ref = now or datetime.now(timezone.utc)
+    stored = {
+        r["job"]: r
+        for r in conn.execute(
+            "SELECT job, last_success_at, detail, success_count FROM heartbeats"
+        ).fetchall()
+    }
+
+    jobs: list[dict[str, Any]] = []
+    for name, contract in JOB_CONTRACTS.items():
+        row = stored.pop(name, None)
+        cadence = float(contract["cadence_hours"])
+        entry: dict[str, Any] = {
+            "job": name,
+            "cadence_hours": cadence,
+            "stale_after_hours": cadence * HEARTBEAT_STALE_FACTOR,
+            "success": contract["success"],
+            "wired": bool(contract["wired"]),
+            "last_success_at": row["last_success_at"] if row else None,
+            "success_count": row["success_count"] if row else 0,
+            "age_hours": None,
+        }
+        if row is None:
+            # Never pinged. If nobody has wired the caller yet that is expected
+            # and reported as such; if the caller IS wired, silence is the
+            # alarm.
+            entry["status"] = (
+                HEARTBEAT_STATUS_NEVER
+                if contract["wired"]
+                else HEARTBEAT_STATUS_PENDING
+            )
+            entry["ping"] = contract["ping"]
+        else:
+            age = _heartbeat_age_hours(row["last_success_at"], ref)
+            entry["age_hours"] = None if age is None else round(age, 3)
+            if age is None or age > cadence * HEARTBEAT_STALE_FACTOR:
+                entry["status"] = HEARTBEAT_STATUS_STALE
+            else:
+                entry["status"] = HEARTBEAT_STATUS_OK
+        jobs.append(entry)
+
+    stale = [j["job"] for j in jobs if j["status"] == HEARTBEAT_STATUS_STALE]
+    never = [j["job"] for j in jobs if j["status"] == HEARTBEAT_STATUS_NEVER]
+    pending = [j["job"] for j in jobs if j["status"] == HEARTBEAT_STATUS_PENDING]
+    return {
+        # `healthy` means "every job in the contract is verified to be
+        # running" — so an uninstrumented job makes it False, exactly like a
+        # stale one. That is the honest answer and it matters: the outer-ping
+        # recipe in docs/reference/job-heartbeat-contract.md alarms on
+        # `healthy == false`, and a version that ignored
+        # pending_instrumentation would report a clean bill of health for a
+        # system observing nothing at all — this project's own bug class,
+        # reintroduced one layer up. Consumers wanting the narrower question
+        # ("is anything I AM watching broken?") read stale_jobs +
+        # never_seen_jobs directly.
+        "healthy": not stale and not never and not pending,
+        "stale_jobs": stale,
+        "never_seen_jobs": never,
+        "pending_instrumentation_jobs": pending,
+        "checked_at": ref.isoformat(),
+        "stale_factor": HEARTBEAT_STALE_FACTOR,
+        # The endpoint declares its own blind spot — see
+        # HEARTBEAT_OUTER_PING_STATE above.
+        "outer_ping": HEARTBEAT_OUTER_PING_STATE,
+        "jobs": jobs,
+        "unknown_jobs": sorted(stored),
+    }
