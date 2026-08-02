@@ -563,16 +563,15 @@ class TestListSnipes:
 
     def test_parse_status_mirror_na_when_no_mirror_snipe(self):
         """BUI-589: literal vocabulary captured from a live, read-only fetch of
-        the real Gixen main page (2026-07-31, 32 live snipes). Every snipe's
-        `Status (main)` read "SCHEDULED" — no genuinely ENDED/WON/LOST snipe
-        was present on the page at capture time, so that finished-state
-        string remains unconfirmed and is deliberately NOT fixture-encoded
-        here (a guessed value would be worse than no fixture at all — see
-        BUI-587/BUI-589). One snipe (no mirror bid configured) DID show a new
-        literal for `Status (mirror)`: "N/A" — every other snipe's mirror
-        status mirrored its `SCHEDULED` main status. This locks in that real
-        value; it must parse as a plain string, not get coerced to "" or
-        None."""
+        the real Gixen main page (2026-07-31, 32 live snipes). One snipe (no
+        mirror bid configured) showed a new literal for `Status (mirror)`:
+        "N/A" — every other snipe's mirror status mirrored its `SCHEDULED`
+        main status. This locks in that real value; it must parse as a plain
+        string, not get coerced to "" or None.
+
+        The finished-state vocabulary that capture could not reach (no snipe
+        on the page had ended yet) was captured on 2026-08-02 and is fixtured
+        in `test_parse_ended_snipe_vocabulary_from_live_capture` below."""
         client = _client()
         client.session_id = "99887766"
 
@@ -586,6 +585,122 @@ class TestListSnipes:
 
         assert snipes[0]["status"] == "SCHEDULED"
         assert snipes[0]["status_mirror"] == "N/A"
+
+    def test_parse_ended_snipe_vocabulary_from_live_capture(self):
+        """BUI-589: the finished-snipe vocabulary, captured read-only from the
+        real Gixen main page on 2026-08-02 once three auctions had actually
+        ended (item ids 137544111777, 137544114146, 147456544560 — 2 won,
+        1 lost). Until this capture the parser had coverage for the
+        *scheduled* vocabulary only, and the ticket's stop condition
+        (correctly) forbade guessing the rest.
+
+        The literals, verbatim from the mobile block:
+
+            Time to end: ENDED   Status (main): WON                      mirror: WON
+            Time to end: ENDED   Status (main): BID UNDER ASKING PRICE   mirror: N/A
+
+        Two things worth locking in beyond the strings themselves:
+
+        * A finished snipe still renders a full row with its edit form and
+          hidden inputs intact — it is parsed by the same path as a live one,
+          not a separate "completed" layout. Gixen keeps it on the page until
+          an explicit purge.
+        * `Status (main)` for the loss is the **bare** "BID UNDER ASKING
+          PRICE". `Status (mirror)` is where Gixen appends an explanatory
+          suffix ("BID UNDER ASKING PRICE: EBAY BID INCREMENT RULE NOT MET",
+          seen on 30 historical rows in the live `bids` table) — main did not
+          carry one. That matters because `_map_terminal_status` does an
+          exact-key lookup on the *main* status, which a suffixed value would
+          miss.
+        """
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("137544111777", "133727891", max_bid="30.00",
+                            current_bid="15.05 USD", time_to_end="ENDED",
+                            status="WON", status_mirror="WON"),
+            _make_snipe_row("147456544560", "133727895", max_bid="15.00",
+                            current_bid="15.05 USD", time_to_end="ENDED",
+                            status="BID UNDER ASKING PRICE",
+                            status_mirror="N/A"),
+        )
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        by_id = {s["item_id"]: s for s in snipes}
+
+        won = by_id["137544111777"]
+        assert won["time_to_end"] == "ENDED"
+        assert won["status"] == "WON"
+        assert won["status_mirror"] == "WON"
+        # The ended row's other fields must survive too — a finished snipe is
+        # where winning_bid gets read from.
+        assert won["current_bid"] == "15.05 USD"
+
+        lost = by_id["147456544560"]
+        assert lost["time_to_end"] == "ENDED"
+        assert lost["status"] == "BID UNDER ASKING PRICE"
+        assert lost["status_mirror"] == "N/A"
+
+    def test_parse_status_main_strips_trailing_newline(self):
+        """BUI-589: the live page renders the WON status cell as
+        `<td>WON\\n</td>` — a trailing newline inside the cell, captured
+        verbatim on 2026-08-02. The `[^<]+` capture takes the newline with
+        it, so the `.strip()` at gixen_client.py:1120 is load-bearing, not
+        defensive tidiness.
+
+        Which consumers it actually protects, since they differ:
+
+        * `cli.py`'s purge dry-run count tests `s["status"] in
+          GIXEN_RAW_TERMINAL_STATUSES` (cli.py:1054) — exact membership, no
+          re-normalization of its own. "WON\\n" misses, and a completed snipe
+          goes uncounted. This one breaks.
+        * `_map_terminal_status` re-applies `.upper().strip()` before its
+          dict lookup, and `record_win_prep.filter_ended_won` uses a
+          substring test — both survive an unstripped value. They are not
+          the reason this strip exists.
+
+        A fixture that rendered the value with no surrounding whitespace —
+        the obvious thing to write from a guess — would pass whether or not
+        the strip existed, which is exactly the false confidence this ticket
+        set out to avoid."""
+        client = _client()
+        client.session_id = "99887766"
+
+        html = _wrap_table(
+            _make_snipe_row("137544111777", "133727891", time_to_end="ENDED",
+                            status="WON\n", status_mirror="WON"),
+        )
+
+        with patch.object(client, "_get_home_page", return_value=html):
+            snipes = client.list_snipes()
+
+        assert snipes[0]["status"] == "WON"
+
+    def test_captured_ended_statuses_all_map_to_terminal(self):
+        """BUI-589's third acceptance criterion: check whether any downstream
+        consumer string-matches on status values that don't exist — and,
+        symmetrically, whether a value that DOES exist goes unmatched.
+
+        Every `Status (main)` literal observed on a finished snipe in the
+        2026-08-02 capture must resolve through `GIXEN_TERMINAL_MAP`, the
+        single vocabulary `server/main.py` (live classification) and
+        `cli.py` (purge dry-run count) both consume since BUI-595. A literal
+        that parses fine but maps to nothing would silently fall through to
+        the generic ENDED branch and lean on the eBay fallback."""
+        from gixen_client import GIXEN_TERMINAL_MAP, GIXEN_RAW_TERMINAL_STATUSES
+
+        captured_main_statuses = {"WON": "WON", "BID UNDER ASKING PRICE": "LOST"}
+
+        for literal, expected in captured_main_statuses.items():
+            assert GIXEN_TERMINAL_MAP.get(literal.upper().strip()) == expected
+            assert literal in GIXEN_RAW_TERMINAL_STATUSES
+
+        # "SCHEDULED" is the live vocabulary and must stay OUT of the terminal
+        # map — mapping it would tombstone every active snipe.
+        assert "SCHEDULED" not in GIXEN_TERMINAL_MAP
 
     def test_unparseable_row_yields_empty_not_neighbour_values(self):
         """A row whose shape we don't recognize must fail loudly (empty), never
