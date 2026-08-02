@@ -23,24 +23,15 @@ The repo is a **uv workspace**: `packages/*` + `plugins/*` are members, and `uv 
 # plus the comics-api wrapper (BUI-510: a symlinked bash script, not uv tool-installed —
 # see scripts/comics-api and scripts/install.sh:87-99)
 ./scripts/install.sh            # uv tool install for apps/ebay + apps/fmv + packages/gixen-cli + packages/locg-cli
-# Re-run this (or `uv tool install --force --no-cache ./packages/<pkg>`) on the Mac Mini after merging any packages/* change —
-# a uv tool install is a frozen copy and goes stale (BUI-365: a post-merge `gixen add` crashed with
-# `ModuleNotFoundError: No module named 'record_win_prep'` until reinstalled). Plain `--force` is NOT
-# enough when the package version is unchanged (BUI-455): uv keys its wheel cache on name+version, so
-# `--force` alone silently reinstalls the STALE cached wheel — e.g. after merging BUI-435 (adds `gixen
-# build-batch`), `uv tool install --force ./packages/gixen-cli` still reported "No such command" because
-# it served the pre-merge wheel. `--no-cache` (or `uv cache clean <pkg>` first) is required to actually
-# pick up new source. `scripts/install.sh` itself is unaffected: it uses `--reinstall`, which implies
-# `--refresh` and busts the cache, so it already picks up fresh source without `--no-cache`.
-# After merging overlay/server changes (gixen-cli server/, plugins/gixen-overlay), additionally (BUI-377):
-#   uv sync --all-packages
-#   launchctl kickstart -k gui/$(id -u)/com.comics.server
-# (the comics server runs via launchd out of the workspace .venv, which install.sh does NOT refresh;
-# the loaded launchd label is com.comics.server as of the BUI-463 migration on 2026-07-20 — the
-# BUI-220 comics-server rename finally reached the Mini, see docs/runbooks/comics-server-dir-migration.md)
-# The comics server is also unaffected by the BUI-455 stale-wheel trap above — it runs from this same
-# editable workspace .venv (source, not a frozen wheel); only the frozen `uv tool install`ed console
-# scripts (gixen, locg, comic-identify, grade-photos) can go stale.
+
+# Re-run after merging to main and pulling on the Mac Mini (BUI-612): one command runs the
+# full documented deploy ritual (uv tool install --force --no-cache for all four packages,
+# uv sync --all-packages, launchctl kickstart) idempotently, then asserts every deployed
+# component reports the merged HEAD git SHA — via each console script's --version and the
+# comics server's /health — failing loudly instead of leaving stale code running silently.
+# See scripts/deploy.sh's header for the three incidents (BUI-365, BUI-455, BUI-377) this
+# replaces having to remember by hand.
+./scripts/deploy.sh
 
 # Sync the workspace env (packages/* + plugins/*) for development + tests
 uv sync --all-packages

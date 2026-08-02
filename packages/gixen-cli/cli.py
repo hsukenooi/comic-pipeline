@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -156,7 +158,60 @@ def _server_request(method: str, path: str, **kwargs) -> dict | list:
     return data
 
 
+def _git(*args: str) -> str:
+    try:
+        output = subprocess.check_output(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return output or "unknown"
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _version_string() -> str:
+    """BUI-612: staleness signal for a `uv tool install`ed binary.
+
+    Reads git HEAD at runtime from this file's own location, rather than
+    stamping it in at build time (contrast BUI-305's comic-fmv and
+    BUI-314's ebay-fetch): gixen-cli is only ever `uv tool install
+    --editable`ed (scripts/install.sh, scripts/deploy.sh — needed for
+    cli.py's own file-relative load_dotenv() to find packages/gixen-cli/.env
+    regardless of caller cwd), which makes it source-backed like the comics
+    server, not a frozen copy — an editable install's console script really
+    does run this exact file out of the git checkout. A build-time stamp
+    would not even be reachable here: setuptools' default editable-install
+    strategy redirects every module straight back to its source-tree path
+    via an import finder, with no mechanism (unlike hatchling's
+    `force_include`) to also drop a separately-generated file into
+    site-packages — so a `_build_info`-style module would never resolve.
+    Falls back to "unknown" (never raises) for a non-editable/frozen
+    install, where `__file__` no longer sits inside a git checkout.
+    """
+    try:
+        pkg_version = importlib.metadata.version("gixen-cli")
+    except importlib.metadata.PackageNotFoundError:
+        pkg_version = "unknown"
+    sha = _git("rev-parse", "--short", "HEAD")
+    date = _git("log", "-1", "--format=%cd", "--date=short")
+    return f"gixen {pkg_version} (git {sha}, {date})"
+
+
+def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+    click.echo(_version_string())
+    ctx.exit()
+
+
 @click.group()
+@click.option("--version", is_flag=True, expose_value=False, is_eager=True,
+              callback=_print_version,
+              help="Print the installed version and the git SHA/date it was built "
+                   "from, then exit. Use this to check for a stale `uv tool install` "
+                   "(see scripts/deploy.sh).")
 def cli():
     """Manage Gixen eBay snipes."""
 
