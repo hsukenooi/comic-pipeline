@@ -13,6 +13,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 import requests
 
+import comic_identity
 import sold_comps as sc
 
 
@@ -134,6 +135,20 @@ class TestHardExclude:
         "Hulk #181 #182",                     # space-separated hash pair (2)
         "ASM #64, #65",                       # 2-member comma pair (both hashed)
         "ASM #64, 65",                        # 2-member comma pair (2nd unhashed)
+        # BUI-598: a BARE (un-'#'-anchored) issue range paired with a run/set
+        # word. Every title here is a real corpus listing that survived
+        # hard_exclude before this rule; the first is the $6500 full-run lot
+        # that manufactured a $3825 max bid on a single X-Men #94.
+        "X-Men 94-300 FULL RUN NM Marvel 1975 Key 94 101 129 141 266",
+        "THE SAVAGE SHE-HULK 1-25 NEAR FULL RUN!!! MARVEL COMICS 1980",
+        "Watchmen 1-12 Run, Complete, Alan Moore 1986 VF 8.0+",
+        "DETECTIVE COMICS 575-578 1987 BATMAN YEAR TWO 1-4 SET TODD MCFARLANE DC COMICS",
+        "X-MEN 92 HOUSE OF XCII 1-5 MARVEL COMIC SET COMPLETE FOXE ESPIN SILVA 2022 NM",
+        "Absolute Martian Manhunter 1-10 Set Cover 1 2 3 4 5 6 7 8 9 10 Random Printings",
+        # keyword BEFORE the range — the rule is order-independent
+        "(2026) ABSOLUTE MARTIAN MANHUNTER #1 2 3 4 5 6 CURRENT PRINT SET! 1-6",
+        # en dash (U+2013) is a real range separator in listing titles
+        "Venom #1–4 (2018) Shiver Set NM Donny Cates + Sam KIETH Art Marvel",
     ])
     def test_excludes(self, title):
         assert sc.hard_exclude(title)
@@ -153,9 +168,53 @@ class TestHardExclude:
         # comma edge: "#300, 9.8" is a hash then a decimal GRADE, not a lot —
         # the (?!\.\d) lookahead keeps this single graded issue in the comp pool.
         "Amazing Spider-Man #300, 9.8 CGC",
+        # ── BUI-598 negative controls ────────────────────────────────────────
+        # The new bare-range rule fires only when a run/set word CO-OCCURS.
+        # These are real corpus titles where a bare 1-3 digit range appears but
+        # means something other than an issue range — a range-only rule would
+        # have dropped them, so pin that they stay in the comp pool.
+        "CAPTAIN AMERICA # 100, Vol. 1, Marvel 1967, Kirby, VG+/FN- (2-/2-3)",
+        "Ultimate X-Men #21 Peach Momoko Connecting Covers 1-3 Trinity Comics LTD 850",
+        "Marvel Comics the West Coast Avengers #45 1989. Excellent Condition. 2-5.",
+        # The mirror case: a run/set word with NO range. "run" is how listings
+        # name a CREATOR run on a single issue, so it can never exclude alone.
+        "New Mutants #98 1st Deadpool Claremont run VF",
+        "Daredevil #181 Frank Miller run Death of Elektra",
+        "Marvel Comics: X-Men '97 Mixed Animated Comic Variant Set (2024-2025)",
+        # Year spans must never read as an issue range — the \d{1,3} member
+        # bound inherited from _LOT_MEMBER is what guarantees it. Both of these
+        # carry a run/set word, so ONLY that bound keeps them.
+        "Amazing Spider-Man #4 1962-1963 Ditko run VF",
+        "Fantastic Four #48 (1966) Kirby 1961-1970 run Silver Age set",
+        # A decimal grade pair straddling a dash is not an issue range either.
+        "X-Men #94 CGC 9.8 - 9.6 Claremont run",
+        # The ticket's stated control: no range, no keyword.
+        "DC Comics Presents #26 1980 VF",
+        # Span guard: adjacent integers are grade notation / box codes, never a
+        # run. This is the real corpus title above with the one word added that
+        # would otherwise have dropped a genuine Silver Age key from the pool.
+        "CAPTAIN AMERICA # 100, Vol. 1, Marvel 1967, Kirby run, VG+/FN- (2-/2-3)",
+        # Span guard: a DESCENDING pair is never an issue range.
+        "NEW McFarlane Toys Marvel Captain America #100 – 1:10 Scale Figure set",
+        # Em dash (U+2014) separates phrases in listing titles, so it is
+        # deliberately NOT a range separator. Pins the accepted under-catch.
+        "X-Men #94 — 300 Claremont run",
     ])
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)
+
+    def test_bare_range_rule_stays_comp_only(self):
+        """BUI-598/BUI-239: the new rule must never reach the purchase path.
+
+        _LOT_RE feeds should_reject/hard_reject, where a false lot-reject drops
+        a book you actually want. The bare-range+run/set rule lives behind
+        is_comp_excluded only, so the same title must be excluded as a COMP
+        while _LOT_RE itself stays unwidened.
+        """
+        title = "X-Men 94-300 FULL RUN NM Marvel 1975 Key 94 101 129 141 266"
+        assert sc.hard_exclude(title)
+        assert comic_identity._fmv_run_range_lot(title)
+        assert not comic_identity._LOT_RE.search(title)
 
 
 # ─── Comp parsing ─────────────────────────────────────────────────────────────

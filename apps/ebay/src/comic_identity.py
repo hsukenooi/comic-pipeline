@@ -834,6 +834,97 @@ _FMV_LOT_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# BUI-598: a BARE (un-'#'-anchored) issue range paired with a run/set word —
+# "X-Men 94-300 FULL RUN NM Marvel 1975" (@$6500), "Amazing Spider-Man 1-100
+# SET", "Watchmen 1-12 Run, Complete".  _LOT_RE catches "#94-#143" (its range
+# branch requires a '#' on the first number) and "complete run"/"complete
+# set"/"set of", but nothing catches a bare range next to "FULL RUN"/"SET".
+# Such a lot is grade-tagged like any single issue, survives hard_exclude, and
+# then prices ONE issue at the whole run's price: the $6500 comp above alone
+# moved X-Men #94 @9.2 from "no bid" to a $3825 max bid.
+#
+# WHY THE KEYWORD IS REQUIRED, and not the range alone.  Measured over the
+# 12,506 unique titles in the offline provider cache (10,326 surviving
+# hard_exclude today), a bare 1-3 digit range fires on 77 kept titles, and the
+# ones WITHOUT a run/set word include genuine single-issue comps and non-comp
+# junk we must not silently drop for the wrong reason:
+#   "CAPTAIN AMERICA # 100, Vol. 1, Marvel 1967, Kirby, VG+/FN- (2-/2-3)"
+#       -> "2-3" is GRADE notation, not an issue range
+#   "Ultimate X-Men #21 Peach Momoko Connecting Covers 1-3 ..."
+#       -> single issue; "1-3" numbers the connecting COVERS
+#   "Kotobukiya ... Cyclops & Beast 1-10 Scale ArtFXPlus"   -> statue scale
+#   "... Men's Tactical Boots 3330 7-14 CLOSEOUT"           -> shoe sizes
+# Requiring the co-occurring run/set word takes the newly-excluded set to 10 of
+# 10,326 (0.097%), all 10 hand-verified genuine multi-book lots — precision
+# 1.00, zero legitimate comps lost.  That is the BUI-347 discipline: widen the
+# comp exclusion only where it has been re-validated against the corpus.
+#
+# Recall is deliberately partial.  ~30 further corpus titles are genuine lots
+# carrying a bare range with NO run/set word ("Uncanny X-Men 144-147 - 1981
+# Claremont", "The Uncanny X-Men 250-299 Marvel Comics x44").  Catching those
+# needs a different signal than the range, because the range alone is exactly
+# what the false positives above also have.  Left open on purpose.
+#
+# Kept comp-only (checked by is_comp_excluded, never merged into _LOT_RE) for
+# the BUI-239 reason: _LOT_RE also feeds should_reject/hard_reject on the
+# purchase-decision path, where a false lot-reject drops a book you want.
+#
+# The \d{1,3} bound on each member is load-bearing and is inherited unchanged
+# from _LOT_MEMBER: it stops a 4-digit YEAR SPAN ("Absolute Martian Manhunter
+# #1-11 (2025-2026)", "FANTASTIC FOUR ... (1975-1983)") from reading as an
+# issue range, and _LOT_MEMBER's (?<!\.)/(?!\.\d) pair stops a decimal grade
+# pair ("CGC 9.8 - 9.6") from binding.  Measured: 0 year-span bindings across
+# the 36 corpus titles carrying an explicit YYYY-YYYY span.
+#
+# NOTE: unlike _FMV_LOT_RE above, this pattern must NOT be compiled re.VERBOSE.
+# _LOT_MEMBER contains a literal '#', which VERBOSE would read as a comment
+# start and silently swallow the rest of the pattern.  _LOT_RE has the same
+# constraint for the same reason.
+#
+# Separator class: ASCII hyphen-minus plus the typographic dashes eBay sellers
+# actually use to write a range — U+2010 hyphen, U+2011 non-breaking hyphen,
+# U+2012 figure dash, U+2013 en dash ("Venom #1–4 (2018) Shiver Set").
+# U+2014 EM DASH is deliberately excluded: in listing titles it separates
+# phrases ("Detective Comics 575-578 — 1987 Barr, McFarlane & Alcala"), not
+# range endpoints, so admitting it would invent ranges out of punctuation.
+_FMV_RANGE_DASHES = "-‐‑‒–"
+_FMV_BARE_RANGE_RE = re.compile(
+    rf"{_LOT_MEMBER}\s*[{_FMV_RANGE_DASHES}]\s*{_LOT_MEMBER}", re.IGNORECASE
+)
+_FMV_RUN_SET_RE = re.compile(r"\b(?:runs?|sets?)\b", re.IGNORECASE)
+
+# A real run/set spans at least three issues (hi - lo >= 2).  This guard costs
+# nothing measurable — all 10 corpus lots the rule catches span 3 to 206 issues
+# — but it neutralizes the nearest observed false-positive shape: adjacent-
+# integer pairs are how sellers write GRADE notation and box codes, e.g. the
+# genuine single-issue comp "CAPTAIN AMERICA # 100, Vol. 1, Marvel 1967,
+# Kirby, VG+/FN- (2-/2-3)", which is one word ("Kirby run") away from being
+# dropped without it.  It also rejects descending pairs, which are never
+# ranges ("Captain America #100 – 1:10 Scale Figure").  A genuine 2-issue
+# set is the accepted miss: the other comp-only shapes ("#94 #95", "#94, #95")
+# already cover the common way those are written, and mispricing against a
+# 2-book lot is a bounded error where a full run is a catastrophic one.
+_FMV_MIN_RANGE_SPAN = 2
+
+
+def _fmv_run_range_lot(title: str) -> bool:
+    """True if *title* pairs a bare issue range with a run/set word (BUI-598).
+
+    Order-independent on purpose: real listings write it both ways —
+    "1-10 Set Cover ..." and "... PRINT SET! 1-6".
+    """
+    if not _FMV_RUN_SET_RE.search(title):
+        return False
+    for match in _FMV_BARE_RANGE_RE.finditer(title):
+        # Exactly two digit runs per match, guaranteed by _LOT_MEMBER's single
+        # bounded \d{1,3}. Unpacking strictly (rather than slicing) is
+        # deliberate: if _LOT_MEMBER ever grows a second digit group, this
+        # raises in the test suite instead of silently degrading a money filter.
+        low, high = (int(n) for n in re.findall(r"\d+", match.group(0)))
+        if high - low >= _FMV_MIN_RANGE_SPAN:
+            return True
+    return False
+
 
 def is_comp_excluded(title: str) -> bool:
     """Return True if *title* should be excluded as an eBay-sold-listing FMV
@@ -853,6 +944,8 @@ def is_comp_excluded(title: str) -> bool:
     if _LOT_RE.search(title or ""):
         return True
     if _FMV_LOT_RE.search(title or ""):  # BUI-269: comp-only lot shapes _LOT_RE misses
+        return True
+    if _fmv_run_range_lot(title or ""):  # BUI-598: bare issue range + "run"/"set"
         return True
     if _reprint_reject(title):
         return True
