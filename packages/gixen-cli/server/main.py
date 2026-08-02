@@ -301,8 +301,6 @@ async def _write_locked():
 # Helpers
 # ---------------------------------------------------------------------------
 
-_TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "ENDED"})
-
 # Gixen reports many ended-auction states the original 4-status set misses.
 # Map every Gixen status we've observed in production to our internal terminal
 # set {WON, LOST, FAILED, ENDED}. Keys are normalized (upper-case, stripped).
@@ -317,6 +315,14 @@ _TERMINAL_GIXEN_STATUSES: frozenset[str] = frozenset({"WON", "LOST", "FAILED", "
 # module both this server and cli.py's direct-mode `purge` command already
 # import, with no FastAPI dependency) so the two stop drifting apart — cli.py's
 # purge dry-run count previously re-listed a stale 4-status subset inline.
+#
+# BUI-589 deleted this module's own copy of that stale subset
+# (`_TERMINAL_GIXEN_STATUSES = {"WON", "LOST", "FAILED", "ENDED"}`), which had
+# no remaining references. The 2026-08-02 live capture confirmed
+# `Status (main)` really does emit "BID UNDER ASKING PRICE" on a finished
+# snipe, so any future consumer reaching for a bare 4-status set would miss a
+# genuine terminal state. Use GIXEN_RAW_TERMINAL_STATUSES for "is this snipe
+# done?" over raw scraped statuses; never re-introduce a hand-listed subset.
 # Re-exported here under the original name: this module's own
 # _map_terminal_status still reads it as `_GIXEN_TERMINAL_MAP`, and it stays
 # importable from `server.main` for any external caller/test expecting it here.
