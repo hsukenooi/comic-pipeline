@@ -154,24 +154,64 @@
     0% { transform: translateX(-100%); }
     100% { transform: translateX(100%); }
   }
+
+  /* BUI-601/602 health chips — a nonzero rejection count and a stale job must
+     be visible without asking. The chips are rendered EMPTY only when the
+     server has affirmatively told us everything is fine; "we could not ask"
+     renders as its own visible state, never as silence. */
+  .health-chip {
+    display: inline-block;
+    font-size: 11px;
+    padding: 0 7px;
+    border-radius: 5px;
+    border: 1px solid var(--line);
+    color: var(--fg-dim);
+    line-height: 18px;
+    margin-left: 8px;
+    cursor: pointer;
+  }
+  .health-chip.bad { color: var(--red); border-color: var(--red); background: rgba(247,118,142,0.13); font-weight: 600; }
+  .health-chip.warn { color: var(--yellow); border-color: var(--yellow); background: rgba(224,175,104,0.12); }
+  .health-chip.unknown { color: var(--orange); border-color: var(--orange); background: rgba(255,158,100,0.10); }
+  .health-chip.good { color: var(--green); border-color: rgba(158,206,106,0.4); background: rgba(158,206,106,0.10); }
+
+  #health-section .job-row { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; }
+  #health-section .job-name { min-width: 150px; color: var(--fg); }
+  #health-section .job-status { min-width: 190px; }
+  #health-section .job-note { color: var(--fg-dim); font-size: 11px; }
+  #health-section .s-ok { color: var(--green); }
+  #health-section .s-stale, #health-section .s-never { color: var(--red); font-weight: 600; }
+  #health-section .s-pending_instrumentation { color: var(--fg-dim); }
+  #health-section .rej-row td { vertical-align: top; }
+  #health-section .rej-payload { color: var(--fg-dim); font-size: 11px; word-break: break-all; }
+  #health-section .outer-ping-gap {
+    margin-top: 8px;
+    padding: 6px 8px;
+    border-left: 2px solid var(--orange);
+    color: var(--fg-dim);
+    font-size: 11px;
+  }
 </style>
 </head>
 <body>
 
 <div class="topbar">
   <div class="seg brand">▎ comic-pipeline</div>
+  <div class="seg health" id="health-seg"></div>
   <div class="spacer"></div>
   <div class="seg host">mac-mini.tail9b7fa5.ts.net</div>
 </div>
 <div class="refresh-bar" id="refresh-bar"></div>
 
 <div class="wrap">
+  <div id="health-section"></div>
   <div id="active-section"></div>
   <div id="ended-section"></div>
 </div>
 
 <script>
 const REFRESH_MS = 30000;
+const HEALTH_REFRESH_MS = 120000;
 const SNIPES_URL = "/api/comics/snipes";
 const HISTORY_URL = "/api/comics/history";
 const ebayUrl = id => `https://www.ebay.com/itm/${id}`;
@@ -429,6 +469,14 @@ function renderEnded(history) {
 
 // ---- Fetch + refresh loop ---------------------------------------------------
 
+// A non-2xx must raise, never resolve to a body — silently rendering an error
+// page as data is the failure mode the whole health strip below exists for.
+async function fetchJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} HTTP ${r.status}`);
+  return r.json();
+}
+
 let _lastSnipes = null;
 let _inFlight = false;
 
@@ -444,8 +492,8 @@ async function load() {
   document.getElementById("refresh-bar").classList.add("is-active");
   try {
     const [snipes, history] = await Promise.all([
-      fetch(SNIPES_URL).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
-      fetch(HISTORY_URL).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+      fetchJson(SNIPES_URL),
+      fetchJson(HISTORY_URL),
     ]);
     _lastSnipes = snipes;
     renderAll(snipes, history);
@@ -455,6 +503,118 @@ async function load() {
     document.getElementById("refresh-bar").classList.remove("is-active");
     _inFlight = false;
   }
+}
+
+// ---- Silent-failure health strip (BUI-601 rejections + BUI-602 heartbeats) ---
+//
+// The whole point of both tables is that a failure here is INVISIBLE by
+// default: a write the server refused, or a job that quietly stopped running.
+// So this strip has one rule — it may only render "fine" when the server has
+// affirmatively said so. A failed health fetch renders as `unknown` (orange),
+// never as green and never as nothing.
+
+const REJECTIONS_URL = "/api/comics/health/rejections";
+const HEARTBEATS_URL = "/api/comics/health/heartbeats";
+
+let _health = {rejections: null, heartbeats: null, error: null};
+let _healthOpen = false;
+
+function healthChips() {
+  if (_health.error) {
+    return `<span class="health-chip unknown" data-health-toggle
+             title="could not read server health: ${escapeHtml(_health.error)}">⚠ health unknown</span>`;
+  }
+  const rej = _health.rejections, hb = _health.heartbeats;
+  if (!rej || !hb) return "";
+  let out = "";
+  if (rej.count > 0) {
+    out += `<span class="health-chip bad" data-health-toggle
+             title="writes the server refused in the last ${rej.window_hours}h">`
+        + `✕ ${rej.count} rejected write${rej.count === 1 ? "" : "s"}</span>`;
+  }
+  const broken = (hb.stale_jobs || []).length + (hb.never_seen_jobs || []).length;
+  const pending = (hb.pending_instrumentation_jobs || []).length;
+  if (broken > 0) {
+    out += `<span class="health-chip bad" data-health-toggle
+             title="jobs whose last success is older than their declared cadence">`
+        + `✕ ${broken} job${broken === 1 ? "" : "s"} stale</span>`;
+  } else if (pending > 0) {
+    // Never green: these jobs have a declared contract but nothing pings yet,
+    // so we genuinely do not know whether they are running.
+    out += `<span class="health-chip warn" data-health-toggle
+             title="declared in the job contract but not yet instrumented — health unknown, not healthy">`
+        + `◌ ${pending} job${pending === 1 ? "" : "s"} unmonitored</span>`;
+  } else {
+    out += `<span class="health-chip good" data-health-toggle title="all jobs pinged within cadence">✓ jobs ok</span>`;
+  }
+  return out;
+}
+
+function renderHealth() {
+  document.getElementById("health-seg").innerHTML = healthChips();
+  const box = document.getElementById("health-section");
+  if (!_healthOpen) { box.innerHTML = ""; return; }
+
+  const rej = _health.rejections, hb = _health.heartbeats;
+  if (_health.error || !rej || !hb) {
+    box.innerHTML = `<div class="panel"><div class="panel-head">`
+      + `<span class="label">server health</span></div>`
+      + `<div style="padding:8px">could not read server health: `
+      + `${escapeHtml(_health.error || "no data")}</div></div>`;
+    return;
+  }
+
+  const jobRows = (hb.jobs || []).map(j => {
+    const age = j.age_hours == null ? "never" : `${j.age_hours.toFixed(1)}h ago`;
+    const note = j.status === "pending_instrumentation"
+      ? escapeHtml(j.ping || "")
+      : `cadence ${j.cadence_hours}h · stale after ${j.stale_after_hours}h`;
+    return `<div class="job-row">`
+      + `<span class="job-name">${escapeHtml(j.job)}</span>`
+      + `<span class="job-status s-${escapeHtml(j.status)}">${escapeHtml(j.status)} · ${escapeHtml(age)}</span>`
+      + `<span class="job-note">${note}</span></div>`;
+  }).join("");
+
+  const rejRows = (rej.rejections || []).map(r => `<tr class="rej-row">`
+    + `<td>${escapeHtml((r.created_at || "").replace("T", " ").slice(0, 19))}</td>`
+    + `<td>${escapeHtml(r.status)}</td>`
+    + `<td>${escapeHtml(r.method)} ${escapeHtml(r.path)}</td>`
+    + `<td class="rej-payload">${escapeHtml(r.detail || "")}</td>`
+    + `<td class="rej-payload">${escapeHtml(r.payload || "")}</td></tr>`).join("");
+
+  box.innerHTML = `<div class="panel">
+    <div class="panel-head"><span class="label">job heartbeats</span>
+      <span class="count">${(hb.jobs || []).length} jobs</span></div>
+    <div style="padding:6px 8px">${jobRows}</div>
+    ${hb.outer_ping !== "wired" ? `<div class="outer-ping-gap">
+      outer ping <b>${escapeHtml(hb.outer_ping)}</b> — nothing outside this machine polls
+      this watchdog, so a server that is entirely down still shows nothing here.
+      See docs/reference/job-heartbeat-contract.md.</div>` : ""}
+  </div>
+  <div class="panel">
+    <div class="panel-head"><span class="label">rejected writes</span>
+      <span class="count">${rej.count} in ${rej.window_hours}h</span></div>
+    ${rej.count === 0
+      ? `<div style="padding:8px">no writes refused in the last ${rej.window_hours}h</div>`
+      : `<div class="scroll"><table><thead><tr>
+          <th>when</th><th>status</th><th>endpoint</th><th>detail</th><th>payload</th>
+        </tr></thead><tbody>${rejRows}</tbody></table></div>`}
+  </div>`;
+}
+
+async function loadHealth() {
+  try {
+    const [rejections, heartbeats] = await Promise.all([
+      fetchJson(REJECTIONS_URL),
+      fetchJson(HEARTBEATS_URL),
+    ]);
+    _health = {rejections, heartbeats, error: null};
+  } catch (e) {
+    // Surfaced, not swallowed — an unreadable health endpoint is itself a
+    // health signal.
+    _health = {rejections: null, heartbeats: null, error: e.message || String(e)};
+  }
+  renderHealth();
 }
 
 // ---- Inline-edit max_bid ----------------------------------------------------
@@ -583,6 +743,13 @@ async function confirmRemove(btn) {
 }
 
 document.addEventListener("click", e => {
+  const chip = e.target.closest("[data-health-toggle]");
+  if (chip) {
+    _healthOpen = !_healthOpen;
+    renderHealth();
+    return;
+  }
+
   const cell = e.target.closest(".editable-max");
   if (cell) {
     if (!cell.classList.contains("editing") && !cell.classList.contains("saving")) {
@@ -618,11 +785,17 @@ document.addEventListener("click", e => {
 
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-  if (e.key === "r" || e.key === "R") { e.preventDefault(); load(); }
+  if (e.key === "r" || e.key === "R") { e.preventDefault(); load(); loadHealth(); }
 });
 
 load();
+loadHealth();
 setInterval(load, REFRESH_MS);
+// Health moves on human timescales (a stale job, a refused write), not on the
+// snipe clock — polled on its own slower loop so it adds no load to the 30s
+// refresh. Kept independent of load() so a failing snipes fetch can never
+// take the health strip down with it.
+setInterval(loadHealth, HEALTH_REFRESH_MS);
 </script>
 </body>
 </html>
