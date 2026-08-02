@@ -1,4 +1,5 @@
-"""comic-fmv CLI — thin Click wrapper around fmv_runner.run()."""
+"""comic-fmv CLI — thin Click wrapper around fmv_runner.run() (plus the
+read-only --inversion-sweep and --sentinel-probe report modes)."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import sys
 import click
 
 import fmv_runner
+import sentinel_probe as sentinel_probe_module
 
 
 def _version_string() -> str:
@@ -86,10 +88,21 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
                    "rows only — zero provider requests, so it is safe to run "
                    "any time. Advisory: nothing is written and no price "
                    "changes. Ignores --batch.")
+@click.option("--sentinel-probe", is_flag=True,
+              help="BUI-603: run the fixed sentinel + negative-control "
+                   "calibration batch (2-3 deep-liquid keys + one query "
+                   "guaranteed to match nothing) through ebay-sold-comps and "
+                   "report pass/fail — n=0 or a wild price jump on a "
+                   "sentinel, or ANY comps on the negative control, alerts. "
+                   "Calibration only: nothing is ever upserted to the "
+                   "fmv/comics DB. Spends real provider requests (unless "
+                   "cache-fresh) — run weekly, not per-invocation. Ignores "
+                   "--batch. Exits 0 (healthy), 1 (a check failed), or 2 "
+                   "(the probe itself could not complete).")
 def cli(batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool, grade_window: float | None,
         quiet: bool, brief: bool, server_url: str | None,
-        inversion_sweep: bool) -> None:
+        inversion_sweep: bool, sentinel_probe: bool) -> None:
     """Compute fair market value for a batch of comics.
 
     Pipeline per book:
@@ -122,6 +135,12 @@ def cli(batch_path: str | None, out_path: str | None,
     if inversion_sweep:
         fmv_runner.run_inversion_sweep(server_url=server_url)
         return
+    # BUI-603: a calibration report, not a pricing run — same reason as
+    # --inversion-sweep above, handled before run()'s --batch/--server-url
+    # gates (a sentinel probe needs neither: its batch is fixed, and the
+    # heartbeat ping it attempts on success is best-effort/optional).
+    if sentinel_probe:
+        sys.exit(sentinel_probe_module.run_sentinel_probe(server_url=server_url))
     fmv_runner.run(
         batch_path=batch_path,
         out_path=out_path,
