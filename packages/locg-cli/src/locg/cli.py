@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import logging
 import sys
@@ -83,6 +84,30 @@ def output(data: Any, pretty: bool = False, fields: list[str] | None = None) -> 
         print(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
 
 
+def _version_string() -> str:
+    """BUI-612: staleness signal for a `uv tool install`ed binary — mirrors
+    the git-stamp pattern from BUI-305 (comic-fmv) and BUI-314 (ebay-fetch).
+
+    `_build_info` is generated at build time by hatch_build.py from the git
+    HEAD of the source tree the wheel was built from; it's absent when
+    running from an unbuilt checkout (e.g. `uv run` here in tests, or the
+    editable workspace install), so fall back to "unknown" rather than
+    failing. Deliberately a bare top-level import, not `locg._build_info`
+    — see hatch_build.py's module docstring for why nesting the stamp
+    inside the `locg` package makes it unreachable under an editable
+    install.
+    """
+    try:
+        pkg_version = importlib.metadata.version("locg")
+    except importlib.metadata.PackageNotFoundError:
+        pkg_version = __version__
+    try:
+        from _build_info import GIT_DATE, GIT_SHA
+    except ImportError:
+        GIT_SHA, GIT_DATE = "unknown", "unknown"
+    return f"locg {pkg_version} (git {GIT_SHA}, {GIT_DATE})"
+
+
 def create_parser() -> argparse.ArgumentParser:
     # Shared flags available on all subcommands
     common = argparse.ArgumentParser(add_help=False)
@@ -96,7 +121,12 @@ def create_parser() -> argparse.ArgumentParser:
         description="CLI for League of Comic Geeks",
         parents=[common],
     )
-    parser.add_argument("--version", action="version", version=f"locg {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=_version_string(),
+        help="Print the installed version and the git SHA/date it was built "
+             "from, then exit. Use this to check for a stale `uv tool "
+             "install` (see scripts/deploy.sh).",
+    )
 
     sub = parser.add_subparsers(dest="command", help="Available commands")
 

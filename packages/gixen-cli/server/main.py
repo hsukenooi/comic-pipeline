@@ -1512,9 +1512,46 @@ def static_v2_css():
     )
 
 
+def _resolve_git_sha() -> str:
+    """BUI-612: SHA attestation for the comics server.
+
+    apps/fmv (BUI-305), apps/ebay (BUI-314), and packages/locg-cli
+    (BUI-612) each stamp their git SHA into the wheel at BUILD time (see
+    their respective hatch_build.py) because their console scripts are
+    `uv tool install`ed hatchling packages, where that stamp survives
+    reliably. The comics server instead runs from the editable *workspace*
+    `.venv` (source, not a frozen wheel — see BUI-377), so it reads git
+    HEAD directly at process startup rather than needing a build-time
+    stamp. packages/gixen-cli/cli.py also reads git HEAD at runtime rather
+    than via a build-time stamp, for a related but distinct reason: it's
+    always `uv tool install --editable`ed, and setuptools' editable
+    strategy (unlike hatchling's) has no mechanism to materialize a
+    separately-generated file into site-packages, so a build-time stamp
+    module would never be reachable there. Computed once at import time
+    (not per-request): a redeploy restarts this process via `launchctl
+    kickstart` (scripts/deploy.sh), which re-imports the module and
+    re-resolves HEAD. Falls back to "unknown" if `git` is missing or this
+    isn't a git checkout, rather than failing server startup over a
+    diagnostics field.
+    """
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return output or "unknown"
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+_SERVER_GIT_SHA = _resolve_git_sha()
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "git_sha": _SERVER_GIT_SHA}
 
 
 @app.get("/api/dashboard-tabs", response_model=list[TabSpec])
