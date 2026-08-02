@@ -105,3 +105,53 @@ def test_inversion_sweep_needs_no_batch(monkeypatch):
 
     assert result.exit_code == 0
     assert "--batch is required" not in result.output
+
+
+def test_sentinel_probe_short_circuits_the_pricing_run(monkeypatch):
+    """BUI-603: --sentinel-probe must reach run_sentinel_probe and NOT
+    fmv_runner.run() — a regression here would spend real pricing-run
+    provider requests (and risk an upsert) under a flag whose whole point is
+    calibration-only, zero-write behavior."""
+    import fmv_cli
+
+    probed, priced = [], []
+    monkeypatch.setattr(fmv_cli.sentinel_probe_module, "run_sentinel_probe",
+                        lambda **kwargs: probed.append(kwargs) or 0)
+    monkeypatch.setattr(fmv_cli.fmv_runner, "run",
+                        lambda **kwargs: priced.append(kwargs))
+
+    result = CliRunner().invoke(
+        cli, ["--sentinel-probe", "--server-url", "http://x"])
+
+    assert result.exit_code == 0
+    assert probed == [{"server_url": "http://x"}]
+    assert priced == []
+
+
+def test_sentinel_probe_needs_no_batch_or_server_url(monkeypatch):
+    """The probe's batch is fixed and the heartbeat ping it attempts is
+    best-effort, so it must not be gated on --batch or --server-url the way
+    a pricing run is."""
+    import fmv_cli
+
+    monkeypatch.setattr(fmv_cli.sentinel_probe_module, "run_sentinel_probe",
+                        lambda **kwargs: 0)
+
+    result = CliRunner().invoke(cli, ["--sentinel-probe"])
+
+    assert result.exit_code == 0
+    assert "--batch is required" not in result.output
+    assert "Usage:" not in result.output
+
+
+def test_sentinel_probe_propagates_a_nonzero_exit_code(monkeypatch):
+    """The probe's exit code (1 = a check failed, 2 = couldn't run) is the
+    alert surface — it must reach the process exit code unchanged."""
+    import fmv_cli
+
+    monkeypatch.setattr(fmv_cli.sentinel_probe_module, "run_sentinel_probe",
+                        lambda **kwargs: 1)
+
+    result = CliRunner().invoke(cli, ["--sentinel-probe"])
+
+    assert result.exit_code == 1
