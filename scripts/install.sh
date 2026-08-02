@@ -11,6 +11,7 @@
 #   - gixen-cli   -> gixen                                       (packages/gixen-cli, editable)
 #   - locg        -> locg                                        (packages/locg-cli, editable)
 #   - comics-api  -> comics-api (symlink, not uv-managed)         (scripts/comics-api, BUI-510)
+#   - premise-check -> premise-check (symlink, not uv-managed)    (scripts/premise-check, BUI-613)
 #
 # comic-fmv shells out to the `ebay-sold-comps` console script at runtime, so
 # both apps must be installed for the FMV pipeline to work end to end. The
@@ -98,6 +99,14 @@ chmod +x "$REPO_ROOT/scripts/comics-api"
 mkdir -p "$bin_dir"
 ln -sf "$REPO_ROOT/scripts/comics-api" "$bin_dir/comics-api"
 
+# premise-check (BUI-613) — same symlink-not-uv-managed pattern as comics-api
+# above, for the same reason: it's a standalone script (Python, not bash —
+# see its own header for why), not a package with a pyproject.toml entry
+# point.
+echo "Installing premise-check (ticket-premise preflight, BUI-613)..."
+chmod +x "$REPO_ROOT/scripts/premise-check"
+ln -sf "$REPO_ROOT/scripts/premise-check" "$bin_dir/premise-check"
+
 # Remove stale hand-rolled wrappers pinned to python@3.14. Only delete files we
 # positively identify as the broken wrappers, never anything else on PATH.
 # (The pre-merge locg install was exactly this python@3.14 wrapper.)
@@ -112,6 +121,6 @@ done
 
 echo
 echo "Done. CLIs installed via uv into $bin_dir:"
-for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers gixen locg comics-api; do
+for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers gixen locg comics-api premise-check; do
   printf '  %-16s -> %s\n' "$name" "$(command -v "$name" 2>/dev/null || echo 'NOT ON PATH — add '"$bin_dir"' to PATH')"
 done

@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""premise-check <BUI-ID> — BUI-613: ticket preflight command.
+
+Pulls a Linear ticket, extracts named symbols / file paths / constants /
+quoted strings from its DESCRIPTION ONLY (never its comments — a ticket's
+resolution comments are written *after* implementation and would leak the
+answer into a tool meant to run *before* implementation starts), greps this
+repo for each, and emits a premise report classifying every extracted claim
+as one of:
+
+    confirmed           the named thing exists where the ticket says
+    drifted             the named location exists but the specific claim
+                         (line numbers, an enumerated count) does not hold
+    absent              nothing matching the claim was found anywhere
+    renamed-near-miss   the exact claim is absent, but a highly similar
+                         symbol/path/route was found elsewhere — the
+                         signature of a rename (see BUI-612: `/api/health`
+                         named in the ticket, `/health` is what shipped)
+    unverifiable        extraction or matching was too ambiguous to trust
+                         (never reported as "confirmed" — see design note)
+
+Design principle (the whole reason this tool exists): false confidence is
+the only real failure mode. A "confirmed" verdict on a symbol that does not
+exist launders exactly the premise drift this tool is meant to catch. So
+every verification path below is written to fail toward "absent" or
+"unverifiable" rather than toward "confirmed" when in doubt — see
+docs/solutions/conventions/verify-ticket-premise-before-implementing.md,
+which is this tool's requirements document.
+
+Why Python, not bash (scripts/ convention is bash — see comics-api,
+deploy.sh): the extraction step is markdown-aware regex classification
+against real prose (backtick spans, fenced code blocks, quoted strings,
+line-number suffixes that sit OUTSIDE the backticks that hold the path) plus
+fuzzy near-miss matching (difflib) — string/regex work bash's tools (sed/awk/
+grep) do not do cleanly or portably across BSD vs GNU. Everything else
+(subprocess to `linear`, `git ls-files`) is exactly as easy from Python.
+Stdlib only — no dependency install needed to run this.
+
+Usage:
+  premise-check BUI-613                 # print the report to stdout
+  premise-check BUI-613 --comment       # also post it as a Linear comment
+  premise-check BUI-613 --repo <path>   # check a different checkout (tests)
+  premise-check --selftest              # run the extraction/classification
+                                         # unit checks (no repo, no network)
+
+Read-only: this tool greps and reports. It never edits code. Posting the
+report as a Linear comment is the one write, and it is opt-in (--comment).
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+CONFIRMED = "confirmed"
+DRIFTED = "drifted"
+ABSENT = "absent"
+NEAR_MISS = "renamed-near-miss"
+UNVERIFIABLE = "unverifiable"
+
+# Extensions treated as "real code" for existence/content checks. Markdown
+# and other docs are deliberately EXCLUDED from the "does this exist in
+# code" search — a doc (including this repo's own ideation seed docs) can
+# carry the exact same stale premise as the ticket, so a hit only in a .md
+# file is not evidence the code target is real (this is precisely how
+# BUI-612's `/api/health` would falsely "confirm": it appears in
+# docs/ideation/2026-08-01-repo-improvements-ideation.md, nowhere in code).
+CODE_EXTS = {
+    ".py", ".sh", ".ts", ".tsx", ".js", ".jsx",
+    ".toml", ".yaml", ".yml", ".json", ".sql", ".cfg", ".ini",
+}
+
+STOPWORDS = {
+    "true", "false", "none", "null", "todo", "fixme", "n/a", "na",
+    "get", "post", "put", "delete", "patch", "why", "what", "out",
+    # Common English words that also happen to be common identifier/keyword
+    # fragments (Python `set()`, SQL SET, generic nouns) — a word-boundary
+    # hit on one of these confirms nothing specific and would be exactly the
+    # false-confidence failure mode this tool exists to avoid (observed:
+    # `LOT`/`SET` from a BUI-598 "candidate signal tokens" bullet matched
+    # dozens of unrelated occurrences). Route these to "skipped" instead of
+    # a spurious "confirmed".
+    "set", "lot", "run", "key", "new", "old", "all", "any", "end", "add",
+    "del", "map", "list", "item", "name", "type", "data", "node", "path",
+    "file", "line", "text", "body",
+}
+
+# A SYMBOL/CONSTANT that isn't in STOPWORDS can still turn out to be
+# generic enough (short, no underscore) that a repo-wide word-boundary hit
+# count this high is not a meaningful confirmation of a *specific* symbol —
+# it is a coincidence of a common short word. Downgrade rather than confirm.
+GENERIC_HIT_COUNT_THRESHOLD = 25
+
+FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+
+PATH_TOKEN_RE = re.compile(
+    r"`?([A-Za-z0-9_][A-Za-z0-9_\-./]*\.(?:py|sh|ts|tsx|js|jsx|json|toml|"
+    r"ya?ml|md|sql|cfg|ini|txt))`?"
+)
+
+LINES_LOOKAHEAD_RE = re.compile(
+    r"^[`\s]*[:~]{1,2}\s*(?:line\s+)?(\d{1,6}(?:\s*[-,]\s*\d{1,6})*)",
+    re.IGNORECASE,
+)
+
+BACKTICK_RE = re.compile(r"`([^`\n]+)`")
+QUOTED_RE = re.compile(r'"([^"\n]{8,150})"')
+
+ENDPOINT_RE = re.compile(
+    r"^(?:(GET|POST|PUT|DELETE|PATCH)\s+)?(/[A-Za-z0-9_\-{}/.*]*)$"
+)
+SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(\(\))?$")
+
+ROUTE_DECORATOR_RE = re.compile(
+    r"@(?:app|router)\.(get|post|put|delete|patch)\(\s*[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Candidate extraction
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Candidate:
+    kind: str  # FILE_PATH | FILE_PATH_LOCATOR | ENDPOINT | SYMBOL | CONSTANT | PHRASE | QUOTED_STRING
+    value: str
+    raw: str
+    lines_spec: Optional[str] = None
+    verb: Optional[str] = None
+    span: tuple = (0, 0)
+    section: str = ""  # e.g. "what", "acceptance" — see SECTION_LABEL_RE / tag_sections
+
+
+def _spans_overlap(a: tuple, b: tuple) -> bool:
+    return a[0] < b[1] and b[0] < a[1]
+
+
+# Tickets in this repo commonly use a **Label:** convention (observed live in
+# BUI-601, BUI-612): **Why:** states the current/verified problem, **What:**
+# and **Acceptance:** describe work TO BE BUILT. A claim inside a
+# What/Acceptance/Follow-up section is a proposal, not an assertion about
+# existing code — its expected absence is not premise drift, and treating it
+# as such would flag "PREMISE DRIFT DETECTED" on nearly every open ticket's
+# own description of its own unbuilt work, crying wolf into uselessness.
+# Only used to WEIGHT the headline; every claim is still fully verified and
+# shown in Findings regardless of section.
+SECTION_LABEL_RE = re.compile(
+    r"\*\*(Why|What|Acceptance|Out of [Ss]cope|Follow-ups?|Starting points)\s*:?\*\*",
+    re.IGNORECASE,
+)
+FUTURE_WORK_SECTIONS = {"what", "acceptance", "follow-up", "out of scope"}
+
+
+def _normalize_section_label(raw: str) -> str:
+    s = raw.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    if s.startswith("follow-up"):
+        return "follow-up"
+    return s
+
+
+def tag_sections(text: str, candidates: list) -> None:
+    boundaries = []
+    for m in SECTION_LABEL_RE.finditer(text):
+        boundaries.append((m.start(), _normalize_section_label(m.group(1))))
+    boundaries.sort()
+    for c in candidates:
+        pos = c.span[0] if c.span != (0, 0) else -1
+        label = ""
+        for start, lbl in boundaries:
+            if start <= pos:
+                label = lbl
+            else:
+                break
+        c.section = label
+
+
+def extract_candidates(text: str) -> tuple[list[Candidate], list[tuple[str, str]]]:
+    """Returns (candidates, skipped) where skipped is [(raw, reason), ...]."""
+    if not text:
+        return [], []
+
+    text_nf = FENCE_RE.sub(" ", text)
+
+    candidates: list[Candidate] = []
+    skipped: list[tuple[str, str]] = []
+    consumed: list[tuple[int, int]] = []
+
+    # Pass 1: file-path (+ optional line locator) tokens anywhere in the text,
+    # backticked or not — this is the one shape that regularly straddles a
+    # backtick boundary (`path.py` ~390-435, with the line spec OUTSIDE the
+    # backticks) as well as living entirely inside one span
+    # (`routes.py:348,456,985,1255`).
+    for m in PATH_TOKEN_RE.finditer(text_nf):
+        path_raw = m.group(1)
+        tail = text_nf[m.end() : m.end() + 60]
+        lm = LINES_LOOKAHEAD_RE.match(tail)
+        if lm:
+            end_pos = m.end() + lm.end()
+            candidates.append(
+                Candidate(
+                    "FILE_PATH_LOCATOR",
+                    path_raw,
+                    raw=text_nf[m.start() : end_pos].strip("` "),
+                    lines_spec=lm.group(1),
+                    span=(m.start(), end_pos),
+                )
+            )
+            consumed.append((m.start(), end_pos))
+        else:
+            candidates.append(
+                Candidate("FILE_PATH", path_raw, raw=path_raw, span=(m.start(), m.end()))
+            )
+            consumed.append((m.start(), m.end()))
+
+    # Pass 2: remaining backtick spans (endpoints, symbols, constants,
+    # short phrases/commands).
+    for m in BACKTICK_RE.finditer(text_nf):
+        if any(_spans_overlap(m.span(), c) for c in consumed):
+            continue
+        content = m.group(1).strip()
+        if not content:
+            continue
+
+        ep = ENDPOINT_RE.match(content)
+        if ep and (ep.group(2) not in ("/", "")):
+            candidates.append(
+                Candidate("ENDPOINT", ep.group(2), raw=content, verb=ep.group(1), span=m.span())
+            )
+            continue
+
+        if "/" in content and not content.startswith("http"):
+            # path-like backtick span without a recognized file extension
+            # (e.g. a bare directory reference).
+            candidates.append(Candidate("FILE_PATH", content.rstrip("/"), raw=content, span=m.span()))
+            continue
+
+        if content.startswith("http://") or content.startswith("https://"):
+            skipped.append((content, "URL, not a repo-checkable claim"))
+            continue
+
+        if SYMBOL_RE.match(content):
+            bare = content.rstrip("()")
+            if len(bare) < 2 or bare.lower() in STOPWORDS:
+                skipped.append((content, "too short / stopword"))
+                continue
+            kind = "CONSTANT" if (bare.isupper() and "_" in bare) else "SYMBOL"
+            candidates.append(Candidate(kind, bare, raw=content, span=m.span()))
+            continue
+
+        # Generic phrase / command / example token.
+        words = content.split()
+        if not any(ch.isalpha() for ch in content):
+            skipped.append((content, "numeric/punctuation-only token — likely illustrative example data, not a code reference"))
+            continue
+        if len(words) > 8:
+            skipped.append((content, "too long to be a reliable literal-match claim (>8 words)"))
+            continue
+        candidates.append(Candidate("PHRASE", content, raw=content, span=m.span()))
+
+    # Pass 3: quoted strings (double-quoted prose/code claims), independent
+    # of backticks.
+    for m in QUOTED_RE.finditer(text_nf):
+        content = m.group(1).strip()
+        if not content or not any(ch.isalpha() for ch in content):
+            continue
+        candidates.append(Candidate("QUOTED_STRING", content, raw=content, span=m.span()))
+
+    # Dedup, preserving first occurrence.
+    seen = set()
+    deduped: list[Candidate] = []
+    for c in candidates:
+        key = (c.kind, c.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(c)
+
+    tag_sections(text_nf, deduped)
+
+    return deduped, skipped
+
+
+# ---------------------------------------------------------------------------
+# Repo access
+# ---------------------------------------------------------------------------
+
+
+class Repo:
+    def __init__(self, root: str):
+        self.root = root
+        out = subprocess.run(
+            ["git", "-C", root, "ls-files"],
+            capture_output=True, text=True, check=True,
+        )
+        self.tracked: list[str] = [l for l in out.stdout.splitlines() if l]
+        self.tracked_set = set(self.tracked)
+        self.code_files: list[str] = [
+            f for f in self.tracked if os.path.splitext(f)[1] in CODE_EXTS
+        ]
+        self._content: dict[str, str] = {}
+        self._lines: dict[str, list[str]] = {}
+
+    def content(self, path: str) -> str:
+        if path not in self._content:
+            full = os.path.join(self.root, path)
+            try:
+                with open(full, "r", encoding="utf-8", errors="ignore") as fh:
+                    self._content[path] = fh.read()
+            except OSError:
+                self._content[path] = ""
+        return self._content[path]
+
+    def lines(self, path: str) -> list[str]:
+        if path not in self._lines:
+            self._lines[path] = self.content(path).splitlines()
+        return self._lines[path]
+
+    def basename_matches(self, name: str) -> list[str]:
+        return [f for f in self.tracked if os.path.basename(f) == name]
+
+    def search_literal_code(self, needle: str, word_boundary: bool = False) -> list[tuple[str, int]]:
+        hits: list[tuple[str, int]] = []
+        if word_boundary:
+            pat = re.compile(r"\b" + re.escape(needle) + r"\b")
+        for f in self.code_files:
+            for i, line in enumerate(self.lines(f), start=1):
+                if word_boundary:
+                    if pat.search(line):
+                        hits.append((f, i))
+                else:
+                    if needle in line:
+                        hits.append((f, i))
+        return hits
+
+    def collect_routes(self) -> list[tuple[str, str, int]]:
+        routes = []
+        for f in self.code_files:
+            if not f.endswith(".py"):
+                continue
+            for i, line in enumerate(self.lines(f), start=1):
+                m = ROUTE_DECORATOR_RE.search(line)
+                if m:
+                    routes.append((m.group(2), f, i))
+        return routes
+
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+
+
+def parse_lines_spec(spec: str):
+    """Returns (endpoints_for_bounds_check, enumerated_list_or_None).
+
+    A comma-separated list ("348,456,985,1255") is an ENUMERATION of
+    distinct cited sites — its length is itself a claim worth checking for
+    completeness. A dash range ("390-435") is a CONTIGUOUS BLOCK reference,
+    not a per-site enumeration, so only its two endpoints matter for bounds
+    checking and the completeness heuristic does not apply to it.
+    """
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    endpoints: list[int] = []
+    has_dash = False
+    for p in parts:
+        if "-" in p:
+            has_dash = True
+            a, b = p.split("-", 1)
+            try:
+                endpoints.extend([int(a), int(b)])
+            except ValueError:
+                continue
+        else:
+            try:
+                endpoints.append(int(p))
+            except ValueError:
+                continue
+    enumerated = None
+    if len(parts) >= 2 and not has_dash:
+        enumerated = sorted(set(endpoints))
+    return endpoints, enumerated
+
+
+def _dominant_call_signature(lines: list[str]) -> Optional[str]:
+    sigs = []
+    for line in lines:
+        m = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+        if m:
+            sigs.append(m.group(1))
+    if not sigs:
+        return None
+    counts: dict[str, int] = {}
+    for s in sigs:
+        counts[s] = counts.get(s, 0) + 1
+    best, n = max(counts.items(), key=lambda kv: kv[1])
+    if n >= max(2, len(sigs) // 2):
+        return best
+    return None
+
+
+def verify_file_path(repo: Repo, c: Candidate):
+    norm = c.value.rstrip("/")
+    if norm in repo.tracked_set:
+        return CONFIRMED, f"exists: `{norm}`"
+    if any(f.startswith(norm + "/") for f in repo.tracked):
+        return CONFIRMED, f"directory exists: `{norm}/`"
+    base = os.path.basename(norm)
+    matches = repo.basename_matches(base)
+    if "/" in c.value and matches:
+        return NEAR_MISS, f"`{norm}` not found; a file with the same name exists at: {', '.join('`'+m+'`' for m in matches[:5])}"
+    if matches:
+        return CONFIRMED, f"found at {', '.join('`'+m+'`' for m in matches[:5])} (bare filename reference)"
+    return ABSENT, f"no file or directory named `{norm}` found anywhere in the repo"
+
+
+def verify_file_locator(repo: Repo, c: Candidate):
+    norm = c.value
+    resolved: Optional[str] = None
+    if norm in repo.tracked_set:
+        resolved = norm
+    else:
+        base = os.path.basename(norm)
+        matches = repo.basename_matches(base)
+        if "/" in norm and matches:
+            return NEAR_MISS, (
+                f"`{norm}` not found; a file with the same name exists at "
+                f"{', '.join('`'+m+'`' for m in matches[:5])} — line numbers not "
+                f"re-checked against that location"
+            )
+        if len(matches) == 1:
+            resolved = matches[0]
+        elif len(matches) > 1:
+            return UNVERIFIABLE, f"multiple files named `{base}` exist ({', '.join(matches[:5])}); cannot disambiguate which one `{c.lines_spec}` refers to"
+        else:
+            return ABSENT, f"file `{norm}` not found anywhere in the repo (cited line(s) {c.lines_spec})"
+
+    total = len(repo.lines(resolved))
+    endpoints, enumerated = parse_lines_spec(c.lines_spec or "")
+    if not endpoints:
+        return UNVERIFIABLE, f"could not parse a line number out of `{c.lines_spec}`"
+    out_of_range = [n for n in endpoints if n < 1 or n > total]
+    if len(out_of_range) == len(endpoints):
+        return DRIFTED, f"`{resolved}` has {total} lines; none of the cited line(s) {c.lines_spec} exist"
+    if out_of_range:
+        return DRIFTED, f"`{resolved}` has {total} lines; out-of-range among cited {c.lines_spec}: {out_of_range}"
+
+    note = ""
+    if enumerated and len(enumerated) >= 2:
+        cited_lines = [repo.lines(resolved)[n - 1] for n in enumerated]
+        sig = _dominant_call_signature(cited_lines)
+        if sig:
+            total_hits = len(re.findall(re.escape(sig) + r"\s*\(", repo.content(resolved)))
+            if total_hits > len(enumerated):
+                note = (
+                    f" NOTE: {len(enumerated)} site(s) cited, but `{sig}(` appears "
+                    f"{total_hits}x in this file — the enumeration may be partial "
+                    f"(see the BUI-601 count-drift class in "
+                    f"docs/solutions/conventions/verify-ticket-premise-before-implementing.md)."
+                )
+    return CONFIRMED, f"`{resolved}`: line(s) {c.lines_spec} within bounds ({total} lines total).{note}"
+
+
+def verify_endpoint(repo: Repo, c: Candidate):
+    path_part = c.value
+    hits = [f for f in repo.code_files if path_part in repo.content(f)]
+    if hits:
+        loc = hits[0]
+        ln = next((i for i, l in enumerate(repo.lines(loc), 1) if path_part in l), None)
+        extra = f" (+{len(hits)-1} more file(s))" if len(hits) > 1 else ""
+        return CONFIRMED, f"found literally in `{loc}`" + (f":{ln}" if ln else "") + extra
+
+    routes = repo.collect_routes()
+    cand_segs = set(s for s in path_part.split("/") if s)
+
+    # Jaccard on raw path segments still over-rewards this repo's dominant
+    # `/api/comics/` namespace prefix: "api" and "comics" appear in nearly
+    # every registered route, so any two `/api/comics/*` endpoints share
+    # substantial "similarity" with zero rename relationship between them
+    # (observed: `/api/comics/health/rejections` vs `/api/comics/collection`
+    # scored 0.75 on raw difflib, 0.50 on unweighted segment Jaccard — both
+    # false near-misses driven purely by shared boilerplate). Down-weight
+    # segments that recur across most routes (structural/namespace noise)
+    # so only DISTINCTIVE, resource-naming segments (e.g. "health") drive a
+    # match — this is what correctly keeps BUI-612's real catch
+    # (`/api/health` -> `/health`, sharing the distinctive "health" segment)
+    # while dropping BUI-601's spurious one.
+    seg_doc_freq: dict = {}
+    for route_str, _, _ in routes:
+        for s in set(x for x in route_str.split("/") if x):
+            seg_doc_freq[s] = seg_doc_freq.get(s, 0) + 1
+    total_routes = max(1, len(routes))
+
+    def _distinctive(segs: set) -> set:
+        return {s for s in segs if seg_doc_freq.get(s, 0) < max(2, total_routes * 0.4)}
+
+    cand_distinctive = _distinctive(cand_segs) or cand_segs
+    best = None
+    best_score = 0.0
+    for route_str, f, ln in routes:
+        route_segs = set(s for s in route_str.split("/") if s)
+        route_distinctive = _distinctive(route_segs)
+        if not cand_distinctive or not route_distinctive:
+            continue
+        score = len(cand_distinctive & route_distinctive) / len(cand_distinctive | route_distinctive)
+        if score > best_score:
+            best_score, best = score, (route_str, f, ln)
+    if best and best_score >= 0.5 and best[0] != path_part:
+        return NEAR_MISS, (
+            f"`{path_part}` not found; closest defined route is `{best[0]}` at "
+            f"`{best[1]}:{best[2]}` (similarity {best_score:.2f})"
+        )
+    return ABSENT, f"`{path_part}` not found in source, and no similar registered route was located"
+
+
+def verify_symbol(repo: Repo, c: Candidate, hint_files: list[str]):
+    sym = c.value
+    hits = repo.search_literal_code(sym, word_boundary=True)
+    if hits:
+        if (
+            c.kind == "SYMBOL"
+            and "_" not in sym
+            and len(sym) <= 6
+            and len(hits) > GENERIC_HIT_COUNT_THRESHOLD
+        ):
+            return UNVERIFIABLE, (
+                f"matched {len(hits)} word-boundary occurrences across the repo — "
+                f"too common/short a token (no underscore, <=6 chars) to serve as "
+                f"a specific-symbol confirmation; manual review recommended"
+            )
+        loc = ", ".join(f"`{f}:{ln}`" for f, ln in hits[:3])
+        extra = f" (+{len(hits)-3} more)" if len(hits) > 3 else ""
+        return CONFIRMED, f"found at {loc}{extra}"
+
+    # Loose case-insensitive fallback.
+    ci_pat = re.compile(r"\b" + re.escape(sym) + r"\b", re.IGNORECASE)
+    for f in repo.code_files:
+        for i, line in enumerate(repo.lines(f), start=1):
+            if ci_pat.search(line):
+                return CONFIRMED, f"found case-insensitively at `{f}:{i}` (case differs from ticket's `{sym}`)"
+
+    # Fuzzy near-miss, scoped to files this same ticket also names (avoids a
+    # repo-wide fuzzy scan, which would be both slow and prone to spurious
+    # matches).
+    best = None
+    best_score = 0.0
+    for hf in hint_files:
+        if hf not in repo.tracked_set:
+            continue
+        idents = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", repo.content(hf)))
+        for ident in idents:
+            score = difflib.SequenceMatcher(None, sym, ident).ratio()
+            if score > best_score and score < 1.0:
+                best_score, best = score, (ident, hf)
+    if best and best_score >= 0.6:
+        return NEAR_MISS, f"`{sym}` not found; closest identifier in `{best[1]}` is `{best[0]}` (similarity {best_score:.2f})"
+
+    return ABSENT, f"`{sym}` not found anywhere in source"
+
+
+def verify_phrase(repo: Repo, c: Candidate):
+    hits = [f for f in repo.code_files if c.value in repo.content(f)]
+    if hits:
+        return CONFIRMED, f"found literally in `{hits[0]}`" + (f" (+{len(hits)-1} more)" if len(hits) > 1 else "")
+    return ABSENT, f"`{c.value}` not found literally in any source file"
+
+
+# ---------------------------------------------------------------------------
+# Report rendering
+# ---------------------------------------------------------------------------
+
+
+def run_checks(repo: Repo, candidates: list[Candidate]):
+    # Scope fuzzy-symbol near-miss matching to actual CODE files this ticket
+    # also names, not .md/docs — fuzzy-matching against doc prose produces
+    # low-value noise (e.g. matching "rejected_writes" against the word
+    # "rejected" in a seed ideation doc), not a genuine rename signal.
+    hint_files = [
+        c.value for c in candidates
+        if c.kind == "FILE_PATH" and os.path.splitext(c.value)[1] in CODE_EXTS
+    ]
+    results = []
+    for c in candidates:
+        if c.kind == "FILE_PATH":
+            verdict, detail = verify_file_path(repo, c)
+        elif c.kind == "FILE_PATH_LOCATOR":
+            verdict, detail = verify_file_locator(repo, c)
+        elif c.kind == "ENDPOINT":
+            verdict, detail = verify_endpoint(repo, c)
+        elif c.kind in ("SYMBOL", "CONSTANT"):
+            verdict, detail = verify_symbol(repo, c, hint_files)
+        elif c.kind in ("PHRASE", "QUOTED_STRING"):
+            verdict, detail = verify_phrase(repo, c)
+        else:
+            verdict, detail = UNVERIFIABLE, "unrecognized extraction kind"
+        results.append((c, verdict, detail))
+    return results
+
+
+def render_report(issue_id: str, title: str, results, skipped, repo_root: str) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = []
+    lines.append(f"# Premise Check: {issue_id} — {title}")
+    lines.append("")
+    lines.append(
+        f"Generated {now} by `scripts/premise-check` (BUI-613 v1). Static, "
+        f"read-only grep checks against `{os.path.basename(repo_root)}` — this "
+        f"is a syntactic sanity check on named symbols/paths/endpoints/strings, "
+        f"not a semantic review. A `confirmed` verdict means the named thing "
+        f"exists where cited; it does not verify the claimed BEHAVIOR at that "
+        f"location."
+    )
+    lines.append("")
+
+    counts = {CONFIRMED: 0, DRIFTED: 0, ABSENT: 0, NEAR_MISS: 0, UNVERIFIABLE: 0}
+    for _, verdict, _ in results:
+        counts[verdict] = counts.get(verdict, 0) + 1
+
+    # Primary classes are location/identity claims (a file, a line number, an
+    # endpoint, a symbol) — a wrong verdict here is a real, actionable
+    # premise-drift signal. Secondary classes (PHRASE / QUOTED_STRING) are
+    # more often narrative or illustrative-output text (an example computed
+    # value, a candidate signal word listed as a *suggestion*) — a literal
+    # miss there is common and expected, not evidence of drift.
+    #
+    # A primary claim sitting in a **What:**/**Acceptance:**/**Out of
+    # scope:**/**Follow-up:** section is a PROPOSAL — the ticket describing
+    # its own not-yet-built work — not an assertion about existing code.
+    # A pure ABSENT there is expected (nothing found anywhere is consistent
+    # with "doesn't exist yet"), so it's downgraded out of the headline
+    # (observed empirically: without this, BUI-601's own "What we'll build"
+    # section flagged "PREMISE DRIFT DETECTED" on its own future work).
+    #
+    # NEAR_MISS and DRIFTED are NOT downgraded by section, regardless: both
+    # verdicts can only fire when something closely related ALREADY EXISTS
+    # (a near-miss route/symbol, or a file that exists but whose cited lines
+    # don't match) — that is a fact about existing code, not a "not built
+    # yet" gap, even when the sentence naming it sits in a What: section.
+    # This is what keeps BUI-612's flagship catch (`/api/health` named in
+    # **What:**, but `/health` already existed) surfaced as real drift
+    # instead of being silently folded into "proposed work, ignore".
+    #
+    # All of this only weights the HEADLINE — every claim, in every section,
+    # is still fully verified and listed in Findings, so nothing is hidden.
+    PRIMARY = {"FILE_PATH", "FILE_PATH_LOCATOR", "ENDPOINT", "SYMBOL", "CONSTANT"}
+    primary_results = [r for r in results if r[0].kind in PRIMARY]
+    secondary_results = [r for r in results if r[0].kind not in PRIMARY]
+    existing_state_bad = sum(
+        1 for c, v, _ in primary_results
+        if v in (DRIFTED, NEAR_MISS) or (v == ABSENT and c.section not in FUTURE_WORK_SECTIONS)
+    )
+    proposed_work_bad = sum(
+        1 for c, v, _ in primary_results
+        if v == ABSENT and c.section in FUTURE_WORK_SECTIONS
+    )
+    secondary_bad = sum(1 for _, v, _ in secondary_results if v in (DRIFTED, ABSENT, NEAR_MISS))
+
+    lines.append("## Summary")
+    lines.append("")
+    if not results:
+        lines.append(
+            "**INCONCLUSIVE** — no checkable claims (file paths, symbols, "
+            "endpoints, constants, quoted strings) were extracted from the "
+            "ticket description. This does not mean the premise is sound — "
+            "it means this tool found nothing concrete enough to grep for. "
+            "Manual review recommended."
+        )
+    else:
+        total = len(results)
+        lines.append(
+            f"{total} claim(s) checked — "
+            f"{counts[CONFIRMED]} confirmed, {counts[DRIFTED]} drifted, "
+            f"{counts[ABSENT]} absent, {counts[NEAR_MISS]} renamed-near-miss, "
+            f"{counts[UNVERIFIABLE]} unverifiable "
+            f"({len(primary_results)} location/identity claims, "
+            f"{len(secondary_results)} phrase/quoted-text claims)."
+        )
+        lines.append("")
+        if existing_state_bad:
+            lines.append("**PREMISE DRIFT DETECTED** — at least one named file/line/endpoint/symbol claim about EXISTING code did not verify as-is. See findings below before implementing.")
+        elif proposed_work_bad:
+            lines.append(
+                f"**NO DRIFT SIGNAL — {proposed_work_bad} claim(s) are about PROPOSED (not-yet-built) work** "
+                f"in a What/Acceptance/Out-of-scope/Follow-up section — their absence is expected, not "
+                f"premise drift. Every claim about EXISTING code confirmed. See Findings for the full list "
+                f"(each row is tagged with its section)."
+            )
+        elif secondary_bad:
+            lines.append(
+                f"**NO DRIFT SIGNAL FROM LOCATION/IDENTITY CHECKS** — every named file, "
+                f"line, endpoint, and symbol confirmed. {secondary_bad} quoted/phrase "
+                f"claim(s) did not match verbatim (see Findings) — commonly illustrative "
+                f"example output rather than a location claim, but worth a human glance."
+            )
+        elif counts[UNVERIFIABLE] == total:
+            lines.append("**INCONCLUSIVE** — every extracted claim was too ambiguous to verify confidently. Manual review recommended.")
+        else:
+            lines.append("**NO DRIFT SIGNAL FROM STATIC CHECKS** — every extracted claim resolved as confirmed. This does not verify claimed behavior, counts, or that the fix direction is correct — see Out of scope below.")
+    lines.append("")
+
+    if results:
+        lines.append("## Findings")
+        lines.append("")
+        lines.append("| Kind | Section | Claim | Verdict | Evidence |")
+        lines.append("|---|---|---|---|---|")
+        for c, verdict, detail in results:
+            claim = c.raw.replace("|", "\\|").replace("\n", " ")
+            if len(claim) > 90:
+                claim = claim[:87] + "..."
+            detail_s = detail.replace("|", "\\|").replace("\n", " ")
+            section_s = c.section or "(general)"
+            lines.append(f"| {c.kind} | {section_s} | `{claim}` | **{verdict}** | {detail_s} |")
+        lines.append("")
+
+    if skipped:
+        lines.append("## Skipped (low-confidence extraction — never reported as confirmed)")
+        lines.append("")
+        for raw, reason in skipped:
+            r = raw.replace("|", "\\|")
+            lines.append(f"- `{r}` — {reason}")
+        lines.append("")
+
+    lines.append("## Out of scope for this tool (BUI-613 v1)")
+    lines.append("")
+    lines.append("- Read-only SQL re-measurement of claimed counts/statistics (a ticket citing a row count is a separate, unimplemented follow-up).")
+    lines.append("- Wiring into em-batch / work-skill intake as an automatic gate.")
+    lines.append("- Cross-checking `docs/solutions` falsification records for a previously-killed premise.")
+    lines.append("")
+    lines.append(
+        "See `docs/solutions/conventions/verify-ticket-premise-before-implementing.md` "
+        "for the discipline this tool mechanizes, and its limits."
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Linear CLI integration
+# ---------------------------------------------------------------------------
+
+
+def fetch_ticket(issue_id: str) -> dict:
+    try:
+        out = subprocess.run(
+            ["linear", "issue", "view", issue_id, "--no-comments", "--json"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        print("error: `linear` CLI not found on PATH — install it before running premise-check.", file=sys.stderr)
+        sys.exit(1)
+    if out.returncode != 0:
+        print(f"error: `linear issue view {issue_id}` failed:", file=sys.stderr)
+        print(out.stderr or out.stdout, file=sys.stderr)
+        sys.exit(1)
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"error: could not parse JSON from `linear issue view {issue_id} --json`: {exc}", file=sys.stderr)
+        print(out.stdout[:2000], file=sys.stderr)
+        sys.exit(1)
+    if not data or "identifier" not in data:
+        print(f"error: `linear issue view {issue_id}` returned no recognizable issue data.", file=sys.stderr)
+        sys.exit(1)
+    return data
+
+
+def post_comment(issue_id: str, body: str) -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
+        fh.write(body)
+        path = fh.name
+    try:
+        out = subprocess.run(
+            ["linear", "issue", "comment", "add", issue_id, "--body-file", path],
+            capture_output=True, text=True,
+        )
+    finally:
+        os.unlink(path)
+    if out.returncode != 0:
+        print(f"error: posting comment to {issue_id} failed:", file=sys.stderr)
+        print(out.stderr or out.stdout, file=sys.stderr)
+        sys.exit(1)
+    print(out.stdout.strip() or f"Comment posted to {issue_id}.")
+
+
+# ---------------------------------------------------------------------------
+# Self-test (no repo, no network — extraction/classification only)
+# ---------------------------------------------------------------------------
+
+
+def selftest() -> int:
+    failures = []
+
+    def check(name, cond):
+        if not cond:
+            failures.append(name)
+
+    # BUI-598 shape: bare backticked path, path+"~lines" straddling the
+    # backtick boundary, a real symbol, and a quoted code comment.
+    text_598 = (
+        '`hard_exclude` in `apps/ebay/src/sold_comps.py` does not exclude '
+        '**multi-issue lot / full-run listings**.\n\n'
+        '* `apps/ebay/src/sold_comps.py` ~390-435 — the BUI-347 exclusion block.\n'
+        '(`sold_comps.py` ~line 396: *"do NOT add anything broader than this '
+        'without re-validating"*)\n'
+    )
+    cands, _ = extract_candidates(text_598)
+    kinds = {(c.kind, c.value) for c in cands}
+    check("598: hard_exclude symbol extracted", ("SYMBOL", "hard_exclude") in kinds)
+    check(
+        "598: sold_comps.py path+range locator extracted",
+        any(c.kind == "FILE_PATH_LOCATOR" and c.value.endswith("sold_comps.py") and c.lines_spec and "390" in c.lines_spec for c in cands),
+    )
+    check(
+        "598: bare sold_comps.py + line 396 locator extracted",
+        any(c.kind == "FILE_PATH_LOCATOR" and c.value == "sold_comps.py" and c.lines_spec == "396" for c in cands),
+    )
+    check(
+        "598: quoted BUI-347 comment extracted",
+        any(c.kind == "QUOTED_STRING" and "do NOT add anything broader" in c.value for c in cands),
+    )
+
+    # BUI-612 shape: an endpoint claim.
+    text_612 = 'Comics server exposes its SHA via `/api/health` (editable .venv...).'
+    cands, _ = extract_candidates(text_612)
+    check(
+        "612: /api/health extracted as ENDPOINT",
+        any(c.kind == "ENDPOINT" and c.value == "/api/health" for c in cands),
+    )
+
+    # BUI-601 shape: single backtick span containing path AND a comma line list.
+    text_601 = (
+        'Verified un-persisted 4xx sites: '
+        '`plugins/gixen-overlay/src/gixen_overlay/routes.py:348,456,985,1255`.'
+    )
+    cands, _ = extract_candidates(text_601)
+    loc = next((c for c in cands if c.kind == "FILE_PATH_LOCATOR"), None)
+    check("601: locator extracted", loc is not None)
+    if loc:
+        check("601: path correct", loc.value == "plugins/gixen-overlay/src/gixen_overlay/routes.py")
+        check("601: lines_spec correct", loc.lines_spec == "348,456,985,1255")
+        endpoints, enumerated = parse_lines_spec(loc.lines_spec)
+        check("601: parsed as enumeration of 4", enumerated == [348, 456, 985, 1255])
+
+    # Fenced code blocks must not pollute extraction with illustrative output.
+    text_fence = (
+        '```\nflag_reason = None\nmax_bid = $3825\n```\n'
+        'The real symbol is `hard_exclude`.'
+    )
+    cands, _ = extract_candidates(text_fence)
+    check(
+        "fence: illustrative output not extracted as a symbol",
+        not any(c.value == "flag_reason" for c in cands),
+    )
+    check("fence: real symbol still extracted", any(c.value == "hard_exclude" for c in cands))
+
+    # Numeric-only tokens should be skipped, not falsely checked as symbols.
+    text_numeric = 'title range like `94-300` or `94,95,96` tokens.'
+    cands, skipped = extract_candidates(text_numeric)
+    check(
+        "numeric-only tokens routed to skipped, not SYMBOL/PHRASE checks",
+        all(c.value not in ("94-300", "94,95,96") for c in cands),
+    )
+
+    if failures:
+        print("SELFTEST FAILED:", file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print(f"SELFTEST OK — all checks passed.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def resolve_repo_root(explicit: Optional[str]) -> str:
+    if explicit:
+        return os.path.abspath(explicit)
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    out = subprocess.run(
+        ["git", "-C", script_dir, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        print("error: could not resolve the comic-pipeline repo root from this script's location.", file=sys.stderr)
+        print(out.stderr, file=sys.stderr)
+        sys.exit(1)
+    return out.stdout.strip()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="premise-check",
+        description="BUI-613: ticket preflight — extract a Linear ticket's named "
+        "symbols/paths/endpoints/constants/quoted strings and grep this repo "
+        "for each, emitting a premise report.",
+    )
+    parser.add_argument("issue_id", nargs="?", help="Linear issue ID, e.g. BUI-613")
+    parser.add_argument("--comment", action="store_true", help="Post the report as a comment on the issue (the only write this tool performs).")
+    parser.add_argument("--repo", default=None, help="Repo root to check against (default: this script's own checkout).")
+    parser.add_argument("--selftest", action="store_true", help="Run extraction/classification unit checks and exit (no repo, no network).")
+    args = parser.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    if not args.issue_id:
+        parser.error("issue_id is required unless --selftest is given")
+
+    issue = fetch_ticket(args.issue_id)
+    description = issue.get("description") or ""
+    title = issue.get("title") or ""
+
+    candidates, skipped = extract_candidates(description)
+
+    repo_root = resolve_repo_root(args.repo)
+    repo = Repo(repo_root)
+
+    results = run_checks(repo, candidates)
+    report = render_report(issue["identifier"], title, results, skipped, repo_root)
+
+    print(report)
+
+    if args.comment:
+        post_comment(issue["identifier"], report)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
