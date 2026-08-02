@@ -50,7 +50,6 @@ docs/solutions/design-patterns/enrich-win-rows-from-full-issue-detail-not-lightw
 docs/solutions/design-patterns/guard-strictness-must-match-consequence.md
 docs/solutions/design-patterns/metron-5xx-detection-trips-batch-breaker.md
 docs/solutions/design-patterns/oauth-token-refresh-retry-pattern.md
-docs/solutions/design-patterns/scope-status-writes-to-row-id-not-item-id.md
 docs/solutions/developer-experience/apps-tests-require-uv-run-with-pytest.md
 docs/solutions/developer-experience/cross-package-regressions-escape-per-package-test-runs.md
 docs/solutions/fmv-bid-linkage-gap-2026-05-23.md
@@ -63,5 +62,4 @@ docs/solutions/logic-errors/fmv-doubled-title-issue-empty-comps-false-fetch-err.
 docs/solutions/ui-bugs/collection-check-alias-and-printing-false-positives.md
 docs/solutions/ui-bugs/purged-snipes-shown-as-won-2026-06-01.md
 docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md
-docs/solutions/workflow-issues/multi-block-skill-shell-state-loss-fallback-swallow.md
 docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md

@@ -63,6 +63,7 @@ and it keeps the same precedent. The CI job is modeled on the `lint:` ruff job i
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import sys
 import tempfile
@@ -71,6 +72,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+from lib.fallback_swallow import check_fallback_swallow as _check_fallback_swallow_impl
+from lib.fallback_swallow import marker_has_justification
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -420,6 +424,207 @@ def check_solutions_frontmatter(root: Path) -> list[Finding]:
     return sorted(findings, key=lambda f: (f.path, f.line, f.message))
 
 
+# --- lint: non-unique-key-mutation ----------------------------------------
+#
+# Enforces docs/solutions/design-patterns/scope-status-writes-to-row-id-not-
+# item-id.md: a status-transition UPDATE/DELETE keyed only on `item_id` (or
+# `gixen_item_id`) silently hits every row sharing that key, including a
+# live PENDING row that has nothing to do with the write's intent — three
+# confirmed incidents (BUI-178, BUI-371's leftovers, BUI-388) before the
+# `only_id=` convention closed it.
+#
+# Scope, deliberately narrow (see BUI-606's review pass): this walks
+# `conn.execute(...)`/`db.execute(...)`-style calls whose first argument is
+# a string/f-string literal SQL statement, and flags an UPDATE/DELETE only
+# when it is keyed on item_id/gixen_item_id AND (for UPDATE) actually writes
+# the `status` column — not every item_id-keyed cache-field UPDATE, which
+# would flag the majority of packages/gixen-cli/server/db.py's legitimate
+# `item_id=? AND status='PENDING'` writes (at most one PENDING row can ever
+# match, by the DB's own partial unique index) and make the lint cry wolf on
+# exactly the single-row writes it must not. DELETE has no SET clause to
+# distinguish, so any non-unique-key DELETE is flagged outright.
+#
+# A hit is suppressed by either escape valve named in the ticket:
+#   * a row-id scope: a bare `id=`/`id<>`/`id IN` predicate, or the
+#     conventional `only_id=`/`id_clause` naming this codebase already uses
+#     for a conditional id-scoping predicate (update_bid_status's own
+#     pattern — see the doc's "Examples" section)
+#   * an explicit `# non-unique-key-mutation: allow (<reason>)` marker
+
+
+_NONUNIQUE_KEY_RE = re.compile(r"\b(item_id|gixen_item_id)\s*(=|\bIN\b)", re.IGNORECASE)
+_BARE_ROW_ID_RE = re.compile(r"\bid\s*(=|<>|!=|\bIN\b)", re.IGNORECASE)
+_STMT_KIND_RE = re.compile(r"^\s*(UPDATE|DELETE)\b", re.IGNORECASE)
+_ALLOW_KEY_MARKER_RE = re.compile(r"non-unique-key-mutation:\s*allow", re.IGNORECASE)
+# A bare marker with no reason attached is a rubber stamp — justification is
+# enforced by lib.fallback_swallow's marker_has_justification (shared with
+# the fallback-swallow lint's identical marker convention), and mirrors
+# MIN_ADVICE_REASON_CHARS above for the frontmatter contract's `advice-only`.
+
+_KEY_MUTATION_MESSAGE = (
+    "{kind} keyed on non-unique `{key}` without a row-id scope (id=/only_id=) "
+    "or an explicit allowlist marker"
+)
+_SKIP_DIR_PARTS = frozenset(
+    {"tests", ".venv", "venv", ".git", "node_modules", "__pycache__", "dist", "build", ".tox"}
+)
+
+_KEY_MUTATION_HINT = (
+    "scope the write to the row's own id (WHERE id=? / only_id=row['id']), or "
+    "if this is a deliberately reviewed multi-row write, mark it with a "
+    "`# non-unique-key-mutation: allow (<reason>)` comment near the statement "
+    "— see docs/solutions/design-patterns/"
+    "scope-status-writes-to-row-id-not-item-id.md"
+)
+
+
+def _sql_text_from_execute_arg(node: ast.expr) -> str | None:
+    """Best-effort reconstruction of a SQL literal argument's text.
+
+    Handles a plain string, an f-string, and the common in-repo pattern of
+    adjacent string/f-string literals the parser already concatenates into
+    one ast.JoinedStr (e.g. a plain prefix plus an f"...{TOMBSTONE...}"
+    suffix). An interpolated expression is kept as its own source text
+    (`{name}`) rather than evaluated — that's what lets a conditional
+    id-scoping fragment like `{id_clause}` still read as containing "id"
+    textually. Returns None for anything else (a bare variable, a built
+    query object) — such calls are opaque to this lint by design.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant):
+                parts.append(str(value.value))
+            elif isinstance(value, ast.FormattedValue):
+                try:
+                    parts.append("{" + ast.unparse(value.value) + "}")
+                except Exception:
+                    parts.append("{...}")
+        return "".join(parts)
+    return None
+
+
+def _iter_execute_sql(tree: ast.AST) -> Iterable[tuple[int, str]]:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in ("execute", "executemany")):
+            continue
+        if not node.args:
+            continue
+        text = _sql_text_from_execute_arg(node.args[0])
+        if text is None:
+            continue
+        yield node.lineno, text
+
+
+def _sets_status_column(sql_text: str) -> bool:
+    """True if the SET clause (the part before WHERE) writes `status`."""
+    where = re.search(r"\bWHERE\b", sql_text, re.IGNORECASE)
+    head = sql_text[: where.start()] if where else sql_text
+    return re.search(r"\bstatus\s*=", head, re.IGNORECASE) is not None
+
+
+def _has_row_id_scope(sql_text: str) -> bool:
+    if _BARE_ROW_ID_RE.search(sql_text):
+        return True
+    lowered = sql_text.lower()
+    return "id_clause" in lowered or "only_id" in lowered
+
+
+def _has_allow_marker(lines: list[str], lineno: int) -> bool:
+    """Look for the allowlist marker in the statement's own leading comment
+    block. Explaining WHY a multi-row write is safe (this codebase's own
+    style — see delete_bid/mark_bids_purged in server/db.py) routinely runs
+    several lines long, so this walks backward through contiguous
+    comment/blank lines from the statement rather than a fixed-size window —
+    capped so a genuinely unrelated block comment above can't accidentally
+    reach across an unbounded gap."""
+    cap = 30
+    block: list[str] = []
+    for i in range(lineno - 2, max(-1, lineno - 2 - cap), -1):
+        stripped = lines[i].strip()
+        if stripped == "" or stripped.startswith("#"):
+            block.append(lines[i])
+            continue
+        break
+    block.reverse()
+    # Also check the statement's own line(s), for a same-line marker. Real
+    # justification must come from comment text, never the SQL/code itself —
+    # see comment_only_text's docstring for the false-pass this closes.
+    forward = lines[lineno - 1 : lineno + 1]
+    return marker_has_justification(block, _ALLOW_KEY_MARKER_RE) or marker_has_justification(
+        forward, _ALLOW_KEY_MARKER_RE
+    )
+
+
+def check_non_unique_key_mutation(root: Path) -> list[Finding]:
+    """Status-transition UPDATE/DELETE must scope to a row id, never a bare
+    item_id/gixen_item_id — see the module docstring above this section."""
+    findings: list[Finding] = []
+    for py_file in sorted(root.rglob("*.py")):
+        relpath = py_file.relative_to(root).as_posix()
+        parts = py_file.relative_to(root).parts
+        if _SKIP_DIR_PARTS.intersection(parts) or any(p.endswith(".egg-info") for p in parts):
+            continue
+        try:
+            source = py_file.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        try:
+            tree = ast.parse(source, filename=relpath)
+        except SyntaxError:
+            continue
+        lines = source.splitlines()
+
+        for lineno, sql_text in _iter_execute_sql(tree):
+            stmt = _STMT_KIND_RE.match(sql_text.lstrip())
+            if not stmt:
+                continue
+            kind = stmt.group(1).upper()
+            key_match = _NONUNIQUE_KEY_RE.search(sql_text)
+            if not key_match:
+                continue
+            if kind == "UPDATE" and not _sets_status_column(sql_text):
+                continue
+            if _has_row_id_scope(sql_text):
+                continue
+
+            if _has_allow_marker(lines, lineno):
+                continue
+
+            key = key_match.group(1).lower()
+            findings.append(
+                Finding(
+                    relpath,
+                    lineno,
+                    _KEY_MUTATION_MESSAGE.format(kind=kind, key=key),
+                    _KEY_MUTATION_HINT,
+                )
+            )
+    return findings
+
+
+# --- lint: fallback-swallow -------------------------------------------------
+#
+# Enforces docs/solutions/workflow-issues/multi-block-skill-shell-state-loss-
+# fallback-swallow.md. The detector itself lives in scripts/lib/
+# fallback_swallow.py so it is independently importable — BUI-607 invokes
+# `lib.fallback_swallow.check_fallback_swallow` directly for its own skill-
+# corpus scan rather than reimplementing it. This wrapper only adapts the
+# result to this file's own Finding type for the pack's registration.
+
+
+def check_fallback_swallow(root: Path) -> list[Finding]:
+    return [
+        Finding(f.path, f.line, f.message, f.hint)
+        for f in _check_fallback_swallow_impl(root)
+    ]
+
+
 # --- self-test fixtures ---------------------------------------------------
 
 _GOOD_DOC = """---
@@ -688,6 +893,203 @@ _STATUS_SELF_TEST = SelfTest(
     ),
 )
 
+_NON_UNIQUE_KEY_SELF_TEST = SelfTest(
+    must_flag=(
+        Fixture(
+            "item_id-wide status UPDATE, no row-id scope",
+            {
+                "server/db.py": (
+                    "import sqlite3\n\n"
+                    "def delete_bid(conn, item_id):\n"
+                    "    conn.execute(\n"
+                    "        \"UPDATE bids SET status='REMOVED' WHERE item_id=?\",\n"
+                    "        (item_id,),\n"
+                    "    )\n"
+                )
+            },
+        ),
+        Fixture(
+            "gixen_item_id-wide DELETE, no row-id scope",
+            {
+                "server/db.py": (
+                    "def purge(conn, gixen_item_id):\n"
+                    "    conn.execute(\n"
+                    "        \"DELETE FROM comics WHERE gixen_item_id=?\",\n"
+                    "        (gixen_item_id,),\n"
+                    "    )\n"
+                )
+            },
+        ),
+        Fixture(
+            "a bare allowlist marker with no justification is a rubber stamp",
+            {
+                "server/db.py": (
+                    "def sweep(conn, item_id):\n"
+                    "    # non-unique-key-mutation: allow\n"
+                    "    conn.execute(\n"
+                    "        \"UPDATE bids SET status='REMOVED' WHERE item_id=?\",\n"
+                    "        (item_id,),\n"
+                    "    )\n"
+                )
+            },
+        ),
+    ),
+    must_pass=(
+        Fixture(
+            "conditional id_clause pattern (update_bid_status's own shape)",
+            {
+                "server/db.py": (
+                    "def update_bid_status(conn, item_id, status, only_id=None):\n"
+                    "    id_clause = ' AND id=?' if only_id is not None else ''\n"
+                    "    params = [status, item_id]\n"
+                    "    if only_id is not None:\n"
+                    "        params.append(only_id)\n"
+                    "    conn.execute(\n"
+                    "        f\"UPDATE bids SET status=? WHERE item_id=?{id_clause}\",\n"
+                    "        params,\n"
+                    "    )\n"
+                )
+            },
+        ),
+        Fixture(
+            "item_id-wide UPDATE that doesn't touch status",
+            {
+                "server/db.py": (
+                    "def cache_title(conn, item_id, title):\n"
+                    "    conn.execute(\n"
+                    "        \"UPDATE bids SET ebay_title=? WHERE item_id=? AND "
+                    "status='PENDING'\",\n"
+                    "        (title, item_id),\n"
+                    "    )\n"
+                )
+            },
+        ),
+        Fixture(
+            "item_id AND bare row id both in the WHERE clause",
+            {
+                "server/db.py": (
+                    "def resolve(conn, item_id, row_id):\n"
+                    "    conn.execute(\n"
+                    "        \"UPDATE bids SET status='WON' WHERE item_id=? AND id=?\",\n"
+                    "        (item_id, row_id),\n"
+                    "    )\n"
+                )
+            },
+        ),
+        Fixture(
+            "item_id-wide status write with an explicit allowlist marker",
+            {
+                "server/db.py": (
+                    "def sweep(conn, item_id):\n"
+                    "    # non-unique-key-mutation: allow (reviewed: guarded by\n"
+                    "    # a status filter no live PENDING row can match, BUI-606)\n"
+                    "    conn.execute(\n"
+                    "        \"UPDATE bids SET status='REMOVED' WHERE item_id=? AND "
+                    "status NOT IN ('PENDING')\",\n"
+                    "        (item_id,),\n"
+                    "    )\n"
+                )
+            },
+        ),
+        Fixture(
+            "a test file is never scanned, even with the unsafe shape",
+            {
+                "tests/test_db.py": (
+                    "def test_delete(conn):\n"
+                    "    conn.execute(\n"
+                    "        \"UPDATE bids SET status='REMOVED' WHERE item_id=?\",\n"
+                    "        ('1',),\n"
+                    "    )\n"
+                )
+            },
+        ),
+    ),
+)
+
+
+_FALLBACK_SWALLOW_SELF_TEST = SelfTest(
+    must_flag=(
+        Fixture(
+            "curl piped through jq, swallowed by 2>/dev/null || echo \"\"",
+            {
+                ".claude/commands/comic/example-seen-set.md": (
+                    "---\nname: comic:example\n---\n\n"
+                    "## Step 1\n\n```bash\n"
+                    "SEEN_IDS=$(curl -sf \"$COMICS_SERVER_URL/api/comics/seen\" "
+                    "| jq -r '.item_ids[]' 2>/dev/null || echo \"\")\n"
+                    "echo \"seen: $SEEN_IDS\"\n"
+                    "```\n"
+                )
+            },
+        ),
+        Fixture(
+            "compound && chain falling through to || echo with no hard stop",
+            {
+                ".claude/commands/comic/example-creds.md": (
+                    "---\nname: comic:example-creds\n---\n\n```bash\n"
+                    "[ -n \"$FOO\" ] && [ -n \"$BAR\" ] && echo \"ok\" || echo \"MISSING\"\n"
+                    "```\n"
+                )
+            },
+        ),
+        Fixture(
+            "a bare allowlist marker with no justification is a rubber stamp",
+            {
+                ".claude/commands/comic/example-bare-marker.md": (
+                    "---\nname: x\n---\n\n```bash\n"
+                    "# fallback-swallow: allow\n"
+                    "RESULT=$(curl -sf \"$URL\" 2>/dev/null || echo \"\")\n"
+                    "```\n"
+                )
+            },
+        ),
+    ),
+    must_pass=(
+        Fixture(
+            "same swallow, but an unconditional exit follows",
+            {
+                ".claude/commands/comic/example-guarded.md": (
+                    "---\nname: x\n---\n\n```bash\n"
+                    "python3 -c \"...\" 2>/dev/null \\\n"
+                    "  || echo \"could not parse\"\n"
+                    "exit 1\n"
+                    "```\n"
+                )
+            },
+        ),
+        Fixture(
+            "explicit allowlist marker",
+            {
+                ".claude/commands/comic/example-marked.md": (
+                    "---\nname: x\n---\n\n```bash\n"
+                    "# fallback-swallow: allow (reviewed: genuine 5xx path, BUI-606)\n"
+                    "RESULT=$(curl -sf \"$URL\" 2>/dev/null || echo \"\")\n"
+                    "```\n"
+                )
+            },
+        ),
+        Fixture(
+            "the pattern only appears in a non-shell fenced block",
+            {
+                ".claude/commands/comic/example-json.md": (
+                    "---\nname: x\n---\n\n```json\n"
+                    "{\"note\": \"discusses || echo in prose, not code\"}\n"
+                    "```\n"
+                )
+            },
+        ),
+        Fixture(
+            "outside .claude/commands/ is out of this lint's scope by design",
+            {
+                "scripts/install.sh": (
+                    "bin_dir=\"$(uv tool dir --bin 2>/dev/null || "
+                    "echo \"$HOME/.local/bin\")\"\n"
+                )
+            },
+        ),
+    ),
+)
+
 
 # --- the pack -------------------------------------------------------------
 #
@@ -707,6 +1109,21 @@ LINTS: tuple[Lint, ...] = (
         doc=f"{SOLUTIONS_DIR}/conventions/status-supersession-frontmatter-contract.md",
         check=check_solutions_status,
         self_test=_STATUS_SELF_TEST,
+    ),
+    # BUI-606: two seed lints for the learning-to-lint pack.
+    Lint(
+        id="non-unique-key-mutation",
+        summary="status writes are keyed on row id, not item_id/gixen_item_id",
+        doc=f"{SOLUTIONS_DIR}/design-patterns/scope-status-writes-to-row-id-not-item-id.md",
+        check=check_non_unique_key_mutation,
+        self_test=_NON_UNIQUE_KEY_SELF_TEST,
+    ),
+    Lint(
+        id="fallback-swallow",
+        summary='`|| echo` / `|| true` / `2>/dev/null`-then-`||` swallows a real failure',
+        doc=f"{SOLUTIONS_DIR}/workflow-issues/multi-block-skill-shell-state-loss-fallback-swallow.md",
+        check=check_fallback_swallow,
+        self_test=_FALLBACK_SWALLOW_SELF_TEST,
     ),
 )
 

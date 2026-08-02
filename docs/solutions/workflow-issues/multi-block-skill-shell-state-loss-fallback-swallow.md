@@ -10,6 +10,9 @@ applies_when:
   - "Authoring a multi-step `.claude/commands/*.md` skill where each `## Step` is its own fenced bash block"
   - "A skill sets or exports shell state (env var, sourced function, `set -e`, `cd`) in one block and a later block depends on it"
   - "A shell pipeline uses `|| echo \"\"` / `|| true` / `2>/dev/null` after a curl or URL-construction step to produce a default on failure"
+mechanized_by: lint
+lint:
+  - fallback-swallow
 tags:
   - claude-skill-authoring
   - bash-block-isolation
