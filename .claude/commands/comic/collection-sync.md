@@ -295,7 +295,13 @@ mirror is **deferred by default** (BUI-208 OQ-3). Push wishes only after **all**
 Generate the owned-safe wishes CSV with the **opt-in** export — the only path that
 emits `In Collection=0` (the machine gate otherwise refuses it):
 
+This is a separate `## Step` block — a fresh shell with none of Step 2's
+variables (BUI-352-class state loss), so re-derive `EXPORT_JSON`/`ts` here
+rather than assuming they're still set:
+
 ```bash
+EXPORT_JSON="$(mktemp -t sync-wishes-export.XXXXXX)"
+ts=$(date +%Y-%m-%dT%H%M%S)
 comics-api GET "/api/comics/collection/export?push_wishes=true" -o "$EXPORT_JSON" \
   || { echo "wish export failed"; exit 1; }
 python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \

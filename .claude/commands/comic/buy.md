@@ -187,7 +187,7 @@ Flags worth knowing:
 python3 -c "import json; r=json.load(open('<results.json>')); print(sum(1 for x in r if x.get('breaker_tripped')), 'of', len(r), 'rows breaker-affected')"
 ```
 
-**Confidence rubric:** fmv.md §8 owns the n/CV thresholds and the wide-window MEDIUM cap. The CLI returns these labels directly (in the human table and on each brief line; the `window` used lives in the `--out` JSON) — surface them as-is in your presentation.
+**Confidence rubric:** `docs/conventions/fmv-math-spec.md` §8 owns the n/CV thresholds and the wide-window MEDIUM cap. The CLI returns these labels directly (in the human table and on each brief line; the `window` used lives in the `--out` JSON) — surface them as-is in your presentation.
 
 **Flagging rules** (apply when presenting the table to the user):
 - `flag_reason` set (on the brief line) → present as **needs-manual (`<reason>`)**, no max bid; user hand-prices or skips (see the needs-manual note in Step 3)
@@ -202,7 +202,7 @@ If the CLI fails, fall back to the manual procedure in `~/Projects/comic-pipelin
 
 ## Step 4: Compute Max Bids
 
-The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is `0.80` by default; fmv.md §6 owns the haircut logic that lowers it when grade or comp confidence is low (see Step 2.5 for where `grade_confidence` comes from). When a haircut applied, the row carries `bid_haircut=…` in its `fmv_notes` — read it straight off the brief line (BUI-505 emits `fmv_notes` there); no `--out` read needed. Present the proposed bids:
+The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_factor` is `0.80` by default; `docs/conventions/fmv-math-spec.md` §6 owns the haircut logic that lowers it when grade or comp confidence is low (see Step 2.5 for where `grade_confidence` comes from). When a haircut applied, the row carries `bid_haircut=…` in its `fmv_notes` — read it straight off the brief line (BUI-505 emits `fmv_notes` there); no `--out` read needed. Present the proposed bids:
 
 ```
 | # | Comic | Grade | FMV Range | Max Bid | Notes |
