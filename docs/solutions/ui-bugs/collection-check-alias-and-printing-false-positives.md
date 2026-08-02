@@ -13,7 +13,12 @@ symptoms:
   - "The user skips a book they don't actually own, or (printing case) skips a book they explicitly wish-listed"
 root_cause: logic_error
 resolution_type: process_change
-status: mitigated (advisory flags in the skill; see BUI-249, BUI-364/373, BUI-316 for the mechanized/upstream parts; Pattern A's series-conflation guard is not mechanized, still heuristic)
+# resolution_status: the underlying bug's resolution progress (free text, no closed
+# vocabulary). Renamed from a bare `status:` under BUI-608, which reserves `status:` for a
+# different axis (does this doc's claim still hold) — see
+# docs/solutions/conventions/status-supersession-frontmatter-contract.md.
+resolution_status: mitigated (advisory flags in the skill; see BUI-249, BUI-364/373, BUI-316 for the mechanized/upstream parts; Pattern A's series-conflation guard is not mechanized, still heuristic)
+status: active
 tags: [collection-check, giant-size, annual, masthead-alias, cross-volume, printing-conflict, false-positive, bui-249, bui-364, bui-373, matcher]
 related_files:
   - .claude/commands/comic/collection-check.md

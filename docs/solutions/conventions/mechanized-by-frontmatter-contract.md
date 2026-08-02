@@ -87,8 +87,11 @@ reaching for `advice-only`.
 **Interaction with the status axis (BUI-608).** `status:`/`superseded_by:` is a separate,
 orthogonal axis: `mechanized_by:` says *how a claim is enforced*, `status:` says *whether
 the claim still holds*. They do not overlap and neither key constrains the other's
-vocabulary. The natural cross-rule — a falsified doc must not keep a live lint pointed at
-it — belongs to BUI-608 and is deliberately not implemented here.
+vocabulary — see `docs/solutions/conventions/status-supersession-frontmatter-contract.md`
+for the closed vocabulary, the companion-key rule, and how it reconciled the three docs
+that already carried a free-text `status:` before that contract existed. The natural
+cross-rule — a falsified doc must not keep a live lint pointed at it — is still not
+implemented; it remains a candidate follow-up, now that both axes exist to write it against.
 
 ## Why This Matters
 
@@ -177,6 +180,8 @@ developer who trips the lint read the incident that caused it.
 - `docs/solutions/conventions/verify-ticket-premise-before-implementing.md` — the sibling
   "mechanize the discipline" tool (`scripts/premise-check`), and the precedent for a
   Python tool living in the bash-conventioned `scripts/` dir.
+- `docs/solutions/conventions/status-supersession-frontmatter-contract.md` — the orthogonal
+  `status:`/`superseded_by:` axis anticipated above, implemented in BUI-608.
 - `docs/ideation/2026-08-01-repo-improvements-ideation.md` — survivor 2, "Learning-to-Lint",
   where this originated.
 - Tickets: BUI-605 (this contract + the CI job), BUI-606 (seed lints: non-unique-key
