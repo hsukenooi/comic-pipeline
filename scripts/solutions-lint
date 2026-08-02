@@ -92,6 +92,14 @@ MIN_ADVICE_REASON_CHARS = 20
 # Files under docs/solutions/ that are not learning docs and carry no contract.
 NON_DOC_FILENAMES = frozenset({"README.md"})
 
+# --- the status/supersession axis (BUI-608) --------------------------------
+# Orthogonal to mechanized_by: optional per doc (absence means "active"), validated only
+# when present — no ledger, no obligation to backfill all pre-existing docs. Kept in sync
+# with docs/solutions/conventions/status-supersession-frontmatter-contract.md.
+STATUS_VALUES = ("active", "corrected", "falsified", "superseded")
+MIN_SUPERSEDED_BY_CHARS = 10
+_SUPERSEDED_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 # --- pack primitives ------------------------------------------------------
 
@@ -527,6 +535,160 @@ _FRONTMATTER_SELF_TEST = SelfTest(
 )
 
 
+# --- lint: solutions-status (BUI-608) -------------------------------------
+
+
+def check_solutions_status(root: Path) -> list[Finding]:
+    """`status:`/`superseded_by:` (when present) follow the closed vocabulary and the
+    companion-key rule. Absence of `status:` is never a finding — it means "active" by
+    convention, and there is no ledger requiring every doc to declare it (contrast
+    `solutions-frontmatter`, which does require `mechanized_by:` on every doc).
+    """
+    findings: list[Finding] = []
+    for doc in _iter_solution_docs(root):
+        relpath = doc.relative_to(root).as_posix()
+        fm = _parse_frontmatter(doc.read_text())
+        if fm.error is not None or fm.data is None:
+            # solutions-frontmatter already reports unparsable frontmatter; avoid a dupe.
+            continue
+
+        data, at = fm.data, fm.key_lines
+        has_status = "status" in data
+        has_superseded_by = "superseded_by" in data
+
+        if has_status:
+            value = data["status"]
+            line = at.get("status", 1)
+            if not isinstance(value, str):
+                findings.append(Finding(relpath, line, "`status:` must be a single string"))
+            elif value not in STATUS_VALUES:
+                findings.append(
+                    Finding(
+                        relpath,
+                        line,
+                        f"unknown `status:` value {value!r}",
+                        f"the vocabulary is closed: {list(STATUS_VALUES)}",
+                    )
+                )
+            elif value != "active" and not has_superseded_by:
+                findings.append(
+                    Finding(
+                        relpath,
+                        line,
+                        f"`status: {value}` requires the companion key `superseded_by:`",
+                    )
+                )
+
+        if has_superseded_by:
+            line = at.get("superseded_by", 1)
+            value = data["superseded_by"]
+            if not isinstance(value, str) or len(value.strip()) < MIN_SUPERSEDED_BY_CHARS:
+                findings.append(
+                    Finding(
+                        relpath,
+                        line,
+                        f"`superseded_by:` must be a string of at least "
+                        f"{MIN_SUPERSEDED_BY_CHARS} characters naming what corrected, "
+                        "falsified, or superseded this doc (a doc path, a ticket id, or a "
+                        "sentence)",
+                    )
+                )
+            if not has_status or data.get("status") == "active":
+                findings.append(
+                    Finding(
+                        relpath,
+                        line,
+                        "`superseded_by:` is set but `status:` is missing or `active` — a "
+                        "pointer to what superseded this doc needs a non-active status",
+                    )
+                )
+
+        if "superseded_date" in data:
+            line = at.get("superseded_date", 1)
+            raw = data["superseded_date"]
+            # An unquoted YYYY-MM-DD is parsed by PyYAML as a datetime.date, not a string.
+            text = raw.isoformat() if hasattr(raw, "isoformat") else raw
+            if not isinstance(text, str) or not _SUPERSEDED_DATE_RE.match(text):
+                findings.append(
+                    Finding(relpath, line, "`superseded_date:` must look like YYYY-MM-DD")
+                )
+
+    return sorted(findings, key=lambda f: (f.path, f.line, f.message))
+
+
+_STATUS_SELF_TEST = SelfTest(
+    must_flag=(
+        Fixture(
+            "unknown status value",
+            {f"{SOLUTIONS_DIR}/bugs/bad-status.md": '---\ntitle: "x"\nstatus: someday\n---\n\n# x\n'},
+        ),
+        Fixture(
+            "non-active status missing superseded_by",
+            {f"{SOLUTIONS_DIR}/bugs/no-pointer.md": '---\ntitle: "x"\nstatus: falsified\n---\n\n# x\n'},
+        ),
+        Fixture(
+            "superseded_by present but status missing (implicitly active)",
+            {
+                f"{SOLUTIONS_DIR}/bugs/orphan-pointer.md": (
+                    '---\ntitle: "x"\nsuperseded_by: "BUI-999 corrected this with new '
+                    'evidence"\n---\n\n# x\n'
+                )
+            },
+        ),
+        Fixture(
+            "superseded_by too short",
+            {
+                f"{SOLUTIONS_DIR}/bugs/short-pointer.md": (
+                    '---\ntitle: "x"\nstatus: corrected\nsuperseded_by: "x"\n---\n\n# x\n'
+                )
+            },
+        ),
+        Fixture(
+            "malformed superseded_date",
+            {
+                f"{SOLUTIONS_DIR}/bugs/bad-date.md": (
+                    '---\ntitle: "x"\nstatus: superseded\nsuperseded_by: "BUI-608 replaced '
+                    'this with the new contract"\nsuperseded_date: "07/28/2026"\n---\n\n# x\n'
+                )
+            },
+        ),
+        Fixture(
+            "status is a list, not a string",
+            {
+                f"{SOLUTIONS_DIR}/bugs/list-status.md": (
+                    '---\ntitle: "x"\nstatus:\n  - active\n  - falsified\n---\n\n# x\n'
+                )
+            },
+        ),
+    ),
+    must_pass=(
+        Fixture("no status axis at all — defaults to active", {f"{SOLUTIONS_DIR}/bugs/none.md": '---\ntitle: "x"\n---\n\n# x\n'}),
+        Fixture(
+            "status: active alone, no companion needed",
+            {f"{SOLUTIONS_DIR}/bugs/ok-active.md": '---\ntitle: "x"\nstatus: active\n---\n\n# x\n'},
+        ),
+        Fixture(
+            "falsified with a real pointer",
+            {
+                f"{SOLUTIONS_DIR}/bugs/ok-falsified.md": (
+                    '---\ntitle: "x"\nstatus: falsified\nsuperseded_by: "BUI-578 measured '
+                    'precision 0.53; see verify-ticket-premise doc"\n---\n\n# x\n'
+                )
+            },
+        ),
+        Fixture(
+            "superseded with a real pointer and a valid date",
+            {
+                f"{SOLUTIONS_DIR}/bugs/ok-superseded.md": (
+                    '---\ntitle: "x"\nstatus: superseded\nsuperseded_by: "BUI-400 staged '
+                    'rollout replaced this convention"\nsuperseded_date: 2026-07-28\n---\n\n# x\n'
+                )
+            },
+        ),
+    ),
+)
+
+
 # --- the pack -------------------------------------------------------------
 #
 # Add lints here. See REGISTRATION SEAM in the module docstring.
@@ -538,6 +700,13 @@ LINTS: tuple[Lint, ...] = (
         doc=f"{SOLUTIONS_DIR}/conventions/mechanized-by-frontmatter-contract.md",
         check=check_solutions_frontmatter,
         self_test=_FRONTMATTER_SELF_TEST,
+    ),
+    Lint(
+        id="solutions-status",
+        summary="status:/superseded_by: (when present) follow the closed vocabulary and companion-key rule",
+        doc=f"{SOLUTIONS_DIR}/conventions/status-supersession-frontmatter-contract.md",
+        check=check_solutions_status,
+        self_test=_STATUS_SELF_TEST,
     ),
 )
 
@@ -646,6 +815,31 @@ def run_self_test() -> int:
     return 0
 
 
+def run_status_report(root: Path, only: frozenset[str] | None) -> int:
+    """List every docs/solutions doc's status axis (BUI-608) — the in-repo half of
+    retrieval filtering. Read-only; always exits 0 (a filter, not a gate). This is the
+    interface an out-of-repo retrieval consumer (e.g. a learnings-search agent) would call
+    to avoid surfacing a corrected/falsified/superseded doc as live guidance.
+    """
+    for doc in _iter_solution_docs(root):
+        relpath = doc.relative_to(root).as_posix()
+        fm = _parse_frontmatter(doc.read_text())
+        status = "active"
+        superseded_by = None
+        if fm.data is not None:
+            raw_status = fm.data.get("status")
+            if isinstance(raw_status, str) and raw_status:
+                status = raw_status
+            superseded_by = fm.data.get("superseded_by")
+        if only is not None and status not in only:
+            continue
+        marker = "  " if status == "active" else "**"
+        print(f"{marker} {status:<10} {relpath}")
+        if superseded_by:
+            print(f"      -> {superseded_by}")
+    return 0
+
+
 def run_list() -> int:
     for lint in LINTS:
         st = lint.self_test
@@ -667,6 +861,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--list", action="store_true", help="list the registered lints")
     parser.add_argument(
+        "--status",
+        action="store_true",
+        help="list every docs/solutions doc's status: axis (BUI-608) instead of linting; "
+        "read-only, always exits 0",
+    )
+    parser.add_argument(
+        "--only",
+        type=str,
+        default=None,
+        help="with --status, a comma-separated status filter (e.g. falsified,superseded)",
+    )
+    parser.add_argument(
         "--root",
         type=Path,
         default=REPO_ROOT,
@@ -674,6 +880,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.status:
+        only = frozenset(s.strip() for s in args.only.split(",")) if args.only else None
+        return run_status_report(args.root.resolve(), only)
     if args.list:
         return run_list()
     if args.self_test:

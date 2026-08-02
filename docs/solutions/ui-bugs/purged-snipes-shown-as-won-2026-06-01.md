@@ -12,7 +12,13 @@ symptoms:
   - winning_bid on these rows is a stale pre-removal current-bid snapshot below max_bid
 root_cause: scope_issue
 resolution_type: code_fix
-status: diagnosis-only (fix tracked in BUI-50)
+# resolution_status: the underlying bug's resolution progress (free text, no closed
+# vocabulary; value carried over verbatim, not re-verified against BUI-50's current state).
+# Renamed from a bare `status:` under BUI-608, which reserves `status:` for a different axis
+# (does this doc's claim still hold) — see
+# docs/solutions/conventions/status-supersession-frontmatter-contract.md.
+resolution_status: diagnosis-only (fix tracked in BUI-50)
+status: active
 tags: [dashboard, gixen, purged, status-filter, recently-ended, won-pill, comics, false-positive]
 related_files:
   - plugins/gixen-overlay/src/gixen_overlay/routes.py

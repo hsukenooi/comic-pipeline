@@ -1,6 +1,13 @@
 ---
 title: "A partition-scoped guard goes vacuous when one partition empties; a mutable identity key manufactures duplicates"
 date: 2026-07-28
+status: corrected
+superseded_by: "BUI-559 (closed Won't Do 2026-07-28) measured the proposed publisher-relabel
+  gate against the live store: it matches zero rows. The DC/Panini pairs are Italian
+  licensed editions, not a relabel. See
+  docs/solutions/conventions/verify-ticket-premise-before-implementing.md, Example 9, for
+  the full account; the real generator is tracked as BUI-563/BUI-564."
+superseded_date: 2026-07-28
 category: architecture-patterns
 module: "locg-cli collection store (packages/locg-cli/src/locg/collection_io.py duplicate counter + _partial_identity; collection_cache.py make_identity)"
 problem_type: architecture_pattern
@@ -116,7 +123,17 @@ _YEAR_RANGE_CAPTURE_RE.sub(r"(\1 - )", series_name)   # (1992 - Present) -> (199
 
 **The rule: fold exactly what the provider rewrites on its own, and nothing else.** Every other difference is still a different series. Verified against the live store — the fold collapsed exactly the 31 same-book groups and neither legitimate pair.
 
-Still uncovered, both live generators: a bare `(YYYY)` when a series starts and ends in one calendar year (`Knull (2026 - Present)` vs `Knull (2026)`, BUI-560), and `publisher_name` relabels (`DC Comics` vs `Panini Comics`, BUI-559).
+Still uncovered: a bare `(YYYY)` when a series starts and ends in one calendar year (`Knull (2026 - Present)` vs `Knull (2026)`, BUI-560).
+
+> **Correction (BUI-559, 2026-07-28 — see the frontmatter `status:` above).** This doc
+> originally named a `publisher_name` relabel (`DC Comics` vs `Panini Comics`) as a second
+> live generator. It isn't one. BUI-559 measured the proposed triple-equality gate
+> (identical `series_name`/`full_title`/`release_date`, publisher differing) against the
+> live store: the DC/Panini pairs never share a `release_date` — they trail by a monotone
+> 147–211 days — so the gate would have matched **zero** rows. These are Italian **licensed
+> editions**, not a relabel; the real generator behind them is tracked separately as
+> BUI-563/BUI-564. Full account:
+> `docs/solutions/conventions/verify-ticket-premise-before-implementing.md`, Example 9.
 
 #### 2b. A key with tolerance is not a key
 
@@ -201,7 +218,8 @@ Note what changed between the original guard and this one: the first asserted a 
 
 - BUI-554 — shipped 2026-07-28 (PR #349): end-year-only fold, `source` partition removed, two-pass tolerant match
 - BUI-556 — the 60-row cleanup this doc's audit snippet found; shipped the same day
-- BUI-559 / BUI-560 — the two generators still uncovered (publisher relabel; bare-`(YYYY)` fold)
+- BUI-560 — still uncovered: the bare-`(YYYY)` fold generator. BUI-559 (publisher relabel)
+  was investigated and found **not** to be a generator — see the correction above.
 - BUI-561 — a sibling instance: BUI-546 changed `_normalize_series_key` without rebuilding the persisted `series_name_index`, leaving 277/307 keys stale with no check able to notice
 - BUI-548 — added the counter; correct when written, outlived its partitioning assumption
 - `docs/solutions/architecture-patterns/durable-evidence-store-encode-unknowns-and-identity-precisely.md` — the sibling lesson that a UNIQUE key silently defines what counts as a duplicate, on the gixen-cli evidence ledger
