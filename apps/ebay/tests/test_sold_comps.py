@@ -893,6 +893,114 @@ class TestFetch:
             assert m.call_count == 2, "a repeat fetch of either page must be a cache hit"
 
 
+# ─── BUI-614: Tier-0 raw response capture ─────────────────────────────────────
+
+def _read_capture_lines(path):
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+class TestRawResponseCapture:
+    """conftest.py's autouse _isolate_raw_response_capture fixture already
+    redirects CAPTURE_DIR/CAPTURE_PATH to a per-test tmp path — no explicit
+    monkeypatch needed here for that half; CACHE_DIR still needs its own
+    per-test isolation like every other TestFetch case."""
+
+    def test_serpapi_success_appends_one_record(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
+        with patch("sold_comps.requests.get",
+                   return_value=self._mock_serpapi(good_url, [{"product_id": "1"}])):
+            sc.fetch("test query", "key")
+
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 1
+        record = records[0]
+        assert record["provider"] == sc.PROVIDER_SERPAPI
+        assert record["query"] == "test query"
+        assert isinstance(record["canonical_url"], str) and record["canonical_url"]
+        assert isinstance(record["timestamp"], (int, float))
+        assert record["response"]["organic_results"] == [{"product_id": "1"}]
+
+    def test_sold_comps_success_appends_one_record(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   return_value=_sold_comps_good([_sc_item()])):
+            sc.fetch_sold_comps("test query", "sc_key")
+
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 1
+        assert records[0]["provider"] == sc.PROVIDER_SOLD_COMPS
+        assert records[0]["query"] == "test query"
+        assert len(records[0]["response"]["items"]) == 1
+
+    def test_append_only_survives_a_requery_that_would_overwrite_the_cache(
+            self, tmp_path, monkeypatch):
+        """The entire point of BUI-614: CACHE_DIR overwrites the same
+        canonical-URL key on a re-query (same digest path); the capture file
+        must instead accumulate BOTH responses as separate lines."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
+        with patch("sold_comps.requests.get",
+                   return_value=self._mock_serpapi(good_url, [{"product_id": "1"}])):
+            sc.fetch("same query", "key")
+            sc.fetch("same query", "key", force=True)  # bypasses cache -> re-fetch
+
+        # Cache still holds exactly one file (the second fetch overwrote it).
+        assert len(list(tmp_path.glob("*.json"))) == 1
+        # Capture file has both, in append order.
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 2
+
+    def test_capture_failure_does_not_break_the_fetch(self, tmp_path, monkeypatch, capsys):
+        """Hard constraint (BUI-614): a capture failure must never fail the
+        fetch it's shadowing. Force _capture_raw_response's write to blow up
+        and confirm fetch() still returns normally with the right data."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_DIR", tmp_path / "unwritable-capture")
+
+        def boom(*a, **k):
+            raise OSError("disk full (simulated)")
+
+        monkeypatch.setattr(sc.os, "open", boom)
+        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
+        with patch("sold_comps.requests.get",
+                   return_value=self._mock_serpapi(good_url, [{"product_id": "1"}])):
+            data, cache_hit = sc.fetch("test", "key")
+
+        assert cache_hit is False
+        assert data["organic_results"] == [{"product_id": "1"}]
+        assert "BUI-614" in capsys.readouterr().err
+
+    def test_capture_failure_does_not_break_sold_comps_fetch(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_DIR", tmp_path / "unwritable-capture")
+
+        def boom(*a, **k):
+            raise OSError("disk full (simulated)")
+
+        monkeypatch.setattr(sc.os, "open", boom)
+        with patch("sold_comps.requests.get",
+                   return_value=_sold_comps_good([_sc_item()])):
+            data, cache_hit = sc.fetch_sold_comps("test", "sc_key")
+
+        assert cache_hit is False
+        assert len(data["items"]) == 1
+        assert "BUI-614" in capsys.readouterr().err
+
+    @staticmethod
+    def _mock_serpapi(ebay_url, organic_results):
+        m = MagicMock()
+        m.raise_for_status = MagicMock()
+        m.status_code = 200
+        m.json = MagicMock(return_value={
+            "organic_results": organic_results,
+            "search_metadata": {"ebay_url": ebay_url},
+        })
+        return m
+
+
 # ─── Tiered query strategy ────────────────────────────────────────────────────
 
 class TestTieredStrategy:
