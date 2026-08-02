@@ -1,0 +1,67 @@
+# UNMECHANIZED — the mechanization backlog (BUI-605)
+#
+# Every doc under docs/solutions/ must declare `mechanized_by:` in its
+# frontmatter — see conventions/mechanized-by-frontmatter-contract.md. The 47
+# docs below predate that contract and have not been classified yet. They are
+# exempt from the `solutions-frontmatter` lint until someone does the thinking.
+#
+# THIS LIST ONLY EVER SHRINKS. It is append-never:
+#
+#   * A NEW doc must never be added here. New docs classify at write time —
+#     that is the whole point of the contract, and /ce-compound asks the
+#     question while the incident is still fresh.
+#   * When you classify a doc, add its `mechanized_by:` and DELETE its line
+#     here. The lint fails if a listed doc has gained the key, so the ratchet
+#     tightens itself.
+#   * If a doc is renamed or deleted, fix or drop its line — the lint fails on
+#     entries that no longer resolve.
+#
+# Format: one repo-relative path per line. `#` starts a comment.
+
+docs/solutions/architecture-patterns/add-a-safety-gate-as-a-fail-closed-precheck-not-by-relocating-an-invariant.md
+docs/solutions/architecture-patterns/durable-evidence-store-encode-unknowns-and-identity-precisely.md
+docs/solutions/architecture-patterns/evidence-layer-disambiguation-vs-heuristic-gating.md
+docs/solutions/architecture-patterns/grade-confidence-haircut-and-print-layer-rule-2026-06-03.md
+docs/solutions/architecture-patterns/http-only-contracts-need-a-source-parsing-canary.md
+docs/solutions/architecture-patterns/vacuous-partition-guards-and-mutable-identity-keys.md
+docs/solutions/architecture-patterns/wish-list-data-safety-enforcement-vs-surfacing-layer.md
+docs/solutions/best-practices/collection-add-record-win-tail-rationale-2026-07-19.md
+docs/solutions/best-practices/collection-add-workflow-patterns-2026-06-18.md
+docs/solutions/best-practices/collection-check-cover-year-forwarding-vs-bui129.md
+docs/solutions/best-practices/comic-identify-annual-classifier-regex-safety.md
+docs/solutions/best-practices/fmv-7a-cgc-proxy-not-safely-automatable.md
+docs/solutions/best-practices/fmv-grade-curve-interpolation-overbid-guards.md
+docs/solutions/best-practices/fmv-outlier-robust-bucket-n-guard.md
+docs/solutions/best-practices/fmv-recency-weighting-baseline-r7.md
+docs/solutions/best-practices/fmv-self-referential-feedback-deflation-guard.md
+docs/solutions/best-practices/mypy-bool-return-type-and-non-required-typecheck-ci.md
+docs/solutions/best-practices/plugin-owned-read-endpoints-cross-repo-2026-05-19.md
+docs/solutions/conventions/bid-group-purge-is-hygiene-not-safety-net.md
+docs/solutions/conventions/relocating-skill-sections-leaves-stale-inbound-references.md
+docs/solutions/conventions/shared-singleton-connection-rollback-on-unexpected-exception.md
+docs/solutions/conventions/verify-ticket-premise-before-implementing.md
+docs/solutions/conventions/write-transaction-per-cycle-isolation.md
+docs/solutions/database-issues/fmv-stub-row-case-mismatch-2026-05-23.md
+docs/solutions/database-issues/sqlite-fk-rename-savepoint-pragma-2026-05-19.md
+docs/solutions/database-issues/stub-fmv-null-after-extract-comics-2026-05-23.md
+docs/solutions/design-patterns/atomic-write-unique-tmp-sweep-must-be-age-gated.md
+docs/solutions/design-patterns/drain-started-cancel-tail-seen-set-loops.md
+docs/solutions/design-patterns/enrich-win-rows-from-full-issue-detail-not-lightweight-lookup.md
+docs/solutions/design-patterns/guard-strictness-must-match-consequence.md
+docs/solutions/design-patterns/metron-5xx-detection-trips-batch-breaker.md
+docs/solutions/design-patterns/oauth-token-refresh-retry-pattern.md
+docs/solutions/design-patterns/scope-status-writes-to-row-id-not-item-id.md
+docs/solutions/developer-experience/apps-tests-require-uv-run-with-pytest.md
+docs/solutions/developer-experience/cross-package-regressions-escape-per-package-test-runs.md
+docs/solutions/fmv-bid-linkage-gap-2026-05-23.md
+docs/solutions/integration-issues/locg-bulk-import-recipe-2026-05-22.md
+docs/solutions/integration-issues/locg-bulk-import-sync-learnings-2026-06-17.md
+docs/solutions/integration-issues/locg-export-deletes-owned-wished-books.md
+docs/solutions/integration-issues/locg-sync-unified-model-2026-06-22.md
+docs/solutions/integration-issues/wishlist-conflict-scoped-removal-2026-07-02.md
+docs/solutions/logic-errors/fmv-doubled-title-issue-empty-comps-false-fetch-err.md
+docs/solutions/ui-bugs/collection-check-alias-and-printing-false-positives.md
+docs/solutions/ui-bugs/purged-snipes-shown-as-won-2026-06-01.md
+docs/solutions/workflow-issues/buy-orchestrator-dispatch-pattern-and-comic-id-chain.md
+docs/solutions/workflow-issues/multi-block-skill-shell-state-loss-fallback-swallow.md
+docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md

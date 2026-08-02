@@ -94,6 +94,30 @@ jobs:
       - name: Lint — ruff bare/blind-except check
         run: uvx ruff check .
 
+  # BUI-605: the docs/solutions lint pack — learnings compiled into checks.
+  # Modeled on the `lint:` job above (BUI-185), and like it runs from the repo
+  # root in one pass. `--self-test` runs FIRST and is not redundant: it proves
+  # every registered lint still produces a finding on its must-flag fixture and
+  # stays silent on its must-pass one. A lint that has quietly stopped firing
+  # passes the pack run trivially, so the self-test is what makes a green pack
+  # mean something. The runner is a PEP 723 script — uv provisions its own deps,
+  # no `uv sync` needed.
+  solutions-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Self-test — every lint proven able to fail
+        run: ./scripts/solutions-lint --self-test
+
+      - name: Lint — docs/solutions mechanization contract
+        run: ./scripts/solutions-lint
+
   # BUI-188: non-strict mypy type check on the two most None-juggling files.
   # The workspace must be synced first so gixen_overlay imports resolve.
   typecheck:

@@ -36,6 +36,12 @@ The repo is a **uv workspace**: `packages/*` + `plugins/*` are members, and `uv 
 # Sync the workspace env (packages/* + plugins/*) for development + tests
 uv sync --all-packages
 
+# Run the docs/solutions lint pack (BUI-605) — the learnings that compile into checks.
+# --self-test proves every registered lint is still able to fail; the bare run is the
+# gate itself. A PEP 723 script: uv provisions its deps, no `uv sync` needed.
+./scripts/solutions-lint --self-test
+./scripts/solutions-lint
+
 # Python tests (run from the package dir)
 cd packages/gixen-cli    && uv run pytest -m "not integration"
 cd packages/locg-cli     && uv run pytest
@@ -50,7 +56,7 @@ npm run build       # tsc -> dist/
 npm run dev         # tsx src/cli.ts
 ```
 
-CI (`.github/workflows/ci.yml`, BUI-140) runs the per-package test suites as the merge gate: the `workspace` job runs the `gixen-cli`/`locg-cli`/`gixen-overlay` pytest suites (plus a `plugin.py` AST smoke-parse), and `apps-python` runs `apps/ebay` + `apps/fmv` (each with `uv run --with pytest pytest`). Also on CI: `lint` (ruff exception-hygiene), `ezship` (tsc + vitest), and `typecheck` (BUI-188: non-strict mypy over `fmv_runner.py` + `routes.py`). Note `typecheck` is a **non-required** check — its failures don't block merges, so a type error can sit red on `main`; check `gh pr checks` rather than just mergeability. Still run the relevant package's tests locally before committing.
+CI (`.github/workflows/ci.yml`, BUI-140) runs the per-package test suites as the merge gate: the `workspace` job runs the `gixen-cli`/`locg-cli`/`gixen-overlay` pytest suites (plus a `plugin.py` AST smoke-parse), and `apps-python` runs `apps/ebay` + `apps/fmv` (each with `uv run --with pytest pytest`). Also on CI: `lint` (ruff exception-hygiene), `ezship` (tsc + vitest), `solutions-lint` (BUI-605: the `docs/solutions` lint pack — self-test, then the pack), and `typecheck` (BUI-188: non-strict mypy over `fmv_runner.py` + `routes.py`). `solutions-lint` is new and only becomes a merge gate once it is added to branch protection's required checks. Note `typecheck` is a **non-required** check — its failures don't block merges, so a type error can sit red on `main`; check `gh pr checks` rather than just mergeability. Still run the relevant package's tests locally before committing.
 
 ## Architecture
 
@@ -84,4 +90,5 @@ Statuses: `PENDING → WON/LOST/ENDED/FAILED`, plus the soft-delete tombstone. *
 - **Linear issues use the `BUI` (Build) team** for work in this repo; `PER` for personal. Issue IDs (`BUI-50`, `PER-140`) are referenced throughout commits, docs, and code comments — look them up with `linear issue view <ID>`.
 - **Branch + commit per issue.** Don't commit directly to `main` for feature/fix work.
 - `docs/solutions/` — documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas, especially gixen-overlay endpoints and the FMV linkage chain. `docs/plans/` and `docs/brainstorms/` hold per-feature planning history.
+- **Every new `docs/solutions/` doc must declare `mechanized_by:` (BUI-605)** — `lint`, `test`, or `advice-only`, each with its required companion key (`lint:` / `enforced_by_test:` / `advice_only_reason:`). The question it forces is *"what part of this learning is a check?"*, and it is answered at write time, not in a later sweep: a documented grep heuristic that stays prose is closed only by discipline, which is how the `WHERE item_id` class shipped five incidents after being documented. The contract is specified in `docs/solutions/conventions/mechanized-by-frontmatter-contract.md` and enforced by `./scripts/solutions-lint`. The 47 pre-contract docs are exempted via `docs/solutions/UNMECHANIZED.txt`, an **append-never** ledger — never add a new doc to it.
 - `CONCEPTS.md` (repo root) — shared domain vocabulary (entities, named processes, status concepts: the Collection, win-sourced vs import-sourced entries, pending push, the collection sync). Relevant when orienting to the codebase or discussing domain concepts.
