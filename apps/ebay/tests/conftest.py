@@ -37,3 +37,17 @@ def _no_sold_comps_secondary(monkeypatch):
     monkeypatch.setattr(sold_comps, "load_sold_comps_key", lambda: None)
     monkeypatch.delenv(sold_comps.PROVIDERS_ENV_VAR, raising=False)
     monkeypatch.delenv("SOLD_COMPS_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_raw_response_capture(monkeypatch, tmp_path):
+    """BUI-614: redirect the raw-response capture file to a per-test tmp path.
+
+    Without this, any test that drives fetch()/fetch_sold_comps() to a real
+    success path appends to the real
+    ``~/.local/share/ebay-sold-comps-capture/raw_responses.jsonl`` — a stray
+    write into the dev machine's real home directory on every test run.
+    """
+    capture_dir = tmp_path / "raw-capture"
+    monkeypatch.setattr(sold_comps, "CAPTURE_DIR", capture_dir)
+    monkeypatch.setattr(sold_comps, "CAPTURE_PATH", capture_dir / "raw_responses.jsonl")

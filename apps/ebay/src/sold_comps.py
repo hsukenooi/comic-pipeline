@@ -8,7 +8,10 @@ fallback tier, failing over per query on error or a tripped breaker. Order is
 configurable via EBAY_SOLD_COMPS_PROVIDERS. Caches responses per provider,
 dedupes by product_id, applies hard-excludes, parses grades, and returns
 clean comp lists. Consumed by comic-pipeline-fmv (apps/fmv) to compute fair
-market value.
+market value. Every successful raw provider response is also appended,
+unmodified, to an append-only capture file (BUI-614) — a hedge against
+losing sold-comps history before a real comps ledger (BUI-610) exists; see
+CAPTURE_DIR/CAPTURE_PATH and _capture_raw_response().
 
 Why this lives in apps/ebay (alongside ebay-fetch):
     All eBay data fetching — live (Browse API, ebay_fetch.py) and sold
@@ -60,6 +63,20 @@ DEFAULT_CACHE_TTL_SEC = 7 * 24 * 3600  # 7 days
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 SERPAPI_TIMEOUT_SEC = 30
 DEFAULT_MAX_WORKERS = 10
+
+# BUI-614: Tier-0 raw response capture — deliberately separate from CACHE_DIR.
+# CACHE_DIR is keyed by a digest of the canonical URL (a re-query overwrites
+# the prior response) and is TTL-evicted, so it silently discards history;
+# this path is append-only and never read or pruned by this file, so neither
+# failure mode can ever reach it. Not a substitute for a real comps ledger
+# (BUI-610 designs that) — just a hedge against losing raw provider data
+# before that ledger exists. Overridable for tests (see conftest.py) and for
+# anyone who wants the capture off the default disk.
+CAPTURE_DIR = Path(
+    os.environ.get("EBAY_SOLD_COMPS_CAPTURE_DIR")
+    or (Path.home() / ".local" / "share" / "ebay-sold-comps-capture")
+)
+CAPTURE_PATH = CAPTURE_DIR / "raw_responses.jsonl"
 
 # Tier thresholds (the "tiered query strategy" from the FMV skill)
 THIN_RESULTS_THRESHOLD = 5     # auto-broaden (drop year) if base returns fewer
@@ -219,6 +236,45 @@ def _cache_put(path: Path, data: dict) -> None:
     shared ebay_fetch.atomic_write_json() rather than a hand-rolled
     tmp→rename copy)."""
     atomic_write_json(path, data)
+
+
+# ─── BUI-614: Tier-0 raw response capture ─────────────────────────────────────
+
+def _capture_raw_response(provider: str, query: str, canonical_url: str, data: dict) -> None:
+    """Append the raw provider response, as received, to CAPTURE_PATH.
+
+    Hedge, not a dependency: this runs right alongside _cache_put(), for the
+    same validated `data` that is about to be cached, and any failure here
+    (disk full, permission error, an unwritable path) is logged to stderr and
+    swallowed — it must never fail the fetch it's shadowing (BUI-614 AC).
+    `data` is written verbatim, with no reshaping/parsing/field-dropping —
+    that judgment belongs to the real ledger (BUI-610), not here.
+
+    JSONL append chosen over a SQLite table: no schema/migration to design
+    (out of scope per the ticket), and a single os.open(O_APPEND) + os.write()
+    call below is a single write(2) syscall, which POSIX guarantees is
+    atomic against other appenders (other threads in this process, and other
+    concurrent `ebay-sold-comps`/`comic-fmv` processes) — so no separate lock
+    file is needed, and a crash mid-write can only ever tear the one
+    in-flight line, never a previously-appended one.
+    """
+    try:
+        record = {
+            "timestamp": time.time(),
+            "provider": provider,
+            "query": query,
+            "canonical_url": canonical_url,
+            "response": data,
+        }
+        line = (json.dumps(record) + "\n").encode("utf-8")
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(CAPTURE_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except Exception as exc:  # noqa: BLE001  # hedge — never fail the fetch (BUI-614)
+        print(f"BUI-614: raw response capture failed (non-fatal): {exc}", file=sys.stderr)
 
 
 # ─── Query construction ──────────────────────────────────────────────────────
@@ -895,6 +951,7 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
         breaker.record_success()
 
     _cache_put(path, data)
+    _capture_raw_response(PROVIDER_SERPAPI, nkw, canonical, data)
     return data, False
 
 
@@ -1017,6 +1074,7 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
         breaker.record_success()
 
     _cache_put(path, data)
+    _capture_raw_response(PROVIDER_SOLD_COMPS, nkw, canonical, data)
     return data, False
 
 
