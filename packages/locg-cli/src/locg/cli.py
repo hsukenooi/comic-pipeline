@@ -26,6 +26,7 @@ from locg.commands import (
     cmd_collection_audit_metron_mismatch,
     cmd_collection_audit_pending,
     cmd_collection_audit_unscoped_lookup,
+    cmd_collection_authority_check,
     cmd_collection_backfill,
     cmd_collection_check,
     cmd_collection_doctor,
@@ -465,6 +466,33 @@ def create_parser() -> argparse.ArgumentParser:
     p_quar.add_argument("--force", action="store_true", help="Override the last-owned-row guard (requires --force-reason)")
     p_quar.add_argument("--force-reason", dest="force_reason", help="Why hiding the last owned copy is safe; stored on the row")
 
+    # collection authority-check — advisory report for a PROPOSED authority.json
+    # entry, run against the live corpus before the entry is ever merged (BUI-654)
+    p_authcheck = coll_sub.add_parser(
+        "authority-check",
+        parents=[common],
+        help="Report what a PROPOSED alias/relabel entry would do to the live collection, before it is added to data/authority.json",
+        epilog=(
+            "Advisory only, never a CI gate — CI cannot see the live corpus. "
+            "Never writes data/authority.json; there is no CLI 'add' path, an "
+            "entry is a reviewed PR to that file. --kind alias takes "
+            "--name-a/--name-b (the SYMMETRIC pair owned_match_keys would "
+            "widen); --kind relabel takes --from/--to (the DIRECTED pair "
+            "identity_series_key would collapse). Reports owned_rows_affected "
+            "(the full equivalence pool the entry would place together) and "
+            "cross_volume_ambiguities (same-issue-number rows in that pool "
+            "whose release dates disagree — a NEW cross-volume ambiguity). "
+            "If you go on to merge a relabel entry, run "
+            "`locg.collection_io.rekey_sweep` (BUI-650) afterward — existing "
+            "rows do not retroactively re-key themselves."
+        ),
+    )
+    p_authcheck.add_argument("--kind", choices=["alias", "relabel"], required=True, help="Entry kind to check")
+    p_authcheck.add_argument("--name-a", dest="name_a", help="First name of the SYMMETRIC pair (--kind alias)")
+    p_authcheck.add_argument("--name-b", dest="name_b", help="Second name of the SYMMETRIC pair (--kind alias)")
+    p_authcheck.add_argument("--from", dest="from_name", help="The literal spelling to rewrite (--kind relabel)")
+    p_authcheck.add_argument("--to", dest="to_name", help="The canonical spelling to rewrite onto (--kind relabel)")
+
     # pull-list
     p = sub.add_parser("pull-list", parents=[common], help="View your pull list (requires login)")
     p.add_argument("--title", help="Filter results by title (case-insensitive substring match)")
@@ -731,7 +759,7 @@ def main() -> None:
         "import", "export", "status", "check", "check-batch", "doctor", "record-win",
         "audit-pending", "audit-unscoped-lookup", "audit-metron-mismatch",
         "remediate-delete", "remediate-set-copies", "backfill",
-        "quarantine", "unquarantine",
+        "quarantine", "unquarantine", "authority-check",
     }
     _collection_sub = (
         getattr(args, "collection_command", None)
@@ -946,6 +974,21 @@ def main() -> None:
                     )
                 else:
                     result = cmd_collection_unquarantine(**identity, by=by)
+                if result.get("status") != "ok":
+                    output(result, pretty=args.pretty, fields=fields)
+                    sys.exit(1)
+            elif sub_cmd == "authority-check":
+                # BUI-654: advisory only, never writes data/authority.json.
+                # Non-"ok" here is a caller error (bad --kind/missing names),
+                # not a finding — a non-empty cross_volume_ambiguities is
+                # still status="ok" and must exit 0 (advisory, not a gate).
+                result = cmd_collection_authority_check(
+                    kind=args.kind,
+                    name_a=getattr(args, "name_a", None),
+                    name_b=getattr(args, "name_b", None),
+                    from_name=getattr(args, "from_name", None),
+                    to_name=getattr(args, "to_name", None),
+                )
                 if result.get("status") != "ok":
                     output(result, pretty=args.pretty, fields=fields)
                     sys.exit(1)

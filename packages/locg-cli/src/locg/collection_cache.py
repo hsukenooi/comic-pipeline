@@ -232,7 +232,7 @@ _DASH_CLASS = r"[-–—−]"
 # Year-range extraction for volume resolution: captures the begin year and the
 # end token (a 4-digit year or "Present") from a decorated series name. Lives
 # up here because two distant readers share it — :func:`series_year_range`
-# below reads both groups, and :func:`identity_series_key` rewrites the end
+# below reads both groups, and :func:`_identity_folds` rewrites the end
 # token off the front group. One pattern, so a new LOCG range spelling can
 # never teach one reader and miss the other.
 _YEAR_RANGE_CAPTURE_RE = re.compile(
@@ -257,7 +257,7 @@ _YEAR_RANGE_CAPTURE_RE = re.compile(
 _BARE_YEAR_CAPTURE_RE = re.compile(r"\((\d{4})\)")
 
 
-def identity_series_key(series_name: str) -> str:
+def _identity_folds(series_name: str) -> str:
     """Fold the one part of a LOCG series name the provider rewrites on its own.
 
     LOCG closes out an ongoing volume's decoration the January after it ends:
@@ -300,6 +300,13 @@ def identity_series_key(series_name: str) -> str:
 
     Folding only what the provider rewrites on its own is the whole rule —
     every other difference is still a different series.
+
+    This is the GENERATIVE half of :func:`identity_series_key` — a rule
+    discovered by writing a regex, applied to every series name because it is
+    a predictable provider rewrite. The other half (BUI-654) is the
+    ``relabel`` table: DIRECTED entries an operator authors for exactly one
+    literal string, for a duplicate class no regex could discover. See
+    :func:`identity_series_key` for how the two compose.
     """
     folded = _YEAR_RANGE_CAPTURE_RE.sub(r"(\1 - )", series_name or "")
     # Run second, not first: the range fold's own output "(YYYY - )" can never
@@ -308,6 +315,76 @@ def identity_series_key(series_name: str) -> str:
     # interacting or double-substituting the same span.
     folded = _BARE_YEAR_CAPTURE_RE.sub(r"(\1 - )", folded)
     return folded.strip()
+
+
+# Directed relabel entries (BUI-654): the SECOND half of the identity key, for
+# the duplicate class :func:`_identity_folds` above cannot close — two
+# literal, unrelated spellings of the same run that no regex could discover
+# (contrast the folds above, which are provider rewrites predictable enough to
+# apply to EVERY series name). A ``relabel`` entry names exactly two strings,
+# so unlike a regex patch it cannot over-fold anything it wasn't written for.
+#
+# Ships EMPTY (``data/authority.json`` carries zero ``relabel`` entries) and
+# is meant to STAY that way until the next incident — every duplicate class
+# known as of BUI-654 is already closed by the folds above, so an entry here
+# would have nothing to fix. The empty table is not a stub: this reader and
+# its test coverage are real and live now, so the next incident is a reviewed
+# one-line JSON diff, not a code change.
+#
+# `authority.build_relabel_table` is given `_identity_folds` here — NOT
+# `identity_series_key` itself — as its normalizer. `identity_series_key`
+# below calls `_RELABEL_TABLE.relabel(...)`, which reads this very table;
+# passing `identity_series_key` in as the normalizer would read
+# `_RELABEL_TABLE` before its own assignment below finishes binding — a
+# `NameError` that an EMPTY table hides completely (the loop that would
+# trigger it never runs over zero entries), so it would first appear the day
+# someone adds the first entry, the worst possible time to discover it.
+# Building the map's KEYS with `_identity_folds` also means an entry written
+# against EITHER generative spelling of a decoration lands: `(2025 -
+# Present)` and `(2025 - 2026)` both fold to `(2025 - )` before the lookup, so
+# one entry against either spelling covers both — asserted by
+# `test_relabel_entry_matches_either_generative_fold_spelling` in
+# test_collection_cache.py.
+#
+# CAUTION for anyone adding a `relabel` entry: it is DIRECTED and NARROWS —
+# the opposite of an `alias` entry (symmetric, WIDENS the matcher; see
+# `_ALIAS_GROUPS` below and `locg.authority`'s module docstring for why the
+# two must never share a reader). Adding an entry here changes the STORED
+# identity of every row whose folded series name equals `from`; existing rows
+# do NOT retroactively re-key themselves — run
+# `locg.collection_io.rekey_sweep` (BUI-650) under `CollectionCache.apply`
+# after merging the entry, or the newly-merged identity sits uncollapsed in
+# the store exactly like the three live collisions that motivated the sweep
+# in the first place. Run `locg collection authority-check` against the live
+# store BEFORE adding an entry — two of the last six identity proposals were
+# falsified only on measurement.
+_RELABEL_TABLE = authority.build_relabel_table(_identity_folds)
+
+
+def identity_series_key(series_name: str) -> str:
+    """The full identity-key fold: :func:`_identity_folds`, then a directed
+    ``relabel`` rewrite if one applies (BUI-654).
+
+    Two stages, in order:
+
+    1. **Generative** (:func:`_identity_folds`) — the provider's own
+       predictable rewrites (end-year decoration, in either the range or
+       bare-year spelling). Runs on every series name.
+    2. **Directed** (the ``relabel`` table, :mod:`locg.authority`) — an
+       operator-authored lookup for exactly one literal string, for the rare
+       duplicate class stage 1 cannot discover. Looked up by STAGE 1's
+       OUTPUT, not the raw input, so an entry written against either
+       generative spelling of a decoration still matches: ``(2025 -
+       Present)`` and ``(2025 - 2026)`` both fold to ``(2025 - )`` before the
+       relabel lookup runs, so one entry covers both.
+
+    The table ships empty, and with it empty this function's output is
+    byte-for-byte identical to :func:`_identity_folds`'s — see
+    ``test_identity_series_key_is_unchanged_with_an_empty_relabel_table`` in
+    test_collection_cache.py, the regression guard over a corpus of real
+    series names pulled from the live store.
+    """
+    return _RELABEL_TABLE.relabel(_identity_folds(series_name))
 
 
 def make_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:

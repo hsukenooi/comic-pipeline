@@ -15,18 +15,21 @@ from typing import Any, Optional
 
 from bs4 import BeautifulSoup
 
+from locg import authority
 from locg._atomic import atomic_write_json
 from locg.cache import IDCache, make_key
 from locg.client import AuthRequired, LOCGClient
 from locg.collection_cache import (
     CollectionCache,
     _coerce_year,
+    _identity_folds,
     _next_seq,
     _normalize_series_key,
     _utcnow_iso,
     base_full_title,
     base_series_name,
     collection_backups_root,
+    identity_series_key,
     is_quarantined,
     make_identity,
     matchable_rows,
@@ -7397,4 +7400,223 @@ def cmd_collection_unquarantine(
         "row": outcome["row"],
         "removed": outcome["removed"],
         "audit": record,
+    }
+
+
+def _authority_check_cross_volume_ambiguities(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group an authority-check candidate's owned-row pool by issue number and
+    flag any group whose release-date years span more than the ±1 cover/
+    on-sale skew tolerance :func:`_has_cross_volume_ambiguity` already uses
+    elsewhere in this file (BUI-284) — the live signal that an ``alias``/
+    ``relabel`` candidate's equivalence pool would put two genuinely different
+    books in play together on a bare (series, issue) query. BUI-654's own
+    worked example: "The X-Men #118" (1978) vs. the Panini "X-Men #118"
+    (2010), both owned, both in the ``uncanny x men``/``x men`` alias pool.
+
+    Deliberately NOT a call to :func:`_has_cross_volume_ambiguity` itself:
+    that function also fires on any two DISTINCT ``series_name`` strings
+    alone, which is true of nearly every pair an alias/relabel candidate's
+    pool contains BY CONSTRUCTION — the whole point of the entry is to span
+    two different literal names. Reusing it here would flag almost every
+    non-trivial candidate regardless of whether the dates actually disagree.
+    This checks only the signal the ticket asks for: incompatible release
+    DATES, not differing series-name spelling.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        _, issue = _split_full_title(row.get("full_title") or "")
+        if issue is None:
+            continue
+        groups.setdefault(normalize_issue_key(issue), []).append(row)
+
+    ambiguities: list[dict[str, Any]] = []
+    for issue_key, group_rows in groups.items():
+        if len(group_rows) < 2:
+            continue
+        years = {
+            year
+            for year in (_coerce_year(row.get("release_date")) for row in group_rows)
+            if year is not None
+        }
+        # Same ±1 cover/on-sale skew tolerance as _has_cross_volume_ambiguity
+        # (BUI-214/251): a January-cover issue that shipped the prior
+        # December must not misread as two eras.
+        if years and (max(years) - min(years) > 1):
+            ambiguities.append(
+                {
+                    "issue": issue_key,
+                    "rows": [_row_summary(row) for row in group_rows],
+                }
+            )
+    return ambiguities
+
+
+def cmd_collection_authority_check(
+    *,
+    kind: str,
+    name_a: Optional[str] = None,
+    name_b: Optional[str] = None,
+    from_name: Optional[str] = None,
+    to_name: Optional[str] = None,
+    cache: Optional[CollectionCache] = None,
+) -> dict[str, Any]:
+    """Advisory report (BUI-654): what a PROPOSED authority-table entry would
+    do to the live collection, run BEFORE the entry is ever merged into
+    ``data/authority.json`` — two of the last six identity proposals in this
+    project were falsified only on measurement, and this is the measurement.
+
+    Never writes ``data/authority.json`` (there is no CLI "add" path — an
+    entry is a reviewed PR to that file, per :mod:`locg.authority`'s module
+    docstring) and is advisory only, never a CI gate: CI cannot see the live
+    corpus, and a blanket refusal would reject the five ``alias`` entries
+    already shipped and working (R12 of the BUI-611 plan).
+
+    ``kind="alias"`` takes ``name_a``/``name_b`` — the SYMMETRIC pair the
+    matcher path (``owned_match_keys``) would widen. ``kind="relabel"`` takes
+    ``from_name``/``to_name`` — the DIRECTED pair the identity path
+    (``identity_series_key``) would collapse. The two branches below touch
+    disjoint halves of the module (the alias branch only
+    ``_normalize_series_key``/``authority._build_alias_groups``, the relabel
+    branch only ``identity_series_key``/``_identity_folds``/
+    ``authority._build_relabel_map``), mirroring :mod:`locg.authority`'s "two
+    disjoint readers" doctrine at the one call site that has to know about
+    both kinds.
+
+    Reports, per entry:
+
+    * ``owned_rows_affected`` — every OWNED (``in_collection`` truthy,
+      ``matchable_rows``-filtered so a row BUI-649 already quarantined stops
+      counting the moment it is) row the entry's resulting equivalence pool
+      would place together. For ``alias`` this is the FULL transitive
+      closure — the candidate edge merged into the already-shipped alias
+      graph and closed exactly the way ``authority._build_alias_groups``
+      closes the real one — not just rows under the two literal names, so a
+      candidate that joins two already-large groups reports the true blast
+      radius. For ``relabel`` it is every row currently keyed (by the real,
+      shipped ``identity_series_key``) to either the literal ``from`` or
+      ``to`` spelling.
+    * ``cross_volume_ambiguities`` — issue-number groups, inside that pool,
+      whose release-date years are incompatible (see
+      :func:`_authority_check_cross_volume_ambiguities`) — the live check for
+      the exact incident class BUI-284's ``ambiguous_cross_volume`` verdict
+      exists to prevent, surfaced here BEFORE the entry ships rather than
+      after a buy-path caller trips it.
+
+    ``corpus_empty`` is always present and must be read FIRST: an empty
+    collection store makes both ``owned_rows_affected`` and
+    ``cross_volume_ambiguities`` empty too, indistinguishably from "checked,
+    found nothing" — R11 (an empty store must never read as "clean").
+
+    A malformed candidate (empty derived key, or ``from``/``to`` deriving to
+    the same key — a no-op) is rejected the same way :mod:`locg.authority`
+    itself would reject it at merge time, as ``status="invalid_request"`` —
+    checked here too, so a bad entry cannot get past ``authority-check``
+    before a reviewer ever sees the diff. A non-empty
+    ``cross_volume_ambiguities`` is never itself an error: ``status`` stays
+    ``"ok"``, the finding is the payload, the decision is the operator's.
+    """
+    if kind not in ("alias", "relabel"):
+        return {
+            "status": "invalid_request",
+            "error": f"kind must be 'alias' or 'relabel', got {kind!r}",
+        }
+
+    cache = cache or CollectionCache()
+    payload = cache.load()
+    comics_all = payload.get("comics", [])
+    corpus_empty = not comics_all
+
+    if kind == "alias":
+        a = (name_a or "").strip()
+        b = (name_b or "").strip()
+        if not a or not b:
+            return {
+                "status": "invalid_request",
+                "error": "kind='alias' requires both name_a and name_b (--name-a/--name-b on the CLI)",
+            }
+        candidate_alias = authority.AliasEntry(
+            names=(a, b), evidence="authority-check preview", added=_utcnow_iso()
+        )
+        try:
+            # Combine the REAL shipped alias entries with the candidate, then
+            # close them exactly the way authority.build_alias_table does —
+            # never mutating authority._ALIAS_ENTRIES itself, so this is a
+            # pure what-if. This also validates the candidate the same way
+            # merging it for real would (no-op / empty-key rejection).
+            combined_groups = authority._build_alias_groups(
+                authority._ALIAS_ENTRIES + (candidate_alias,), _normalize_series_key
+            )
+        except authority.AuthorityTableError as exc:
+            return {"status": "invalid_request", "error": str(exc)}
+
+        key_a = _normalize_series_key(a)
+        key_b = _normalize_series_key(b)
+        pool_keys = combined_groups.get(
+            key_a, frozenset({key_a})
+        ) | combined_groups.get(key_b, frozenset({key_b}))
+        entry_echo: dict[str, Any] = {"kind": "alias", "names": [a, b]}
+
+        def _row_key(row: dict[str, Any]) -> str:
+            return _normalize_series_key(row.get("series_name") or "")
+
+    else:
+        f = (from_name or "").strip()
+        t = (to_name or "").strip()
+        if not f or not t:
+            return {
+                "status": "invalid_request",
+                "error": "kind='relabel' requires both from_name and to_name (--from/--to on the CLI)",
+            }
+        candidate_relabel = authority.RelabelEntry(
+            from_name=f, to_name=t, evidence="authority-check preview", added=_utcnow_iso()
+        )
+        try:
+            # Same validation-parity shape as the alias branch: the REAL
+            # relabel table is built with _identity_folds (never
+            # identity_series_key — see collection_cache.py's own comment on
+            # _RELABEL_TABLE for why), so this preview must use the same
+            # normalizer to raise on exactly the same no-op/empty-key
+            # conditions the real merge would.
+            authority._build_relabel_map(
+                authority._RELABEL_ENTRIES + (candidate_relabel,), _identity_folds
+            )
+        except authority.AuthorityTableError as exc:
+            return {"status": "invalid_request", "error": str(exc)}
+
+        # For matching against LIVE rows (which are keyed by the real,
+        # currently-shipped identity_series_key, folds + any already-shipped
+        # relabel entries), use identity_series_key itself rather than the
+        # bare fold — this is "what key do owned rows carry today", not "what
+        # would the candidate's own two keys look like in isolation".
+        #
+        # Known limitation, harmless while the table ships empty (today):
+        # this does not re-derive a full combined map the way the alias
+        # branch above does, so a CHAIN through an already-shipped relabel
+        # entry (this candidate's `to` landing on a key some OTHER shipped
+        # entry then relabels again) is not walked. Advisory only — the
+        # worst case is under-reporting a rare compound scenario, never a
+        # write — and moot until the table holds a second entry to chain
+        # against.
+        key_from = identity_series_key(f)
+        key_to = identity_series_key(t)
+        pool_keys = frozenset({key_from, key_to})
+        entry_echo = {"kind": "relabel", "from": f, "to": t}
+
+        def _row_key(row: dict[str, Any]) -> str:
+            return identity_series_key(row.get("series_name") or "")
+
+    owned_rows = [
+        row
+        for row in matchable_rows(comics_all)
+        if row.get("in_collection") and _row_key(row) in pool_keys
+    ]
+
+    return {
+        "status": "ok",
+        "entry": entry_echo,
+        "corpus_empty": corpus_empty,
+        "owned_rows_affected": [_row_summary(row) for row in owned_rows],
+        "cross_volume_ambiguities": _authority_check_cross_volume_ambiguities(owned_rows),
     }
