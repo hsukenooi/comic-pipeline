@@ -2224,7 +2224,8 @@ def test_notes_md_manual_series_section(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_pending_push_rows_partitions(tmp_path):
-    """_pending_push_rows correctly partitions ready / manual_variant / manual_series."""
+    """_pending_push_rows correctly partitions ready / manual_variant /
+    manual_series / quarantined (the fourth bucket added in BUI-648)."""
     from locg.collection_io import _pending_push_rows
 
     r = _make_ready_row()
@@ -2237,10 +2238,11 @@ def test_pending_push_rows_partitions(tmp_path):
     already_pushed["local_added_at"] = "2026-01-01T00:00:00Z"
 
     payload = {"comics": [r, v, s, already_pushed]}
-    ready, mv, ms = _pending_push_rows(payload)
+    ready, mv, ms, quarantined = _pending_push_rows(payload)
     assert len(ready) == 1
     assert len(mv) == 1
     assert len(ms) == 1
+    assert quarantined == []
     assert ready[0]["full_title"] == _make_ready_row()["full_title"]
 
 
@@ -2252,10 +2254,11 @@ def test_pending_push_already_pushed_excluded(tmp_path):
     row["pushed_to_locg_at"] = "2030-01-01T00:00:00Z"  # pushed far in the future
     row["local_added_at"] = "2026-01-01T00:00:00Z"  # added before push timestamp
 
-    ready, mv, ms = _pending_push_rows({"comics": [row]})
+    ready, mv, ms, quarantined = _pending_push_rows({"comics": [row]})
     assert len(ready) == 0
     assert len(mv) == 0
     assert len(ms) == 0
+    assert len(quarantined) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -3388,7 +3391,7 @@ def test_unresolvable_row_keeps_its_manual_series_flag(tmp_path):
     assert result["manual_series_flags_cleared"] == 0
     assert row["needs_manual_series_canonical"] is True
     assert row["series_name"] == "Some Series Nobody Has Ever Heard Of"
-    _ready, _variant, manual_series = _pending_push_rows(payload)
+    _ready, _variant, manual_series, _quarantined = _pending_push_rows(payload)
     assert [r["gixen_item_id"] for r in manual_series] == ["99"], "stays out of the CSV"
 
 
