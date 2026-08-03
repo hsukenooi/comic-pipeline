@@ -251,6 +251,11 @@ def run(*, batch_path: str | None, out_path: str | None,
     #    Each result echoes its _req_id (the original input index); we require an
     #    exact 1:1 id round-trip and fail loud on any mismatch rather than guess.
     fresh_fmvs: dict[int, dict] = {}
+    # BUI-639: a THIRD skip bucket, alongside skipped_hand/skipped_lookup_error
+    # — a book whose comics-server write was PERMANENTLY rejected (422, e.g. a
+    # multi-issue lot listing BUI-625 refuses to mint as its first issue).
+    # original input index → the server's rejection detail.
+    skipped_rejected: dict[int, str] = {}
     if needs_compute:
         sent_ids = [b["_idx"] for b in needs_compute]
         results_by_id: dict[int, dict] = {}
@@ -272,10 +277,18 @@ def run(*, batch_path: str | None, out_path: str | None,
                 "map comps positionally (would price the wrong comic)."
             )
         for idx in sent_ids:
-            fresh_fmvs[idx] = _compute_and_upsert_one(
-                results_by_id[idx], books[idx],
-                server_url=server_url, grade_window=grade_window,
-            )
+            # BUI-639: a 422 on THIS book's write must not abort the rest of
+            # the batch — `_UpsertRejected` bubbles up from
+            # `_compute_and_upsert_one`'s `_upsert_fmv` call specifically so
+            # it can be caught HERE, per book, instead of anywhere further up
+            # the call stack (which would still take the whole run down).
+            try:
+                fresh_fmvs[idx] = _compute_and_upsert_one(
+                    results_by_id[idx], books[idx],
+                    server_url=server_url, grade_window=grade_window,
+                )
+            except _UpsertRejected as exc:
+                skipped_rejected[idx] = str(exc)
 
         # 3b. BUI-348 CGC-proxy rescue: a freshly-computed book that produced NO
         # bid-able number (raw pool too sparse to price, no §7 interpolation) may
@@ -297,9 +310,10 @@ def run(*, batch_path: str | None, out_path: str | None,
             fresh_fmvs, books, server_url=server_url, force=force,
         )
 
-    # 4. Stitch cached + fresh + hand-priced-skipped + lookup-error-skipped
+    # 4. Stitch cached + fresh + hand-priced-skipped + lookup-error-skipped +
+    #    write-rejected-skipped
     final = _stitch(books, cached, fresh_fmvs, skipped_hand,
-                    skipped_lookup_error)
+                    skipped_lookup_error, skipped_rejected)
 
     if not quiet:
         _print_table(final)
@@ -333,6 +347,26 @@ def run(*, batch_path: str | None, out_path: str | None,
             "recomputed, not overwritten) rather than risk overwriting a "
             "hand-priced row. Check the comics server and re-run; --force "
             "does NOT bypass this.",
+            err=True,
+        )
+
+    # BUI-639: a THIRD skip class, reported separately from both above and
+    # worded so it can never be read as either. Unlike skipped_lookup_error
+    # (nothing was priced), this book WAS priced in-memory — the write that
+    # would have persisted it was permanently REJECTED (422, e.g. a
+    # multi-issue lot listing BUI-625 refuses to mint as its first issue).
+    # Loud for the same BUI-565/570/593 reasoning as the other two skip
+    # classes: a per-book problem must never be able to look like a clean
+    # `n=0` or vanish from the summary — this book has no comic_id/fmv_id and
+    # is NOT linked, despite having a computed price.
+    if skipped_rejected:
+        click.echo(
+            f"⚠️  skipped {len(skipped_rejected)} book(s): the comics-server "
+            "REJECTED the write (422) — a PERMANENT, per-book rejection (e.g. "
+            "a multi-issue lot listing, BUI-625), not a transient failure. "
+            "Each was priced in-memory but NOT persisted, and is NOT linked "
+            "to a comic_id/fmv_id. See each row's `error` for the server's "
+            "reason.",
             err=True,
         )
 
@@ -798,7 +832,13 @@ def _fetch_first_party_outcomes(server_url: str, *, target_grade: float,
 def _compute_and_upsert_one(result: dict, original_book: dict, *,
                             server_url: str,
                             grade_window: float | None = None) -> dict:
-    """Run FMV math + DB upsert for a single book. Returns the assembled result."""
+    """Run FMV math + DB upsert for a single book. Returns the assembled result.
+
+    BUI-639: does NOT catch `_UpsertRejected` — a 422 on the `_upsert_fmv`
+    call below (a permanent, per-book write rejection) propagates straight
+    out of this function on purpose. It is caught by `run()`'s per-book loop,
+    which turns it into a skip for just this book rather than a crash for the
+    whole batch."""
     inp = result.get("input") or {}
     # _req_id is an internal correlation key (BUI-174/187); drop it before it can
     # leak into the upsert body or the emitted result.
@@ -1269,6 +1309,23 @@ def _extract_ids(row: dict | None) -> tuple[int | None, int | None]:
     return row.get("comic_id"), row.get("fmv_id")
 
 
+class _UpsertRejected(Exception):
+    """BUI-639: the comics-server write returned 422 — a PERMANENT, per-item
+    rejection (e.g. BUI-625's write boundary refusing to mint a multi-issue
+    lot listing as its first issue), not a transient/infrastructure failure.
+    Retrying it or aborting the WHOLE run buys nothing, so `_post_json` raises
+    this instead of the usual `sys.exit(1)` when `hard_fail=True`. The one
+    call site that cares — `_compute_and_upsert_one`'s primary write, called
+    with the `hard_fail=True` default — catches it and skips just this book,
+    so the rest of the batch keeps pricing normally.
+
+    Deliberately only raised when `hard_fail=True`. A `hard_fail=False` caller
+    (the BUI-348 proxy re-upsert, the BUI-529 cross-check note update) already
+    treats ANY write failure — 422 included — as a soft `None` return it
+    handles correctly on its own, so that path is left untouched here.
+    """
+
+
 def _post_json(url: str, body: dict, *, what: str,
                hard_fail: bool = True) -> dict | None:
     """POST JSON and return the parsed response, failing LOUD (BUI-186 / R11).
@@ -1278,16 +1335,44 @@ def _post_json(url: str, body: dict, *, what: str,
     an un-persisted FMV silently breaks the downstream snipe-add FMV link (the
     book is priced but never linked, and verify reports it missing).
 
-    ``hard_fail=False`` (the BUI-348 proxy re-upsert): return None on failure
-    instead of aborting, so a server blip on the best-effort proxy write leaves
-    the book at its already-persisted raw needs_manual result rather than nuking
-    a run whose raw results all succeeded. The caller must then NOT promote the
+    BUI-639: a 422 is carved out of that default. It is the write boundary's
+    PERMANENT, per-item rejection of THIS book (e.g. BUI-625 refusing to mint
+    a multi-issue lot listing as its first issue) — never transient, so
+    aborting the whole batch over one already-fully-explained book buys
+    nothing. Under `hard_fail=True` this raises `_UpsertRejected` instead of
+    exiting; every OTHER failure (5xx, connection errors, timeouts, and any
+    non-422 4xx) still keeps the BUI-186 fail-loud `sys.exit(1)` — the
+    reasoning there is unchanged, only 422 is different in kind.
+
+    ``hard_fail=False`` (the BUI-348 proxy re-upsert / BUI-529 cross-check):
+    return None on ANY failure — 422 included — instead of aborting or
+    raising, so a server blip (or rejection) on a best-effort write leaves the
+    book at its already-persisted result rather than nuking a run whose
+    primary writes all succeeded. The caller must then NOT promote the
     in-memory result to a price the DB doesn't hold.
     """
     try:
         resp = requests.post(url, json=body, timeout=15)
         resp.raise_for_status()
         return resp.json()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        click.echo(f"Error: {what} failed (POST {url}): {e}", err=True)
+        if status == 422 and hard_fail:
+            detail = None
+            if e.response is not None:
+                try:
+                    body_json = e.response.json()
+                    if isinstance(body_json, dict):
+                        detail = body_json.get("detail")
+                except ValueError:
+                    pass
+                if detail is None:
+                    detail = e.response.text
+            raise _UpsertRejected(detail or str(e)) from e
+        if hard_fail:
+            sys.exit(1)
+        return None
     except requests.RequestException as e:
         click.echo(f"Error: {what} failed (POST {url}): {e}", err=True)
         if hard_fail:
@@ -1301,7 +1386,13 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
     the run on a failed call (BUI-186) rather than silently returning None.
 
     ``hard_fail=False`` propagates to ``_post_json`` for the best-effort proxy
-    re-upsert (returns None on failure instead of ``sys.exit``)."""
+    re-upsert (returns None on failure instead of ``sys.exit``).
+
+    BUI-639: under the default ``hard_fail=True``, a 422 (permanent per-item
+    rejection) propagates as ``_UpsertRejected`` instead of exiting — see
+    ``_post_json``. The caller (``_compute_and_upsert_one``) does not catch
+    it either; it is meant to bubble all the way to `run()`'s per-book loop,
+    which turns it into a skip rather than a crash."""
     body = {
         "title": inp["title"],
         "issue": str(inp["issue"]),
@@ -1490,20 +1581,30 @@ def _build_notes(fmv: dict) -> str:
 def _stitch(books: list[dict], cached: dict[int, dict],
             fresh: dict[int, dict],
             skipped_hand: dict[int, dict] | None = None,
-            skipped_lookup_error: dict[int, str] | None = None) -> list[dict]:
-    """Combine cached, fresh, and both kinds of skipped result back into the
-    input order. `skipped_hand` (BUI-533) reuses the existing DB row exactly
-    like `cached` does (never recomputed), tagged with a distinct `source` so
-    the table/summary/--brief can tell a protected hand-priced row apart from
-    an ordinary cache hit.
+            skipped_lookup_error: dict[int, str] | None = None,
+            skipped_rejected: dict[int, str] | None = None) -> list[dict]:
+    """Combine cached, fresh, and all three kinds of skipped result back into
+    the input order. `skipped_hand` (BUI-533) reuses the existing DB row
+    exactly like `cached` does (never recomputed), tagged with a distinct
+    `source` so the table/summary/--brief can tell a protected hand-priced
+    row apart from an ordinary cache hit.
 
     `skipped_lookup_error` (BUI-544) is the opposite case: the lookup FAILED,
     so there is no row to reuse and no price at all this run. It gets its own
     `source` too — never `skipped_hand_priced` (that would let an outage be
     read as protection) and never the bare `error` source (that reads as a
-    compute failure, when in fact nothing was even attempted)."""
+    compute failure, when in fact nothing was even attempted).
+
+    `skipped_rejected` (BUI-639) is a third distinct case: the book WAS
+    computed (fmv_math ran) but the comics-server write that would have
+    persisted it was PERMANENTLY rejected (422). Like `skipped_lookup_error`
+    it carries no price in the stitched row — `fmv: None` — deliberately:
+    `_print_table` checks `fmv.get("fmv_low")` before it ever looks at
+    `source`, so a non-null fmv here would render as an ordinary priced row
+    and defeat the whole point of a loud, unmistakable skip."""
     skipped_hand = skipped_hand or {}
     skipped_lookup_error = skipped_lookup_error or {}
+    skipped_rejected = skipped_rejected or {}
     out: list[dict] = []
     for i, book in enumerate(books):
         if i in cached:
@@ -1541,6 +1642,21 @@ def _stitch(books: list[dict], cached: dict[int, dict],
                     "BUI-544: skipped, hand-priced provenance unverifiable — "
                     f"{skipped_lookup_error[i]}. Row left untouched; this is a "
                     "server failure, not a hand-priced skip and not zero comps."
+                ),
+            })
+        elif i in skipped_rejected:
+            out.append({
+                "input": _input_summary(book),
+                "fmv": None,
+                "comp_count_total": 0,
+                "queries_used": [],
+                "db_row": None,
+                "source": "skipped_rejected",
+                "breaker_tripped": False,
+                "error": (
+                    "BUI-639: skipped, comics-server REJECTED the write "
+                    f"(422, permanent) — {skipped_rejected[i]}. Priced "
+                    "in-memory but not persisted; no comic_id/fmv_id link."
                 ),
             })
         elif i in fresh:
@@ -1759,13 +1875,16 @@ def _brief_row(r: dict) -> dict:
         cosmetic field, so a KeyError there degrades to a null note instead.
       - source (BUI-549) → the row's own `source` verbatim (`"fresh"`,
         `"cached"`, `"cgc-proxy"`, `"skipped_hand_priced"`,
-        `"skipped_lookup_error"`, or `"error"`). Without this, a
-        `skipped_lookup_error` row (comics-server lookup FAILED — hand-priced
-        provenance unverifiable, row left completely untouched) projects
-        identically to an ordinary unpriced/no-comps row: both have every
-        pricing field null. A `--brief`-only consumer (no table, no summary)
-        otherwise has no way to tell "priced honestly, no comps" apart from
-        "the lookup failed" — see BUI-549.
+        `"skipped_lookup_error"`, `"skipped_rejected"` (BUI-639), or
+        `"error"`). Without this, a `skipped_lookup_error` row (comics-server
+        lookup FAILED — hand-priced provenance unverifiable, row left
+        completely untouched) projects identically to an ordinary
+        unpriced/no-comps row: both have every pricing field null. A
+        `--brief`-only consumer (no table, no summary) otherwise has no way
+        to tell "priced honestly, no comps" apart from "the lookup failed" —
+        see BUI-549. `skipped_rejected` needs the same distinction for the
+        same reason: it too has every pricing field null despite having
+        actually been priced in-memory.
     """
     fmv = r.get("fmv") or {}
     db_row = r.get("db_row") or {}
@@ -1864,6 +1983,14 @@ def _print_table(rows: list[dict]) -> None:
             # mistaken for the hand-priced skip. Distinct token, distinct
             # source column.
             fmv_str = "skip:db-err"
+            med_str = "—"
+            mb_str = "—"
+        elif r.get("source") == "skipped_rejected":
+            # BUI-639: priced in-memory, but the write was PERMANENTLY
+            # rejected (422) — never persisted, no comic_id/fmv_id. Distinct
+            # token so it can't be mistaken for a genuine no-comps 'n/a', a
+            # fetch-err, or the skipped_lookup_error skip above.
+            fmv_str = "skip:422"
             med_str = "—"
             mb_str = "—"
         elif _is_fetch_error(r):
