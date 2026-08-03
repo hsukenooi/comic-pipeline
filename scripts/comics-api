@@ -72,7 +72,7 @@ shift 2
 
 case "$path" in
   http://*|https://*)
-    echo "comics-api: <path> must be a server-relative path (e.g. /api/health), not a full URL: $path" >&2
+    echo "comics-api: <path> must be a server-relative path (e.g. /health), not a full URL: $path" >&2
     exit 1
     ;;
   /*)

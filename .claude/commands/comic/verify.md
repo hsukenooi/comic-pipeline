@@ -121,6 +121,35 @@ Surface a table for the user. Use the verdict column to scan for issues:
 If `summary.issues > 0`, after the table print each issue row's `guidance`
 string from the response, one line per row.
 
+### Rejections report (BUI-601)
+
+The linkage table above catches a write that landed *wrong*. It cannot catch
+one the server refused outright — a 422 on a malformed payload, or any other
+mutating call that never got past validation (the BUI-593 shape: the fetch
+succeeded, the write didn't, and the book ended up nowhere). That failure
+mode has its own signal, the rejected-writes ledger, so surface it too — a
+run with a clean linkage table but recent rejections is not an all-clear.
+
+```bash
+comics-api GET /api/comics/health/rejections
+```
+
+(`hours` defaults server-side to the dashboard badge's own 24h window; pass
+`?hours=N` for a longer look-back, e.g.
+`comics-api GET "/api/comics/health/rejections?hours=720"` for the full
+retention window.)
+
+Report `count` and `window_hours` from the response:
+
+- **`count == 0`** — say so plainly ("No rejected writes in the last N
+  hours"). That IS the all-clear for this signal, distinct from the linkage
+  table's all-clear above.
+- **`count > 0`** — list each entry in `rejections` (`created_at`, `method`,
+  `path`, `status`, `detail`) so the operator can see exactly what the server
+  refused and why. `rejections` is capped at the response's `limit` (50 by
+  default) even when `count` is larger — a big `count` with a short list
+  means "see more via a higher `?limit=`," never "only these happened."
+
 ---
 
 ## ORCHESTRATOR NOTES

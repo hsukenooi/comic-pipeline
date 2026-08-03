@@ -83,8 +83,25 @@ that captured zero rows across `collection.json`/`wish-list.json` is
 indistinguishable from a broken one, so `comics-api` never treats it as
 success. Do not proceed to Step 2 without a completed backup.
 
-Keep `$BACKUP_PATH` for the rest of the run — Steps 3/3b's abort path restores
-from it via `POST /api/comics/collection/restore`.
+**`$BACKUP_PATH` does NOT persist past this step.** Each `## Step` heading below
+is a separate shell, so a shell variable set here is gone by the time Steps
+3/3b/6 run — do not assume it's still set (this is the same BUI-352-class
+state-loss trap as `$ts`/`$CSV`, just for the abort path). Remember the
+`backup_path` value **printed above** (not the shell variable) and substitute
+it literally into Steps 3/3b/6's restore commands wherever they show
+`<BACKUP_PATH>` — the same hand-off pattern Step 5 already uses for `<XLSX>`
+from Step 4's output. Do **not** re-run the backup call to get a fresh path in
+a later step: by then it would be backing up the very state you're trying to
+recover from, not the original.
+
+**If you've genuinely lost the printed value** (e.g. a session restart
+between Step 1 and the restore) — there is no API to list or look up past
+backups, only to create one. Do not guess a path or fall back to a fresh
+backup call. STOP and tell the operator that a manual restore is needed: the
+backups live in a UTC-timestamp-named subdirectory under the collection
+store's `-backups` sibling directory on the Mac Mini, sorted lexicographically
+= chronologically, so the correct one is discoverable by hand even without
+the printed value.
 
 ## Step 2: Export pending rows to a CSV
 
@@ -147,7 +164,10 @@ this off hand-authored inline Python — never re-export before auditing, since
 the export re-blanks placeholder dates):
 
 ```bash
-locg collection audit-pending "$CSV" --pretty
+# Replace <CSV> below with the csv path printed in Step 2's output — this is
+# a fresh shell (a separate `## Step` heading), so Step 2's shell variable is
+# not set here.
+locg collection audit-pending "<CSV>" --pretty
 ```
 
 Read `row_count`, `flagged_count`, and `flagged_rows` (each entry has
@@ -260,9 +280,11 @@ upload it alone. LOCG shows an import **preview/result** — read it row by row:
   restore the Step 1 backup (BUI-433 — the owned-safe export regressed):
 
 ```bash
+# Replace <BACKUP_PATH> below with the backup_path value printed in Step 1 —
+# this is a fresh shell; Step 1's shell variable is not set here.
 comics-api POST /api/comics/collection/restore \
   -H 'Content-Type: application/json' \
-  -d "{\"backup_path\": \"$BACKUP_PATH\"}"
+  -d '{"backup_path": "<BACKUP_PATH>"}'
 ```
 
 Only after a clean probe, upload the rest. **Data completeness is the
@@ -317,9 +339,11 @@ Probe it the same way (≤5 rows), reading LOCG's preview:
   if a deletion already landed, restore the Step 1 backup (BUI-433):
 
 ```bash
+# Replace <BACKUP_PATH> below with the backup_path value printed in Step 1 —
+# this is a fresh shell; Step 1's shell variable is not set here.
 comics-api POST /api/comics/collection/restore \
   -H 'Content-Type: application/json' \
-  -d "{\"backup_path\": \"$BACKUP_PATH\"}"
+  -d '{"backup_path": "<BACKUP_PATH>"}'
 ```
 
 Only after a clean probe, upload the rest (complete-and-exact, no row-count limit).
@@ -446,9 +470,11 @@ Assert all of:
 Restore the Step 1 backup if needed (BUI-433):
 
 ```bash
+# Replace <BACKUP_PATH> below with the backup_path value printed in Step 1 —
+# this is a fresh shell; Step 1's shell variable is not set here.
 comics-api POST /api/comics/collection/restore \
   -H 'Content-Type: application/json' \
-  -d "{\"backup_path\": \"$BACKUP_PATH\"}"
+  -d '{"backup_path": "<BACKUP_PATH>"}'
 ```
 
 **If any assertion fails**, report the discrepancy and the backup path; do not
@@ -525,7 +551,7 @@ win-records cleanup in
 | Trying to push wishes in the default sync | The export is wins-only (BUI-208 machine gate — it refuses to emit `In Collection=0`); wishes are a separate opt-in export (`?push_wishes=true`, Step 3b), gated on a clean conflicts audit. Wins can only add; wishes can delete |
 | Pushing wishes without cleaning conflicts first | Step 3b is gated on Step 2b reporting **zero** wish-list conflicts. An owned-but-wished entry pushed as In Collection=0 deletes the owned copy |
 | Syncing without a backup | Step 1 is mandatory and hard-stops on failure (`POST /api/comics/collection/backup`, BUI-433) |
-| Seeing "Deleted from Collection" on upload | A win/wish row should never delete (BUI-122/BUI-200) — STOP, do not upload the rest, report it, restore the Step 1 backup if a deletion landed (`POST /api/comics/collection/restore` with `backup_path=$BACKUP_PATH`, BUI-433) |
+| Seeing "Deleted from Collection" on upload | A win/wish row should never delete (BUI-122/BUI-200) — STOP, do not upload the rest, report it, restore the Step 1 backup if a deletion landed (`POST /api/comics/collection/restore` with `backup_path=<the value printed in Step 1>`, BUI-433) |
 | "Error: timeout" at 0% on small batches | LOCG's import backend is degraded (a `queue_import_comic` XHR shows `(canceled)`); wait and retry later — not a file problem |
 | Trusting the row-count arithmetic alone to prove the import reconciled | It structurally cannot (BUI-548). Each unreconciled duplicate is one `added` row, so the arithmetic balances exactly while books quietly become owned twice — that is precisely what happened on 2026-07-27 (`2902 + 46 - 3 = 2945`, exact, 28 books doubled). Step 6 also asserts `owned_duplicate_identities == 0` |
 | Claiming success without checking `row_count` against `added - auto_healed_duplicates` | Step 6's check is two-sided (BUI-468): `ROWS_AFTER` must equal `ROWS_BEFORE + added - auto_healed_duplicates` exactly. A large `added` means duplicates were inserted instead of reconciled; a shrink beyond `auto_healed_duplicates` means rows vanished for an unaccounted reason. Either way — STOP, investigate, restore the backup if needed (`POST /api/comics/collection/restore`) |
