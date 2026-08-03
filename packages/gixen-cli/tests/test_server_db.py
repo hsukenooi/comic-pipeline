@@ -11,7 +11,7 @@ from server.db import (
     init_db, insert_bid, get_bid_by_item_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged, set_local_snipe_result,
-    mirror_gixen_max_bid,
+    mirror_gixen_max_bid, list_bid_decisions,
 )
 
 
@@ -2382,3 +2382,230 @@ def test_update_bid_stamps_max_bid_changed_at(db):
     ).fetchone()
     assert row["max_bid"] == 80.0
     assert row["max_bid_changed_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# BUI-618 (U6) — bid_decisions ledger: schema, record_bid_decision,
+# list_bid_decisions, migration safety.
+# ---------------------------------------------------------------------------
+
+
+def test_bid_decisions_table_present_on_fresh_db(db):
+    cur = db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {row[0] for row in cur}
+    assert "bid_decisions" in tables
+
+
+def test_bid_decisions_migration_is_idempotent(tmp_path):
+    """Calling init_db twice on the same path (a normal server restart) must
+    not error — CREATE TABLE/INDEX IF NOT EXISTS, forward-only, like every
+    other table this file tests the same way (e.g.
+    test_bids_fmv_id_migration_is_idempotent above)."""
+    db_path = tmp_path / "idem_decisions.db"
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)
+    cur = conn2.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    assert "bid_decisions" in {row[0] for row in cur}
+    conn2.close()
+
+
+def test_bid_decisions_added_to_pre_existing_db_without_losing_bids_data(tmp_path):
+    """A DB that already has live bids rows (simulating an upgrade from a
+    pre-BUI-618 install) gains bid_decisions on the next startup without
+    disturbing the existing bids data — the correctness bar for a forward-
+    only migration applied to a live DB."""
+    db_path = tmp_path / "pre_existing.db"
+    conn = init_db(db_path)
+    insert_bid(conn, "556000001", 42.0, 6, 0, "pre-existing-seller")
+    conn.commit()
+    conn.close()
+
+    # Simulate the upgraded code starting up against this pre-existing file.
+    upgraded = init_db(db_path)
+    tables = {row[0] for row in upgraded.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    assert "bid_decisions" in tables
+    row = get_bid_by_item_id(upgraded, "556000001")
+    assert row is not None
+    assert row["max_bid"] == 42.0
+    assert row["seller"] == "pre-existing-seller"
+    upgraded.close()
+
+
+def test_bid_decisions_no_foreign_key_declared(db):
+    """Deliberately denormalized like group_wins (see the _SCHEMA comment) —
+    no literal SQL FK on bid_row_id, so a future bids-table rebuild never
+    needs the bid_fmvs-style FK-preservation dance."""
+    fk_rows = db.execute("PRAGMA foreign_key_list(bid_decisions)").fetchall()
+    assert len(fk_rows) == 0
+
+
+def test_record_bid_decision_rejects_unknown_outcome_before_any_sql(db):
+    """The closed vocabulary is enforced in Python BEFORE the INSERT, not
+    only by the SQL CHECK constraint — U6 acceptance: a bad outcome value
+    must never persist."""
+    from server.db import record_bid_decision
+
+    with pytest.raises(ValueError):
+        record_bid_decision(
+            db, item_id="556000002", trigger="create", outcome="not-a-real-outcome",
+        )
+    row = db.execute(
+        "SELECT 1 FROM bid_decisions WHERE item_id=?", ("556000002",)
+    ).fetchone()
+    assert row is None  # never persisted
+
+
+def test_record_bid_decision_committed_with_bid_row_id(db):
+    from server.db import record_bid_decision, BID_DECISION_OUTCOME_COMMITTED
+
+    bid_id = insert_bid(db, "556000003", 55.0, 6, 0, None)
+    db.commit()
+    row_id = record_bid_decision(
+        db, item_id="556000003", trigger="create",
+        outcome=BID_DECISION_OUTCOME_COMMITTED, bid_row_id=bid_id,
+        requested_max_bid=55.0, source="cli",
+        config={"POLICY_EXPOSURE_CEILING": None},
+        check_results=[{"code": "exposure_ceiling", "outcome": "pass"}],
+        advisories=[],
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT * FROM bid_decisions WHERE id=?", (row_id,)
+    ).fetchone()
+    assert row["bid_row_id"] == bid_id
+    assert row["item_id"] == "556000003"
+    assert row["trigger"] == "create"
+    assert row["outcome"] == "committed"
+    assert row["bypass"] == 0
+    assert row["requested_max_bid"] == 55.0
+    assert row["source"] == "cli"
+
+
+def test_record_bid_decision_gixen_failed_create_has_null_bid_row_id(db):
+    """A create Gixen rejected outright never inserted a bids row at all —
+    the ledger row anchors on item_id + trigger instead (U6 acceptance)."""
+    from server.db import record_bid_decision, BID_DECISION_OUTCOME_GIXEN_FAILED
+
+    row_id = record_bid_decision(
+        db, item_id="556000004", trigger="create",
+        outcome=BID_DECISION_OUTCOME_GIXEN_FAILED, bid_row_id=None,
+        requested_max_bid=99.0,
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM bid_decisions WHERE id=?", (row_id,)).fetchone()
+    assert row["bid_row_id"] is None
+    assert row["item_id"] == "556000004"
+    assert row["outcome"] == "gixen_failed"
+
+
+def test_record_bid_decision_two_bids_rows_sharing_item_id_anchors_correct_row(db):
+    """item_id is NOT unique — a re-listed item, or a terminal row followed
+    by a fresh live one, can share it. The ledger must anchor to the
+    SPECIFIC row id evaluated, never resolve by item_id alone (the row-id-
+    scoping lesson)."""
+    from server.db import record_bid_decision, BID_DECISION_OUTCOME_COMMITTED
+
+    first_id = insert_bid(db, "556000005", 10.0, 6, 0, None)
+    db.execute("UPDATE bids SET status='WON' WHERE id=?", (first_id,))
+    second_id = insert_bid(db, "556000005", 20.0, 6, 0, None)
+    db.commit()
+    assert first_id != second_id
+
+    row_id = record_bid_decision(
+        db, item_id="556000005", trigger="create",
+        outcome=BID_DECISION_OUTCOME_COMMITTED, bid_row_id=second_id,
+        requested_max_bid=20.0,
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM bid_decisions WHERE id=?", (row_id,)).fetchone()
+    assert row["bid_row_id"] == second_id
+    assert row["bid_row_id"] != first_id
+
+
+def test_bid_decisions_check_constraint_rejects_unknown_outcome_at_sql_level(db):
+    """Belt-and-suspenders: the SQL CHECK constraint is a second line of
+    defense behind the Python-level validation in record_bid_decision."""
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "INSERT INTO bid_decisions (item_id, trigger, outcome) "
+            "VALUES (?, ?, ?)",
+            ("556000006", "create", "not-a-real-outcome"),
+        )
+
+
+def test_list_bid_decisions_newest_first(db):
+    from server.db import record_bid_decision, BID_DECISION_OUTCOME_COMMITTED
+
+    record_bid_decision(
+        db, item_id="556000007", trigger="create",
+        outcome=BID_DECISION_OUTCOME_COMMITTED, requested_max_bid=1.0,
+    )
+    record_bid_decision(
+        db, item_id="556000007", trigger="edit",
+        outcome=BID_DECISION_OUTCOME_COMMITTED, requested_max_bid=2.0,
+    )
+    db.commit()
+    rows = list_bid_decisions(db, item_id="556000007")
+    assert [r["trigger"] for r in rows] == ["edit", "create"]  # newest first
+
+
+def test_list_bid_decisions_filters_by_item_id(db):
+    from server.db import record_bid_decision, BID_DECISION_OUTCOME_COMMITTED
+
+    record_bid_decision(
+        db, item_id="556000008", trigger="create",
+        outcome=BID_DECISION_OUTCOME_COMMITTED, requested_max_bid=1.0,
+    )
+    record_bid_decision(
+        db, item_id="556000009", trigger="create",
+        outcome=BID_DECISION_OUTCOME_COMMITTED, requested_max_bid=2.0,
+    )
+    db.commit()
+    rows = list_bid_decisions(db, item_id="556000008")
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == "556000008"
+
+
+def test_list_bid_decisions_respects_limit(db):
+    from server.db import record_bid_decision, BID_DECISION_OUTCOME_COMMITTED
+
+    for i in range(5):
+        record_bid_decision(
+            db, item_id="556000010", trigger="create",
+            outcome=BID_DECISION_OUTCOME_COMMITTED, requested_max_bid=float(i),
+        )
+    db.commit()
+    rows = list_bid_decisions(db, item_id="556000010", limit=2)
+    assert len(rows) == 2
+
+
+def test_list_bid_decisions_parses_json_columns(db):
+    from server.db import record_bid_decision, BID_DECISION_OUTCOME_COMMITTED
+
+    record_bid_decision(
+        db, item_id="556000011", trigger="create",
+        outcome=BID_DECISION_OUTCOME_COMMITTED, requested_max_bid=1.0,
+        config={"POLICY_EXPOSURE_CEILING": "100"},
+        check_results=[{"code": "exposure_ceiling", "outcome": "pass"}],
+        advisories=[{"code": "x", "severity": "warning"}],
+    )
+    db.commit()
+    rows = list_bid_decisions(db, item_id="556000011")
+    assert rows[0]["config"] == {"POLICY_EXPOSURE_CEILING": "100"}
+    assert rows[0]["checks"] == [{"code": "exposure_ceiling", "outcome": "pass"}]
+    assert rows[0]["advisories"] == [{"code": "x", "severity": "warning"}]
+    assert rows[0]["bypass"] is False  # coerced from the stored 0/1 int
+
+
+def test_bid_decisions_has_no_update_path():
+    """U6 verification: no UPDATE path exists on this table — grep the
+    module source rather than the DB, since "no code path" is a source-level
+    property, not a runtime one."""
+    import inspect
+    import server.db as db_module
+
+    source = inspect.getsource(db_module)
+    assert "UPDATE bid_decisions" not in source

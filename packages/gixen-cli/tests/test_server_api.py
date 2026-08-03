@@ -1,6 +1,7 @@
 """HTTP endpoint tests — GixenClient is mocked, DB uses tmp_path."""
 import sys
 import os
+import json
 import sqlite3
 import types
 import pytest
@@ -4342,3 +4343,459 @@ def test_add_bid_policy_check_exception_never_5xxs_a_live_add(api, monkeypatch):
     ).fetchone()
     assert row is not None
     assert row["max_bid"] == 42.0
+
+
+# ---------------------------------------------------------------------------
+# BUI-618 (U6): the bid_decisions ledger, written at the same api_add_bid/
+# api_edit_bid sites the advisories envelope tests above exercise. One row
+# per check-point evaluation, outcome mapped per branch (committed/
+# unconfirmed/gixen_failed — `blocked` is U9, a later wave, unused here).
+# ---------------------------------------------------------------------------
+
+def _decisions(item_id: str | None = None) -> list[sqlite3.Row]:
+    conn = _dbconn()
+    try:
+        if item_id is None:
+            return conn.execute(
+                "SELECT * FROM bid_decisions ORDER BY id"
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM bid_decisions WHERE item_id=? ORDER BY id", (item_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_add_bid_create_success_records_committed_decision(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    r = api.post("/api/bids", json={"item_id": "618000001", "max_bid": 50.0})
+    assert r.status_code == 200
+    bid_id = _dbconn().execute(
+        "SELECT id FROM bids WHERE item_id='618000001'"
+    ).fetchone()["id"]
+
+    rows = _decisions("618000001")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "committed"
+    assert rows[0]["trigger"] == "create"
+    assert rows[0]["bid_row_id"] == bid_id
+    assert rows[0]["requested_max_bid"] == 50.0
+    assert rows[0]["bypass"] == 0
+
+
+def test_add_bid_upsert_modify_success_records_committed_with_upsert_trigger(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "618000002", "max_bid": 50.0})
+    r = api.post("/api/bids", json={"item_id": "618000002", "max_bid": 60.0})
+    assert r.status_code == 200
+
+    rows = _decisions("618000002")
+    assert len(rows) == 2
+    assert rows[0]["trigger"] == "create"
+    assert rows[1]["trigger"] == "upsert"
+    assert rows[1]["outcome"] == "committed"
+    assert rows[1]["requested_max_bid"] == 60.0
+    # Same bids row both times — an upsert modifies in place, it doesn't
+    # insert a second row.
+    assert rows[0]["bid_row_id"] == rows[1]["bid_row_id"]
+
+
+def test_add_bid_applied_false_records_unconfirmed_decision(api, monkeypatch):
+    """Covers AE5-adjacent U6 acceptance: the applied:False upsert branch is
+    a maybe-money-moved case and must get a ledger row too, distinctly
+    `unconfirmed` (not `committed`, not silently skipped)."""
+    from gixen_client import GixenSnipeNotFoundError, GixenAddNotConfirmedError
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "618000003", "max_bid": 50.0})
+    existing_id = _dbconn().execute(
+        "SELECT id FROM bids WHERE item_id='618000003'"
+    ).fetchone()["id"]
+    api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("gone")
+    api.mock_gixen.add_snipe.side_effect = GixenAddNotConfirmedError("618000003")
+
+    r = api.post("/api/bids", json={"item_id": "618000003", "max_bid": 65.0})
+    assert r.status_code == 200
+    assert r.json()["applied"] is False
+
+    rows = _decisions("618000003")
+    assert rows[-1]["outcome"] == "unconfirmed"
+    assert rows[-1]["bid_row_id"] == existing_id
+    assert rows[-1]["requested_max_bid"] == 65.0
+
+
+def test_add_bid_create_gixen_error_records_gixen_failed_with_null_bid_row_id(api, monkeypatch):
+    """A create Gixen rejects outright never inserts a bids row — the ledger
+    row must anchor on item_id (bid_row_id NULL), per U6 acceptance."""
+    from gixen_client import GixenError
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.mock_gixen.add_snipe.side_effect = GixenError("Gixen down")
+
+    r = api.post("/api/bids", json={"item_id": "618000004", "max_bid": 50.0})
+    assert r.status_code == 503
+
+    rows = _decisions("618000004")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "gixen_failed"
+    assert rows[0]["bid_row_id"] is None
+    assert rows[0]["trigger"] == "create"
+    bids_row = _dbconn().execute(
+        "SELECT 1 FROM bids WHERE item_id='618000004'"
+    ).fetchone()
+    assert bids_row is None  # confirms there really is no row to anchor to
+
+
+def test_add_bid_upsert_gixen_error_records_gixen_failed_with_existing_bid_row_id(api, monkeypatch):
+    """The upsert counterpart: a live row already existed before this
+    request, so the gixen_failed row anchors to IT, not NULL — the write
+    never touched the existing row's content."""
+    from gixen_client import GixenError
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "618000005", "max_bid": 50.0})
+    existing_id = _dbconn().execute(
+        "SELECT id FROM bids WHERE item_id='618000005'"
+    ).fetchone()["id"]
+    api.mock_gixen.modify_snipe.side_effect = GixenError("network blip")
+
+    r = api.post("/api/bids", json={"item_id": "618000005", "max_bid": 60.0})
+    assert r.status_code == 503
+
+    rows = _decisions("618000005")
+    assert rows[-1]["outcome"] == "gixen_failed"
+    assert rows[-1]["bid_row_id"] == existing_id
+    assert rows[-1]["trigger"] == "upsert"
+
+
+def test_add_bid_source_field_recorded_on_ledger_row(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    r = api.post(
+        "/api/bids",
+        json={"item_id": "618000006", "max_bid": 50.0, "source": "cli"},
+    )
+    assert r.status_code == 200
+    rows = _decisions("618000006")
+    assert rows[0]["source"] == "cli"
+
+
+def test_edit_bid_success_records_committed_decision(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "618000007", "max_bid": 50.0})
+    r = api.patch(
+        "/api/bids/618000007",
+        json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0},
+    )
+    assert r.status_code == 200
+    bid_id = _dbconn().execute(
+        "SELECT id FROM bids WHERE item_id='618000007'"
+    ).fetchone()["id"]
+
+    rows = _decisions("618000007")
+    edit_rows = [r for r in rows if r["trigger"] == "edit"]
+    assert len(edit_rows) == 1
+    assert edit_rows[0]["outcome"] == "committed"
+    assert edit_rows[0]["bid_row_id"] == bid_id
+    assert edit_rows[0]["requested_max_bid"] == 75.0
+
+
+def test_edit_bid_snipe_not_found_records_gixen_failed_decision(api, monkeypatch):
+    """No prior local row and Gixen has never heard of the item — a clean
+    pre-write failure with no ambiguity (the code comment's own words), so
+    it must land gixen_failed, not unconfirmed."""
+    from gixen_client import GixenSnipeNotFoundError
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("no such item")
+
+    r = api.patch(
+        "/api/bids/618000008",
+        json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0},
+    )
+    assert r.status_code == 404
+
+    rows = _decisions("618000008")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "gixen_failed"
+    assert rows[0]["bid_row_id"] is None
+    assert rows[0]["trigger"] == "edit"
+
+
+def test_edit_bid_reconcile_failure_records_unconfirmed_decision(api, monkeypatch):
+    """BUI-555's unconfirmed-modify path (modify_snipe raised AFTER its POST
+    may have already mutated Gixen) is the maybe-money-moved case named in
+    the ticket ('unconfirmed modify -> unconfirmed') — never gixen_failed."""
+    from gixen_client import GixenError
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "618000009", "max_bid": 50.0})
+    existing_id = _dbconn().execute(
+        "SELECT id FROM bids WHERE item_id='618000009'"
+    ).fetchone()["id"]
+    api.mock_gixen.modify_snipe.side_effect = GixenError("confirm read failed")
+    # _reconcile_after_unconfirmed_modify re-lists to reconcile; keep the
+    # item present so that path doesn't itself explode.
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "618000009",
+        "max_bid": "50.00 USD",
+        "current_bid": "10.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "1d",
+        "seller": "s",
+        "snipe_group": "0",
+        "bid_offset": "6",
+    }]
+
+    r = api.patch(
+        "/api/bids/618000009",
+        json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0},
+    )
+    assert r.status_code == 503
+
+    rows = _decisions("618000009")
+    assert rows[-1]["outcome"] == "unconfirmed"
+    assert rows[-1]["bid_row_id"] == existing_id
+    assert rows[-1]["trigger"] == "edit"
+
+
+def test_get_decisions_returns_newest_first_with_parsed_json(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "618000010", "max_bid": 10.0})
+    api.patch(
+        "/api/bids/618000010",
+        json={"max_bid": 20.0, "bid_offset": 6, "snipe_group": 0},
+    )
+    r = api.get("/api/decisions", params={"item_id": "618000010"})
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 2
+    assert rows[0]["trigger"] == "edit"  # newest first
+    assert rows[1]["trigger"] == "create"
+    for row in rows:
+        assert isinstance(row["checks"], list)
+        assert isinstance(row["advisories"], list)
+        assert isinstance(row["config"], dict)
+
+
+def test_get_decisions_filters_by_item_id(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "618000011", "max_bid": 10.0})
+    api.post("/api/bids", json={"item_id": "618000012", "max_bid": 10.0})
+    r = api.get("/api/decisions", params={"item_id": "618000011"})
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == "618000011"
+
+
+def test_get_decisions_limit_is_clamped(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    for i in range(3):
+        api.post("/api/bids", json={"item_id": f"6180001{20 + i}", "max_bid": 10.0})
+    r = api.get("/api/decisions", params={"limit": 2})
+    assert len(r.json()) == 2
+
+    # A non-positive limit clamps to 1, never 0 or a negative slice.
+    r_zero = api.get("/api/decisions", params={"limit": 0})
+    assert len(r_zero.json()) == 1
+
+
+def test_bid_decisions_append_failure_never_breaks_the_write(api, monkeypatch):
+    """KTD3/origin AE5: a ledger write failure must never block, delay, or
+    fail the snipe write itself — the write still returns 2xx and the bid
+    row still lands, even though the ledger append blew up."""
+    import server.main as main
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(main, "record_bid_decision", boom)
+    r = api.post("/api/bids", json={"item_id": "618000030", "max_bid": 50.0})
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT * FROM bids WHERE item_id='618000030' AND status='PENDING'"
+    ).fetchone()
+    assert row is not None
+    assert row["max_bid"] == 50.0
+    # And no ledger row landed for this item — the append genuinely failed,
+    # it didn't silently succeed via some other path.
+    assert _decisions("618000030") == []
+
+
+# ---------------------------------------------------------------------------
+# BUI-617 (U3): check_bid_write / on_bid_write_committed hookspec invocation
+# through the real endpoints. These build their own TestClient (rather than
+# using the `api` fixture, which forces zero plugins via _install_plugins(
+# monkeypatch, {})) so a fake plugin module can be installed instead —
+# mirrors test_api_dashboard_tabs_returns_plugin_tabs' pattern above.
+# ---------------------------------------------------------------------------
+
+def _boot_client(tmp_path, monkeypatch, db_name: str, plugins: dict):
+    _install_plugins(monkeypatch, plugins)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / db_name))
+    monkeypatch.setenv("GIXEN_USERNAME", "u")
+    monkeypatch.setenv("GIXEN_PASSWORD", "p")
+    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
+    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    mock = _make_mock_gixen()
+    patcher = patch("server.main.GixenClient", return_value=mock)
+    patcher.start()
+    from server.main import app
+    client = TestClient(app)
+    client.__enter__()
+    client.mock_gixen = mock
+    return client, patcher
+
+
+def test_check_bid_write_plugin_advisory_surfaces_in_response_and_ledger(tmp_path, monkeypatch):
+    from gixen.plugins import hookimpl
+
+    check_mod = types.ModuleType("_check_stub")
+
+    @hookimpl
+    def check_bid_write(conn, intent):
+        return [{"code": "fmv_over", "outcome": "advise", "message": "over FMV", "data": {"x": 1}}]
+
+    check_mod.check_bid_write = check_bid_write
+    client, patcher = _boot_client(tmp_path, monkeypatch, "check_stub.db", {"check-stub": check_mod})
+    try:
+        r = client.post("/api/bids", json={"item_id": "618100001", "max_bid": 50.0})
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["advisories"]) == 1
+        assert data["advisories"][0]["code"] == "fmv_over"
+
+        conn = sqlite3.connect(str(tmp_path / "check_stub.db"))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM bid_decisions WHERE item_id='618100001'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        checks = json.loads(row["checks_json"])
+        assert any(c["code"] == "fmv_over" for c in checks)
+        advisories = json.loads(row["advisories_json"])
+        assert any(a["code"] == "fmv_over" for a in advisories)
+    finally:
+        client.__exit__(None, None, None)
+        patcher.stop()
+
+
+def test_check_bid_write_plugin_raising_does_not_break_add(tmp_path, monkeypatch):
+    from gixen.plugins import hookimpl
+
+    check_mod = types.ModuleType("_raising_check_stub")
+
+    @hookimpl
+    def check_bid_write(conn, intent):
+        raise RuntimeError("plugin exploded")
+
+    check_mod.check_bid_write = check_bid_write
+    client, patcher = _boot_client(
+        tmp_path, monkeypatch, "raising_check.db", {"raising-check-stub": check_mod},
+    )
+    try:
+        r = client.post("/api/bids", json={"item_id": "618100002", "max_bid": 50.0})
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["advisories"]) == 1
+        assert data["advisories"][0]["severity"] == "unevaluable"
+        client.mock_gixen.add_snipe.assert_called_once()
+
+        conn = sqlite3.connect(str(tmp_path / "raising_check.db"))
+        conn.row_factory = sqlite3.Row
+        bid_row = conn.execute(
+            "SELECT * FROM bids WHERE item_id='618100002'"
+        ).fetchone()
+        decision_row = conn.execute(
+            "SELECT * FROM bid_decisions WHERE item_id='618100002'"
+        ).fetchone()
+        conn.close()
+        assert bid_row is not None  # the write still committed
+        assert decision_row["outcome"] == "committed"
+    finally:
+        client.__exit__(None, None, None)
+        patcher.stop()
+
+
+def test_on_bid_write_committed_plugin_invoked_on_commit(tmp_path, monkeypatch):
+    from gixen.plugins import hookimpl
+
+    calls = []
+    commit_mod = types.ModuleType("_commit_stub")
+
+    @hookimpl
+    def on_bid_write_committed(conn, intent, bid_row_id, check_results):
+        calls.append((intent.item_id, bid_row_id))
+
+    commit_mod.on_bid_write_committed = on_bid_write_committed
+    client, patcher = _boot_client(
+        tmp_path, monkeypatch, "commit_stub.db", {"commit-stub": commit_mod},
+    )
+    try:
+        r = client.post("/api/bids", json={"item_id": "618100003", "max_bid": 50.0})
+        assert r.status_code == 200
+        bid_id = r.json()["id"]
+        assert calls == [("618100003", bid_id)]
+    finally:
+        client.__exit__(None, None, None)
+        patcher.stop()
+
+
+def test_on_bid_write_committed_plugin_not_invoked_on_unconfirmed(tmp_path, monkeypatch):
+    """The notification hookspec is documented to fire only on a genuine
+    committed write — an applied:False upsert must not trigger it."""
+    from gixen.plugins import hookimpl
+    from gixen_client import GixenSnipeNotFoundError, GixenAddNotConfirmedError
+
+    calls = []
+    commit_mod = types.ModuleType("_commit_stub_unconfirmed")
+
+    @hookimpl
+    def on_bid_write_committed(conn, intent, bid_row_id, check_results):
+        calls.append((intent.item_id, bid_row_id))
+
+    commit_mod.on_bid_write_committed = on_bid_write_committed
+    client, patcher = _boot_client(
+        tmp_path, monkeypatch, "commit_stub_unconfirmed.db",
+        {"commit-stub-unconfirmed": commit_mod},
+    )
+    try:
+        client.post("/api/bids", json={"item_id": "618100004", "max_bid": 50.0})
+        calls.clear()  # drop the create's own committed notification
+        client.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("gone")
+        client.mock_gixen.add_snipe.side_effect = GixenAddNotConfirmedError("618100004")
+        r = client.post("/api/bids", json={"item_id": "618100004", "max_bid": 65.0})
+        assert r.status_code == 200
+        assert r.json()["applied"] is False
+        assert calls == []
+    finally:
+        client.__exit__(None, None, None)
+        patcher.stop()
+
+
+def test_on_bid_write_committed_plugin_raising_does_not_break_add(tmp_path, monkeypatch):
+    from gixen.plugins import hookimpl
+
+    commit_mod = types.ModuleType("_raising_commit_stub")
+
+    @hookimpl
+    def on_bid_write_committed(conn, intent, bid_row_id, check_results):
+        raise RuntimeError("commit hook exploded")
+
+    commit_mod.on_bid_write_committed = on_bid_write_committed
+    client, patcher = _boot_client(
+        tmp_path, monkeypatch, "raising_commit.db", {"raising-commit-stub": commit_mod},
+    )
+    try:
+        r = client.post("/api/bids", json={"item_id": "618100005", "max_bid": 50.0})
+        assert r.status_code == 200
+        conn = sqlite3.connect(str(tmp_path / "raising_commit.db"))
+        conn.row_factory = sqlite3.Row
+        bid_row = conn.execute(
+            "SELECT * FROM bids WHERE item_id='618100005'"
+        ).fetchone()
+        decision_row = conn.execute(
+            "SELECT * FROM bid_decisions WHERE item_id='618100005'"
+        ).fetchone()
+        conn.close()
+        assert bid_row is not None
+        assert decision_row["outcome"] == "committed"  # the ledger append still ran
+    finally:
+        client.__exit__(None, None, None)
+        patcher.stop()
