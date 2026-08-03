@@ -212,6 +212,18 @@ is deliberately outside the seam.
 
 Units are ordered by dependency. U-IDs are stable identifiers, not a reading order.
 
+| Unit | Linear | Depends on |
+|---|---|---|
+| U1 Quarantine state + `matchable_rows` seam | BUI-647 | — |
+| U2 Quarantine write path, guard, surfaces | BUI-648 | U1 |
+| U3 Remediate the 6 cross-edition twins | BUI-649 | U1, U2 |
+| U4 `identity_collisions` counter + re-key sweep | BUI-650 | — |
+| U5 Remediate the 3 identity collisions | BUI-651 | U4 |
+| U6 Authority table schema, loader, validation | BUI-652 | — |
+| U7 Move the masthead aliases into the table | BUI-653 | U6 |
+| U8 Relabel entries + `authority-check` report | BUI-654 | U4, U6 |
+| U9 Spike: `metron_id` resolvability | BUI-655 | — |
+
 ### Phase A — quarantine (ships alone, useful alone)
 
 ### U1. Quarantine state and the `matchable_rows` seam
