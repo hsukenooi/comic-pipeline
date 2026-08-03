@@ -219,16 +219,23 @@ def _cache_path(canonical_url: str) -> Path:
     return CACHE_DIR / f"{digest}.json"
 
 
-def _cache_get(path: Path, ttl_sec: int) -> dict | None:
+def _cache_get(path: Path, ttl_sec: int) -> tuple[dict, float] | tuple[None, None]:
+    """Returns (data, mtime) on a hit, (None, None) on a miss.
+
+    BUI-657/KTD7: `mtime` is the cache entry's file mtime — i.e. when the
+    response was originally fetched, not when this lookup ran — so a cache
+    hit can be stamped with the response's real fetch time rather than now.
+    """
     if not path.exists():
-        return None
-    age = time.time() - path.stat().st_mtime
+        return None, None
+    mtime = path.stat().st_mtime
+    age = time.time() - mtime
     if age > ttl_sec:
-        return None
+        return None, None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text()), mtime
     except Exception:  # noqa: BLE001  # cache read — corrupt/partial file, return None
-        return None
+        return None, None
 
 
 def _cache_put(path: Path, data: dict) -> None:
@@ -815,8 +822,9 @@ class _CircuitBreaker:
 def fetch(nkw: str, api_key: str, *, force: bool = False,
           ttl_sec: int = DEFAULT_CACHE_TTL_SEC, page: int = 1,
           record_attempt=None, breaker: "_CircuitBreaker | None" = None,
-          ) -> tuple[dict, bool]:
-    """Fetch a SerpApi response with caching. Returns (data, cache_hit).
+          ) -> tuple[dict, bool, float]:
+    """Fetch a SerpApi response with caching. Returns
+    (data, cache_hit, response_fetched_at).
 
     BUI-523: `page` (default 1) selects the SerpApi page — see
     canonical_serpapi_url for why page 1 stays byte-for-byte identical to
@@ -838,16 +846,21 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
     `BreakerTrippedError` on a miss) — even under `force=True`, which
     otherwise means "bypass the cache," but does not mean "bypass the
     breaker."
+
+    BUI-657/KTD7: `response_fetched_at` is the cache entry's mtime on a hit,
+    or `time.time()` at the moment the live response was validated on a live
+    fetch — never "now" for a cache hit. A re-run of a stable book must not
+    restate three-month-old comps as observed today.
     """
     canonical = canonical_serpapi_url(nkw, page=page)
     path = _cache_path(canonical)
 
     cache_checked = False
     if not force:
-        cached = _cache_get(path, ttl_sec)
+        cached, cached_mtime = _cache_get(path, ttl_sec)
         cache_checked = True
         if cached is not None:
-            return cached, True
+            return cached, True, cached_mtime
 
     if breaker is not None and breaker.should_skip_live():
         # BUI-535: the breaker overrides --force too — once tripped, no more
@@ -856,9 +869,9 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
         # cache reads") — re-check here since the `not force` branch above
         # may have skipped the cache lookup entirely (force=True).
         if not cache_checked:
-            cached = _cache_get(path, ttl_sec)
+            cached, cached_mtime = _cache_get(path, ttl_sec)
             if cached is not None:
-                return cached, True
+                return cached, True, cached_mtime
         raise BreakerTrippedError(
             "SerpApi circuit breaker tripped (BUI-535) — no cache entry for "
             "this query; skipping the live fetch for the rest of this batch."
@@ -950,9 +963,10 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
     if breaker is not None:
         breaker.record_success()
 
+    fetched_at = time.time()
     _cache_put(path, data)
     _capture_raw_response(PROVIDER_SERPAPI, nkw, canonical, data)
-    return data, False
+    return data, False, fetched_at
 
 
 # ─── Secondary provider fetch + failover orchestration (BUI-545) ─────────────
@@ -988,8 +1002,9 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
                      ttl_sec: int = DEFAULT_CACHE_TTL_SEC,
                      record_attempt=None,
                      breaker: "_CircuitBreaker | None" = None,
-                     ) -> tuple[dict, bool]:
-    """Fetch a sold-comps.com response with caching. Returns (data, cache_hit).
+                     ) -> tuple[dict, bool, float]:
+    """Fetch a sold-comps.com response with caching. Returns
+    (data, cache_hit, response_fetched_at).
 
     Mirrors fetch()'s contract (own cache key → breaker gate → live with the
     same retry policy) with one deliberate asymmetry: this breaker counts
@@ -1001,23 +1016,27 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
     attempt IS a charge there.) `record_attempt` still fires for superseded
     retry attempts — the trail stays a full attempt trail (BUI-537); trail
     recording and breaker accounting are simply decoupled here.
+
+    BUI-657/KTD7: `response_fetched_at` mirrors fetch()'s contract — the
+    cache entry's mtime on a hit, `time.time()` at successful validation on a
+    live fetch.
     """
     canonical = canonical_sold_comps_url(nkw)
     path = _cache_path(canonical)
 
     cache_checked = False
     if not force:
-        cached = _cache_get(path, ttl_sec)
+        cached, cached_mtime = _cache_get(path, ttl_sec)
         cache_checked = True
         if cached is not None:
-            return cached, True
+            return cached, True, cached_mtime
 
     if breaker is not None and breaker.should_skip_live():
         # Same force-does-not-bypass-the-breaker semantics as fetch().
         if not cache_checked:
-            cached = _cache_get(path, ttl_sec)
+            cached, cached_mtime = _cache_get(path, ttl_sec)
             if cached is not None:
-                return cached, True
+                return cached, True, cached_mtime
         raise BreakerTrippedError(
             "sold-comps.com circuit breaker tripped (BUI-545) — no cache "
             "entry for this query; skipping the live fetch for the rest of "
@@ -1073,9 +1092,10 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
     if breaker is not None:
         breaker.record_success()
 
+    fetched_at = time.time()
     _cache_put(path, data)
     _capture_raw_response(PROVIDER_SOLD_COMPS, nkw, canonical, data)
-    return data, False
+    return data, False, fetched_at
 
 
 def _fetch_with_fallback(nkw: str, api_key: str, *, force: bool = False,
@@ -1085,10 +1105,13 @@ def _fetch_with_fallback(nkw: str, api_key: str, *, force: bool = False,
                          sold_comps_key: str | None = None,
                          sold_comps_breaker: "_CircuitBreaker | None" = None,
                          providers: tuple = DEFAULT_PROVIDER_ORDER,
-                         ) -> tuple[dict, bool, str]:
+                         ) -> tuple[dict, bool, str, float]:
     """Run one query through the provider chain (BUI-545). Returns
-    (data, cache_hit, provider): `provider` names who served, so the caller
-    can parse the raw response with the right extractor and tag the trail.
+    (data, cache_hit, provider, response_fetched_at): `provider` names who
+    served, so the caller can parse the raw response with the right
+    extractor and tag the trail; `response_fetched_at` (BUI-657/KTD7) is
+    whichever provider's own fetch time — cache mtime on a hit, live fetch
+    time otherwise.
 
     Failover fires on EXCEPTION only — a 200 with zero results from either
     provider is a genuine n=0 (BUI-536's error-vs-empty distinction), never
@@ -1129,16 +1152,16 @@ def _fetch_with_fallback(nkw: str, api_key: str, *, force: bool = False,
                 record_attempt(outcome, detail, _provider)
         try:
             if provider == PROVIDER_SERPAPI:
-                data, cache_hit = fetch(
+                data, cache_hit, response_fetched_at = fetch(
                     nkw, api_key, force=force, ttl_sec=ttl_sec, page=page,
                     record_attempt=hook, breaker=breaker,
                 )
             else:
-                data, cache_hit = fetch_sold_comps(
+                data, cache_hit, response_fetched_at = fetch_sold_comps(
                     nkw, sold_comps_key, force=force, ttl_sec=ttl_sec,
                     record_attempt=hook, breaker=sold_comps_breaker,
                 )
-            return data, cache_hit, provider
+            return data, cache_hit, provider, response_fetched_at
         except (SerpApiError, requests.RequestException) as e:
             e.provider = provider
             if i == len(active) - 1:
@@ -1535,7 +1558,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                 # page=page is byte-identical to the old page==1 branch that
                 # omitted the kwarg — collapsed now that this call also needs
                 # to thread record_attempt/breaker uniformly.
-                data, cache_hit, provider = _fetch_with_fallback(
+                data, cache_hit, provider, response_fetched_at = _fetch_with_fallback(
                     nkw, api_key, force=force, ttl_sec=ttl_sec, page=page,
                     record_attempt=_record_retry_attempt, breaker=breaker,
                     sold_comps_key=sold_comps_key,
@@ -1577,6 +1600,22 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                 if hard_exclude(comp["title"]):
                     continue
                 seen_ids.add(comp["product_id"])
+                # BUI-657/KTD6: stamp provenance on the comp at the point it
+                # joins the pool — provider/tier/query are already in scope
+                # here and this is the one place downstream readers cannot
+                # reconstruct them from (queries_used only records them at
+                # book level, recoverable otherwise only by append order,
+                # the exact positional-inference trap BUI-174/187 added
+                # `_req_id` to escape). KTD7: `from_cache`/`observed_at` come
+                # straight from the fetch that produced `data` — mtime on a
+                # cache hit, this query's own fetch time otherwise — never
+                # "now", so a re-run of a stable book doesn't restate old
+                # comps as freshly observed.
+                comp["provider"] = provider
+                comp["tier"] = tier
+                comp["query"] = nkw
+                comp["from_cache"] = cache_hit
+                comp["observed_at"] = response_fetched_at
                 # BUI-524: only the inclusive tier passes route_slabs=True —
                 # every other tier's behavior (add every non-excluded comp to
                 # `comps`) is byte-for-byte unchanged. A slab comp is counted
