@@ -16,6 +16,7 @@ import pytest
 from add_batch import (
     AddBatchError,
     STATUS_ADDED,
+    STATUS_BLOCKED,
     STATUS_FAILED,
     STATUS_NOT_ATTEMPTED,
     STATUS_UPDATED,
@@ -182,6 +183,19 @@ def test_build_bid_payload_omits_source_by_default():
 def test_build_bid_payload_includes_source_when_given():
     payload = build_bid_payload("1", 100, 6, 0, source="cli")
     assert payload["source"] == "cli"
+
+
+def test_build_bid_payload_omits_policy_bypass_by_default():
+    """BUI-623 (U9): default False is left OUT of the payload entirely, same
+    'only send what was given' convention as `source` above — an old server
+    that has never heard of `policy_bypass` sees byte-identical requests."""
+    payload = build_bid_payload("1", 100, 6, 0)
+    assert "policy_bypass" not in payload
+
+
+def test_build_bid_payload_includes_policy_bypass_when_true():
+    payload = build_bid_payload("1", 100, 6, 0, policy_bypass=True)
+    assert payload["policy_bypass"] is True
 
 
 def test_created_from_response_defaults_true_when_key_missing():
@@ -461,6 +475,79 @@ def test_add_one_row_server_failure_marks_failed_with_error_text():
 
 
 # ---------------------------------------------------------------------------
+# add_one_row — BUI-623 (U9): policy block (409) is BLOCKED, not FAILED
+# ---------------------------------------------------------------------------
+
+_BLOCK_DETAIL = {
+    "blocked": True,
+    "message": "Blocked by policy check(s): over_fmv.",
+    "blocking_codes": ["over_fmv"],
+    "unevaluable_while_blocking": [],
+    "advisories": [
+        {"code": "over_fmv", "severity": "warning", "message": "over FMV", "data": {}},
+    ],
+    "surviving_snipe": None,
+}
+
+
+def test_add_one_row_blocked_response_marks_status_blocked_not_failed():
+    """The server's 409 policy block surfaces through server_request as
+    (False, <structured detail dict with blocked=True>, <error string>) —
+    add_one_row must read the STRUCTURED shape (not just `ok`) to tell a
+    policy block apart from a genuine add failure."""
+    server = _FakeServer({
+        ("post", "/api/bids"): (False, _BLOCK_DETAIL, "Server returned 409: ..."),
+    })
+    result = add_one_row(_row("1"), server_request=server)
+    assert result.status == STATUS_BLOCKED
+    assert result.status != STATUS_FAILED
+
+
+def test_add_one_row_blocked_carries_message_and_advisories():
+    server = _FakeServer({
+        ("post", "/api/bids"): (False, _BLOCK_DETAIL, "Server returned 409: ..."),
+    })
+    result = add_one_row(_row("1"), server_request=server)
+    assert result.error == "Blocked by policy check(s): over_fmv."
+    assert result.advisories == _BLOCK_DETAIL["advisories"]
+
+
+def test_add_one_row_blocked_preserves_max_bid_and_grade_for_the_table():
+    server = _FakeServer({
+        ("post", "/api/bids"): (False, _BLOCK_DETAIL, "Server returned 409: ..."),
+    })
+    result = add_one_row(_row("1", max_bid=250, grade=9.4), server_request=server)
+    assert result.max_bid == 250.0
+    assert result.grade == 9.4
+
+
+def test_add_one_row_non_409_failure_still_marks_failed_not_blocked():
+    """Adversarial: a genuine failure whose response happens to be a dict
+    must NOT be mistaken for a block — only `resp.get("blocked")` truthy
+    routes to STATUS_BLOCKED."""
+    server = _FakeServer({
+        ("post", "/api/bids"): (False, {"detail": "internal error"}, "Server returned 500: boom"),
+    })
+    result = add_one_row(_row("1"), server_request=server)
+    assert result.status == STATUS_FAILED
+
+
+def test_add_one_row_sends_policy_bypass_when_row_flag_true():
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    add_one_row(_row("1", policy_bypass=True), server_request=server)
+    assert server.calls[0][2]["policy_bypass"] is True
+
+
+def test_add_one_row_omits_policy_bypass_by_default():
+    """Matches the 'only send what was given' convention every other
+    optional add_one_row field follows — an absent/false row flag must not
+    even add the key, for byte-identical behavior against an old server."""
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    add_one_row(_row("1"), server_request=server)
+    assert "policy_bypass" not in server.calls[0][2]
+
+
+# ---------------------------------------------------------------------------
 # add_one_row — stale-listing guard (BUI-567)
 # ---------------------------------------------------------------------------
 
@@ -621,6 +708,40 @@ def test_run_batch_never_calls_health_check_when_nothing_fails():
     assert outcome.exit_code() == 0
 
 
+def test_run_batch_ae9_blocked_row_continues_no_halt():
+    """AE9: an add-batch with one over-FMV (blocked) row and two clean rows
+    ends with 2 added + 1 BLOCKED, and the batch does not halt — a policy
+    block is not a server fault, so BUI-168 halt semantics don't apply."""
+    server = _FakeServer({
+        ("post", "/api/bids"): [
+            (True, {"item_id": "1", "created": True}, None),
+            (False, _BLOCK_DETAIL, "Server returned 409: ..."),
+            (True, {"item_id": "3", "created": True}, None),
+        ],
+    })
+    health_calls = []
+
+    def health_check():
+        health_calls.append(1)
+        return True
+
+    rows = [_row("1"), _row("2"), _row("3")]
+    outcome = run_batch(rows, server_request=server, health_check=health_check)
+
+    statuses = [r.status for r in outcome.rows]
+    assert statuses == [STATUS_ADDED, STATUS_BLOCKED, STATUS_ADDED]
+    assert outcome.halted is False
+    # every row was attempted — the BLOCKED row never triggered a health
+    # re-check the way a STATUS_FAILED row does (a policy block is not the
+    # BUI-168 "is the server still up" signal).
+    assert health_calls == []
+    summary = outcome.summary()
+    assert summary["added"] == 2
+    assert summary["blocked"] == 1
+    assert summary["failed"] == 0
+    assert summary["not_attempted"] == 0
+
+
 # ---------------------------------------------------------------------------
 # BatchOutcome.summary / exit_code / to_dict
 # ---------------------------------------------------------------------------
@@ -634,9 +755,13 @@ def test_batch_outcome_summary_counts_each_status():
         RowResult(item_id="4", status=STATUS_NOT_ATTEMPTED),
     ])
     summary = outcome.summary()
+    # BUI-623 (U9): STATUS_BLOCKED is now a fixed key in every summary dict
+    # (present at 0 even when no row was blocked) — see summary()'s own
+    # comment for why it's listed unconditionally like every other status.
     assert summary == {
         "total": 4, STATUS_ADDED: 1, STATUS_UPDATED: 1,
-        STATUS_FAILED: 1, STATUS_NOT_ATTEMPTED: 1, "advisories": 0,
+        STATUS_FAILED: 1, STATUS_NOT_ATTEMPTED: 1, STATUS_BLOCKED: 0,
+        "advisories": 0,
     }
 
 
@@ -681,6 +806,33 @@ def test_batch_outcome_exit_code_nonzero_on_not_attempted_alone():
         RowResult(item_id="2", status=STATUS_NOT_ATTEMPTED),
     ], halted=True)
     assert outcome.exit_code() == 1
+
+
+def test_batch_outcome_exit_code_nonzero_on_blocked_alone():
+    """BUI-623 (U9): a BLOCKED row's write did not land any more than a
+    FAILED or NOT_ATTEMPTED row's did — same 'any row failed to land'
+    rationale exit_code()'s own docstring already applies to those two, even
+    though (unlike NOT_ATTEMPTED) the batch never halts for it."""
+    outcome = BatchOutcome(rows=[
+        RowResult(item_id="1", status=STATUS_ADDED),
+        RowResult(item_id="2", status=STATUS_BLOCKED, error="Blocked by policy check(s): over_fmv."),
+    ])
+    assert outcome.halted is False
+    assert outcome.exit_code() == 1
+
+
+def test_batch_outcome_summary_never_looks_all_clean_with_a_blocked_row():
+    """AE9's summary claim, at the summary-dict level: 2 added + 1 blocked
+    must be readable as NOT a clean batch from the summary alone."""
+    outcome = BatchOutcome(rows=[
+        RowResult(item_id="1", status=STATUS_ADDED),
+        RowResult(item_id="2", status=STATUS_ADDED),
+        RowResult(item_id="3", status=STATUS_BLOCKED, error="blocked"),
+    ])
+    summary = outcome.summary()
+    assert summary["added"] == 2
+    assert summary["blocked"] == 1
+    assert not (summary["failed"] == 0 and summary["blocked"] == 0 and summary["not_attempted"] == 0)
 
 
 def test_batch_outcome_to_dict_shape():

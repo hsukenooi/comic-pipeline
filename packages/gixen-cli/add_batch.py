@@ -34,6 +34,12 @@ STATUS_ADDED = "added"
 STATUS_UPDATED = "updated"
 STATUS_FAILED = "failed"
 STATUS_NOT_ATTEMPTED = "not_attempted"
+# BUI-623 (U9): distinct from FAILED — a 409 policy block, not a server/
+# Gixen fault. `run_batch` below does NOT treat a BLOCKED row as a health-
+# check trigger the way it does STATUS_FAILED (BUI-168 halt semantics apply
+# only to genuine failures; a policy block is a deliberate, working-as-
+# designed rejection, so the batch continues past it).
+STATUS_BLOCKED = "blocked"
 
 _TERMINAL_OK_STATUSES = (STATUS_ADDED, STATUS_UPDATED)
 
@@ -57,12 +63,15 @@ class ServerRequestFn(Protocol):
 @dataclass
 class RowResult:
     """`error` and `link_error` are deliberately separate fields, not one
-    overloaded string: `error` is set only when the add itself failed
-    (status == STATUS_FAILED — the row did not land). `link_error` is set
-    when the add succeeded but the subsequent link-fmv call failed (status
-    stays ADDED/UPDATED — the snipe landed, it's just unlinked). A consumer
-    scanning for `error is not None` to mean "this row failed" must not
-    catch a merely-unlinked-but-added row."""
+    overloaded string: `error` is set when the row's own add did not land —
+    status == STATUS_FAILED (a server/Gixen fault) or, since BUI-623 (U9),
+    status == STATUS_BLOCKED (a 409 policy block; `error` holds the block's
+    human-readable message, and `advisories` below carries its structured
+    advisory set same as any other row). `link_error` is set when the add
+    succeeded but the subsequent link-fmv call failed (status stays
+    ADDED/UPDATED — the snipe landed, it's just unlinked). A consumer
+    scanning for `error is not None` to mean "this row did not land" must
+    not catch a merely-unlinked-but-added row."""
 
     item_id: str | None
     status: str
@@ -119,6 +128,12 @@ class BatchOutcome:
             STATUS_UPDATED: 0,
             STATUS_FAILED: 0,
             STATUS_NOT_ATTEMPTED: 0,
+            # BUI-623 (U9): a distinct bucket from FAILED — see STATUS_BLOCKED's
+            # own comment. Listed even when zero (same as every other status
+            # here) so a reader of just this dict always sees the full
+            # added/blocked/failed/remaining picture the plan calls for, not
+            # just whichever statuses happened to occur.
+            STATUS_BLOCKED: 0,
         }
         for r in self.rows:
             counts[r.status] = counts.get(r.status, 0) + 1
@@ -131,9 +146,24 @@ class BatchOutcome:
     def exit_code(self) -> int:
         """Non-zero if ANY row failed to land — a not-attempted row (batch
         halted before reaching it) is just as much a non-success as a failed
-        one, so it counts too."""
+        one, so it counts too.
+
+        BUI-623 (U9): a BLOCKED row counts too, by the SAME rationale — its
+        write did not land either, even though the block was a deliberate
+        policy decision rather than a technical fault and the batch
+        continues past it (STATUS_BLOCKED never sets `halted`). Exit code
+        communicates row-level completeness to whatever script/skill invoked
+        `add-batch`; "2 added + 1 blocked" must not look like full success to
+        a caller checking `$?` any more than "2 added + 1 not_attempted"
+        does — both mean the caller has follow-up to do (retry, `--ack-
+        policy`, or a manual decision) before treating the batch as done.
+        """
         s = self.summary()
-        return 0 if (s[STATUS_FAILED] == 0 and s[STATUS_NOT_ATTEMPTED] == 0) else 1
+        return 0 if (
+            s[STATUS_FAILED] == 0
+            and s[STATUS_NOT_ATTEMPTED] == 0
+            and s[STATUS_BLOCKED] == 0
+        ) else 1
 
     def to_dict(self) -> dict:
         return {
@@ -269,6 +299,7 @@ def build_bid_payload(
     locg_id: int | None = None,
     grade: float | None = None,
     source: str | None = None,
+    policy_bypass: bool = False,
 ) -> dict[str, Any]:
     """The POST /api/bids payload shape, shared by cli.py's single-item
     `add` command and `add_one_row` below so the two request paths cannot
@@ -279,6 +310,12 @@ def build_bid_payload(
     it (None, the default) to leave the key out of the payload entirely,
     matching the existing seller/seller_grade/photo_grade "only send what
     was given" convention below.
+
+    BUI-623 (U9): `policy_bypass` populates `AddBidRequest.policy_bypass`
+    (`gixen add --ack-policy`, or a per-row `"policy_bypass": true` in an
+    add-batch ROWS_FILE) — omitted from the payload when False (the
+    server-side default anyway), same "only send what was given" convention
+    as `source` above.
 
     BUI-619 (U5): `comic_id`/`locg_id`/`grade` build the payload's
     `comic_identities` list — `{comic_id|locg_id, grade}` entries, so the
@@ -307,6 +344,8 @@ def build_bid_payload(
         payload["photo_grade"] = photo_grade
     if source is not None:
         payload["source"] = source
+    if policy_bypass:
+        payload["policy_bypass"] = True
 
     identities: list[dict[str, Any]] = []
     if grade is not None and (comic_id is not None or locg_id is not None):
@@ -377,6 +416,12 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         seller_grade = _optional_float(row, "seller_grade")
         photo_grade = _optional_float(row, "photo_grade")
         _check_end_date_not_past(row)  # BUI-567: before the network, not after
+        # BUI-623 (U9): per-row audited bypass — a ROWS_FILE row may set
+        # "policy_bypass": true so this specific row commits past a blocking
+        # policy check instead of coming back BLOCKED. Leniently coerced
+        # (any truthy JSON value), matching this file's existing tolerant
+        # style for row-level flags rather than a hard 422-style rejection.
+        policy_bypass = bool(row.get("policy_bypass", False))
     except _RowValidationError as e:
         return RowResult(item_id=item_id, status=STATUS_FAILED, error=str(e), title=title)
 
@@ -390,10 +435,25 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         # BUI-621 (U7): every add-batch row is provenance-tagged "batch",
         # distinct from cli.py's `add` command tagging "cli".
         source="batch",
+        policy_bypass=policy_bypass,
     )
 
     ok, resp, err = server_request("post", "/api/bids", json=payload)
     if not ok:
+        if isinstance(resp, dict) and resp.get("blocked"):
+            # BUI-623 (U9): a 409 policy block is distinct from a genuine
+            # add failure — STATUS_BLOCKED, not STATUS_FAILED, so `run_batch`
+            # below does not treat it as a BUI-168 health-check trigger (a
+            # policy block is not a server fault) and the batch continues.
+            # `error` carries the block's human-readable message (mirroring
+            # every other row-did-not-land case) and `advisories` carries
+            # the same structured KTD4 set a landed row would, so the human
+            # table/JSON summary render it the same way.
+            return RowResult(
+                item_id=item_id, status=STATUS_BLOCKED, max_bid=float(bid),
+                grade=grade, error=resp.get("message") or err, title=title,
+                advisories=resp.get("advisories") or [],
+            )
         return RowResult(
             item_id=item_id, status=STATUS_FAILED, max_bid=float(bid),
             grade=grade, error=err, title=title,

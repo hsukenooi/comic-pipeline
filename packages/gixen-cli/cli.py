@@ -34,6 +34,7 @@ from add_batch import (
     BatchOutcome,
     RowResult,
     STATUS_ADDED,
+    STATUS_BLOCKED,
     STATUS_FAILED,
     STATUS_NOT_ATTEMPTED,
     STATUS_UPDATED,
@@ -147,13 +148,35 @@ def _server_request_result(method: str, path: str, **kwargs) -> tuple[bool, dict
                 detail = e.response.json().get("detail", "")
             except (ValueError, AttributeError):
                 pass
-        return False, None, f"Server returned {status_code}: {detail}"
+        # BUI-623 (U9): a policy block's 409 `detail` is a structured KTD4
+        # envelope (`{blocked, message, advisories, blocking_codes,
+        # surviving_snipe, ...}`), not a plain string — surface it as `data`
+        # too (distinct from `error`'s flattened-to-string message below) so
+        # a caller that wants the structured shape (add_batch.py's BLOCKED
+        # detection, `_server_request`'s nicer rendering below) doesn't have
+        # to re-parse it out of the error string. Every OTHER failure keeps
+        # returning `data=None` exactly as before — this is additive, not a
+        # contract change for any existing caller that ignores `data` on
+        # failure (every add_batch.py test that seeds `(False, None, ...)`
+        # by hand is unaffected).
+        data = detail if isinstance(detail, dict) and detail.get("blocked") else None
+        return False, data, f"Server returned {status_code}: {detail}"
 
 
 def _server_request(method: str, path: str, **kwargs) -> dict | list:
     """Make a request to the comics server. Raises SystemExit on failure."""
     ok, data, error = _server_request_result(method, path, **kwargs)
     if not ok:
+        if isinstance(data, dict) and data.get("blocked"):
+            # BUI-623 (U9): render the structured 409 policy-block envelope
+            # clearly instead of the generic f"Error: Server returned 409:
+            # {dict}" the branch below would otherwise print — the message
+            # already names the blocking check(s) and (for a blocked
+            # upsert/edit of a live row) the surviving snipe; advisories
+            # render via the same helper the 2xx path uses.
+            click.echo(f"Error: {data.get('message', 'Blocked by policy.')}", err=True)
+            _print_advisories(data.get("advisories") or [])
+            sys.exit(1)
         click.echo(f"Error: {error}", err=True)
         sys.exit(1)
     return data
@@ -387,6 +410,16 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.option("--seller", default=None, help="eBay seller username (BUI-78 seller-reliability)")
 @click.option("--seller-grade", type=float, default=None, help="Seller's stated grade (CGC float, BUI-78)")
 @click.option("--photo-grade", type=float, default=None, help="Photo-assessed consensus grade (CGC float, BUI-78)")
+@click.option(
+    "--ack-policy",
+    is_flag=True,
+    help="Audited bypass (BUI-623): commit past a blocking policy check "
+         "(POLICY_BLOCK_<CHECK>) instead of getting a 409. Per-invocation "
+         "and blanket — it acknowledges every advisory that fired, not one "
+         "check by name — and the full advisory set is recorded on the "
+         "server's decisions ledger with bypass=1. Server mode only; has "
+         "no effect in direct-Gixen mode (there is no policy layer there).",
+)
 def add(
     item_id: str,
     max_bid: str,
@@ -398,6 +431,7 @@ def add(
     seller: str | None,
     seller_grade: float | None,
     photo_grade: float | None,
+    ack_policy: bool,
 ):
     """Add a snipe for an eBay item."""
     try:
@@ -427,6 +461,8 @@ def add(
             # BUI-621 (U7): tag this row's provenance "cli" — add-batch's
             # add_one_row tags its own rows "batch".
             source="cli",
+            # BUI-623 (U9): --ack-policy -> policy_bypass=true in the payload.
+            policy_bypass=ack_policy,
         )
         resp = _server_request("post", "/api/bids", json=payload)
         # BUI-67: the server upserts. created=False means an existing live snipe
@@ -480,6 +516,14 @@ def add(
         click.echo(
             "⚠️  --seller/--seller-grade/--photo-grade require COMICS_SERVER_URL "
             "(server mode); ignored in direct-Gixen mode.",
+            err=True,
+        )
+    if ack_policy:
+        # BUI-623 (U9): the policy layer only exists server-side — there is
+        # nothing to bypass when talking to Gixen directly.
+        click.echo(
+            "⚠️  --ack-policy requires COMICS_SERVER_URL (server mode); "
+            "ignored in direct-Gixen mode.",
             err=True,
         )
     client = _make_client()
@@ -537,12 +581,15 @@ _STATUS_ICON = {
     STATUS_UPDATED: "🔄 Updated",
     STATUS_FAILED: "❌ Failed",
     STATUS_NOT_ATTEMPTED: "⏸️  Not attempted",
+    # BUI-623 (U9): distinct icon from Failed — a policy block is not a
+    # server/Gixen fault (see add_batch.py's STATUS_BLOCKED comment).
+    STATUS_BLOCKED: "🚫 Blocked",
 }
 
 
 def _add_batch_status_cell(row: dict) -> str:
     label = _STATUS_ICON.get(row["status"], row["status"])
-    if row["status"] == STATUS_FAILED and row.get("error"):
+    if row["status"] in (STATUS_FAILED, STATUS_BLOCKED) and row.get("error"):
         label = f"{label} ({row['error']})"
     elif row["status"] in (STATUS_ADDED, STATUS_UPDATED) and row.get("link_attempted"):
         if row.get("link_ok"):
@@ -859,7 +906,14 @@ def build_batch_cmd(
               help="Seconds before end to place bid (1-15); omit to keep the current offset")
 @click.option("--group", type=int, default=None,
               help="Snipe group (0=none, 1-10); omit to keep the current group")
-def edit(item_id: str, max_bid: str, offset: int | None, group: int | None):
+@click.option(
+    "--ack-policy",
+    is_flag=True,
+    help="Audited bypass (BUI-623): commit past a blocking policy check "
+         "instead of getting a 409 — same semantics as `gixen add "
+         "--ack-policy`. Server mode only.",
+)
+def edit(item_id: str, max_bid: str, offset: int | None, group: int | None, ack_policy: bool):
     """Change the bid on an existing snipe.
 
     BUI-401/BUI-404: --offset / --group default to None so a bare
@@ -886,12 +940,24 @@ def edit(item_id: str, max_bid: str, offset: int | None, group: int | None):
         # own source tag (EditBidRequest.source accepts the same optional
         # field U6 added).
         payload["source"] = "cli"
+        # BUI-623 (U9): --ack-policy -> policy_bypass=true in the payload.
+        if ack_policy:
+            payload["policy_bypass"] = True
         resp = _server_request("patch", f"/api/bids/{item_id}", json=payload)
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
         # BUI-621 (U7): render policy advisories from the PATCH response
         # (KTD4) after the success line above — visible, non-fatal.
         _print_advisories(advisories_from_response(resp))
         return
+
+    if ack_policy:
+        # BUI-623 (U9): the policy layer only exists server-side — there is
+        # nothing to bypass when talking to Gixen directly.
+        click.echo(
+            "⚠️  --ack-policy requires COMICS_SERVER_URL (server mode); "
+            "ignored in direct-Gixen mode.",
+            err=True,
+        )
 
     # BUI-414: this whole direct-mode branch (the list_snipes resolve below
     # plus the modify_snipe call at the end) has NO mutual exclusion against

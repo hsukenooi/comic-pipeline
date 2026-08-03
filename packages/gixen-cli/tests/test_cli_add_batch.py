@@ -697,3 +697,120 @@ def test_add_batch_source_batch_reaches_the_add_payload(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert captured["json"]["source"] == "batch"
+
+
+# ---------------------------------------------------------------------------
+# BUI-623 (U9): a 409 policy block is BLOCKED, distinct from FAILED, and the
+# batch continues past it (no health re-check, no halt).
+# ---------------------------------------------------------------------------
+
+_BLOCK_DETAIL = {
+    "blocked": True,
+    "message": "Blocked by policy check(s): over_fmv.",
+    "blocking_codes": ["over_fmv"],
+    "unevaluable_while_blocking": [],
+    "advisories": [
+        {"code": "over_fmv", "severity": "warning", "message": "over FMV", "data": {}},
+    ],
+    "surviving_snipe": None,
+}
+
+
+def test_add_batch_ae9_blocked_row_continues_batch_with_two_added(tmp_path):
+    """AE9: one over-FMV (blocked) row between two clean rows ends with 2
+    added + 1 BLOCKED, and the batch does not halt."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [
+        {"item_id": "1", "max_bid": 10}, {"item_id": "2", "max_bid": 999},
+        {"item_id": "3", "max_bid": 10},
+    ])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): [
+            (True, {"item_id": "1", "created": True}, None),
+            (False, _BLOCK_DETAIL, "Server returned 409: ..."),
+            (True, {"item_id": "3", "created": True}, None),
+        ],
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    payload = _extract_json(result.output)
+    assert [r["status"] for r in payload["rows"]] == ["added", "blocked", "added"]
+    assert payload["summary"]["added"] == 2
+    assert payload["summary"]["blocked"] == 1
+    assert payload["halted"] is False
+    # BLOCKED is not a health-check trigger — /health was never called
+    # beyond the pre-flight gate (which "get"/"/health" above always
+    # satisfies, so the fake never runs dry).
+    assert "🚫 Blocked" in result.output
+    assert "Blocked by policy check(s): over_fmv." in result.output
+
+
+def test_add_batch_blocked_row_trips_nonzero_exit_code(tmp_path):
+    """A batch that lands 2 added + 1 blocked must not exit 0 — see
+    add_batch.py's exit_code() docstring for the 'row did not land' logic
+    this extends from FAILED/NOT_ATTEMPTED to BLOCKED."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [{"item_id": "1", "max_bid": 999}])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): (False, _BLOCK_DETAIL, "Server returned 409: ..."),
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 1, result.output
+
+
+def test_add_batch_blocked_row_never_records_add_history(tmp_path):
+    """A BLOCKED row never landed — it must not be treated as a create for
+    the --added-since history the way an ADDED row is."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [{"item_id": "1", "max_bid": 999}])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): (False, _BLOCK_DETAIL, "Server returned 409: ..."),
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds") as mock_record:
+        runner.invoke(cli, ["add-batch", rows_file])
+
+    mock_record.assert_not_called()
+
+
+def test_add_batch_per_row_policy_bypass_reaches_the_payload(tmp_path):
+    """A ROWS_FILE row's own "policy_bypass": true reaches the POST
+    /api/bids payload verbatim."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [
+        {"item_id": "1", "max_bid": 999, "policy_bypass": True},
+    ])
+    captured = {}
+
+    def fake(method, path, **kwargs):
+        if (method, path) == ("post", "/api/bids"):
+            captured["json"] = kwargs.get("json")
+            return (True, {"item_id": "1", "created": True}, None)
+        return (True, {}, None)
+
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"]["policy_bypass"] is True

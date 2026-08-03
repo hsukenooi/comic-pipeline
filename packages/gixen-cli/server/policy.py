@@ -1,4 +1,4 @@
-"""Pre-trade policy check point (BUI-609 Phase A / BUI-615 / BUI-616).
+"""Pre-trade policy check point (BUI-609 Phase A / BUI-615 / BUI-616 / BUI-623).
 
 Owns the single check point both write handlers call — `api_add_bid` and
 `api_edit_bid` in `server/main.py` — inside their existing `_api_lock`
@@ -362,7 +362,7 @@ def notify_bid_write_committed(
 # ---------------------------------------------------------------------------
 
 
-def config_snapshot() -> dict:
+def config_snapshot(check_results: list[dict] | None = None) -> dict:
     """Snapshot of the policy env vars consulted for a request (KTD2/KTD3),
     read fresh on every call — same per-request-read discipline as the
     checks themselves, never cached at import time. Recorded verbatim (raw
@@ -370,12 +370,27 @@ def config_snapshot() -> dict:
     value or a mid-soak env change is self-describing per row instead of
     needing log correlation.
 
-    Only lists vars this phase's checks consult (today: just
-    POLICY_EXPOSURE_CEILING). Later waves (U4's FMV checks, U9's blocking
-    flags) extend this dict without changing the ledger schema — config_json
-    is opaque JSON.
+    Always includes the host-owned vars every request consults (today: just
+    POLICY_EXPOSURE_CEILING). `check_results` is optional and additive
+    (BUI-623/U9): when a caller passes the same `check_results` list
+    `run_checks` returned, this ALSO records the raw `POLICY_BLOCK_<CODE>`
+    value (or None if unset) for every code that actually ran this request —
+    not a fixed/exhaustive list of every check that could theoretically
+    exist, so config_json only ever documents flags that were live for
+    THIS evaluation. Omitting `check_results` (every pre-U9 call site, and
+    any future caller that doesn't have it handy) reproduces the exact
+    pre-U9 shape byte-for-byte — the existing `test_config_snapshot_reads_
+    current_env`-style equality assertions keep passing unmodified.
     """
-    return {"POLICY_EXPOSURE_CEILING": os.getenv("POLICY_EXPOSURE_CEILING")}
+    snapshot: dict = {"POLICY_EXPOSURE_CEILING": os.getenv("POLICY_EXPOSURE_CEILING")}
+    if check_results:
+        for result in check_results:
+            code = result.get("code")
+            if not code:
+                continue
+            var = _policy_block_env_var(code)
+            snapshot.setdefault(var, os.getenv(var))
+    return snapshot
 
 
 def run_checks(
@@ -431,3 +446,191 @@ def run_checks(
     advisories = [a for r in results if (a := r.to_advisory()) is not None]
     check_results = [asdict(r) for r in results]
     return advisories, check_results
+
+
+# ---------------------------------------------------------------------------
+# U9 — blocking mode with audited bypass (BUI-623)
+#
+# Everything below is called AFTER `run_checks` returns, from the SAME two
+# call sites (`api_add_bid`/`api_edit_bid` in server/main.py), still inside
+# `_api_lock`, still before any Gixen call — one shared implementation so
+# the two handlers can't drift on what "blocked" means (the same anti-drift
+# rule U1's `run_checks` itself already applies to the check point).
+#
+# Design recap (plan KTD4/R14/R15):
+#   - `POLICY_BLOCK_<CODE>` (CODE = a check's own `code`, upper-cased) is an
+#     opt-in per-check boolean flag, default OFF, read PER REQUEST (KTD2
+#     discipline extended to a boolean flag, not just a numeric threshold).
+#   - A check that came back `advise` AND whose flag is on AND the caller
+#     did not set `policy_bypass` -> this write is BLOCKED: 409, no Gixen
+#     call, no bid-row change, ledger `outcome=blocked`.
+#   - A check that came back `unevaluable` NEVER blocks by itself — fail-
+#     closed is reserved for a check that affirmatively fired (the guard-
+#     strictness learning: a check that couldn't run is not evidence of a
+#     problem). But if THAT check's own flag is on, the check has gone
+#     blind while configured to gate money — silently proceeding would be
+#     "permissive without saying so," so the response and ledger row both
+#     carry an explicit `unevaluable_while_blocking` marker instead.
+#   - `policy_bypass=True` on the request suppresses blocking entirely for
+#     this one call (per-invocation, and blanket — it does not name which
+#     check(s) it acknowledges); the full advisory set still lands in the
+#     ledger (`bypass=1`) so what was overridden is always reconstructable.
+# ---------------------------------------------------------------------------
+
+# Boolean parsing for POLICY_BLOCK_<CODE>. Deliberately narrow and fail-safe
+# in the "stays off" direction: this flag starts blocking real-money writes,
+# so an operator typo (or a stray non-boolean value) must never be silently
+# interpreted as "on." Unlike POLICY_EXPOSURE_CEILING's numeric KTD2 handling
+# (malformed -> `unevaluable`, because that check has nothing sane to do
+# without a real ceiling), a malformed boolean flag has an obvious safe
+# fallback — treat it as unset/off — so this degrades to "blocking stays
+# disabled" rather than inventing an unevaluable-flag concept of its own.
+_BLOCK_FLAG_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_BLOCK_FLAG_FALSY = frozenset({"0", "false", "no", "off", ""})
+
+
+def _policy_block_env_var(code: str) -> str:
+    """The env var name a check's `code` maps to. Codes are already
+    snake_case (`exposure_ceiling`, and the overlay's `over_fmv` /
+    `recomputed_cap` / `staleness` / `unpriced_entry` / `duplicate_comic`
+    per BUI-620/U4) so upper-casing alone produces exactly the
+    `POLICY_BLOCK_<CHECK>` shape the plan/ticket specify — no separate
+    registry to keep in sync with whatever checks exist today or are added
+    later, host- or plugin-owned alike."""
+    return f"POLICY_BLOCK_{code.upper()}"
+
+
+def _block_flag_on(code: str) -> bool:
+    """Read `POLICY_BLOCK_<CODE>` fresh (KTD2 discipline — never cached).
+    Unset, empty, or a value outside the recognized truthy/falsy vocabulary
+    all resolve to `False` — the safe default for a flag that starts
+    blocking the money path. An unrecognized non-empty value gets one loud
+    log (an operator typo that silently fails to enable blocking is still
+    worth a signal, even though the safe behavior is "stays disabled")."""
+    var = _policy_block_env_var(code)
+    raw = os.getenv(var)
+    if raw is None:
+        return False
+    normalized = raw.strip().lower()
+    if normalized in _BLOCK_FLAG_TRUTHY:
+        return True
+    if normalized not in _BLOCK_FLAG_FALSY:
+        logger.warning(
+            "policy: %s=%r is not a recognized boolean value; treating as "
+            "off (blocking stays disabled for check %r) — use one of %s to "
+            "enable",
+            var, raw, code, sorted(_BLOCK_FLAG_TRUTHY),
+        )
+    return False
+
+
+@dataclass
+class BlockDecision:
+    """The U9 blocking verdict for one write's already-computed check
+    results.
+
+    `blocked` is the only field either handler needs to branch on — True
+    means raise the 409 instead of proceeding to Gixen. `blocking_codes`
+    names every check whose `advise` outcome had its block flag on (plural:
+    more than one blocking check can fire on the same write); it is
+    populated even when `bypass` suppressed the block, so the ledger/409
+    body can still say what WOULD have blocked. `unevaluable_while_
+    blocking_codes` names checks that are `unevaluable` with their block
+    flag ALSO on — `evaluate_block` has already stamped `data
+    ["unevaluable_while_blocking"] = True` onto the matching check_results/
+    advisories dicts by the time this is returned (both the response and
+    the ledger read those same dicts), so this list is just the code-only
+    summary callers use to build the 409 body / assert on in tests.
+    """
+
+    blocked: bool
+    blocking_codes: list[str] = field(default_factory=list)
+    unevaluable_while_blocking_codes: list[str] = field(default_factory=list)
+
+
+def evaluate_block(
+    check_results: list[dict],
+    advisories: list[dict],
+    *,
+    bypass: bool,
+) -> BlockDecision:
+    """Decide block/bypass/markers from this write's own check_results
+    (KTD1: called once, right after `run_checks`, by both `api_add_bid` and
+    `api_edit_bid` — the single shared implementation the module docstring
+    above promises).
+
+    Mutates matching entries of `check_results` AND `advisories` in place
+    (adding `data["unevaluable_while_blocking"] = True`) rather than
+    returning new lists — both are the SAME objects the caller is about to
+    hand to `_append_bid_decision` (ledger) and the HTTP response, so
+    mutating in place is what makes "response AND ledger row carry the
+    marker" true by construction instead of by two call sites remembering
+    to apply it identically.
+
+    A check whose own `POLICY_EXPOSURE_CEILING`-style config is unset never
+    appears in `check_results` at all (KTD2: disabled, not unevaluable) —
+    there is nothing here for that check's block flag to act on, which is
+    consistent with "the operator disabled this check" rather than a gap:
+    U9 does not invent an evaluable state for a check the operator never
+    turned on in the first place.
+    """
+    blocking_codes: list[str] = []
+    unevaluable_while_blocking_codes: list[str] = []
+
+    for result in check_results:
+        code = result.get("code")
+        outcome = result.get("outcome")
+        if not code or not _block_flag_on(code):
+            continue
+        if outcome == "advise":
+            blocking_codes.append(code)
+        elif outcome == "unevaluable":
+            unevaluable_while_blocking_codes.append(code)
+            result.setdefault("data", {})["unevaluable_while_blocking"] = True
+
+    if unevaluable_while_blocking_codes:
+        marked = set(unevaluable_while_blocking_codes)
+        for advisory in advisories:
+            if advisory.get("code") in marked:
+                advisory.setdefault("data", {})["unevaluable_while_blocking"] = True
+
+    blocked = bool(blocking_codes) and not bypass
+    return BlockDecision(
+        blocked=blocked,
+        blocking_codes=blocking_codes,
+        unevaluable_while_blocking_codes=unevaluable_while_blocking_codes,
+    )
+
+
+def build_block_detail(
+    decision: BlockDecision,
+    advisories: list[dict],
+    *,
+    surviving_snipe: dict | None = None,
+) -> dict:
+    """The HTTPException(status_code=409, detail=...) body — one builder so
+    `api_add_bid`/`api_edit_bid` can't drift on its shape (KTD4: the 409
+    carries the same structured advisory envelope a 2xx response does,
+    inside `detail`).
+
+    `surviving_snipe` is `{"item_id", "max_bid"}` for the live PENDING row
+    this write would have upserted/edited, or None for a genuine create —
+    R14/U9 acceptance: a BLOCKED write on top of an existing live snipe must
+    never read as "no money committed" when a prior commitment survives, so
+    the message names it explicitly (not just buried in `surviving_snipe`'s
+    structured data) and the caller (main.py) is expected to pass it
+    whenever `intent.prior_row`/`existing`/`current` was not None.
+    """
+    parts = [f"Blocked by policy check(s): {', '.join(decision.blocking_codes)}."]
+    if surviving_snipe is not None:
+        parts.append(
+            f"Existing snipe at ${surviving_snipe['max_bid']:.2f} remains active."
+        )
+    return {
+        "blocked": True,
+        "message": " ".join(parts),
+        "blocking_codes": decision.blocking_codes,
+        "unevaluable_while_blocking": decision.unevaluable_while_blocking_codes,
+        "advisories": advisories,
+        "surviving_snipe": surviving_snipe,
+    }
