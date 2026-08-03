@@ -1019,6 +1019,16 @@ def _fmv_run_range_lot(title: str) -> bool:
 # **The pre-BUI-637 $25 cap was the wrong number; the $20 lot comp had been
 # holding the fence shut.**  No comp-exclusion gap here — closed, no code.
 #
+# CAVEAT (BUI-668) on the bracket above: the "raw VF+ 8.5 at $159.99"
+# corroborator is "X-Men #54 in VF+ 8.5 COND from 1969! Marvel very fine
+# unrestored C166" — and the pipeline DROPS it, because LOCAL_EXCLUDE_RE's
+# `restored` branch is substring-matched and so also fires on "unrestored".
+# The conclusion stands (the graded comps alone bracket it), but that one comp
+# is outside the pool it is cited as being in.  Un-dropping it was measured
+# under BUI-668 and deliberately NOT shipped: 1 of 483 priced pools moves, UP
+# +28.6%, net +$95 cap-RAISING across the CGC ladder — correct on identity,
+# worth no downside protection.
+#
 # The CLASS was characterized too, since a one-pool anecdote proves nothing.
 # Re-running the leave-one-out sweep on the post-BUI-645 tree (so, after two
 # more exclusions landed than BUI-646 measured — a re-measurement, not a
@@ -1029,9 +1039,14 @@ def _fmv_run_range_lot(title: str) -> bool:
 #      Flash #2 x3 -> $10.67, Watchmen #1 -> $68, Moon Knight #15 -> $30,
 #      X-Men #78 -> $89).  The wider cap is the honest one; nothing to fix.
 #   2  re-admit a SIGNED/COA copy (Wolverine #75, "Signed Adam Kubert w/ COA
-#      DF #2589/7500", $32.50).  sold_comps.LOCAL_EXCLUDE_RE carries
+#      DF #2589/7500", $32.50).  sold_comps.LOCAL_EXCLUDE_RE carried
 #      `signed\s+by` and `signature\s+series` but not a bare "Signed <name>",
-#      so this slips through — the one real exclusion gap in the class.
+#      so this slipped through — the one real exclusion gap in the class.
+#      CLOSED by BUI-668: that branch is now a word-bounded `signed` with a
+#      `(?<!not\s)` guard.  Measured before shipping — the class sits at 2.22x
+#      its pools' median with 84 of 99 members above it, scores 8 on the sharp
+#      test (BUI-629 and BUI-667 both scored 0), and moves max_bid DOWN 12 /
+#      UP 4 across the CGC ladder.  Cap-LOWERING, which is why it shipped.
 #   1  re-admits a 1:100 VIRGIN incentive variant (Wolverine #50, $28.00).
 #   1  re-admits a DIFFERENT BOOK (Tales to Astonish #90 at $265 inside the
 #      "Hulk 1" pool) — query contamination, not comp exclusion.
