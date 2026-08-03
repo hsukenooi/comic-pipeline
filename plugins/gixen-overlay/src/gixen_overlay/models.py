@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
+from gixen_overlay.db import COMPS_POOLS, COMPS_PROVENANCES
+
 # Every needs_manual reason `comic-fmv` may post as `fmv_flag_reason` (BUI-593).
 #
 # This is a CROSS-PACKAGE CONTRACT with `apps/fmv/src/fmv_runner.py`, which is
@@ -426,4 +428,75 @@ class CollectionQuarantineRequest(_QuarantineIdentityRequest):
                 "reason, ticket and by must all be non-empty — a quarantine "
                 "nobody can attribute is one nobody can safely lift"
             )
+        return v
+
+
+class CompItem(BaseModel):
+    """One comp within a `POST /api/comics/comps` batch (BUI-656).
+
+    Mirrors the parsed-comp shape `apps/ebay`'s `parse_comp`/
+    `parse_comp_sold_comps` already produce (KTD1 — a ledger row and a pool
+    row are the same object, so a future reader never has to ask which
+    filters had run). Only `provider`, `product_id`, `pool`, and `provenance`
+    are required; every other field is optional market/provenance data and
+    defaults to NULL when the caller omits it.
+
+    `pool` and `provenance` are closed vocabularies (`COMPS_POOLS`/
+    `COMPS_PROVENANCES`, imported from `gixen_overlay.db` so this validation
+    and the table's CHECK constraints share one source of truth) — an
+    unrecognized value 422s the WHOLE request before anything is written,
+    which `LedgerRoute` persists to `rejected_writes` for free.
+    """
+
+    pool: str
+    provider: str
+    product_id: str
+    title: str | None = None
+    price: float | None = None
+    sold_date: str | None = None
+    grade: float | None = None
+    buying_format: str | None = None
+    link: str | None = None
+    query: str | None = None
+    tier: str | None = None
+    from_cache: bool | None = None
+    observed_at: str | None = None
+    provenance: str
+
+    @field_validator("pool")
+    @classmethod
+    def _validate_pool(cls, v: str) -> str:
+        if v not in COMPS_POOLS:
+            raise ValueError(f"pool must be one of: {', '.join(COMPS_POOLS)}")
+        return v
+
+    @field_validator("provenance")
+    @classmethod
+    def _validate_provenance(cls, v: str) -> str:
+        if v not in COMPS_PROVENANCES:
+            raise ValueError(
+                f"provenance must be one of: {', '.join(COMPS_PROVENANCES)}"
+            )
+        return v
+
+
+class CompsIngestRequest(BaseModel):
+    """POST /api/comics/comps — ingest a batch of comps for one book (BUI-656).
+
+    `comic_id` is nullable and shared by every comp in the batch (KTD3: never
+    inferred — a backfilled response whose book could not be resolved posts
+    `comic_id: null`). One call is one priced book's comps (raw + slab
+    together, distinguished per-comp by `pool`) — see `apps/fmv`'s
+    `_post_comps`, which posts once per book immediately after the upsert
+    that yields `comic_id`.
+    """
+
+    comic_id: int | None = None
+    comps: list[CompItem]
+
+    @field_validator("comps")
+    @classmethod
+    def _non_empty(cls, v: list[CompItem]) -> list[CompItem]:
+        if not v:
+            raise ValueError("comps must be a non-empty list")
         return v

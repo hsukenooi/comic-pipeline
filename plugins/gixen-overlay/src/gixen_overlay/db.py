@@ -10,6 +10,16 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# BUI-656: the comps ledger's closed vocabularies (KTD3). Single-sourced here
+# — `models.CompItem` imports both so its pydantic validation and this
+# module's CHECK constraints can never drift apart (the cross-layer drift
+# BUI-588 warns about for FMV_FLAG_REASONS, avoided here because db.py and
+# models.py share one package and an import edge is available).
+COMPS_POOLS = ("raw", "slab")
+COMPS_PROVENANCES = ("live", "backfill-cache", "backfill-capture")
+_comps_pools_sql = ", ".join(f"'{p}'" for p in COMPS_POOLS)
+_comps_provenances_sql = ", ".join(f"'{p}'" for p in COMPS_PROVENANCES)
+
 
 # ---------------------------------------------------------------------------
 # Table creation (called from register_db_tables hookimpl)
@@ -128,6 +138,61 @@ def create_tables(conn: sqlite3.Connection) -> None:
             migration TEXT PRIMARY KEY
         )
     """)
+    # BUI-656: the comps ledger. Durable, identity-scoped storage for every
+    # comp the pipeline treats as a comp (tier 1 — see the comps-data-flywheel
+    # plan's KTD1), so a `comic-fmv` recompute no longer destroys the comps
+    # behind the price it replaces (`fmv.comps` is a bare INTEGER count under
+    # UNIQUE(comic_id, grade) — a recompute overwrites it with no history).
+    # comic_id is nullable (KTD3) and never inferred: a backfilled response
+    # whose book could not be resolved lands with comic_id NULL rather than
+    # attached to a guess. ON DELETE SET NULL (not CASCADE): deleting a bad
+    # comics row must not delete market facts, only orphan them.
+    #
+    # Uniqueness is (provider, product_id, COALESCE(comic_id, -1), pool) — the
+    # COALESCE is load-bearing for the same reason idx_comics_tiyv's
+    # COALESCE(variant,'') is above: SQLite treats bare NULLs as distinct in a
+    # unique index, so without it every re-observation of an identity-free
+    # (comic_id IS NULL) comp would insert a new duplicate row instead of
+    # updating the one already on file.
+    #
+    # Both `pool` and `provenance` are closed vocabularies, CHECK-enforced here
+    # as defense-in-depth alongside the route's pydantic validation (the same
+    # belt-and-suspenders pattern `fmv.confidence`'s CHECK already applies) —
+    # `models.CompItem` validates the identical two vocabularies against these
+    # same constants, imported from here so the two enforcement points can
+    # never drift apart.
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS comps (
+            id             INTEGER PRIMARY KEY,
+            comic_id       INTEGER REFERENCES comics(id) ON DELETE SET NULL,
+            pool           TEXT NOT NULL CHECK(pool IN ({_comps_pools_sql})),
+            provider       TEXT NOT NULL,
+            product_id     TEXT NOT NULL,
+            title          TEXT,
+            price          REAL,
+            sold_date      TEXT,
+            grade          REAL,
+            buying_format  TEXT,
+            link           TEXT,
+            query          TEXT,
+            tier           TEXT,
+            from_cache     INTEGER,
+            observed_at    TEXT,
+            provenance     TEXT NOT NULL CHECK(provenance IN ({_comps_provenances_sql})),
+            first_seen_at  TEXT NOT NULL,
+            last_seen_at   TEXT NOT NULL,
+            seen_count     INTEGER NOT NULL DEFAULT 1,
+            conflict_count INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_comps_identity "
+        "ON comps(provider, product_id, COALESCE(comic_id, -1), pool)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_comps_comic ON comps(comic_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_comps_observed ON comps(observed_at)"
+    )
     _migrate_fmv_split(conn)
     _migrate_year_nullable(conn)
     _migrate_sweep_allcaps_orphans(conn)
@@ -1543,6 +1608,128 @@ def upsert_fmv(
         "SELECT id FROM fmv WHERE comic_id=? AND grade=?", (comic_id, grade)
     ).fetchone()
     return row["id"]
+
+
+# ---------------------------------------------------------------------------
+# Comps ledger (BUI-656)
+# ---------------------------------------------------------------------------
+
+
+def upsert_comps(
+    conn: sqlite3.Connection,
+    comic_id: int | None,
+    comps: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Upsert a batch of comps for one book (or an identity-free backfill
+    response, `comic_id=None`). One `INSERT ... ON CONFLICT DO UPDATE` per
+    comp, all inside the caller's transaction (a single commit at the end).
+
+    KTD4: a sold listing is immutable — item X cleared at $Y on date D — so
+    the conflict rule is *keep the first answer*. Re-observing an already-
+    known comp only ever bumps bookkeeping (`last_seen_at`, `seen_count`);
+    `price`/`sold_date`/`title`/`link` are never rewritten by any branch of
+    this function. When the incoming `price` or `sold_date` disagrees with
+    what's on file, `conflict_count` increments and one warning names both
+    the stored and incoming values — silently overwriting would let a
+    provider bug rewrite history with no trace, and silently ignoring would
+    make the disagreement invisible.
+
+    Each `comp` dict is expected to carry `provider`, `product_id`, `pool`,
+    and `provenance` (all required — the route's pydantic model enforces the
+    closed vocabularies before this ever runs); every other key is optional
+    and defaults to NULL when absent.
+
+    Returns `{"inserted": n, "updated": n, "conflicts": n}` — a running
+    total across the batch, so the caller (the ingest endpoint) can report
+    exactly what happened rather than a bare 200.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    identity_comic_id = comic_id if comic_id is not None else -1
+    inserted = updated = conflicts = 0
+    for comp in comps:
+        # A direct caller (bypassing the route's pydantic model — e.g. a
+        # future backfill script calling this function in-process) gets a
+        # named error instead of a bare KeyError, matching upsert_fmv's
+        # house style for its own required-field guard (`grade is required
+        # for upsert_fmv`).
+        missing = [k for k in ("provider", "product_id", "pool", "provenance")
+                   if k not in comp]
+        if missing:
+            raise ValueError(
+                f"comp is missing required field(s): {', '.join(missing)}"
+            )
+        provider = comp["provider"]
+        product_id = comp["product_id"]
+        pool = comp["pool"]
+        price = comp.get("price")
+        sold_date = comp.get("sold_date")
+
+        # Pre-check (rather than inferring insert-vs-update from rowcount,
+        # which INSERT...ON CONFLICT DO UPDATE reports identically either
+        # way) both decides the counters below AND drives the conflict
+        # comparison — the same comparison the persisted conflict_count
+        # increment uses, so the two can't disagree. Safe without extra
+        # locking: this function runs synchronously with no `await` between
+        # the SELECT and the INSERT, same as every other read-then-write
+        # helper in this module (upsert_fmv, upsert_comic).
+        existing = conn.execute(
+            "SELECT price, sold_date FROM comps "
+            "WHERE provider=? AND product_id=? AND COALESCE(comic_id,-1)=? AND pool=?",
+            (provider, product_id, identity_comic_id, pool),
+        ).fetchone()
+
+        conflict = False
+        if existing is not None:
+            if (
+                price is not None
+                and existing["price"] is not None
+                and price != existing["price"]
+            ) or (
+                sold_date is not None
+                and existing["sold_date"] is not None
+                and sold_date != existing["sold_date"]
+            ):
+                conflict = True
+                logger.warning(
+                    "comps conflict: provider=%s product_id=%s pool=%s "
+                    "comic_id=%s stored(price=%s, sold_date=%s) "
+                    "incoming(price=%s, sold_date=%s)",
+                    provider, product_id, pool, comic_id,
+                    existing["price"], existing["sold_date"], price, sold_date,
+                )
+
+        conn.execute(
+            """
+            INSERT INTO comps (
+                comic_id, pool, provider, product_id, title, price, sold_date,
+                grade, buying_format, link, query, tier, from_cache,
+                observed_at, provenance, first_seen_at, last_seen_at,
+                seen_count, conflict_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+            ON CONFLICT(provider, product_id, COALESCE(comic_id, -1), pool)
+            DO UPDATE SET
+                last_seen_at   = excluded.last_seen_at,
+                seen_count     = seen_count + 1,
+                conflict_count = conflict_count + ?
+            """,
+            (
+                comic_id, pool, provider, product_id,
+                comp.get("title"), price, sold_date, comp.get("grade"),
+                comp.get("buying_format"), comp.get("link"), comp.get("query"),
+                comp.get("tier"), comp.get("from_cache"), comp.get("observed_at"),
+                comp["provenance"], now, now,
+                1 if conflict else 0,
+            ),
+        )
+        if existing is None:
+            inserted += 1
+        else:
+            updated += 1
+            if conflict:
+                conflicts += 1
+
+    conn.commit()
+    return {"inserted": inserted, "updated": updated, "conflicts": conflicts}
 
 
 def link_fmv_to_bid(

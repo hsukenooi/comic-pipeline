@@ -24,6 +24,7 @@ from gixen_overlay.db import (
     rejected_writes_report,
     upsert_comic,
     upsert_fmv,
+    upsert_comps,
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
@@ -43,6 +44,7 @@ from gixen_overlay.ledger import LedgerRoute
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import (
     UpsertComicRequest,
+    CompsIngestRequest,
     LocgLinkRequest,
     LinkFmvRequest,
     VerifyRequest,
@@ -356,6 +358,37 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
         )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return {**dict(row), "comic_id": comic_id, "fmv_id": fmv_id}
+
+
+@router.post("/api/comics/comps")
+async def api_ingest_comps(req: CompsIngestRequest, request: Request):
+    """Ingest a batch of comps for one book (or an identity-free backfill
+    response) into the comps ledger (BUI-656, tier 1 of the comps-data-
+    flywheel plan's KTD1).
+
+    `comic_id` is nullable and never inferred (KTD3) — a backfilled response
+    whose book could not be resolved posts `comic_id: null` and the row lands
+    with no identity rather than a guessed one. Re-observing a comp already on
+    file (same `provider` + `product_id` + `comic_id` + `pool`) never rewrites
+    the stored `price`/`sold_date`/`title`/`link` — a sold listing is
+    immutable, so the first recorded value wins (KTD4); a disagreeing price or
+    sold date only increments `conflict_count` and logs both values.
+
+    An unknown `pool` or `provenance` on any comp 422s the WHOLE batch before
+    anything is written — `LedgerRoute` persists that refusal to
+    `rejected_writes` for free (`GET /api/comics/health/rejections`).
+
+    Returns `{comic_id, inserted, updated, conflicts}` so the caller
+    (`comic-fmv`) can report exactly what happened rather than a bare 200 —
+    KTD5's "a run cannot end clean while its comps went nowhere."
+    """
+    db = request.app.state.db
+    result = upsert_comps(
+        db,
+        req.comic_id,
+        [c.model_dump() for c in req.comps],
+    )
+    return {"comic_id": req.comic_id, **result}
 
 
 @router.post("/api/bids/{item_id}/link-fmv")
