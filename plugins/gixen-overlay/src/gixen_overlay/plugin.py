@@ -31,12 +31,22 @@ class GixenOverlayPlugin:
 
     @hookimpl
     def check_bid_write(self, conn: sqlite3.Connection, intent: Any) -> list[dict]:
-        """BUI-617 (U3): stub so this hookspec lands green independently of
-        the FMV-aware checks that fill it in (BUI-609 U4, a later wave).
-        Returning `[]` contributes no advisories/checks — identical to no
-        plugin being registered at all.
+        """BUI-620 (U4): the five FMV-aware pre-trade checks — over-FMV,
+        recomputed cap, staleness, unpriced entry, duplicate comic. All
+        read-only (v1 is advisory-only, KTD1); the implementations live in
+        `gixen_overlay.policy` so this stays a thin dispatcher, mirroring
+        how the host keeps its own checks in `server/policy.py`.
+
+        Deferred import for the same reason `on_bid_write_committed` below
+        defers its import of `gixen_overlay.routes`: `gixen_overlay.policy`
+        itself imports `gixen_overlay.routes` (for `_resolve_fmv_for_link`),
+        which imports `server.main` — still mid-import the first time this
+        module loads at plugin-registration time. Safe here because this
+        hook only runs at request time, long after `server.main` has
+        finished importing.
         """
-        return []
+        from gixen_overlay.policy import check_bid_write as _check_bid_write
+        return _check_bid_write(conn, intent)
 
     @hookimpl
     def on_bid_write_committed(
