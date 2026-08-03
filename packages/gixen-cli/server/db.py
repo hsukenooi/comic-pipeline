@@ -1047,26 +1047,35 @@ def cache_gixen_data(
 
 
 def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
+    """Soft-delete tombstone the row this item_id's remove/purge caller means.
+
+    BUI-633: id-scoped, not item_id-wide (the prior shape of this bug). Both
+    callers (api_remove_bid, api_purge's sibling-cleanup loop) invoke this
+    only after confirming Gixen itself no longer has a live snipe for
+    item_id, so the BUI-178 "live snipe silently vanishes" class does not
+    apply here — the intended target is the live PENDING row when one
+    exists. Resolve it first (get_pending_bid_by_item_id) and fall back to
+    the latest row for this item_id (get_bid_by_item_id) only when there is
+    no PENDING row — e.g. a caller removing an item that's already
+    resolved, which preserves the previous single-row behavior exactly.
+    Writing WHERE id=? instead of WHERE item_id=? means an old
+    resolved-but-not-yet-purged sibling sharing item_id (mark_bids_purged's
+    own scenario) can never be collaterally re-tombstoned or have its
+    resolved_at overwritten with the removal timestamp — see
+    docs/solutions/design-patterns/scope-status-writes-to-row-id-not-item-id.md.
+
+    Renamed PURGED -> REMOVED in BUI-49; skip a row that already carries
+    either tombstone value so we don't re-stamp resolved_at.
+
+    Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
+    """
+    row = get_pending_bid_by_item_id(conn, item_id) or get_bid_by_item_id(conn, item_id)
+    if row is None or row["status"] in ("PURGED", "REMOVED"):
+        return
     now = datetime.now(timezone.utc).isoformat()
-    # Soft-delete tombstone. Renamed PURGED -> REMOVED in BUI-49; skip rows that
-    # already carry either tombstone value so we don't re-stamp resolved_at.
-    #
-    # non-unique-key-mutation: allow (BUI-606 review) — this is item_id-wide,
-    # unlike mark_bids_purged below it does NOT exclude PENDING. Both callers
-    # (api_remove_bid, api_purge's sibling-cleanup loop) invoke this only
-    # after confirming Gixen itself no longer has a live snipe for item_id, so
-    # the BUI-178 "live snipe silently vanishes" class does not apply here —
-    # whatever PENDING row exists for item_id IS the one just removed. What
-    # this does NOT guard against: an old resolved-but-not-yet-purged sibling
-    # sharing item_id (mark_bids_purged's own scenario) gets its resolved_at
-    # collaterally overwritten to `now` and re-tombstoned early. Narrower than
-    # a live-snipe loss, not independently reviewed here — worth a follow-up
-    # ticket to id-scope this the same way mark_bids_purged is guarded.
-    #
-    # Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
     conn.execute(
-        f"UPDATE bids SET status='REMOVED', resolved_at=? WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL})",
-        (now, item_id),
+        "UPDATE bids SET status='REMOVED', resolved_at=? WHERE id=?",
+        (now, row["id"]),
     )
 
 

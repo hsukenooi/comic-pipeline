@@ -8,7 +8,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from server.db import (
-    init_db, insert_bid, get_bid_by_item_id, get_pending_bid_by_item_id,
+    init_db, insert_bid, get_bid_by_item_id, get_bid_by_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged, set_local_snipe_result,
     mirror_gixen_max_bid,
@@ -126,11 +126,43 @@ def test_delete_bid_marks_purged(db):
 
 
 def test_delete_bid_marks_won_bid_purged(db):
+    """No PENDING sibling exists for this item_id — delete_bid falls back to
+    the latest (only) row via get_bid_by_item_id and still tombstones it.
+    Not the BUI-633 hazard case; see
+    test_delete_bid_spares_resolved_sibling_sharing_item_id below for that."""
     insert_bid(db, "666777888", 50.0, 6, 0, "s")
     update_bid_status(db, "666777888", status="WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")
     delete_bid(db, "666777888")
     row = get_bid_by_item_id(db, "666777888")
     assert row["status"] == "REMOVED"
+
+
+def test_delete_bid_spares_resolved_sibling_sharing_item_id(db):
+    """BUI-633 regression: delete_bid must be id-scoped, not item_id-wide.
+
+    Seed a WON row (an old resolved-but-not-yet-purged bid) and a PENDING
+    row (the live snipe just removed from Gixen) sharing one item_id — a
+    re-listed/re-added item, per BUI-178's own scenario. delete_bid must
+    tombstone only the live PENDING row; the WON sibling's status AND
+    resolved_at must be completely untouched (the corruption this ticket
+    closes: an old resolved_at silently overwritten with the removal time).
+    """
+    won_row_id = insert_bid(db, "666777889", 40.0, 6, 0, "s")
+    update_bid_status(db, "666777889", status="WON", winning_bid=35.0,
+                      resolved_at="2026-04-25T10:00:00")
+    # Re-add: a fresh PENDING row for the same item_id, sharing it with the
+    # already-resolved WON row above (the partial unique index only forbids
+    # two PENDING rows, not a PENDING + a resolved row).
+    pending_row_id = insert_bid(db, "666777889", 45.0, 6, 0, "s")
+
+    delete_bid(db, "666777889")
+
+    won_row = get_bid_by_id(db, won_row_id)
+    assert won_row["status"] == "WON"
+    assert won_row["resolved_at"] == "2026-04-25T10:00:00"
+
+    pending_row = get_bid_by_id(db, pending_row_id)
+    assert pending_row["status"] == "REMOVED"
 
 
 def test_get_all_bids_returns_list(db):
