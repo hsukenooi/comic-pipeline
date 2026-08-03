@@ -30,6 +30,7 @@ from gixen.plugins import (
     load_plugins,
     _invoke_db_tables_isolated,
     _invoke_register_routes,
+    _invoke_sync_observed,
     _collect_dashboard_tabs,
 )
 from server.db import (
@@ -1180,6 +1181,48 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
             # equivalent to reading it here on wconn.
             _insert_web_added_bids(wconn, snipes, existing_ids)
 
+            # BUI-624: the `gixen-sync` heartbeat, fired as the LAST statement
+            # inside the apply transaction rather than beside
+            # _stamp_sync_observed below. Both the mechanism and the placement
+            # are forced, for different reasons.
+            #
+            # MECHANISM. gixen-cli cannot import the overlay that owns the
+            # heartbeat contract (the dependency runs overlay → gixen-cli,
+            # never back), so the ping has to cross the boundary outward.
+            # Three ways existed:
+            #
+            #   (a) an HTTP self-call to the overlay's own heartbeat endpoint
+            #       (deliberately not spelled out here: the contract-doc test
+            #       greps for that literal to decide whether a job is really
+            #       wired, and a rejected option must not read as a call site)
+            #       — rejected: the server would have to know its own bind URL,
+            #       and a blocking POST from the event loop to itself deadlocks
+            #       under a single-worker uvicorn. It also makes a purely local
+            #       write depend on the network stack.
+            #   (b) writing the overlay's `heartbeats` table directly — works
+            #       (one SQLite file), but gixen-cli would encode a
+            #       plugin-owned table name and schema, inverting the one
+            #       import direction the plugin system exists to protect.
+            #   (c) a pluggy hookspec — chosen. Matches the existing
+            #       check_bid_write / on_bid_write_committed hooks (BUI-617/U3)
+            #       and leaves the host ignorant of heartbeats entirely.
+            #
+            # PLACEMENT. A heartbeat is I/O, and the comment below forbids I/O
+            # after the commit. Firing inside the transaction removes the
+            # post-commit I/O rather than arguing about it, and binds the
+            # heartbeat to the fate of this cycle's own writes.
+            #
+            # MUST STAY LAST in this block. _invoke_sync_observed brackets the
+            # hook in a SAVEPOINT, and a savepoint taken when no DML is pending
+            # is the OUTERMOST one — its RELEASE commits. Harmless here (a
+            # cycle with nothing to change has no writes for the heartbeat to
+            # contradict), but a statement added below it could fail with the
+            # heartbeat already committed. See _invoke_sync_observed's docstring.
+            _invoke_sync_observed(
+                getattr(app.state, "plugin_manager", None),
+                wconn, len(snipes), logger=logger,
+            )
+
     # BUI-604: a completed pass — the scrape reached the apply phase and the
     # write transaction committed without raising. Stamped HERE, after every
     # write above, so the watchdog can never claim "this snipe never resolved"
@@ -1197,7 +1240,9 @@ async def _sync_gixen(db: sqlite3.Connection, client: GixenClient, *, reraise: b
     # intact but turn a healthy cycle into a _sync_loop backoff / an api_sync
     # 500. It cannot: _stamp_sync_observed only reads the clock, calls len() on
     # a list, and assigns two module globals. No I/O, no parsing, no lookup that
-    # can miss. Keep it that way if it ever grows.
+    # can miss. Keep it that way if it ever grows — BUI-624 needed a heartbeat
+    # ping at exactly this moment and deliberately did NOT add it here, putting
+    # it inside the transaction above instead, precisely to honour this line.
     _stamp_sync_observed(len(snipes))
     return snipes
 

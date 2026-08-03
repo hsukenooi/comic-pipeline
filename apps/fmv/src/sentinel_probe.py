@@ -394,12 +394,18 @@ def _ping_heartbeat(server_url: str | None) -> None:
     changes the probe's exit code — the probe's own report/exit-code IS the
     alert surface; the heartbeat is the staleness backstop on top of it.
 
-    BUI-603 finding: 'sentinel-probe' is not yet registered in
-    gixen_overlay.db.JOB_CONTRACTS (that file, and the doc table it's pinned
-    to, live under plugins/gixen-overlay — off-limits for this change; see
-    the BUI-603 commit message). Until that lands this call 404s harmlessly
-    and is logged, not fatal — the same posture BUI-602 shipped for its own
-    four not-yet-wired jobs.
+    BUI-624 registered 'sentinel-probe' in gixen_overlay.db.JOB_CONTRACTS, so
+    this no longer 404s against a current server; the BUI-603 note that it
+    would has been removed rather than left to mislead. The 404 branch below
+    stays anyway — it is now a package-skew signal (an older overlay deployed
+    against a newer comic-fmv), and it must stay non-fatal for the same reason
+    it always was: the probe's own exit code is the alert surface, and a
+    heartbeat that could fail the probe would invert their roles.
+
+    Called ONLY from `run_sentinel_probe`'s all-pass branch. Exit 1 (ran, found
+    the pipeline miscalibrated) and exit 2 (could not complete) both skip it —
+    see the `success` field of the JOB_CONTRACTS entry for why the stricter
+    definition is deliberate here.
     """
     if not server_url:
         print(
@@ -414,8 +420,10 @@ def _ping_heartbeat(server_url: str | None) -> None:
         )
         if resp.status_code == 404:
             print(
-                f"sentinel-probe: heartbeat ping 404 — {HEARTBEAT_JOB_NAME!r} is not "
-                "yet registered in JOB_CONTRACTS (BUI-603 follow-up).",
+                f"sentinel-probe: heartbeat ping 404 — {HEARTBEAT_JOB_NAME!r} is "
+                "not in this server's JOB_CONTRACTS. BUI-624 added it, so this "
+                "means the deployed overlay predates that change; re-deploy the "
+                "comics server (./scripts/deploy.sh).",
                 file=sys.stderr,
             )
             return

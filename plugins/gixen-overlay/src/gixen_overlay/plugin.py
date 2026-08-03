@@ -6,7 +6,7 @@ import sqlite3
 from typing import TYPE_CHECKING, Any
 
 from gixen.plugins import hookimpl
-from gixen_overlay.db import create_tables, link_fmv_to_bid
+from gixen_overlay.db import create_tables, link_fmv_to_bid, record_heartbeat
 from gixen_overlay.models import LinkFmvRequest
 
 if TYPE_CHECKING:
@@ -28,6 +28,26 @@ class GixenOverlayPlugin:
     @hookimpl
     def register_dashboard_tabs(self) -> list[dict]:
         return [{"label": "comics", "path": "/comics"}]
+
+    @hookimpl
+    def on_sync_observed(self, conn: sqlite3.Connection, snipe_count: int) -> None:
+        """BUI-624: record the `gixen-sync` heartbeat (BUI-602's contract).
+
+        This is the overlay half of the only one of the five jobs whose call
+        site lives in a package that cannot import this one. The host fires
+        `on_sync_observed` from `_sync_gixen`'s apply phase; all this has to do
+        is store the ping.
+
+        Runs on the host's own `write_transaction()` connection with the
+        app-wide write lock held, so it is emphatically NOT the place for
+        network I/O or a long read — `record_heartbeat` is a single upsert on
+        a one-row-per-job table and commits with the sync itself.
+
+        `snipe_count == 0` still pings. "Reached Gixen, nothing live right now"
+        is a completed pass, and the entire reason this heartbeat exists is to
+        stop that from looking identical to a sync loop that died.
+        """
+        record_heartbeat(conn, "gixen-sync", detail=f"{snipe_count} snipe(s)")
 
     @hookimpl
     def check_bid_write(self, conn: sqlite3.Connection, intent: Any) -> list[dict]:

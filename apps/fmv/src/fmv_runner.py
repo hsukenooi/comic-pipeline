@@ -370,11 +370,63 @@ def run(*, batch_path: str | None, out_path: str | None,
             err=True,
         )
 
+    # BUI-624: the `fmv-refresh` heartbeat. Counted from `fresh_fmvs`, whose
+    # `fmv_id` is only ever set by `_extract_ids(upserted)` — i.e. only when
+    # `/api/comics` actually returned a row. "comic-fmv exited 0" is NOT the
+    # success definition (BUI-593 is exactly a run that exited 0 while the
+    # write 422'd), and neither is a fetch that succeeded: every skip bucket
+    # reported above (hand-priced, lookup-error, 422-rejected) and every
+    # `source: "error"` book leaves `fmv_id` None and contributes nothing here.
+    #
+    # This reads each row's FINAL `fmv_id`, so a book whose 3b CGC-proxy
+    # RE-upsert soft-failed reverts to None even though its first upsert
+    # landed. That undercounts, which is the safe direction: at worst the
+    # heartbeat goes stale on a batch that did persist something, and a false
+    # `stale` is loud and investigable where a false `ok` is neither.
+    _ping_fmv_heartbeat(
+        server_url,
+        persisted=sum(1 for r in fresh_fmvs.values() if r.get("fmv_id") is not None),
+    )
+
     if brief:
         _print_brief(final)
 
     if out_path:
         _write_json(out_path, final)
+
+
+def _ping_fmv_heartbeat(server_url: str, *, persisted: int) -> None:
+    """Record the `fmv-refresh` heartbeat (BUI-602's contract, BUI-624).
+
+    Best-effort: a failed ping is reported on stderr and never changes this
+    command's exit code or its output. The heartbeat is a staleness backstop on
+    top of comic-fmv's own reporting, not a second gate in front of it — a
+    watchdog that could fail a real FMV batch would be worse than the silence
+    it exists to break.
+
+    `persisted == 0` is silence on purpose, and it is the whole point of the
+    gate. A batch served entirely from the DB cache, or one where every write
+    was rejected, did not refresh anything; pinging for it would report the
+    fails-green case (BUI-593: fetch fine, nothing stored) as health. The cost
+    is a false `stale` if nothing genuinely needs repricing for two weeks —
+    accepted deliberately, because that error direction is loud and
+    investigable, and the other one is silent and expensive.
+    """
+    if persisted <= 0:
+        return
+    try:
+        resp = requests.post(
+            f"{server_url}/api/heartbeat/fmv-refresh",
+            params={"detail": f"{persisted} FMV row(s) persisted"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        click.echo(
+            "fmv-refresh heartbeat ping failed (non-fatal, the FMV writes "
+            f"above still landed): {e}",
+            err=True,
+        )
 
 
 # ─── Hand-priced row protection (BUI-533) ─────────────────────────────────────

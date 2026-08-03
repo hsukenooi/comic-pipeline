@@ -19,6 +19,12 @@ check point on every ``POST /api/bids`` / ``PATCH /api/bids/{item_id}``:
     on_bid_write_committed(conn, intent, bid_row_id, check_results)
                                     — post-write notification
 
+Plus one **background-loop** hook (BUI-624), invoked from ``_sync_gixen``
+inside its apply-phase transaction:
+
+    on_sync_observed(conn, snipe_count)
+                                    — a full snipe-sync pass is landing
+
 Plugin authors import the ``hookimpl`` marker from this module to decorate
 their hook implementations::
 
@@ -212,6 +218,38 @@ class GixenPluginSpec:
         pattern) and only logs loudly on failure.
         """
 
+    @hookspec
+    def on_sync_observed(self, conn: sqlite3.Connection, snipe_count: int) -> None:
+        """Notify plugins that a full ``_sync_gixen`` pass is landing (BUI-624).
+
+        Fired from ``server/main.py``'s ``_sync_gixen``, at the same point
+        BUI-604's ``_stamp_sync_observed`` marks — a scrape that reached the
+        apply phase without raising — but from *inside* that apply phase's
+        ``write_transaction()``, immediately before it commits. Not fired on
+        any of the ``return []`` paths above it: a ``GixenConnectionError`` /
+        ``GixenError`` is exactly the case a watchdog must see as "I am
+        blind", never as a healthy observation.
+
+        :param conn: the apply phase's open ``write_transaction()``
+            connection, with the app-wide ``_write_lock`` held. A plugin
+            writing here joins the sync's own transaction — which is the
+            point: its write commits if and only if the sync's writes do, so
+            a "the sync ran" record can never outlive a cycle whose DML
+            rolled back.
+        :param snipe_count: how many snipes the scrape returned. **Zero is a
+            success**, not a failure — "reached Gixen, nothing live right now"
+            is a completed pass, and conflating it with "did not run" is the
+            fails-green bug this hook exists to let a plugin close.
+        :return: ignored — this hook is notification-only.
+
+        **Must not raise, and cannot break the sync if it does.** The host
+        fires this through ``_invoke_sync_observed`` below, which brackets the
+        call in a SQLite savepoint: a raising hookimpl is rolled back to the
+        savepoint and logged, and the sync's own DML commits untouched. Do NOT
+        do network I/O here — the write lock is held and the event loop is
+        blocked for the duration.
+        """
+
 
 def make_plugin_manager() -> pluggy.PluginManager:
     """Construct a fresh ``PluginManager`` with the gixen hookspecs loaded.
@@ -365,6 +403,79 @@ def _invoke_register_routes(
         )
     finally:
         app.openapi_schema = None
+
+
+def _invoke_sync_observed(
+    pm: pluggy.PluginManager | None,
+    conn: sqlite3.Connection,
+    snipe_count: int,
+    *,
+    logger: logging.Logger,
+) -> None:
+    """Fire ``on_sync_observed`` inside the caller's transaction, savepointed.
+
+    BUI-624. The caller is ``_sync_gixen``'s apply phase, and the invariant it
+    documents at that site is absolute: **nothing here may turn a healthy sync
+    cycle into a failed one.** A raise reaching ``_sync_gixen`` would leave the
+    committed DML intact but convert the cycle into a ``_sync_loop`` backoff or
+    an ``api_sync`` 500 — a watchdog ping that can black out the very loop it
+    reports on is worse than no ping at all.
+
+    Two mechanisms enforce that, not one:
+
+    * the savepoint (``_invoke_db_tables_isolated``'s pattern) — a raising
+      hookimpl's partial DML is rolled back and the sync's own writes survive;
+    * the outer try/except — this function has no raising path of its own.
+
+    Firing INSIDE the transaction rather than after the commit is deliberate,
+    and it is what lets the ping obey that invariant by construction instead of
+    by promise: there is simply no post-commit I/O left to go wrong.
+
+    It also buys atomicity, with one honest caveat. When the caller's
+    transaction already has pending DML the savepoint nests, so the plugin's
+    write commits with the caller's and a later rollback takes it too — a "the
+    job ran" record can never outlive writes that vanished. When the caller has
+    written *nothing* yet, this savepoint is the outermost one and its
+    ``RELEASE`` commits on its own. That is harmless where it happens (a Gixen
+    cycle that found nothing to change has no writes for the record to
+    contradict, and the hook is the last statement in the block) but it is a
+    real property of SQLite savepoints, not a rounding error: **keep this call
+    last inside the caller's transaction.** A statement added after it would be
+    able to fail with the plugin's write already committed.
+
+    ``pm=None`` is a no-op (a server started without a plugin manager, e.g. a
+    unit test calling ``_sync_gixen`` directly).
+    """
+    if pm is None:
+        return
+    sp = "sp_sync_observed"
+    try:
+        conn.execute(f"SAVEPOINT {sp}")
+        try:
+            pm.hook.on_sync_observed(conn=conn, snipe_count=snipe_count)
+        except Exception:
+            logger.exception(
+                "on_sync_observed hook raised; rolling back to %s. The sync's "
+                "own writes are unaffected — only this cycle's plugin-side "
+                "bookkeeping is lost",
+                sp,
+            )
+            conn.execute(f"ROLLBACK TO {sp}")
+        finally:
+            conn.execute(f"RELEASE {sp}")
+    except Exception:
+        # Reached only if the savepoint machinery itself failed — e.g. a
+        # hookimpl that violated the contract by committing the transaction
+        # out from under us (the `executescript` trap register_db_tables
+        # documents), which destroys the savepoint and makes ROLLBACK TO /
+        # RELEASE raise in turn. Swallowed here so the caller still returns
+        # normally; the connection may be inconsistent, which is why the log
+        # is loud.
+        logger.exception(
+            "on_sync_observed savepoint bookkeeping failed; a plugin likely "
+            "committed or closed the sync's transaction, which the hookspec "
+            "forbids. Connection state may be inconsistent"
+        )
 
 
 def _collect_dashboard_tabs(

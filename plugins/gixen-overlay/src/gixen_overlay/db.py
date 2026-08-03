@@ -2354,10 +2354,17 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "a healthy server pings ~6x/hour; the 1h cadence tolerates the "
             "documented flapping/backoff (BUI-562) without alarming."
         ),
-        "wired": False,
+        "wired": True,
         "ping": (
-            "server.main._sync_gixen, after the write phase commits. Owned by "
-            "packages/gixen-cli, which BUI-601/602 must not modify."
+            "server.main._sync_gixen, as the last statement INSIDE its apply-"
+            "phase write_transaction(), via the on_sync_observed hookspec "
+            "(BUI-624) — gixen-cli cannot import this package, so the ping "
+            "crosses the boundary outward as a hook, and gixen_overlay.plugin "
+            "stores it with record_heartbeat(conn, \"gixen-sync\"). It is the "
+            "one job whose ping is NOT an HTTP POST: firing inside the "
+            "transaction leaves no post-commit I/O that could turn a healthy "
+            "sync into a _sync_loop backoff, and binds the heartbeat to the "
+            "fate of the cycle's own writes."
         ),
     },
     "wishlist-sellers": {
@@ -2370,7 +2377,7 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "found nothing' is the case this whole table exists to "
             "distinguish from 'did not run'."
         ),
-        "wired": False,
+        "wired": True,
         "ping": (
             ".claude/commands/comic/wishlist-sellers.md, final step, guarded "
             "on exit 0: comics-api POST /api/heartbeat/wishlist-sellers"
@@ -2379,18 +2386,20 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
     "collection-sync": {
         "cadence_hours": 336.0,
         "success": (
-            "A /comic:collection-sync round-trip that completed its Step 6 "
-            "re-import and post-import safety check. An aborted sync (the "
+            "A /comic:collection-sync round-trip that completed its Step 5 "
+            "re-import and its Step 6 post-import safety check. An aborted "
+            "sync (the "
             "'Deleted from Collection.' probe tripping, the BUI-122 guard) "
             "must NOT ping — an abort is the sync working correctly but NOT "
             "having synced. Manual/user-invoked, hence the long cadence; the "
             "signal being watched for is 'I have not synced in a month and "
             "wins are piling up unpushed', not a missed tick."
         ),
-        "wired": False,
+        "wired": True,
         "ping": (
-            ".claude/commands/comic/collection-sync.md, after the Step 6 "
-            "re-import reconciles: comics-api POST /api/heartbeat/collection-sync"
+            ".claude/commands/comic/collection-sync.md, after the Step 5 "
+            "re-import reconciles and the Step 6 post-import safety check "
+            "passes: comics-api POST /api/heartbeat/collection-sync"
         ),
     },
     "fmv-refresh": {
@@ -2404,10 +2413,37 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "ledger: the heartbeat says the refresh ran, the ledger says what "
             "it failed to store."
         ),
-        "wired": False,
+        "wired": True,
         "ping": (
-            "apps/fmv's runner, after the /api/comics upsert returns 2xx: "
-            "comics-api POST /api/heartbeat/fmv-refresh"
+            "apps/fmv/src/fmv_runner.py's run(), once per batch, gated on at "
+            "least one /api/comics upsert having returned 2xx (a persisted row "
+            "carries a non-null fmv_id): POST /api/heartbeat/fmv-refresh. A "
+            "batch that fetch-erred, 422'd, or came entirely from cache "
+            "refreshed nothing and does NOT ping."
+        ),
+    },
+    "sentinel-probe": {
+        "cadence_hours": 168.0,
+        "success": (
+            "A `comic-fmv --sentinel-probe` run (BUI-603) in which every "
+            "sentinel book AND the negative control passed — exit 0. This one "
+            "is deliberately STRICTER than the others: exit 1 means the probe "
+            "ran fine and found the comp pipeline miscalibrated, and it "
+            "already alarms through its own exit code, so re-reporting it as a "
+            "healthy run would be the fails-green shape one layer up. The "
+            "consequence is intended: a persistently failing probe eventually "
+            "also goes stale here, which is a second, louder alarm about the "
+            "same fact and never a quieter one. Exit 2 (the probe could not "
+            "complete) must not ping either."
+        ),
+        "wired": True,
+        "ping": (
+            "apps/fmv/src/sentinel_probe.py's _ping_heartbeat, called from "
+            "run_sentinel_probe only on the all-pass branch: POST "
+            "/api/heartbeat/sentinel-probe. Best-effort — a failed ping never "
+            "changes the probe's own exit code, which is the primary alert "
+            "surface. Scheduling: docs/reference/sentinel-probe-scheduling.md "
+            "(weekly — each run spends real provider request budget)."
         ),
     },
 }
@@ -2427,6 +2463,13 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
 # reports this gap in its own response (`outer_ping: "unwired"`) rather than
 # implying a health it cannot vouch for. See
 # docs/reference/job-heartbeat-contract.md for the wiring recipe.
+#
+# BUI-624 wired all five jobs above and deliberately left this at "unwired".
+# Creating the external monitor is an ops action, not a code change, and the
+# flag describes the deployed world, not this repo's intent: flipping it to
+# "wired" on a monitor that does not exist would be the exact lie the whole
+# project exists to close. Flip it in the same change that creates the check —
+# which is now unblocked, since `healthy` can finally reach True.
 HEARTBEAT_OUTER_PING_STATE = "unwired"
 
 # Watchdog verdicts, worst-first. `stale` and `never` are both actionable;
