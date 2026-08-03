@@ -287,15 +287,35 @@ def test_over_fmv_malformed_env_is_unevaluable(conn, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_recomputed_cap_low_confidence_caps_at_060(conn):
+def test_recomputed_cap_stored_low_caps_at_070(conn):
+    """A stored 'low' collapses MEDIUM-LOW and LOW (fmv_runner's
+    _confidence_to_db_label), so the cap is the LAXEST rung in that band
+    (0.70) — a CGC-proxy bid at its legitimate 0.70x high must not advise,
+    while a bid above 0.70x (which no rung would have produced) must."""
     _comic_id, fmv_id = _insert_comic_fmv(conn, high=100.0, confidence="low")
-    bid = _insert_bid(conn, "900100050", 65.0)
+    bid = _insert_bid(conn, "900100050", 75.0)
     _link(conn, bid["id"], fmv_id)
-    intent = _intent(item_id="900100050", max_bid=65.0, trigger="edit", prior_row=bid)
+    intent = _intent(item_id="900100050", max_bid=75.0, trigger="edit", prior_row=bid)
     results = policy.check_bid_write(conn, intent)
     r = _by_code(results, "recomputed_cap")
     assert r is not None and r["outcome"] == "advise"
-    assert r["data"]["recomputed_cap"] == pytest.approx(60.0)
+    assert r["data"]["recomputed_cap"] == pytest.approx(70.0)
+
+
+def test_recomputed_cap_stored_medium_passes_at_standard_080_bid(conn):
+    """A stored 'medium' row was bid at 0.80 by the brief path (bid_factor
+    pays BASE for MEDIUM and above; _confidence_to_db_label stores both
+    MEDIUM-HIGH and MEDIUM as 'medium') — the standard /comic:buy bid must
+    NOT draw a false advisory. Guards the mapping bug where 'medium' -> 0.70
+    would have flagged every ordinary medium-confidence add."""
+    _comic_id, fmv_id = _insert_comic_fmv(conn, high=100.0, confidence="medium")
+    bid = _insert_bid(conn, "900100053", 80.0)
+    _link(conn, bid["id"], fmv_id)
+    intent = _intent(item_id="900100053", max_bid=80.0, trigger="edit", prior_row=bid)
+    results = policy.check_bid_write(conn, intent)
+    r = _by_code(results, "recomputed_cap")
+    assert r is not None and r["outcome"] == "pass"
+    assert r["data"]["recomputed_cap"] == pytest.approx(80.0)
 
 
 def test_recomputed_cap_high_confidence_passes_within_080(conn):

@@ -91,21 +91,34 @@ RUNG_MEDIUM_CONFIDENCE = 0.70  # == the literal MEDIUM-LOW-branch return in fmv_
 RUNG_LOW_CONFIDENCE = 0.60     # == fmv_math.INTERPOLATED_BID_FACTOR
 
 # fmv.confidence is CHECK-constrained to 'high' / 'medium' / 'low' / NULL
-# (gixen_overlay/db.py's create_tables). A NULL or unrecognized value maps to
-# the MEDIUM rung, not the most permissive HIGH one — mirroring fmv_math's
-# own `_rank()` helper, which defaults an unrecognized/blank confidence label
-# to MEDIUM rather than failing open to HIGH.
+# (gixen_overlay/db.py's create_tables), and the writer is fmv_runner's
+# _confidence_to_db_label, which COLLAPSES the brief path's finer ladder:
+# HIGH → 'high', {MEDIUM-HIGH, MEDIUM} → 'medium', {MEDIUM-LOW, LOW} → 'low'.
+# fmv_math.bid_factor pays BASE (0.80) for MEDIUM and above, so a stored
+# 'medium' row was bid at 0.80 by the brief path — mapping 'medium' to 0.70
+# here would false-advise every standard medium-confidence bid. Likewise a
+# stored 'low' can be a MEDIUM-LOW row (0.70 — the entire CGC-proxy tier,
+# whose factor is capped at 0.70 and whose confidence stores as 'low'), so
+# it maps to 0.70, not 0.60. The cap is therefore the LAXEST rung the brief
+# path could have applied to that stored label: the advisory only fires on
+# a bid NO rung would have produced, never on a legitimately-computed one.
+# A sub-rung overshoot inside the collapsed band (a genuine-LOW book bid
+# between 0.60x and 0.70x) is deliberately not flagged — tightening below
+# this lax bound is a rung-demotion signal, which KTD9 gates on U8's
+# measurement, never on an unmeasured reverse-map guess. NULL/unrecognized
+# maps to 0.80 because bid_factor's own default for an absent confidence
+# signal is BASE_BID_FACTOR (no haircut without a signal).
 _RUNG_BY_CONFIDENCE = {
     "high": RUNG_HIGH_CONFIDENCE,
-    "medium": RUNG_MEDIUM_CONFIDENCE,
-    "low": RUNG_LOW_CONFIDENCE,
+    "medium": RUNG_HIGH_CONFIDENCE,   # stored 'medium' ⊇ {MEDIUM-HIGH, MEDIUM} → brief factor 0.80
+    "low": RUNG_MEDIUM_CONFIDENCE,    # stored 'low' ⊇ {MEDIUM-LOW, LOW} → laxest brief factor 0.70
 }
 
 
 def _rung_for_confidence(confidence: Any) -> float:
     if isinstance(confidence, str):
-        return _RUNG_BY_CONFIDENCE.get(confidence.strip().lower(), RUNG_MEDIUM_CONFIDENCE)
-    return RUNG_MEDIUM_CONFIDENCE
+        return _RUNG_BY_CONFIDENCE.get(confidence.strip().lower(), RUNG_HIGH_CONFIDENCE)
+    return RUNG_HIGH_CONFIDENCE
 
 
 def _result(code: str, outcome: str, message: str, data: dict | None = None) -> dict:
