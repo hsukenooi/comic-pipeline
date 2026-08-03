@@ -26,7 +26,8 @@ enforced_by_test:
   - packages/gixen-cli/tests/test_cli_add_batch.py::test_add_batch_ae9_blocked_row_continues_batch_with_two_added
   - plugins/gixen-overlay/tests/test_skill_contracts.py::test_snipe_add_documents_failed_add_policy
   - plugins/gixen-overlay/tests/test_skill_contracts.py::test_snipe_add_documents_blocked_status_and_remediation
-tags: [add-batch, row-status, exit-code, BUI-360, BUI-168, BUI-623, policy-block, gixen-cli]
+  - plugins/gixen-overlay/tests/test_skill_contracts.py::test_snipe_add_documents_updated_status
+tags: [add-batch, row-status, exit-code, BUI-360, BUI-168, BUI-623, BUI-666, policy-block, gixen-cli]
 ---
 
 # gixen add-batch's row-status contract: five statuses, two that halt, one that blocks without halting
