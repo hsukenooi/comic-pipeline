@@ -238,6 +238,17 @@ _COLUMN_MIGRATIONS = [
     # in-flight PATCH — and bids.max_bid is what _sniper_loop fires real money
     # from, so a stale-scrape clobber is not cosmetic.
     "ALTER TABLE bids ADD COLUMN max_bid_changed_at TEXT",
+    # BUI-660: the status a tombstone replaced. Nullable — NULL means either
+    # "never tombstoned" or "tombstoned before this column existed" (the 89
+    # already-swept rows this ticket cannot recover). Written by
+    # mark_bids_purged and update_bid_status (both SET prior_status=status in
+    # the same UPDATE that writes the new status, so it always captures the
+    # OLD value per SQLite's per-statement UPDATE semantics — see the
+    # resolved_at CASE a few lines below in update_bid_status for the same
+    # trick already in use). gixen-overlay's get_first_party_outcomes reads
+    # this to admit a purge-swept first-party comp: "resolved now, or
+    # resolved before the tombstone."
+    "ALTER TABLE bids ADD COLUMN prior_status TEXT",
     # BUI-385: provenance tag on the group_wins ledger (which writer recorded
     # a row) — a GROUP_WIN_SOURCES value, exposed over /api/group-wins for
     # forensics. Nullable on ADD; _apply_migrations stamps pre-column rows
@@ -277,7 +288,8 @@ _BIDS_TABLE_SQL = """
         gixen_vanished_at   TEXT,
         ebay_no_price_at    TEXT,
         group_changed_at    TEXT,
-        max_bid_changed_at  TEXT
+        max_bid_changed_at  TEXT,
+        prior_status        TEXT
     )
 """
 
@@ -1162,11 +1174,22 @@ def update_bid_status(
     ]
     if only_id is not None:
         params.append(only_id)
+    # BUI-660: prior_status=status records the OLD status this call is
+    # overwriting — same per-statement-evaluates-against-the-pre-update-row
+    # trick the resolved_at CASE above already relies on. This is the single
+    # writer behind all three BUI-371 classification sites (they all call
+    # this function with status="REMOVED"), so it covers them for free: a
+    # tombstone written here from PENDING records prior_status='PENDING' with
+    # no per-call-site change, and gixen-overlay's get_first_party_outcomes
+    # correctly keeps excluding it (PENDING is never in the WON/LOST admit
+    # set). A no-op re-classification (same status in and out) harmlessly
+    # re-records the same value.
     conn.execute(
         "UPDATE bids SET status=?, winning_bid=?, "
         "resolved_at=CASE WHEN status != ? THEN ? ELSE resolved_at END, "
         "auction_end_at=COALESCE(auction_end_at, ?), "
-        "status_mirror=COALESCE(?, status_mirror) "
+        "status_mirror=COALESCE(?, status_mirror), "
+        "prior_status=status "
         f"WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL}){id_clause}",
         params,
     )
@@ -1296,9 +1319,20 @@ def mark_bids_purged(conn: sqlite3.Connection, item_ids: list[str]) -> None:
     # tests/test_server_db.py — seeds two rows sharing an item_id and asserts
     # the live PENDING one survives.
     #
+    # BUI-660: prior_status=status records the status this sweep is about to
+    # overwrite, in the SAME UPDATE — SQLite evaluates every SET expression
+    # against the pre-update row, so `status` here is still the OLD value
+    # even though `status` is also being SET to 'REMOVED' in this statement
+    # (the identical trick update_bid_status's resolved_at CASE already
+    # relies on). This is the fix for 89 first-party comps (WON/LOST rows
+    # with a winning_bid and a primary FMV link) already destroyed by this
+    # exact sweep: get_first_party_outcomes can no longer tell a purge-swept
+    # comp apart from a genuine tombstone once prior_status is gone, so
+    # recording it here is what makes the comp durable against this sweep.
+    #
     # Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
     conn.execute(
-        f"UPDATE bids SET status='REMOVED', resolved_at=? "
+        f"UPDATE bids SET status='REMOVED', resolved_at=?, prior_status=status "
         f"WHERE item_id IN ({placeholders}) "
         f"AND status NOT IN ('PENDING', {TOMBSTONE_STATUSES_SQL})",
         [now, *item_ids],

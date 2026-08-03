@@ -324,6 +324,156 @@ def test_mark_bids_purged_empty_list_is_noop(db):
     assert row["status"] == "PENDING"
 
 
+# ---------------------------------------------------------------------------
+# prior_status column (BUI-660)
+# ---------------------------------------------------------------------------
+
+
+def test_bids_prior_status_column_present_on_fresh_db(db):
+    cols = {row[1] for row in db.execute("PRAGMA table_info(bids)")}
+    assert "prior_status" in cols
+
+
+def test_bids_prior_status_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem_prior_status.db"
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "prior_status" in cols
+    conn2.close()
+
+
+def test_prior_status_present_after_legacy_rebuild(tmp_path):
+    """A pre-BUI-49 DB forces the status-rename table rebuild; the rebuilt
+    table (created from _BIDS_TABLE_SQL) must still carry prior_status — the
+    ALTER runs before the rebuild, so a missing _BIDS_TABLE_SQL entry would
+    either drop the column or fail the rebuild's column copy (the same class
+    of trap test_ebay_no_price_at_present_after_legacy_rebuild guards)."""
+    db_path = tmp_path / "legacy_prior_status.db"
+    _seed_old_db(db_path)
+    conn = init_db(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "prior_status" in cols
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bids'"
+    ).fetchone()["sql"]
+    assert "REMOVED" in sql
+    conn.close()
+
+
+def test_mark_bids_purged_records_prior_status(db):
+    """BUI-660 acceptance: the sweep records the status it replaces, so a
+    purge-swept WON/LOST bid stays distinguishable from a genuine tombstone."""
+    insert_bid(db, "700000001", 50.0, 6, 0, "s")
+    insert_bid(db, "700000002", 60.0, 6, 0, "s")
+    update_bid_status(db, "700000001", status="WON", winning_bid=45.0,
+                      resolved_at="2026-04-25T10:00:00")
+    update_bid_status(db, "700000002", status="LOST", winning_bid=None,
+                      resolved_at="2026-04-25T10:00:00")
+    mark_bids_purged(db, ["700000001", "700000002"])
+    row1 = get_bid_by_item_id(db, "700000001")
+    row2 = get_bid_by_item_id(db, "700000002")
+    assert row1["status"] == "REMOVED"
+    assert row1["prior_status"] == "WON"
+    assert row2["status"] == "REMOVED"
+    assert row2["prior_status"] == "LOST"
+
+
+def test_mark_bids_purged_spares_live_pending_sharing_item_id_prior_status_untouched(db):
+    """BUI-178 regression, re-asserted against the new column: the sweep must
+    not touch the live PENDING sibling's prior_status either (it stays NULL,
+    same as any never-tombstoned row)."""
+    won_id = insert_bid(db, "700000003", 50.0, 6, 0, "s")
+    update_bid_status(db, "700000003", status="WON", winning_bid=45.0,
+                      resolved_at="2026-04-25T10:00:00")
+    pending_id = insert_bid(db, "700000003", 70.0, 6, 0, "s")
+
+    mark_bids_purged(db, ["700000003"])
+
+    won_row = db.execute(
+        "SELECT status, prior_status FROM bids WHERE id=?", (won_id,)
+    ).fetchone()
+    pending_row = db.execute(
+        "SELECT status, prior_status FROM bids WHERE id=?", (pending_id,)
+    ).fetchone()
+    assert won_row["status"] == "REMOVED"
+    assert won_row["prior_status"] == "WON"
+    assert pending_row["status"] == "PENDING"
+    assert pending_row["prior_status"] is None
+
+
+def test_update_bid_status_removed_from_pending_records_prior_status(db):
+    """Simulates a BUI-371 classification site (update_bid_status(conn, iid,
+    "REMOVED", ...) called against a live PENDING row) — prior_status ends up
+    'PENDING' with no per-call-site change, purely from update_bid_status's
+    own prior_status=status SET clause."""
+    insert_bid(db, "700000004", 50.0, 6, 0, "s")
+    update_bid_status(db, "700000004", status="REMOVED", winning_bid=None,
+                      resolved_at="2026-04-25T10:00:00")
+    row = get_bid_by_item_id(db, "700000004")
+    assert row["status"] == "REMOVED"
+    assert row["prior_status"] == "PENDING"
+
+
+def test_update_bid_status_prior_status_none_on_fresh_pending_row(db):
+    """A never-transitioned PENDING row has no prior_status yet."""
+    insert_bid(db, "700000005", 50.0, 6, 0, "s")
+    row = get_bid_by_item_id(db, "700000005")
+    assert row["prior_status"] is None
+
+
+def test_update_bid_status_won_records_prior_status_pending(db):
+    insert_bid(db, "700000006", 50.0, 6, 0, "s")
+    update_bid_status(db, "700000006", status="WON", winning_bid=45.0,
+                      resolved_at="2026-04-25T10:00:00")
+    row = get_bid_by_item_id(db, "700000006")
+    assert row["status"] == "WON"
+    assert row["prior_status"] == "PENDING"
+
+
+def test_pre_existing_removed_row_has_null_prior_status(db):
+    """AE9: a REMOVED row written before this fix (or by a raw SQL write that
+    bypasses both update_bid_status and mark_bids_purged) carries no
+    prior_status — the migration fabricates no history for it."""
+    insert_bid(db, "700000007", 50.0, 6, 0, "s")
+    db.execute(
+        "UPDATE bids SET status='REMOVED', winning_bid=45.0 WHERE item_id=?",
+        ("700000007",),
+    )
+    db.commit()
+    row = get_bid_by_item_id(db, "700000007")
+    assert row["status"] == "REMOVED"
+    assert row["prior_status"] is None
+
+
+def test_mark_bids_purged_after_noop_resync_still_captures_correct_prior_status(db):
+    """Adversarial case: prior_status=status captures whatever the row's
+    status was IMMEDIATELY before the write, not the row's original
+    pre-transition status — so a no-op resync (the terminal_transitions loop
+    re-fires update_bid_status with the SAME status every cycle Gixen still
+    lists an already-resolved snipe, per the BUI-636 comment above
+    update_bid_status) harmlessly re-records the CURRENT status as
+    prior_status too. This is fine: mark_bids_purged always re-derives
+    prior_status fresh from the row's status at the moment IT tombstones the
+    row, so a stale intermediate value from an earlier no-op resync can never
+    survive into the final purge — assert that chain end to end."""
+    insert_bid(db, "700000008", 50.0, 6, 0, "s")
+    update_bid_status(db, "700000008", status="WON", winning_bid=45.0,
+                      resolved_at="2026-04-25T10:00:00")
+    # No-op resync: Gixen's list still shows this item as WON, so the sync
+    # loop re-fires update_bid_status with the SAME status.
+    update_bid_status(db, "700000008", status="WON", winning_bid=45.0,
+                      resolved_at="2026-04-26T10:00:00")
+    row = get_bid_by_item_id(db, "700000008")
+    assert row["prior_status"] == "WON"  # re-derived from the current status
+
+    mark_bids_purged(db, ["700000008"])
+    purged_row = get_bid_by_item_id(db, "700000008")
+    assert purged_row["status"] == "REMOVED"
+    assert purged_row["prior_status"] == "WON"
+
+
 def test_update_bid_noop_on_non_pending(db):
     insert_bid(db, "300000001", 50.0, 6, 0, "s")
     update_bid_status(db, "300000001", "WON", winning_bid=40.0, resolved_at="2026-04-25T10:00:00")

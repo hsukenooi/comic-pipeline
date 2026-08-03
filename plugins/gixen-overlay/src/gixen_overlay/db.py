@@ -1912,6 +1912,31 @@ _STATUS_LOST = "LOST"
 # can't drift if the resolved-status set ever changes.
 _OUTCOME_STATUSES_SQL = f"'{_STATUS_WON}', '{_STATUS_LOST}'"
 
+# BUI-660: mark_bids_purged (the completed-bids sweep) and update_bid_status
+# (the three BUI-371 classification sites) both tombstone a resolved bid to
+# REMOVED, erasing whether it was WON or LOST — 89 first-party comps were
+# already destroyed this way before `bids.prior_status` existed (see
+# packages/gixen-cli/server/db.py). `prior_status` records the status a
+# tombstone replaced, so a purge-swept row is still admissible: "resolved
+# now, or resolved before the tombstone."
+#
+# The status a caller should treat as "what this bid resolved as": the live
+# status normally, or the pre-tombstone status for a purge-swept REMOVED row.
+# A REMOVED row whose prior_status is NULL — written before this fix, or
+# tombstoned from PENDING by a BUI-371 classification site — evaluates to
+# NULL here, same as any other never-resolved row; no history is fabricated
+# for either.
+_EFFECTIVE_STATUS_SQL = (
+    "CASE WHEN b.status = 'REMOVED' THEN b.prior_status ELSE b.status END"
+)
+# Defined as a single IN-check against _EFFECTIVE_STATUS_SQL (not an OR of
+# two separately-worded status checks) so the two constants can never drift
+# apart — SQL's three-valued logic already does the right thing for a
+# tombstone with no recoverable prior status: NULL IN (...) evaluates to
+# NULL, which WHERE treats as "no match," excluding the row exactly as
+# intended.
+_RESOLVED_STATUS_CLAUSE = f"{_EFFECTIVE_STATUS_SQL} IN ({_OUTCOME_STATUSES_SQL})"
+
 # Shared "a resolved auction" predicate fragments (BUI-286/BUI-288). Both
 # `get_first_party_outcomes` (Issue A, the comp-pool feed) and
 # `calibration_report` (Issue C, the loss-vs-FMV audit) build their WHERE
@@ -1961,10 +1986,14 @@ def get_first_party_outcomes(
     to pricing exactly as it does today, not error.
 
     Trustworthiness filter (R3): `b.winning_bid IS NOT NULL` AND
-    `b.status IN ('WON','LOST')` — NULL-price ENDED rows and the
-    PURGED/REMOVED tombstones are excluded (tombstones are never WON/LOST, so
-    the status filter alone is sufficient; winning_bid IS NOT NULL is kept as
-    an explicit belt-and-suspenders check per R3's wording).
+    `_RESOLVED_STATUS_CLAUSE` — NULL-price ENDED rows are excluded, and a
+    REMOVED tombstone is admitted only when `prior_status` shows it was
+    purge-swept from WON/LOST (BUI-660); a tombstone with no prior_status
+    (written from PENDING, or before this column existed) stays excluded.
+    `winning_bid IS NOT NULL` is kept as an explicit belt-and-suspenders check
+    per R3's wording. The returned `status` column reflects this: a
+    purge-swept row reports its pre-tombstone status (WON/LOST), never the
+    literal `REMOVED` stored on the row — see `_EFFECTIVE_STATUS_SQL`.
 
     `bf.is_primary = 1` restricts to the bid's primary linked comic. A
     multi-comic lot's `winning_bid` prices the whole lot, not one book, so a
@@ -1998,7 +2027,9 @@ def get_first_party_outcomes(
 
     clauses.append("f.grade BETWEEN ? AND ?")
     params.extend([grade - window, grade + window])
-    clauses.append(f"b.status IN ({_OUTCOME_STATUSES_SQL})")
+    # BUI-660: admits a live WON/LOST row, or a REMOVED row purge-swept from
+    # one (prior_status IN (WON, LOST)) — see _RESOLVED_STATUS_CLAUSE.
+    clauses.append(_RESOLVED_STATUS_CLAUSE)
     clauses.append(_WINNING_BID_NOT_NULL_CLAUSE)
     # Normalize both sides through SQLite's own datetime() rather than
     # comparing against a Python-formatted ISO string: auction_end_at/
@@ -2016,7 +2047,7 @@ def get_first_party_outcomes(
         SELECT b.winning_bid AS price,
                f.grade AS grade,
                COALESCE(b.auction_end_at, b.resolved_at) AS sold_date,
-               b.status AS status
+               {_EFFECTIVE_STATUS_SQL} AS status
         FROM bids b
         JOIN bid_fmvs bf ON bf.bid_id = b.id
         JOIN fmv f       ON f.id = bf.fmv_id
@@ -2091,19 +2122,26 @@ def calibration_report(
     margin, a loss count, or a loss rate.
 
     Reuses the exact same "a resolved auction" predicate as
-    `get_first_party_outcomes` — `_OUTCOME_STATUSES_SQL`, `_PRIMARY_LINK_CLAUSE`,
-    `_WINNING_BID_NOT_NULL_CLAUSE`, and `_RESOLVED_RECENCY_CLAUSE` — rather
-    than forking a second definition. Unlike `get_first_party_outcomes` (which
-    grade-windows around a *target* grade for a fresh pricing run), this
-    report only considers a bid's own directly-linked `fmv` row
+    `get_first_party_outcomes` — `_RESOLVED_STATUS_CLAUSE`,
+    `_PRIMARY_LINK_CLAUSE`, `_WINNING_BID_NOT_NULL_CLAUSE`, and
+    `_RESOLVED_RECENCY_CLAUSE` — rather than forking a second definition
+    (BUI-660 verified this report inherits the purge-durability fix rather
+    than assuming it: `_RESOLVED_STATUS_CLAUSE` admits a purge-swept REMOVED
+    row exactly as `get_first_party_outcomes` does, and the WON/LOST bucketing
+    below reads `_EFFECTIVE_STATUS_SQL` — the pre-tombstone status — so a
+    restored row still counts as its original win or loss rather than
+    silently dropping out of both buckets). Unlike `get_first_party_outcomes`
+    (which grade-windows around a *target* grade for a fresh pricing run),
+    this report only considers a bid's own directly-linked `fmv` row
     (`bid_fmvs.fmv_id = fmv.id`, no window): calibration measures each priced
     (comic, grade) row against the auctions actually linked to it.
 
-    Excludes: NULL `winning_bid`, tombstoned/`ENDED` bids (never WON/LOST, so
-    the status filter alone excludes them), secondary lot members
-    (`is_primary = 0`), and any `fmv` row with a NULL (or non-positive)
-    `high` — an unpriced or flagged book has nothing to compare a hammer
-    price against, so it is excluded rather than dividing by zero/NULL.
+    Excludes: NULL `winning_bid`, `ENDED` bids and a REMOVED tombstone with no
+    recoverable prior WON/LOST status (`_RESOLVED_STATUS_CLAUSE` excludes
+    both), secondary lot members (`is_primary = 0`), and any `fmv` row with a
+    NULL (or non-positive) `high` — an unpriced or flagged book has nothing to
+    compare a hammer price against, so it is excluded rather than dividing by
+    zero/NULL.
 
     A (comic, grade) with **fewer than `min_losses` losses** (default
     `DEFAULT_CALIBRATION_MIN_LOSSES` = 2) in-window does not get a loss-based
@@ -2177,13 +2215,13 @@ def calibration_report(
                f.grade AS grade,
                f.high AS fmv_high,
                b.winning_bid AS winning_bid,
-               b.status AS status
+               {_EFFECTIVE_STATUS_SQL} AS status
         FROM bids b
         JOIN bid_fmvs bf ON bf.bid_id = b.id
         JOIN fmv f       ON f.id = bf.fmv_id
         JOIN comics c    ON c.id = f.comic_id
         WHERE {_PRIMARY_LINK_CLAUSE}
-          AND b.status IN ({_OUTCOME_STATUSES_SQL})
+          AND {_RESOLVED_STATUS_CLAUSE}
           AND {_WINNING_BID_NOT_NULL_CLAUSE}
           AND f.high IS NOT NULL
           AND {_RESOLVED_RECENCY_CLAUSE}
