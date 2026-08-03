@@ -156,10 +156,13 @@ flowchart TB
 - R15. The backfill reports how many responses resolved to a unique comic, how many were
   ambiguous, and how many were unresolvable — a silent partial import is a failed import.
 - R16. The tier-0 capture rotates by size into compressed segments and is never pruned.
+- R17. A provider response that fails our own shape validation is captured too, tagged with the
+  validation outcome — provider drift is exactly what tier 0 exists to make diagnosable, and it
+  is currently the one class being discarded (raised by BUI-628 as a BUI-610 decision).
 
 **Read surface**
 
-- R17. Comp rows and FMV history are readable over provider-neutral endpoints filtered by comic
+- R18. Comp rows and FMV history are readable over provider-neutral endpoints filtered by comic
   identity, grade, and recency.
 
 ---
@@ -254,8 +257,6 @@ flowchart TB
 
 - Whether slab comps (the tier-4 CGC pass) share the comps table with a pool discriminator or
   stay out of the ledger entirely.
-- Whether the tier-0 capture rotation threshold is size-based, count-based, or time-based, and
-  where rotated segments live.
 - Whether `fmv_history` appends on every upsert or only when a value changed — always-append is
   simpler and honest about "we re-measured and nothing moved", but a `--force` sweep writes 796
   rows per run.

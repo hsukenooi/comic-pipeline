@@ -34,7 +34,7 @@ full framing and the live measurements this plan is built on are in the origin d
 
 ## Requirements
 
-Origin R1–R17 carry forward. Refinements forced by reading the code:
+Origin R1–R18 carry forward. Refinements forced by reading the code:
 
 - **R1 (scope of "every comp") — the ledger's grain is a *priced* book, not a fetch.** comic-fmv
   posts comps after the `POST /api/comics` upsert, so a book that bails before the upsert
@@ -140,6 +140,16 @@ Origin R1–R17 carry forward. Refinements forced by reading the code:
   with zero network calls and diff the computed bands. Every unit that touches `apps/ebay` or
   `apps/fmv` carries that check.
 
+- **KTD12 — Tier 0 captures shape-invalid responses too, tagged.** BUI-628 raised this as an
+  explicit BUI-610 decision: today `_capture_raw_response` fires only after
+  `_verify_sold_comps_shape` / the `LH_Sold=1` assertion pass, so a response that violated our
+  shape expectations — the single best evidence of provider drift — is discarded. The capture
+  moves ahead of validation and carries the validation outcome (`ok` or the error string). This
+  is safe precisely because nothing reads tier 0: an invalid body cannot reach a pool, a price,
+  or the ledger, which only ever ingests parsed comps from a *successful* fetch. A network error
+  with no body is still not captured — there is nothing to capture. Deciding this by default was
+  the alternative BUI-628 warned against.
+
 ---
 
 ## High-Level Technical Design
@@ -187,6 +197,17 @@ flowchart TB
 
 Units are ordered by dependency. U-IDs are stable identifiers, not a reading order — U4 and U5
 are independent of Phase A and can ship in any order relative to it.
+
+| Unit | Issue |
+|---|---|
+| U1 comps table + ingest endpoint | BUI-656 |
+| U2 per-comp provenance | BUI-657 |
+| U3 comic-fmv posts comps | BUI-658 |
+| U4 `fmv_history` | BUI-659 |
+| U5 purge-durable first-party comps | BUI-660 |
+| U6 backfill | BUI-661 |
+| U7 tier-0 rotation + invalid capture | BUI-628 (pre-existing) |
+| U8 read endpoints | BUI-662 |
 
 ### Phase A — the ledger
 
@@ -401,20 +422,28 @@ are independent of Phase A and can ship in any order relative to it.
 - **Verification:** the run reports every count; the resolution rate is at or above the measured
   floor or the shortfall is explained on the issue; a second run is a no-op.
 
-### U7. Tier-0 capture rotation
+### U7. Tier-0 capture rotation and invalid-response capture
 
-- **Goal:** The raw capture can grow forever without filling a disk, and nothing is ever deleted.
-- **Requirements:** R16.
+*Already filed as BUI-628, which raised both halves of this unit.*
+
+- **Goal:** The raw capture can grow forever without filling a disk, nothing is ever deleted, and
+  the responses most worth keeping stop being the ones thrown away.
+- **Requirements:** R16, R17; KTD12.
 - **Dependencies:** none.
-- **Files:** `apps/ebay/src/sold_comps.py` (`_capture_raw_response`),
-  `apps/ebay/tests/test_sold_comps.py`.
-- **Approach:** Before appending, if `raw_responses.jsonl` exceeds a size threshold, rename it to
-  `raw_responses.<UTC timestamp>.jsonl` and gzip it in place, then append to a fresh file.
-  Rotation runs inside the existing swallow-everything try/except — a rotation failure must
-  degrade to "keep appending to the current file", never to "lose the append". Size-based, not
-  time-based: the failure being prevented is a full disk, and the write rate is bursty (a batch
-  run writes dozens of responses in minutes and then nothing for days). Nothing is ever pruned;
-  the whole premise of tier 0 is that history cannot be re-acquired.
+- **Files:** `apps/ebay/src/sold_comps.py` (`_capture_raw_response`, `fetch`,
+  `fetch_sold_comps`), `apps/ebay/tests/test_sold_comps.py`.
+- **Approach:** *Rotation:* before appending, if `raw_responses.jsonl` exceeds a size threshold,
+  rename it to `raw_responses.<UTC timestamp>.jsonl` and gzip it in place, then append to a
+  fresh file. Rotation runs inside the existing swallow-everything try/except — a rotation
+  failure must degrade to "keep appending to the current file", never to "lose the append".
+  Size-based, not time-based: the failure being prevented is a full disk, and the write rate is
+  bursty (a batch writes dozens of responses in minutes, then nothing for days). Nothing is ever
+  pruned. Explicitly **not** TTL eviction — that is the exact property that makes `CACHE_DIR`
+  useless as a historical record and the reason this file exists separately.
+  *Invalid responses (KTD12):* move the capture call ahead of `_verify_sold_comps_shape` and the
+  `LH_Sold=1` assertion, and record the validation outcome on the record (`ok`, or the error
+  string). A body that arrived is captured whether or not we liked its shape; a network error
+  with no body still captures nothing.
 - **Patterns to follow:** the existing `_capture_raw_response` hedge posture — single
   `os.open(O_APPEND)` + `os.write`, everything wrapped, failures logged and swallowed.
 - **Test scenarios:**
@@ -425,16 +454,20 @@ are independent of Phase A and can ship in any order relative to it.
     the failure is logged.
   - Two concurrent appenders during a rotation → no record is lost (assert total record count
     across all segments).
+  - A shape-invalid sold-comps.com body → captured with its validation error; the fetch still
+    raises exactly as today and the response is still not cached.
+  - A SerpApi response missing `LH_Sold=1` → captured with that error, fetch still raises.
+  - A connection error with no body → nothing captured, no crash.
   - Covers AE6-adjacent: FMV output unaffected.
 - **Verification:** no code path deletes a capture segment; total records across segments is
-  conserved across a rotation.
+  conserved across a rotation; every response body that reached us is on disk exactly once.
 
 ### Phase D — read
 
 ### U8. Comps and history read endpoints
 
 - **Goal:** The archive is queryable without opening SQLite by hand.
-- **Requirements:** R17.
+- **Requirements:** R18.
 - **Dependencies:** U1, U4.
 - **Files:** `plugins/gixen-overlay/src/gixen_overlay/db.py` (query helpers),
   `plugins/gixen-overlay/src/gixen_overlay/routes.py`,
@@ -485,10 +518,11 @@ ungated; the Collection Identity Spine neither depended on nor touched.
 
 ### Deferred to Follow-Up Work
 
-- Degraded-mode pricing from the ledger when both providers fail — the outage-resilience payoff,
-  needing its own staleness rules, labeling, and soak before it goes near the money path.
+- Degraded-mode pricing from the ledger when both providers fail (**BUI-663**) — the
+  outage-resilience payoff, needing its own staleness rules, labeling, and soak before it goes
+  near the money path.
 - `GET /api/comics/portfolio` (cost basis versus current FMV) and the cost-basis backfill it
-  needs — 172 of 2,191 owned books qualify today.
+  needs (**BUI-664**) — 172 of 2,191 owned books qualify today.
 - A dashboard price-history view over `fmv_history`.
 - Comp-level analytics (per-provider yield, cache-hit rate over time, comp survival across
   recomputes) — the data lands here first; the questions can wait.
