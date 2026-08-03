@@ -30,6 +30,7 @@ from locg.collection_cache import (
     _normalize_series_key,
     _utcnow_iso,
     build_volume_candidates,
+    identity_collision_groups,
     identity_series_key,
     is_quarantined,
     make_identity,
@@ -1883,6 +1884,311 @@ def _standard_merge_phase(
     return xlsx_identities
 
 
+# ---------------------------------------------------------------------------
+# Re-key sweep (BUI-650)
+# ---------------------------------------------------------------------------
+#
+# The repair for what `identity_collision_groups` reports. It lives here, beside
+# the merge phases, rather than in `collection_cache` with `make_identity`,
+# because it is not a storage primitive: it decides "same book?" from the same
+# evidence the merge phases do (`in_collection` is a copy count, a blank
+# `price_paid` is LOCG's placeholder rather than a price), and its ordering
+# constraint — run AFTER exact identity matching, never instead of it — is a
+# statement about `_standard_merge_phase` two functions up.
+#
+# Per-row bookkeeping the sweep never folds from a dropped row onto the
+# survivor. `local_added_*` and `last_seen_in_export_at` say when THAT ROW was
+# written; `pushed_to_locg_at` and `source` say where it came from. All four are
+# facts about the dropped row, not about the book, so carrying them forward
+# would stamp the survivor with another row's provenance and (for
+# `pushed_to_locg_at`) silently change whether it is pending push.
+# `in_collection` is excluded for a stronger reason: it is a copy COUNT, decided
+# by the evidence rule in `_rekey_plan` rather than by the generic "fill what
+# the survivor lacks" fold.
+_REKEY_NEVER_FOLD: frozenset[str] = frozenset({
+    "local_added_at",
+    "local_added_seq",
+    "last_seen_in_export_at",
+    "pushed_to_locg_at",
+    "source",
+    "in_collection",
+})
+
+
+def _rekey_survivor_rank(row: dict[str, Any], index: int) -> tuple[str, int, int]:
+    """Sort key for picking a collision group's survivor — highest wins.
+
+    ``last_seen_in_export_at`` is the whole rule and the only measured one:
+    BUI-556 compared it against ``local_added_seq`` over 60 duplicate groups and
+    the sequence number picked the STALE row in 35 of them. It is a
+    within-import counter — it orders rows inside one import run, not across
+    runs — so it says nothing about which row LOCG most recently confirmed.
+    Never rank on it. A row LOCG has never confirmed sorts last (``""``).
+
+    The two trailing components only break a tie on that timestamp:
+
+    * the owned copy count, so a tie can never resolve in favour of a wish row
+      over an owned one (see :func:`_rekey_plan` on why losing an ownership is
+      the one direction that deletes a book);
+    * the negated index, so a full tie resolves to the LOWEST index and the
+      outcome never depends on where in the file a row happens to sit.
+    """
+    return (
+        row.get("last_seen_in_export_at") or "",
+        _coerce_count_cell(row.get("in_collection")),
+        -index,
+    )
+
+
+def _rekey_conflicting_signals(rows: list[dict[str, Any]]) -> list[str]:
+    """Second-copy signals a collision group DISAGREES on, or ``[]``.
+
+    Two rows carrying two different non-null ``gixen_item_id`` values are two
+    different eBay purchases, and two different non-null ``price_paid`` values
+    are two different prices paid. Either is positive evidence of a genuine
+    SECOND COPY filed under one identity — not a duplicate row — and merging
+    them would silently destroy a purchase record. The sweep aborts wholly on
+    this rather than guessing (see :func:`rekey_sweep`).
+
+    "Different" is the operative word: the same ``gixen_item_id`` on two rows is
+    one purchase recorded twice, which is exactly what the sweep exists to
+    collapse. A lot bought as a single auction legitimately shares one
+    ``gixen_item_id`` across several books (BUI-500), and those are different
+    identities anyway.
+
+    A ``price_paid`` of 0/blank is NOT evidence and never conflicts: the CSV
+    writes ``0.00`` for a price-less win and LOCG echoes it straight back, so
+    treating it as a price would make every wish row conflict with every other
+    (``_same_copy_corroborated`` makes the same exclusion, for the same reason).
+    """
+    conflicts: list[str] = []
+
+    item_ids = {
+        str(row.get("gixen_item_id")).strip()
+        for row in rows
+        if str(row.get("gixen_item_id") or "").strip()
+    }
+    if len(item_ids) > 1:
+        conflicts.append("gixen_item_id")
+
+    prices: set[float] = set()
+    for row in rows:
+        try:
+            price = round(float(row.get("price_paid")), 2)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            prices.add(price)
+    if len(prices) > 1:
+        conflicts.append("price_paid")
+
+    return conflicts
+
+
+def _rekey_plan(comics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build (never apply) the merge plan :func:`rekey_sweep` executes.
+
+    Pure: it reads ``comics`` and returns a description. Separating the decision
+    from the write is what makes an all-or-nothing abort expressible at all —
+    every group is judged before the first row is touched, so a conflict found
+    in the last group cannot leave the first one half-merged.
+    """
+    groups = identity_collision_groups(comics)
+
+    conflicts: list[dict[str, Any]] = []
+    merges: list[dict[str, Any]] = []
+    dropped_rows: list[dict[str, Any]] = []
+
+    for identity in sorted(groups):
+        indices = groups[identity]
+        rows = [comics[i] for i in indices]
+
+        signals = _rekey_conflicting_signals(rows)
+        if signals:
+            conflicts.append({
+                "identity": list(identity),
+                "full_title": rows[0].get("full_title"),
+                "signals": signals,
+                "indices": list(indices),
+            })
+            continue
+
+        # One ranking, best first: the head survives, the tail is dropped in
+        # descending order so the fold below sees the freshest evidence first.
+        # `_rekey_survivor_rank` ends in the row's own index, so no two rows can
+        # tie and the head is unambiguous.
+        ranked = sorted(
+            indices, key=lambda i: _rekey_survivor_rank(comics[i], i), reverse=True
+        )
+        kept_index = ranked[0]
+        survivor = comics[kept_index]
+        losers = [(i, comics[i]) for i in ranked[1:]]
+
+        # Fold every field the survivor LACKS, best evidence first (the losers
+        # are walked newest-first, so the freshest value wins a field two of
+        # them could fill). "Lacks" means absent, None or "" — never merely
+        # falsy: a stored `False` or `0` is a real value someone wrote, and
+        # overwriting it with a loser's `True` would invent a flag.
+        #
+        # `quarantined` (BUI-647) is deliberately NOT exempted, so a marker on
+        # a dropped row carries onto the survivor. The alternative is that
+        # merging silently LIFTS a quarantine — the one failure the marker's
+        # whole shape exists to prevent ("a quarantine nobody can attribute is
+        # one nobody can safely lift"). Carrying it forward is recoverable and
+        # attributable: the marker still names who/why/which ticket, and
+        # `locg collection unquarantine` (BUI-648) lifts it deliberately.
+        folded: dict[str, Any] = {}
+        for _idx, loser in losers:
+            for field, value in loser.items():
+                if field in _REKEY_NEVER_FOLD or field in folded:
+                    continue
+                if value is None or value == "":
+                    continue
+                current = survivor.get(field)
+                if current is None or current == "":
+                    folded[field] = value
+
+        # Copy count from evidence, not arithmetic. One book recorded twice
+        # keeps the SURVIVOR's count — summing would invent phantom copies out
+        # of rows that were never separate books (the whole premise of the
+        # merge is that they are one).
+        #
+        # The single exception is asymmetric on purpose, and it is the only
+        # place the sweep departs from "keep the survivor's count": if the
+        # survivor is UNOWNED and a row being dropped is owned, taking the
+        # survivor's 0 would end the sweep with the book marked not-owned. That
+        # is not a counting error, it is the BUI-122 data-loss path — the next
+        # export emits `In Collection=0` and LOCG DELETES the book (the BUI-200
+        # 26-deleted-X-Men incident). So ownership is carried forward rather
+        # than dropped. Deliberately narrow: it fires only on 0 → owned, never
+        # on a 1-vs-2 disagreement (there the freshest row's count is the
+        # better evidence and resurrecting a stale higher count would be the
+        # phantom copy this rule exists to avoid).
+        survivor_count = _coerce_count_cell(survivor.get("in_collection"))
+        dropped_max = max(
+            (_coerce_count_cell(loser.get("in_collection")) for _idx, loser in losers),
+            default=0,
+        )
+        ownership_preserved = survivor_count == 0 and dropped_max >= 1
+        in_collection = dropped_max if ownership_preserved else survivor_count
+
+        merges.append({
+            "identity": list(identity),
+            "full_title": survivor.get("full_title"),
+            "kept_index": kept_index,
+            "dropped_indices": [i for i, _row in losers],
+            "folded": folded,
+            "in_collection": in_collection,
+            "ownership_preserved": ownership_preserved,
+        })
+        dropped_rows.extend(dict(loser) for _idx, loser in losers)
+
+    aborted = bool(conflicts)
+    return {
+        "aborted": aborted,
+        "collisions": len(groups),
+        "groups_merged": 0 if aborted else len(merges),
+        "rows_dropped": 0 if aborted else len(dropped_rows),
+        "conflicts": conflicts,
+        "merges": [] if aborted else merges,
+        # Full copies of every row the sweep removes, so a caller can audit or
+        # reverse the merge from the plan alone rather than from a backup.
+        "dropped_rows": [] if aborted else dropped_rows,
+    }
+
+
+def rekey_sweep(payload: dict[str, Any]) -> dict[str, Any]:
+    """Merge the rows that share an identity tuple, and return the merge plan.
+
+    The repair for what
+    :func:`~locg.collection_cache.identity_collision_groups` reports. A shipped
+    change to the identity key (BUI-554's end-year fold, BUI-560's bare-year
+    fold, any future one) makes rows that used to be distinct collide, and
+    nothing rebuilds the store to match — the second instance of that class
+    (BUI-561 was the first: ``_normalize_series_key`` changed without rebuilding
+    the persisted ``series_name_index``). A fold that ships without a re-key
+    sweep leaves the colliding rows behind, permanently unreachable: the import
+    keeps only the LAST row per identity in ``identity_to_idx``, so the others
+    can be duplicated but never updated.
+
+    **Mutates ``payload`` in place; the CALLER must hold the store lock.** The
+    intended shape is inside :meth:`CollectionCache.apply`, which holds the
+    exclusive flock for the whole read-mutate-write cycle and rotates a backup
+    first::
+
+        plan: dict[str, Any] = {}
+        def sweep(payload):
+            plan.update(rekey_sweep(payload))
+        cache.apply(sweep, command="rekey-sweep")
+
+    **Runs AFTER exact identity matching, never instead of it.** Inside an
+    import that means after :func:`_standard_merge_phase` — the same reason its
+    own Pass A drains exact matches before either inexact path claims a row.
+    The sweep collapses rows an exact match could still have spoken for if it
+    ran first, and which row won would then depend on the order LOCG happened
+    to emit its spreadsheet.
+
+    The survivor rules are BUI-556's measured findings, not preferences — see
+    :func:`_rekey_survivor_rank` (newest ``last_seen_in_export_at``, never
+    ``local_added_seq``), the fold in :func:`_rekey_plan` (fill only what the
+    survivor lacks, excluding :data:`_REKEY_NEVER_FOLD`), and that function's
+    copy-count rule (the survivor's count, never a sum).
+
+    **All or nothing.** If ANY collision group holds two different non-null
+    ``gixen_item_id`` or ``price_paid`` values — the signature of a genuine
+    second copy rather than a duplicate row — the whole sweep applies nothing
+    and returns ``aborted: True`` with the offending groups in ``conflicts``.
+    Partially applying would leave the store in a state no one planned, and the
+    conflicting group is exactly the one a human has to look at.
+
+    Returns the plan: ``{aborted, collisions, groups_merged, rows_dropped,
+    conflicts, merges, dropped_rows}``. ``collisions`` is the PRE-sweep count,
+    so a caller can assert it fell to zero by re-reading the store. Every index
+    in the plan (``kept_index``, ``dropped_indices``) is likewise a PRE-sweep
+    position and does not address the returned, shortened list — read
+    ``dropped_rows`` (full copies of every removed row) rather than trying to
+    index back into the store.
+
+    Callers that also persist ``series_name_index`` should rebuild it
+    afterwards (:func:`rebuild_series_name_index`) — a dropped row may have
+    carried the only copy of an obsolete decorated spelling. Nothing unsafe
+    rides on skipping that (the index is an optional lookup hint, BUI-561), but
+    it is free at the same call site.
+    """
+    comics = payload.get("comics")
+    if not comics:
+        return _rekey_plan([])
+
+    plan = _rekey_plan(comics)
+    if plan["aborted"] or not plan["merges"]:
+        return plan
+
+    for merge in plan["merges"]:
+        survivor = comics[merge["kept_index"]]
+        survivor.update(merge["folded"])
+        if merge["ownership_preserved"]:
+            survivor["in_collection"] = merge["in_collection"]
+
+    dropped = {i for merge in plan["merges"] for i in merge["dropped_indices"]}
+    payload["comics"] = [row for i, row in enumerate(comics) if i not in dropped]
+    return plan
+
+
+def _summarize_names(names: list[str], limit: int = 10) -> str:
+    """``"a, b, c (+N more)"`` — the shared tail of every post-import warning.
+
+    Each of the three data-quality checks at the end of ``import_xlsx`` names
+    the affected titles the same way: enough of them to act on, a count for the
+    rest. Extracted at the third copy (BUI-650), by which point the first two
+    had already drifted apart in formatting while staying identical in
+    behavior.
+    """
+    shown = ", ".join(names[:limit])
+    if len(names) <= limit:
+        return shown
+    return f"{shown} (+{len(names) - limit} more)"
+
+
 def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
     """Parse a LOCG Excel export and merge it into the cache.
 
@@ -1898,7 +2204,12 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
     possibly_removed, ownership_downgrades_held, behavioral_drift_count,
     auto_healed_duplicates, second_copies_credited, null_release_date_owned,
     manual_series_flags_cleared, owned_duplicate_identities,
-    release_date_drift_merged, warnings}.
+    identity_collisions, release_date_drift_merged, warnings}.
+
+    `identity_collisions` (BUI-650) is a non-blocking count of identity tuples
+    held by more than one row, over ALL rows — the store noticing that its own
+    identity key has stopped being a key. Advisory on purpose; the repair is
+    :func:`rekey_sweep`, a separate user-gated operation.
 
     `null_release_date_owned` (BUI-412) is a non-blocking data-quality count of
     owned rows (`in_collection` truthy) whose `release_date` is null/empty,
@@ -1954,6 +2265,12 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # win-vs-export partition that made this read a vacuous 0 once every
         # win had round-tripped back as an export row.
         "owned_duplicate_identities": 0,
+        # BUI-650: identity tuples held by MORE THAN ONE row, post-import — the
+        # store reporting that its identity key has stopped being a key.
+        # ADVISORY, never a sync blocker, and deliberately a SEPARATE key from
+        # `owned_duplicate_identities` above: see the counter's own comment
+        # below for both reasons.
+        "identity_collisions": 0,
         # BUI-554: export rows merged into an existing row whose release_date
         # LOCG had rewritten (cover date vs on-sale date), instead of inserting
         # a duplicate. Each one is a row NOT added, so the sync's
@@ -2178,14 +2495,12 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         )
         summary["owned_duplicate_identities"] = len(owned_duplicates)
         if owned_duplicates:
-            shown = ", ".join(owned_duplicates[:10])
-            more = "" if len(owned_duplicates) <= 10 else f" (+{len(owned_duplicates) - 10} more)"
             summary["warnings"].append(
                 f"{len(owned_duplicates)} book(s) are now owned TWICE — two "
                 "owned rows claim the same title and the reconciler's own date "
                 f"predicate says they are the same book (BUI-548/BUI-554): "
-                f"{shown}{more}. The row-count arithmetic cannot see this; "
-                "treat it as a failed reconcile, not a clean sync."
+                f"{_summarize_names(owned_duplicates)}. The row-count arithmetic "
+                "cannot see this; treat it as a failed reconcile, not a clean sync."
             )
         elif not owned_groups:
             # Liveness assertion (BUI-554). A check that has lost the ability to
@@ -2230,21 +2545,63 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         )
         summary["owned_duplicate_identities_cross_edition"] = len(cross_edition_twins)
         if cross_edition_twins:
-            shown = ", ".join(cross_edition_twins[:10])
-            more = (
-                ""
-                if len(cross_edition_twins) <= 10
-                else f" (+{len(cross_edition_twins) - 10} more)"
-            )
             summary["warnings"].append(
                 f"ADVISORY (not a sync blocker): {len(cross_edition_twins)} book(s) "
                 "are owned TWICE across editions — a foreign licensed edition "
                 "carrying the same price_paid + date_purchased as its US twin, "
                 "which means our own record-win push created it (BUI-563/BUI-564): "
-                f"{shown}{more}. The release dates are months apart, so the "
+                f"{_summarize_names(cross_edition_twins)}. The release dates are "
+                "months apart, so the "
                 "owned_duplicate_identities hard stop cannot see these. Do NOT "
                 "fix by deleting the local row — LOCG re-emits it, and clearing "
                 "the ownership runs the BUI-122 In Collection=0 data-loss path."
+            )
+
+        # ----- Identity collisions: the key has stopped being a key (BUI-650) --
+        # A DIFFERENT question from either check above. Those two ask "is a book
+        # owned twice?"; this one asks "is the identity key still injective?" —
+        # and the store could not previously answer it at all. The import writes
+        # `identity_to_idx[identity] = index`, so of two rows sharing an
+        # identity only the LAST is ever reachable again; the other can never be
+        # updated, only duplicated. Three tuples on the live store were in that
+        # state on 2026-08-03 (all wish-side Absolute Martian Manhunter, both
+        # `(2025 - Present)` and `(2025 - 2026)` folding to one key).
+        #
+        # Counted over ALL rows via `identity_collision_groups`, which is where
+        # the reasoning for the two easy-to-"fix" choices lives: it is not
+        # owned-scoped (the scoping that hid these three for months), and it
+        # counts quarantined rows (a quarantined row still occupies its slot in
+        # `identity_to_idx`).
+        #
+        # ADVISORY — deliberately NOT folded into `owned_duplicate_identities`,
+        # which `/comic:collection-sync` asserts is 0. Its first reading is 3,
+        # so folding it in would refuse every sync from the day it shipped, over
+        # a condition whose remedy (`rekey_sweep`) is a separate user-gated
+        # operation. That is the BUI-563 lesson exactly: a hard stop over a
+        # condition with no local remedy blocks every sync indefinitely.
+        collision_groups = identity_collision_groups(comics)
+        summary["identity_collisions"] = len(collision_groups)
+        if collision_groups:
+            # Named off a representative ROW rather than by indexing into the
+            # identity tuple. Every field of that tuple is a `str`, so a future
+            # reordering of `make_identity`'s components would silently retitle
+            # this warning with no type error anywhere; reading the same two
+            # fields by name cannot. Any row in a group serves — `full_title`
+            # and `release_date` are carried raw into the identity, so every
+            # member of the group agrees on both.
+            collision_names = sorted(
+                f"{comics[indices[0]].get('full_title') or '(no full_title)'} "
+                f"({comics[indices[0]].get('release_date') or 'no release_date'})"
+                for indices in collision_groups.values()
+            )
+            summary["warnings"].append(
+                f"ADVISORY (not a sync blocker): {len(collision_groups)} identity "
+                "tuple(s) are held by more than one row — the store's identity "
+                "key has stopped being a key (BUI-650): "
+                f"{_summarize_names(collision_names)}. Only the LAST row per "
+                "identity is reachable via identity_to_idx, so the others can "
+                "never be updated, only duplicated. Repair with the re-key sweep "
+                "(collection_io.rekey_sweep), never by hand-editing the store."
             )
 
         # ----- Rebuild series_name_index --------------------------------------

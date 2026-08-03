@@ -4558,3 +4558,457 @@ def test_build_series_publishers_reads_only_locg_export_rows():
         "Spawn (1992 - Present)": {"image"},
         "Spawn (2012 - Present)": {"kamite"},
     }
+
+
+# ---------------------------------------------------------------------------
+# BUI-650: `identity_collisions` — the import summary reporting that the
+# store's identity key has stopped being a key. Advisory, never a sync blocker
+# (its first reading against the live store is 3), and counted over ALL rows:
+# `owned_duplicate_identities` above is owned-scoped, and that scoping is
+# exactly why the three live collisions sat invisible for months.
+# ---------------------------------------------------------------------------
+
+def _wish_row(full_title: str, series: str, release_date: str, seq: int,
+              last_seen: str | None = None) -> dict[str, Any]:
+    """An unowned, wish-listed store row — the shape all three live collisions
+    have."""
+    row = make_agent_win_row(
+        publisher="DC Comics",
+        series=series,
+        full_title=full_title,
+        release_date=release_date,
+        gixen_item_id=None,
+    )
+    row.update({
+        "in_collection": 0,
+        "in_wish_list": 1,
+        "source": "locg_export",
+        "local_added_seq": seq,
+        "pushed_to_locg_at": "2026-06-23T03:30:13.498725Z",
+        "last_seen_in_export_at": last_seen,
+    })
+    return row
+
+
+def _unrelated_export(path: Path) -> None:
+    """A one-row export that touches none of the seeded collision rows, so the
+    counter reads the store as it was seeded."""
+    _build_export_xlsx(path, [{
+        "publisher": "Marvel Comics",
+        "series": "Amazing Spider-Man (1963 - 1998)",
+        "full_title": "Amazing Spider-Man #300",
+        "release_date": "1988-05-10",
+    }])
+
+
+def test_identity_collisions_reports_and_names_a_collision(tmp_path):
+    """Two rows sharing an identity tuple: counted, named, and non-blocking.
+
+    Both spellings of the same volume — LOCG closes an ongoing volume's
+    decoration the January after it ends — fold to one identity key, which is
+    the live shape (all three collisions are Absolute Martian Manhunter).
+    """
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    present = _wish_row(
+        "Absolute Martian Manhunter #3",
+        "Absolute Martian Manhunter (2025 - Present)",
+        "2025-05-28", seq=1, last_seen="2026-06-23T03:30:13.498725Z",
+    )
+    closed = _wish_row(
+        "Absolute Martian Manhunter #3",
+        "Absolute Martian Manhunter (2025 - 2026)",
+        "2025-05-28", seq=2, last_seen="2026-07-27T23:48:15.542930Z",
+    )
+
+    def seed(payload):
+        payload["comics"].extend([present, closed])
+
+    cache.apply(seed, command="pre-import")
+
+    xlsx = tmp_path / "export.xlsx"
+    _unrelated_export(xlsx)
+
+    result = import_xlsx(xlsx, cache)
+
+    assert result["identity_collisions"] == 1
+    assert any("Absolute Martian Manhunter #3 (2025-05-28)" in w
+               for w in result["warnings"])
+    # Advisory, not a hard stop: the owned-duplicate counter the sync asserts
+    # on is untouched, so the sync still runs.
+    assert result["owned_duplicate_identities"] == 0
+    # And nothing was merged or dropped — the counter only reports.
+    payload = cache.load()
+    assert sum(1 for r in payload["comics"]
+               if r["full_title"] == "Absolute Martian Manhunter #3") == 2
+
+
+def test_identity_collisions_can_go_red_then_green(tmp_path):
+    """Proof the counter can fail: the SAME fixture minus the colliding row
+    reports 0, so a 0 means "checked and clean", not "unable to check"."""
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+
+    def seed(payload):
+        payload["comics"].append(_wish_row(
+            "Absolute Martian Manhunter #3",
+            "Absolute Martian Manhunter (2025 - Present)",
+            "2025-05-28", seq=1, last_seen="2026-06-23T03:30:13.498725Z",
+        ))
+
+    cache.apply(seed, command="pre-import")
+
+    xlsx = tmp_path / "export.xlsx"
+    _unrelated_export(xlsx)
+
+    result = import_xlsx(xlsx, cache)
+
+    assert result["identity_collisions"] == 0
+    assert not any("stopped being a key" in w for w in result["warnings"])
+
+
+def test_identity_collisions_counts_a_quarantined_row(tmp_path):
+    """Quarantine hides a row from every MATCHER pool, never from storage — it
+    still occupies its identity_to_idx slot and still shadows the other row."""
+    from locg.collection_cache import quarantine_marker
+    from locg.collection_io import import_xlsx
+
+    cache = make_cache(tmp_path)
+    plain = _wish_row(
+        "Absolute Martian Manhunter #11",
+        "Absolute Martian Manhunter (2025 - Present)",
+        "2026-05-13", seq=1, last_seen="2026-06-23T03:30:13.498725Z",
+    )
+    hidden = _wish_row(
+        "Absolute Martian Manhunter #11",
+        "Absolute Martian Manhunter (2025 - 2026)",
+        "2026-05-13", seq=2, last_seen="2026-07-27T23:48:15.542930Z",
+    )
+    hidden["quarantined"] = quarantine_marker(
+        reason="foreign licensed edition", ticket="BUI-563", by="test"
+    )
+
+    def seed(payload):
+        payload["comics"].extend([plain, hidden])
+
+    cache.apply(seed, command="pre-import")
+
+    xlsx = tmp_path / "export.xlsx"
+    _unrelated_export(xlsx)
+
+    result = import_xlsx(xlsx, cache)
+
+    assert result["identity_collisions"] == 1
+    assert result["quarantined_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# BUI-650: rekey_sweep — the repair. Survivor rules are BUI-556's measured
+# findings, and the abort is all-or-nothing.
+# ---------------------------------------------------------------------------
+
+def _collide_pair(**overrides: Any) -> list[dict[str, Any]]:
+    """Two store rows on one identity, spelled the two ways LOCG spells it."""
+    stale = _wish_row(
+        "Absolute Martian Manhunter #3",
+        "Absolute Martian Manhunter (2025 - Present)",
+        "2025-05-28", seq=99, last_seen="2026-06-23T03:30:13.498725Z",
+    )
+    fresh = _wish_row(
+        "Absolute Martian Manhunter #3",
+        "Absolute Martian Manhunter (2025 - 2026)",
+        "2025-05-28", seq=1, last_seen="2026-07-27T23:48:15.542930Z",
+    )
+    stale.update(overrides.get("stale", {}))
+    fresh.update(overrides.get("fresh", {}))
+    return [stale, fresh]
+
+
+def test_rekey_sweep_survivor_is_newest_last_seen_not_highest_seq():
+    """BUI-556 measured `local_added_seq` picking the STALE row in 35 of 60
+    groups — it is a within-import counter, so it orders rows inside one run,
+    never across runs. Seeded in OPPOSITE order here so ranking on the wrong
+    field is unmistakable."""
+    from locg.collection_io import rekey_sweep
+
+    stale, fresh = _collide_pair()
+    assert stale["local_added_seq"] > fresh["local_added_seq"]
+    assert stale["last_seen_in_export_at"] < fresh["last_seen_in_export_at"]
+
+    payload = {"comics": [stale, fresh]}
+    plan = rekey_sweep(payload)
+
+    assert plan["aborted"] is False
+    assert plan["collisions"] == 1
+    assert plan["groups_merged"] == 1
+    assert plan["rows_dropped"] == 1
+    assert len(payload["comics"]) == 1
+    survivor = payload["comics"][0]
+    assert survivor["series_name"] == "Absolute Martian Manhunter (2025 - 2026)"
+    assert survivor["local_added_seq"] == 1
+    assert plan["dropped_rows"][0]["local_added_seq"] == 99
+
+
+def test_rekey_sweep_folds_a_field_only_the_loser_has():
+    """Fill what the survivor LACKS — and nothing else. The dropped row's own
+    bookkeeping (local_added_*, last_seen, pushed_to_locg_at, source) describes
+    that row, not the book, so it must never be carried forward."""
+    from locg.collection_io import rekey_sweep
+
+    stale, fresh = _collide_pair(
+        stale={
+            "notes": "signed at con",
+            "condition": "NM",
+            "metron_id": 12345,
+            "source": "agent_win",
+            "pushed_to_locg_at": None,
+        },
+        fresh={"notes": None, "condition": "", "metron_id": None},
+    )
+
+    payload = {"comics": [stale, fresh]}
+    plan = rekey_sweep(payload)
+
+    survivor = payload["comics"][0]
+    assert survivor["notes"] == "signed at con"
+    assert survivor["condition"] == "NM", "'' counts as lacking, same as None"
+    assert survivor["metron_id"] == 12345
+    assert plan["merges"][0]["folded"] == {
+        "notes": "signed at con", "condition": "NM", "metron_id": 12345,
+    }
+    # Bookkeeping stays the survivor's own.
+    assert survivor["source"] == "locg_export"
+    assert survivor["local_added_seq"] == 1
+    assert survivor["last_seen_in_export_at"] == "2026-07-27T23:48:15.542930Z"
+    assert survivor["pushed_to_locg_at"] == "2026-06-23T03:30:13.498725Z"
+
+
+def test_rekey_sweep_never_overwrites_a_value_the_survivor_already_holds():
+    """A stored False or 0 is a real value someone wrote, not an absence —
+    folding a loser's True over it would invent a flag."""
+    from locg.collection_io import rekey_sweep
+
+    stale, fresh = _collide_pair(
+        stale={"needs_manual_variant": True, "marked_read": 1, "notes": "loser"},
+        fresh={"needs_manual_variant": False, "marked_read": 0, "notes": "winner"},
+    )
+
+    payload = {"comics": [stale, fresh]}
+    rekey_sweep(payload)
+
+    survivor = payload["comics"][0]
+    assert survivor["needs_manual_variant"] is False
+    assert survivor["marked_read"] == 0
+    assert survivor["notes"] == "winner"
+
+
+def test_rekey_sweep_aborts_wholly_on_conflicting_price_paid():
+    """BUI-650 AE11: two different non-null price_paid values are the signature of a
+    genuine SECOND COPY, not a duplicate row. Nothing is applied — including
+    for the innocent group in the same sweep."""
+    from locg.collection_io import rekey_sweep
+
+    conflicted = _collide_pair(
+        stale={"price_paid": 32.00, "in_collection": 1},
+        fresh={"price_paid": 45.50, "in_collection": 1},
+    )
+    innocent = [
+        _wish_row("Absolute Martian Manhunter #11",
+                  "Absolute Martian Manhunter (2025 - Present)",
+                  "2026-05-13", seq=5, last_seen="2026-06-23T03:30:13.498725Z"),
+        _wish_row("Absolute Martian Manhunter #11",
+                  "Absolute Martian Manhunter (2025 - 2026)",
+                  "2026-05-13", seq=6, last_seen="2026-07-27T23:48:15.542930Z"),
+    ]
+
+    payload = {"comics": [*conflicted, *innocent]}
+    before = [dict(r) for r in payload["comics"]]
+    plan = rekey_sweep(payload)
+
+    assert plan["aborted"] is True
+    assert plan["collisions"] == 2
+    assert plan["groups_merged"] == 0
+    assert plan["rows_dropped"] == 0
+    assert plan["merges"] == [] and plan["dropped_rows"] == []
+    assert [c["signals"] for c in plan["conflicts"]] == [["price_paid"]]
+    assert payload["comics"] == before, "all or nothing — the store is untouched"
+
+
+def test_rekey_sweep_aborts_on_conflicting_gixen_item_id():
+    """Two different eBay purchases filed under one identity are two books."""
+    from locg.collection_io import rekey_sweep
+
+    payload = {"comics": _collide_pair(
+        stale={"gixen_item_id": "147434010581"},
+        fresh={"gixen_item_id": "147434099999"},
+    )}
+    plan = rekey_sweep(payload)
+
+    assert plan["aborted"] is True
+    assert plan["conflicts"][0]["signals"] == ["gixen_item_id"]
+    assert len(payload["comics"]) == 2
+
+
+def test_rekey_sweep_merges_one_purchase_recorded_twice():
+    """The SAME gixen_item_id on both rows is one purchase recorded twice —
+    precisely what the sweep exists to collapse — and a 0.00/blank price is
+    LOCG's placeholder, never a price, so it cannot conflict either."""
+    from locg.collection_io import rekey_sweep
+
+    payload = {"comics": _collide_pair(
+        stale={"gixen_item_id": "147434010581", "price_paid": 0.00},
+        fresh={"gixen_item_id": "147434010581", "price_paid": None},
+    )}
+    plan = rekey_sweep(payload)
+
+    assert plan["aborted"] is False
+    assert len(payload["comics"]) == 1
+
+
+def test_rekey_sweep_does_not_sum_the_copy_count():
+    """One book recorded twice keeps the SURVIVOR's count. Summing would invent
+    a phantom second copy out of rows the merge just declared to be one book."""
+    from locg.collection_io import rekey_sweep
+
+    payload = {"comics": _collide_pair(
+        stale={"in_collection": 1},
+        fresh={"in_collection": 1},
+    )}
+    rekey_sweep(payload)
+
+    assert payload["comics"][0]["in_collection"] == 1
+
+
+def test_rekey_sweep_never_drops_an_ownership():
+    """The one asymmetry: an unowned survivor plus an owned loser must not end
+    the sweep marked not-owned. That is not a counting error — the next export
+    emits `In Collection=0` and LOCG DELETES the book (BUI-122 / the BUI-200
+    26-deleted-X-Men incident)."""
+    from locg.collection_io import rekey_sweep
+
+    payload = {"comics": _collide_pair(
+        stale={"in_collection": 1, "in_wish_list": 0},   # owned, older
+        fresh={"in_collection": 0, "in_wish_list": 1},   # wish, newer -> survives
+    )}
+    plan = rekey_sweep(payload)
+
+    survivor = payload["comics"][0]
+    assert survivor["in_collection"] == 1
+    assert plan["merges"][0]["ownership_preserved"] is True
+    # ...but a 1-vs-2 disagreement is NOT widened: the freshest row's count is
+    # the better evidence, and resurrecting a stale higher count would be the
+    # phantom copy the rule above exists to avoid.
+    payload = {"comics": _collide_pair(
+        stale={"in_collection": 2}, fresh={"in_collection": 1},
+    )}
+    plan = rekey_sweep(payload)
+    assert payload["comics"][0]["in_collection"] == 1
+    assert plan["merges"][0]["ownership_preserved"] is False
+
+
+def test_rekey_sweep_carries_a_quarantine_onto_the_survivor():
+    """A merge must never silently LIFT a quarantine — that is the one failure
+    the marker's shape exists to prevent. Carrying it forward stays
+    attributable and is lifted deliberately via `collection unquarantine`."""
+    from locg.collection_cache import is_quarantined, quarantine_marker
+    from locg.collection_io import rekey_sweep
+
+    marker = quarantine_marker(
+        reason="foreign licensed edition", ticket="BUI-563", by="test"
+    )
+    payload = {"comics": _collide_pair(stale={"quarantined": marker})}
+    rekey_sweep(payload)
+
+    survivor = payload["comics"][0]
+    assert is_quarantined(survivor)
+    assert survivor["quarantined"]["ticket"] == "BUI-563"
+
+
+def test_rekey_sweep_applies_under_the_cache_lock(tmp_path):
+    """The documented call shape end to end: inside `CollectionCache.apply`,
+    which holds the exclusive flock and rotates a backup first. Proves the
+    merge actually persists and that the store re-reads clean."""
+    from locg.collection_cache import identity_collision_groups
+    from locg.collection_io import rekey_sweep
+
+    cache = make_cache(tmp_path)
+
+    def seed(payload):
+        payload["comics"].extend(_collide_pair())
+
+    cache.apply(seed, command="pre-sweep")
+    assert len(identity_collision_groups(cache.load()["comics"])) == 1
+
+    plan: dict[str, Any] = {}
+
+    def sweep(payload):
+        plan.update(rekey_sweep(payload))
+
+    cache.apply(sweep, command="rekey-sweep")
+
+    assert plan["rows_dropped"] == 1
+    reloaded = cache.load()
+    assert len(reloaded["comics"]) == 1
+    assert identity_collision_groups(reloaded["comics"]) == {}
+    # The pre-sweep state survives in the rotating backup ring.
+    assert len(json.loads((tmp_path / "collection.json.bak.0").read_text())["comics"]) == 2
+
+
+def test_rekey_sweep_is_a_no_op_on_a_store_with_no_collisions():
+    from locg.collection_io import rekey_sweep
+
+    rows = [_wish_row(f"Absolute Martian Manhunter #{i}",
+                      "Absolute Martian Manhunter (2025 - Present)",
+                      f"2025-0{i}-28", seq=i,
+                      last_seen="2026-07-27T23:48:15.542930Z")
+            for i in range(1, 5)]
+    payload = {"comics": rows}
+    plan = rekey_sweep(payload)
+
+    assert plan == {
+        "aborted": False, "collisions": 0, "groups_merged": 0, "rows_dropped": 0,
+        "conflicts": [], "merges": [], "dropped_rows": [],
+    }
+    assert len(payload["comics"]) == 4
+    assert rekey_sweep({"comics": []})["collisions"] == 0
+    assert rekey_sweep({})["collisions"] == 0
+
+
+def test_rekey_sweep_resolves_the_live_three_row_group():
+    """The live `Absolute Martian Manhunter #1` shape (2026-08-03): two wish
+    rows plus the owned row that carries the purchase. The owned row is newest
+    by last_seen and LOWEST by local_added_seq, so ranking on the sequence
+    number would have merged the purchase away."""
+    from locg.collection_cache import identity_collision_groups
+    from locg.collection_io import rekey_sweep
+
+    wish_old = _wish_row("Absolute Martian Manhunter #1",
+                         "Absolute Martian Manhunter (2025 - Present)",
+                         "2025-03-26", seq=127,
+                         last_seen="2026-06-23T03:30:13.498725Z")
+    wish_new = _wish_row("Absolute Martian Manhunter #1",
+                         "Absolute Martian Manhunter (2025 - Present)",
+                         "2025-03-26", seq=75,
+                         last_seen="2026-07-19T08:45:53.914390Z")
+    owned = _wish_row("Absolute Martian Manhunter #1",
+                      "Absolute Martian Manhunter (2025 - 2026)",
+                      "2025-03-26", seq=1,
+                      last_seen="2026-07-27T23:48:15.542930Z")
+    owned.update({
+        "in_collection": 1, "in_wish_list": 0,
+        "gixen_item_id": "147434010581", "price_paid": 32.00,
+    })
+
+    payload = {"comics": [wish_old, wish_new, owned]}
+    plan = rekey_sweep(payload)
+
+    assert plan["aborted"] is False
+    assert plan["rows_dropped"] == 2
+    assert len(payload["comics"]) == 1
+    survivor = payload["comics"][0]
+    assert survivor["gixen_item_id"] == "147434010581"
+    assert survivor["price_paid"] == 32.00
+    assert survivor["in_collection"] == 1, "the purchase must survive the merge"
+    assert identity_collision_groups(payload["comics"]) == {}
