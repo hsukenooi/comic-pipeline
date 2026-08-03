@@ -680,6 +680,136 @@ class TestRunFailsClosedOnLookupError:
             in cap.err
 
 
+class TestRunSkipsPermanentWriteRejection:
+    """BUI-639 end-to-end (mocked network): a 422 write rejection (e.g.
+    BUI-625's multi-issue-lot refusal) on one book must skip only that book,
+    not abort the whole run — and the skip must be LOUD in the summary, per
+    the BUI-565/570/593 "must never look like a clean run" precedent the
+    other two skip classes (BUI-533/BUI-544) already follow."""
+
+    def _batch(self):
+        return [
+            {"item_id": "1", "title": "Lot", "issue": "1", "year": 1990,
+             "grade": 9.0},
+            {"item_id": "2", "title": "Solo", "issue": "1", "year": 1990,
+             "grade": 9.0},
+        ]
+
+    def _fake_results(self):
+        comps = [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]]
+        return [
+            {"input": {"_req_id": 0, "title": "Lot", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": "1"},
+             "comps": comps, "queries_used": [{"tier": "base", "cached": False}]},
+            {"input": {"_req_id": 1, "title": "Solo", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": "2"},
+             "comps": comps, "queries_used": [{"tier": "base", "cached": False}]},
+        ]
+
+    @staticmethod
+    def _upsert_side_effect(server_url, inp, fmv, hard_fail=True):
+        # Mocks the classification _post_json already has unit coverage for
+        # (TestUpsertFmv) — here we're only proving run()'s per-book handling
+        # of the exception it raises, not re-deriving the HTTP mechanics.
+        if inp.get("title") == "Lot":
+            raise fmv_runner._UpsertRejected(
+                "multi-issue lot listing cannot be its first issue")
+        return {"comic_id": 99, "fmv_id": 5}
+
+    def test_second_book_still_priced_when_first_is_rejected(
+            self, tmp_path, server_url):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+        out_path = tmp_path / "out.json"
+
+        with patch("fmv_runner._fetch_comps", return_value=self._fake_results()), \
+             patch("fmv_runner._upsert_fmv", side_effect=self._upsert_side_effect):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        out = json.loads(out_path.read_text())
+        assert len(out) == 2
+        assert out[0]["source"] == "skipped_rejected"
+        assert out[0]["fmv"] is None
+        assert out[1]["source"] == "fresh"
+        assert out[1]["fmv"]["n"] == 5
+        assert out[1]["comic_id"] == 99
+
+    def test_run_completes_without_exiting(self, tmp_path, server_url):
+        """The premise this ticket fixes: before BUI-639, ANY 422 aborted the
+        whole run via sys.exit(1). If that regressed, this test would raise
+        SystemExit and fail — there is no pytest.raises wrapping the call."""
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+
+        with patch("fmv_runner._fetch_comps", return_value=self._fake_results()), \
+             patch("fmv_runner._upsert_fmv", side_effect=self._upsert_side_effect):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+    def test_summary_reports_exactly_one_skipped_book_with_reason(
+            self, tmp_path, server_url, capsys):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+        out_path = tmp_path / "out.json"
+
+        with patch("fmv_runner._fetch_comps", return_value=self._fake_results()), \
+             patch("fmv_runner._upsert_fmv", side_effect=self._upsert_side_effect):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        cap = capsys.readouterr()
+        # The aggregate stderr line is a COUNT, not a per-book reason dump —
+        # same convention as the BUI-544 skipped_lookup_error line. Exactly
+        # one book skipped, and it must be unmistakably a permanent rejection.
+        assert "skipped 1 book(s)" in cap.err
+        assert "REJECTED the write (422)" in cap.err
+        assert "PERMANENT" in cap.err
+        # Must not fire the OTHER two skip-count lines — nothing here was
+        # hand-priced or lookup-failed, so those must stay silent.
+        assert "hand-priced row(s)" not in cap.err
+        assert "comics-server FMV lookup FAILED" not in cap.err
+        # The per-book REASON lives on the stitched row's `error` field (the
+        # --out/--brief surface), not in the aggregate stderr count line.
+        out = json.loads(out_path.read_text())
+        assert "multi-issue lot listing cannot be its first issue" in out[0]["error"]
+
+    def test_table_marks_the_rejected_row_distinctly_not_n_a(
+            self, tmp_path, server_url, capsys):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+
+        with patch("fmv_runner._fetch_comps", return_value=self._fake_results()), \
+             patch("fmv_runner._upsert_fmv", side_effect=self._upsert_side_effect):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=False,
+                           server_url=server_url)
+        out = capsys.readouterr().out
+        assert "skip:422" in out
+        assert "skipped_rejected" in out
+
+    def test_brief_projects_both_rows_with_distinct_sources(
+            self, tmp_path, server_url, capsys):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+
+        with patch("fmv_runner._fetch_comps", return_value=self._fake_results()), \
+             patch("fmv_runner._upsert_fmv", side_effect=self._upsert_side_effect):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True, brief=True,
+                           server_url=server_url)
+        cap = capsys.readouterr()
+        lines = [ln for ln in cap.out.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        rows = [json.loads(ln) for ln in lines]
+        assert rows[0]["source"] == "skipped_rejected"
+        assert rows[0]["max_bid"] is None
+        assert rows[1]["source"] == "fresh"
+        assert rows[1]["max_bid"] is not None
+
+
 class TestHandPricedAndFetchErrComposition:
     """BUI-533 x BUI-536 composition: --force on a hand-priced row whose
     fetch THEN errors out. The force-overwrite echo fires (it's a statement of
@@ -1481,6 +1611,65 @@ class TestUpsertFmv:
             with pytest.raises(SystemExit):
                 fmv_runner._upsert_fmv(server_url, inp, fmv)
 
+    def test_upsert_fmv_still_fails_loud_on_5xx(self, server_url):
+        """BUI-639: only 422 is carved out of the BUI-186 fail-loud default —
+        a 5xx (infrastructure failure) is exactly the transient case BUI-186
+        exists for, and must keep aborting the run."""
+        import requests
+        inp = {"title": "X", "issue": "1", "year": 1990, "grade": 9.0}
+        fmv = {"fmv_low": 100, "fmv_high": 150, "n": 8, "confidence": "HIGH",
+               "window": 0.5, "cv_pct": "20%"}
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        http_err = requests.HTTPError("500 Server Error")
+        http_err.response = mock_resp
+        mock_resp.raise_for_status.side_effect = http_err
+        with patch("fmv_runner.requests.post", return_value=mock_resp):
+            with pytest.raises(SystemExit):
+                fmv_runner._upsert_fmv(server_url, inp, fmv)
+
+    def test_upsert_fmv_raises_permanent_rejection_on_422_instead_of_exiting(
+            self, server_url):
+        """BUI-639: a 422 is the comics-server write boundary's PERMANENT,
+        per-item rejection (e.g. BUI-625's multi-issue-lot refusal) — never
+        transient, so it must not take the whole run down via sys.exit. It
+        raises `_UpsertRejected` instead, carrying the server's detail, so the
+        caller can skip just this one book."""
+        import requests
+        inp = {"title": "X", "issue": "1", "year": 1990, "grade": 9.0}
+        fmv = {"fmv_low": 100, "fmv_high": 150, "n": 8, "confidence": "HIGH",
+               "window": 0.5, "cv_pct": "20%"}
+        mock_resp = MagicMock()
+        mock_resp.status_code = 422
+        http_err = requests.HTTPError("422 Client Error")
+        http_err.response = mock_resp
+        mock_resp.raise_for_status.side_effect = http_err
+        mock_resp.json.return_value = {
+            "detail": "multi-issue lot listing cannot be its first issue"}
+        with patch("fmv_runner.requests.post", return_value=mock_resp):
+            with pytest.raises(fmv_runner._UpsertRejected) as exc_info:
+                fmv_runner._upsert_fmv(server_url, inp, fmv)
+        assert "multi-issue lot listing" in str(exc_info.value)
+
+    def test_upsert_fmv_422_soft_fails_under_hard_fail_false(self, server_url):
+        """The BUI-348/BUI-529 best-effort re-upsert sites pass hard_fail=False
+        and already treat ANY failure (422 included) as a soft None return —
+        that pre-existing behavior must be untouched by the BUI-639 carve-out,
+        which only changes the hard_fail=True (default) path."""
+        import requests
+        inp = {"title": "X", "issue": "1", "year": 1990, "grade": 9.0}
+        fmv = {"fmv_low": 100, "fmv_high": 150, "n": 8, "confidence": "HIGH",
+               "window": 0.5, "cv_pct": "20%"}
+        mock_resp = MagicMock()
+        mock_resp.status_code = 422
+        http_err = requests.HTTPError("422 Client Error")
+        http_err.response = mock_resp
+        mock_resp.raise_for_status.side_effect = http_err
+        mock_resp.json.return_value = {"detail": "rejected"}
+        with patch("fmv_runner.requests.post", return_value=mock_resp):
+            result = fmv_runner._upsert_fmv(server_url, inp, fmv, hard_fail=False)
+        assert result is None
+
     def test_collapses_finegrained_confidence(self, server_url):
         # MEDIUM-HIGH and MEDIUM both map to "medium"
         # MEDIUM-LOW and LOW both map to "low"
@@ -1610,6 +1799,36 @@ class TestStitch:
         books = [_make_book("a", "A", "1", 1990, 9.0)]
         out = fmv_runner._stitch(books, {}, {}, {})
         assert out[0]["source"] == "error"
+
+    def test_rejected_skip_gets_its_own_source_and_no_price(self):
+        """BUI-639: a permanent (422) write rejection has no persisted row to
+        reuse, so — like skipped_lookup_error — it carries no price. It must
+        NOT borrow either existing skip source, or a permanent per-book
+        rejection would misread as an outage or as hand-priced protection."""
+        book = _make_book("a", "A", "1", 1990, 9.0)
+        out = fmv_runner._stitch([book], {}, {}, {}, {},
+                                 {0: "multi-issue lot listing"})
+        assert out[0]["source"] == "skipped_rejected"
+        assert out[0]["fmv"] is None
+        assert out[0]["db_row"] is None
+        assert "BUI-639" in out[0]["error"]
+        assert "multi-issue lot listing" in out[0]["error"]
+
+    def test_all_three_skip_kinds_stay_distinct_in_one_batch(self):
+        """All three skip classes must remain separable per-row, not just in
+        aggregate — a batch can plausibly hit all three in one run."""
+        books = [_make_book("a", "A", "1", 1990, 9.0),
+                 _make_book("b", "B", "2", 1990, 9.0),
+                 _make_book("c", "C", "3", 1990, 9.0)]
+        hand_row = {"fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+                    "fmv_confidence": "low",
+                    "fmv_notes": "hand § anchored on the lone 4.0 sale"}
+        out = fmv_runner._stitch(books, {}, {}, {0: hand_row}, {1: "boom"},
+                                 {2: "lot listing"})
+        assert out[0]["source"] == "skipped_hand_priced"
+        assert out[1]["source"] == "skipped_lookup_error"
+        assert out[2]["source"] == "skipped_rejected"
+        assert out[2]["fmv"] is None
 
 
 # ─── Flagged-state presentation (BUI-86) ─────────────────────────────────────
