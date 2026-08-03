@@ -1868,6 +1868,101 @@ def test_comics_outcomes_resolves_by_title_issue_year_when_no_locg_id(api):
     assert [r["price"] for r in rows] == [450.0]
 
 
+# --- purge-durable first-party comps (BUI-660) -------------------------------
+
+
+def test_comics_outcomes_admits_purge_swept_won_and_lost_bids(api):
+    """AE5/U5: seed WON and LOST bids with winning_bid + a primary FMV link,
+    run the completed-bids purge (the REAL POST /api/purge, not a raw-SQL
+    stand-in), and assert /api/comics/outcomes returns the same rows before
+    and after — the acceptance criterion this ticket exists to satisfy. 89
+    first-party comps were already destroyed by exactly this sweep before
+    bids.prior_status existed."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Uncanny X-Men", issue="141", year=1981, grade=9.2,
+        locg_id=9100,
+    )
+    _add_resolved_bid(api, db_path, "800000001", fmv_id,
+                       status="WON", winning_bid=300.0)
+    _add_resolved_bid(api, db_path, "800000002", fmv_id,
+                       status="LOST", winning_bid=280.0)
+
+    before = api.get("/api/comics/outcomes",
+                     params={"locg_id": 9100, "grade": 9.2}).json()
+    assert {r["price"] for r in before} == {300.0, 280.0}
+    assert {r["status"] for r in before} == {"WON", "LOST"}
+
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 200
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    swept = raw.execute(
+        "SELECT item_id, status, prior_status FROM bids "
+        "WHERE item_id IN ('800000001','800000002')"
+    ).fetchall()
+    raw.close()
+    assert {r["status"] for r in swept} == {"REMOVED"}  # the sweep did fire
+    assert {r["prior_status"] for r in swept} == {"WON", "LOST"}
+
+    after = api.get("/api/comics/outcomes",
+                    params={"locg_id": 9100, "grade": 9.2}).json()
+    assert {r["price"] for r in after} == {300.0, 280.0}
+    # The reported status is the pre-tombstone one, never the literal REMOVED
+    # stored on the row — _EFFECTIVE_STATUS_SQL.
+    assert {r["status"] for r in after} == {"WON", "LOST"}
+
+
+def test_comics_outcomes_excludes_removed_row_with_null_prior_status(api):
+    """AE9: a REMOVED row whose prior_status is NULL (swept before this fix
+    existed, or written by any path that never records prior_status) stays
+    excluded — the fix fabricates no history for it."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Iron Man", issue="1", year=1968, grade=8.0, locg_id=9101,
+    )
+    _add_resolved_bid(api, db_path, "800000003", fmv_id,
+                       status="WON", winning_bid=200.0)
+    raw = sqlite3.connect(db_path)
+    # Simulates a pre-fix sweep / any raw write that bypasses both
+    # mark_bids_purged and update_bid_status — prior_status is left NULL.
+    raw.execute(
+        "UPDATE bids SET status='REMOVED' WHERE item_id=?", ("800000003",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/outcomes",
+                   params={"locg_id": 9101, "grade": 8.0}).json()
+    assert rows == []
+
+
+def test_comics_outcomes_excludes_removed_row_tombstoned_from_pending(api):
+    """A BUI-371 classification-site tombstone (from PENDING — prior_status
+    ends up 'PENDING') stays excluded: PENDING is never in the WON/LOST
+    admit set, so _RESOLVED_STATUS_CLAUSE correctly keeps it out."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Thor", issue="337", year=1983, grade=9.0, locg_id=9102,
+    )
+    api.post("/api/bids", json={"item_id": "800000004", "max_bid": 50.0})
+    _link_bid_to_fmv(db_path, "800000004", fmv_id)
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET status='REMOVED', prior_status='PENDING', "
+        "winning_bid=45.0, auction_end_at=datetime('now', '-1 day') "
+        "WHERE item_id=?",
+        ("800000004",),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/outcomes",
+                   params={"locg_id": 9102, "grade": 9.0}).json()
+    assert rows == []
+
+
 # --- /api/comics/calibration (BUI-288) ---------------------------------------
 
 
@@ -2294,6 +2389,36 @@ def test_calibration_report_fields_match_skill_doc(api):
         f"calibration_report() actually returns {actual_fields} — a field "
         "was renamed/added/removed on one side without the other"
     )
+
+
+def test_calibration_inherits_purge_durability(api):
+    """BUI-660 acceptance: 'calibration_report inherits the fix — verify
+    rather than assume.' Two losses that clear above fmv_high must keep
+    surfacing here after the completed-bids purge sweeps them to REMOVED —
+    calibration_report reads the same _RESOLVED_STATUS_CLAUSE/
+    _EFFECTIVE_STATUS_SQL as get_first_party_outcomes, not a second,
+    divergent definition of 'a resolved auction'."""
+    db_path = os.environ["DB_PATH"]
+    _, fmv_id = _create_comic_and_fmv(
+        api, title="Daredevil", issue="181", year=1982, grade=9.0,
+        fmv_high=100.0,
+    )
+    _add_resolved_bid(api, db_path, "800000010", fmv_id,
+                       status="LOST", winning_bid=150.0)
+    _add_resolved_bid(api, db_path, "800000011", fmv_id,
+                       status="LOST", winning_bid=160.0)
+
+    before = api.get("/api/comics/calibration").json()
+    assert len(before) == 1
+    assert before[0]["loss_count"] == 2
+
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 200
+
+    after = api.get("/api/comics/calibration").json()
+    assert len(after) == 1
+    assert after[0]["loss_count"] == 2
+    assert after[0]["overshoot"] == before[0]["overshoot"]
 
 
 # --- JS outcome() (v2-comics.html) -------------------------------------------
