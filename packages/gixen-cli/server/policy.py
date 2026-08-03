@@ -72,8 +72,13 @@ class PolicyIntent:
       ingested — the "no_prior_row" case the U6 ledger will mark; the
       exposure check below derives this from the DB directly rather than
       from this field, so it stays correct even if a caller leaves it None).
-    - `comic_identities` is unpopulated in this phase (U5/U4, a later wave,
-      wire it up) — carried now so the intent shape is stable across waves.
+    - `comic_identities` is populated on the POST path only (BUI-619/U5):
+      `api_add_bid` threads `AddBidRequest.comic_identities` straight
+      through — the payload's `{comic_id|locg_id, grade}` list, list-capable
+      for a future lot caller (KTD8). `api_edit_bid` leaves it at this
+      field's own `[]` default; PATCH resolves identity from the bid's
+      existing FMV links instead of request-supplied identity (U4
+      territory), matching `EditBidRequest`, which never gained the field.
     """
 
     item_id: str

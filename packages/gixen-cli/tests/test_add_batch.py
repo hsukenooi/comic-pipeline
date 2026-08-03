@@ -112,7 +112,10 @@ def test_parse_rows_distinct_item_ids_ok():
 
 def test_build_bid_payload_minimal():
     payload = build_bid_payload("1", 100, 6, 0)
-    assert payload == {"item_id": "1", "max_bid": 100.0, "bid_offset": 6, "snipe_group": 0}
+    assert payload == {
+        "item_id": "1", "max_bid": 100.0, "bid_offset": 6, "snipe_group": 0,
+        "comic_identities": [],
+    }
 
 
 def test_build_bid_payload_omits_unset_optional_fields():
@@ -127,7 +130,42 @@ def test_build_bid_payload_includes_all_optional_fields_when_given():
     assert payload == {
         "item_id": "1", "max_bid": 100.0, "bid_offset": 6, "snipe_group": 0,
         "seller": "X", "seller_grade": 9.0, "photo_grade": 8.5,
+        "comic_identities": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# build_bid_payload — comic identity (BUI-619/U5)
+# ---------------------------------------------------------------------------
+
+
+def test_build_bid_payload_comic_id_and_grade_builds_one_identity():
+    payload = build_bid_payload("1", 100, 6, 0, comic_id=187, grade=9.2)
+    assert payload["comic_identities"] == [{"comic_id": 187, "grade": 9.2}]
+
+
+def test_build_bid_payload_locg_id_and_grade_builds_one_identity():
+    payload = build_bid_payload("1", 100, 6, 0, locg_id=555, grade=9.2)
+    assert payload["comic_identities"] == [{"locg_id": 555, "grade": 9.2}]
+
+
+def test_build_bid_payload_comic_id_wins_over_locg_id_when_both_given():
+    """Mirrors cli.py's `add` --comic-id/--catalog-id precedence."""
+    payload = build_bid_payload("1", 100, 6, 0, comic_id=187, locg_id=555, grade=9.2)
+    assert payload["comic_identities"] == [{"comic_id": 187, "grade": 9.2}]
+
+
+def test_build_bid_payload_no_identity_without_grade():
+    """comic_id/locg_id alone (no grade) never fires the link resolution —
+    matches the pre-existing link_attempted = grade is not None AND
+    comic_id is not None gate."""
+    payload = build_bid_payload("1", 100, 6, 0, comic_id=187)
+    assert payload["comic_identities"] == []
+
+
+def test_build_bid_payload_no_identity_without_comic_id_or_locg_id():
+    payload = build_bid_payload("1", 100, 6, 0, grade=9.2)
+    assert payload["comic_identities"] == []
 
 
 def test_created_from_response_defaults_true_when_key_missing():
@@ -227,6 +265,7 @@ def test_add_one_row_minimal_success():
     assert result.link_attempted is False
     assert server.calls == [("post", "/api/bids", {
         "item_id": "1", "max_bid": 100.0, "bid_offset": 6, "snipe_group": 0,
+        "comic_identities": [],
     })]
 
 
@@ -270,7 +309,27 @@ def test_add_one_row_passes_seller_and_grade_fields():
     assert payload == {
         "item_id": "1", "max_bid": 100.0, "bid_offset": 10, "snipe_group": 2,
         "seller": "SomeSeller", "seller_grade": 9.0, "photo_grade": 8.5,
+        "comic_identities": [],
     }
+
+
+def test_add_one_row_comic_id_and_grade_reach_the_add_payload():
+    """BUI-619 (U5): identity travels in the POST /api/bids payload itself
+    now, not only the post-add link-fmv call below — so pre-trade FMV
+    checks (U4) can see it before the Gixen call."""
+    server = _FakeServer({
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+        ("post", "/api/bids/1/link-fmv"): (True, {}, None),
+    })
+    add_one_row(_row("1", comic_id=187, grade=9.2), server_request=server)
+    add_calls = [c for c in server.calls if c[1] == "/api/bids"]
+    assert add_calls[0][2]["comic_identities"] == [{"comic_id": 187, "grade": 9.2}]
+
+
+def test_add_one_row_no_comic_id_sends_empty_identity_list():
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    add_one_row(_row("1"), server_request=server)
+    assert server.calls[0][2]["comic_identities"] == []
 
 
 def test_add_one_row_links_fmv_when_grade_and_comic_id_present():

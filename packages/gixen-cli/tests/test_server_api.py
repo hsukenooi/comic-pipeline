@@ -4799,3 +4799,119 @@ def test_on_bid_write_committed_plugin_raising_does_not_break_add(tmp_path, monk
     finally:
         client.__exit__(None, None, None)
         patcher.stop()
+
+
+# ---------------------------------------------------------------------------
+# BUI-619 (U5): AddBidRequest.comic_identities threading into PolicyIntent
+# ---------------------------------------------------------------------------
+
+
+def test_add_bid_comic_identities_reach_on_bid_write_committed_intent(tmp_path, monkeypatch):
+    """The POST payload's comic_identities list must land on the
+    PolicyIntent the post-write hook receives — end to end, not just
+    unit-tested on build_bid_payload/AddBidRequest in isolation."""
+    from gixen.plugins import hookimpl
+
+    seen = []
+    commit_mod = types.ModuleType("_identity_commit_stub")
+
+    @hookimpl
+    def on_bid_write_committed(conn, intent, bid_row_id, check_results):
+        seen.append(intent.comic_identities)
+
+    commit_mod.on_bid_write_committed = on_bid_write_committed
+    client, patcher = _boot_client(
+        tmp_path, monkeypatch, "identity_commit.db", {"identity-commit-stub": commit_mod},
+    )
+    try:
+        r = client.post(
+            "/api/bids",
+            json={
+                "item_id": "619100001", "max_bid": 50.0,
+                "comic_identities": [{"comic_id": 187, "grade": 9.2}],
+            },
+        )
+        assert r.status_code == 200
+        assert seen == [[{"comic_id": 187, "grade": 9.2}]]
+    finally:
+        client.__exit__(None, None, None)
+        patcher.stop()
+
+
+def test_add_bid_no_comic_identities_field_yields_empty_list_intent(tmp_path, monkeypatch):
+    """Old CLI -> new server: an add that omits comic_identities entirely
+    must behave identically to one that sends comic_identities=[] — both
+    land on PolicyIntent's own empty-list default, so nothing fires."""
+    from gixen.plugins import hookimpl
+
+    seen = []
+    commit_mod = types.ModuleType("_identity_absent_commit_stub")
+
+    @hookimpl
+    def on_bid_write_committed(conn, intent, bid_row_id, check_results):
+        seen.append(intent.comic_identities)
+
+    commit_mod.on_bid_write_committed = on_bid_write_committed
+    client, patcher = _boot_client(
+        tmp_path, monkeypatch, "identity_absent.db", {"identity-absent-stub": commit_mod},
+    )
+    try:
+        r1 = client.post("/api/bids", json={"item_id": "619100002", "max_bid": 50.0})
+        assert r1.status_code == 200
+        r2 = client.post(
+            "/api/bids",
+            json={"item_id": "619100003", "max_bid": 50.0, "comic_identities": []},
+        )
+        assert r2.status_code == 200
+        assert seen == [[], []]
+    finally:
+        client.__exit__(None, None, None)
+        patcher.stop()
+
+
+def test_edit_bid_never_populates_comic_identities(tmp_path, monkeypatch):
+    """EditBidRequest gained no comic_identities field (unchanged per the
+    plan) — PATCH's PolicyIntent stays at the dataclass's own [] default
+    even when a prior POST on the same item DID carry identity."""
+    from gixen.plugins import hookimpl
+
+    seen = []
+    commit_mod = types.ModuleType("_identity_edit_stub")
+
+    @hookimpl
+    def on_bid_write_committed(conn, intent, bid_row_id, check_results):
+        seen.append((intent.trigger, intent.comic_identities))
+
+    commit_mod.on_bid_write_committed = on_bid_write_committed
+    client, patcher = _boot_client(
+        tmp_path, monkeypatch, "identity_edit.db", {"identity-edit-stub": commit_mod},
+    )
+    try:
+        client.post(
+            "/api/bids",
+            json={
+                "item_id": "619100004", "max_bid": 50.0,
+                "comic_identities": [{"comic_id": 187, "grade": 9.2}],
+            },
+        )
+        seen.clear()  # drop the create's own notification
+        r = client.patch("/api/bids/619100004", json={"max_bid": 60.0})
+        assert r.status_code == 200
+        assert seen == [("edit", [])]
+    finally:
+        client.__exit__(None, None, None)
+        patcher.stop()
+
+
+def test_add_bid_extra_unknown_field_ignored(api):
+    """New CLI -> old server direction proxy: AddBidRequest tolerates an
+    unrecognized field (Pydantic v2's extra='ignore') rather than 422ing —
+    confirms no `extra="forbid"` has crept onto this model."""
+    r = api.post(
+        "/api/bids",
+        json={
+            "item_id": "619100005", "max_bid": 50.0,
+            "totally_unknown_future_field": "whatever",
+        },
+    )
+    assert r.status_code == 200

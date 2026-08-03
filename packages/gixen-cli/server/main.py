@@ -1762,6 +1762,19 @@ class AddBidRequest(BaseModel):
     # Optional and unvalidated here — U7 (a later wave) populates it from the
     # CLI and add-batch; an old client that omits it just gets a NULL source.
     source: str | None = None
+    # BUI-619 (U5): comic identity carried at add time — `{comic_id|locg_id,
+    # grade}` per entry — so pre-trade FMV-aware checks (U4) see it before
+    # the Gixen call, instead of only learning it from the post-add
+    # link-fmv call. List-capable for a future lot caller (KTD8); every
+    # caller today sends 0 or 1 entries. Optional with an empty-list
+    # default (Pydantic v2 deep-copies a bare mutable default per instance,
+    # so this needs no Field(default_factory=...)): an old CLI that omits
+    # this field is byte-identical to one that sends `comic_identities: []`
+    # — both land on PolicyIntent's own empty-list default, so nothing
+    # fires. Not validated further here — an inner dict missing grade/
+    # comic_id/locg_id degrades to "no link resolved" downstream (the
+    # overlay's on_bid_write_committed), never a 422 on the money path.
+    comic_identities: list[dict] = []
 
     @field_validator("item_id")
     @classmethod
@@ -2060,6 +2073,10 @@ async def api_add_bid(req: AddBidRequest):
                 snipe_group=req.snipe_group,
                 trigger="upsert" if existing is not None else "create",
                 prior_row=existing,
+                # BUI-619 (U5): POST-only — api_edit_bid's PolicyIntent below
+                # leaves this at PolicyIntent's own [] default; PATCH resolves
+                # identity from the bid's existing FMV links instead (U4).
+                comic_identities=req.comic_identities,
             )
             advisories, check_results = run_checks(db, intent, app.state.plugin_manager)
 

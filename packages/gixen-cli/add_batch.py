@@ -253,10 +253,27 @@ def build_bid_payload(
     seller: str | None = None,
     seller_grade: float | None = None,
     photo_grade: float | None = None,
+    comic_id: int | None = None,
+    locg_id: int | None = None,
+    grade: float | None = None,
 ) -> dict[str, Any]:
     """The POST /api/bids payload shape, shared by cli.py's single-item
     `add` command and `add_one_row` below so the two request paths cannot
-    silently drift on a future field addition to one and not the other."""
+    silently drift on a future field addition to one and not the other.
+
+    BUI-619 (U5): `comic_id`/`locg_id`/`grade` build the payload's
+    `comic_identities` list — `{comic_id|locg_id, grade}` entries, so the
+    server's pre-trade FMV checks (U4) see identity at add time instead of
+    only learning it from the post-add link-fmv call below, which STAYS
+    (old-server compatibility). `comic_id` wins if both identity forms are
+    given, mirroring cli.py's `add` --comic-id/--catalog-id precedence.
+    Always a list (empty when no identity was supplied) — never a bare
+    optional scalar — so a future lot caller (KTD8) can supply more than
+    one entry without a payload-shape change; every caller today sends 0 or
+    1. The server links via the overlay's `on_bid_write_committed` hookimpl
+    (`plugins/gixen-overlay/src/gixen_overlay/plugin.py`), which lands on
+    the same idempotent `link_fmv_to_bid` primary-replacement semantics as
+    the legacy link-fmv call, so the two never double-link."""
     payload: dict[str, Any] = {
         "item_id": item_id,
         "max_bid": float(max_bid),
@@ -269,6 +286,16 @@ def build_bid_payload(
         payload["seller_grade"] = seller_grade
     if photo_grade is not None:
         payload["photo_grade"] = photo_grade
+
+    identities: list[dict[str, Any]] = []
+    if grade is not None and (comic_id is not None or locg_id is not None):
+        identity: dict[str, Any] = {"grade": grade}
+        if comic_id is not None:
+            identity["comic_id"] = comic_id
+        else:
+            identity["locg_id"] = locg_id
+        identities.append(identity)
+    payload["comic_identities"] = identities
     return payload
 
 
@@ -320,6 +347,10 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
     payload = build_bid_payload(
         item_id, bid, offset, group,
         seller=seller, seller_grade=seller_grade, photo_grade=photo_grade,
+        # BUI-619 (U5): row schema only ever carries comic_id (cli.py's
+        # add-batch docstring: "--comic-id/--catalog-id ambiguity doesn't
+        # apply here: this row schema only has comic_id") — no locg_id kwarg.
+        comic_id=comic_id, grade=grade,
     )
 
     ok, resp, err = server_request("post", "/api/bids", json=payload)
