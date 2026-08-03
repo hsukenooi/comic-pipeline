@@ -2459,6 +2459,135 @@ def test_verify_resolves_newest_bid_not_oldest(api):
     assert row["verdict"] == "fully_linked", row
 
 
+# ---------------------------------------------------------------------------
+# on_bid_write_committed — comic identity carried in the add payload
+# (BUI-619/U5). These use the real `api` fixture (the real overlay plugin
+# registered via the production entry-point path), so they exercise the
+# hookimpl exactly as `POST /api/bids` invokes it, not a bare unit call.
+# ---------------------------------------------------------------------------
+
+
+def test_add_bid_with_payload_identity_links_without_explicit_link_call(api):
+    """The bids -> bid_fmvs -> fmv -> comics chain must be provably
+    populated for a book added with payload identity and NO explicit
+    link-fmv call — the on_bid_write_committed hookimpl alone must do it.
+    Stands in for a live /comic:verify run (not runnable from a test) by
+    driving the same GET/POST endpoints /comic:verify itself calls."""
+    comic_resp = api.post("/api/comics", json={
+        "title": "Daredevil", "issue": "1", "year": 1964,
+        "grade": 9.4, "fmv_low": 1200.0, "fmv_high": 1500.0,
+    })
+    assert comic_resp.status_code == 200
+    comic_id = comic_resp.json()["comic_id"]
+
+    r = api.post("/api/bids", json={
+        "item_id": "619200001", "max_bid": 1300.0,
+        "comic_identities": [{"comic_id": comic_id, "grade": 9.4}],
+    })
+    assert r.status_code == 200
+
+    verify = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "619200001", "grade": 9.4}],
+    })
+    assert verify.status_code == 200
+    row = verify.json()["results"][0]
+    assert row["verdict"] == "fully_linked", row
+    assert row["comic_id"] == comic_id
+    assert row["missing"] == []
+
+
+def test_add_bid_with_locg_id_identity_links_without_explicit_link_call(api):
+    """The catalog-id (locg_id) identity form must resolve + link too, not
+    just comic_id — and must not draw an unpriced advisory (U4 territory,
+    but the link itself is this unit's job)."""
+    comic_resp = api.post("/api/comics", json={
+        "title": "Fantastic Four", "issue": "1", "year": 1961,
+        "grade": 6.0, "fmv_low": 2000.0, "fmv_high": 3000.0,
+        "locg_id": 424242,
+    })
+    assert comic_resp.status_code == 200
+
+    r = api.post("/api/bids", json={
+        "item_id": "619200002", "max_bid": 2200.0,
+        "comic_identities": [{"locg_id": 424242, "grade": 6.0}],
+    })
+    assert r.status_code == 200
+
+    verify = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "619200002", "grade": 6.0}],
+    })
+    assert verify.status_code == 200
+    assert verify.json()["results"][0]["verdict"] == "fully_linked"
+
+
+def test_add_bid_no_identity_leaves_bid_unlinked(api):
+    """An add with no comic_identities entry must not spuriously create a
+    link out of nothing — the hookimpl is a no-op on an empty list."""
+    r = api.post("/api/bids", json={"item_id": "619200003", "max_bid": 50.0})
+    assert r.status_code == 200
+
+    verify = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "619200003", "grade": None}],
+    })
+    assert verify.status_code == 200
+    row = verify.json()["results"][0]
+    assert row["verdict"] != "fully_linked"
+
+
+def test_add_time_link_then_explicit_link_fmv_call_is_idempotent(api):
+    """Double-linking — the add-time hook link plus the CLI's legacy
+    post-add link-fmv call (kept for old-server compatibility) — must
+    converge on exactly one bid_fmvs junction row, never a duplicate or a
+    500 from the second call."""
+    comic_resp = api.post("/api/comics", json={
+        "title": "Iron Man", "issue": "1", "year": 1968,
+        "grade": 8.5, "fmv_low": 400.0, "fmv_high": 600.0,
+    })
+    comic_id = comic_resp.json()["comic_id"]
+
+    add_resp = api.post("/api/bids", json={
+        "item_id": "619200004", "max_bid": 450.0,
+        "comic_identities": [{"comic_id": comic_id, "grade": 8.5}],
+    })
+    assert add_resp.status_code == 200
+
+    link_resp = api.post(
+        "/api/bids/619200004/link-fmv", json={"comic_id": comic_id, "grade": 8.5},
+    )
+    assert link_resp.status_code == 200
+
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    junctions = raw.execute(
+        "SELECT bf.* FROM bid_fmvs bf JOIN bids b ON b.id=bf.bid_id WHERE b.item_id=?",
+        ("619200004",),
+    ).fetchall()
+    raw.close()
+    assert len(junctions) == 1
+    assert junctions[0]["is_primary"] == 1
+
+
+def test_add_bid_with_unresolvable_identity_still_commits(api):
+    """AE4 (U5 slice — the advisory half is U4/BUI-620, out of scope here):
+    identity supplied but resolution fails (no comic exists at that
+    comic_id/grade) → the snipe still commits, it's just left unlinked. A
+    resolution failure inside on_bid_write_committed must never turn into a
+    failed or delayed bid write (KTD1)."""
+    r = api.post("/api/bids", json={
+        "item_id": "619200005", "max_bid": 50.0,
+        "comic_identities": [{"comic_id": 999999, "grade": 9.9}],
+    })
+    assert r.status_code == 200
+    assert r.json()["created"] is True
+
+    verify = api.post("/api/comics/verify", json={
+        "items": [{"item_id": "619200005", "grade": 9.9}],
+    })
+    assert verify.status_code == 200
+    assert verify.json()["results"][0]["verdict"] != "fully_linked"
+
+
 def test_verify_no_bid(api):
     """item_id that never made it into the bids table."""
     r = api.post("/api/comics/verify", json={

@@ -348,14 +348,18 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
     "--catalog-id",
     type=int,
     default=None,
-    help="External LOCG catalog id (locg_id) for post-bid FMV linking. "
+    help="External LOCG catalog id (locg_id) for FMV linking (BUI-619: "
+         "carried in the add payload for pre-trade checks, plus the "
+         "existing post-bid link-fmv call for old-server compatibility). "
          "Use --comic-id if you have the internal comics.id from gixen-overlay.",
 )
 @click.option(
     "--comic-id",
     type=int,
     default=None,
-    help="Internal gixen-overlay comics.id for post-bid FMV linking. "
+    help="Internal gixen-overlay comics.id for FMV linking (BUI-619: "
+         "carried in the add payload for pre-trade checks, plus the "
+         "existing post-bid link-fmv call for old-server compatibility). "
          "Takes precedence over --catalog-id if both are given.",
 )
 @click.option("--grade", type=float, default=None, help="Numeric condition grade for post-bid FMV linking")
@@ -396,6 +400,9 @@ def add(
         payload = build_bid_payload(
             item_id, bid, offset, group,
             seller=seller, seller_grade=seller_grade, photo_grade=photo_grade,
+            # BUI-619 (U5): comic_id/catalog_id are already mutually exclusive
+            # by this point (the both-given branch above nulls out catalog_id).
+            comic_id=comic_id, locg_id=catalog_id, grade=grade,
         )
         resp = _server_request("post", "/api/bids", json=payload)
         # BUI-67: the server upserts. created=False means an existing live snipe
