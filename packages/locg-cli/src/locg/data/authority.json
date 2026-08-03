@@ -1,4 +1,35 @@
 {
     "version": 1,
-    "entries": []
+    "entries": [
+        {
+            "kind": "alias",
+            "names": ["Mighty Thor", "Thor"],
+            "evidence": "BUI-197",
+            "added": "2026-08-03"
+        },
+        {
+            "kind": "alias",
+            "names": ["Invincible Iron Man", "Iron Man"],
+            "evidence": "BUI-197",
+            "added": "2026-08-03"
+        },
+        {
+            "kind": "alias",
+            "names": ["Incredible Hulk", "Hulk"],
+            "evidence": "BUI-197",
+            "added": "2026-08-03"
+        },
+        {
+            "kind": "alias",
+            "names": ["Uncanny X-Men", "X-Men"],
+            "evidence": "BUI-197",
+            "added": "2026-08-03"
+        },
+        {
+            "kind": "alias",
+            "names": ["Dr. Strange", "Doctor Strange"],
+            "evidence": "BUI-546",
+            "added": "2026-08-03"
+        }
+    ]
 }

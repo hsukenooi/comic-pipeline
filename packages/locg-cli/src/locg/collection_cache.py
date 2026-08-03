@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, NamedTuple, Optional
 
+from locg import authority
 from locg._atomic import atomic_write, atomic_write_json
 from locg.config import collection_cache_path, import_history_path
 
@@ -429,8 +430,9 @@ def _normalize_series_key(series_name: str) -> str:
     "Dawnrunner" remain distinct keys.
 
     Every hardcoded normalized key in this module (:data:`_XMEN_SPLIT_KEYS`,
-    :data:`_MASTHEAD_ALIAS_PAIRS`) is derived by calling THIS function rather
-    than hand-written, so a future change here can never silently orphan them.
+    and — via :func:`locg.authority.build_alias_table` — :data:`_ALIAS_GROUPS`)
+    is derived by calling THIS function rather than hand-written, so a future
+    change here can never silently orphan them.
     """
     s = series_name.strip()
     s = _YEAR_RANGE_RE.sub("", s)
@@ -590,85 +592,38 @@ def _xmen_classic_split(issue_num: Optional[str], year: Any) -> Optional[str]:
 # ``In Collection=0`` and LOCG DELETES the owned copy (the BUI-200 26-deleted
 # incident; the masthead-alias variant of it is what BUI-197 closes).
 #
-# Each entry maps two series names that name the SAME run under different
-# mastheads. Entries are written in DISPLAY form and run through
-# :func:`_normalize_series_key` when :data:`_ALIAS_GROUPS` is built below, so
-# the table can never drift out of sync with the normalizer (BUI-546: folding
-# punctuation turned "x-men" into "x men", which would have silently emptied
-# this table of its X-Men pair had the keys stayed hand-normalized). The
-# relation is made SYMMETRIC and transitively closed below, so equivalence
-# holds regardless of which side the collection vs the query happens to hold.
+# BUI-653: the pairs themselves moved out of this module and into
+# ``data/authority.json`` as ``kind: "alias"`` entries — DISPLAY strings, each
+# carrying its originating ticket as ``evidence`` (Mighty Thor/Thor, Invincible
+# Iron Man/Iron Man, Incredible Hulk/Hulk, and Uncanny X-Men/X-Men are all
+# BUI-197; the BUI-546 "Dr." abbreviation is Dr. Strange/Doctor Strange). Adding
+# a sixth pair is now a reviewed PR to that JSON file, never a code change here.
+# :func:`authority.build_alias_table` runs each entry's names through
+# :func:`_normalize_series_key` (the normalizer THIS module injects, so the
+# derived keys can never drift out of sync with it the way a hand-normalized
+# table would — BUI-546's punctuation fold turning "x-men" into "x men" is
+# exactly the trap :mod:`locg.authority`'s derived-key discipline exists to
+# close) and closes them into the same symmetric, transitively-closed
+# equivalence groups this module used to build by hand (a↔b, a~b ∧ b~c ⇒ a~c),
+# so equivalence holds regardless of which side the collection vs the query
+# happens to hold.
 #
 # This is consulted by :func:`owned_match_keys` — the single source of
 # cross-series equivalence for collection-check, the conflicts audit, AND the
 # owned-safe export. It carries NO year, so it works in the no-year audit/export
 # (the old year-gated _SERIES_ALIASES fallback in commands.py was dead there).
 #
-# CAUTION (era collision): only add a pair when the dropped/added adjective names
-# the SAME run, never a distinct same-masthead reuse (e.g. the modern
-# "The Mighty Thor (Vol. 3)" 2015 is a different series from "Thor" Vol. 1 — but
-# they share the issue-number space only by coincidence; the alias makes them
-# *candidates*, and the per-issue (series, issue) match plus, on the buy path,
-# the year gate are what keep a genuinely-different era from matching). Extend
-# conservatively and verify the LOCG catalog spelling against the live
-# series-names endpoint before adding.
-_MASTHEAD_ALIAS_PAIRS: tuple[tuple[str, str], ...] = (
-    ("Mighty Thor", "Thor"),
-    ("Invincible Iron Man", "Iron Man"),
-    ("Incredible Hulk", "Hulk"),
-    ("Uncanny X-Men", "X-Men"),
-    # BUI-546: the "Dr." abbreviation. Folding punctuation alone only gets
-    # "Dr. Strange" as far as "dr strange", which still does not meet LOCG's
-    # canonical "Doctor Strange (Vol. 2) (1974 - 1986)" — the expansion is a
-    # NAMING equivalence, not a punctuation one, so it belongs in this
-    # auditable per-masthead table rather than as a blanket "dr" -> "doctor"
-    # rewrite in the normalizer (which would also rewrite unrelated names, and
-    # is unbounded: every abbreviation would want the same privilege).
-    # Scoped to the ONE masthead the live store showed as stuck; a subtitled
-    # sibling ("Dr. Strange, Sorcerer Supreme") is an exact-key relation and
-    # would need its own verified entry.
-    ("Dr. Strange", "Doctor Strange"),
-)
-
-
-def _build_alias_groups(
-    pairs: tuple[tuple[str, str], ...],
-) -> dict[str, frozenset[str]]:
-    """Close the alias pairs into symmetric, transitive equivalence groups.
-
-    Returns norm_key -> frozenset of all keys equivalent to it (including
-    itself). Symmetric (a↔b) and transitive (a~b, b~c ⇒ a~c) so the masthead
-    equivalence holds no matter which name the collection vs the query holds.
-    """
-    adj: dict[str, set[str]] = {}
-    for a, b in pairs:
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-    groups: dict[str, frozenset[str]] = {}
-    for node in adj:
-        if node in groups:
-            continue
-        # BFS over the symmetric adjacency to gather the full component.
-        seen: set[str] = set()
-        stack = [node]
-        while stack:
-            cur = stack.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            stack.extend(adj.get(cur, ()))
-        frozen = frozenset(seen)
-        for member in seen:
-            groups[member] = frozen
-    return groups
-
-
-_ALIAS_GROUPS: dict[str, frozenset[str]] = _build_alias_groups(
-    tuple(
-        (_normalize_series_key(a), _normalize_series_key(b))
-        for a, b in _MASTHEAD_ALIAS_PAIRS
-    )
-)
+# CAUTION (era collision) for anyone adding a new ``alias`` entry: only pair
+# names that name the SAME run, never a distinct same-masthead reuse (e.g. the
+# modern "The Mighty Thor (Vol. 3)" 2015 is a different series from "Thor" Vol.
+# 1 — but they share the issue-number space only by coincidence; the alias
+# makes them *candidates*, and the per-issue (series, issue) match plus, on the
+# buy path, the year gate are what keep a genuinely-different era from
+# matching). Extend conservatively and verify the LOCG catalog spelling against
+# the live series-names endpoint before adding.
+_ALIAS_GROUPS: dict[str, frozenset[str]] = authority.build_alias_table(
+    _normalize_series_key
+).groups
 
 # An "Annual" (or "Annuals") qualifier sits between the base series and the issue
 # token in the full_title ("X-Men Annual #9" -> series portion "X-Men Annual"),
@@ -722,7 +677,8 @@ def owned_match_keys(series: str, issue_num: Optional[str]) -> frozenset[str]:
     * **The classic X-Men issue-number split** (BUI-199/BUI-200): ``x men``
       (LOCG ``The X-Men``) holds #1–141, ``uncanny x men`` holds #142+. So a wish
       ``Uncanny X-Men #107`` (≤141) also matches an owned ``The X-Men #107``.
-    * **Masthead aliases** (BUI-197, :data:`_MASTHEAD_ALIAS_PAIRS`): symmetric
+    * **Masthead aliases** (BUI-197, ``alias`` entries in
+      ``data/authority.json`` — see :mod:`locg.authority`): symmetric
       adjective-dropping equivalences (``incredible hulk``↔``hulk``,
       ``mighty thor``↔``thor``, ``invincible iron man``↔``iron man``,
       ``uncanny x men``↔``x men``) covering the variants the issue-number split
@@ -809,7 +765,7 @@ def resolve_series_for_win(
 
     * **Masthead-alias candidate expansion** — the candidate gather now unions
       every alias-equivalent key (:func:`_alias_keys_for` /
-      :data:`_MASTHEAD_ALIAS_PAIRS`), so a ``"mighty thor"`` win also sees the
+      :data:`_ALIAS_GROUPS`), so a ``"mighty thor"`` win also sees the
       ``"thor"``-keyed Vol. 1, an ``"incredible hulk"`` win sees ``"hulk"``,
       etc. Without this a masthead-drifted win could never even reach its true
       volume as a candidate. Expansion is applied ONLY here, AFTER the X-Men
