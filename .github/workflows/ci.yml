@@ -112,6 +112,18 @@ jobs:
   # passes the pack run trivially, so the self-test is what makes a green pack
   # mean something. The runner is a PEP 723 script — uv provisions its own deps,
   # no `uv sync` needed.
+  #
+  # BUI-632: scripts/premise-check (BUI-613) rides in this same job rather
+  # than getting a job of its own or being registered as a solutions-lint
+  # pack entry. It's a standalone stdlib-only tool with its own `--selftest`
+  # mode (no uv sync, no fixture-tree contract to satisfy — the pack's
+  # `check(root) -> list[Finding]` + doc-with-`lint:`-frontmatter contract is
+  # built for docs/solutions checks, not for a ticket-preflight tool with its
+  # own extraction+classification unit tests), so a plain CI step is the
+  # smaller, truthful wiring. `--selftest` now covers CLASSIFICATION
+  # (CONFIRMED/ABSENT/NEAR_MISS), not just extraction — a mutation that
+  # disables its near-miss detector (the `renamed-near-miss` verdict BUI-630
+  # relies on) previously left `--selftest` exiting 0 silently; it now fails.
   solutions-lint:
     runs-on: ubuntu-latest
     steps:
@@ -127,6 +139,9 @@ jobs:
 
       - name: Lint — docs/solutions mechanization contract
         run: ./scripts/solutions-lint
+
+      - name: Self-test — premise-check extraction + classification (BUI-632)
+        run: ./scripts/premise-check --selftest
 
   # BUI-188: non-strict mypy type check on the two most None-juggling files.
   # The workspace must be synced first so gixen_overlay imports resolve.
