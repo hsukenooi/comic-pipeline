@@ -1658,12 +1658,28 @@ def _build_snipe_watchdog_report(
     ).fetchall()
 
     alerts: list[dict] = []
-    counts = {"ok": 0, "unknown_end": 0, "vanished_before_end": 0, "missing_outcome": 0}
+    # BUI-627 seeds `stale_unknown_end` here rather than letting the
+    # setdefault below conjure it, because a counter that only APPEARS once it
+    # is non-zero cannot distinguish "checked, found none" from "this build
+    # doesn't have the check" — absence-as-zero is the same fails-green shape
+    # BUI-602's heartbeat_report avoids by iterating its contract instead of
+    # its stored rows. The ticket's own evidence was read this way (`curl
+    # /api/snipe-watchdog | jq .counts` reporting `unknown_end: 0`), so the key
+    # has to be there when the answer is zero. Touching this line is safe: it
+    # is a counter in the read-only report, nowhere near the eBay WON-inference
+    # the zero-modification bar exists to protect.
+    counts = {
+        "ok": 0,
+        "unknown_end": 0,
+        "vanished_before_end": 0,
+        "missing_outcome": 0,
+        "stale_unknown_end": 0,
+    }
     for row in rows:
         bucket, alert = _classify_watchdog_row(row, now_dt, uptime_floor_dt)
-        # BUI-627: stale_unknown_end is a bucket _classify_watchdog_row can
-        # return that isn't seeded in the counts literal above — setdefault
-        # instead of adding a key there so that line stays untouched.
+        # Kept as a guard for any FUTURE bucket added to _classify_watchdog_row
+        # without a matching seed above — a KeyError here would take down the
+        # whole report over a counter.
         counts.setdefault(bucket, 0)
         counts[bucket] += 1
         if alert is not None:

@@ -452,6 +452,29 @@ def test_a_fresh_null_end_row_is_quiet_end_to_end(db):
     assert report["counts"]["unknown_end"] == 1
     assert report["alerts"] == []
     assert report["healthy"] is True
+    # Present-and-zero, not absent (BUI-627): an operator reading
+    # `jq .counts` after deploy has to be able to tell "the check ran and
+    # found nothing" from "this build predates the check".
+    assert report["counts"]["stale_unknown_end"] == 0
+
+
+def test_every_bucket_is_counted_even_on_an_empty_store(db):
+    """The counter is self-describing on a healthy server.
+
+    A watchdog that only names a failure mode once it fires teaches its reader
+    that a missing key means nothing is wrong — which is indistinguishable
+    from a missing key meaning the check was never deployed. Pinned so the
+    seeded set cannot silently shrink back to four.
+    """
+    report = _report(db)
+    assert set(report["counts"]) == {
+        "ok",
+        "unknown_end",
+        "vanished_before_end",
+        "missing_outcome",
+        "stale_unknown_end",
+    }
+    assert set(report["counts"].values()) == {0}
 
 
 # --------------------------------------------------------------------------
