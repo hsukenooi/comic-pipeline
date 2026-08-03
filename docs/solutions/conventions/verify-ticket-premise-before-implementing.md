@@ -631,6 +631,62 @@ the entire difference between "no bid" and a **$3825** bid cap on X-Men #94 @9.2
 BUI-598. **When a pool contains junk, rank the junk by whether it can reach the price, not by
 how obviously wrong it looks.**
 
+## The eighth failure mode: the premise understates the problem, and the literal fix manufactures the false confidence the ticket exists to remove
+
+Modes 1–5 concern premises that are false. This one is about a premise that is *directionally
+right and materially understated* — the most dangerous shape, because implementing it as
+written closes the ticket, passes review, and leaves the hazard in place wearing a green badge.
+
+### Example 20 — "it has no tests" was drifted; it had a test that tested nothing (BUI-632)
+
+BUI-632 read: `scripts/premise-check` **has no tests and no CI job**, so wire it into CI.
+
+Half of that was already false — the tool shipped with a `--selftest` that exited 0. The
+gap was the *other* half, and it was worse than the ticket described: **the self-test was
+vacuous on the path that mattered.** Injecting a hard `raise` immediately before the
+near-miss detector left `--selftest` still exiting 0. Every check covered *extraction*
+(parsing ticket prose); none covered *classification* — the `confirmed`/`drifted`/`absent`/
+`renamed-near-miss` verdicts where the tool's own design principle lives.
+
+So the literal instruction — add a CI step that runs `--selftest` — would have shipped a
+**green check over an untested detector**, and specifically over `renamed-near-miss`, the
+verdict BUI-630 cites as load-bearing. It would also have failed BUI-632's own acceptance
+criterion (*"a deliberate break in its detection logic fails a build"*) while appearing to
+satisfy it.
+
+**The tell:** the ticket asserted an absence (*"no tests"*). Absence claims are cheap to
+check and are wrong in both directions — sometimes the thing exists (BUI-630 item 2 below),
+and sometimes it exists but does not work. Neither is visible without running it.
+
+### The two supporting cases from the same batch (2026-08-03)
+
+| ticket | premise | reality |
+|---|---|---|
+| BUI-630 item 2 | "Five `apps/ebay` console scripts have no `--version`" | **Fully falsified.** All five already had it, wired to `_version_string()`, shipped by BUI-314. Item dropped, no code written. |
+| BUI-631 pt 2 | "Add `solutions-lint` to branch protection's required checks" | **No branch protection and no rulesets existed at all.** Nothing was required — including the four checks this repo's own `CLAUDE.md` documented as gates. The required/non-required distinction was pure convention. |
+| BUI-626 | "Adjudicate ids 330 and 335" | Scanning for the signature found **4** rows, not 2 (332 and 334 identical). The ticket's own acceptance was *zero rows remaining*, so shipping its literal scope would have failed it. |
+
+Three of eight tickets in one batch carried a falsified or drifted premise, each caught by a
+single grep run *before* spawning any work.
+
+### The counter-lesson: the checker is not exempt
+
+The same batch's EM asserted in a spawn prompt that a particular line was *"the ONLY
+near-miss call site"*. True of `difflib.SequenceMatcher` — and false of the tool, which has a
+second, independent near-miss mechanism (IDF-weighted segment Jaccard) in `verify_endpoint`.
+That second path is the one that actually produces the canonical `/api/health` → `/health`
+catch, so the motivating example was still uncovered after the first fix.
+
+It was caught only because the subagent reported an out-of-scope finding rather than closing
+silently. **A premise check performed once, on one call site, and then generalized, is itself
+an unverified premise.** Grep for the *behavior* (`renamed-near-miss`, the verdict) rather
+than for the *implementation* (`SequenceMatcher`, one way of producing it).
+
+Note that `scripts/premise-check` (BUI-613) exists to automate exactly this class, and as of
+BUI-632 it has CI coverage — but it reports on a ticket's *named symbols and paths*. It cannot
+tell you that a self-test which exists is vacuous, or that a documented gate list is fiction.
+Those still need a human to run the thing.
+
 ## Why This Matters
 
 - **A dead ticket's parting recommendation is an unmeasured hypothesis, and this document is
