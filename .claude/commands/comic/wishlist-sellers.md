@@ -146,6 +146,18 @@ When run as a skill on a schedule, check the exit code: on **3**, tell the user 
 
 When run as a skill, present the per-seller blocks clearly so the user can decide which seller to pursue for a combined purchase. Note the ending times so they can prioritize sellers whose auctions close soonest.
 
+## Final step: record the heartbeat (BUI-624) — only on exit 0
+
+**Run this only if `wishlist-sellers` exited `0`.** On exit **3** (partial) or exit **1** (verifier down), skip it entirely and say so in your report.
+
+```bash
+comics-api POST /api/heartbeat/wishlist-sellers
+```
+
+Why the guard is the whole point: this scan is unattended and its clean result is *silence*, so a run that stops happening looks exactly like a run that found nothing. The heartbeat is what tells those apart — but only if it means what it says. On exit 3 the un-verified books are precisely the ones that would silently stop surfacing, so pinging there would certify the failure mode as health. A zero-seller run that exited 0 **does** ping: "ran and found nothing" is a success, and distinguishing it from "did not run" is this heartbeat's entire job.
+
+If `comics-api` itself fails here, the scan still succeeded — report the ping failure plainly (the watchdog at `comics-api GET /api/comics/health/heartbeats` will show `wishlist-sellers` going stale) and do not re-run the scan on account of it. Contract: `docs/reference/job-heartbeat-contract.md`.
+
 ## Scheduling and recurring runs
 
 `/comic:wishlist-sellers` is designed to run on a **recurring schedule** — daily or weekly — and notify you when new multi-match sellers are found, or when a run is partial (exit 3 — some candidates never verified; see the exit-code table above). A clean empty result (exit 0, no sellers) is silent (three cache layers make steady-state runs near-free — search cache, verdict cache, seen-item filter). For setup instructions (`/schedule` cloud agent vs local cron) and the cache-cost breakdown, see `docs/reference/wishlist-sellers-scheduling.md`.

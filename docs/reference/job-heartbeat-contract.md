@@ -25,10 +25,11 @@ a ping is the alarm.
 
 | job | cadence | stale after | success means | wired? |
 | --- | --- | --- | --- | --- |
-| `gixen-sync` | 1h | 2h | One completed pass of the comics server's background Gixen snipe-sync loop (`server.main._sync_gixen`) that reached its write phase without raising. `GIXEN_SYNC_INTERVAL` defaults to 600s, so a healthy server pings ~6×/hour; the 1h cadence tolerates the documented flapping/backoff (BUI-562) without alarming. | no |
-| `wishlist-sellers` | 168h | 336h | A `/comic:wishlist-sellers` run that exited 0. Exit 3 (partial — some candidates never verified) must **not** ping: the un-verified books are exactly the ones that would silently stop surfacing. Zero matching sellers on a clean run **is** a success. | no |
-| `collection-sync` | 336h | 672h | A `/comic:collection-sync` round-trip that completed its Step 6 re-import and post-import safety check. An aborted sync (the `Deleted from Collection.` probe tripping, the BUI-122 guard) must **not** ping — an abort is the sync working correctly but *not* having synced. | no |
-| `fmv-refresh` | 168h | 336h | A `comic-fmv` batch that fetched sold comps **and persisted them**. BUI-593 is precisely a run where the fetch succeeded and the write 422'd, so "`comic-fmv` exited 0" alone is not the success definition; the upsert must have been accepted. | no |
+| `gixen-sync` | 1h | 2h | One completed pass of the comics server's background Gixen snipe-sync loop (`server.main._sync_gixen`) that reached its write phase without raising. `GIXEN_SYNC_INTERVAL` defaults to 600s, so a healthy server pings ~6×/hour; the 1h cadence tolerates the documented flapping/backoff (BUI-562) without alarming. | yes |
+| `wishlist-sellers` | 168h | 336h | A `/comic:wishlist-sellers` run that exited 0. Exit 3 (partial — some candidates never verified) must **not** ping: the un-verified books are exactly the ones that would silently stop surfacing. Zero matching sellers on a clean run **is** a success. | yes |
+| `collection-sync` | 336h | 672h | A `/comic:collection-sync` round-trip that completed its Step 5 re-import and its Step 6 post-import safety check. An aborted sync (the `Deleted from Collection.` probe tripping, the BUI-122 guard) must **not** ping — an abort is the sync working correctly but *not* having synced. | yes |
+| `fmv-refresh` | 168h | 336h | A `comic-fmv` batch that fetched sold comps **and persisted them**. BUI-593 is precisely a run where the fetch succeeded and the write 422'd, so "`comic-fmv` exited 0" alone is not the success definition; the upsert must have been accepted. | yes |
+| `sentinel-probe` | 168h | 336h | A `comic-fmv --sentinel-probe` run (BUI-603) where every sentinel book **and** the negative control passed — exit 0. Stricter than the rest on purpose: exit 1 means the probe ran and found the comp pipeline miscalibrated, which already alarms via its own exit code. Exit 2 (could not complete) does not ping either. | yes |
 
 Cadences are sized to the **slowest normal run**, not the average, and a job is
 only flagged once it is `HEARTBEAT_STALE_FACTOR` (2×) cadences late. A watchdog
@@ -66,29 +67,63 @@ A job with no heartbeat row is never reported as healthy. It reports:
 
 The report's top-level `healthy` means *every job in the contract is verified
 to be running*, so an uninstrumented job makes it `false` exactly as a stale one
-does. **Today that means `healthy` is `false`, by design** — nothing pings yet,
-and a version that counted only wired jobs would hand an external monitor a
-green light for a system observing almost nothing. A consumer wanting the
-narrower question ("is anything I *am* watching broken?") reads `stale_jobs` and
-`never_seen_jobs` directly.
+does. Before BUI-624 that meant `healthy` was permanently `false`: nothing
+pinged, and a version that counted only wired jobs would have handed an external
+monitor a green light for a system observing almost nothing. All five are wired
+now, so `healthy: true` is finally reachable — and still means what it said. A
+consumer wanting the narrower question ("is anything I *am* watching broken?")
+reads `stale_jobs` and `never_seen_jobs` directly.
 
-## Wiring the four jobs
+## Where the five jobs ping (BUI-624)
 
-None of the four ping yet — every row above says `wired: no`, and the endpoint
-reports them as `pending_instrumentation` rather than pretending they are fine.
+Four of the five ping over HTTP. `gixen-sync` cannot, and the exception is
+instructive rather than incidental.
 
-- **`gixen-sync`** — the ping belongs in `server.main._sync_gixen` after its
-  write phase commits. That file is owned by `packages/gixen-cli`, which
-  BUI-601/602 was scoped not to modify.
-- **`wishlist-sellers`** — add to `.claude/commands/comic/wishlist-sellers.md`
-  as a final step, guarded on exit 0 (see that skill's exit-code table; exit 3
-  must not ping).
-- **`collection-sync`** — add to `.claude/commands/comic/collection-sync.md`
-  after the Step 6 re-import reconciles and the post-import safety check
-  passes.
-- **`fmv-refresh`** — add to `apps/fmv`'s runner after the `/api/comics` upsert
-  returns 2xx. Pair it with the BUI-601 ledger: the heartbeat says the refresh
-  ran, the ledger says what it failed to store.
+- **`gixen-sync`** — `server.main._sync_gixen`, as the **last statement inside**
+  its apply-phase `write_transaction()`. `packages/gixen-cli` cannot import the
+  overlay (the dependency runs overlay → gixen-cli, never back), so the ping
+  leaves the host through a pluggy hookspec, `on_sync_observed(conn,
+  snipe_count)`, which `gixen_overlay.plugin` implements with
+  `record_heartbeat`. Two alternatives were rejected: an HTTP self-call (the
+  server would need its own bind URL, and a blocking POST from the event loop
+  to itself deadlocks under single-worker uvicorn) and a direct write to the
+  `heartbeats` table (gixen-cli would encode a plugin-owned schema, inverting
+  the one import direction the plugin system protects).
+
+  Firing *inside* the transaction rather than after it is the load-bearing
+  part. `_sync_gixen` carries an explicit invariant — nothing after the commit
+  may raise, because a raise there converts a healthy cycle into a `_sync_loop`
+  backoff or an `api_sync` 500 — and a heartbeat ping is I/O. Putting the write
+  in the transaction removes the post-commit I/O entirely, and binds the
+  heartbeat to the fate of the cycle's own writes: a cycle that wrote and then
+  rolled back takes its heartbeat with it. `_invoke_sync_observed` additionally
+  brackets the hook call in a SQLite savepoint, so a raising plugin rolls back
+  alone and the sync's DML survives.
+
+  One caveat, pinned by `test_savepoint_is_outermost_when_the_caller_wrote_nothing`:
+  a savepoint taken with no DML pending is the *outermost* one, and its
+  `RELEASE` commits. On a cycle that changed nothing there is nothing for the
+  heartbeat to contradict, so this is harmless — but it is why the hook call
+  must stay the **last** statement inside that transaction.
+- **`wishlist-sellers`** — `.claude/commands/comic/wishlist-sellers.md`, final
+  step, guarded on exit 0 (exit 3 partial and exit 1 verifier-down both skip).
+- **`collection-sync`** — `.claude/commands/comic/collection-sync.md`, Step 6b,
+  after every Step 6 hard-stop assertion passes. Any abort — the Step 3
+  `Deleted from Collection.` probe above all — skips it.
+- **`fmv-refresh`** — `apps/fmv/src/fmv_runner.py`'s `run()`, once per batch,
+  gated on at least one `/api/comics` upsert having returned 2xx (a persisted
+  row carries a non-null `fmv_id`). A batch that fetch-erred, was 422'd, or came
+  entirely from the DB cache refreshed nothing and stays silent. Pairs with the
+  BUI-601 ledger: the heartbeat says the refresh ran, the ledger says what it
+  failed to store.
+- **`sentinel-probe`** — `apps/fmv/src/sentinel_probe.py`'s `_ping_heartbeat`,
+  on the all-pass branch only. Best-effort: a failed ping never changes the
+  probe's exit code, which is the primary alert surface. It needs a schedule to
+  be worth anything — see `docs/reference/sentinel-probe-scheduling.md`.
+
+Every ping is **advisory to its caller**: none of the five may fail, block, or
+alter the job it reports on. A watchdog that can break the work it watches has
+bought nothing.
 
 ## The outer layer — NOT WIRED
 
@@ -111,12 +146,20 @@ needs a check that lives *outside* this machine and alarms on silence:
    ```
 
 3. Flip `HEARTBEAT_OUTER_PING_STATE` in `db.py` to `"wired"` and update this
-   section.
+   section — **in the same change that creates the check, never ahead of it.**
 
 Wire the jobs **before** the outer ping, or in the same change. `healthy` is
 `false` while anything is `pending_instrumentation`, so an outer check added
 first would alarm continuously — and a monitor you have muted is another
 fails-green instance.
+
+**That ordering constraint is now satisfied.** BUI-624 wired all five jobs, so
+`healthy: true` is reachable and step 2's one-liner will sit green on a healthy
+day instead of alarming forever. Creating the external check is the only thing
+left, and it is an ops action rather than a code change — which is exactly why
+BUI-624 left `HEARTBEAT_OUTER_PING_STATE` at `"unwired"`. The flag describes the
+deployed world, not this repo's intentions; setting it for a monitor nobody has
+created would be the same lie as a job marked `wired` that never pings.
 
 Until then the endpoint declares the gap in its own response
 (`"outer_ping": "unwired"`) and the dashboard prints it under the heartbeat

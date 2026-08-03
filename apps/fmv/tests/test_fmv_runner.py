@@ -3107,6 +3107,127 @@ class TestCgcProxyNotesAndTable:
         assert "envelope_clamped" not in notes
         assert "CGC proxy" in notes  # unaffected: existing token still present
 
+
+class TestFmvRefreshHeartbeat:
+    """BUI-624: the `fmv-refresh` heartbeat (contract: BUI-602).
+
+    The success definition is deliberately NOT "comic-fmv exited 0" — BUI-593
+    is exactly a run that exited 0 while the write 422'd and the book was
+    stored nowhere. So the ping is gated on a PERSISTED row: at least one
+    `/api/comics` upsert that came back carrying an fmv_id.
+
+    Both directions are pinned, because the two failures cost differently.
+    Pinging when nothing persisted certifies the BUI-593 shape as health — the
+    expensive, silent error. Failing to ping when something did persist makes a
+    working pipeline look dead — loud, and cheap to fix.
+    """
+
+    def _batch(self):
+        return [
+            {"item_id": "1", "title": "Lot", "issue": "1", "year": 1990,
+             "grade": 9.0},
+            {"item_id": "2", "title": "Solo", "issue": "1", "year": 1990,
+             "grade": 9.0},
+        ]
+
+    def _results(self):
+        comps = [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]]
+        return [
+            {"input": {"_req_id": i, "title": title, "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": str(i + 1)},
+             "comps": comps,
+             "queries_used": [{"tier": "base", "cached": False}]}
+            for i, title in enumerate(["Lot", "Solo"])
+        ]
+
+    def _run(self, tmp_path, server_url, results, upsert):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+        with patch("fmv_runner._fetch_comps", return_value=results), \
+             patch("fmv_runner._upsert_fmv", side_effect=upsert), \
+             patch("fmv_runner.requests.post") as post:
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        return post
+
+    @staticmethod
+    def _ok_upsert(server_url, inp, fmv, hard_fail=True):
+        return {"comic_id": 99, "fmv_id": 5}
+
+    @staticmethod
+    def _all_rejected(server_url, inp, fmv, hard_fail=True):
+        raise fmv_runner._UpsertRejected("multi-issue lot listing")
+
+    def test_persisted_batch_pings_once(self, tmp_path, server_url):
+        post = self._run(tmp_path, server_url, self._results(), self._ok_upsert)
+
+        assert post.call_count == 1, "one ping per BATCH, never one per book"
+        assert post.call_args[0][0] == f"{server_url}/api/heartbeat/fmv-refresh"
+        assert "2" in post.call_args.kwargs["params"]["detail"]
+
+    def test_all_writes_rejected_does_not_ping(self, tmp_path, server_url):
+        """The BUI-593 shape itself: every fetch succeeded, every write 422'd,
+        every book stored nowhere — and `comic-fmv` still exits 0. Silence is
+        mandatory here, or the heartbeat certifies the very failure it exists
+        to expose."""
+        post = self._run(tmp_path, server_url, self._results(),
+                         self._all_rejected)
+
+        assert post.call_count == 0
+
+    def test_fetch_errors_do_not_ping(self, tmp_path, server_url):
+        """A book whose fetch raised bails before the upsert (BUI-565), so it
+        persists nothing and contributes nothing to the heartbeat."""
+        results = self._results()
+        for r in results:
+            r["comps"] = []
+            r["error"] = "provider timeout"
+
+        post = self._run(tmp_path, server_url, results, self._ok_upsert)
+
+        assert post.call_count == 0
+
+    def test_one_survivor_is_enough_to_ping(self, tmp_path, server_url):
+        """The refresh DID run and DID store something. A partially-rejected
+        batch reports its skips loudly on stderr; the heartbeat answers the
+        narrower question "is this pipeline alive at all", and it is."""
+        def upsert(server_url_, inp, fmv, hard_fail=True):
+            if inp.get("title") == "Lot":
+                raise fmv_runner._UpsertRejected("multi-issue lot listing")
+            return {"comic_id": 99, "fmv_id": 5}
+
+        post = self._run(tmp_path, server_url, self._results(), upsert)
+
+        assert post.call_count == 1
+        assert "1" in post.call_args.kwargs["params"]["detail"]
+
+    def test_nothing_persisted_is_silence_not_a_zero_ping(self, server_url):
+        with patch("fmv_runner.requests.post") as post:
+            fmv_runner._ping_fmv_heartbeat(server_url, persisted=0)
+        post.assert_not_called()
+
+    def test_a_failed_ping_never_fails_the_run(self, server_url, capsys):
+        """The heartbeat is a backstop under comic-fmv's reporting, not a gate
+        in front of it. A watchdog able to fail a real FMV batch would cost
+        more than the silence it exists to break."""
+        with patch("fmv_runner.requests.post",
+                   side_effect=fmv_runner.requests.ConnectionError("down")):
+            fmv_runner._ping_fmv_heartbeat(server_url, persisted=3)
+
+        assert "heartbeat ping failed" in capsys.readouterr().err
+
+    def test_a_non_2xx_ping_is_reported_not_swallowed(self, server_url, capsys):
+        """A 404 (job missing from a stale server's JOB_CONTRACTS) must surface
+        — otherwise the operator sees a green run and a watchdog going stale
+        with nothing connecting the two."""
+        resp = MagicMock()
+        resp.raise_for_status.side_effect = fmv_runner.requests.HTTPError("404")
+        with patch("fmv_runner.requests.post", return_value=resp):
+            fmv_runner._ping_fmv_heartbeat(server_url, persisted=1)
+
+        assert "heartbeat ping failed" in capsys.readouterr().err
+
     def test_cached_proxy_row_recovers_marker_and_caps_bid(self):
         # A persisted proxy row: fmv_confidence collapses to "low", notes carry
         # the "CGC proxy" token. On reuse the factor must be re-capped at the

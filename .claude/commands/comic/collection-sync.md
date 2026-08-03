@@ -493,6 +493,28 @@ comics-api POST /api/comics/collection/restore \
 **If any assertion fails**, report the discrepancy and the backup path; do not
 proceed.
 
+### Step 6b: Record the heartbeat (BUI-624)
+
+**Only once every hard-stop assertion above has passed.** If you aborted
+anywhere earlier — the Step 3 `Deleted from Collection.` probe tripping (the
+BUI-122 guard), a Step 5 import failure, or any Step 6 assertion — skip this
+and say so in the Step 7 report.
+
+```bash
+comics-api POST /api/heartbeat/collection-sync
+```
+
+An abort is the sync *working correctly and not having synced*, which is
+exactly the state this heartbeat has to keep visible: the signal being watched
+for is "I have not synced in a month and wins are piling up unpushed", and a
+ping from an aborted run would hide precisely that. The advisory counters
+(`owned_duplicate_identities_cross_edition`, `identity_collisions`) never block
+a sync, so they never block the ping either.
+
+A failed ping does **not** undo the sync — report it and move on; the watchdog
+(`comics-api GET /api/comics/health/heartbeats`) will show `collection-sync`
+going stale. Contract: `docs/reference/job-heartbeat-contract.md`.
+
 ## Step 7: Report
 
 ```
