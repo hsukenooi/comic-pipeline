@@ -360,6 +360,38 @@ def test_snipe_add_documents_blocked_status_and_remediation():
     )
 
 
+def test_snipe_add_documents_updated_status():
+    """BUI-666: `add-batch` emits STATUS_UPDATED ("🔄 Updated",
+    packages/gixen-cli/cli.py) whenever an add upserts an item that already had
+    a PENDING snipe, but snipe-add.md's Output status-values line enumerated
+    only Added/Failed/Blocked/Skipped/Not attempted. The doc contradicted
+    itself — its block-retry step already told the operator to confirm
+    `✅ Added`/`🔄 Updated`.
+
+    The assertion is scoped to the "Status values:" LINE, not to the document,
+    on purpose: `🔄 Updated` already appeared elsewhere in the body before this
+    fix, so a whole-document membership check would have passed against the
+    very drift it claims to catch (see
+    docs/solutions/best-practices/mutation-test-each-check-against-the-break-it-claims-to-catch.md).
+    """
+    doc = (SKILLS_DIR / "snipe-add.md").read_text()
+    status_lines = [ln for ln in doc.splitlines() if ln.startswith("Status values:")]
+    assert len(status_lines) == 1, (
+        f"expected exactly one 'Status values:' line in snipe-add.md, found "
+        f"{len(status_lines)} — this test's anchor has drifted"
+    )
+    assert "🔄 Updated" in status_lines[0], (
+        "snipe-add.md's Output status-values line omits 🔄 Updated, a status "
+        "`gixen add-batch` can print (STATUS_UPDATED)"
+    )
+    # The one thing this gap could mislead an operator about: `updated` is a
+    # success. It must not read as a partial failure needing remediation.
+    assert "🔄 Updated` is a **success**" in doc, (
+        "snipe-add.md must state that 🔄 Updated is a success — an upsert of an "
+        "existing PENDING snipe, not a row needing remediation"
+    )
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the

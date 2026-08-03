@@ -231,9 +231,12 @@ gixen list
 | 2 | Invincible #1 | 987654321 | $256 | ❌ Failed (server 503 — not added) |
 | 3 | Batman #608 | 555555555 | — | ⏭️ Skipped (BIN) |
 | 4 | X-Men #1 | 444444444 | $2500 | 🚫 Blocked (Blocked by policy check(s): over_fmv. — not added) |
+| 5 | Daredevil #181 | 333333333 | $140 | 🔄 Updated |
 ```
 
-Status values: `✅ Added`, `❌ Failed (<reason> — not added)`, `🚫 Blocked (<reason> — not added)` (a policy check's `POLICY_BLOCK_<CODE>` flag is on — see § Handling Policy Advisories), `⏭️ Skipped (BIN)`, and `⏸️ Not attempted` for items after a batch-halting failure. End with an added/failed/blocked/remaining count.
+Status values: `✅ Added`, `🔄 Updated`, `❌ Failed (<reason> — not added)`, `🚫 Blocked (<reason> — not added)` (a policy check's `POLICY_BLOCK_<CODE>` flag is on — see § Handling Policy Advisories), `⏭️ Skipped (BIN)`, and `⏸️ Not attempted` for items after a batch-halting failure. End with an added/updated/failed/blocked/remaining count.
+
+`🔄 Updated` is a **success**, not a partial one: the add landed on an item that already had a PENDING snipe, so `POST /api/bids` upserted the existing row instead of creating a new one (`created: false`, BUI-67). It counts toward the batch's success total exactly as `✅ Added` does — it never contributes to the non-zero exit code, and like `✅ Added` it is one of the only two statuses the `--verify` pass runs against. Treat a run of `🔄 Updated` rows as a clean re-add of snipes you already had, not as something to remediate. The full row-status contract is `docs/solutions/conventions/add-batch-row-status-contract.md`.
 
 ## Handling Policy Advisories (BUI-621)
 
