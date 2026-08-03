@@ -124,6 +124,10 @@ def test_empty_store_reports_corpus_empty_not_clean(tmp_path):
     assert result["corpus_empty"] is True
     assert result["owned_rows_affected"] == []
     assert result["cross_volume_ambiguities"] == []
+    # BUI-671: R11 must survive whatever shape the diff takes — an empty
+    # corpus is empty under EITHER closure, never "newly created" noise.
+    assert result["cross_volume_ambiguities_newly_created"] == []
+    assert result["cross_volume_ambiguities_already_present"] == []
 
 
 def test_non_empty_store_with_no_matching_rows_is_not_corpus_empty(tmp_path):
@@ -300,3 +304,242 @@ def test_wish_list_only_rows_are_not_owned_rows_affected(tmp_path):
         kind="alias", name_a="Uncanny X-Men", name_b="X-Men", cache=cache
     )
     assert result["owned_rows_affected"] == []
+
+
+# ---------------------------------------------------------------------------
+# BUI-671: newly-created vs. already-present ambiguity attribution. The
+# ticket's own premise — the X-Men #118 pair collides via the bare
+# normalizer alone, so a strict before/after diff would report NOTHING for
+# the pair the ticket names as its acceptance example — is asserted first,
+# directly against the fixture already used above (BUI-654's worked
+# example).
+# ---------------------------------------------------------------------------
+
+
+def test_x118_ambiguity_is_already_present_not_newly_created(tmp_path):
+    """BUI-654's own worked example, re-asserted for BUI-671's split: the pair
+    is equivalent under bare `_normalize_series_key` alone (also — as it
+    happens — already joined by the SHIPPED `Uncanny X-Men`/`X-Men` alias
+    entry itself), so it must report as already-present, never as something
+    this (redundant) candidate newly creates."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(
+            publisher="Marvel Comics", series="The X-Men (Vol. 1) (1963 - 1981)",
+            full_title="The X-Men #118", release_date="1978-11-14",
+        ),
+        _row(
+            publisher="Panini Comics", series="X-Men (Vol. 2) (2001 - 2013)",
+            full_title="X-Men #118", release_date="2010-10-26",
+        ),
+    ])
+    result = cmd_collection_authority_check(
+        kind="alias", name_a="Uncanny X-Men", name_b="X-Men", cache=cache
+    )
+    assert result["cross_volume_ambiguities_newly_created"] == []
+    already = result["cross_volume_ambiguities_already_present"]
+    assert len(already) == 1
+    assert already[0]["issue"] == "118"
+    # Partition: pool view == newly_created + already_present, no drops, no
+    # double-counting.
+    assert result["cross_volume_ambiguities"] == already
+
+
+def test_alias_candidate_creates_a_genuinely_new_cross_volume_ambiguity(tmp_path):
+    """Two owned rows under names that share NOTHING today — no bare-normalizer
+    collision, no already-shipped alias edge — so each is alone in its own
+    singleton bucket without the candidate (no ambiguity possible with only
+    one row per bucket). Only THIS candidate's edge puts them in the same
+    pool, so the resulting issue-number collision must report as
+    newly_created, not already_present. Also the regression guard for
+    _authority_check_ambiguity_diff's "never union without_buckets before
+    checking" design: a buggy union-of-rows implementation would find this
+    same collision by combining the two buckets and misreport it as
+    already-present."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(publisher="Indie Press", series="Zorro Prime (1950 - 1955)",
+             full_title="Zorro Prime #5", release_date="1950-03-01"),
+        _row(publisher="Indie Press", series="Zorro Omega (2018 - 2020)",
+             full_title="Zorro Omega #5", release_date="2020-05-01"),
+    ])
+    result = cmd_collection_authority_check(
+        kind="alias", name_a="Zorro Prime", name_b="Zorro Omega", cache=cache
+    )
+    assert len(result["owned_rows_affected"]) == 2
+    assert len(result["cross_volume_ambiguities"]) == 1
+    assert result["cross_volume_ambiguities"][0]["issue"] == "5"
+    assert result["cross_volume_ambiguities_already_present"] == []
+    newly = result["cross_volume_ambiguities_newly_created"]
+    assert len(newly) == 1
+    assert newly[0]["issue"] == "5"
+
+
+def test_alias_diff_fields_partition_the_pool_view(tmp_path):
+    """One candidate producing BOTH kinds at once: newly_created and
+    already_present together must reconstruct cross_volume_ambiguities
+    exactly — no ambiguity silently dropped from either bucket, and none
+    double-counted in both."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        # Issue 118: both already fold into the SAME "x men" bucket today
+        # (bare normalizer + the shipped Uncanny X-Men/X-Men entry) — this
+        # candidate does not touch either name, so it must land as
+        # already_present.
+        _row(
+            publisher="Marvel Comics", series="The X-Men (Vol. 1) (1963 - 1981)",
+            full_title="The X-Men #118", release_date="1978-11-14",
+        ),
+        _row(
+            publisher="Panini Comics", series="X-Men (Vol. 2) (2001 - 2013)",
+            full_title="X-Men #118", release_date="2010-10-26",
+        ),
+        # Issue 5: one row in the "x men" bucket above, one row in "Zorro
+        # Prime"'s own bucket — the two buckets are unrelated until THIS
+        # candidate joins them, so this collision must be newly_created.
+        _row(
+            publisher="Marvel Comics", series="Uncanny X-Men (Vol. 1) (1980 - 2011)",
+            full_title="Uncanny X-Men #5", release_date="1985-01-01",
+        ),
+        _row(publisher="Indie Press", series="Zorro Prime (1950 - 1955)",
+             full_title="Zorro Prime #5", release_date="1950-03-01"),
+    ])
+    result = cmd_collection_authority_check(
+        kind="alias", name_a="X-Men", name_b="Zorro Prime", cache=cache
+    )
+    pool_issues = {amb["issue"] for amb in result["cross_volume_ambiguities"]}
+    assert pool_issues == {"118", "5"}
+    assert {amb["issue"] for amb in result["cross_volume_ambiguities_already_present"]} == {"118"}
+    assert {amb["issue"] for amb in result["cross_volume_ambiguities_newly_created"]} == {"5"}
+
+    split_issues = {amb["issue"] for amb in result["cross_volume_ambiguities_newly_created"]}
+    split_issues |= {amb["issue"] for amb in result["cross_volume_ambiguities_already_present"]}
+    assert pool_issues == split_issues
+    newly_issues = {amb["issue"] for amb in result["cross_volume_ambiguities_newly_created"]}
+    already_issues = {amb["issue"] for amb in result["cross_volume_ambiguities_already_present"]}
+    assert newly_issues.isdisjoint(already_issues)
+
+
+# ---------------------------------------------------------------------------
+# Same distinction on the relabel branch — the two branches are disjoint
+# readers, so the diff has to be proven independently on each.
+# ---------------------------------------------------------------------------
+
+
+def test_relabel_already_present_via_base_identity_fold(tmp_path):
+    """The candidate's `to` name folds (bare `_identity_folds`, no relabel
+    needed — BUI-560's bare-year/end-year fold) onto the SAME identity key
+    as two already-owned rows that already collide on issue number with
+    incompatible years. The candidate's `from` name is unrelated and owns
+    nothing. The collision must report as already-present: it exists in the
+    `to`-bucket alone, with no candidate in the picture."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(publisher="Boom Studios", series="Riverrun (2025)",
+             full_title="Riverrun #5", release_date="2025-02-01"),
+        _row(publisher="Boom Studios", series="Riverrun (2025 - Present)",
+             full_title="Riverrun #5", release_date="2027-04-01"),
+    ])
+    result = cmd_collection_authority_check(
+        kind="relabel",
+        from_name="Riverrun Vol One",
+        to_name="Riverrun (2025 - Present)",
+        cache=cache,
+    )
+    assert len(result["owned_rows_affected"]) == 2
+    assert len(result["cross_volume_ambiguities"]) == 1
+    assert result["cross_volume_ambiguities_newly_created"] == []
+    already = result["cross_volume_ambiguities_already_present"]
+    assert len(already) == 1
+    assert already[0]["issue"] == "5"
+
+
+def test_relabel_candidate_creates_a_genuinely_new_cross_volume_ambiguity(tmp_path):
+    """`from` and `to` name two owned rows with no pre-existing identity
+    relationship — each alone in its own singleton bucket without the
+    candidate. Only the candidate's own directed collapse puts them
+    together, so the resulting issue-number collision is newly_created."""
+    cache = make_cache(tmp_path)
+    _seed(cache, [
+        _row(publisher="Indie Press", series="Solar Flare (1988 - 1990)",
+             full_title="Solar Flare #9", release_date="1988-09-01"),
+        _row(publisher="Indie Press", series="Lunar Tide (2015 - 2017)",
+             full_title="Lunar Tide #9", release_date="2016-11-01"),
+    ])
+    result = cmd_collection_authority_check(
+        kind="relabel",
+        from_name="Solar Flare (1988 - 1990)",
+        to_name="Lunar Tide (2015 - 2017)",
+        cache=cache,
+    )
+    assert len(result["owned_rows_affected"]) == 2
+    assert len(result["cross_volume_ambiguities"]) == 1
+    assert result["cross_volume_ambiguities_already_present"] == []
+    newly = result["cross_volume_ambiguities_newly_created"]
+    assert len(newly) == 1
+    assert newly[0]["issue"] == "9"
+
+
+# ---------------------------------------------------------------------------
+# A direct unit test of the diff helper itself, isolated from the cache/
+# fixture plumbing — locks down the set-difference/intersection semantics.
+# ---------------------------------------------------------------------------
+
+
+def test_authority_check_ambiguity_diff_set_semantics():
+    from locg.commands import _authority_check_ambiguity_diff
+
+    owned_rows = [
+        _row(publisher="P", series="A (1990 - 1992)", full_title="A #1", release_date="1990-01-01"),
+        _row(publisher="P", series="B (2020 - 2022)", full_title="B #1", release_date="2021-01-01"),
+        _row(publisher="P", series="C (1970 - 1972)", full_title="C #2", release_date="1970-06-01"),
+        _row(publisher="P", series="D (2010 - 2012)", full_title="D #2", release_date="2011-06-01"),
+    ]
+    # Issue "1": incompatible years (1990 vs 2021) -> an ambiguity in the
+    # WITH pool. Issue "2": incompatible years (1970 vs 2011) -> also an
+    # ambiguity in the WITH pool, but ALSO reproduced inside without_bucket_a
+    # below (already present independent of any candidate).
+    without_bucket_a = [owned_rows[2], owned_rows[3]]  # issue "2" pair, alone
+    without_bucket_b = [owned_rows[0]]  # issue "1"'s first half, alone — no partner
+
+    cross_volume_ambiguities, newly_created, already_present = _authority_check_ambiguity_diff(
+        owned_rows, [without_bucket_a, without_bucket_b]
+    )
+
+    issues = {amb["issue"] for amb in cross_volume_ambiguities}
+    assert issues == {"1", "2"}
+    assert {amb["issue"] for amb in newly_created} == {"1"}
+    assert {amb["issue"] for amb in already_present} == {"2"}
+    # Exact partition — every element of the pool view lands in exactly one
+    # of the two output lists.
+    assert len(newly_created) + len(already_present) == len(cross_volume_ambiguities)
+
+
+def test_authority_check_ambiguity_diff_attributes_by_issue_key_not_by_row():
+    """Documents the chosen granularity (flagged in BUI-671 review): when a
+    candidate adds a THIRD row to an issue number that already had an
+    ambiguous PAIR in one without-bucket alone, the whole group — including
+    the candidate's own contributed row — is classified already_present, not
+    split row-by-row. This is intentional (the ticket asks for ambiguity
+    GROUPS, attributed by issue key, not per-row provenance) and is locked
+    down here so a future reader does not mistake it for a bug."""
+    from locg.commands import _authority_check_ambiguity_diff
+
+    row_old_1 = _row(publisher="P", series="E (1970 - 1972)", full_title="E #3", release_date="1970-01-01")
+    row_old_2 = _row(publisher="P", series="F (2010 - 2012)", full_title="F #3", release_date="2011-01-01")
+    row_new = _row(publisher="P", series="G (1950 - 1952)", full_title="G #3", release_date="1950-01-01")
+
+    owned_rows = [row_old_1, row_old_2, row_new]
+    without_bucket_already_ambiguous_alone = [row_old_1, row_old_2]  # issue "3" pair, alone
+
+    _, newly_created, already_present = _authority_check_ambiguity_diff(
+        owned_rows, [without_bucket_already_ambiguous_alone]
+    )
+    assert newly_created == []
+    assert len(already_present) == 1
+    assert already_present[0]["issue"] == "3"
+    # All three rows — including row_new, which only reached this issue
+    # number via the candidate — are folded into the single already_present
+    # group.
+    titles = {row["full_title"] for row in already_present[0]["rows"]}
+    assert titles == {"E #3", "F #3", "G #3"}

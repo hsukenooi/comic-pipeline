@@ -7547,6 +7547,49 @@ def _authority_check_cross_volume_ambiguities(
     return ambiguities
 
 
+def _authority_check_ambiguity_diff(
+    owned_rows: list[dict[str, Any]],
+    without_buckets: list[list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a candidate's cross-volume ambiguities into NEWLY CREATED vs.
+    ALREADY PRESENT (BUI-671, a follow-up from BUI-654's own worked example:
+    "The X-Men #118" and the Panini "X-Men #118" are already equivalent
+    under bare ``_normalize_series_key`` alone — no alias entry required —
+    so a strict before/after diff reports NOTHING for the ticket's own
+    acceptance pair. The pool view is the honest blast radius; this is the
+    attribution layered on top of it, never a replacement for it).
+
+    ``owned_rows`` is the FULL with-candidate pool (what
+    ``owned_rows_affected``/``cross_volume_ambiguities`` already report,
+    unchanged) — the blast radius. Each entry of ``without_buckets`` is the
+    SAME candidate's two names' rows, filtered under the corpus's existing
+    equivalence closure with the candidate absent, kept as SEPARATE buckets
+    — never unioned into one row list before checking. Unioning them would
+    let two rows that only share a query BECAUSE of the candidate
+    manufacture a false "already present" verdict for an issue-number
+    collision the candidate itself creates; an ambiguity counts as
+    already-present only if it fires INSIDE one bucket entirely on its own.
+
+    Returns ``(cross_volume_ambiguities, newly_created, already_present)`` —
+    the unchanged pool view, then the set difference and the intersection
+    (by issue key) of that view against the union of ambiguities found
+    across ``without_buckets``.
+    """
+    cross_volume_ambiguities = _authority_check_cross_volume_ambiguities(owned_rows)
+    already_issue_keys: set[str] = set()
+    for bucket in without_buckets:
+        already_issue_keys.update(
+            amb["issue"] for amb in _authority_check_cross_volume_ambiguities(bucket)
+        )
+    newly_created = [
+        amb for amb in cross_volume_ambiguities if amb["issue"] not in already_issue_keys
+    ]
+    already_present = [
+        amb for amb in cross_volume_ambiguities if amb["issue"] in already_issue_keys
+    ]
+    return cross_volume_ambiguities, newly_created, already_present
+
+
 def cmd_collection_authority_check(
     *,
     kind: str,
@@ -7596,7 +7639,25 @@ def cmd_collection_authority_check(
       :func:`_authority_check_cross_volume_ambiguities`) — the live check for
       the exact incident class BUI-284's ``ambiguous_cross_volume`` verdict
       exists to prevent, surfaced here BEFORE the entry ships rather than
-      after a buy-path caller trips it.
+      after a buy-path caller trips it. This is the POOL view: every
+      ambiguity live in the candidate's resulting equivalence pool, whether
+      or not the candidate itself is what puts the colliding rows together
+      (BUI-654's own worked example — "The X-Men #118" vs. the Panini
+      "X-Men #118" — collides via the bare normalizer alone, with no alias
+      entry in play at all). Kept exactly as before (BUI-671): it is the
+      honest answer to "what would a bare ``(series, issue)`` query have in
+      play", and dropping it would lose the blast radius.
+    * ``cross_volume_ambiguities_newly_created`` /
+      ``cross_volume_ambiguities_already_present`` (BUI-671) — the same
+      ambiguity groups, ATTRIBUTED: which ones the candidate actually
+      creates (present in the pool WITH the candidate, absent from a second
+      closure built the same way but WITHOUT it) versus which were already
+      live in the corpus today via the base normalizer or an already-shipped
+      entry (see :func:`_authority_check_ambiguity_diff`). An operator's
+      question before merging an entry is "what does adding this change?",
+      and the pool alone (22 groups on the live store for the worked
+      example, almost none attributable to the candidate) is a poor answer
+      to it — this is the attribution, never a replacement for the pool.
 
     ``corpus_empty`` is always present and must be read FIRST: an empty
     collection store makes both ``owned_rows_affected`` and
@@ -7645,11 +7706,25 @@ def cmd_collection_authority_check(
         except authority.AuthorityTableError as exc:
             return {"status": "invalid_request", "error": str(exc)}
 
+        # The WITHOUT-candidate closure (BUI-671): the same construction as
+        # combined_groups above, minus the candidate — the real shipped
+        # entries alone, via the public build_alias_table. Never raises: the
+        # shipped table is already validated at authority.py's own import.
+        base_groups = authority.build_alias_table(_normalize_series_key).groups
+
         key_a = _normalize_series_key(a)
         key_b = _normalize_series_key(b)
         pool_keys = combined_groups.get(
             key_a, frozenset({key_a})
         ) | combined_groups.get(key_b, frozenset({key_b}))
+        # Kept as two SEPARATE key-sets, never unioned into one (BUI-671) —
+        # see _authority_check_ambiguity_diff's docstring for why unioning
+        # before checking would manufacture a false "already present"
+        # verdict for a collision the candidate itself creates.
+        without_key_sets = [
+            base_groups.get(key_a, frozenset({key_a})),
+            base_groups.get(key_b, frozenset({key_b})),
+        ]
         entry_echo: dict[str, Any] = {"kind": "alias", "names": [a, b]}
 
         def _row_key(row: dict[str, Any]) -> str:
@@ -7685,32 +7760,56 @@ def cmd_collection_authority_check(
         # bare fold — this is "what key do owned rows carry today", not "what
         # would the candidate's own two keys look like in isolation".
         #
-        # Known limitation, harmless while the table ships empty (today):
-        # this does not re-derive a full combined map the way the alias
-        # branch above does, so a CHAIN through an already-shipped relabel
-        # entry (this candidate's `to` landing on a key some OTHER shipped
-        # entry then relabels again) is not walked. Advisory only — the
-        # worst case is under-reporting a rare compound scenario, never a
-        # write — and moot until the table holds a second entry to chain
-        # against.
+        # Known limitation, harmless while the table ships empty (today) and
+        # UNCHANGED by BUI-671's without-candidate reading below — both
+        # readings share it, since without_key_sets (below) is built from
+        # these same two keys, not a re-derived combined map: this does not
+        # re-derive a full combined map the way the alias branch above does,
+        # so a CHAIN through an already-shipped relabel entry is not walked.
+        # Concretely: key_to below already reflects a single hop through any
+        # EXISTING entry sourced FROM `to`'s fold (it calls the real
+        # identity_series_key, which reads the live table), but the
+        # CANDIDATE's own entry would store `to`'s BARE fold
+        # (_identity_folds, not identity_series_key) as its target — so if
+        # some OTHER shipped entry separately sources FROM that bare fold,
+        # rows this candidate would move off `key_from` land one hop short
+        # of where `key_to`'s own rows already sit, and the two would NOT
+        # actually end up equivalent post-merge the way pool_keys here
+        # assumes. Advisory only — the worst case is under- or
+        # mis-reporting a rare compound scenario, never a write — and moot
+        # until the table holds a second entry to chain against.
         key_from = identity_series_key(f)
         key_to = identity_series_key(t)
         pool_keys = frozenset({key_from, key_to})
+        # Kept as two SEPARATE singleton key-sets for the without-candidate
+        # reading (BUI-671) — see _authority_check_ambiguity_diff's
+        # docstring for why unioning before checking would manufacture a
+        # false "already present" verdict.
+        without_key_sets = [frozenset({key_from}), frozenset({key_to})]
         entry_echo = {"kind": "relabel", "from": f, "to": t}
 
         def _row_key(row: dict[str, Any]) -> str:
             return identity_series_key(row.get("series_name") or "")
 
-    owned_rows = [
-        row
-        for row in matchable_rows(comics_all)
-        if row.get("in_collection") and _row_key(row) in pool_keys
+    # A single matchable_rows() pass (BUI-671 needs the WITH pool plus two
+    # WITHOUT buckets; a bare comprehension here, not a nested def, keeps the
+    # call site attributed to cmd_collection_authority_check alone for
+    # test_pool_table_matches_the_source's source scan in test_quarantine.py).
+    owned_candidates = [row for row in matchable_rows(comics_all) if row.get("in_collection")]
+    owned_rows = [row for row in owned_candidates if _row_key(row) in pool_keys]
+    without_buckets = [
+        [row for row in owned_candidates if _row_key(row) in keys] for keys in without_key_sets
     ]
+    cross_volume_ambiguities, newly_created, already_present = _authority_check_ambiguity_diff(
+        owned_rows, without_buckets
+    )
 
     return {
         "status": "ok",
         "entry": entry_echo,
         "corpus_empty": corpus_empty,
         "owned_rows_affected": [_row_summary(row) for row in owned_rows],
-        "cross_volume_ambiguities": _authority_check_cross_volume_ambiguities(owned_rows),
+        "cross_volume_ambiguities": cross_volume_ambiguities,
+        "cross_volume_ambiguities_newly_created": newly_created,
+        "cross_volume_ambiguities_already_present": already_present,
     }
