@@ -1449,6 +1449,45 @@ def cmd_wish_list_conflicts() -> dict[str, Any]:
     query's true (marked) ordinal and correctly routes this into
     ``printing_conflicts`` instead.
 
+    BUI-670: this audit stays on :func:`cmd_collection_check`'s
+    QUARANTINE-FILTERED population (BUI-647) — DECIDED, not inherited. A book
+    whose only owned row is quarantined is therefore not named here at all,
+    even though the row is still in the store. Three reasons, in the order that
+    decided it:
+
+    1. **``conflicts`` is a removable set, and this one must not be removed.**
+       :func:`cmd_wish_list_remove_conflicts` re-derives this audit and deletes
+       every ``conflicts`` entry it is asked for. Reporting a
+       quarantined-owned book here would hand it a wish to destroy on the
+       authority of a row we have formally disowned — and the primary case is
+       a Panini/Kamite licensed edition (BUI-563), where the user genuinely
+       still wants the US edition. That is the ticket's own bar ("must not
+       start reporting a conflict it cannot act on") failing in its worse
+       form: the action exists and is wrong.
+    2. **There is no data-loss exposure to report.** The owned-safe export
+       layer (``collection_io._owned_series_issue_index`` /
+       ``wish_rows_for_export``) is deliberately NOT quarantine-filtered, so
+       the wish is still suppressed at export and the BUI-122
+       ``In Collection=0`` path is never reached. This audit exists to find
+       wishes that would trigger that path; a quarantined-owned wish cannot.
+       Pinned by ``tests/test_quarantine.py``, both halves.
+    3. **The alternative costs the seam more than the gap costs.** Reading
+       unfiltered rows here means threading an opt-out through
+       ``cmd_collection_check`` and all four of its pools, whose whole design
+       property is that each filters at its own entry so a new caller inherits
+       it (see :func:`~locg.collection_cache.matchable_rows`). Making that
+       conditional on a caller-supplied flag dismantles it for a state
+       BUI-648's last-owned-row guard already makes reachable only through
+       ``quarantine --force``. A second pass NOT routed through
+       ``cmd_collection_check`` is worse still: it would be year-blind and
+       printing-blind, re-importing the exact decoy classes BUI-266/BUI-372/
+       BUI-387 spent three tickets removing from this audit.
+
+    Where a quarantined row IS reported: ``collection status``'s
+    ``quarantined_count`` (BUI-648) and the ``collection_quarantine`` audit
+    record. The visibility question is answered there, on the surface that owns
+    the state — not by widening a removable conflict list.
+
     Raises ``FileNotFoundError`` if the wish-list cache does not exist.
     """
     items = cmd_wish_list_from_cache()
@@ -5016,6 +5055,81 @@ def _build_win_row(
     }
 
 
+def _owned_dedup_index(
+    comics: Optional[list[dict[str, Any]]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """``(normalized series prefix, issue token) -> owned rows`` — record-win's
+    already-owned skip pool (BUI-34/BUI-184/BUI-267), quarantined rows excluded.
+
+    BUI-34: index of what is already owned in the cache, so wins for back-issues
+    won before the last import aren't written as duplicate pending rows. Series
+    identity is the full_title prefix so an Annual doesn't shadow the base issue.
+
+    BUI-184: this keys on the full_title PREFIX, not series_name, by design.
+    Real LOCG exports file annuals/specials under the BASE series_name with the
+    qualifier only in Full Title (88/98 of the sample's post-normalize series
+    divergences are this shape, e.g. "The Amazing Spider-Man" / "...Annual #14";
+    zero are the inverse masthead shape). Also keying on series_name would
+    therefore collapse "...Annual #N" into base "#N" and false-skip a genuine
+    base win — a skipped win later reads as owned and triggers a duplicate buy.
+    The prefix basis errs toward recording (never hiding ownership) — the safe
+    direction — so we intentionally do NOT broaden the key here. The token key
+    is normalize_issue_key from locg.parsing (BUI-189, shared with the probe).
+
+    BUI-267: keyed to a LIST of owned rows (not a bare presence set) so the
+    dedup check in :func:`_build_win_row` can compare era (series_name /
+    release_date year) and print edition (Newsstand/Direct suffix) before
+    treating a bare (series, issue) collision as a genuine duplicate — an
+    unrelated same-numbered issue from another volume/era, or the opposite
+    print edition, must not silently swallow a genuinely-new win.
+
+    **BUI-669: this pool IS quarantine-filtered** (:func:`matchable_rows`),
+    which is why it was lifted out of ``cmd_collection_record_win``'s body into
+    a named function — BUI-647's pool table enumerates pools by name, and an
+    index built inline could not be registered or tested as one.
+
+    The decision to filter rather than exempt, since the trade is real:
+
+    1. **Coherence with the check it is protecting against.** Since BUI-647,
+       ``cmd_collection_check`` reads a filtered population, so a quarantined
+       row already answers "not owned" to the buy path. An UNfiltered index
+       here makes the two readers of the same store contradict each other in
+       the direction that costs money: the win is skipped (never recorded) AND
+       the book still reads not-owned, so the buy path re-buys it. This is the
+       same argument :func:`_owned_rows_covering` makes for reading the check's
+       own pool (BUI-648) — a guard consulting a different population than the
+       check can permit exactly the outcome the check then contradicts.
+    2. **The trade lands on the cheaper failure.** Filtering swaps a skipped
+       win for a possible duplicate ROW (the BUI-424 twin class). A duplicate
+       row is a store cleanup; a skipped win is a duplicate purchase. That is
+       the same ordering BUI-184 above already commits this call site to.
+    3. **The row this exists for is one we have formally disowned.** The
+       primary case is a Panini/Kamite licensed edition our own record-win push
+       minted (BUI-563). Skipping a genuine US win because a row quarantined
+       precisely for mis-matching matched it is backwards, which is BUI-669's
+       whole complaint.
+
+    Blast radius is bounded but NOT zero: BUI-648's last-owned-row guard
+    refuses to quarantine a row unless another owned, non-quarantined row
+    covers the same ownership question, so the outcome only changes for a
+    ``quarantine --force`` row — or for a covering twin filed under a key this
+    PREFIX-based index does not share, since the guard reads
+    ``owned_match_keys`` and this index reads the full_title prefix (BUI-184
+    keeps them deliberately different). Both land on "record the win", the
+    direction this function already errs toward.
+    """
+    index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in matchable_rows(comics):
+        if not row.get("in_collection"):
+            continue
+        prefix, token = _split_full_title(row.get("full_title") or "")
+        if token is None:
+            continue
+        key = (_normalize_series_key(prefix), normalize_issue_key(token))
+        index.setdefault(key, []).append(row)
+    return index
+
+
 def cmd_collection_record_win(
     wins: list[dict[str, Any]],
     cache: Optional[Any] = None,
@@ -5093,41 +5207,21 @@ def cmd_collection_record_win(
     # the volumes that DO agree — see _build_win_row's BUI-564 block. Built once
     # per batch alongside volume_candidates, from the same locg_export rows.
     series_publishers = build_series_publishers(payload)
+    # BUI-669: deliberately NOT matchable_rows-filtered, unlike `owned_index`
+    # below. This is not an ownership pool — it is a title-collision set whose
+    # only effect (_build_win_row's `elif base_title in existing_titles`) is to
+    # leave `needs_manual_variant` off when the base title already exists. Both
+    # of that branch's arms write the same full_title, so no write is ever
+    # suppressed by it and a quarantined row cannot hide a win here. Filtering
+    # it "for consistency" would buy nothing and would owe BUI-647's pool table
+    # another entry.
     existing_titles: set[str] = {
         row.get("full_title", "") for row in payload.get("comics", [])
     }
 
-    # BUI-34: index of (normalized series, issue token) already owned in the
-    # cache, so wins for back-issues won before the last import aren't written as
-    # duplicate pending rows. Uses the full_title prefix for series identity so
-    # an Annual doesn't shadow the base issue (consistent with collection-check).
-    #
-    # BUI-184: this keys on the full_title PREFIX, not series_name, by design.
-    # Real LOCG exports file annuals/specials under the BASE series_name with the
-    # qualifier only in Full Title (88/98 of the sample's post-normalize series
-    # divergences are this shape, e.g. "The Amazing Spider-Man" / "...Annual #14";
-    # zero are the inverse masthead shape). Also keying on series_name would
-    # therefore collapse "...Annual #N" into base "#N" and false-skip a genuine
-    # base win — a skipped win later reads as owned and triggers a duplicate buy.
-    # The prefix basis errs toward recording (never hiding ownership) — the safe
-    # direction — so we intentionally do NOT broaden the key here. The token key
-    # is normalize_issue_key from locg.parsing (BUI-189, shared with the probe).
-    #
-    # BUI-267: keyed to a LIST of owned rows (not a bare presence set) so the
-    # dedup check below can compare era (series_name/release_date year) and
-    # print edition (Newsstand/Direct suffix) before treating a bare (series,
-    # issue) collision as a genuine duplicate — an unrelated same-numbered
-    # issue from another volume/era, or the opposite print edition, must not
-    # silently swallow a genuinely-new win.
-    owned_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for r in payload.get("comics", []):
-        if not r.get("in_collection"):
-            continue
-        prefix, token = _split_full_title(r.get("full_title") or "")
-        if token is None:
-            continue
-        key = (_normalize_series_key(prefix), normalize_issue_key(token))
-        owned_index.setdefault(key, []).append(r)
+    # BUI-34/BUI-184/BUI-267 already-owned skip index, quarantine-filtered per
+    # BUI-669 — see _owned_dedup_index for the key design and the decision.
+    owned_index = _owned_dedup_index(payload.get("comics"))
 
     rows_written = 0
     rows_inserted = 0

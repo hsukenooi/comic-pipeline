@@ -210,6 +210,15 @@ def matchable_rows(
     a new pool is one call and a new CALLER of an existing pool inherits the
     filter for free.
 
+    A pool need not be on a READ path: ``commands._owned_dedup_index`` is
+    record-win's already-owned skip index (BUI-669), and it filters for the
+    same reason the read matchers do — it must not answer "owned" with a row
+    ``cmd_collection_check`` has already stopped answering with, or the win is
+    dropped AND the book still reads not-owned and gets re-bought. The prose
+    list here is a map; the territory is
+    ``tests/test_quarantine.py::test_pool_table_matches_the_source``, which
+    reconciles the registry against the real call sites in both directions.
+
     **Never call this on the owned-safe export layer.**
     ``collection_io._owned_series_issue_index`` and
     ``collection_io.wish_rows_for_export`` are ENFORCEMENT, not candidate
