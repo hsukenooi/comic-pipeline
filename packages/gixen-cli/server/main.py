@@ -63,6 +63,7 @@ from server.fallback import (
     _listed_win_evidence_already_covered, _apply_listed_win_evidence,
     _ebay_fallback_rows, _run_ebay_fallback,
 )
+from server.policy import PolicyIntent, run_checks
 import ebay_bidder
 
 # The eBay Browse-API fallback (winning-bid capture for ENDED auctions) shells
@@ -1983,6 +1984,21 @@ async def api_add_bid(req: AddBidRequest):
         # partial unique index (+ _add_bid_row's recovery) guards that race.
         async with _api_lock:
             existing = get_pending_bid_by_item_id(db, req.item_id)
+            # BUI-615/616: one check-point evaluation per request, BEFORE any
+            # Gixen call — the same advisories apply to whichever branch below
+            # this request ultimately returns through (KTD1). AE6: trigger is
+            # "upsert" (not "create") when a live row already exists, and
+            # target_max_bid is always req.max_bid — the NEW amount — so an
+            # upsert-modify of a live item is checked against the new value,
+            # never the stale existing one.
+            intent = PolicyIntent(
+                item_id=req.item_id,
+                target_max_bid=req.max_bid,
+                snipe_group=req.snipe_group,
+                trigger="upsert" if existing is not None else "create",
+                prior_row=existing,
+            )
+            advisories, _check_results = run_checks(db, intent, app.state.plugin_manager)
             if existing is not None:
                 # A live snipe exists → update in place. Gixen rejects a re-add of
                 # an already-sniped item (code 202), so modify, not add.
@@ -1992,7 +2008,7 @@ async def api_add_bid(req: AddBidRequest):
                         seller=seller, seller_grade=req.seller_grade,
                         photo_grade=req.photo_grade,
                     )
-                    return {**dict(row), "created": False}
+                    return {**dict(row), "created": False, "advisories": advisories}
                 except GixenSnipeNotFoundError:
                     # DB has a live row but Gixen lost it (state skew). Intent is
                     # "add" → fall back. If Gixen can't confirm the add, keep the
@@ -2003,16 +2019,19 @@ async def api_add_bid(req: AddBidRequest):
                             seller=seller, seller_grade=req.seller_grade,
                             photo_grade=req.photo_grade,
                         )
-                        return {**dict(row), "created": created}
+                        return {**dict(row), "created": created, "advisories": advisories}
                     except GixenAddNotConfirmedError:
-                        return {**dict(existing), "created": False, "applied": False}
+                        return {
+                            **dict(existing), "created": False, "applied": False,
+                            "advisories": advisories,
+                        }
 
             row, created = await _add_bid_row(
                 req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
                 seller=seller, seller_grade=req.seller_grade,
                 photo_grade=req.photo_grade,
             )
-            return {**dict(row), "created": created}
+            return {**dict(row), "created": created, "advisories": advisories}
     except GixenError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except requests.HTTPError as e:
@@ -2432,14 +2451,29 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
     # acquisition.
     try:
         async with _api_lock:
+            # BUI-615/616: fetch the live row once, up front — it feeds both
+            # the pre-existing offset/group passthrough resolution below AND
+            # the policy check point's PolicyIntent.prior_row (None when this
+            # item was never ingested, e.g. a web-added snipe — the
+            # "no_prior_row" case the U6 ledger will mark, a later wave).
+            current = get_pending_bid_by_item_id(db, item_id)
             gixen_bid_offset = req.bid_offset
             gixen_snipe_group = req.snipe_group
-            if gixen_bid_offset is None or gixen_snipe_group is None:
-                current = get_pending_bid_by_item_id(db, item_id)
-                if gixen_bid_offset is None:
-                    gixen_bid_offset = current["bid_offset"] if current is not None else 6
-                if gixen_snipe_group is None:
-                    gixen_snipe_group = current["snipe_group"] if current is not None else 0
+            if gixen_bid_offset is None:
+                gixen_bid_offset = current["bid_offset"] if current is not None else 6
+            if gixen_snipe_group is None:
+                gixen_snipe_group = current["snipe_group"] if current is not None else 0
+            # One check-point evaluation per request, BEFORE the Gixen call
+            # (KTD1) — same advisories apply to whichever return path below
+            # this request takes.
+            intent = PolicyIntent(
+                item_id=item_id,
+                target_max_bid=req.max_bid,
+                snipe_group=gixen_snipe_group,
+                trigger="edit",
+                prior_row=current,
+            )
+            advisories, _check_results = run_checks(db, intent, app.state.plugin_manager)
             await _modify_with_cache_fallback(
                 db, item_id, Decimal(str(req.max_bid)),
                 gixen_bid_offset, gixen_snipe_group,
@@ -2511,7 +2545,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                 status_code=500,
                 detail=f"Item {item_id} not in DB after sync — Gixen state unexpectedly empty",
             )
-    return dict(row)
+    return {**dict(row), "advisories": advisories}
 
 
 @app.delete("/api/bids/{item_id}")

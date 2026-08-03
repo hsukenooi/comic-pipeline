@@ -4155,3 +4155,190 @@ def test_lockfree_sync_write_and_overlay_write_are_isolated(tmp_path):
         "the overlay's isolated write_transaction() write must land "
         "independent of the batcher's still-uncommitted DML on _db"
     )
+
+
+# ---------------------------------------------------------------------------
+# BUI-615/616: policy check point + advisory envelope. Config tests set
+# POLICY_EXPOSURE_CEILING via the SAME monkeypatch instance the `api` fixture
+# used to build the TestClient — the check reads it fresh per request (KTD2),
+# so setting it after the app has started still takes effect on the next call.
+# ---------------------------------------------------------------------------
+
+def test_add_bid_happy_path_carries_empty_advisories(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    r = api.post("/api/bids", json={"item_id": "615000001", "max_bid": 50.0})
+    assert r.status_code == 200
+    assert r.json()["advisories"] == []
+
+
+def test_edit_bid_happy_path_carries_empty_advisories(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "615000002", "max_bid": 50.0})
+    r = api.patch("/api/bids/615000002", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 200
+    assert r.json()["advisories"] == []
+
+
+def test_add_bid_upsert_modify_branch_carries_advisories_key(api, monkeypatch):
+    """The update-in-place (upsert) branch of api_add_bid is a distinct
+    return statement from the create branch — KTD4 requires the envelope on
+    every 2xx branch, not just the first one."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "615000003", "max_bid": 50.0})
+    r = api.post("/api/bids", json={"item_id": "615000003", "max_bid": 60.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["created"] is False
+    assert data["advisories"] == []
+
+
+def test_add_bid_gixen_state_skew_fallback_branch_carries_advisories(api, monkeypatch):
+    """The GixenSnipeNotFoundError -> fresh-add fallback branch."""
+    from gixen_client import GixenSnipeNotFoundError
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "615000004", "max_bid": 50.0})
+    api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("gone")
+
+    r = api.post("/api/bids", json={"item_id": "615000004", "max_bid": 65.0})
+    assert r.status_code == 200
+    assert r.json()["advisories"] == []
+
+
+def test_add_bid_applied_false_branch_carries_advisories(api, monkeypatch):
+    """The `applied: False` branch (fallback add itself unconfirmed) must
+    still carry the envelope — this is the branch the acceptance criteria
+    calls out explicitly."""
+    from gixen_client import GixenSnipeNotFoundError, GixenAddNotConfirmedError
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "615000005", "max_bid": 50.0})
+    api.mock_gixen.modify_snipe.side_effect = GixenSnipeNotFoundError("gone")
+    api.mock_gixen.add_snipe.side_effect = GixenAddNotConfirmedError("615000005")
+
+    r = api.post("/api/bids", json={"item_id": "615000005", "max_bid": 65.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["applied"] is False
+    assert data["advisories"] == []
+
+
+def test_edit_bid_not_in_db_self_heals_branch_carries_advisories(api, monkeypatch):
+    """The PATCH self-heal-via-sync branch (item accepted by Gixen but never
+    ingested locally) — the other distinct 2xx return path in api_edit_bid."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.mock_gixen.list_snipes.return_value = [{
+        "item_id": "615000006",
+        "max_bid": "75.00 USD",
+        "current_bid": "10.00 USD",
+        "status": "SCHEDULED",
+        "time_to_end": "1d",
+        "seller": "someseller",
+        "snipe_group": "0",
+        "bid_offset": "6",
+    }]
+    r = api.patch("/api/bids/615000006", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
+    assert r.status_code == 200
+    assert r.json()["advisories"] == []
+
+
+def test_add_bid_exposure_advisory_fires_but_still_2xx_and_bid_written(api, monkeypatch):
+    """v1 never blocks (KTD4/plan Problem Frame): an advisory-carrying
+    request still returns 2xx and the bid row is written."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    r = api.post("/api/bids", json={"item_id": "615000007", "max_bid": 50.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["advisories"]) == 1
+    assert data["advisories"][0]["code"] == "exposure_ceiling"
+    assert data["advisories"][0]["severity"] == "warning"
+    row = _dbconn().execute(
+        "SELECT * FROM bids WHERE item_id='615000007' AND status='PENDING'"
+    ).fetchone()
+    assert row is not None
+    assert row["max_bid"] == 50.0
+
+
+def test_add_bid_upsert_checks_new_amount_not_stale_existing(api, monkeypatch):
+    """Covers AE6: an upsert-modify of a live item runs the exposure check
+    against the NEW amount, not the amount already on the row. A ceiling that
+    the original $50 add didn't cross must still fire once the edit-via-add
+    raises it to $100."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "60")
+    r1 = api.post("/api/bids", json={"item_id": "615000008", "max_bid": 50.0})
+    assert r1.json()["advisories"] == []  # $50 <= $60 ceiling
+
+    r2 = api.post("/api/bids", json={"item_id": "615000008", "max_bid": 100.0})
+    assert r2.status_code == 200
+    data = r2.json()
+    assert data["created"] is False
+    assert len(data["advisories"]) == 1
+    assert data["advisories"][0]["data"]["projected"] == 100.0
+
+
+def test_add_bid_malformed_ceiling_is_unevaluable_advisory_not_a_crash(api, monkeypatch):
+    """A malformed POLICY_EXPOSURE_CEILING must never 5xx the write or
+    silently disable the check — it surfaces as an `unevaluable` advisory."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "not-a-number")
+    r = api.post("/api/bids", json={"item_id": "615000009", "max_bid": 50.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["advisories"]) == 1
+    assert data["advisories"][0]["severity"] == "unevaluable"
+    assert data["advisories"][0]["data"]["raw_config"] == "not-a-number"
+    row = _dbconn().execute(
+        "SELECT * FROM bids WHERE item_id='615000009' AND status='PENDING'"
+    ).fetchone()
+    assert row is not None  # the bid still wrote
+
+
+def test_policy_env_read_per_request_across_two_http_calls(api, monkeypatch):
+    """KTD2: the ceiling is read fresh on every request, not cached at app
+    startup — changing it between two calls on the same TestClient/app
+    instance changes the second call's outcome."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "1000")
+    r1 = api.post("/api/bids", json={"item_id": "615000010", "max_bid": 50.0})
+    assert r1.json()["advisories"] == []
+
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    r2 = api.post("/api/bids", json={"item_id": "615000011", "max_bid": 50.0})
+    assert len(r2.json()["advisories"]) == 1
+
+
+def test_add_bid_group_aware_exposure_ae3(api, monkeypatch):
+    """AE3 at the HTTP layer: ungrouped $100 + $50 plus a group of $200/$180
+    projects to $350 — adding a new $1 ungrouped bid on top of a $360
+    ceiling must not advise (350 + 1 = 351 <= 360), proving the group member
+    counted once (at its max), not summed, through the real endpoint."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "615000012", "max_bid": 100.0})
+    api.post("/api/bids", json={"item_id": "615000013", "max_bid": 50.0})
+    api.post("/api/bids", json={"item_id": "615000014", "max_bid": 200.0, "snipe_group": 42})
+    api.post("/api/bids", json={"item_id": "615000015", "max_bid": 180.0, "snipe_group": 42})
+
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "360")
+    r = api.post("/api/bids", json={"item_id": "615000016", "max_bid": 1.0})
+    assert r.status_code == 200
+    assert r.json()["advisories"] == []
+
+
+def test_add_bid_policy_check_exception_never_5xxs_a_live_add(api, monkeypatch):
+    """Adversarial: a check raising during a LIVE add (real Gixen call, real
+    DB write going through the full endpoint, not just run_checks in
+    isolation) must still commit the bid and return 200 — v1 is
+    advisory-only and a check bug must never turn into a failed write."""
+    import server.policy as policy
+
+    def boom(conn, intent):
+        raise RuntimeError("policy check exploded mid-request")
+
+    monkeypatch.setattr(policy, "_CHECKS", (boom,))
+    r = api.post("/api/bids", json={"item_id": "615000017", "max_bid": 42.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["advisories"]) == 1
+    assert data["advisories"][0]["severity"] == "unevaluable"
+    api.mock_gixen.add_snipe.assert_called_once()
+    row = _dbconn().execute(
+        "SELECT * FROM bids WHERE item_id='615000017' AND status='PENDING'"
+    ).fetchone()
+    assert row is not None
+    assert row["max_bid"] == 42.0
