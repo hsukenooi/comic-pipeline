@@ -165,6 +165,26 @@ class TestHardExclude:
         "Uncanny X-Men #146 147 148 152 154 157 158 162 (1981-82) Claremont Cockrum",
         # the ascending slice may sit anywhere in the run, not just at its head
         "Ghost Rider #15 15 (2nd) 16 19 20 21 23 24 25 26 39! VF/NM! 1990! 1st Badalino!",
+        # BUI-645: an ORDINAL later printing. _reprint_reject's lexicon carries
+        # only the "-ing" spellings ("2nd printing"/"second printing"), so every
+        # title here is a real corpus listing that survived hard_exclude before
+        # this rule. The Ghost Rider #15 and Hulk #377 pools each had 14 and 12
+        # such comps, holding fmv_high at $15 where $10 is right (-33%).
+        "Ghost Rider #15 2nd Print Marvel 1991",
+        "The Incredible Hulk #377 (Marvel Comics January 1991) - VF/NM - 2nd Print",
+        "1986 Copper Age DC Comic Watchmen #1 2nd Print Newstand Edition NM-",
+        "Absolute Flash #3 3rd Print",
+        "Absolute Batman #6 5th Print Comic Book 2026",
+        "ABSOLUTE FLASH #2 Third Printing",
+        "Ultimate Spider-Man #1 Fourth Printing-Marco Checchetto (Marvel Comics 2024) NM",
+        "Ultimate Spider-Man #1 Fifth Printing-Marco Checchetto NM 2024 Marvel Comics",
+        "Saga #1 Fourth Print (Image Comics March 2012)",
+        "X-MEN '97 #2 Second Print Gambit and Rogue Cover Marvel Comics NM HOT!",
+        "Venom #1 Stegman 2nd Print 2018 Marvel Comics NM",
+        # A lot bundling a 1st WITH a later print is not a single-issue comp
+        # either — the ordinal token catches it regardless of the "1st Print".
+        "GHOST RIDER #15 (1991) 1st Print & Gold 2nd Print Glow in the Dark Cover NM",
+        "Marvel The Incredible Hulk #377 (1991) direct 1st & 2nd print",
     ])
     def test_excludes(self, title):
         assert sc.hard_exclude(title)
@@ -241,6 +261,30 @@ class TestHardExclude:
         "X Men '92 2 3 4",
         # Descending numbers are never an issue enumeration.
         "Marvel Kotobukiya ArtFX+ X-Men 92 97 1/10 JUBILEE RARE LOOSE",
+        # ── BUI-645 keep-list ────────────────────────────────────────────────
+        # Original print-run distribution variants and explicit first prints.
+        # 1,307 corpus titles carry one of these words; none may be filtered.
+        "X-Men #94 newsstand VF",
+        "Amazing Spider-Man #129 direct VF",
+        "X-Men #1 first print NM",
+        "Amazing Spider-Man #300 1st print",
+        # Bare "printing" with no ordinal is a condition descriptor, not a
+        # later pressing — left to Haiku, per the BUI-244 comment.
+        "Fine printing condition Batman #1",
+        # BUI-645 negative controls: the BARE "reprint"/"reprints" token is
+        # deliberately NOT on the comp path. X-Men vol.1 #67-93 (1970-1975) were
+        # published as all-reprint issues, so their listings honestly say
+        # "reprints #28" — but each is a genuine first-print issue with a real
+        # market, and these ARE the comps for those books. Excluding them killed
+        # the #76 and #79 pools outright and raised #72's fmv_high +25%.
+        "X-MEN 76 (VG+) reprints #28 new Gil Kane cover! BANSHEE! 1972 Marvel Comics k733",
+        "X-Men #72 VG+ All Reprints 1971 Marvel Comics",
+        "X-Men 79 1972 Marvel Comics F/VF 7.0 Reprint X-Men 31 Cyclops Cobalt Man Beast",
+        "UNCANNY X-MEN #76 (1972) - GRADE 6.0 - REPRINT 1ST FULL APPEARANCE BANSHEE",
+        # Same class: a genuine issue whose title describes what it CONTAINS.
+        "Tales to Astonish 60 Giant Man Includes Reprint of Hulk 6 Silver Age 1964",
+        "Nick Fury Agent of SHIELD #17 (1971)- Bronze Age, 52-Pg Giant, Reprints",
+        "X-Men #66 Marvel 1970 Last Original Story Before Reprints Silver Age",
     ])
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)
@@ -286,6 +330,61 @@ class TestHardExclude:
         assert sc.hard_exclude(title)
         assert comic_identity._fmv_run_range_lot(title)
         assert not comic_identity._LOT_RE.search(title)
+
+    def test_later_printing_rule_stays_comp_only(self):
+        """BUI-645/BUI-239: the comp-path later-printing check adds no purchase-
+        path behavior.
+
+        _comp_later_printing_reject is reached only through is_comp_excluded.
+        should_reject already rejected this title via its own step-7
+        _second_print_reject call, so the purchase path is unchanged either way
+        — what this pins is that the NEW function is not wired into it.
+        """
+        title = "Ghost Rider #15 2nd Print Marvel 1991"
+        assert sc.hard_exclude(title)
+        assert comic_identity._comp_later_printing_reject(title)
+        assert not comic_identity._LOT_RE.search(title)
+        assert not comic_identity.identify_comic(title).is_lot
+
+    def test_bare_reprint_stays_off_the_comp_path(self):
+        """BUI-645: the bare "reprint"/"reprints" half of _second_print_reject
+        must NOT reach is_comp_excluded.
+
+        This is the load-bearing half of the BUI-645 split. _second_print_reject
+        still fires on the title (the purchase path is unchanged), but the comp
+        path must keep it — it is a genuine first-print issue and its own pool's
+        comp. Wiring the full _second_print_reject in would flip this.
+        """
+        title = "X-MEN 76 (VG+) reprints #28 new Gil Kane cover! BANSHEE! 1972 Marvel Comics k733"
+        assert comic_identity._second_print_reject(title)      # purchase path: rejects
+        assert not comic_identity._comp_later_printing_reject(title)
+        assert not comic_identity.is_comp_excluded(title)      # comp path: KEEPS
+        assert not sc.hard_exclude(title)
+
+    def test_later_printing_regex_split_is_behavior_preserving(self):
+        """BUI-645 recomposed _LATER_PRINTING_RE from two named halves so the
+        comp path could adopt one. _second_print_reject must be unchanged.
+
+        Verified across all 12,418 corpus titles at 0 drift; these pin the two
+        alternations and their union so a future edit to one half cannot
+        silently change what the purchase path rejects.
+        """
+        ordinal = "Amazing Spider-Man #300 2nd print NM"
+        bare = "Amazing Fantasy #15 reprint VF"
+        neither = "Amazing Spider-Man #4 VF"
+        assert comic_identity._LATER_PRINTING_ORDINAL_RE.search(ordinal)
+        assert not comic_identity._BARE_REPRINT_RE.search(ordinal)
+        assert comic_identity._BARE_REPRINT_RE.search(bare)
+        assert not comic_identity._LATER_PRINTING_ORDINAL_RE.search(bare)
+        for title in (ordinal, bare):
+            assert comic_identity._second_print_reject(title)
+            assert comic_identity._LATER_PRINTING_RE.search(title)
+        assert not comic_identity._second_print_reject(neither)
+        assert not comic_identity._LATER_PRINTING_RE.search(neither)
+        # Same empty/None tolerance as _second_print_reject — this sits on the
+        # money path and must never raise on a missing title.
+        assert not comic_identity._comp_later_printing_reject("")
+        assert not comic_identity._comp_later_printing_reject(None)  # type: ignore[arg-type]
 
 
 # ─── Comp parsing ─────────────────────────────────────────────────────────────
