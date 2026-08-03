@@ -14,8 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from importlib.metadata import EntryPoint
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi import APIRouter, Body, FastAPI, File, HTTPException, UploadFile
@@ -24,50 +23,14 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
 from gixen_overlay.db import record_rejected_write, rejected_writes_report
-from gixen_overlay.routes import LedgerRoute
+from gixen_overlay.ledger import LedgerRoute
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
-
-def _install_real_plugin(monkeypatch):
-    # Mirrors the `_install_real_plugin` + `api` fixture pattern in
-    # test_gixen_overlay_routes.py (and the four collection_* suites), which
-    # each carry their own copy rather than sharing a conftest.
-    ep = EntryPoint(
-        name="gixen-overlay",
-        value="gixen_overlay.plugin:plugin",
-        group="gixen.plugins",
-    )
-    monkeypatch.setattr(
-        "gixen.plugins.entry_points",
-        lambda group: [ep] if group == "gixen.plugins" else [],
-    )
-
-
-def _mock_gixen():
-    m = MagicMock()
-    m.list_snipes.return_value = []
-    m.purge_completed.return_value = None
-    return m
-
-
-@pytest.fixture
-def api(tmp_path, monkeypatch):
-    """The real comics server with the real overlay plugin loaded."""
-    _install_real_plugin(monkeypatch)
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
-    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
-    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
-    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
-    monkeypatch.setenv("LOCG_DATA_DIR", str(tmp_path / "store"))
-    with patch("server.main.GixenClient", return_value=_mock_gixen()):
-        from server.main import app
-        with TestClient(app) as client:
-            yield client
+# `api` fixture: see conftest.py (BUI-630 de-duplicated the three hand-copies).
 
 
 class _ProbeBody(BaseModel):
@@ -265,7 +228,7 @@ def test_ledger_write_failure_leaves_the_response_untouched(probe, api, caplog):
     def _explode(*a, **kw):
         raise sqlite3.OperationalError("no such table: rejected_writes")
 
-    with patch("gixen_overlay.routes.record_rejected_write", side_effect=_explode):
+    with patch("gixen_overlay.ledger.record_rejected_write", side_effect=_explode):
         rejected = probe.post("/probe/http422")
         healthy = probe.post("/probe/ok")
 

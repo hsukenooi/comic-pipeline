@@ -15,11 +15,8 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from importlib.metadata import EntryPoint
-from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
 from gixen_overlay.db import (
     HEARTBEAT_STALE_FACTOR,
@@ -40,36 +37,7 @@ def conn():
     return c
 
 
-def _install_real_plugin(monkeypatch):
-    # Mirrors the `_install_real_plugin` + `api` fixture pattern in
-    # test_gixen_overlay_routes.py (and the four collection_* suites), which
-    # each carry their own copy rather than sharing a conftest.
-    ep = EntryPoint(
-        name="gixen-overlay",
-        value="gixen_overlay.plugin:plugin",
-        group="gixen.plugins",
-    )
-    monkeypatch.setattr(
-        "gixen.plugins.entry_points",
-        lambda group: [ep] if group == "gixen.plugins" else [],
-    )
-
-
-@pytest.fixture
-def api(tmp_path, monkeypatch):
-    _install_real_plugin(monkeypatch)
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
-    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
-    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
-    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
-    monkeypatch.setenv("LOCG_DATA_DIR", str(tmp_path / "store"))
-    m = MagicMock()
-    m.list_snipes.return_value = []
-    with patch("server.main.GixenClient", return_value=m):
-        from server.main import app
-        with TestClient(app) as client:
-            yield client
+# `api` fixture: see conftest.py (BUI-630 de-duplicated the three hand-copies).
 
 
 # ---------------------------------------------------------------------------

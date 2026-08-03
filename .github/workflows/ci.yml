@@ -130,6 +130,10 @@ jobs:
 
   # BUI-188: non-strict mypy type check on the two most None-juggling files.
   # The workspace must be synced first so gixen_overlay imports resolve.
+  # BUI-630: ledger.py joined the target list the same commit LedgerRoute was
+  # extracted out of routes.py into it — moving code out of a mypy-covered
+  # file without also moving the CI target silently drops it from
+  # typechecking (the reason the extraction was declined the first time).
   typecheck:
     runs-on: ubuntu-latest
     steps:
@@ -144,7 +148,7 @@ jobs:
         run: uv sync --all-packages
 
       - name: Type check — mypy (non-strict, targeted files)
-        run: uvx mypy --ignore-missing-imports apps/fmv/src/fmv_runner.py plugins/gixen-overlay/src/gixen_overlay/routes.py
+        run: uvx mypy --ignore-missing-imports apps/fmv/src/fmv_runner.py plugins/gixen-overlay/src/gixen_overlay/routes.py plugins/gixen-overlay/src/gixen_overlay/ledger.py
 
   # ezship is a standalone TypeScript CLI (apps/ezship). vitest, not pytest.
   ezship:

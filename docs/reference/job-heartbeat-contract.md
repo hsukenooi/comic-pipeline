@@ -135,7 +135,8 @@ comics-api GET "/api/comics/health/rejections?hours=720"  # full retention windo
 ```
 
 Every 4xx/5xx on a **mutating** overlay request is persisted automatically by
-`LedgerRoute` in `routes.py` — a custom `APIRoute` class, not middleware
+`LedgerRoute` in `ledger.py` (wired into `routes.py`'s `router = APIRouter(route_class=LedgerRoute)`,
+BUI-630) — a custom `APIRoute` class, not middleware
 (`app.add_middleware` is impossible from a plugin, whose `register_routes` hook
 fires inside the host lifespan after Starlette has sealed its middleware stack).
 New overlay endpoints are covered with zero per-endpoint code. Rows are pruned
