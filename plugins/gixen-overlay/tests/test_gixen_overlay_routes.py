@@ -12,12 +12,10 @@ import shutil
 import sqlite3
 import statistics
 import subprocess
-from importlib.metadata import EntryPoint
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
-from fastapi.testclient import TestClient
 
 _STATIC_DIR = os.path.join(
     os.path.dirname(__file__), "..", "src", "gixen_overlay", "static"
@@ -87,43 +85,7 @@ def _run_is_ended(row: dict) -> bool:
     return out.stdout == "1"
 
 
-def _install_real_plugin(monkeypatch):
-    """Wire the actual gixen-overlay plugin into gixen.plugins.entry_points."""
-    ep = EntryPoint(
-        name="gixen-overlay",
-        value="gixen_overlay.plugin:plugin",
-        group="gixen.plugins",
-    )
-    monkeypatch.setattr(
-        "gixen.plugins.entry_points",
-        lambda group: [ep] if group == "gixen.plugins" else [],
-    )
-
-
-def _mock_gixen():
-    m = MagicMock()
-    m.list_snipes.return_value = []
-    m.add_snipe.return_value = None
-    m.modify_snipe.return_value = None
-    m.remove_snipe.return_value = True
-    m.purge_completed.return_value = None
-    return m
-
-
-@pytest.fixture
-def api(tmp_path, monkeypatch):
-    _install_real_plugin(monkeypatch)
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
-    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
-    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
-    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
-    mock = _mock_gixen()
-    with patch("server.main.GixenClient", return_value=mock):
-        from server.main import app
-        with TestClient(app) as client:
-            client.mock_gixen = mock
-            yield client
+# `api` fixture: see conftest.py (BUI-630 de-duplicated the three hand-copies).
 
 
 # ---------------------------------------------------------------------------
