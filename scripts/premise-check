@@ -54,6 +54,7 @@ import difflib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -792,7 +793,11 @@ def post_comment(issue_id: str, body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Self-test (no repo, no network — extraction/classification only)
+# Self-test (no dependency on this checkout, no network — extraction and
+# classification checks only. BUI-632's classification block below does
+# build one throwaway `git init`-only repo under tempfile, entirely
+# offline and torn down before returning — that is not "the repo" this
+# heading disclaims.)
 # ---------------------------------------------------------------------------
 
 
@@ -869,6 +874,82 @@ def selftest() -> int:
         "numeric-only tokens routed to skipped, not SYMBOL/PHRASE checks",
         all(c.value not in ("94-300", "94,95,96") for c in cands),
     )
+
+    # ------------------------------------------------------------------
+    # Classification checks (BUI-632). Everything above only proves
+    # EXTRACTION works (parsing symbols/paths/endpoints out of ticket
+    # prose). None of it exercises CLASSIFICATION — the CONFIRMED/ABSENT/
+    # NEAR_MISS/UNVERIFIABLE verdict ladder that is this tool's entire
+    # stated design principle (see module docstring: "false confidence is
+    # the only real failure mode"). Verified by mutation on 2026-08-03:
+    # injecting a `raise` immediately before the `difflib.SequenceMatcher`
+    # call in verify_symbol left `--selftest` exiting 0 — nothing below
+    # this comment existed yet to notice the near-miss path had gone dead.
+    #
+    # Repo() only reads via `git ls-files` (the index), so a throwaway repo
+    # needs `git init` + `git add`, no commit — still fully offline, no
+    # network, and isolated from this actual checkout.
+    class_tmpdir = tempfile.mkdtemp(prefix="premise-check-selftest-")
+    try:
+        os.makedirs(os.path.join(class_tmpdir, "pkg"), exist_ok=True)
+        with open(os.path.join(class_tmpdir, "pkg", "health.py"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "def fetch_health_state():\n"
+                "    return {'status': 'ok'}\n"
+            )
+        subprocess.run(["git", "init", "-q"], cwd=class_tmpdir, capture_output=True, text=True, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=class_tmpdir, capture_output=True, text=True, check=True)
+        class_repo = Repo(class_tmpdir)
+        hint_files = ["pkg/health.py"]
+
+        # Each call goes through this wrapper rather than being called
+        # inline: a broken detector should show up as a named "SELFTEST
+        # FAILED: - classify: ..." line via `check()` like every other
+        # failure in this function, not as a bare uncaught traceback that
+        # aborts selftest() before the remaining checks below it run.
+        def classify(candidate: Candidate):
+            try:
+                return verify_symbol(class_repo, candidate, hint_files)
+            except Exception as exc:  # noqa: BLE001 — a raising detector IS the failure being tested for
+                return None, f"verify_symbol raised {exc!r}"
+
+        confirmed_c = Candidate("SYMBOL", "fetch_health_state", raw="`fetch_health_state`")
+        verdict, detail = classify(confirmed_c)
+        check("classify: symbol that exists -> CONFIRMED", verdict == CONFIRMED)
+        # Pin the exact-match word-boundary hit-list path specifically
+        # (verify_symbol's PRIMARY path) — `fetch_health_state` matches
+        # case-for-case, so without this the assertion above would still
+        # pass via the case-insensitive fallback a few lines down even if
+        # the primary path were deleted outright.
+        check(
+            "classify: CONFIRMED came from the primary hit-list path, not the case-insensitive fallback",
+            isinstance(detail, str) and detail.startswith("found at "),
+        )
+
+        absent_c = Candidate("SYMBOL", "totally_unrelated_symbol_xyz", raw="`totally_unrelated_symbol_xyz`")
+        verdict, _ = classify(absent_c)
+        check("classify: symbol absent everywhere -> ABSENT", verdict == ABSENT)
+        check("classify: absent symbol never CONFIRMED (fail-toward-absent design)", verdict != CONFIRMED)
+
+        # BUI-630 shape one level down: `/api/health` -> `/health` was an
+        # ENDPOINT rename caught by verify_endpoint's Jaccard segment
+        # similarity (a separate, still-uncovered detector — out of scope
+        # here); this models the equivalent SYMBOL rename, since the
+        # difflib.SequenceMatcher call this block exists to keep alive
+        # lives in verify_symbol. `fetch_health_status` is absent verbatim
+        # and case-insensitively, but `fetch_health_state` — a
+        # near-identical identifier — exists in a hint file this same
+        # (hypothetical) ticket also names.
+        near_miss_c = Candidate("SYMBOL", "fetch_health_status", raw="`fetch_health_status`")
+        verdict, detail = classify(near_miss_c)
+        check("classify: renamed symbol -> NEAR_MISS (renamed-near-miss)", verdict == NEAR_MISS)
+        check("classify: NEAR_MISS never mistaken for CONFIRMED", verdict != CONFIRMED)
+        check(
+            "classify: NEAR_MISS evidence names the actual identifier",
+            isinstance(detail, str) and "fetch_health_state" in detail,
+        )
+    finally:
+        shutil.rmtree(class_tmpdir, ignore_errors=True)
 
     if failures:
         print("SELFTEST FAILED:", file=sys.stderr)
