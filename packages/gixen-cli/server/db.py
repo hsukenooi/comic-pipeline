@@ -1125,11 +1125,46 @@ def update_bid_status(
             f"AND status NOT IN ({TOMBSTONE_STATUSES_SQL}){id_clause}",
             params_won,
         ).fetchall()
-    params: list = [status, winning_bid, resolved_at, resolved_at, status_mirror, item_id]
+    # BUI-636: resolved_at used to be written unconditionally, so a no-op
+    # re-classification (Gixen's list still shows an already-WON/LOST row —
+    # the terminal_transitions loop in _sync_gixen recomputes purely from
+    # Gixen's scraped status every cycle, not gated on the DB's current
+    # status) re-stamped it with the sync's observation time, destroying the
+    # genuine resolution time. Measured live: 27/29 re-stamps in one sync
+    # window were exactly this — same status in and out.
+    #
+    # Fix is a CASE, not a blanket COALESCE(resolved_at, ?): COALESCE would
+    # permanently freeze the FIRST value and block a legitimate
+    # re-resolution. And it is NOT gated on "old status was PENDING" either
+    # (the ticket's literal suggestion) — the eBay fallback (fallback.py)
+    # re-resolves an already-ENDED row to WON/LOST/REMOVED once eBay's price
+    # comes back (see _run_ebay_fallback's `fresh["status"] not in
+    # ("PENDING", "ENDED")` guard), and that ENDED->WON/LOST transition is a
+    # genuine new resolution — gating strictly on PENDING would silently
+    # freeze resolved_at for every one of those. The correct predicate is
+    # simply "did status actually change": compare the OLD status (`status`
+    # in the CASE, which — per SQLite's UPDATE semantics — evaluates against
+    # the pre-update row even though `status` is also being SET in this same
+    # statement) against the new target `status` param. Same status in/out
+    # (a no-op re-classification) keeps the existing resolved_at; any real
+    # transition (including ENDED->WON/LOST/REMOVED) still stamps it fresh.
+    #
+    # This leaves the other two resolved_at bindings in this statement
+    # untouched: the auction_end_at COALESCE fill (an observation-time proxy,
+    # unrelated to whether status changed) and record_group_win's
+    # recorded_at=resolved_at below (the Python `resolved_at` variable itself
+    # is unconditionally "now" regardless of what lands in the column; its
+    # own idempotency is win_rows' status=="WON" gate + the ledger's
+    # (group, item, won_end_at) unique key — see
+    # test_update_bid_status_won_resync_is_ledger_idempotent).
+    params: list = [
+        status, winning_bid, status, resolved_at, resolved_at, status_mirror, item_id,
+    ]
     if only_id is not None:
         params.append(only_id)
     conn.execute(
-        "UPDATE bids SET status=?, winning_bid=?, resolved_at=?, "
+        "UPDATE bids SET status=?, winning_bid=?, "
+        "resolved_at=CASE WHEN status != ? THEN ? ELSE resolved_at END, "
         "auction_end_at=COALESCE(auction_end_at, ?), "
         "status_mirror=COALESCE(?, status_mirror) "
         f"WHERE item_id=? AND status NOT IN ({TOMBSTONE_STATUSES_SQL}){id_clause}",
