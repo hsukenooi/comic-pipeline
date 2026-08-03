@@ -332,6 +332,50 @@ def make_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+def identity_collision_groups(
+    comics: Optional[Iterable[dict[str, Any]]],
+) -> dict[tuple[str, str, str, str], list[int]]:
+    """Identity tuples held by MORE THAN ONE row → the indices of those rows.
+
+    An identity two rows share is a key that has stopped being a key, and
+    nothing in the store can notice on its own: the import assigns
+    ``identity_to_idx[identity] = index``, so of two colliding rows only the
+    LAST is ever reachable again — the other can never be updated, only
+    duplicated (BUI-650). Three tuples on the live store were in exactly that
+    state on 2026-08-03, all wish-side ``Absolute Martian Manhunter``, because
+    both spellings ``(2025 - Present)`` and ``(2025 - 2026)`` fold to one key.
+
+    Counted over **every** row. Deliberately NOT owned-scoped:
+    ``collection_io``'s ``owned_duplicate_identities`` is, and that scoping is
+    precisely why those three sat invisible for months — a counter must not
+    repeat the partition mistake it exists to catch.
+
+    **Quarantined rows are counted too**, and that is deliberate:
+    :func:`matchable_rows` is about MATCHING, :func:`make_identity` is about
+    STORAGE. A quarantined row still occupies its slot in ``identity_to_idx``
+    and still shadows whatever else lands on that identity, so filtering it
+    here would hide a real collision. Do not "fix" this by wrapping the loop in
+    ``matchable_rows``.
+
+    Returns INDICES, not rows, because the one operation that repairs a
+    collision (``collection_io.rekey_sweep``) has to drop rows by position.
+
+    Call THIS rather than re-deriving the grouping. A hand-rolled key gives a
+    plausible wrong answer instead of an error — grouping the same store by
+    exact ``full_title`` reports 4 duplicate twins where the module's own
+    ``_duplicate_check_title_key`` finds 6, because it strips a leading
+    ``The``. An approximate key never raises; it just lies quietly.
+    """
+    by_identity: dict[tuple[str, str, str, str], list[int]] = {}
+    for idx, row in enumerate(comics or ()):
+        by_identity.setdefault(make_identity(row), []).append(idx)
+    return {
+        identity: indices
+        for identity, indices in by_identity.items()
+        if len(indices) > 1
+    }
+
+
 def empty_payload() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,

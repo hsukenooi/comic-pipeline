@@ -1727,3 +1727,101 @@ def test_stale_series_name_index_warning_never_becomes_an_exception(tmp_path, ca
     assert loaded["series_name_index"] == stale_index
     warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert any("stale" in msg for msg in warnings)
+
+
+# ---------------------------------------------------------------------------
+# identity_collision_groups (BUI-650): the store noticing that its identity key
+# has stopped being a key. Three tuples on the live store were in exactly this
+# state on 2026-08-03 and nothing could report it — only the LAST row per
+# identity is reachable via identity_to_idx.
+# ---------------------------------------------------------------------------
+
+def test_identity_collision_groups_empty_when_every_identity_is_unique():
+    from locg.collection_cache import identity_collision_groups
+
+    rows = [make_row(full_title=f"Comic #{i}", seq=i) for i in range(5)]
+    assert identity_collision_groups(rows) == {}
+    assert identity_collision_groups([]) == {}
+    assert identity_collision_groups(None) == {}
+
+
+def test_identity_collision_groups_can_go_red_then_green():
+    """The liveness proof: seed a collision -> 1, remove it -> 0.
+
+    A counter nobody has watched go red is not a counter. The same fixture
+    produces both readings, so a 0 here means "checked and clean", never
+    "unable to check" — the vacuous reading that let the pre-BUI-554 owned
+    duplicate check certify a store holding 60 collisions.
+    """
+    from locg.collection_cache import identity_collision_groups
+
+    # Both spellings of the SAME volume: LOCG closes an ongoing volume's
+    # decoration the January after it ends, and identity_series_key folds them
+    # onto one key. This is precisely the live shape (BUI-554/BUI-650).
+    present = make_row(
+        series="Absolute Martian Manhunter (2025 - Present)",
+        full_title="Absolute Martian Manhunter #3",
+        release_date="2025-05-28",
+        seq=1,
+    )
+    closed = make_row(
+        series="Absolute Martian Manhunter (2025 - 2026)",
+        full_title="Absolute Martian Manhunter #3",
+        release_date="2025-05-28",
+        seq=2,
+    )
+
+    groups = identity_collision_groups([present, closed])
+    assert len(groups) == 1, "two spellings of one volume are ONE identity"
+    assert list(groups.values()) == [[0, 1]], "indices, in store order"
+
+    # Remove the collision and the very same call reports zero.
+    assert identity_collision_groups([present]) == {}
+
+
+def test_identity_collision_groups_counts_unowned_rows():
+    """NOT owned-scoped. The three live collisions were all wish-side, and
+    owned-scoping is exactly why they sat invisible for months."""
+    from locg.collection_cache import identity_collision_groups
+
+    wish_a = make_row(full_title="Absolute Martian Manhunter #11", seq=1)
+    wish_b = make_row(full_title="Absolute Martian Manhunter #11", seq=2)
+    for row in (wish_a, wish_b):
+        row["in_collection"] = 0
+        row["in_wish_list"] = 1
+
+    assert len(identity_collision_groups([wish_a, wish_b])) == 1
+
+
+def test_identity_collision_groups_counts_quarantined_rows():
+    """Quarantine is about MATCHING; make_identity is about STORAGE.
+
+    A quarantined row still occupies its slot in identity_to_idx and still
+    shadows whatever else lands on that identity, so a matchable_rows filter
+    here would hide a real collision.
+    """
+    from locg.collection_cache import identity_collision_groups, quarantine_marker
+
+    plain = make_row(seq=1)
+    hidden = make_row(seq=2)
+    hidden["quarantined"] = quarantine_marker(
+        reason="foreign licensed edition", ticket="BUI-563", by="test"
+    )
+
+    assert len(identity_collision_groups([plain, hidden])) == 1
+
+
+def test_identity_collision_groups_keeps_genuinely_different_books_apart():
+    """Only the end-year is folded — three volumes of X-Men #17 are three
+    identities, not one collision."""
+    from locg.collection_cache import identity_collision_groups
+
+    rows = [
+        make_row(series="The X-Men (Vol. 1) (1963 - 1981)",
+                 full_title="X-Men #17", release_date="1966-02-01", seq=1),
+        make_row(series="X-Men (Vol. 2) (1991 - 2001)",
+                 full_title="X-Men #17", release_date="1993-02-01", seq=2),
+        make_row(series="X-Men (Vol. 2) (2001 - 2013)",
+                 full_title="X-Men #17", release_date="2005-02-01", seq=3),
+    ]
+    assert identity_collision_groups(rows) == {}

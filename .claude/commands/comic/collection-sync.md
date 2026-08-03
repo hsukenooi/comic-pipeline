@@ -466,6 +466,19 @@ Assert all of:
   non-zero count here is a standing known-issue tally, not a regression signal,
   and it should **fall over time, never rise**. A *rise* is the thing worth
   investigating — it means a new mis-resolved push landed.
+- **`identity_collisions` is ADVISORY — report it, never block on it
+  (BUI-650):** a *different* question from the two above. Those ask "is a book
+  owned twice?"; this one asks whether the store's identity key
+  `(publisher, series, full_title, release_date)` is still a key at all.
+  Counted over **all** rows, not owned rows — the owned-scoping is exactly why
+  the three live collisions (all wish-side `Absolute Martian Manhunter`) sat
+  invisible for months. Non-zero means the import can only ever reach the
+  **last** row per identity, so the others can be duplicated but never updated.
+  Its first reading is **3**, and the remedy — `collection_io.rekey_sweep` — is
+  a separate user-gated operation, so blocking on it would stop every sync from
+  the day it shipped (the BUI-563 lesson). Never fold it into
+  `owned_duplicate_identities`. Report the number and the warning that names
+  the titles; do not attempt to fix collisions by hand-editing the store.
 
 Restore the Step 1 backup if needed (BUI-433):
 
@@ -494,6 +507,8 @@ Pending:          PENDING_BEFORE → PENDING_AFTER  (cleared ~N)
 Row count:        ROWS_BEFORE → ROWS_AFTER  (Δ = added - auto_healed_duplicates, verified two-sided in Step 6)
 Owned twice:      D  (must be 0 — Step 6 hard-stops otherwise)
 Owned twice (cross-edition): E  (advisory only — never blocks; must not RISE)
+Identity collisions: I  (advisory only — never blocks; identity tuples held by
+                  >1 row, all rows not just owned; remedy is the re-key sweep)
 Wish-list:        unchanged (local-only adds preserved)
 Warnings:         W warning(s) from the re-import (see below) — or "none"
 ```
