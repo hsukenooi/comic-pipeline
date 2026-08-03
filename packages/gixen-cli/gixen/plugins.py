@@ -10,6 +10,15 @@ invokes three hooks during the lifespan:
     register_dashboard_tabs() -> list[dict]
                                     — plugin returns dashboard tab specs
 
+Plus two **request-time** hooks (BUI-617/U3 — the first hooks that fire per
+request rather than once at lifespan), invoked from ``server/policy.py``'s
+check point on every ``POST /api/bids`` / ``PATCH /api/bids/{item_id}``:
+
+    check_bid_write(conn, intent) -> list[dict]
+                                    — pre-write, read-only policy checks
+    on_bid_write_committed(conn, intent, bid_row_id, check_results)
+                                    — post-write notification
+
 Plugin authors import the ``hookimpl`` marker from this module to decorate
 their hook implementations::
 
@@ -39,6 +48,13 @@ import pluggy
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
+    # Type-only: server/policy.py never imports this module, so importing
+    # PolicyIntent here under TYPE_CHECKING (never at runtime) documents the
+    # hookspec signatures below without creating a real import edge — this
+    # module stays a leaf of the plugin subsystem with zero dependency on
+    # server/* at runtime (server/main.py imports FROM here, not the other
+    # way around).
+    from server.policy import PolicyIntent
 
 # Plugin authors only need `hookimpl`. `hookspec`, `GixenPluginSpec`, and
 # `make_plugin_manager` are host-side primitives — re-exported in this module
@@ -116,6 +132,84 @@ class GixenPluginSpec:
         ``GET /api/dashboard-tabs``. The dashboard JS fetches that endpoint
         at page load and injects the tabs into the nav after the hardcoded
         core tabs (snipes, bids).
+        """
+
+    @hookspec
+    def check_bid_write(
+        self, conn: sqlite3.Connection, intent: "PolicyIntent"
+    ) -> list[dict]:
+        """Contribute pre-write, read-only policy checks (BUI-617/U3).
+
+        Fired once per write, from ``server/policy.py``'s ``run_checks`` —
+        the host's single check point, called from both ``api_add_bid`` and
+        ``api_edit_bid`` inside their existing ``_api_lock`` acquisition,
+        BEFORE the Gixen call. This is the first **request-time** hook (the
+        three above fire once, at lifespan startup) — see KTD1 in
+        ``docs/plans/2026-08-02-001-feat-capital-commitment-layer-plan.md``.
+
+        :param conn: the host's open ``sqlite3.Connection``. Gather-phase
+            reads only — no writes. A plugin that writes here breaks the
+            check point's read-only contract (checks run inside a lock held
+            across the eventual Gixen call; a write here has no transaction
+            of its own to land in safely).
+        :param intent: a ``server.policy.PolicyIntent`` snapshot of the write
+            being evaluated (``item_id``, ``target_max_bid``, ``snipe_group``,
+            ``trigger``, ``prior_row``, ``comic_identities``). Imported only
+            under ``TYPE_CHECKING`` here — this module has no runtime
+            dependency on ``server.*``; plugins receive the real object at
+            call time and can import the real type themselves.
+        :return: a list of plain ``dict``s, each shaped like
+            ``server.policy.CheckResult`` — ``{"code": str, "outcome":
+            "pass" | "advise" | "unevaluable", "message": str, "data":
+            dict}``. An empty list (or ``None``) contributes nothing.
+
+        **Must not raise.** The host wraps this call defensively (the
+        ``_collect_dashboard_tabs`` pattern below): an exception anywhere in
+        this hook — from any registered plugin, since pluggy halts a bulk
+        hook call's impl chain on the first raise (see
+        ``_invoke_register_routes``'s docstring) — is caught by the host,
+        logged loudly, and downgraded to a single ``unevaluable`` check
+        result. It never becomes an exception into the money path, and never
+        blocks, fails, or delays the bid write (v1 is advisory-only). A
+        returned ``outcome`` outside the tri-state vocabulary above is
+        likewise downgraded to ``unevaluable`` by the host — a cooperative
+        plugin should still avoid raising, since one plugin's raise loses
+        every OTHER registered plugin's contribution for this call too
+        (bulk-call semantics, not per-plugin isolation).
+        """
+
+    @hookspec
+    def on_bid_write_committed(
+        self,
+        conn: sqlite3.Connection,
+        intent: "PolicyIntent",
+        bid_row_id: int | None,
+        check_results: list[dict],
+    ) -> None:
+        """Notify plugins after a bid write has committed (BUI-617/U3).
+
+        Fired by the host, in the same request, AFTER the bid row has been
+        written (created or modified) — never for a write that only
+        evaluated checks without landing a row (an unconfirmed upsert/edit,
+        or a Gixen failure). Lets a plugin persist state it resolved during
+        its own ``check_bid_write`` call — the overlay's motivating use case
+        is linking the FMV row(s) its checks resolved to the now-existing
+        bid row (a later wave, U4/U5) — something the host cannot do itself:
+        it has no import edge into overlay code.
+
+        :param conn: the host's open ``sqlite3.Connection``.
+        :param intent: the same ``PolicyIntent`` passed to ``check_bid_write``
+            for this write.
+        :param bid_row_id: the committed ``bids.id`` this write produced.
+        :param check_results: the full tri-state ``check_results`` list this
+            request's ``run_checks`` produced (host + every plugin's
+            contribution), the same shape ``check_bid_write`` returns.
+        :return: ignored — this hook is notification-only.
+
+        **Must not raise.** The write has already committed by the time this
+        fires, so there is nothing left to roll back or degrade — the host
+        wraps this call in a single try/except (the ``_collect_dashboard_tabs``
+        pattern) and only logs loudly on failure.
         """
 
 

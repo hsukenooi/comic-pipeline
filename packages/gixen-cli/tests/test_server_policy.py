@@ -22,7 +22,9 @@ from server.db import init_db, insert_bid
 from server.policy import (
     PolicyIntent, CheckResult, run_checks,
     _sum_grouped_pending, _project_exposure, _check_exposure,
+    notify_bid_write_committed, config_snapshot,
 )
+from gixen.plugins import make_plugin_manager, hookimpl
 
 
 @pytest.fixture
@@ -340,3 +342,180 @@ def test_run_checks_one_check_raising_does_not_stop_others(db, monkeypatch, capl
     codes = {a["code"] for a in advisories}
     assert codes == {"boom", "fine"}
     assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# BUI-617 (U3) — check_bid_write / on_bid_write_committed hookspec invocation
+# ---------------------------------------------------------------------------
+
+class _FakeCheckPlugin:
+    """Registers check_bid_write returning a fixed list of result dicts."""
+
+    def __init__(self, results):
+        self._results = results
+
+    @hookimpl
+    def check_bid_write(self, conn, intent):
+        return self._results
+
+
+class _FakeRaisingCheckPlugin:
+    @hookimpl
+    def check_bid_write(self, conn, intent):
+        raise RuntimeError("plugin check_bid_write kaboom")
+
+
+class _FakeCommitPlugin:
+    """Registers on_bid_write_committed, recording every call it receives."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    @hookimpl
+    def on_bid_write_committed(self, conn, intent, bid_row_id, check_results):
+        self.calls.append((bid_row_id, check_results))
+
+
+class _FakeRaisingCommitPlugin:
+    @hookimpl
+    def on_bid_write_committed(self, conn, intent, bid_row_id, check_results):
+        raise RuntimeError("plugin on_bid_write_committed kaboom")
+
+
+def test_run_checks_merges_plugin_advisory(db, monkeypatch):
+    """A fake plugin's check_bid_write contribution lands in both the
+    envelope (advisories) and the full tri-state record (check_results)."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    pm = make_plugin_manager()
+    pm.register(_FakeCheckPlugin([
+        {"code": "fmv_over", "outcome": "advise", "message": "over FMV", "data": {"x": 1}},
+    ]))
+    advisories, results = run_checks(db, _intent(), pm)
+    assert len(advisories) == 1
+    assert advisories[0] == {
+        "code": "fmv_over", "severity": "warning", "message": "over FMV", "data": {"x": 1},
+    }
+    assert len(results) == 1
+    assert results[0]["outcome"] == "advise"
+    assert results[0]["code"] == "fmv_over"
+
+
+def test_run_checks_plugin_pass_does_not_surface_as_advisory(db, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    pm = make_plugin_manager()
+    pm.register(_FakeCheckPlugin([
+        {"code": "fine", "outcome": "pass", "message": "ok", "data": {}},
+    ]))
+    advisories, results = run_checks(db, _intent(), pm)
+    assert advisories == []
+    assert len(results) == 1  # pass still recorded in the full tri-state list
+    assert results[0]["outcome"] == "pass"
+
+
+def test_run_checks_plugin_check_bid_write_raising_downgrades_to_unevaluable(
+    db, monkeypatch, caplog,
+):
+    """Covers AE8/KTD1: the overlay hook raises -> the write must be able to
+    proceed (this call never raises), one unevaluable result is recorded,
+    and a loud log is emitted."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    pm = make_plugin_manager()
+    pm.register(_FakeRaisingCheckPlugin())
+    with caplog.at_level("ERROR", logger="server.policy"):
+        advisories, results = run_checks(db, _intent(), pm)
+
+    assert len(advisories) == 1
+    assert advisories[0]["severity"] == "unevaluable"
+    assert len(results) == 1
+    assert results[0]["outcome"] == "unevaluable"
+    assert any(rec.levelname == "ERROR" for rec in caplog.records)
+
+
+def test_run_checks_plugin_malformed_outcome_downgrades_to_unevaluable(db, monkeypatch):
+    """A plugin returning an outcome outside the tri-state vocabulary is
+    itself downgraded — a malformed contribution must never read as a clean
+    pass or as a normal advisory."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    pm = make_plugin_manager()
+    pm.register(_FakeCheckPlugin([
+        {"code": "weird", "outcome": "not-a-real-outcome", "message": "??", "data": {}},
+    ]))
+    _advisories, results = run_checks(db, _intent(), pm)
+    assert results[0]["outcome"] == "unevaluable"
+
+
+def test_run_checks_no_plugin_registered_no_unevaluable_noise(db, monkeypatch):
+    """An empty PluginManager (no overlay registered — R5's standalone
+    gixen-cli case) contributes nothing; only host checks run."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    pm = make_plugin_manager()
+    advisories, results = run_checks(db, _intent(), pm)
+    assert advisories == []
+    assert results == []
+
+
+def test_run_checks_host_and_plugin_checks_both_contribute(db, monkeypatch):
+    """Host-owned + plugin-contributed checks merge into one list — neither
+    displaces the other."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    pm = make_plugin_manager()
+    pm.register(_FakeCheckPlugin([
+        {"code": "plugin_check", "outcome": "advise", "message": "hmm", "data": {}},
+    ]))
+    intent = _intent(item_id="343434399", target_max_bid=50.0, snipe_group=0, trigger="create")
+    advisories, results = run_checks(db, intent, pm)
+    codes = {a["code"] for a in advisories}
+    assert codes == {"exposure_ceiling", "plugin_check"}
+    assert len(results) == 2
+
+
+def test_notify_bid_write_committed_invokes_hook(db):
+    pm = make_plugin_manager()
+    fake = _FakeCommitPlugin()
+    pm.register(fake)
+    notify_bid_write_committed(pm, db, _intent(), 42, [{"code": "x"}])
+    assert fake.calls == [(42, [{"code": "x"}])]
+
+
+def test_notify_bid_write_committed_raising_hook_is_logged_not_raised(db, caplog):
+    """Notification-only: the write already committed by the time this
+    fires, so a raising plugin can only be logged, never surfaced."""
+    pm = make_plugin_manager()
+    pm.register(_FakeRaisingCommitPlugin())
+    with caplog.at_level("ERROR", logger="server.policy"):
+        notify_bid_write_committed(pm, db, _intent(), 42, [])
+    assert any(rec.levelname == "ERROR" for rec in caplog.records)
+
+
+def test_notify_bid_write_committed_pm_none_is_noop(db):
+    notify_bid_write_committed(None, db, _intent(), 42, [])  # must not raise
+
+
+def test_notify_bid_write_committed_no_plugin_registered_is_noop(db):
+    pm = make_plugin_manager()  # empty
+    notify_bid_write_committed(pm, db, _intent(), 42, [])  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# BUI-618 (U6) — config_snapshot
+# ---------------------------------------------------------------------------
+
+def test_config_snapshot_reads_current_env(monkeypatch):
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "123")
+    assert config_snapshot() == {"POLICY_EXPOSURE_CEILING": "123"}
+
+
+def test_config_snapshot_unset_is_none(monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    assert config_snapshot() == {"POLICY_EXPOSURE_CEILING": None}
+
+
+def test_config_snapshot_reads_per_call_not_cached(monkeypatch):
+    """KTD2 discipline extends to the ledger's config snapshot too — two
+    calls with the env changed in between must see the new value."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "1")
+    first = config_snapshot()
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "2")
+    second = config_snapshot()
+    assert first != second
+    assert second["POLICY_EXPOSURE_CEILING"] == "2"

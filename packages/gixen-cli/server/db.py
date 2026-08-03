@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -96,6 +97,50 @@ CREATE TABLE IF NOT EXISTS group_wins (
     won_end_at  TEXT NOT NULL,
     recorded_at TEXT NOT NULL
 );
+
+-- BUI-618 (U6): append-only decisions ledger, one row per pre-trade policy
+-- check-point evaluation (server/policy.py's run_checks — called from
+-- api_add_bid/api_edit_bid under _api_lock, BEFORE the Gixen call), written
+-- REGARDLESS of what Gixen/the write ultimately does. Modeled on group_wins
+-- above: append-only, no UPDATE path, closed-vocabulary column enforced at
+-- the write boundary (record_bid_decision raises before ever executing SQL —
+-- the same pattern record_group_win uses for `source`). Deliberately
+-- denormalized like group_wins (no literal SQL FOREIGN KEY on bid_row_id) —
+-- a real FK would need bid_row_id preserved across every future bids-table
+-- rebuild the way _rebuild_bids_table already has to special-case for
+-- bid_fmvs (BUI-79's dangling-FK-on-RENAME lesson), which this table's
+-- append-only, forensics-only role doesn't need to take on.
+--
+-- bid_row_id is NULLable BY DESIGN: a decision can be recorded before any
+-- bids row exists at all (a Gixen-failed create — see
+-- BID_DECISION_OUTCOME_GIXEN_FAILED — or, in a later wave, a blocked
+-- create). item_id + trigger are the anchor for those rows; item_id alone is
+-- NOT unique (a re-listed same-ID item, or several evaluations of the same
+-- live item, all share it), so never key a lookup on item_id alone (the
+-- row-id-scoping lesson this repo has already learned elsewhere).
+--
+-- checks_json carries the FULL tri-state check_results (including `pass`,
+-- unlike advisories_json which — matching the KTD4 response envelope — omits
+-- clean passes). config_json is the policy env snapshot consulted for this
+-- evaluation (server.policy.config_snapshot()), so a later env change is
+-- self-describing per row instead of requiring log correlation.
+CREATE TABLE IF NOT EXISTS bid_decisions (
+    id                 INTEGER PRIMARY KEY,
+    bid_row_id         INTEGER,
+    item_id            TEXT NOT NULL,
+    evaluated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    trigger            TEXT NOT NULL,
+    outcome            TEXT NOT NULL CHECK(outcome IN ('committed','unconfirmed','gixen_failed','blocked')),
+    bypass             INTEGER NOT NULL DEFAULT 0,
+    requested_max_bid  REAL,
+    source             TEXT,
+    config_json        TEXT,
+    checks_json        TEXT,
+    advisories_json    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_bid_decisions_item_id ON bid_decisions(item_id);
+CREATE INDEX IF NOT EXISTS idx_bid_decisions_bid_row_id ON bid_decisions(bid_row_id);
 """
 
 # BUI-385: the group_wins unique index, defined once. _apply_migrations creates
@@ -920,6 +965,111 @@ def record_group_win(
         (snipe_group, item_id, won_end_at,
          recorded_at or datetime.now(timezone.utc).isoformat(), source),
     )
+
+
+# BUI-618 (U6): closed vocabulary of bid_decisions.outcome (KTD3). Mirrors the
+# GROUP_WIN_SOURCES pattern above — a frozenset so a typo can never land in
+# the ledger, checked in Python at the write boundary (record_bid_decision)
+# ahead of the SQL CHECK constraint (belt-and-suspenders, same reasoning as
+# TOMBSTONE_STATUSES_SQL's redundancy with the bids.status CHECK).
+# BID_DECISION_OUTCOME_BLOCKED is reserved for U9 (blocking mode, a later
+# wave) — the constant exists now so the vocabulary is stable across waves,
+# but no writer produces it yet.
+BID_DECISION_OUTCOME_COMMITTED = "committed"
+BID_DECISION_OUTCOME_UNCONFIRMED = "unconfirmed"
+BID_DECISION_OUTCOME_GIXEN_FAILED = "gixen_failed"
+BID_DECISION_OUTCOME_BLOCKED = "blocked"
+BID_DECISION_OUTCOMES = frozenset({
+    BID_DECISION_OUTCOME_COMMITTED,
+    BID_DECISION_OUTCOME_UNCONFIRMED,
+    BID_DECISION_OUTCOME_GIXEN_FAILED,
+    BID_DECISION_OUTCOME_BLOCKED,
+})
+
+
+def record_bid_decision(
+    conn: sqlite3.Connection,
+    *,
+    item_id: str,
+    trigger: str,
+    outcome: str,
+    bid_row_id: int | None = None,
+    requested_max_bid: float | None = None,
+    source: str | None = None,
+    bypass: bool = False,
+    config: dict | None = None,
+    check_results: list[dict] | None = None,
+    advisories: list[dict] | None = None,
+) -> int:
+    """Append one row to the bid_decisions ledger (KTD3). Append-only — no
+    UPDATE path exists on this table (U6 verification).
+
+    Callers append via their own write_transaction() (server/main.py's
+    `_append_bid_decision`, its own try/except with a loud log on failure —
+    KTD3: a ledger write must NEVER block, delay, or fail the snipe write,
+    origin AE5). Caller commits (BUI-407 convention, same as
+    record_group_win above); this function never calls conn.commit().
+
+    `outcome` is validated against BID_DECISION_OUTCOMES and raises
+    ValueError BEFORE any SQL executes on an unknown value — the closed
+    vocabulary is enforced at the write boundary in Python, not merely by the
+    SQL CHECK constraint (which exists too, as a second line of defense), so
+    a bad outcome value is guaranteed to never persist (U6 acceptance).
+
+    `bid_row_id=None` is valid and expected for the gixen_failed-before-any-
+    row-exists case (a create Gixen rejected outright) — item_id + trigger
+    anchor that row instead (never item_id alone, non-unique by design).
+    """
+    if outcome not in BID_DECISION_OUTCOMES:
+        raise ValueError(
+            f"record_bid_decision: unknown outcome {outcome!r} "
+            f"(expected one of {sorted(BID_DECISION_OUTCOMES)})"
+        )
+    cur = conn.execute(
+        """
+        INSERT INTO bid_decisions
+            (bid_row_id, item_id, trigger, outcome, bypass, requested_max_bid,
+             source, config_json, checks_json, advisories_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            bid_row_id, item_id, trigger, outcome, 1 if bypass else 0,
+            requested_max_bid, source,
+            json.dumps(config if config is not None else {}),
+            json.dumps(check_results if check_results is not None else []),
+            json.dumps(advisories if advisories is not None else []),
+        ),
+    )
+    return cur.lastrowid
+
+
+def list_bid_decisions(
+    conn: sqlite3.Connection,
+    *,
+    item_id: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Newest-first read of the decisions ledger, for `GET /api/decisions`
+    (U6 audit read — agents have no sqlite access to the Mac Mini, mirroring
+    /api/group-wins' rationale). Parses the JSON columns back into plain
+    structures so callers get dicts/lists, not raw strings."""
+    query = "SELECT * FROM bid_decisions"
+    params: list = []
+    if item_id is not None:
+        query += " WHERE item_id=?"
+        params.append(item_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    results = []
+    for row in rows:
+        d = dict(row)
+        d["config"] = json.loads(d.pop("config_json") or "{}")
+        d["checks"] = json.loads(d.pop("checks_json") or "[]")
+        d["advisories"] = json.loads(d.pop("advisories_json") or "[]")
+        d["bypass"] = bool(d["bypass"])
+        results.append(d)
+    return results
 
 
 def update_bid_status(

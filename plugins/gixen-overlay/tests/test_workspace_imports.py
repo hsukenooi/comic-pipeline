@@ -56,6 +56,49 @@ def test_plugin_hook_entrypoint_importable():
     assert plugin is not None
 
 
+def test_check_bid_write_hookspec_hookimpl_names_match():
+    """BUI-617 (U3): check_bid_write / on_bid_write_committed are the first
+    REQUEST-TIME hookspecs (register_routes/register_db_tables/
+    register_dashboard_tabs above all fire once, at lifespan startup) — a
+    misspelled hookimpl name on either side of the host/overlay boundary
+    would silently never fire the overlay's contribution. `pm.check_pending()`
+    is exactly the check the real `load_plugins()` loader runs at startup
+    (gixen/plugins.py); this registers the REAL overlay plugin instance
+    against a fresh PluginManager and asserts it raises nothing, so a name
+    drift between the hookspec (gixen-cli) and the hookimpl (gixen-overlay)
+    fails this test loudly instead of silently no-op'ing in production.
+    """
+    from gixen.plugins import make_plugin_manager
+    from gixen_overlay.plugin import plugin
+
+    pm = make_plugin_manager()
+    pm.register(plugin, name="gixen-overlay")
+    pm.check_pending()  # raises pluggy.PluginValidationError on any mismatch
+
+
+def test_overlay_stub_hooks_are_inert():
+    """BUI-617 (U3) acceptance: the overlay's check_bid_write/
+    on_bid_write_committed stubs land green independently of the FMV-aware
+    checks that fill them in later (U4) — return [] / no-op, contributing
+    nothing. Exercises the REAL registered hookimpls through pluggy's bulk
+    call (not just calling the methods directly), so a signature mismatch
+    with the hookspec (e.g. a missing/renamed kwarg) would fail here too.
+    """
+    from gixen.plugins import make_plugin_manager
+    from gixen_overlay.plugin import plugin
+
+    pm = make_plugin_manager()
+    pm.register(plugin, name="gixen-overlay")
+
+    check_results = pm.hook.check_bid_write(conn=None, intent=None)
+    assert check_results == [[]]
+
+    # Notification-only; must not raise and has no return value to assert on.
+    pm.hook.on_bid_write_committed(
+        conn=None, intent=None, bid_row_id=None, check_results=[],
+    )
+
+
 def test_locg_command_surface_resolves():
     """BUI-91/92: the overlay wraps locg-cli's collection + wish-list functions
     behind /api/comics/*. These resolve via the `locg` workspace dependency. If

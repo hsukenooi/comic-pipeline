@@ -41,6 +41,9 @@ from server.db import (
     refresh_snipe_group, mirror_gixen_max_bid,
     TOMBSTONE_STATUSES_SQL,
     write_transaction,
+    record_bid_decision, list_bid_decisions,
+    BID_DECISION_OUTCOME_COMMITTED, BID_DECISION_OUTCOME_UNCONFIRMED,
+    BID_DECISION_OUTCOME_GIXEN_FAILED,
 )
 # BUI-389: the eBay-fallback/cancel-evidence cluster (_run_ebay_fallback and
 # its BUI-371 cancel-evidence helpers) was extracted to server/fallback.py to
@@ -63,7 +66,9 @@ from server.fallback import (
     _listed_win_evidence_already_covered, _apply_listed_win_evidence,
     _ebay_fallback_rows, _run_ebay_fallback,
 )
-from server.policy import PolicyIntent, run_checks
+from server.policy import (
+    PolicyIntent, run_checks, notify_bid_write_committed, config_snapshot,
+)
 import ebay_bidder
 
 # The eBay Browse-API fallback (winning-bid capture for ENDED auctions) shells
@@ -313,6 +318,48 @@ async def _write_locked():
         )
     async with _write_lock:
         yield
+
+
+async def _append_bid_decision(
+    *,
+    item_id: str,
+    trigger: str,
+    outcome: str,
+    bid_row_id: int | None,
+    requested_max_bid: float,
+    check_results: list[dict],
+    advisories: list[dict],
+    source: str | None = None,
+    bypass: bool = False,
+) -> None:
+    """BUI-618 (U6/KTD3): append one `bid_decisions` ledger row for this
+    write's check-point evaluation.
+
+    Own `write_transaction()` (via `_get_db_path()`, never the module-level
+    `DB_PATH` — same BUI-408 discipline as every other write site) under
+    `_write_locked()`, own try/except, loud log on failure — a ledger write
+    must NEVER block, delay, or fail the snipe write itself (origin AE5).
+    Callers invoke this AFTER the write's outcome (Gixen + the local DB) is
+    already known — a fire-and-forget tail call, entered with no pending
+    network await, matching the "enter _write_locked() only after any await
+    has completed" discipline every other write site in this module follows.
+    """
+    try:
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                record_bid_decision(
+                    wconn,
+                    item_id=item_id, trigger=trigger, outcome=outcome,
+                    bid_row_id=bid_row_id, requested_max_bid=requested_max_bid,
+                    source=source, bypass=bypass, config=config_snapshot(),
+                    check_results=check_results, advisories=advisories,
+                )
+    except Exception:
+        logger.exception(
+            "bid_decisions: failed to append ledger row for item_id=%s "
+            "trigger=%s outcome=%s — the bid write itself is unaffected",
+            item_id, trigger, outcome,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1710,6 +1757,11 @@ class AddBidRequest(BaseModel):
     seller: str | None = None
     seller_grade: float | None = None
     photo_grade: float | None = None
+    # BUI-618 (U6): which caller made this write (cli/batch/dashboard),
+    # recorded verbatim on the bid_decisions ledger row for this request.
+    # Optional and unvalidated here — U7 (a later wave) populates it from the
+    # CLI and add-batch; an old client that omits it just gets a NULL source.
+    source: str | None = None
 
     @field_validator("item_id")
     @classmethod
@@ -1756,6 +1808,9 @@ class EditBidRequest(BaseModel):
     # and this route's Gixen-side resolution below for the two halves of the
     # fix (local DB state vs. the live Gixen snipe).
     snipe_group: int | None = None
+    # BUI-618 (U6): same optional provenance tag as AddBidRequest.source —
+    # see its docstring.
+    source: str | None = None
 
     @field_validator("max_bid")
     @classmethod
@@ -1977,6 +2032,14 @@ async def api_add_bid(req: AddBidRequest):
     # BUI-78: req.seller is already normalized (lowercased, validated) by
     # AddBidRequest.normalize_seller.
     seller = req.seller
+    # Populated inside the lock below, before any Gixen call can raise — see
+    # the outer except clauses, which read these back for the gixen_failed
+    # ledger row. Defaults cover the (unreachable in practice) case where an
+    # exception lands before they're assigned.
+    existing = None
+    intent: PolicyIntent | None = None
+    advisories: list[dict] = []
+    check_results: list[dict] = []
     try:
         # Lookup + Gixen call + DB write all under _api_lock so the add/modify
         # decision is atomic against other request handlers (BUI-67 KTD6). The
@@ -1998,7 +2061,40 @@ async def api_add_bid(req: AddBidRequest):
                 trigger="upsert" if existing is not None else "create",
                 prior_row=existing,
             )
-            advisories, _check_results = run_checks(db, intent, app.state.plugin_manager)
+            advisories, check_results = run_checks(db, intent, app.state.plugin_manager)
+
+            # BUI-617/618 (U3/U6): one helper per outcome class, defined here
+            # so every branch below records the SAME shape instead of each
+            # branch hand-rolling its own call (the duplicated-predicates-
+            # drift lesson U1's approach already applied to run_checks
+            # itself). Closures capture req/db/intent/check_results/
+            # advisories from this call's own scope.
+            async def _record_committed(bid_row_id: int) -> None:
+                # Notification fires ONLY on a genuine committed write — the
+                # overlay's on_bid_write_committed persists state (a future
+                # wave's FMV link) that only makes sense once a row exists.
+                # Synchronous (KTD1: same-thread DB reads, like the checks) —
+                # no await.
+                notify_bid_write_committed(
+                    app.state.plugin_manager, db, intent, bid_row_id, check_results,
+                )
+                await _append_bid_decision(
+                    item_id=req.item_id, trigger=intent.trigger,
+                    outcome=BID_DECISION_OUTCOME_COMMITTED,
+                    bid_row_id=bid_row_id, requested_max_bid=req.max_bid,
+                    check_results=check_results, advisories=advisories,
+                    source=req.source,
+                )
+
+            async def _record_unconfirmed(bid_row_id: int | None) -> None:
+                await _append_bid_decision(
+                    item_id=req.item_id, trigger=intent.trigger,
+                    outcome=BID_DECISION_OUTCOME_UNCONFIRMED,
+                    bid_row_id=bid_row_id, requested_max_bid=req.max_bid,
+                    check_results=check_results, advisories=advisories,
+                    source=req.source,
+                )
+
             if existing is not None:
                 # A live snipe exists → update in place. Gixen rejects a re-add of
                 # an already-sniped item (code 202), so modify, not add.
@@ -2008,6 +2104,7 @@ async def api_add_bid(req: AddBidRequest):
                         seller=seller, seller_grade=req.seller_grade,
                         photo_grade=req.photo_grade,
                     )
+                    await _record_committed(row["id"])
                     return {**dict(row), "created": False, "advisories": advisories}
                 except GixenSnipeNotFoundError:
                     # DB has a live row but Gixen lost it (state skew). Intent is
@@ -2019,8 +2116,10 @@ async def api_add_bid(req: AddBidRequest):
                             seller=seller, seller_grade=req.seller_grade,
                             photo_grade=req.photo_grade,
                         )
+                        await _record_committed(row["id"])
                         return {**dict(row), "created": created, "advisories": advisories}
                     except GixenAddNotConfirmedError:
+                        await _record_unconfirmed(existing["id"])
                         return {
                             **dict(existing), "created": False, "applied": False,
                             "advisories": advisories,
@@ -2031,10 +2130,34 @@ async def api_add_bid(req: AddBidRequest):
                 seller=seller, seller_grade=req.seller_grade,
                 photo_grade=req.photo_grade,
             )
+            await _record_committed(row["id"])
             return {**dict(row), "created": created, "advisories": advisories}
     except GixenError as e:
+        # No row landed from THIS request — `existing` (possibly None) is
+        # whatever was already there before we tried. BUI-618: a create that
+        # Gixen rejected outright has no bid row at all (bid_row_id=None);
+        # an upsert whose modify raised a non-GixenSnipeNotFoundError
+        # GixenError leaves the existing row exactly as it was.
+        await _append_bid_decision(
+            item_id=req.item_id,
+            trigger=(intent.trigger if intent is not None else "create"),
+            outcome=BID_DECISION_OUTCOME_GIXEN_FAILED,
+            bid_row_id=(existing["id"] if existing is not None else None),
+            requested_max_bid=req.max_bid,
+            check_results=check_results, advisories=advisories,
+            source=req.source,
+        )
         raise HTTPException(status_code=503, detail=str(e)) from e
     except requests.HTTPError as e:
+        await _append_bid_decision(
+            item_id=req.item_id,
+            trigger=(intent.trigger if intent is not None else "create"),
+            outcome=BID_DECISION_OUTCOME_GIXEN_FAILED,
+            bid_row_id=(existing["id"] if existing is not None else None),
+            requested_max_bid=req.max_bid,
+            check_results=check_results, advisories=advisories,
+            source=req.source,
+        )
         raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}") from e
 
 
@@ -2228,6 +2351,35 @@ async def api_get_group_wins(
         params,
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+# BUI-618 (U6): sensible bound on ?limit= — /api/decisions is an operator
+# audit surface (the soak review in the plan's Operational Notes), not a bulk
+# export; an unbounded limit could pull the entire ledger over HTTP.
+_MAX_DECISIONS_LIMIT = 500
+
+
+@app.get("/api/decisions")
+async def api_get_decisions(item_id: str | None = None, limit: int = 50):
+    """BUI-618 (U6) audit read: the append-only `bid_decisions` ledger, one
+    row per pre-trade policy check-point evaluation (server/policy.py's
+    `run_checks`, called from api_add_bid/api_edit_bid) — written regardless
+    of what Gixen/the write ultimately does, so the maybe-money-moved cases
+    (an unconfirmed upsert, an unconfirmed edit) get rows here too, alongside
+    a clean committed write and a pre-write Gixen failure. Pure DB read,
+    newest-first (`ORDER BY id DESC` — evaluated_at has only second
+    granularity, so id is the tiebreaker that actually orders same-second
+    rows deterministically).
+
+    Optional ?item_id= filters to one item's decisions (mirrors /api/bids and
+    /api/group-wins' filter convention); ?limit= is clamped to [1, 500] —
+    this is an audit surface for the soak review, not a bulk export. Agents
+    have no sqlite access to the Mac Mini, so this is the only way to audit
+    the ledger over HTTP — same rationale as /api/group-wins above.
+    """
+    db = _get_db()
+    clamped_limit = max(1, min(limit, _MAX_DECISIONS_LIMIT))
+    return list_bid_decisions(db, item_id=item_id, limit=clamped_limit)
 
 
 def _cached_dbidid(db: sqlite3.Connection, item_id: str) -> str | None:
@@ -2449,13 +2601,19 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
     # Gixen but not yet to the DB. _modify_with_cache_fallback no longer
     # acquires the lock (asyncio.Lock is not reentrant); this is the single
     # acquisition.
+    # Populated inside the lock below, before any Gixen call can raise — see
+    # the except clauses, which read `current` back for their ledger rows.
+    current = None
+    intent: PolicyIntent | None = None
+    advisories: list[dict] = []
+    check_results: list[dict] = []
     try:
         async with _api_lock:
             # BUI-615/616: fetch the live row once, up front — it feeds both
             # the pre-existing offset/group passthrough resolution below AND
             # the policy check point's PolicyIntent.prior_row (None when this
             # item was never ingested, e.g. a web-added snipe — the
-            # "no_prior_row" case the U6 ledger will mark, a later wave).
+            # "no_prior_row" case the U6 ledger marks via bid_row_id=None).
             current = get_pending_bid_by_item_id(db, item_id)
             gixen_bid_offset = req.bid_offset
             gixen_snipe_group = req.snipe_group
@@ -2473,7 +2631,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                 trigger="edit",
                 prior_row=current,
             )
-            advisories, _check_results = run_checks(db, intent, app.state.plugin_manager)
+            advisories, check_results = run_checks(db, intent, app.state.plugin_manager)
             await _modify_with_cache_fallback(
                 db, item_id, Decimal(str(req.max_bid)),
                 gixen_bid_offset, gixen_snipe_group,
@@ -2495,13 +2653,34 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                     row = get_bid_by_item_id(wconn, item_id)
     except GixenSnipeNotFoundError as e:
         # Nothing was POSTed — the pre-POST lookup found no such snipe — so
-        # there is no "may have applied" ambiguity to reconcile here.
+        # there is no "may have applied" ambiguity to reconcile here. BUI-618:
+        # a clean pre-write failure -> gixen_failed, anchored to whatever
+        # local row (if any) existed before this request.
+        await _append_bid_decision(
+            item_id=item_id, trigger="edit",
+            outcome=BID_DECISION_OUTCOME_GIXEN_FAILED,
+            bid_row_id=(current["id"] if current is not None else None),
+            requested_max_bid=req.max_bid,
+            check_results=check_results, advisories=advisories,
+            source=req.source,
+        )
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen") from e
     except (GixenError, requests.HTTPError) as e:
         # BUI-555: both of these can be raised AFTER modify_snipe's POST has
         # already mutated Gixen (the confirm read is what failed), so neither
         # may be reported as a clean no-op failure. Reconcile, then 503.
+        # BUI-618: this is the "maybe-money-moved" / unconfirmed-modify case
+        # the ledger must still record (never gixen_failed — Gixen may well
+        # hold the new value even though this request can't confirm it).
         detail = await _reconcile_after_unconfirmed_modify(item_id, req.max_bid, e)
+        await _append_bid_decision(
+            item_id=item_id, trigger="edit",
+            outcome=BID_DECISION_OUTCOME_UNCONFIRMED,
+            bid_row_id=(current["id"] if current is not None else None),
+            requested_max_bid=req.max_bid,
+            check_results=check_results, advisories=advisories,
+            source=req.source,
+        )
         raise HTTPException(status_code=503, detail=detail) from e
 
     if row is None:
@@ -2545,6 +2724,21 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                 status_code=500,
                 detail=f"Item {item_id} not in DB after sync — Gixen state unexpectedly empty",
             )
+
+    # BUI-617/618: the modify committed (whether via the direct path above or
+    # the web-added sync-and-reapply recovery just above) — notify plugins
+    # and append the ledger row using the FINAL resolved row, exactly once.
+    # notify_bid_write_committed is synchronous (KTD1) — no await.
+    notify_bid_write_committed(
+        app.state.plugin_manager, db, intent, row["id"], check_results,
+    )
+    await _append_bid_decision(
+        item_id=item_id, trigger="edit",
+        outcome=BID_DECISION_OUTCOME_COMMITTED,
+        bid_row_id=row["id"], requested_max_bid=req.max_bid,
+        check_results=check_results, advisories=advisories,
+        source=req.source,
+    )
     return {**dict(row), "advisories": advisories}
 
 
