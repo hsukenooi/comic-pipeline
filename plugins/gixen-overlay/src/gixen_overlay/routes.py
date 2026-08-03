@@ -25,6 +25,7 @@ from gixen_overlay.db import (
     heartbeat_report,
     record_heartbeat,
     record_rejected_write,
+    multi_issue_lot_reason,
     rejected_writes_report,
     upsert_comic,
     upsert_fmv,
@@ -608,7 +609,28 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
     `fmv_id` (the upserted fmv row, or null when no grade was provided).
     PER-144: callers like `fmv_runner` need both ids in one round-trip so
     they can thread them straight into `gixen-cli add` for link-fmv.
+
+    **422 on a multi-issue lot title (BUI-625, BUI-596 class D).** A lot
+    listing names several books, and `issue` carries only the first, so there
+    is no honest `comics` row to write: storing it asserts that a five-book lot
+    IS issue 18, and then merges with the real single issue. Every other
+    malformed-title shape has a correct row that normalization can find, so it
+    is cleaned and written; this one does not, so it is refused. `LedgerRoute`
+    persists the refusal to `rejected_writes`, readable at
+    `GET /api/comics/health/rejections` — the refusal is surfaced, not
+    silently dropped. Post one request per issue to record a lot.
     """
+    lot_reason = multi_issue_lot_reason(req.title, req.issue)
+    if lot_reason is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Refusing to create a comics row for a multi-issue lot: "
+                f"{lot_reason}. One comics row cannot stand for several books, "
+                f"and issue={req.issue!r} names only the first of them. POST one "
+                f"request per issue instead. title={req.title!r}"
+            ),
+        )
     db = request.app.state.db
     comic_id = upsert_comic(
         db,

@@ -785,8 +785,45 @@ def _strip_embedded_issue(title: str, issue: str) -> str:
 # no series name can reach these patterns, because the series name is exactly
 # the part that is kept and never examined.
 
-# A multi-issue lot: `#18,19,20,21,22 ...` or `... lot of 5 ...` (class D).
-_LOT_RUN_RE = re.compile(r'\s*[,/&+]\s*\d')
+# A multi-issue lot: `18,19,20,21,22 ...` or `... lot of 5 ...` (class D).
+#
+# BUI-625 widened both tests from "the text after a `#<issue>` token" to the
+# WHOLE title, because the `#` is not part of the shape. The same lot listings
+# appear hashless in `bids.ebay_title` on the live Mac Mini
+# (`"Uncanny X-men  5,6,7,8,9  Bronze age lot of 5 Fine to VF"`), and a
+# hashless lot tells exactly the same lie as a hashed one.
+#
+# Measured before widening (live DB, 2026-08-03, read-only): across the 666
+# `comics` rows BOTH tests match ZERO rows, so no legitimate stored identity is
+# affected; across the 641 raw listing titles in `bids.ebay_title` the pair
+# matches 7, and all 7 are genuine multi-issue lots (`Full Run`,
+# `1,2,3 Limited Series`, `Akira 1,2,3,4,5,6,7,8,9`). Precision 7/7, and 3 of
+# those 7 are reachable only by the run test — `lot of N` alone misses a
+# "Full Run" listing.
+#
+# The run test is keyed on the row's OWN issue number followed by a separator
+# and another digit, so it inherits the same "the caller's own `issue` is
+# duplicated into the title" signal the rest of this module trusts rather than
+# scanning for any comma-digit anywhere. `(?<!\d)` is BUI-591's guard, for the
+# same reason it exists there: issue="99" must not match inside "2099".
+# `-` IS DELIBERATELY NOT A SEPARATOR HERE, and the reason is counter-intuitive
+# enough to be worth freezing: a dash range (`#18-22`) really is a lot shape,
+# and `apps/ebay/src/comic_identity.py`'s `_LOT_RE` — the older, incident-driven
+# lot detector for this same input class (BUI-135/221/226-245/261) — does match
+# it. Measuring the widening against `comics` alone says it is free: adding `-`
+# flags 0 additional rows of 666, and 0 additional rows of BUI-596's frozen 173.
+# Measuring it against the INPUT corpus says the opposite. `bids.ebay_title`
+# holds ~100 single-issue listings in one seller's house format —
+# `"X-Men   96 - 1st Moira MacTaggert VG/Fine Cond"` — where the issue is
+# followed by a dash and the digit of a "1st appearance" note. Every one of
+# those would be refused as a lot. The `comics` table looked safe only because
+# its rows are already-normalized series names with no tail left to match.
+#
+# So the separator set stays punctuation that enumerates rather than separates
+# prose. `apps/ebay` is not a workspace member (same barrier documented on
+# `_strip_embedded_issue` above), so `_LOT_RE` cannot be imported; the dash
+# range is a known, accepted gap rather than an oversight.
+_LOT_SEPARATORS = r'[,/&+]'
 _LOT_PHRASE_RE = re.compile(r'\blot\s+of\s+\d', re.IGNORECASE)
 
 # An edition designation that belongs in the `variant` COLUMN (class C). The
@@ -794,15 +831,185 @@ _LOT_PHRASE_RE = re.compile(r'\blot\s+of\s+\d', re.IGNORECASE)
 # rows — they are here because a printing marker is a documented data-loss
 # class in this repo (BUI-364/372/373), and the cost of listing one that never
 # fires is zero while the cost of omitting one is a silent merge.
+#
+# THREE RELATED VOCABULARIES EXIST. None is reusable here, but a spelling added
+# to one is usually worth adding to the others, and BUI-373 exists precisely
+# because two printing-marker lists drifted and silently missed "2nd Ptg":
+#
+#   - `locg.commands._PRINTING_MARKER_RE` (packages/locg-cli) — the ONE
+#     printing-marker detector for that package, and ordinal-aware where this
+#     list is not. Importable (locg is a workspace dep) but scoped to LOCG
+#     collection names, not eBay listing tails.
+#   - `title_parser._EDITION_TAGS` (same package, next door) — deliberately NOT
+#     reused: it is a listing-NOISE vocabulary for cleaning a series name, so
+#     it also matches `wow`, `gem`, `beauty`, `rare` and every grade token.
+#     Feeding it to the extractor below would make `Gem` an edition designation.
+#   - `comic_identity.py` (apps/ebay) — freeform-title parsing, not importable.
+_EDITION_WORDS = (
+    r'variants?', r'virgin', r'newsstand', r'foil', r'incentive', r'cover',
+    r'facsimile', r'reprint', r'printing', r'ptg',
+)
+_EDITION_WORDS_ALT = '|'.join(_EDITION_WORDS)
 _VARIANT_DESIGNATION_RE = re.compile(
-    r'\b(variants?|virgin|newsstand|foil|incentive|cover|1:\d+'
-    r'|facsimile|reprint|printing|ptg)\b',
-    re.IGNORECASE,
+    rf'\b(?:{_EDITION_WORDS_ALT}|1:\d+)\b', re.IGNORECASE
 )
 
+# --- BUI-625: the class-C EXTRACTION rule. ---------------------------------
+#
+# `_VARIANT_DESIGNATION_RE` above answers "is there an edition designation in
+# this tail?" — which is all a DECLINE needs. Moving the designation into the
+# `variant` column needs a strictly harder answer: "where does the designation
+# start and end?" On BUI-596's measured corpus that second question is only
+# reliably answerable for one shape — a tail that is NOTHING BUT the
+# designation, ending in the designation word:
+#
+#     "Absolute Flash #10 Nick Robles Cover"   -> variant "Nick Robles Cover"
+#
+# That is exactly the 8 rows rows.tsv classifies `C-variant-designation`. The
+# other 21 tails that reach the class-C decline are class-B listing titles with
+# a designation word buried mid-prose, and their span is NOT decidable:
+#
+#   - `"... McFarlane Newsstand X-men Spider-man FVF Beauty Wow"` — is the
+#     designation `Newsstand` or `McFarlane Newsstand`? McFarlane is the
+#     interior artist, a selling point, not part of the edition.
+#   - `"WORLD'S FINEST # 200 - (VG+) -SUPERMAN/ROBIN-NEAL ADAMS COVER-..."` —
+#     a 1971 book with exactly ONE cover. `NEAL ADAMS COVER` is a cover-artist
+#     CREDIT, not a variant; extracting it would mint a phantom variant beside
+#     the real base edition.
+#   - `"Iron Man #125 Newsstand Variant (Marvel Comics August 1979) ..."` —
+#     would yield `Newsstand Variant`, while the live table already stores that
+#     designation as `Newsstand` (comics id 578 is `Iron Man` #124 1979
+#     `Newsstand`). Same book, two spellings, two rows.
+#
+# So the rule below is SYNTACTIC, not a vocabulary judgement, and every clause
+# exists to keep it on the safe side of the BUI-28 identity asymmetry:
+#
+#   * merging two distinct books into one row is UNRECOVERABLE — the row no
+#     longer records which book it was;
+#   * minting an extra variant row is recoverable — the base row is untouched
+#     and still reachable.
+#
+# Therefore the extracted value is taken VERBATIM and never canonicalized.
+# Canonicalizing (folding `Kirkham virgin variant` -> `Kirkham variant`, say)
+# is the one transformation that could merge, and BUI-596's corpus holds that
+# exact pair at the same (series, issue): rows 444 and 460 are
+# `Amazing Spider-man` #25 `Rare Kirkham virgin variant` and
+# `Rare Kirkham variant` — two genuinely different books one token apart.
+
+# One name token: letters, with internal punctuation a person's or masthead's
+# name can carry. No digits — that alone excludes every grade token (`NM-`,
+# `FN/VF`), every `1:100` ratio, every `2nd Ptg`, every parenthesised
+# publisher/date, and every enumerated lot run.
+_EDITION_NAME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z.'\-]*")
+_EDITION_TERMINAL_RE = re.compile(_EDITION_WORDS_ALT, re.IGNORECASE)
 # Separators left dangling on the kept prefix once the tail is cut, e.g.
 # `FANTASTIC FOUR # 31 - (VG-) ...` would otherwise keep a trailing hyphen.
+# Also stripped off the FRONT of a tail before it is tokenized.
 _TRAILING_SEPARATORS = " \t-–—:,;|"
+# Total tokens allowed in an extractable designation, INCLUDING the terminal
+# word. All 8 measured class-C rows are 3 (`<First> <Last> Cover`); 4 leaves
+# room for a middle name without letting listing prose be swallowed whole —
+# `"Silver age Neal Adams Cover"` (a credit on a single-cover book, 5 tokens)
+# stays declined. `variant` is row identity, so an unbounded swallow is an
+# unbounded number of ways to mint a distinct row for one book.
+_EDITION_MAX_TOKENS = 4
+
+
+def _find_issue_token(title: str, issue: str) -> re.Match[str] | None:
+    """Locate *title*'s own ``#<issue>`` token — the signal every rule here is
+    keyed on, and the one BUI-596 measured at zero false positives across the
+    table (the `#<own issue>` rule and a loose `title LIKE '%#%'` select the
+    same 173 rows of 808, so there are no legitimate `#`-in-title rows).
+
+    Shared by `_extract_edition_designation` and `_strip_listing_tail` so the
+    two cannot drift on what counts as the token; they run back to back on the
+    same (title, issue) inside a single `upsert_comic` call.
+    """
+    if not title or not issue:
+        return None
+    return re.search(rf'#\s*{re.escape(issue)}\b', title, flags=re.IGNORECASE)
+
+
+def multi_issue_lot_reason(title: str, issue: str) -> str | None:
+    """Return why *title* reads as a multi-issue lot, or None if it does not.
+
+    BUI-596 class D: one listing, several books, and `issue` holding only the
+    first. No title rule repairs this — truncating
+    `"Amazing Spider-man #18,19,20,21,22 lot of 5"` mints a clean-looking
+    `Amazing Spider-man` #18 that silently asserts the lot IS issue 18, and
+    then merges it with the real single issue. `POST /api/comics` refuses these
+    outright (BUI-625); `_strip_listing_tail` declines to truncate them.
+
+    Fails OPEN on a blank title/issue, matching every other rule in this module:
+    a shape that cannot be evaluated is not a lot.
+    """
+    issue_str = str(issue).strip() if issue else ""
+    if not title or not issue_str:
+        return None
+    run = rf'(?<!\d){re.escape(issue_str)}\s*{_LOT_SEPARATORS}\s*\d'
+    if re.search(run, title):
+        return (
+            f"issue {issue_str} is followed by a separator and another issue "
+            "number, which reads as an enumerated multi-issue run"
+        )
+    if _LOT_PHRASE_RE.search(title):
+        return "the title says 'lot of N', which names several books"
+    return None
+
+
+def _extract_edition_designation(title: str, issue: str) -> str | None:
+    """Pull an edition designation out of *title* into a `variant` value.
+
+    Returns the designation verbatim (`"Nick Robles Cover"`), or None when the
+    title carries none this rule can attribute unambiguously. See the block
+    comment above for why "unambiguous" is defined so narrowly, and why the
+    result is never canonicalized.
+
+    Fires only when ALL of these hold, so that two distinct designations can
+    never produce one string:
+
+    1. The title duplicates its own `#<issue>` token — the same signal
+       `_strip_listing_tail` is keyed on, whose false-positive rate BUI-596
+       measured at zero across the table.
+    2. Everything after that token is 2..4 whitespace-separated name tokens of
+       letters only (no digits, parentheses, slashes or plus/minus).
+    3. The LAST of those tokens is an edition word. Ending on it is what makes
+       the span decidable: the designation runs to the end of the title, so
+       there is no listing prose left over to guess about.
+    4. At least one token precedes it. A bare `"#20 Variant"` names no
+       distinguishing feature, so two different variants of one issue would
+       both extract `"Variant"` and MERGE — the one outcome this must not have.
+
+    Never fires on a lot: clause 2 forbids digits, and a lot tail is an
+    enumerated run of them.
+
+    Known, accepted over-split: `variant` is compared case-SENSITIVELY (the
+    column has no `COLLATE NOCASE`, and both unique indexes key on
+    `COALESCE(variant,'')` with no `LOWER` — unlike `title`, which they do
+    lower). So `"Nick Robles Cover"` and `"Nick Robles cover"` would be two
+    rows for one book. That asymmetry predates this rule (BUI-28), and folding
+    case here would not fix it — only the index would. Splitting is the
+    recoverable direction, so it is left alone rather than half-fixed.
+    """
+    issue_str = str(issue).strip() if issue else ""
+    match = _find_issue_token(title, issue_str)
+    if match is None:
+        return None
+
+    tail = title[match.end():].strip().lstrip(_TRAILING_SEPARATORS).strip()
+    tokens = tail.split()
+    if not 2 <= len(tokens) <= _EDITION_MAX_TOKENS:
+        return None
+    if not all(_EDITION_NAME_TOKEN_RE.fullmatch(t) for t in tokens):
+        return None
+    if not _EDITION_TERMINAL_RE.fullmatch(tokens[-1]):
+        return None
+    # Rejoin from the split rather than returning the raw slice so that the
+    # value is whitespace-normalized — `"Nick  Robles Cover"` and
+    # `"Nick Robles Cover"` are one book, and `variant` is matched exactly
+    # (the identity index keys on `COALESCE(variant,'')`, with no LOWER and no
+    # collation), so an unsquashed double space would be a second row.
+    return " ".join(tokens)
 
 
 def _strip_listing_tail(
@@ -833,34 +1040,48 @@ def _strip_listing_tail(
       name to keep, so the title is left for BUI-591's strip.
     - **A multi-issue lot** (class D, ``"Amazing Spider-man #18,19,20,21,22
       lot of 5"``): truncating would produce a clean-looking `Amazing
-      Spider-man` #18 that silently asserts the lot *is* issue 18. Whether a
-      lot should produce a `comics` row at all is an open product decision;
-      declining preserves today's behaviour rather than pre-empting it.
+      Spider-man` #18 that silently asserts the lot *is* issue 18. Since
+      BUI-625 `POST /api/comics` refuses these with a 422 before they ever
+      reach here; this decline still covers the in-process callers, which pass
+      an already-parsed series rather than a raw listing title.
     - **A variant designation with no `variant` supplied** (class C,
-      ``"Absolute Flash #10 Nick Robles Cover"``, ``"Iron Man #125 Newsstand
-      Variant ..."``): `variant` is part of row identity (BUI-28), so cutting
-      a cover designation out of the title without moving it into that column
-      would merge a variant into its base edition — and merge distinct variant
+      ``"Iron Man #125 Newsstand Variant (Marvel Comics August 1979) ..."``):
+      `variant` is part of row identity (BUI-28), so cutting a cover
+      designation out of the title without moving it into that column would
+      merge a variant into its base edition — and merge distinct variant
       siblings (`#20 Bermejo Variant` / `#20 Crain Variant`) into one row.
       That is precisely the "silently collide two distinct books" failure this
-      write boundary must not have. When the caller *does* supply `variant`,
-      the designation is already recorded in its column and truncation is safe,
-      so the rule fires normally.
+      write boundary must not have.
+
+      BUI-625 narrowed this decline rather than removing it. `upsert_comic`
+      now runs `_extract_edition_designation` FIRST, which moves the
+      designation into `variant` for the one tail shape whose span is
+      decidable (``"Absolute Flash #10 Nick Robles Cover"``) — and having
+      supplied `variant`, truncation here is safe and fires normally. What
+      still reaches this decline is the residue: a designation word buried in
+      listing prose, where no rule can say which words belong to the edition.
+      Those keep today's behaviour (BUI-591's strip, a malformed but
+      recoverable title) instead of guessing.
+
+      Note the asymmetry that decides class C vs class D: a lot has NO correct
+      row, so refusing the write loses nothing; an unattributable designation
+      HAS a correct row that simply cannot be named, so degrading beats
+      refusing — hard-failing it would store the book nowhere (the BUI-593
+      class), and the caller has no `variant` to supply on a retry.
     """
     issue_str = str(issue).strip() if issue else ""
-    if not title or not issue_str:
-        return None
-    match = re.search(rf'#\s*{re.escape(issue_str)}\b', title, flags=re.IGNORECASE)
+    match = _find_issue_token(title, issue_str)
     if match is None:
         return None
 
     tail = title[match.end():]
-    if _LOT_RUN_RE.match(tail) or _LOT_PHRASE_RE.search(tail):
+    lot_reason = multi_issue_lot_reason(title, issue_str)
+    if lot_reason is not None:
         logger.warning(
-            "upsert_comic: declining listing-title truncation — text after '#%s' "
-            "reads as a multi-issue lot, and one comics row cannot stand for "
-            "several books (BUI-599 class D, open). title=%r",
-            issue_str,
+            "upsert_comic: declining listing-title truncation — %s, and one "
+            "comics row cannot stand for several books (BUI-596 class D). "
+            "title=%r",
+            lot_reason,
             title,
         )
         return None
@@ -871,9 +1092,10 @@ def _strip_listing_tail(
     if not variant and _VARIANT_DESIGNATION_RE.search(tail):
         logger.warning(
             "upsert_comic: declining listing-title truncation — text after '#%s' "
-            "carries a variant designation but no `variant` was supplied; "
-            "truncating would merge this into the base edition (BUI-599 class C, "
-            "open; variant is row identity per BUI-28). title=%r",
+            "carries an edition designation that could not be attributed to a "
+            "`variant` value, and truncating would merge this into the base "
+            "edition (BUI-596 class C residue; variant is row identity per "
+            "BUI-28). Pass `variant` explicitly to record it. title=%r",
             issue_str,
             title,
         )
@@ -965,6 +1187,12 @@ def upsert_comic(
     comic ids. An empty/blank variant normalizes to NULL (the base edition). All
     the reconciliation below is scoped to a single variant.
 
+    BUI-625: when the caller supplies no `variant` and the title ends in an
+    edition designation, `_extract_edition_designation` recovers it into that
+    column, so `"Absolute Flash #10 Nick Robles Cover"` lands as
+    `("Absolute Flash", "10", variant="Nick Robles Cover")` — distinct from the
+    base edition rather than either merged into it or left malformed.
+
     Year is optional. Reconciliation rules keep at most one row per
     (title, issue, variant) logical comic:
 
@@ -989,6 +1217,15 @@ def upsert_comic(
     # whether a variant was supplied before it will cut a cover designation out
     # of the title.
     variant = (variant or "").strip() or None
+
+    # BUI-625: when the caller named no variant but the title ends in an
+    # edition designation, move it into the column it belongs in. This runs
+    # BEFORE the title normalization on purpose — having recovered the
+    # designation, `_strip_listing_tail` will now truncate the title instead of
+    # declining, and the variant stays distinct from the base edition. A
+    # caller-supplied `variant` always wins; nothing is overwritten.
+    if variant is None:
+        variant = _extract_edition_designation(title, issue)
 
     # BUI-591/BUI-599: normalize before any identity query runs, so
     # reconciliation below (and the yearless-promotion logic) all operate on
