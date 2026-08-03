@@ -12,8 +12,12 @@ Two concerns run through this file, mirroring the two halves of validation
   keys. Exercised with stub normalizers (never `collection_cache`'s real
   ones — this module must not import that one; see the module docstring).
 
-Wiring `authority.py` into `owned_match_keys`/`identity_series_key` is
-BUI-653/BUI-654; nothing here touches `collection_cache.py`.
+Wiring `authority.py`'s alias groups into `owned_match_keys` is BUI-653
+(the packaged file now carries the five migrated masthead-alias entries,
+asserted below); the `relabel` side into `identity_series_key` is BUI-654's.
+This file still tests `authority.py` in isolation — the migration's own
+`collection_cache.py`-facing tests (the dead-tuple check, the fixture-widens
+`owned_match_keys` demo) live in `test_masthead_alias_migration.py`.
 """
 from __future__ import annotations
 
@@ -47,30 +51,47 @@ def _table(*entries) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_packaged_authority_json_ships_empty():
-    """v1 ships `{"version": 1, "entries": []}` — the five masthead aliases
-    are BUI-653's migration, not this ticket's."""
+def test_packaged_authority_json_has_the_five_migrated_masthead_aliases():
+    """v1 shipped `{"version": 1, "entries": []}` (BUI-652). BUI-653 migrates
+    collection_cache.py's five-entry `_MASTHEAD_ALIAS_PAIRS` tuple here as
+    `alias` entries — this asserts the migration landed with the right
+    pairs and that every entry carries its evidence ticket."""
     from importlib import resources
 
     text = (resources.files("locg") / "data" / "authority.json").read_text(
         encoding="utf-8"
     )
     raw = json.loads(text)
-    assert raw == {"version": 1, "entries": []}
+    assert raw["version"] == 1
+    names = {tuple(entry["names"]) for entry in raw["entries"]}
+    assert names == {
+        ("Mighty Thor", "Thor"),
+        ("Invincible Iron Man", "Iron Man"),
+        ("Incredible Hulk", "Hulk"),
+        ("Uncanny X-Men", "X-Men"),
+        ("Dr. Strange", "Doctor Strange"),
+    }
+    for entry in raw["entries"]:
+        assert entry["kind"] == "alias"
+        assert entry["evidence"]
+        assert entry["added"]
 
 
 def test_module_import_parses_the_packaged_file_without_raising():
     # If this collection succeeded, the module-level `parse_table(...)` call
     # in authority.py already ran; assert its result directly too.
-    assert authority._ALIAS_ENTRIES == ()
+    assert len(authority._ALIAS_ENTRIES) == 5
     assert authority._RELABEL_ENTRIES == ()
 
 
-def test_build_tables_from_the_packaged_empty_file():
+def test_build_tables_from_the_packaged_file():
     alias_table = authority.build_alias_table(str.lower)
     relabel_table = authority.build_relabel_table(str.lower)
+    # A name outside the five migrated pairs is still an untouched singleton.
     assert alias_table.equivalents("anything") == frozenset({"anything"})
     assert relabel_table.relabel("anything") == "anything"
+    # And the migrated pairs are actually there.
+    assert alias_table.equivalents("thor") == frozenset({"thor", "mighty thor"})
 
 
 # ---------------------------------------------------------------------------
