@@ -670,6 +670,17 @@ async function saveMaxBid(cell, newMax) {
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
       try { const j = await resp.json(); if (j.detail) detail = j.detail; } catch (_) {}
+      // BUI-623 (U9): a policy block's 409 detail is a structured object
+      // (KTD4 envelope: {blocked, message, advisories, ...}), not a plain
+      // string — left as-is it stringifies to "[object Object]" below.
+      // Surface the human-readable message in a plain alert (the minimal
+      // U9 dashboard treatment the plan calls for; a fuller advisory UI is
+      // deferred), then fall through to the same revert/tag flow as any
+      // other save failure so the cell's own state stays consistent.
+      if (resp.status === 409 && detail && typeof detail === "object") {
+        alert(detail.message || "Blocked by policy.");
+        detail = detail.message || "blocked by policy";
+      }
       throw new Error(detail);
     }
     cell.classList.remove("saving");

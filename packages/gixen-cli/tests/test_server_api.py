@@ -4617,6 +4617,215 @@ def test_bid_decisions_append_failure_never_breaks_the_write(api, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# BUI-623 (U9): blocking mode with audited bypass. Exercised through the
+# host-owned exposure_ceiling check (POLICY_EXPOSURE_CEILING +
+# POLICY_BLOCK_EXPOSURE_CEILING) — no overlay/plugin needed, matching how
+# the BUI-615/616 section above exercises the advisory-only behavior of the
+# same check.
+# ---------------------------------------------------------------------------
+
+def test_add_bid_blocked_returns_409_no_gixen_call_no_row(api, monkeypatch):
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    r = api.post("/api/bids", json={"item_id": "623000001", "max_bid": 50.0})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["blocked"] is True
+    assert detail["blocking_codes"] == ["exposure_ceiling"]
+    assert any(a["code"] == "exposure_ceiling" for a in detail["advisories"])
+
+    api.mock_gixen.add_snipe.assert_not_called()
+    row = _dbconn().execute(
+        "SELECT * FROM bids WHERE item_id='623000001'"
+    ).fetchone()
+    assert row is None  # no bid row was ever created
+
+    rows = _decisions("623000001")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "blocked"
+    assert rows[0]["bid_row_id"] is None
+    assert rows[0]["bypass"] == 0
+    assert rows[0]["trigger"] == "create"
+
+
+def test_add_bid_bypass_commits_and_records_bypass_1(api, monkeypatch):
+    """Same blocking config as above, but policy_bypass=true suppresses the
+    409 — the write commits normally and the ledger records bypass=1 with
+    the full advisory set that was acknowledged."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    r = api.post(
+        "/api/bids",
+        json={"item_id": "623000002", "max_bid": 50.0, "policy_bypass": True},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["advisories"]) == 1
+    assert data["advisories"][0]["code"] == "exposure_ceiling"
+
+    api.mock_gixen.add_snipe.assert_called_once()
+    row = _dbconn().execute(
+        "SELECT * FROM bids WHERE item_id='623000002' AND status='PENDING'"
+    ).fetchone()
+    assert row is not None
+
+    rows = _decisions("623000002")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "committed"
+    assert rows[0]["bypass"] == 1
+
+
+def test_add_bid_blocked_upsert_names_surviving_snipe_and_max_bid(api, monkeypatch):
+    """R14/U9 acceptance: a blocked upsert-modify of a live row must name
+    the surviving snipe and its CURRENT max_bid — the $100 already on
+    Gixen, not the new (rejected) $500 the request asked for."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    monkeypatch.delenv("POLICY_BLOCK_EXPOSURE_CEILING", raising=False)
+    r0 = api.post("/api/bids", json={"item_id": "623000003", "max_bid": 100.0})
+    assert r0.status_code == 200
+
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    r = api.post("/api/bids", json={"item_id": "623000003", "max_bid": 500.0})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["surviving_snipe"] == {"item_id": "623000003", "max_bid": 100.0}
+    assert "100.00" in detail["message"]
+    assert "remains active" in detail["message"]
+
+    # The Gixen modify call must never have been attempted, and the row on
+    # disk must still read $100 — not "no money committed" and not the
+    # rejected $500.
+    api.mock_gixen.modify_snipe.assert_not_called()
+    row = _dbconn().execute(
+        "SELECT max_bid FROM bids WHERE item_id='623000003' AND status='PENDING'"
+    ).fetchone()
+    assert row["max_bid"] == 100.0
+
+    rows = _decisions("623000003")
+    assert rows[-1]["outcome"] == "blocked"
+    assert rows[-1]["trigger"] == "upsert"
+    assert rows[-1]["bid_row_id"] is not None  # anchors to the existing row
+
+
+def test_edit_bid_blocked_names_surviving_snipe(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    monkeypatch.delenv("POLICY_BLOCK_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "623000004", "max_bid": 75.0})
+
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    r = api.patch(
+        "/api/bids/623000004",
+        json={"max_bid": 200.0, "bid_offset": 6, "snipe_group": 0},
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["surviving_snipe"] == {"item_id": "623000004", "max_bid": 75.0}
+
+    api.mock_gixen.modify_snipe.assert_not_called()
+    row = _dbconn().execute(
+        "SELECT max_bid FROM bids WHERE item_id='623000004' AND status='PENDING'"
+    ).fetchone()
+    assert row["max_bid"] == 75.0
+
+    rows = _decisions("623000004")
+    assert rows[-1]["outcome"] == "blocked"
+    assert rows[-1]["trigger"] == "edit"
+
+
+def test_edit_bid_bypass_commits_past_a_block(api, monkeypatch):
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    monkeypatch.delenv("POLICY_BLOCK_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "623000005", "max_bid": 75.0})
+
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    r = api.patch(
+        "/api/bids/623000005",
+        json={"max_bid": 200.0, "bid_offset": 6, "snipe_group": 0, "policy_bypass": True},
+    )
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT max_bid FROM bids WHERE item_id='623000005'"
+    ).fetchone()
+    assert row["max_bid"] == 200.0
+    rows = _decisions("623000005")
+    assert rows[-1]["outcome"] == "committed"
+    assert rows[-1]["bypass"] == 1
+
+
+def test_add_bid_unevaluable_check_with_block_flag_proceeds_with_marker(api, monkeypatch):
+    """A malformed POLICY_EXPOSURE_CEILING makes the check `unevaluable` —
+    per the guard-strictness learning, that NEVER blocks by itself, even
+    with POLICY_BLOCK_EXPOSURE_CEILING set. But a blind blocking check must
+    stay visible: both the response advisory and the ledger row carry the
+    unevaluable_while_blocking marker instead of proceeding silently."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "not-a-number")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    r = api.post("/api/bids", json={"item_id": "623000006", "max_bid": 50.0})
+    assert r.status_code == 200  # never blocked
+    data = r.json()
+    assert len(data["advisories"]) == 1
+    adv = data["advisories"][0]
+    assert adv["severity"] == "unevaluable"
+    assert adv["data"]["unevaluable_while_blocking"] is True
+
+    api.mock_gixen.add_snipe.assert_called_once()
+
+    rows = _decisions("623000006")
+    assert rows[0]["outcome"] == "committed"
+    checks = json.loads(rows[0]["checks_json"])
+    assert checks[0]["data"]["unevaluable_while_blocking"] is True
+    advisories_json = json.loads(rows[0]["advisories_json"])
+    assert advisories_json[0]["data"]["unevaluable_while_blocking"] is True
+
+
+def test_add_bid_flags_off_identical_to_v1_regression_guard(api, monkeypatch):
+    """The merge condition: with every POLICY_BLOCK_* flag off (the
+    default), a write that would otherwise be blocked behaves EXACTLY like
+    v1 — 200, advisory-only, bid row written, no 409 anywhere."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.delenv("POLICY_BLOCK_EXPOSURE_CEILING", raising=False)
+    r = api.post("/api/bids", json={"item_id": "623000007", "max_bid": 50.0})
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["advisories"]) == 1
+    assert data["advisories"][0]["severity"] == "warning"
+    assert "unevaluable_while_blocking" not in data["advisories"][0]["data"]
+
+    api.mock_gixen.add_snipe.assert_called_once()
+    row = _dbconn().execute(
+        "SELECT * FROM bids WHERE item_id='623000007' AND status='PENDING'"
+    ).fetchone()
+    assert row is not None
+    assert row["max_bid"] == 50.0
+
+    rows = _decisions("623000007")
+    assert rows[0]["outcome"] == "committed"
+    assert rows[0]["bypass"] == 0
+
+
+def test_add_bid_flag_false_explicit_behaves_like_unset(api, monkeypatch):
+    """Adversarial: an explicit POLICY_BLOCK_EXPOSURE_CEILING=false must
+    behave identically to leaving it unset — no block."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "false")
+    r = api.post("/api/bids", json={"item_id": "623000008", "max_bid": 50.0})
+    assert r.status_code == 200
+
+
+def test_add_bid_malformed_block_flag_does_not_block(api, monkeypatch):
+    """Adversarial: a malformed POLICY_BLOCK_EXPOSURE_CEILING (not a
+    recognized boolean) must fail in the 'stays off' direction — never
+    silently start blocking a real-money write over an operator typo."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "yesplease")
+    r = api.post("/api/bids", json={"item_id": "623000009", "max_bid": 50.0})
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # BUI-617 (U3): check_bid_write / on_bid_write_committed hookspec invocation
 # through the real endpoints. These build their own TestClient (rather than
 # using the `api` fixture, which forces zero plugins via _install_plugins(

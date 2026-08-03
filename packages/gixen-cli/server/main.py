@@ -43,7 +43,7 @@ from server.db import (
     write_transaction,
     record_bid_decision, list_bid_decisions,
     BID_DECISION_OUTCOME_COMMITTED, BID_DECISION_OUTCOME_UNCONFIRMED,
-    BID_DECISION_OUTCOME_GIXEN_FAILED,
+    BID_DECISION_OUTCOME_GIXEN_FAILED, BID_DECISION_OUTCOME_BLOCKED,
 )
 # BUI-389: the eBay-fallback/cancel-evidence cluster (_run_ebay_fallback and
 # its BUI-371 cancel-evidence helpers) was extracted to server/fallback.py to
@@ -68,6 +68,7 @@ from server.fallback import (
 )
 from server.policy import (
     PolicyIntent, run_checks, notify_bid_write_committed, config_snapshot,
+    evaluate_block, build_block_detail,
 )
 import ebay_bidder
 
@@ -343,6 +344,12 @@ async def _append_bid_decision(
     already known — a fire-and-forget tail call, entered with no pending
     network await, matching the "enter _write_locked() only after any await
     has completed" discipline every other write site in this module follows.
+
+    BUI-623 (U9): `config_snapshot(check_results)` — not the bare
+    `config_snapshot()` — so the ledger's `config_json` also records the raw
+    `POLICY_BLOCK_<CODE>` value for every check that actually ran this
+    request (see that function's own docstring); `check_results` is always
+    the same list this call's caller already has from `run_checks`.
     """
     try:
         async with _write_locked():
@@ -351,7 +358,8 @@ async def _append_bid_decision(
                     wconn,
                     item_id=item_id, trigger=trigger, outcome=outcome,
                     bid_row_id=bid_row_id, requested_max_bid=requested_max_bid,
-                    source=source, bypass=bypass, config=config_snapshot(),
+                    source=source, bypass=bypass,
+                    config=config_snapshot(check_results),
                     check_results=check_results, advisories=advisories,
                 )
     except Exception:
@@ -1775,6 +1783,16 @@ class AddBidRequest(BaseModel):
     # comic_id/locg_id degrades to "no link resolved" downstream (the
     # overlay's on_bid_write_committed), never a 422 on the money path.
     comic_identities: list[dict] = []
+    # BUI-623 (U9): the audited bypass — `gixen add --ack-policy` sets this.
+    # Default False means an old client (or a new one that never passes
+    # --ack-policy) is byte-identical to v1: with every POLICY_BLOCK_* flag
+    # also off by default, `evaluate_block` never blocks anything, so this
+    # field being present-but-false changes nothing. When True, it suppresses
+    # a block that would otherwise fire for THIS request only (per-
+    # invocation, and blanket across every blocking check that fired) — the
+    # commit still records `bypass=1` and the full advisory set on the
+    # ledger row, so what was overridden is always reconstructable later.
+    policy_bypass: bool = False
 
     @field_validator("item_id")
     @classmethod
@@ -1824,6 +1842,10 @@ class EditBidRequest(BaseModel):
     # BUI-618 (U6): same optional provenance tag as AddBidRequest.source —
     # see its docstring.
     source: str | None = None
+    # BUI-623 (U9): the audited bypass — `gixen edit --ack-policy` sets
+    # this. Same semantics as AddBidRequest.policy_bypass above (both
+    # request models gained this field together, per the plan).
+    policy_bypass: bool = False
 
     @field_validator("max_bid")
     @classmethod
@@ -2080,6 +2102,37 @@ async def api_add_bid(req: AddBidRequest):
             )
             advisories, check_results = run_checks(db, intent, app.state.plugin_manager)
 
+            # BUI-623 (U9): the blocking verdict for THIS evaluation, decided
+            # right after run_checks and BEFORE any Gixen call below — still
+            # inside _api_lock. `req.policy_bypass` never suppresses
+            # evaluation itself, only the block; the full advisory set still
+            # lands in the ledger either way. When blocked, this returns
+            # (via the 409 raise) without ever reaching _modify_and_update_
+            # bid/_add_bid_row — no Gixen call, no bid-row change.
+            block_decision = evaluate_block(
+                check_results, advisories, bypass=req.policy_bypass,
+            )
+            if block_decision.blocked:
+                # R14/U9: an upsert-modify of a live row must not read as
+                # "no money committed" — name the surviving snipe and its
+                # current max_bid when one exists (None for a genuine create).
+                surviving_snipe = (
+                    {"item_id": existing["item_id"], "max_bid": existing["max_bid"]}
+                    if existing is not None else None
+                )
+                detail = build_block_detail(
+                    block_decision, advisories, surviving_snipe=surviving_snipe,
+                )
+                await _append_bid_decision(
+                    item_id=req.item_id, trigger=intent.trigger,
+                    outcome=BID_DECISION_OUTCOME_BLOCKED,
+                    bid_row_id=(existing["id"] if existing is not None else None),
+                    requested_max_bid=req.max_bid,
+                    check_results=check_results, advisories=advisories,
+                    source=req.source, bypass=False,
+                )
+                raise HTTPException(status_code=409, detail=detail)
+
             # BUI-617/618 (U3/U6): one helper per outcome class, defined here
             # so every branch below records the SAME shape instead of each
             # branch hand-rolling its own call (the duplicated-predicates-
@@ -2100,7 +2153,7 @@ async def api_add_bid(req: AddBidRequest):
                     outcome=BID_DECISION_OUTCOME_COMMITTED,
                     bid_row_id=bid_row_id, requested_max_bid=req.max_bid,
                     check_results=check_results, advisories=advisories,
-                    source=req.source,
+                    source=req.source, bypass=req.policy_bypass,
                 )
 
             async def _record_unconfirmed(bid_row_id: int | None) -> None:
@@ -2109,7 +2162,7 @@ async def api_add_bid(req: AddBidRequest):
                     outcome=BID_DECISION_OUTCOME_UNCONFIRMED,
                     bid_row_id=bid_row_id, requested_max_bid=req.max_bid,
                     check_results=check_results, advisories=advisories,
-                    source=req.source,
+                    source=req.source, bypass=req.policy_bypass,
                 )
 
             if existing is not None:
@@ -2162,7 +2215,7 @@ async def api_add_bid(req: AddBidRequest):
             bid_row_id=(existing["id"] if existing is not None else None),
             requested_max_bid=req.max_bid,
             check_results=check_results, advisories=advisories,
-            source=req.source,
+            source=req.source, bypass=req.policy_bypass,
         )
         raise HTTPException(status_code=503, detail=str(e)) from e
     except requests.HTTPError as e:
@@ -2173,7 +2226,7 @@ async def api_add_bid(req: AddBidRequest):
             bid_row_id=(existing["id"] if existing is not None else None),
             requested_max_bid=req.max_bid,
             check_results=check_results, advisories=advisories,
-            source=req.source,
+            source=req.source, bypass=req.policy_bypass,
         )
         raise HTTPException(status_code=503, detail=f"Gixen HTTP error: {e}") from e
 
@@ -2649,6 +2702,34 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                 prior_row=current,
             )
             advisories, check_results = run_checks(db, intent, app.state.plugin_manager)
+
+            # BUI-623 (U9): same blocking verdict as api_add_bid, decided
+            # right after run_checks and BEFORE the Gixen modify call below
+            # — still inside _api_lock. Blocked -> 409, no Gixen call, no
+            # bid-row change; `current` (the live PENDING row, if any) is
+            # the surviving snipe named in the 409 detail (R14/U9: an edit
+            # blocked on a live row must not read as "no money committed").
+            block_decision = evaluate_block(
+                check_results, advisories, bypass=req.policy_bypass,
+            )
+            if block_decision.blocked:
+                surviving_snipe = (
+                    {"item_id": current["item_id"], "max_bid": current["max_bid"]}
+                    if current is not None else None
+                )
+                detail = build_block_detail(
+                    block_decision, advisories, surviving_snipe=surviving_snipe,
+                )
+                await _append_bid_decision(
+                    item_id=item_id, trigger="edit",
+                    outcome=BID_DECISION_OUTCOME_BLOCKED,
+                    bid_row_id=(current["id"] if current is not None else None),
+                    requested_max_bid=req.max_bid,
+                    check_results=check_results, advisories=advisories,
+                    source=req.source, bypass=False,
+                )
+                raise HTTPException(status_code=409, detail=detail)
+
             await _modify_with_cache_fallback(
                 db, item_id, Decimal(str(req.max_bid)),
                 gixen_bid_offset, gixen_snipe_group,
@@ -2679,7 +2760,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             bid_row_id=(current["id"] if current is not None else None),
             requested_max_bid=req.max_bid,
             check_results=check_results, advisories=advisories,
-            source=req.source,
+            source=req.source, bypass=req.policy_bypass,
         )
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in Gixen") from e
     except (GixenError, requests.HTTPError) as e:
@@ -2696,7 +2777,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             bid_row_id=(current["id"] if current is not None else None),
             requested_max_bid=req.max_bid,
             check_results=check_results, advisories=advisories,
-            source=req.source,
+            source=req.source, bypass=req.policy_bypass,
         )
         raise HTTPException(status_code=503, detail=detail) from e
 
@@ -2754,7 +2835,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         outcome=BID_DECISION_OUTCOME_COMMITTED,
         bid_row_id=row["id"], requested_max_bid=req.max_bid,
         check_results=check_results, advisories=advisories,
-        source=req.source,
+        source=req.source, bypass=req.policy_bypass,
     )
     return {**dict(row), "advisories": advisories}
 

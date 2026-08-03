@@ -234,3 +234,161 @@ def test_edit_direct_mode_has_no_advisory_rendering_path_error():
     assert result.exit_code == 0, result.output
     assert result.exception is None
     assert "advisor" not in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# BUI-623 (U9): `--ack-policy` -> payload policy_bypass=true, and the 409
+# policy-block detail rendering in `_server_request`'s error path.
+# ---------------------------------------------------------------------------
+
+_BLOCK_DETAIL = {
+    "blocked": True,
+    "message": "Blocked by policy check(s): over_fmv.",
+    "blocking_codes": ["over_fmv"],
+    "unevaluable_while_blocking": [],
+    "advisories": [
+        {"code": "over_fmv", "severity": "warning", "message": "over FMV", "data": {}},
+    ],
+    "surviving_snipe": None,
+}
+
+
+def test_add_ack_policy_sets_policy_bypass_in_payload():
+    runner = CliRunner()
+    captured = {}
+
+    def fake_request(method, path, **kwargs):
+        if path == "/api/bids":
+            captured["json"] = kwargs.get("json")
+            return {"item_id": "444", "created": True}
+        return {}
+
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request", side_effect=fake_request), \
+         patch("cli._record_add"):
+        result = runner.invoke(cli, ["add", "444", "20.00", "--ack-policy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"]["policy_bypass"] is True
+
+
+def test_add_without_ack_policy_omits_policy_bypass():
+    runner = CliRunner()
+    captured = {}
+
+    def fake_request(method, path, **kwargs):
+        if path == "/api/bids":
+            captured["json"] = kwargs.get("json")
+            return {"item_id": "444", "created": True}
+        return {}
+
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request", side_effect=fake_request), \
+         patch("cli._record_add"):
+        result = runner.invoke(cli, ["add", "444", "20.00"])
+
+    assert result.exit_code == 0, result.output
+    assert "policy_bypass" not in captured["json"]
+
+
+def test_add_direct_mode_ack_policy_warns_and_is_ignored():
+    runner = CliRunner()
+    with patch("cli._make_client") as mock_make, \
+         patch("cli._record_add"), \
+         patch("cli._server_url", return_value=None):
+        mock_client = MagicMock()
+        mock_client.list_snipes.return_value = []
+        mock_make.return_value = mock_client
+
+        result = runner.invoke(cli, ["add", "444555666", "15.00", "--ack-policy"])
+
+    assert result.exit_code == 0, result.output
+    assert "--ack-policy requires COMICS_SERVER_URL" in result.output
+
+
+def test_add_blocked_409_renders_message_and_advisories_then_exits_nonzero():
+    """The CLI's own _server_request error path (not a mocked wrapper) must
+    render the structured KTD4 detail clearly instead of the generic
+    'Server returned 409: {dict}' string."""
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result",
+               return_value=(False, _BLOCK_DETAIL, "Server returned 409: ...")):
+        result = runner.invoke(cli, ["add", "444", "999.00"])
+
+    assert result.exit_code == 1
+    assert "Blocked by policy check(s): over_fmv." in result.output
+    assert "over_fmv" in result.output  # the advisory itself also rendered
+    assert "[object Object]" not in result.output
+
+
+def test_add_non_blocked_503_still_renders_generic_error_message():
+    """Regression guard: a genuine (non-policy) server failure must keep
+    rendering exactly like before — the new structured-detail branch must
+    only trigger for a `blocked: true` 409, not every failure."""
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result",
+               return_value=(False, None, "Server returned 503: gixen down")):
+        result = runner.invoke(cli, ["add", "444", "20.00"])
+
+    assert result.exit_code == 1
+    assert "Error: Server returned 503: gixen down" in result.output
+
+
+def test_edit_ack_policy_sets_policy_bypass_in_payload():
+    runner = CliRunner()
+    captured = {}
+
+    def fake_request(method, path, **kwargs):
+        captured["json"] = kwargs.get("json")
+        return {"item_id": "200000001"}
+
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request", side_effect=fake_request):
+        result = runner.invoke(cli, ["edit", "200000001", "75.0", "--ack-policy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"]["policy_bypass"] is True
+
+
+def test_edit_without_ack_policy_omits_policy_bypass():
+    runner = CliRunner()
+    captured = {}
+
+    def fake_request(method, path, **kwargs):
+        captured["json"] = kwargs.get("json")
+        return {"item_id": "200000001"}
+
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request", side_effect=fake_request):
+        result = runner.invoke(cli, ["edit", "200000001", "75.0"])
+
+    assert result.exit_code == 0, result.output
+    assert "policy_bypass" not in captured["json"]
+
+
+def test_edit_direct_mode_ack_policy_warns_and_is_ignored():
+    runner = CliRunner()
+    mock_client = MagicMock()
+    mock_client.list_snipes.return_value = [{
+        "item_id": "200000001", "bid_offset": "9", "snipe_group": "3", "dbidid": "555",
+    }]
+    with patch("cli._server_url", return_value=None), \
+         patch("cli._make_client", return_value=mock_client):
+        result = runner.invoke(cli, ["edit", "200000001", "75.0", "--ack-policy"])
+
+    assert result.exit_code == 0, result.output
+    assert "--ack-policy requires COMICS_SERVER_URL" in result.output
+
+
+def test_edit_blocked_409_renders_message_and_advisories_then_exits_nonzero():
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result",
+               return_value=(False, _BLOCK_DETAIL, "Server returned 409: ...")):
+        result = runner.invoke(cli, ["edit", "200000001", "999.0"])
+
+    assert result.exit_code == 1
+    assert "Blocked by policy check(s): over_fmv." in result.output
+    assert "over_fmv" in result.output

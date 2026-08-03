@@ -23,6 +23,8 @@ from server.policy import (
     PolicyIntent, CheckResult, run_checks,
     _sum_grouped_pending, _project_exposure, _check_exposure,
     notify_bid_write_committed, config_snapshot,
+    BlockDecision, evaluate_block, build_block_detail,
+    _block_flag_on, _policy_block_env_var,
 )
 from gixen.plugins import make_plugin_manager, hookimpl
 
@@ -519,3 +521,194 @@ def test_config_snapshot_reads_per_call_not_cached(monkeypatch):
     second = config_snapshot()
     assert first != second
     assert second["POLICY_EXPOSURE_CEILING"] == "2"
+
+
+def test_config_snapshot_with_check_results_adds_block_flags(monkeypatch):
+    """BUI-623 (U9): passing check_results additionally records the raw
+    POLICY_BLOCK_<CODE> value for every code that ran this request."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "10")
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    check_results = [{"code": "exposure_ceiling", "outcome": "advise"}]
+    snapshot = config_snapshot(check_results)
+    assert snapshot == {
+        "POLICY_EXPOSURE_CEILING": "10",
+        "POLICY_BLOCK_EXPOSURE_CEILING": "true",
+    }
+
+
+def test_config_snapshot_with_check_results_records_unset_flag_as_none(monkeypatch):
+    monkeypatch.delenv("POLICY_BLOCK_OVER_FMV", raising=False)
+    check_results = [{"code": "over_fmv", "outcome": "pass"}]
+    snapshot = config_snapshot(check_results)
+    assert snapshot["POLICY_BLOCK_OVER_FMV"] is None
+
+
+def test_config_snapshot_empty_check_results_matches_bare_call(monkeypatch):
+    """An empty list must not add any POLICY_BLOCK_* keys — same shape as
+    omitting the argument entirely."""
+    monkeypatch.setenv("POLICY_EXPOSURE_CEILING", "5")
+    assert config_snapshot([]) == config_snapshot()
+
+
+# ---------------------------------------------------------------------------
+# BUI-623 (U9) — blocking mode with audited bypass
+# ---------------------------------------------------------------------------
+
+def test_policy_block_env_var_uppercases_code():
+    assert _policy_block_env_var("over_fmv") == "POLICY_BLOCK_OVER_FMV"
+    assert _policy_block_env_var("exposure_ceiling") == "POLICY_BLOCK_EXPOSURE_CEILING"
+
+
+def test_block_flag_unset_is_off(monkeypatch):
+    monkeypatch.delenv("POLICY_BLOCK_OVER_FMV", raising=False)
+    assert _block_flag_on("over_fmv") is False
+
+
+def test_block_flag_truthy_values_are_on(monkeypatch):
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("POLICY_BLOCK_OVER_FMV", value)
+        assert _block_flag_on("over_fmv") is True, value
+
+
+def test_block_flag_falsy_values_are_off(monkeypatch):
+    for value in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("POLICY_BLOCK_OVER_FMV", value)
+        assert _block_flag_on("over_fmv") is False, value
+
+
+def test_block_flag_malformed_value_is_off_not_a_crash(monkeypatch, caplog):
+    """Adversarial: a malformed flag value must never be silently
+    interpreted as 'on' — a boolean flag that starts blocking real-money
+    writes must fail in the 'stays off' direction, not the 'starts
+    blocking' one."""
+    monkeypatch.setenv("POLICY_BLOCK_OVER_FMV", "banana")
+    with caplog.at_level("WARNING", logger="server.policy"):
+        result = _block_flag_on("over_fmv")
+    assert result is False
+    assert any("POLICY_BLOCK_OVER_FMV" in rec.message for rec in caplog.records)
+
+
+def test_block_flag_whitespace_and_case_insensitive(monkeypatch):
+    monkeypatch.setenv("POLICY_BLOCK_OVER_FMV", "  True  ")
+    assert _block_flag_on("over_fmv") is True
+
+
+def test_evaluate_block_no_blocking_flags_never_blocks(monkeypatch):
+    monkeypatch.delenv("POLICY_BLOCK_EXPOSURE_CEILING", raising=False)
+    check_results = [{"code": "exposure_ceiling", "outcome": "advise", "data": {}}]
+    advisories = [{"code": "exposure_ceiling", "severity": "warning", "message": "m", "data": {}}]
+    decision = evaluate_block(check_results, advisories, bypass=False)
+    assert decision.blocked is False
+    assert decision.blocking_codes == []
+
+
+def test_evaluate_block_advise_plus_flag_no_bypass_blocks(monkeypatch):
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    check_results = [{"code": "exposure_ceiling", "outcome": "advise", "data": {}}]
+    advisories = [{"code": "exposure_ceiling", "severity": "warning", "message": "m", "data": {}}]
+    decision = evaluate_block(check_results, advisories, bypass=False)
+    assert decision.blocked is True
+    assert decision.blocking_codes == ["exposure_ceiling"]
+
+
+def test_evaluate_block_advise_plus_flag_with_bypass_does_not_block(monkeypatch):
+    """The audited bypass suppresses the block, but blocking_codes still
+    names what WOULD have blocked — the ledger/response can still record
+    what was acknowledged."""
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    check_results = [{"code": "exposure_ceiling", "outcome": "advise", "data": {}}]
+    advisories = [{"code": "exposure_ceiling", "severity": "warning", "message": "m", "data": {}}]
+    decision = evaluate_block(check_results, advisories, bypass=True)
+    assert decision.blocked is False
+    assert decision.blocking_codes == ["exposure_ceiling"]
+
+
+def test_evaluate_block_pass_outcome_with_flag_on_never_blocks(monkeypatch):
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    check_results = [{"code": "exposure_ceiling", "outcome": "pass", "data": {}}]
+    decision = evaluate_block(check_results, [], bypass=False)
+    assert decision.blocked is False
+    assert decision.blocking_codes == []
+
+
+def test_evaluate_block_unevaluable_never_blocks_even_with_flag_on(monkeypatch):
+    """Guard-strictness: fail-closed is reserved for a check that
+    AFFIRMATIVELY fired — an unevaluable check never blocks by itself, no
+    matter how its flag is set."""
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    check_results = [{"code": "exposure_ceiling", "outcome": "unevaluable", "data": {}}]
+    advisories = [{"code": "exposure_ceiling", "severity": "unevaluable", "message": "m", "data": {}}]
+    decision = evaluate_block(check_results, advisories, bypass=False)
+    assert decision.blocked is False
+    assert decision.blocking_codes == []
+
+
+def test_evaluate_block_unevaluable_with_flag_on_marks_both_response_and_result(monkeypatch):
+    """A blocking check gone blind must be visible in BOTH check_results
+    (the ledger's checks_json) and advisories (the response/ledger's
+    advisories_json) — not silently permissive."""
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    check_results = [{"code": "exposure_ceiling", "outcome": "unevaluable", "data": {}}]
+    advisories = [{"code": "exposure_ceiling", "severity": "unevaluable", "message": "m", "data": {}}]
+    decision = evaluate_block(check_results, advisories, bypass=False)
+    assert decision.unevaluable_while_blocking_codes == ["exposure_ceiling"]
+    assert check_results[0]["data"]["unevaluable_while_blocking"] is True
+    assert advisories[0]["data"]["unevaluable_while_blocking"] is True
+
+
+def test_evaluate_block_unevaluable_flag_off_no_marker(monkeypatch):
+    monkeypatch.delenv("POLICY_BLOCK_EXPOSURE_CEILING", raising=False)
+    check_results = [{"code": "exposure_ceiling", "outcome": "unevaluable", "data": {}}]
+    advisories = [{"code": "exposure_ceiling", "severity": "unevaluable", "message": "m", "data": {}}]
+    decision = evaluate_block(check_results, advisories, bypass=False)
+    assert decision.unevaluable_while_blocking_codes == []
+    assert "unevaluable_while_blocking" not in check_results[0]["data"]
+    assert "unevaluable_while_blocking" not in advisories[0]["data"]
+
+
+def test_evaluate_block_flag_set_for_a_code_that_never_ran(monkeypatch):
+    """Adversarial: a flag set for a check code that isn't in check_results
+    at all (a typo'd env var, or a plugin check that never registered) must
+    not raise and must not block anything — there is nothing to act on."""
+    monkeypatch.setenv("POLICY_BLOCK_SOME_CHECK_THAT_DOES_NOT_EXIST", "true")
+    check_results = [{"code": "exposure_ceiling", "outcome": "advise", "data": {}}]
+    decision = evaluate_block(check_results, [], bypass=False)
+    assert decision.blocked is False
+
+
+def test_evaluate_block_multiple_blocking_checks_all_named(monkeypatch):
+    monkeypatch.setenv("POLICY_BLOCK_EXPOSURE_CEILING", "true")
+    monkeypatch.setenv("POLICY_BLOCK_OVER_FMV", "true")
+    check_results = [
+        {"code": "exposure_ceiling", "outcome": "advise", "data": {}},
+        {"code": "over_fmv", "outcome": "advise", "data": {}},
+        {"code": "staleness", "outcome": "pass", "data": {}},
+    ]
+    decision = evaluate_block(check_results, [], bypass=False)
+    assert decision.blocked is True
+    assert set(decision.blocking_codes) == {"exposure_ceiling", "over_fmv"}
+
+
+def test_build_block_detail_shape():
+    decision = BlockDecision(blocked=True, blocking_codes=["over_fmv"])
+    advisories = [{"code": "over_fmv", "severity": "warning", "message": "m", "data": {}}]
+    detail = build_block_detail(decision, advisories, surviving_snipe=None)
+    assert detail["blocked"] is True
+    assert "over_fmv" in detail["message"]
+    assert detail["blocking_codes"] == ["over_fmv"]
+    assert detail["advisories"] == advisories
+    assert detail["surviving_snipe"] is None
+    assert detail["unevaluable_while_blocking"] == []
+
+
+def test_build_block_detail_names_surviving_snipe():
+    """R14/U9 acceptance: a blocked upsert/edit of a live row must name the
+    surviving snipe and its current max_bid in the message text, not just
+    bury it in structured data."""
+    decision = BlockDecision(blocked=True, blocking_codes=["over_fmv"])
+    detail = build_block_detail(
+        decision, [], surviving_snipe={"item_id": "123", "max_bid": 100.0},
+    )
+    assert "100.00" in detail["message"]
+    assert "remains active" in detail["message"]
+    assert detail["surviving_snipe"] == {"item_id": "123", "max_bid": 100.0}
