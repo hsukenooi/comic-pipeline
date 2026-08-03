@@ -38,7 +38,7 @@ where `add-batch` (server-mode-only) doesn't apply.
 
 `buy.md` references specific parts of this file (§ Bid groups, the CGC-float
 grade conversion under *Available `add` flags*, the pre-flight bid sanity
-check); keep those anchors stable when editing.
+check, § Handling Policy Advisories); keep those anchors stable when editing.
 
 ## Input
 
@@ -48,13 +48,17 @@ A list of approved auctions, each with:
 
 ## Max Bid Formula (if not already computed)
 
-If the user hasn't set max bids, default to:
+Bid caps follow the same **rung ladder** `comic-fmv` computes (`docs/conventions/fmv-math-spec.md` §6 owns the canonical logic) — a base rung and two confidence-gated haircut rungs below it, never a single flat percentage:
 
-> `max_bid = 80% × top of FMV range`
+| Rung | Formula | When it applies |
+|---|---|---|
+| Base | `max_bid = 0.80 × top of FMV range` | Default — no confidence signal, or grade + comp confidence are both HIGH/MEDIUM |
+| Haircut (medium-low) | `max_bid = 0.70 × top of FMV range` | The more conservative of photo `grade_confidence` and comp-pool confidence lands at MEDIUM-LOW |
+| Haircut (low) | `max_bid = 0.60 × top of FMV range` | The more conservative of the two lands at LOW (includes a §7 interpolated single-point estimate and the CGC-proxy tier, both capped here) |
+
+If the user hasn't set max bids manually, default to the **base rung**: `max_bid = 80% × top of FMV range`. When the bid comes from `comic-fmv` (the `/comic:buy` path), the CLI has already applied whichever rung its confidence axes require — look for `bid_haircut=…` in the row's Notes to see which one fired. A haircut rung is intentional; don't "correct" it back up to 0.80× without a reason. The base-rung formula above is the fallback for manually-set bids only, never a correction to apply on top of a comic-fmv-computed max_bid.
 
 Round to a clean number (e.g., $136 → $135). User can override per comic.
-
-**Note:** when the bid comes from `comic-fmv` (the `/comic:buy` path), the CLI may have already applied a **confidence haircut** below 80% — `0.70` or `0.60` × FMV high — when the photo `grade_confidence` or comp confidence was low (look for `bid_haircut=…` in the row's Notes). That lowered number is intentional; don't "correct" it back up to 80% without a reason. The 80% formula above is the fallback for manually-set bids.
 
 ## Pre-flight Check
 
@@ -230,6 +234,22 @@ gixen list
 
 Status values: `✅ Added`, `❌ Failed (<reason> — not added)`, `⏭️ Skipped (BIN)`, and `⏸️ Not attempted` for items after a batch-halting failure. End with an added/failed/remaining count.
 
+## Handling Policy Advisories (BUI-621)
+
+Both `gixen add`/`edit` and `gixen add-batch` surface **policy advisories** — non-fatal, server-side checks (the comics server's pre-trade policy checks, e.g. an exposure ceiling or an FMV-derived check that came back unable to evaluate) run at add/edit time. An advisory never blocks the write — the snipe is already recorded by the time one appears — but it must never be silently swallowed:
+
+- **`gixen add` / `gixen edit`** print each advisory to stderr, one line per advisory (`code` + `message`), immediately **after** the command's own success line. They never change the exit code and never appear at all in direct-Gixen mode (no `COMICS_SERVER_URL` — there is no server response to carry advisories in the first place).
+- **`gixen add-batch`** marks each affected row in the human table with an advisory-count suffix on that row's status cell, carries the row's full advisories verbatim in the JSON summary (`rows[].advisories`), and prints an end-of-run count whenever any row carried one. A batch is never allowed to read as clean just because every row landed — check the end-of-run count, not only the per-row statuses.
+
+**Before declaring the add/edit step done, surface every advisory to the user** — the same gate discipline as a failed add (§ Handling a failed add). For each advisory:
+
+1. **Read the message** — it names what the check flagged, and `data` (in the JSON form) carries whatever numbers back it.
+2. **Choose a remediation:**
+   - `gixen edit {item_id} {new_max_bid}` — lower the bid if the advisory is bid-driven.
+   - `gixen remove {item_id}` — drop the snipe entirely if the advisory shows it shouldn't have been added.
+   - **Acknowledge and proceed** — a deliberate, user-made call that the flagged risk is acceptable as-is. There is no CLI bypass flag for this yet (advisories are v1/advisory-only by design); "acknowledge" here means the user consciously decided, not an automated action.
+3. Don't re-run the same add/edit hoping the advisory disappears — it reflects the bid the server just wrote, not a transient condition.
+
 ## Editing Existing Snipes
 
 Same CLI, different subcommand:
@@ -245,7 +265,7 @@ Useful when FMV analysis shows an existing bid is too low.
 | Mistake | Fix |
 |---|---|
 | Attempting to snipe a BIN listing | Skip — Gixen is for auctions only |
-| Max bid = FMV top | Use 80% × top — leaves margin for bidder competition |
+| Max bid = FMV top | Use the rung formula (80% × top, or whichever confidence-haircut rung comic-fmv already applied) — leaves margin for bidder competition |
 | Odd number bids ($137.43) | Round to clean numbers — doesn't materially change outcomes |
 | Sniping only the earliest-ending copy when 2+ listings of the same comic are approved | Add all copies with the same `--group N` (§ Bid groups owns the rules) |
 | Leaving a group's cancelled siblings on Gixen after a win | Not a safety risk — `gixen purge` is optional hygiene (§ Bid groups) |

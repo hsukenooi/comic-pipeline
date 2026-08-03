@@ -82,6 +82,13 @@ class RowResult:
     # bare item_id, replacing the /comic:buy Step 5 orchestrator's old
     # in-context "reformat with the comic names ... joined by item_id" pass.
     title: str | None = None
+    # BUI-621 (U7): the KTD4 advisory envelope from the POST /api/bids
+    # response (see `advisories_from_response`) — empty for a row that never
+    # reached the network (validation failure) or whose add call itself
+    # failed (STATUS_FAILED), since there is no response to read advisories
+    # from in either case. Never populated from the link-fmv response — that
+    # call carries no advisories envelope of its own.
+    advisories: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -96,6 +103,7 @@ class RowResult:
             "link_error": self.link_error,
             "verify": self.verify,
             "title": self.title,
+            "advisories": self.advisories,
         }
 
 
@@ -114,7 +122,11 @@ class BatchOutcome:
         }
         for r in self.rows:
             counts[r.status] = counts.get(r.status, 0) + 1
-        return {"total": len(self.rows), **counts}
+        # BUI-621 (U7): a total advisory count, so the summary itself proves
+        # a batch never "looks clean" when rows carried challenges — a
+        # reader of just the summary dict (not every row) still sees it.
+        advisory_count = sum(len(r.advisories) for r in self.rows)
+        return {"total": len(self.rows), **counts, "advisories": advisory_count}
 
     def exit_code(self) -> int:
         """Non-zero if ANY row failed to land — a not-attempted row (batch
@@ -256,10 +268,17 @@ def build_bid_payload(
     comic_id: int | None = None,
     locg_id: int | None = None,
     grade: float | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """The POST /api/bids payload shape, shared by cli.py's single-item
     `add` command and `add_one_row` below so the two request paths cannot
     silently drift on a future field addition to one and not the other.
+
+    BUI-621 (U7): `source` populates the optional provenance tag U6 added to
+    `AddBidRequest` (`"cli"` from `add`, `"batch"` from `add_one_row`) — omit
+    it (None, the default) to leave the key out of the payload entirely,
+    matching the existing seller/seller_grade/photo_grade "only send what
+    was given" convention below.
 
     BUI-619 (U5): `comic_id`/`locg_id`/`grade` build the payload's
     `comic_identities` list — `{comic_id|locg_id, grade}` entries, so the
@@ -286,6 +305,8 @@ def build_bid_payload(
         payload["seller_grade"] = seller_grade
     if photo_grade is not None:
         payload["photo_grade"] = photo_grade
+    if source is not None:
+        payload["source"] = source
 
     identities: list[dict[str, Any]] = []
     if grade is not None and (comic_id is not None or locg_id is not None):
@@ -304,6 +325,21 @@ def created_from_response(resp: Any) -> bool:
     live snipe was updated in place. Shared by `add` and `add_one_row` so
     the "missing key defaults to True" rule lives in exactly one place."""
     return resp.get("created", True) if isinstance(resp, dict) else True
+
+
+def advisories_from_response(resp: Any) -> list[dict]:
+    """Extract the KTD4 `advisories` list from a /api/bids or
+    /api/bids/{item_id} response. Tolerant of an old server whose 2xx
+    responses predate the envelope (missing key), of a non-dict response,
+    and of a present-but-malformed `advisories` value — every one of those
+    is treated as "no advisories" rather than raised, per BUI-621/U7's
+    binding constraint that an old server must never crash the CLI. Shared
+    by `add_one_row` below and cli.py's `add`/`edit` commands so the same
+    tolerance rule lives in exactly one place."""
+    if not isinstance(resp, dict):
+        return []
+    advisories = resp.get("advisories")
+    return advisories if isinstance(advisories, list) else []
 
 
 def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
@@ -351,6 +387,9 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         # add-batch docstring: "--comic-id/--catalog-id ambiguity doesn't
         # apply here: this row schema only has comic_id") — no locg_id kwarg.
         comic_id=comic_id, grade=grade,
+        # BUI-621 (U7): every add-batch row is provenance-tagged "batch",
+        # distinct from cli.py's `add` command tagging "cli".
+        source="batch",
     )
 
     ok, resp, err = server_request("post", "/api/bids", json=payload)
@@ -365,6 +404,7 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
     result = RowResult(
         item_id=item_id, status=status, max_bid=float(bid), grade=grade,
         created=created, title=title,
+        advisories=advisories_from_response(resp),
     )
 
     link_attempted = grade is not None and comic_id is not None

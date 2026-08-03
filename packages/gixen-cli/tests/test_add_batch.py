@@ -22,6 +22,7 @@ from add_batch import (
     BatchOutcome,
     RowResult,
     add_one_row,
+    advisories_from_response,
     apply_verify_results,
     build_batch_rows,
     build_bid_payload,
@@ -168,6 +169,21 @@ def test_build_bid_payload_no_identity_without_comic_id_or_locg_id():
     assert payload["comic_identities"] == []
 
 
+# ---------------------------------------------------------------------------
+# build_bid_payload — source provenance tag (BUI-621/U7)
+# ---------------------------------------------------------------------------
+
+
+def test_build_bid_payload_omits_source_by_default():
+    payload = build_bid_payload("1", 100, 6, 0)
+    assert "source" not in payload
+
+
+def test_build_bid_payload_includes_source_when_given():
+    payload = build_bid_payload("1", 100, 6, 0, source="cli")
+    assert payload["source"] == "cli"
+
+
 def test_created_from_response_defaults_true_when_key_missing():
     assert created_from_response({}) is True
 
@@ -178,6 +194,33 @@ def test_created_from_response_respects_explicit_false():
 
 def test_created_from_response_true_for_non_dict():
     assert created_from_response(None) is True
+
+
+# ---------------------------------------------------------------------------
+# advisories_from_response — KTD4 envelope extraction (BUI-621/U7)
+# ---------------------------------------------------------------------------
+
+
+def test_advisories_from_response_extracts_list():
+    advisories = [{"code": "x", "severity": "warning", "message": "m", "data": {}}]
+    assert advisories_from_response({"item_id": "1", "advisories": advisories}) == advisories
+
+
+def test_advisories_from_response_missing_key_is_empty():
+    """An old server whose 2xx response predates the KTD4 envelope must not
+    crash the CLI — absent key normalizes to []."""
+    assert advisories_from_response({"item_id": "1", "created": True}) == []
+
+
+def test_advisories_from_response_non_dict_is_empty():
+    assert advisories_from_response(None) == []
+    assert advisories_from_response([1, 2, 3]) == []
+
+
+def test_advisories_from_response_non_list_value_is_empty():
+    """A malformed (non-list) advisories value degrades to empty rather than
+    propagating a bad shape into the CLI's rendering."""
+    assert advisories_from_response({"advisories": "not-a-list"}) == []
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +308,7 @@ def test_add_one_row_minimal_success():
     assert result.link_attempted is False
     assert server.calls == [("post", "/api/bids", {
         "item_id": "1", "max_bid": 100.0, "bid_offset": 6, "snipe_group": 0,
-        "comic_identities": [],
+        "comic_identities": [], "source": "batch",
     })]
 
 
@@ -298,6 +341,37 @@ def test_add_one_row_updated_when_created_false():
     assert result.status == STATUS_UPDATED
 
 
+# ---------------------------------------------------------------------------
+# add_one_row — advisories (BUI-621/U7)
+# ---------------------------------------------------------------------------
+
+
+def test_add_one_row_carries_advisories_from_response():
+    advisories = [{"code": "exposure_ceiling", "severity": "warning",
+                   "message": "over the group exposure ceiling", "data": {}}]
+    server = _FakeServer({("post", "/api/bids"): (
+        True, {"item_id": "1", "created": True, "advisories": advisories}, None,
+    )})
+    result = add_one_row(_row("1"), server_request=server)
+    assert result.advisories == advisories
+    assert result.to_dict()["advisories"] == advisories
+
+
+def test_add_one_row_absent_advisories_key_defaults_empty():
+    """An old server whose 2xx response predates the KTD4 envelope must not
+    crash add-batch — the row just carries no advisories."""
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    result = add_one_row(_row("1"), server_request=server)
+    assert result.advisories == []
+
+
+def test_add_one_row_failed_row_has_no_advisories():
+    server = _FakeServer({("post", "/api/bids"): (False, None, "Server returned 503: gixen down")})
+    result = add_one_row(_row("1"), server_request=server)
+    assert result.status == STATUS_FAILED
+    assert result.advisories == []
+
+
 def test_add_one_row_passes_seller_and_grade_fields():
     server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
     result = add_one_row(
@@ -309,7 +383,7 @@ def test_add_one_row_passes_seller_and_grade_fields():
     assert payload == {
         "item_id": "1", "max_bid": 100.0, "bid_offset": 10, "snipe_group": 2,
         "seller": "SomeSeller", "seller_grade": 9.0, "photo_grade": 8.5,
-        "comic_identities": [],
+        "comic_identities": [], "source": "batch",
     }
 
 
@@ -562,8 +636,25 @@ def test_batch_outcome_summary_counts_each_status():
     summary = outcome.summary()
     assert summary == {
         "total": 4, STATUS_ADDED: 1, STATUS_UPDATED: 1,
-        STATUS_FAILED: 1, STATUS_NOT_ATTEMPTED: 1,
+        STATUS_FAILED: 1, STATUS_NOT_ATTEMPTED: 1, "advisories": 0,
     }
+
+
+def test_batch_outcome_summary_counts_advisories_across_rows():
+    """BUI-621 (U7): the summary's own advisory count is what lets a reader
+    of just the summary dict (not every row) see that a batch carried
+    challenges — sums across every row, not just the first that has any."""
+    outcome = BatchOutcome(rows=[
+        RowResult(item_id="1", status=STATUS_ADDED, advisories=[
+            {"code": "a", "severity": "warning", "message": "m1", "data": {}},
+        ]),
+        RowResult(item_id="2", status=STATUS_UPDATED, advisories=[
+            {"code": "b", "severity": "warning", "message": "m2", "data": {}},
+            {"code": "c", "severity": "unevaluable", "message": "m3", "data": {}},
+        ]),
+        RowResult(item_id="3", status=STATUS_FAILED, error="boom"),
+    ])
+    assert outcome.summary()["advisories"] == 3
 
 
 def test_batch_outcome_exit_code_zero_when_all_landed():

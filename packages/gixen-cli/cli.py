@@ -37,6 +37,7 @@ from add_batch import (
     STATUS_FAILED,
     STATUS_NOT_ATTEMPTED,
     STATUS_UPDATED,
+    advisories_from_response,
     apply_verify_results,
     build_batch_rows,
     build_bid_payload,
@@ -156,6 +157,26 @@ def _server_request(method: str, path: str, **kwargs) -> dict | list:
         click.echo(f"Error: {error}", err=True)
         sys.exit(1)
     return data
+
+
+def _print_advisories(advisories: list[dict]) -> None:
+    """Render each KTD4 policy advisory (BUI-621/U7) to stderr, after the
+    command's success line — visible but never fatal: advisories never
+    change the exit code, and this is only ever called from the server-mode
+    branch of `add`/`edit` after that branch's own success echo, never from
+    the direct-Gixen path (there is no server response to render there).
+    `advisories` has already been normalized to `[]` by
+    `add_batch.advisories_from_response` for an old server whose 2xx
+    response predates the envelope, so this never needs to re-check that —
+    but a malformed *entry* within an otherwise-list `advisories` value
+    (server bug, not the envelope-absent case) is still tolerated here
+    rather than raising, per the same never-crash-the-CLI spirit."""
+    for advisory in advisories:
+        if not isinstance(advisory, dict):
+            continue
+        code = advisory.get("code", "?")
+        message = advisory.get("message", "")
+        click.echo(f"⚠️  [{code}] {message}", err=True)
 
 
 def _git(*args: str) -> str:
@@ -403,6 +424,9 @@ def add(
             # BUI-619 (U5): comic_id/catalog_id are already mutually exclusive
             # by this point (the both-given branch above nulls out catalog_id).
             comic_id=comic_id, locg_id=catalog_id, grade=grade,
+            # BUI-621 (U7): tag this row's provenance "cli" — add-batch's
+            # add_one_row tags its own rows "batch".
+            source="cli",
         )
         resp = _server_request("post", "/api/bids", json=payload)
         # BUI-67: the server upserts. created=False means an existing live snipe
@@ -445,6 +469,10 @@ def add(
             click.echo(f"Added snipe for {item_id} with max bid {bid}")
         else:
             click.echo(f"Updated existing snipe for {item_id} with max bid {bid}")
+        # BUI-621 (U7): render policy advisories from the POST /api/bids
+        # response (KTD4) after the success line above — visible, non-fatal,
+        # never reorders/replaces the pre-existing success/failure lines.
+        _print_advisories(advisories_from_response(resp))
         return
 
     # Existing direct-Gixen path
@@ -515,12 +543,20 @@ _STATUS_ICON = {
 def _add_batch_status_cell(row: dict) -> str:
     label = _STATUS_ICON.get(row["status"], row["status"])
     if row["status"] == STATUS_FAILED and row.get("error"):
-        return f"{label} ({row['error']})"
-    if row["status"] in (STATUS_ADDED, STATUS_UPDATED) and row.get("link_attempted"):
+        label = f"{label} ({row['error']})"
+    elif row["status"] in (STATUS_ADDED, STATUS_UPDATED) and row.get("link_attempted"):
         if row.get("link_ok"):
-            return f"{label} + linked"
-        detail = row.get("link_error")
-        return f"{label} (FMV link failed: {detail})" if detail else f"{label} (FMV link failed)"
+            label = f"{label} + linked"
+        else:
+            detail = row.get("link_error")
+            label = f"{label} (FMV link failed: {detail})" if detail else f"{label} (FMV link failed)"
+    # BUI-621 (U7): a landed row's KTD4 advisories get their own marker —
+    # appended after the link-status suffix above so a row can show both
+    # "+ linked" AND an advisory count without either clobbering the other.
+    advisories = row.get("advisories") or []
+    if advisories:
+        n = len(advisories)
+        label = f"{label} ⚠️  {n} {'advisory' if n == 1 else 'advisories'}"
     return label
 
 
@@ -703,6 +739,18 @@ def _emit_add_batch_result(outcome: BatchOutcome, json_out: str | None) -> None:
             # via `outcome.exit_code()`, not this write).
             click.echo(f"warning: could not write --json-out ({json_out}): {e}", err=True)
 
+    # BUI-621 (U7): an explicit end-of-run count, on every exit path that
+    # goes through this function — a batch whose rows all landed but carried
+    # advisories must never read as clean just because nothing failed.
+    advisory_count = outcome.summary()["advisories"]
+    if advisory_count:
+        noun = "advisory" if advisory_count == 1 else "advisories"
+        click.echo(
+            f"⚠️  {advisory_count} {noun} across this batch — review before "
+            "treating it as clean.",
+            err=True,
+        )
+
 
 def _load_json_file(path: str, expected_type: type, type_description: str):
     """Read + json.loads(path), exiting 1 with a clear message on any I/O or
@@ -834,8 +882,15 @@ def edit(item_id: str, max_bid: str, offset: int | None, group: int | None):
             payload["bid_offset"] = offset
         if group is not None:
             payload["snipe_group"] = group
-        _server_request("patch", f"/api/bids/{item_id}", json=payload)
+        # BUI-621 (U7): tag this edit's provenance "cli" — mirrors `add`'s
+        # own source tag (EditBidRequest.source accepts the same optional
+        # field U6 added).
+        payload["source"] = "cli"
+        resp = _server_request("patch", f"/api/bids/{item_id}", json=payload)
         click.echo(f"Updated snipe for {item_id} to max bid {bid}")
+        # BUI-621 (U7): render policy advisories from the PATCH response
+        # (KTD4) after the success line above — visible, non-fatal.
+        _print_advisories(advisories_from_response(resp))
         return
 
     # BUI-414: this whole direct-mode branch (the list_snipes resolve below
