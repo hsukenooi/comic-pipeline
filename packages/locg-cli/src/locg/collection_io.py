@@ -32,6 +32,7 @@ from locg.collection_cache import (
     build_volume_candidates,
     identity_series_key,
     make_identity,
+    matchable_rows,
     owned_match_keys,
     rebuild_series_name_index,
     resolve_series_for_win,
@@ -285,9 +286,17 @@ def build_series_publishers(payload: dict[str, Any]) -> dict[str, set[str]]:
     Comics") is not defeated by the naming drift BUI-548 already measured. A
     series legitimately holds MORE than one publisher over its life (an imprint
     move), hence a set and not a single value.
+
+    BUI-647: quarantined rows are excluded (:func:`matchable_rows`), keeping
+    this the same population :func:`build_volume_candidates` draws from. It
+    matters most here: a quarantined row is typically quarantined for being a
+    FOREIGN edition (Panini/Kamite, BUI-563), so leaving it in would teach this
+    map that "Panini" is a legitimate publisher of the series and defeat the
+    very conflict check (:func:`series_publisher_conflicts`) that would
+    otherwise catch the next win resolving onto it.
     """
     out: dict[str, set[str]] = {}
-    for row in payload.get("comics", []):
+    for row in matchable_rows(payload.get("comics")):
         if row.get("source") != "locg_export":
             continue
         series = row.get("series_name") or ""
@@ -2353,6 +2362,21 @@ def _owned_series_issue_index(payload: dict[str, Any]) -> set[tuple[str, str]]:
     could be matched against (:func:`owned_match_keys` adds the cross-masthead
     key for the classic X-Men split), so a wish written under either masthead
     finds it.
+
+    **QUARANTINE MUST NOT BE FILTERED HERE (BUI-647).** Do not "for
+    consistency" wrap this loop in ``matchable_rows`` the way every CANDIDATE
+    pool does. This index is not a candidate pool — it is the owned-safe
+    export's enforcement layer, and its job is the opposite one: an owned row
+    missing from it is an owned row the export will happily emit a wish for
+    with ``In Collection=0``, which is not "a wish we skipped" but the
+    instruction that makes **LOCG DELETE THE BOOK FROM THE COLLECTION**. That
+    is the BUI-122 data-loss path, and the BUI-200 incident is what it looks
+    like when it fires: 26 owned X-Men deleted because the owned copy was
+    invisible to this index. A quarantined row is still a book you OWN — the
+    marker means "stop treating this as a match candidate", never "stop
+    protecting it from deletion".
+    ``tests/test_quarantine.py::test_quarantined_owned_row_still_suppresses_its_wish``
+    fails the moment this loop starts filtering.
     """
     index: set[tuple[str, str]] = set()
     for r in payload.get("comics", []):
@@ -2394,6 +2418,16 @@ def wish_rows_for_export(payload: dict[str, Any]) -> list[dict[str, Any]]:
         path for issueless TPB/OGN rows).
 
     Owned-but-wished books are simply not pushed; the wish stays local.
+
+    **QUARANTINE MUST NOT BE FILTERED HERE (BUI-647)** — neither from the
+    ``owned_titles`` set below nor from :func:`_owned_series_issue_index`. Both
+    are owned-safe ENFORCEMENT, not candidate selection. Every row dropped from
+    them is a book this function may then emit as a wish row, and a wish row
+    carries ``In Collection=0``, which tells LOCG to **DELETE** the matching
+    owned copy (BUI-122; the BUI-200 incident deleted 26 owned X-Men exactly
+    this way). Quarantine means "not a match candidate"; it never means "safe
+    to delete" — the whole reason the marker exists is that these rows CANNOT
+    be deleted or un-owned.
     """
     owned_titles = {
         _normalize_title(r.get("full_title"))
