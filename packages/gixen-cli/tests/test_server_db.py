@@ -118,6 +118,104 @@ def test_update_bid_status(db):
     assert row["resolved_at"] == "2026-04-25T12:00:00"
 
 
+def test_update_bid_status_noop_reclassification_preserves_resolved_at(db):
+    """BUI-636 regression (the ticket's own shape): seed a LOST row with a
+    known resolved_at, call update_bid_status again with the SAME status —
+    the terminal_transitions loop in _sync_gixen does exactly this every
+    cycle Gixen still lists an already-resolved snipe. resolved_at must
+    survive untouched even though a fresh (later) timestamp is passed in;
+    only winning_bid, which legitimately can be refreshed, is allowed to
+    change."""
+    insert_bid(db, "636000001", 50.0, 6, 0, "s")
+    update_bid_status(db, "636000001", status="LOST", winning_bid=30.0,
+                      resolved_at="2026-04-25T10:00:00")
+    update_bid_status(db, "636000001", status="LOST", winning_bid=30.0,
+                      resolved_at="2026-08-03T00:30:00")
+    row = get_bid_by_item_id(db, "636000001")
+    assert row["status"] == "LOST"
+    assert row["resolved_at"] == "2026-04-25T10:00:00"  # unchanged
+
+
+def test_update_bid_status_genuine_transition_updates_resolved_at(db):
+    """Positive control for the fix: a REAL status change (PENDING -> WON)
+    must still stamp resolved_at with the new value — the fix must not
+    regress into a blanket freeze-on-first-write (that's exactly what a
+    naive COALESCE(resolved_at, ?) would have done, blocking any legitimate
+    re-resolution)."""
+    insert_bid(db, "636000002", 50.0, 6, 0, "s")
+    row = get_bid_by_item_id(db, "636000002")
+    assert row["resolved_at"] is None
+    update_bid_status(db, "636000002", status="WON", winning_bid=45.0,
+                      resolved_at="2026-08-03T00:30:00")
+    row = get_bid_by_item_id(db, "636000002")
+    assert row["status"] == "WON"
+    assert row["resolved_at"] == "2026-08-03T00:30:00"
+
+
+def test_update_bid_status_ended_to_won_transition_updates_resolved_at(db):
+    """The eBay fallback's genuine second resolution (ENDED -> WON/LOST once
+    eBay's price comes back — server/fallback.py's `fresh["status"] not in
+    ("PENDING", "ENDED")` guard) is a real transition even though it does not
+    originate from PENDING. A fix gated strictly on 'was PENDING' would
+    silently freeze resolved_at here; the actual gate is 'did status change
+    at all'."""
+    insert_bid(db, "636000003", 50.0, 6, 0, "s")
+    update_bid_status(db, "636000003", status="ENDED", winning_bid=None,
+                      resolved_at="2026-08-01T00:00:00")
+    update_bid_status(db, "636000003", status="WON", winning_bid=45.0,
+                      resolved_at="2026-08-03T00:30:00")
+    row = get_bid_by_item_id(db, "636000003")
+    assert row["status"] == "WON"
+    assert row["resolved_at"] == "2026-08-03T00:30:00"  # updated: genuine transition
+
+
+def test_update_bid_status_noop_reclassification_still_fills_auction_end_at(db):
+    """Binding 2 (auction_end_at's COALESCE observation-time-proxy fill) must
+    keep working independent of the resolved_at gate: a no-op
+    reclassification with a NULL auction_end_at still backfills it from
+    resolved_at."""
+    insert_bid(db, "636000004", 50.0, 6, 0, "s")
+    update_bid_status(db, "636000004", status="LOST", winning_bid=30.0,
+                      resolved_at="2026-04-25T10:00:00")
+    assert get_bid_by_item_id(db, "636000004")["auction_end_at"] == \
+        "2026-04-25T10:00:00"
+    # Re-fire the same status (no-op) — auction_end_at is already filled, so
+    # this just confirms the COALESCE branch of the statement is untouched by
+    # the resolved_at CASE change (it stays the first-filled value either way).
+    update_bid_status(db, "636000004", status="LOST", winning_bid=30.0,
+                      resolved_at="2026-08-03T00:30:00")
+    row = get_bid_by_item_id(db, "636000004")
+    assert row["auction_end_at"] == "2026-04-25T10:00:00"  # still the first fill
+    assert row["resolved_at"] == "2026-04-25T10:00:00"      # BUI-636: unchanged
+
+
+def test_update_bid_status_noop_won_reclassification_still_records_group_win(db):
+    """Binding 3 (record_group_win) must keep firing on a no-op WON
+    re-classification — this is the exact shape
+    test_update_bid_status_won_resync_is_ledger_idempotent already covers
+    lower in this file (a resync passing the SAME resolved_at both times);
+    this variant passes a DIFFERENT resolved_at on the second call — the
+    BUI-636 fix's new CASE branch — and confirms the ledger write, which
+    depends on the Python resolved_at parameter (not the column), is
+    unaffected by the column now being conditionally written."""
+    insert_bid(db, "636000005", 50.0, 6, 3, "s")
+    db.execute(
+        "UPDATE bids SET auction_end_at='2026-06-30T23:55:00+00:00' "
+        "WHERE item_id='636000005'"
+    )
+    update_bid_status(db, "636000005", "WON", 42.0, "2026-07-01T00:00:00+00:00")
+    db.commit()
+    update_bid_status(db, "636000005", "WON", 42.0, "2026-08-03T00:30:00+00:00")
+    db.commit()
+    rows = db.execute(
+        "SELECT * FROM group_wins WHERE item_id='636000005'"
+    ).fetchall()
+    assert len(rows) == 1  # same (group, item, won_end_at) key — no duplicate
+    # And the no-op resync must not have re-stamped resolved_at either.
+    assert get_bid_by_item_id(db, "636000005")["resolved_at"] == \
+        "2026-07-01T00:00:00+00:00"
+
+
 def test_delete_bid_marks_purged(db):
     insert_bid(db, "555444333", 30.0, 6, 0, "s")
     delete_bid(db, "555444333")
