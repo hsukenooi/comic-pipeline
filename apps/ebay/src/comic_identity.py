@@ -892,11 +892,12 @@ _FMV_LOT_RE = re.compile(
 # lot vocabulary, number-group density, pick-lexicon subtraction) tops out at
 # 0.95 precision and drops genuine single-issue comps.  Left open on purpose.
 #
-# A DIFFERENT shape, measured in the same pass, IS worth catching and is filed as
-# BUI-637: a space-separated bare-number list ("X-Men 46 47 48 49 50 51 52 1995
-# VF/NM ...", $20 @ 6.7x its pool median).  Unlike this class it is grade-tagged,
-# so it survives into a priced pool — the property that makes a lot comp actually
-# expensive.  Don't confuse the two when reading this comment.
+# A DIFFERENT shape, measured in the same pass, IS worth catching and is now
+# caught by _fmv_spaced_number_run_lot below (BUI-637): a space-separated
+# bare-number list ("X-Men 46 47 48 49 50 51 52 1995 VF/NM ...", $20 @ 6.7x its
+# pool median).  Unlike this class it is grade-tagged, so it survives into a
+# priced pool — the property that makes a lot comp actually expensive.  Don't
+# confuse the two when reading this comment.
 #
 # Kept comp-only (checked by is_comp_excluded, never merged into _LOT_RE) for
 # the BUI-239 reason: _LOT_RE also feeds should_reject/hard_reject on the
@@ -959,6 +960,114 @@ def _fmv_run_range_lot(title: str) -> bool:
     return False
 
 
+# BUI-637: a SPACE-separated bare-number issue enumeration — "X-Men 46 47 48
+# 49 50 51 52 1995 VF/NM Rare Newsstand Variants" (@$20, 6.7x its pool median),
+# "Batman #655 656 657 658 1st Damian Wayne NM Set" (@$105 into a pool whose
+# single-issue median is ~$16).  Nothing above catches this shape: _FMV_LOT_RE
+# needs a '#' on at least the first TWO members, _LOT_RE's generic list branch
+# needs a separator from [,/&-] (a plain space is not one), and
+# _fmv_run_range_lot needs a bare RANGE plus a run/set word — this is an
+# enumeration with neither.
+#
+# WHY THIS ONE IS WORTH CATCHING WHERE BUI-629's RESIDUAL WAS NOT.  The
+# distinguishing property is grade-tagging, not lot-ness: 14 of the 57 corpus
+# comps this rule drops carry a parsed grade, so they survive
+# fmv_math.build_pool into a PRICED pool, where BUI-629's class was 35/42
+# grade-less and priced nothing.  Measured over the 493-response offline cache
+# (13,797 kept comps / 10,263 kept unique titles), removing them moves fmv_high
+# in 2 of 493 pools at each pool's median comp grade, and in 6 of 493 across a
+# 10-point sweep of the CGC ladder.  That count is small; the MAGNITUDE is what
+# justifies the rule.  On "Batman 655" fmv_high falls 100 -> 40 (-60%) at grade
+# 9.2-9.4 and 90 -> 35 (-61%) at 8.5, because four of that pool's comps are the
+# same 4-issue Damian Wayne SET priced as if it were issue #655 alone — a
+# bid cap of $80 where $32 is right.  BUI-629's oracle, by contrast, topped out
+# at 9.6% ($6.79 -> $6.14), which is why it was closed Won't Do.  Same shape of
+# evidence, two orders of magnitude apart in money.
+#
+# WHY FOUR MEMBERS, AND WHY STRICTLY ASCENDING.  Hand-labeling every kept
+# corpus title that carries a >=3-member spaced bare-number run (65 titles: 61
+# genuine multi-issue lots, 4 non-comic products, 0 genuine single issues)
+# gives, for this rule: precision 1.000 against the only failure that costs
+# money (dropping a genuine single-issue comp — 0 of 52), precision 0.962
+# against "is a real multi-book lot" (the 2 misses are paracord listings whose
+# "10 25 50 100 ft" lengths are not issues; they were polluting a comp pool
+# anyway), recall 0.820 of the >=3 class.
+#
+# Both bounds were measured, not guessed:
+#   - THREE members also scores precision 1.000 / recall 0.984 on this corpus,
+#     and was still declined.  It buys no measured money: the one extra pool it
+#     moves goes UP (20 -> 25) and None -> 5.  And it has a concrete unmeasured
+#     failure shape — a single issue that REPRINTS an arc ("King Size Hulk #1
+#     ... Reprints #180 181", a real corpus title) needs only one more number
+#     to false-fire, and is_comp_excluded does not run _second_print_reject, so
+#     nothing downstream would catch it.  Precision over recall on the money
+#     path; revisit only with corpus evidence, per BUI-347.
+#   - TWO members is measurably UNSAFE and is the reason a count gate exists at
+#     all.  It fires on 27 extra kept titles, and the generators are ordinary
+#     single-issue notation: ratio variants ("Uncanny X-Men #19 1:100" -> 19 1),
+#     cent variants ("The X-Men #99 25 Cent Variant" -> 99 25), SKU/cover codes
+#     ("The Uncanny X-Men #20 720 Cover A" -> 20 720), reprint-of references
+#     ("Reprints #180 181"), FigPin part numbers ("MARVEL 438 439") and toy
+#     scales ("X-Men 97 6\" Figure").  Those are books we must keep.
+#   - STRICTLY ASCENDING is the co-occurring signal: a real issue enumeration
+#     counts up.  It is evaluated on the longest ASCENDING CONSECUTIVE SLICE
+#     inside a whitespace-joined numeric run, not on the whole run, so a
+#     leading non-issue number cannot defeat it OR manufacture it — "X Men '92
+#     2 3 4" yields [92, 2, 3, 4] whose longest ascending slice is 3, below the
+#     gate (an accepted miss), and "Marvel Kotobukiya ArtFX+ X-Men 92 97 1/10
+#     Scale Set" yields [92, 97, 1] -> 2, keeping a statue listing from being
+#     called a lot for the wrong reason.
+#
+# The \d{1,3} member bound and the decimal-grade lookarounds are inherited
+# unchanged from _LOT_MEMBER and are load-bearing here too: a 4-digit YEAR can
+# never join a run (verified on "X-Men 46 47 48 49 50 51 52 1995", where 1995
+# is correctly excluded), and a grade pair cannot ("CLASSIC X-MEN 41 42 43 44
+# 45 NM 9.4 9.6" yields only [41..45]).
+#
+# Kept comp-only — checked by is_comp_excluded, never merged into _LOT_RE —
+# for the BUI-239 reason: _LOT_RE feeds should_reject/hard_reject on the
+# purchase-decision path, where a false lot-reject drops a book you want.
+#
+# NOTE: like _fmv_run_range_lot and _LOT_RE, this pattern must NOT be compiled
+# re.VERBOSE — _LOT_MEMBER contains a literal '#', which VERBOSE would read as
+# a comment start and silently swallow the rest of the pattern.
+_FMV_SPACED_RUN_RE = re.compile(
+    rf"{_LOT_MEMBER}(?:\s+{_LOT_MEMBER})+", re.IGNORECASE
+)
+_FMV_MIN_SPACED_RUN = 4
+
+
+def _longest_ascending_run(numbers: "list[int]") -> int:
+    """Length of the longest strictly-ascending CONSECUTIVE slice of *numbers*.
+
+    Total by construction: 0 for an empty list, 1 for a singleton. The caller's
+    regex guarantees >=2 members today, but a seeded `best = 1` would report a
+    phantom run of 1 for [] if that ever loosened, so the degenerate cases are
+    answered explicitly rather than left to the accumulator's initial value.
+    """
+    if len(numbers) < 2:
+        return len(numbers)
+    best = current = 1
+    for prev, nxt in zip(numbers, numbers[1:]):
+        current = current + 1 if nxt > prev else 1
+        best = max(best, current)
+    return best
+
+
+def _fmv_spaced_number_run_lot(title: str) -> bool:
+    """True if *title* enumerates >=4 ascending issue numbers separated only by
+    whitespace (BUI-637) — "Batman #655 656 657 658", "Spawn 1 2 3 4 5".
+
+    Comp-only. See the block comment above for the corpus measurement that set
+    the 4-member floor and the strictly-ascending requirement.
+    """
+    for match in _FMV_SPACED_RUN_RE.finditer(title or ""):
+        numbers = [int(n) for n in re.findall(r"\d+", match.group(0))]
+        if _longest_ascending_run(numbers) >= _FMV_MIN_SPACED_RUN:
+            return True
+    return False
+
+
 def is_comp_excluded(title: str) -> bool:
     """Return True if *title* should be excluded as an eBay-sold-listing FMV
     comparable (BUI-269 — the single source of truth for
@@ -979,6 +1088,8 @@ def is_comp_excluded(title: str) -> bool:
     if _FMV_LOT_RE.search(title or ""):  # BUI-269: comp-only lot shapes _LOT_RE misses
         return True
     if _fmv_run_range_lot(title or ""):  # BUI-598: bare issue range + "run"/"set"
+        return True
+    if _fmv_spaced_number_run_lot(title or ""):  # BUI-637: "#655 656 657 658"
         return True
     if _reprint_reject(title):
         return True

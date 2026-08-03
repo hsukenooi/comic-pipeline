@@ -149,6 +149,22 @@ class TestHardExclude:
         "(2026) ABSOLUTE MARTIAN MANHUNTER #1 2 3 4 5 6 CURRENT PRINT SET! 1-6",
         # en dash (U+2013) is a real range separator in listing titles
         "Venom #1–4 (2018) Shiver Set NM Donny Cates + Sam KIETH Art Marvel",
+        # BUI-637: a SPACE-separated bare-number issue enumeration (>=4 members,
+        # strictly ascending). Every title here is a real corpus listing that
+        # survived hard_exclude before this rule. The Batman #655-658 set is the
+        # one that mattered: four such comps priced a single #655 at fmv_high
+        # $100 where the single-issue pool median was ~$16.
+        "Batman 655 656 657 658 1st Damian Wayne NM Set Kubert DC Comics 2006",
+        "X-Men 46 47 48 49 50 51 52 1995 VF/NM Rare Newsstand Variants Gambit Bishop",
+        "CLASSIC X-MEN 41 42 43 44 45 NM 9.4 9.6 Dark Phoenix Saga WOLVERINE Marvel 1989",
+        "Spawn 1 2 3 4 5 DIRECT Todd McFarlane Image Comics 1992",
+        # '#' on the first member only — the shape _FMV_LOT_RE misses because
+        # it requires a hash on at least the first TWO members.
+        "Detective Comics #523 524 525 526 DC Comics 1983",
+        # non-contiguous enumeration (skips issues) — still a lot
+        "Uncanny X-Men #146 147 148 152 154 157 158 162 (1981-82) Claremont Cockrum",
+        # the ascending slice may sit anywhere in the run, not just at its head
+        "Ghost Rider #15 15 (2nd) 16 19 20 21 23 24 25 26 39! VF/NM! 1990! 1st Badalino!",
     ])
     def test_excludes(self, title):
         assert sc.hard_exclude(title)
@@ -199,9 +215,64 @@ class TestHardExclude:
         # Em dash (U+2014) separates phrases in listing titles, so it is
         # deliberately NOT a range separator. Pins the accepted under-catch.
         "X-Men #94 — 300 Claremont run",
+        # ── BUI-637 negative controls ────────────────────────────────────────
+        # Real corpus titles that carry two adjacent bare numbers because that
+        # is how ordinary SINGLE-issue notation reads. A 2-member gate would
+        # have dropped every one of these, which is why the floor is 4.
+        "Uncanny X-Men #19 1:100 J. Scott Campbell Virgin Variant (2025)",
+        "The X-Men #99 25 Cent Variant (Marvel Comics June 1976) NM!!",
+        "The Uncanny X-Men #20 720 Cover A 2025 Marvel Comics 1st Print",
+        "King Size Hulk #1 VF/NM VHTF NEWSSTAND Variant Marvel 2008 Reprints #180 181",
+        "Figpin X-Men ‘92 Rogue & Gambit Set  MARVEL 438 439",
+        "Marvel Legends Bishop X-Men 97 6\" Figure MOSC New Sealed",
+        # Three ascending members is deliberately below the gate — measured at
+        # precision 1.000 on the corpus but declined for no measured money and
+        # a real unmeasured failure shape (see the block comment).
+        "Uncanny X-Men #286 287 288 - Newsstand / Bishop - Marvel Comics, 1992",
+        # A 4-digit YEAR can never join a run: the \d{1,3} member bound means
+        # "1995" contributes nothing, leaving a 1-member run here.
+        "Amazing Spider-Man 252 1995 VF/NM black costume Marvel",
+        # A decimal grade pair can never join a run either (the _LOT_MEMBER
+        # lookarounds), so this stays a single graded issue.
+        "New Mutants #98 NM 9.4 9.6 1st Deadpool Marvel 1991",
+        # A leading non-issue number must not manufacture a run: [92, 2, 3, 4]
+        # has a longest ascending slice of 3. Accepted miss, pinned so the
+        # slice-not-whole-run semantics can't silently regress to whole-run.
+        "X Men '92 2 3 4",
+        # Descending numbers are never an issue enumeration.
+        "Marvel Kotobukiya ArtFX+ X-Men 92 97 1/10 JUBILEE RARE LOOSE",
     ])
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)
+
+    def test_spaced_run_rule_stays_comp_only(self):
+        """BUI-637/BUI-239: the new rule must never reach the purchase path.
+
+        Same contract as test_bare_range_rule_stays_comp_only above — _LOT_RE
+        feeds should_reject/hard_reject, where a false lot-reject drops a book
+        you actually want, so this shape is excluded as a COMP only.
+        """
+        title = "Batman 655 656 657 658 1st Damian Wayne NM Set Kubert DC Comics 2006"
+        assert sc.hard_exclude(title)
+        assert comic_identity._fmv_spaced_number_run_lot(title)
+        assert not comic_identity._LOT_RE.search(title)
+        assert not comic_identity.should_reject(title, "Batman", "655")
+
+    @pytest.mark.parametrize("numbers,expected", [
+        ([655, 656, 657, 658], 4),
+        ([92, 2, 3, 4], 3),          # leading non-issue number breaks the slice
+        ([92, 97, 1], 2),            # descending tail
+        ([15, 15, 16], 2),           # equal adjacent members are not ascending
+        ([1], 1),
+        ([], 0),                     # total on the degenerate input
+        ([9, 8, 7, 6], 1),           # strictly descending — no run at all
+        ([10, 25, 50, 100], 4),      # ascending but not contiguous — still a run
+    ])
+    def test_longest_ascending_run(self, numbers, expected):
+        """BUI-637: the ascending gate reads the longest CONSECUTIVE ascending
+        slice, not the whole run — the property that keeps "X Men '92 2 3 4"
+        out and "Ghost Rider #15 15 (2nd) 16 19 20 21 ..." in."""
+        assert comic_identity._longest_ascending_run(numbers) == expected
 
     def test_bare_range_rule_stays_comp_only(self):
         """BUI-598/BUI-239: the new rule must never reach the purchase path.
