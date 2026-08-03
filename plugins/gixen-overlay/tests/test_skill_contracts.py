@@ -899,3 +899,292 @@ def test_fallback_swallow_detector_is_wired_up(tmp_path):
     )
     findings = check_fallback_swallow(tmp_path)
     assert findings, "check_fallback_swallow did not flag a known-bad fixture — wiring is broken"
+
+
+# --- Class 5: cross-`## Step`-block variable state loss (BUI-634) -----------
+#
+# SC2154 ("referenced but not assigned", Class 1) already catches SOME of
+# this class — the one bug Class 1's calibration found this way,
+# collection-sync.md Step 3b's `$ts`/`$EXPORT_JSON` (see Class 1's
+# calibration comment above), was exactly a variable set in one `## Step`
+# block and read in a later one. But ShellCheck has a verified blind spot:
+# it treats ALL-CAPS names as possibly-exported environment variables and
+# stays silent on them. Identical code, only the case differs:
+#
+#   -d "{\"backup_path\": \"$BACKUP_PATH\"}"   # shellcheck: silent (ALL-CAPS)
+#   -d "{\"backup_path\": \"$backup_path\"}"   # SC2154 (lowercase): warns
+#
+# This corpus names cross-step variables in ALL-CAPS almost exclusively
+# (BACKUP_PATH, EXPORT_JSON, CSV, SCRATCH), so SC2154 catches the lowercase
+# minority and misses the majority of the class it was kept enabled for.
+# ShellCheck can't be made to see the rest even by tuning flags: Class 1
+# pipes ONE fenced block into the binary at a time (a block never has a
+# shebang or its siblings' content — see Class 1's own comment), so it
+# structurally cannot know a variable was set in an EARLIER, separately
+# piped-in block. This check tracks assignments itself, across fenced
+# blocks, grouped by the `## Step` heading each block falls under — this
+# corpus's own documented shell-boundary unit (see the SC2034 comment
+# above: "each `## Step` block ... is its own fresh shell"). It flags a
+# `$VAR`/`${VAR}` reference in a later `## Step` whose only assignment (in
+# the whole file) lives under an earlier `## Step`, regardless of case.
+_STEP_HEADING_RE = re.compile(r"^##\s+Step\b", re.IGNORECASE)
+
+# Assignment forms this corpus actually uses: `FOO=...`, `export FOO=...`,
+# `local`/`declare`/`readonly FOO=...`, `FOO+=...`, `for FOO in ...`, and
+# `read [-r] FOO` (including `IFS=... read -r FOO`). Anchored at the start of
+# the (stripped) line so a JSON/curl body fragment like `"title=Children of
+# the Vault #1"` — not at line start — can never match.
+_CROSS_STEP_ASSIGN_RE = re.compile(
+    r"^\s*(?:export\s+|local\s+|declare\s+(?:-\w+\s+)*|readonly\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\+?=(?!=)"
+)
+_CROSS_STEP_FOR_RE = re.compile(r"^\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
+_CROSS_STEP_READ_RE = re.compile(r"\bread\s+(?:-\w+\s+)*([A-Za-z_][A-Za-z0-9_]*)\b")
+
+# Reference form: `$VAR` / `${VAR...}`. Deliberately excludes command
+# substitution (`$(...)` — `(` is neither `{` nor a letter) and positional/
+# special parameters (`$1`, `$@`, `$?`, `$$`, ... all start with a digit or
+# symbol, never `[A-Za-z_]`) by construction, not by a denylist.
+_CROSS_STEP_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+# A fenced block's heredoc body lines are never real shell statements (an
+# assignment-shaped line inside one is literal payload, e.g. verify.md's
+# `cat > working_list.verify.json <<'EOF' ... EOF` JSON template), so they're
+# never scanned for assignments. A QUOTED delimiter (`<<'EOF'`/`<<"EOF"`)
+# additionally disables bash variable expansion inside the body, so a `$VAR`
+# there is literal text too and must not be scanned as a reference; an
+# UNQUOTED delimiter (`<<EOF`) still expands, so those bodies stay in scope
+# for reference scanning.
+_HEREDOC_START_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _step_boundaries(text: str) -> list[tuple[int, int]]:
+    """(heading_line_no, step_index) for every `## Step` heading, OUTSIDE any
+    fenced code block, in document order. Mirrors Class 2's `_extract_headings`
+    fence-skip for the same reason stated there: this corpus's bash comments
+    all use single-`#` today, so a `## Step`-shaped line can't currently hide
+    inside a fence, but this check shouldn't depend on that staying true.
+    `step_index` is a simple 0-based ordinal, not a parse of "Step 3b" into
+    (3, "b") — this check only needs "earlier than" / "same as", and document
+    order already gives that."""
+    boundaries: list[tuple[int, int]] = []
+    idx = 0
+    in_fence = False
+    for i, line in enumerate(text.splitlines(), 1):
+        if _FENCE_RE.match(line.strip()) is not None:
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if _STEP_HEADING_RE.match(line):
+            boundaries.append((i, idx))
+            idx += 1
+    return boundaries
+
+
+def _step_index_for_line(line_no: int, boundaries: list[tuple[int, int]]) -> int:
+    """-1 if the line precedes every `## Step` heading in the file (a
+    preamble block, or a file that doesn't use `## Step` headings at all)."""
+    current = -1
+    for heading_line, step_idx in boundaries:
+        if heading_line <= line_no:
+            current = step_idx
+        else:
+            break
+    return current
+
+
+def _cross_step_state_findings(root: Path) -> list[tuple[str, int, str, str]]:
+    """Returns (skill_filename, line, var, snippet) for every `$VAR`/`${VAR}`
+    reference in a fenced bash/sh/shell block under a `## Step` heading whose
+    ONLY assignment (anywhere in the file) lives under an EARLIER `## Step`
+    heading — the BUI-634 class: each `## Step` is a separate shell, so that
+    assignment is gone by the time this reference runs.
+
+    Not flagged, by construction rather than a denylist:
+      - Files with 0-1 `## Step` headings — no "later" heading can exist, so
+        this class of bug cannot occur (most skills don't use `## Step` at
+        all; this check only applies to the multi-shell `## Step` corpus).
+      - A var assigned again anywhere under the SAME `## Step` heading as the
+        reference (any block under that heading, not only the referencing
+        one) — matches this corpus's own established re-derive convention
+        (e.g. Step 3b already re-deriving `$ts`/`$EXPORT_JSON`); genuinely
+        fine, not a bug.
+      - A var with NO assignment anywhere in the file — env vars
+        (`$COMICS_SERVER_URL`), loop/read-introduced names that are never
+        ALSO an earlier cross-step assignment, and `$1`/`$@`/... (excluded by
+        the reference regex's construction, not detected as "assigned" or
+        "referenced" at all). Nothing this check can say is wrong; SC2154
+        already covers true reference-with-no-assignment-anywhere for the
+        lowercase half of this class (see Class 1's calibration note).
+      - Full-comment lines (`#...`) — skipped for both assignment and
+        reference scanning, so an explanatory `# ... $VAR ...` comment can't
+        self-trigger.
+      - Heredoc body lines — never scanned for assignments; scanned for
+        references only when the delimiter is unquoted (see
+        `_HEREDOC_START_RE`'s comment above).
+    """
+    skills_dir = root / ".claude" / "commands" / "comic"
+    findings: list[tuple[str, int, str, str]] = []
+    for md in sorted(skills_dir.glob("*.md")):
+        text = md.read_text()
+        boundaries = _step_boundaries(text)
+        if len(boundaries) < 2:
+            continue  # no "later" `## Step` heading can exist
+
+        assigned_steps: dict[str, set[int]] = {}
+        ref_events: list[tuple[int, int, str, str]] = []  # (line, step_idx, var, raw)
+
+        for start, block_lines in _iter_shell_blocks(text):
+            heredoc_delim: str | None = None
+            heredoc_literal = False
+            for offset, raw in enumerate(block_lines):
+                line_no = start + offset
+                if heredoc_delim is not None:
+                    if raw.strip() == heredoc_delim:
+                        heredoc_delim = None
+                        heredoc_literal = False
+                    elif not heredoc_literal:
+                        step_idx = _step_index_for_line(line_no, boundaries)
+                        for vm in _CROSS_STEP_REF_RE.finditer(raw):
+                            ref_events.append((line_no, step_idx, vm.group(1), raw.strip()))
+                    continue
+                if raw.strip().startswith("#"):
+                    continue
+                step_idx = _step_index_for_line(line_no, boundaries)
+                m = _CROSS_STEP_ASSIGN_RE.match(raw)
+                if m:
+                    assigned_steps.setdefault(m.group(1), set()).add(step_idx)
+                m = _CROSS_STEP_FOR_RE.match(raw)
+                if m:
+                    assigned_steps.setdefault(m.group(1), set()).add(step_idx)
+                for rm in _CROSS_STEP_READ_RE.finditer(raw):
+                    assigned_steps.setdefault(rm.group(1), set()).add(step_idx)
+                for vm in _CROSS_STEP_REF_RE.finditer(raw):
+                    ref_events.append((line_no, step_idx, vm.group(1), raw.strip()))
+                hd = _HEREDOC_START_RE.search(raw)
+                if hd:
+                    heredoc_delim = hd.group(2)
+                    heredoc_literal = bool(hd.group(1))
+
+        for line_no, step_idx, var, raw in ref_events:
+            if step_idx < 0:
+                continue
+            steps = assigned_steps.get(var)
+            if not steps or step_idx in steps:
+                continue
+            if any(s < step_idx for s in steps):
+                findings.append((md.name, line_no, var, raw))
+    return findings
+
+
+def test_no_skill_references_cross_step_variable_without_reassignment():
+    """BUI-634: SC2154 (Class 1) has a verified ALL-CAPS blind spot and, even
+    setting that aside, can't see across fenced blocks at all — it analyzes
+    each one in isolation. This check tracks assignments itself, across
+    `## Step` boundaries, catching the class regardless of case. A finding
+    here means a skill sets a variable in one `## Step` and reads it (unset)
+    in a later one — the exact collection-sync.md `BACKUP_PATH`/`CSV` shape
+    that motivated this check, both fixed alongside it landing (BUI-634)."""
+    findings = _cross_step_state_findings(REPO_ROOT)
+    assert not findings, (
+        "cross-`## Step` variable reference without reassignment:\n"
+        + "\n".join(f"{name}:{line}: ${var} -- {raw}" for name, line, var, raw in findings)
+    )
+
+
+def test_cross_step_state_harness_actually_scans_something():
+    """Guard the guard (mirrors Class 1/2's harness-scans-something tests): if
+    `_STEP_HEADING_RE`/`_step_boundaries` silently matched nothing, every
+    skill file would look like it has <2 `## Step` headings, every file would
+    be skipped, and the main test above would pass vacuously regardless of
+    what bugs exist. Pin a floor — with slack — on how many real skill files
+    have >=2 `## Step` headings (5 as of BUI-634: buy.md, collection-add.md,
+    collection-sync.md, grade.md, wishlist-add.md)."""
+    multi_step_files = [
+        md.name
+        for md in sorted(SKILLS_DIR.glob("*.md"))
+        if len(_step_boundaries(md.read_text())) >= 2
+    ]
+    assert len(multi_step_files) >= 4, (
+        f"expected >=4 skill files with >=2 `## Step` headings, found "
+        f"{len(multi_step_files)} ({multi_step_files}) — Step-heading "
+        "extraction may be broken"
+    )
+
+
+def test_cross_step_state_check_detects_a_real_violation(tmp_path):
+    """Prove it can fail: the ticket's required fixture shape — FOO assigned
+    in one `## Step` block, referenced (unset) in a later one."""
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "fixture.md").write_text(
+        "# Fixture\n\n"
+        "## Step 1\n\n"
+        "```bash\n"
+        'FOO="x"\n'
+        "```\n\n"
+        "## Step 2\n\n"
+        "```bash\n"
+        'echo "$FOO"\n'
+        "```\n"
+    )
+    findings = _cross_step_state_findings(tmp_path)
+    assert findings, "did not flag a cross-`## Step` reference to an unreassigned variable"
+    assert findings[0][2] == "FOO"
+
+
+def test_cross_step_state_check_passes_when_reassigned(tmp_path):
+    """...and stays clean on the ticket's required counter-fixture: the same
+    file, but the second `## Step` block re-assigns FOO before the
+    reference — the sanctioned re-derive pattern this corpus already uses
+    (Step 3b's `$ts`/`$EXPORT_JSON`, and this same change's collection-sync.md
+    fix)."""
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "fixture.md").write_text(
+        "# Fixture\n\n"
+        "## Step 1\n\n"
+        "```bash\n"
+        'FOO="x"\n'
+        "```\n\n"
+        "## Step 2\n\n"
+        "```bash\n"
+        'FOO="y"\n'
+        'echo "$FOO"\n'
+        "```\n"
+    )
+    findings = _cross_step_state_findings(tmp_path)
+    assert not findings, f"reassigned variable incorrectly flagged: {findings}"
+
+
+def test_cross_step_state_check_ignores_false_positive_shapes(tmp_path):
+    """...and stays clean on the shapes explicitly flagged as false-positive
+    risks: a positional parameter (`$1`), a loop variable (`for`), same-block
+    assign-then-use, a variable referenced only within the SAME `## Step`
+    it's assigned in — and, the one that actually needs a LATER `## Step` to
+    be meaningful, a `$VAR`-shaped literal inside a quoted heredoc body in a
+    later Step. Without the heredoc protection this WOULD look like the
+    real-violation shape (BAR assigned only in Step 1, "referenced" in Step
+    2) — it stays clean only because a quoted `<<'EOF'` delimiter disables
+    bash expansion, so `$BAR` inside is literal payload text, not a real
+    reference (mirrors verify.md's own `<<'EOF'` JSON template)."""
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "fixture.md").write_text(
+        "# Fixture\n\n"
+        "## Step 1\n\n"
+        "```bash\n"
+        'echo "$1"\n'
+        'for ITEM in a b c; do echo "$ITEM"; done\n'
+        'BAR="inline"; echo "$BAR"\n'
+        "```\n\n"
+        "## Step 2\n\n"
+        "```bash\n"
+        "cat > payload.json <<'EOF'\n"
+        '{"backup_path": "$BAR"}\n'
+        "EOF\n"
+        "```\n"
+    )
+    findings = _cross_step_state_findings(tmp_path)
+    assert not findings, f"false-positive shape(s) incorrectly flagged: {findings}"
