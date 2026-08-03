@@ -403,6 +403,52 @@ def test_mark_bids_purged_spares_live_pending_sharing_item_id_prior_status_untou
     assert pending_row["prior_status"] is None
 
 
+def test_delete_bid_records_prior_status_on_resolved_row(db):
+    """BUI-660, third tombstone writer. delete_bid's intended target is a live
+    PENDING row, but get_pending_bid_by_item_id falls back to
+    get_bid_by_item_id — so removing a snipe whose only row already resolved
+    tombstones that row. Without prior_status that destroys a first-party comp
+    exactly as the completed-bids sweep did."""
+    insert_bid(db, "700000010", 50.0, 6, 0, "s")
+    update_bid_status(db, "700000010", status="WON", winning_bid=45.0,
+                      resolved_at="2026-04-25T10:00:00")
+
+    delete_bid(db, "700000010")
+
+    row = get_bid_by_item_id(db, "700000010")
+    assert row["status"] == "REMOVED"
+    assert row["prior_status"] == "WON"
+
+
+def test_delete_bid_on_pending_row_records_pending_not_resolved(db):
+    """The normal remove-a-live-snipe path: prior_status is 'PENDING', which is
+    never in the WON/LOST admit set, so the row stays correctly excluded from
+    the comp pool. No history is fabricated for a bid that never resolved."""
+    insert_bid(db, "700000011", 50.0, 6, 0, "s")
+
+    delete_bid(db, "700000011")
+
+    row = get_bid_by_item_id(db, "700000011")
+    assert row["status"] == "REMOVED"
+    assert row["prior_status"] == "PENDING"
+
+
+def test_delete_bid_does_not_clobber_existing_prior_status(db):
+    """An already-tombstoned row returns early, so a second delete_bid cannot
+    overwrite a recorded prior_status with 'REMOVED' and silently erase the
+    comp the first write preserved."""
+    insert_bid(db, "700000012", 50.0, 6, 0, "s")
+    update_bid_status(db, "700000012", status="LOST", winning_bid=None,
+                      resolved_at="2026-04-25T10:00:00")
+    delete_bid(db, "700000012")
+
+    delete_bid(db, "700000012")
+
+    row = get_bid_by_item_id(db, "700000012")
+    assert row["status"] == "REMOVED"
+    assert row["prior_status"] == "LOST"
+
+
 def test_update_bid_status_removed_from_pending_records_prior_status(db):
     """Simulates a BUI-371 classification site (update_bid_status(conn, iid,
     "REMOVED", ...) called against a live PENDING row) — prior_status ends up

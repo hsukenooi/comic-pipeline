@@ -1281,8 +1281,17 @@ def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     if row is None or row["status"] in ("PURGED", "REMOVED"):
         return
     now = datetime.now(timezone.utc).isoformat()
+    # BUI-660: the third tombstone writer, and the one the ticket's own
+    # analysis missed. The intended target is a live PENDING row, but the
+    # get_bid_by_item_id fallback above means an operator removing a snipe
+    # whose only row already resolved WON/LOST tombstones that row instead —
+    # destroying a first-party comp exactly as mark_bids_purged did. Same
+    # pre-update-row semantics as the other two writers; the early return
+    # above (already-tombstoned rows) additionally guarantees this can never
+    # overwrite a recorded prior_status with 'REMOVED'.
     conn.execute(
-        "UPDATE bids SET status='REMOVED', resolved_at=? WHERE id=?",
+        "UPDATE bids SET status='REMOVED', resolved_at=?, prior_status=status "
+        "WHERE id=?",
         (now, row["id"]),
     )
 
