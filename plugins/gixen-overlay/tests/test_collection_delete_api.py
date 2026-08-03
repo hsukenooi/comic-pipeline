@@ -3,48 +3,18 @@
 Mirrors the fixture pattern in test_collection_api.py (real gixen-cli server +
 overlay plugin, LOCG_DATA_DIR pointed at a seeded temp store), kept in its own
 file per the wave's ownership split: another agent is actively editing
-test_collection_api.py this wave.
+test_collection_api.py this wave. BUI-640: the shared plumbing (plugin
+install, gixen mock, env setup, TestClient) now lives in conftest.py's
+`_seeded_client`; this file keeps only its own seed data (no wish-list here,
+unlike test_collection_api.py — see conftest.py's BUI-640 docstring).
 """
 from __future__ import annotations
 
 import json
-from importlib.metadata import EntryPoint
-from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
-
-def _install_real_plugin(monkeypatch):
-    ep = EntryPoint(
-        name="gixen-overlay",
-        value="gixen_overlay.plugin:plugin",
-        group="gixen.plugins",
-    )
-    monkeypatch.setattr(
-        "gixen.plugins.entry_points",
-        lambda group: [ep] if group == "gixen.plugins" else [],
-    )
-
-
-def _mock_gixen():
-    m = MagicMock()
-    m.list_snipes.return_value = []
-    return m
-
-
-def _seed_collection(store, comics):
-    payload = {
-        "schema_version": 1,
-        "last_full_import": "2026-06-01T00:00:00.000000Z",
-        "last_import_source": "seed.xlsx",
-        "migration_in_progress": False,
-        "last_writer": None,
-        "series_name_index": {},
-        "comics": comics,
-    }
-    (store / "collection.json").write_text(json.dumps(payload))
-
+from .conftest import _seed_collection, _seeded_client
 
 # One single-copy row and one two-copy row, so the tests exercise both the
 # "remove outright" and "decrement" branches of the in_collection copy count
@@ -73,19 +43,8 @@ def client(tmp_path, monkeypatch):
     store.mkdir()
     _seed_collection(store, _OWNED)
 
-    _install_real_plugin(monkeypatch)
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setenv("LOCG_DATA_DIR", str(store))
-    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
-    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
-    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
-    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
-    with patch("server.main.GixenClient", return_value=_mock_gixen()):
-        from server.main import app
-
-        with TestClient(app) as c:
-            c.store = store
-            yield c
+    with _seeded_client(tmp_path, monkeypatch, store) as c:
+        yield c
 
 
 def test_delete_removes_single_copy_row(client):

@@ -6,55 +6,17 @@ and the restore path was prose-only (no command). These endpoints move the
 backup onto the server (which already has filesystem access to the store) and
 make restore executable. Mirrors the `client` fixture pattern in
 test_collection_api.py, pointing locg-cli's store (LOCG_DATA_DIR) at a seeded
-temp directory.
+temp directory. BUI-640: the shared plumbing (plugin install, gixen mock, env
+setup, TestClient) now lives in conftest.py's `_seeded_client`.
 """
 from __future__ import annotations
 
 import json
-from importlib.metadata import EntryPoint
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
-
-def _install_real_plugin(monkeypatch):
-    ep = EntryPoint(
-        name="gixen-overlay",
-        value="gixen_overlay.plugin:plugin",
-        group="gixen.plugins",
-    )
-    monkeypatch.setattr(
-        "gixen.plugins.entry_points",
-        lambda group: [ep] if group == "gixen.plugins" else [],
-    )
-
-
-def _mock_gixen():
-    m = MagicMock()
-    m.list_snipes.return_value = []
-    return m
-
-
-def _seed_collection(store, comics):
-    payload = {
-        "schema_version": 1,
-        "last_full_import": "2026-06-01T00:00:00.000000Z",
-        "last_import_source": "seed.xlsx",
-        "migration_in_progress": False,
-        "last_writer": None,
-        "series_name_index": {},
-        "comics": comics,
-    }
-    (store / "collection.json").write_text(json.dumps(payload))
-
-
-def _seed_wish_list(store, items):
-    (store / "wish-list.json").write_text(
-        json.dumps({"updated_at": "2026-06-01T00:00:00Z", "items": items})
-    )
-
+from .conftest import _seed_collection, _seed_wish_list, _seeded_client
 
 _OWNED = [
     {
@@ -76,19 +38,8 @@ def client(tmp_path, monkeypatch):
     _seed_collection(store, _OWNED)
     _seed_wish_list(store, _WISH)
 
-    _install_real_plugin(monkeypatch)
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setenv("LOCG_DATA_DIR", str(store))
-    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
-    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
-    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
-    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
-    with patch("server.main.GixenClient", return_value=_mock_gixen()):
-        from server.main import app
-
-        with TestClient(app) as c:
-            c.store = store
-            yield c
+    with _seeded_client(tmp_path, monkeypatch, store) as c:
+        yield c
 
 
 # --- backup ------------------------------------------------------------

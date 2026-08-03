@@ -4,56 +4,22 @@ These exercise the real gixen-cli server (server.main.app) with the real
 overlay plugin loaded, pointing locg-cli's store (LOCG_DATA_DIR) at a seeded
 temp directory. Mirrors the `api` fixture pattern in
 test_gixen_overlay_routes.py but adds the seeded collection/wish-list store.
+BUI-640: the shared plumbing (plugin install, gixen mock, env setup,
+TestClient) now lives in conftest.py's `_seeded_client`; `server_default_
+store_client` below still builds its own client inline since it deliberately
+leaves LOCG_DATA_DIR unset (see conftest.py's BUI-640 docstring).
 """
 from __future__ import annotations
 
 import json
 from datetime import datetime
-from importlib.metadata import EntryPoint
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-
-def _install_real_plugin(monkeypatch):
-    ep = EntryPoint(
-        name="gixen-overlay",
-        value="gixen_overlay.plugin:plugin",
-        group="gixen.plugins",
-    )
-    monkeypatch.setattr(
-        "gixen.plugins.entry_points",
-        lambda group: [ep] if group == "gixen.plugins" else [],
-    )
-
-
-def _mock_gixen():
-    m = MagicMock()
-    m.list_snipes.return_value = []
-    return m
-
-
-def _seed_collection(store, comics):
-    """Write a minimal collection.json the locg matcher can read."""
-    payload = {
-        "schema_version": 1,
-        "last_full_import": "2026-06-01T00:00:00.000000Z",
-        "last_import_source": "seed.xlsx",
-        "migration_in_progress": False,
-        "last_writer": None,
-        "series_name_index": {},
-        "comics": comics,
-    }
-    (store / "collection.json").write_text(json.dumps(payload))
-
-
-def _seed_wish_list(store, items):
-    (store / "wish-list.json").write_text(
-        json.dumps({"updated_at": "2026-06-01T00:00:00Z", "items": items})
-    )
-
+from .conftest import _install_real_plugin, _mock_gixen, _seed_collection, _seed_wish_list, _seeded_client
 
 # A small owned collection: one owned ASM #300, one *wish-list-only* row
 # (in_collection=0) to prove the copies-owned gate is respected.
@@ -87,19 +53,8 @@ def client(tmp_path, monkeypatch):
     _seed_collection(store, _OWNED)
     _seed_wish_list(store, _WISH)
 
-    _install_real_plugin(monkeypatch)
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setenv("LOCG_DATA_DIR", str(store))  # overrides the server default
-    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
-    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
-    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
-    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
-    with patch("server.main.GixenClient", return_value=_mock_gixen()):
-        from server.main import app
-
-        with TestClient(app) as c:
-            c.store = store
-            yield c
+    with _seeded_client(tmp_path, monkeypatch, store) as c:
+        yield c
 
 
 # --- collection check ------------------------------------------------------
