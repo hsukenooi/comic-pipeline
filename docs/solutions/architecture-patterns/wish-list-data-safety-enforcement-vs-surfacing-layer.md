@@ -6,6 +6,9 @@ module: locg-cli (wish-list conflicts audit + collection export)
 problem_type: architecture_pattern
 component: service_object
 severity: high
+status: corrected
+superseded_by: "BUI-670 (PR #434, 2026-08-03) — 'the conflicts audit is only a surfacing layer, scope it freely' holds when NARROWING what it reports, not when widening it. cmd_wish_list_remove_conflicts DELETES every `conflicts` entry it is handed, so a false positive destroys a genuine wish. See 'Correction: the asymmetry runs both ways' below."
+superseded_date: 2026-08-03
 related_components:
   - locg-cli
   - gixen-overlay
@@ -14,6 +17,8 @@ applies_when:
   - "Changing the wish-list conflicts audit (cmd_wish_list_conflicts / remove-conflicts) or adding year/variant scoping to it"
   - "Tempted to add year or printing scoping to the collection EXPORT owned-safe filter"
   - "Two coupled tickets both need to thread new match signal through one shared wish-list function"
+  - "WIDENING what the conflicts audit reports — relaxing a filter, adding a population, surfacing a class it currently omits"
+  - "Deciding whether a reporting surface may be widened for visibility — check what consumes it first"
 tags: [wish-list, data-loss, bui-122, bui-387, cover-year, enforcement-layer, conflicts-audit, coupled-tickets]
 ---
 
@@ -40,6 +45,28 @@ Concretely:
 - **The conflicts audit is the surfacing layer.** It decides which wishes to *show* (and, via remove-conflicts, delete from the wish-list — never from the collection). Adding a per-issue year here changes *which owned volume a wish is compared against*; a mis-scoped year only makes the audit **fail to surface** a wish for cleanup. It can never delete an owned collection book, because the collection's deletion protection is enforced elsewhere, independently, and year-blind.
 
 The safety argument that let BUI-387 ship: *worst case of a wrong audit year = reduced audit completeness (a decoy isn't cleaned), never a deleted owned book.* That argument is only valid **because the two layers are separate**. If you ever collapse them — route the audit's year into the export filter, or move the owned-safe check into the audit — you forfeit it.
+
+### Correction: the asymmetry runs both ways (BUI-670, 2026-08-03)
+
+**"Scope it freely" is only safe in the NARROWING direction.** The BUI-387 argument above analyses one failure mode — the audit *fails to surface* something — and correctly finds it cheap. It says nothing about the opposite move, and the opposite move is not cheap:
+
+**`conflicts` is not a report. It is the input to a deleter.** `cmd_wish_list_remove_conflicts` re-derives this audit and deletes every `conflicts` entry it is asked for. So a false positive here destroys a wish the user genuinely still wants. It still cannot touch the *collection* — that part of the original thesis holds, and it is why this is a correction rather than a falsification — but "cosmetic-ish (audit hygiene)" undersells what a wrongly-widened audit costs.
+
+BUI-670 is where this bit. BUI-647 made `cmd_collection_check` quarantine-aware, so a book whose only owned row is quarantined stopped appearing in the audit. Read through the original guidance that is a reporting surface silently dropping rows — the vacuous-partition shape (`vacuous-partition-guards-and-mutable-identity-keys.md`) — and the obvious fix is to widen the audit back. **That fix would have been wrong.** The primary quarantined class is a Panini/Kamite licensed edition our own record-win push minted (BUI-563); the user still wants the US edition. Widening the audit hands `remove-conflicts` that genuine want to delete, on the authority of a row we formally disowned.
+
+So the two layers have opposite prohibitions, and both are load-bearing:
+
+| layer | must never | because |
+|---|---|---|
+| `wish_rows_for_export` (enforcement) | **narrow** — drop an owned row from the index | the export emits `In Collection=0` and LOCG deletes the owned book (BUI-122 / BUI-200) |
+| `cmd_wish_list_conflicts` (surfacing) | **widen** carelessly — report a book we cannot act on correctly | `remove-conflicts` deletes every reported entry, destroying a genuine wish |
+
+**The reusable test, before widening any reporting surface: ask what consumes it.** A list read by a human is a report and can be over-inclusive at the cost of noise. A list read by a deleter is a work queue, and over-inclusion is data loss. The word "audit" hides the difference — this one is both, and the removable half sets the bar.
+
+Two corollaries worth keeping:
+
+- **An under-report is only cosmetic if something else still enforces the invariant — assert that, don't assume it.** BUI-670's decision rests on the export layer being unfiltered, so the wish is still suppressed and BUI-122 is unreachable. That is now pinned by a test asserting *both* halves (`tests/test_quarantine.py`), so the day it stops being true a test says so instead of an incident.
+- **Answer a visibility gap on the surface that owns the state.** Quarantined rows are reported by `collection status`'s `quarantined_count`, not by widening a removable conflict list. "Nobody can see X" is an argument for a report, never for enlarging a work queue.
 
 ### Companion pattern: coupled tickets adding signal to one shared function
 
