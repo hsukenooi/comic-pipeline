@@ -40,12 +40,13 @@ def _run_edit(args):
 
 def test_edit_max_bid_only_omits_offset_and_group():
     """Bare `edit <id> <bid>` sends only max_bid — both passthrough fields are
-    omitted so the server preserves them."""
+    omitted so the server preserves them. `source` (BUI-621/U7) is always
+    sent — it's cli.py's own provenance tag, not a passthrough field."""
     result, captured = _run_edit(["200000001", "75.0"])
     assert result.exit_code == 0, result.output
     assert captured["method"] == "patch"
     assert captured["path"] == "/api/bids/200000001"
-    assert captured["json"] == {"max_bid": 75.0}
+    assert captured["json"] == {"max_bid": 75.0, "source": "cli"}
 
 
 def test_edit_includes_offset_and_group_when_provided():
@@ -54,7 +55,9 @@ def test_edit_includes_offset_and_group_when_provided():
         ["200000001", "75.0", "--offset", "9", "--group", "3"]
     )
     assert result.exit_code == 0, result.output
-    assert captured["json"] == {"max_bid": 75.0, "bid_offset": 9, "snipe_group": 3}
+    assert captured["json"] == {
+        "max_bid": 75.0, "bid_offset": 9, "snipe_group": 3, "source": "cli",
+    }
 
 
 def test_edit_explicit_group_zero_is_sent():
@@ -62,13 +65,13 @@ def test_edit_explicit_group_zero_is_sent():
     it equals the pre-BUI-401 default, and bid_offset stays omitted."""
     result, captured = _run_edit(["200000001", "75.0", "--group", "0"])
     assert result.exit_code == 0, result.output
-    assert captured["json"] == {"max_bid": 75.0, "snipe_group": 0}
+    assert captured["json"] == {"max_bid": 75.0, "snipe_group": 0, "source": "cli"}
 
 
 def test_edit_only_offset_provided_omits_group():
     result, captured = _run_edit(["200000001", "75.0", "--offset", "3"])
     assert result.exit_code == 0, result.output
-    assert captured["json"] == {"max_bid": 75.0, "bid_offset": 3}
+    assert captured["json"] == {"max_bid": 75.0, "bid_offset": 3, "source": "cli"}
 
 
 # ---------------------------------------------------------------------------

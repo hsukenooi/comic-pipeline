@@ -553,3 +553,147 @@ def test_add_batch_verify_failure_recorded_but_does_not_change_exit_code(tmp_pat
     payload = _extract_json(result.output)
     assert payload["verify_error"] == "Server returned 500: verify boom"
     assert "--verify" in result.output  # warning surfaced to the user
+
+
+# ---------------------------------------------------------------------------
+# Policy advisories (BUI-621/U7) — per-row marker, JSON summary, end-of-run count
+# ---------------------------------------------------------------------------
+
+
+def test_add_batch_row_with_advisories_marks_table_and_json(tmp_path):
+    """A row whose POST /api/bids response carries KTD4 advisories must show
+    a marker in the human table AND carry the full advisories verbatim in
+    the JSON summary — the batch must never end looking clean."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [{"item_id": "1", "max_bid": 10}])
+    advisories = [{
+        "code": "exposure_ceiling", "severity": "warning",
+        "message": "over the group exposure ceiling", "data": {"limit": 500},
+    }]
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): (
+            True, {"item_id": "1", "created": True, "advisories": advisories}, None,
+        ),
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 0, result.output
+    assert "advisor" in result.output.lower()  # per-row table marker
+    payload = _extract_json(result.output)
+    assert payload["rows"][0]["advisories"] == advisories
+    assert payload["summary"]["advisories"] == 1
+    # end-of-run count, distinct from the per-row table marker
+    assert "1 advisory across this batch" in result.output
+
+
+def test_add_batch_all_clean_batch_has_no_advisory_noise(tmp_path):
+    """The inverse of the above: when no row carries an advisory, the table
+    and end-of-run output must stay silent about advisories entirely."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [{"item_id": "1", "max_bid": 10}])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 0, result.output
+    # "no advisory noise" means no human-visible marker (per-row table
+    # suffix, end-of-run count line) — the JSON summary legitimately always
+    # carries a neutral "advisories": 0 field, which is not noise.
+    human_text = result.output.split("{", 1)[0]  # everything before the JSON blob
+    assert "advisor" not in human_text.lower()
+    assert "review before treating it as clean" not in result.output
+    payload = _extract_json(result.output)
+    assert payload["rows"][0]["advisories"] == []
+    assert payload["summary"]["advisories"] == 0
+
+
+def test_add_batch_advisory_count_survives_a_multi_row_batch(tmp_path):
+    """Advisories from multiple rows all sum into the one end-of-run count,
+    and each row's own advisories still land verbatim in the JSON summary."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [
+        {"item_id": "1", "max_bid": 10}, {"item_id": "2", "max_bid": 20},
+    ])
+    advisory_1 = {"code": "a", "severity": "warning", "message": "m1", "data": {}}
+    advisory_2 = {"code": "b", "severity": "unevaluable", "message": "m2", "data": {}}
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): [
+            (True, {"item_id": "1", "created": True, "advisories": [advisory_1]}, None),
+            (True, {"item_id": "2", "created": True, "advisories": [advisory_2]}, None),
+        ],
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 0, result.output
+    payload = _extract_json(result.output)
+    assert payload["rows"][0]["advisories"] == [advisory_1]
+    assert payload["rows"][1]["advisories"] == [advisory_2]
+    assert payload["summary"]["advisories"] == 2
+    assert "2 advisories across this batch" in result.output
+
+
+def test_add_batch_old_server_response_without_advisories_key_does_not_crash(tmp_path):
+    """An old server's 2xx response predates the KTD4 envelope entirely (no
+    `advisories` key) — add-batch must degrade to zero advisories, not
+    crash."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [{"item_id": "1", "max_bid": 10}])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        # No "advisories" key at all — the shape a pre-KTD4 server returns.
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+    })
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 0, result.output
+    payload = _extract_json(result.output)
+    assert payload["rows"][0]["advisories"] == []
+    assert payload["summary"]["advisories"] == 0
+
+
+def test_add_batch_source_batch_reaches_the_add_payload(tmp_path):
+    """Every add-batch row is provenance-tagged "batch" in the POST
+    /api/bids payload (BUI-621/U7)."""
+    from cli import cli
+
+    rows_file = _write_rows(tmp_path, [{"item_id": "1", "max_bid": 10}])
+    captured = {}
+
+    def fake(method, path, **kwargs):
+        if (method, path) == ("post", "/api/bids"):
+            captured["json"] = kwargs.get("json")
+            return (True, {"item_id": "1", "created": True}, None)
+        return (True, {}, None)
+
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file])
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"]["source"] == "batch"
