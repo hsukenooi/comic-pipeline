@@ -26,6 +26,8 @@ applies_when:
   - "A precision/recall bar is being set before the value of perfect precision is known"
   - "About to claim an exclusion rule 'can only lower' a price, cap, or score"
   - "Reporting the measured effect of an exclusion rule without stating its direction"
+  - "A class is proposed for exclusion because it is the WRONG ITEM, without checking
+    whether it sits above or below the pool median"
 related_components:
   - "fmv"
 tags:
@@ -191,10 +193,70 @@ IQR fence frozen from a pre-removal pool is not an IQR fence, and there is no ca
 - **Do not claim an exclusion "can only lower" a price.** On this pipeline that sentence is
   measurably false; scope it to the ≥3× class if you need it.
 
+## Which side of the pool median does the class sit on?
+
+BUI-667 proposed excluding reprint-*format* comics — `Classic X-Men`, `Marvel's Greatest
+Comics`, `Marvel Super Action`, `Marvel Milestone`, `JC Penney` reprints — from the pools of
+the originals they reprint. The premise is unimpeachable on identity grounds: a `Classic
+X-Men #41` (1989) genuinely is a different book from `X-Men #41` (1968), so pricing one
+against the other is wrong.
+
+The oracle killed it anyway. Hand-labelled 86 reprint-format titles, excluded all of them at
+precision 1.000, measured `fmv_high` in both directions:
+
+| Sampling | UP | DOWN | NULLED | REVIVED |
+|---|---|---|---|---|
+| at each pool's median comp grade (2 of 493 pools move) | 1 | **0** | 1 | 0 |
+| across a 13-point CGC-ladder sweep | 23 | 5 | 15 | 6 |
+
+**Zero pools where the exclusion lowers a cap at the headline sampling, and the ladder sweep
+is 23 up against 5 down.** Worst case is `"X-Men 83"` at grade 7.0, where the "fix" takes
+`fmv_high` from 45 to 180. The sharp test agrees: 0 class members sit above their pool's Q75
+at ≥3× the pool median.
+
+The mechanism generalizes past this ticket, and it is the cheapest question to ask after the
+oracle number itself:
+
+> **Correct-on-identity and profitable-to-exclude are independent properties. A polluting
+> comp only costs money if it sits ABOVE the pool median; a class that sits below it is
+> depressing the cap, and removing it RAISES the cap.**
+
+Reprint editions are cheap — that is what makes them recognizable as reprints and it is
+exactly what makes excluding them a cap-raising change with no downside protection to buy.
+Contrast BUI-598's class (a $6500 slab manufacturing a $3825 cap) and BUI-637's (a 4-issue
+Damian Wayne set priced as if it were one issue): both sat *above* their pools. Same word —
+"pollution" — opposite sign on the money.
+
+This is the same shape that made BUI-645 ship its ordinal half and withhold its bare half
+(UP 29 / DOWN 2 / 19 nulled). Two independent classes, one rule of thumb.
+
+## A load-bearing removal is usually load-bearing for a good reason
+
+BUI-665 chased the one live consequence in "A shipped rule that raised a real bid cap" above:
+was the re-admitted $139.99 comp itself pollution the fence had been suppressing for the
+wrong reason? Hand-checked: **no.** It is a genuine raw, single-issue, first-print copy of
+the very book, parsed at 7.5, bracketed by the same corpus's graded pool (CGC 8.0 $160/$125,
+raw 7.0 $103, raw 8.0 $91) — which also holds a raw VF+ 8.5 at $159.99. The $60 cap is
+conservative for an 8.5 copy; the pre-BUI-637 $25 cap was the wrong number.
+
+Characterizing the whole class rather than the anecdote is what settled it. Re-running the
+leave-one-out sweep on the post-BUI-645 tree gives 38 up-moves whose removed comp was priced
+above the published `fmv_high`, **11 via IQR-fence re-admit across 8 pools** (a re-measurement
+on a tree carrying two more exclusions than BUI-646's 7-of-34, not a contradiction of it).
+Read by hand: 6 re-admit a genuine raw comp of the right book, 1 re-admits a 1:100 virgin
+variant, 1 re-admits a different book entirely, 1 is a graded pool behaving as designed, and
+**2 — one pool — are an actual exclusion gap** (a signed/COA copy; `LOCAL_EXCLUDE_RE` matches
+`signed by` but not a bare `Signed <name>`). Largest single move in the class: `fmv_high`
+40 → 70 on `"X-Men 78"`.
+
+The lesson is the direction one, sharpened: **when an exclusion rule's removal widens a fence
+and re-admits something, check what got re-admitted before assuming the rule misfired.** Most
+of the time the pool simply got more honest.
+
 ## Why This Matters
 
-Seven consecutive FMV signal tickets in this repo have now been Canceled on measurement
-(BUI-578, 582, 590, 592, 594, 597, and 629). Every one of them spent its effort on classifier
+Eight consecutive FMV signal tickets in this repo have now been Canceled on measurement
+(BUI-578, 582, 590, 592, 594, 597, 629, and 667). Every one of them spent its effort on classifier
 precision. Not one of them established first that a perfect classifier was worth having.
 
 An oracle bound is cheap, it is an upper bound rather than an estimate, and it either kills
@@ -239,6 +301,18 @@ Step 2 has a direction half that BUI-629 and BUI-637 both skipped, added by BUI-
 2c. Read every UP move by hand      -> rare enough to afford (BUI-637: 3
                                        up-moves in 2 of 493 pools); it is
                                        where the surprises are
+```
+
+And a step 4b added by BUI-667, which is step 4's cheap precursor — it needs no
+per-comp quantile arithmetic, just the class's prices against the pools':
+
+```
+4b. Which side of the median?       -> if the class is systematically CHEAPER
+                                       than the pools it pollutes, excluding it
+                                       RAISES caps.  Correct-on-identity is not
+                                       profitable-to-exclude (BUI-667: UP 1 /
+                                       DOWN 0 at 493 pools; UP 23 / DOWN 5 on
+                                       the CGC ladder)
 ```
 
 The result is recorded in the design essay in `apps/ebay/src/comic_identity.py` rather than
