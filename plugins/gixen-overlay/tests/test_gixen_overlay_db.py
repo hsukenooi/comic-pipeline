@@ -18,6 +18,7 @@ from gixen_overlay.db import (
     get_collection_wins_seen,
     mark_collection_wins_seen,
     _normalize_comic_title,
+    multi_issue_lot_reason,
 )
 
 
@@ -452,6 +453,67 @@ def test_normalize_comic_title_declines_on_edition_markers():
         assert _normalize_comic_title(title, issue) != "Amazing Spider-Man"
 
 
+@pytest.mark.parametrize(
+    "title, issue, detected",
+    [
+        # All 6 class-D rows from rows.tsv, hashed.
+        ("Uncanny X-men #5,6,7,8,9  Bronze age lot of 5 Fine to VF", "5", True),
+        ("Classic X-men #1,2,3,4,5,6,7,8 Bronze age lot of 8 New X-men Art Adams FVF -VF", "1", True),
+        ("Amazing Spider-man #18,19,20,21,22 lot of 5 NM Gems Wow", "18", True),
+        ("Amazing Spider-man #14,15,16,17,18 lot of 5 NM Gems Wow z", "14", True),
+        ("Amazing Spider-man #19,20,21,22,23 lot of 5 NM Gems Wow z", "19", True),
+        ("Uncanny X-men #146,147 Bronze age Dr. Doom lot of 2 Wow", "146", True),
+        # BUI-625: the SAME listings appear HASHLESS in bids.ebay_title on the
+        # live Mac Mini. The `#` is not part of the shape, so neither is it
+        # part of the rule.
+        ("Uncanny X-men  5,6,7,8,9  Bronze age lot of 5 Fine to VF", "5", True),
+        ("Uncanny X-men  146,147 Bronze age Dr. Doom lot of 2 Wow", "146", True),
+        # Hashless, and with NO `lot of N` phrase — reachable only by the run
+        # test. Verbatim from bids.ebay_title.
+        ("Akira 1,2,3,4,5,6,7,8,9 Marvel Epic Comics 1988 1st Prints High Grades", "1", True),
+        ("Daredevil The Man Without Fear 1,2,3,4,5 Marvel Comics 1993 Limited Series", "1", True),
+        ("Marvel Spotlight On GHOST RIDER #5,6,7,8,9,10,11 Full Run 1st App Ghost Rider!", "5", True),
+        # `lot of N` with no enumerated run.
+        ("Uncanny X-men #146 Bronze age Dr. Doom lot of 2 Wow", "146", True),
+        # --- must NOT fire: verbatim single-issue rows from the live table ---
+        ("Iron Man #126 (Marvel Comics September 1979) VF Condition!", "126", False),
+        ("The Mighty Thor #127 (FN+) 1st App of Pluto & Hippolyta", "127", False),
+        ("FANTASTIC FOUR # 31 - (VG-) -THE MAD MENACE OF THE MACABRE MOLE MAN", "31", False),
+        ("Amazing Spider-man #20 Bermejo Variant NM Gem Wow", "20", False),
+        # The BUI-591 `(?<!\d)` guard: issue 99 must not match inside "2099",
+        # so the comma-digit AFTER the masthead year does not read as a run.
+        ("X-Men 2099, 2 covers", "99", False),
+        ("X-Men 2099", "99", False),
+        # ...but a genuine run on the same issue number still fires.
+        ("X-Men 99, 100 lot", "99", True),
+        # Fails open on a blank issue rather than guessing.
+        ("Amazing Spider-man 18,19,20 lot of 3", "", False),
+        # --- the dash is NOT a separator, and this is why (BUI-625) ---------
+        # One seller's house format puts the issue, a dash, then a "1st app"
+        # note that STARTS WITH A DIGIT. ~100 of the 641 rows in the live
+        # `bids.ebay_title` corpus look like this, and every one is a single
+        # book. Adding `-` to the separator class would refuse them all — a
+        # widening that measuring `comics` alone (0 rows affected) says is free.
+        ("X-Men   96 - 1st Moira MacTaggert VG/Fine Cond", "96", False),
+        ("Fantastic Four   50 - 3rd Silver Surfer & Galactus VG/Fine Cond", "50", False),
+        ("Incredible Hulk # 330 - 1st Todd McFarlane pencils & cover NM- Cond", "330", False),
+    ],
+)
+def test_multi_issue_lot_reason_detects_lots_without_false_positives(title, issue, detected):
+    """BUI-625 class D. Measured read-only against the live DB before widening
+    to the whole title: 0/666 `comics` rows match (no stored identity is
+    affected) and 7/641 raw `bids.ebay_title` rows match — all 7 genuine lots.
+    """
+    assert (multi_issue_lot_reason(title, issue) is not None) is detected
+
+
+def test_multi_issue_lot_reason_returns_a_usable_explanation():
+    """The reason is surfaced to the caller in the 422 detail and persisted to
+    the rejections ledger, so it has to name the shape, not just say 'no'."""
+    reason = multi_issue_lot_reason("Amazing Spider-man #18,19,20 lot of 3", "18")
+    assert reason and "18" in reason
+
+
 def test_upsert_comic_declines_truncation_for_multi_issue_lot(db):
     """Class D stays open by design. Truncating would mint a clean-looking
     `Amazing Spider-man` #18 that silently asserts a five-book lot IS issue 18,
@@ -472,15 +534,148 @@ def test_upsert_comic_declines_truncation_for_space_separated_lot(db):
     assert row["title"] != "Uncanny X-men"
 
 
-def test_upsert_comic_declines_truncation_for_unrecorded_variant(db):
-    """Class C stays open by design, and this is the constraint that decides
-    it: `variant` is row identity (BUI-28), so cutting a cover designation out
-    of the title without moving it into that column would silently merge a
-    variant into its base edition."""
-    cid = upsert_comic(db, "Absolute Flash #10 Nick Robles Cover", "10")
+# ---------------------------------------------------------------------------
+# upsert_comic — edition designation extraction (BUI-625, BUI-596 class C)
+#
+# BUI-599 DECLINED to truncate a title whose tail carried an edition
+# designation, because cutting `Nick Robles Cover` away would merge a variant
+# into its base edition. BUI-625 moves the designation into the `variant`
+# column instead, which makes the truncation safe and keeps the two books
+# distinct — the column where the distinction belongs.
+#
+# The rule fires only on a tail that is NOTHING BUT the designation, ending in
+# the designation word. That is exactly the 8 rows rows.tsv classifies
+# `C-variant-designation`; the 21 class-B rows with a designation buried in
+# listing prose still decline (see the residue test below). Verified against
+# the frozen 173-row corpus: 8 extracted, 6 refused as lots, 21 declined, 138
+# truncated, and ZERO new identity merges versus BUI-599's behaviour.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "title, issue, expected_title, expected_variant",
+    [
+        # All four distinct series/artist pairs from rows.tsv's class C.
+        ("Absolute Flash #10 Nick Robles Cover", "10",
+         "Absolute Flash", "Nick Robles Cover"),
+        ("Absolute Green Lantern #9 Jahnoy Lindsay Cover", "9",
+         "Absolute Green Lantern", "Jahnoy Lindsay Cover"),
+        ("Absolute Martian Manhunter #1 Javier Rodriguez Cover", "1",
+         "Absolute Martian Manhunter", "Javier Rodriguez Cover"),
+        # Two tokens is the floor: one name plus the designation word.
+        ("Amazing Spider-man #20 Bermejo Variant", "20",
+         "Amazing Spider-man", "Bermejo Variant"),
+    ],
+)
+def test_upsert_comic_extracts_edition_designation_into_variant(
+    db, title, issue, expected_title, expected_variant
+):
+    """The BUI-625 acceptance criterion: a listing-titled book with an edition
+    designation round-trips with the designation in `variant`."""
+    cid = upsert_comic(db, title, issue)
     row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
-    assert row["title"] != "Absolute Flash"
-    assert "Nick Robles Cover" in row["title"]
+    assert row["title"] == expected_title
+    assert row["variant"] == expected_variant
+
+
+def test_upsert_comic_extracted_variant_is_distinct_from_base_edition(db):
+    """The whole point of extracting rather than truncating: the variant must
+    NOT land on the base edition's row. `variant` is row identity (BUI-28)."""
+    base = upsert_comic(db, "Absolute Flash", "10")
+    var = upsert_comic(db, "Absolute Flash #10 Nick Robles Cover", "10")
+    assert base != var
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 2
+
+
+def test_upsert_comic_extracted_variant_siblings_stay_distinct(db):
+    """The merging direction is unrecoverable, so it gets its own test: two
+    DIFFERENT cover artists on the same issue must never collapse into one row.
+    The extracted value is verbatim, so distinct designations stay distinct."""
+    a = upsert_comic(db, "Amazing Spider-man #20 Bermejo Variant", "20")
+    b = upsert_comic(db, "Amazing Spider-man #20 Crain Variant", "20")
+    assert a != b
+    variants = {
+        r["variant"] for r in db.execute("SELECT variant FROM comics").fetchall()
+    }
+    assert variants == {"Bermejo Variant", "Crain Variant"}
+
+
+def test_upsert_comic_extraction_is_idempotent(db):
+    """Runs on every write to a durable identity column, so re-posting the same
+    listing title must land on the same row rather than eroding it further."""
+    first = upsert_comic(db, "Absolute Flash #10 Nick Robles Cover", "10")
+    again = upsert_comic(db, "Absolute Flash #10 Nick Robles Cover", "10")
+    # And the already-extracted form must resolve to that same row.
+    split = upsert_comic(db, "Absolute Flash", "10", variant="Nick Robles Cover")
+    assert first == again == split
+    assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 1
+
+
+def test_upsert_comic_caller_supplied_variant_is_never_overwritten(db):
+    """Extraction is a fallback for a caller that named no variant. A caller
+    that DID name one has already recorded the distinction and must win."""
+    cid = upsert_comic(
+        db, "Absolute Flash #10 Nick Robles Cover", "10", variant="Robles"
+    )
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["variant"] == "Robles"
+    assert row["title"] == "Absolute Flash"
+
+
+def test_upsert_comic_does_not_extract_a_bare_designation_word(db):
+    """A bare `"Variant"` names no distinguishing feature, so two different
+    variants of one issue would both extract it and MERGE — the one outcome
+    this boundary must not have. At least one name token is required."""
+    a = upsert_comic(db, "Amazing Spider-man #20 Variant", "20")
+    b = upsert_comic(db, "Amazing Spider-man #20 Cover", "20")
+    rows = db.execute("SELECT title, variant FROM comics").fetchall()
+    assert a != b
+    assert all(r["variant"] is None for r in rows), "bare word must not become identity"
+    assert all(r["title"] != "Amazing Spider-man" for r in rows)
+
+
+@pytest.mark.parametrize(
+    "title, issue",
+    [
+        # Verbatim rows.tsv class-B residue: a designation word buried in
+        # listing prose, where no rule can say which words are the edition.
+        # `McFarlane` is the interior artist, not part of the edition.
+        ("Marvel Tales #238 McFarlane Newsstand X-men Spider-man FVF Beauty Wow", "238"),
+        # A 1971 book with exactly ONE cover — `NEAL ADAMS COVER` is a credit,
+        # not a variant, and extracting it would mint a phantom edition.
+        ("WORLD'S FINEST # 200 - (VG+) -SUPERMAN/ROBIN-NEAL ADAMS COVER-ORGIN OF ROBIN", "200"),
+        # Would yield `Newsstand Variant` while the live table spells the same
+        # designation `Newsstand` — same book, two spellings, two rows.
+        ("Iron Man #125 Newsstand Variant (Marvel Comics August 1979) FN/VF Condition!", "125"),
+        # Grade tokens after the designation word: the span is not terminal.
+        ("Amazing Spider-man #20 Bermejo Variant NM Gem Wow", "20"),
+        # Over the token cap — listing prose must not be swallowed whole.
+        ("X-men #58 Silver age Neal Adams Legendary Cover", "58"),
+    ],
+)
+def test_upsert_comic_declines_extraction_for_unattributable_designation(db, title, issue):
+    """The residue keeps BUI-599's behaviour rather than guessing a span.
+
+    Declining leaves a malformed but RECOVERABLE title; guessing wrong either
+    merges two books (unrecoverable) or mints a phantom edition. The title is
+    deliberately not truncated here — truncating without recording the
+    designation is the merge this whole rule exists to prevent."""
+    cid = upsert_comic(db, title, issue)
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["variant"] is None
+    # The series name alone would be the merged form; it must not be reached.
+    assert row["title"] not in ("Marvel Tales", "WORLD'S FINEST", "Iron Man",
+                                "Amazing Spider-man", "X-men")
+
+
+def test_upsert_comic_extraction_does_not_fire_on_a_lot(db):
+    """Belt and braces on the class C/D boundary: a lot tail is an enumerated
+    run of digits, which the name-token rule forbids, so a lot can never be
+    mistaken for an edition designation."""
+    cid = upsert_comic(db, "Amazing Spider-man #18,19,20 lot of 3 Variant", "18")
+    row = db.execute("SELECT * FROM comics WHERE id=?", (cid,)).fetchone()
+    assert row["variant"] is None
+    assert row["title"] != "Amazing Spider-man"
 
 
 def test_upsert_comic_variant_siblings_do_not_collide(db):

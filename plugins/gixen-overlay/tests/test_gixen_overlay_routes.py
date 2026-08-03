@@ -499,6 +499,92 @@ def test_upsert_comic_invalid_flag_reason_returns_422(api):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/comics — multi-issue lot refusal (BUI-625, BUI-596 class D)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("title, issue", [
+    ("Amazing Spider-man #18,19,20,21,22 lot of 5 NM Gems Wow", "18"),
+    ("Uncanny X-men #146,147 Bronze age Dr. Doom lot of 2 Wow", "146"),
+    # Hashless — verbatim from bids.ebay_title on the live Mac Mini.
+    ("Uncanny X-men  5,6,7,8,9  Bronze age lot of 5 Fine to VF", "5"),
+    ("Akira 1,2,3,4,5,6,7,8,9 Marvel Epic Comics 1988 1st Prints High Grades", "1"),
+    # `lot of N` with no enumerated run.
+    ("Uncanny X-men #146 Bronze age Dr. Doom lot of 2 Wow", "146"),
+])
+def test_upsert_comic_multi_issue_lot_returns_422(api, title, issue):
+    """A lot listing names several books and `issue` holds only the first, so
+    there is no honest row to write. Refusing beats storing the lie that a
+    five-book lot IS issue 18."""
+    r = api.post("/api/comics", json={"title": title, "issue": issue})
+    assert r.status_code == 422, r.text
+
+
+def test_upsert_comic_multi_issue_lot_writes_no_row(api):
+    """The refusal must be a refusal: no `comics` row, and in particular not a
+    truncated one asserting the lot is its first issue."""
+    api.post("/api/comics", json={
+        "title": "Amazing Spider-man #18,19,20,21,22 lot of 5 NM Gems Wow",
+        "issue": "18",
+    })
+    assert api.get("/api/comics").json() == []
+
+
+def test_upsert_comic_multi_issue_lot_detail_is_actionable(api):
+    """The 422 body is what a human debugging a failed comic-fmv run reads, so
+    it must name the shape and the fix, not just refuse."""
+    r = api.post("/api/comics", json={
+        "title": "Amazing Spider-man #18,19,20,21,22 lot of 5 NM Gems Wow",
+        "issue": "18",
+    })
+    detail = r.json()["detail"]
+    assert "multi-issue lot" in detail
+    assert "one request per issue" in detail.lower()
+
+
+def test_upsert_comic_multi_issue_lot_is_persisted_to_the_rejections_ledger(api):
+    """The BUI-625 acceptance criterion, and why refusing is safe: the write is
+    surfaced in BUI-601's ledger rather than silently dropped."""
+    api.post("/api/comics", json={
+        "title": "Amazing Spider-man #18,19,20,21,22 lot of 5 NM Gems Wow",
+        "issue": "18",
+    })
+    report = api.get("/api/comics/health/rejections").json()
+    assert report["count"] == 1
+    row = report["rejections"][0]
+    assert row["method"] == "POST"
+    assert row["path"] == "/api/comics"
+    assert row["status"] == 422
+    assert "multi-issue lot" in row["detail"]
+    # The payload snapshot is what makes the refusal diagnosable after the fact.
+    assert "lot of 5" in row["payload"]
+
+
+def test_upsert_comic_single_issue_from_the_same_lot_still_succeeds(api):
+    """The refusal must not block the documented remedy — posting the lot's
+    issues one at a time."""
+    for issue in ("18", "19", "20"):
+        r = api.post("/api/comics", json={"title": "Amazing Spider-man", "issue": issue})
+        assert r.status_code == 200, r.text
+    assert len(api.get("/api/comics").json()) == 3
+
+
+def test_upsert_comic_edition_designation_round_trips_into_variant(api):
+    """The class-C half of BUI-625's acceptance criterion, end to end over
+    HTTP: the designation lands in `variant`, and the base edition stays a
+    separate row."""
+    r = api.post("/api/comics", json={
+        "title": "Absolute Flash #10 Nick Robles Cover", "issue": "10",
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["title"] == "Absolute Flash"
+    assert r.json()["variant"] == "Nick Robles Cover"
+
+    base = api.post("/api/comics", json={"title": "Absolute Flash", "issue": "10"})
+    assert base.json()["comic_id"] != r.json()["comic_id"]
+
+
+# ---------------------------------------------------------------------------
 # GET /api/comics — locg_id and max_age_days filters (comic-fmv cache lookup)
 # ---------------------------------------------------------------------------
 
