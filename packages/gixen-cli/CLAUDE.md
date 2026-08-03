@@ -60,6 +60,32 @@ Five components:
 
 **`add-batch` is server-mode-only — unlike `add`/`edit`/`remove`, it has no direct-Gixen fallback.** `add`, `edit`, and `remove` each check `_server_url()` and, when `COMICS_SERVER_URL` is unset, fall back to talking directly to Gixen via `_make_client()`/`GixenClient` (`cli.py`'s `add`/`edit`/`remove` commands). `add_batch_cmd` doesn't: it resolves `_server_url()` once and, if unset, prints an error and `sys.exit(1)` immediately — there is no equivalent direct-Gixen branch to fall back to. This is intentional (BUI-360), not a gap to fill in later: `add-batch` exists specifically to encode BUI-168's mid-batch failure semantics as deterministic code instead of an LLM-followed skill loop — marking a failed row FAILED with its error, re-checking server health before the next row, halting and marking every remaining row NOT_ATTEMPTED if the server is down, and never emitting an all-success summary after a failure (see `add_batch.py`'s module docstring and `run_batch()`). Every one of those mechanics is built from comics-server-only primitives — `GET /health` as the inter-row health check and `POST /api/bids` per row, plus `POST /api/comics/verify` for the optional `--verify` flag — and `GixenClient`'s direct-Gixen path has no equivalent for any of them (no health endpoint, no verify endpoint; a direct-mode failure is just a raised `GixenError` with no separate "is the service still up" signal to gate a halt decision on). Without the comics server there's nothing left to build BUI-168's semantics out of, so a "direct-Gixen add-batch" isn't a smaller version of the feature — it's not the feature at all.
 
+## Policy checks (env vars)
+
+`server/policy.py` is the single pre-trade check point both `api_add_bid` and `api_edit_bid` call, inside `_api_lock`, before every Gixen write (BUI-609/615/616/623). **Six check codes exist, split across two packages** — tuning the wrong `.env` leaves half of them unresponsive:
+
+| check code | owner | threshold env var |
+|---|---|---|
+| `exposure_ceiling` | this package (`server/policy.py`) | `POLICY_EXPOSURE_CEILING` |
+| `unpriced_entry` | overlay — see root `CLAUDE.md` | none |
+| `over_fmv` | overlay — see root `CLAUDE.md` | `POLICY_FMV_MULTIPLE` |
+| `recomputed_cap` | overlay — see root `CLAUDE.md` | none (fixed rung constants) |
+| `fmv_staleness` | overlay — see root `CLAUDE.md` | `POLICY_FMV_STALE_DAYS` |
+| `duplicate_comic` | overlay — see root `CLAUDE.md` | none |
+
+The overlay (`plugins/gixen-overlay/src/gixen_overlay/policy.py`) contributes its five checks via the `check_bid_write` hookspec (`gixen/plugins.py`) — it has no CLAUDE.md of its own, so its two threshold env vars are documented in the root `CLAUDE.md`'s "gixen-overlay" architecture section, not here. This package owns only `exposure_ceiling` and the blocking mechanism below, which is shared by both packages' checks.
+
+**Host-owned vars:**
+
+- **`POLICY_EXPOSURE_CEILING`** (`server/policy.py:185`) — **no default; unset disables the `exposure_ceiling` check entirely** (it doesn't appear in results at all — not `pass`, not `unevaluable`). This is the surprising one: every other threshold in this system has a safe fallback default; this one doesn't.
+- **`POLICY_BLOCK_<CODE>`** (`server/policy.py:461`, parsing at `:480-504`) — a per-check blocking flag, one per check `code` upper-cased (the env var name is built by `_policy_block_env_var` at `:500`, e.g. `POLICY_BLOCK_EXPOSURE_CEILING`, `POLICY_BLOCK_OVER_FMV`). Applies to **any** of the six codes above, not just the host's own — it's a shared mechanism. Default off. A deliberately narrow, fail-safe boolean parse: `1`/`true`/`yes`/`on` (any case) enables it; anything else, including a typo, stays off — never silently "on." When a check comes back `advise` with its flag on, the write 409s before reaching Gixen instead of landing (bypassable per-request via `policy_bypass` / `gixen add --ack-policy` / an add-batch row's `"policy_bypass": true`).
+
+**Soak gate — do not skip:**
+- Do not set any `POLICY_BLOCK_*` until after reviewing `GET /api/decisions` following real buys.
+- Keep `POLICY_BLOCK_OVER_FMV` **off** while lot briefs remain single-identity.
+
+**Operational note:** every var above is read **per request**, never cached at import time (KTD2) — change one by editing `~/.comics-server/.env` and running `launchctl kickstart`. No deploy, no restart of anything else.
+
 ## Key Details
 
 - Credentials come from environment variables or `.env` file: `GIXEN_USERNAME`, `GIXEN_PASSWORD`
