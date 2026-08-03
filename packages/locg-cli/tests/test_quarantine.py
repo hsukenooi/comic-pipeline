@@ -235,6 +235,31 @@ def _probe_build_series_publishers(payload) -> set[str]:
     return set(build_series_publishers(payload))
 
 
+class _FakeAuthorityCheckCache:
+    """Only ``load()`` is used by ``cmd_collection_authority_check`` (BUI-654)."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def load(self) -> dict[str, Any]:
+        return self._payload
+
+
+def _probe_authority_check(payload) -> set[str]:
+    """BUI-654's ``cmd_collection_authority_check``: an alias candidate
+    between SERIES and a name it does not otherwise share a normalized key
+    with, exercised over ``owned_rows_affected`` — the store-derived list."""
+    from locg.commands import cmd_collection_authority_check
+
+    result = cmd_collection_authority_check(
+        kind="alias",
+        name_a="Spawn",
+        name_b="Spawn Rebirth",
+        cache=_FakeAuthorityCheckCache(payload),
+    )
+    return {row["full_title"] for row in result["owned_rows_affected"]}
+
+
 # The registry. Keys are "<module>.<function>" so the source cross-check below
 # can compare them against what actually calls ``matchable_rows``. Registering a
 # new pool is one line here.
@@ -243,6 +268,7 @@ POOLS: dict[str, Callable[[dict[str, Any]], set[str]]] = {
     "commands._match_owned_issue": _probe_match_owned_issue,
     "commands._match_wishlisted_issue": _probe_match_wishlisted_issue,
     "commands._printing_conflict_fields": _probe_printing_conflict_fields,
+    "commands.cmd_collection_authority_check": _probe_authority_check,
     "collection_cache.rebuild_series_name_index": _probe_rebuild_series_name_index,
     "collection_cache.build_volume_candidates": _probe_build_volume_candidates,
     "collection_io.build_series_publishers": _probe_build_series_publishers,

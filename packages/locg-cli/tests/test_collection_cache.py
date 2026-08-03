@@ -1825,3 +1825,157 @@ def test_identity_collision_groups_keeps_genuinely_different_books_apart():
                  full_title="X-Men #17", release_date="2005-02-01", seq=3),
     ]
     assert identity_collision_groups(rows) == {}
+
+
+# ---------------------------------------------------------------------------
+# identity_series_key's relabel wiring (BUI-654): the directed half of the
+# authority table, composed on top of the generative folds (_identity_folds,
+# tested above as part of identity_series_key before this ticket).
+# ---------------------------------------------------------------------------
+
+def _fixture_relabel_table(pairs: list[tuple[str, str]]):
+    """Build a real, NON-EMPTY RelabelTable from fixture (from, to) pairs,
+    normalized through the actual `_identity_folds` — never the packaged
+    (empty) `data/authority.json`. A reader test exercised only against the
+    packaged table proves nothing (it ships with zero relabel entries by
+    design); this is how every test below gets a live table to prove the
+    order property, the either-spelling property, and the disjointness
+    against."""
+    from locg import authority
+    from locg.collection_cache import _identity_folds
+
+    entries = tuple(
+        authority.RelabelEntry(from_name=f, to_name=t, evidence="test fixture", added="2026-08-03")
+        for f, t in pairs
+    )
+    return authority.RelabelTable(authority._build_relabel_map(entries, _identity_folds))
+
+
+def test_relabel_entry_rewrites_the_identity_key(monkeypatch):
+    """A relabel entry collapses its `from` spelling onto its `to` spelling,
+    through the real, wired `identity_series_key` — not just the table
+    builder in isolation (test_authority.py already covers that)."""
+    import locg.collection_cache as cc
+
+    table = _fixture_relabel_table([("Zzyzx Ranger Classic", "Zzyzx Ranger (Vol. 1)")])
+    monkeypatch.setattr(cc, "_RELABEL_TABLE", table)
+
+    assert cc.identity_series_key("Zzyzx Ranger Classic") == cc.identity_series_key(
+        "Zzyzx Ranger (Vol. 1)"
+    )
+
+
+def test_relabel_table_keys_are_derived_via_the_generative_folds_not_raw_names():
+    """Order, asserted by test (the ticket's own acceptance criterion) —
+    white-box half: the relabel table's KEYS are `_identity_folds` output,
+    never the entry's raw `from` string. This is the Fact-1 fix itself:
+    `build_relabel_table` must be given `_identity_folds`, never
+    `identity_series_key` (which would read `_RELABEL_TABLE` before its own
+    module-level assignment finishes binding — a `NameError` an empty table
+    hides completely, see the comment on `_RELABEL_TABLE` in
+    collection_cache.py)."""
+    from locg.collection_cache import _identity_folds
+
+    table = _fixture_relabel_table([("Zzyzx Ranger (2025 - Present)", "Zzyzx Ranger Canonical")])
+    assert set(table.mapping.keys()) == {_identity_folds("Zzyzx Ranger (2025 - Present)")}
+    assert "Zzyzx Ranger (2025 - Present)" not in table.mapping, "raw string must not be a key"
+
+
+def test_relabel_entry_matches_either_generative_fold_spelling(monkeypatch):
+    """A relabel entry written against EITHER generative spelling of a
+    decoration still lands, because the map's KEYS are built with
+    `_identity_folds`, and both spellings fold to the same key before the
+    lookup runs: `(2025 - Present)` and `(2025 - 2026)` both fold to
+    `(2025 - )`. One entry against either spelling covers both."""
+    import locg.collection_cache as cc
+
+    table = _fixture_relabel_table(
+        [("Zzyzx Ranger (2025 - Present)", "Zzyzx Ranger Canonical")]
+    )
+    monkeypatch.setattr(cc, "_RELABEL_TABLE", table)
+
+    # The entry was written against the "- Present" spelling; the CLOSED
+    # spelling of the SAME one-year-later transition must still match, because
+    # both fold to "(2025 - )" before the relabel lookup.
+    assert cc.identity_series_key("Zzyzx Ranger (2025 - 2026)") == cc.identity_series_key(
+        "Zzyzx Ranger Canonical"
+    )
+    assert cc.identity_series_key("Zzyzx Ranger (2025 - Present)") == cc.identity_series_key(
+        "Zzyzx Ranger Canonical"
+    )
+
+
+def test_identity_series_key_is_unchanged_with_an_empty_relabel_table():
+    """Regression guard (the ticket's own acceptance criterion, AE12 of the
+    BUI-611 plan): with zero relabel entries — the table's shipped, correct
+    state — `identity_series_key`'s output must be byte-for-byte identical to
+    `_identity_folds` alone, over a corpus of REAL series names.
+
+    The corpus (`tests/fixtures/identity_series_key_corpus.json`, 353 distinct
+    `series_name` values) was pulled read-only from the live store
+    (`~/.comics-server/collection-store/collection.json`, 2843 rows,
+    2026-08-03) and committed as a fixture — CI cannot see that machine-local
+    path, so this test must not (and does not) read it directly.
+    """
+    from locg.collection_cache import _identity_folds, identity_series_key
+
+    fixtures_dir = Path(__file__).parent / "fixtures"
+    corpus = json.loads((fixtures_dir / "identity_series_key_corpus.json").read_text())
+    assert len(corpus) > 300, "corpus fixture must not have silently shrunk to near-empty"
+
+    for name in corpus:
+        assert identity_series_key(name) == _identity_folds(name), (
+            f"identity_series_key drifted from _identity_folds for {name!r} "
+            "with the relabel table empty — the empty-table no-op guarantee "
+            "no longer holds"
+        )
+
+
+def test_relabel_table_ships_empty_on_the_packaged_data():
+    """The table stays empty by design (none of the currently-known duplicate
+    classes needs a relabel entry — the generative folds cover them all), but
+    the reader wired into `identity_series_key` is live now, not a stub."""
+    from locg.collection_cache import _RELABEL_TABLE
+
+    assert _RELABEL_TABLE.mapping == {}
+
+
+# ---------------------------------------------------------------------------
+# Disjointness of the LIVE wiring (BUI-654): test_authority.py already proves
+# AliasTable/RelabelTable are structurally disjoint TYPES
+# (test_readers_are_structurally_disjoint). This extends that guarantee to
+# collection_cache.py's actual module-level globals: the identity path
+# (identity_series_key) must read ONLY _RELABEL_TABLE, never _ALIAS_GROUPS,
+# and the matcher path (owned_match_keys/_alias_keys_for) must read ONLY
+# _ALIAS_GROUPS, never _RELABEL_TABLE.
+# ---------------------------------------------------------------------------
+
+def test_identity_series_key_reads_only_the_relabel_table_not_the_alias_groups(monkeypatch):
+    """A relabel entry that collapses two names must change
+    `identity_series_key`'s output; an ALIAS entry between the same two names
+    must NOT — the identity path is wired to `_RELABEL_TABLE` only."""
+    import locg.collection_cache as cc
+    from locg import authority
+
+    # An alias entry (matcher-path, symmetric) between two otherwise-unrelated
+    # names must have NO effect on the identity key.
+    alias_groups = authority._build_alias_groups(
+        (authority.AliasEntry(names=("Zzyzx Ranger", "Ranger of Zzyzx"), evidence="t", added="2026-08-03"),),
+        cc._normalize_series_key,
+    )
+    monkeypatch.setattr(cc, "_ALIAS_GROUPS", alias_groups)
+
+    assert cc.identity_series_key("Zzyzx Ranger") != cc.identity_series_key("Ranger of Zzyzx")
+
+
+def test_owned_match_keys_reads_only_the_alias_groups_not_the_relabel_table(monkeypatch):
+    """A relabel entry (identity-path, directed) between two names must have
+    NO effect on `owned_match_keys` — the matcher path is wired to
+    `_ALIAS_GROUPS` only."""
+    import locg.collection_cache as cc
+
+    table = _fixture_relabel_table([("Zzyzx Ranger", "Ranger of Zzyzx")])
+    monkeypatch.setattr(cc, "_RELABEL_TABLE", table)
+
+    widened = cc.owned_match_keys("Zzyzx Ranger", "1")
+    assert cc._normalize_series_key("Ranger of Zzyzx") not in widened

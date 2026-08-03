@@ -574,3 +574,100 @@ def test_cli_wish_list_add_skips_client_and_writes_cache(monkeypatch, tmp_path, 
     # path patched by the autouse `_isolate_wish_list_cache` fixture in conftest.
     payload = json.loads(locg.cli.wish_list_cache_path().read_text())
     assert payload["items"][-1] == {"name": "Amazing Spider-Man #300", "id": None, "source": "local"}
+
+
+# --- collection authority-check (BUI-654) ---
+
+
+def test_authority_check_alias_args_parse():
+    parser = create_parser()
+    args = parser.parse_args([
+        "collection", "authority-check", "--kind", "alias",
+        "--name-a", "Uncanny X-Men", "--name-b", "X-Men",
+    ])
+    assert args.command == "collection"
+    assert args.collection_command == "authority-check"
+    assert args.kind == "alias"
+    assert args.name_a == "Uncanny X-Men"
+    assert args.name_b == "X-Men"
+
+
+def test_authority_check_relabel_args_parse():
+    parser = create_parser()
+    args = parser.parse_args([
+        "collection", "authority-check", "--kind", "relabel",
+        "--from", "Old Spelling", "--to", "New Spelling",
+    ])
+    assert args.kind == "relabel"
+    assert args.from_name == "Old Spelling"
+    assert args.to_name == "New Spelling"
+
+
+def test_authority_check_skips_client_and_dispatches(monkeypatch, capsys):
+    """`locg collection authority-check` must not construct LOCGClient (a pure
+    local-cache read, like `quarantine`/`check`) and must dispatch to
+    cmd_collection_authority_check with the parsed kwargs."""
+    import locg.cli
+
+    client_constructed = []
+
+    class FakeClient:
+        def __init__(self):
+            client_constructed.append(True)
+        def close(self):
+            pass
+
+    calls = {}
+
+    def fake_authority_check(*, kind, name_a=None, name_b=None, from_name=None, to_name=None):
+        calls["kwargs"] = dict(kind=kind, name_a=name_a, name_b=name_b, from_name=from_name, to_name=to_name)
+        return {
+            "status": "ok",
+            "entry": {"kind": kind, "names": [name_a, name_b]},
+            "corpus_empty": True,
+            "owned_rows_affected": [],
+            "cross_volume_ambiguities": [],
+        }
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "cmd_collection_authority_check", fake_authority_check)
+    monkeypatch.setattr(sys, "argv", [
+        "locg", "collection", "authority-check", "--kind", "alias",
+        "--name-a", "Uncanny X-Men", "--name-b", "X-Men",
+    ])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert not client_constructed, "LOCGClient must not be constructed for authority-check"
+    assert calls["kwargs"] == {
+        "kind": "alias", "name_a": "Uncanny X-Men", "name_b": "X-Men",
+        "from_name": None, "to_name": None,
+    }
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "ok"
+
+
+def test_authority_check_invalid_request_exits_1(monkeypatch, capsys):
+    """A caller error (bad --kind/missing names) must exit non-zero — a
+    chained caller must not read exit 0 as 'checked'."""
+    import locg.cli
+
+    class FakeClient:
+        def __init__(self):
+            pass
+        def close(self):
+            pass
+
+    def fake_authority_check(**kwargs):
+        return {"status": "invalid_request", "error": "kind='alias' requires both name_a and name_b"}
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "cmd_collection_authority_check", fake_authority_check)
+    monkeypatch.setattr(sys, "argv", ["locg", "collection", "authority-check", "--kind", "alias"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 1

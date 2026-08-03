@@ -9,12 +9,16 @@ class). This module is the schema, loader, and validator for
 ``data/authority.json``, a git-versioned JSON file that holds the same kind
 of fact as data instead of code — a reviewed PR touching no matcher logic.
 
-BUI-652 (plan unit U6 of BUI-611) ships the table, the loader, and the
-validation with the table EMPTY. Wiring this module into ``owned_match_keys``
-(the matcher) and ``identity_series_key`` (the identity key) is BUI-653 and
-BUI-654's job, not this module's — importing this module from
-``collection_cache.py`` and passing its real normalizers in is next wave's
-change, not this one's.
+BUI-652 (plan unit U6 of BUI-611) shipped the table, the loader, and the
+validation with the table EMPTY. BUI-653 wired this module into
+``owned_match_keys`` (``_ALIAS_GROUPS = authority.build_alias_table(
+_normalize_series_key).groups`` in ``collection_cache.py``) — a data-only PR
+to ``data/authority.json`` now widens the matcher, no code change. BUI-654
+wired the other reader: ``identity_series_key`` composes ``_identity_folds``
+(the generative half, unchanged) with ``authority.build_relabel_table(
+_identity_folds).relabel(...)`` (the directed half, this module's ``relabel``
+entries) — see ``collection_cache.py`` for both. The table still ships with
+zero ``relabel`` entries; the reader is live, waiting for the first one.
 
 Two entry kinds, two disjoint readers, opposite pressures
 -----------------------------------------------------------
@@ -27,7 +31,16 @@ Two entry kinds, two disjoint readers, opposite pressures
   "added"}``. Meant to be read only by the identity path
   (``identity_series_key``), which NARROWS: "this literal string is the same
   identity as that canonical one, so collapse it rather than filing a second
-  row."
+  row." **Adding a ``relabel`` entry owes a re-key sweep.** Merging the entry
+  changes what ``identity_series_key`` computes for every row whose folded
+  series name equals ``from``, but existing rows do not retroactively re-key
+  themselves — run ``locg.collection_io.rekey_sweep`` (BUI-650) under
+  ``CollectionCache.apply`` right after the entry lands, or the rows the
+  entry was meant to merge sit uncollapsed in the store exactly like the
+  three live collisions that motivated the sweep in the first place. Run
+  ``locg collection authority-check`` (BUI-654, ``commands.py``) against the
+  live store first — it reports what the candidate entry would do before it
+  is ever merged.
 
 Matcher normalization and identity normalization have OPPOSITE pressures —
 widening finds more candidates, narrowing keeps fewer identities — and must
@@ -319,7 +332,11 @@ def build_relabel_table(normalize: Normalizer) -> RelabelTable:
     """Build the directed :class:`RelabelTable` by running every ``relabel``
     entry's ``from``/``to`` through ``normalize``.
 
-    Called by the identity path with the real ``identity_series_key``, and
+    Called by the identity path with ``collection_cache._identity_folds`` —
+    deliberately NOT ``identity_series_key`` itself, which reads the table
+    this call builds and would therefore read it before this assignment
+    finishes binding (a ``NameError`` an empty table hides completely, since
+    the loop that would trigger it never runs over zero entries). Also called
     by tests with a stub normalizer. Raises :class:`AuthorityTableError` if
     any entry's derived keys collide, are empty, or form a no-op. Reads only
     ``relabel``-kind entries — ``alias`` entries never reach this function.
