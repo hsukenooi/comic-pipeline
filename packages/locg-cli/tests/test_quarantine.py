@@ -219,8 +219,12 @@ def _probe_printing_conflict_fields(payload) -> set[str]:
 
 def _probe_owned_dedup_index(payload) -> set[str]:
     """BUI-669's ``_owned_dedup_index``: record-win's already-owned skip index,
-    the eighth pool and the only one on a WRITE path. Only ``in_collection``
-    rows enter it, so the observable output is the owned row alone."""
+    and the only pool on a WRITE path. Only ``in_collection`` rows enter it, so
+    the observable output is the owned row alone.
+
+    Deliberately not numbered: BUI-669's own ticket body said "seven pools"
+    when there were already eight, because BUI-648 had added one and the prose
+    did not follow. :data:`POOLS` below is the count."""
     from locg.commands import _owned_dedup_index
 
     index = _owned_dedup_index(payload["comics"])
