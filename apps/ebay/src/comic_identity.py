@@ -859,11 +859,44 @@ _FMV_LOT_RE = re.compile(
 # 1.00, zero legitimate comps lost.  That is the BUI-347 discipline: widen the
 # comp exclusion only where it has been re-validated against the corpus.
 #
-# Recall is deliberately partial.  ~30 further corpus titles are genuine lots
-# carrying a bare range with NO run/set word ("Uncanny X-Men 144-147 - 1981
-# Claremont", "The Uncanny X-Men 250-299 Marvel Comics x44").  Catching those
-# needs a different signal than the range, because the range alone is exactly
-# what the false positives above also have.  Left open on purpose.
+# Recall is deliberately partial, and BUI-629 MEASURED that the remainder is not
+# worth closing.  65 kept corpus titles carry a bare range with no run/set word;
+# 42 are genuine lots ("Uncanny X-Men 144-147 - 1981 Claremont", "The Uncanny
+# X-Men 250-299 Marvel Comics x44").  They are still admitted as comps.  That is
+# fine, and the reason is mechanical rather than lexical:
+#
+#   35 of the 42 carry NO parseable grade, so fmv_math.build_pool drops them
+#   before pricing happens at all; IQR-trim removes 4 more.  Only 3 of 42 ever
+#   reach a priced pool, all cheap ($18, $39.99, $39.99) and near the pool
+#   median.  An ORACLE that excludes all 42 with perfect precision — better than
+#   any rule could do — moves fmv_high (Q75) in 3 of 493 pools, worst case 9.6%
+#   ($6.79 -> $6.14).  Of the 112 kept comps that DO survive into a priced pool
+#   above Q75 at >=3x the pool median (the only comps that can inflate an FMV),
+#   ZERO are in this class; they are genuine high-grade single-issue keys.
+#
+# The class BUI-598 caught was expensive AND grade-tagged (max $6500 @ 9.4 — the
+# comp that manufactured a $3825 bid cap).  This residual is cheap (median
+# $49.48) and mostly grade-less.  The premise "a lot comp inflates FMV" is true
+# of the former and measurably false of the latter.
+#
+# Seventeen candidate second signals were measured against the corpus.  Only the
+# explicit count token ("(N)", "xN", "N issues/comics/books") reached precision
+# 1.00, at recall 0.262 — and that precision is an artifact of the range gate,
+# not of the signal: ungated, "xN" fires on poster dimensions (11"x17"), magnets
+# (2"x3") and SKU codes (X54-9, X78-157), and bare "(N)" fires mostly on SINGLE
+# issues where it is a seller's inventory index ("Uncanny X-Men 104 1st App.
+# Starjammers VG/FN (7)") plus a shorthand cover year ("Absolute Green Lantern 9
+# (26)").  Price-vs-pool signals score well but are UNIMPLEMENTABLE here:
+# is_comp_excluded/hard_exclude take a bare title and run per-comp at
+# sold_comps.py:1549, before any pool exists.  Everything else (span magnitude,
+# lot vocabulary, number-group density, pick-lexicon subtraction) tops out at
+# 0.95 precision and drops genuine single-issue comps.  Left open on purpose.
+#
+# A DIFFERENT shape, measured in the same pass, IS worth catching and is filed as
+# BUI-637: a space-separated bare-number list ("X-Men 46 47 48 49 50 51 52 1995
+# VF/NM ...", $20 @ 6.7x its pool median).  Unlike this class it is grade-tagged,
+# so it survives into a priced pool — the property that makes a lot comp actually
+# expensive.  Don't confuse the two when reading this comment.
 #
 # Kept comp-only (checked by is_comp_excluded, never merged into _LOT_RE) for
 # the BUI-239 reason: _LOT_RE also feeds should_reject/hard_reject on the
