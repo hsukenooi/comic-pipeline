@@ -50,6 +50,16 @@ jobs:
         run: uv run pytest
         working-directory: packages/locg-cli
 
+      # BUI-607: the skill-lint family's shellcheck check (test_skill_contracts.py)
+      # skips gracefully when shellcheck is missing, so a missing binary would
+      # NOT fail this job — it would silently stop covering that check with no
+      # red signal anywhere. Don't rely on an assumption about what a given
+      # ubuntu-latest image happens to preinstall (that's out of this repo's
+      # control and can change under it) — install explicitly instead.
+      # `command -v` first keeps this a no-op on any image that already has it.
+      - name: Ensure shellcheck is available (BUI-607)
+        run: command -v shellcheck || (sudo apt-get update && sudo apt-get install -y shellcheck)
+
       - name: Test — gixen-overlay
         run: uv run pytest
         working-directory: plugins/gixen-overlay

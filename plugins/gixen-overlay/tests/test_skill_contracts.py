@@ -14,16 +14,39 @@ command that doesn't exist), BUI-167 (score thresholds) — add a test HERE
 asserting the now-consistent contract, so the same drift fails CI next time.
 Add the assertion in the per-skill batch that fixes the drift, not before (the
 contract is still violated until then, so the assertion would fail early).
+
+BUI-607 (skill-lint family): the section below ("SKILL LINT") generalizes this
+harness from spot-checked contracts to four corpus-wide drift classes: every
+fenced ```bash block must be shellcheck-clean, every `file.md § Section`/
+`file.md Step N` cross-reference must resolve to a real heading, two idioms
+already outlawed in CLAUDE.md prose must not reappear, and BUI-606's
+fallback-swallow detector must stay clean over the skill corpus (reusing that
+detector, not a second implementation of it — see lib/fallback_swallow.py's
+own module docstring). Each check degrades/skips only where an external binary
+(shellcheck) is genuinely unavailable; the other three always run.
 """
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import gixen_overlay.routes as overlay_routes
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SKILLS_DIR = REPO_ROOT / ".claude" / "commands" / "comic"
+
+# scripts/lib is a package (has __init__.py) but sits outside the plugin's own
+# package tree, so it needs REPO_ROOT/"scripts" on sys.path to import — see
+# BUI-606's fallback_swallow module docstring ("Two entry points...").
+_SCRIPTS_DIR = str(REPO_ROOT / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from lib.fallback_swallow import check_fallback_swallow  # noqa: E402
 
 
 def _registered_comics_paths() -> set[str]:
@@ -324,3 +347,555 @@ def test_endpoint_names_are_provider_neutral():
     skills hard-code."""
     leaky = {p for p in _registered_comics_paths() if "/locg" in p}
     assert not leaky, f"non-neutral comics endpoint(s) registered: {sorted(leaky)}"
+
+
+# =============================================================================
+# SKILL LINT (BUI-607) — four corpus-wide drift classes, generalizing the
+# spot-checked contracts above. See this module's docstring for the overview.
+# =============================================================================
+
+_FENCE_RE = re.compile(r"^```\s*([A-Za-z0-9_+-]*)")
+_SHELL_FENCE_LANGS = {"bash", "sh", "shell"}
+
+
+def _iter_shell_blocks(text: str) -> list[tuple[int, list[str]]]:
+    """Return (first_line_no, lines) for every fenced ```bash/sh/shell block
+    in `text`. `first_line_no` is the 1-indexed line of the block's first
+    content line (the line right after the opening fence), matching how a
+    human reading the file would count."""
+    lines = text.splitlines()
+    blocks: list[tuple[int, list[str]]] = []
+    in_fence = False
+    in_shell = False
+    block_start = 0
+    block_lines: list[str] = []
+    for i, raw in enumerate(lines, 1):
+        fence = _FENCE_RE.match(raw.strip())
+        if fence is not None:
+            if in_fence:
+                if in_shell:
+                    blocks.append((block_start, block_lines))
+                in_fence = False
+                in_shell = False
+                block_lines = []
+            else:
+                in_fence = True
+                in_shell = fence.group(1).lower() in _SHELL_FENCE_LANGS
+                block_start = i + 1
+                block_lines = []
+            continue
+        if in_fence and in_shell:
+            block_lines.append(raw)
+    return blocks
+
+
+# --- Class 1: shellcheck every fenced bash block -----------------------------
+#
+# Calibration note (BUI-607): running shellcheck unmodified over the real
+# corpus produced ~60 findings across 20+ of the 78 blocks, and every single
+# one was a false positive from the SAME root cause — these blocks are
+# copy/fill-in-the-blank templates for a human/agent, not standalone scripts.
+# Two artifact classes, both neutralized below rather than suppressed by
+# disabling codes (disabling doesn't help: SC1009/SC1072/SC1073 are outright
+# parse failures that stop shellcheck from checking the rest of the block):
+#
+#   1. Doc placeholders — `<working_list.json>`, `{tracking}`, `[options]` —
+#      collide with real bash redirection (`<`/`>`), brace-expansion (`{}`),
+#      and glob (`[]`) syntax. Replaced with an inert PLACEHOLDER_* token
+#      before shellcheck ever sees the line.
+#   2. Cross-block references — a block only has the lines physically inside
+#      its own fence, never a shebang, and often references `source`d files
+#      (comics-server.sh) shellcheck can't resolve from a piped fragment.
+#
+# After neutralizing (1) and disabling the three fragment-inherent codes for
+# (2) below, the real corpus is 100% clean — confirmed by rerunning both
+# unmodified and calibrated against all 78 blocks. The one non-artifact hit
+# this calibration surfaced (SC2154 on collection-sync.md's Step 3b reusing
+# Step 2's `$ts`/`$EXPORT_JSON` across a fresh-shell block boundary — the
+# exact Trap 1 class documented in multi-block-skill-shell-state-loss-
+# fallback-swallow.md) was a genuine bug, fixed in this same change
+# (collection-sync.md now re-derives both at the top of Step 3b). SC2154 is
+# deliberately left ENABLED for that reason: it has real signal here, and
+# ShellCheck's own ALL-CAPS-is-probably-an-env-var heuristic means it never
+# fired on the (ALL_CAPS-by-convention) vars this corpus treats as
+# environment-provided (COMICS_SERVER_URL, EXPORT_JSON, BACKUP_JSON, ...).
+_PLACEHOLDER_ANGLE_RE = re.compile(r"<([A-Za-z0-9_.\-]+)>")
+_PLACEHOLDER_BRACE_RE = re.compile(r"\{([A-Za-z0-9_.\-]+)\}")
+# Square-bracket placeholder ("[options]"): only a lone bracketed word with no
+# adjoining non-space char, so a real glob (`file[0-9].txt`) or test (`[ -f x
+# ]`, which always has surrounding spaces inside the brackets) is untouched.
+_PLACEHOLDER_BRACKET_RE = re.compile(r"(?<!\S)\[([A-Za-z][A-Za-z0-9_\-]*)\](?!\S)")
+
+_SHELLCHECK_DISABLED_CODES = (
+    # "Not following: X was not specified as input" — every skill sources
+    # scripts/comics-server.sh or scripts/metron-curl.sh by a relative/
+    # dynamic path a single-block fragment can never resolve.
+    "SC1091",
+    # "ShellCheck can't follow non-constant source" — same root cause, the
+    # `source "$(git rev-parse --show-toplevel)/..."` dynamic-path form.
+    "SC1090",
+    # "var appears unused" — BY DESIGN in this corpus: a `## Step` block
+    # routinely sets a var (BACKUP_PATH, CSV, ts, EXPORT_JSON) that a LATER,
+    # separately-executed Step block reads (each Step is its own fresh shell
+    # — see multi-block-skill-shell-state-loss-fallback-swallow.md). Flagging
+    # that as "unused" would flag the documented architecture, not a bug.
+    # (SC2154 — "referenced but not assigned", the other half of that same
+    # cross-block pattern — is deliberately left enabled; see above.)
+    "SC2034",
+)
+
+
+def _neutralize_doc_placeholders(line: str) -> str:
+    def _token(m: re.Match[str]) -> str:
+        return "PLACEHOLDER_" + re.sub(r"[.\-]", "_", m.group(1).upper())
+
+    line = _PLACEHOLDER_ANGLE_RE.sub(_token, line)
+    line = _PLACEHOLDER_BRACE_RE.sub(_token, line)
+    line = _PLACEHOLDER_BRACKET_RE.sub(_token, line)
+    return line
+
+
+def _run_shellcheck_on_corpus(root: Path) -> list[tuple[str, int, str]]:
+    """Run shellcheck over every fenced bash/sh/shell block under
+    `root/.claude/commands/comic/*.md`. Returns (skill_filename,
+    block_start_line, shellcheck_output) triples, one per block with any
+    finding. Caller must confirm shellcheck is on PATH first — this does not
+    skip on a missing binary."""
+    skills_dir = root / ".claude" / "commands" / "comic"
+    findings: list[tuple[str, int, str]] = []
+    for md in sorted(skills_dir.glob("*.md")):
+        text = md.read_text()
+        for start, block_lines in _iter_shell_blocks(text):
+            neutralized = [_neutralize_doc_placeholders(line) for line in block_lines]
+            script = "#!/usr/bin/env bash\n" + "\n".join(neutralized) + "\n"
+            proc = subprocess.run(
+                [
+                    "shellcheck",
+                    "-s", "bash",
+                    "-f", "gcc",
+                    "-e", ",".join(_SHELLCHECK_DISABLED_CODES),
+                    "-",
+                ],
+                input=script,
+                capture_output=True,
+                text=True,
+            )
+            if proc.stdout.strip():
+                findings.append((md.name, start, proc.stdout.strip()))
+    return findings
+
+
+def _skip_if_no_shellcheck() -> None:
+    if shutil.which("shellcheck") is None:
+        pytest.skip(
+            "shellcheck not installed — this must degrade gracefully on a "
+            "clean local checkout (BUI-607); CI installs it explicitly, see "
+            "the gixen-overlay job in .github/workflows/ci.yml"
+        )
+
+
+def test_skill_bash_blocks_pass_shellcheck():
+    """BUI-607: every fenced ```bash block in a /comic:* skill is a copy/run
+    instruction for an agent, so a real quoting/redirection/reference bug in
+    one is a bug the agent will execute. Skips (never fails) when shellcheck
+    isn't on PATH — see `_skip_if_no_shellcheck`."""
+    _skip_if_no_shellcheck()
+    findings = _run_shellcheck_on_corpus(REPO_ROOT)
+    assert not findings, "shellcheck found issue(s) in skill bash block(s):\n" + "\n".join(
+        f"{name}:{line}\n{out}" for name, line, out in findings
+    )
+
+
+def test_shellcheck_harness_actually_scans_something():
+    """Guard the guard (mirrors test_harness_actually_found_endpoints): if
+    fence/language extraction silently matched nothing, the test above would
+    pass vacuously every run. Pin the known corpus size with slack (78 bash/
+    sh/shell blocks across 15 skills as of BUI-607) rather than exact
+    equality, so adding a skill doesn't require editing this pin. Runs
+    unconditionally — no shellcheck binary needed, this only tests our own
+    fence-parsing."""
+    total = sum(
+        len(_iter_shell_blocks(md.read_text())) for md in sorted(SKILLS_DIR.glob("*.md"))
+    )
+    assert total >= 70, (
+        f"expected >=70 fenced bash/sh/shell blocks in the skill corpus, found {total} "
+        "— fence/language extraction may be broken"
+    )
+
+
+def test_shellcheck_check_detects_a_real_violation(tmp_path):
+    """Prove the check can fail (the same discipline solutions-lint's
+    --self-test enforces, BUI-605): our own wiring — fence extraction,
+    placeholder neutralization, the disabled-code list — could silently stop
+    catching anything even though shellcheck itself works fine, e.g. a
+    disabled code that's broader than intended would mask this too."""
+    _skip_if_no_shellcheck()
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "fixture.md").write_text(
+        "# Fixture\n\n"
+        "## Step 1\n\n"
+        "```bash\n"
+        "cp $SRC_FILE $DEST_FILE\n"  # SC2086: unquoted expansion, word-splitting bug
+        "```\n"
+    )
+    findings = _run_shellcheck_on_corpus(tmp_path)
+    assert findings, "shellcheck wiring did not flag a deliberately unquoted expansion — check is vacuous"
+
+
+def test_shellcheck_check_passes_clean_bash(tmp_path):
+    """...and stays silent on a block that's actually fine, including the
+    doc-placeholder idioms the neutralizer exists for — proves the
+    neutralizer isn't just suppressing everything wholesale."""
+    _skip_if_no_shellcheck()
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "fixture.md").write_text(
+        "# Fixture\n\n"
+        "## Step 1\n\n"
+        "```bash\n"
+        'comic-fmv --batch <working_list.json> --out <results.json> --brief\n'
+        'gixen add {item_id} {max_bid} --comic-id {comic_id}\n'
+        "npx tsx src/cli.ts new -t {tracking} -c {carrier} [options]\n"
+        '```\n'
+    )
+    findings = _run_shellcheck_on_corpus(tmp_path)
+    assert not findings, f"clean placeholder-only bash incorrectly flagged: {findings}"
+
+
+# --- Class 2: intra-/cross-skill section-reference resolution ---------------
+#
+# docs/solutions/conventions/relocating-skill-sections-leaves-stale-inbound-
+# references.md documents the drift class: a skill cites another skill's
+# section by `file.md § Name` / `file.md § N` / `file.md Step N`, and a later
+# rename/relocation/renumbering in the target orphans the pointer silently
+# (CI stays green — there was no cross-reference linter before this one).
+#
+# Scope, deliberately narrow: only `file.md`-prefixed references, where
+# `file.md` names another skill actually in SKILLS_DIR. Two things this does
+# NOT attempt, both considered and rejected during calibration:
+#   - Bare self-references with no filename ("see § Provider request budget",
+#     "the math spec's §7") — real instances of both patterns exist in the
+#     corpus, but "the math spec's §7" is an alias for a *docs/* file
+#     (fmv-math-spec.md) with no `.md` mention nearby to key off of; treating
+#     unprefixed "§ N" as "this file's own heading N" would have produced a
+#     false positive there (fmv.md itself has no numbered headings — the
+#     spec's headings are the target). Filename-prefixed refs only.
+#   - References to non-skill files (docs/, .claude/agents/) — real and
+#     common (e.g. `comic-grader.md`, `fmv-math-spec.md`), but validating
+#     those needs whole-repo path resolution, a different and larger check.
+#     Silently out of scope, not silently mis-flagged.
+_CROSSREF_RE = re.compile(
+    r"\b(?P<file>[a-z][a-z0-9-]*\.md)`?(?:'s)?\s*"
+    r"(?:§\s*(?P<sec>[^\n]{1,80})|(?P<bare_step>Step\s+\d+(?:\.\d+)?))"
+)
+_CROSSREF_STOP_CHARS = ")].;,—–\n"
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def _extract_headings(text: str) -> list[str]:
+    """Markdown headings only — explicitly OUTSIDE any fenced code block. A
+    bash comment (`# BUI-138: ...`) is indistinguishable from a level-1
+    markdown heading by `_HEADING_RE` alone, and this corpus's bash blocks are
+    full of them; without this exclusion they'd leak into the heading list
+    and could make a genuinely orphaned reference resolve by accident (a
+    descriptor coincidentally substring-matching comment text)."""
+    headings = []
+    in_fence = False
+    for line in text.splitlines():
+        if _FENCE_RE.match(line.strip()) is not None:
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _HEADING_RE.match(line)
+        if m:
+            headings.append(m.group(2).strip())
+    return headings
+
+
+def _load_skill_headings(skills_dir: Path) -> dict[str, list[str]]:
+    return {md.name: _extract_headings(md.read_text()) for md in skills_dir.glob("*.md")}
+
+
+def _trim_crossref_descriptor(raw: str) -> str:
+    for ch in _CROSSREF_STOP_CHARS:
+        idx = raw.find(ch)
+        if idx != -1:
+            raw = raw[:idx]
+    return raw.strip()
+
+
+def _descriptor_resolves(descriptor: str, headings: list[str]) -> bool:
+    """Longest-prefix match: try shrinking word-windows of `descriptor`
+    against the target's headings (case-insensitive substring), so a
+    reference like "Input shape owns the BUI-316..." resolves on its real
+    2-word heading name "Input shape" without needing to guess exactly where
+    the heading name ends and the surrounding sentence begins. A single-word
+    candidate must be >=6 chars to count, so a short common word can't count
+    as a spuriously "resolved" match."""
+    words = descriptor.split()
+    for n in range(min(len(words), 6), 0, -1):
+        candidate = " ".join(words[:n])
+        if n == 1 and len(candidate) < 6:
+            continue
+        candidate_lower = candidate.lower()
+        if any(candidate_lower in h.lower() for h in headings):
+            return True
+    return False
+
+
+def _crossref_findings(root: Path) -> list[tuple[str, int, str, str]]:
+    """Returns (source_file, line, target_file, descriptor) for every
+    `file.md § .../Step N` reference that does not resolve to a real heading
+    in the named target skill file."""
+    skills_dir = root / ".claude" / "commands" / "comic"
+    headings_by_file = _load_skill_headings(skills_dir)
+    findings: list[tuple[str, int, str, str]] = []
+    for md in sorted(skills_dir.glob("*.md")):
+        for i, line in enumerate(md.read_text().splitlines(), 1):
+            for m in _CROSSREF_RE.finditer(line):
+                fname = m.group("file")
+                target_headings = headings_by_file.get(fname)
+                if target_headings is None:
+                    continue  # not a skill file (docs/, agents/, ...) — out of scope
+                if m.group("bare_step"):
+                    descriptor = m.group("bare_step")
+                else:
+                    descriptor = _trim_crossref_descriptor(m.group("sec"))
+                    num_m = re.match(r"^(\d+[a-z]?)\b", descriptor)
+                    if num_m:
+                        descriptor = num_m.group(1)  # "8 owns the..." -> "8"
+                if not descriptor:
+                    continue
+                if descriptor.lower().startswith("step "):
+                    stepnum = descriptor.split(None, 1)[1]
+                    ok = any(
+                        re.search(rf"\bStep\s+{re.escape(stepnum)}\b", h, re.IGNORECASE)
+                        for h in target_headings
+                    )
+                elif re.match(r"^\d+[a-z]?$", descriptor):
+                    ok = any(
+                        re.match(rf"^{re.escape(descriptor)}[.:)]", h) for h in target_headings
+                    )
+                else:
+                    ok = _descriptor_resolves(descriptor, target_headings)
+                if not ok:
+                    findings.append((md.name, i, fname, descriptor))
+    return findings
+
+
+def test_no_skill_crossref_is_orphaned():
+    """BUI-607, generalizing relocating-skill-sections-leaves-stale-inbound-
+    references.md: every `file.md § Section`/`file.md Step N` reference from
+    one skill into another must resolve to a real heading in the target.
+    Caught live at authoring time: buy.md cited `fmv.md §8`/`fmv.md §6`, but
+    BUI-438 moved that math into docs/conventions/fmv-math-spec.md — fmv.md
+    carries no numbered headings anymore. Fixed alongside this check landing
+    (buy.md now cites the spec doc directly)."""
+    findings = _crossref_findings(REPO_ROOT)
+    assert not findings, "orphaned cross-skill section reference(s):\n" + "\n".join(
+        f"{src}:{line}: -> {target} § {descriptor!r} (no matching heading)"
+        for src, line, target, descriptor in findings
+    )
+
+
+def test_crossref_harness_actually_scans_something():
+    """Guard the guard: pin a floor on how many `file.md §...`/`file.md Step
+    N` references the extractor finds across the real corpus, so a broken
+    regex silently matching nothing doesn't make the test above pass
+    vacuously. 12 resolvable refs exist as of BUI-607; assert well under
+    that so a legitimate future edit removing one doesn't require re-pinning."""
+    skills_dir = REPO_ROOT / ".claude" / "commands" / "comic"
+    total_refs = sum(
+        1
+        for md in skills_dir.glob("*.md")
+        for line in md.read_text().splitlines()
+        for _ in _CROSSREF_RE.finditer(line)
+    )
+    assert total_refs >= 10, (
+        f"expected >=10 file.md cross-references in the skill corpus, found {total_refs} "
+        "— extraction may be broken"
+    )
+
+
+def test_crossref_check_detects_a_real_violation(tmp_path):
+    """Prove it can fail: a reference to a section the target genuinely
+    doesn't have."""
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "a.md").write_text(
+        "# A\n\nSee b.md § Nonexistent Section for details.\n"
+    )
+    (skill_dir / "b.md").write_text("# B\n\n## Real Section\n\nContent.\n")
+    findings = _crossref_findings(tmp_path)
+    assert findings, "crossref check did not flag a reference to a genuinely missing section"
+
+
+def test_crossref_check_passes_on_resolvable_and_non_reference_text(tmp_path):
+    """...and stays clean both on a real resolvable reference AND on the two
+    false-positive shapes calibration found in the live corpus: "file.md at
+    Step N" (describes which of the *caller's* own steps reads file.md, not
+    a pointer into file.md) and "file.md references ... (§ X)" (meta-prose
+    about another document's citations, not a citation itself — both real
+    sentences in buy.md/snipe-add.md)."""
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "a.md").write_text(
+        "# A\n\n"
+        "See b.md § Real Section for details.\n"
+        "Reads `b.md` at Step 2.5 of this flow.\n"
+        "`b.md` references specific parts of this file (§ Nonexistent, other stuff).\n"
+    )
+    (skill_dir / "b.md").write_text("# B\n\n## Real Section\n\nContent.\n")
+    findings = _crossref_findings(tmp_path)
+    assert not findings, f"non-reference prose incorrectly flagged as an orphaned crossref: {findings}"
+
+
+# --- Class 3: forbidden idioms already outlawed in CLAUDE.md prose ----------
+#
+# Both scoped to fenced bash/sh/shell blocks only (a prose *warning* against
+# the idiom, like collection-check.md's blockquote citing the bare CLI form
+# by name, lives outside a code fence and must not self-trigger the lint).
+_LOCG_BARE_CHECK_RE = re.compile(r"\blocg collection check\b(?!-batch)")
+
+
+def _is_bare_collection_check_curl(line: str) -> bool:
+    """`curl ... $COMICS_SERVER_URL.../api/comics/collection/check` (the
+    single-item ownership endpoint) bypassing comics-api/check-batch — the
+    literal curl analog of the bare-CLI idiom above (CLAUDE.md's BUI-352
+    trap: a bare curl silently hits an empty host when the var is unset).
+
+    Deliberately NOT "any curl touching $COMICS_SERVER_URL" — the existing
+    test_no_skill_swallows_a_server_curl above already established, and this
+    corpus already relies on, "a bare curl -sf/--fail" as a *sanctioned*
+    fail-loud idiom for other endpoints (e.g. snipe-add.md's `curl -sf
+    "$COMICS_SERVER_URL/health"`, which matches comics_health_gate's own
+    internal implementation). A blanket ban here would flag that already-
+    reviewed, already-tested pattern — two lints disagreeing about the same
+    line is exactly what BUI-607's coordinates warn against replicating.
+    """
+    if "curl" not in line:
+        return False
+    if "$COMICS_SERVER_URL" not in line and "$GIXEN_SERVER_URL" not in line:
+        return False
+    if "/api/comics/collection/check/batch" in line:
+        return False
+    return "/api/comics/collection/check" in line
+
+
+def _forbidden_idiom_findings(root: Path) -> list[tuple[str, int, str]]:
+    skills_dir = root / ".claude" / "commands" / "comic"
+    findings: list[tuple[str, int, str]] = []
+    for md in sorted(skills_dir.glob("*.md")):
+        for start, block_lines in _iter_shell_blocks(md.read_text()):
+            for offset, raw in enumerate(block_lines):
+                stripped = raw.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                lineno = start + offset
+                if _LOCG_BARE_CHECK_RE.search(raw):
+                    findings.append((
+                        md.name, lineno,
+                        "bare `locg collection check` (no -batch) reads the MacBook's "
+                        "never-seeded local store — use `locg collection check-batch` "
+                        "or the comics-api wrapper (BUI-504/BUI-510)",
+                    ))
+                if _is_bare_collection_check_curl(raw):
+                    findings.append((
+                        md.name, lineno,
+                        "bare curl to /api/comics/collection/check bypasses the "
+                        "resolve+health-gate comics-api provides — silently hits an "
+                        "empty host when COMICS_SERVER_URL is unset (BUI-352); use "
+                        "`comics-api GET /api/comics/collection/check`",
+                    ))
+    return findings
+
+
+def test_no_skill_uses_forbidden_ownership_idioms():
+    """BUI-607: bare `locg collection check` (no -batch) and a bare curl to
+    /api/comics/collection/check both bypass the sanctioned check-batch/
+    comics-api paths — both already outlawed in CLAUDE.md prose (the
+    BUI-352/BUI-504/BUI-510 traps). Either reads a never-seeded local store
+    or an unresolved/unhealth-gated host instead of the Mac Mini's
+    authoritative collection store."""
+    findings = _forbidden_idiom_findings(REPO_ROOT)
+    assert not findings, "forbidden ownership-check idiom(s) found:\n" + "\n".join(
+        f"{name}:{line}: {msg}" for name, line, msg in findings
+    )
+
+
+def test_forbidden_idiom_check_detects_a_real_violation(tmp_path):
+    """Prove it can fail: one fixture per idiom."""
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "fixture.md").write_text(
+        "# Fixture\n\n"
+        "```bash\n"
+        'locg collection check "Amazing Spider-Man" 300\n'
+        'curl -sf "$COMICS_SERVER_URL/api/comics/collection/check?series=x"\n'
+        "```\n"
+    )
+    findings = _forbidden_idiom_findings(tmp_path)
+    assert len(findings) == 2, f"expected both forbidden idioms flagged, got {findings}"
+
+
+def test_forbidden_idiom_check_passes_on_sanctioned_calls(tmp_path):
+    """...and stays clean on the sanctioned replacements, a prose warning
+    outside a code fence (must not self-trigger — mirrors collection-check.md
+    § the docs use a blockquote to name the very idiom this lint forbids),
+    and a bare `curl -sf .../health` (a different, already-sanctioned idiom;
+    see `_is_bare_collection_check_curl`'s docstring)."""
+    skill_dir = tmp_path / ".claude" / "commands" / "comic"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "fixture.md").write_text(
+        "# Fixture\n\n"
+        "> Never use the `locg collection check` CLI (no `-batch`) for ownership.\n\n"
+        "```bash\n"
+        "locg collection check-batch items.json --table\n"
+        "comics-api GET /api/comics/collection/check -G --data-urlencode series=x\n"
+        'comics-api POST /api/comics/collection/check/batch\n'
+        'curl -sf "$COMICS_SERVER_URL/health"\n'
+        "```\n"
+    )
+    findings = _forbidden_idiom_findings(tmp_path)
+    assert not findings, f"sanctioned calls incorrectly flagged: {findings}"
+
+
+# --- Class 4: fallback-swallow over the skill corpus (BUI-606's detector) ---
+#
+# Reuses lib.fallback_swallow.check_fallback_swallow directly per BUI-607's
+# coordinates — writing a second swallow heuristic here is explicitly out of
+# scope (two detectors disagreeing about the same files is the outcome this
+# split was designed to prevent). collection-add.md:212 is BUI-606-adjudicated
+# EXEMPT (cosmetic message-selection before an unconditional exit 1) and
+# wishlist-add.md's former creds-block swallow is already fixed — neither is
+# re-litigated here.
+def test_no_skill_fallback_swallow():
+    """BUI-607 invoking BUI-606: run the shared fallback-swallow detector over
+    the live skill corpus. A finding here means a new `|| echo`/`|| true`/
+    `2>/dev/null`-then-`||` shape landed without a hard stop — see
+    lib/fallback_swallow.py and docs/solutions/workflow-issues/
+    multi-block-skill-shell-state-loss-fallback-swallow.md."""
+    findings = check_fallback_swallow(REPO_ROOT)
+    assert not findings, "fallback-swallow finding(s) in the skill corpus:\n" + "\n".join(
+        f"{f.path}:{f.line}: {f.message}" for f in findings
+    )
+
+
+def test_fallback_swallow_detector_is_wired_up(tmp_path):
+    """Guard the guard: BUI-606's own module is responsible for proving the
+    detector itself can fail (its own self-test fixtures). This test only
+    proves *our* import + invocation actually reaches it, so a typo'd path or
+    signature drift here doesn't silently no-op — a known-bad fixture must
+    still be flagged when scanned through this same entry point."""
+    skill_dir = tmp_path / ".claude" / "commands"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "fixture.md").write_text(
+        "# Fixture\n\n"
+        "```bash\n"
+        "curl -sf \"$COMICS_SERVER_URL/api/comics/wish-list\" 2>/dev/null || echo '[]'\n"
+        "```\n"
+    )
+    findings = check_fallback_swallow(tmp_path)
+    assert findings, "check_fallback_swallow did not flag a known-bad fixture — wiring is broken"
