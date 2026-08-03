@@ -1005,6 +1005,45 @@ def _fmv_run_range_lot(title: str) -> bool:
 # at 9.6% ($6.79 -> $6.14), which is why it was closed Won't Do.  Same shape of
 # evidence, two orders of magnitude apart in money.
 #
+# BUI-665 FOLLOW-UP — THIS RULE RAISED A REAL BID CAP, AND THAT WAS CORRECT.
+# BUI-646's leave-one-out sweep found that on the "X-Men 54" pool at grade 8.5
+# this rule's (correct) removal of a $20 17-issue run widened the IQR fence
+# enough to re-admit a $139.99 comp it had been suppressing: fmv_high 30 -> 80,
+# max_bid 25 -> 60.  BUI-665 asked the narrow question — is that $139.99 itself
+# pollution?  Hand-checked on the same corpus: NO.  It is
+# "X-MEN 54 (VF-) 1st ALEX SUMMERS! ... 1969 Marvel k727", a genuine RAW,
+# single-issue, first-print copy of the very book being priced, parsed at 7.5,
+# not slabbed and not a lot.  The same corpus's graded pool brackets it (CGC 8.0
+# $160/$125, CGC 6.5 $99, raw 7.0 $103, raw 8.0 $91) and that pool ALSO holds a
+# raw VF+ 8.5 at $159.99, so a $60 cap at grade 8.5 is if anything conservative.
+# **The pre-BUI-637 $25 cap was the wrong number; the $20 lot comp had been
+# holding the fence shut.**  No comp-exclusion gap here — closed, no code.
+#
+# The CLASS was characterized too, since a one-pool anecdote proves nothing.
+# Re-running the leave-one-out sweep on the post-BUI-645 tree (so, after two
+# more exclusions landed than BUI-646 measured — a re-measurement, not a
+# contradiction of its 7-of-34) gives 38 up-moves where the removed comp was
+# priced above the published fmv_high, 11 of them via IQR-fence re-admit, across
+# 8 distinct pools.  Every one read by hand:
+#   6  re-admit a GENUINE raw single-issue comp of the right book (Absolute
+#      Flash #2 x3 -> $10.67, Watchmen #1 -> $68, Moon Knight #15 -> $30,
+#      X-Men #78 -> $89).  The wider cap is the honest one; nothing to fix.
+#   2  re-admit a SIGNED/COA copy (Wolverine #75, "Signed Adam Kubert w/ COA
+#      DF #2589/7500", $32.50).  sold_comps.LOCAL_EXCLUDE_RE carries
+#      `signed\s+by` and `signature\s+series` but not a bare "Signed <name>",
+#      so this slips through — the one real exclusion gap in the class.
+#   1  re-admits a 1:100 VIRGIN incentive variant (Wolverine #50, $28.00).
+#   1  re-admits a DIFFERENT BOOK (Tales to Astonish #90 at $265 inside the
+#      "Hulk 1" pool) — query contamination, not comp exclusion.
+#   1  is a graded-tier pool behaving as designed (FF #16, a CGC 4.5 re-entering
+#      a CGC pool).
+# So the class is 8 pools, its largest single move is X-Men #78's fmv_high
+# 40 -> 70 (max_bid 30 -> 60), and only ONE pool in it is a comp-exclusion gap
+# at all — and that pool's re-admitted comp is a signed copy, i.e. the fix would
+# belong in LOCAL_EXCLUDE_RE, not here.  Do not build a "re-admit
+# guard": the mechanism is the IQR trim doing its job on the pool it was handed,
+# and BUI-646 already ruled that by design.
+#
 # WHY FOUR MEMBERS, AND WHY STRICTLY ASCENDING.  Hand-labeling every kept
 # corpus title that carries a >=3-member spaced bare-number run (65 titles: 61
 # genuine multi-issue lots, 4 non-comic products, 0 genuine single issues)
@@ -1141,6 +1180,42 @@ def _fmv_spaced_number_run_lot(title: str) -> bool:
 #   UP 29 / DOWN 2 cells with 19 more nulled, versus the ordinal half's UP 13 /
 #   DOWN 6 / 1 nulled.  A rule that mostly RAISES caps and destroys pools is
 #   not a comp-exclusion rule.  Same-corpus, same-pass control pair (BUI-637).
+#
+# BUI-667 — THE REPRINT-*FORMAT* RESIDUAL IS MEASURED AND CLOSED.  DO NOT
+# EXTEND _REPRINT_MARKERS WITH NAMED REPRINT LINES.  The BARE-half note above
+# left a residual: reprint-FORMAT titles (Classic X-Men, Marvel's Greatest
+# Comics, Marvel Super Action, Marvel Milestone, Marvel Legends reprints, JC
+# Penney) still enter comp pools, and the proposed fix was a _REPRINT_MARKERS
+# lexicon extension matched as series identity rather than a bare token.  The
+# oracle bound was measured first, on this same 493-response corpus, per
+# docs/solutions/best-practices/size-the-oracle-ceiling-before-designing-a-classifier.md:
+#
+#   Hand-labelled class     86 unique reprint-FORMAT COMIC titles (the naive
+#                           lexicon matches 197 — "marvel legends" alone sweeps
+#                           in ~110 Hasbro action figures and accessories, which
+#                           is its own reason to keep that phrase OUT of
+#                           _REPRINT_MARKERS: _marker_hit matches the whole
+#                           title, so the entry would fire on every toy listing).
+#   Grade-bearing            27 of 86.  The other 59 never reach a priced pool
+#                           at all — build_pool drops them (the BUI-629 mechanism).
+#   ORACLE @ P=1.000        fmv_high moves in 2 of 493 pools at each pool's
+#                           median comp grade: UP 1 / DOWN 0 / NULLED 1.
+#                           "X-Men 44" 45 -> 50 (+11%, max_bid 35 -> 40) and
+#                           "X-Men 81" 15 -> None (a priced book made unpriceable).
+#   CGC-ladder sweep        UP 23 / DOWN 5 / NULLED 15 / REVIVED 6.  Worst:
+#                           "X-Men 83" @7.0 fmv_high 45 -> 180 (4x the cap).
+#   Sharp test              0 class members sit above their pool's Q75 at >=3x
+#                           the pool median — the only place a comp can inflate.
+#
+# **ZERO pools where the exclusion lowers a cap, at either sampling.**  The
+# asymmetry matches the BARE half's rejection shape (UP 29 / DOWN 2 / 19 nulled)
+# almost exactly, and for the same reason, which is the transferable part:
+# THIS CLASS IS CORRECTLY IDENTIFIED AS POLLUTION AND SITS BELOW THE POOL MEDIAN.
+# A Classic X-Men #41 at $5.19 genuinely is the wrong book for pricing X-Men
+# (1963) #41 — but it is DEPRESSING that pool, not inflating it, so deleting it
+# moves the quantiles UP.  Correct-on-identity and profitable-to-exclude are
+# independent properties; only the second one is worth code on the money path.
+# Re-open only with corpus evidence of this class landing ABOVE a pool's Q75.
 #
 # Keep-list holds: 1,307 kept titles carrying Newsstand / Direct / 1st Print /
 # First Print are untouched by the ordinal half, and 0 of the 12,418 corpus
