@@ -319,14 +319,21 @@ def test_pool_table_matches_the_source():
     )
 
 
-def test_commands_side_pools_are_reached_only_from_cmd_collection_check():
-    """The four ``commands.py`` pools take their rows from ONE call site.
+def test_commands_side_pools_are_reached_only_from_expected_call_sites():
+    """The four ``commands.py`` pools take their rows from known call sites.
 
     Asserted rather than assumed (the point of filtering each pool at its own
-    entry): the moment a second caller appears, this fails and whoever added it
-    has to confirm the new path is a candidate pool and not an enforcement
+    entry): the moment an unlisted caller appears, this fails and whoever added
+    it has to confirm the new path is a candidate pool and not an enforcement
     layer. It is not a licence to move the filter to the call site — that would
     make the exclusion depend on the caller remembering.
+
+    BUI-648 added the second caller, and it went through exactly that check:
+    ``_owned_rows_covering`` is the last-owned-row guard's predicate, whose job
+    is to predict what ``cmd_collection_check`` will answer once a quarantine
+    lands. Reading the check's OWN pool is what makes the two provably agree —
+    a guard consulting a different population could permit a quarantine the
+    check then reports as not-owned, and the buy path would re-buy the book.
     """
     import importlib
 
@@ -347,7 +354,9 @@ def test_commands_side_pools_are_reached_only_from_cmd_collection_check():
             if name in pools:
                 callers[name].add(node.name)
 
-    assert callers == {name: {"cmd_collection_check"} for name in pools}
+    expected = {name: {"cmd_collection_check"} for name in pools}
+    expected["_owned_series_issue_candidates"] |= {"_owned_rows_covering"}
+    assert callers == expected
 
 
 # ---------------------------------------------------------------------------

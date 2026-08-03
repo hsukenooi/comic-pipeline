@@ -351,3 +351,79 @@ class CollectionRemediateSetCopiesRequest(BaseModel):
     in_collection: int | None = None
     delta: int | None = None
     dry_run: bool = False
+
+
+class _QuarantineIdentityRequest(BaseModel):
+    """The row-naming half both BUI-648 quarantine endpoints share.
+
+    Names ONE row by the store's own identity tuple —
+    ``(publisher_name, series_name, full_title, release_date)`` — and exactly
+    one row must match; two matches is refused before any write. An omitted
+    field matches a null/empty field on the row, never a wildcard.
+
+    Deliberately NOT keyed on ``gixen_item_id``: a lot or run bought together
+    shares one across every issue in it (BUI-500), so it names a purchase, not
+    a book. And deliberately not routed through the check-matcher, whose
+    masthead-alias / X-Men-split / cross-volume normalization makes it the
+    wrong tool for naming ONE row (the same reasoning as
+    ``CollectionRemediateDeleteRequest``).
+    """
+
+    publisher_name: str | None = None
+    series_name: str | None = None
+    full_title: str
+    release_date: str | None = None
+
+    @field_validator("full_title")
+    @classmethod
+    def _full_title_non_empty(cls, v: str) -> str:
+        if not (v or "").strip():
+            raise ValueError("full_title must be a non-empty string")
+        return v
+
+
+class CollectionUnquarantineRequest(_QuarantineIdentityRequest):
+    """POST /api/comics/collection/unquarantine (BUI-648).
+
+    Identity contract per :class:`_QuarantineIdentityRequest`. ``by`` is
+    optional and lands in the audit record beside the marker being lifted.
+    """
+
+    by: str | None = None
+
+
+class CollectionQuarantineRequest(_QuarantineIdentityRequest):
+    """POST /api/comics/collection/quarantine (BUI-648).
+
+    Identity contract per :class:`_QuarantineIdentityRequest` (see it for why
+    ``gixen_item_id`` is not an option), plus the marker fields.
+
+    ``reason``/``ticket``/``by`` are ALL required and non-empty. That is the
+    marker's own contract (``locg.collection_cache.quarantine_marker``), not
+    ceremony: quarantine pulls the row out of every matcher pool, and one that
+    cannot say who hid it, when, why and under which ticket is one nobody can
+    ever safely lift.
+
+    ``force`` overrides the last-owned-row guard and REQUIRES ``force_reason``,
+    which is stored on the row under ``quarantined.forced``. It is a separate
+    field from ``reason`` because they answer different questions — ``reason``
+    says why the row is quarantined, ``force_reason`` says why it was safe to
+    hide the LAST owned copy, and the second is what an operator debugging a
+    duplicate purchase needs to read.
+    """
+
+    by: str
+    reason: str
+    ticket: str
+    force: bool = False
+    force_reason: str | None = None
+
+    @field_validator("by", "reason", "ticket")
+    @classmethod
+    def _marker_field_non_empty(cls, v: str) -> str:
+        if not (v or "").strip():
+            raise ValueError(
+                "reason, ticket and by must all be non-empty — a quarantine "
+                "nobody can attribute is one nobody can safely lift"
+            )
+        return v

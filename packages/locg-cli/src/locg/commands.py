@@ -27,8 +27,11 @@ from locg.collection_cache import (
     base_full_title,
     base_series_name,
     collection_backups_root,
+    is_quarantined,
+    make_identity,
     matchable_rows,
     owned_match_keys,
+    quarantine_marker,
     resolve_series_for_win,
     series_year_range,
 )
@@ -2554,7 +2557,7 @@ def cmd_collection_export(
                 ),
             }
 
-    ready, manual_variant, manual_series = _pending_push_rows(payload)
+    ready, manual_variant, manual_series, quarantined = _pending_push_rows(payload)
     # BUI-122: only push local-only wish adds that aren't already owned. Re-dumping
     # the whole wish list re-uploaded LOCG-derived wishes and, because wish rows
     # carry In Collection=0, deleted owned-but-wished books from the collection.
@@ -2579,6 +2582,12 @@ def cmd_collection_export(
         "ready_count": len(ready),
         "manual_variant_count": len(manual_variant),
         "manual_series_count": len(manual_series),
+        # BUI-648: pending rows held back because they are quarantined. Reported
+        # so they never silently vanish from the counts this export used to show
+        # them in — they are excluded from `ready` (never pushed) AND from
+        # `oldest_pending_days`, since a row that will never be pushed cannot be
+        # "overdue for a push".
+        "quarantined_pending_count": len(quarantined),
         "wish_list_count": len(wish_rows),
         "oldest_pending_days": _oldest_pending_days(all_pending),
         "pushed_wishes": push_wishes,
@@ -2682,7 +2691,10 @@ def cmd_collection_audit_pending(
     try:
         store = cache if cache is not None else CollectionCache()
         payload = store.load()
-        ready, _manual_variant, _manual_series = _pending_push_rows(payload)
+        # BUI-648: `ready` now excludes quarantined rows, and that is correct
+        # here too — this audit checks rows about to be UPLOADED, and a
+        # quarantined row is never in the CSV to be audited.
+        ready, _manual_variant, _manual_series, _quarantined = _pending_push_rows(payload)
         for sr in ready:
             key = (sr.get("series_name") or "", sr.get("full_title") or "")
             placeholder_lookup.setdefault(key, []).append(sr)
@@ -2899,7 +2911,7 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
     payload = cache.load()
 
     comics = payload.get("comics", [])
-    ready, manual_variant, manual_series = _pending_push_rows(payload)
+    ready, manual_variant, manual_series, quarantined_pending = _pending_push_rows(payload)
     all_pending = ready + manual_variant + manual_series
 
     last_full_import = payload.get("last_full_import")
@@ -2910,6 +2922,14 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
         "row_count": len(comics),
         "cache_age_days": _cache_age_days(last_full_import),
         "pending_push_count": len(all_pending),
+        # BUI-648: rows carrying a quarantine marker — invisible to every
+        # ownership/wish matcher, still fully present in `row_count` and in the
+        # owned-safe export layer. Top-level rather than verbose-only because
+        # `pending_push_count` above no longer counts a quarantined pending row,
+        # and a count that drops rows needs its counterpart visible in the same
+        # default view or the row has silently vanished. Store-wide; the
+        # pending-scoped subset is `quarantined_pending_count` below.
+        "quarantined_count": sum(1 for row in comics if is_quarantined(row)),
         "oldest_pending_days": _oldest_pending_days(all_pending),
         "locg_cli_version": __version__,
         "schema_version": payload.get("schema_version"),
@@ -2974,6 +2994,12 @@ def cmd_collection_status(verbose: bool = False) -> dict[str, Any]:
         "locg_export_count": len(locg_exports),
         "needs_manual_variant_count": len(manual_variant),
         "needs_manual_series_canonical_count": len(manual_series),
+        # BUI-648: the exact rows that left `pending_push_count` — pending push
+        # AND quarantined. Sits beside the two manual-flag counts because it is
+        # the same kind of fact (a pending row held back from the CSV), and it
+        # is what makes the drop from `pending_push_count` auditable rather than
+        # merely explained.
+        "quarantined_pending_count": len(quarantined_pending),
         "median_agent_win_age_days": median_win_age,
         "reconciliation_success_rate_last_5_imports": recon_success_rate,
         "behavioral_drift_events_last_5_imports": drift_events,
@@ -6831,4 +6857,544 @@ def cmd_collection_backfill(
         "chunks_committed": chunks_committed,
         **base_result,
         "changes": applied_changes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# BUI-648: the quarantine WRITE path.
+#
+# BUI-647 gave the collection store the third state it never had — neither a
+# full-citizen row nor an unsafe delete — and made it READABLE (`is_quarantined`
+# / `matchable_rows`, filtered at each candidate pool's own entry point). This
+# is the other half: setting it, lifting it, and refusing the one application
+# that costs money.
+#
+# Quarantining pulls a row out of every ownership-matcher pool. That is the
+# point (an Italian Panini row must stop answering for the US edition — the
+# BUI-563 mis-resolution), and BUI-647 already documents why it is the SAFER
+# direction than the alternative: hiding a row from the matcher can only cost
+# money, while hiding it from the owned-safe export layer would cost the book
+# itself (BUI-122). "Can only cost money" is not "costs nothing", though —
+# quarantine the LAST owned copy of a book and `collection check` answers "not
+# owned", and the buy path re-buys it. That single branch is fail-closed here.
+# Every other quarantine proceeds with no ceremony.
+# ---------------------------------------------------------------------------
+
+
+def _ownership_coverage(row: dict[str, Any]) -> Optional[tuple[str, str, str]]:
+    """``(series_portion, issue_stripped, issue_token)`` for the ownership
+    question ``row`` answers, or None when no such question can be formed.
+
+    None means the title carries no issue token (a TPB/OGN/special) — the same
+    rows :func:`locg.collection_io._owned_series_issue_index` skips. There is
+    then no ``owned_match_keys × issue_key`` pair to compare, so a replacement
+    copy cannot be PROVEN to exist. Callers must treat None exactly like "no
+    covering row", never like "no guard needed".
+
+    The split is :func:`split_series_issue_for_ownership` and the issue token is
+    stripped exactly the way :func:`cmd_collection_check` strips its own query
+    (``lstrip("0")``, falling back to the raw token), so coverage is computed on
+    the same terms the check will later ask on.
+    """
+    series_portion, issue_token = split_series_issue_for_ownership(
+        row.get("full_title") or ""
+    )
+    if issue_token is None:
+        return None
+    stripped = issue_token.strip().lstrip("0") or issue_token.strip()
+    return series_portion, stripped, issue_token
+
+
+def _owned_rows_covering(
+    comics: list[dict[str, Any]],
+    target: dict[str, Any],
+) -> Optional[list[dict[str, Any]]]:
+    """Every OTHER owned, non-quarantined row that answers the same ownership
+    question as ``target`` — the last-owned-row guard's predicate (BUI-648).
+
+    Returns None when the question cannot be formed at all (see
+    :func:`_ownership_coverage`); an empty list when it can be formed and
+    nothing else answers it. **Both mean "refuse".**
+
+    Rows come from :func:`_owned_series_issue_candidates` — the pool
+    ``cmd_collection_check`` itself reads, already ``matchable_rows``-filtered
+    at its own entry. That reuse is the point rather than an economy: this
+    function's job is to PREDICT what ``collection check`` will answer once the
+    quarantine lands, and a guard consulting a different population than the
+    check could permit a quarantine the check then reports as not-owned. It is
+    also why an already-quarantined row cannot vouch for another — two
+    quarantines in sequence would otherwise blind a book neither one alone
+    would have.
+
+    The scan spans the full :func:`owned_match_keys` set, not one literal series
+    key, because the surviving copy can be filed under a DIFFERENT masthead for
+    the same run (``The X-Men #107`` vs ``Uncanny X-Men #107``, BUI-197/BUI-200).
+    A guard comparing normalized series names alone would call that the last
+    owned row and refuse a perfectly safe quarantine.
+
+    ``target`` is excluded by object identity, not by index or by any field: a
+    row must never prove its own replaceability (that collapses the guard
+    entirely), and ``gixen_item_id`` is NOT unique — a lot or run bought
+    together shares one across every issue in it (BUI-500).
+
+    **Known bound: coverage is year-blind, like the pool it reads.** Two
+    genuinely different volumes sharing a masthead and an issue number (``FF
+    (Vol. 1) #1`` vs ``FF (Vol. 7) #1``) cover each other here, so quarantining
+    one is permitted even though a YEAR-bearing ``collection check`` — which
+    applies a release-date filter the year-free pool does not — would afterwards
+    report the other era not-owned. Tightening this to require an era-compatible
+    cover was considered and rejected: it would refuse the PRIMARY case this
+    state exists for, since a Panini/US twin pair is by construction two
+    catalog entries with different volumes and dates ~150 days apart (BUI-563).
+    The year-free equivalence is also the one the conflicts audit deliberately
+    uses (BUI-129). What closes the gap instead is evidence, not strictness —
+    the rows relied on are recorded in the audit record and echoed on the
+    success response, so a quarantine that leaned on a different era is
+    visible after the fact rather than merely assumed away.
+    """
+    coverage = _ownership_coverage(target)
+    if coverage is None:
+        return None
+    series_portion, issue_stripped, issue_token = coverage
+
+    covering: list[dict[str, Any]] = []
+    for key in owned_match_keys(series_portion, issue_token):
+        for row in _owned_series_issue_candidates(
+            comics, key, issue_stripped, issue_token
+        ):
+            if row is target:
+                continue
+            if not any(row is seen for seen in covering):
+                covering.append(row)
+    return covering
+
+
+def _last_owned_row_verdict(
+    comics: list[dict[str, Any]], target: dict[str, Any]
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    """``(refusal_or_None, covering_rows)`` for quarantining ``target``.
+
+    The refusal is non-None exactly when quarantining would blind the last owned
+    copy of the book. ``covering_rows`` is the evidence behind the verdict — the
+    rows that made it safe — returned even on the pass so the caller can RECORD
+    what it relied on rather than merely acting on it. That is the same reasoning
+    that made the marker an object instead of a flag (BUI-647): a decision whose
+    grounds are not written down is one nobody can re-examine.
+
+    The guard applies only to an OWNED row. ``in_collection`` is a copies-owned
+    count and 0 is a valid tracked-but-not-owned state (BUI-249/250/251) that
+    answers no ownership check — hiding such a row cannot blind one.
+
+    Called twice on purpose: once before the lock (so the common refusal is
+    cheap and its error message is good) and once INSIDE
+    :meth:`CollectionCache.apply`'s exclusive lock against the freshly-loaded
+    payload. Only the second is load-bearing — a concurrent writer can
+    quarantine or un-own the covering copy between the two.
+    """
+    if not target.get("in_collection"):
+        return None, []
+    covering = _owned_rows_covering(comics, target)
+    if covering:
+        return None, covering
+
+    title = target.get("full_title") or "(untitled row)"
+    if covering is None:
+        detail = "unparseable_issue_token"
+        why = (
+            f"{title!r} carries no parseable issue token, so no ownership-"
+            "coverage question can be formed for it and no replacement copy "
+            "can be proven to exist"
+        )
+    else:
+        detail = "no_covering_row"
+        why = (
+            "no other owned, non-quarantined row answers an ownership check "
+            f"for {title!r}"
+        )
+    return {
+        "status": "last_owned_row",
+        "reason_detail": detail,
+        "error": (
+            f"refusing to quarantine the last owned copy: {why}. Quarantine "
+            "removes the row from every ownership-matcher pool, so "
+            "`collection check` would report this book NOT owned and the buy "
+            "path would re-buy it. If that is genuinely intended, override with "
+            "force + a force reason (`--force --force-reason '<why>'` on the "
+            "CLI, `force`/`force_reason` in the API)."
+        ),
+        "full_title": target.get("full_title"),
+        "series_name": target.get("series_name"),
+        "release_date": target.get("release_date"),
+    }, []
+
+
+def _quarantine_identity(
+    publisher_name: Optional[str],
+    series_name: Optional[str],
+    full_title: Optional[str],
+    release_date: Optional[str],
+) -> tuple[str, str, str, str]:
+    """The four-field identity as :func:`make_identity` would compute it.
+
+    An omitted field matches a null/empty field on the row, never a wildcard —
+    the same convention :func:`_stable_identity_candidates` uses.
+    """
+    return make_identity({
+        "publisher_name": publisher_name,
+        "series_name": series_name,
+        "full_title": full_title,
+        "release_date": release_date,
+    })
+
+
+def _quarantine_identity_candidates(
+    comics: list[dict[str, Any]],
+    identity: tuple[str, str, str, str],
+) -> list[int]:
+    """Indices of rows whose :func:`make_identity` equals ``identity``.
+
+    :func:`make_identity` is the store's OWN identity key —
+    ``(publisher_name, series_name, full_title, release_date)``, with
+    ``series_name`` folded through ``identity_series_key`` so a volume's
+    end-year relabel does not miss the row (BUI-554). Every matching index is
+    returned, never just the first: the store genuinely holds duplicate
+    identities (the import counts them as ``owned_duplicate_identities``), and
+    silently picking one of two indistinguishable rows is exactly the guess a
+    write path must refuse to make.
+
+    Deliberately NOT keyed on ``gixen_item_id`` (BUI-500: a lot or run bought
+    together shares one across every issue in it) and deliberately NOT routed
+    through ``cmd_collection_check``'s matcher — masthead alias / X-Men split /
+    cross-volume ambiguity make it the wrong tool for naming ONE row, the same
+    reasoning behind :func:`_stable_identity_candidates` (BUI-427).
+    """
+    return [i for i, row in enumerate(comics) if make_identity(row) == identity]
+
+
+def _quarantine_identity_echo(
+    publisher_name: Optional[str],
+    series_name: Optional[str],
+    full_title: Optional[str],
+    release_date: Optional[str],
+) -> dict[str, Optional[str]]:
+    """The caller's raw identity args, for audit records and error bodies."""
+    return {
+        "publisher_name": publisher_name,
+        "series_name": series_name,
+        "full_title": full_title,
+        "release_date": release_date,
+    }
+
+
+def _quarantine_match_error(candidates: list[int], verb: str) -> dict[str, Any]:
+    """Shared not_found/ambiguous shape for both quarantine ops."""
+    if not candidates:
+        return {
+            "status": "not_found",
+            "error": (
+                "no row matches the given (publisher_name, series_name, "
+                f"full_title, release_date) identity — nothing to {verb}"
+            ),
+        }
+    return {
+        "status": "ambiguous",
+        "count": len(candidates),
+        "error": (
+            f"{len(candidates)} rows share this identity — refusing to "
+            f"{verb} an arbitrary one of them. Disambiguate the store first "
+            "(see the import's owned_duplicate_identities count)."
+        ),
+    }
+
+
+def cmd_collection_quarantine(
+    *,
+    publisher_name: Optional[str] = None,
+    series_name: Optional[str] = None,
+    full_title: Optional[str] = None,
+    release_date: Optional[str] = None,
+    reason: str = "",
+    ticket: str = "",
+    by: str = "",
+    force: bool = False,
+    force_reason: Optional[str] = None,
+    cache: Optional[CollectionCache] = None,
+) -> dict[str, Any]:
+    """Quarantine ONE row by its four-field identity (BUI-648).
+
+    Marks the row with :func:`locg.collection_cache.quarantine_marker`, which
+    removes it from every ownership/wish candidate pool while leaving it fully
+    present in the owned-safe export layer — a quarantined row is still a book
+    you OWN, and dropping it from the export's owned index is the BUI-122
+    delete path (see ``collection_io._owned_series_issue_index``'s comment).
+
+    Identity is ``(publisher_name, series_name, full_title, release_date)`` via
+    :func:`make_identity`, matched with an exactly-one-match assertion — two
+    matches is ``ambiguous`` and writes nothing. ``full_title`` is required; the
+    other three match a null/empty field on the row when omitted.
+
+    **The last-owned-row guard** (:func:`_last_owned_row_verdict`) refuses with
+    ``status="last_owned_row"`` when no other owned, non-quarantined row answers
+    the same ownership question. ``force=True`` overrides it and REQUIRES
+    ``force_reason``, which is stored in the marker under ``forced``. That is a
+    field of its own rather than the marker's ``reason`` because they answer
+    different questions — ``reason`` says why the row is quarantined, while
+    ``forced`` says why it was safe to hide the last owned copy, and the second
+    is the one an operator debugging a duplicate purchase needs. ``forced`` is
+    stamped only when the guard actually fired, so it never reads as an
+    override on a quarantine that needed none.
+
+    The write runs through :meth:`CollectionCache.apply` (exclusive flock, .bak
+    rotation, atomic write) and re-resolves the identity AND re-runs the guard
+    inside the lock — the same TOCTOU-safe shape
+    :func:`cmd_collection_remediate_set_copies` uses. Reversible with
+    :func:`cmd_collection_unquarantine`, which is why there is no ``dry_run``:
+    the refusals ARE the preview, and nothing here is destructive.
+
+    On success the response and the audit record both carry ``covering_rows``:
+    the owned rows the guard accepted as proof this book stays findable. It is
+    the pass-branch counterpart to ``forced`` — one records why an override was
+    safe, the other records why no override was needed.
+
+    No ``last_full_import`` gate (unlike the remediation ops): the
+    record-win-only flow populates real rows with ``last_full_import`` still
+    unset, and a store that genuinely holds nothing fails loudly as
+    ``not_found`` anyway.
+
+    Statuses: ``ok``, ``invalid_request``, ``explicit_store_required``,
+    ``not_found``, ``ambiguous``, ``already_quarantined``, ``last_owned_row``.
+    """
+    if not (full_title or "").strip():
+        return {
+            "status": "invalid_request",
+            "error": "full_title is required to name the row to quarantine",
+        }
+    # Build the marker before anything else: its reason/ticket/by contract is a
+    # caller error true of every store, so it must not be masked by a store
+    # refusal — and a marker that cannot be built must never get as far as a
+    # half-done write.
+    try:
+        marker = quarantine_marker(reason=reason, ticket=ticket, by=by)
+    except ValueError as exc:
+        return {"status": "invalid_request", "error": str(exc)}
+    if force and not (force_reason or "").strip():
+        return {
+            "status": "invalid_request",
+            "error": (
+                "force requires a force_reason (`--force-reason '<why>'` on "
+                "the CLI) — overriding the last-owned-row guard hides the only "
+                "copy of a book from every ownership check, and the row itself "
+                "has to say why that was safe"
+            ),
+        }
+
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error(
+            "locg collection quarantine --full-title <title> --reason <why> "
+            "--ticket <BUI-N>"
+        )
+
+    if cache is None:
+        cache = CollectionCache()
+
+    identity = _quarantine_identity(
+        publisher_name, series_name, full_title, release_date
+    )
+    identity_echo = _quarantine_identity_echo(
+        publisher_name, series_name, full_title, release_date
+    )
+
+    comics = cache.load().get("comics", [])
+    candidates = _quarantine_identity_candidates(comics, identity)
+    if len(candidates) != 1:
+        return {
+            **_quarantine_match_error(candidates, "quarantine"),
+            "identity": identity_echo,
+        }
+    if is_quarantined(comics[candidates[0]]):
+        return {
+            "status": "already_quarantined",
+            "error": (
+                "row is already quarantined — refusing to overwrite its marker, "
+                "which is the only record of who hid it and why. Unquarantine "
+                "first if you mean to re-attribute it."
+            ),
+            "identity": identity_echo,
+            "quarantined": dict(comics[candidates[0]]["quarantined"]),
+        }
+    refusal, _covering = _last_owned_row_verdict(comics, comics[candidates[0]])
+    if refusal is not None and not force:
+        return {**refusal, "identity": identity_echo}
+
+    outcome: dict[str, Any] = {}
+
+    def _mutate(locked_payload: dict[str, Any]) -> None:
+        locked_comics = locked_payload.get("comics", [])
+        locked_candidates = _quarantine_identity_candidates(locked_comics, identity)
+        if len(locked_candidates) != 1:
+            outcome.update(_quarantine_match_error(locked_candidates, "quarantine"))
+            return
+        locked_row = locked_comics[locked_candidates[0]]
+        if is_quarantined(locked_row):
+            outcome["status"] = "already_quarantined"
+            outcome["error"] = "row was quarantined by a concurrent writer"
+            return
+        # Re-run under the lock: the covering copy can be quarantined or
+        # un-owned between the pre-check and here, and this is the branch whose
+        # failure costs a duplicate purchase.
+        locked_refusal, locked_covering = _last_owned_row_verdict(
+            locked_comics, locked_row
+        )
+        if locked_refusal is not None and not force:
+            outcome.update(locked_refusal)
+            return
+
+        applied = dict(marker)
+        if locked_refusal is not None:
+            applied["forced"] = {
+                "guard": "last_owned_row",
+                "reason": (force_reason or "").strip(),
+            }
+        locked_row["quarantined"] = applied
+        outcome["quarantined"] = applied
+        outcome["forced"] = locked_refusal is not None
+        # The rows the guard accepted as proof this book stays findable. Recorded
+        # because the guard is year-blind by construction (see
+        # `_owned_rows_covering`) — naming the copy it leaned on is what makes a
+        # cover from a different era visible afterwards instead of assumed away.
+        outcome["covering_rows"] = [_row_summary(row) for row in locked_covering]
+        outcome["row"] = dict(locked_row)
+
+    cache.apply(_mutate, command="collection-quarantine")
+
+    if outcome.get("status"):
+        return {**outcome, "identity": identity_echo}
+
+    record = {
+        "type": "collection_quarantine",
+        "ts": _utcnow_iso(),
+        "command": "collection-quarantine",
+        "details": {
+            "identity": identity_echo,
+            "quarantined": outcome["quarantined"],
+            "forced": outcome["forced"],
+            "covering_rows": outcome["covering_rows"],
+            "row": outcome["row"],
+        },
+    }
+    cache.append_audit(record)
+
+    return {
+        "status": "ok",
+        "identity": identity_echo,
+        "row": outcome["row"],
+        "quarantined": outcome["quarantined"],
+        "forced": outcome["forced"],
+        "covering_rows": outcome["covering_rows"],
+        "audit": record,
+    }
+
+
+def cmd_collection_unquarantine(
+    *,
+    publisher_name: Optional[str] = None,
+    series_name: Optional[str] = None,
+    full_title: Optional[str] = None,
+    release_date: Optional[str] = None,
+    by: Optional[str] = None,
+    cache: Optional[CollectionCache] = None,
+) -> dict[str, Any]:
+    """Lift a quarantine from ONE row by its four-field identity (BUI-648).
+
+    The exact reverse of :func:`cmd_collection_quarantine`: same identity
+    resolution and exactly-one-match assertion, same
+    :meth:`CollectionCache.apply` write, its own audit record. Deletes the
+    ``quarantined`` KEY rather than blanking it — an empty object reads as
+    unquarantined to ``is_quarantined`` but would linger in the store as a
+    marker recording nothing.
+
+    No guard: restoring a row to the matcher pools can only ADD ownership
+    evidence, never remove it. Refuses with ``not_quarantined`` when the row
+    carries no marker, so a no-op is never reported as a lift.
+
+    ``by`` is optional and lands in the audit record; the marker being removed
+    is echoed there in full, since it is the only record of why the row was
+    ever hidden.
+    """
+    if not (full_title or "").strip():
+        return {
+            "status": "invalid_request",
+            "error": "full_title is required to name the row to unquarantine",
+        }
+
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error(
+            "locg collection unquarantine --full-title <title>"
+        )
+
+    if cache is None:
+        cache = CollectionCache()
+
+    identity = _quarantine_identity(
+        publisher_name, series_name, full_title, release_date
+    )
+    identity_echo = _quarantine_identity_echo(
+        publisher_name, series_name, full_title, release_date
+    )
+
+    comics = cache.load().get("comics", [])
+    candidates = _quarantine_identity_candidates(comics, identity)
+    if len(candidates) != 1:
+        return {
+            **_quarantine_match_error(candidates, "unquarantine"),
+            "identity": identity_echo,
+        }
+    if not is_quarantined(comics[candidates[0]]):
+        return {
+            "status": "not_quarantined",
+            "error": "row carries no quarantine marker — nothing to lift",
+            "identity": identity_echo,
+        }
+
+    outcome: dict[str, Any] = {}
+
+    def _mutate(locked_payload: dict[str, Any]) -> None:
+        locked_comics = locked_payload.get("comics", [])
+        locked_candidates = _quarantine_identity_candidates(locked_comics, identity)
+        if len(locked_candidates) != 1:
+            outcome.update(_quarantine_match_error(locked_candidates, "unquarantine"))
+            return
+        locked_row = locked_comics[locked_candidates[0]]
+        if not is_quarantined(locked_row):
+            outcome["status"] = "not_quarantined"
+            outcome["error"] = "row was unquarantined by a concurrent writer"
+            return
+        outcome["removed"] = dict(locked_row["quarantined"])
+        del locked_row["quarantined"]
+        outcome["row"] = dict(locked_row)
+
+    cache.apply(_mutate, command="collection-unquarantine")
+
+    if outcome.get("status"):
+        return {**outcome, "identity": identity_echo}
+
+    record = {
+        "type": "collection_unquarantine",
+        "ts": _utcnow_iso(),
+        "command": "collection-unquarantine",
+        "details": {
+            "identity": identity_echo,
+            "removed": outcome["removed"],
+            "by": by,
+            "row": outcome["row"],
+        },
+    }
+    cache.append_audit(record)
+
+    return {
+        "status": "ok",
+        "identity": identity_echo,
+        "row": outcome["row"],
+        "removed": outcome["removed"],
+        "audit": record,
     }

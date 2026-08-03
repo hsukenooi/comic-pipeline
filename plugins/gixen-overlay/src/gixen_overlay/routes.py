@@ -53,6 +53,8 @@ from gixen_overlay.models import (
     CollectionRestoreRequest,
     CollectionRemediateDeleteRequest,
     CollectionRemediateSetCopiesRequest,
+    CollectionQuarantineRequest,
+    CollectionUnquarantineRequest,
     SellerScanSeenRequest,
     CollectionCheckBatchRequest,
     SeriesNameResolveRequest,
@@ -86,10 +88,12 @@ from locg.commands import (
     collection_check_reports_owned,
     cmd_collection_export,
     cmd_collection_import,
+    cmd_collection_quarantine,
     cmd_collection_record_win,
     cmd_collection_record_win_era_evidence,
     cmd_collection_remediate_delete,
     cmd_collection_remediate_set_copies,
+    cmd_collection_unquarantine,
     cmd_collection_series_names,
     cmd_collection_series_names_resolve,
     cmd_collection_status,
@@ -2210,6 +2214,26 @@ _REMEDIATION_STATUS_CODES: dict[str, int] = {
 }
 
 
+def _status_mapped_response(
+    result: dict[str, Any], codes: dict[str, int]
+) -> dict[str, Any]:
+    """Raise the `HTTPException` `codes` maps `result["status"]` to, else
+    return `result` as the 200 body.
+
+    `detail` is the WHOLE result dict, verbatim, so a caller reads
+    `detail["status"]` and every field beside it (`count`, `reason_detail`, …)
+    survives alongside the message. A status absent from `codes` passes through
+    as 200 — which is why each family keeps its OWN table (see
+    `_REMEDIATION_STATUS_CODES` and `_QUARANTINE_STATUS_CODES`): a shared table
+    would let one family's new status silently acquire the other's code.
+    """
+    status = result.get("status")
+    code = codes.get(status) if isinstance(status, str) else None
+    if code is not None:
+        raise HTTPException(status_code=code, detail=result)
+    return result
+
+
 def _remediation_response(result: dict[str, Any]) -> dict[str, Any]:
     """Translate a `cmd_collection_remediate_*` result into the HTTP shape.
 
@@ -2218,11 +2242,45 @@ def _remediation_response(result: dict[str, Any]) -> dict[str, Any]:
     `count`/etc. survive alongside the message) rather than returning 200
     with a body a caller could mistake for success.
     """
-    status = result.get("status")
-    code = _REMEDIATION_STATUS_CODES.get(status) if isinstance(status, str) else None
-    if code is not None:
-        raise HTTPException(status_code=code, detail=result)
-    return result
+    return _status_mapped_response(result, _REMEDIATION_STATUS_CODES)
+
+
+# ---------------------------------------------------------------------------
+# BUI-648: the quarantine write path, served.
+#
+# The store lives on the Mac Mini, so a reversal you cannot reach from the
+# server is not a reversal — `unquarantine` is served alongside `quarantine`
+# rather than left as a CLI-only escape hatch.
+#
+# Its own status table, deliberately not folded into
+# `_REMEDIATION_STATUS_CODES` even though four codes coincide: `last_owned_row`
+# and `not_quarantined` mean nothing to the remediation ops, and a future edit
+# to either table for one family's needs must not silently reach into the
+# other's contract (the same reasoning the DELETE endpoint's separate mapping
+# carries above).
+# ---------------------------------------------------------------------------
+
+_QUARANTINE_STATUS_CODES: dict[str, int] = {
+    "invalid_request": 422,
+    "not_found": 404,
+    "ambiguous": 409,
+    # The last-owned-row guard. 409 rather than 422: the request is perfectly
+    # well-formed, it is the STORE's state that makes it unsafe — quarantining
+    # here would leave no owned row answering an ownership check for the book,
+    # so `collection check` would report it not-owned and the buy path would
+    # re-buy it. Retry with `force` + `force_reason` to override.
+    "last_owned_row": 409,
+    "already_quarantined": 409,
+    "not_quarantined": 409,
+    # BUI-489 backstop, same shape and same "unreachable in practice" caveat as
+    # the remediation table's entry above.
+    "explicit_store_required": 500,
+}
+
+
+def _quarantine_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Translate a `cmd_collection_(un)quarantine` result into the HTTP shape."""
+    return _status_mapped_response(result, _QUARANTINE_STATUS_CODES)
 
 
 @router.post("/api/comics/collection/remediate/delete")
@@ -2272,6 +2330,68 @@ async def api_collection_remediate_set_copies(req: CollectionRemediateSetCopiesR
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
     return _remediation_response(result)
+
+
+@router.post("/api/comics/collection/quarantine")
+async def api_collection_quarantine(req: CollectionQuarantineRequest):
+    """Quarantine ONE collection row by its four-field identity (BUI-648).
+
+    Hides the row from every ownership/wish candidate pool while leaving it
+    fully present in the owned-safe export layer — a quarantined row is still a
+    book you OWN, and dropping it from the export's owned index is the BUI-122
+    delete path (BUI-647 documents both sides).
+
+    Refuses with **409 `last_owned_row`** when no other owned, non-quarantined
+    row answers the same ownership question: hiding the last owned copy makes
+    `collection check` report the book not-owned, and the buy path re-buys it.
+    `force` overrides that and REQUIRES `force_reason`, which is stored on the
+    row. Every ordinary quarantine proceeds with no ceremony.
+
+    The write goes through `CollectionCache.apply` (exclusive flock, .bak
+    rotation, atomic write), re-resolving the identity AND re-running the guard
+    inside the lock. The 200 body carries the appended `audit` record.
+    """
+    _ensure_collection_store()
+    try:
+        result = cmd_collection_quarantine(
+            publisher_name=req.publisher_name,
+            series_name=req.series_name,
+            full_title=req.full_title,
+            release_date=req.release_date,
+            reason=req.reason,
+            ticket=req.ticket,
+            by=req.by,
+            force=req.force,
+            force_reason=req.force_reason,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+    return _quarantine_response(result)
+
+
+@router.post("/api/comics/collection/unquarantine")
+async def api_collection_unquarantine(req: CollectionUnquarantineRequest):
+    """Lift a quarantine from ONE collection row by its identity (BUI-648).
+
+    The exact reverse of `POST .../collection/quarantine`, served because the
+    store lives on the Mac Mini — a reversal only reachable from a CLI on the
+    right host is not a reversal. No guard: restoring a row to the matcher
+    pools can only ADD ownership evidence. 409 `not_quarantined` when the row
+    carries no marker, so a no-op is never reported as a lift. The 200 body
+    carries the appended `audit` record, including the marker that was removed.
+    """
+    _ensure_collection_store()
+    try:
+        result = cmd_collection_unquarantine(
+            publisher_name=req.publisher_name,
+            series_name=req.series_name,
+            full_title=req.full_title,
+            release_date=req.release_date,
+            by=req.by,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+    return _quarantine_response(result)
 
 
 @router.post("/api/comics/wish-list")

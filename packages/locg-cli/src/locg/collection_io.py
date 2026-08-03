@@ -31,6 +31,7 @@ from locg.collection_cache import (
     _utcnow_iso,
     build_volume_candidates,
     identity_series_key,
+    is_quarantined,
     make_identity,
     matchable_rows,
     owned_match_keys,
@@ -1934,6 +1935,14 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
         # BUI-412: owned rows with no release_date, post-import. Non-blocking —
         # a data-quality count only, never used to reject/alter/drop a row.
         "null_release_date_owned": 0,
+        # BUI-648: rows carrying a quarantine marker, post-import. Import is the
+        # one operation that rewrites every row, and BUI-647's whole claim is
+        # that the marker survives it untouched (the merge copies LOCG_COLUMNS
+        # onto the existing row in place). Reporting the count here makes that
+        # survival observable at the moment it matters, instead of something you
+        # have to re-read the store by hand to confirm. Reported only; the
+        # import never sets or clears the marker.
+        "quarantined_count": 0,
         # BUI-547: pending rows whose stale needs_manual_series_canonical flag
         # was re-checked and cleared because the series resolves now. One-way —
         # this pass never sets the flag.
@@ -2110,6 +2119,12 @@ def import_xlsx(path: Path, cache: CollectionCache) -> dict[str, Any]:
             if row.get("in_collection") and not (row.get("release_date") or "").strip()
         )
         summary["null_release_date_owned"] = null_release_date_owned
+
+        # BUI-648: quarantined rows surviving the rewrite (see the summary key's
+        # own comment). Store-wide, not owned-scoped — an unowned quarantined
+        # row is just as much a row the matchers no longer see.
+        summary["quarantined_count"] = sum(1 for row in comics if is_quarantined(row))
+
         if null_release_date_owned:
             summary["warnings"].append(
                 f"{null_release_date_owned} owned collection row(s) have no "
@@ -2276,29 +2291,59 @@ def _is_pending_push_row(row: dict[str, Any]) -> bool:
 
 def _pending_push_rows(
     payload: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Partition pending-push rows into (ready, manual_variant, manual_series_canonical).
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Partition pending-push rows into
+    (ready, manual_variant, manual_series_canonical, quarantined).
 
     Pending: :func:`_is_pending_push_row`.
-    Ready: pending AND not flagged.
+    Ready: pending AND not flagged AND not quarantined.
     Manual: pending AND flagged (excluded from CSV).
+
+    **Quarantine is checked FIRST and wins every other bucket (BUI-648).** The
+    export writes ``ready`` to the LOCG bulk-import CSV, and re-pushing a
+    quarantined row is precisely the loop BUI-563 could not break: the foreign
+    Panini rows exist because our own record-win push put them on LOCG, so
+    pushing them again re-asserts the ownership the quarantine exists to stop
+    trusting. The order matters against the manual flags too — a quarantined row
+    that also carries ``needs_manual_variant`` is not awaiting manual attention
+    (it is never going to be pushed at all), and listing it under a manual flag
+    invites someone to "fix" it back into the export.
+
+    A quarantined pending row therefore leaves ``pending_push_count``, which is
+    why it is RETURNED as its own bucket rather than dropped: both
+    ``cmd_collection_status`` and ``cmd_collection_export`` surface the count, so
+    the row never silently vanishes from a total it used to appear in.
+
+    Uses :func:`is_quarantined` directly rather than
+    :func:`~locg.collection_cache.matchable_rows`: this is not a candidate pool,
+    it is a SUPPRESSION (which rows may be written back to LOCG) — the opposite
+    question — and the ``matchable_rows`` call sites are a closed, test-asserted
+    set of pools (``tests/test_quarantine.py::test_pool_table_matches_the_source``).
     """
     ready: list[dict[str, Any]] = []
     manual_variant: list[dict[str, Any]] = []
     manual_series: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
 
     for row in payload.get("comics", []):
         if not _is_pending_push_row(row):
             continue
 
-        if row.get("needs_manual_variant"):
+        if is_quarantined(row):
+            quarantined.append(row)
+        elif row.get("needs_manual_variant"):
             manual_variant.append(row)
         elif row.get("needs_manual_series_canonical"):
             manual_series.append(row)
         else:
             ready.append(row)
 
-    return ready, manual_variant, manual_series
+    return ready, manual_variant, manual_series, quarantined
 
 
 def _format_price(value: Any) -> str:

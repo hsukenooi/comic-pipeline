@@ -5,6 +5,7 @@ import argparse
 import importlib.metadata
 import json
 import logging
+import os
 import sys
 from typing import Any, Optional
 
@@ -31,10 +32,12 @@ from locg.commands import (
     cmd_collection_export,
     cmd_collection_has,
     cmd_collection_import,
+    cmd_collection_quarantine,
     cmd_collection_record_win,
     cmd_collection_remediate_delete,
     cmd_collection_remediate_set_copies,
     cmd_collection_status,
+    cmd_collection_unquarantine,
     cmd_comic,
     cmd_creator_run_lookup,
     cmd_find,
@@ -421,6 +424,47 @@ def create_parser() -> argparse.ArgumentParser:
     p_rem_set_count.add_argument("--delta", type=int, help="Adjust copies-owned by this signed amount")
     p_rem_set.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview the op without mutating")
 
+    # collection quarantine / unquarantine — the BUI-647 row state, set + lifted (BUI-648)
+    _QUARANTINE_IDENTITY_HELP = (
+        "The row is named by its full identity — --publisher, --series, "
+        "--full-title, --release-date — and exactly one row must match; two "
+        "matches is refused before any write. Never keyed on gixen_item_id: a "
+        "lot or run bought together shares one across every issue in it "
+        "(BUI-500). An omitted field matches a null/empty field on the row."
+    )
+    p_quar = coll_sub.add_parser(
+        "quarantine",
+        parents=[common],
+        help="Hide ONE collection row from every ownership/wish matcher, without deleting it",
+        epilog=(
+            f"{_QUARANTINE_IDENTITY_HELP} The row stays fully present in the "
+            "owned-safe export layer — a quarantined row is still a book you "
+            "OWN, and dropping it there is the BUI-122 delete path. "
+            "--reason/--ticket/--by are all required: a quarantine nobody can "
+            "attribute is one nobody can safely lift. Refused when it would "
+            "hide the LAST owned copy of a book (`collection check` would then "
+            "report it not-owned and the buy path would re-buy it); --force "
+            "overrides that and requires --force-reason. Reverse with "
+            "`collection unquarantine`."
+        ),
+    )
+    p_unquar = coll_sub.add_parser(
+        "unquarantine",
+        parents=[common],
+        help="Lift the quarantine from ONE collection row, restoring it to the matchers",
+        epilog=_QUARANTINE_IDENTITY_HELP,
+    )
+    for _p in (p_quar, p_unquar):
+        _p.add_argument("--publisher", dest="publisher_name", help="Exact publisher_name to match")
+        _p.add_argument("--series", dest="series_name", help="Exact series_name to match (volume decoration folded)")
+        _p.add_argument("--full-title", dest="full_title", required=True, help="Exact full_title to match")
+        _p.add_argument("--release-date", dest="release_date", help="Exact release_date to match")
+        _p.add_argument("--by", help="Who is making the change (defaults to $USER)")
+    p_quar.add_argument("--reason", required=True, help="Why this row must stop answering matches")
+    p_quar.add_argument("--ticket", required=True, help="Ticket this quarantine is filed under (e.g. BUI-648)")
+    p_quar.add_argument("--force", action="store_true", help="Override the last-owned-row guard (requires --force-reason)")
+    p_quar.add_argument("--force-reason", dest="force_reason", help="Why hiding the last owned copy is safe; stored on the row")
+
     # pull-list
     p = sub.add_parser("pull-list", parents=[common], help="View your pull list (requires login)")
     p.add_argument("--title", help="Filter results by title (case-insensitive substring match)")
@@ -687,6 +731,7 @@ def main() -> None:
         "import", "export", "status", "check", "check-batch", "doctor", "record-win",
         "audit-pending", "audit-unscoped-lookup", "audit-metron-mismatch",
         "remediate-delete", "remediate-set-copies", "backfill",
+        "quarantine", "unquarantine",
     }
     _collection_sub = (
         getattr(args, "collection_command", None)
@@ -875,6 +920,33 @@ def main() -> None:
                     dry_run=getattr(args, "dry_run", False),
                 )
                 if result.get("status") not in ("ok", "preview"):
+                    output(result, pretty=args.pretty, fields=fields)
+                    sys.exit(1)
+            elif sub_cmd in ("quarantine", "unquarantine"):
+                # BUI-648. Identity kwargs are shared; only `quarantine` carries
+                # the marker fields and the guard override.
+                identity = {
+                    "publisher_name": getattr(args, "publisher_name", None),
+                    "series_name": getattr(args, "series_name", None),
+                    "full_title": getattr(args, "full_title", None),
+                    "release_date": getattr(args, "release_date", None),
+                }
+                # `by` is the marker's attribution field and must be non-empty;
+                # the login name is the honest answer for a CLI invocation, and
+                # the server path passes its own `by` through the endpoint.
+                by = getattr(args, "by", None) or os.environ.get("USER") or "cli"
+                if sub_cmd == "quarantine":
+                    result = cmd_collection_quarantine(
+                        **identity,
+                        reason=getattr(args, "reason", "") or "",
+                        ticket=getattr(args, "ticket", "") or "",
+                        by=by,
+                        force=getattr(args, "force", False),
+                        force_reason=getattr(args, "force_reason", None),
+                    )
+                else:
+                    result = cmd_collection_unquarantine(**identity, by=by)
+                if result.get("status") != "ok":
                     output(result, pretty=args.pretty, fields=fields)
                     sys.exit(1)
             else:
