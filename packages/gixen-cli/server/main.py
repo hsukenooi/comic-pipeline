@@ -1438,10 +1438,25 @@ async def _sniper_loop() -> None:
 #   post-end deadline, and that ordering is load-bearing: it makes "no outcome
 #   for 4 cycles" unstateable from observations older than 3, so the watchdog
 #   can never blame Gixen for a silence that is really our own sync being dead.
+#
+# _WATCHDOG_UNKNOWN_END_DEADLINE (4 cycles, BUI-627) — how long a PENDING row
+#   may sit with NULL auction_end_at before that absence becomes an alert in
+#   its own right, clocked on `added_at` rather than `auction_end_at` (there is
+#   no end to measure against). Sized identically to _WATCHDOG_POST_END_DEADLINE
+#   and for the same reasons, because the two normal paths that fill an end
+#   share its structure: one cycle for the ordinary case (Gixen's own
+#   time_to_end string is read on the first sync after add), one more for the
+#   BUI-417 one-cycle re-add-safety deferral the vanished-with-NULL-end path
+#   uses, plus two cycles of flapping slack (BUI-562: ~16 minutes across six
+#   consecutive failures). Fewer cycles would fire on rows still working
+#   through that ordinary path; more would leave the BUI-627 hole (ebay-fetch
+#   unavailable) unreported for longer than the structurally identical
+#   missing_outcome deadline tolerates for "no evidence arrived yet."
 _WATCHDOG_PRE_END_WINDOW = timedelta(seconds=3 * SYNC_INTERVAL)
 _WATCHDOG_VANISH_CONFIRM = timedelta(seconds=SYNC_INTERVAL)
 _WATCHDOG_POST_END_DEADLINE = timedelta(seconds=4 * SYNC_INTERVAL)
 _WATCHDOG_SYNC_STALE_AFTER = timedelta(seconds=3 * SYNC_INTERVAL)
+_WATCHDOG_UNKNOWN_END_DEADLINE = timedelta(seconds=4 * SYNC_INTERVAL)
 
 
 def _classify_watchdog_row(
@@ -1462,6 +1477,13 @@ def _classify_watchdog_row(
         NULL-end row is exactly the BUI-85/BUI-417 deferral case, which is
         *supposed* to sit PENDING for a cycle. Reported as context, never as an
         alert; the row becomes judgeable the moment an end is captured.
+    ``stale_unknown_end``
+        PENDING with no captured auction_end_at AND has stayed that way for at
+        least _WATCHDOG_UNKNOWN_END_DEADLINE since `added_at` (BUI-627). The
+        BUI-85/BUI-417 deferral above is supposed to resolve within a cycle or
+        two; still NULL-end after the deadline means neither the ordinary
+        Gixen-scrape path nor the eBay-fallback disambiguation path ever ran to
+        completion (commonly: ebay-fetch is unavailable) — THIS check's alert.
     ``ok``
         Live, present on Gixen (or not yet near enough to its end to care).
 
@@ -1469,10 +1491,41 @@ def _classify_watchdog_row(
     ``max(auction_end_at, uptime_floor)``, so an auction that ended while the
     server was down does not alarm the instant it comes back: the resolution
     machinery gets its full deadline of actual uptime to do its job first.
+
+    The stale_unknown_end clock (below) applies the identical uptime-floor
+    fairness to `added_at` instead, for the identical reason: the sync loop has
+    to be UP to ever fill an end, so a NULL-end row that predates a restart
+    gets the restart's full uptime before its silence counts against it.
     """
     end_dt = _parse_iso_utc(row["auction_end_at"])
     if end_dt is None:
-        return "unknown_end", None
+        # BUI-627: clock the NULL-end row on `added_at` — the only timestamp it
+        # has — rather than on auction_end_at, which is exactly what's missing.
+        added_dt = _parse_iso_utc(row["added_at"])
+        if added_dt is None:
+            return "unknown_end", None  # can't clock it — fail open, no alarm
+        stale_from = added_dt
+        if uptime_floor_dt is not None and uptime_floor_dt > stale_from:
+            stale_from = uptime_floor_dt
+        if now_dt - stale_from < _WATCHDOG_UNKNOWN_END_DEADLINE:
+            return "unknown_end", None
+        seconds_since_added = int((now_dt - added_dt).total_seconds())
+        return "stale_unknown_end", {
+            "bid_id": row["id"],
+            "item_id": row["item_id"],
+            "title": row["ebay_title"],
+            "auction_end_at": row["auction_end_at"],
+            "local_snipe_result": row["local_snipe_result"],
+            "kind": "stale_unknown_end",
+            "added_at": row["added_at"],
+            "seconds_since_added": seconds_since_added,
+            "detail": (
+                f"added {seconds_since_added // 60}m ago and still has no "
+                "captured auction end — ebay-fetch may be unavailable, or the "
+                "snipe vanished from Gixen before any end time was ever "
+                "observed. Check the listing on eBay directly."
+            ),
+        }
     base = {
         "bid_id": row["id"],
         "item_id": row["item_id"],
@@ -1593,15 +1646,25 @@ def _build_snipe_watchdog_report(
     # bids history table — the cost BUI-418 moved a full get_all_bids() scan
     # out of the write lock to avoid. Verified via EXPLAIN QUERY PLAN:
     # "SCAN bids USING INDEX idx_bids_pending_item_id".
+    #
+    # `added_at` (BUI-627) is the one existing-line touch this ticket makes to
+    # this query — it's the clock the new stale_unknown_end check runs on, and
+    # it's a column already on every bids row (DEFAULT (datetime('now')),
+    # never NULL on insert), so adding it costs nothing extra: still one
+    # statement, same index, same scan.
     rows = conn.execute(
         "SELECT id, item_id, ebay_title, auction_end_at, gixen_vanished_at, "
-        "local_snipe_result FROM bids WHERE status = 'PENDING'"
+        "local_snipe_result, added_at FROM bids WHERE status = 'PENDING'"
     ).fetchall()
 
     alerts: list[dict] = []
     counts = {"ok": 0, "unknown_end": 0, "vanished_before_end": 0, "missing_outcome": 0}
     for row in rows:
         bucket, alert = _classify_watchdog_row(row, now_dt, uptime_floor_dt)
+        # BUI-627: stale_unknown_end is a bucket _classify_watchdog_row can
+        # return that isn't seeded in the counts literal above — setdefault
+        # instead of adding a key there so that line stays untouched.
+        counts.setdefault(bucket, 0)
         counts[bucket] += 1
         if alert is not None:
             alerts.append(alert)
@@ -1647,6 +1710,7 @@ def _build_snipe_watchdog_report(
             "pre_end_window_seconds": int(_WATCHDOG_PRE_END_WINDOW.total_seconds()),
             "vanish_confirm_seconds": int(_WATCHDOG_VANISH_CONFIRM.total_seconds()),
             "post_end_deadline_seconds": int(_WATCHDOG_POST_END_DEADLINE.total_seconds()),
+            "unknown_end_deadline_seconds": int(_WATCHDOG_UNKNOWN_END_DEADLINE.total_seconds()),
         },
     }
 

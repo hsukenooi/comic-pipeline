@@ -46,6 +46,10 @@ def _row(**over):
         "auction_end_at": (NOW + CYCLE).isoformat(),
         "gixen_vanished_at": None,
         "local_snipe_result": None,
+        # BUI-627: freshly added by default so the existing unknown_end tests
+        # exercise ONLY the end-time question, not the new added_at staleness
+        # clock — tests of that clock override this explicitly.
+        "added_at": NOW.isoformat(),
     }
     base.update(over)
     return base
@@ -168,6 +172,81 @@ def test_an_unparseable_end_does_not_raise():
     assert (bucket, alert) == ("unknown_end", None)
 
 
+# --------------------------------------------------------------------------
+# BUI-627: the unknown_end deadline — a NULL end that never gets captured
+# --------------------------------------------------------------------------
+
+def test_a_null_end_row_just_inside_the_deadline_is_still_quiet():
+    """Just inside _WATCHDOG_UNKNOWN_END_DEADLINE since added_at: still the
+    ordinary BUI-85/BUI-417 deferral window, not yet the BUI-627 alarm."""
+    bucket, alert = _classify(
+        auction_end_at=None,
+        added_at=(NOW - smain._WATCHDOG_UNKNOWN_END_DEADLINE + CYCLE).isoformat(),
+    )
+    assert (bucket, alert) == ("unknown_end", None)
+
+
+def test_a_null_end_row_just_past_the_deadline_is_the_alert():
+    """Just past the deadline: neither the ordinary Gixen-scrape path nor the
+    eBay-fallback disambiguation ever filled an end — the row itself is now
+    the alarm, THE ticket's alert."""
+    bucket, alert = _classify(
+        auction_end_at=None,
+        added_at=(NOW - smain._WATCHDOG_UNKNOWN_END_DEADLINE - CYCLE).isoformat(),
+    )
+    assert bucket == "stale_unknown_end"
+    assert alert["kind"] == "stale_unknown_end"
+    assert alert["item_id"] == "111111111"
+    assert alert["seconds_since_added"] > smain._WATCHDOG_UNKNOWN_END_DEADLINE.total_seconds()
+
+
+def test_an_added_at_that_cannot_be_parsed_does_not_raise():
+    """Same fail-open philosophy as an unparseable auction_end_at: a value we
+    can't trust must never become an alarm we can't justify."""
+    bucket, alert = _classify(auction_end_at=None, added_at="not-a-timestamp")
+    assert (bucket, alert) == ("unknown_end", None)
+
+
+def test_a_naive_added_at_is_read_as_utc_not_a_crash():
+    """bids.added_at is SQLite's own DEFAULT (datetime('now')), which renders
+    naive ('YYYY-MM-DD HH:MM:SS', no offset) — every real row's added_at looks
+    like this, not like an aware isoformat() string. A naive/aware comparison
+    would raise TypeError and 500 the endpoint."""
+    bucket, alert = _classify(
+        auction_end_at=None,
+        added_at=(NOW - smain._WATCHDOG_UNKNOWN_END_DEADLINE - CYCLE)
+        .replace(tzinfo=None).isoformat(sep=" "),
+    )
+    assert bucket == "stale_unknown_end"
+
+
+def test_a_null_end_row_added_before_a_restart_gets_the_uptime_floor_grace():
+    """Mirrors test_an_auction_that_ended_while_the_server_was_down_does_not_
+    alarm_on_restart: the sync loop has to be UP to ever fill an end, so a
+    NULL-end row added long ago but only recently observed (server just
+    restarted) gets the restart's full uptime before its silence counts."""
+    just_started = NOW - CYCLE
+    bucket, alert = smain._classify_watchdog_row(
+        _row(auction_end_at=None, added_at=(NOW - timedelta(days=3)).isoformat()),
+        NOW,
+        just_started,
+    )
+    assert (bucket, alert) == ("unknown_end", None)
+
+
+def test_the_restart_grace_expires_rather_than_suppressing_forever_for_unknown_end():
+    started = NOW - smain._WATCHDOG_UNKNOWN_END_DEADLINE - CYCLE
+    bucket, alert = smain._classify_watchdog_row(
+        _row(auction_end_at=None, added_at=(NOW - timedelta(days=3)).isoformat()),
+        NOW,
+        started,
+    )
+    assert bucket == "stale_unknown_end"
+    # Reported elapsed is measured from added_at, not the grace floor — a
+    # human needs to know the row has been unaccounted for three days.
+    assert alert["seconds_since_added"] > 3 * 86400 - 60
+
+
 def test_a_naive_sqlite_timestamp_is_read_as_utc_not_a_crash():
     """bids timestamps are UTC, but SQLite's own defaults render naive. A
     naive/aware comparison would raise TypeError and 500 the endpoint."""
@@ -191,6 +270,7 @@ def test_every_window_is_a_multiple_of_the_sync_interval():
         smain._WATCHDOG_VANISH_CONFIRM,
         smain._WATCHDOG_POST_END_DEADLINE,
         smain._WATCHDOG_SYNC_STALE_AFTER,
+        smain._WATCHDOG_UNKNOWN_END_DEADLINE,
     ):
         assert window.total_seconds() % smain.SYNC_INTERVAL == 0
 
@@ -200,6 +280,14 @@ def test_the_observation_gate_is_tighter_than_the_post_end_deadline():
     from observations older than 3, so the watchdog can never blame Gixen for a
     silence that is really our own sync being dead."""
     assert smain._WATCHDOG_SYNC_STALE_AFTER < smain._WATCHDOG_POST_END_DEADLINE
+
+
+def test_the_observation_gate_is_tighter_than_the_unknown_end_deadline():
+    """Same ordering invariant as above, applied to the BUI-627 check: the
+    watchdog must never blame a NULL-end row's silence on its own stale sync
+    either — sync_stale's generic suppression only makes that true if this
+    deadline, too, sits strictly outside the staleness window."""
+    assert smain._WATCHDOG_SYNC_STALE_AFTER < smain._WATCHDOG_UNKNOWN_END_DEADLINE
 
 
 # --------------------------------------------------------------------------
@@ -218,12 +306,23 @@ def db(db_path):
     conn.close()
 
 
-def _seed(conn, item_id, status, *, end_at=None, vanished_at=None):
-    conn.execute(
-        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, gixen_vanished_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (item_id, 20.0, status, end_at, vanished_at),
-    )
+def _seed(conn, item_id, status, *, end_at=None, vanished_at=None, added_at=None):
+    # added_at defaults to None, which leaves the DB's own
+    # `datetime('now')` default in place (real wall-clock time) — pass it
+    # explicitly (BUI-627) to seed a row at a known age relative to the
+    # fixture NOW.
+    if added_at is None:
+        conn.execute(
+            "INSERT INTO bids (item_id, max_bid, status, auction_end_at, gixen_vanished_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (item_id, 20.0, status, end_at, vanished_at),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO bids (item_id, max_bid, status, auction_end_at, "
+            "gixen_vanished_at, added_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (item_id, 20.0, status, end_at, vanished_at, added_at),
+        )
     conn.commit()
 
 
@@ -318,6 +417,41 @@ def test_the_report_names_the_windows_it_judged_by(db):
     assert windows["post_end_deadline_seconds"] == int(
         smain._WATCHDOG_POST_END_DEADLINE.total_seconds()
     )
+    assert windows["unknown_end_deadline_seconds"] == int(
+        smain._WATCHDOG_UNKNOWN_END_DEADLINE.total_seconds()
+    )
+
+
+def test_a_stale_null_end_row_is_the_alert_end_to_end(db):
+    """The whole pipeline, not just the pure classifier: a NULL-end row seeded
+    with an old added_at surfaces as stale_unknown_end through the real SELECT
+    (which BUI-627 extends with added_at) and the report's counts/alerts. Uses
+    the naive 'YYYY-MM-DD HH:MM:SS' format SQLite's own added_at DEFAULT
+    actually writes, not an aware isoformat() string."""
+    stale_added_at = (
+        (NOW - smain._WATCHDOG_UNKNOWN_END_DEADLINE - CYCLE)
+        .replace(tzinfo=None).isoformat(sep=" ")
+    )
+    _seed(db, "666666666", "PENDING", added_at=stale_added_at)
+    report = _report(db)
+    assert report["counts"]["stale_unknown_end"] == 1
+    assert [a["kind"] for a in report["alerts"]] == ["stale_unknown_end"]
+    assert report["healthy"] is False
+
+
+def test_a_fresh_null_end_row_is_quiet_end_to_end(db):
+    """The boundary's other side, also through the real pipeline: a NULL-end
+    row still inside the deadline stays in the unquiet-context bucket and
+    raises nothing. Same naive added_at format as above."""
+    fresh_added_at = (
+        (NOW - smain._WATCHDOG_UNKNOWN_END_DEADLINE + CYCLE)
+        .replace(tzinfo=None).isoformat(sep=" ")
+    )
+    _seed(db, "777777777", "PENDING", added_at=fresh_added_at)
+    report = _report(db)
+    assert report["counts"]["unknown_end"] == 1
+    assert report["alerts"] == []
+    assert report["healthy"] is True
 
 
 # --------------------------------------------------------------------------
