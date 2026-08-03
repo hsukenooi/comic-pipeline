@@ -1161,13 +1161,41 @@ def _fetch_with_fallback(nkw: str, api_key: str, *, force: bool = False,
 # damage exclusion with no analog in comic_identity: it isn't about comic
 # *identity* at all, so it stays local to the FMV comp pipeline.
 
+# BUI-668: the signature branch is a bare word-bounded `signed`, not `signed by`.
+# `signed by` let a bare "Signed <name>" copy into the pool — a signed/COA copy
+# is not comparable to a raw one, and the class is systematically dearer than the
+# pools it lands in (measured: 2.22x the pool median, 84 of 99 members above it).
+# The word boundary is load-bearing and does most of the precision work on its
+# own: it rejects "DESIGN"/"Designs", "unsigned", and "METAL SIGN". The one
+# residual false positive the corpus holds is a seller advertising a book as
+# "NOT signed", hence the fixed-width negative lookbehind.
+#
+# Measured over the offline corpus at ~/.cache/ebay-sold-comps (518 cached
+# responses, 483 of them yielding a priced pool) — BUI-668: agrees with the
+# hand-labelled class on all 13,876 surviving comps at 0 disagreements, excludes
+# 99 comps, re-admits 0 (so dropping `signed\s+by` regresses nothing), and moves
+# max_bid DOWN 12 / UP 4 across the CGC ladder — net -$45, the cap-protecting
+# direction. It is the first class in this ticket sequence to register on the
+# sharp test (8 members above their pool's Q75 at >=3x its median; BUI-629 and
+# BUI-667 both scored 0), including a $132.50 comp at 18.9x its pool median.
+# The three BUI-603 sentinel books are unaffected (depth 105->103 / 62->62 /
+# 88->88, all three medians unchanged), so the probe's bounds do not move.
+#
+# NOT fixed here, deliberately: `restored` also matches inside "unrestored".
+# That false positive is real and precision 1.000 fixable via `(?<!un)restored`,
+# but it was measured at 1 of 483 priced pools moving, UP +28.6% (max_bid
+# $60 -> $70), net +$95 cap-RAISING across the ladder. A correct-on-identity fix that
+# only raises caps buys no downside protection — see BUI-668 and
+# docs/solutions/best-practices/size-the-oracle-ceiling-before-designing-a-classifier.md
+# ("Which side of the pool median does the class sit on?"). Do not "fix" it
+# without re-measuring.
 LOCAL_EXCLUDE_RE = re.compile(
     r'''
     coverless | no\s+cover | cover\s+torn | cvr\s+off | detached\s+cover |
     missing\s+pages? | missing\s+pin | missing\s+wrap |
     vol[\s.]?[2-9] | \bv[2-9]\b |
     \bpsa\b | \bpgx\b |
-    signed\s+by | stan\s+lee.*sign | signature\s+series |
+    (?<!not\s)\bsigned\b | \bautograph | stan\s+lee.*sign | signature\s+series |
     ww\s+live\s+sale | space\s+filler | restored | water.?stain
     ''',
     re.IGNORECASE | re.VERBOSE,

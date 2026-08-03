@@ -289,6 +289,72 @@ class TestHardExclude:
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)
 
+    @pytest.mark.parametrize("title", [
+        # BUI-668: the gap that motivated the fix — a bare "Signed <name>" that
+        # `signed\s+by` never matched, so a signed/COA copy entered a raw pool.
+        # This exact listing is the BUI-665 IQR re-admit that surfaced the class.
+        "Wolverine #75 (1993 Marvel Comics) NM Signed Adam Kubert w/ COA DF #2589/7500",
+        # The same class at the money end: 18.9x its pool's median.
+        "X-Force #11 Deadpool! NM- 1st Appearance Domino! Signed Stan Lee & Rob Liefeld!",
+        # Leading-position and all-caps forms.
+        "Signed X-Men '97 #1 (Marvel Comics May 2024) Whatnot Gold Foil. LTD. 50 NM",
+        "SIGNED! Todd McFarlane Detective Comics #576 DC Comics 1987 VF Batman Year Two",
+        # `autograph`, the other way a signature is advertised.
+        "X-MEN #13 CGC 6.0 OW-W 1965 KIRBY, Goldberg autograph/signature 2nd JUGGERNAUT",
+        # Must stay excluded: the pre-BUI-668 `signed by` form still fires.
+        "1991 Incredible Hulk #377 Signed By DALE KEOWN & PETER DAVID Comic Book Marvel",
+    ])
+    def test_signed_copies_are_excluded(self, title):
+        """BUI-668: a signed/COA copy is not comparable to a raw one.
+
+        `signed\\s+by` matched only one phrasing. The class is systematically
+        dearer than the pools it lands in (2.22x the pool median, 84 of 99
+        members above it) and is the first in this ticket sequence to register
+        on the sharp test, so excluding it is cap-LOWERING: measured over the
+        offline corpus at max_bid DOWN 12 / UP 4 across the CGC ladder.
+        """
+        assert sc.hard_exclude(title)
+
+    @pytest.mark.parametrize("title", [
+        # BUI-668: the word boundary does the precision work. "DESIGN" and
+        # "Designs" contain "sign"; an unbounded token would sweep them in.
+        "X-Men #21 (DESIGN VARIANT) COMIC BOOK ~ Marvel Comics",
+        "Ultimate X-Men #15 Peach Momoko Design Cover RI 1:10 RAT Marvel Comics July 2025",
+        "WATCHMEN 1st Edition Hardcover (1987) | Graphitti Designs Slipcase | Alan Moore",
+        # "unsigned" is the token's own opposite — \b already rejects it.
+        "X-Men 100 unsigned raw copy",
+        # A metal wall SIGN, not a signature.
+        "The Uncanny X-Men #94 NEW METAL SIGN: Count Nefaria - The New X-Men",
+        # The one residual false positive in the corpus, and the reason the
+        # branch carries a negative lookbehind: the seller is advertising that
+        # the book is NOT signed, which makes it a GOOD raw comp at $174.50.
+        "Batman #251 - Neal Adams & Denny O'Neil - 1973 - NOT signed - KEY - FREE SHIP",
+    ])
+    def test_signed_lookalikes_are_kept(self, title):
+        """BUI-668: precision guard on the signature branch.
+
+        Measured at 0 disagreements against the hand-labelled class over all
+        13,876 surviving corpus comps; dropping `signed\\s+by` for the bounded
+        token re-admits 0 of the 16,825 comps the corpus holds.
+        """
+        assert not sc.hard_exclude(title)
+
+    @pytest.mark.parametrize("title,excluded", [
+        # BUI-668 measured-but-not-shipped: `restored` still matches inside
+        # "unrestored", so these two genuine raw comps stay dropped. The fix
+        # (`(?<!un)restored`) is precision 1.000 but moved only 1 of 483 pools,
+        # UP +28.6% — cap-RAISING, which buys no downside protection. Pinned so
+        # the known-wrong behavior is deliberate and a future change is a
+        # visible decision rather than an accident.
+        ("X-Men #54 in VF+ 8.5 COND from 1969! Marvel very fine unrestored C166", True),
+        ("X-MEN 54 VF+ 8.5 UNRESTORED", True),
+        # The genuinely restored books this branch exists for.
+        ("Captain America #100 VG- 3.5 RESTORED 1968", True),
+        ("Fantastic Four 50 - Marvel Silver Age Key Cover, F/F+, Restored", True),
+    ])
+    def test_restored_token_is_still_substring_matched(self, title, excluded):
+        assert sc.hard_exclude(title) is excluded
+
     def test_spaced_run_rule_stays_comp_only(self):
         """BUI-637/BUI-239: the new rule must never reach the purchase path.
 
