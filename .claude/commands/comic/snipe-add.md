@@ -230,25 +230,37 @@ gixen list
 | 1 | Amazing Spider-Man #300 | 123456789 | $800 | ✅ Added |
 | 2 | Invincible #1 | 987654321 | $256 | ❌ Failed (server 503 — not added) |
 | 3 | Batman #608 | 555555555 | — | ⏭️ Skipped (BIN) |
+| 4 | X-Men #1 | 444444444 | $2500 | 🚫 Blocked (Blocked by policy check(s): over_fmv. — not added) |
 ```
 
-Status values: `✅ Added`, `❌ Failed (<reason> — not added)`, `⏭️ Skipped (BIN)`, and `⏸️ Not attempted` for items after a batch-halting failure. End with an added/failed/remaining count.
+Status values: `✅ Added`, `❌ Failed (<reason> — not added)`, `🚫 Blocked (<reason> — not added)` (a policy check's `POLICY_BLOCK_<CODE>` flag is on — see § Handling Policy Advisories), `⏭️ Skipped (BIN)`, and `⏸️ Not attempted` for items after a batch-halting failure. End with an added/failed/blocked/remaining count.
 
 ## Handling Policy Advisories (BUI-621)
 
-Both `gixen add`/`edit` and `gixen add-batch` surface **policy advisories** — non-fatal, server-side checks (the comics server's pre-trade policy checks, e.g. an exposure ceiling or an FMV-derived check that came back unable to evaluate) run at add/edit time. An advisory never blocks the write — the snipe is already recorded by the time one appears — but it must never be silently swallowed:
+Both `gixen add`/`edit` and `gixen add-batch` run the comics server's pre-trade policy checks (e.g. an exposure ceiling or an FMV-derived check that came back unable to evaluate — see `packages/gixen-cli/CLAUDE.md` § "Policy checks" for the full six-code list) at add/edit time. By default each check surfaces as a **non-fatal advisory** and the write still lands — but since BUI-623, an operator can flip any individual check's `POLICY_BLOCK_<CODE>` env var on (off by default, gated behind a soak review — see that same section), and a failing check then **blocks the write outright** with a 409 instead of landing with an advisory. **Whether a given check can block is a per-check, operator-set setting, not something snipe-add controls or can assume either way** — check the row's status (`🚫 Blocked` vs. a landed status carrying an advisory) rather than assuming advisories never block. Neither an advisory nor a block may ever be silently swallowed:
 
-- **`gixen add` / `gixen edit`** print each advisory to stderr, one line per advisory (`code` + `message`), immediately **after** the command's own success line. They never change the exit code and never appear at all in direct-Gixen mode (no `COMICS_SERVER_URL` — there is no server response to carry advisories in the first place).
-- **`gixen add-batch`** marks each affected row in the human table with an advisory-count suffix on that row's status cell, carries the row's full advisories verbatim in the JSON summary (`rows[].advisories`), and prints an end-of-run count whenever any row carried one. A batch is never allowed to read as clean just because every row landed — check the end-of-run count, not only the per-row statuses.
+- **`gixen add` / `gixen edit`** print each advisory to stderr, one line per advisory (`code` + `message`), immediately **after** the command's own success line — the write already landed. They never change the exit code in that case, and advisories never appear at all in direct-Gixen mode (no `COMICS_SERVER_URL` — there is no server response to carry advisories in the first place). A **blocked** write instead prints `Error: <message>` (plus the same advisory detail) and **exits non-zero** — there is no success line, because nothing was written.
+- **`gixen add-batch`** marks each affected row in the human table with an advisory-count suffix on that row's status cell, or with `🚫 Blocked (<message>)` for a blocked row (see Output above), carries the row's full advisories verbatim in the JSON summary (`rows[].advisories`), and prints an end-of-run count whenever any row carried one. A batch is never allowed to read as clean just because every row landed — check the end-of-run count and the blocked count, not only the per-row statuses. **A `BLOCKED` row does not halt the batch** the way a server-down failure does (§ Handling a failed add) — remaining rows still run — but it does make `gixen add-batch`'s own exit code non-zero, the same as a `failed` or `not_attempted` row (`docs/solutions/conventions/add-batch-row-status-contract.md` is the full row-status contract).
 
-**Before declaring the add/edit step done, surface every advisory to the user** — the same gate discipline as a failed add (§ Handling a failed add). For each advisory:
+**Before declaring the add/edit step done, surface every advisory and every block to the user** — the same gate discipline as a failed add (§ Handling a failed add).
+
+For an **advisory** (the write landed):
 
 1. **Read the message** — it names what the check flagged, and `data` (in the JSON form) carries whatever numbers back it.
 2. **Choose a remediation:**
    - `gixen edit {item_id} {new_max_bid}` — lower the bid if the advisory is bid-driven.
    - `gixen remove {item_id}` — drop the snipe entirely if the advisory shows it shouldn't have been added.
-   - **Acknowledge and proceed** — a deliberate, user-made call that the flagged risk is acceptable as-is. There is no CLI bypass flag for this yet (advisories are v1/advisory-only by design); "acknowledge" here means the user consciously decided, not an automated action.
+   - **Acknowledge and proceed** — a deliberate, user-made call that the flagged risk is acceptable as-is. An advisory never blocked the write in the first place, so there is nothing to bypass; "acknowledge" here means the user consciously decided, not an automated action.
 3. Don't re-run the same add/edit hoping the advisory disappears — it reflects the bid the server just wrote, not a transient condition.
+
+For a **block** (`🚫 Blocked` — unlike an advisory, **the write did not land**):
+
+1. **`gixen edit`/`gixen remove` are the wrong remediation here** — there is no live snipe to edit or remove; the row was never recorded.
+2. **Read the error** — it names the blocking check(s) the same way an advisory would (e.g. `Blocked by policy check(s): over_fmv.`).
+3. **Choose a remediation:**
+   - Lower the max bid and re-add if the block was bid-driven (e.g. `over_fmv`), or clear whatever condition the check flagged (link the correct FMV, resolve a duplicate, etc.) and re-add.
+   - To deliberately commit past the block instead, use the same bypass an advisory never needed: `gixen add`/`gixen edit --ack-policy` for a single item, or a per-row `"policy_bypass": true` in an add-batch ROWS_FILE — a conscious, user-made override, not an automated one.
+4. Confirm the retry actually landed (`✅ Added`/`🔄 Updated`) before moving on — a block that recurs after a bid-lowering retry means the check is still failing, not that the retry itself failed.
 
 ## Editing Existing Snipes
 

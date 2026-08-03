@@ -25,6 +25,7 @@ enforced_by_test:
   - packages/gixen-cli/tests/test_add_batch.py::test_add_one_row_link_failure_does_not_demote_status
   - packages/gixen-cli/tests/test_cli_add_batch.py::test_add_batch_ae9_blocked_row_continues_batch_with_two_added
   - plugins/gixen-overlay/tests/test_skill_contracts.py::test_snipe_add_documents_failed_add_policy
+  - plugins/gixen-overlay/tests/test_skill_contracts.py::test_snipe_add_documents_blocked_status_and_remediation
 tags: [add-batch, row-status, exit-code, BUI-360, BUI-168, BUI-623, policy-block, gixen-cli]
 ---
 
@@ -200,10 +201,13 @@ partially-blocked or partially-halted batch as fully successful — silently ski
   rule), continues (BLOCKED's rule), or needs a third rule of its own; don't let it default
   to whichever `run_batch()` happens to do today.
 - Editing `snipe-add.md` or `buy.md`'s status-table / advisory-handling sections — keep the
-  prose in sync with this contract rather than re-deriving it from memory. **Known gap as
-  of this writing:** `snipe-add.md`'s "Handling Policy Advisories" section documents the
-  BUI-621 advisory envelope but does not yet mention `BLOCKED`/🚫 by name, and its Output
-  status-values list omits `blocked` entirely — a follow-up should close that, not this doc.
+  prose in sync with this contract rather than re-deriving it from memory. **Closed by
+  BUI-644:** `snipe-add.md`'s Output status-values list and its "Handling Policy Advisories"
+  section (renamed remediation guidance, not the heading text — `buy.md` cites it by name)
+  now document `blocked`/🚫 and its distinct not-landed remediation (lower the bid and
+  re-add, or clear the blocking condition — never `gixen edit`/`gixen remove`, which assume
+  a live snipe a blocked row doesn't have); `buy.md`'s mirrored advisory paragraph and its
+  non-zero-exit-code explanation were updated the same way.
 
 ## Related
 
