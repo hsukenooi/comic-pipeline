@@ -594,9 +594,30 @@ def _foreign_edition_reject(title: str) -> bool:
 # on condition descriptors.  Facsimile is already handled by _reprint_reject —
 # leave it.  BUI-244.
 
+# BUI-645 split the original single pattern into its two alternations so the
+# comp path can adopt ONE of them.  _LATER_PRINTING_RE is recomposed from the
+# halves below and is behavior-identical to the pre-BUI-645 literal, so
+# _second_print_reject and every caller of it are untouched.
+#
+#   ORDINAL — "this copy IS a later pressing".  The ordinal is what carries the
+#   claim, so the phrase can only describe the copy being sold.
+#
+#   BARE — "reprint"/"reprints".  Ambiguous by construction: it states a
+#   RELATION between the book and some other book, and the title alone does not
+#   say which side of that relation is for sale.  Fine on the purchase path
+#   (where a wish item pins the intended book, so a false reject costs one
+#   skipped listing), NOT fine on the comp path — see the block above
+#   is_comp_excluded's _comp_later_printing_reject call for the corpus
+#   measurement that separates them.
+_LATER_PRINTING_ORDINAL_RE = re.compile(
+    r"(?<!\w)(?:2nd|3rd|4th|5th|second|third|fourth|fifth|later)\s+print(?:ing|s)?(?!\w)",
+    re.IGNORECASE,
+)
+
+_BARE_REPRINT_RE = re.compile(r"(?<!\w)reprints?(?!\w)", re.IGNORECASE)
+
 _LATER_PRINTING_RE = re.compile(
-    r"(?<!\w)(?:2nd|3rd|4th|5th|second|third|fourth|fifth|later)\s+print(?:ing|s)?(?!\w)"
-    r"|(?<!\w)reprints?(?!\w)",
+    f"{_LATER_PRINTING_ORDINAL_RE.pattern}|{_BARE_REPRINT_RE.pattern}",
     re.IGNORECASE,
 )
 
@@ -999,9 +1020,15 @@ def _fmv_run_range_lot(title: str) -> bool:
 #     moves goes UP (20 -> 25) and None -> 5.  And it has a concrete unmeasured
 #     failure shape — a single issue that REPRINTS an arc ("King Size Hulk #1
 #     ... Reprints #180 181", a real corpus title) needs only one more number
-#     to false-fire, and is_comp_excluded does not run _second_print_reject, so
-#     nothing downstream would catch it.  Precision over recall on the money
-#     path; revisit only with corpus evidence, per BUI-347.
+#     to false-fire, and nothing downstream would catch it.  Precision over
+#     recall on the money path; revisit only with corpus evidence, per BUI-347.
+#     BUI-645 UPDATE: this blocker is NOT closed.  BUI-645 wired a later-
+#     printing check into is_comp_excluded, but only the ORDINAL half ("2nd
+#     Print"); the bare "reprint"/"reprints" half — the half that would catch
+#     "Reprints #180 181" — was measured on this same corpus and REJECTED for
+#     the comp path, because it deletes the X-Men #67-93 all-reprint issues'
+#     own comps from their own pools (see _comp_later_printing_reject above).
+#     So the FOUR-member floor still stands on its original reasoning.
 #   - TWO members is measurably UNSAFE and is the reason a count gate exists at
 #     all.  It fires on 27 extra kept titles, and the generators are ordinary
 #     single-issue notation: ratio variants ("Uncanny X-Men #19 1:100" -> 19 1),
@@ -1068,6 +1095,70 @@ def _fmv_spaced_number_run_lot(title: str) -> bool:
     return False
 
 
+# ─── Later-printing comp exclusion (BUI-645) ─────────────────────────────────
+# is_comp_excluded ran _reprint_reject but never _second_print_reject, so a
+# later pressing entered an FMV comp pool priced as if it were a first print.
+# _reprint_reject's lexicon carries only "2nd printing"/"second printing" (the
+# -ing spellings), so "#15 2nd Print", "3rd Print", "Fourth Printing" and
+# "Fifth Printing" all survived.
+#
+# This wires in the ORDINAL half of _second_print_reject ONLY, and deliberately
+# leaves the bare "reprint"/"reprints" half on the purchase path where it
+# already lives.  That split is the whole finding, and it was measured, not
+# assumed, on the same 493-response offline cache as BUI-637 (13,740 kept comps
+# / 10,211 kept unique titles).
+#
+# ORDINAL half — 87 newly-excluded unique titles / 93 comps, 41 grade-bearing.
+#   Precision 1.000 against the only failure that costs money (dropping a
+#   genuine first-print single-issue comp): 0 of 87, all hand-checked.  Every
+#   hit is either a later pressing of the very book being priced, or a lot
+#   bundling a 1st + a later print — neither is a single-issue first-print
+#   comp.  fmv_high moves in 5 of 493 pools at each pool's median comp grade,
+#   all correct: Ghost Rider #15 15->10 (-33%, 14 of that pool's comps are 2nd
+#   prints), Incredible Hulk #377 15->10 (-33%, 12 comps), Watchmen #1 35->30
+#   (-14%), and Absolute Martian Manhunter #1 20->25 / 25->30 (later prints
+#   were cheap and dragging the first-print pool DOWN — removing a comp can
+#   raise fmv_high, because build_pool widens progressively; BUI-646).
+#
+# BARE half — 62 newly-excluded titles, and measurably UNSAFE on the comp path.
+#   X-Men vol.1 #67-93 (1970-1975) were published as all-reprint issues, so
+#   their listings honestly say "reprints #28" — yet each is a genuine, unique,
+#   first-print issue with a real market ($20-$75 here).  The bare token cannot
+#   tell "this copy IS a later pressing" from "this book CONTAINS reprinted
+#   material", so it deletes those books' own comps from their own pools:
+#     X-Men #76  fmv_high 30 -> None   (5 genuine comps dropped -> unpriceable)
+#     X-Men #79  fmv_high 60 -> None   (2 dropped -> unpriceable)
+#     X-Men #72  fmv_high 40 -> 50     (+25% cap on a book whose comps we just
+#                                       deleted — the overbid direction)
+#     X-Men #75  fmv_high None -> 35   (a correctly-unpriceable book gets a
+#                                       price from a thinner pool)
+#   The #76 pool is not emptied — it goes 14 grade-bearing comps to 9.  It goes
+#   unpriceable because the dropped comps (g=3.5/4.5/3.5/6.0/4.5) sat NEAREST
+#   the 4.75 target, so removing them destroys the bracketing that build_pool's
+#   progressive widening needs.  Fewer comps, no price, and on #72 a HIGHER
+#   cap — the non-monotonicity BUI-646 documents, in its costly direction.
+#   Across the CGC-ladder sweep the asymmetry is unambiguous: the bare half is
+#   UP 29 / DOWN 2 cells with 19 more nulled, versus the ordinal half's UP 13 /
+#   DOWN 6 / 1 nulled.  A rule that mostly RAISES caps and destroys pools is
+#   not a comp-exclusion rule.  Same-corpus, same-pass control pair (BUI-637).
+#
+# Keep-list holds: 1,307 kept titles carrying Newsstand / Direct / 1st Print /
+# First Print are untouched by the ordinal half, and 0 of the 12,418 corpus
+# titles use a negation ("not a 2nd print"), so there is no negation trap.
+#
+# Comp-only, per BUI-239: should_reject/hard_reject/_LOT_RE are not touched,
+# and _second_print_reject itself is byte-for-byte unchanged for its purchase-
+# path callers (should_reject step 7, comic_identity_year._classify_edition_kind).
+def _comp_later_printing_reject(title: str) -> bool:
+    """Return True if *title* names an ordinal later printing ("2nd Print").
+
+    The comp-path half of _second_print_reject: ordinal printings only, never
+    the bare "reprint"/"reprints" token.  See the block comment above for the
+    corpus measurement that made that split.  BUI-645.
+    """
+    return bool(_LATER_PRINTING_ORDINAL_RE.search(title or ""))
+
+
 def is_comp_excluded(title: str) -> bool:
     """Return True if *title* should be excluded as an eBay-sold-listing FMV
     comparable (BUI-269 — the single source of truth for
@@ -1092,6 +1183,8 @@ def is_comp_excluded(title: str) -> bool:
     if _fmv_spaced_number_run_lot(title or ""):  # BUI-637: "#655 656 657 658"
         return True
     if _reprint_reject(title):
+        return True
+    if _comp_later_printing_reject(title):  # BUI-645: "#15 2nd Print"
         return True
     if _trading_card_reject(title):
         return True
