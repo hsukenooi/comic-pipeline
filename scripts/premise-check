@@ -896,6 +896,17 @@ def selftest() -> int:
             fh.write(
                 "def fetch_health_state():\n"
                 "    return {'status': 'ok'}\n"
+                "\n"
+                "# canary phrase for premise-check selftest\n"
+            )
+        # A second file sharing pkg/health.py's basename (BUI-641) — needed to
+        # exercise verify_file_locator's "multiple files, cannot disambiguate"
+        # UNVERIFIABLE branch, which a single-basename fixture can never reach.
+        os.makedirs(os.path.join(class_tmpdir, "pkg2"), exist_ok=True)
+        with open(os.path.join(class_tmpdir, "pkg2", "health.py"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "def fetch_health_state_duplicate():\n"
+                "    return {'status': 'ok'}\n"
             )
         # A small route table modeling this repo's own dominant `/api/comics/`
         # namespace (see verify_endpoint's own comment at the top of this
@@ -1023,6 +1034,150 @@ def selftest() -> int:
         # substring-in-source check, before route-similarity logic even runs).
         verdict, _ = classify_endpoint("/api/comics/collection")
         check("classify: endpoint that exists -> CONFIRMED", verdict == CONFIRMED)
+
+        # ------------------------------------------------------------
+        # verify_file_path / verify_file_locator / verify_phrase (BUI-641).
+        # BUI-632 closed classification coverage for verify_endpoint and
+        # verify_symbol only; these three still had extraction coverage
+        # alone (a stray path/locator/phrase getting *parsed out* of
+        # ticket prose was checked, but never that it then classifies
+        # correctly). verify_file_locator is the priority: it is the sole
+        # producer of DRIFTED — "the file exists but the cited line(s)
+        # don't" — the single most common defect class this tool exists
+        # to catch (stale line numbers after a merge).
+
+        def classify_file_path(value: str):
+            c = Candidate("FILE_PATH", value, raw=f"`{value}`")
+            try:
+                return verify_file_path(class_repo, c)
+            except Exception as exc:  # noqa: BLE001 — a raising detector IS the failure being tested for
+                return None, f"verify_file_path raised {exc!r}"
+
+        def classify_file_locator(value: str, lines_spec: str):
+            c = Candidate(
+                "FILE_PATH_LOCATOR", value, raw=f"`{value}:{lines_spec}`", lines_spec=lines_spec
+            )
+            try:
+                return verify_file_locator(class_repo, c)
+            except Exception as exc:  # noqa: BLE001 — a raising detector IS the failure being tested for
+                return None, f"verify_file_locator raised {exc!r}"
+
+        def classify_phrase(value: str):
+            c = Candidate("PHRASE", value, raw=f"`{value}`")
+            try:
+                return verify_phrase(class_repo, c)
+            except Exception as exc:  # noqa: BLE001 — a raising detector IS the failure being tested for
+                return None, f"verify_phrase raised {exc!r}"
+
+        # --- verify_file_path -----------------------------------------
+        # 1. Exact tracked-file match -> CONFIRMED.
+        verdict, _ = classify_file_path("pkg/health.py")
+        check("classify: file_path exact match -> CONFIRMED", verdict == CONFIRMED)
+
+        # 2. A bare directory reference (no file of that exact name, but
+        # files live under it) -> CONFIRMED via the directory-exists branch.
+        verdict, detail = classify_file_path("pkg")
+        check("classify: file_path directory-exists -> CONFIRMED", verdict == CONFIRMED)
+        check(
+            "classify: directory-exists CONFIRMED evidence says so (not the exact-file branch)",
+            isinstance(detail, str) and "directory exists" in detail,
+        )
+
+        # 3. Same basename as pkg/health.py but under a path that was never
+        # tracked ("/" in the claim) -> NEAR_MISS naming the real location(s),
+        # never silently CONFIRMED against the wrong file.
+        verdict, detail = classify_file_path("other_dir/health.py")
+        check("classify: file_path renamed (same basename, wrong dir) -> NEAR_MISS", verdict == NEAR_MISS)
+        check(
+            "classify: file_path NEAR_MISS evidence names an actual location",
+            isinstance(detail, str) and "pkg/health.py" in detail,
+        )
+
+        # 4. Bare filename (no "/" in the claim) matching one or more tracked
+        # files -> CONFIRMED via the "bare filename reference" fallback, the
+        # one CONFIRMED branch distinct from an exact tracked-path match.
+        verdict, detail = classify_file_path("health.py")
+        check("classify: file_path bare filename match -> CONFIRMED", verdict == CONFIRMED)
+        check(
+            "classify: bare-filename CONFIRMED evidence is the fallback branch, not the exact-match branch",
+            isinstance(detail, str) and "bare filename reference" in detail,
+        )
+
+        # 5. Nothing anywhere with this name -> ABSENT (never CONFIRMED —
+        # fail-toward-absent).
+        verdict, _ = classify_file_path("totally_missing_file_xyz.py")
+        check("classify: file_path absent everywhere -> ABSENT", verdict == ABSENT)
+
+        # --- verify_file_locator (the priority: sole DRIFTED producer) --
+        # 1. Resolved file, cited line in bounds -> CONFIRMED.
+        verdict, _ = classify_file_locator("pkg/health.py", "1")
+        check("classify: file_locator in-bounds line -> CONFIRMED", verdict == CONFIRMED)
+
+        # 2. Resolved file, ALL cited lines out of bounds -> DRIFTED (the
+        # "none of the cited line(s) exist" branch).
+        verdict, detail = classify_file_locator("pkg/health.py", "50,60")
+        check("classify: file_locator all-lines-out-of-range -> DRIFTED", verdict == DRIFTED)
+        check(
+            "classify: all-out-of-range DRIFTED evidence says none exist",
+            isinstance(detail, str) and "none of the cited" in detail,
+        )
+
+        # 3. Resolved file, SOME cited lines out of bounds -> DRIFTED (the
+        # partial-mismatch branch — a distinct code path from #2 above: a
+        # ticket citing "routes.py:1,50" when the file only has a few lines
+        # is exactly the stale-line-number-after-a-merge case this verdict
+        # exists to catch).
+        verdict, detail = classify_file_locator("pkg/health.py", "1,50")
+        check("classify: file_locator partial-out-of-range -> DRIFTED", verdict == DRIFTED)
+        check(
+            "classify: partial-out-of-range DRIFTED evidence names the bad line",
+            isinstance(detail, str) and "50" in detail,
+        )
+
+        # 4. File itself doesn't exist anywhere -> ABSENT.
+        verdict, _ = classify_file_locator("totally_missing_file_xyz.py", "10")
+        check("classify: file_locator file absent everywhere -> ABSENT", verdict == ABSENT)
+
+        # 5. Same-basename-wrong-directory shape as verify_file_path's #3,
+        # but through the locator path -> NEAR_MISS, and line numbers are
+        # explicitly NOT re-checked against the guessed file (see the
+        # detail string verify_file_locator emits for this branch).
+        verdict, detail = classify_file_locator("other_dir/health.py", "1")
+        check("classify: file_locator renamed (wrong dir) -> NEAR_MISS", verdict == NEAR_MISS)
+        check(
+            "classify: file_locator NEAR_MISS evidence names an actual location",
+            isinstance(detail, str) and "pkg/health.py" in detail,
+        )
+
+        # 6. Bare filename ("health.py") resolves to TWO tracked files
+        # (pkg/health.py and pkg2/health.py) -> UNVERIFIABLE, cannot
+        # disambiguate which one the cited line refers to.
+        verdict, detail = classify_file_locator("health.py", "1")
+        check("classify: file_locator ambiguous basename -> UNVERIFIABLE", verdict == UNVERIFIABLE)
+        check(
+            "classify: ambiguous-basename UNVERIFIABLE evidence says so explicitly",
+            isinstance(detail, str) and "cannot disambiguate" in detail,
+        )
+
+        # 7. Resolved file, but the lines_spec itself doesn't parse to any
+        # int -> UNVERIFIABLE (a distinct branch from #6: this file resolves
+        # uniquely, the claim's line locator is just unparseable).
+        verdict, detail = classify_file_locator("routes.py", "abc")
+        check("classify: file_locator unparseable lines_spec -> UNVERIFIABLE", verdict == UNVERIFIABLE)
+        check(
+            "classify: unparseable-spec UNVERIFIABLE evidence says so explicitly",
+            isinstance(detail, str) and "could not parse" in detail,
+        )
+
+        # --- verify_phrase ----------------------------------------------
+        # 1. A phrase that appears literally in a tracked code file ->
+        # CONFIRMED (the canary comment planted in pkg/health.py above).
+        verdict, _ = classify_phrase("canary phrase for premise-check selftest")
+        check("classify: phrase found literally -> CONFIRMED", verdict == CONFIRMED)
+
+        # 2. A phrase that appears nowhere -> ABSENT.
+        verdict, _ = classify_phrase("this phrase does not exist anywhere in the fixture")
+        check("classify: phrase absent everywhere -> ABSENT", verdict == ABSENT)
     finally:
         shutil.rmtree(class_tmpdir, ignore_errors=True)
 
