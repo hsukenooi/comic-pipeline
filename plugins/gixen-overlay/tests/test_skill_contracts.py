@@ -341,6 +341,25 @@ def test_snipe_add_documents_failed_add_policy():
     assert "Handling a failed add" in doc, "snipe-add has no mid-batch failure policy"
 
 
+def test_snipe_add_documents_blocked_status_and_remediation():
+    """BUI-644: snipe-add.md's "Handling Policy Advisories" section predates
+    BUI-623's POLICY_BLOCK_<CODE> blocking mode — it used to claim an advisory
+    "never blocks the write" and never mentioned BLOCKED/🚫 at all, and the
+    Output status-values list omitted `blocked` entirely. Assert the skill now
+    documents the BLOCKED status/icon, and — the one place this doc can
+    mislead an operator into a wrong action (see
+    docs/solutions/conventions/add-batch-row-status-contract.md) — that it
+    tells the operator NOT to use the advisory remediations (gixen edit/
+    remove) on a blocked row, since a blocked write never landed and there is
+    nothing to edit or remove."""
+    doc = (SKILLS_DIR / "snipe-add.md").read_text()
+    assert "🚫 Blocked" in doc, "snipe-add output has no Blocked state"
+    assert "gixen edit`/`gixen remove` are the wrong remediation" in doc, (
+        "snipe-add must warn that the advisory remediations (edit/remove) are "
+        "wrong for a blocked row — there is no live snipe to edit or remove"
+    )
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the
