@@ -76,13 +76,26 @@ def test_check_bid_write_hookspec_hookimpl_names_match():
     pm.check_pending()  # raises pluggy.PluginValidationError on any mismatch
 
 
-def test_overlay_stub_hooks_are_inert():
-    """BUI-617 (U3) acceptance: the overlay's check_bid_write/
-    on_bid_write_committed stubs land green independently of the FMV-aware
-    checks that fill them in later (U4) — return [] / no-op, contributing
-    nothing. Exercises the REAL registered hookimpls through pluggy's bulk
-    call (not just calling the methods directly), so a signature mismatch
-    with the hookspec (e.g. a missing/renamed kwarg) would fail here too.
+def test_overlay_hookimpls_match_hookspec_signatures_and_never_raise():
+    """BUI-617 (U3) shipped `check_bid_write` as a stub returning `[]` so
+    this hookspec/hookimpl pairing landed green independently of the
+    FMV-aware checks that fill it in; BUI-620 (U4) has since filled it in
+    with the five real checks (`gixen_overlay.policy`), so it is no longer
+    a no-op — this test's old name/assertion (`test_overlay_stub_hooks_
+    are_inert`, `check_results == [[]]`) is stale and is updated here.
+
+    Exercises the REAL registered hookimpls through pluggy's bulk call (not
+    just calling the methods directly), so a signature mismatch with the
+    hookspec (e.g. a missing/renamed kwarg) would fail here too.
+    `conn=None, intent=None` is a signature-match smoke test, not a
+    realistic call (the host always passes a real open connection and
+    PolicyIntent) — but it doubles as a robustness proof: every one of the
+    five checks hits `intent.trigger`/`intent.item_id` on a None `intent`
+    and raises AttributeError, and `check_bid_write`'s own per-check
+    try/except (KTD1/KTD6) catches each one and downgrades it to
+    `unevaluable` rather than letting any of them propagate — so the call
+    still returns cleanly instead of raising, and no check's failure
+    costs the other four their contribution.
     """
     from gixen.plugins import make_plugin_manager
     from gixen_overlay.plugin import plugin
@@ -91,7 +104,10 @@ def test_overlay_stub_hooks_are_inert():
     pm.register(plugin, name="gixen-overlay")
 
     check_results = pm.hook.check_bid_write(conn=None, intent=None)
-    assert check_results == [[]]
+    assert len(check_results) == 1  # exactly one plugin registered
+    (results,) = check_results
+    assert len(results) == 5  # all five checks ran; none lost to the others' raise
+    assert all(r["outcome"] == "unevaluable" for r in results)
 
     # Notification-only; must not raise and has no return value to assert on.
     pm.hook.on_bid_write_committed(
