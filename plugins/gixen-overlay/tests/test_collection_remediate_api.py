@@ -8,48 +8,21 @@ X-Men-split / leading-article matcher (the BUI-254 `DELETE
 /api/comics/collection` endpoint's matcher, which is exactly what can't
 disambiguate a volume-mis-filed row — see BUI-424). Mirrors the fixture
 pattern in test_collection_delete_api.py, kept in its own file per that
-file's documented ownership-split convention.
+file's documented ownership-split convention. BUI-640: the shared plumbing
+(plugin install, gixen mock, env setup, TestClient) now lives in
+conftest.py's `_seeded_client`; `server_default_store_client` below still
+builds its own client inline since it deliberately leaves LOCG_DATA_DIR
+unset (see conftest.py's BUI-640 docstring).
 """
 from __future__ import annotations
 
 import json
-from importlib.metadata import EntryPoint
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-
-def _install_real_plugin(monkeypatch):
-    ep = EntryPoint(
-        name="gixen-overlay",
-        value="gixen_overlay.plugin:plugin",
-        group="gixen.plugins",
-    )
-    monkeypatch.setattr(
-        "gixen.plugins.entry_points",
-        lambda group: [ep] if group == "gixen.plugins" else [],
-    )
-
-
-def _mock_gixen():
-    m = MagicMock()
-    m.list_snipes.return_value = []
-    return m
-
-
-def _seed_collection(store, comics):
-    payload = {
-        "schema_version": 1,
-        "last_full_import": "2026-06-01T00:00:00.000000Z",
-        "last_import_source": "seed.xlsx",
-        "migration_in_progress": False,
-        "last_writer": None,
-        "series_name_index": {},
-        "comics": comics,
-    }
-    (store / "collection.json").write_text(json.dumps(payload))
-
+from .conftest import _install_real_plugin, _mock_gixen, _seed_collection, _seeded_client
 
 # Two rows sharing the SAME masthead-alias series+issue (a check-matcher could
 # resolve either as "Thor #127"), distinguished only by gixen_item_id.
@@ -103,19 +76,8 @@ def client(tmp_path, monkeypatch):
     store.mkdir()
     _seed_collection(store, _THOR_TWINS + _BATMAN_DUPLICATE_TWINS)
 
-    _install_real_plugin(monkeypatch)
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setenv("LOCG_DATA_DIR", str(store))
-    monkeypatch.setenv("GIXEN_USERNAME", "testuser")
-    monkeypatch.setenv("GIXEN_PASSWORD", "testpass")
-    monkeypatch.setenv("GIXEN_SYNC_ENABLED", "false")
-    monkeypatch.setenv("LOCAL_SNIPER_ENABLED", "false")
-    with patch("server.main.GixenClient", return_value=_mock_gixen()):
-        from server.main import app
-
-        with TestClient(app) as c:
-            c.store = store
-            yield c
+    with _seeded_client(tmp_path, monkeypatch, store) as c:
+        yield c
 
 
 def _comics(client) -> list[dict]:
