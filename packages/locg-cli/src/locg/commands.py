@@ -27,6 +27,7 @@ from locg.collection_cache import (
     base_full_title,
     base_series_name,
     collection_backups_root,
+    matchable_rows,
     owned_match_keys,
     resolve_series_for_win,
     series_year_range,
@@ -3095,10 +3096,16 @@ def _owned_series_issue_candidates(
     issue: str,
 ) -> list[dict[str, Any]]:
     """All owned rows matching the series key + issue token (no variant/year
-    gate). Used by the BUI-284 cross-volume ambiguity probe."""
+    gate). Used by the BUI-284 cross-volume ambiguity probe.
+
+    BUI-647: filters quarantined rows at its OWN entry (:func:`matchable_rows`)
+    rather than relying on its caller, so a quarantined foreign edition cannot
+    manufacture a phantom second "volume" and turn a clean ``in_collection``
+    verdict into ``ambiguous_cross_volume``.
+    """
     return [
         row
-        for row in comics
+        for row in matchable_rows(comics)
         if _owned_row_matches_series_issue(row, series_key, issue_stripped, issue)
     ]
 
@@ -3190,9 +3197,21 @@ def _match_owned_issue(
     relaunch query (``Hulk #1`` 2021) and skip a legitimate buy. The exact-key
     pass keeps the BUI-105 fail-open behavior (``require_dated=False``): a
     dateless same-series record-win must still match.
+
+    BUI-647: quarantined rows are excluded at this function's OWN entry point
+    (:func:`matchable_rows`), not at its caller's — every one of the four
+    ``cmd_collection_check`` pools filters itself, so a second caller added
+    later inherits the exclusion instead of having to remember it. Note the
+    direction this fails in: a quarantined owned row no longer answers
+    ``in_collection``, so the buy path may re-buy it. That is the intended
+    cost — the alternative (an Italian Panini row answering for the US
+    edition) is the mis-resolution BUI-563 measured. It is also strictly the
+    SAFER direction: hiding a row from this matcher can only cost money, while
+    hiding it from the owned-safe export layer would cost the book itself
+    (BUI-122) — which is why that layer deliberately does not filter.
     """
     fallback: Optional[dict[str, Any]] = None
-    for row in comics:
+    for row in matchable_rows(comics):
         # Series-key + issue-token core (BUI-26 bugs B/C/D), shared with the
         # cross-volume ambiguity probe via _owned_row_matches_series_issue.
         if not _owned_row_matches_series_issue(row, series_key, issue_stripped, issue):
@@ -3260,8 +3279,12 @@ def _match_wishlisted_issue(
     wishlisted 2008 "Hulk #1" flagging a query about the 1962 "Hulk #1") would
     reproduce the exact wrong-era false-positive BUI-249 addressed for
     ownership — so year-gating here mirrors the ownership pass exactly.
+
+    BUI-647: quarantined rows are excluded at this function's own entry point,
+    same as the ownership matcher. This one is advisory (it only sets the
+    ``in_wish_list`` bool), so the cost of over-excluding is a missing hint.
     """
-    for row in comics:
+    for row in matchable_rows(comics):
         if row.get("in_collection"):
             continue  # owned rows are _match_owned_issue's job, not this one
 
@@ -3499,6 +3522,11 @@ def _printing_conflict_fields(
     Advisory only (R11): the flag qualifies the verdict, it never flips
     ``match_status`` — every owned-guard consumer (the wish-list 409, the
     conflicts audit, record-win dedup) behaves exactly as before.
+
+    BUI-647: quarantined rows are excluded from the candidate scan at this
+    function's own entry point. ``matched_row`` is NOT re-checked — it arrives
+    already chosen by :func:`_match_owned_issue`, which did its own filtering,
+    so a quarantined row can never be the matched row in the first place.
     """
     query_ordinal = _printing_ordinal(query_text)
     matched_ordinal = _printing_ordinal(matched_row.get("full_title") or "")
@@ -3507,7 +3535,7 @@ def _printing_conflict_fields(
 
     candidates = [
         row
-        for row in comics
+        for row in matchable_rows(comics)
         if any(
             _row_matches_series_issue(row, key, issue_stripped, issue)
             for key in series_keys

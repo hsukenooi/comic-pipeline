@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, NamedTuple, Optional
+from typing import Any, Callable, Iterable, Iterator, NamedTuple, Optional
 
 from locg._atomic import atomic_write, atomic_write_json
 from locg.config import collection_cache_path, import_history_path
@@ -113,6 +113,113 @@ def _next_seq() -> int:
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+# --- Quarantine (BUI-647) ----------------------------------------------------
+#
+# The third state the collection store never had. Until now a row was either a
+# full-citizen row or an unsafe delete, with nothing in between — which is why
+# the six Panini/Italian licensed-edition rows our own record-win push created
+# could only get an advisory counter (BUI-563). Deleting them loses to LOCG
+# re-emitting them on the next export; clearing ``in_collection`` runs the
+# BUI-122 ``In Collection=0`` data-loss path. The ``bids`` table solved exactly
+# this shape of problem with a tombstone years ago (``REMOVED``, BUI-49); the
+# collection store never got one.
+#
+# The marker is deliberately an OBJECT, not a boolean, because ``bids`` had to
+# learn that lesson afterwards: a bare ``REMOVED`` could not distinguish a live
+# cancel from a completed sweep, and BUI-371 had to bolt a ``notes`` marker on
+# so a later audit could tell the causes apart. A quarantine that cannot say
+# WHO quarantined the row, WHEN, WHY, and under which ticket is a quarantine
+# nobody can ever safely lift.
+#
+# The key's ABSENCE means "not quarantined", so every row already on disk and
+# every row a LOCG import writes is unquarantined by default — no migration,
+# and no import-side code has to learn about this at all (the import merge
+# copies LOCG_COLUMNS onto an existing row in place, so an unknown key like
+# this one survives the round-trip untouched).
+QUARANTINE_FIELDS: tuple[str, ...] = ("at", "by", "reason", "ticket")
+
+
+def quarantine_marker(
+    *,
+    reason: str,
+    ticket: str,
+    by: str,
+    at: Optional[str] = None,
+) -> dict[str, str]:
+    """Build the ``row["quarantined"]`` object — the ONE constructor for it.
+
+    Every field is required and must be non-empty (``at`` defaults to now).
+    Raising on a blank ``reason``/``ticket``/``by`` is the point: the whole
+    reason this is an object rather than a flag is that a future operator has
+    to be able to answer "why is this row hidden, and may I un-hide it?" from
+    the row itself. A marker missing that is worse than no marker, because the
+    row silently disappears from every matcher pool with no way back.
+    """
+    fields = {"reason": reason, "ticket": ticket, "by": by}
+    blank = sorted(name for name, value in fields.items() if not (value or "").strip())
+    if blank:
+        raise ValueError(
+            f"quarantine marker requires non-empty {', '.join(blank)} — a "
+            "quarantine nobody can attribute is one nobody can safely lift"
+        )
+    return {
+        "at": at or _utcnow_iso(),
+        "by": by.strip(),
+        "reason": reason.strip(),
+        "ticket": ticket.strip(),
+    }
+
+
+def is_quarantined(row: dict[str, Any]) -> bool:
+    """True when ``row`` carries a populated quarantine marker (BUI-647).
+
+    THE single definition of the predicate. It appears nowhere else — every
+    candidate pool goes through :func:`matchable_rows`, so "what counts as
+    quarantined" is one edit, not a grep.
+
+    Absent, ``None`` and ``{}`` all mean NOT quarantined: an empty object
+    carries none of :data:`QUARANTINE_FIELDS`, so it fails the same
+    "attributable or it doesn't count" rule :func:`quarantine_marker` enforces
+    at write time.
+
+    A non-mapping value (a hand-written ``"quarantined": true``) is also NOT
+    quarantined. Honoring a shape the contract forbids is the worse failure:
+    it would pull rows out of every matcher pool on a token that records
+    nothing about who did it or why, which is precisely the ``bids`` mistake
+    this marker's shape exists to avoid. Build markers with
+    :func:`quarantine_marker` and the shape can't be wrong.
+    """
+    marker = row.get("quarantined")
+    return isinstance(marker, dict) and bool(marker)
+
+
+def matchable_rows(
+    comics: Optional[Iterable[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """``comics`` minus every quarantined row — the seam every pool filters through.
+
+    A "pool" here is any function that gathers CANDIDATES out of the store: the
+    ownership/wish matchers and the cross-volume + printing probes in
+    ``commands.py``, the two volume-resolution indexes below
+    (:func:`rebuild_series_name_index`, :func:`build_volume_candidates`), and
+    ``collection_io.build_series_publishers``. Each filters at its OWN entry
+    point rather than trusting a caller to have filtered first, so registering
+    a new pool is one call and a new CALLER of an existing pool inherits the
+    filter for free.
+
+    **Never call this on the owned-safe export layer.**
+    ``collection_io._owned_series_issue_index`` and
+    ``collection_io.wish_rows_for_export`` are ENFORCEMENT, not candidate
+    selection: dropping a quarantined owned row from them makes the export emit
+    ``In Collection=0`` for a wish that matches it, and LOCG deletes the owned
+    book (BUI-122 / the BUI-200 26-deleted-X-Men incident). Those two call
+    sites carry the same warning, and
+    ``tests/test_quarantine.py::test_quarantined_owned_row_still_suppresses_its_wish``
+    fails if the filter is ever added there.
+    """
+    return [row for row in (comics or ()) if not is_quarantined(row)]
 
 
 # Dash variants LOCG/Metron use in year ranges: ASCII hyphen-minus, en-dash
@@ -827,9 +934,14 @@ def rebuild_series_name_index(payload: dict[str, Any]) -> dict[str, str]:
     returns ``resolved: None`` until a re-import, which fails SAFE (falls
     through to Metron / manual). So: after shipping a normalizer change, run a
     ``collection import`` — the tail of ``/comic:collection-sync`` already does.
+
+    BUI-647: a quarantined row is not a candidate volume name. This is a
+    CANDIDATE pool (it answers "which volume should a win be filed under?"),
+    never an enforcement layer, so filtering here is safe — a missing key
+    degrades to ``resolved: None`` and falls through to Metron / manual.
     """
     index: dict[str, str] = {}
-    for row in payload.get("comics", []):
+    for row in matchable_rows(payload.get("comics")):
         if row.get("source") == "locg_export":
             sn = row.get("series_name") or ""
             if sn:
@@ -845,9 +957,17 @@ def build_volume_candidates(payload: dict[str, Any]) -> dict[str, list[str]]:
     this preserves ALL volumes filed under a key so a win can be matched to the
     volume whose year-range contains the issue's era (BUI-199). Built from
     source='locg_export' rows only (R61).
+
+    BUI-647: quarantined rows are excluded (:func:`matchable_rows`). This is
+    the pool that made the BUI-563/BUI-564 compounding loop possible — a
+    foreign-edition row our own push created comes back as ``locg_export`` on
+    the next import and then becomes a resolution CANDIDATE, so every later
+    win of that series resolves onto it. Quarantining such a row takes it out
+    of the candidate set without deleting it (LOCG would re-emit it) and
+    without clearing ``in_collection`` (the BUI-122 deletion path).
     """
     multi: dict[str, list[str]] = {}
-    for row in payload.get("comics", []):
+    for row in matchable_rows(payload.get("comics")):
         if row.get("source") != "locg_export":
             continue
         sn = row.get("series_name") or ""
