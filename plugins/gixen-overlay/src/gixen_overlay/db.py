@@ -20,6 +20,13 @@ COMPS_PROVENANCES = ("live", "backfill-cache", "backfill-capture")
 _comps_pools_sql = ", ".join(f"'{p}'" for p in COMPS_POOLS)
 _comps_provenances_sql = ", ".join(f"'{p}'" for p in COMPS_PROVENANCES)
 
+# BUI-659: the fmv_history closed vocabulary. 'upsert' marks a row appended
+# by the live POST /api/comics path (api_upsert_comic); 'backfill' marks a
+# row seeded once by the one-time migration from pre-existing `fmv` rows.
+# Single-sourced here for the same cross-layer-drift reason as COMPS_POOLS.
+FMV_HISTORY_SOURCES = ("upsert", "backfill")
+_fmv_history_sources_sql = ", ".join(f"'{s}'" for s in FMV_HISTORY_SOURCES)
+
 
 # ---------------------------------------------------------------------------
 # Table creation (called from register_db_tables hookimpl)
@@ -221,6 +228,65 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # Drop the pre-variant indexes (they'd wrongly reject a second variant row).
     conn.execute("DROP INDEX IF EXISTS idx_comics_tiy")
     conn.execute("DROP INDEX IF EXISTS idx_comics_ti_nullyear")
+    # BUI-659: fmv_history — an append-only ledger of every fmv snapshot,
+    # keyed by comic_id (not comic_id+grade), so a book's price at grade 9.4
+    # today doesn't erase what it was worth last month. `fmv` itself stays a
+    # bare UNIQUE(comic_id, grade) upsert target (unchanged) — this table is
+    # purely additive alongside it.
+    #
+    # Created HERE — after _migrate_fmv_split/_migrate_year_nullable, not up
+    # in the initial DDL block above — on purpose: both of those migrations
+    # `ALTER TABLE comics RENAME TO comics_old` on a legacy DB, and SQLite
+    # 3.26+ rewrites any FK in another table that pointed at `comics` to
+    # follow the rename. A `fmv_history` created earlier would have its
+    # `REFERENCES comics(id)` silently rewritten to `REFERENCES
+    # comics_old(id)`, then left dangling once `comics_old` is dropped —
+    # exactly the documented failure in
+    # docs/solutions/database-issues/sqlite-fk-rename-savepoint-pragma-2026-05-19.md.
+    # `fmv`/`bid_fmvs` avoid this by being dropped and rebuilt AROUND the
+    # rename inside those migrations; `fmv_history` avoids it more simply by
+    # not existing yet when the rename happens — comics is in its final,
+    # stable shape (fresh or migrated) by this point in create_tables.
+    #
+    # comic_id is NOT NULL with ON DELETE CASCADE (unlike comps' nullable,
+    # ON DELETE SET NULL comic_id): a comps row is a market fact about a
+    # listing that outlives any one comics identity guess, but an fmv_history
+    # row is *about* the comics row itself — deleting the book deletes its
+    # price history with it, same as `fmv` already does.
+    #
+    # `source` is a closed vocabulary (defense-in-depth CHECK, mirroring
+    # comps' pool/provenance pattern) — 'upsert' for a live append from
+    # api_upsert_comic, 'backfill' for the one-time seeding migration below.
+    # There is deliberately no UPDATE or DELETE statement anywhere in this
+    # module that targets fmv_history — every row, once written, is
+    # permanent for the life of its comic_id.
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS fmv_history (
+            id          INTEGER PRIMARY KEY,
+            comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+            grade       REAL NOT NULL,
+            low         REAL,
+            high        REAL,
+            comps       INTEGER,
+            confidence  TEXT,
+            flag_reason TEXT,
+            notes       TEXT,
+            recorded_at TEXT,
+            source      TEXT NOT NULL CHECK(source IN ({_fmv_history_sources_sql}))
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fmv_history_comic ON fmv_history(comic_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fmv_history_recorded "
+        "ON fmv_history(recorded_at)"
+    )
+    # Seed fmv_history from whatever `fmv` rows already exist. Also runs LAST
+    # for the same reason the table creation just above does — `fmv` is in
+    # its final, stable shape here on both a fresh DB (the legacy migrations
+    # above are no-ops) and an existing one (they've already run).
+    _migrate_seed_fmv_history(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -1611,6 +1677,103 @@ def upsert_fmv(
 
 
 # ---------------------------------------------------------------------------
+# fmv_history (BUI-659)
+# ---------------------------------------------------------------------------
+
+
+def append_fmv_history(
+    conn: sqlite3.Connection, fmv_id: int, source: str = "upsert"
+) -> None:
+    """Append an immutable snapshot of `fmv_id`'s CURRENT row to fmv_history.
+
+    Re-SELECTs the fmv row by id rather than accepting the caller's posted
+    values directly — `upsert_fmv`'s CASE/COALESCE logic can leave the stored
+    row different from what was posted (an n=0 stub preserves the existing
+    price; a flagged row clears it), so the row actually on file after the
+    upsert is the only thing worth snapshotting. `recorded_at` is copied from
+    the row's own `updated_at`, matching the seeding migration below (which
+    uses `fmv.updated_at`, never its own clock) — both paths agree that
+    `recorded_at` means "when this reading was established," not "when we
+    happened to log it."
+
+    Commits independently (its own transaction) so the caller can wrap this
+    in a try/except without the fmv upsert's own commit (already durable by
+    the time this runs) being affected either way.
+
+    Raises `ValueError` if `fmv_id` doesn't exist — callers (api_upsert_comic)
+    are expected to call this immediately after `upsert_fmv` returns a fresh
+    id, so a missing row here means something upstream is already broken and
+    should not be swallowed silently by this function itself; the caller's
+    own try/except is where "never block the write" is enforced.
+    """
+    row = conn.execute(
+        "SELECT comic_id, grade, low, high, comps, confidence, flag_reason, "
+        "notes, updated_at FROM fmv WHERE id=?",
+        (fmv_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"append_fmv_history: no fmv row with id={fmv_id}")
+    conn.execute(
+        """
+        INSERT INTO fmv_history (
+            comic_id, grade, low, high, comps, confidence, flag_reason, notes,
+            recorded_at, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["comic_id"], row["grade"], row["low"], row["high"],
+            row["comps"], row["confidence"], row["flag_reason"], row["notes"],
+            row["updated_at"], source,
+        ),
+    )
+    conn.commit()
+
+
+def _migrate_seed_fmv_history(conn: sqlite3.Connection) -> None:
+    """One-time seed: one fmv_history row per existing `fmv` row (BUI-659).
+
+    Gate: migration_state row 'seed_fmv_history' present → already ran, so a
+    restart cannot double-seed. Each seeded row carries `source='backfill'`
+    and `recorded_at = fmv.updated_at` (the row's own historical timestamp,
+    NOT this migration's clock — a row seeded today must not claim its price
+    was set today).
+
+    IMPORTANT: Uses raw conn.execute() only — no conn.commit(). Called from
+    create_tables(), which runs inside the host's per-plugin SAVEPOINT;
+    committing here would destroy it (same constraint as the older
+    _migrate_* functions above).
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state WHERE migration='seed_fmv_history'"
+    ).fetchone()
+    if row is not None:
+        return
+
+    fmv_rows = conn.execute(
+        "SELECT comic_id, grade, low, high, comps, confidence, flag_reason, "
+        "notes, updated_at FROM fmv"
+    ).fetchall()
+    for r in fmv_rows:
+        conn.execute(
+            """
+            INSERT INTO fmv_history (
+                comic_id, grade, low, high, comps, confidence, flag_reason,
+                notes, recorded_at, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'backfill')
+            """,
+            (
+                r["comic_id"], r["grade"], r["low"], r["high"], r["comps"],
+                r["confidence"], r["flag_reason"], r["notes"], r["updated_at"],
+            ),
+        )
+    if fmv_rows:
+        logger.info(
+            "_migrate_seed_fmv_history: seeded %d row(s)", len(fmv_rows)
+        )
+    _set_migration_marker(conn, "seed_fmv_history")
+
+
+# ---------------------------------------------------------------------------
 # Comps ledger (BUI-656)
 # ---------------------------------------------------------------------------
 
@@ -2312,6 +2475,231 @@ def calibration_report(
         reverse=True,
     )
     return report
+
+
+# ---------------------------------------------------------------------------
+# Won-auctions cost basis (BUI-664)
+# ---------------------------------------------------------------------------
+#
+# NOT a portfolio view. Measured on the live Mini 2026-08-03: 172 WON bids
+# carry both a cost basis (bids.winning_bid) and a primary priced FMV link,
+# against 2,191 owned collection rows — of which only 256 (11.7%) have
+# price_paid and 71 have a gixen_item_id at all. A mark-to-market view over
+# ~8% of the collection would mislead more than it informs (the deferred
+# "real" portfolio view needs a cost-basis backfill across collection.json
+# that is explicitly out of scope here — see BUI-664/BUI-611). So this
+# function reports exactly the WON-and-FMV-linked rows and nothing else; the
+# naming (`get_won_auctions_cost_basis`, not `get_portfolio`) and the
+# response shape below are the deliverable as much as the query is.
+
+
+def get_won_auctions_cost_basis(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Cost basis vs. current FMV for WON Gixen auctions with a linked,
+    priced primary FMV. Feeds `GET /api/comics/won-auctions/value`.
+
+    Deliberately WON-only — NOT R2/KTD-3's WON+LOST-together shape used by
+    `get_first_party_outcomes`/`calibration_report` above. Those two exist to
+    feed FMV pricing feedback, where a wins-only sample truncates from above
+    (a proxy-auction win's winning_bid is the underbidder's max, so wins-only
+    biases low) — R2 forbids narrowing THAT query to wins alone. This
+    function answers a different question — "what did I pay for the ones I
+    actually bought" — where a LOST auction has no purchase price by
+    definition; there is no bias to introduce by excluding it, because there
+    is nothing to include.
+
+    Uses `_EFFECTIVE_STATUS_SQL` (BUI-660), not a bare `b.status = 'WON'`, so
+    a WON bid later purge-swept to the REMOVED tombstone still counts via its
+    `prior_status` — same tombstone-survival rule `get_first_party_outcomes`
+    already applies. Reuses `_PRIMARY_LINK_CLAUSE` and
+    `_WINNING_BID_NOT_NULL_CLAUSE` from that section verbatim: a secondary
+    lot member isn't a valid per-book cost basis (the lot's winning_bid
+    prices the whole lot), and a NULL winning_bid carries no trustworthy
+    price. `f.high IS NOT NULL` additionally requires the linked FMV to
+    actually be priced (not a bare grade-only stub) — otherwise there is no
+    current value to compare against.
+
+    Sorted by `unrealized_gain_loss` descending (biggest apparent winners
+    first) — a fixed order, not a caller-configurable parameter; this is a
+    diagnostic report, not a general-purpose query endpoint.
+    """
+    where = " AND ".join([
+        f"{_EFFECTIVE_STATUS_SQL} = 'WON'",
+        _WINNING_BID_NOT_NULL_CLAUSE,
+        _PRIMARY_LINK_CLAUSE,
+        "f.high IS NOT NULL",
+    ])
+    return conn.execute(f"""
+        SELECT b.item_id,
+               c.title, c.issue, c.year, f.grade,
+               b.winning_bid AS cost_basis,
+               f.high AS current_fmv_high,
+               (f.high - b.winning_bid) AS unrealized_gain_loss,
+               COALESCE(b.auction_end_at, b.resolved_at) AS won_at
+        FROM bids b
+        JOIN bid_fmvs bf ON bf.bid_id = b.id
+        JOIN fmv f       ON f.id = bf.fmv_id
+        JOIN comics c    ON c.id = f.comic_id
+        WHERE {where}
+        ORDER BY unrealized_gain_loss DESC
+    """).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Comps and fmv_history read endpoints (BUI-662)
+# ---------------------------------------------------------------------------
+
+# Neither read function below is ever called from the pricing path — this
+# project writes the archive and never reads it back into a price (see the
+# comps-data-flywheel plan's Scope Boundaries). See
+# tests/test_fmv_history.py's contract test, which greps apps/fmv for exactly
+# that.
+
+DEFAULT_COMPS_READ_LIMIT = 100
+DEFAULT_FMV_HISTORY_READ_LIMIT = 100
+
+
+def _resolve_comic_id(
+    conn: sqlite3.Connection,
+    *,
+    comic_id: int | None,
+    title: str | None,
+    issue: str | None,
+    year: int | None,
+) -> int | None:
+    """Resolve a `comic_id` or `(title, issue[, year])` pair to a comics.id.
+
+    Returns None when the identity is UNRESOLVABLE: neither `comic_id` nor
+    `(title AND issue)` was supplied, or what was supplied matches no row in
+    `comics`. Both `get_comps` and `get_fmv_history` below treat that as
+    distinct from "resolved, but nothing on file for it" — the caller 400s
+    on None (wrong/unknown book) versus 200 + [] on an empty result (a known
+    book we simply have no rows for yet). Same resolution shape as
+    `list_comics` (case-insensitive title match, optional year).
+    """
+    if comic_id is not None:
+        row = conn.execute(
+            "SELECT id FROM comics WHERE id=?", (comic_id,)
+        ).fetchone()
+        return row["id"] if row is not None else None
+    if title is not None and issue is not None:
+        clauses = ["LOWER(title) = LOWER(?)", "issue = ?"]
+        params: list[Any] = [title, issue]
+        if year is not None:
+            clauses.append("year = ?")
+            params.append(year)
+        row = conn.execute(
+            f"SELECT id FROM comics WHERE {' AND '.join(clauses)} LIMIT 1",
+            params,
+        ).fetchone()
+        return row["id"] if row is not None else None
+    return None
+
+
+def get_comps(
+    conn: sqlite3.Connection,
+    *,
+    comic_id: int | None = None,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+    days: float | None = None,
+    pool: str | None = None,
+    provider: str | None = None,
+    limit: int = DEFAULT_COMPS_READ_LIMIT,
+) -> list[sqlite3.Row] | None:
+    """Read path for `GET /api/comics/comps` (BUI-662). Newest-first by
+    `observed_at`.
+
+    Identity: `comic_id`, or `(title, issue[, year])` — see
+    `_resolve_comic_id`. Returns None when the identity is unresolvable (the
+    route 400s); returns [] when it resolves to a real book with no comps on
+    file (the route 200s) — "no comps" must never be confusable with "wrong
+    book."
+
+    `days` filters on `observed_at` (when the comp was fetched), never
+    `first_seen_at` (when this row was first written to the ledger) — a
+    re-observed comp's `observed_at` advances even though `first_seen_at`
+    doesn't, and staleness here is about the market data's age, not the
+    ledger row's age. Comparison goes through SQLite's own `datetime()`
+    (mirrors `_RESOLVED_RECENCY_CLAUSE`), not a Python-formatted string, since
+    `observed_at` may carry a 'Z' suffix that doesn't compare correctly
+    byte-for-byte against `datetime.isoformat()`'s output.
+    """
+    resolved_id = _resolve_comic_id(
+        conn, comic_id=comic_id, title=title, issue=issue, year=year
+    )
+    if resolved_id is None:
+        return None
+
+    clauses = ["comic_id = ?"]
+    params: list[Any] = [resolved_id]
+    if grade is not None:
+        clauses.append("grade = ?")
+        params.append(grade)
+    if pool is not None:
+        clauses.append("pool = ?")
+        params.append(pool)
+    if provider is not None:
+        clauses.append("provider = ?")
+        params.append(provider)
+    if days is not None:
+        clauses.append(
+            "observed_at IS NOT NULL AND datetime(observed_at) >= datetime('now', ?)"
+        )
+        params.append(f"-{days} days")
+    where = " AND ".join(clauses)
+    params.append(limit)
+    return conn.execute(
+        f"""
+        SELECT * FROM comps
+        WHERE {where}
+        ORDER BY observed_at DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+
+
+def get_fmv_history(
+    conn: sqlite3.Connection,
+    *,
+    comic_id: int | None = None,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+    limit: int = DEFAULT_FMV_HISTORY_READ_LIMIT,
+) -> list[sqlite3.Row] | None:
+    """Read path for `GET /api/comics/fmv-history` (BUI-662). Newest-first by
+    `recorded_at`.
+
+    Identity and the None-vs-[] contract are identical to `get_comps` above
+    (see `_resolve_comic_id`) — an unresolvable book returns None (the route
+    400s), a resolved book with no history rows returns [] (the route 200s).
+    """
+    resolved_id = _resolve_comic_id(
+        conn, comic_id=comic_id, title=title, issue=issue, year=year
+    )
+    if resolved_id is None:
+        return None
+
+    clauses = ["comic_id = ?"]
+    params: list[Any] = [resolved_id]
+    if grade is not None:
+        clauses.append("grade = ?")
+        params.append(grade)
+    where = " AND ".join(clauses)
+    params.append(limit)
+    return conn.execute(
+        f"""
+        SELECT * FROM fmv_history
+        WHERE {where}
+        ORDER BY recorded_at DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
 
 
 # ---------------------------------------------------------------------------

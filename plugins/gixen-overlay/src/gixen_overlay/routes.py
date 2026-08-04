@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import tempfile
@@ -25,6 +26,7 @@ from gixen_overlay.db import (
     upsert_comic,
     upsert_fmv,
     upsert_comps,
+    append_fmv_history,
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
@@ -36,9 +38,14 @@ from gixen_overlay.db import (
     mark_collection_wins_seen,
     get_first_party_outcomes,
     calibration_report,
+    get_won_auctions_cost_basis,
+    get_comps,
+    get_fmv_history,
     DEFAULT_OUTCOME_GRADE_WINDOW,
     DEFAULT_OUTCOME_RECENCY_DAYS,
     DEFAULT_CALIBRATION_MIN_LOSSES,
+    DEFAULT_COMPS_READ_LIMIT,
+    DEFAULT_FMV_HISTORY_READ_LIMIT,
 )
 from gixen_overlay.ledger import LedgerRoute
 from gixen_overlay.locg_lookup import resolve_year_and_locg
@@ -106,6 +113,8 @@ from locg.commands import (
     cmd_wish_list_remove_conflicts,
 )
 from openpyxl.utils.exceptions import InvalidFileException
+
+logger = logging.getLogger(__name__)
 
 
 _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
@@ -303,6 +312,56 @@ async def api_comics_calibration(
     return calibration_report(db, days=days, min_losses=min_losses)
 
 
+@router.get("/api/comics/won-auctions/value")
+async def api_won_auctions_value(request: Request):
+    """BUI-664: cost basis vs. current FMV for WON Gixen auctions with a
+    linked, priced FMV — DIAGNOSTIC ONLY, read-only, never an input to a bid.
+
+    **This is deliberately NOT a portfolio view, and the naming says so on
+    purpose.** Measured on the live Mini 2026-08-03: 172 WON bids qualify
+    (a WON auction whose primary-linked `fmv.high` is priced) against 2,191
+    owned collection rows total, of which only 256 (11.7%) carry a
+    `price_paid` and 71 a `gixen_item_id` at all — most owned books were
+    added via LOCG import or a manual record-win with no cost basis captured
+    here, or have no FMV link. A mark-to-market view claiming to cover "your
+    collection" over that ~8% would mislead more than it informs; the
+    honest, narrower thing — cost basis for the auctions we actually won
+    through Gixen — is what this endpoint ships instead. See
+    `get_won_auctions_cost_basis` in `db.py` for the exact query and why it
+    is WON-only (a different, and unrelated, question from R2/KTD-3's
+    WON+LOST-together rule for FMV pricing feedback).
+
+    Response field names carry the same narrowness the path does:
+    `won_auctions` (never `portfolio` / `items` / `holdings`), each row's
+    `cost_basis` (from `bids.winning_bid`, never "price_paid" — that field
+    lives on the collection store, a different source this endpoint does not
+    touch), `current_fmv_high`, and `unrealized_gain_loss`
+    (`current_fmv_high - cost_basis`) — "unrealized" because none of these
+    books have been sold. Sorted by `unrealized_gain_loss` descending
+    (biggest apparent winners first); not caller-configurable.
+
+    `coverage_note` restates the scope in the response body itself, so a
+    caller that renders this JSON directly (or a human skimming a curl
+    response) cannot mistake `count` for "how many books I own" — see the
+    BUI-664 ticket's own framing: naming this correctly was as much the
+    deliverable as the query.
+    """
+    db = request.app.state.db
+    rows = get_won_auctions_cost_basis(db)
+    return {
+        "coverage": "won_auctions_only",
+        "coverage_note": (
+            "Cost basis vs. current FMV for WON Gixen auctions with a "
+            "linked, priced FMV ONLY — this is NOT your full collection. "
+            "`count` below is exactly how many auctions qualify right now; "
+            "most owned books have no purchase price captured here (LOCG "
+            "import, manual record-win) or no linked FMV — see BUI-664."
+        ),
+        "count": len(rows),
+        "won_auctions": [dict(r) for r in rows],
+    }
+
+
 @router.post("/api/comics")
 async def api_upsert_comic(req: UpsertComicRequest, request: Request):
     """Upsert a comic (and optional FMV at grade) and return both ids.
@@ -356,6 +415,23 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
             notes=req.fmv_notes,
             flag_reason=req.fmv_flag_reason,
         )
+        # BUI-659: append an immutable snapshot of the row upsert_fmv just
+        # wrote to fmv_history. Runs AFTER upsert_fmv's own commit — the fmv
+        # row is already durable by this point — in its own try/except with
+        # a loud log, so a failed append can never turn a successful upsert
+        # into an error response (mirrors the ledger's own
+        # never-break-the-request posture in ledger.py). The multi-issue-lot
+        # 422 above returns before this line is ever reached, so a rejected
+        # upsert appends no history row, matching the acceptance criterion.
+        try:
+            append_fmv_history(db, fmv_id)
+        except Exception:  # noqa: BLE001  # archive append must never fail the write
+            logger.exception(
+                "append_fmv_history failed for fmv_id=%s comic_id=%s grade=%s "
+                "— the fmv row itself is written; only its history snapshot "
+                "was lost",
+                fmv_id, comic_id, req.grade,
+            )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return {**dict(row), "comic_id": comic_id, "fmv_id": fmv_id}
 
@@ -389,6 +465,94 @@ async def api_ingest_comps(req: CompsIngestRequest, request: Request):
         [c.model_dump() for c in req.comps],
     )
     return {"comic_id": req.comic_id, **result}
+
+
+_UNRESOLVABLE_IDENTITY_DETAIL = (
+    "unresolvable comic identity — supply comic_id, or title+issue "
+    "(+ optional year) matching a known book"
+)
+
+
+@router.get("/api/comics/comps")
+async def api_comics_comps(
+    request: Request,
+    comic_id: int | None = None,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+    days: float | None = None,
+    pool: str | None = None,
+    provider: str | None = None,
+    limit: int = DEFAULT_COMPS_READ_LIMIT,
+):
+    """BUI-662: read the comps ledger for one book — DIAGNOSTIC/ARCHIVE ONLY.
+
+    Read-only counterpart to `POST /api/comics/comps` (BUI-656) above, on the
+    same path. Identity: `comic_id`, or `(title, issue[, year])` mirroring
+    `/api/comics`' resolution. A known book with no comps returns 200 + an
+    empty list; an unresolvable identity (no book matches, or neither
+    identity was supplied) returns 400 — "no comps" must never be confusable
+    with "wrong book" (the fetch-err-versus-genuine-zero lesson this project
+    keeps re-learning). `days` filters on `observed_at`, not `first_seen_at`.
+
+    **Never call this from the pricing path.** This project writes the comps
+    archive and never reads it back into a price — degraded-mode pricing
+    from stored comps is a deliberately separate follow-up (BUI-663) with its
+    own staleness rules and soak. See `tests/test_fmv_history.py`'s contract
+    test, which greps `apps/fmv` for exactly that.
+    """
+    db = request.app.state.db
+    rows = get_comps(
+        db,
+        comic_id=comic_id,
+        title=title,
+        issue=issue,
+        year=year,
+        grade=grade,
+        days=days,
+        pool=pool,
+        provider=provider,
+        limit=limit,
+    )
+    if rows is None:
+        raise HTTPException(status_code=400, detail=_UNRESOLVABLE_IDENTITY_DETAIL)
+    return [dict(r) for r in rows]
+
+
+@router.get("/api/comics/fmv-history")
+async def api_comics_fmv_history(
+    request: Request,
+    comic_id: int | None = None,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+    limit: int = DEFAULT_FMV_HISTORY_READ_LIMIT,
+):
+    """BUI-662: read fmv_history for one book — DIAGNOSTIC/ARCHIVE ONLY.
+
+    Every FMV snapshot `POST /api/comics` (BUI-659) ever appended for this
+    book, newest-first by `recorded_at`. Identity and the 200-empty-list vs.
+    400-unresolvable contract are identical to `GET /api/comics/comps` above
+    — see that endpoint's docstring.
+
+    **Never call this from the pricing path** — same scope boundary as
+    `GET /api/comics/comps`; see that docstring's last paragraph.
+    """
+    db = request.app.state.db
+    rows = get_fmv_history(
+        db,
+        comic_id=comic_id,
+        title=title,
+        issue=issue,
+        year=year,
+        grade=grade,
+        limit=limit,
+    )
+    if rows is None:
+        raise HTTPException(status_code=400, detail=_UNRESOLVABLE_IDENTITY_DETAIL)
+    return [dict(r) for r in rows]
 
 
 @router.post("/api/bids/{item_id}/link-fmv")

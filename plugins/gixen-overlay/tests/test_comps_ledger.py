@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -474,3 +475,164 @@ def test_ingest_comps_missing_required_field_422s(api):
         json={"comic_id": comic_id, "comps": [comp]},
     )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# GET /api/comics/comps (BUI-662) — the read side of this same table
+# ---------------------------------------------------------------------------
+#
+# Shares the identity-resolution and 400-vs-200-empty-list contract with
+# GET /api/comics/fmv-history — see tests/test_fmv_history.py for that
+# endpoint's own tests and the scope-boundary contract test both endpoints
+# share (never called from the pricing path).
+
+
+def test_get_comps_by_comic_id(api):
+    comic_id = _create_comic(api)
+    api.post("/api/comics/comps", json={"comic_id": comic_id, "comps": [_comp()]})
+    r = api.get("/api/comics/comps", params={"comic_id": comic_id})
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["product_id"] == "1234567890"
+
+
+def test_get_comps_by_title_issue_year(api):
+    comic_id = _create_comic(api, title="Daredevil", issue="1", year=1964)
+    api.post("/api/comics/comps", json={"comic_id": comic_id, "comps": [_comp()]})
+    r = api.get("/api/comics/comps", params={
+        "title": "Daredevil", "issue": "1", "year": 1964,
+    })
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+
+
+def test_get_comps_unresolvable_comic_id_400s(api):
+    r = api.get("/api/comics/comps", params={"comic_id": 999999})
+    assert r.status_code == 400
+
+
+def test_get_comps_unresolvable_title_issue_400s(api):
+    r = api.get("/api/comics/comps", params={
+        "title": "Nonexistent Series", "issue": "1",
+    })
+    assert r.status_code == 400
+
+
+def test_get_comps_no_identity_supplied_400s(api):
+    r = api.get("/api/comics/comps")
+    assert r.status_code == 400
+
+
+def test_get_comps_known_book_with_no_comps_returns_empty_list(api):
+    """A known book with no comps must 200 with [] — never 400. 'No comps'
+    and 'wrong book' are distinguishable states."""
+    comic_id = _create_comic(api)
+    r = api.get("/api/comics/comps", params={"comic_id": comic_id})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_get_comps_newest_first(api):
+    comic_id = _create_comic(api)
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id,
+        "comps": [
+            _comp(product_id="old", observed_at="2026-01-01T00:00:00Z"),
+            _comp(product_id="new", observed_at="2026-07-01T00:00:00Z"),
+        ],
+    })
+    r = api.get("/api/comics/comps", params={"comic_id": comic_id})
+    rows = r.json()
+    assert [row["product_id"] for row in rows] == ["new", "old"]
+
+
+def test_get_comps_grade_filter_narrows(api):
+    comic_id = _create_comic(api)
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id,
+        "comps": [
+            _comp(product_id="a", grade=9.4),
+            _comp(product_id="b", grade=9.8),
+        ],
+    })
+    r = api.get("/api/comics/comps", params={"comic_id": comic_id, "grade": 9.4})
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["product_id"] == "a"
+
+
+def test_get_comps_pool_filter_narrows(api):
+    comic_id = _create_comic(api)
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id,
+        "comps": [
+            _comp(product_id="raw1", pool="raw"),
+            _comp(product_id="slab1", pool="slab"),
+        ],
+    })
+    r = api.get("/api/comics/comps", params={"comic_id": comic_id, "pool": "slab"})
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["product_id"] == "slab1"
+
+
+def test_get_comps_provider_filter_narrows(api):
+    comic_id = _create_comic(api)
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id,
+        "comps": [
+            _comp(product_id="p1", provider="sold-comps.com"),
+            _comp(product_id="p2", provider="serpapi"),
+        ],
+    })
+    r = api.get("/api/comics/comps", params={
+        "comic_id": comic_id, "provider": "serpapi",
+    })
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["product_id"] == "p2"
+
+
+def test_get_comps_days_filter_uses_observed_at_not_first_seen_at(api):
+    """A comp whose row is old (first_seen_at backdated) but whose sale is
+    fresh (observed_at recent) must pass a tight `days` filter — staleness
+    here is about the market data's age, not the ledger row's age."""
+    comic_id = _create_comic(api)
+    now = datetime.now(timezone.utc)
+    old_iso = (now - timedelta(days=365)).isoformat()
+    recent_iso = (now - timedelta(hours=1)).isoformat()
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id,
+        "comps": [_comp(product_id="old-sale", observed_at=old_iso)],
+    })
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id,
+        "comps": [_comp(product_id="recent-sale", observed_at=recent_iso)],
+    })
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    # Backdate first_seen_at on the recent sale, so its ROW looks old even
+    # though its underlying SALE (observed_at) is fresh.
+    raw.execute(
+        "UPDATE comps SET first_seen_at=? WHERE product_id='recent-sale'",
+        (old_iso,),
+    )
+    raw.commit()
+    raw.close()
+
+    r = api.get("/api/comics/comps", params={"comic_id": comic_id, "days": 30})
+    rows = r.json()
+    # A 30-day window on observed_at admits only the recent sale, even though
+    # its row's first_seen_at was just backdated to look old.
+    assert {row["product_id"] for row in rows} == {"recent-sale"}
+
+
+def test_get_comps_limit_respected(api):
+    comic_id = _create_comic(api)
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id,
+        "comps": [_comp(product_id=str(i)) for i in range(5)],
+    })
+    r = api.get("/api/comics/comps", params={"comic_id": comic_id, "limit": 2})
+    assert len(r.json()) == 2
