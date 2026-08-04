@@ -2960,10 +2960,14 @@ async def api_health_heartbeats(request: Request):
     `/api/heartbeat/{job}` — a job emitting a heartbeat is not a comics-domain
     operation, and the ticket names that path explicitly.
 
-    Note the response carries `outer_ping: "unwired"`. Nothing outside this
-    machine polls this endpoint yet, so the watchdog can still fail green if
-    the whole server is down — it says so in its own payload rather than
-    implying a health it cannot vouch for. See `db.JOB_CONTRACTS`.
+    Note the response carries `outer_ping: db.HEARTBEAT_OUTER_PING_STATE`
+    verbatim — never a hand-maintained duplicate of it. BUI-672 wired an
+    hourly off-machine healthchecks.io dead-man's-switch
+    (`scripts/heartbeat-outer-ping.sh`) that polls this very endpoint and
+    alarms on silence, closing the gap where the watchdog could fail green if
+    the whole server were down and nothing outside this machine asked. See
+    `docs/reference/job-heartbeat-contract.md` and
+    `docs/reference/heartbeat-outer-ping-scheduling.md`.
     """
     db = request.app.state.db
     return heartbeat_report(db)

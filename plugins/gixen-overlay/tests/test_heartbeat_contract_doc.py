@@ -62,15 +62,22 @@ def test_row_cadence_matches_the_constant(text, job):
     assert wired == ("yes" if JOB_CONTRACTS[job]["wired"] else "no")
 
 
-def test_outer_ping_gap_is_documented_prominently(text):
-    """BUI-602's stated gotcha. A watchdog that can die unnoticed must not ship
-    with the gap buried or unmentioned."""
-    assert "## The outer layer — NOT WIRED" in text
+def test_outer_ping_is_documented_prominently(text):
+    """BUI-602's stated gotcha, closed by BUI-672. A watchdog whose outer ping
+    can die unnoticed must not ship with that fact buried or unmentioned — and
+    once a real check is wired, the doc must say so accurately rather than
+    leave the old "not wired" warning sitting on top of it (a stale warning
+    is its own small instance of the fails-green bug this file exists to
+    describe)."""
+    assert "## The outer layer (BUI-672)" in text
     assert HEARTBEAT_OUTER_PING_STATE in text
     assert "healthchecks.io" in text
-    # And a concrete, runnable recipe rather than a vague intention.
     assert "/api/comics/health/heartbeats" in text
-    assert 'd["healthy"]' in text
+    # Points at the real setup doc rather than re-describing the recipe here,
+    # so the two cannot drift the way a duplicated recipe would.
+    assert "heartbeat-outer-ping-scheduling.md" in text
+    # The pre-BUI-672 framing must not survive alongside the new one.
+    assert "NOT WIRED" not in text
 
 
 def test_doc_states_the_retention_window(text):

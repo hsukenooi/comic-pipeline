@@ -125,7 +125,7 @@ Every ping is **advisory to its caller**: none of the five may fail, block, or
 alter the job it reports on. A watchdog that can break the work it watches has
 bought nothing.
 
-## The outer layer — NOT WIRED
+## The outer layer (BUI-672)
 
 Everything above is a **pull**. Something has to ask
 `GET /api/comics/health/heartbeats` for a stale job to be noticed. If the comics
@@ -133,37 +133,56 @@ server is down, the Mac Mini is asleep, or launchd never restarted the process,
 nobody asks — and the watchdog fails green in exactly the way it was built to
 prevent.
 
-**A watchdog with no outer ping is its own worst bug class.** Closing the gap
-needs a check that lives *outside* this machine and alarms on silence:
+**A watchdog with no outer ping is its own worst bug class.** BUI-672 closes
+it with `scripts/heartbeat-outer-ping.sh`, an hourly launchd job on the Mac
+Mini that feeds a healthchecks.io **dead-man's-switch** — a check that alarms
+on a *missing* ping, never one that arrives complaining:
 
-1. Create a check on healthchecks.io (or any uptime pinger / cloud `/schedule`
-   agent) with a period matching the tightest cadence you care about.
-2. Have it poll the endpoint and fail on a non-200 **or** on any job not `ok`:
+```
+launchd job on the Mac Mini, hourly
+  └─ GET $COMICS_SERVER_URL/api/comics/health/heartbeats   (via scripts/comics-api)
+       healthy == true   → GET  https://hc-ping.com/<uuid>          ("still breathing")
+       healthy == false  → POST https://hc-ping.com/<uuid>/fail     (body names the offending jobs)
+       anything else     → NO PING AT ALL                            (unset config, an
+                                                                       unreachable server,
+                                                                       non-200, curl error,
+                                                                       parse failure, a bug
+                                                                       in the script itself)
+```
 
-   ```sh
-   curl -fsS "$COMICS_SERVER_URL/api/comics/health/heartbeats" \
-     | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["healthy"] else 1)'
-   ```
+The bottom row is not a gap, it's the mechanism: healthchecks.io alarms on
+**silence**, so every one of those "anything else" cases — including the
+script or the whole Mini being unable to run at all — trips the exact same
+off-machine alarm a stale job would. That is what makes this different from a
+*local* poller (rejected explicitly): a check that decides locally whether to
+alarm fails green precisely when the Mini is asleep or launchd is dead,
+because nobody local is left to read the result. Here the alarm lives outside
+this machine and fires on absence, so a dead Mini, a dead launchd, a dead
+comics server, and a broken copy of the script are all indistinguishable from
+"forgot to ping" — which is exactly what they are.
 
-3. Flip `HEARTBEAT_OUTER_PING_STATE` in `db.py` to `"wired"` and update this
-   section — **in the same change that creates the check, never ahead of it.**
+Full setup — the healthchecks.io check (period 1h / grace 1h), the launchd
+plist recipe (documented, **never committed**, since it carries the ping URL
+as a secret), and how to verify one end-to-end run — lives in
+`docs/reference/heartbeat-outer-ping-scheduling.md`. The chosen cadence is
+**hourly**, matching the contract's tightest inner cadence (`gixen-sync`);
+unlike `sentinel-probe`'s deliberately-weekly schedule, this check spends no
+provider budget, so there's no cost reason to run it any less often than
+useful.
 
-Wire the jobs **before** the outer ping, or in the same change. `healthy` is
-`false` while anything is `pending_instrumentation`, so an outer check added
-first would alarm continuously — and a monitor you have muted is another
-fails-green instance.
+`HEARTBEAT_OUTER_PING_STATE` in `db.py` now reads `"wired"`. As with every
+other claim in this file, that describes **deployed reality, not intent**: it
+was flipped only once a real healthchecks.io check existed and the launchd job
+was installed and verified end to end — the PR that flipped it was held
+unmerged until a human confirmed both, the same discipline BUI-624 used when
+it left the flag at `"unwired"` rather than claim a monitor that did not exist
+yet. If the check or the launchd job is ever removed, flip this back to
+`"unwired"` in the same change: a stale `"wired"` claiming a monitor nobody is
+running is the identical lie this project exists to close.
 
-**That ordering constraint is now satisfied.** BUI-624 wired all five jobs, so
-`healthy: true` is reachable and step 2's one-liner will sit green on a healthy
-day instead of alarming forever. Creating the external check is the only thing
-left, and it is an ops action rather than a code change — which is exactly why
-BUI-624 left `HEARTBEAT_OUTER_PING_STATE` at `"unwired"`. The flag describes the
-deployed world, not this repo's intentions; setting it for a monitor nobody has
-created would be the same lie as a job marked `wired` that never pings.
-
-Until then the endpoint declares the gap in its own response
-(`"outer_ping": "unwired"`) and the dashboard prints it under the heartbeat
-tile, rather than implying a health it cannot vouch for.
+The endpoint's own response still carries this flag verbatim
+(`"outer_ping": "wired"`) and the dashboard reads it directly — nothing here
+is a second, hand-maintained copy of the claim.
 
 ## Related: the rejected-writes ledger (BUI-601)
 

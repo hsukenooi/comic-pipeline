@@ -3061,7 +3061,7 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
     },
 }
 
-# THE OUTER LAYER — NOT WIRED. Read this before trusting the watchdog.
+# THE OUTER LAYER — WIRED (BUI-672). Read this before trusting the watchdog.
 #
 # Everything above is a PULL: something must ask
 # GET /api/comics/health/heartbeats for a stale job to be noticed. If the
@@ -3070,20 +3070,28 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
 # it was built to prevent. A watchdog with no outer ping is its own worst bug
 # class.
 #
-# Closing it needs a check OUTSIDE this machine (healthchecks.io, an uptime
-# pinger, a cloud /schedule agent) that polls the endpoint on a schedule and
-# alarms on a non-200 OR on any job not `ok`. Until that exists, the endpoint
-# reports this gap in its own response (`outer_ping: "unwired"`) rather than
-# implying a health it cannot vouch for. See
-# docs/reference/job-heartbeat-contract.md for the wiring recipe.
+# BUI-672 closes it with an hourly launchd job on the Mac Mini
+# (scripts/heartbeat-outer-ping.sh) that polls this endpoint and feeds a
+# healthchecks.io dead-man's-switch: ping success on `healthy: true`, ping
+# `/fail` naming the offending jobs on `healthy: false`, and — the load-bearing
+# case — NO ping at all on anything else (unset config, an unreachable server,
+# a non-200, a parse failure, a bug in the script). healthchecks.io alarms on
+# a MISSING ping, so that last case is not a gap, it's the mechanism: a dead
+# Mini, a dead launchd, a dead comics server, or a broken copy of the script
+# all trip the same off-machine alarm a stale job would. See
+# docs/reference/job-heartbeat-contract.md (the recipe) and
+# docs/reference/heartbeat-outer-ping-scheduling.md (setup + the chosen
+# hourly cadence).
 #
-# BUI-624 wired all five jobs above and deliberately left this at "unwired".
-# Creating the external monitor is an ops action, not a code change, and the
-# flag describes the deployed world, not this repo's intent: flipping it to
-# "wired" on a monitor that does not exist would be the exact lie the whole
-# project exists to close. Flip it in the same change that creates the check —
-# which is now unblocked, since `healthy` can finally reach True.
-HEARTBEAT_OUTER_PING_STATE = "unwired"
+# This flag must keep describing DEPLOYED reality, never intent. It was
+# flipped to "wired" only once a real healthchecks.io check existed and the
+# launchd job was installed and verified end to end — the PR that flipped it
+# was deliberately held unmerged until a human confirmed both, the same
+# discipline BUI-624 used to leave it at "unwired" rather than claim a monitor
+# that did not exist yet. If the check or the launchd job is ever removed,
+# flip this back to "unwired" in the same change: a stale "wired" claiming a
+# monitor nobody is running is the identical lie this project exists to close.
+HEARTBEAT_OUTER_PING_STATE = "wired"
 
 # Watchdog verdicts, worst-first. `stale` and `never` are both actionable;
 # `pending_instrumentation` is a declared-but-unbuilt contract and is NOT a
