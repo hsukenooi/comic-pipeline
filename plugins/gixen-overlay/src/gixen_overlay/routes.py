@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import tempfile
@@ -25,6 +26,7 @@ from gixen_overlay.db import (
     upsert_comic,
     upsert_fmv,
     upsert_comps,
+    append_fmv_history,
     link_fmv_to_bid,
     get_primary_fmv_for_bid,
     list_comics,
@@ -106,6 +108,8 @@ from locg.commands import (
     cmd_wish_list_remove_conflicts,
 )
 from openpyxl.utils.exceptions import InvalidFileException
+
+logger = logging.getLogger(__name__)
 
 
 _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
@@ -356,6 +360,23 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
             notes=req.fmv_notes,
             flag_reason=req.fmv_flag_reason,
         )
+        # BUI-659: append an immutable snapshot of the row upsert_fmv just
+        # wrote to fmv_history. Runs AFTER upsert_fmv's own commit — the fmv
+        # row is already durable by this point — in its own try/except with
+        # a loud log, so a failed append can never turn a successful upsert
+        # into an error response (mirrors the ledger's own
+        # never-break-the-request posture in ledger.py). The multi-issue-lot
+        # 422 above returns before this line is ever reached, so a rejected
+        # upsert appends no history row, matching the acceptance criterion.
+        try:
+            append_fmv_history(db, fmv_id)
+        except Exception:  # noqa: BLE001  # archive append must never fail the write
+            logger.exception(
+                "append_fmv_history failed for fmv_id=%s comic_id=%s grade=%s "
+                "— the fmv row itself is written; only its history snapshot "
+                "was lost",
+                fmv_id, comic_id, req.grade,
+            )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
     return {**dict(row), "comic_id": comic_id, "fmv_id": fmv_id}
 
