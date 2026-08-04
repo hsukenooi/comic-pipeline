@@ -206,8 +206,12 @@ class TestFirstPartyMergeIntoComputeOne:
             "comps": comps,
         }
         book = {"title": "X", "issue": "1", "grade": 9.0}
+        # BUI-658: _compute_and_upsert_one now also POSTs to the comps
+        # ledger — mocked here (not this test's concern) so it doesn't
+        # attempt a real network call. Covered by test_post_comps.py.
         with patch("fmv_runner._fetch_first_party_outcomes", return_value=[]), \
-             patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}), \
+             patch("fmv_runner._post_comps", return_value=None):
             out = fmv_runner._compute_and_upsert_one(
                 result, book, server_url=server_url())
         baseline = fmv_math.compute_fmv(comps, target_grade=9.0)
@@ -233,7 +237,8 @@ class TestFirstPartyMergeIntoComputeOne:
         ]
         with patch("fmv_runner._fetch_first_party_outcomes",
                   return_value=first_party), \
-             patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}), \
+             patch("fmv_runner._post_comps", return_value=None):
             out = fmv_runner._compute_and_upsert_one(
                 result, book, server_url=server_url())
         baseline = fmv_math.compute_fmv(comps, target_grade=9.0)
@@ -260,7 +265,8 @@ class TestFirstPartyMergeIntoComputeOne:
                     "source": "first_party"}]
         with patch("fmv_runner._fetch_first_party_outcomes",
                   return_value=outlier), \
-             patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}), \
+             patch("fmv_runner._post_comps", return_value=None):
             out = fmv_runner._compute_and_upsert_one(
                 result, book, server_url=server_url())
         assert 5000.0 not in out["fmv"]["trimmed_pool"]
@@ -277,7 +283,8 @@ class TestFirstPartyMergeIntoComputeOne:
         book = {"title": "X", "issue": "1"}
         with patch("fmv_runner._fetch_first_party_outcomes",
                   return_value=[]) as fp_mock, \
-             patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}), \
+             patch("fmv_runner._post_comps", return_value=None):
             fmv_runner._compute_and_upsert_one(
                 result, book, server_url=server_url())
         assert fp_mock.call_args.kwargs["target_grade"] == 9.0
