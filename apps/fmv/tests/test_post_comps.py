@@ -13,7 +13,11 @@ Covers, in order:
     (fetch-err, missing grade, the BUI-565 truncated-pool guard); a failed
     post never changes the priced numbers (byte-identical FMV output).
   - The CGC-proxy rescue (`_apply_cgc_proxy_rescue`) and cross-check
-    (`_apply_cgc_cross_check`) re-upserts never post comps a second time.
+    (`_apply_cgc_cross_check`) RE-UPSERTS never post comps a second time, but
+    each tier's own dedicated SECOND FETCH (genuinely new comps nothing has
+    recorded) DOES post its slab-filtered subset, once (BUI-674 for the
+    rescue, BUI-676 for the cross-check) — never the reused-ladder case,
+    which is already-posted data.
   - `run()`'s comps-write-failure summary: silent on an all-success run,
     counted and printed whenever a post failed, silent when there was
     nothing to post, and never changes the exit code.
@@ -510,17 +514,21 @@ class TestCgcRescueAndCrossCheckDoNotRepostComps:
     the BUI-529 cross-check's re-upsert, neither of which must repost the
     primary pass's raw+slab comps.
 
-    BUI-674 narrows that: the CGC-proxy rescue's SECOND FETCH (not its
+    BUI-674 narrowed that for the rescue: its SECOND FETCH (not its
     re-upsert) returns genuinely NEW comps the primary pass never saw, and
     those (slab-filtered only — see TestCgcProxyRescuePostsGenuinelyNewSlabComps)
-    ARE posted, once, as `pool='slab'`. The cross-check is untouched by
-    BUI-674 (its own dedicated fetch, when it fires, still never posts —
-    tracked as a separate, unaddressed gap; out of this ticket's scope).
-    Reuses the exact fixture shapes TestCgcProxyRescue/TestCgcCrossCheckApply
-    already establish in test_fmv_runner.py (duplicated locally, not
-    imported, to avoid coupling this file to that one's internals)."""
+    ARE posted, once, as `pool='slab'`. BUI-676 does the identical thing for
+    the cross-check's own dedicated fallback fetch (see
+    TestCgcCrossCheckPostsGenuinelyNewSlabComps below) — so the ONE case that
+    remains genuinely "never post" for the cross-check is the fixture this
+    test covers: a candidate BUI-524's inclusive tier already supplied a
+    big-enough ladder for, which needs no second fetch at all and whose
+    comps were already posted by the primary pass. Reuses the exact fixture
+    shapes TestCgcProxyRescue/TestCgcCrossCheckApply already establish in
+    test_fmv_runner.py (duplicated locally, not imported, to avoid coupling
+    this file to that one's internals)."""
 
-    def test_cross_check_never_calls_post_comps(self, server_url):
+    def test_cross_check_never_reposts_an_already_fetched_ladder(self, server_url):
         fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
                                "year": 1967, "grade": 6.5},
                      "fmv": {"fmv_high": 200, "fmv_low": 150, "median": 100.0,
@@ -674,6 +682,148 @@ class TestCgcProxyRescuePostsGenuinelyNewSlabComps:
              patch("fmv_runner._post_comps", return_value=True):
             fmv_runner._apply_cgc_proxy_rescue(
                 fresh, books, server_url=server_url, force=False)
+        assert fresh[0]["comps_posted"] is True
+
+
+# ─── BUI-676: cross-check posts its genuinely-new slab comps ────────────────
+
+class TestCgcCrossCheckPostsGenuinelyNewSlabComps:
+    """The cross-check's dedicated graded-only fallback fetch (fired only
+    for a candidate BUI-524's inclusive tier didn't already supply a
+    big-enough ladder for — see `_apply_cgc_cross_check`'s `need_fetch`
+    split) returns comps the primary raw pass never saw, the same gap
+    BUI-674 closed for the rescue tier. Only the slab-filtered subset is
+    posted, as `pool='slab'`, using the comic_id the primary pass already
+    resolved — unconditionally on whether the ladder ends up trustworthy
+    enough to actually FLAG a divergence.
+
+    The candidates that instead reuse a ladder BUI-524 already fetched
+    (`have_ladder[idx] = slabs`, no second fetch) must NEVER be posted here
+    — see `TestCgcRescueAndCrossCheckDoNotRepostComps
+    .test_cross_check_never_reposts_an_already_fetched_ladder` above, which
+    is the test that would fail if that guard were ever weakened."""
+
+    def _fresh(self, **overrides):
+        base = {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                          "year": 1967, "grade": 6.5},
+                "fmv": {"fmv_high": 200, "fmv_low": 150, "median": 100.0,
+                        "n": 3, "confidence": "MEDIUM-LOW",
+                        "interpolated": False},
+                "comic_id": 5, "source": "fresh", "slab_comps": []}
+        base.update(overrides)
+        return base
+
+    def _books(self):
+        return [{"title": "Amazing Spider-Man", "issue": "50",
+                 "year": 1967, "grade": 6.5}]
+
+    def test_posts_slab_subset_only_never_the_non_slab_comps_as_raw(
+            self, server_url):
+        """Trap 1: `include_graded=True` drops the -cgc/-cbcs exclusion, so
+        this pass's raw `comps` list is a MIX of genuine slabs and raw
+        listings that merely carry a grade token. Posting the non-slab
+        remainder as `pool='raw'` would double-count `product_id`s the
+        primary raw pass already posted this same run. Assert the `comps`
+        (raw) argument is always empty and only the slab subset is passed."""
+        non_slab = _make_comp(150.0, 6.0, product_id="raw-1",
+                               title="Amazing Spider-Man 50 FN 6.0")
+        mixed = [non_slab, *_ASM50_SLABS]
+        fresh = {0: self._fresh()}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[{"input": {"_req_id": 0}, "comps": mixed,
+                                  "queries_used": []}]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 5, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, self._books(), server_url=server_url, force=False)
+        post_mock.assert_called_once()
+        args = post_mock.call_args.args
+        assert args[0] == server_url
+        assert args[1] == 5  # the primary pass's pre-existing comic_id
+        assert args[2] == []  # never pool='raw' from this pass
+        assert args[3] == _ASM50_SLABS  # only the certified-slab subset
+
+    def test_never_reposts_a_reused_bui524_ladder(self, server_url):
+        """Trap 2 — the distinction this whole ticket turns on, asserted
+        directly against `_apply_cgc_cross_check` (not just via the shared
+        fixture in TestCgcRescueAndCrossCheckDoNotRepostComps): a candidate
+        BUI-524's inclusive tier already supplied a big-enough ladder for
+        needs no second fetch, and its comps came off the SAME primary
+        pass's `result["slab_comps"]`, which `_compute_and_upsert_one`
+        already posted. Would fail if a future refactor moved the post call
+        out of the `need_fetch`-only loop to cover every `have_ladder` entry."""
+        fresh = {0: self._fresh(slab_comps=_ASM50_SLABS)}  # >= MIN_LADDER_COMPS
+        with patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 5, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps") as post_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, self._books(), server_url=server_url, force=False)
+        fetch_mock.assert_not_called()  # no second fetch needed
+        assert fresh[0]["fmv"]["cgc_cross_check"] is not None  # the check DID fire
+        post_mock.assert_not_called()
+
+    def test_posts_even_when_ladder_too_thin_to_flag(self, server_url):
+        """Trap 2 companion: a ladder too thin to produce a comparison
+        (`check is None`, so no flag and no re-upsert) still means these
+        comps were genuinely fetched — posted regardless."""
+        thin_ladder = [_slab(1200, 6.5)]  # 1 comp < CGC_PROXY_MIN_LADDER_COMPS
+        fresh = {0: self._fresh()}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, thin_ladder)]), \
+             patch("fmv_runner._upsert_fmv") as upsert_mock, \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
+            fmv_runner._apply_cgc_cross_check(
+                fresh, self._books(), server_url=server_url, force=False)
+        upsert_mock.assert_not_called()  # nothing to flag, no re-upsert
+        assert fresh[0]["fmv"].get("cgc_cross_check") is None
+        post_mock.assert_called_once_with(server_url, 5, [], thin_ladder)
+        assert fresh[0]["comps_posted"] is True
+
+    def test_post_failure_is_counted_even_though_the_flag_succeeded(
+            self, server_url):
+        """Trap 4: a ledger-write failure on THIS post must still surface
+        through the same `comps_posted` counter `run()`'s summary reads —
+        never silently dropped, and never touching the divergence flag."""
+        fresh = {0: self._fresh()}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 5, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=False):
+            fmv_runner._apply_cgc_cross_check(
+                fresh, self._books(), server_url=server_url, force=False)
+        assert fresh[0]["fmv"]["cgc_cross_check"] is not None  # still flagged
+        assert fresh[0]["comps_posted"] is False
+
+    def test_post_success_never_clears_a_primary_pass_failure(self, server_url):
+        """Combine logic (`_combine_comps_posted`, shared with the rescue
+        tier): if the PRIMARY pass's own comps post already failed
+        (comps_posted=False, set before the cross-check ever runs), a
+        later-succeeding cross-check post must not paper over that."""
+        fresh = {0: self._fresh(comps_posted=False)}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 5, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True):
+            fmv_runner._apply_cgc_cross_check(
+                fresh, self._books(), server_url=server_url, force=False)
+        assert fresh[0]["comps_posted"] is False
+
+    def test_post_upgrades_a_primary_none_to_true(self, server_url):
+        """Combine logic: the primary pass had nothing to post
+        (comps_posted=None) and the cross-check's own post succeeds — the
+        summary should reflect that SOMETHING was posted."""
+        fresh = {0: self._fresh(comps_posted=None)}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 5, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True):
+            fmv_runner._apply_cgc_cross_check(
+                fresh, self._books(), server_url=server_url, force=False)
         assert fresh[0]["comps_posted"] is True
 
 

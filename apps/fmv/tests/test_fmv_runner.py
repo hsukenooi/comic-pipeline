@@ -2970,20 +2970,25 @@ class TestCgcCrossCheckApply:
                      "fmv": {"fmv_high": 200, "fmv_low": 150, "median": 100.0,
                              "n": 3, "confidence": "MEDIUM-LOW",
                              "interpolated": False},
-                     "source": "fresh",
+                     "source": "fresh", "comic_id": 1,
                      "slab_comps": []}}
         books = [{"title": "Amazing Spider-Man", "issue": "50",
                   "year": 1967, "grade": 6.5}]
         with patch("fmv_runner._fetch_comps",
                    return_value=[_graded_result(0, _ASM50_SLABS)]) as fetch_mock, \
              patch("fmv_runner._upsert_fmv",
-                   return_value={"comic_id": 1, "fmv_id": 2}):
+                   return_value={"comic_id": 1, "fmv_id": 2}), \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
             fmv_runner._apply_cgc_cross_check(
                 fresh, books, server_url=server_url, force=False)
         graded_books = fetch_mock.call_args[0][0]
         assert graded_books[0]["include_graded"] is True
         assert graded_books[0]["_idx"] == 0
         assert fresh[0]["fmv"]["cgc_cross_check"] is not None
+        # BUI-676: this second fetch's slab-filtered subset is posted, using
+        # the comic_id the primary pass already resolved.
+        post_mock.assert_called_once_with(server_url, 1, [], _ASM50_SLABS)
+        assert fresh[0]["comps_posted"] is True
 
     def test_skips_book_already_rescued_by_proxy(self, server_url):
         # n=3 (<5) would otherwise make this a candidate — the source guard
@@ -3059,19 +3064,25 @@ class TestCgcCrossCheckApply:
         assert "CGC cross-check notes update failed" in capsys.readouterr().err
 
     def test_thin_ladder_produces_no_flag(self, server_url):
+        thin_ladder = [_slab(1200, 6.5)]
         fresh = {0: {"input": {"grade": 6.5, "year": 1967}, "source": "fresh",
                      "fmv": {"fmv_high": 200, "median": 100.0, "n": 2,
                              "confidence": "LOW", "interpolated": False},
-                     "slab_comps": []}}
+                     "comic_id": 5, "slab_comps": []}}
         with patch("fmv_runner._fetch_comps",
-                   return_value=[_graded_result(0, [_slab(1200, 6.5)])]) as fetch_mock, \
-             patch("fmv_runner._upsert_fmv") as upsert_mock:
+                   return_value=[_graded_result(0, thin_ladder)]) as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock, \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
             fmv_runner._apply_cgc_cross_check(
                 fresh, [{"grade": 6.5, "year": 1967}],
                 server_url=server_url, force=False)
         fetch_mock.assert_called_once()
         upsert_mock.assert_not_called()
         assert fresh[0]["fmv"].get("cgc_cross_check") is None
+        # BUI-676 / trap 2 companion: a ladder too thin to FLAG a divergence
+        # still means these comps were genuinely observed — posted anyway.
+        post_mock.assert_called_once_with(server_url, 5, [], thin_ladder)
+        assert fresh[0]["comps_posted"] is True
 
     def test_rescue_pricing_for_unpriced_books_is_byte_identical(self, server_url):
         """Hard invariant (BUI-529 spec): promoting the CGC-proxy heuristic to
