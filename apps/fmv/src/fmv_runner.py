@@ -411,11 +411,12 @@ def run(*, batch_path: str | None, out_path: str | None,
     # the three skip counts above) whenever it's non-zero. All-success prints
     # nothing here — no happy-path noise.
     #
-    # BUI-674: `_apply_cgc_proxy_rescue` also writes into this SAME
-    # `comps_posted` field, for its own second-fetch slab post — False always
-    # wins (never cleared by a later success), and a rescue success upgrades
-    # an untouched None but never a pre-existing False. So a book can fail
-    # here because of either post, and this count still catches it.
+    # BUI-674/BUI-676: `_apply_cgc_proxy_rescue` and `_apply_cgc_cross_check`
+    # also write into this SAME `comps_posted` field, each for its own
+    # second-fetch slab post (`_combine_comps_posted`) — False always wins
+    # (never cleared by a later success), and a success upgrades an untouched
+    # None but never a pre-existing False. So a book can fail here because of
+    # any of up to three posts this run, and this count still catches it.
     comps_post_failures = sum(
         1 for r in fresh_fmvs.values() if r.get("comps_posted") is False
     )
@@ -1403,11 +1404,15 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # `seen_count` for comps that were only ever observed once, so posting
     # once per OBSERVATION (not once per upsert) is the deliberate choice.
     #
-    # BUI-674 sharpened that rule rather than breaking it: the rescue's
-    # graded-only pass is a SECOND FETCH, so its slab comps are a genuinely
-    # new observation and it posts them itself. What stays banned is
-    # re-posting comps already sent from here — which is why that call passes
-    # `comps=[]` and only the slab subset. See `_post_comps`'s docstring for
+    # BUI-674/BUI-676 sharpened that rule rather than breaking it: the
+    # rescue's graded-only pass AND the cross-check's own graded-only
+    # fallback fetch are each a SECOND FETCH, so their slab comps are a
+    # genuinely new observation and each posts them itself. What stays
+    # banned is re-posting comps already sent from here — which is why both
+    # calls pass `comps=[]` and only their own slab subset. The
+    # cross-check's OTHER path (reusing BUI-524's already-fetched
+    # `slab_comps`, i.e. no second fetch at all) posts nothing further — it
+    # IS the comps already sent from here. See `_post_comps`'s docstring for
     # the failure-path decision (soft-fail, counted, never fatal).
     comps_posted = _post_comps(server_url, comic_id, comps, slab_comps)
 
@@ -1461,6 +1466,30 @@ def _slab_comps_only(comps: list[dict]) -> list[dict]:
     return [c for c in comps
             if c.get("grade") is not None and c.get("price") is not None
             and _SLAB_TITLE_RE.search(c.get("title") or "")]
+
+
+def _combine_comps_posted(current: bool | None, latest: bool | None) -> bool | None:
+    """Fold one more `_post_comps` outcome into a book's running
+    `comps_posted` state. Shared by `_apply_cgc_proxy_rescue` (BUI-674) and
+    `_apply_cgc_cross_check` (BUI-676) — both can post a SECOND time for a
+    book the primary pass in `_compute_and_upsert_one` already posted (or
+    had nothing to post) once this run, so the field has to combine two
+    outcomes, not just record the latest one.
+
+    `False` always sticks: once ANY of a book's posts this run fails,
+    `run()`'s summary (which counts `comps_posted is False` across
+    `fresh_fmvs`) must keep seeing that — a later success must never paper
+    over it. `True` upgrades only an untouched `None` (the primary pass had
+    nothing to post, e.g. a genuine n=0 raw book) to record that SOMETHING
+    was posted; it never clears a pre-existing `False`. `latest is None`
+    (this call's `_post_comps` had nothing to post — `comps` and
+    `slab_comps` both empty) leaves the running state untouched, since "no
+    comps this observation" is not itself a failure."""
+    if latest is False:
+        return False
+    if latest is True and current is not False:
+        return True
+    return current
 
 
 def _is_unpriced_raw(result: dict) -> bool:
@@ -1586,15 +1615,12 @@ def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
         rescue_posted = _post_comps(
             server_url, fresh_fmvs[idx].get("comic_id"), [], graded_comps,
         )
-        if rescue_posted is False:
-            fresh_fmvs[idx]["comps_posted"] = False
-        elif (rescue_posted is True
-              and fresh_fmvs[idx].get("comps_posted") is not False):
-            # Upgrade None (primary pass had nothing to post) to True; never
-            # clear an already-False primary-pass failure with a later
-            # success — run()'s summary must still see that ONE of this
-            # book's two posts this run failed.
-            fresh_fmvs[idx]["comps_posted"] = True
+        # BUI-676: combine logic extracted to `_combine_comps_posted` once the
+        # cross-check tier below needed the exact same fold — see its
+        # docstring for the False-sticks / None-only-upgrades invariant.
+        fresh_fmvs[idx]["comps_posted"] = _combine_comps_posted(
+            fresh_fmvs[idx].get("comps_posted"), rescue_posted,
+        )
         inp = fresh_fmvs[idx].get("input") or {}
         proxy = fmv_math.cgc_proxy_fmv(
             graded_comps, target_grade=inp["grade"],
@@ -1694,6 +1720,20 @@ def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
     is precisely the leak BUI-663 must not have: the ``fmv`` table is where
     ``snipe-add``, the overlay's policy checks and the dashboard read prices,
     so a written advisory becomes a real bid cap on the next run.
+
+    BUI-676: the dedicated graded-only fetch (the ``need_fetch`` branch below)
+    is, exactly like ``_apply_cgc_proxy_rescue``'s own second pass, a fetch
+    nothing has recorded yet — its slab-filtered subset is posted to the
+    comps ledger as ``pool='slab'``, using the ``comic_id`` the primary pass
+    already resolved (this tier's candidates all DID price — see
+    ``_is_thin_or_low_confidence_priced`` — so that primary upsert always ran
+    and returned one). The candidates that instead reuse BUI-524's
+    already-fetched ``slab_comps`` (``have_ladder[idx] = slabs`` below) are
+    NOT posted again here: those comps came off the SAME primary pass's
+    ``result["slab_comps"]``, which ``_compute_and_upsert_one`` already
+    posted — re-posting them would inflate ``seen_count`` for a comp only
+    actually observed once. That is the whole split this tier turns on: the
+    reused-ladder half is a re-observation, the fetched half is new.
     """
     candidates = [idx for idx in fresh_fmvs
                   if fresh_fmvs[idx].get("source") != "cgc-proxy"
@@ -1736,6 +1776,27 @@ def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
             result = by_id.get(idx)
             if result is not None:
                 have_ladder[idx] = _slab_comps_only(result.get("comps") or [])
+                # BUI-676: this second, graded-only fetch just observed comps
+                # nothing has posted before — post the slab-filtered subset
+                # to the SAME comic identity the primary raw pass already
+                # resolved (`comic_id` is already on `fresh_fmvs[idx]` from
+                # that pass's BUI-44 unconditional upsert; unlike the rescue's
+                # unpriced-raw candidates, this tier's candidates all DID
+                # price, so that upsert is guaranteed to have run and
+                # returned one — see this function's docstring). `comps=[]`
+                # — never this pass's non-slab comps as `pool='raw'`; they
+                # overlap `product_id`s the primary pass already posted this
+                # run (BUI-658's once-per-book rule). Posted unconditionally
+                # on whether `check` below ends up non-None: a ladder too
+                # untrustworthy to FLAG a divergence still means these comps
+                # were genuinely observed.
+                cross_check_posted = _post_comps(
+                    server_url, fresh_fmvs[idx].get("comic_id"), [],
+                    have_ladder[idx],
+                )
+                fresh_fmvs[idx]["comps_posted"] = _combine_comps_posted(
+                    fresh_fmvs[idx].get("comps_posted"), cross_check_posted,
+                )
                 # BUI-535: same rationale as _apply_cgc_proxy_rescue — this is
                 # its own separate ebay-sold-comps subprocess/breaker, OR it
                 # into the book's flag rather than overwrite.
