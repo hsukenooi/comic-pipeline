@@ -388,6 +388,12 @@ def run(*, batch_path: str | None, out_path: str | None,
     # `_post_comps`) and print unconditionally (not gated by --quiet, same as
     # the three skip counts above) whenever it's non-zero. All-success prints
     # nothing here — no happy-path noise.
+    #
+    # BUI-674: `_apply_cgc_proxy_rescue` also writes into this SAME
+    # `comps_posted` field, for its own second-fetch slab post — False always
+    # wins (never cleared by a later success), and a rescue success upgrades
+    # an untouched None but never a pre-existing False. So a book can fail
+    # here because of either post, and this count still catches it.
     comps_post_failures = sum(
         1 for r in fresh_fmvs.values() if r.get("comps_posted") is False
     )
@@ -1199,6 +1205,18 @@ def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
     The graded fetch soft-fails (a SerpApi outage on this second pass leaves the
     candidates as needs_manual rather than aborting an otherwise-complete run —
     the proxy tier is a best-effort rescue, never a hard dependency).
+
+    BUI-674: the graded-only fetch above returns genuinely NEW comps the
+    primary raw pass in ``_compute_and_upsert_one`` never saw (unlike the
+    BUI-529 cross-check, which mostly re-upserts). Their SLAB-filtered subset
+    (``_slab_comps_only``) is posted to the comps ledger as ``pool='slab'``
+    for every candidate with a graded result — regardless of whether the
+    ladder below is trustworthy enough to actually price the book — since a
+    too-thin/non-monotonic ladder still means real comps were observed. The
+    pass's non-slab comps are deliberately NEVER posted as ``pool='raw'``:
+    they overlap ``product_id``s the primary pass already posted this run
+    (BUI-658's once-per-book rule), and re-posting would inflate
+    ``seen_count`` for a comp only actually observed once.
     """
     candidates = [idx for idx in fresh_fmvs
                   if _is_unpriced_raw(fresh_fmvs[idx])
@@ -1241,6 +1259,28 @@ def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
         if result.get("breaker_tripped"):
             fresh_fmvs[idx]["breaker_tripped"] = True
         graded_comps = _slab_comps_only(result.get("comps") or [])
+        # BUI-674: post the slab comps this second fetch just observed, to
+        # the SAME comic identity the primary raw pass already resolved
+        # (`comic_id` is already on `fresh_fmvs[idx]` from that pass's
+        # unconditional upsert, BUI-44 — real even for an n=0 raw book, and
+        # unaffected by whether the ladder below prices this book). Posted
+        # unconditionally on the proxy outcome: a too-thin/non-monotonic
+        # ladder (`proxy is None` below) still means these comps were
+        # genuinely observed and are worth recording. `comps=[]` — never the
+        # pass's non-slab comps as `pool='raw'`; see this function's
+        # docstring for why.
+        rescue_posted = _post_comps(
+            server_url, fresh_fmvs[idx].get("comic_id"), [], graded_comps,
+        )
+        if rescue_posted is False:
+            fresh_fmvs[idx]["comps_posted"] = False
+        elif (rescue_posted is True
+              and fresh_fmvs[idx].get("comps_posted") is not False):
+            # Upgrade None (primary pass had nothing to post) to True; never
+            # clear an already-False primary-pass failure with a later
+            # success — run()'s summary must still see that ONE of this
+            # book's two posts this run failed.
+            fresh_fmvs[idx]["comps_posted"] = True
         inp = fresh_fmvs[idx].get("input") or {}
         proxy = fmv_math.cgc_proxy_fmv(
             graded_comps, target_grade=inp["grade"],

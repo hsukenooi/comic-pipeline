@@ -2753,19 +2753,28 @@ class TestCgcProxyRescue:
                                "year": 1967, "grade": 6.5},
                      "fmv": {"fmv_high": None, "interpolated": False,
                              "flag_reason": None},
+                     # The primary raw pass's unconditional upsert (BUI-44)
+                     # already set this before the rescue ever runs.
+                     "comic_id": 5,
                      "source": "fresh"}}
         upserts = []
         with patch("fmv_runner._fetch_comps",
                    return_value=[_graded_result(0, _ASM50_SLABS)]) as fetch_mock, \
              patch("fmv_runner._upsert_fmv",
                    side_effect=lambda *a, **k: upserts.append(a[2])
-                   or {"comic_id": 7, "fmv_id": 9}):
+                   or {"comic_id": 7, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
             fmv_runner._apply_cgc_proxy_rescue(
                 fresh, books, server_url=server_url, force=False)
         # Graded pass ran with include_graded=True on the candidate book.
         graded_books = fetch_mock.call_args[0][0]
         assert graded_books[0]["include_graded"] is True
         assert graded_books[0]["_idx"] == 0
+        # BUI-674: the slab-filtered subset of this second fetch is posted to
+        # the ledger, using the comic_id ALREADY present from the primary
+        # pass (5) — not the proxy re-upsert's comic_id (7), which hasn't
+        # happened yet at post time. Never posts pool='raw'.
+        post_mock.assert_called_once_with(server_url, 5, [], _ASM50_SLABS)
         # Result replaced with a proxy band, re-upserted, ids refreshed.
         assert fresh[0]["source"] == "cgc-proxy"
         assert fresh[0]["fmv"]["cgc_proxy"] is True
@@ -2774,6 +2783,8 @@ class TestCgcProxyRescue:
         assert fresh[0]["comic_id"] == 7 and fresh[0]["fmv_id"] == 9
         assert fresh[0]["db_row"] == {"comic_id": 7, "fmv_id": 9}
         assert len(upserts) == 1
+        # The successful ledger post is reflected in comps_posted.
+        assert fresh[0]["comps_posted"] is True
 
     def test_modern_book_is_not_rescued(self, server_url):
         # The 0.50-0.55 factor is vintage-calibrated; a modern book (year >=
@@ -2810,7 +2821,8 @@ class TestCgcProxyRescue:
                   "year": 1967, "grade": 6.5}]
         with patch("fmv_runner._fetch_comps",
                    return_value=[_graded_result(0, _ASM50_SLABS)]), \
-             patch("fmv_runner._upsert_fmv", return_value=None):  # soft-fail
+             patch("fmv_runner._upsert_fmv", return_value=None), \
+             patch("fmv_runner._post_comps", return_value=True):  # soft-fail
             fmv_runner._apply_cgc_proxy_rescue(
                 fresh, books, server_url=server_url, force=False)
         assert fresh[0]["source"] == "fresh"          # NOT promoted
@@ -2839,9 +2851,18 @@ class TestCgcProxyRescue:
         # Results deliberately reversed relative to candidate order.
         graded = [_graded_result(2, high_ladder), _graded_result(0, low_ladder)]
         with patch("fmv_runner._fetch_comps", return_value=graded), \
-             patch("fmv_runner._upsert_fmv", return_value={"comic_id": 1}):
+             patch("fmv_runner._upsert_fmv", return_value={"comic_id": 1}), \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
             fmv_runner._apply_cgc_proxy_rescue(
                 fresh, books, server_url=server_url, force=False)
+        # BUI-674: each candidate's own slab ladder is posted once, mapped by
+        # _req_id like the pricing itself — never swapped across candidates.
+        assert post_mock.call_count == 2
+        posted_by_ladder = {
+            tuple(c["price"] for c in call.args[3]) for call in post_mock.call_args_list
+        }
+        assert tuple(c["price"] for c in low_ladder) in posted_by_ladder
+        assert tuple(c["price"] for c in high_ladder) in posted_by_ladder
         # idx 0 priced off the low ladder (slab 6.5=$1200 → ~$600-650).
         assert 600 <= fresh[0]["fmv"]["fmv_low"] <= 660
         # idx 2 priced off the high ladder (slab 8.0=$2050 → ~$1025-1125).
@@ -2881,17 +2902,25 @@ class TestCgcProxyRescue:
 
     def test_thin_ladder_leaves_needs_manual(self, server_url):
         fresh = {0: {"input": {"grade": 6.5, "year": 1967}, "source": "fresh",
-                     "fmv": {"fmv_high": None, "interpolated": False}}}
+                     "fmv": {"fmv_high": None, "interpolated": False},
+                     "comic_id": 5}}
         thin = [_slab(1200, 6.5)]  # 1 slab comp < MIN_LADDER_COMPS
         with patch("fmv_runner._fetch_comps",
                    return_value=[_graded_result(0, thin)]), \
-             patch("fmv_runner._upsert_fmv") as upsert_mock:
+             patch("fmv_runner._upsert_fmv") as upsert_mock, \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
             fmv_runner._apply_cgc_proxy_rescue(
                 fresh, [{"grade": 6.5, "year": 1967}],
                 server_url=server_url, force=False)
         upsert_mock.assert_not_called()
         assert fresh[0]["source"] == "fresh"
         assert fresh[0]["fmv"].get("cgc_proxy") is None  # never overwritten
+        # BUI-674 / trap 2: the ladder was too thin to PRICE the book, but the
+        # single slab comp it fetched was still a genuine market observation —
+        # post it to the ledger (using the comic_id the primary raw pass
+        # already resolved) even though no proxy band or re-upsert happens.
+        post_mock.assert_called_once_with(server_url, 5, [], thin)
+        assert fresh[0]["comps_posted"] is True
 
 
 # ─── Always-on vintage cross-check (BUI-529) ──────────────────────────────────
@@ -3051,7 +3080,8 @@ class TestCgcCrossCheckApply:
         with patch("fmv_runner._fetch_comps",
                    return_value=[_graded_result(0, _ASM50_SLABS)]), \
              patch("fmv_runner._upsert_fmv",
-                   side_effect=lambda *a, **k: {"comic_id": 7, "fmv_id": 9}):
+                   side_effect=lambda *a, **k: {"comic_id": 7, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True):
             fmv_runner._apply_cgc_proxy_rescue(
                 fresh, books, server_url=server_url, force=False)
         assert fresh[0]["source"] == "cgc-proxy"
