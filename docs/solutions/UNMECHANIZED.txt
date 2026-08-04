@@ -22,7 +22,6 @@ docs/solutions/architecture-patterns/add-a-safety-gate-as-a-fail-closed-precheck
 docs/solutions/architecture-patterns/durable-evidence-store-encode-unknowns-and-identity-precisely.md
 docs/solutions/architecture-patterns/evidence-layer-disambiguation-vs-heuristic-gating.md
 docs/solutions/architecture-patterns/grade-confidence-haircut-and-print-layer-rule-2026-06-03.md
-docs/solutions/architecture-patterns/http-only-contracts-need-a-source-parsing-canary.md
 docs/solutions/architecture-patterns/vacuous-partition-guards-and-mutable-identity-keys.md
 docs/solutions/architecture-patterns/wish-list-data-safety-enforcement-vs-surfacing-layer.md
 docs/solutions/best-practices/collection-add-record-win-tail-rationale-2026-07-19.md

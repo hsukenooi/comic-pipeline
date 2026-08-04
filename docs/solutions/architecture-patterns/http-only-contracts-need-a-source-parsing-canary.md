@@ -6,6 +6,8 @@ module: "apps/fmv (fmv_runner.py — sole producer of forced_flag_reason) + gixe
 problem_type: architecture_pattern
 component: service_object
 severity: high
+mechanized_by: test
+enforced_by_test: plugins/gixen-overlay/tests/test_flag_reason_contract.py
 related_components:
   - apps/fmv
   - gixen-overlay
@@ -110,6 +112,10 @@ Reach for a source-parsing canary when **all** of these hold:
 - The mismatch surfaces only at runtime, in production, on real data
 
 If an import edge *does* exist, don't do this — share the constant and let the type system work. This technique is a fallback for boundaries that deliberately forbid coupling, and it carries real costs: it is regex-fragile, it breaks on producer-side refactors, and it needs the `pytest.skip` escape hatch for checkouts where the peer is absent.
+
+**Update (BUI-673, 2026-08-04): the regex fragility above is avoidable — parse with `ast` instead.** A sibling canary on this same boundary reads the producer's tuple structurally (`ast.parse` → find the `Assign` → read `ast.Constant` elements), so a reformat, a line-wrap, or a trailing comma cannot silently turn the check into a no-op. Same `pytest.fail` guards on both the not-found and the wrong-shape paths. Prefer AST for anything that is a literal collection; regex remains necessary only for scattered call-site literals like `forced_flag_reason=` above, which have no single node to read.
+
+**Also on this boundary, and not covered here: the same 422 can come from a field's TYPE rather than its value.** BUI-673 sent `observed_at` as an epoch float where the validator wanted `str | None` — right field, wrong type, whole batch discarded. See [a mock at the contract boundary cannot test the contract](../best-practices/a-mock-at-the-contract-boundary-cannot-test-the-contract.md) for why a green 30-test suite did not catch it.
 
 Also worth separating from its neighbor: [cross-package regressions escaping per-package test runs](../developer-experience/cross-package-regressions-escape-per-package-test-runs.md) is about a test that **existed and wasn't run**. This is about a test that **could not have existed** until someone wrote the canary. The remedy for the first is running the full CI matrix; the remedy for this one is creating the enforcement point in the first place.
 
