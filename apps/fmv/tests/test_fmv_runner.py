@@ -32,6 +32,20 @@ def _no_first_party_outcomes_by_default(monkeypatch):
                         lambda *a, **k: [])
 
 
+@pytest.fixture(autouse=True)
+def _no_comps_post_by_default(monkeypatch):
+    """BUI-658: `_compute_and_upsert_one` now also calls out to `_post_comps`
+    (a real HTTP POST to /api/comics/comps) immediately after the primary
+    upsert. None of the tests in this file are about that feature — it's
+    covered end-to-end in test_post_comps.py — so default it to a no-op
+    (`None` — "nothing to post", not a failure, matching `_post_comps`'s own
+    empty-input return) here rather than editing every existing
+    `_compute_and_upsert_one`/`run` call site to mock yet another network
+    call it was never testing. Mirrors `_no_first_party_outcomes_by_default`
+    directly above, which solved the identical problem for BUI-286."""
+    monkeypatch.setattr(fmv_runner, "_post_comps", lambda *a, **k: None)
+
+
 def _make_book(item_id, title, issue, year, grade, locg_id=None):
     book = {"item_id": item_id, "title": title, "issue": issue,
             "year": year, "grade": grade}

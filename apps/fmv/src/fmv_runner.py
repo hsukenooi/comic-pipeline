@@ -10,6 +10,10 @@ Pipeline per book:
      (apps/ebay; that command itself caches SerpApi responses)
   3. Run IQR + quartiles + confidence rubric (fmv_math, pure functions)
   4. POST /api/comics to upsert FMV; the gixen-overlay route stamps fmv_updated_at
+  5. POST /api/comics/comps to record the raw+slab pool that produced the
+     price (BUI-658, tier 1 of the comps-data-flywheel plan) — best-effort,
+     never blocks pricing; a failure is counted and surfaced in run()'s
+     summary rather than swallowed (see _post_comps)
 """
 
 from __future__ import annotations
@@ -367,6 +371,35 @@ def run(*, batch_path: str | None, out_path: str | None,
             "Each was priced in-memory but NOT persisted, and is NOT linked "
             "to a comic_id/fmv_id. See each row's `error` for the server's "
             "reason.",
+            err=True,
+        )
+
+    # BUI-658/KTD5: "a run cannot end clean while its comps went nowhere."
+    # `_compute_and_upsert_one` posts each freshly-priced book's raw+slab
+    # comps to the comps ledger immediately after the primary upsert, soft-
+    # failing like `_db_lookup`/`_get_json_or_warn` — never raises, never
+    # touches the priced number or the exit code (see `_post_comps`'s
+    # docstring for the full failure-path decision). That silence is exactly
+    # the BUI-593 shape ("fetch fine, nothing stored") this ticket exists to
+    # close, so the non-fatal half is paired with a mandatory visible half
+    # here: count every `comps_posted is False` (an attempted post that
+    # failed — `None` means nothing to post and is not a failure, see
+    # `_post_comps`) and print unconditionally (not gated by --quiet, same as
+    # the three skip counts above) whenever it's non-zero. All-success prints
+    # nothing here — no happy-path noise.
+    comps_post_failures = sum(
+        1 for r in fresh_fmvs.values() if r.get("comps_posted") is False
+    )
+    if comps_post_failures:
+        click.echo(
+            f"⚠️  {comps_post_failures} book(s) priced successfully, but "
+            "their comps ledger POST (BUI-658, POST /api/comics/comps) "
+            "FAILED — pricing and comic_id/fmv_id linkage are unaffected, "
+            "but the sold-comps pool that produced the price was NOT "
+            "recorded in the ledger for this observation. Not retried "
+            "automatically (a cached re-run skips these books entirely); "
+            "check the comics server and re-run (--force to bypass the "
+            "cache) to retry.",
             err=True,
         )
 
@@ -1050,6 +1083,20 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     upserted = _upsert_fmv(server_url, inp, fmv)
     comic_id, fmv_id = _extract_ids(upserted)
 
+    slab_comps = result.get("slab_comps") or []
+    # BUI-658/KTD5: post this book's raw + slab comps to the comps ledger
+    # exactly ONCE here, immediately after the primary upsert that first
+    # yields `comic_id` — never from `_apply_cgc_proxy_rescue` or
+    # `_apply_cgc_cross_check` below, both of which may re-upsert the SAME
+    # book's `fmv` row again later. `upsert_comps` is idempotent on
+    # re-observation (bumps `seen_count`, never rewrites price), so a second
+    # post wouldn't corrupt anything — but it WOULD misleadingly inflate
+    # `seen_count` for comps that were only ever observed once, so posting
+    # once per book (not once per upsert) is the deliberate choice. See
+    # `_post_comps`'s docstring for the failure-path decision (soft-fail,
+    # counted, never fatal).
+    comps_posted = _post_comps(server_url, comic_id, comps, slab_comps)
+
     return {
         "input": inp, "fmv": fmv, "comp_count_total": len(comps),
         "queries_used": result.get("queries_used", []),
@@ -1059,7 +1106,11 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
         # inclusive tier already fetched (empty when that tier never fired),
         # so the cross-check below can reuse them instead of a dedicated
         # second graded-only fetch in the common case.
-        "slab_comps": result.get("slab_comps") or [],
+        "slab_comps": slab_comps,
+        # BUI-658: True/False/None — see _post_comps docstring. run()'s
+        # summary counts False across fresh_fmvs to decide whether to print
+        # the comps-write failure line.
+        "comps_posted": comps_posted,
     }
 
 
@@ -1477,6 +1528,113 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
         what=f"FMV upsert for {inp.get('title')} #{inp.get('issue')}",
         hard_fail=hard_fail,
     )
+
+
+# ─── Step 3d — comps ledger POST (BUI-658) ────────────────────────────────────
+
+# The `CompItem` fields (`gixen_overlay.models`) a parsed comp already carries
+# verbatim: `product_id`/`title`/`price`/`sold_date`/`grade`/`buying_format`/
+# `link` from `parse_comp`/`parse_comp_sold_comps`, plus `provider`/`tier`/
+# `query`/`from_cache`/`observed_at` stamped on at parse time by BUI-657/KTD6.
+# `pool`/`provenance` are NOT in here — this function adds those itself, since
+# they depend on which list (`comps` vs `slab_comps`) a given comp came from,
+# not on anything the comp carries.
+_COMP_LEDGER_FIELDS = (
+    "product_id", "title", "price", "sold_date", "grade", "buying_format",
+    "link", "query", "tier", "from_cache", "observed_at", "provider",
+)
+
+
+def _comp_to_ledger_item(comp: dict, *, pool: str) -> dict:
+    """Project one parsed comp onto the `POST /api/comics/comps` `CompItem`
+    shape (BUI-658).
+
+    Explicit field selection, not `**comp` — a future field added to the
+    parsed-comp shape upstream (`apps/ebay`) must not silently ride along into
+    this cross-package HTTP contract unreviewed. `models.py:8-25` documents
+    exactly this risk: apps/fmv is not a workspace member, so a producer-side
+    mistake here cannot fail to compile, only 422 at runtime (BUI-588's
+    failure mode). `provenance="live"` unconditionally: comic-fmv always runs
+    live against fresh (or cached-this-run) provider responses — the
+    `backfill-cache`/`backfill-capture` provenances belong to the separate
+    backfill script (BUI-661), which is not this code path.
+    """
+    item = {field: comp.get(field) for field in _COMP_LEDGER_FIELDS}
+    item["pool"] = pool
+    item["provenance"] = "live"
+    return item
+
+
+def _post_comps(server_url: str, comic_id: int | None,
+                comps: list[dict], slab_comps: list[dict]) -> bool | None:
+    """POST one book's raw + slab comps to the comps ledger (BUI-658, tier 1
+    of the comps-data-flywheel plan, `POST /api/comics/comps`).
+
+    FAILURE-PATH DECISION (KTD5): this degrades LOUDLY rather than failing
+    the run. It never raises and never changes the book's priced number,
+    `comic_id`/`fmv_id`, or comic-fmv's exit code — a market-data ledger write
+    is strictly secondary to pricing the book in front of the operator right
+    now. Concretely this means calling `_post_json(..., hard_fail=False)`,
+    which already implements exactly this soft-fail shape (log to stderr,
+    return None, never sys.exit/raise) for every other best-effort write in
+    this module (the BUI-348 proxy re-upsert, the BUI-529 cross-check
+    re-upsert) — reused rather than re-implemented so this ledger post can't
+    drift from that established contract.
+    "Non-fatal" does not mean "invisible", though (KTD5's other half): the
+    caller (`_compute_and_upsert_one`) threads this function's return value
+    onto the book's result as `comps_posted`, and `run()`'s summary counts
+    every `False` and prints a line whenever that count is non-zero — so a
+    run cannot end looking clean while its comps went nowhere. An unrecognized
+    `pool`/`provenance` value 422s the WHOLE batch before anything is written
+    (`CompItem`'s closed-vocabulary validators) and lands in
+    `rejected_writes` for free via `LedgerRoute` — this function does not need
+    to duplicate that visibility, only surface that ITS post failed.
+
+    Returns:
+      - `True`  — the POST landed (2xx).
+      - `False` — the POST was attempted and failed (transport error, 4xx,
+        5xx, or an unparseable response) — `_post_json` already logged it.
+      - `None`  — there was nothing to post (`comps` and `slab_comps` both
+        empty). Distinct from `False` on purpose: the endpoint 422s an empty
+        `comps` list, and a book with zero comps this observation is a real,
+        non-error state (e.g. a genuine n=0 book, BUI-44), not a ledger
+        failure — counting it as one would make the failure count noisy and
+        untrustworthy.
+
+    The whole body is wrapped in a broad except: `_post_json` already turns
+    every REQUEST-level failure into `False`, but building `items` itself
+    (`_comp_to_ledger_item` calling `.get()` on each entry) would raise on a
+    malformed comp — e.g. a `None` entry, or one that isn't a dict — reaching
+    this function. That is exactly the per-book-crash-reads-as-clean-n=0
+    failure class this codebase has already been burned by (BUI-565/570), and
+    the caller (`_compute_and_upsert_one` → `run()`'s per-book loop) does NOT
+    catch a bare exception here the way it catches `_UpsertRejected` — an
+    uncaught crash in this best-effort write would take down the ENTIRE
+    batch, not just this book's ledger post. Same broad-except convention as
+    `sentinel_probe._safe_check` / `sold_comps.py`'s per-book boundaries.
+    """
+    try:
+        items = (
+            [_comp_to_ledger_item(c, pool="raw") for c in comps] +
+            [_comp_to_ledger_item(c, pool="slab") for c in slab_comps]
+        )
+        if not items:
+            return None
+        result = _post_json(
+            f"{server_url}/api/comics/comps",
+            {"comic_id": comic_id, "comps": items},
+            what=f"comps ledger POST ({len(items)} comp(s), comic_id={comic_id})",
+            hard_fail=False,
+        )
+        return result is not None
+    except Exception as e:  # noqa: BLE001 — see docstring: must not crash the run
+        click.echo(
+            f"Warning: comps ledger POST failed unexpectedly for "
+            f"comic_id={comic_id} (malformed comp data, not a network "
+            f"failure): {e!r}",
+            err=True,
+        )
+        return False
 
 
 def _confidence_to_db_label(label: str) -> str:
