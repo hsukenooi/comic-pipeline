@@ -501,33 +501,24 @@ class TestComputeAndUpsertOnePostsComps:
         assert out_failure["comps_posted"] is False
 
 
-# ─── CGC-proxy rescue / cross-check must not repost ─────────────────────────
+# ─── CGC-proxy rescue posts slab-only; cross-check never reposts ───────────
 
 class TestCgcRescueAndCrossCheckDoNotRepostComps:
-    """BUI-658 acceptance: the CGC-proxy rescue and cross-check re-upserts do
-    NOT post comps again — a second post would bump `seen_count` misleadingly
-    for comps that were only ever observed once. Reuses the exact fixture
-    shapes TestCgcProxyRescue/TestCgcCrossCheckApply already establish in
-    test_fmv_runner.py (duplicated locally, not imported, to avoid coupling
-    this file to that one's internals)."""
+    """BUI-658's once-per-book rule (never re-post the SAME comps a second
+    time — it would bump `seen_count` misleadingly) covers the two
+    RE-UPSERTS in this module: the BUI-348 CGC-proxy rescue's re-upsert and
+    the BUI-529 cross-check's re-upsert, neither of which must repost the
+    primary pass's raw+slab comps.
 
-    def test_proxy_rescue_never_calls_post_comps(self, server_url):
-        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
-                               "year": 1967, "grade": 6.5},
-                     "fmv": {"fmv_high": None, "interpolated": False,
-                             "flag_reason": None},
-                     "source": "fresh"}}
-        books = [{"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
-                  "year": 1967, "grade": 6.5}]
-        with patch("fmv_runner._fetch_comps",
-                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
-             patch("fmv_runner._upsert_fmv",
-                   return_value={"comic_id": 7, "fmv_id": 9}), \
-             patch("fmv_runner._post_comps") as post_mock:
-            fmv_runner._apply_cgc_proxy_rescue(
-                fresh, books, server_url=server_url, force=False)
-        assert fresh[0]["source"] == "cgc-proxy"  # the rescue DID fire
-        post_mock.assert_not_called()
+    BUI-674 narrows that: the CGC-proxy rescue's SECOND FETCH (not its
+    re-upsert) returns genuinely NEW comps the primary pass never saw, and
+    those (slab-filtered only — see TestCgcProxyRescuePostsGenuinelyNewSlabComps)
+    ARE posted, once, as `pool='slab'`. The cross-check is untouched by
+    BUI-674 (its own dedicated fetch, when it fires, still never posts —
+    tracked as a separate, unaddressed gap; out of this ticket's scope).
+    Reuses the exact fixture shapes TestCgcProxyRescue/TestCgcCrossCheckApply
+    already establish in test_fmv_runner.py (duplicated locally, not
+    imported, to avoid coupling this file to that one's internals)."""
 
     def test_cross_check_never_calls_post_comps(self, server_url):
         fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
@@ -547,6 +538,143 @@ class TestCgcRescueAndCrossCheckDoNotRepostComps:
                 fresh, books, server_url=server_url, force=False)
         assert fresh[0]["fmv"]["cgc_cross_check"] is not None  # the check DID fire
         post_mock.assert_not_called()
+
+
+# ─── BUI-674: rescue posts its genuinely-new slab comps ─────────────────────
+
+class TestCgcProxyRescuePostsGenuinelyNewSlabComps:
+    """The rescue's second, graded-only fetch (`_fetch_comps` with
+    `include_graded=True`) returns comps the primary raw pass never saw. Only
+    the slab-filtered subset is posted, as `pool='slab'`, using the comic_id
+    the primary pass already resolved (BUI-44's unconditional upsert) —
+    unconditionally on whether the ladder below is trustworthy enough to
+    price the book."""
+
+    def test_posts_slab_subset_only_never_the_non_slab_comps_as_raw(
+            self, server_url):
+        """Trap 1: `include_graded=True` drops the -cgc/-cbcs exclusion, so
+        this pass's raw `comps` list is a MIX of genuine slabs and raw
+        listings that merely carry a grade token. Posting the non-slab
+        remainder as `pool='raw'` would double-count `product_id`s the
+        primary raw pass already posted this same run, inflating
+        `seen_count` for a comp only actually observed once — exactly what
+        BUI-658's once-per-book rule exists to prevent. Assert the `comps`
+        (raw) argument is always empty and only the slab subset is passed."""
+        non_slab = _make_comp(150.0, 6.0, product_id="raw-1",
+                               title="Amazing Spider-Man 50 FN 6.0")
+        mixed = [non_slab, *_ASM50_SLABS]
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False,
+                             "flag_reason": None},
+                     "comic_id": 5, "source": "fresh"}}
+        books = [{"title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[{"input": {"_req_id": 0}, "comps": mixed,
+                                  "queries_used": []}]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 7, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        post_mock.assert_called_once()
+        args = post_mock.call_args.args
+        assert args[0] == server_url
+        assert args[1] == 5  # pre-existing comic_id, not the re-upsert's 7
+        assert args[2] == []  # never pool='raw' from this pass
+        assert args[3] == _ASM50_SLABS  # only the certified-slab subset
+
+    def test_posts_even_when_ladder_too_thin_to_price(self, server_url):
+        """Trap 2: `proxy is None` (ladder too thin/non-monotonic) means no
+        re-upsert and no NEW comic_id extraction inside this function — but
+        the comps were still genuinely fetched, and a comic_id already
+        exists on `fresh_fmvs` from the primary pass, so they are posted
+        (not withheld as 'unidentified')."""
+        thin_ladder = [_slab(1200, 6.5)]  # 1 comp < CGC_PROXY_MIN_LADDER_COMPS
+        fresh = {0: {"input": {"grade": 6.5, "year": 1967}, "source": "fresh",
+                     "fmv": {"fmv_high": None, "interpolated": False},
+                     "comic_id": 5}}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, thin_ladder)]), \
+             patch("fmv_runner._upsert_fmv") as upsert_mock, \
+             patch("fmv_runner._post_comps", return_value=True) as post_mock:
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, [{"grade": 6.5, "year": 1967}],
+                server_url=server_url, force=False)
+        upsert_mock.assert_not_called()  # ladder never priced the book
+        assert fresh[0]["source"] == "fresh"  # not promoted
+        post_mock.assert_called_once_with(server_url, 5, [], thin_ladder)
+        assert fresh[0]["comps_posted"] is True
+
+    def test_rescue_post_failure_is_counted_even_though_pricing_succeeded(
+            self, server_url):
+        """Trap 4: a ledger-write failure on THIS post must still surface
+        through the same `comps_posted` counter `run()`'s summary reads —
+        never silently dropped, and never touching the priced result."""
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False,
+                             "flag_reason": None},
+                     "comic_id": 5, "source": "fresh"}}
+        books = [{"title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 7, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=False):
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        # The book still priced off the proxy band — a ledger post failure
+        # must never block or alter the pricing outcome (KTD5).
+        assert fresh[0]["source"] == "cgc-proxy"
+        assert fresh[0]["comps_posted"] is False
+
+    def test_rescue_post_success_never_clears_a_primary_pass_failure(
+            self, server_url):
+        """Combine logic: if the PRIMARY pass's own comps post already
+        failed (comps_posted=False, set before the rescue ever runs), a
+        later-succeeding rescue post must not paper over that — the summary
+        must still see that one of this book's posts failed this run."""
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False,
+                             "flag_reason": None},
+                     "comic_id": 5, "source": "fresh",
+                     "comps_posted": False}}  # primary pass already failed
+        books = [{"title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 7, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True):
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        assert fresh[0]["comps_posted"] is False
+
+    def test_rescue_post_upgrades_a_primary_none_to_true(self, server_url):
+        """Combine logic: the primary pass had nothing to post
+        (comps_posted=None, e.g. a genuine n=0 raw pool — exactly the shape
+        that makes a book a rescue candidate), and the rescue's own post
+        succeeds — the summary should reflect that SOMETHING was posted."""
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False,
+                             "flag_reason": None},
+                     "comic_id": 5, "source": "fresh",
+                     "comps_posted": None}}
+        books = [{"title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 7, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True):
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        assert fresh[0]["comps_posted"] is True
 
 
 # ─── run()'s comps-write-failure summary ────────────────────────────────────
