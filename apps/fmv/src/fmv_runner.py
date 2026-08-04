@@ -1091,17 +1091,21 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     comic_id, fmv_id = _extract_ids(upserted)
 
     slab_comps = result.get("slab_comps") or []
-    # BUI-658/KTD5: post this book's raw + slab comps to the comps ledger
-    # exactly ONCE here, immediately after the primary upsert that first
-    # yields `comic_id` — never from `_apply_cgc_proxy_rescue` or
-    # `_apply_cgc_cross_check` below, both of which may re-upsert the SAME
-    # book's `fmv` row again later. `upsert_comps` is idempotent on
+    # BUI-658/KTD5: post THESE comps to the comps ledger exactly ONCE, here,
+    # immediately after the primary upsert that first yields `comic_id` —
+    # never again from the re-upserts in `_apply_cgc_proxy_rescue` /
+    # `_apply_cgc_cross_check` below. `upsert_comps` is idempotent on
     # re-observation (bumps `seen_count`, never rewrites price), so a second
     # post wouldn't corrupt anything — but it WOULD misleadingly inflate
     # `seen_count` for comps that were only ever observed once, so posting
-    # once per book (not once per upsert) is the deliberate choice. See
-    # `_post_comps`'s docstring for the failure-path decision (soft-fail,
-    # counted, never fatal).
+    # once per OBSERVATION (not once per upsert) is the deliberate choice.
+    #
+    # BUI-674 sharpened that rule rather than breaking it: the rescue's
+    # graded-only pass is a SECOND FETCH, so its slab comps are a genuinely
+    # new observation and it posts them itself. What stays banned is
+    # re-posting comps already sent from here — which is why that call passes
+    # `comps=[]` and only the slab subset. See `_post_comps`'s docstring for
+    # the failure-path decision (soft-fail, counted, never fatal).
     comps_posted = _post_comps(server_url, comic_id, comps, slab_comps)
 
     return {
