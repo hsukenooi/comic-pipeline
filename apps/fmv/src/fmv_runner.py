@@ -433,6 +433,31 @@ def run(*, batch_path: str | None, out_path: str | None,
             err=True,
         )
 
+    # BUI-678: a currency-rejected comp (BUI-675's gate) is a SUCCESSFUL fetch
+    # whose parse discarded every result on non-USD currency — the fetch-err
+    # signal (`queries_used` all carrying 'error') can't see it, and it is
+    # indistinguishable from a genuine no-comps book without this count. Same
+    # BUI-565/570/593 invisible-clean-n=0 shape this codebase keeps getting
+    # burned by. Reported unconditionally (not gated by --quiet, same as the
+    # skip counts and comps-post-failure line above) so an operator relying on
+    # --brief alone still learns some rows lost comps to the gate rather than
+    # having genuinely no sold history.
+    non_usd_dropped_rows = [
+        r for r in final if (r.get("fmv") or {}).get("non_usd_dropped")
+    ]
+    if non_usd_dropped_rows:
+        total_non_usd_dropped = sum(
+            r["fmv"]["non_usd_dropped"] for r in non_usd_dropped_rows
+        )
+        click.echo(
+            f"⚠️  {len(non_usd_dropped_rows)} book(s) had comps dropped by "
+            f"the BUI-675 currency gate ({total_non_usd_dropped} comp(s) "
+            "total, non-USD sold listings). This is NOT a fetch error — "
+            "check each row's fmv_notes (non_usd_dropped=N) before treating "
+            "a resulting 'n/a'/0-comps row as a genuine no-comps book.",
+            err=True,
+        )
+
     # BUI-624: the `fmv-refresh` heartbeat. Counted from `fresh_fmvs`, whose
     # `fmv_id` is only ever set by `_extract_ids(upserted)` — i.e. only when
     # `/api/comics` actually returned a row. "comic-fmv exited 0" is NOT the
@@ -1152,6 +1177,7 @@ def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
     fmv["first_party_count"] = 0
     fmv["variant_dropped"] = None
     fmv["masthead_swapped_to"] = None
+    fmv["non_usd_dropped"] = 0
 
     comic_ids = {r.get("comic_id") for r in rows if r.get("comic_id") is not None}
     return {
@@ -1383,6 +1409,26 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # this book under the other name its series carried.
     fmv["variant_dropped"] = dropped_variant
     fmv["masthead_swapped_to"] = result.get("masthead_swapped_to")
+    # BUI-678: comps ebay-sold-comps' BUI-675 currency gate rejected for this
+    # book (0 for the common case — `.get(...)` with a default, never `[...]`,
+    # since a deployed ebay-sold-comps that predates BUI-678 won't emit this
+    # key at all). A book whose pool went to zero ENTIRELY because of this is
+    # a successful fetch the parser discarded, not a fetch-err (queries_used
+    # has no 'error') and not necessarily a genuine no-comps book — see
+    # `_print_table` and `_build_notes` for where this renders, and the
+    # fmv.md "third category" note for the operator-facing rule.
+    non_usd_dropped = result.get("non_usd_dropped") or 0
+    fmv["non_usd_dropped"] = non_usd_dropped
+    if non_usd_dropped:
+        click.echo(
+            f"Note: {inp.get('title')} #{inp.get('issue')} — the BUI-675 "
+            f"currency gate dropped {non_usd_dropped} non-USD comp(s) from "
+            "this book's fetch. Not a fetch error, and — if this book's pool "
+            "is otherwise empty — not necessarily a genuine no-comps book; "
+            "see fmv_notes (non_usd_dropped=N) before treating it as "
+            "illiquid.",
+            err=True,
+        )
     # BUI-286: surface the first-party contribution on the returned dict so
     # `_build_notes` can mention it — informational only, fmv_math's output
     # shape is otherwise untouched.
@@ -2169,6 +2215,13 @@ def _build_notes(fmv: dict) -> str:
     dropped_variant = fmv.get("variant_dropped")
     if dropped_variant:
         parts.append(f"variant_dropped={dropped_variant}")
+    # BUI-678: name how many comps the BUI-675 currency gate rejected for this
+    # book — written whenever non-zero, even on a row that still priced (some
+    # tiers can lose comps to the gate while others still find USD ones), so
+    # the drop is never invisible even when it didn't end up mattering.
+    non_usd_dropped = fmv.get("non_usd_dropped")
+    if non_usd_dropped:
+        parts.append(f"non_usd_dropped={non_usd_dropped}")
     # BUI-581: name the masthead these comps actually came from when it isn't the
     # title we were asked about — a renamed series (X-Men → Uncanny X-Men) lists
     # its vintage issues under the ORIGINAL name, so a pool found under the other
@@ -2694,6 +2747,17 @@ def _print_table(rows: list[dict]) -> None:
             fmv_str = "fetch-err"
             med_str = "—"
             mb_str = "—"
+        elif fmv.get("non_usd_dropped"):
+            # BUI-678: a THIRD category, distinct from both `fetch-err` above
+            # and the genuine-no-comps `n/a` below — the fetch SUCCEEDED
+            # (queries_used carries no 'error') but the BUI-675 currency gate
+            # rejected every comp it returned. Reachable only once fmv_low is
+            # confirmed None above, so this is always a fully-emptied pool,
+            # never a partial one. Naming the count keeps an operator from
+            # reading this row as "illiquid" the way a bare 'n/a' would.
+            fmv_str = f"0 comps ({fmv['non_usd_dropped']} non-USD dropped)"
+            med_str = "n/a"
+            mb_str = "n/a"
         else:
             fmv_str = "n/a"
             med_str = "n/a"

@@ -1685,6 +1685,29 @@ def _is_usd_serpapi_price(price_obj: dict) -> bool:
     return isinstance(raw, str) and bool(_USD_PRICE_RAW_RE.match(raw))
 
 
+def _is_non_usd_serpapi_result(result: dict) -> bool:
+    """BUI-678: True when a SerpApi organic_result is the specific shape
+    `parse_comp()` drops for FAILING the BUI-675 currency gate — a real
+    listing (title + a price object present) that `_is_usd_serpapi_price`
+    rejects — as opposed to a listing `parse_comp()` drops for an unrelated
+    reason (no title at all, or a price that fails to parse after passing
+    the gate). Callers must only consult this AFTER `parse_comp(result)` has
+    already returned None, so a comp that priced normally is never
+    double-counted as a currency drop.
+
+    This exists because `parse_comp()`'s `dict | None` contract is relied on
+    by its own tests (asserting the parsed shape or a bare None) and by nothing
+    else needing a rejection *reason* until now — duplicating the two guards
+    here, rather than widening that return type, keeps the parser's contract
+    unchanged."""
+    if not result.get("title"):
+        return False
+    price_obj = result.get("price") or {}
+    if not price_obj:
+        return False
+    return not _is_usd_serpapi_price(price_obj)
+
+
 def parse_comp(result: dict) -> dict | None:
     """Convert a SerpApi organic_result into our normalized comp shape."""
     title = result.get("title", "")
@@ -1770,6 +1793,21 @@ def parse_comp_sold_comps(item: dict) -> dict | None:
         "buying_format": item.get("buyingFormat", ""),
         "link": item.get("url", ""),
     }
+
+
+def _is_non_usd_sold_comps_item(item: dict) -> bool:
+    """BUI-678: sold-comps.com counterpart of `_is_non_usd_serpapi_result` —
+    True when a raw item is the specific shape `parse_comp_sold_comps()`
+    drops for its currency guard (a titled item whose `soldCurrency` is
+    present and not USD), not for an unrelated reason. Measured as a no-op
+    today (see that guard's docstring — 6,192/6,192 USD in the offline
+    corpus) but kept so the count stays honest if that ever changes. Callers
+    must only consult this AFTER `parse_comp_sold_comps(item)` has already
+    returned None."""
+    if not item.get("title"):
+        return False
+    currency = str(item.get("soldCurrency") or "").strip()
+    return bool(currency) and currency.upper() != "USD"
 
 
 def _has_next_page(data: dict) -> bool:
@@ -1892,6 +1930,14 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # the bottom carries the same keys as the success return.
     masthead_swapped_to: str | None = None
     variant_dropped: str | None = None
+    # BUI-678: comps the BUI-675 currency gate rejected (title present, price
+    # object present, currency proven non-USD) — summed across every tier's
+    # `_run` call below. A response that loses ALL its comps to this gate is a
+    # successful, non-empty `queries_used` that still classifies as a genuine
+    # n=0 to `_is_fetch_error` (deliberately — see that function's docstring;
+    # this is NOT a fetch failure). This total is how a caller tells that
+    # shape apart from a book that genuinely has no sold history.
+    non_usd_dropped_total = 0
 
     def _breaker_tripped() -> bool:
         # BUI-545: OR of both providers' breakers — either one tripping means
@@ -1975,13 +2021,25 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             if provider == PROVIDER_SOLD_COMPS:
                 raw_results = data.get("items", [])
                 parse = parse_comp_sold_comps
+                is_non_usd = _is_non_usd_sold_comps_item
             else:
                 raw_results = data.get("organic_results", [])
                 parse = parse_comp
+                is_non_usd = _is_non_usd_serpapi_result
             added = 0
+            # BUI-678: counted separately from the ordinary "no title" / "bad
+            # price" None-returns above, so a currency-specific rejection has
+            # a distinct signal instead of vanishing into the same silent
+            # `continue` as every other reason `parse()` can return None.
+            non_usd_dropped = 0
+            nonlocal non_usd_dropped_total
             for r in raw_results:
                 comp = parse(r)
-                if comp is None or not comp["product_id"]:
+                if comp is None:
+                    if is_non_usd(r):
+                        non_usd_dropped += 1
+                    continue
+                if not comp["product_id"]:
                     continue
                 if comp["product_id"] in seen_ids:
                     continue
@@ -2016,11 +2074,18 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                     continue
                 comps.append(comp)
                 added += 1
+            non_usd_dropped_total += non_usd_dropped
             queries_used.append({
                 "tier": tier,
                 "nkw": nkw,
                 "raw_results": len(raw_results),
                 "new_comps": added,
+                # BUI-678: how many of THIS query's raw_results the BUI-675
+                # currency gate rejected — the gap between raw_results and
+                # new_comps that isn't already explained by dedup/hard-excludes
+                # is otherwise unnamed. 0 on every query for a book/response
+                # this gate never touched (the common case).
+                "non_usd_dropped": non_usd_dropped,
                 "cached": cache_hit,
                 # SerpApi-only field; "" for a sold-comps.com response (its
                 # data has no search_metadata).
@@ -2218,6 +2283,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # cover, not that variant — the caller must surface the trade, not
             # bury it.
             "variant_dropped": variant_dropped,
+            # BUI-678: total comps the BUI-675 currency gate rejected across
+            # every tier this book ran — 0 for the overwhelming common case.
+            # A caller compares this to `comps`/`comp_count_total` to tell a
+            # currency-gate-emptied pool apart from a genuine no-comps book.
+            "non_usd_dropped": non_usd_dropped_total,
         }
     except Exception as e:  # noqa: BLE001 — BUI-537: preserve the partial
         # trail rather than losing it; see the docstring above. `book.get(...)`
@@ -2243,6 +2313,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             "breaker_tripped": _breaker_tripped(),
             "masthead_swapped_to": masthead_swapped_to,
             "variant_dropped": variant_dropped,
+            "non_usd_dropped": non_usd_dropped_total,
             "error": str(e),
         }
 
@@ -2374,8 +2445,14 @@ def _print_human(results: list[dict]) -> None:
         tiers = ",".join(_tier_label(q) for q in r["queries_used"])
         cached = sum(1 for q in r["queries_used"] if q.get("cached"))
         breaker_note = " [breaker-tripped]" if r.get("breaker_tripped") else ""
+        # BUI-678: name it inline on the book's own line — this is the count
+        # that turns a bare "0 comps" into a currency-gate drop rather than a
+        # genuine no-comps book.
+        non_usd = r.get("non_usd_dropped") or 0
+        non_usd_note = f" [non-USD dropped: {non_usd}]" if non_usd else ""
         print(f"  {label}: {n_total} comps ({n_graded} grade-tagged) "
-              f"tiers=[{tiers}] cached={cached}/{len(r['queries_used'])}{breaker_note}")
+              f"tiers=[{tiers}] cached={cached}/{len(r['queries_used'])}"
+              f"{breaker_note}{non_usd_note}")
 
     # BUI-535: aggregate stdout visibility (distinct from the one-time stderr
     # warning _CircuitBreaker.record_error() prints the instant it trips) —
@@ -2390,6 +2467,25 @@ def _print_human(results: list[dict]) -> None:
             f"\n  A provider circuit breaker tripped during this batch — "
             f"{n_breaker_tripped} book(s) affected (failover, cache-only, "
             "or fetch-err); re-run later."
+        )
+
+    # BUI-678: a currency-rejected comp (BUI-675's gate) is a SUCCESSFUL fetch
+    # whose parse discarded every result — a distinct, silent shape from both
+    # a fetch-err (queries_used carries 'error') and a genuine no-comps book
+    # (queries_used is clean AND non-usd_dropped is 0). Unconditional stderr
+    # line (not folded into the stdout summary above) so it can't be missed
+    # under --quiet, matching this repo's other loud-diagnostic precedents.
+    n_non_usd_dropped = sum(r.get("non_usd_dropped") or 0 for r in results)
+    if n_non_usd_dropped:
+        n_books_affected = sum(
+            1 for r in results if r.get("non_usd_dropped"))
+        print(
+            f"note: the BUI-675 currency gate dropped {n_non_usd_dropped} "
+            f"non-USD comp(s) across {n_books_affected} book(s) in this "
+            "batch — a successful fetch whose parse rejected every result, "
+            "NOT a fetch error and not necessarily a genuine no-comps book. "
+            "See each book's `non_usd_dropped` count.",
+            file=sys.stderr,
         )
 
 

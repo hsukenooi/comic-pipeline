@@ -3710,6 +3710,206 @@ class TestVariantDroppedSignal:
         assert "variant_dropped" not in fmv_runner._build_notes(out["fmv"])
 
 
+class TestNonUsdDroppedSignal:
+    """BUI-678: ebay-sold-comps' BUI-675 currency gate can reject EVERY comp
+    a response returned — a successful fetch (queries_used carries no
+    'error') that the parse discarded, not a fetch-err and not necessarily a
+    genuine no-comps book. The same invisible-clean-n=0 shape this codebase
+    has been burned by before (BUI-565/570/593): make it observable, don't
+    reclassify it."""
+
+    def _priced_result(self, **extra):
+        result = {
+            "input": {"title": "New X-Men", "issue": "128", "year": 2002,
+                      "grade": 9.0},
+            "comps": [_make_comp(p, 9.0) for p in [20, 22, 24, 26, 28]],
+        }
+        result.update(extra)
+        return result
+
+    def _empty_result(self, non_usd_dropped, **extra):
+        result = {
+            "input": {"title": "New X-Men", "issue": "128", "year": 2002,
+                      "grade": 9.0},
+            "comps": [],
+            "queries_used": [{"tier": "base", "nkw": "x", "raw_results": non_usd_dropped,
+                              "new_comps": 0, "non_usd_dropped": non_usd_dropped,
+                              "cached": False, "outcome": "live"}],
+            "non_usd_dropped": non_usd_dropped,
+        }
+        result.update(extra)
+        return result
+
+    def _book(self):
+        return {"title": "New X-Men", "issue": "128", "grade": 9.0}
+
+    def test_absent_signal_defaults_to_zero(self, server_url):
+        """The overwhelmingly common path this ticket never touches must
+        still carry a real 0 — a consumer relying on `.get(...)` needs to
+        tell "checked, none dropped" apart from "field never existed"."""
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._priced_result(), self._book(), server_url=server_url)
+        assert out["fmv"]["non_usd_dropped"] == 0
+        assert out["fmv"]["flag_reason"] is None
+        assert out["fmv"]["max_bid"] is not None
+
+    def test_currency_emptied_pool_stays_unflagged_and_unpriced(self, server_url):
+        """An empty pool is BUI-44's existing no-comps stub — deliberately
+        NOT a new flag_reason (this is a diagnostic count, not a pricing
+        verdict), so flag_reason stays None exactly as a genuine no-comps
+        book's does (see fmv_math._classify_pool's own "n=0 → (None, None)"
+        rule). The count is what tells the two apart, not the flag."""
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._empty_result(26), self._book(), server_url=server_url)
+        assert out["fmv"]["flag_reason"] is None
+        assert out["fmv"]["fmv_low"] is None
+        assert out["fmv"]["max_bid"] is None
+        assert out["fmv"]["non_usd_dropped"] == 26
+
+    def test_is_fetch_error_stays_false(self, server_url):
+        """Do NOT widen _is_fetch_error's classification (explicit BUI-678
+        scope boundary): a currency-rejected response has a clean,
+        error-free queries_used entry — it IS a successful fetch — so it
+        must never enter the fetch-err count/warning."""
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._empty_result(26), self._book(), server_url=server_url)
+        assert out.get("fetch_error") is not True
+        assert fmv_runner._is_fetch_error({
+            "comp_count_total": out["comp_count_total"],
+            "queries_used": out["queries_used"],
+        }) is False
+
+    def test_note_prints_to_stderr_when_non_zero(self, server_url, capsys):
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            fmv_runner._compute_and_upsert_one(
+                self._empty_result(26), self._book(), server_url=server_url)
+        err = capsys.readouterr().err
+        assert "26 non-USD comp(s)" in err
+        assert "currency gate" in err
+
+    def test_no_note_when_nothing_was_dropped(self, server_url, capsys):
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            fmv_runner._compute_and_upsert_one(
+                self._priced_result(), self._book(), server_url=server_url)
+        err = capsys.readouterr().err
+        assert "currency gate" not in err
+
+    def test_notes_name_the_drop_count(self, server_url):
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._empty_result(26), self._book(), server_url=server_url)
+        assert "non_usd_dropped=26" in fmv_runner._build_notes(out["fmv"])
+
+    def test_notes_omit_the_token_when_nothing_was_dropped(self, server_url):
+        with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
+            out = fmv_runner._compute_and_upsert_one(
+                self._priced_result(), self._book(), server_url=server_url)
+        assert "non_usd_dropped" not in fmv_runner._build_notes(out["fmv"])
+
+    def test_table_renders_a_third_category_not_bare_na(self, capsys):
+        """BUI-678's own scope: distinct from BOTH `fetch-err` (BUI-143) and
+        a genuine no-comps `n/a` — reading either into a currency-gate drop
+        is exactly the failure this ticket exists to close."""
+        rows = [
+            {"input": {"title": "New X-Men", "issue": "128", "grade": 9.0},
+             "fmv": {"fmv_low": None, "non_usd_dropped": 26},
+             "comp_count_total": 0,
+             "queries_used": [{"tier": "base", "nkw": "x"}],
+             "source": "fresh"},
+        ]
+        fmv_runner._print_table(rows)
+        out = capsys.readouterr().out
+        assert "0 comps (26 non-USD dropped)" in out
+        assert "fetch-err" not in out
+
+    def test_table_still_renders_bare_na_for_a_genuine_no_comps_book(self, capsys):
+        """Regression guard: a book with no non_usd_dropped signal at all
+        (the ordinary illiquid case) must keep rendering the plain 'n/a' —
+        this ticket must not repaint every empty pool."""
+        rows = [
+            {"input": {"title": "Nobody Buys This", "issue": "1", "grade": 9.0},
+             "fmv": {"fmv_low": None},
+             "comp_count_total": 0,
+             "queries_used": [{"tier": "base", "nkw": "x"}],
+             "source": "fresh"},
+        ]
+        fmv_runner._print_table(rows)
+        out = capsys.readouterr().out
+        assert "n/a" in out
+        assert "non-USD dropped" not in out
+
+
+class TestRunNonUsdDroppedSummary:
+    """run()'s unconditional (not --quiet-gated) aggregate warning — same
+    shape as the skip-count/comps-post-failure lines it sits beside, so an
+    operator relying on `--brief` alone still learns some rows lost comps to
+    the BUI-675 gate."""
+
+    def _batch(self):
+        return [
+            {"item_id": "1", "title": "A", "issue": "1", "year": 1990,
+             "grade": 9.0},
+            {"item_id": "2", "title": "B", "issue": "1", "year": 1990,
+             "grade": 9.0},
+        ]
+
+    def _fake_results(self):
+        comps = [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]]
+        return [
+            {"input": {"_req_id": 0, "title": "A", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": "1"},
+             "comps": [], "queries_used": [{"tier": "base", "cached": False}],
+             "non_usd_dropped": 26},
+            {"input": {"_req_id": 1, "title": "B", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": "2"},
+             "comps": comps, "queries_used": [{"tier": "base", "cached": False}]},
+        ]
+
+    @staticmethod
+    def _upsert_side_effect(server_url, inp, fmv, hard_fail=True):
+        if inp.get("title") == "A":
+            return {"comic_id": 1, "fmv_id": 10}
+        return {"comic_id": 2, "fmv_id": 20}
+
+    def test_one_book_affected_is_counted_and_reported(
+            self, tmp_path, server_url, capsys):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+
+        with patch("fmv_runner._fetch_comps", return_value=self._fake_results()), \
+             patch("fmv_runner._upsert_fmv", side_effect=self._upsert_side_effect):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        cap = capsys.readouterr()
+        assert "1 book(s) had comps dropped" in cap.err
+        assert "26 comp(s) total" in cap.err
+        assert "currency gate" in cap.err
+        # Both books still priced normally — this is diagnostic-only.
+        assert "not a fetch error" in cap.err.lower()
+
+    def test_no_line_when_nothing_dropped(self, tmp_path, server_url, capsys):
+        """All-clean run stays silent about this — no happy-path noise."""
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+        results = self._fake_results()
+        results[0]["comps"] = [_make_comp(p, 9.0) for p in [10, 12, 14, 16, 18]]
+        del results[0]["non_usd_dropped"]
+
+        with patch("fmv_runner._fetch_comps", return_value=results), \
+             patch("fmv_runner._upsert_fmv", side_effect=self._upsert_side_effect):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+
+        cap = capsys.readouterr()
+        assert "comps dropped by the BUI-675 currency gate" not in cap.err
+
+
 class TestMastheadSwapSignal:
     def _result(self, **extra):
         result = {
