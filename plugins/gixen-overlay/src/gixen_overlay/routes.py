@@ -38,9 +38,13 @@ from gixen_overlay.db import (
     mark_collection_wins_seen,
     get_first_party_outcomes,
     calibration_report,
+    get_comps,
+    get_fmv_history,
     DEFAULT_OUTCOME_GRADE_WINDOW,
     DEFAULT_OUTCOME_RECENCY_DAYS,
     DEFAULT_CALIBRATION_MIN_LOSSES,
+    DEFAULT_COMPS_READ_LIMIT,
+    DEFAULT_FMV_HISTORY_READ_LIMIT,
 )
 from gixen_overlay.ledger import LedgerRoute
 from gixen_overlay.locg_lookup import resolve_year_and_locg
@@ -410,6 +414,94 @@ async def api_ingest_comps(req: CompsIngestRequest, request: Request):
         [c.model_dump() for c in req.comps],
     )
     return {"comic_id": req.comic_id, **result}
+
+
+_UNRESOLVABLE_IDENTITY_DETAIL = (
+    "unresolvable comic identity — supply comic_id, or title+issue "
+    "(+ optional year) matching a known book"
+)
+
+
+@router.get("/api/comics/comps")
+async def api_comics_comps(
+    request: Request,
+    comic_id: int | None = None,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+    days: float | None = None,
+    pool: str | None = None,
+    provider: str | None = None,
+    limit: int = DEFAULT_COMPS_READ_LIMIT,
+):
+    """BUI-662: read the comps ledger for one book — DIAGNOSTIC/ARCHIVE ONLY.
+
+    Read-only counterpart to `POST /api/comics/comps` (BUI-656) above, on the
+    same path. Identity: `comic_id`, or `(title, issue[, year])` mirroring
+    `/api/comics`' resolution. A known book with no comps returns 200 + an
+    empty list; an unresolvable identity (no book matches, or neither
+    identity was supplied) returns 400 — "no comps" must never be confusable
+    with "wrong book" (the fetch-err-versus-genuine-zero lesson this project
+    keeps re-learning). `days` filters on `observed_at`, not `first_seen_at`.
+
+    **Never call this from the pricing path.** This project writes the comps
+    archive and never reads it back into a price — degraded-mode pricing
+    from stored comps is a deliberately separate follow-up (BUI-663) with its
+    own staleness rules and soak. See `tests/test_fmv_history.py`'s contract
+    test, which greps `apps/fmv` for exactly that.
+    """
+    db = request.app.state.db
+    rows = get_comps(
+        db,
+        comic_id=comic_id,
+        title=title,
+        issue=issue,
+        year=year,
+        grade=grade,
+        days=days,
+        pool=pool,
+        provider=provider,
+        limit=limit,
+    )
+    if rows is None:
+        raise HTTPException(status_code=400, detail=_UNRESOLVABLE_IDENTITY_DETAIL)
+    return [dict(r) for r in rows]
+
+
+@router.get("/api/comics/fmv-history")
+async def api_comics_fmv_history(
+    request: Request,
+    comic_id: int | None = None,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+    limit: int = DEFAULT_FMV_HISTORY_READ_LIMIT,
+):
+    """BUI-662: read fmv_history for one book — DIAGNOSTIC/ARCHIVE ONLY.
+
+    Every FMV snapshot `POST /api/comics` (BUI-659) ever appended for this
+    book, newest-first by `recorded_at`. Identity and the 200-empty-list vs.
+    400-unresolvable contract are identical to `GET /api/comics/comps` above
+    — see that endpoint's docstring.
+
+    **Never call this from the pricing path** — same scope boundary as
+    `GET /api/comics/comps`; see that docstring's last paragraph.
+    """
+    db = request.app.state.db
+    rows = get_fmv_history(
+        db,
+        comic_id=comic_id,
+        title=title,
+        issue=issue,
+        year=year,
+        grade=grade,
+        limit=limit,
+    )
+    if rows is None:
+        raise HTTPException(status_code=400, detail=_UNRESOLVABLE_IDENTITY_DETAIL)
+    return [dict(r) for r in rows]
 
 
 @router.post("/api/bids/{item_id}/link-fmv")

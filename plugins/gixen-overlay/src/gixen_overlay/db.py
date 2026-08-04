@@ -2477,6 +2477,163 @@ def calibration_report(
     return report
 
 
+# ---------------------------------------------------------------------------
+# Comps and fmv_history read endpoints (BUI-662)
+# ---------------------------------------------------------------------------
+
+# Neither read function below is ever called from the pricing path — this
+# project writes the archive and never reads it back into a price (see the
+# comps-data-flywheel plan's Scope Boundaries). See
+# tests/test_fmv_history.py's contract test, which greps apps/fmv for exactly
+# that.
+
+DEFAULT_COMPS_READ_LIMIT = 100
+DEFAULT_FMV_HISTORY_READ_LIMIT = 100
+
+
+def _resolve_comic_id(
+    conn: sqlite3.Connection,
+    *,
+    comic_id: int | None,
+    title: str | None,
+    issue: str | None,
+    year: int | None,
+) -> int | None:
+    """Resolve a `comic_id` or `(title, issue[, year])` pair to a comics.id.
+
+    Returns None when the identity is UNRESOLVABLE: neither `comic_id` nor
+    `(title AND issue)` was supplied, or what was supplied matches no row in
+    `comics`. Both `get_comps` and `get_fmv_history` below treat that as
+    distinct from "resolved, but nothing on file for it" — the caller 400s
+    on None (wrong/unknown book) versus 200 + [] on an empty result (a known
+    book we simply have no rows for yet). Same resolution shape as
+    `list_comics` (case-insensitive title match, optional year).
+    """
+    if comic_id is not None:
+        row = conn.execute(
+            "SELECT id FROM comics WHERE id=?", (comic_id,)
+        ).fetchone()
+        return row["id"] if row is not None else None
+    if title is not None and issue is not None:
+        clauses = ["LOWER(title) = LOWER(?)", "issue = ?"]
+        params: list[Any] = [title, issue]
+        if year is not None:
+            clauses.append("year = ?")
+            params.append(year)
+        row = conn.execute(
+            f"SELECT id FROM comics WHERE {' AND '.join(clauses)} LIMIT 1",
+            params,
+        ).fetchone()
+        return row["id"] if row is not None else None
+    return None
+
+
+def get_comps(
+    conn: sqlite3.Connection,
+    *,
+    comic_id: int | None = None,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+    days: float | None = None,
+    pool: str | None = None,
+    provider: str | None = None,
+    limit: int = DEFAULT_COMPS_READ_LIMIT,
+) -> list[sqlite3.Row] | None:
+    """Read path for `GET /api/comics/comps` (BUI-662). Newest-first by
+    `observed_at`.
+
+    Identity: `comic_id`, or `(title, issue[, year])` — see
+    `_resolve_comic_id`. Returns None when the identity is unresolvable (the
+    route 400s); returns [] when it resolves to a real book with no comps on
+    file (the route 200s) — "no comps" must never be confusable with "wrong
+    book."
+
+    `days` filters on `observed_at` (when the comp was fetched), never
+    `first_seen_at` (when this row was first written to the ledger) — a
+    re-observed comp's `observed_at` advances even though `first_seen_at`
+    doesn't, and staleness here is about the market data's age, not the
+    ledger row's age. Comparison goes through SQLite's own `datetime()`
+    (mirrors `_RESOLVED_RECENCY_CLAUSE`), not a Python-formatted string, since
+    `observed_at` may carry a 'Z' suffix that doesn't compare correctly
+    byte-for-byte against `datetime.isoformat()`'s output.
+    """
+    resolved_id = _resolve_comic_id(
+        conn, comic_id=comic_id, title=title, issue=issue, year=year
+    )
+    if resolved_id is None:
+        return None
+
+    clauses = ["comic_id = ?"]
+    params: list[Any] = [resolved_id]
+    if grade is not None:
+        clauses.append("grade = ?")
+        params.append(grade)
+    if pool is not None:
+        clauses.append("pool = ?")
+        params.append(pool)
+    if provider is not None:
+        clauses.append("provider = ?")
+        params.append(provider)
+    if days is not None:
+        clauses.append(
+            "observed_at IS NOT NULL AND datetime(observed_at) >= datetime('now', ?)"
+        )
+        params.append(f"-{days} days")
+    where = " AND ".join(clauses)
+    params.append(limit)
+    return conn.execute(
+        f"""
+        SELECT * FROM comps
+        WHERE {where}
+        ORDER BY observed_at DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+
+
+def get_fmv_history(
+    conn: sqlite3.Connection,
+    *,
+    comic_id: int | None = None,
+    title: str | None = None,
+    issue: str | None = None,
+    year: int | None = None,
+    grade: float | None = None,
+    limit: int = DEFAULT_FMV_HISTORY_READ_LIMIT,
+) -> list[sqlite3.Row] | None:
+    """Read path for `GET /api/comics/fmv-history` (BUI-662). Newest-first by
+    `recorded_at`.
+
+    Identity and the None-vs-[] contract are identical to `get_comps` above
+    (see `_resolve_comic_id`) — an unresolvable book returns None (the route
+    400s), a resolved book with no history rows returns [] (the route 200s).
+    """
+    resolved_id = _resolve_comic_id(
+        conn, comic_id=comic_id, title=title, issue=issue, year=year
+    )
+    if resolved_id is None:
+        return None
+
+    clauses = ["comic_id = ?"]
+    params: list[Any] = [resolved_id]
+    if grade is not None:
+        clauses.append("grade = ?")
+        params.append(grade)
+    where = " AND ".join(clauses)
+    params.append(limit)
+    return conn.execute(
+        f"""
+        SELECT * FROM fmv_history
+        WHERE {where}
+        ORDER BY recorded_at DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+
 
 # ---------------------------------------------------------------------------
 # Seller-scan seen-tracking (BUI-113)

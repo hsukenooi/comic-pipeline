@@ -1,13 +1,19 @@
-"""Tests for fmv_history (BUI-659) — the append-only FMV price ledger.
+"""Tests for fmv_history (BUI-659) and its two read endpoints (BUI-662).
 
-`fmv` stores exactly one row per (comic_id, grade) — a recompute overwrites
-it, so there is no way to ask what a book was worth last month. `fmv_history`
-is the append-only fix: every `POST /api/comics` upsert that carries a grade
-appends an immutable snapshot, and a one-time migration seeds one row per
-pre-existing `fmv` row. These tests pin the two invariants that matter most:
-the append happens on EVERY upsert including a no-op one (never conditional
-on "did anything change"), and the seeding migration cannot double-seed on a
-restart.
+BUI-659: `fmv` stores exactly one row per (comic_id, grade) — a recompute
+overwrites it, so there is no way to ask what a book was worth last month.
+`fmv_history` is the append-only fix: every `POST /api/comics` upsert that
+carries a grade appends an immutable snapshot, and a one-time migration seeds
+one row per pre-existing `fmv` row. These tests pin the two invariants that
+matter most: the append happens on EVERY upsert including a no-op one (never
+conditional on "did anything change"), and the seeding migration cannot
+double-seed on a restart.
+
+BUI-662 adds `GET /api/comics/comps` and `GET /api/comics/fmv-history` — the
+read side of both this table and the BUI-656 comps ledger. Both endpoints
+share one identity-resolution contract: an unresolvable book 400s, a known
+book with nothing on file 200s with an empty list — "no comps" must never be
+confusable with "wrong book."
 """
 from __future__ import annotations
 
@@ -400,4 +406,138 @@ def test_append_failure_does_not_break_the_upsert_response(api, caplog):
     assert _history_rows_from_db(data["comic_id"]) == []
     assert any(
         "append_fmv_history failed" in r.message for r in caplog.records
+    )
+
+# ---------------------------------------------------------------------------
+# GET /api/comics/fmv-history (BUI-662)
+# ---------------------------------------------------------------------------
+
+
+def test_get_fmv_history_by_comic_id(api):
+    data = _create_comic(api, grade=9.4, fmv_low=100.0, fmv_high=150.0)
+    r = api.get("/api/comics/fmv-history", params={"comic_id": data["comic_id"]})
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["low"] == 100.0
+
+
+def test_get_fmv_history_by_title_issue_year(api):
+    _create_comic(api, title="Daredevil", issue="1", year=1964,
+                  grade=9.0, fmv_low=200.0)
+    r = api.get("/api/comics/fmv-history", params={
+        "title": "Daredevil", "issue": "1", "year": 1964,
+    })
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+
+
+def test_get_fmv_history_unresolvable_comic_id_400s(api):
+    r = api.get("/api/comics/fmv-history", params={"comic_id": 999999})
+    assert r.status_code == 400
+
+
+def test_get_fmv_history_unresolvable_title_issue_400s(api):
+    r = api.get("/api/comics/fmv-history", params={
+        "title": "Nonexistent Series", "issue": "1",
+    })
+    assert r.status_code == 400
+
+
+def test_get_fmv_history_no_identity_supplied_400s(api):
+    r = api.get("/api/comics/fmv-history")
+    assert r.status_code == 400
+
+
+def test_get_fmv_history_known_book_with_no_history_returns_empty_list(api):
+    """A known book with no history rows must 200 with [] — never 400. 'No
+    history' and 'wrong book' are distinguishable states."""
+    data = _create_comic(api)  # no grade => no fmv/history row at all
+    r = api.get("/api/comics/fmv-history", params={"comic_id": data["comic_id"]})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_get_fmv_history_newest_first(api):
+    payload = {"title": "Hulk", "issue": "181", "year": 1974, "grade": 9.8}
+    data = api.post("/api/comics", json={**payload, "fmv_low": 100.0}).json()
+    api.post("/api/comics", json={**payload, "fmv_low": 200.0})
+    api.post("/api/comics", json={**payload, "fmv_low": 300.0})
+    r = api.get("/api/comics/fmv-history", params={"comic_id": data["comic_id"]})
+    rows = r.json()
+    assert len(rows) == 3
+    assert [row["low"] for row in rows] == [300.0, 200.0, 100.0]
+
+
+def test_get_fmv_history_grade_filter_narrows(api):
+    data = _create_comic(api, grade=9.4, fmv_low=100.0)
+    api.post("/api/comics", json={
+        "title": "Amazing Spider-Man", "issue": "1", "year": 1963,
+        "grade": 9.6, "fmv_low": 200.0,
+    })
+    r = api.get("/api/comics/fmv-history", params={
+        "comic_id": data["comic_id"], "grade": 9.4,
+    })
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["grade"] == 9.4
+
+
+# ---------------------------------------------------------------------------
+# Scope-boundary contract: never read into a price (BUI-662)
+#
+# GET /api/comics/comps' own tests live in test_comps_ledger.py, alongside
+# its POST sibling (BUI-656) — see that file's "GET /api/comics/comps" section.
+# ---------------------------------------------------------------------------
+
+
+def _fmv_runner_source() -> str:
+    """apps/fmv's pricing-path source, or skip if it isn't checked out beside
+    us. Located relative to this file so the test works from any CWD —
+    apps/fmv is not a workspace member, so there is no importable path.
+    Mirrors test_flag_reason_contract.py's precedent for this cross-package
+    canary shape.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    runner = repo_root / "apps" / "fmv" / "src" / "fmv_runner.py"
+    if not runner.is_file():
+        pytest.skip(f"apps/fmv not present at {runner}; cross-package canary skipped")
+    return runner.read_text(encoding="utf-8")
+
+
+def test_fmv_history_endpoint_never_referenced_in_pricing_path():
+    """This project writes the archive and never reads it back into a
+    price — degraded-mode pricing from stored comps is a deliberately
+    separate follow-up (BUI-663) with its own staleness rules and soak.
+    `/api/comics/fmv-history` has no legitimate caller anywhere in the
+    pricing path, unlike `/api/comics/comps`, which apps/fmv legitimately
+    POSTs to (BUI-658/U3, the ledger write) — see the next test, which is
+    scoped to GET-only usage for exactly that reason."""
+    source = _fmv_runner_source()
+    assert "fmv-history" not in source, (
+        "apps/fmv references /api/comics/fmv-history somewhere — the archive "
+        "read endpoint must never be wired into the pricing path (BUI-662 "
+        "scope boundary)."
+    )
+
+
+def test_comps_read_endpoint_never_get_fetched_in_pricing_path():
+    """`GET /api/comics/comps` (the BUI-662 read endpoint on this path) must
+    never be called from apps/fmv. This is deliberately narrower than 'the
+    string /api/comics/comps never appears' — `POST /api/comics/comps`
+    (BUI-658/U3's ledger write, same path) is legitimate and expected."""
+    source = _fmv_runner_source()
+    get_paths = re.findall(
+        r'_get_json_or_warn\(\s*\n?\s*f"\{server_url\}(/api/comics[^"?]*)"',
+        source,
+    )
+    assert get_paths, (
+        "found no _get_json_or_warn(...) GET calls in fmv_runner.py — did "
+        "the helper move? Update this contract test's regex."
+    )
+    assert "/api/comics/comps" not in get_paths, (
+        "apps/fmv GET-fetches /api/comics/comps — the read endpoint must "
+        "never feed a price (BUI-662 scope boundary). A POST to this same "
+        "path (BUI-658/U3's ledger write) is fine; only a GET is the "
+        "violation this test guards."
     )
