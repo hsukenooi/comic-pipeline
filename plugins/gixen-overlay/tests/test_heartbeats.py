@@ -9,7 +9,8 @@ signal rather than a second thing that fails green:
 * a job absent from the heartbeats table is still reported, because iterating
   stored rows would render "never ran" as nothing at all;
 * an unparseable or unknown-job ping fails loudly instead of storing quietly;
-* the watchdog declares its own missing outer ping.
+* the watchdog declares its own true outer-ping state (BUI-672 wired it; see
+  test_watchdog_endpoint_declares_its_own_outer_ping_state).
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from gixen_overlay.db import (
+    HEARTBEAT_OUTER_PING_STATE,
     HEARTBEAT_STALE_FACTOR,
     JOB_CONTRACTS,
     create_tables,
@@ -367,12 +369,15 @@ def test_unknown_job_is_404(api):
     assert rejections["rejections"][0]["path"] == "/api/heartbeat/not-a-real-job"
 
 
-def test_watchdog_endpoint_declares_its_own_blind_spot(api):
-    """The gotcha BUI-602 names: nothing outside this machine polls the
-    watchdog, so it can still fail green if the server is down. The endpoint
-    must say so rather than imply a health it cannot vouch for."""
+def test_watchdog_endpoint_declares_its_own_outer_ping_state(api):
+    """The gotcha BUI-602 names, closed by BUI-672: the endpoint must always
+    report the outer ping's TRUE deployed state, not a hand-maintained claim
+    that could drift from it. Asserting against the constant (rather than a
+    hardcoded literal) is the point — this test must keep passing whether the
+    state is `"unwired"` or `"wired"`, and fail if the endpoint ever stops
+    reading the constant it's supposed to expose."""
     report = api.get("/api/comics/health/heartbeats").json()
-    assert report["outer_ping"] == "unwired"
+    assert report["outer_ping"] == HEARTBEAT_OUTER_PING_STATE
 
 
 def test_report_names_the_ping_site_for_every_silent_job(api):
