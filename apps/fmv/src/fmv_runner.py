@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -1545,6 +1546,36 @@ _COMP_LEDGER_FIELDS = (
 )
 
 
+def _observed_at_iso(value: object) -> str | None:
+    """Render BUI-657's `observed_at` stamp as an ISO-8601 UTC string (BUI-673).
+
+    BUI-657 stamps `observed_at` as a raw epoch **float** — `time.time()` on a
+    live fetch, `st_mtime` on a cache hit — which is the natural in-process
+    representation but NOT the wire type. `CompItem.observed_at` is
+    `str | None`, and pydantic v2 does not coerce float to str, so posting the
+    float verbatim 422s and the server discards the WHOLE batch. BUI-658
+    shipped exactly that: every comps post failed, on every book.
+
+    ISO-8601 UTC rather than `str(float)`, which would also validate: the
+    column sits beside `first_seen_at`/`last_seen_at` (both ISO) and under
+    `idx_comps_observed`, where lexical order must match chronological order.
+    BUI-661's backfill already emits ISO, so `str(float)` here would leave one
+    column holding two incompatible encodings that neither sorts nor parses
+    as a unit.
+
+    Anything that is neither numeric nor a string becomes None rather than
+    raising — `observed_at` is optional provenance metadata, and losing it on
+    one comp must never cost the batch the comp itself. A string is passed
+    through untouched on the assumption it is already ISO; nothing in the live
+    path produces one today, so this is defensive rather than load-bearing.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+
+
 def _comp_to_ledger_item(comp: dict, *, pool: str) -> dict:
     """Project one parsed comp onto the `POST /api/comics/comps` `CompItem`
     shape (BUI-658).
@@ -1560,6 +1591,7 @@ def _comp_to_ledger_item(comp: dict, *, pool: str) -> dict:
     backfill script (BUI-661), which is not this code path.
     """
     item = {field: comp.get(field) for field in _COMP_LEDGER_FIELDS}
+    item["observed_at"] = _observed_at_iso(item["observed_at"])
     item["pool"] = pool
     item["provenance"] = "live"
     return item

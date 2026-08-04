@@ -24,6 +24,7 @@ established convention for this module.
 """
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,9 +38,19 @@ def server_url():
     return "http://test-server:8080"
 
 
+# BUI-673: the real BUI-657 stamp. `sold_comps.fetch`/`fetch_sold_comps`
+# return `response_fetched_at` as a raw epoch FLOAT (`time.time()` live,
+# `st_mtime` on a cache hit) and `fetch_book_comps` assigns it verbatim. This
+# fixture originally defaulted to an ISO string, which is what the wire
+# contract wants but NOT what the producer emits — so every test here passed
+# while every real post 422'd. A fixture that is wrong in the direction of the
+# desired answer tests nothing; keep this a float.
+_STAMPED_OBSERVED_AT = 1785587400.0  # 2026-08-01T12:30:00+00:00
+
+
 def _make_comp(price, grade, product_id="x", provider="serpapi", tier="base",
                query="q", from_cache=False,
-               observed_at="2026-08-01T00:00:00+00:00", title=None,
+               observed_at=_STAMPED_OBSERVED_AT, title=None,
                sold_date="2026-07-01", buying_format="Auction",
                link="https://ebay.com/itm/1"):
     """A comp in the exact shape `parse_comp`/`parse_comp_sold_comps` +
@@ -97,7 +108,13 @@ class TestCompToLedgerItem:
         assert item["from_cache"] == comp["from_cache"]
         # KTD7: observed_at is the response fetch time already stamped on the
         # comp (a cache mtime on a hit) — never overwritten with "now" here.
-        assert item["observed_at"] == comp["observed_at"]
+        # BUI-673 renders it ISO-8601 UTC for the wire, but it must still name
+        # the SAME INSTANT the producer stamped, not the moment of the post.
+        assert item["observed_at"] == "2026-08-01T12:30:00+00:00"
+        assert (
+            datetime.fromisoformat(item["observed_at"]).timestamp()
+            == comp["observed_at"]
+        )
 
     def test_slab_pool_tag(self):
         item = fmv_runner._comp_to_ledger_item(_make_comp(1200.0, 6.5), pool="slab")
@@ -122,6 +139,84 @@ class TestCompToLedgerItem:
         assert item["title"] is None
         assert item["price"] is None
         assert item["provider"] is None
+        assert item["observed_at"] is None
+
+
+class TestObservedAtWireType:
+    """BUI-673. `CompItem.observed_at` is `str | None` and pydantic v2 does not
+    coerce float to str, so posting BUI-657's raw epoch stamp 422s and the
+    server discards the WHOLE batch — which is what BUI-658 shipped.
+
+    These assert on the TYPE crossing the wire, not just the value. The
+    original suite compared `item["observed_at"] == comp["observed_at"]`,
+    which passes for any type at all, and did so against a fixture that used
+    a string the producer never emits.
+    """
+
+    def test_epoch_float_becomes_an_iso_8601_utc_string(self):
+        item = fmv_runner._comp_to_ledger_item(
+            _make_comp(10.0, 9.0, observed_at=1785587400.0), pool="raw"
+        )
+        assert isinstance(item["observed_at"], str)
+        assert item["observed_at"] == "2026-08-01T12:30:00+00:00"
+
+    def test_result_is_utc_not_local_time(self):
+        """`datetime.fromtimestamp` without a tz uses the host's local zone —
+        which would make the stamp depend on where the run happened and break
+        ordering against `first_seen_at`/`last_seen_at`."""
+        item = fmv_runner._comp_to_ledger_item(
+            _make_comp(10.0, 9.0, observed_at=1785587400.0), pool="raw"
+        )
+        parsed = datetime.fromisoformat(item["observed_at"])
+        assert parsed.utcoffset() == timezone.utc.utcoffset(None)
+
+    def test_iso_string_sorts_lexically_in_chronological_order(self):
+        """`idx_comps_observed` orders on this column, so lexical order must
+        match chronological order. `str(float)` would validate but sort
+        wrongly across digit-count boundaries."""
+        earlier = fmv_runner._comp_to_ledger_item(
+            _make_comp(10.0, 9.0, observed_at=999999999.0), pool="raw"
+        )["observed_at"]
+        later = fmv_runner._comp_to_ledger_item(
+            _make_comp(10.0, 9.0, observed_at=1785587400.0), pool="raw"
+        )["observed_at"]
+        assert earlier < later
+
+    def test_int_stamp_also_converts(self):
+        item = fmv_runner._comp_to_ledger_item(
+            _make_comp(10.0, 9.0, observed_at=1785587400), pool="raw"
+        )
+        assert item["observed_at"] == "2026-08-01T12:30:00+00:00"
+
+    def test_existing_string_passes_through_untouched(self):
+        item = fmv_runner._comp_to_ledger_item(
+            _make_comp(10.0, 9.0, observed_at="2026-08-01T12:30:00+00:00"),
+            pool="raw",
+        )
+        assert item["observed_at"] == "2026-08-01T12:30:00+00:00"
+
+    def test_none_stays_none(self):
+        item = fmv_runner._comp_to_ledger_item(
+            _make_comp(10.0, 9.0, observed_at=None), pool="raw"
+        )
+        assert item["observed_at"] is None
+
+    @pytest.mark.parametrize("junk", [object(), [1], {"a": 1}, True])
+    def test_unrenderable_stamp_degrades_to_none_rather_than_raising(self, junk):
+        """Losing optional provenance on one comp must never cost the batch
+        the comp itself. `True` is in here deliberately: bool is a subclass of
+        int, and `fromtimestamp(True)` would silently yield 1970-01-01."""
+        item = fmv_runner._comp_to_ledger_item(
+            _make_comp(10.0, 9.0, observed_at=junk), pool="raw"
+        )
+        assert item["observed_at"] is None
+
+    def test_whole_item_is_json_serializable(self):
+        """`_post_json` serializes this dict. A float `observed_at` survived
+        json.dumps fine — which is why serialization tests did not catch the
+        bug — but anything non-serializable would raise inside the post."""
+        item = fmv_runner._comp_to_ledger_item(_make_comp(10.0, 9.0), pool="raw")
+        assert json.loads(json.dumps(item)) == item
 
 
 # ─── _post_comps ─────────────────────────────────────────────────────────────
