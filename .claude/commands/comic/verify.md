@@ -170,6 +170,8 @@ Verdicts (ladder — first failure wins):
 
 `bids.fmv_id` mismatch with the matched fmv shows up as `partial` — this is the PER-90 footgun (denormalized pointer drifted from the canonical primary row).
 
+**A `ledger-advisory` book verifies as `no_comic`, and that is correct (BUI-663).** When `comic-fmv` cannot reach either sold-comps provider it may emit a degraded ADVISORY band priced from the comps ledger — `source: "ledger-advisory"` on its `--brief` line. That band is **never written to the comics server**: no `comics` row, no `fmv` row, no junction. So a bid for such a book lands here at the bottom of the ladder, exactly like a book that was never priced at all. Do **not** treat that as a linkage bug to chase, and do **not** try to link the advisory band by hand — the fix is to re-run `/comic:fmv` once the providers recover, which writes a real price and moves the row up the ladder. Nothing in this skill can see an advisory band, by design: `/comic:verify` reads the DB, and the whole point is that a ledger-derived number never reaches it.
+
 **Per-verdict guidance (BUI-507):** no longer duplicated here — the endpoint
 returns a `guidance` string on every result (see EXECUTOR CONTRACT § Output).
 Both this skill and `/comic:buy` Step 6 render that string directly.

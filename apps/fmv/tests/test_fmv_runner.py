@@ -46,6 +46,17 @@ def _no_comps_post_by_default(monkeypatch):
     monkeypatch.setattr(fmv_runner, "_post_comps", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_ledger_advisory_by_default(monkeypatch):
+    """BUI-663: a fetch-err book now also calls out to `_ledger_advisory` (a
+    real HTTP GET of /api/comics/comps) before returning. None of the tests in
+    this file are about that feature — it's covered end-to-end in
+    test_ledger_advisory.py — and every fetch-err assertion here is about the
+    NO-advisory outcome, which is what `None` produces. Same pattern as the
+    two fixtures above (BUI-286, BUI-658)."""
+    monkeypatch.setattr(fmv_runner, "_ledger_advisory", lambda *a, **k: None)
+
+
 def _make_book(item_id, title, issue, year, grade, locg_id=None):
     book = {"item_id": item_id, "title": title, "issue": issue,
             "year": year, "grade": grade}

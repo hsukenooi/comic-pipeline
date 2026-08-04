@@ -496,11 +496,23 @@ async def api_comics_comps(
     with "wrong book" (the fetch-err-versus-genuine-zero lesson this project
     keeps re-learning). `days` filters on `observed_at`, not `first_seen_at`.
 
-    **Never call this from the pricing path.** This project writes the comps
-    archive and never reads it back into a price — degraded-mode pricing
-    from stored comps is a deliberately separate follow-up (BUI-663) with its
-    own staleness rules and soak. See `tests/test_fmv_history.py`'s contract
-    test, which greps `apps/fmv` for exactly that.
+    **BUI-663 (2026-08-04) narrowed the old "never call this from the pricing
+    path" rule to exactly one sanctioned caller**, and everything about that
+    caller is the reason the exception is safe. `apps/fmv`'s
+    `_fetch_ledger_comps` reads this endpoint ONLY when both sold-comps
+    providers have already failed for a book, and what it produces is an
+    ADVISORY band: `max_bid` is nulled, and the row is never upserted, so a
+    ledger-derived number reaches no `fmv` row and therefore no bid cap. Any
+    other GET from the pricing path is still the violation — enforced by
+    `tests/test_fmv_history.py`'s contract test, which now parses `apps/fmv`'s
+    AST and permits that one function by name.
+
+    BUI-663's own measurement is why this endpoint needs no staleness
+    parameters on that path: both providers serve a ~90-day sold window, so
+    p99 of every comp ever priced is 90 days old; a 365d/730d `days` cutoff
+    moves 0 of 483 pools and a 90d cutoff moves 3, all UPWARD. The measured
+    hazard of a stale ledger price is pool THINNESS, not price drift, so the
+    caller gates on pool depth and passes no `days` at all.
     """
     db = request.app.state.db
     rows = get_comps(
