@@ -2478,6 +2478,73 @@ def calibration_report(
 
 
 # ---------------------------------------------------------------------------
+# Won-auctions cost basis (BUI-664)
+# ---------------------------------------------------------------------------
+#
+# NOT a portfolio view. Measured on the live Mini 2026-08-03: 172 WON bids
+# carry both a cost basis (bids.winning_bid) and a primary priced FMV link,
+# against 2,191 owned collection rows — of which only 256 (11.7%) have
+# price_paid and 71 have a gixen_item_id at all. A mark-to-market view over
+# ~8% of the collection would mislead more than it informs (the deferred
+# "real" portfolio view needs a cost-basis backfill across collection.json
+# that is explicitly out of scope here — see BUI-664/BUI-611). So this
+# function reports exactly the WON-and-FMV-linked rows and nothing else; the
+# naming (`get_won_auctions_cost_basis`, not `get_portfolio`) and the
+# response shape below are the deliverable as much as the query is.
+
+
+def get_won_auctions_cost_basis(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Cost basis vs. current FMV for WON Gixen auctions with a linked,
+    priced primary FMV. Feeds `GET /api/comics/won-auctions/value`.
+
+    Deliberately WON-only — NOT R2/KTD-3's WON+LOST-together shape used by
+    `get_first_party_outcomes`/`calibration_report` above. Those two exist to
+    feed FMV pricing feedback, where a wins-only sample truncates from above
+    (a proxy-auction win's winning_bid is the underbidder's max, so wins-only
+    biases low) — R2 forbids narrowing THAT query to wins alone. This
+    function answers a different question — "what did I pay for the ones I
+    actually bought" — where a LOST auction has no purchase price by
+    definition; there is no bias to introduce by excluding it, because there
+    is nothing to include.
+
+    Uses `_EFFECTIVE_STATUS_SQL` (BUI-660), not a bare `b.status = 'WON'`, so
+    a WON bid later purge-swept to the REMOVED tombstone still counts via its
+    `prior_status` — same tombstone-survival rule `get_first_party_outcomes`
+    already applies. Reuses `_PRIMARY_LINK_CLAUSE` and
+    `_WINNING_BID_NOT_NULL_CLAUSE` from that section verbatim: a secondary
+    lot member isn't a valid per-book cost basis (the lot's winning_bid
+    prices the whole lot), and a NULL winning_bid carries no trustworthy
+    price. `f.high IS NOT NULL` additionally requires the linked FMV to
+    actually be priced (not a bare grade-only stub) — otherwise there is no
+    current value to compare against.
+
+    Sorted by `unrealized_gain_loss` descending (biggest apparent winners
+    first) — a fixed order, not a caller-configurable parameter; this is a
+    diagnostic report, not a general-purpose query endpoint.
+    """
+    where = " AND ".join([
+        f"{_EFFECTIVE_STATUS_SQL} = 'WON'",
+        _WINNING_BID_NOT_NULL_CLAUSE,
+        _PRIMARY_LINK_CLAUSE,
+        "f.high IS NOT NULL",
+    ])
+    return conn.execute(f"""
+        SELECT b.item_id,
+               c.title, c.issue, c.year, f.grade,
+               b.winning_bid AS cost_basis,
+               f.high AS current_fmv_high,
+               (f.high - b.winning_bid) AS unrealized_gain_loss,
+               COALESCE(b.auction_end_at, b.resolved_at) AS won_at
+        FROM bids b
+        JOIN bid_fmvs bf ON bf.bid_id = b.id
+        JOIN fmv f       ON f.id = bf.fmv_id
+        JOIN comics c    ON c.id = f.comic_id
+        WHERE {where}
+        ORDER BY unrealized_gain_loss DESC
+    """).fetchall()
+
+
+# ---------------------------------------------------------------------------
 # Comps and fmv_history read endpoints (BUI-662)
 # ---------------------------------------------------------------------------
 

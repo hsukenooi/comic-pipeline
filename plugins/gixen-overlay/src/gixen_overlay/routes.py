@@ -38,6 +38,7 @@ from gixen_overlay.db import (
     mark_collection_wins_seen,
     get_first_party_outcomes,
     calibration_report,
+    get_won_auctions_cost_basis,
     get_comps,
     get_fmv_history,
     DEFAULT_OUTCOME_GRADE_WINDOW,
@@ -309,6 +310,56 @@ async def api_comics_calibration(
     """
     db = request.app.state.db
     return calibration_report(db, days=days, min_losses=min_losses)
+
+
+@router.get("/api/comics/won-auctions/value")
+async def api_won_auctions_value(request: Request):
+    """BUI-664: cost basis vs. current FMV for WON Gixen auctions with a
+    linked, priced FMV — DIAGNOSTIC ONLY, read-only, never an input to a bid.
+
+    **This is deliberately NOT a portfolio view, and the naming says so on
+    purpose.** Measured on the live Mini 2026-08-03: 172 WON bids qualify
+    (a WON auction whose primary-linked `fmv.high` is priced) against 2,191
+    owned collection rows total, of which only 256 (11.7%) carry a
+    `price_paid` and 71 a `gixen_item_id` at all — most owned books were
+    added via LOCG import or a manual record-win with no cost basis captured
+    here, or have no FMV link. A mark-to-market view claiming to cover "your
+    collection" over that ~8% would mislead more than it informs; the
+    honest, narrower thing — cost basis for the auctions we actually won
+    through Gixen — is what this endpoint ships instead. See
+    `get_won_auctions_cost_basis` in `db.py` for the exact query and why it
+    is WON-only (a different, and unrelated, question from R2/KTD-3's
+    WON+LOST-together rule for FMV pricing feedback).
+
+    Response field names carry the same narrowness the path does:
+    `won_auctions` (never `portfolio` / `items` / `holdings`), each row's
+    `cost_basis` (from `bids.winning_bid`, never "price_paid" — that field
+    lives on the collection store, a different source this endpoint does not
+    touch), `current_fmv_high`, and `unrealized_gain_loss`
+    (`current_fmv_high - cost_basis`) — "unrealized" because none of these
+    books have been sold. Sorted by `unrealized_gain_loss` descending
+    (biggest apparent winners first); not caller-configurable.
+
+    `coverage_note` restates the scope in the response body itself, so a
+    caller that renders this JSON directly (or a human skimming a curl
+    response) cannot mistake `count` for "how many books I own" — see the
+    BUI-664 ticket's own framing: naming this correctly was as much the
+    deliverable as the query.
+    """
+    db = request.app.state.db
+    rows = get_won_auctions_cost_basis(db)
+    return {
+        "coverage": "won_auctions_only",
+        "coverage_note": (
+            "Cost basis vs. current FMV for WON Gixen auctions with a "
+            "linked, priced FMV ONLY — this is NOT your full collection. "
+            "`count` below is exactly how many auctions qualify right now; "
+            "most owned books have no purchase price captured here (LOCG "
+            "import, manual record-win) or no linked FMV — see BUI-664."
+        ),
+        "count": len(rows),
+        "won_auctions": [dict(r) for r in rows],
+    }
 
 
 @router.post("/api/comics")
