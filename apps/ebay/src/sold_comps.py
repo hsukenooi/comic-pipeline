@@ -8,10 +8,16 @@ fallback tier, failing over per query on error or a tripped breaker. Order is
 configurable via EBAY_SOLD_COMPS_PROVIDERS. Caches responses per provider,
 dedupes by product_id, applies hard-excludes, parses grades, and returns
 clean comp lists. Consumed by comic-pipeline-fmv (apps/fmv) to compute fair
-market value. Every successful raw provider response is also appended,
+market value. Every raw provider response that HAS A BODY is also appended,
 unmodified, to an append-only capture file (BUI-614) — a hedge against
 losing sold-comps history before a real comps ledger (BUI-610) exists; see
-CAPTURE_DIR/CAPTURE_PATH and _capture_raw_response().
+CAPTURE_DIR/CAPTURE_PATH and _capture_raw_response(). Since BUI-628, that
+includes a response that fails our own shape validation (a dropped
+LH_Sold=1, a sold-comps.com shape violation) — tagged with the validation
+outcome — because provider drift is exactly what tier 0 exists to make
+diagnosable, and a network error with no body still captures nothing.
+BUI-628 also rotates CAPTURE_PATH by size (never by age, never pruned) so
+it cannot grow into a full disk.
 
 Why this lives in apps/ebay (alongside ebay-fetch):
     All eBay data fetching — live (Browse API, ebay_fetch.py) and sold
@@ -20,6 +26,7 @@ Why this lives in apps/ebay (alongside ebay-fetch):
 """
 
 import argparse
+import gzip
 import hashlib
 import importlib.metadata
 import json
@@ -29,7 +36,9 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -77,6 +86,19 @@ CAPTURE_DIR = Path(
     or (Path.home() / ".local" / "share" / "ebay-sold-comps-capture")
 )
 CAPTURE_PATH = CAPTURE_DIR / "raw_responses.jsonl"
+
+# BUI-628/KTD1/R16: rotate CAPTURE_PATH before it grows unbounded. Size-based,
+# never age-based — the failure being prevented is a full disk, and the write
+# rate is bursty (a batch writes dozens of responses in minutes, then nothing
+# for days), so a clock-based rotation would either fire mid-burst for no
+# reason or leave a whole burst unrotated for a long stretch. ~10 MB (roughly
+# 250 responses at the measured ~40.3 KB/response average, per BUI-628) keeps
+# segments a manageable size without rotating so eagerly that tiny segments
+# pile up. Explicitly NOT TTL eviction — nothing is ever pruned, which is the
+# entire reason this capture exists separately from the TTL-evicted CACHE_DIR.
+CAPTURE_ROTATE_BYTES = int(
+    os.environ.get("EBAY_SOLD_COMPS_CAPTURE_ROTATE_BYTES") or 10_000_000
+)
 
 # Tier thresholds (the "tiered query strategy" from the FMV skill)
 THIN_RESULTS_THRESHOLD = 5     # auto-broaden (drop year) if base returns fewer
@@ -247,15 +269,119 @@ def _cache_put(path: Path, data: dict) -> None:
 
 # ─── BUI-614: Tier-0 raw response capture ─────────────────────────────────────
 
-def _capture_raw_response(provider: str, query: str, canonical_url: str, data: dict) -> None:
+def _compress_rotated_segment(rotated_path: Path) -> None:
+    """Gzip *rotated_path* in place and remove the plaintext copy.
+
+    Called once, right after `_rotate_capture_if_needed` has already
+    `os.rename`d the old CAPTURE_PATH out of the way — the rename alone is
+    what makes the rotation "count" (new appends go to a fresh CAPTURE_PATH
+    from that point on); this step is purely a disk-space optimization on
+    the segment that was just retired, and its failure is independent of
+    and never allowed to affect that fact.
+
+    Race note (BUI-628): every append in this module is a bare
+    open+write+close with no fd held across calls (see
+    _capture_raw_response), so the only way *rotated_path* could still
+    receive a write after the rename is a straggler that already called
+    os.open() on the pre-rename path a moment earlier — a single-syscall-pair
+    window, not a held-open race, but not literally zero either. To make
+    sure such a straggler is never destroyed by compression: read the file,
+    and only replace it with the gzip + unlink the plaintext if a follow-up
+    stat proves the size never moved while we were reading and compressing
+    it. If it moved, discard the (incomplete) .gz and leave the plaintext
+    segment exactly as it is — uncompressed but intact, and not re-attempted
+    later (out of scope for this hedge) — never lost, and never duplicated
+    against a .gz that would otherwise also hold the straggler's line.
+
+    A failure partway through the gzip write (e.g. disk full, mirroring
+    ebay_fetch.atomic_write_json's BUI-333 fix) can leave an orphaned `.tmp`
+    file behind; it is best-effort unlinked in the except block below, same
+    as that precedent, so a repeat failure doesn't litter the capture dir.
+    """
+    gz_path = rotated_path.with_name(rotated_path.name + ".gz")
+    tmp_path = gz_path.with_name(gz_path.name + ".tmp")
+    try:
+        before = rotated_path.stat().st_size
+        raw = rotated_path.read_bytes()
+        if len(raw) != before or rotated_path.stat().st_size != before:
+            return  # a straggling append landed mid-read; leave it plaintext
+        with gzip.open(tmp_path, "wb") as f:
+            f.write(raw)
+        os.replace(tmp_path, gz_path)
+        if rotated_path.stat().st_size != before:
+            # A straggler landed between the read above and here — the .gz
+            # we just wrote is missing that line. Discard it (the plaintext
+            # already has everything) rather than leave a stale duplicate.
+            try:
+                gz_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        rotated_path.unlink()
+    except Exception as exc:  # noqa: BLE001  # never let compression touch the append path
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass  # best-effort — never mask the original failure below
+        print(
+            f"BUI-628: capture rotation compress failed (non-fatal, "
+            f"segment kept uncompressed): {exc}", file=sys.stderr,
+        )
+
+
+def _rotate_capture_if_needed() -> None:
+    """Rotate CAPTURE_PATH to a timestamped, gzip-compressed segment once it
+    crosses CAPTURE_ROTATE_BYTES (BUI-628/KTD1/R16).
+
+    Called from _capture_raw_response() before every append, inside its own
+    try/except there — ANY exception raised here (an unwritable directory, a
+    concurrent rotation racing this one and winning, ...) is caught by the
+    caller, logged, and swallowed: it degrades to "CAPTURE_PATH is still
+    whatever it was" and the caller's own append proceeds against that path
+    unchanged. Rotation itself is never allowed to lose the append that
+    triggered it — at worst the file stays over-threshold for one more
+    write and gets picked up by the next call.
+
+    The rotated name carries a UTC timestamp plus a short random token, not
+    the timestamp alone: two processes racing this same check within the
+    same rotation cycle could otherwise both mint the identical timestamped
+    name, and os.rename() onto an EXISTING destination silently overwrites
+    it — which would destroy whichever segment lost that race. The random
+    token makes that collision practically impossible without needing an
+    existence-check-and-retry loop.
+    """
+    try:
+        size = CAPTURE_PATH.stat().st_size
+    except FileNotFoundError:
+        return  # nothing captured yet — nothing to rotate
+    if size < CAPTURE_ROTATE_BYTES:
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    token = uuid.uuid4().hex[:8]
+    rotated = CAPTURE_DIR / f"raw_responses.{ts}-{token}.jsonl"
+    os.rename(CAPTURE_PATH, rotated)  # atomic — the new CAPTURE_PATH starts empty
+    _compress_rotated_segment(rotated)
+
+
+def _capture_raw_response(
+    provider: str, query: str, canonical_url: str, data: dict,
+    validation: str = "ok",
+) -> None:
     """Append the raw provider response, as received, to CAPTURE_PATH.
 
-    Hedge, not a dependency: this runs right alongside _cache_put(), for the
-    same validated `data` that is about to be cached, and any failure here
-    (disk full, permission error, an unwritable path) is logged to stderr and
-    swallowed — it must never fail the fetch it's shadowing (BUI-614 AC).
-    `data` is written verbatim, with no reshaping/parsing/field-dropping —
-    that judgment belongs to the real ledger (BUI-610), not here.
+    Hedge, not a dependency: this runs right alongside _cache_put() for a
+    validated response, and — since BUI-628/KTD12 — also for a response that
+    FAILED our own shape validation (a dropped LH_Sold=1, a sold-comps.com
+    shape violation): callers now capture the raw body before deciding
+    whether to raise, passing `validation="ok"` or the validation error
+    string. `data` is written verbatim either way, with no
+    reshaping/parsing/field-dropping — that judgment belongs to the real
+    ledger (BUI-610), not here. `validation` is keyword-only-by-convention
+    with a default so the 4-positional-arg call shape stays exactly what it
+    was for BUI-614 (another agent reads this function's output format).
+    Any failure in this whole function (disk full, permission error, an
+    unwritable path, a rotation failure) is logged to stderr and swallowed
+    — it must never fail the fetch it's shadowing (BUI-614 AC).
 
     JSONL append chosen over a SQLite table: no schema/migration to design
     (out of scope per the ticket), and a single os.open(O_APPEND) + os.write()
@@ -263,14 +389,31 @@ def _capture_raw_response(provider: str, query: str, canonical_url: str, data: d
     atomic against other appenders (other threads in this process, and other
     concurrent `ebay-sold-comps`/`comic-fmv` processes) — so no separate lock
     file is needed, and a crash mid-write can only ever tear the one
-    in-flight line, never a previously-appended one.
+    in-flight line, never a previously-appended one. BUI-628's rotation
+    (_rotate_capture_if_needed, called first, below) preserves this: it only
+    ever moves the *whole file* out from under CAPTURE_PATH via one atomic
+    os.rename(), which either happens entirely before this call's open() or
+    entirely after it — there is no window where a partial rotation could
+    make this call's single write(2) non-atomic. A straggling append that
+    lands in the just-rotated (old) segment rather than the fresh one is
+    explicitly tolerated (see _rotate_capture_if_needed) — that is a record
+    landing in a different, still fully-readable segment, never a lost one.
     """
+    try:
+        _rotate_capture_if_needed()
+    except Exception as exc:  # noqa: BLE001  # rotation is itself a hedge — never block the append
+        print(
+            f"BUI-628: capture rotation failed (non-fatal, appending to "
+            f"current file): {exc}", file=sys.stderr,
+        )
+
     try:
         record = {
             "timestamp": time.time(),
             "provider": provider,
             "query": query,
             "canonical_url": canonical_url,
+            "validation": validation,
             "response": data,
         }
         line = (json.dumps(record) + "\n").encode("utf-8")
@@ -941,20 +1084,36 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
 
         data = resp.json()
 
+        # BUI-628/KTD12: capture the raw body BEFORE deciding whether it's
+        # shape-valid — a response that fails our own checks (an "error" key,
+        # a dropped LH_Sold=1) is exactly the provider-drift signal tier 0
+        # exists to preserve, and it was previously discarded here. Compute
+        # the validation outcome first, capture unconditionally with it, THEN
+        # raise if invalid — a network error with no body (raise_for_status()
+        # above, or resp.json() itself) never reaches this point, so it still
+        # captures nothing, unchanged from before.
+        validation_error = None
         if "error" in data:
-            raise SerpApiError(f"SerpApi error: {data['error']}")
-
-        # Verify the eBay URL actually has LH_Sold=1 — SerpApi silently drops
-        # LH_* params if you pass them directly, and a missing sold filter
-        # returns active listings (FMV will be wrong, typically far too low).
-        ebay_url = data.get("search_metadata", {}).get("ebay_url", "")
-        if "LH_Sold=1" not in ebay_url:
-            raise SerpApiError(
-                f"Sold filter not applied — eBay URL missing LH_Sold=1.\n"
-                f"  ebay_url={ebay_url}\n"
-                f"  query={nkw}\n"
-                "Use show_only=Sold (LH_Sold=1 / LH_Complete=1 are silently dropped)."
-            )
+            validation_error = f"SerpApi error: {data['error']}"
+        else:
+            # Verify the eBay URL actually has LH_Sold=1 — SerpApi silently
+            # drops LH_* params if you pass them directly, and a missing sold
+            # filter returns active listings (FMV will be wrong, typically
+            # far too low).
+            ebay_url = data.get("search_metadata", {}).get("ebay_url", "")
+            if "LH_Sold=1" not in ebay_url:
+                validation_error = (
+                    f"Sold filter not applied — eBay URL missing LH_Sold=1.\n"
+                    f"  ebay_url={ebay_url}\n"
+                    f"  query={nkw}\n"
+                    "Use show_only=Sold (LH_Sold=1 / LH_Complete=1 are silently dropped)."
+                )
+        _capture_raw_response(
+            PROVIDER_SERPAPI, nkw, canonical, data,
+            validation=validation_error or "ok",
+        )
+        if validation_error is not None:
+            raise SerpApiError(validation_error)
     except (SerpApiError, requests.RequestException):
         if breaker is not None:
             breaker.record_error()
@@ -965,7 +1124,6 @@ def fetch(nkw: str, api_key: str, *, force: bool = False,
 
     fetched_at = time.time()
     _cache_put(path, data)
-    _capture_raw_response(PROVIDER_SERPAPI, nkw, canonical, data)
     return data, False, fetched_at
 
 
@@ -1079,7 +1237,24 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
     try:
         resp.raise_for_status()
         data = resp.json()
-        _verify_sold_comps_shape(nkw, data)
+
+        # BUI-628/KTD12: capture ahead of the shape check — mirrors fetch()'s
+        # matching comment above. A shape-invalid body is provider-drift
+        # evidence tier 0 exists to keep, tagged with the validation outcome
+        # instead of being silently discarded as it was before. A non-2xx or
+        # unparseable body never reaches this point, so it still captures
+        # nothing, unchanged from before.
+        validation_error = None
+        try:
+            _verify_sold_comps_shape(nkw, data)
+        except SoldCompsError as exc:
+            validation_error = str(exc)
+        _capture_raw_response(
+            PROVIDER_SOLD_COMPS, nkw, canonical, data,
+            validation=validation_error or "ok",
+        )
+        if validation_error is not None:
+            raise SoldCompsError(validation_error)
     except (SerpApiError, requests.RequestException):
         # (SoldCompsError subclasses SerpApiError.) A terminal failure — the
         # one kind this provider's breaker counts. Covers a non-2xx after
@@ -1094,7 +1269,6 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
 
     fetched_at = time.time()
     _cache_put(path, data)
-    _capture_raw_response(PROVIDER_SOLD_COMPS, nkw, canonical, data)
     return data, False, fetched_at
 
 

@@ -4,6 +4,7 @@ Pure-function tests only. Network calls are exercised through fetch() with
 a mocked requests.get; no real SerpApi calls happen in CI.
 """
 
+import gzip
 import json
 import threading
 import time
@@ -1278,6 +1279,335 @@ class TestRawResponseCapture:
         m.status_code = 200
         m.json = MagicMock(return_value={
             "organic_results": organic_results,
+            "search_metadata": {"ebay_url": ebay_url},
+        })
+        return m
+
+
+def _read_all_capture_records(capture_dir):
+    """Read every record across every capture segment — the current
+    CAPTURE_PATH, any rotated-but-not-yet-compressed plaintext segment, and
+    any gzip-compressed rotated segment. Mirrors what a real reader (BUI-661)
+    would have to do once rotation exists, and is the "no record lost across
+    rotation" assertion's only honest way to count."""
+    records = []
+    for path in sorted(capture_dir.glob("raw_responses*.jsonl")):
+        records.extend(json.loads(line) for line in path.read_text().splitlines() if line.strip())
+    for path in sorted(capture_dir.glob("raw_responses*.jsonl.gz")):
+        with gzip.open(path, "rt") as f:
+            records.extend(json.loads(line) for line in f if line.strip())
+    return records
+
+
+class TestCaptureRotation:
+    """BUI-628/KTD1/R16: size-based rotation of CAPTURE_PATH, never pruned."""
+
+    def _serpapi_ok(self, product_id="1"):
+        m = MagicMock()
+        m.raise_for_status = MagicMock()
+        m.status_code = 200
+        m.json = MagicMock(return_value={
+            "organic_results": [{"product_id": product_id}],
+            "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+        })
+        return m
+
+    def test_below_threshold_no_rotation(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 10_000_000)
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            sc.fetch("q1", "key")
+            sc.fetch("q2", "key", force=True)
+
+        assert sc.CAPTURE_PATH.exists()
+        assert list(sc.CAPTURE_DIR.glob("raw_responses.*.jsonl")) == [], \
+            "no rotation expected below the threshold"
+        assert list(sc.CAPTURE_DIR.glob("*.gz")) == []
+        assert len(_read_all_capture_records(sc.CAPTURE_DIR)) == 2
+
+    def test_crossing_threshold_rotates_and_gzips(self, tmp_path, monkeypatch):
+        """Below-threshold writes accumulate in one file; the write that
+        crosses the threshold rotates the OLD content into a gzip-compressed,
+        timestamped segment and starts a fresh current file. Both segments'
+        records are readable together (AE11)."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 200)  # tiny — a couple records crosses it
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            sc.fetch("q1", "key")
+            sc.fetch("q2", "key", force=True)
+            sc.fetch("q3", "key", force=True)
+
+        rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
+        gzipped = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl.gz"))
+        assert gzipped, "the rotated segment should have been gzip-compressed"
+        assert rotated == [], "a successfully compressed segment leaves no plaintext behind"
+        assert sc.CAPTURE_PATH.exists(), "a fresh current file must exist after rotation"
+
+        all_records = _read_all_capture_records(sc.CAPTURE_DIR)
+        assert len(all_records) == 3
+        assert {r["query"] for r in all_records} == {"q1", "q2", "q3"}
+
+    def test_rotation_failure_falls_back_to_appending_current_file(
+            self, tmp_path, monkeypatch, capsys):
+        """A rotation failure (e.g. an unwritable directory / a failed
+        os.rename) must degrade to 'keep appending to the current file',
+        never to 'lose the append' — the governing constraint this whole
+        ticket exists to protect."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)  # every write is "over threshold"
+
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            sc.fetch("q1", "key")  # first write: CAPTURE_PATH doesn't exist yet, no rotation
+
+        def boom_rename(*a, **k):
+            raise PermissionError("simulated unwritable capture dir")
+
+        monkeypatch.setattr(sc.os, "rename", boom_rename)
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            data, cache_hit, _fetched_at = sc.fetch("q2", "key", force=True)
+
+        assert cache_hit is False
+        assert data["organic_results"] == [{"product_id": "1"}]
+        assert "BUI-628" in capsys.readouterr().err
+        # No rotation happened (rename raised) — both records landed in the
+        # SAME still-over-threshold current file, and nothing was lost.
+        assert list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl")) == []
+        assert list(sc.CAPTURE_DIR.glob("*.gz")) == []
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 2
+        assert {r["query"] for r in records} == {"q1", "q2"}
+
+    def test_compress_failure_leaves_plaintext_segment_intact(self, tmp_path, monkeypatch, capsys):
+        """If gzip-compressing a just-rotated segment fails, the rename
+        (which is what actually rotates — see _rotate_capture_if_needed's
+        docstring) already succeeded, so the append must still land in a
+        fresh current file, and the retired segment must still be fully
+        present on disk (as plaintext, not gzip) — never lost."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
+
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            sc.fetch("q1", "key")  # seed one record into what will be rotated away
+
+        def boom_gzip(*a, **k):
+            raise OSError("simulated compress failure")
+
+        monkeypatch.setattr(sc.gzip, "open", boom_gzip)
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            data, cache_hit, _fetched_at = sc.fetch("q2", "key", force=True)
+
+        assert cache_hit is False
+        assert data["organic_results"] == [{"product_id": "1"}]
+        assert "BUI-628" in capsys.readouterr().err
+
+        rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
+        assert len(rotated) == 1, "the retired segment must survive, uncompressed"
+        assert list(sc.CAPTURE_DIR.glob("*.gz")) == []
+        all_records = _read_all_capture_records(sc.CAPTURE_DIR)
+        assert len(all_records) == 2
+        assert {r["query"] for r in all_records} == {"q1", "q2"}
+
+    def test_compress_failure_after_tmp_write_cleans_up_orphan(self, tmp_path, monkeypatch, capsys):
+        """A failure AFTER the .tmp gzip file is fully written (e.g. the
+        os.replace() that publishes it under its final .gz name) must not
+        leave an orphaned .tmp file behind — mirrors the BUI-333 precedent in
+        ebay_fetch.atomic_write_json. Data safety (the point of this ticket)
+        doesn't depend on this cleanup — the plaintext segment is untouched
+        either way — but a leaked .tmp file on every failed compress would
+        itself become a slow unbounded-growth bug in the very code meant to
+        fix one."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
+
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            sc.fetch("q1", "key")  # seed one record into what will be rotated away
+
+        real_replace = sc.os.replace
+
+        def boom_replace_for_gz_only(src, dst, *a, **k):
+            # Only the compress step's tmp->.gz publish should fail here —
+            # _cache_put()'s own atomic_write_json() also goes through
+            # os.replace() and must keep working normally, or this test
+            # would be exercising a cache-write failure instead of the
+            # compress-orphan-cleanup path it's named for.
+            if str(dst).endswith(".gz"):
+                raise OSError("simulated replace failure")
+            return real_replace(src, dst, *a, **k)
+
+        monkeypatch.setattr(sc.os, "replace", boom_replace_for_gz_only)
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            data, cache_hit, _fetched_at = sc.fetch("q2", "key", force=True)
+
+        assert cache_hit is False
+        assert data["organic_results"] == [{"product_id": "1"}]
+        assert "BUI-628" in capsys.readouterr().err
+
+        assert list(sc.CAPTURE_DIR.glob("*.tmp")) == [], "no orphaned .tmp file"
+        assert list(sc.CAPTURE_DIR.glob("*.gz")) == []
+        rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
+        assert len(rotated) == 1, "the retired segment must survive, uncompressed"
+        all_records = _read_all_capture_records(sc.CAPTURE_DIR)
+        assert len(all_records) == 2
+
+    def test_full_disk_write_still_lets_fetch_succeed(self, tmp_path, monkeypatch, capsys):
+        """A full-disk write failure (simulated via a patched os.write) on
+        the actual append must still never fail the fetch it's shadowing —
+        the BUI-614 hard constraint, re-asserted now that rotation runs
+        ahead of that write on every call."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 10_000_000)
+
+        def boom_write(*a, **k):
+            raise OSError(28, "No space left on device")  # ENOSPC
+
+        monkeypatch.setattr(sc.os, "write", boom_write)
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            data, cache_hit, _fetched_at = sc.fetch("q1", "key")
+
+        assert cache_hit is False
+        assert data["organic_results"] == [{"product_id": "1"}]
+        assert "BUI-614" in capsys.readouterr().err
+
+    def test_concurrent_appenders_during_rotation_no_record_lost(self, tmp_path, monkeypatch):
+        """Multiple threads racing _capture_raw_response while it repeatedly
+        crosses a tiny rotation threshold — total record count across every
+        segment (current + rotated + gzipped) must equal the total number of
+        calls made, no matter how the rotations interleaved."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 300)
+
+        n_threads = 8
+        calls_per_thread = 15
+        errors = []
+
+        def worker(thread_id):
+            try:
+                for i in range(calls_per_thread):
+                    sc._capture_raw_response(
+                        sc.PROVIDER_SERPAPI, f"t{thread_id}-{i}", "https://x", {"n": i},
+                    )
+            except Exception as exc:  # noqa: BLE001  # captured for the assertion below, not swallowed
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"_capture_raw_response must never raise: {errors}"
+        all_records = _read_all_capture_records(sc.CAPTURE_DIR)
+        assert len(all_records) == n_threads * calls_per_thread
+        # No duplicates either — every (thread, i) query string is unique.
+        assert len({r["query"] for r in all_records}) == n_threads * calls_per_thread
+
+
+class TestCaptureInvalidResponse:
+    """BUI-628/KTD12: a response that fails our own shape validation is still
+    captured, tagged with the validation outcome — moved ahead of validation
+    so provider drift is diagnosable instead of silently discarded."""
+
+    def test_serpapi_missing_lh_sold_still_captures_with_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        bad_url = "https://www.ebay.com/sch/i.html?_nkw=test"  # no LH_Sold=1
+        m = MagicMock()
+        m.raise_for_status = MagicMock()
+        m.status_code = 200
+        m.json = MagicMock(return_value={
+            "organic_results": [{"product_id": "1"}],
+            "search_metadata": {"ebay_url": bad_url},
+        })
+        with patch("sold_comps.requests.get", return_value=m):
+            with pytest.raises(sc.SerpApiError, match="LH_Sold=1"):
+                sc.fetch("test", "key")
+
+        # The fetch still raised (unchanged) and nothing was cached...
+        assert list(tmp_path.glob("*.json")) == []
+        # ...but the raw body IS captured, tagged with the validation error.
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 1
+        assert "LH_Sold=1" in records[0]["validation"]
+        assert records[0]["response"]["organic_results"] == [{"product_id": "1"}]
+
+    def test_serpapi_error_field_still_captures_with_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        m = MagicMock()
+        m.raise_for_status = MagicMock()
+        m.status_code = 200
+        m.json = MagicMock(return_value={"error": "Invalid API key"})
+        with patch("sold_comps.requests.get", return_value=m):
+            with pytest.raises(sc.SerpApiError, match="Invalid API key"):
+                sc.fetch("test", "key")
+
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 1
+        assert "Invalid API key" in records[0]["validation"]
+
+    def test_serpapi_success_still_captures_ok(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
+        with patch("sold_comps.requests.get",
+                   return_value=self.__class__._mock_serpapi_ok(good_url)):
+            sc.fetch("test", "key")
+
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 1
+        assert records[0]["validation"] == "ok"
+
+    def test_sold_comps_shape_invalid_still_captures_with_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        items = [_sc_item(),
+                 _sc_item("222", price=None, ended=None, listing_type="active")]
+        with patch("sold_comps.requests.get", return_value=_sold_comps_good(items)):
+            with pytest.raises(sc.SoldCompsError, match="not sold-shaped"):
+                sc.fetch_sold_comps("t", "sc_key")
+
+        # Still not cached, still raises (unchanged) — but the raw body with
+        # BOTH items (including the active-shaped one) is on disk, tagged.
+        assert list(tmp_path.glob("*.json")) == []
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 1
+        assert "not sold-shaped" in records[0]["validation"]
+        assert len(records[0]["response"]["items"]) == 2
+
+    def test_sold_comps_success_still_captures_ok(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   return_value=_sold_comps_good([_sc_item()])):
+            sc.fetch_sold_comps("t", "sc_key")
+
+        records = _read_capture_lines(sc.CAPTURE_PATH)
+        assert len(records) == 1
+        assert records[0]["validation"] == "ok"
+
+    def test_network_error_captures_nothing(self, tmp_path, monkeypatch):
+        """A connection error with no body must still capture nothing — this
+        was already true before BUI-628 and must stay true: there is no body
+        to tag with a validation outcome."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   side_effect=requests.ConnectionError("simulated network failure")):
+            with pytest.raises(requests.ConnectionError):
+                sc.fetch("test", "key")
+
+        assert _read_capture_lines(sc.CAPTURE_PATH) == []
+
+    def test_sold_comps_network_error_captures_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   side_effect=requests.ConnectionError("simulated network failure")):
+            with pytest.raises(requests.ConnectionError):
+                sc.fetch_sold_comps("test", "sc_key")
+
+        assert _read_capture_lines(sc.CAPTURE_PATH) == []
+
+    @staticmethod
+    def _mock_serpapi_ok(ebay_url):
+        m = MagicMock()
+        m.raise_for_status = MagicMock()
+        m.status_code = 200
+        m.json = MagicMock(return_value={
+            "organic_results": [{"product_id": "1"}],
             "search_metadata": {"ebay_url": ebay_url},
         })
         return m
