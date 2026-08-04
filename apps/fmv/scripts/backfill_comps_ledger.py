@@ -259,7 +259,7 @@ def _provider_and_query(sc: types.ModuleType, data: dict) -> tuple[str, str] | N
 
 
 def capture_segments(capture_dir: Path) -> list[Path]:
-    """Every tier-0 capture segment in *capture_dir*, oldest first.
+    """Every tier-0 capture segment in *capture_dir*, retired ones then live.
 
     BUI-628 turned the capture from one file into a rotating set: the live
     ``raw_responses.jsonl``, plus retired ``raw_responses.<stamp>-<token>
@@ -270,12 +270,21 @@ def capture_segments(capture_dir: Path) -> list[Path]:
     rotation silently drops all the history, and a short read looks exactly
     like a small corpus.
 
-    Retired segments sort before the live one (their names carry a timestamp,
-    so lexical order is chronological), so the earliest observation of a comp
-    is the one ``upsert_comps`` keeps (KTD4). When a retired segment exists in
-    BOTH forms, the plaintext one is read and the ``.gz`` skipped: that pair
-    can only mean compression is still in flight, and the plaintext copy is the
-    one known to be complete.
+    WHAT THE NAME SORT DOES AND DOES NOT GUARANTEE (BUI-680). Retired segments
+    come before the live one, and among themselves they are ordered by name.
+    That order is DETERMINISTIC — a re-run reads the corpus the same way — but
+    it is only APPROXIMATELY chronological. ``_rotate_capture_if_needed`` mints
+    ``<UTC stamp to the second>-<8 random hex>``, and the random token exists
+    precisely so two rotations in one second cannot collide; within a shared
+    second the sort therefore compares two random tokens, in an order
+    uncorrelated with which segment was actually retired first. Do not build a
+    first-observation rule on this order. KTD4's earliest-observation-wins is
+    enforced one level down, in ``read_capture``, which sorts the RECORDS by
+    the timestamp each one carries.
+
+    When a retired segment exists in BOTH forms, the plaintext one is read and
+    the ``.gz`` skipped: that pair can only mean compression is still in
+    flight, and the plaintext copy is the one known to be complete.
     """
     if not capture_dir.is_dir():
         return []
@@ -283,6 +292,9 @@ def capture_segments(capture_dir: Path) -> list[Path]:
     gzipped = [p for p in capture_dir.glob("raw_responses*.jsonl.gz")
                if p.with_suffix("") not in plain]
     live = capture_dir / "raw_responses.jsonl"
+    # Name order only: deterministic, but NOT chronological within a shared
+    # second (BUI-680 — see the docstring). Ordering observations is
+    # `read_capture`'s job, not this one's.
     retired = sorted((plain | set(gzipped)) - {live}, key=lambda p: p.name)
     return retired + ([live] if live.is_file() else [])
 
@@ -318,6 +330,28 @@ def read_capture(sc: types.ModuleType, capture_dir: Path,
     ran only AFTER validation passed — so its absence positively means "valid",
     and it is imported. That is a fact about the old call site, not an
     optimistic default.
+
+    RECORDS ARE RETURNED OLDEST FIRST, sorted by that same ``timestamp``, and
+    that sort — not the segment order — is what makes KTD4's earliest-wins
+    true (BUI-680). ``capture_segments`` orders segments by name, which is only
+    second-resolution and so arbitrary between two segments rotated in the same
+    second; sorting the records instead sidesteps the segment order entirely,
+    at record granularity, for no extra I/O — every timestamp is already read
+    in this same pass. It needs no fallback value, because a record whose
+    ``timestamp`` is missing or non-numeric raises in the parse block below and
+    is counted malformed: a ``RawResponse`` on this path always carries a real
+    captured time. The sort is STABLE, so records sharing a timestamp keep
+    segment-then-line order and a re-run stays byte-identical.
+
+    The clock is the writer's ``time.time()``, so a backwards NTP step could
+    still misorder two records. That is the same wall clock the segment names
+    were minted from, so it is no worse than what it replaces — and the blast
+    radius shrinks from a whole segment to a single fetch.
+
+    Scoped to THIS corpus on purpose. ``main`` concatenates capture BEFORE
+    cache so the capture's real fetch time beats the cache's mtime fallback on
+    a response present in both; a sort spanning both corpora would silently
+    undo that.
     """
     out: list[RawResponse] = []
     segments = capture_segments(capture_dir)
@@ -366,6 +400,10 @@ def read_capture(sc: types.ModuleType, capture_dir: Path,
             print(f"  skip: capture segment {segment.name} unreadable after "
                   f"line {lineno} ({exc}) — records already read are kept",
                   file=sys.stderr)
+    # BUI-680: the ordering KTD4 actually relies on. Stable, so equal
+    # timestamps keep segment-then-line order. See the docstring for why this
+    # is done here and not by ordering the segments.
+    out.sort(key=lambda r: r.observed_at)
     return out
 
 
