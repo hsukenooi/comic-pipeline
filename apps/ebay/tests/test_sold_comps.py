@@ -642,6 +642,165 @@ class TestForeignCurrencyComps:
         assert not sc.hard_exclude(title)
 
 
+class TestNonUsdDropPredicates:
+    """BUI-678: the BUI-675 currency gate makes a comp vanish into the same
+    `continue` as every other `parse_comp`/`parse_comp_sold_comps` None-return
+    (no title, unparseable price), so a response that loses every comp to the
+    gate is indistinguishable from a genuine no-comps book downstream. These
+    predicates isolate specifically the currency-gate rejection so the
+    accumulation loop can count it separately. Every price/currency shape
+    below is one already used in TestForeignCurrencyComps — pasted from a
+    real cached response, not invented."""
+
+    _BRL_RESULT = {
+        "product_id": "127719123834",
+        "title": "New X-Men #128 (Marvel Comics Late August 2002)",
+        "price": {"raw": "R$ 76.37", "extracted": 76.37},
+    }
+    _RMB_RESULT = {
+        "product_id": "327129890430",
+        "title": "Uncanny X-Men #311 Vol. 1 1994 Marvel Comics Newsstand",
+        "price": {"raw": "RMB 67.56", "extracted": 67.56},
+    }
+    _USD_RESULT = {
+        "product_id": "177614885669",
+        "title": "Absolute Green Lantern #10 CVR A Jahnoy Lindsay DC Comics",
+        "price": {"raw": "$4.98", "extracted": 4.98},
+    }
+
+    def test_brl_and_rmb_results_are_non_usd(self):
+        assert sc._is_non_usd_serpapi_result(self._BRL_RESULT)
+        assert sc._is_non_usd_serpapi_result(self._RMB_RESULT)
+
+    def test_usd_result_is_not_non_usd(self):
+        assert not sc._is_non_usd_serpapi_result(self._USD_RESULT)
+
+    def test_no_title_is_not_a_currency_rejection(self):
+        """A listing with no title at all is a DIFFERENT parse_comp() failure
+        (hard `if not title: return None`) — must not be double-counted as a
+        currency drop just because it also happens to lack a price object."""
+        assert not sc._is_non_usd_serpapi_result({**self._BRL_RESULT, "title": ""})
+        assert not sc._is_non_usd_serpapi_result({
+            "product_id": "1", "title": "",
+            "price": {"raw": "R$ 5.00", "extracted": 5.0},
+        })
+
+    def test_no_price_object_is_not_a_currency_rejection(self):
+        """A titled listing with no price at all fails a DIFFERENT guard in
+        parse_comp() (empty price_obj) — not proof of a foreign currency."""
+        assert not sc._is_non_usd_serpapi_result({
+            "product_id": "1", "title": "ASM #142 FN Marvel 1975", "price": {},
+        })
+        assert not sc._is_non_usd_serpapi_result({
+            "product_id": "1", "title": "ASM #142 FN Marvel 1975",
+        })
+
+    def test_sold_comps_declared_foreign_currency_is_non_usd(self):
+        assert sc._is_non_usd_sold_comps_item(_sc_item(currency="BRL"))
+        assert sc._is_non_usd_sold_comps_item(_sc_item(currency="CAD"))
+
+    def test_sold_comps_usd_item_is_not_non_usd(self):
+        assert not sc._is_non_usd_sold_comps_item(_sc_item(currency="USD"))
+
+    def test_sold_comps_absent_currency_is_not_non_usd(self):
+        """Mirrors parse_comp_sold_comps()'s own absent-currency tolerance —
+        a missing/blank soldCurrency is not evidence of a foreign currency."""
+        item = _sc_item()
+        del item["soldCurrency"]
+        assert not sc._is_non_usd_sold_comps_item(item)
+        assert not sc._is_non_usd_sold_comps_item(_sc_item(currency=""))
+
+    def test_sold_comps_no_title_is_not_a_currency_rejection(self):
+        assert not sc._is_non_usd_sold_comps_item(
+            _sc_item(title="", currency="BRL"))
+
+
+class TestNonUsdDropCounting:
+    """BUI-678 integration: fetch_book_comps() must surface HOW MANY comps
+    the BUI-675 currency gate rejected, per query and per book — the gap
+    between a response's raw_results and new_comps that today has no name.
+    Do not change _is_fetch_error's classification: a currency-rejected
+    response still has a clean, error-free queries_used entry (it IS a
+    successful fetch), so it correctly stays OUTSIDE the fetch-err count.
+    """
+
+    def test_serpapi_mixed_response_counts_only_currency_drops(
+            self, tmp_path, monkeypatch):
+        """One USD comp kept, one BRL and one RMB comp dropped — the count
+        must be exactly 2, not 3 (a genuinely malformed result in the same
+        response must not inflate it).
+
+        Deliberately omits `year`/`grade`/`variant` from the book so ONLY the
+        base tier fires (tiers 2-5 are each gated on one of those being
+        present/thin) — otherwise the mock's fixed `return_value` would
+        re-serve the same currency-rejected results to every tier's query
+        (each a distinct cache key) and inflate the book-level total, which
+        is not what this test is isolating."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        results = [
+            {"product_id": "1", "title": "ASM #142 FN Marvel 1975",
+             "price": {"raw": "$10.0", "extracted": 10.0}},
+            {"product_id": "127719123834",
+             "title": "New X-Men #128 (Marvel Comics Late August 2002)",
+             "price": {"raw": "R$ 76.37", "extracted": 76.37}},
+            {"product_id": "327129890430",
+             "title": "Uncanny X-Men #311 Vol. 1 1994 Marvel Comics",
+             "price": {"raw": "RMB 67.56", "extracted": 67.56}},
+            # No title at all — an UNRELATED parse_comp() rejection reason,
+            # must not be folded into the currency count.
+            {"product_id": "9", "title": "",
+             "price": {"raw": "$1.0", "extracted": 1.0}},
+        ]
+        with patch("sold_comps.requests.get",
+                   return_value=_serpapi_good(results)):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+        assert len(out["queries_used"]) == 1, out["queries_used"]
+        assert [c["product_id"] for c in out["comps"]] == ["1"]
+        entry = out["queries_used"][0]
+        assert entry["raw_results"] == 4
+        assert entry["new_comps"] == 1
+        assert entry["non_usd_dropped"] == 2
+        assert out["non_usd_dropped"] == 2
+
+    def test_serpapi_all_usd_response_counts_zero(self, tmp_path, monkeypatch):
+        """The overwhelming common case: the field must be present and 0,
+        never absent — a consumer doing `.get("non_usd_dropped")` needs a
+        real 0 to distinguish "checked, none dropped" from "field missing"."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        with patch("sold_comps.requests.get",
+                   return_value=_serpapi_good([
+                       {"product_id": "1", "title": "ASM #142 FN Marvel 1975",
+                        "price": {"raw": "$10.0", "extracted": 10.0}},
+                   ])):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+        assert out["queries_used"][0]["non_usd_dropped"] == 0
+        assert out["non_usd_dropped"] == 0
+
+    def test_sold_comps_provider_counts_currency_drops_too(
+            self, tmp_path, monkeypatch):
+        """The sold-comps.com path shares the same counting mechanism — a
+        measured no-op TODAY (BUI-675: 6,192/6,192 corpus items are USD), but
+        the count must not silently stop working if that ever changes."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        items = [
+            _sc_item(item_id="1", currency="USD"),
+            _sc_item(item_id="2", currency="BRL"),
+        ]
+        with patch("sold_comps.requests.get",
+                   side_effect=_route(sold_comps=lambda: _sold_comps_good(items))):
+            out = sc.fetch_book_comps(
+                {"title": "ASM", "issue": "142"}, "key", sold_comps_key="sc_k",
+            )
+        assert [c["product_id"] for c in out["comps"]] == ["1"]
+        entry = out["queries_used"][0]
+        assert entry["provider"] == "sold-comps.com"
+        assert entry["non_usd_dropped"] == 1
+        assert out["non_usd_dropped"] == 1
+        # And _is_fetch_error's own input signal stays untouched: this is a
+        # clean, error-free queries_used entry, not a fetch failure.
+        assert "error" not in entry
+
+
 # ─── Query construction ─────────────────────────────────────────────────────
 
 class TestBuildQuery:
@@ -4286,7 +4445,8 @@ class TestCompProvenance:
             assert comp[k] == v, f"pre-existing field {k!r} was altered"
         new_keys = set(comp) - set(parsed_alone)
         assert new_keys == {"provider", "tier", "query", "from_cache", "observed_at"}
-        # queries_used entries keep their pre-BUI-657 key set exactly.
+        # queries_used entries keep their pre-BUI-657 key set exactly, plus
+        # BUI-678's additive `non_usd_dropped` count.
         entry = out["queries_used"][0]
         assert {"tier", "nkw", "raw_results", "new_comps", "cached", "ebay_url",
-                "page", "outcome", "provider"} == set(entry)
+                "page", "outcome", "provider", "non_usd_dropped"} == set(entry)
