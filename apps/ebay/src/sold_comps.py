@@ -1496,6 +1496,49 @@ def _parse_price(raw) -> float | None:
     return v if 0.50 <= v <= 50000 else None
 
 
+# BUI-675: SerpApi's `price.extracted` is a naked float with the currency
+# symbol already stripped, so a foreign-currency sold listing used to enter the
+# priced pool at FACE VALUE. The proof was one eBay listing (267656830968, New
+# X-Men #128) cached twice: `{"raw": "R$ 101.77", "extracted": 101.77}` and
+# `{"raw": "$19.99", "extracted": 19.99}` — the same sale, once in Brazilian
+# Real, once in USD. Taken as dollars that is a 5.09x inflation of a $19.99
+# comp. It only ever surfaced because that listing happened to be fetched
+# twice; a book seen ONCE in a foreign currency is silently wrong.
+#
+# `price.raw` is the only place the currency survives, so it — not `extracted` —
+# is the authority on whether the number is dollars. Measured over the offline
+# corpus at ~/.cache/ebay-sold-comps (518 responses, 10,644 SerpApi results
+# carrying a price): `raw` and `extracted` are always present TOGETHER (10,644
+# both / 0 with only one), so gating on `raw` costs nothing today and cannot
+# regress a result that has a price. Rejecting a missing `raw` is therefore
+# fail-closed on evidence, not on a guess: with no currency string we have no
+# reason to believe a number is dollars, and mispricing a cap costs money where
+# dropping a comp only thins a pool.
+#
+# The predicate is an ALLOWLIST, not a "contains $" test: `R$`, `C $`, `AU $`,
+# `HK$`, `CA$`, `NZ$` and `S$` all carry a dollar sign and none of them are USD.
+# Only a bare `$` or an explicit `US $` qualifier passes, and the pattern is
+# anchored at BOTH ends so a trailing currency code (`$19.99 CAD`) cannot slip
+# through on the strength of its prefix. Over the corpus this accepts 10,618
+# and rejects 26 — the 22 `R$` and 4 `RMB` results, which are 100% of two
+# responses ("New X-Men 128", "Uncanny X-Men 311"): the flip happens per
+# RESPONSE, not per listing.
+#
+# Deliberately NOT allowed: a trailing `USD` (`"$19.99 USD"`). It is a genuine
+# USD format but has never appeared in the corpus, and its failure mode is a
+# dropped comp, not a wrong cap. Do not widen without re-measuring.
+#
+# No FX conversion — an exchange rate at parse time is not the rate at sale
+# time, and one comp is not worth that dependency.
+_USD_PRICE_RAW_RE = re.compile(r'^\s*(?:US\s*)?\$\s*[\d,]*\.?\d+\s*$', re.IGNORECASE)
+
+
+def _is_usd_serpapi_price(price_obj: dict) -> bool:
+    """True when SerpApi's price object proves the amount is US dollars."""
+    raw = price_obj.get("raw")
+    return isinstance(raw, str) and bool(_USD_PRICE_RAW_RE.match(raw))
+
+
 def parse_comp(result: dict) -> dict | None:
     """Convert a SerpApi organic_result into our normalized comp shape."""
     title = result.get("title", "")
@@ -1503,6 +1546,10 @@ def parse_comp(result: dict) -> dict | None:
         return None
     product_id = str(result.get("product_id") or result.get("item_id") or "")
     price_obj = result.get("price") or {}
+    # BUI-675: currency gate BEFORE the price parse — `extracted` is only
+    # trusted once `raw` has vouched that the number is dollars.
+    if not _is_usd_serpapi_price(price_obj):
+        return None
     price = _parse_price(price_obj.get("extracted") or price_obj.get("raw"))
     if price is None:
         return None
@@ -1538,9 +1585,30 @@ def parse_comp_sold_comps(item: dict) -> dict | None:
     closed that option — this is settled, not an open question.
     `endedAt` (ISO YYYY-MM-DD) passes through verbatim:
     fmv_math._parse_sold_date already accepts ISO-8601.
+
+    BUI-675 correction: `soldPrice` IS a bare number, but this provider is not
+    currency-blind the way that suggests — every item also carries an explicit
+    `soldCurrency`, and it reads 'USD' on 6,192 of 6,192 items in the offline
+    corpus, including items shipping from the UK, Canada, Australia and China.
+    So sold-comps.com normalizes to dollars and has none of the face-value bug
+    parse_comp had. The guard below is consequently a measured NO-OP today; it
+    exists so the primary provider is not the unguarded one if that ever
+    changes. It rejects only a currency that is PRESENT and not USD: a missing
+    field — or a blank one, which is the same absence of a declaration — is
+    treated as USD, deliberately unlike parse_comp. The asymmetry is
+    the blast radius, not a different standard of evidence — for SerpApi the
+    currency lives inside the price string, so its absence means we never had a
+    price string to trust, whereas here it is an independent field whose
+    disappearance would black out the DEFAULT PRIMARY provider (and a
+    provider-wide blackout surfaces as a clean n=0, the invisible failure class
+    of BUI-565). Two independent schema changes are needed to slip a foreign
+    price past this; one would be needed to break FMV entirely.
     """
     title = item.get("title", "")
     if not title:
+        return None
+    currency = str(item.get("soldCurrency") or "").strip()
+    if currency and currency.upper() != "USD":
         return None
     m = _ITM_ID_RE.search(item.get("url") or "")
     product_id = str(item.get("itemId") or (m.group(1) if m else ""))

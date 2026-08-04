@@ -476,8 +476,8 @@ class TestParseComp:
         assert c["grade"] == 8.0
         assert c["sold_date"].startswith("Sold")
 
-    def test_falls_back_to_extracted_price(self):
-        c = sc.parse_comp(self._make(price={"extracted": 5.99}))
+    def test_prefers_extracted_over_raw(self):
+        c = sc.parse_comp(self._make(price={"raw": "$5.99", "extracted": 5.99}))
         assert c["price"] == 5.99
 
     def test_falls_back_to_raw_price(self):
@@ -486,6 +486,17 @@ class TestParseComp:
 
     def test_drops_no_price(self):
         assert sc.parse_comp(self._make(price={})) is None
+
+    def test_extracted_alone_is_no_longer_enough(self):
+        """BUI-675: `extracted` without `raw` carries no currency evidence.
+
+        This asserts a DELIBERATE behavior change. SerpApi ships the two keys
+        together — 10,644 results in the offline corpus carry both and 0 carry
+        only one — so no real result loses a price here; the case is reachable
+        only if SerpApi's schema changes, and then fail-closed (drop the comp)
+        beats fail-open (price a cap off an unknown currency).
+        """
+        assert sc.parse_comp(self._make(price={"extracted": 5.99})) is None
 
     def test_drops_no_title(self):
         assert sc.parse_comp(self._make(title="")) is None
@@ -499,8 +510,136 @@ class TestParseComp:
         assert c["product_id"] == "123"
 
     def test_price_out_of_range_drops(self):
-        assert sc.parse_comp(self._make(price={"extracted": 0.10})) is None
-        assert sc.parse_comp(self._make(price={"extracted": 100000})) is None
+        assert sc.parse_comp(
+            self._make(price={"raw": "$0.10", "extracted": 0.10})) is None
+        assert sc.parse_comp(
+            self._make(price={"raw": "$100,000.00", "extracted": 100000})) is None
+
+
+class TestForeignCurrencyComps:
+    """BUI-675: a non-USD sold listing must not enter the pool at face value.
+
+    Every `price` object below is pasted verbatim from a cached SerpApi
+    response in ~/.cache/ebay-sold-comps — these are wire shapes, not
+    invented ones.
+    """
+
+    # The ticket's proof: ONE eBay listing (267656830968, New X-Men #128)
+    # cached twice, once in each currency, same title and same sold date.
+    _USD_TWIN = {
+        "product_id": "267656830968",
+        "title": "New X-Men # 128 VF/NM Marvel Comic Book 1st Fantomex Grant Morrison 10 J453",
+        "price": {"raw": "$19.99", "extracted": 19.99},
+        "sold_date": "Jul 9, 2026",
+        "buying_format": "accepts_offers",
+    }
+    _BRL_TWIN = {
+        **_USD_TWIN,
+        "price": {"raw": "R$ 101.77", "extracted": 101.77},
+    }
+
+    def test_the_usd_twin_is_kept(self):
+        comp = sc.parse_comp(self._USD_TWIN)
+        assert comp is not None and comp["price"] == 19.99
+
+    def test_the_brl_twin_is_dropped(self):
+        """R$ 101.77 is ~$20, not $102 — 5.09x if taken as dollars."""
+        assert sc.parse_comp(self._BRL_TWIN) is None
+
+    def test_real_brl_result_is_dropped(self):
+        assert sc.parse_comp({
+            "product_id": "127719123834",
+            "title": "New X-Men #128 (Marvel Comics Late August 2002)",
+            "price": {"raw": "R$ 76.37", "extracted": 76.37},
+            "sold_date": "Jul 16, 2026",
+            "buying_format": "accepts_offers",
+        }) is None
+
+    def test_real_rmb_result_is_dropped(self):
+        assert sc.parse_comp({
+            "product_id": "327129890430",
+            "title": "Uncanny X-Men #311 Vol. 1 1994 Marvel Comics Newsstand High Grade Q20-271",
+            "price": {"raw": "RMB 67.56", "extracted": 67.56},
+            "sold_date": "May 24, 2026",
+            "buying_format": "buy_it_now",
+        }) is None
+
+    def test_real_usd_result_is_kept(self):
+        comp = sc.parse_comp({
+            "product_id": "177614885669",
+            "title": "Absolute Green Lantern #10 CVR A Jahnoy Lindsay 1/7/26 DC Comics",
+            "price": {"raw": "$4.98", "extracted": 4.98},
+            "sold_date": "Jun 3, 2026",
+            "buying_format": "buy_it_now",
+        })
+        assert comp is not None and comp["price"] == 4.98
+
+    @pytest.mark.parametrize("raw", [
+        "$19.99", "$4.98", "$1,234.56", "$19", "$0.99", "$.99",
+        # eBay's own qualified rendering of US dollars.
+        "US $19.99", "US$19.99", "us $5",
+    ])
+    def test_usd_formats_accepted(self, raw):
+        assert sc._is_usd_serpapi_price({"raw": raw}), raw
+
+    @pytest.mark.parametrize("raw", [
+        # Every one of these carries a '$', which is why a bare "contains $"
+        # test is not enough — none of them is USD.
+        "R$ 101.77", "C $19.99", "AU $25.00", "HK$100", "CA$19.99",
+        "NZ$5", "S$5", "A $5", "AUS $5",
+        # No dollar sign at all.
+        "RMB 67.56", "€19.99", "£19.99", "19.99",
+        # Anchored at both ends: a trailing code cannot ride in on the prefix.
+        "$19.99 CAD",
+        # European decimal comma — a locale signal, and one the old parser
+        # silently mangled ("1.234,56" -> 1.23456 after comma-stripping).
+        "$1.234,56",
+        # Not a price.
+        "$", "$abc", "",
+    ])
+    def test_non_usd_formats_rejected(self, raw):
+        assert not sc._is_usd_serpapi_price({"raw": raw}), raw
+
+    def test_trailing_usd_code_is_a_deliberate_false_reject(self):
+        """Pins a documented choice rather than an accident.
+
+        "$19.99 USD" is genuinely US dollars but has never appeared in the
+        corpus, and the both-ends anchor that rejects "$19.99 CAD" rejects it
+        too. Dropping one comp is the cheap side of that trade. If a future
+        measurement shows SerpApi emitting this shape, widen the pattern and
+        delete this test — do not widen it on the strength of this comment.
+        """
+        assert not sc._is_usd_serpapi_price({"raw": "$19.99 USD"})
+
+    def test_missing_raw_is_rejected(self):
+        assert not sc._is_usd_serpapi_price({"extracted": 19.99})
+        assert not sc._is_usd_serpapi_price({})
+
+    def test_non_string_raw_is_rejected(self):
+        """A naked number is exactly the no-currency-evidence case."""
+        assert not sc._is_usd_serpapi_price({"raw": 19.99})
+
+    def test_range_priced_result_still_dropped(self):
+        """SerpApi's from/to shape (229 in the corpus) has no top-level raw."""
+        assert sc.parse_comp({
+            "product_id": "354211183594",
+            "title": "1994 Fleer Flair Annual Marvel Base Card You Pick Finish Your Set HULK X-Men",
+            "price": {"from": {"raw": "$1.00", "extracted": 1.0},
+                      "to": {"raw": "$14.00", "extracted": 14.0}},
+            "sold_date": "Jul 19, 2026",
+        }) is None
+
+    def test_currency_gate_is_comp_path_only(self):
+        """BUI-239: the comp path must never leak into the purchase path.
+
+        `_LOT_RE` and hard_exclude/is_comp_excluded take a bare TITLE and have
+        no access to a price object, which is why the gate lives in
+        `parse_comp` rather than there. Neither purchase-path predicate can
+        see, or be changed by, a currency.
+        """
+        title = self._BRL_TWIN["title"]
+        assert not comic_identity._LOT_RE.search(title)
+        assert not sc.hard_exclude(title)
 
 
 # ─── Query construction ─────────────────────────────────────────────────────
@@ -1639,7 +1778,7 @@ class TestTieredStrategy:
         return {
             "product_id": pid,
             "title": title,
-            "price": {"extracted": price},
+            "price": {"raw": f"${price}", "extracted": price},
             "sold_date": "",
             "buying_format": "auction",
         }
@@ -1877,7 +2016,7 @@ class TestGatedPagination:
         return {
             "product_id": pid,
             "title": title,
-            "price": {"extracted": price},
+            "price": {"raw": f"${price}", "extracted": price},
             "sold_date": "",
             "buying_format": "auction",
         }
@@ -2051,7 +2190,7 @@ class TestInclusiveTier:
         return {
             "product_id": pid,
             "title": title,
-            "price": {"extracted": price},
+            "price": {"raw": f"${price}", "extracted": price},
             "sold_date": "",
             "buying_format": "auction",
         }
@@ -2203,7 +2342,7 @@ class TestBatch:
                 "organic_results": [{
                     "product_id": "1",
                     "title": "ASM #142 FN+",
-                    "price": {"extracted": 12.0},
+                    "price": {"raw": "$12.0", "extracted": 12.0},
                 }],
                 "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
             }, False, 1234567890.0)
@@ -2882,12 +3021,17 @@ class TestCircuitBreakerBatchIntegration:
 # ─── BUI-545: secondary provider (sold-comps.com) failover ───────────────────
 
 def _sc_item(item_id="111", title="ASM #142 FN+ Marvel 1975", price=25.0,
-             ended="2026-07-25", listing_type="sold"):
-    """A sold-comps.com response item in the shape the live API returns."""
+             ended="2026-07-25", listing_type="sold", currency="USD"):
+    """A sold-comps.com response item in the shape the live API returns.
+
+    BUI-675: `soldCurrency` is part of that wire shape — it is present on all
+    6,192 items in the offline corpus and reads 'USD' on every one.
+    """
     return {
         "itemId": item_id,
         "title": title,
         "soldPrice": price,
+        "soldCurrency": currency,
         "endedAt": ended,
         "listingType": listing_type,
         "buyingFormat": "auction",
@@ -2977,6 +3121,46 @@ class TestParseCompSoldComps:
     def test_price_bounds_apply(self):
         # Same 0.50–50000 sanity bounds as the SerpApi parse path.
         assert sc.parse_comp_sold_comps(_sc_item(price=0.25)) is None
+
+    def test_real_wire_item_carries_usd_and_is_kept(self):
+        """Pasted verbatim from a cached sold-comps.com response."""
+        comp = sc.parse_comp_sold_comps({
+            "itemId": "256686698319",
+            "title": "1992 Impel The Uncanny X-Men #93 Storm",
+            "soldPrice": "1.00",
+            "soldCurrency": "USD",
+            "totalPrice": "1.99",
+            "endedAt": "2026-07-15",
+            "buyingFormat": "buyItNow",
+            "itemLocation": "United States",
+            "url": "https://www.ebay.com/itm/256686698319?nordt=true",
+        })
+        assert comp is not None and comp["price"] == 1.0
+
+    def test_declared_foreign_currency_is_dropped(self):
+        """BUI-675: a no-op today (6,192/6,192 corpus items are USD), but the
+        primary provider must not be the unguarded one if that changes."""
+        assert sc.parse_comp_sold_comps(_sc_item(currency="BRL")) is None
+        assert sc.parse_comp_sold_comps(_sc_item(currency="CAD")) is None
+
+    def test_currency_match_is_case_and_space_insensitive(self):
+        assert sc.parse_comp_sold_comps(_sc_item(currency=" usd ")) is not None
+
+    def test_absent_currency_is_treated_as_usd(self):
+        """Deliberately unlike parse_comp — see the docstring on the parser.
+
+        The field is an INDEPENDENT one here, so failing closed on its absence
+        would black out the default primary provider (a clean n=0, the
+        invisible failure class of BUI-565) on a single schema change.
+        """
+        item = _sc_item()
+        del item["soldCurrency"]
+        assert sc.parse_comp_sold_comps(item) is not None
+        assert sc.parse_comp_sold_comps(_sc_item(currency=None)) is not None
+        # A blank string is an absent declaration, not a foreign currency —
+        # it must not black the provider out either.
+        assert sc.parse_comp_sold_comps(_sc_item(currency="")) is not None
+        assert sc.parse_comp_sold_comps(_sc_item(currency="   ")) is not None
 
 
 class TestFetchSoldComps:
@@ -3113,7 +3297,7 @@ class TestProviderFallback:
                    side_effect=_route(serpapi=lambda: _serpapi_good([{
                        "product_id": "555",
                        "title": "ASM #142 FN Marvel",
-                       "price": {"extracted": 20.0},
+                       "price": {"raw": "$20.0", "extracted": 20.0},
                    }]), sold_comps=sold_comps_403)):
             out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
                                       sold_comps_key="sc_k")
@@ -3242,11 +3426,11 @@ class TestProviderFallback:
                 return _serpapi_good([{
                     "product_id": "111",
                     "title": "ASM #142 FN Marvel",
-                    "price": {"extracted": 20.0},
+                    "price": {"raw": "$20.0", "extracted": 20.0},
                 }, {
                     "product_id": "999",
                     "title": "ASM #142 VG Marvel",
-                    "price": {"extracted": 8.0},
+                    "price": {"raw": "$8.0", "extracted": 8.0},
                 }])
             return _serpapi_down()
 
@@ -3336,7 +3520,7 @@ class TestAltMastheadTier:
         return {
             "product_id": pid,
             "title": title,
-            "price": {"extracted": price},
+            "price": {"raw": f"${price}", "extracted": price},
             "sold_date": "",
             "buying_format": "auction",
         }
@@ -3543,7 +3727,7 @@ class TestVariantDropRetry:
         return {
             "product_id": pid,
             "title": title,
-            "price": {"extracted": price},
+            "price": {"raw": f"${price}", "extracted": price},
             "sold_date": "",
             "buying_format": "auction",
         }
@@ -3686,7 +3870,7 @@ class TestCompProvenance:
         with patch("sold_comps.requests.get",
                    return_value=self._serpapi_response(
                        [{"product_id": "1", "title": "ASM #142 FN+ Marvel 1975",
-                         "price": {"extracted": 12.0}}])):
+                         "price": {"raw": "$12.0", "extracted": 12.0}}])):
             out = sc.fetch_book_comps(
                 {"title": "ASM", "issue": "142", "year": 1975}, "key",
             )
@@ -3710,7 +3894,7 @@ class TestCompProvenance:
         with patch("sold_comps.requests.get",
                    return_value=self._serpapi_response(
                        [{"product_id": "1", "title": "ASM #142 FN+ Marvel 1975",
-                         "price": {"extracted": 12.0}}])):
+                         "price": {"raw": "$12.0", "extracted": 12.0}}])):
             sc.fetch_book_comps(book, "key")  # populates the cache
 
         # Backdate every cache entry (well within the default 7-day TTL).
@@ -3743,7 +3927,7 @@ class TestCompProvenance:
         sc._cache_put(base_path, {
             "organic_results": [{"product_id": "cached1",
                                   "title": "ASM #142 FN Marvel 1975",
-                                  "price": {"extracted": 10.0}}],
+                                  "price": {"raw": "$10.0", "extracted": 10.0}}],
             "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
         })
         old = time.time() - (5 * 24 * 3600)
@@ -3753,7 +3937,7 @@ class TestCompProvenance:
         with patch("sold_comps.requests.get",
                    return_value=self._serpapi_response(
                        [{"product_id": "live1", "title": "ASM #142 FN Marvel",
-                         "price": {"extracted": 10.0}}])) as m:
+                         "price": {"raw": "$10.0", "extracted": 10.0}}])) as m:
             out = sc.fetch_book_comps(book, "key")
 
         by_id = {c["product_id"]: c for c in out["comps"]}
@@ -3780,9 +3964,9 @@ class TestCompProvenance:
             calls.append(nkw)
             results_per_query = [
                 [{"product_id": "b1", "title": "ASM #142 FN Marvel 1975",
-                  "price": {"extracted": 10.0}}],   # tier 1 base: thin (1 < 5)
+                  "price": {"raw": "$10.0", "extracted": 10.0}}],   # tier 1 base: thin (1 < 5)
                 [{"product_id": "w1", "title": "ASM #142 FN Marvel",
-                  "price": {"extracted": 10.0}}],   # tier 2 broader
+                  "price": {"raw": "$10.0", "extracted": 10.0}}],   # tier 2 broader
             ]
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
@@ -3822,7 +4006,7 @@ class TestCompProvenance:
                        serpapi=lambda: _serpapi_good([{
                            "product_id": "555",
                            "title": "ASM #142 FN Marvel",
-                           "price": {"extracted": 20.0},
+                           "price": {"raw": "$20.0", "extracted": 20.0},
                        }]),
                        sold_comps=sold_comps_403)):
             out = sc.fetch_book_comps(
@@ -3850,14 +4034,14 @@ class TestCompProvenance:
             # one raw + one genuine slab comp.
             results_per_query = [
                 [{"product_id": "r1", "title": "ASM #142 FN Marvel 1975",
-                  "price": {"extracted": 10.0}}],
+                  "price": {"raw": "$10.0", "extracted": 10.0}}],
                 [{"product_id": "r2", "title": "ASM #142 FN Marvel 1975",
-                  "price": {"extracted": 10.0}}],
+                  "price": {"raw": "$10.0", "extracted": 10.0}}],
                 [
                     {"product_id": "r3", "title": "ASM #142 FN Marvel 1975",
-                     "price": {"extracted": 10.0}},
+                     "price": {"raw": "$10.0", "extracted": 10.0}},
                     {"product_id": "s1", "title": "ASM #142 CGC 6.5 1975",
-                     "price": {"extracted": 1200.0}},
+                     "price": {"raw": "$1200.0", "extracted": 1200.0}},
                 ],
             ]
             results = results_per_query[idx] if idx < len(results_per_query) else []
@@ -3887,7 +4071,7 @@ class TestCompProvenance:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         raw_item = {
             "product_id": "1", "title": "ASM #142 FN+ Marvel 1975",
-            "price": {"extracted": 12.0}, "sold_date": "2025-01-01",
+            "price": {"raw": "$12.0", "extracted": 12.0}, "sold_date": "2025-01-01",
             "buying_format": "auction", "link": "https://x",
         }
         with patch("sold_comps.requests.get",
