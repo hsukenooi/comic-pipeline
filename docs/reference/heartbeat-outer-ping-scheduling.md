@@ -180,11 +180,26 @@ one real run on its own schedule.
 
 **The fix is to let the jobs run, never to mute the check or weaken
 `heartbeat-outer-ping.sh`'s alarm condition.** A monitor tuned to be quiet on
-day one is the exact bug class this project exists to close. Each job clears
-itself the first time it completes successfully — `wishlist-sellers` and
-`sentinel-probe` weekly, `fmv-refresh` also weekly, `collection-sync` every
-two weeks — so expect the check to go green incrementally over roughly the
-next two weeks, not all at once.
+day one is the exact bug class this project exists to close.
+
+Each job clears itself the first time it completes successfully — but only one
+of the four clears **unattended**, and it is worth being precise about which,
+because "it will go green on its own" is exactly the false expectation that
+gets a monitor muted three weeks later:
+
+| job | what clears it | unattended? |
+| --- | --- | --- |
+| `sentinel-probe` | `com.comics.sentinel-probe` launchd job, Sundays 09:00 | **yes** |
+| `wishlist-sellers` | a `/comic:wishlist-sellers` run exiting 0 | no — user-invoked |
+| `collection-sync` | a `/comic:collection-sync` round-trip through Step 6 | no — user-invoked |
+| `fmv-refresh` | a `comic-fmv` batch that persisted at least one upsert | no — user-invoked |
+
+The contract's cadences for those three (168h, 336h, 168h) describe **how often
+they are expected to be run**, not automation that runs them. So the check goes
+green as the normal buying workflow exercises them, not on a timer. If one of
+them stays `never` for well past its cadence, the heartbeat is telling the truth
+about a workflow that has quietly stopped being used — which is the signal, not
+noise.
 
 ## Uninstalling
 
