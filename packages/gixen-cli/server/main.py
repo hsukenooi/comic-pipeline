@@ -263,9 +263,11 @@ _SYNC_BACKOFF_FIRST_UNEXPECTED = SYNC_INTERVAL * 2
 #
 # _last_sync_ok_at is stamped at the very END of _sync_gixen, after its apply
 # phase committed and every terminal transition it was going to make has been
-# made. That is the same site the BUI-602 heartbeat contract nominates for the
-# (still unwired, follow-up-owned) `gixen-sync` ping — see
-# docs/reference/job-heartbeat-contract.md.
+# made. The BUI-602 heartbeat contract's `gixen-sync` ping is a NEARBY but
+# distinct site: BUI-624 wired it as the last statement INSIDE the apply-phase
+# transaction (via the `on_sync_observed` hookspec), one step earlier than this
+# stamp, so a cycle that wrote and then rolled back takes its heartbeat with it
+# and no post-commit I/O can raise. See docs/reference/job-heartbeat-contract.md.
 _process_started_at: float = 0.0
 _last_sync_ok_at: float = 0.0
 _last_sync_snipe_count: int | None = None
