@@ -100,6 +100,29 @@ CAPTURE_ROTATE_BYTES = int(
     os.environ.get("EBAY_SOLD_COMPS_CAPTURE_ROTATE_BYTES") or 10_000_000
 )
 
+# BUI-677: how long a retired segment must sit UNTOUCHED before compression is
+# allowed to destroy its plaintext copy. Compression ends in an unlink(), and
+# an unlink destroys whatever the plaintext holds at that instant — including a
+# straggling append from an fd that was opened on CAPTURE_PATH just before the
+# rename and has not issued its write() yet. No stat-check can close that: the
+# check and the unlink cannot be made atomic against a foreign fd. BUI-628
+# shipped two such checks and CI still lost 3 of 120 records under contention.
+#
+# So compression is DEFERRED instead of guarded: a segment is never compressed
+# by the pass that retired it, only by a LATER rotation, and only once it has
+# sat unwritten for this long. Both conditions are lock-free and visible
+# cross-process (mtime is a filesystem fact, not process state), which matters
+# because several ebay-sold-comps/comic-fmv processes share this directory.
+#
+# 60s is ~4 orders of magnitude more than the gap it must cover: after the
+# deferral the only surviving straggler is a thread descheduled BETWEEN its
+# os.open() and its os.write() — two adjacent syscalls in _capture_raw_response
+# — for longer than this whole delay. Deliberately NOT env-overridable, unlike
+# CAPTURE_DIR/CAPTURE_ROTATE_BYTES (which are operator choices about where the
+# capture lives and how big segments get): this is a correctness parameter, and
+# turning it down toward zero re-opens the data-loss window it exists to close.
+CAPTURE_COMPRESS_DELAY_SEC = 60.0
+
 # Tier thresholds (the "tiered query strategy" from the FMV skill)
 THIN_RESULTS_THRESHOLD = 5     # auto-broaden (drop year) if base returns fewer
 GRADE_TAGGED_THRESHOLD = 10    # add grade-targeted query if base returns fewer
@@ -272,26 +295,38 @@ def _cache_put(path: Path, data: dict) -> None:
 def _compress_rotated_segment(rotated_path: Path) -> None:
     """Gzip *rotated_path* in place and remove the plaintext copy.
 
-    Called once, right after `_rotate_capture_if_needed` has already
-    `os.rename`d the old CAPTURE_PATH out of the way — the rename alone is
-    what makes the rotation "count" (new appends go to a fresh CAPTURE_PATH
-    from that point on); this step is purely a disk-space optimization on
-    the segment that was just retired, and its failure is independent of
-    and never allowed to affect that fact.
+    Purely a disk-space optimization on a segment that some EARLIER call to
+    `_rotate_capture_if_needed` already `os.rename`d out of the way — the
+    rename alone is what makes a rotation "count" (new appends go to a fresh
+    CAPTURE_PATH from that point on), so this step's failure is independent
+    of and never allowed to affect that fact.
 
-    Race note (BUI-628): every append in this module is a bare
-    open+write+close with no fd held across calls (see
-    _capture_raw_response), so the only way *rotated_path* could still
-    receive a write after the rename is a straggler that already called
-    os.open() on the pre-rename path a moment earlier — a single-syscall-pair
-    window, not a held-open race, but not literally zero either. To make
-    sure such a straggler is never destroyed by compression: read the file,
-    and only replace it with the gzip + unlink the plaintext if a follow-up
-    stat proves the size never moved while we were reading and compressing
-    it. If it moved, discard the (incomplete) .gz and leave the plaintext
-    segment exactly as it is — uncompressed but intact, and not re-attempted
-    later (out of scope for this hedge) — never lost, and never duplicated
-    against a .gz that would otherwise also hold the straggler's line.
+    Never called on the segment the current pass just retired — see
+    `_sweep_compressible_segments`, which is the only caller and which
+    enforces both halves of the BUI-677 deferral (never this pass's own
+    segment; never one written to within CAPTURE_COMPRESS_DELAY_SEC). By the
+    time a segment reaches this function it has been quiescent for at least
+    that long, so the "straggler holding a pre-rename fd" that BUI-628 tried
+    (and failed) to guard against with stat-checks can no longer exist: it
+    would have had to sit descheduled between its own os.open() and
+    os.write() for the whole delay.
+
+    The size checks below are kept as belt-and-braces behind that deferral,
+    not as the primary guard — BUI-628's mistake was believing a stat could
+    be atomic against a foreign fd, and CI disproved it. If a write does land
+    mid-compress, the plaintext segment is left exactly as it is:
+    uncompressed but intact, authoritative, and picked up again by a later
+    rotation's sweep. Every branch here resolves toward "keep the plaintext",
+    never toward "trust the .gz".
+
+    Multi-process note (BUI-677): because compression is now deferred rather
+    than done by the process that rotated, two processes' sweeps can pick the
+    same eligible segment at once. The `.tmp` name therefore carries a
+    per-attempt pid+token so concurrent attempts cannot clobber each other's
+    partial gzip, and every step that touches the plaintext tolerates it
+    having already been compressed and removed by the peer. Both sweeps read
+    the same quiescent bytes, so whichever `os.replace` lands last publishes
+    a complete, content-equal `.gz`.
 
     A failure partway through the gzip write (e.g. disk full, mirroring
     ebay_fetch.atomic_write_json's BUI-333 fix) can leave an orphaned `.tmp`
@@ -299,34 +334,126 @@ def _compress_rotated_segment(rotated_path: Path) -> None:
     as that precedent, so a repeat failure doesn't litter the capture dir.
     """
     gz_path = rotated_path.with_name(rotated_path.name + ".gz")
-    tmp_path = gz_path.with_name(gz_path.name + ".tmp")
+    tmp_path = gz_path.with_name(f"{gz_path.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
     try:
-        before = rotated_path.stat().st_size
-        raw = rotated_path.read_bytes()
+        try:
+            before = rotated_path.stat().st_size
+            raw = rotated_path.read_bytes()
+        except FileNotFoundError:
+            return  # a peer sweep already compressed and removed it
         if len(raw) != before or rotated_path.stat().st_size != before:
             return  # a straggling append landed mid-read; leave it plaintext
         with gzip.open(tmp_path, "wb") as f:
             f.write(raw)
-        os.replace(tmp_path, gz_path)
-        if rotated_path.stat().st_size != before:
-            # A straggler landed between the read above and here — the .gz
-            # we just wrote is missing that line. Discard it (the plaintext
-            # already has everything) rather than leave a stale duplicate.
-            try:
-                gz_path.unlink()
-            except FileNotFoundError:
-                pass
-            return
-        rotated_path.unlink()
-    except Exception as exc:  # noqa: BLE001  # never let compression touch the append path
         try:
-            tmp_path.unlink()
-        except OSError:
-            pass  # best-effort — never mask the original failure below
+            if rotated_path.stat().st_size != before:
+                _unlink_quietly(tmp_path)
+                return  # grew while compressing — leave the plaintext authoritative
+        except FileNotFoundError:
+            # A peer sweep finished the whole job while we compressed. Its .gz
+            # is already published; do NOT os.replace ours over it — ours was
+            # read earlier and could be the shorter of the two.
+            _unlink_quietly(tmp_path)
+            return
+        os.replace(tmp_path, gz_path)
+        try:
+            if rotated_path.stat().st_size != before:
+                # A straggler landed between the read above and here, so the
+                # .gz we just published is missing its line. LEAVE BOTH: the
+                # plaintext is authoritative and complete, and a reader that
+                # finds a segment in both forms reads the plaintext and skips
+                # the .gz (the BUI-661 backfill's `capture_segments`). The
+                # next sweep re-compresses this segment and os.replace()s a
+                # correct .gz over the stale one, so this self-heals.
+                #
+                # Deliberately NOT unlinking the .gz here: this process cannot
+                # tell its own .gz from one a peer sweep published a moment
+                # ago, and deleting a peer's COMPLETE .gz just before that
+                # peer unlinks the plaintext would lose the whole segment
+                # rather than one record. Leaving a redundant .gz costs disk;
+                # removing the wrong one costs data.
+                return
+            rotated_path.unlink()
+        except FileNotFoundError:
+            return  # peer removed the plaintext; our .gz holds the same bytes
+    except Exception as exc:  # noqa: BLE001  # never let compression touch the append path
+        _unlink_quietly(tmp_path)  # best-effort — never mask the original failure below
         print(
             f"BUI-628: capture rotation compress failed (non-fatal, "
             f"segment kept uncompressed): {exc}", file=sys.stderr,
         )
+
+
+def _unlink_quietly(path: Path) -> None:
+    """Best-effort unlink — used only for cleanup paths where the file's
+    absence is as good as its removal, so an error here must never surface."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _sweep_compressible_segments(just_rotated: Path) -> None:
+    """Gzip every retired plaintext segment that is safe to compress.
+
+    BUI-677: this is the deferral. *just_rotated* — the segment this very
+    pass retired — is skipped unconditionally, because that is the one
+    segment a straggling append can still be about to land in (its fd was
+    resolved before the rename). Every other retired plaintext segment is
+    compressed only once its mtime shows it has taken no write for
+    CAPTURE_COMPRESS_DELAY_SEC.
+
+    mtime, not the rotation timestamp in the filename, is the right clock:
+    it is bumped by the straggler's own write, so an actively-written segment
+    keeps postponing its own compression, and it is equally visible to a
+    sweep running in a different process. A segment whose mtime is somehow in
+    the future is skipped, which is the safe direction.
+
+    Called only from inside `_rotate_capture_if_needed`'s rotation branch, so
+    the directory glob costs nothing on the hot append path — it runs once
+    per CAPTURE_ROTATE_BYTES written, not once per response. The consequence
+    is explicit and accepted: if this process never rotates again, the last
+    retired segment stays plaintext forever. An uncompressed segment is a
+    disk-space cost; a compressed-away record is unrecoverable. Readers glob
+    both extensions (see the BUI-661 backfill's `capture_segments`), so a
+    segment left plaintext is fully readable, never lost.
+
+    A failed compress is not fatal and not final: `_compress_rotated_segment`
+    swallows and logs its own errors, and the segment stays eligible for the
+    next rotation's sweep.
+
+    RESIDUAL WINDOW, stated honestly rather than claimed away (the mistake
+    BUI-677 was): this is a time bound, not a proof. One interleaving still
+    loses a record — an appender that resolves CAPTURE_PATH with os.open(),
+    is then descheduled for longer than CAPTURE_COMPRESS_DELAY_SEC *between
+    that open and its os.write*, and only then writes into a segment a sweep
+    has meanwhile compressed and unlinked. Those are two adjacent syscalls
+    with nothing but a `try:` between them, so reaching 60s takes something
+    like a SIGSTOP, a suspended VM or a machine sleeping mid-append. Closing
+    it completely needs a lock held across rotate+compress AND around every
+    append's open — rejected: it puts a lock on the hot fetch path, for a
+    hedge, to buy the difference between "practically impossible" and
+    "impossible".
+    """
+    try:
+        candidates = sorted(CAPTURE_DIR.glob("raw_responses.*.jsonl"))
+    except OSError as exc:
+        print(
+            f"BUI-628: capture segment sweep failed (non-fatal, segments kept "
+            f"uncompressed): {exc}", file=sys.stderr,
+        )
+        return
+    now = time.time()
+    for path in candidates:
+        if path == just_rotated or path == CAPTURE_PATH:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue  # vanished under us (a peer sweep) — nothing to do
+        if now - mtime < CAPTURE_COMPRESS_DELAY_SEC:
+            continue  # too fresh: a straggling append could still be in flight
+        _compress_rotated_segment(path)
 
 
 def _rotate_capture_if_needed() -> None:
@@ -349,6 +476,12 @@ def _rotate_capture_if_needed() -> None:
     it — which would destroy whichever segment lost that race. The random
     token makes that collision practically impossible without needing an
     existence-check-and-retry loop.
+
+    BUI-677: the segment this call retires is deliberately NOT compressed
+    here. Compression destroys the plaintext, and a straggling append can
+    still land in a segment that was CAPTURE_PATH a moment ago. The sweep
+    below compresses only OLDER, quiescent segments; this one becomes
+    eligible for a later rotation's sweep. See _sweep_compressible_segments.
     """
     try:
         size = CAPTURE_PATH.stat().st_size
@@ -360,7 +493,7 @@ def _rotate_capture_if_needed() -> None:
     token = uuid.uuid4().hex[:8]
     rotated = CAPTURE_DIR / f"raw_responses.{ts}-{token}.jsonl"
     os.rename(CAPTURE_PATH, rotated)  # atomic — the new CAPTURE_PATH starts empty
-    _compress_rotated_segment(rotated)
+    _sweep_compressible_segments(just_rotated=rotated)
 
 
 def _capture_raw_response(
@@ -394,10 +527,23 @@ def _capture_raw_response(
     ever moves the *whole file* out from under CAPTURE_PATH via one atomic
     os.rename(), which either happens entirely before this call's open() or
     entirely after it — there is no window where a partial rotation could
-    make this call's single write(2) non-atomic. A straggling append that
-    lands in the just-rotated (old) segment rather than the fresh one is
-    explicitly tolerated (see _rotate_capture_if_needed) — that is a record
-    landing in a different, still fully-readable segment, never a lost one.
+    make this call's single write(2) non-atomic.
+
+    A straggling append — one whose os.open() resolved CAPTURE_PATH just
+    before a concurrent rename, so its write(2) lands in the just-retired
+    segment rather than the fresh one — is tolerated, but the reason is
+    NOT the rename's atomicity alone. This docstring used to claim that the
+    straggler was "never a lost one" because it landed "in a different,
+    still fully-readable segment"; CI disproved it (BUI-677: 3 of 120
+    records lost). The rename argument above is sound and stops where the
+    rename does — it says nothing about what happens to that segment
+    afterwards, and BUI-628's compression then UNLINKED the plaintext the
+    straggler had just written into. What actually makes the straggler safe
+    is BUI-677's deferral: no segment is ever compressed by the pass that
+    retired it, nor until it has taken no write for
+    CAPTURE_COMPRESS_DELAY_SEC — so by the time the plaintext is destroyed,
+    no fd that could still write to it can plausibly exist. See
+    _sweep_compressible_segments for the residual window that leaves.
     """
     try:
         _rotate_capture_if_needed()

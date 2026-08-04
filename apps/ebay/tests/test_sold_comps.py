@@ -1464,11 +1464,16 @@ class TestCaptureRotation:
         assert list(sc.CAPTURE_DIR.glob("*.gz")) == []
         assert len(_read_all_capture_records(sc.CAPTURE_DIR)) == 2
 
-    def test_crossing_threshold_rotates_and_gzips(self, tmp_path, monkeypatch):
+    def test_crossing_threshold_rotates_and_defers_gzip(self, tmp_path, monkeypatch):
         """Below-threshold writes accumulate in one file; the write that
-        crosses the threshold rotates the OLD content into a gzip-compressed,
-        timestamped segment and starts a fresh current file. Both segments'
-        records are readable together (AE11)."""
+        crosses the threshold rotates the OLD content into a timestamped
+        segment and starts a fresh current file.
+
+        BUI-677: that segment is left as PLAINTEXT by the pass that retired
+        it — compressing it there is what destroyed straggling appends — so
+        the gzip is deferred to a later rotation's sweep. Either way both
+        segments' records are readable together (AE11), which is the property
+        that actually matters."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 200)  # tiny — a couple records crosses it
         with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
@@ -1477,13 +1482,56 @@ class TestCaptureRotation:
             sc.fetch("q3", "key", force=True)
 
         rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
-        gzipped = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl.gz"))
-        assert gzipped, "the rotated segment should have been gzip-compressed"
-        assert rotated == [], "a successfully compressed segment leaves no plaintext behind"
+        assert rotated, "the threshold-crossing write should have retired a segment"
+        assert list(sc.CAPTURE_DIR.glob("*.gz")) == [], \
+            "BUI-677: a just-retired segment is never compressed by the pass that retired it"
         assert sc.CAPTURE_PATH.exists(), "a fresh current file must exist after rotation"
 
         all_records = _read_all_capture_records(sc.CAPTURE_DIR)
         assert len(all_records) == 3
+        assert {r["query"] for r in all_records} == {"q1", "q2", "q3"}
+
+    def test_retired_segment_is_compressed_by_a_later_rotation(self, tmp_path, monkeypatch):
+        """The deferral postpones compression, it does not cancel it: once a
+        retired segment has been quiescent for CAPTURE_COMPRESS_DELAY_SEC, the
+        NEXT rotation's sweep gzips it and removes the plaintext. Without this
+        the fix would silently turn BUI-628's disk-space bound back off."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)  # every write is "over threshold"
+        monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)  # "long enough ago" = always
+
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            sc.fetch("q1", "key")               # creates the current file
+            sc.fetch("q2", "key", force=True)   # rotates q1's segment (not compressed yet)
+            sc.fetch("q3", "key", force=True)   # rotates q2's; sweeps q1's
+
+        gzipped = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl.gz"))
+        rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
+        assert len(gzipped) == 1, "the older retired segment must eventually be compressed"
+        assert len(rotated) == 1, "the just-retired segment stays plaintext one more cycle"
+        assert sc.CAPTURE_PATH.exists()
+
+        all_records = _read_all_capture_records(sc.CAPTURE_DIR)
+        assert len(all_records) == 3, "compression must not lose or duplicate a record"
+        assert {r["query"] for r in all_records} == {"q1", "q2", "q3"}
+
+    def test_retired_segment_not_compressed_until_the_delay_elapses(self, tmp_path, monkeypatch):
+        """The age half of the deferral, independent of the "never the segment
+        this pass retired" half: with a long delay, even a segment retired two
+        rotations ago is still plaintext — and still fully readable."""
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
+        monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 3600.0)
+
+        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+            sc.fetch("q1", "key")
+            sc.fetch("q2", "key", force=True)
+            sc.fetch("q3", "key", force=True)
+
+        assert list(sc.CAPTURE_DIR.glob("*.gz")) == [], \
+            "no segment is old enough to compress yet"
+        assert len(list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))) == 2
+        all_records = _read_all_capture_records(sc.CAPTURE_DIR)
         assert {r["query"] for r in all_records} == {"q1", "q2", "q3"}
 
     def test_rotation_failure_falls_back_to_appending_current_file(
@@ -1524,27 +1572,31 @@ class TestCaptureRotation:
         present on disk (as plaintext, not gzip) — never lost."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
+        monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)
 
         with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")  # seed one record into what will be rotated away
+            sc.fetch("q1", "key")               # seed one record into what will be rotated away
+            sc.fetch("q2", "key", force=True)   # rotates it; BUI-677 defers its compression
 
         def boom_gzip(*a, **k):
             raise OSError("simulated compress failure")
 
         monkeypatch.setattr(sc.gzip, "open", boom_gzip)
         with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            data, cache_hit, _fetched_at = sc.fetch("q2", "key", force=True)
+            # This rotation's sweep is the one that tries (and fails) to
+            # compress q1's now-eligible segment.
+            data, cache_hit, _fetched_at = sc.fetch("q3", "key", force=True)
 
         assert cache_hit is False
         assert data["organic_results"] == [{"product_id": "1"}]
         assert "BUI-628" in capsys.readouterr().err
 
         rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
-        assert len(rotated) == 1, "the retired segment must survive, uncompressed"
+        assert len(rotated) == 2, "both retired segments must survive, uncompressed"
         assert list(sc.CAPTURE_DIR.glob("*.gz")) == []
         all_records = _read_all_capture_records(sc.CAPTURE_DIR)
-        assert len(all_records) == 2
-        assert {r["query"] for r in all_records} == {"q1", "q2"}
+        assert len(all_records) == 3
+        assert {r["query"] for r in all_records} == {"q1", "q2", "q3"}
 
     def test_compress_failure_after_tmp_write_cleans_up_orphan(self, tmp_path, monkeypatch, capsys):
         """A failure AFTER the .tmp gzip file is fully written (e.g. the
@@ -1557,9 +1609,11 @@ class TestCaptureRotation:
         fix one."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
+        monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)
 
         with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")  # seed one record into what will be rotated away
+            sc.fetch("q1", "key")               # seed one record into what will be rotated away
+            sc.fetch("q2", "key", force=True)   # rotates it; BUI-677 defers its compression
 
         real_replace = sc.os.replace
 
@@ -1575,7 +1629,7 @@ class TestCaptureRotation:
 
         monkeypatch.setattr(sc.os, "replace", boom_replace_for_gz_only)
         with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            data, cache_hit, _fetched_at = sc.fetch("q2", "key", force=True)
+            data, cache_hit, _fetched_at = sc.fetch("q3", "key", force=True)
 
         assert cache_hit is False
         assert data["organic_results"] == [{"product_id": "1"}]
@@ -1584,9 +1638,9 @@ class TestCaptureRotation:
         assert list(sc.CAPTURE_DIR.glob("*.tmp")) == [], "no orphaned .tmp file"
         assert list(sc.CAPTURE_DIR.glob("*.gz")) == []
         rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
-        assert len(rotated) == 1, "the retired segment must survive, uncompressed"
+        assert len(rotated) == 2, "both retired segments must survive, uncompressed"
         all_records = _read_all_capture_records(sc.CAPTURE_DIR)
-        assert len(all_records) == 2
+        assert len(all_records) == 3
 
     def test_full_disk_write_still_lets_fetch_succeed(self, tmp_path, monkeypatch, capsys):
         """A full-disk write failure (simulated via a patched os.write) on
@@ -1639,6 +1693,153 @@ class TestCaptureRotation:
         assert len(all_records) == n_threads * calls_per_thread
         # No duplicates either — every (thread, i) query string is unique.
         assert len({r["query"] for r in all_records}) == n_threads * calls_per_thread
+
+    def test_straggling_append_into_the_retired_segment_is_not_destroyed(
+            self, tmp_path, monkeypatch):
+        """BUI-677 regression — the CI failure, forced instead of raced.
+
+        The interleaving that lost 3 of 120 records on a slow runner, staged
+        deterministically: an appender resolves CAPTURE_PATH with os.open()
+        (its fd now names inode X), a rotation then renames X out of the way,
+        and only afterwards does the appender issue its write(2) — which lands
+        in the retired segment, not the fresh one. That record must still be
+        readable.
+
+        Before the deferral this failed on every run, not just a contended
+        one: the rotation compressed the segment it had just retired and
+        unlinked the plaintext inode the straggler was about to write into,
+        so the record existed in neither the .gz nor on disk.
+
+        Deliberately NOT a threads-and-hope test — the invariant is about a
+        specific ordering, so the test states that ordering outright. The
+        multi-threaded test above covers the same window statistically; this
+        one covers it deterministically, which is the only kind that stays a
+        regression test on a fast machine.
+        """
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)  # every write is "over threshold"
+
+        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "seed", "https://x", {"n": 0})
+
+        # Step 1-2 of the ticket's sequence: the straggler's fd is resolved
+        # BEFORE the rotation, so it names the inode that is about to be
+        # renamed away. Nothing is written through it yet.
+        straggler_fd = sc.os.open(
+            sc.CAPTURE_PATH, sc.os.O_WRONLY | sc.os.O_CREAT | sc.os.O_APPEND, 0o644)
+        try:
+            # Step 3: a full rotation (+ whatever compression it chooses to
+            # do) happens while the straggler holds its fd.
+            sc._capture_raw_response(sc.PROVIDER_SERPAPI, "after-rotation", "https://x", {"n": 1})
+            assert list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl*")), \
+                "precondition: the second capture must have rotated a segment"
+
+            # Step 4: the straggler finally writes, into the retired inode.
+            line = (json.dumps({
+                "timestamp": time.time(), "provider": sc.PROVIDER_SERPAPI,
+                "query": "straggler", "canonical_url": "https://x",
+                "validation": "ok", "response": {"n": 2},
+            }) + "\n").encode("utf-8")
+            written = sc.os.write(straggler_fd, line)
+            assert written == len(line)
+        finally:
+            sc.os.close(straggler_fd)
+
+        all_records = _read_all_capture_records(sc.CAPTURE_DIR)
+        assert {r["query"] for r in all_records} == {"seed", "after-rotation", "straggler"}, (
+            "a straggling append that lands in the just-retired segment must "
+            "survive — compression must not have unlinked that segment"
+        )
+        assert len(all_records) == 3, "and must not be duplicated across segments either"
+
+    def test_write_landing_after_the_gz_is_published_keeps_the_plaintext(
+            self, tmp_path, monkeypatch):
+        """The belt-and-braces guard behind the BUI-677 deferral: if a write
+        somehow does land in a segment mid-compress — after the .gz has been
+        published but before the plaintext is removed — the plaintext must
+        survive holding BOTH records, and must NOT be unlinked in favour of a
+        .gz that is missing one.
+
+        Staged by injecting the write from inside os.replace(), the last
+        instant at which it can still slip past the earlier size checks.
+
+        The stale .gz is deliberately left on disk rather than deleted: this
+        process cannot distinguish its own .gz from one a peer sweep just
+        published, and a reader that finds a segment in both forms reads the
+        plaintext (the BUI-661 backfill's `capture_segments`), so the
+        redundant .gz is invisible and the next sweep overwrites it.
+        """
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
+        monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)
+
+        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "q1", "https://x", {"n": 1})
+        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "q2", "https://x", {"n": 2})  # rotates q1's
+        [segment] = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
+
+        real_replace = sc.os.replace
+        straggler = (json.dumps({"query": "straggler", "response": {}}) + "\n").encode("utf-8")
+
+        def replace_then_straggle(src, dst, *args, **kwargs):
+            result = real_replace(src, dst, *args, **kwargs)
+            if str(dst).endswith(".gz"):
+                with segment.open("ab") as f:  # a foreign appender, on purpose
+                    f.write(straggler)
+            return result
+
+        monkeypatch.setattr(sc.os, "replace", replace_then_straggle)
+        sc._compress_rotated_segment(segment)
+
+        assert segment.exists(), "the plaintext segment must not be unlinked"
+        assert {r["query"] for r in _read_capture_lines(segment)} == {"q1", "straggler"}, \
+            "the plaintext holds both the compressed record and the straggler's"
+        assert list(sc.CAPTURE_DIR.glob("*.tmp")) == [], "no orphaned .tmp file"
+
+    def test_two_sweeps_of_the_same_segment_cannot_clobber_each_other(
+            self, tmp_path, monkeypatch, capsys):
+        """BUI-677 side effect, guarded: deferring compression means the
+        process that rotates a segment is no longer the only one that will
+        ever compress it, so two concurrent sweeps — in two `ebay-sold-comps`
+        or `comic-fmv` processes sharing this dir — can pick the same segment.
+
+        Staged deterministically by re-entering a complete second compression
+        of the same segment from inside the first one's gzip.open(): the peer
+        publishes its .gz and removes the plaintext while we are still
+        writing our own. The outcome must be one valid .gz, no record lost or
+        duplicated, no orphaned .tmp, and no spurious failure on stderr — and
+        the two attempts must never have shared a .tmp path, or the peer's
+        bytes and ours would have been interleaved into one corrupt file.
+        """
+        monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
+        monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)
+
+        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "q1", "https://x", {"n": 1})
+        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "q2", "https://x", {"n": 2})  # rotates q1's
+        [segment] = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
+
+        real_gzip_open = sc.gzip.open
+        tmp_paths = []
+
+        def gzip_open_letting_a_peer_finish_first(path, *args, **kwargs):
+            first = not tmp_paths
+            tmp_paths.append(Path(path))
+            if first:
+                sc._compress_rotated_segment(segment)  # the peer process's whole sweep
+            return real_gzip_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(sc.gzip, "open", gzip_open_letting_a_peer_finish_first)
+        sc._compress_rotated_segment(segment)
+
+        assert len(tmp_paths) == 2, "precondition: both attempts reached the gzip write"
+        assert tmp_paths[0] != tmp_paths[1], \
+            "concurrent compressions must not share a .tmp path"
+        assert list(sc.CAPTURE_DIR.glob("*.tmp")) == [], "no orphaned .tmp file"
+        assert len(list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl.gz"))) == 1
+        assert list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl")) == [], \
+            "the peer's successful compress removed the plaintext"
+        assert "compress failed" not in capsys.readouterr().err, \
+            "losing the race to a peer is normal, not a failure worth logging"
+
+        all_records = _read_all_capture_records(sc.CAPTURE_DIR)
+        assert {r["query"] for r in all_records} == {"q1", "q2"}
+        assert len(all_records) == 2
 
 
 class TestCaptureInvalidResponse:
