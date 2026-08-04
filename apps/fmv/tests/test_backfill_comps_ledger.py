@@ -191,6 +191,58 @@ def test_capture_reads_every_rotated_segment_oldest_first(tmp_path):
     assert stats["capture_segments"] == 4
 
 
+def test_same_second_rotations_order_by_record_timestamp_not_segment_name(tmp_path):
+    """BUI-680: segment names carry a UTC stamp only to the SECOND, plus a
+    random collision-avoidance token — so two rotations inside one second sort
+    by two random tokens, an order uncorrelated with which was retired first.
+    Segment order therefore cannot carry KTD4's earliest-observation-wins.
+    `read_capture` orders the RECORDS by their own captured timestamp instead,
+    and that list order is exactly the order `main` iterates and POSTs in.
+    """
+    import collections
+    cap = tmp_path / "capture"
+    # One shared second; tokens picked so lexical order is the exact REVERSE
+    # of the order the two segments were actually retired in.
+    older = "raw_responses.20260804T120000Z-ffffffff.jsonl"
+    newer = "raw_responses.20260804T120000Z-00000000.jsonl"
+    write_capture(cap, [capture_record(serpapi_response('"First 1"', []), '"First 1"',
+                                       timestamp=1_700_000_000.0)], name=older)
+    write_capture(cap, [capture_record(serpapi_response('"Second 1"', []), '"Second 1"',
+                                       timestamp=1_700_000_050.0)], name=newer)
+
+    assert [p.name for p in bf.capture_segments(cap)] == [newer, older], (
+        "pins the gap this test exists for: within a shared second the name "
+        "sort compares random tokens, and here it puts the NEWER segment first"
+    )
+    stats = collections.Counter()
+    responses = bf.read_capture(sc, cap, stats)
+    assert [r.query for r in responses] == ['"First 1"', '"Second 1"'], (
+        "the earlier observation must be presented first regardless of which "
+        "way the segment names happened to sort"
+    )
+    assert [r.observed_at for r in responses] == [1_700_000_000.0, 1_700_000_050.0]
+
+
+def test_equal_capture_timestamps_keep_a_stable_deterministic_order(tmp_path):
+    """The BUI-680 sort must not make a re-run reorder itself: two records
+    sharing a timestamp (the capture clock is coarse enough for a burst to do
+    this) fall back on segment-then-line order, because the sort is stable."""
+    import collections
+    cap = tmp_path / "capture"
+    write_capture(cap, [capture_record(serpapi_response('"A 1"', []), '"A 1"',
+                                       timestamp=1_700_000_000.0)],
+                  name="raw_responses.20260804T120000Z-aaaaaaaa.jsonl")
+    write_capture(cap, [
+        capture_record(serpapi_response('"B 1"', []), '"B 1"', timestamp=1_700_000_000.0),
+        capture_record(serpapi_response('"C 1"', []), '"C 1"', timestamp=1_700_000_000.0),
+    ], name="raw_responses.20260804T120000Z-bbbbbbbb.jsonl")
+
+    order = [r.query for r in bf.read_capture(sc, cap, collections.Counter())]
+    reread = [r.query for r in bf.read_capture(sc, cap, collections.Counter())]
+    assert order == ['"A 1"', '"B 1"', '"C 1"']
+    assert reread == order, "a second read must present the same order"
+
+
 def test_shape_invalid_capture_records_are_skipped_and_counted(tmp_path):
     """BUI-628 captures bodies the live path REFUSED. Importing one would
     manufacture rows the pipeline never treated as comps — and KTD4's
@@ -492,6 +544,24 @@ def test_capture_is_imported_before_the_cache(tmp_path, server):
         "same comp both times — the ledger's unique index is what collapses "
         "them, and the capture's row is the one that survives"
     )
+
+
+def test_capture_still_precedes_the_cache_when_its_timestamp_is_later(tmp_path, server):
+    """BUI-680's record sort is confined to the capture corpus, deliberately.
+    `main` puts the WHOLE capture list before the WHOLE cache list because the
+    capture's real fetch time is better provenance than the cache's mtime
+    fallback — a sort grown to span both corpora would silently undo that
+    design whenever the cache file's mtime happened to be the earlier of the
+    two, handing KTD4's surviving row to the weaker source."""
+    response = serpapi_response(EXCLUDING_Q, [serpapi_result("100", "X-Men #94")])
+    write_cache(tmp_path / "cache", response, mtime=1_700_000_000.0)
+    write_capture(tmp_path / "capture",
+                  [capture_record(response, EXCLUDING_Q, timestamp=1_800_000_000.0)])
+
+    assert bf.main(_argv(tmp_path)) == 0
+    first, second = server.posts
+    assert first["comps"][0]["provenance"] == bf.PROVENANCE_CAPTURE
+    assert second["comps"][0]["provenance"] == bf.PROVENANCE_CACHE
 
 
 def test_rerunning_emits_a_byte_identical_batch_set(tmp_path, server):
