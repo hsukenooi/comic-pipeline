@@ -169,6 +169,8 @@ Each brief line includes the internal `comic_id` (and `fmv_id`) returned by `POS
 
 **Needs-manual rows (BUI-86):** a row whose `flag_reason` is set (`one_sided`, `too_wide`, `too_sparse`, or `variant_dropped` — surfaced directly on its brief line) could not be honestly auto-priced — its `fmv_low`/`fmv_high`/`max_bid` are all `null`. It still has a real `comic_id` (the comic stub was written), so the `comic_id: null` check above will **not** catch it. Gate on `flag_reason` instead: surface these rows as **needs-manual** and do not auto-propose a max bid. The user either hand-prices them (via the `fmv.md` interpolation / CGC-proxy methods) or skips them — never bid the absent number.
 
+**Ledger-advisory rows (BUI-663):** a row with `source: "ledger-advisory"` is the one degraded shape that *looks* priced — it has a real `fmv_low`/`fmv_high` and a `null` `flag_reason` — but its `max_bid` is `null` and its `comic_id`/`fmv_id` are `null` too. The sold-comps fetch FAILED for that book, so `comic-fmv` priced it from the **comps ledger** (stored comps from past runs) and deliberately withheld the bid cap; nothing was written to the comics server, so there is nothing for Step 5 to link a snipe to. **Gate on `source` — before both checks below, since neither catches it**: the `comic_id: null` check would read it as "no FMV computed" (it was computed, just not persisted) and the `flag_reason` check would miss it entirely. Surface it as **advisory (ledger)**, show the band with an explicit "not a live price, no proposed cap" note, and offer the user two routes: fix the provider outage and re-run `comic-fmv` for a real price, or hand-price a max bid from the band. **Never propose a max bid derived from an advisory band** — not `0.8 × fmv_high`, not anything. The whole reason this row is allowed to exist is that it carries no cap.
+
 **Lookup-error rows (BUI-544/BUI-549):** a row with `source: "skipped_lookup_error"` has every pricing field null too — same shape as an ordinary unpriced/no-comps row — but for a different reason: the comics-server lookup that answers "is this hand-priced?" FAILED, so the CLI left the row completely untouched rather than risk overwriting a hand-priced price. Do **not** present it as needs-manual or as a genuine zero-comps book. Gate on `source` to catch it before the `flag_reason`/`comic_id` checks above: surface it as a system failure (comics-server lookup failed for this book) and tell the user to check the server and re-run `comic-fmv` — `--force` does not bypass this skip.
 
 Flags worth knowing:
@@ -190,6 +192,7 @@ python3 -c "import json; r=json.load(open('<results.json>')); print(sum(1 for x 
 **Confidence rubric:** `docs/conventions/fmv-math-spec.md` §8 owns the n/CV thresholds and the wide-window MEDIUM cap. The CLI returns these labels directly (in the human table and on each brief line; the `window` used lives in the `--out` JSON) — surface them as-is in your presentation.
 
 **Flagging rules** (apply when presenting the table to the user):
+- `source: "ledger-advisory"` (BUI-663) → present as **advisory (ledger)**, show the band, propose **no** max bid. Check this BEFORE `flag_reason` — the row's `flag_reason` is null, so the rule below will not catch it (see the ledger-advisory note in Step 3)
 - `flag_reason` set (on the brief line) → present as **needs-manual (`<reason>`)**, no max bid; user hand-prices or skips (see the needs-manual note in Step 3)
 - LOW or MEDIUM-LOW with `n ≤ 3` → call out explicitly; user may want to skip or set a conservative max
 - Auction ends within 24h → mark with **⚠️ ends <date>** in the Notes column. Always surface urgency before max-bid approval
@@ -216,6 +219,8 @@ The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_fa
 Clean-number rounding: $5 step below $50, $10 step from $50–$200, $25 step above $200.
 
 A `needs-manual` row (`flag_reason` set) has no CLI-computed max bid. Present it without a proposed number; the user supplies a hand-derived max bid (via the `fmv.md` interpolation / CGC-proxy methods) or skips it. Don't fabricate a max from the absent FMV.
+
+An **advisory (ledger)** row (`source: "ledger-advisory"`, BUI-663) is the same rule with a sharper edge, because unlike a needs-manual row it *does* show a band: the band came from stored comps after the live fetch failed, and `max_bid` is `null` on purpose. Present the range in the FMV column and `—` in Max Bid, noting `LEDGER-ADVISORY — not a live price`. **Do not compute `0.8 × fmv_high` yourself** — the withheld cap is the entire safety property of this row, and a proposed number reinstates exactly the risk it was withheld to avoid. It also has no `comic_id`, so even if the user hand-prices it, Step 5's FMV link will not attach; prefer re-running `comic-fmv` once the providers recover.
 
 **Current-price context, conditional on data age (BUI-359/BUI-567):** the
 Step 1 table carries each auction's **Current Price**, **Bids**, and **Ends**

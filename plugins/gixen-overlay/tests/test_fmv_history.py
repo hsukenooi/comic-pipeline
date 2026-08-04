@@ -17,8 +17,8 @@ confusable with "wrong book."
 """
 from __future__ import annotations
 
+import ast
 import os
-import re
 import sqlite3
 from pathlib import Path
 from unittest.mock import patch
@@ -521,23 +521,85 @@ def test_fmv_history_endpoint_never_referenced_in_pricing_path():
     )
 
 
-def test_comps_read_endpoint_never_get_fetched_in_pricing_path():
-    """`GET /api/comics/comps` (the BUI-662 read endpoint on this path) must
-    never be called from apps/fmv. This is deliberately narrower than 'the
-    string /api/comics/comps never appears' — `POST /api/comics/comps`
-    (BUI-658/U3's ledger write, same path) is legitimate and expected."""
+# BUI-663 narrowed the tripwire below from "never" to "exactly once, here".
+# `apps/fmv` may GET the comps ledger from this ONE function and nowhere else:
+# it is the degraded-mode read that prices a book advisory-only after both
+# sold-comps providers fail, and it withholds the bid cap. Any OTHER GET of
+# that endpoint from the pricing path is the BUI-662 violation this test has
+# always guarded, and still fails the build.
+_SANCTIONED_COMPS_GET_FN = "_fetch_ledger_comps"
+
+
+def _get_json_or_warn_call_sites(source: str) -> list[tuple[str, str]]:
+    """[(enclosing function name, "/api/comics…" path)] for every
+    `_get_json_or_warn(f"{server_url}/api/comics…", …)` call in the source.
+
+    Parsed with `ast`, not regex, per the BUI-673 update to
+    `docs/solutions/architecture-patterns/http-only-contracts-need-a-source-parsing-canary.md`:
+    a reformat or a line-wrap must not be able to turn this contract test into
+    a silent no-op. The path is rebuilt from the f-string's literal
+    `ast.Constant` parts, so the interpolated `{server_url}` prefix drops out
+    and `f"{server_url}/api/comics/comps"` yields exactly `/api/comics/comps`.
+    """
+    sites: list[tuple[str, str]] = []
+    for fn in ast.walk(ast.parse(source)):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Name)
+                    and node.func.id == "_get_json_or_warn"):
+                continue
+            if not (node.args and isinstance(node.args[0], ast.JoinedStr)):
+                continue
+            literal = "".join(
+                part.value for part in node.args[0].values
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            )
+            if literal.startswith("/api/comics"):
+                sites.append((fn.name, literal))
+    return sites
+
+
+def test_comps_read_endpoint_get_fetched_only_from_the_degraded_mode_call_site():
+    """`GET /api/comics/comps` (the BUI-662 read endpoint on this path) may be
+    called from exactly ONE function in apps/fmv — the BUI-663 degraded-mode
+    read — and from nowhere else.
+
+    Formerly `test_comps_read_endpoint_never_get_fetched_in_pricing_path`; the
+    boundary it guards is unchanged, the permitted set grew from zero to one.
+    Still deliberately narrower than 'the string /api/comics/comps never
+    appears': `POST /api/comics/comps` (BUI-658/U3's ledger write, same path)
+    is legitimate and expected, and only a GET is the violation.
+
+    Why the exception is safe, and why it must stay exactly this narrow: the
+    sanctioned call site prices a book ADVISORY-only after both sold-comps
+    providers have failed. It nulls `max_bid` and never upserts, so the number
+    reaches no `fmv` row and therefore no bid cap. An unrestricted GET
+    elsewhere in the pricing path carries none of those guarantees, which is
+    exactly why the tripwire narrows rather than disappears.
+    """
     source = _fmv_runner_source()
-    get_paths = re.findall(
-        r'_get_json_or_warn\(\s*\n?\s*f"\{server_url\}(/api/comics[^"?]*)"',
-        source,
+    sites = _get_json_or_warn_call_sites(source)
+    assert sites, (
+        "found no _get_json_or_warn(f\"{server_url}/api/comics…\") calls in "
+        "fmv_runner.py — did the helper move or get renamed? This contract "
+        "test is vacuous until that is fixed."
     )
-    assert get_paths, (
-        "found no _get_json_or_warn(...) GET calls in fmv_runner.py — did "
-        "the helper move? Update this contract test's regex."
+    comps_gets = [fn for fn, path in sites if path == "/api/comics/comps"]
+    unsanctioned = sorted({fn for fn in comps_gets
+                           if fn != _SANCTIONED_COMPS_GET_FN})
+    assert not unsanctioned, (
+        f"{unsanctioned} GET-fetch /api/comics/comps — only "
+        f"{_SANCTIONED_COMPS_GET_FN}() (BUI-663's degraded-mode read, which "
+        "withholds max_bid and never upserts) may read the comps ledger from "
+        "the pricing path. A POST to this same path (BUI-658/U3's ledger "
+        "write) is fine; only a GET is the violation this test guards."
     )
-    assert "/api/comics/comps" not in get_paths, (
-        "apps/fmv GET-fetches /api/comics/comps — the read endpoint must "
-        "never feed a price (BUI-662 scope boundary). A POST to this same "
-        "path (BUI-658/U3's ledger write) is fine; only a GET is the "
-        "violation this test guards."
+    assert len(comps_gets) <= 1, (
+        f"{_SANCTIONED_COMPS_GET_FN}() GET-fetches /api/comics/comps "
+        f"{len(comps_gets)} times — the degraded-mode read is a single call "
+        "site by design, so a second one means the guard conditions around it "
+        "have been duplicated (or dropped). Consolidate them."
     )

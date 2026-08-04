@@ -375,6 +375,28 @@ def run(*, batch_path: str | None, out_path: str | None,
             err=True,
         )
 
+    # BUI-663: degraded-mode advisory rows. Reported unconditionally (not
+    # gated by --quiet, like the three skip counts above and for the same
+    # BUI-549 reason: an operator reading only --brief must still learn this
+    # happened). These are a SUBSET of the fetch-err count `_print_table`
+    # prints, not a fourth skip class — the fetch really did fail for each of
+    # them, and the run must keep saying so. Worded so it can never read as a
+    # price the pipeline stands behind: the whole safety argument for shipping
+    # this ahead of a long soak is that an advisory-only number cannot overpay
+    # by construction, and that only holds while every surface keeps saying so.
+    n_advisory = sum(1 for r in final
+                     if r.get("source") == SOURCE_LEDGER_ADVISORY)
+    if n_advisory:
+        click.echo(
+            f"⚠️  {n_advisory} book(s) carry a BUI-663 LEDGER ADVISORY band: "
+            "the live comp fetch FAILED, so they were priced from STORED "
+            "comps instead. These are NOT live prices, they were NOT written "
+            "to the comics server (no comic_id, no fmv row, nothing for a "
+            "snipe to link to), and they carry NO max_bid. Treat the band as "
+            "a starting point for a hand-priced cap, never as one.",
+            err=True,
+        )
+
     # BUI-658/KTD5: "a run cannot end clean while its comps went nowhere."
     # `_compute_and_upsert_one` posts each freshly-priced book's raw+slab
     # comps to the comps ledger immediately after the primary upsert, soft-
@@ -919,6 +941,236 @@ def _fetch_first_party_outcomes(server_url: str, *, target_grade: float,
     ]
 
 
+# ─── Step 2c — Degraded-mode advisory from the comps ledger (BUI-663) ─────────
+#
+# When BOTH sold-comps providers fail for a book (the BUI-536 all-tiers-errored
+# signal), the pipeline's answer today is `fetch-err`: no price at all, and — by
+# design — no write. At an auction deadline that is the same as blocking the
+# buy. BUI-663's payoff is to degrade instead: price that book from the comps
+# ledger the flywheel has been accumulating (BUI-656/658), LABELLED, with the
+# bid cap WITHHELD.
+#
+# THE ONE INVARIANT: a ledger-derived number must never set a bid cap. It is
+# enforced three ways, not one, because any single one of them could be edited
+# away by a later change:
+#   1. `max_bid` is nulled on the returned `fmv` dict (below), exactly the way
+#      the BUI-86 needs-manual path withholds it.
+#   2. The row is NEVER upserted. It keeps the fetch-err return's
+#      `db_row=None, comic_id=None, fmv_id=None`, so nothing reaches the `fmv`
+#      table — which is where `snipe-add --comic-id`, the overlay's policy
+#      checks, `/comic:verify` and the `/comics` dashboard all read prices
+#      from. A surface that reads the DB structurally cannot see this number.
+#      It is also why a later run can never re-serve it as `source: "cached"`.
+#   3. Both re-upserting tiers below (`_apply_cgc_proxy_rescue` via
+#      `_is_unpriced_raw`, and `_apply_cgc_cross_check`) exclude the source
+#      explicitly — see `_is_ledger_advisory`. The cross-check in particular
+#      calls `_upsert_fmv(..., hard_fail=False)` on whatever `fmv` dict the row
+#      carries, which without that guard would persist this advisory band.
+#
+# STALENESS: there is deliberately NO age cutoff on the ledger read. Measured
+# over the whole cached corpus (BUI-663's own homework, 483 pools): both
+# providers serve a ~90-day sold window, so p99 of every comp we have ever
+# priced is exactly 90 days; a 365d/730d cutoff moves 0 of 483 pools and a 90d
+# cutoff moves 3 — all UPWARD, raising two bid caps by 50% and 100%. The
+# measured hazard of a stale ledger price is THINNESS, not drift (splitting
+# each pool at its own median comp age: older half higher in 65, lower in 65,
+# equal in 47; median signed difference +0.00%). So the gate here is a
+# POOL-DEPTH FLOOR, routed through the existing pool-shape guards and the
+# existing confidence label, which already describe that error correctly.
+# BUI-287's recency weighting (referenced to the pool's newest comp, not a wall
+# clock) already handles the intra-pool half and is deliberately left alone.
+
+# The `source` value a degraded-mode row carries. Deliberately its own value
+# rather than "fresh"/"cached"/"error": every surface that renders a price
+# keys off `source`, and this row is none of those three — it was priced (so
+# not `error`), from stored comps (so not `fresh`), that were never a persisted
+# FMV row (so not `cached`).
+SOURCE_LEDGER_ADVISORY = "ledger-advisory"
+
+# Pool-depth floor for a degraded-mode advisory. 3 is the number BUI-663's lag
+# backtest keys on: at 30 days of ledger lag 68.3% of pools still keep >=3
+# trimmed comps and at 60 days only 40.0% do, and a thinned pool's error was
+# statistically indistinguishable from a size-matched random-drop control —
+# i.e. thinness, not age, is what makes a ledger price wrong. Applied to the
+# TRIMMED pool `compute_fmv` actually priced, not to the rows fetched.
+#
+# Strictly tighter than fmv_math.MIN_PRICEABLE_POOL (2, the `too_sparse`
+# floor): a live pool of 2 is at least a live measurement of today's market,
+# where a ledger pool of 2 is two old observations AND a thin pool at once.
+LEDGER_ADVISORY_MIN_POOL = 3
+
+# How many ledger rows to pull. The server orders `observed_at DESC`, so this
+# truncates to the most recently observed comps if a book has more. Sent
+# explicitly rather than inheriting the endpoint's own default, so a change to
+# that default cannot silently change a priced number.
+LEDGER_ADVISORY_READ_LIMIT = 200
+
+# Deliberately shorter than `_get_json_or_warn`'s 15s default. This read is the
+# ONE server call the pre-BUI-663 fetch-err path did not make, and it happens
+# once per failed book — so in a DUAL outage (providers down AND the comics
+# server unreachable) the 15s default would add 15s x N of dead wait to a batch
+# that is already returning nothing. Giving up early costs exactly the plain
+# fetch-err, which is the outcome anyway; a local SQLite read of <=200 rows
+# does not need seconds.
+LEDGER_ADVISORY_TIMEOUT_SECONDS = 5
+
+
+def _fetch_ledger_comps(server_url: str, *, title: str | None,
+                        issue: object, year: int | None) -> list[dict] | None:
+    """The ONE sanctioned read of `GET /api/comics/comps` from the pricing path.
+
+    `plugins/gixen-overlay/tests/test_fmv_history.py` enforces that by parsing
+    this module's AST: a GET of that endpoint from any other function in
+    `apps/fmv` fails the build. BUI-662 left that tripwire deliberately, for
+    this ticket to narrow rather than remove.
+
+    FAILURE POSTURE — soft-fail, and that is the fail-CLOSED choice here, not
+    the fail-open one. `_get_json_or_warn` collapses transport errors, HTTP
+    errors (including the endpoint's 400 for an unresolvable identity) and
+    non-JSON bodies into `default`; the fail-CLOSED sibling
+    (`_db_lookup(strict=True)` / `_DbLookupFailed`, BUI-544) exists for callers
+    where "I don't know" is NOT safely equivalent to "there's nothing there".
+    This caller is the opposite case by construction: the ONLY outcome of
+    returning None here is that its caller emits the ordinary BUI-536
+    `fetch-err` row it would have emitted if this function did not exist. A
+    failed ledger read therefore degrades to the pre-BUI-663 behaviour exactly
+    — it cannot produce a silent no-price that looks like something else,
+    because the no-price outcome IS the fetch-err. `_get_json_or_warn` still
+    warns to stderr, so the read failure is visible, not swallowed.
+
+    Identity: `(title, issue[, year])`, the same resolution `/api/comics` uses
+    (`_resolve_comic_id`). `requests` drops a None-valued param, so a book with
+    no known year sends no `year` at all and the server falls back to a
+    title+issue match — which, like `/api/comics`, resolves LIMIT 1 and can
+    therefore land on a different volume or a variant row. That imprecision is
+    survivable here and only here: the number this feeds is advisory, capped
+    nowhere, and the resolved `comic_id` is echoed back onto the row (see
+    `_ledger_advisory`) so a human can check which book answered.
+
+    `pool="raw"` is not optional. The ledger also stores the graded/slab pool
+    (BUI-658 posts both), and slab prices are multiples of raw ones — pricing a
+    raw book off an unfiltered ledger read would be a silent order-of-magnitude
+    overstatement. No `grade` filter: `build_pool` does its own progressive
+    ±window widening around the target grade and needs the neighbouring grades
+    to do it. No `days` filter — see the staleness note above.
+    """
+    if not title or issue in (None, ""):
+        return None
+    rows = _get_json_or_warn(
+        f"{server_url}/api/comics/comps",
+        params={
+            "title": title,
+            "issue": str(issue),
+            "year": year,
+            "pool": "raw",
+            "limit": LEDGER_ADVISORY_READ_LIMIT,
+        },
+        warn=(f"comps-ledger advisory read failed for {title!r} #{issue} "
+              "— falling back to a plain fetch-err for this book"),
+        default=None,
+        timeout=LEDGER_ADVISORY_TIMEOUT_SECONDS,
+    )
+    if not isinstance(rows, list):
+        return None
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _is_priceable_number(value: object) -> bool:
+    """True for a JSON number usable as a price/grade. `bool` is excluded
+    explicitly — it is an `int` subclass, so a stray `true` would otherwise
+    sail into the pool as the price 1.0."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
+                     grade_window: float | None) -> dict | None:
+    """A degraded-mode ADVISORY band for one book, or None to keep the
+    plain fetch-err (BUI-663).
+
+    Returns `{"fmv": <band with max_bid withheld>, "comic_id": <the comic_id
+    the ledger rows carry, or None>, "ledger_rows": <rows read>}`.
+
+    Returns None — meaning "the caller emits the ordinary fetch-err" — for
+    every one of: the ledger read failed, the book resolved to nothing, the
+    rows carry too few usable (price, grade) pairs, `compute_fmv` set a
+    pool-shape `flag_reason` (the book is needs-manual on the ledger pool
+    exactly as it would be on a live one), the band came back unpriced, or the
+    TRIMMED pool fell under `LEDGER_ADVISORY_MIN_POOL`. That last one is the
+    ticket's "what happens when the ledger is also thin" — it is the same
+    question the pipeline already answers, answered the same way, and a book
+    that fails it is left in the honest fetch-err state rather than given a
+    number two observations wide.
+
+    The band itself is `fmv_math.compute_fmv` unchanged — the same math, the
+    same guards, the same recency weighting — run over ledger comps instead of
+    freshly-fetched ones. What differs is what comes back out: `max_bid` is
+    nulled, because a ledger-derived number must never set a bid cap, and
+    `ledger_advisory` is set so `_build_notes` / `_print_table` can render the
+    row as unmistakably not-live.
+
+    First-party outcomes (BUI-286) are deliberately NOT merged in. The live
+    path merges them; this one does not, so an advisory band is explicitly not
+    the number a live run would have produced, and nothing here should be
+    compared against one as though it were.
+    """
+    rows = _fetch_ledger_comps(
+        server_url, title=inp.get("title"), issue=inp.get("issue"),
+        year=inp.get("year"),
+    )
+    if not rows:
+        return None
+    comps = [
+        {"price": float(r["price"]), "grade": float(r["grade"]),
+         "sold_date": r.get("sold_date") or "", "title": r.get("title") or ""}
+        for r in rows
+        if _is_priceable_number(r.get("price"))
+        and _is_priceable_number(r.get("grade"))
+    ]
+    if len(comps) < LEDGER_ADVISORY_MIN_POOL:
+        return None
+
+    fmv = fmv_math.compute_fmv(
+        comps, target_grade=target_grade,
+        grade_confidence=inp.get("grade_confidence"),
+        max_window=grade_window,
+    )
+    if fmv.get("flag_reason") is not None or fmv.get("fmv_high") is None:
+        return None
+    n = fmv.get("n")
+    if not isinstance(n, int) or n < LEDGER_ADVISORY_MIN_POOL:
+        return None
+
+    # THE withholding. Nulled after compute_fmv rather than by asking it not to
+    # compute one, so this stays a one-line, greppable, testable assertion
+    # about the emitted row instead of a new branch inside the shared math.
+    fmv["max_bid"] = None
+    fmv["ledger_advisory"] = True
+    # Keys `_build_notes` reads off a fresh band; absent here because no live
+    # fetch happened. Set explicitly so the notes projection can't differ from
+    # a live row's for reasons unrelated to this feature.
+    fmv["first_party_count"] = 0
+    fmv["variant_dropped"] = None
+    fmv["masthead_swapped_to"] = None
+
+    comic_ids = {r.get("comic_id") for r in rows if r.get("comic_id") is not None}
+    return {
+        "fmv": fmv,
+        # Exactly one comic_id by construction (the endpoint filters on a
+        # single resolved id); anything else means the server's contract
+        # changed, so report None rather than pick one arbitrarily.
+        "comic_id": comic_ids.pop() if len(comic_ids) == 1 else None,
+        "ledger_rows": len(rows),
+    }
+
+
+def _is_ledger_advisory(result: dict) -> bool:
+    """True for a BUI-663 degraded-mode row. Every tier that RE-UPSERTS must
+    check this: an advisory band is never persisted, and a tier that wrote one
+    back would put a ledger-derived number into the `fmv` table, which is
+    exactly where a bid cap comes from."""
+    return result.get("source") == SOURCE_LEDGER_ADVISORY
+
+
 # ─── Step 3 — Math + DB upsert ────────────────────────────────────────────────
 
 def _compute_and_upsert_one(result: dict, original_book: dict, *,
@@ -1026,13 +1278,64 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # check does not touch that path (see _is_fetch_error's own guards).
     if _is_fetch_error({"comp_count_total": len(comps),
                        "queries_used": result.get("queries_used", [])}):
-        return {
+        fetch_err_row = {
             "input": inp, "fmv": None, "comp_count_total": len(comps),
             "queries_used": result.get("queries_used", []),
             "db_row": None, "comic_id": None, "fmv_id": None,
             "source": "error", "breaker_tripped": breaker_tripped,
             "error": "fetch-err: all tiers failed; fmv DB row left "
                      "untouched (BUI-536)",
+        }
+        # BUI-663: THE degraded-mode hook. Both providers just failed for this
+        # book, so instead of handing the operator nothing at an auction
+        # deadline, try to price it from the comps ledger — ADVISORY only, no
+        # bid cap, no write. `_ledger_advisory` returns None for every failure
+        # and every too-thin pool, in which case the row below is byte-for-byte
+        # the pre-BUI-663 fetch-err.
+        #
+        # Hooked HERE and only here, of the four `source: "error"` returns in
+        # this function. The two grade-failure returns above cannot be helped by
+        # any comp pool — with no numeric target grade there is nothing to price
+        # AT. The BUI-565 per-book-raise return above is deliberately excluded
+        # too: its grade has not been coerced yet at that point, and a raise
+        # mid-fetch is as often a malformed book as a provider outage, where
+        # `_is_fetch_error` here means specifically "every query tier ERRORED"
+        # — the provider-outage signal this ticket is about.
+        #
+        # `_is_fetch_error` still returns True for the row we emit below
+        # (`comp_count_total` is 0 and every query carries an error), so the
+        # book stays inside the loud BUI-143 fetch-err warning and count. The
+        # advisory is an ADDITION to that report, never a replacement for it:
+        # the fetch really did fail, and the run must keep saying so.
+        advisory = _ledger_advisory(
+            server_url, inp=inp, target_grade=target_grade,
+            grade_window=grade_window,
+        )
+        if advisory is None:
+            return fetch_err_row
+        click.echo(
+            f"Note: {inp.get('title')} #{inp.get('issue')} — comp fetch FAILED; "
+            f"emitting a BUI-663 ADVISORY band from {advisory['ledger_rows']} "
+            f"stored comp(s) (ledger comic_id={advisory['comic_id']}). "
+            "Not live, not written to the DB, NO bid cap — do not bid this "
+            "number without hand-checking it.",
+            err=True,
+        )
+        return {
+            **fetch_err_row,
+            "fmv": advisory["fmv"],
+            "source": SOURCE_LEDGER_ADVISORY,
+            # The comic_id the LEDGER resolved to — named distinctly from the
+            # top-level `comic_id`, which stays None because nothing was
+            # written. A consumer keying on `comic_id` to decide "is this book
+            # linked?" must keep seeing None here; this field exists so a human
+            # can verify WHICH book answered the read.
+            "ledger_comic_id": advisory["comic_id"],
+            "ledger_rows": advisory["ledger_rows"],
+            "error": "fetch-err: all tiers failed; fmv DB row left "
+                     "untouched (BUI-536). ADVISORY band priced from the "
+                     "comps ledger instead (BUI-663): NOT a live price, NOT "
+                     "persisted, and it carries NO max_bid.",
         }
 
     # BUI-286: merge the user's own resolved auctions in as first-party comps
@@ -1177,8 +1480,15 @@ def _is_unpriced_raw(result: dict) -> bool:
     succeed, upserted via it, defeating BUI-536's "no upsert at all" guarantee
     through a side door the main fetch-err guard in
     ``_compute_and_upsert_one`` doesn't cover.
+
+    BUI-663: excludes a ``ledger-advisory`` row for the same reason and one
+    more. Such a row DID produce an ``fmv_high`` (so it would not reach the
+    ``fmv_high is None`` test below anyway), but the exclusion is stated
+    explicitly rather than relied on implicitly: the rescue's own second fetch
+    ends in ``_upsert_fmv``, and a degraded row must never be written by any
+    path (see ``_is_ledger_advisory``).
     """
-    if result.get("source") == "error":
+    if result.get("source") == "error" or _is_ledger_advisory(result):
         return False
     fmv = result.get("fmv") or {}
     grade = (result.get("input") or {}).get("grade")
@@ -1374,9 +1684,20 @@ def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
     "cgc-proxy"``) is skipped — its price IS the slab ladder, so comparing it
     against itself is meaningless. This function must therefore run AFTER the
     rescue so it can see the promoted ``source``.
+
+    BUI-663: a ``ledger-advisory`` row is skipped too, and that exclusion is
+    load-bearing rather than cosmetic. A degraded row is priced (so
+    ``_is_thin_or_low_confidence_priced`` would happily claim it — a ledger
+    band is often exactly the thin/LOW shape this tier looks for) and it
+    carries ``comic_id: None``, so the best-effort ``_upsert_fmv`` below would
+    MINT a comics row and write the advisory band into the ``fmv`` table. That
+    is precisely the leak BUI-663 must not have: the ``fmv`` table is where
+    ``snipe-add``, the overlay's policy checks and the dashboard read prices,
+    so a written advisory becomes a real bid cap on the next run.
     """
     candidates = [idx for idx in fresh_fmvs
                   if fresh_fmvs[idx].get("source") != "cgc-proxy"
+                  and not _is_ledger_advisory(fresh_fmvs[idx])
                   and _is_vintage(fresh_fmvs[idx])
                   and _is_thin_or_low_confidence_priced(fresh_fmvs[idx])]
     if not candidates:
@@ -1730,6 +2051,14 @@ def _build_notes(fmv: dict) -> str:
     win_str = f"±{win}" if win is not None else "n/a"
     parts = [f"window={win_str}", f"cv={fmv['cv_pct']}",
              f"label={fmv['confidence']}"]
+    # BUI-663: FIRST token, before anything else, on a degraded-mode row. This
+    # string is the row's `fmv_notes` on the `--brief` line, and a reader
+    # skimming notes must hit the disclaimer before the numbers, not after a
+    # window/cv/label preamble that reads exactly like a live row's. (It never
+    # reaches the DB — an advisory row is never upserted — so unlike every
+    # other token here this one is a display marker only.)
+    if fmv.get("ledger_advisory"):
+        parts.insert(0, "LEDGER-ADVISORY (stale comps, no bid cap)")
     # BUI-86: surface grade-span and the manual-pricing flag so a needs_manual
     # stub is legible (distinct from a never-filled n=0 stub) on inspection.
     span = fmv.get("grade_span")
@@ -2159,10 +2488,17 @@ def _brief_row(r: dict) -> dict:
         `cgc_proxy_fmv`) always has them, but a caller passing a partial dict
         (e.g. a test double) shouldn't crash the whole projection over one
         cosmetic field, so a KeyError there degrades to a null note instead.
+        A `ledger-advisory` row (BUI-663) takes this same fresh-row branch —
+        it has a top-level `comic_id` key, pinned to None because nothing was
+        written — so its notes are rebuilt from the in-memory band and lead
+        with the `LEDGER-ADVISORY` token. Its `max_bid` projects as null by
+        construction, exactly like a needs-manual row's, while `flag_reason`
+        stays null: gate on `source`, never on `flag_reason`, to catch it.
       - source (BUI-549) → the row's own `source` verbatim (`"fresh"`,
         `"cached"`, `"cgc-proxy"`, `"skipped_hand_priced"`,
-        `"skipped_lookup_error"`, `"skipped_rejected"` (BUI-639), or
-        `"error"`). Without this, a `skipped_lookup_error` row (comics-server
+        `"skipped_lookup_error"`, `"skipped_rejected"` (BUI-639),
+        `"ledger-advisory"` (BUI-663), or `"error"`). Without this, a
+        `skipped_lookup_error` row (comics-server
         lookup FAILED — hand-priced provenance unverifiable, row left
         completely untouched) projects identically to an ordinary
         unpriced/no-comps row: both have every pricing field null. A
@@ -2245,6 +2581,18 @@ def _print_table(rows: list[dict]) -> None:
             fmv_str = f"manual:{fmv['flag_reason']}"
             med_str = "—"
             mb_str = "manual"
+        elif fmv.get("ledger_advisory"):
+            # BUI-663: a degraded-mode band priced from STORED comps after both
+            # providers failed. Checked here — above every branch that renders
+            # a normal price — because this row has a real `fmv_low`/`fmv_high`
+            # and no `flag_reason`, so the generic priced branch below would
+            # otherwise render it as an ordinary live range whose max bid just
+            # happens to print as "$?". The Max-bid column says "advisory", not
+            # a number and not "manual": there is no cap to propose and the
+            # operator must not read one into the blank.
+            fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']} LEDGER"
+            med_str = f"${fmv.get('median') or '?'}"
+            mb_str = "advisory"
         elif fmv.get("cgc_proxy"):
             # BUI-348: CGC-proxy band (raw priced off the slab ladder) — mark it
             # so it's never conflated with a real raw-comp range.
