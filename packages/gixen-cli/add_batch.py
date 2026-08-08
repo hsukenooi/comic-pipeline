@@ -11,6 +11,12 @@ section is the prose spec this module makes literal:
      keep firing adds at a dead server.
   3. Never emit an all-success summary when any row failed.
 
+BUI-697 adds a fourth rule the incident of 2026-08-07 forced: a *client-side
+timeout* is not a failure. It is INDETERMINATE — the CLI stopped waiting, the
+server did not stop working — and the batch reconciles those rows against
+live server state before it reports (see `STATUS_INDETERMINATE` and
+`reconcile_indeterminate_rows`).
+
 This module is pure logic (no click, no sys.exit) so it's independently
 testable and reusable — `cli.py`'s `add-batch` command wires it to the real
 `_server_request_result` HTTP call and prints the human table + JSON summary.
@@ -24,6 +30,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -40,8 +47,38 @@ STATUS_NOT_ATTEMPTED = "not_attempted"
 # only to genuine failures; a policy block is a deliberate, working-as-
 # designed rejection, so the batch continues past it).
 STATUS_BLOCKED = "blocked"
+# BUI-697: a client-side timeout is INDETERMINATE, not failed. The comics
+# server keeps working past the CLI's read deadline and frequently commits
+# the write after the CLI has stopped waiting — on 2026-08-07 a 36-row batch
+# reported 36/36 `failed` while 11 had actually landed, and the 25-row retry
+# reported all-failed while all 25 landed. Reporting that as FAILED is a
+# real-money lie in both directions: it invites a duplicate add, and it
+# skipped the post-add FMV link for every row that did land (they rendered
+# permanently unlinked, `link_attempted: false`). Worse, it is what let a
+# stale write commit overnight against a queue that had been edited
+# underneath it (ASM #61 went live at $1.09 instead of $20). This status
+# claims exactly one thing: *we do not know*. `reconcile_indeterminate_rows`
+# below is what turns that into knowledge.
+STATUS_INDETERMINATE = "indeterminate"
 
 _TERMINAL_OK_STATUSES = (STATUS_ADDED, STATUS_UPDATED)
+
+# BUI-168 halt rule membership: a row with one of these statuses triggers the
+# inter-row server-health re-check in `run_batch`. FAILED (a genuine fault)
+# and INDETERMINATE (a timeout — the server may well be sick) both qualify;
+# BLOCKED deliberately does not (a policy 409 proves the server is up and
+# evaluating correctly — see STATUS_BLOCKED's comment).
+_HEALTH_RECHECK_STATUSES = (STATUS_FAILED, STATUS_INDETERMINATE)
+
+# BUI-697: how long to let an in-flight write settle before the end-of-batch
+# reconcile read. Deliberately short — see `reconcile_indeterminate_rows`,
+# which explains why the *reconcile*, not this wait, is the load-bearing part.
+RECONCILE_SETTLE_SECONDS = 10.0
+
+# Tolerance for comparing a live snipe's max_bid against what this row sent.
+# Half a cent — below any meaningful bid difference, above float round-trip
+# noise through JSON/SQLite REAL.
+_MAX_BID_EPSILON = 0.005
 
 
 class AddBatchError(Exception):
@@ -98,6 +135,14 @@ class RowResult:
     # from in either case. Never populated from the link-fmv response — that
     # call carries no advisories envelope of its own.
     advisories: list[dict] = field(default_factory=list)
+    # BUI-697: the end-of-batch reconcile verdict for a row whose add call
+    # came back INDETERMINATE — `None` for every row that never needed one.
+    # Shape: {"checked": bool, "found": bool | None, "error": str | None,
+    # "live_max_bid": float | None}. `checked` is False (and `found` None)
+    # when the reconcile read itself failed: an unreadable server tells us
+    # nothing, so the row must stay indeterminate rather than be upgraded OR
+    # demoted on the strength of a call that never answered.
+    reconcile: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +158,7 @@ class RowResult:
             "verify": self.verify,
             "title": self.title,
             "advisories": self.advisories,
+            "reconcile": self.reconcile,
         }
 
 
@@ -134,6 +180,11 @@ class BatchOutcome:
             # added/blocked/failed/remaining picture the plan calls for, not
             # just whichever statuses happened to occur.
             STATUS_BLOCKED: 0,
+            # BUI-697: likewise seeded at zero so a reader of just this dict
+            # always sees the indeterminate count. A batch that reports
+            # `failed: 0` while carrying indeterminate rows has NOT landed
+            # everything — that conflation is the whole bug this status fixes.
+            STATUS_INDETERMINATE: 0,
         }
         for r in self.rows:
             counts[r.status] = counts.get(r.status, 0) + 1
@@ -157,12 +208,20 @@ class BatchOutcome:
         a caller checking `$?` any more than "2 added + 1 not_attempted"
         does — both mean the caller has follow-up to do (retry, `--ack-
         policy`, or a manual decision) before treating the batch as done.
+
+        BUI-697: an INDETERMINATE row counts too, and it is the one status
+        here that does not mean "did not land" — it means "unknown, even
+        after the reconcile pass." It still must not exit 0: the caller's
+        follow-up (re-read live state before re-adding, editing, or removing
+        anything for that item) is precisely what the ASM #61 incident
+        skipped. "Unknown" is not success.
         """
         s = self.summary()
         return 0 if (
             s[STATUS_FAILED] == 0
             and s[STATUS_NOT_ATTEMPTED] == 0
             and s[STATUS_BLOCKED] == 0
+            and s[STATUS_INDETERMINATE] == 0
         ) else 1
 
     def to_dict(self) -> dict:
@@ -454,6 +513,17 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
                 grade=grade, error=resp.get("message") or err, title=title,
                 advisories=resp.get("advisories") or [],
             )
+        if isinstance(resp, dict) and resp.get("indeterminate"):
+            # BUI-697: the request callable flags a client-side timeout as
+            # indeterminate (`cli._server_request_result` returns
+            # `{"indeterminate": True, ...}` as `data`, mirroring the BUI-623
+            # `{"blocked": ...}` convention above) rather than making this
+            # module string-match an error message. We stopped waiting; the
+            # server did not stop working. Never STATUS_FAILED.
+            return RowResult(
+                item_id=item_id, status=STATUS_INDETERMINATE, max_bid=float(bid),
+                grade=grade, error=err, title=title,
+            )
         return RowResult(
             item_id=item_id, status=STATUS_FAILED, max_bid=float(bid),
             grade=grade, error=err, title=title,
@@ -467,25 +537,46 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         advisories=advisories_from_response(resp),
     )
 
-    link_attempted = grade is not None and comic_id is not None
-    if link_attempted:
-        result.link_attempted = True
-        link_ok, _link_resp, link_err = server_request(
-            "post",
-            f"/api/bids/{item_id}/link-fmv",
-            json={"comic_id": comic_id, "grade": grade},
-        )
-        result.link_ok = link_ok
-        if not link_ok:
-            # A link failure is tracked separately from `error` (which is
-            # reserved for an add-call failure / STATUS_FAILED) — the snipe
-            # itself landed (matches `gixen add`'s single-item behavior,
-            # which still exits 0 when only the link-fmv call fails), so a
-            # consumer scanning for `error is not None` as "this row failed"
-            # must not catch a merely-unlinked-but-added row.
-            result.link_error = link_err
+    attempt_fmv_link(result, comic_id=comic_id, grade=grade, server_request=server_request)
 
     return result
+
+
+def attempt_fmv_link(
+    result: RowResult,
+    *,
+    comic_id: Any,
+    grade: float | None,
+    server_request: ServerRequestFn,
+) -> None:
+    """The post-add `POST /api/bids/{item_id}/link-fmv` call, mutating
+    `result` in place. Factored out of `add_one_row` (BUI-697) so a row whose
+    add timed out and was *later reconciled as landed* gets exactly the same
+    link attempt every other landed row gets — that is the difference between
+    the BUI-697 incident's 25 permanently-unlinked rows (rendering `—` for
+    title, grade and FMV range on the dashboard, with no retry path) and 25
+    ordinary linked snipes. Only ever call this for a landed row.
+
+    Linking fires only when grade AND comic_id are both present (the existing
+    add/add-batch contract) — a gradeless or unidentified row leaves
+    `link_attempted` False, exactly as before."""
+    if grade is None or comic_id is None:
+        return
+    result.link_attempted = True
+    link_ok, _link_resp, link_err = server_request(
+        "post",
+        f"/api/bids/{result.item_id}/link-fmv",
+        json={"comic_id": comic_id, "grade": grade},
+    )
+    result.link_ok = link_ok
+    if not link_ok:
+        # A link failure is tracked separately from `error` (which is
+        # reserved for an add-call failure / STATUS_FAILED) — the snipe
+        # itself landed (matches `gixen add`'s single-item behavior,
+        # which still exits 0 when only the link-fmv call fails), so a
+        # consumer scanning for `error is not None` as "this row failed"
+        # must not catch a merely-unlinked-but-added row.
+        result.link_error = link_err
 
 
 def run_batch(
@@ -493,11 +584,18 @@ def run_batch(
     *,
     server_request: ServerRequestFn,
     health_check: Callable[[], bool],
+    sleep: Callable[[float], None] = time.sleep,
+    settle_seconds: float = RECONCILE_SETTLE_SECONDS,
 ) -> BatchOutcome:
     """Run every row strictly sequentially (Gixen sessions are stateful —
-    parallel adds fail). On any row FAILED, re-check server health before
-    the next row; if the server is down, halt and mark every remaining row
-    NOT_ATTEMPTED without another network call (BUI-168)."""
+    parallel adds fail). On any row FAILED or INDETERMINATE, re-check server
+    health before the next row; if the server is down, halt and mark every
+    remaining row NOT_ATTEMPTED without another network call (BUI-168).
+
+    BUI-697: after the loop, any INDETERMINATE row is reconciled against
+    live server state (`reconcile_indeterminate_rows`) before the outcome is
+    returned, so the report reflects what is actually live rather than what
+    the CLI's own socket happened to hear back."""
     results: list[RowResult] = []
     halted = False
 
@@ -512,10 +610,166 @@ def run_batch(
         result = add_one_row(row, server_request=server_request)
         results.append(result)
 
-        if result.status == STATUS_FAILED and not health_check():
+        if result.status in _HEALTH_RECHECK_STATUSES and not health_check():
             halted = True
 
-    return BatchOutcome(rows=results, halted=halted)
+    outcome = BatchOutcome(rows=results, halted=halted)
+    reconcile_indeterminate_rows(
+        outcome, rows,
+        server_request=server_request, sleep=sleep, settle_seconds=settle_seconds,
+    )
+    return outcome
+
+
+def _live_max_bid(snipe: dict) -> float | None:
+    """Pull a numeric max_bid out of one `/api/comics/snipes` row. Prefers
+    the response's raw `max_bid_numeric`; falls back to parsing the display
+    string (`"125.00 USD"`) so an older server without the numeric field
+    still reconciles. Returns None when neither is usable — the caller then
+    simply skips the amount comparison rather than guessing."""
+    numeric = snipe.get("max_bid_numeric")
+    if isinstance(numeric, (int, float)) and not isinstance(numeric, bool):
+        value = float(numeric)
+        return value if math.isfinite(value) else None
+    display = snipe.get("max_bid")
+    if isinstance(display, str):
+        try:
+            value = float(display.split()[0])
+        except (ValueError, IndexError):
+            return None
+        return value if math.isfinite(value) else None
+    return None
+
+
+def reconcile_indeterminate_rows(
+    outcome: BatchOutcome,
+    rows: list[dict],
+    *,
+    server_request: ServerRequestFn,
+    sleep: Callable[[float], None] = time.sleep,
+    settle_seconds: float = RECONCILE_SETTLE_SECONDS,
+) -> None:
+    """BUI-697: resolve every INDETERMINATE row against live server state.
+
+    **The reconcile — not the settle wait, and not a bigger client timeout —
+    is the load-bearing part of this fix.** A stalled transfer can exceed any
+    bound: on 2026-08-07 `home_2.php` returned healthy TTFB and then stalled
+    mid-body, and rows kept landing minutes after the CLI gave up. So no
+    choice of `settle_seconds` (or of `COMICS_SERVER_TIMEOUT`) can make a
+    timeout determinate; only *reading back what is live* can. The wait exists
+    solely to give the common case — a write already committed, or committing
+    within seconds — a chance to be visible on the first read; the honest
+    answer when it is not visible is still "unknown", never "failed".
+
+    Verdicts, written to `RowResult.reconcile` and reflected in `status`:
+
+    - **found live at this row's max_bid** → upgraded to `STATUS_UPDATED` and
+      given its FMV link attempt (`attempt_fmv_link`). `UPDATED` rather than
+      `ADDED` because after the fact the CLI genuinely cannot tell a create
+      from a BUI-67 upsert, and `UPDATED` is the non-claiming choice: it
+      never fabricates an "add" event in the local adds history that
+      `--added-since` reads.
+    - **found live at a DIFFERENT max_bid** → stays INDETERMINATE. Something
+      is live for this item, but it is not demonstrably this row's write, and
+      calling that "landed" is exactly the ASM #61 failure (a snipe live at
+      $1.09 while the operator believed $20 had landed). The error names both
+      amounts so a human can resolve it.
+    - **absent** → stays INDETERMINATE, error updated to record that it was
+      not live at reconcile time. NOT demoted to FAILED: absence at T+settle
+      is evidence, not proof (the 25-row incident retry reported all-failed
+      and all 25 appeared live later).
+    - **reconcile call itself failed** → stays INDETERMINATE with
+      `checked: False`. A server that cannot answer tells us nothing; a row
+      is never upgraded or demoted on the strength of a call that failed.
+
+    Mutates `outcome` in place; makes no calls at all when no row is
+    indeterminate (so the ordinary batch pays nothing for this).
+
+    Known limitation, deliberately not engineered around: `/api/comics/snipes`
+    triggers the comics server's own pull-on-visit sync, so during the very
+    slowdown that produced the timeouts this read can itself time out. That
+    lands on the `checked: False` branch, which is the safe answer — the rows
+    stay indeterminate and the operator is told to re-read live state — rather
+    than a wrong one. Reading a cheaper endpoint would trade that honesty for
+    possibly-stale data, which is the wrong trade for a real-money report."""
+    pending = [r for r in outcome.rows if r.status == STATUS_INDETERMINATE]
+    if not pending:
+        return
+
+    if settle_seconds and settle_seconds > 0:
+        sleep(settle_seconds)
+
+    ok, resp, err = server_request("get", "/api/comics/snipes")
+    if not ok or not isinstance(resp, list):
+        detail = err or "reconcile call returned no parseable snipe list"
+        for r in pending:
+            r.reconcile = {
+                "checked": False, "found": None, "error": detail, "live_max_bid": None,
+            }
+            r.error = (
+                f"{r.error or 'Server timed out.'} Reconcile against "
+                f"/api/comics/snipes also failed ({detail}) — still UNKNOWN "
+                "whether this bid landed. Re-check live state before "
+                "re-adding, editing, or removing this item."
+            )
+        return
+
+    live: dict[str, dict] = {}
+    for snipe in resp:
+        if isinstance(snipe, dict) and snipe.get("item_id") is not None:
+            live.setdefault(str(snipe["item_id"]), snipe)
+
+    rows_by_item_id = {
+        str(row["item_id"]): row
+        for row in rows
+        if isinstance(row, dict) and row.get("item_id")
+    }
+
+    for r in pending:
+        snipe = live.get(str(r.item_id)) if r.item_id else None
+        if snipe is None:
+            r.reconcile = {
+                "checked": True, "found": False, "error": None, "live_max_bid": None,
+            }
+            r.error = (
+                "Server timed out; reconciled against /api/comics/snipes and this "
+                "item was NOT live. Still UNKNOWN, not failed — a stalled write "
+                "can commit after any bound. Re-check live state before re-adding."
+            )
+            continue
+
+        observed = _live_max_bid(snipe)
+        if (
+            r.max_bid is not None
+            and observed is not None
+            and abs(observed - r.max_bid) > _MAX_BID_EPSILON
+        ):
+            r.reconcile = {
+                "checked": True, "found": True, "error": None, "live_max_bid": observed,
+            }
+            r.error = (
+                f"Server timed out; a snipe for this item IS live but at "
+                f"{observed:.2f}, not the {r.max_bid:.2f} this row sent — this "
+                "row's write is NOT confirmed. Resolve by hand before treating "
+                "either amount as intended."
+            )
+            continue
+
+        r.status = STATUS_UPDATED
+        r.error = None
+        r.reconcile = {
+            "checked": True, "found": True, "error": None, "live_max_bid": observed,
+        }
+        row = rows_by_item_id.get(str(r.item_id), {})
+        comic_id = row.get("comic_id")
+        if comic_id is not None:
+            try:
+                comic_id = int(comic_id)
+            except (TypeError, ValueError):
+                comic_id = None
+        attempt_fmv_link(
+            r, comic_id=comic_id, grade=r.grade, server_request=server_request,
+        )
 
 
 def verify_items(outcome: BatchOutcome) -> list[dict]:

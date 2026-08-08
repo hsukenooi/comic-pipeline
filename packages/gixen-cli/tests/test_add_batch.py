@@ -18,11 +18,13 @@ from add_batch import (
     STATUS_ADDED,
     STATUS_BLOCKED,
     STATUS_FAILED,
+    STATUS_INDETERMINATE,
     STATUS_NOT_ATTEMPTED,
     STATUS_UPDATED,
     BatchOutcome,
     RowResult,
     add_one_row,
+    reconcile_indeterminate_rows,
     advisories_from_response,
     apply_verify_results,
     build_batch_rows,
@@ -758,9 +760,11 @@ def test_batch_outcome_summary_counts_each_status():
     # BUI-623 (U9): STATUS_BLOCKED is now a fixed key in every summary dict
     # (present at 0 even when no row was blocked) — see summary()'s own
     # comment for why it's listed unconditionally like every other status.
+    # BUI-697: STATUS_INDETERMINATE joins it on the same rule.
     assert summary == {
         "total": 4, STATUS_ADDED: 1, STATUS_UPDATED: 1,
         STATUS_FAILED: 1, STATUS_NOT_ATTEMPTED: 1, STATUS_BLOCKED: 0,
+        STATUS_INDETERMINATE: 0,
         "advisories": 0,
     }
 
@@ -1263,3 +1267,353 @@ def test_build_batch_rows_multiple_copies_same_group_bid_group_scenario():
     assert len(result.rows) == 2
     assert all(r["group"] == 4 for r in result.rows)
     assert result.rows[0]["max_bid"] != result.rows[1]["max_bid"]
+
+
+# ---------------------------------------------------------------------------
+# BUI-697: a client timeout is INDETERMINATE, not failed — and the
+# end-of-batch reconcile is what turns "unknown" into knowledge.
+# ---------------------------------------------------------------------------
+
+_TIMEOUT = (
+    False,
+    {"indeterminate": True, "reason": "timeout"},
+    "Server timed out — the write may still have committed.",
+)
+
+
+def _snipe(item_id, max_bid):
+    """One /api/comics/snipes row, trimmed to the fields the reconcile reads."""
+    return {"item_id": item_id, "max_bid": f"{max_bid:.2f} USD", "max_bid_numeric": max_bid}
+
+
+def _no_sleep(_seconds):
+    return None
+
+
+def test_add_one_row_timeout_is_indeterminate_not_failed():
+    """The whole bug in one assertion: `_server_request_result`'s timeout
+    marker must never produce STATUS_FAILED, because a timeout is the CLI
+    giving up on the read — not evidence the write did not commit."""
+    server = _FakeServer({("post", "/api/bids"): _TIMEOUT})
+    result = add_one_row(_row("111", max_bid=20), server_request=server)
+
+    assert result.status == STATUS_INDETERMINATE
+    assert result.status != STATUS_FAILED
+    assert result.max_bid == 20.0
+    assert "may still have committed" in result.error
+
+
+def test_add_one_row_non_timeout_failure_is_still_failed():
+    """The indeterminate branch is keyed on the structured marker, not on
+    "any failure" — an ordinary 500 must stay FAILED."""
+    server = _FakeServer({("post", "/api/bids"): (False, None, "Server returned 500: boom")})
+    result = add_one_row(_row("111"), server_request=server)
+
+    assert result.status == STATUS_FAILED
+
+
+def test_indeterminate_row_counts_in_summary_and_exit_code():
+    """Exit-code membership: "unknown" is not success. A caller checking $?
+    must be told it has follow-up to do."""
+    outcome = BatchOutcome(rows=[
+        RowResult(item_id="1", status=STATUS_ADDED),
+        RowResult(item_id="2", status=STATUS_INDETERMINATE, error="Server timed out."),
+    ])
+
+    assert outcome.summary()[STATUS_INDETERMINATE] == 1
+    assert outcome.summary()[STATUS_FAILED] == 0
+    assert outcome.exit_code() == 1
+
+
+def test_batch_outcome_exit_code_nonzero_on_indeterminate_alone():
+    outcome = BatchOutcome(rows=[RowResult(item_id="1", status=STATUS_INDETERMINATE)])
+    assert outcome.exit_code() == 1
+
+
+def test_run_batch_indeterminate_row_rechecks_health_and_halts_when_down():
+    """Halt semantics: a timeout takes FAILED's rule, not BLOCKED's. The
+    server may genuinely be sick, so re-check health before the next row —
+    but only a DOWN server halts the batch."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (False, None, "Server timed out."),
+    })
+    health_calls = []
+
+    def health_check():
+        health_calls.append(1)
+        return False
+
+    outcome = run_batch(
+        [_row("1"), _row("2")],
+        server_request=server, health_check=health_check,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+
+    assert len(health_calls) == 1
+    assert outcome.halted is True
+    assert [r.status for r in outcome.rows] == [STATUS_INDETERMINATE, STATUS_NOT_ATTEMPTED]
+
+
+def test_run_batch_indeterminate_row_continues_when_server_healthy():
+    server = _FakeServer({
+        ("post", "/api/bids"): [_TIMEOUT, (True, {"created": True}, None)],
+        ("get", "/api/comics/snipes"): (True, [], None),
+    })
+    outcome = run_batch(
+        [_row("1"), _row("2")],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+
+    assert outcome.halted is False
+    assert [r.status for r in outcome.rows] == [STATUS_INDETERMINATE, STATUS_ADDED]
+
+
+def test_reconcile_found_live_upgrades_to_landed_and_attempts_fmv_link():
+    """The load-bearing behaviour: a row found live is landed, and it gets
+    the SAME post-add FMV link every other landed row gets. The BUI-697
+    incident left 25 landed rows permanently unlinked (`link_attempted:
+    false`) precisely because this path did not exist."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, [_snipe("111", 20.0)], None),
+        ("post", "/api/bids/111/link-fmv"): (True, {"ok": True}, None),
+    })
+
+    outcome = run_batch(
+        [_row("111", max_bid=20, comic_id=42, grade=9.0)],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+
+    row = outcome.rows[0]
+    assert row.status == STATUS_UPDATED
+    assert row.error is None
+    assert row.reconcile == {
+        "checked": True, "found": True, "error": None, "live_max_bid": 20.0,
+    }
+    assert row.link_attempted is True
+    assert row.link_ok is True
+    assert ("post", "/api/bids/111/link-fmv", {"comic_id": 42, "grade": 9.0}) in server.calls
+    assert outcome.exit_code() == 0
+
+
+def test_reconcile_found_live_without_identity_does_not_fake_a_link():
+    """A row with no comic_id/grade never had a link to attempt — the
+    reconcile must not invent one just because it upgraded the status."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, [_snipe("111", 100.0)], None),
+    })
+    outcome = run_batch(
+        [_row("111", max_bid=100)],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+
+    row = outcome.rows[0]
+    assert row.status == STATUS_UPDATED
+    assert row.link_attempted is False
+    assert not any(path.endswith("/link-fmv") for _m, path, _j in server.calls)
+
+
+def test_reconcile_absent_stays_indeterminate_and_is_reported_not_landed():
+    """Absence at T+settle is evidence, not proof (the incident's 25-row
+    retry reported all-failed and all 25 appeared live later) — so the row
+    is reported as not-landed WITHOUT being demoted to FAILED."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, [_snipe("999", 5.0)], None),
+    })
+
+    outcome = run_batch(
+        [_row("111", max_bid=20, comic_id=42, grade=9.0)],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+
+    row = outcome.rows[0]
+    assert row.status == STATUS_INDETERMINATE
+    assert row.status != STATUS_FAILED
+    assert row.reconcile == {
+        "checked": True, "found": False, "error": None, "live_max_bid": None,
+    }
+    assert "NOT live" in row.error
+    # Not landed: excluded from the verify pass and from a clean exit code.
+    assert verify_items(outcome) == []
+    assert outcome.exit_code() == 1
+    # And no link was attempted for a row we cannot confirm landed.
+    assert row.link_attempted is False
+
+
+def test_reconcile_found_live_at_a_different_max_bid_stays_indeterminate():
+    """The ASM #61 shape: a snipe IS live for this item but at a different
+    amount, so this row's write is not confirmed. Claiming "landed" there
+    would tell the operator their $20 cap is in when $1.09 is."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, [_snipe("111", 1.09)], None),
+    })
+
+    outcome = run_batch(
+        [_row("111", max_bid=20, comic_id=42, grade=9.0)],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+
+    row = outcome.rows[0]
+    assert row.status == STATUS_INDETERMINATE
+    assert row.reconcile["found"] is True
+    assert row.reconcile["live_max_bid"] == 1.09
+    assert "1.09" in row.error and "20.00" in row.error
+    assert row.link_attempted is False
+
+
+def test_reconcile_tolerates_float_noise_in_max_bid():
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (
+            True, [{"item_id": "111", "max_bid_numeric": 20.000000001}], None,
+        ),
+    })
+    outcome = run_batch(
+        [_row("111", max_bid=20)],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+    assert outcome.rows[0].status == STATUS_UPDATED
+
+
+def test_reconcile_falls_back_to_the_display_max_bid_string():
+    """An older server without `max_bid_numeric` must still reconcile."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, [{"item_id": "111", "max_bid": "20.00 USD"}], None),
+    })
+    outcome = run_batch(
+        [_row("111", max_bid=20)],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+    assert outcome.rows[0].status == STATUS_UPDATED
+
+
+def test_reconcile_call_failure_never_upgrades_a_row():
+    """A server that cannot answer tells us nothing. The row must stay
+    indeterminate — never upgraded to landed, never demoted to failed."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (
+            False, None, "Server unreachable. Is the comics server running?",
+        ),
+    })
+
+    outcome = run_batch(
+        [_row("111", max_bid=20, comic_id=42, grade=9.0)],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+
+    row = outcome.rows[0]
+    assert row.status == STATUS_INDETERMINATE
+    assert row.reconcile["checked"] is False
+    assert row.reconcile["found"] is None
+    assert "Server unreachable" in row.reconcile["error"]
+    assert row.link_attempted is False
+    assert outcome.exit_code() == 1
+
+
+def test_reconcile_rejects_a_non_list_snipes_response():
+    """A 2xx body of the wrong shape is as uninformative as a failed call —
+    it must not be read as "no snipes are live" (which would falsely confirm
+    every row as absent)."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, {"unexpected": "shape"}, None),
+    })
+    outcome = run_batch(
+        [_row("111")],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+    assert outcome.rows[0].status == STATUS_INDETERMINATE
+    assert outcome.rows[0].reconcile["checked"] is False
+
+
+def test_reconcile_is_skipped_entirely_when_no_row_is_indeterminate():
+    """An ordinary batch pays nothing for this: no settle wait, no extra
+    round trip."""
+    server = _FakeServer({("post", "/api/bids"): (True, {"created": True}, None)})
+    slept = []
+
+    outcome = run_batch(
+        [_row("1"), _row("2")],
+        server_request=server, health_check=lambda: True,
+        sleep=slept.append,
+    )
+
+    assert slept == []
+    assert not any(path == "/api/comics/snipes" for _m, path, _j in server.calls)
+    assert outcome.exit_code() == 0
+
+
+def test_reconcile_waits_the_settle_interval_before_reading():
+    """The settle wait is a courtesy to the common case, not the fix — but
+    it must actually happen, and before the read."""
+    order = []
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, [], None),
+    })
+
+    def tracking(method, path, **kwargs):
+        order.append(("request", path))
+        return server(method, path, **kwargs)
+
+    run_batch(
+        [_row("111")],
+        server_request=tracking, health_check=lambda: True,
+        sleep=lambda s: order.append(("sleep", s)), settle_seconds=7.5,
+    )
+
+    assert order == [
+        ("request", "/api/bids"),
+        ("sleep", 7.5),
+        ("request", "/api/comics/snipes"),
+    ]
+
+
+def test_reconcile_resolves_each_row_independently():
+    """A mixed batch: one landed, one absent — the found row must not carry
+    the absent row's verdict or vice versa."""
+    server = _FakeServer({
+        ("post", "/api/bids"): [_TIMEOUT, _TIMEOUT],
+        ("get", "/api/comics/snipes"): (True, [_snipe("222", 30.0)], None),
+    })
+
+    outcome = run_batch(
+        [_row("111", max_bid=20), _row("222", max_bid=30)],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+
+    assert [r.status for r in outcome.rows] == [STATUS_INDETERMINATE, STATUS_UPDATED]
+    assert outcome.rows[0].reconcile["found"] is False
+    assert outcome.rows[1].reconcile["found"] is True
+
+
+def test_reconcile_indeterminate_rows_is_a_noop_without_indeterminate_rows():
+    """Direct call, no run_batch: the guard is in the function itself."""
+    server = _FakeServer({})
+    outcome = BatchOutcome(rows=[RowResult(item_id="1", status=STATUS_ADDED)])
+    reconcile_indeterminate_rows(outcome, [_row("1")], server_request=server, sleep=_no_sleep)
+    assert server.calls == []
+    assert outcome.rows[0].reconcile is None
+
+
+def test_row_result_to_dict_carries_the_reconcile_verdict():
+    row = RowResult(item_id="1", status=STATUS_INDETERMINATE)
+    row.reconcile = {"checked": True, "found": False, "error": None, "live_max_bid": None}
+    assert row.to_dict()["reconcile"] == row.reconcile
+    assert RowResult(item_id="2", status=STATUS_ADDED).to_dict()["reconcile"] is None

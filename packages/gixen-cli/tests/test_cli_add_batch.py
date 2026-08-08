@@ -814,3 +814,155 @@ def test_add_batch_per_row_policy_bypass_reaches_the_payload(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert captured["json"]["policy_bypass"] is True
+
+
+# ---------------------------------------------------------------------------
+# BUI-697: timeout -> indeterminate -> end-of-batch reconcile, end to end
+# through the CLI (table rendering, JSON summary, exit code, stderr warning).
+# ---------------------------------------------------------------------------
+
+_TIMEOUT = (
+    False,
+    {"indeterminate": True, "reason": "timeout"},
+    "Server timed out — the write may still have committed.",
+)
+
+
+def _no_settle(monkeypatch):
+    """Skip add-batch's reconcile settle wait so CLI tests don't sleep."""
+    monkeypatch.setenv("ADD_BATCH_SETTLE_SECONDS", "0")
+
+
+def test_add_batch_timeout_reconciled_live_lands_and_links(tmp_path, monkeypatch):
+    """The incident's happy path, end to end: the add call times out, the
+    reconcile finds the snipe live at the amount we sent, so the row reports
+    as landed AND gets the FMV link that the old `failed` mapping skipped."""
+    from cli import cli
+
+    _no_settle(monkeypatch)
+    rows_file = _write_rows(tmp_path, [
+        {"item_id": "111", "max_bid": 20, "comic_id": 42, "grade": 9.0, "title": "ASM #61"},
+    ])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (
+            True, [{"item_id": "111", "max_bid_numeric": 20.0}], None,
+        ),
+        ("post", "/api/bids/111/link-fmv"): (True, {"ok": True}, None),
+    })
+
+    out_path = tmp_path / "results.json"
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file, "--json-out", str(out_path)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(out_path.read_text())
+    assert payload["summary"]["indeterminate"] == 0
+    assert payload["summary"]["updated"] == 1
+    assert payload["summary"]["failed"] == 0
+    row = payload["rows"][0]
+    assert row["status"] == "updated"
+    assert row["link_attempted"] is True
+    assert row["link_ok"] is True
+    assert row["reconcile"]["found"] is True
+
+
+def test_add_batch_timeout_not_live_reports_indeterminate_not_failed(tmp_path, monkeypatch):
+    """The row must never render as ❌ Failed, the JSON must bucket it under
+    `indeterminate`, and the operator must be told in so many words not to
+    edit or re-add it before re-reading live state."""
+    from cli import cli
+
+    _no_settle(monkeypatch)
+    rows_file = _write_rows(tmp_path, [{"item_id": "111", "max_bid": 20}])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, [], None),
+    })
+
+    out_path = tmp_path / "results.json"
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds"):
+        result = runner.invoke(cli, ["add-batch", rows_file, "--json-out", str(out_path)])
+
+    assert result.exit_code == 1
+    assert "Indeterminate" in result.output
+    assert "Failed" not in result.output
+    assert "INDETERMINATE" in result.output
+    assert "re-read live state" in result.output
+    payload = json.loads(out_path.read_text())
+    assert payload["summary"]["indeterminate"] == 1
+    assert payload["summary"]["failed"] == 0
+    assert payload["rows"][0]["status"] == "indeterminate"
+
+
+def test_add_batch_timeout_never_records_an_add(tmp_path, monkeypatch):
+    """A reconciled-landed row reports `updated`, so it must not fabricate an
+    "add" event in the local adds history that `--added-since` reads — the
+    CLI cannot tell a create from a BUI-67 upsert after the fact."""
+    from cli import cli
+
+    _no_settle(monkeypatch)
+    rows_file = _write_rows(tmp_path, [{"item_id": "111", "max_bid": 20}])
+    fake = _fake_request_from({
+        ("get", "/health"): (True, {}, None),
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (
+            True, [{"item_id": "111", "max_bid_numeric": 20.0}], None,
+        ),
+    })
+
+    runner = CliRunner()
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request_result", side_effect=fake), \
+         patch("cli._record_adds") as mock_record:
+        runner.invoke(cli, ["add-batch", rows_file])
+
+    mock_record.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# BUI-697: the timeout value itself
+# ---------------------------------------------------------------------------
+
+
+def test_server_timeout_default_is_sixty(monkeypatch):
+    import cli as cli_module
+
+    monkeypatch.delenv("COMICS_SERVER_TIMEOUT", raising=False)
+    assert cli_module._server_timeout() == 60
+
+
+def test_server_timeout_is_env_overridable(monkeypatch):
+    import cli as cli_module
+
+    monkeypatch.setenv("COMICS_SERVER_TIMEOUT", "120.5")
+    assert cli_module._server_timeout() == 120.5
+
+
+def test_server_timeout_falls_back_safely_on_a_degenerate_value(monkeypatch):
+    """A typo, a zero, or a negative must land on the default — never on
+    "block forever", which is strictly worse than the value it replaced."""
+    import cli as cli_module
+
+    for bad in ("banana", "0", "-5", "", "  ", "nan", "inf"):
+        monkeypatch.setenv("COMICS_SERVER_TIMEOUT", bad)
+        assert cli_module._server_timeout() == 60, bad
+
+
+def test_reconcile_settle_seconds_allows_zero_but_not_garbage(monkeypatch):
+    import cli as cli_module
+
+    monkeypatch.setenv("ADD_BATCH_SETTLE_SECONDS", "0")
+    assert cli_module._reconcile_settle_seconds() == 0.0
+    monkeypatch.setenv("ADD_BATCH_SETTLE_SECONDS", "banana")
+    assert cli_module._reconcile_settle_seconds() == 10.0
+    monkeypatch.delenv("ADD_BATCH_SETTLE_SECONDS", raising=False)
+    assert cli_module._reconcile_settle_seconds() == 10.0
