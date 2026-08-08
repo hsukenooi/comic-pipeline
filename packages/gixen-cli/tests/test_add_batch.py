@@ -122,6 +122,27 @@ def test_build_bid_payload_minimal():
     }
 
 
+def test_build_bid_payload_group_none_omits_snipe_group():
+    """BUI-708: group=None omits `snipe_group` from the payload entirely —
+    same "only send what was given" convention as seller/source below — so
+    AddBidRequest's own None-passthrough resolves it server-side instead of
+    this client silently sending a `0` that un-groups an already-grouped
+    snipe on a re-run."""
+    payload = build_bid_payload("1", 100, 6, None)
+    assert "snipe_group" not in payload
+    assert payload == {
+        "item_id": "1", "max_bid": 100.0, "bid_offset": 6,
+        "comic_identities": [],
+    }
+
+
+def test_build_bid_payload_explicit_zero_group_is_sent():
+    """Contrast with the None case above: explicit 0 is a positive "ungroup"
+    claim (BUI-383) and is always sent, never omitted."""
+    payload = build_bid_payload("1", 100, 6, 0)
+    assert payload["snipe_group"] == 0
+
+
 def test_build_bid_payload_omits_unset_optional_fields():
     payload = build_bid_payload("1", 100, 6, 0, seller="X")
     assert "seller_grade" not in payload
@@ -317,15 +338,34 @@ def test_add_one_row_invalid_int_fields_fail_without_network(field):
 
 
 def test_add_one_row_minimal_success():
+    """BUI-708: a row that never mentions `group` at all sends no
+    `snipe_group` key — the server resolves the omission itself (passthrough
+    on an upsert of a live row, 0 on a fresh create). This is the fix: the
+    old behavior sent an explicit `snipe_group: 0` here, which un-grouped an
+    already-grouped snipe on any add-batch re-run."""
     server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
     result = add_one_row(_row("1"), server_request=server)
     assert result.status == STATUS_ADDED
     assert result.max_bid == 100.0
     assert result.link_attempted is False
     assert server.calls == [("post", "/api/bids", {
-        "item_id": "1", "max_bid": 100.0, "bid_offset": 6, "snipe_group": 0,
+        "item_id": "1", "max_bid": 100.0, "bid_offset": 6,
         "comic_identities": [], "source": "batch",
     })]
+
+
+def test_add_one_row_explicit_group_reaches_the_payload():
+    """A row that DOES carry `group` — even 0 — sends it concretely. Explicit
+    0 is still a real un-group request (BUI-383: 0 is a positive claim, never
+    "unspecified"), distinct from the omitted-key case above."""
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    result = add_one_row(_row("1", group=5), server_request=server)
+    assert result.status == STATUS_ADDED
+    assert server.calls[0][2]["snipe_group"] == 5
+
+    server0 = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": False}, None)})
+    add_one_row(_row("1", group=0), server_request=server0)
+    assert server0.calls[0][2]["snipe_group"] == 0
 
 
 def test_add_one_row_carries_title_through_to_result(): # BUI-506

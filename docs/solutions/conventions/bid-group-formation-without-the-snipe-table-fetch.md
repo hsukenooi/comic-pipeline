@@ -11,7 +11,7 @@ enforced_by_test:
   - "packages/gixen-cli/tests/test_gixen_client.py::TestNewSnipeGroupOnEveryWritePath"
   - "packages/gixen-cli/tests/test_server_api.py::test_upsert_of_a_live_row_applies_group_end_to_end"
   - "packages/gixen-cli/tests/test_server_api.py::test_gixen_failure_on_a_group_upsert_writes_no_group"
-  - "packages/gixen-cli/tests/test_server_api.py::test_upsert_omitting_group_silently_ungroups_a_grouped_row"
+  - "packages/gixen-cli/tests/test_server_api.py::test_upsert_omitting_group_preserves_the_existing_group"
 applies_when:
   - "Gixen's home_2.php is stalling and a bid group needs to be formed or changed"
   - "`gixen group` fails and you are looking for another way to group snipes"
@@ -72,10 +72,19 @@ from the add path.**
 mirror makes `bids.snipe_group` a *reflection* of Gixen's state, not a record of your
 intent. Confirm with `gixen list` (or `/api/comics/snipes` after a sync).
 
-**And do not take the write's own success as proof either.** `modify_snipe`'s post-POST
-confirmation compares `max_bid` only; `add_snipe`'s just checks the item appears in the
-list. Neither verifies `snipe_group`, so a `True` return means *the cap is live*, not
-*the group is*. During an outage that distinction is the whole question.
+**And do not take the write's own success as proof either — update (BUI-709, fixed):**
+this used to be true unconditionally. `modify_snipe`'s post-POST confirmation now also
+compares the LISTED `snipe_group` against the sent one (a DIFFERENT parsed group is NOT
+confirmed — retried once, then `GixenModifyNotConfirmedError`), and `add_snipe`'s
+`_verify_present` does the same whenever the add carried a nonzero group, including the
+202-retry arm that a wrong-group add used to sneak through. `True` now means the group
+landed too, not just the cap. The one carve-out: an unparseable/missing listed group (a
+BUI-383 regex miss — parser drift, not evidence of a real mismatch) confirms on the
+cap/presence alone plus a `logger.warning`, rather than failing every grouped write
+closed — that would take down grouping entirely on ordinary scrape noise. A group=0
+*add* still verifies presence only (0 there means "no group requested" for a fresh
+create, not a deliberate claim to confirm); a group=0 *modify* is a deliberate un-group
+write and is checked like any other value.
 
 ### 2. No write path is `home_2.php`-free. Count round trips instead.
 
@@ -115,17 +124,27 @@ several-round-trips-old one risks writing a cap onto the wrong snipe.
 - **Do not shrink `home_2.php` by purging** to make the fetch cheaper — that destroys
   first-party comps.
 
-### 4. The retry trap: an add-batch re-run un-groups already-grouped snipes.
+### 4. The retry trap: an add-batch re-run un-groups already-grouped snipes — fixed (BUI-708).
 
-`AddBidRequest.snipe_group` defaults to **0** with no `None` passthrough (unlike
-`EditBidRequest.snipe_group`, which gained one in BUI-392), and
-`add_batch.build_bid_payload` **always** sends the key. So re-running a rows.json whose
-row lacks `"group"` against a snipe that is already grouped POSTs `newsnipegroup=0` and
-**un-groups it**. `0` is a positive claim ("ungrouped"), never "unknown" (BUI-383).
+`AddBidRequest.snipe_group` **used to** default to **0** with no `None` passthrough
+(unlike `EditBidRequest.snipe_group`, which gained one in BUI-392), and
+`add_batch.build_bid_payload` **always** sent the key. So re-running a rows.json whose
+row lacked `"group"` against a snipe that was already grouped POSTed `newsnipegroup=0`
+and **un-grouped it**. `0` is a positive claim ("ungrouped"), never "unknown" (BUI-383).
 
-This is characterized, not fixed: `gixen add --group` omitted legitimately means group 0
-for a fresh add. The operational rule is **carry `group` on every re-run of a grouped
-row**, or regroup with `PATCH`, which does pass through an omitted `snipe_group`.
+**Now fixed.** `AddBidRequest.snipe_group` defaults to `None`, resolved server-side in
+`api_add_bid` the same way `EditBidRequest.snipe_group` has been since BUI-392: on the
+UPSERT branch (a live row already exists) an omitted group passes through the existing
+row's group; on a genuine CREATE (no live row) it resolves to 0, since there is no prior
+group to preserve. `add_batch.build_bid_payload` only includes `"snipe_group"` in the
+payload when the row was actually given a `group` — the same "only send what was given"
+convention as `seller`/`source` in that function — so `add_one_row` now sends nothing at
+all for a row that omits `group`, instead of an explicit 0. Re-running an add-batch
+rows.json whose row lacks `"group"` against an already-grouped snipe now **preserves**
+that group. An explicit `"group": 0` in the row still un-groups it, on either the create
+or upsert branch — 0 remains a positive claim, never "unspecified" — and `gixen add`
+(no `--group` flag involved here) is unaffected: its `--group` option still defaults to
+0 and sends it explicitly.
 
 ## Ticket answer (BUI-700)
 

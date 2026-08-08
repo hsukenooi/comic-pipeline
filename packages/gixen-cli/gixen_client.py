@@ -258,6 +258,28 @@ def parse_listed_max_bid(value: str | int | float | None) -> float | None:
     return float(parsed)
 
 
+def parse_listed_snipe_group(value: str | int | None) -> int | None:
+    """Parse a Gixen-reported snipe_group to an int, or None when the value
+    is absent, blank, or unparseable (a scrape quirk, or the BUI-383 regex-
+    miss case). "None means unknown" — the same contract as
+    `parse_listed_max_bid` above and `server.fallback._parse_snipe_group` —
+    never coerce a miss to 0: group 0 is a positive "no group" claim, and a
+    caller (BUI-709's write confirms below) that collapsed "unknown" to 0
+    would falsely report a mismatch for every parser-drift case, or worse,
+    falsely confirm a real un-group that never actually landed.
+
+    Duplicated in spirit (not import) from `server.fallback._parse_snipe_group`:
+    this module carries no dependency on `server/`, the same reasoning
+    `parse_listed_max_bid` already documents for `_max_bid_matches`.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Terminal-status vocabulary (BUI-595)
 # ---------------------------------------------------------------------------
@@ -701,15 +723,56 @@ class GixenClient:
             html = self._get_home_page(retry_on_expired=False)
             return self._parse_snipe_table(html)
 
-    def _verify_present(self, target: str) -> bool:
+    @staticmethod
+    def _group_matches(listed: str | int | None, expected: int) -> bool | None:
+        """Compare a listed snipe_group against the sent value.
+
+        BUI-709 (EM-decided policy, following BUI-383's group semantics):
+        returns True on a match, False when the listed value parses to a
+        DIFFERENT int than `expected`, and None when the listed value is
+        unparseable/missing — a parser-drift regex miss, not evidence of a
+        mismatch. Callers treat None as "confirm on cap/presence alone" +
+        `logger.warning`: failing closed on parser drift would take down
+        every grouped write, and warn-and-pass only degrades verification
+        back to the pre-BUI-709 status quo rather than blocking real money.
+        """
+        parsed = parse_listed_snipe_group(listed)
+        if parsed is None:
+            return None
+        return parsed == expected
+
+    def _verify_present(self, target: str, snipe_group: int = 0) -> bool:
         """True if `target` (an item_id) appears in the current snipe list.
+
+        BUI-709: when this add carried a group (`snipe_group` nonzero),
+        presence alone does not prove the write landed correctly — the
+        listed group must also match the sent one (same mismatch/unknown
+        policy as `modify_snipe`'s `_confirmed`, via `_group_matches`). A
+        `snipe_group=0` add has nothing extra to verify: 0 here means "no
+        group was requested" for a fresh create, not a deliberate un-group
+        claim to confirm (contrast `modify_snipe`, where an explicit 0 IS a
+        deliberate write and is always checked).
 
         Raises whatever list_snipes() raises (GixenParseError,
         requests.HTTPError, GixenSessionExpiredError) — callers decide how to
         log and chain the resulting GixenAddNotConfirmedError.
         """
-        snipes = self.list_snipes()
-        return any(s["item_id"] == target for s in snipes)
+        for s in self.list_snipes():
+            if s["item_id"] != target:
+                continue
+            if not snipe_group:
+                return True
+            group_match = self._group_matches(s.get("snipe_group"), snipe_group)
+            if group_match is None:
+                logger.warning(
+                    "add_snipe verify for item=%s: listed snipe_group "
+                    "unparseable/missing (%r) for sent group=%s; confirming "
+                    "presence only (BUI-709 parser-drift carve-out)",
+                    target, s.get("snipe_group"), snipe_group,
+                )
+                return True
+            return group_match
+        return False
 
     def add_snipe(
         self,
@@ -729,6 +792,10 @@ class GixenClient:
                 even after one retry. Also raised when the verify list_snipes
                 itself fails (parse error, HTTP error) — in that case we cannot
                 tell whether the POST landed, so we refuse to double-POST.
+                BUI-709: also raised when the add carried a group
+                (snipe_group != 0) and the item is present but listed under a
+                DIFFERENT group than sent — a wrong-group add is not a
+                confirmed add.
         """
         data = {
             "newitemid": str(item_id),
@@ -747,7 +814,7 @@ class GixenClient:
         # double-POSTing in that uncertain state risks duplicate snipes. Bail
         # with AddNotConfirmedError so the caller can investigate.
         try:
-            present = self._verify_present(target)
+            present = self._verify_present(target, snipe_group)
         except (GixenParseError, requests.HTTPError, GixenSessionExpiredError) as e:
             logger.warning(
                 "add_snipe for item=%s: verify list_snipes failed (%s); "
@@ -778,8 +845,12 @@ class GixenClient:
             self._post_home(data)
         except GixenItemError as e:
             if e.code == 202:
+                # BUI-709: the 202-retry arm — a wrong-group add would sneak
+                # through exactly here if this verify only checked presence
+                # (the retry POST hitting ITEM ALREADY PRESENT proves *an*
+                # item is there, not that it carries the group we sent).
                 try:
-                    present = self._verify_present(target)
+                    present = self._verify_present(target, snipe_group)
                 except (GixenParseError, requests.HTTPError, GixenSessionExpiredError):
                     raise GixenAddNotConfirmedError(item_id) from e
                 if present:
@@ -788,12 +859,13 @@ class GixenClient:
                         "202; treating as success", item_id,
                     )
                     return True
-                # 202 but verify still doesn't see it → genuinely confused.
+                # 202 but verify still doesn't see it (or the group doesn't
+                # match) → genuinely confused.
                 raise GixenAddNotConfirmedError(item_id) from e
             raise
 
         try:
-            present = self._verify_present(target)
+            present = self._verify_present(target, snipe_group)
         except (GixenParseError, requests.HTTPError, GixenSessionExpiredError) as e:
             raise GixenAddNotConfirmedError(item_id) from e
 
@@ -842,11 +914,27 @@ class GixenClient:
         A stale cached dbidid is caught by the post-POST verify below; the caller
         (the server, which owns the cache) handles re-resolving and retrying.
 
+        BUI-709: the confirm also compares the LISTED snipe_group against the
+        sent one — unconditionally, unlike add_snipe's `_verify_present`
+        (which only checks group when the add carried a nonzero one). Every
+        modify's `snipe_group` is already a deliberate, resolved value by
+        the time it reaches this client (the server resolves any None-
+        passthrough intent before calling here — see AddBidRequest/
+        EditBidRequest's snipe_group docs in server/main.py), so an explicit
+        0 here IS a deliberate un-group write and must be confirmed like any
+        other value, not skipped the way a fresh create's incidental 0 is.
+        A DIFFERENT listed group is NOT confirmed (EM-decided policy); an
+        unparseable/missing listed group (BUI-383 parser drift) confirms on
+        the cap alone plus a warning — failing closed there would take down
+        every grouped modify during ordinary scrape noise.
+
         Raises:
             GixenSnipeNotFoundError: If item_id is not in the snipe list (only
                 when dbidid is not supplied — the lookup path).
             GixenModifyNotConfirmedError: If the modify POST returned no error but
-                the new max_bid never appeared in the list, even after one retry.
+                the new max_bid never appeared in the list, or (BUI-709) appeared
+                at the right cap but under a different listed group, even after
+                one retry.
         """
         target = str(item_id)
         if dbidid is None:
@@ -868,8 +956,25 @@ class GixenClient:
             # Re-read AFTER the POST and confirm the new max_bid is live. A list
             # failure here propagates (GixenError -> 503) rather than confirming.
             for s in self.list_snipes():
-                if s["item_id"] == target:
-                    return self._max_bid_matches(s.get("max_bid", ""), max_bid)
+                if s["item_id"] != target:
+                    continue
+                if not self._max_bid_matches(s.get("max_bid", ""), max_bid):
+                    return False
+                # BUI-709: cap matched — now confirm the group actually
+                # landed too. A True return here used to mean only "the cap
+                # is live"; a caller reading it as "the group landed too"
+                # was exactly the gap this closes.
+                group_match = self._group_matches(s.get("snipe_group"), snipe_group)
+                if group_match is None:
+                    logger.warning(
+                        "modify_snipe for item=%s: listed snipe_group "
+                        "unparseable/missing (%r) for sent group=%s; "
+                        "confirming cap only (BUI-709 parser-drift "
+                        "carve-out)",
+                        item_id, s.get("snipe_group"), snipe_group,
+                    )
+                    return True
+                return group_match
             return False
 
         self._post_home(data)
