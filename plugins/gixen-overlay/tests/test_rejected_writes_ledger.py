@@ -90,6 +90,14 @@ def _probe_app() -> FastAPI:
     async def _get404():
         raise HTTPException(status_code=404, detail="a read, not a write")
 
+    @probe.get("/probe/get200")
+    async def _get200():
+        return {"ok": True}
+
+    @probe.get("/probe/getboom")
+    async def _getboom():
+        raise RuntimeError("unhandled crash on a read")
+
     @probe.post("/probe/upload")
     async def _upload(f: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="upload refused")
@@ -129,6 +137,27 @@ def test_real_overlay_422_is_persisted(api):
     assert len(rows) == 1
     assert rows[0]["path"] == "/api/comics/seller-scan/seen"
     assert rows[0]["method"] == "POST"
+    assert rows[0]["status"] == 422
+
+
+def test_real_overlay_get_4xx_is_persisted(api):
+    """BUI-707: a real overlay GET endpoint's 4xx also lands in the ledger.
+
+    `/api/comics/health/rejections` rejects `hours=0` via query validation
+    before the handler runs — the GET counterpart of
+    `test_real_overlay_422_is_persisted`'s POST proof, exercised on the real
+    router (not the throwaway probe app) so the wiring is checked end to end.
+    """
+    r = api.get("/api/comics/health/rejections?hours=0")
+    assert r.status_code == 422
+
+    rows = [
+        x
+        for x in _ledger(api)
+        if x["path"] == "/api/comics/health/rejections"
+    ]
+    assert len(rows) == 1
+    assert rows[0]["method"] == "GET"
     assert rows[0]["status"] == 422
 
 
@@ -183,10 +212,47 @@ def test_healthy_write_is_not_recorded(probe, api):
     assert _ledger(api) == []
 
 
-def test_failed_read_is_not_recorded(probe, api):
-    """Only MUTATING requests are ledgered — a rejected GET loses no data."""
+def test_failed_read_is_recorded(probe, api):
+    """BUI-707: a rejected GET now lands in the ledger too.
+
+    BUI-601 originally carved GETs out entirely (a rejected GET "returns its
+    error to the caller and loses no data"), but ~65 advisory-read 400s in
+    one incident left no trace anywhere and had to be reconstructed from a
+    session transcript (BUI-698) — so read failures are worth the same
+    diagnostic record write failures already get.
+    """
     assert probe.get("/probe/get404").status_code == 404
+    rows = [x for x in _ledger(api) if x["path"] == "/probe/get404"]
+    assert len(rows) == 1
+    assert rows[0]["method"] == "GET"
+    assert rows[0]["status"] == 404
+    assert "a read, not a write" in rows[0]["detail"]
+
+
+def test_healthy_get_is_not_recorded_and_response_is_untouched(probe, api):
+    """HARD CONSTRAINT: successful GET behaviour stays byte-identical.
+
+    A 2xx GET must never be recorded (the ledger records failures only,
+    regardless of method — see `_LEDGER_METHODS`'s BUI-707 comment on
+    volume), and the response the client receives must be the exact object
+    `original()` produced, not something rebuilt by the wrapper.
+    """
+    r = probe.get("/probe/get200")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
     assert _ledger(api) == []
+
+
+def test_get_unhandled_exception_is_recorded(probe, api):
+    """A GET handler that raises (not just returns 4xx) is recorded too, with
+    the client-visible status — the same trap `_ledger_classify_exception`
+    exists for on the write side."""
+    assert probe.get("/probe/getboom").status_code == 500
+    rows = [x for x in _ledger(api) if x["path"] == "/probe/getboom"]
+    assert len(rows) == 1
+    assert rows[0]["method"] == "GET"
+    assert rows[0]["status"] == 500
+    assert "RuntimeError" in rows[0]["detail"]
 
 
 def test_query_string_is_recorded(probe, api):
@@ -238,6 +304,29 @@ def test_ledger_write_failure_leaves_the_response_untouched(probe, api, caplog):
     assert healthy.json() == {"ok": True}
     # Nothing was persisted, and the failure was surfaced in the log rather
     # than swallowed silently.
+    assert _ledger(api) == []
+    assert any(
+        "rejected-writes ledger failed to record" in r.message for r in caplog.records
+    )
+
+
+def test_ledger_write_failure_leaves_a_failed_get_untouched(probe, api, caplog):
+    """The GET counterpart of `test_ledger_write_failure_leaves_the_response_
+    untouched`. BUI-707 put every dashboard read through this wrapper, so a
+    broken ledger must degrade to a log line here too — not to a 500 in
+    place of a 404, and not to any change in a healthy GET.
+    """
+    def _explode(*a, **kw):
+        raise sqlite3.OperationalError("no such table: rejected_writes")
+
+    with patch("gixen_overlay.ledger.record_rejected_write", side_effect=_explode):
+        rejected = probe.get("/probe/get404")
+        healthy = probe.get("/probe/get200")
+
+    assert rejected.status_code == 404
+    assert rejected.json() == {"detail": "a read, not a write"}
+    assert healthy.status_code == 200
+    assert healthy.json() == {"ok": True}
     assert _ledger(api) == []
     assert any(
         "rejected-writes ledger failed to record" in r.message for r in caplog.records

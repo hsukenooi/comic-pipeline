@@ -50,7 +50,17 @@ logger = logging.getLogger(__name__)
 # "four un-persisted 422 sites" (there are 16 in that file today) is an
 # argument FOR the generic mechanism rather than a list to work through.
 
-_LEDGER_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# BUI-707: GET joined this set — a rejected read now lands in the ledger too
+# (previously only mutations did; see `test_failed_read_is_not_recorded`'s
+# BUI-698 motivation, where ~65 advisory-read 400s left no trace). Recording
+# is gated purely on outcome (exception, or status >= 400 — see
+# `ledger_handler` below), never on method, so widening this set changes
+# nothing about *how* a request is recorded, only *which methods are eligible
+# to be*. No route in this plugin currently registers a method outside this
+# set; it stays a closed list rather than "every method" so a future
+# HEAD/OPTIONS route is passed through unrecorded until someone decides it
+# belongs here, instead of silently inheriting ledger behaviour.
+_LEDGER_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _LEDGER_MAX_PAYLOAD_CHARS = 2000
 _LEDGER_MAX_DETAIL_CHARS = 1000
 # Above this, don't even attempt a JSON parse for redaction — parsing an
@@ -293,14 +303,24 @@ async def _ledger_record_safely(
 
 
 class LedgerRoute(APIRoute):
-    """Persist every 4xx/5xx on a mutating overlay request (BUI-601).
+    """Persist every 4xx/5xx on an overlay request (BUI-601; GETs BUI-707).
 
     HARD CONSTRAINT: recording must never change what the client gets.
     Exceptions are re-raised unchanged with a bare `raise`; successful
-    responses are returned as the identical object; and the recording itself
-    is wrapped so that a broken ledger (locked DB, full disk, missing table
-    on a version-skewed deploy) degrades to a log line instead of converting
-    a working request into a 500.
+    responses — GET included — are returned as the identical object; and the
+    recording itself is wrapped so that a broken ledger (locked DB, full
+    disk, missing table on a version-skewed deploy) degrades to a log line
+    instead of converting a working request into a 500.
+
+    GETs were carved out at BUI-601 and added back at BUI-707: the dashboard
+    polls several GET endpoints every few seconds, but this route only ever
+    records on `>= 400` or a raised exception (see below) — a healthy poll
+    was never recorded before and still never is, so the added volume is
+    bounded by how often a *rejected* GET actually happens, not by poll
+    frequency. A GET that fails the same way on every poll (e.g. a 404 every
+    5s) rides the SAME `rejected_writes` table and its existing age + row
+    count cap (`db._prune_rejected_writes`) as a retried failing write
+    already does — no new throttling was added for this.
     """
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
@@ -308,9 +328,9 @@ class LedgerRoute(APIRoute):
 
         async def ledger_handler(request: Request) -> Response:
             if request.method not in _LEDGER_METHODS:
-                # Reads are out of scope: a rejected GET returns its error to
-                # the caller and loses no data. Short-circuiting keeps the
-                # read path byte-for-byte what it is today.
+                # No route in this plugin uses a method outside
+                # _LEDGER_METHODS today; if one ever does, it is passed
+                # through unrecorded rather than guessed at.
                 return await original(request)
             try:
                 response = await original(request)
