@@ -2575,24 +2575,64 @@ def _resolve_comic_id(
     on None (wrong/unknown book) versus 200 + [] on an empty result (a known
     book we simply have no rows for yet). Same resolution shape as
     `list_comics` (case-insensitive title match, optional year).
+
+    BUI-698: when a `year` is supplied but no row matches it exactly, falls
+    back to a YEARLESS placeholder row for the same (title, issue) before
+    giving up. This mirrors `upsert_comic`'s own reconciliation rule — a
+    yearless row IS the same book as a later-yeared write, just "not yet
+    promoted" (see its docstring's "Yeared insert finds an existing yearless
+    row... promotes it"). Confirmed live: a 2026-08-07 FMV run 400'd
+    `title=Invincible&issue=77&year=2011` at 05:25:45 because comic_id 743
+    was still yearless at that instant — `fmv_history` shows it was promoted
+    to year=2011 by a live fetch at 09:57:42, almost 4.5 hours later. Without
+    this fallback, the READ path 400s on exactly the book the WRITE path
+    already considers resolved, for as long as the placeholder sits
+    unpromoted — which BUI-663's advisory caller hits routinely, since it
+    fires precisely when a live fetch (the thing that promotes the row) has
+    just failed.
+
+    Guarded against cross-volume ambiguity (mirrors `upsert_comic`'s PER-104
+    guard): the fallback only fires when the yearless row is the SOLE
+    candidate for (title, issue). If a yeared row already exists at a
+    DIFFERENT year, the yearless row might belong to THAT volume instead —
+    resolving to it would silently answer with the wrong book, which is worse
+    than the 400 it replaces. In that case resolution still fails (None).
     """
     if comic_id is not None:
         row = conn.execute(
             "SELECT id FROM comics WHERE id=?", (comic_id,)
         ).fetchone()
         return row["id"] if row is not None else None
-    if title is not None and issue is not None:
-        clauses = ["LOWER(title) = LOWER(?)", "issue = ?"]
-        params: list[Any] = [title, issue]
-        if year is not None:
-            clauses.append("year = ?")
-            params.append(year)
-        row = conn.execute(
-            f"SELECT id FROM comics WHERE {' AND '.join(clauses)} LIMIT 1",
-            params,
-        ).fetchone()
-        return row["id"] if row is not None else None
-    return None
+    if title is None or issue is None:
+        return None
+    clauses = ["LOWER(title) = LOWER(?)", "issue = ?"]
+    params: list[Any] = [title, issue]
+    if year is not None:
+        clauses.append("year = ?")
+        params.append(year)
+    row = conn.execute(
+        f"SELECT id FROM comics WHERE {' AND '.join(clauses)} LIMIT 1",
+        params,
+    ).fetchone()
+    if row is not None:
+        return row["id"]
+    if year is None:
+        return None
+    # BUI-698 fallback: no exact-year match. Only resolve onto a yearless
+    # placeholder when it is the sole candidate for this (title, issue).
+    other_yeared = conn.execute(
+        "SELECT 1 FROM comics WHERE LOWER(title) = LOWER(?) AND issue = ? "
+        "AND year IS NOT NULL LIMIT 1",
+        (title, issue),
+    ).fetchone()
+    if other_yeared is not None:
+        return None
+    row = conn.execute(
+        "SELECT id FROM comics WHERE LOWER(title) = LOWER(?) AND issue = ? "
+        "AND year IS NULL LIMIT 1",
+        (title, issue),
+    ).fetchone()
+    return row["id"] if row is not None else None
 
 
 def get_comps(
@@ -2612,10 +2652,13 @@ def get_comps(
     `observed_at`.
 
     Identity: `comic_id`, or `(title, issue[, year])` — see
-    `_resolve_comic_id`. Returns None when the identity is unresolvable (the
-    route 400s); returns [] when it resolves to a real book with no comps on
-    file (the route 200s) — "no comps" must never be confusable with "wrong
-    book."
+    `_resolve_comic_id`, which as of BUI-698 also falls back onto an
+    unambiguous yearless placeholder row when a `year` is supplied but no
+    exact-year match exists. Returns None when the identity is unresolvable
+    (the route 400s); returns [] when it resolves to a real book with no
+    comps on file (the route 200s) — "no comps" must never be confusable with
+    "wrong book." The None-vs-[] contract itself is unchanged by BUI-698;
+    only which identities count as "resolved" grew slightly less strict.
 
     `days` filters on `observed_at` (when the comp was fetched), never
     `first_seen_at` (when this row was first written to the ledger) — a

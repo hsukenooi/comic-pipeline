@@ -513,6 +513,29 @@ async def api_comics_comps(
     moves 0 of 483 pools and a 90d cutoff moves 3, all UPWARD. The measured
     hazard of a stale ledger price is pool THINNESS, not price drift, so the
     caller gates on pool depth and passes no `days` at all.
+
+    **BUI-698 (2026-08-08):** a 2026-08-07 run saw ~70 of these advisory
+    reads 400 (only 6 produced a band). Root cause was two-fold, both fixed
+    without touching the 400-vs-200-empty-list contract above:
+
+    1. Most failures were books never yet priced — genuinely unresolvable,
+       400-by-design, exactly BUI-663's documented tradeoff. That half is
+       NOT a bug; it is the sanctioned caller discovering, correctly, that
+       the ledger has nothing on this book yet.
+    2. A real minority WERE a bug: `_resolve_comic_id` required an exact
+       `year` match and had no fallback onto a YEARLESS placeholder row for
+       the same (title, issue) — even though `upsert_comic` (the write side)
+       treats that placeholder as the identical book, just not yet promoted.
+       A book archived yearless therefore 400'd on this read the instant a
+       caller supplied a year, which is the common case. `_resolve_comic_id`
+       now falls back to the yearless row when it is the sole candidate for
+       (title, issue) — see its docstring for the confirmed live timeline
+       (comic_id 743 400'd at 05:25:45, promoted to yeared at 09:57:42).
+
+    Because case 1 is expected steady-state for the sanctioned caller, NOT
+    a fetch failure, `_fetch_ledger_comps` (BUI-698) stopped logging it as
+    one — this endpoint still 400s exactly as before; only the caller's
+    noise changed.
     """
     db = request.app.state.db
     rows = get_comps(
