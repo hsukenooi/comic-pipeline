@@ -854,7 +854,8 @@ def _fetch_comps(books: list[dict], *, force: bool,
 
 
 def _get_json_or_warn(url: str, *, params: dict, warn: str, default,
-                      timeout: int = 15):
+                      timeout: int = 15,
+                      quiet_statuses: frozenset[int] = frozenset()):
     """GET `url` and return parsed JSON, or `default` on any failure.
 
     The shared soft-fail HTTP shape for the comics-server read helpers
@@ -862,6 +863,20 @@ def _get_json_or_warn(url: str, *, params: dict, warn: str, default,
     non-JSON body warns to stderr (`Warning: {warn}: {err}`) and returns
     `default`, so the caller degrades gracefully (prices as if the lookup found
     nothing) rather than raising.
+
+    `quiet_statuses` (BUI-698): HTTP status codes that still return `default`
+    but WITHOUT the `Warning:` line. For most callers every HTTP error is
+    equally surprising and should warn. `_fetch_ledger_comps` is the
+    exception: its endpoint 400s BY DESIGN for a book the ledger has never
+    seen yet (see `_resolve_comic_id`'s None-vs-[] contract), which is the
+    ROUTINE case for that caller — it only runs after a live fetch has
+    already failed, i.e. exactly when a book is least likely to be archived
+    yet. A run with dozens of such books printed dozens of "Warning: ...
+    failed: 400 Client Error" lines that read as broken infrastructure when
+    the outage was actually elsewhere (BUI-698's postmortem). Every OTHER
+    failure — timeout, connection error, a non-quiet HTTP status, malformed
+    JSON — still warns exactly as before; this mutes only a status a caller
+    has explicitly named as unsurprising.
     """
     try:
         resp = requests.get(url, params=params, timeout=timeout)
@@ -875,6 +890,16 @@ def _get_json_or_warn(url: str, *, params: dict, warn: str, default,
         # FIRST, before the generic RequestException handler below, or the
         # decode case would be swallowed there with a less specific message.
         click.echo(f"Warning: {warn}: invalid JSON response", err=True)
+        return default
+    except requests.exceptions.HTTPError as e:
+        # More specific than the generic RequestException handler below, so
+        # it must come first (HTTPError subclasses RequestException) — the
+        # only way to inspect the status code and decide whether this
+        # particular failure is one the caller pre-declared as quiet.
+        status = e.response.status_code if e.response is not None else None
+        if status in quiet_statuses:
+            return default
+        click.echo(f"Warning: {warn}: {e}", err=True)
         return default
     except requests.RequestException as e:
         click.echo(f"Warning: {warn}: {e}", err=True)
@@ -1061,8 +1086,21 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
     `fetch-err` row it would have emitted if this function did not exist. A
     failed ledger read therefore degrades to the pre-BUI-663 behaviour exactly
     — it cannot produce a silent no-price that looks like something else,
-    because the no-price outcome IS the fetch-err. `_get_json_or_warn` still
-    warns to stderr, so the read failure is visible, not swallowed.
+    because the no-price outcome IS the fetch-err.
+
+    BUI-698: a 400 (unresolvable identity) is passed as a `quiet_status` —
+    `_get_json_or_warn` still returns `default` for it, but prints no
+    `Warning:` line. This is the ROUTINE outcome for this ONE caller, not a
+    surprise: it only runs after both sold-comps providers have already
+    failed for a book, i.e. exactly when that book is least likely to be
+    archived in the ledger yet. A 2026-08-07 run hit this ~65 times in one
+    batch and every one printed "Warning: ... failed: 400 Client Error", each
+    indistinguishable from a real infrastructure problem — which is what
+    made the genuine outage that day look far worse than it was. Every OTHER
+    failure mode (timeout, connection refused, 5xx, malformed JSON) still
+    warns exactly as before — `_get_json_or_warn` still returns `default` for
+    those too, so the read failure is visible, not swallowed; only the one
+    status this caller can explain away goes quiet.
 
     Identity: `(title, issue[, year])`, the same resolution `/api/comics` uses
     (`_resolve_comic_id`). `requests` drops a None-valued param, so a book with
@@ -1095,6 +1133,11 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
               "— falling back to a plain fetch-err for this book"),
         default=None,
         timeout=LEDGER_ADVISORY_TIMEOUT_SECONDS,
+        # BUI-698: a 400 here means "the ledger has never seen this book" —
+        # the expected, designed-for outcome for this caller (see docstring),
+        # not evidence the read itself is broken. Every other failure still
+        # warns.
+        quiet_statuses=frozenset({400}),
     )
     if not isinstance(rows, list):
         return None

@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gixen_overlay.db import create_tables, upsert_comic, upsert_comps
+from gixen_overlay.db import create_tables, get_comps, upsert_comic, upsert_comps
 
 # `api` fixture: see conftest.py (BUI-630 de-duplicated the three hand-copies).
 
@@ -522,6 +522,57 @@ def test_get_comps_unresolvable_title_issue_400s(api):
 def test_get_comps_no_identity_supplied_400s(api):
     r = api.get("/api/comics/comps")
     assert r.status_code == 400
+
+
+def test_get_comps_resolves_yearless_placeholder_when_year_supplied(api):
+    """BUI-698: a comics row can sit YEARLESS for a while — `upsert_comic`
+    (the write side) treats it as the same book a later yeared write
+    "promotes" in place. Before this fix, `_resolve_comic_id`'s exact-year
+    match had no such fallback, so a caller supplying a year (comic-fmv's
+    `_fetch_ledger_comps` almost always does) 400'd on a book the ledger
+    genuinely already had data for. Confirmed live for Invincible #77
+    (comic_id 743 on the production DB): 400 at 05:25:45 on 2026-08-07,
+    promoted to year=2011 by a live fetch at 09:57:42 that same run — this
+    test reproduces that exact query shape (title, issue as str, year as
+    int, pool=raw, limit=200, the params `_fetch_ledger_comps` sends)."""
+    comic_id = _create_comic(api, title="Invincible", issue="77", year=None)
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id, "comps": [_comp(title="Invincible #77")],
+    })
+    r = api.get("/api/comics/comps", params={
+        "title": "Invincible", "issue": "77", "year": 2011,
+        "pool": "raw", "limit": 200,
+    })
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["comic_id"] == comic_id
+
+
+def test_get_comps_yearless_fallback_still_declines_pure_mismatch(api):
+    """Sanity floor: the fallback only rescues a YEARLESS placeholder — a
+    book that plain doesn't exist (no row at all, yearless or otherwise)
+    must still 400, exactly as before."""
+    r = api.get("/api/comics/comps", params={
+        "title": "Never Fetched Series", "issue": "1", "year": 2020,
+    })
+    assert r.status_code == 400
+
+
+def test_get_comps_yearless_fallback_declines_with_conflicting_yeared_sibling(db):
+    """DB-layer: if a YEARED sibling already exists at a DIFFERENT year, the
+    fallback must NOT resolve onto an unrelated yearless row — it might
+    belong to that other volume instead, and resolving onto it would
+    silently answer with the wrong book (worse than the 400 it would
+    otherwise replace). Constructed via raw SQL because `upsert_comic`'s own
+    write-side reconciliation (PER-104) never lets this exact state arise
+    through its own API — the read path must still defend against it, since
+    older historical data can predate that guard."""
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', 1963)")
+    db.execute("INSERT INTO comics (title, issue, year) VALUES ('X-Men', '1', NULL)")
+    db.commit()
+    rows = get_comps(db, title="X-Men", issue="1", year=1991)
+    assert rows is None
 
 
 def test_get_comps_known_book_with_no_comps_returns_empty_list(api):

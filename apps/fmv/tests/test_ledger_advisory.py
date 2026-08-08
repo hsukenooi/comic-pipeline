@@ -112,23 +112,31 @@ def _book(title="Fantastic Four", issue="46", year=1963, grade=8.0):
             "item_id": "12345"}
 
 
-def _ledger_get(payload, *, status_ok=True):
+def _ledger_get(payload, *, status_ok=True, status_code=400):
     """A `requests.get` double returning one JSON payload — the transport
-    boundary, and the only thing mocked. Everything above it is real."""
+    boundary, and the only thing mocked. Everything above it is real.
+
+    `status_code` (BUI-698) is carried on the mocked response and attached to
+    the raised `HTTPError` via `response=resp`, matching real `requests`
+    behaviour — needed so `_get_json_or_warn`'s `quiet_statuses` check (which
+    reads `e.response.status_code`) has something real to inspect.
+    """
     resp = MagicMock()
     resp.json.return_value = payload
+    resp.status_code = status_code if not status_ok else 200
     if not status_ok:
         import requests
-        resp.raise_for_status.side_effect = requests.exceptions.HTTPError("400")
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            str(status_code), response=resp)
     return MagicMock(return_value=resp)
 
 
 def _price_with_ledger(payload, *, server_url, book=None, status_ok=True,
-                       result=None):
+                       status_code=400, result=None):
     """Run the real degraded-mode path with the ledger returning `payload`."""
     book = book or _book()
-    with patch("fmv_runner.requests.get", _ledger_get(payload,
-                                                      status_ok=status_ok)), \
+    with patch("fmv_runner.requests.get",
+              _ledger_get(payload, status_ok=status_ok, status_code=status_code)), \
             patch("fmv_runner._upsert_fmv") as upsert_mock, \
             patch("fmv_runner._post_comps", return_value=None):
         out = fmv_runner._compute_and_upsert_one(
@@ -366,6 +374,63 @@ class TestLedgerReadFailuresDegradeToFetchErr:
             fmv_runner._fetch_ledger_comps(
                 server_url, title="X-Men", issue=None, year=1963)
         get_mock.assert_not_called()
+
+
+# ─── BUI-698: an unresolvable-identity 400 is expected, not alarming ─────────
+#
+# During the 2026-08-07 outage, ~65 of these advisory reads 400'd because the
+# ledger had never seen the book yet — the designed-for outcome for THIS
+# caller (it only runs after both providers have already failed, i.e. when a
+# book is least likely to be archived). Every one printed the same
+# `Warning: ... failed: 400 Client Error` line a genuine read failure would,
+# making a routine "no data yet" result indistinguishable from a broken
+# server. `_get_json_or_warn`'s `quiet_statuses={400}` (set in
+# `_fetch_ledger_comps`) fixes the noise without touching the route's
+# None-vs-[] 400 contract — the read still degrades to the ordinary fetch-err
+# exactly as before, it just stops LOOKING like a failure of the read itself.
+
+class TestUnresolvableIdentityIsQuiet:
+    def test_400_prints_no_warning(self, server_url, capsys):
+        out, _ = _price_with_ledger([], server_url=server_url, status_ok=False,
+                                    status_code=400)
+        assert out["source"] == "error"  # still degrades to the honest fetch-err
+        assert out["fmv"] is None
+        err = capsys.readouterr().err
+        assert "comps-ledger advisory read failed" not in err
+
+    def test_400_via_the_raw_helper_returns_default_quietly(self, server_url,
+                                                             capsys):
+        """Same assertion, one layer down — directly against
+        `_fetch_ledger_comps`, the one sanctioned caller `quiet_statuses` is
+        set on."""
+        with patch("fmv_runner.requests.get",
+                  _ledger_get([], status_ok=False, status_code=400)):
+            rows = fmv_runner._fetch_ledger_comps(
+                server_url, title="Fantastic Four", issue="46", year=1963)
+        assert rows is None
+        assert capsys.readouterr().err == ""
+
+    def test_other_http_statuses_still_warn(self, server_url, capsys):
+        """The mute is scoped to 400 only — a 500 (or any other status) is
+        still a genuine surprise and must still warn."""
+        out, _ = _price_with_ledger([], server_url=server_url, status_ok=False,
+                                    status_code=500)
+        assert out["source"] == "error"
+        err = capsys.readouterr().err
+        assert "comps-ledger advisory read failed" in err
+
+    def test_transport_failure_still_warns(self, server_url, capsys):
+        """A connection error is not a resolvability question — still noisy,
+        exactly as before."""
+        import requests
+        with patch("fmv_runner.requests.get",
+                  side_effect=requests.exceptions.ConnectionError("down")), \
+                patch("fmv_runner._upsert_fmv"), \
+                patch("fmv_runner._post_comps", return_value=None):
+            fmv_runner._compute_and_upsert_one(
+                _all_tiers_failed(), _book(), server_url=server_url)
+        err = capsys.readouterr().err
+        assert "comps-ledger advisory read failed" in err
 
 
 # ─── The wire contract of the read ────────────────────────────────────────────

@@ -449,6 +449,22 @@ def test_get_fmv_history_no_identity_supplied_400s(api):
     assert r.status_code == 400
 
 
+def test_get_fmv_history_resolves_yearless_placeholder_when_year_supplied(api):
+    """BUI-698: `_resolve_comic_id` is shared with `get_comps` — see that
+    endpoint's own tests in test_comps_ledger.py for the full rationale and
+    the confirmed live incident. Pinned here too so this endpoint cannot
+    silently regress if the shared helper ever gets split."""
+    data = _create_comic(api, title="Invincible", issue="77", year=None,
+                         grade=9.2, fmv_low=60.0, fmv_high=80.0)
+    r = api.get("/api/comics/fmv-history", params={
+        "title": "Invincible", "issue": "77", "year": 2011,
+    })
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["comic_id"] == data["comic_id"]
+
+
 def test_get_fmv_history_known_book_with_no_history_returns_empty_list(api):
     """A known book with no history rows must 200 with [] — never 400. 'No
     history' and 'wrong book' are distinguishable states."""
