@@ -392,6 +392,46 @@ def test_snipe_add_documents_updated_status():
     )
 
 
+def test_snipe_add_documents_indeterminate_status_and_remediation():
+    """BUI-697: `add-batch` gained STATUS_INDETERMINATE — a client-side
+    timeout, which is NOT evidence the bid failed to land. A skill that
+    renders it as a failure re-creates the incident that produced it: on
+    2026-08-07 a timed-out (reported-`failed`) write was treated as dead, the
+    queue file was edited underneath it, and the stale write committed
+    overnight, putting ASM #61 live at $1.09 instead of $20.
+
+    Scoped to the "Status values:" LINE for the enumeration, same as
+    test_snipe_add_documents_updated_status and for the same reason (a
+    whole-document membership check would pass against the very drift it
+    claims to catch), plus a document-level check on the one action that
+    turns this status into a money error: taking a dependent action before
+    re-reading live state.
+    """
+    doc = (SKILLS_DIR / "snipe-add.md").read_text()
+    status_lines = [ln for ln in doc.splitlines() if ln.startswith("Status values:")]
+    assert len(status_lines) == 1, (
+        f"expected exactly one 'Status values:' line in snipe-add.md, found "
+        f"{len(status_lines)} — this test's anchor has drifted"
+    )
+    assert "❓ Indeterminate" in status_lines[0], (
+        "snipe-add.md's Output status-values line omits ❓ Indeterminate, a "
+        "status `gixen add-batch` can print (STATUS_INDETERMINATE, BUI-697)"
+    )
+    assert "Handling an indeterminate row" in doc, (
+        "snipe-add.md must document what to do with an indeterminate row — "
+        "the status is useless if the operator has no remediation for it"
+    )
+    assert "**It is not a failure.**" in doc, (
+        "snipe-add.md must say outright that an indeterminate row is not a "
+        "failure; that misreading is what caused the BUI-697 money error"
+    )
+    assert "Re-read live state" in doc, (
+        "snipe-add.md must tell the operator to re-read live state before any "
+        "dependent action on an indeterminate row (re-add/edit/remove, or "
+        "editing the rows file that produced it)"
+    )
+
+
 def test_endpoint_names_are_provider_neutral():
     """CLAUDE.md invariant: comics endpoints are provider-neutral — never
     /api/comics/locg/*. A drift here would leak the provider into the URL the

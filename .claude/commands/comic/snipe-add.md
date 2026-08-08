@@ -236,7 +236,7 @@ gixen list
 | 5 | Daredevil #181 | 333333333 | $140 | 🔄 Updated |
 ```
 
-Status values: `✅ Added`, `🔄 Updated`, `❌ Failed (<reason> — not added)`, `🚫 Blocked (<reason> — not added)` (a policy check's `POLICY_BLOCK_<CODE>` flag is on — see § Handling Policy Advisories), `⏭️ Skipped (BIN)`, and `⏸️ Not attempted` for items after a batch-halting failure. End with an added/updated/failed/blocked/remaining count.
+Status values: `✅ Added`, `🔄 Updated`, `❌ Failed (<reason> — not added)`, `🚫 Blocked (<reason> — not added)` (a policy check's `POLICY_BLOCK_<CODE>` flag is on — see § Handling Policy Advisories), `❓ Indeterminate (<reason>)` (BUI-697 — the add call timed out and the reconcile could not confirm it either way; see § Handling an indeterminate row), `⏭️ Skipped (BIN)`, and `⏸️ Not attempted` for items after a batch-halting failure. End with an added/updated/failed/blocked/indeterminate/remaining count.
 
 `🔄 Updated` is a **success**, not a partial one: the add landed on an item that already had a PENDING snipe, so `POST /api/bids` upserted the existing row instead of creating a new one (`created: false`, BUI-67). It counts toward the batch's success total exactly as `✅ Added` does — it never contributes to the non-zero exit code, and like `✅ Added` it is one of the only two statuses the `--verify` pass runs against. Treat a run of `🔄 Updated` rows as a clean re-add of snipes you already had, not as something to remediate. The full row-status contract is `docs/solutions/conventions/add-batch-row-status-contract.md`.
 
@@ -266,6 +266,20 @@ For a **block** (`🚫 Blocked` — unlike an advisory, **the write did not land
    - Lower the max bid and re-add if the block was bid-driven (e.g. `over_fmv`), or clear whatever condition the check flagged (link the correct FMV, resolve a duplicate, etc.) and re-add.
    - To deliberately commit past the block instead, use the same bypass an advisory never needed: `gixen add`/`gixen edit --ack-policy` for a single item, or a per-row `"policy_bypass": true` in an add-batch ROWS_FILE — a conscious, user-made override, not an automated one.
 4. Confirm the retry actually landed (`✅ Added`/`🔄 Updated`) before moving on — a block that recurs after a bid-lowering retry means the check is still failing, not that the retry itself failed.
+
+## Handling an indeterminate row (BUI-697)
+
+`❓ Indeterminate` means the CLI's request **timed out** and the end-of-batch reconcile against `/api/comics/snipes` still could not confirm the outcome. **It is not a failure.** The comics server keeps working past the CLI's read deadline and frequently commits the write anyway — on 2026-08-07 a 36-row batch reported 36/36 "failed" while 11 had landed, and the 25-row retry reported all-failed while all 25 landed.
+
+Treating an indeterminate row as dead is what cost real money once: a timed-out write was assumed not to have happened, the queue file was edited underneath it, and the stale write committed overnight (ASM #61 went live at $1.09 instead of the instructed $20).
+
+So, for every `❓ Indeterminate` row, in this order:
+
+1. **Do nothing else to that item first.** No re-add, no `gixen edit`, no `gixen remove`, and no editing the rows file it came from — every one of those is a dependent action on an unknown state.
+2. **Re-read live state** — `gixen list` (or `GET /api/comics/snipes`). That is the only thing that can settle it. `rows[].reconcile` in the JSON summary records what the automatic reconcile saw (`found: false` = not live at that moment; `checked: false` = the reconcile call itself failed, so it saw nothing at all).
+3. **Then act on what you actually see:** live at your intended max bid → it landed, nothing to do (its FMV link was already attempted). Live at a *different* max bid → an earlier write won; decide which amount you want and `gixen edit` to it. Absent → re-add it.
+
+`POST /api/bids` upserts on `item_id` (BUI-67), so a re-add after step 2 cannot create a duplicate — but do step 2 anyway, because it is what tells you which amount is live.
 
 ## Editing Existing Snipes
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import math
 import os
 import re
 import subprocess
@@ -32,10 +33,12 @@ from record_win_prep import RecordWinPrepError, build_payload
 from add_batch import (
     AddBatchError,
     BatchOutcome,
+    RECONCILE_SETTLE_SECONDS,
     RowResult,
     STATUS_ADDED,
     STATUS_BLOCKED,
     STATUS_FAILED,
+    STATUS_INDETERMINATE,
     STATUS_NOT_ATTEMPTED,
     STATUS_UPDATED,
     advisories_from_response,
@@ -110,7 +113,51 @@ def _server_url() -> str | None:
     return url.rstrip("/") or None
 
 
-_DEFAULT_SERVER_TIMEOUT = 15  # seconds
+# BUI-697: raised from 15s. 15 was below the comics server's own worst-case
+# CLI→server→Gixen chain: `GixenClient(timeout=15.0)` is a SEPARATE, inner
+# timeout, so a slow Gixen could consume this entire outer budget and fire it
+# while the write was still in flight. A bigger budget makes that rarer — it
+# does NOT make it impossible (a stalled transfer can exceed any bound), which
+# is why `add_batch.reconcile_indeterminate_rows` exists and is the actual fix.
+_DEFAULT_SERVER_TIMEOUT = 60  # seconds
+_SERVER_TIMEOUT_ENV = "COMICS_SERVER_TIMEOUT"
+_RECONCILE_SETTLE_ENV = "ADD_BATCH_SETTLE_SECONDS"
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    """Read a float from the environment, falling back to `default` for an
+    unset, unparseable, non-finite, or below-`minimum` value. Deliberately
+    fail-safe rather than fail-loud, matching this system's existing
+    `POLICY_BLOCK_*` parse convention: a typo must land on the safe default,
+    never on a degenerate one (an accidental `0` timeout must not mean "wait
+    forever"). Read per call, never cached at import (KTD2), so an operator
+    can change it without a reinstall."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not math.isfinite(value) or value < minimum:
+        return default
+    return value
+
+
+def _server_timeout() -> float:
+    """The CLI→comics-server read timeout, overridable via
+    `COMICS_SERVER_TIMEOUT` (seconds)."""
+    # minimum is a positive epsilon, not 0: a 0/negative timeout would be
+    # "block forever", which is strictly worse than the value it replaced.
+    return _env_float(_SERVER_TIMEOUT_ENV, _DEFAULT_SERVER_TIMEOUT, minimum=0.001)
+
+
+def _reconcile_settle_seconds() -> float:
+    """How long `add-batch` lets an in-flight write settle before its BUI-697
+    reconcile read, overridable via `ADD_BATCH_SETTLE_SECONDS`. Unlike the
+    timeout above, 0 IS a legitimate value (read back immediately) — the
+    reconcile itself, not the wait, is what makes the report honest."""
+    return _env_float(_RECONCILE_SETTLE_ENV, RECONCILE_SETTLE_SECONDS, minimum=0.0)
 
 
 def _server_request_result(method: str, path: str, **kwargs) -> tuple[bool, dict | list | None, str | None]:
@@ -121,7 +168,7 @@ def _server_request_result(method: str, path: str, **kwargs) -> tuple[bool, dict
     single row's failure doesn't abort the whole batch process — including a
     sequential batch loop, where a hang or a malformed response must degrade
     to a per-row failure rather than block/crash the whole run."""
-    kwargs.setdefault("timeout", _DEFAULT_SERVER_TIMEOUT)
+    kwargs.setdefault("timeout", _server_timeout())
     url = f"{_server_url()}{path}"
     try:
         resp = getattr(requests, method)(url, **kwargs)
@@ -138,7 +185,18 @@ def _server_request_result(method: str, path: str, **kwargs) -> tuple[bool, dict
     except requests.ConnectionError:
         return False, None, "Server unreachable. Is the comics server running?"
     except requests.Timeout:
-        return False, None, "Server timed out."
+        # BUI-697: a timeout is INDETERMINATE, not a failure. We stopped
+        # waiting; the comics server did not stop working, and it frequently
+        # commits the write afterwards (2026-08-07: 36 rows reported "failed",
+        # 11 had landed; the 25-row retry reported all-failed and all 25
+        # landed). The structured `{"indeterminate": True}` marker rides in
+        # `data` — the same channel BUI-623 uses for `{"blocked": ...}` — so
+        # callers branch on a flag instead of string-matching this message.
+        return (
+            False,
+            {"indeterminate": True, "reason": "timeout"},
+            "Server timed out — the write may still have committed.",
+        )
     except requests.HTTPError as e:
         status_code = "unknown"
         detail = ""
@@ -178,6 +236,17 @@ def _server_request(method: str, path: str, **kwargs) -> dict | list:
             _print_advisories(data.get("advisories") or [])
             sys.exit(1)
         click.echo(f"Error: {error}", err=True)
+        if isinstance(data, dict) and data.get("indeterminate"):
+            # BUI-697: single-item commands still exit 1 here (the caller got
+            # no confirmation), but they must not leave the operator believing
+            # nothing happened — that belief is what let a stale write commit
+            # against an already-edited queue.
+            click.echo(
+                "       This is INDETERMINATE, not a failure: the write may "
+                "have committed anyway. Re-read live state (gixen list) "
+                "before re-adding, editing, or removing this item.",
+                err=True,
+            )
         sys.exit(1)
     return data
 
@@ -584,12 +653,14 @@ _STATUS_ICON = {
     # BUI-623 (U9): distinct icon from Failed — a policy block is not a
     # server/Gixen fault (see add_batch.py's STATUS_BLOCKED comment).
     STATUS_BLOCKED: "🚫 Blocked",
+    # BUI-697: deliberately NOT an ❌ — this row makes no claim either way.
+    STATUS_INDETERMINATE: "❓ Indeterminate",
 }
 
 
 def _add_batch_status_cell(row: dict) -> str:
     label = _STATUS_ICON.get(row["status"], row["status"])
-    if row["status"] in (STATUS_FAILED, STATUS_BLOCKED) and row.get("error"):
+    if row["status"] in (STATUS_FAILED, STATUS_BLOCKED, STATUS_INDETERMINATE) and row.get("error"):
         label = f"{label} ({row['error']})"
     elif row["status"] in (STATUS_ADDED, STATUS_UPDATED) and row.get("link_attempted"):
         if row.get("link_ok"):
@@ -679,7 +750,17 @@ def add_batch_cmd(rows_file: str, verify: bool, json_out: str | None):
     health before the next row. If the server is down, halt the batch and
     report every remaining row as not-attempted — never keep firing adds at
     a dead server, and never print an all-success summary after a failure.
-    Exits non-zero if any row failed or was left not-attempted.
+
+    On a row whose add call TIMED OUT (BUI-697): mark it indeterminate, not
+    failed — the CLI stopped waiting, the comics server did not stop working,
+    and the write often commits anyway. A timeout re-checks server health the
+    same way a failure does. After the batch, every indeterminate row is
+    reconciled against GET /api/comics/snipes (after a short settle wait): a
+    row found live at its own max_bid becomes `updated` and gets its FMV link
+    attempted; anything else stays `indeterminate`, never demoted to failed.
+
+    Exits non-zero if any row failed, was blocked, was left not-attempted, or
+    is still indeterminate after the reconcile.
     """
     server_url = _server_url()
     if not server_url:
@@ -736,7 +817,12 @@ def add_batch_cmd(rows_file: str, verify: bool, json_out: str | None):
         _emit_add_batch_result(outcome, json_out)
         sys.exit(1)
 
-    outcome = run_batch(rows, server_request=_server_request_result, health_check=_health_check)
+    outcome = run_batch(
+        rows,
+        server_request=_server_request_result,
+        health_check=_health_check,
+        settle_seconds=_reconcile_settle_seconds(),
+    )
 
     # Record-add history only for genuine new creates — mirrors `add`'s own
     # BUI-67 rule (an in-place update must not reset the --added-since
@@ -786,10 +872,26 @@ def _emit_add_batch_result(outcome: BatchOutcome, json_out: str | None) -> None:
             # via `outcome.exit_code()`, not this write).
             click.echo(f"warning: could not write --json-out ({json_out}): {e}", err=True)
 
+    # BUI-697: an unresolved-after-reconcile row is the one outcome a reader
+    # is most likely to misread as "it didn't land" — say the opposite out
+    # loud, and name the dependent action (editing the queue) that turned
+    # this misreading into a real-money error on 2026-08-07.
+    summary = outcome.summary()
+    unresolved = summary[STATUS_INDETERMINATE]
+    if unresolved:
+        noun = "row" if unresolved == 1 else "rows"
+        click.echo(
+            f"❓ {unresolved} INDETERMINATE {noun} — the write may have "
+            "committed even though this CLI stopped waiting. Do NOT treat "
+            "these as failed, and do NOT edit/re-add/remove them until you "
+            "have re-read live state (gixen list).",
+            err=True,
+        )
+
     # BUI-621 (U7): an explicit end-of-run count, on every exit path that
     # goes through this function — a batch whose rows all landed but carried
     # advisories must never read as clean just because nothing failed.
-    advisory_count = outcome.summary()["advisories"]
+    advisory_count = summary["advisories"]
     if advisory_count:
         noun = "advisory" if advisory_count == 1 else "advisories"
         click.echo(

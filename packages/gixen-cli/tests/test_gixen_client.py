@@ -1752,7 +1752,35 @@ class TestServerRequestResult:
 
         assert ok is True
         assert data == {"ok": True}
-        assert mock_get.call_args.kwargs["timeout"] == 15
+        # BUI-697: raised 15 -> 60. 15s sat below the CLI→server→Gixen chain's
+        # worst case and fired while writes were still in flight.
+        assert mock_get.call_args.kwargs["timeout"] == 60
+
+    def test_timeout_returns_the_indeterminate_marker(self):
+        """BUI-697: the seam between cli.py and add_batch.py. Every add_batch
+        test hand-rolls this tuple, so this is the one place that proves a
+        real `requests.Timeout` actually produces the structured marker
+        add_batch branches on — a `data=None` here would silently downgrade
+        every timed-out row back to FAILED."""
+        from cli import _server_request_result
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("requests.post", side_effect=requests.Timeout("read timed out")):
+            ok, data, err = _server_request_result("post", "/api/bids", json={})
+
+        assert ok is False
+        assert data == {"indeterminate": True, "reason": "timeout"}
+        assert "may still have committed" in err
+
+    def test_connection_error_is_not_marked_indeterminate(self):
+        """The marker is scoped to timeouts on purpose — a refused connection
+        is a determinate "did not land"."""
+        from cli import _server_request_result
+        with patch("cli._server_url", return_value="http://srv"), \
+             patch("requests.post", side_effect=requests.ConnectionError("refused")):
+            ok, data, err = _server_request_result("post", "/api/bids", json={})
+
+        assert ok is False
+        assert data is None
 
     def test_explicit_timeout_kwarg_is_not_overridden(self):
         from cli import _server_request_result
