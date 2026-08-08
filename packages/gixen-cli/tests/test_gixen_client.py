@@ -181,6 +181,70 @@ def _client():
 
 
 # ---------------------------------------------------------------------------
+# Timeout configuration (BUI-699)
+# ---------------------------------------------------------------------------
+
+class TestClientTimeout:
+    """The 15s default left ~2s of margin on a home_2.php fetch measured at
+    12.95s (2026-08-07 probe). It must be raised with real headroom and be
+    overridable via GIXEN_CLIENT_TIMEOUT without a code change, and that
+    default must actually reach the login/get/post calls that hit
+    home_2.php."""
+
+    def test_default_timeout_has_real_headroom_over_measured_good_case(self):
+        client = GixenClient(username="user", password="pass")
+        # The measured good-case fetch was 12.95s; the default must clear it
+        # with a comfortable margin, not just barely exceed it.
+        assert client.timeout >= 60.0
+
+    def test_client_default_timeout_matches_module_constant(self):
+        """The default flows from the module-level constant into the
+        instance — not a second, independently-drifting literal."""
+        import gixen_client as gc_module
+
+        client = GixenClient(username="user", password="pass")
+        assert client.timeout == gc_module._DEFAULT_TIMEOUT
+
+    def test_env_var_overrides_default_timeout(self, monkeypatch):
+        """Exercises the exact resolution function backing the module-level
+        default (avoids importlib.reload, which mints duplicate exception
+        classes and breaks isinstance/except checks in other test modules
+        that already imported the originals)."""
+        from gixen_client import _default_client_timeout
+
+        monkeypatch.setenv("GIXEN_CLIENT_TIMEOUT", "45")
+        assert _default_client_timeout() == 45.0
+
+    def test_no_env_var_falls_back_to_60s(self, monkeypatch):
+        from gixen_client import _default_client_timeout
+
+        monkeypatch.delenv("GIXEN_CLIENT_TIMEOUT", raising=False)
+        assert _default_client_timeout() == 60.0
+
+    def test_explicit_timeout_kwarg_still_overrides_default(self):
+        client = GixenClient(username="user", password="pass", timeout=5.0)
+        assert client.timeout == 5.0
+
+    @patch("gixen_client.requests.Session")
+    def test_default_timeout_reaches_home_page_get(self, MockSession):
+        """login()/_get_home_page() must pass the client's (raised) timeout
+        through to the underlying session call, not some other constant."""
+        session = MockSession.return_value
+        login_resp = MagicMock()
+        login_resp.text = LOGIN_REDIRECT_HTML
+        session.post.return_value = login_resp
+        home_resp = MagicMock(status_code=200, text="<html>snipes</html>")
+        session.get.return_value = home_resp
+
+        client = GixenClient(username="user", password="pass")
+        client.session = session
+        client._get_home_page()
+
+        assert session.get.call_args.kwargs["timeout"] == client.timeout
+        assert client.timeout >= 60.0
+
+
+# ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------
 
