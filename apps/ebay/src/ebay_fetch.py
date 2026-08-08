@@ -173,6 +173,7 @@ def retry_request(
     network_error_context=None,
     status_retry_message=None,
     on_attempt=None,
+    backoff_seconds=None,
 ):
     """Drive the exponential-backoff retry loop shared by every network call
     in this module.
@@ -213,6 +214,15 @@ def retry_request(
     one is already visible to the caller via this function's normal return
     value / raised exception, so calling the hook there too would double
     report the same charge. Exactly one of `resp`/`exc` is non-None per call.
+
+    BUI-701: `backoff_seconds(attempt, resp, exc)` (optional; default None
+    keeps every pre-existing caller's `2 ** attempt` schedule byte-for-byte
+    unchanged) computes the wait before the next attempt instead of the
+    default. Called with the same `(resp, exc)` shape as `on_attempt` —
+    exactly one of the two is non-None. sold_comps.fetch_sold_comps() passes
+    one so a 429 specifically gets a much longer, jittered wait than an
+    ordinary transient (5xx / network error) gets — see that module's
+    `_sold_comps_backoff_seconds` for why.
     """
     if retries < 1:
         raise ValueError("retries must allow at least one attempt")
@@ -224,7 +234,8 @@ def retry_request(
             if not retry_network_errors:
                 raise
             if attempt < retries - 1:
-                wait = 2 ** attempt
+                wait = (backoff_seconds(attempt, None, exc)
+                        if backoff_seconds is not None else 2 ** attempt)
                 if on_attempt is not None:
                     on_attempt(attempt, None, exc)
                 if network_error_context:
@@ -241,7 +252,8 @@ def retry_request(
             return resp
 
         if attempt < retries - 1:
-            wait = 2 ** attempt
+            wait = (backoff_seconds(attempt, resp, None)
+                    if backoff_seconds is not None else 2 ** attempt)
             if on_attempt is not None:
                 on_attempt(attempt, resp, None)
             if status_retry_message:

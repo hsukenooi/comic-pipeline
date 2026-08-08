@@ -31,6 +31,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -166,10 +167,82 @@ SOLD_COMPS_COUNT = 240
 # pool's recency profile at SerpApi parity.
 SOLD_COMPS_DAYS_TO_SCRAPE = 90
 # sold-comps.com rate-limits at 60 req/min. DEFAULT_MAX_WORKERS books × up to
-# 4 tiers can burst past that on a big batch; this semaphore plus the
-# existing 429-retry/backoff rides the window out without a token bucket.
+# 4 tiers can burst past that on a big batch, and this semaphore ALONE only
+# bounds how many requests are simultaneously IN FLIGHT — it does nothing to
+# stop the DISPATCH rate (4 workers x ~4s responses already lands exactly on
+# the 60 req/min ceiling with zero headroom, which is what let the
+# 2026-08-07 batch tip into a self-reinforcing 429 storm; see the
+# retrospective at docs/retrospectives/2026-08-07-gixen-outage-session.md).
+# BUI-701 closed that gap with _SOLD_COMPS_RATE_LIMITER below, which is now
+# the PRIMARY throttle; this semaphore remains a secondary cap on
+# simultaneous connections, not the thing keeping the batch under the
+# ceiling.
 _SOLD_COMPS_MAX_CONCURRENCY = 4
 _SOLD_COMPS_SEMAPHORE = threading.Semaphore(_SOLD_COMPS_MAX_CONCURRENCY)
+
+# BUI-701: the token bucket the comment above used to admit was missing.
+# 48 req/min (a 1.25s minimum gap between dispatches) buys ~20% headroom
+# below the 60 req/min ceiling — enough to absorb ordinary jitter in
+# response timing without drifting back up to the edge, while still moving
+# a large batch at a reasonable pace (this replaces the manual "4 chunks x
+# 10 books with 45s pauses" workaround proven during the 2026-08-07
+# incident — see fmv.md's "Provider request budget" section).
+_SOLD_COMPS_RATE_LIMIT_PER_MIN = 48.0
+
+
+class _RateLimiter:
+    """Thread-safe inter-request spacing limiter (BUI-701).
+
+    Enforces a minimum wall-clock gap between successive request
+    DISPATCHES — not completions — shared globally across every calling
+    thread, so N concurrent workers collectively cannot exceed
+    `rate_per_min` regardless of _SOLD_COMPS_SEMAPHORE's concurrency
+    ceiling (concurrency bounds how many requests can be in flight at
+    once; this bounds how fast new ones may be sent, independent of how
+    long each one takes to complete).
+
+    Implemented as a "next free slot" leaky bucket: one lock protects a
+    single float (`_next_slot`), and each acquire() reserves its own slot
+    under the lock, then sleeps OUTSIDE the lock for however long remains
+    until that slot arrives. Sleeping outside the lock is load-bearing, not
+    an optimization: a thread that must wait must not block every other
+    thread's ability to compute its OWN slot and start waiting
+    concurrently — only the microseconds-scale bookkeeping (read the
+    current slot, bump it, release) happens under the lock; the
+    potentially seconds-long wait never does.
+
+    This is also why fetch_sold_comps() calls acquire() BEFORE acquiring
+    _SOLD_COMPS_SEMAPHORE, not after, and why the semaphore itself is
+    scoped to only the HTTP call (see _paced_get() there) rather than
+    wrapping the whole retry_request() loop: acquiring the semaphore first
+    would have a paced, sleeping thread sit on one of the four concurrency
+    slots for however long it waits — including a 429's much longer BUI-701
+    backoff — starving the other three workers of a slot they could
+    otherwise be using right now.
+    """
+
+    def __init__(self, rate_per_min: float):
+        self._interval = 60.0 / rate_per_min
+        self._lock = threading.Lock()
+        self._next_slot = 0.0  # monotonic time; 0.0 is always in the past
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_slot)
+            self._next_slot = start + self._interval
+        wait = start - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+
+
+# Module-level singleton, deliberately — like _SOLD_COMPS_SEMAPHORE, pacing
+# must be shared across every caller in this process (run_batch()'s whole
+# ThreadPoolExecutor, any concurrent console-script invocation importing
+# this module), not scoped per-batch. Unlike _CircuitBreaker, there is no
+# per-batch "start clean" need: the rate limiter has no notion of tripped/
+# untripped state to reset, only a next-slot clock that keeps ticking.
+_SOLD_COMPS_RATE_LIMITER = _RateLimiter(_SOLD_COMPS_RATE_LIMIT_PER_MIN)
 
 PROVIDER_SERPAPI = "serpapi"
 PROVIDER_SOLD_COMPS = "sold-comps.com"
@@ -1302,6 +1375,34 @@ def _verify_sold_comps_shape(nkw: str, data: dict) -> None:
         )
 
 
+# BUI-701: a much longer, jittered backoff specifically for a 429 from
+# sold-comps.com. The default retry_request() schedule (2**attempt: 2s/4s/8s)
+# is right for an ordinary transient (a 5xx blip, a network error) but wrong
+# here: sold-comps.com's ceiling is exactly the rate this module dispatches
+# at (see _SOLD_COMPS_RATE_LIMIT_PER_MIN), so a 429 is not noise — it is live
+# evidence the request window is currently saturated. Retrying 2s later lands
+# the retry back in that SAME saturated window; this was the mechanism that
+# turned the 2026-08-07 outage's initial 429s into a self-reinforcing storm
+# that fed itself until the breaker tripped (109 queries short-circuited).
+# This base is sized to comfortably outlast one whole rate-limiter interval
+# many times over (one interval = 60s / 48 req-per-min ~= 1.25s — 15s is
+# >10x that), with up to 50% jitter so the up-to-4 semaphore-holding threads
+# that can all 429 in the same saturated instant don't retry in lockstep and
+# recreate the very burst they're recovering from.
+_SOLD_COMPS_429_BASE_BACKOFF_SEC = 15.0
+
+
+def _sold_comps_backoff_seconds(attempt: int, resp, exc) -> float:
+    """backoff_seconds callback for fetch_sold_comps()'s retry_request() call
+    (BUI-701) — see _SOLD_COMPS_429_BASE_BACKOFF_SEC for why a 429
+    specifically gets a different, longer schedule than everything else
+    (an ordinary 5xx/network transient keeps the shared 2**attempt default)."""
+    if resp is not None and resp.status_code == 429:
+        base = _SOLD_COMPS_429_BASE_BACKOFF_SEC * (2 ** attempt)
+        return base + random.uniform(0, base * 0.5)
+    return float(2 ** attempt)
+
+
 def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
                      ttl_sec: int = DEFAULT_CACHE_TTL_SEC,
                      record_attempt=None,
@@ -1360,19 +1461,34 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
             except requests.exceptions.RequestException as http_exc:
                 record_attempt(f"error:{type(http_exc).__name__}", str(http_exc))
 
-    try:
+    def _paced_get():
+        # BUI-701: pace BEFORE acquiring the semaphore, and scope the
+        # semaphore to only the HTTP call itself — not retry_request()'s
+        # backoff sleep between attempts. A thread waiting on either the
+        # rate limiter or a 429's (now much longer) backoff must not sit on
+        # one of the 4 concurrency slots the whole time it waits, or it
+        # starves the other 3 workers of a slot they could be using right
+        # now. See _RateLimiter's docstring for the same reasoning applied
+        # to its own wait. This also means every RETRY (not just the first
+        # attempt) is itself paced — a retry is a fresh request against the
+        # same ceiling, not exempt from it.
+        _SOLD_COMPS_RATE_LIMITER.acquire()
         with _SOLD_COMPS_SEMAPHORE:
-            resp = retry_request(
-                lambda: requests.get(
-                    canonical,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=SOLD_COMPS_TIMEOUT_SEC,
-                ),
-                retries=FETCH_MAX_RETRIES,
-                is_retryable_status=lambda code: code == 429 or code >= 500,
-                retry_network_errors=True,
-                on_attempt=_on_retry_attempt,
+            return requests.get(
+                canonical,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=SOLD_COMPS_TIMEOUT_SEC,
             )
+
+    try:
+        resp = retry_request(
+            _paced_get,
+            retries=FETCH_MAX_RETRIES,
+            is_retryable_status=lambda code: code == 429 or code >= 500,
+            retry_network_errors=True,
+            on_attempt=_on_retry_attempt,
+            backoff_seconds=_sold_comps_backoff_seconds,
+        )
     except RetryExhausted as exc:
         if exc.network_error is not None:
             if breaker is not None:

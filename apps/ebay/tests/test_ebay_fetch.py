@@ -605,6 +605,63 @@ class TestRetryRequestHelper:
         assert make_request.call_count == 1
         mock_sleep.assert_not_called()
 
+    def test_custom_backoff_seconds_used_for_retryable_status(self):
+        """BUI-701: backoff_seconds(attempt, resp, exc) overrides the
+        default 2**attempt schedule when given — sold_comps.fetch_sold_comps()
+        uses this to give a 429 a much longer wait than a 5xx gets."""
+        rate_limited = MagicMock(status_code=429)
+        ok = MagicMock(status_code=200)
+        make_request = MagicMock(side_effect=[rate_limited, ok])
+        backoff_seconds = MagicMock(return_value=99.5)
+
+        with patch("ebay_fetch.time.sleep") as mock_sleep:
+            resp = ebay_fetch.retry_request(
+                make_request,
+                retries=3,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=False,
+                backoff_seconds=backoff_seconds,
+            )
+        assert resp is ok
+        mock_sleep.assert_called_once_with(99.5)
+        backoff_seconds.assert_called_once_with(0, rate_limited, None)
+
+    def test_custom_backoff_seconds_used_for_network_error(self):
+        exc = requests.exceptions.ConnectionError("timeout")
+        ok = MagicMock(status_code=200)
+        make_request = MagicMock(side_effect=[exc, ok])
+        backoff_seconds = MagicMock(return_value=42.0)
+
+        with patch("ebay_fetch.time.sleep") as mock_sleep:
+            resp = ebay_fetch.retry_request(
+                make_request,
+                retries=3,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=True,
+                backoff_seconds=backoff_seconds,
+            )
+        assert resp is ok
+        mock_sleep.assert_called_once_with(42.0)
+        backoff_seconds.assert_called_once_with(0, None, exc)
+
+    def test_backoff_seconds_none_keeps_default_schedule(self):
+        """Explicit regression guard: every pre-existing caller passes no
+        backoff_seconds at all, and this proves the default path is
+        unchanged (2**attempt) rather than merely "not crashing"."""
+        rate_limited = MagicMock(status_code=429)
+        ok = MagicMock(status_code=200)
+        make_request = MagicMock(side_effect=[rate_limited, rate_limited, ok])
+
+        with patch("ebay_fetch.time.sleep") as mock_sleep:
+            ebay_fetch.retry_request(
+                make_request,
+                retries=3,
+                is_retryable_status=lambda code: code == 429,
+                retry_network_errors=False,
+            )
+        mock_sleep.assert_any_call(1)  # 2**0
+        mock_sleep.assert_any_call(2)  # 2**1
+
     def test_retries_less_than_one_raises_value_error(self):
         """retries=0 (or negative) is a caller bug, not a network outcome —
         must raise ValueError immediately rather than silently returning a
