@@ -2475,6 +2475,211 @@ class TestCliGroup:
         assert attempted == ["111", "222"]
         assert "Updated 1 of 2" in result.output
 
+    def test_uses_direct_gixen_when_no_server_url_configured(self, monkeypatch):
+        """BUI-710 kept the direct-Gixen branch as the fallback. With no
+        COMICS_SERVER_URL (conftest clears it), nothing may touch the server."""
+        from cli import cli
+
+        monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
+        runner = CliRunner()
+        snipes = [{"item_id": "111", "max_bid": "10", "bid_offset": "6",
+                   "snipe_group": "0"}]
+
+        with patch("cli._make_client") as mock_make, \
+                patch("cli._server_request") as mock_req, \
+                patch("cli._server_request_result") as mock_req_result:
+            mock_client = MagicMock()
+            mock_client.list_snipes.return_value = snipes
+            mock_make.return_value = mock_client
+            result = runner.invoke(cli, ["group", "1", "111"])
+
+        assert result.exit_code == 0
+        mock_client.modify_snipe.assert_called_once()
+        mock_req.assert_not_called()
+        mock_req_result.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# BUI-710: CLI `group` in server mode — one PATCH per item through the same
+# retrying, policy-checked write `edit` uses, carrying NO max_bid.
+# ---------------------------------------------------------------------------
+
+def _snipe_row(item_id, *, max_bid=50.0, snipe_group=0, status="PENDING"):
+    return {"item_id": item_id, "max_bid": max_bid,
+            "snipe_group": snipe_group, "status": status}
+
+
+class TestCliGroupServerMode:
+    def _run(self, monkeypatch, args, *, snipes, patch_results):
+        from cli import cli
+
+        monkeypatch.setenv("COMICS_SERVER_URL", "http://localhost:8080")
+        runner = CliRunner()
+        with patch("cli._make_client") as mock_make, \
+                patch("cli._server_request", return_value=snipes) as mock_get, \
+                patch("cli._server_request_result",
+                      side_effect=patch_results) as mock_patch:
+            result = runner.invoke(cli, args)
+        return result, mock_make, mock_get, mock_patch
+
+    def test_patches_each_item_with_no_max_bid_in_the_body(self, monkeypatch):
+        """The whole real-money argument for routing `group` through a cap
+        endpoint: the request carries no bid amount, so it cannot carry a
+        wrong one. If this assertion ever has to be relaxed, re-read BUI-710."""
+        result, mock_make, _, mock_patch = self._run(
+            monkeypatch, ["group", "3", "111", "222"],
+            snipes=[_snipe_row("111", max_bid=75.0),
+                    _snipe_row("222", max_bid=60.0)],
+            patch_results=[
+                (True, {"item_id": "111", "max_bid": 75.0, "snipe_group": 3}, None),
+                (True, {"item_id": "222", "max_bid": 60.0, "snipe_group": 3}, None),
+            ],
+        )
+        assert result.exit_code == 0
+        assert mock_patch.call_count == 2
+        for call, iid in zip(mock_patch.call_args_list, ["111", "222"]):
+            assert call.args[0] == "patch"
+            assert call.args[1] == f"/api/bids/{iid}"
+            assert call.kwargs["json"] == {"snipe_group": 3, "source": "cli"}
+            assert "max_bid" not in call.kwargs["json"]
+        # Server mode never opens a direct Gixen session.
+        mock_make.assert_not_called()
+        assert "Updated 2 of 2" in result.output
+
+    def test_reads_api_snipes_for_the_freshness_mirror_not_api_bids(self, monkeypatch):
+        """GET /api/snipes (not /api/bids) is load-bearing: only it runs
+        _ensure_fresh_sync server-side, which re-mirrors each row's max_bid
+        from Gixen before the server resolves caps from those rows."""
+        _, _, mock_get, _ = self._run(
+            monkeypatch, ["group", "1", "111"],
+            snipes=[_snipe_row("111")],
+            patch_results=[(True, {"max_bid": 50.0, "snipe_group": 1}, None)],
+        )
+        assert mock_get.call_args.args == ("get", "/api/snipes")
+
+    def test_prints_the_unchanged_cap_per_item(self, monkeypatch):
+        """The command promises not to move money; showing the resulting cap
+        is what lets an operator verify that rather than trust it."""
+        result, _, _, _ = self._run(
+            monkeypatch, ["group", "2", "111"],
+            snipes=[_snipe_row("111", max_bid=75.0)],
+            patch_results=[(True, {"max_bid": 75.0, "snipe_group": 2}, None)],
+        )
+        assert "111: group -> 2 (max bid unchanged at $75.00)" in result.output
+
+    def test_aborts_before_any_patch_when_an_item_is_not_live(self, monkeypatch):
+        """All-or-nothing preflight, matching direct mode: a typo must not
+        leave a half-formed group behind."""
+        result, _, _, mock_patch = self._run(
+            monkeypatch, ["group", "1", "111", "999"],
+            snipes=[_snipe_row("111")],
+            patch_results=[],
+        )
+        assert result.exit_code == 1
+        assert "999" in result.output
+        mock_patch.assert_not_called()
+
+    def test_non_pending_row_counts_as_not_live(self, monkeypatch):
+        """The server resolves the cap from the PENDING row only, so a
+        terminal row would 422 mid-loop. Refuse up front, with a message that
+        names the real problem."""
+        result, _, _, mock_patch = self._run(
+            monkeypatch, ["group", "1", "111"],
+            snipes=[_snipe_row("111", status="WON")],
+            patch_results=[],
+        )
+        assert result.exit_code == 1
+        assert "111" in result.output
+        mock_patch.assert_not_called()
+
+    def test_per_item_failure_continues_and_exits_nonzero(self, monkeypatch):
+        result, _, _, mock_patch = self._run(
+            monkeypatch, ["group", "1", "111", "222"],
+            snipes=[_snipe_row("111"), _snipe_row("222")],
+            patch_results=[
+                (False, None, "Server returned 503: gixen down"),
+                (True, {"max_bid": 50.0, "snipe_group": 1}, None),
+            ],
+        )
+        assert result.exit_code == 1
+        # The second item is still attempted despite the first failing.
+        assert [c.args[1] for c in mock_patch.call_args_list] == [
+            "/api/bids/111", "/api/bids/222",
+        ]
+        assert "111: failed" in result.output
+        assert "Updated 1 of 2" in result.output
+
+    def test_timeout_is_reported_indeterminate_not_failed(self, monkeypatch):
+        """BUI-697's lesson: the CLI stopped waiting; the server did not stop
+        working. Reporting a flat failure is what lets an operator re-run
+        against a queue that already changed."""
+        result, _, _, _ = self._run(
+            monkeypatch, ["group", "1", "111"],
+            snipes=[_snipe_row("111")],
+            patch_results=[(
+                False,
+                {"indeterminate": True, "reason": "timeout"},
+                "Server timed out — the write may still have committed.",
+            )],
+        )
+        assert result.exit_code == 1
+        assert "INDETERMINATE" in result.output
+        assert "may have landed" in result.output
+        assert "Updated 0 of 1" in result.output
+
+    def test_policy_block_renders_the_structured_envelope(self, monkeypatch):
+        """`group` has no --ack-policy of its own; the 409 must at least say
+        what blocked it (and name the fallback in the docs, not swallow it)."""
+        result, _, _, _ = self._run(
+            monkeypatch, ["group", "1", "111"],
+            snipes=[_snipe_row("111")],
+            patch_results=[(
+                False,
+                {"blocked": True, "message": "Blocked by exposure_ceiling.",
+                 "advisories": [{"code": "exposure_ceiling", "message": "over"}]},
+                "Server returned 409: ...",
+            )],
+        )
+        assert result.exit_code == 1
+        assert "blocked — Blocked by exposure_ceiling." in result.output
+        assert "exposure_ceiling" in result.output
+
+    def test_renders_advisories_from_a_successful_patch(self, monkeypatch):
+        result, _, _, _ = self._run(
+            monkeypatch, ["group", "1", "111"],
+            snipes=[_snipe_row("111")],
+            patch_results=[(True, {
+                "max_bid": 50.0, "snipe_group": 1,
+                "advisories": [{"code": "fmv_staleness", "message": "old FMV"}],
+            }, None)],
+        )
+        assert result.exit_code == 0
+        assert "fmv_staleness" in result.output
+
+    def test_warns_but_does_not_fail_when_the_echoed_group_differs(self, monkeypatch):
+        """BUI-709's Gixen-side confirm is the authority on whether the group
+        landed. The read-back row here is not status-filtered, so a mismatch
+        warns rather than manufacturing a false failure."""
+        result, _, _, _ = self._run(
+            monkeypatch, ["group", "5", "111"],
+            snipes=[_snipe_row("111")],
+            patch_results=[(True, {"max_bid": 50.0, "snipe_group": 2}, None)],
+        )
+        assert result.exit_code == 0
+        assert "warning — server reports group 2, not 5" in result.output
+        assert "Updated 1 of 1" in result.output
+
+    def test_ungroup_with_zero_sends_explicit_zero(self, monkeypatch):
+        """snipe_group=0 must ride in the body as a real un-group request, not
+        be dropped as falsy — the exact bug BUI-392 fixed on the other side."""
+        _, _, _, mock_patch = self._run(
+            monkeypatch, ["group", "0", "111"],
+            snipes=[_snipe_row("111", snipe_group=4)],
+            patch_results=[(True, {"max_bid": 50.0, "snipe_group": 0}, None)],
+        )
+        assert mock_patch.call_args.kwargs["json"]["snipe_group"] == 0
+
+
 # ---------------------------------------------------------------------------
 # CLI thin-client mode tests
 # ---------------------------------------------------------------------------
