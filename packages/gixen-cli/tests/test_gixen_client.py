@@ -2992,3 +2992,138 @@ class TestParseListedMaxBid:
         for raw in ("40", "40.00", "40.00 USD", " 40.00 "):
             assert GixenClient._max_bid_matches(raw, Decimal("40.00")) is True
             assert parse_listed_max_bid(raw) == 40.0
+
+
+# ---------------------------------------------------------------------------
+# BUI-700: `newsnipegroup` on every Gixen write path
+#
+# A bid group is only real once Gixen itself accepts it: _sync_gixen mirrors the
+# listed group back onto every PENDING row each cycle (refresh_snipe_group), so
+# a local-only group write is erased on the next sync. The one field that
+# carries a group to Gixen is the `newsnipegroup` form key — these tests pin it
+# on BOTH write verbs, because the open question after the 2026-08-07/08
+# home_2.php outage was whether the modify path applied `group` at all.
+# ---------------------------------------------------------------------------
+
+class TestNewSnipeGroupOnEveryWritePath:
+    def test_add_snipe_posts_newsnipegroup(self):
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        with patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post, \
+             patch.object(client, "list_snipes",
+                          return_value=[{"item_id": "700000001", "dbidid": "5001"}]):
+            assert client.add_snipe(
+                "700000001", Decimal("42.00"), bid_offset=6, snipe_group=5,
+            ) is True
+
+        data = mock_post.call_args[0][0]
+        assert data["newsnipegroup"] == "5"
+        assert data["newitemid"] == "700000001"
+        assert data["newmaxbid"] == "42.00"
+        # An add is not a modify: no ismodified flag in the payload.
+        assert "ismodified" not in data
+
+    def test_modify_snipe_posts_newsnipegroup(self):
+        """The list-lookup modify path (dbidid=None) — what the comics server's
+        POST /api/bids upsert of an existing PENDING row uses."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        old = [{"item_id": "700000002", "dbidid": "5002", "max_bid": "40.00"}]
+        new = [{"item_id": "700000002", "dbidid": "5002", "max_bid": "40.00"}]
+
+        with patch.object(client, "list_snipes", side_effect=[old, new]), \
+             patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+            assert client.modify_snipe(
+                "700000002", Decimal("40.00"), bid_offset=6, snipe_group=5,
+            ) is True
+
+        data = mock_post.call_args[0][0]
+        assert data["newsnipegroup"] == "5"
+        assert data["dbidid"] == "5002"
+        assert data["ismodified"] == "1"
+        # A pure regroup still re-POSTs the cap — there is no group-only Gixen
+        # verb, so every regroup rewrites max_bid to whatever the caller passed.
+        assert data["newmaxbid"] == "40.00"
+
+    def test_modify_snipe_posts_newsnipegroup_on_the_cached_dbidid_fast_path(self):
+        """The dbidid fast path (the comics server's PATCH /api/bids/{id})
+        carries the group too, and skips the pre-POST list_snipes() — one fewer
+        home_2.php read than the lookup path above."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        verify = [{"item_id": "700000003", "dbidid": "cached-9", "max_bid": "40.00"}]
+
+        with patch.object(client, "list_snipes", side_effect=[verify]) as mock_list, \
+             patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+            assert client.modify_snipe(
+                "700000003", Decimal("40.00"), bid_offset=6, snipe_group=5,
+                dbidid="cached-9",
+            ) is True
+
+        data = mock_post.call_args[0][0]
+        assert data["newsnipegroup"] == "5"
+        assert data["dbidid"] == "cached-9"
+        # Exactly one list_snipes(): the post-POST confirm, not a pre-POST lookup.
+        assert mock_list.call_count == 1
+
+    def test_modify_snipe_zero_group_is_an_explicit_ungroup(self):
+        """snipe_group=0 is a positive claim ("ungrouped"), not "unknown" — it
+        POSTs newsnipegroup=0 and really does un-group the snipe. This is why a
+        re-run of an add-batch row that omits `group` un-groups it:
+        add_batch.build_bid_payload always sends snipe_group, defaulting to 0."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        old = [{"item_id": "700000004", "dbidid": "5004", "max_bid": "40.00"}]
+        new = [{"item_id": "700000004", "dbidid": "5004", "max_bid": "40.00"}]
+
+        with patch.object(client, "list_snipes", side_effect=[old, new]), \
+             patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+            client.modify_snipe("700000004", Decimal("40.00"), snipe_group=0)
+
+        assert mock_post.call_args[0][0]["newsnipegroup"] == "0"
+
+    def test_a_confirmed_modify_does_not_prove_the_group_landed(self):
+        """modify_snipe's post-POST confirm compares max_bid ONLY (and
+        add_snipe's confirm just checks the item is present) — neither verifies
+        snipe_group. So a True return says the cap is live, not that the group
+        is. Confirm a group with `gixen list` / a sync, never with the write's
+        own return value."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        old = [{"item_id": "700000006", "dbidid": "5006", "max_bid": "40.00",
+                "snipe_group": "0"}]
+        # Cap matches; group did NOT take. modify_snipe still reports success.
+        new = [{"item_id": "700000006", "dbidid": "5006", "max_bid": "40.00",
+                "snipe_group": "0"}]
+
+        with patch.object(client, "list_snipes", side_effect=[old, new]), \
+             patch.object(client, "_post_home", return_value="<html>OK</html>"):
+            assert client.modify_snipe(
+                "700000006", Decimal("40.00"), snipe_group=5,
+            ) is True
+
+    def test_a_failed_modify_posts_nothing_and_cannot_carry_a_group(self):
+        """The 2026-08-08 outage shape (BUI-700): the pre-POST list_snipes()
+        read of home_2.php raises, so no newsnipegroup ever reaches Gixen. The
+        group did not "fail to apply" — the write never happened at all."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        with patch.object(client, "list_snipes",
+                          side_effect=GixenConnectionError("curl exit 28: timeout")), \
+             patch.object(client, "_post_home") as mock_post:
+            with pytest.raises(GixenConnectionError):
+                client.modify_snipe("700000005", Decimal("40.00"), snipe_group=5)
+
+        mock_post.assert_not_called()
