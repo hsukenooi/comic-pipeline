@@ -1887,7 +1887,15 @@ class AddBidRequest(BaseModel):
     item_id: str
     max_bid: float
     bid_offset: int = 6
-    snipe_group: int = 0
+    # BUI-708: None means "leave snipe_group unchanged" on the UPSERT branch
+    # (a live row already exists for this item_id) — same passthrough
+    # contract EditBidRequest.snipe_group gained in BUI-392. A CREATE (no
+    # live row) has no existing group to preserve, so None there resolves to
+    # 0 (fresh add, ungrouped) instead. Explicit 0 always means "un-group" on
+    # either branch (BUI-383: 0 is a positive claim, never "unknown"). See
+    # api_add_bid's resolution just after its `existing` lookup for both
+    # halves of the fix (mirrors api_edit_bid's Gixen-side resolution).
+    snipe_group: int | None = None
     # BUI-78: optional seller + grades captured by the buy flow at add time.
     seller: str | None = None
     seller_grade: float | None = None
@@ -2209,6 +2217,15 @@ async def api_add_bid(req: AddBidRequest):
         # partial unique index (+ _add_bid_row's recovery) guards that race.
         async with _api_lock:
             existing = get_pending_bid_by_item_id(db, req.item_id)
+            # BUI-708: req.snipe_group being None means "leave unchanged" on
+            # an upsert of a live row (mirrors api_edit_bid's BUI-392
+            # resolution below) — resolve it once, here, before it's used by
+            # either the policy intent or either Gixen call site. A CREATE
+            # (no live row) has no existing group to preserve, so None there
+            # resolves to 0 (fresh add, ungrouped), not a passthrough.
+            resolved_snipe_group = req.snipe_group
+            if resolved_snipe_group is None:
+                resolved_snipe_group = existing["snipe_group"] if existing is not None else 0
             # BUI-615/616: one check-point evaluation per request, BEFORE any
             # Gixen call — the same advisories apply to whichever branch below
             # this request ultimately returns through (KTD1). AE6: trigger is
@@ -2219,7 +2236,7 @@ async def api_add_bid(req: AddBidRequest):
             intent = PolicyIntent(
                 item_id=req.item_id,
                 target_max_bid=req.max_bid,
-                snipe_group=req.snipe_group,
+                snipe_group=resolved_snipe_group,
                 trigger="upsert" if existing is not None else "create",
                 prior_row=existing,
                 # BUI-619 (U5): POST-only — api_edit_bid's PolicyIntent below
@@ -2297,7 +2314,7 @@ async def api_add_bid(req: AddBidRequest):
                 # an already-sniped item (code 202), so modify, not add.
                 try:
                     row = await _modify_and_update_bid(
-                        req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                        req.item_id, req.max_bid, req.bid_offset, resolved_snipe_group,
                         seller=seller, seller_grade=req.seller_grade,
                         photo_grade=req.photo_grade,
                     )
@@ -2307,9 +2324,12 @@ async def api_add_bid(req: AddBidRequest):
                     # DB has a live row but Gixen lost it (state skew). Intent is
                     # "add" → fall back. If Gixen can't confirm the add, keep the
                     # existing row visible rather than a bare 503 that hides it.
+                    # resolved_snipe_group still reflects the UPSERT resolution
+                    # (passthrough from `existing`) — the fallback add carries
+                    # the group forward even though Gixen forced a re-add.
                     try:
                         row, created = await _add_bid_row(
-                            req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                            req.item_id, req.max_bid, req.bid_offset, resolved_snipe_group,
                             seller=seller, seller_grade=req.seller_grade,
                             photo_grade=req.photo_grade,
                         )
@@ -2323,7 +2343,7 @@ async def api_add_bid(req: AddBidRequest):
                         }
 
             row, created = await _add_bid_row(
-                req.item_id, req.max_bid, req.bid_offset, req.snipe_group,
+                req.item_id, req.max_bid, req.bid_offset, resolved_snipe_group,
                 seller=seller, seller_grade=req.seller_grade,
                 photo_grade=req.photo_grade,
             )

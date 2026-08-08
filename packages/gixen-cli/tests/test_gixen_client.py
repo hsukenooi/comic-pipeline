@@ -25,6 +25,7 @@ from gixen_client import (
     GixenModifyNotConfirmedError,
     find_sibling_cleanup_targets,
     parse_listed_max_bid,
+    parse_listed_snipe_group,
 )
 
 
@@ -2994,6 +2995,40 @@ class TestParseListedMaxBid:
             assert parse_listed_max_bid(raw) == 40.0
 
 
+class TestParseListedSnipeGroup:
+    """BUI-709. Same "None means unknown, never coerce to 0" contract as
+    `parse_listed_max_bid` above and `server.fallback._parse_snipe_group` —
+    duplicated here (not imported) because gixen_client.py carries no
+    dependency on server/."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("0", 0), ("5", 5), (" 5 ", 5), (3, 3), (0, 0),
+    ])
+    def test_reads_a_real_group(self, raw, expected):
+        assert parse_listed_snipe_group(raw) == expected
+
+    @pytest.mark.parametrize("raw", [None, "", "   ", "N/A", "abc"])
+    def test_unknown_or_nonsense_is_none(self, raw):
+        assert parse_listed_snipe_group(raw) is None
+
+
+class TestGroupMatches:
+    """BUI-709: unit coverage for the comparison `_confirmed()`/
+    `_verify_present()` both delegate to."""
+
+    def test_matching_group_is_true(self):
+        assert GixenClient._group_matches("5", 5) is True
+
+    def test_different_group_is_false(self):
+        assert GixenClient._group_matches("3", 5) is False
+
+    @pytest.mark.parametrize("raw", [None, "", "N/A"])
+    def test_unparseable_or_missing_is_none_not_false(self, raw):
+        """None (unknown) is a distinct outcome from False (confirmed
+        mismatch) — callers must warn-and-pass on None, not raise on it."""
+        assert GixenClient._group_matches(raw, 5) is None
+
+
 # ---------------------------------------------------------------------------
 # BUI-700: `newsnipegroup` on every Gixen write path
 #
@@ -3090,27 +3125,168 @@ class TestNewSnipeGroupOnEveryWritePath:
 
         assert mock_post.call_args[0][0]["newsnipegroup"] == "0"
 
-    def test_a_confirmed_modify_does_not_prove_the_group_landed(self):
-        """modify_snipe's post-POST confirm compares max_bid ONLY (and
-        add_snipe's confirm just checks the item is present) — neither verifies
-        snipe_group. So a True return says the cap is live, not that the group
-        is. Confirm a group with `gixen list` / a sync, never with the write's
-        own return value."""
+    def test_a_confirmed_modify_now_proves_the_group_landed(self):
+        """BUI-709: modify_snipe's post-POST confirm now compares snipe_group
+        too, not just max_bid. A cap-matches-but-group-never-took modify is
+        NOT confirmed — it retries once, and when the listed group still
+        doesn't match after the retry, raises GixenModifyNotConfirmedError
+        instead of reporting success with a lying group."""
         client = _client()
         client.session_id = "99887766"
         client._min_post_gap = 0
 
-        old = [{"item_id": "700000006", "dbidid": "5006", "max_bid": "40.00",
-                "snipe_group": "0"}]
-        # Cap matches; group did NOT take. modify_snipe still reports success.
-        new = [{"item_id": "700000006", "dbidid": "5006", "max_bid": "40.00",
-                "snipe_group": "0"}]
+        pre_post_lookup = [{"item_id": "700000006", "dbidid": "5006",
+                             "max_bid": "40.00", "snipe_group": "0"}]
+        # Cap matches both times; group never takes (stays "0" though 5 was
+        # sent) — persists through the one retry this method allows.
+        still_ungrouped = [{"item_id": "700000006", "dbidid": "5006",
+                             "max_bid": "40.00", "snipe_group": "0"}]
 
-        with patch.object(client, "list_snipes", side_effect=[old, new]), \
+        with patch("gixen_client.time.sleep"), \
+             patch.object(client, "list_snipes",
+                          side_effect=[pre_post_lookup, still_ungrouped, still_ungrouped]), \
+             patch.object(client, "_post_home", return_value="<html>OK</html>") as mock_post:
+            with pytest.raises(GixenModifyNotConfirmedError):
+                client.modify_snipe("700000006", Decimal("40.00"), snipe_group=5)
+
+        # Initial POST + one retry POST, same shape as the cap-mismatch case.
+        assert mock_post.call_count == 2
+
+    def test_modify_snipe_group_mismatch_after_retry_still_raises(self):
+        """A DIFFERENT (not just missing) listed group after the retry is
+        exactly as unconfirmed as a group that never appeared at all —
+        confirms the EM-decided "different parsed group -> NOT confirmed"
+        policy isn't limited to the "stayed the same" case."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        pre_post_lookup = [{"item_id": "700000007", "dbidid": "5007",
+                             "max_bid": "40.00", "snipe_group": "2"}]
+        # Sent group=5 both times; Gixen keeps applying some OTHER group (3),
+        # never the one we sent.
+        wrong_group = [{"item_id": "700000007", "dbidid": "5007",
+                         "max_bid": "40.00", "snipe_group": "3"}]
+
+        with patch("gixen_client.time.sleep"), \
+             patch.object(client, "list_snipes",
+                          side_effect=[pre_post_lookup, wrong_group, wrong_group]), \
              patch.object(client, "_post_home", return_value="<html>OK</html>"):
+            with pytest.raises(GixenModifyNotConfirmedError):
+                client.modify_snipe("700000007", Decimal("40.00"), snipe_group=5)
+
+    def test_modify_snipe_unparseable_listed_group_confirms_on_cap_alone(self):
+        """BUI-709's EM-decided parser-drift carve-out: an unparseable/blank
+        listed snipe_group (a BUI-383 regex miss) must not fail every grouped
+        modify closed — it warns and confirms on the cap match alone, same as
+        the pre-BUI-709 status quo."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        pre_post_lookup = [{"item_id": "700000008", "dbidid": "5008",
+                             "max_bid": "40.00", "snipe_group": None}]
+        confirm = [{"item_id": "700000008", "dbidid": "5008",
+                    "max_bid": "40.00", "snipe_group": None}]
+
+        with patch.object(client, "list_snipes",
+                          side_effect=[pre_post_lookup, confirm]), \
+             patch.object(client, "_post_home", return_value="<html>OK</html>"), \
+             patch("gixen_client.logger") as mock_logger:
             assert client.modify_snipe(
-                "700000006", Decimal("40.00"), snipe_group=5,
+                "700000008", Decimal("40.00"), snipe_group=5,
             ) is True
+
+        assert mock_logger.warning.called
+
+    def test_add_snipe_group_mismatch_raises_not_confirmed(self):
+        """BUI-709: add_snipe's verify now checks the listed group too when
+        the add carried one — an item present but under the WRONG group is
+        not a confirmed add, not just "present"."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+        client._add_retry_backoff = 0
+
+        # Present both times (initial verify + retry verify), but always
+        # under group 3 even though we asked for group 5.
+        wrong_group = [{"item_id": "700000009", "dbidid": "5009",
+                         "snipe_group": "3"}]
+
+        with patch.object(client, "_post_home", return_value="<html>OK</html>"), \
+             patch.object(client, "list_snipes",
+                          side_effect=[wrong_group, wrong_group]):
+            with pytest.raises(GixenAddNotConfirmedError):
+                client.add_snipe("700000009", Decimal("10.00"), snipe_group=5)
+
+    def test_add_snipe_group_zero_only_verifies_presence(self):
+        """A group=0 add has nothing extra to verify — 0 there means "no
+        group requested" for a fresh create, so presence alone still
+        confirms it even when the listed group is something else entirely
+        (e.g. this item_id was previously grouped and the row simply hasn't
+        been re-scraped as ungrouped yet)."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        present = [{"item_id": "700000010", "dbidid": "5010",
+                    "snipe_group": "7"}]
+
+        with patch.object(client, "_post_home", return_value="<html>OK</html>"), \
+             patch.object(client, "list_snipes", return_value=present):
+            assert client.add_snipe("700000010", Decimal("10.00"), snipe_group=0) is True
+
+    def test_add_snipe_unparseable_listed_group_confirms_on_presence_alone(self):
+        """Same BUI-709 parser-drift carve-out as modify_snipe's: an
+        unparseable/missing listed group must not fail every grouped add
+        closed — it warns and confirms on presence alone."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+
+        present_unparseable_group = [{"item_id": "700000011", "dbidid": "5011",
+                                       "snipe_group": "N/A"}]
+
+        with patch.object(client, "_post_home", return_value="<html>OK</html>"), \
+             patch.object(client, "list_snipes", return_value=present_unparseable_group), \
+             patch("gixen_client.logger") as mock_logger:
+            assert client.add_snipe(
+                "700000011", Decimal("10.00"), snipe_group=5,
+            ) is True
+
+        assert mock_logger.warning.called
+
+    def test_add_snipe_202_retry_arm_applies_group_check(self):
+        """BUI-709's named edge case: the 202-RETRY arm (retry POST hits
+        ITEM ALREADY PRESENT, then re-verifies) must apply the same group
+        check as the ordinary verify path — otherwise a wrong-group add
+        sneaks through exactly there. Mirrors
+        test_add_handles_202_duplicate_on_retry_as_success's shape, but the
+        202-arm's re-verify finds the item under the WRONG group."""
+        client = _client()
+        client.session_id = "99887766"
+        client._min_post_gap = 0
+        client._add_retry_backoff = 0
+
+        # POST 1 succeeds but the snipe doesn't land in the first verify;
+        # POST 2 (the retry) raises 202 (item already present) because POST 1
+        # actually landed — but under group 3, not the group 5 we sent.
+        post_calls = ["<html>OK</html>", GixenItemError(202, "ITEM ALREADY PRESENT")]
+        list_calls = [
+            [],  # first verify: not yet visible
+            [{"item_id": "777", "dbidid": "5099", "snipe_group": "3"}],  # 202-arm re-verify
+        ]
+
+        def post_side_effect(*args, **kwargs):
+            result = post_calls.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with patch.object(client, "_post_home", side_effect=post_side_effect), \
+             patch.object(client, "list_snipes", side_effect=list_calls):
+            with pytest.raises(GixenAddNotConfirmedError):
+                client.add_snipe("777", Decimal("10.00"), snipe_group=5)
 
     def test_a_failed_modify_posts_nothing_and_cannot_carry_a_group(self):
         """The 2026-08-08 outage shape (BUI-700): the pre-POST list_snipes()

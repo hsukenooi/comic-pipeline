@@ -349,7 +349,7 @@ def build_bid_payload(
     item_id: str,
     max_bid: Decimal | float,
     offset: int,
-    group: int,
+    group: int | None,
     *,
     seller: str | None = None,
     seller_grade: float | None = None,
@@ -388,13 +388,22 @@ def build_bid_payload(
     1. The server links via the overlay's `on_bid_write_committed` hookimpl
     (`plugins/gixen-overlay/src/gixen_overlay/plugin.py`), which lands on
     the same idempotent `link_fmv_to_bid` primary-replacement semantics as
-    the legacy link-fmv call, so the two never double-link."""
+    the legacy link-fmv call, so the two never double-link.
+
+    BUI-708: `group=None` omits `snipe_group` from the payload entirely —
+    same "only send what was given" convention as `seller`/`source` below —
+    so `AddBidRequest.snipe_group`'s own None-passthrough resolves it
+    server-side (existing group on an upsert of a live row, 0 on a fresh
+    create) instead of this client silently sending a `0` that un-groups an
+    already-grouped snipe. `group=0` is still sent explicitly: 0 is a
+    positive "ungrouped" claim (BUI-383), never "unspecified"."""
     payload: dict[str, Any] = {
         "item_id": item_id,
         "max_bid": float(max_bid),
         "bid_offset": offset,
-        "snipe_group": group,
     }
+    if group is not None:
+        payload["snipe_group"] = group
     if seller is not None:
         payload["seller"] = seller
     if seller_grade is not None:
@@ -466,7 +475,13 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
             raise _RowValidationError(f"invalid max_bid: {max_bid_raw!r} (not finite)")
 
         offset = _optional_int(row, "offset", 6)
-        group = _optional_int(row, "group", 0)
+        # BUI-708: a row that omits "group" entirely sends no group at all
+        # (None -> build_bid_payload omits `snipe_group` from the payload),
+        # so a re-run of a rows.json against an already-grouped snipe
+        # preserves that group instead of un-grouping it. A row that DOES
+        # carry "group" (including an explicit 0) still validates/parses it
+        # concretely via `_optional_int` — explicit 0 always means "ungroup".
+        group = _optional_int(row, "group", 0) if "group" in row else None
         comic_id = row.get("comic_id")
         if comic_id is not None:
             comic_id = _optional_int(row, "comic_id", 0)

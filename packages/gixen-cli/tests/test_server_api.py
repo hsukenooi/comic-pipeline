@@ -5264,22 +5264,48 @@ def test_gixen_failure_on_a_group_upsert_writes_no_group(api):
     assert (decision["trigger"], decision["outcome"]) == ("upsert", "gixen_failed")
 
 
-def test_upsert_omitting_group_silently_ungroups_a_grouped_row(api):
-    """The retry trap. AddBidRequest.snipe_group defaults to 0 (no None
-    passthrough, unlike EditBidRequest since BUI-392) and
-    add_batch.build_bid_payload always sends the key — so re-running an
-    add-batch rows.json whose row has no `group` UN-GROUPS a snipe that was
-    already grouped. Characterized, not fixed: `gixen add` without --group
-    legitimately means group 0. Carry `group` on every re-run, or regroup with
-    PATCH (which does pass through)."""
+def test_create_omitting_group_resolves_to_zero(api):
+    """BUI-708: a CREATE (no live row for this item_id yet) has no existing
+    group to pass through — an omitted snipe_group on a fresh add resolves
+    to 0 (ungrouped), same as it always did. Only the UPSERT branch gets the
+    passthrough; a create never had a prior group to preserve."""
+    r = api.post("/api/bids", json={"item_id": "700100012", "max_bid": 40.0})
+    assert r.status_code == 200
+    assert r.json()["created"] is True
+    assert api.mock_gixen.add_snipe.call_args.kwargs["snipe_group"] == 0
+    assert _group_state("700100012")["snipe_group"] == 0
+
+
+def test_upsert_omitting_group_preserves_the_existing_group(api):
+    """BUI-708 fix: AddBidRequest.snipe_group now defaults to None, resolved
+    server-side the same way EditBidRequest's has been since BUI-392 — an
+    omitted snipe_group on the UPSERT branch (a live row already exists)
+    passes through the existing group instead of silently un-grouping it.
+    add_batch.build_bid_payload only sends `snipe_group` when the row was
+    actually given a `group` (see test_add_batch.py), so a re-run of an
+    add-batch rows.json whose row omits `group` no longer un-groups an
+    already-grouped snipe."""
     api.post("/api/bids", json={"item_id": "700100007", "max_bid": 40.0, "snipe_group": 5})
     assert _group_state("700100007")["snipe_group"] == 5
 
-    api.post("/api/bids", json={"item_id": "700100007", "max_bid": 45.0})
+    # Omitting snipe_group from the POST body (the add-batch re-run shape)
+    # now PRESERVES the existing group instead of un-grouping it.
+    r = api.post("/api/bids", json={"item_id": "700100007", "max_bid": 45.0})
+    assert r.status_code == 200
+    assert api.mock_gixen.modify_snipe.call_args.kwargs["snipe_group"] == 5
+    assert _group_state("700100007")["snipe_group"] == 5
+
+    # Explicit 0 is still a real un-group request on the upsert branch — 0
+    # is a positive claim, never "unspecified" (BUI-383).
+    r = api.post(
+        "/api/bids",
+        json={"item_id": "700100007", "max_bid": 45.0, "snipe_group": 0},
+    )
+    assert r.status_code == 200
     assert api.mock_gixen.modify_snipe.call_args.kwargs["snipe_group"] == 0
     assert _group_state("700100007")["snipe_group"] == 0
 
-    # PATCH is the contrast: omitting snipe_group leaves the group alone.
+    # PATCH remains an equally valid way to leave the group alone.
     api.post("/api/bids", json={"item_id": "700100007", "max_bid": 45.0, "snipe_group": 5})
     api.patch("/api/bids/700100007", json={"max_bid": 50.0})
     assert api.mock_gixen.modify_snipe.call_args.kwargs["snipe_group"] == 5
@@ -5288,8 +5314,10 @@ def test_upsert_omitting_group_silently_ungroups_a_grouped_row(api):
 
 def test_add_batch_row_group_reaches_the_bid_payload():
     """The rows.json `group` key is what a skill actually writes — pin that it
-    lands on the POST /api/bids field the tests above exercise, and that an
-    omitted `group` becomes an explicit 0 (the trap characterized above)."""
+    lands on the POST /api/bids field the tests above exercise. BUI-708: an
+    omitted `group` (None) is covered separately in test_add_batch.py, since
+    that's client-side omission-from-the-payload behavior, not a value
+    build_bid_payload was given here."""
     import add_batch
 
     payload = add_batch.build_bid_payload("700100008", 40.0, 6, 5)
