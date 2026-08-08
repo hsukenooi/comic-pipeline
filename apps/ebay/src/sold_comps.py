@@ -238,10 +238,15 @@ class _RateLimiter:
 
 # Module-level singleton, deliberately — like _SOLD_COMPS_SEMAPHORE, pacing
 # must be shared across every caller in this process (run_batch()'s whole
-# ThreadPoolExecutor, any concurrent console-script invocation importing
-# this module), not scoped per-batch. Unlike _CircuitBreaker, there is no
-# per-batch "start clean" need: the rate limiter has no notion of tripped/
-# untripped state to reset, only a next-slot clock that keeps ticking.
+# ThreadPoolExecutor and anything else on this interpreter), not scoped
+# per-batch. The scope IS the process: a concurrent console-script
+# invocation is a separate process with its own module copy and its own
+# limiter, so two simultaneous runs can jointly exceed the 60 req/min
+# ceiling. Known and accepted (BUI-706, Won't Do): single-human workflow,
+# and the 48/60 pacing leaves headroom for the ordinary case. Unlike
+# _CircuitBreaker, there is no per-batch "start clean" need: the rate
+# limiter has no notion of tripped/untripped state to reset, only a
+# next-slot clock that keeps ticking.
 _SOLD_COMPS_RATE_LIMITER = _RateLimiter(_SOLD_COMPS_RATE_LIMIT_PER_MIN)
 
 PROVIDER_SERPAPI = "serpapi"
