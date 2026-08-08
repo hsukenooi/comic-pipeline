@@ -101,13 +101,16 @@ def create_tables(conn: sqlite3.Connection) -> None:
             first_seen_at  TEXT DEFAULT (datetime('now'))
         )
     """)
-    # BUI-601: the rejected-writes ledger. Every 4xx/5xx on a *mutating*
-    # overlay request lands here (see routes.LedgerRoute), so a write that the
+    # BUI-601: the rejected-writes ledger. Every 4xx/5xx on an overlay
+    # request lands here (see ledger.LedgerRoute) — mutations from BUI-601,
+    # and GETs too since BUI-707 — so a write (or now, a read) that the
     # server refused is recorded somewhere instead of vanishing into the
     # caller's stderr. BUI-593 is the motivating incident: an FMV fetch
     # succeeded, the write 422'd, and the book was stored NOWHERE — BUI-585
     # then sat blocked for days on the wrong theory because nothing had
-    # persisted the refusal. Standalone (no FK, no JOIN to comics/bids) — the
+    # persisted the refusal. BUI-707's own motivation: ~65 advisory-read 400s
+    # left no trace, forcing a session-transcript reconstruction during the
+    # BUI-698 investigation. Standalone (no FK, no JOIN to comics/bids) — the
     # same plain-additive pattern as seller_scan_seen / collection_wins_seen,
     # so it needs none of the Python-memory rebuild machinery the comic tables
     # require.
@@ -2879,7 +2882,8 @@ def record_rejected_write(
     payload: str | None = None,
     at: str | None = None,
 ) -> int:
-    """Append one refused mutating request to the ledger. Returns its row id.
+    """Append one refused request (write or, since BUI-707, GET) to the
+    ledger. Returns its row id.
 
     Commit-free by design: the caller owns the transaction (routes.py writes
     through `write_transaction()` under the app-wide write lock, per BUI-408).
