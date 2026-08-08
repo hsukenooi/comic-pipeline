@@ -330,7 +330,10 @@ async def _append_bid_decision(
     trigger: str,
     outcome: str,
     bid_row_id: int | None,
-    requested_max_bid: float,
+    # BUI-710: `float | None` only so an edit that fails before its cap could
+    # be resolved still records a ledger row (`requested_max_bid` is a nullable
+    # REAL). Every reachable call site passes a real number.
+    requested_max_bid: float | None,
     check_results: list[dict],
     advisories: list[dict],
     source: str | None = None,
@@ -1962,7 +1965,20 @@ class AddBidRequest(BaseModel):
 class EditBidRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
-    max_bid: float
+    # BUI-710: None means "leave max_bid unchanged" (passthrough) — the third
+    # and last field of Gixen's modify form to join the BUI-392/BUI-401
+    # passthrough family. It exists so a GROUP-ONLY write (`gixen group N id
+    # ...` in server mode) never has to re-state a cap at all: a request that
+    # carries no number cannot carry a WRONG number, which is the whole
+    # real-money hazard that kept `gixen group` off this path until now.
+    #
+    # Resolution is the same shape as the two fields below — read the live
+    # PENDING row inside `api_edit_bid`'s single `_api_lock` acquisition — but
+    # it is strictly FAIL-CLOSED where they are not: `bid_offset`/`snipe_group`
+    # fall back to plain defaults (6 / 0) when no live row exists, and for
+    # those a wrong guess is an annoyance. There is no safe default cap, so an
+    # unresolvable max_bid is a 422, never a guess.
+    max_bid: float | None = None
     # BUI-401: None means "leave bid_offset unchanged" (passthrough) — same
     # latent bug snipe_group had pre-BUI-392: a max_bid-only PATCH that omits
     # this field must not silently reset a tuned fire-offset back to 6. See
@@ -1984,8 +2000,12 @@ class EditBidRequest(BaseModel):
 
     @field_validator("max_bid")
     @classmethod
-    def max_bid_positive(cls, v: float) -> float:
-        if v <= 0:
+    def max_bid_positive(cls, v: float | None) -> float | None:
+        # BUI-710: None (omitted -> passthrough) skips the check; an explicitly
+        # supplied cap is still validated exactly as before. Note the asymmetry
+        # with AddBidRequest, whose max_bid stays REQUIRED — a create has no
+        # prior row to inherit a cap from.
+        if v is not None and v <= 0:
             raise ValueError("max_bid must be positive")
         return v
 
@@ -2690,7 +2710,7 @@ async def _remove_with_cache_fallback(db: sqlite3.Connection, item_id: str) -> N
 
 
 async def _reconcile_after_unconfirmed_modify(
-    item_id: str, requested_max_bid: float, exc: Exception,
+    item_id: str, requested_max_bid: float | None, exc: Exception,
 ) -> str:
     """BUI-555: after a modify_snipe that raised, re-read Gixen and persist what
     it ACTUALLY holds. Returns the 503 detail string for the caller to raise.
@@ -2824,6 +2844,13 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
     intent: PolicyIntent | None = None
     advisories: list[dict] = []
     check_results: list[dict] = []
+    # BUI-710: the cap this request will actually POST to Gixen, write to the
+    # DB, and check policy against — req.max_bid when supplied, else resolved
+    # from the live row below. Declared out here so the except clauses can put
+    # the real number on their ledger rows (they are only reachable from the
+    # Gixen call, which is downstream of the resolve, so in practice it is
+    # always set by then; None survives only as a defensive NULL).
+    effective_max_bid: float | None = None
     try:
         async with _api_lock:
             # BUI-615/616: fetch the live row once, up front — it feeds both
@@ -2838,12 +2865,51 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                 gixen_bid_offset = current["bid_offset"] if current is not None else 6
             if gixen_snipe_group is None:
                 gixen_snipe_group = current["snipe_group"] if current is not None else 0
+            # BUI-710: resolve the max_bid passthrough from the SAME live row,
+            # inside this SAME _api_lock acquisition as the Gixen modify below
+            # — that co-location is the point. A client that read the cap
+            # itself and echoed it back would leave a read->PATCH window a
+            # concurrent dashboard/CLI/add-batch edit could land in, and the
+            # group write would then silently revert it. Resolving here cannot:
+            # nothing else can commit a cap between this read and the modify.
+            #
+            # Fail closed when there is nothing to resolve from — no live
+            # PENDING row (never-ingested web-added snipe, or the auction
+            # already resolved) or a NULL cap on it. Substituting any default
+            # here would be the silent-money-change bug this passthrough exists
+            # to make impossible, so it is a 422 telling the caller to state
+            # the cap explicitly (same fail-closed shape as cli.py's direct-mode
+            # offset/group resolution, BUI-383/BUI-404).
+            # The resolved value is held to the SAME bar the request model
+            # applies to an explicit one (a real number, strictly positive):
+            # sqlite is dynamically typed, so a REAL column is a convention,
+            # not a guarantee, and the validator that would have caught a
+            # degenerate cap is bypassed on this path. A resolved 0 would POST
+            # newmaxbid=0 to Gixen.
+            effective_max_bid = req.max_bid
+            if effective_max_bid is None:
+                stored = current["max_bid"] if current is not None else None
+                try:
+                    resolved = float(stored) if stored is not None else None
+                except (TypeError, ValueError):
+                    resolved = None
+                if resolved is None or resolved <= 0:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"max_bid omitted but there is no usable current cap "
+                            f"for {item_id} to resolve from (no live PENDING row, "
+                            f"or its stored max_bid is missing/non-positive) — "
+                            f"pass max_bid explicitly."
+                        ),
+                    )
+                effective_max_bid = resolved
             # One check-point evaluation per request, BEFORE the Gixen call
             # (KTD1) — same advisories apply to whichever return path below
             # this request takes.
             intent = PolicyIntent(
                 item_id=item_id,
-                target_max_bid=req.max_bid,
+                target_max_bid=effective_max_bid,
                 snipe_group=gixen_snipe_group,
                 trigger="edit",
                 prior_row=current,
@@ -2871,18 +2937,26 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
                     item_id=item_id, trigger="edit",
                     outcome=BID_DECISION_OUTCOME_BLOCKED,
                     bid_row_id=(current["id"] if current is not None else None),
-                    requested_max_bid=req.max_bid,
+                    requested_max_bid=effective_max_bid,
                     check_results=check_results, advisories=advisories,
                     source=req.source, bypass=False,
                 )
                 raise HTTPException(status_code=409, detail=detail)
 
             await _modify_with_cache_fallback(
-                db, item_id, Decimal(str(req.max_bid)),
+                db, item_id, Decimal(str(effective_max_bid)),
                 gixen_bid_offset, gixen_snipe_group,
             )
             # Passthrough (None) values go to update_bid so a max_bid-only edit
             # leaves both fields untouched locally; explicit values write through.
+            # BUI-710: max_bid is the exception — the RESOLVED value is written
+            # (update_bid has no None branch for it), which is deliberate, not a
+            # shortcut: we just POSTed exactly this cap to Gixen, so
+            # "the edit path last wrote this row's cap at now" is literally
+            # true, and the resulting max_bid_changed_at stamp is what stops a
+            # scrape that started earlier from clobbering it (see
+            # mirror_gixen_max_bid's write-ordering guard). A group-only PATCH
+            # writing back the value it read is a no-op on the column itself.
             # BUI-408: await-free write, entered after the Gixen modify await
             # above — its own short-lived write_transaction() under _write_lock
             # instead of a commit on the shared _db. The read-back also
@@ -2894,7 +2968,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             # returning stale/missing data for the row this just wrote.
             async with _write_locked():
                 with write_transaction(_get_db_path()) as wconn:
-                    update_bid(wconn, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+                    update_bid(wconn, item_id, effective_max_bid, req.bid_offset, req.snipe_group)
                     row = get_bid_by_item_id(wconn, item_id)
     except GixenSnipeNotFoundError as e:
         # Nothing was POSTed — the pre-POST lookup found no such snipe — so
@@ -2905,7 +2979,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
             item_id=item_id, trigger="edit",
             outcome=BID_DECISION_OUTCOME_GIXEN_FAILED,
             bid_row_id=(current["id"] if current is not None else None),
-            requested_max_bid=req.max_bid,
+            requested_max_bid=effective_max_bid,
             check_results=check_results, advisories=advisories,
             source=req.source, bypass=req.policy_bypass,
         )
@@ -2917,12 +2991,12 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         # BUI-618: this is the "maybe-money-moved" / unconfirmed-modify case
         # the ledger must still record (never gixen_failed — Gixen may well
         # hold the new value even though this request can't confirm it).
-        detail = await _reconcile_after_unconfirmed_modify(item_id, req.max_bid, e)
+        detail = await _reconcile_after_unconfirmed_modify(item_id, effective_max_bid, e)
         await _append_bid_decision(
             item_id=item_id, trigger="edit",
             outcome=BID_DECISION_OUTCOME_UNCONFIRMED,
             bid_row_id=(current["id"] if current is not None else None),
-            requested_max_bid=req.max_bid,
+            requested_max_bid=effective_max_bid,
             check_results=check_results, advisories=advisories,
             source=req.source, bypass=req.policy_bypass,
         )
@@ -2962,7 +3036,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
         # reasoning as the main write above.
         async with _write_locked():
             with write_transaction(_get_db_path()) as wconn:
-                update_bid(wconn, item_id, req.max_bid, req.bid_offset, req.snipe_group)
+                update_bid(wconn, item_id, effective_max_bid, req.bid_offset, req.snipe_group)
                 row = get_bid_by_item_id(wconn, item_id)
         if row is None:
             raise HTTPException(
@@ -2980,7 +3054,7 @@ async def api_edit_bid(item_id: str, req: EditBidRequest):
     await _append_bid_decision(
         item_id=item_id, trigger="edit",
         outcome=BID_DECISION_OUTCOME_COMMITTED,
-        bid_row_id=row["id"], requested_max_bid=req.max_bid,
+        bid_row_id=row["id"], requested_max_bid=effective_max_bid,
         check_results=check_results, advisories=advisories,
         source=req.source, bypass=req.policy_bypass,
     )

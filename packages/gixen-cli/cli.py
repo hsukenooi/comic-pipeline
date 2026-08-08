@@ -1153,6 +1153,145 @@ def edit(item_id: str, max_bid: str, offset: int | None, group: int | None, ack_
         sys.exit(1)
 
 
+def _format_cap(value) -> str | None:
+    """Render a server-reported max_bid for the per-item group line, or None if
+    it isn't a usable number. Never raises — this is a display path on a
+    command whose write has already committed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return f"${float(value):.2f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _group_via_server(group_n: int, item_ids: tuple[str, ...]) -> None:
+    """BUI-710: `gixen group` in server mode — one PATCH per item, sequentially.
+
+    Sequential on purpose, like every other multi-write path in this CLI: the
+    server serializes Gixen calls under `_api_lock`, so concurrent PATCHes buy
+    nothing and only widen the window in which a half-formed group exists.
+
+    **The residual real-money risk, stated plainly.** Gixen's modify form has
+    no passthrough — `newmaxbid` is mandatory — so *something* must supply a
+    concrete cap; BUI-710 moves that job to the server rather than removing it.
+    The cap the server resolves is the DB mirror, which can lag Gixen only if
+    someone edits the cap on gixen.com's own web UI while our list fetches are
+    failing. Four things bound it, and there is no fifth:
+
+    1. the opening `GET /api/snipes` re-mirrors every live cap from Gixen
+       (`_ensure_fresh_sync` -> `mirror_gixen_max_bid`) whenever Gixen's read
+       path works at all;
+    2. the resolve happens under the server's `_api_lock`, so no concurrent
+       write *through the server* can be reverted;
+    3. an unusable cap (no live row, missing, non-positive, unparseable) is a
+       422 — never a default;
+    4. the resolved cap is printed per item, so a wrong one is visible rather
+       than silent.
+
+    In the one window that escapes (1) — Gixen's GET path stalling while POSTs
+    land, the exact 2026-08-07 signature — every other route to a group change
+    is *staler*: `edit --group` takes a cap a human read off the same DB (plus
+    typo risk), and an `add-batch` re-run takes one off a rows.json. This is
+    the least-stale option available then, and the only one that works at all.
+    """
+    # The opening read is GET /api/snipes, NOT GET /api/bids, and the
+    # difference is the ticket's stale-cap guard. Both would list the rows,
+    # but only /api/snipes runs `_ensure_fresh_sync()` first, which re-mirrors
+    # each live row's max_bid from Gixen's own list (`mirror_gixen_max_bid`).
+    # So the caps the server is about to resolve from have just been
+    # reconciled against Gixen — for the cost of the single Gixen round trip
+    # the direct-Gixen branch already spends on its opening `list_snipes()`.
+    # When Gixen is unreachable `_ensure_fresh_sync` logs and serves
+    # last-known rows instead of failing: deliberate, because grouping while
+    # Gixen flaps is the entire reason BUI-710 exists, and the mirrored cap is
+    # still the best value anyone has. A failure to reach the COMICS SERVER,
+    # by contrast, aborts here — we must never guess our way past a failed
+    # read (`_server_request` exits nonzero).
+    snipes = _server_request("get", "/api/snipes")
+    if not isinstance(snipes, list):
+        click.echo(
+            "Error: unexpected /api/snipes response (expected a list)", err=True
+        )
+        sys.exit(1)
+
+    # PENDING-only, matching the server's own resolution source
+    # (`get_pending_bid_by_item_id`): a terminal or never-ingested row has no
+    # cap for the server to resolve and would come back 422 mid-loop. Refusing
+    # up front — all-or-nothing, exactly like the direct-Gixen branch's
+    # missing-id check — keeps a typo from leaving a half-formed group.
+    live = {
+        str(s.get("item_id")): s
+        for s in snipes
+        if isinstance(s, dict) and s.get("status") == "PENDING"
+    }
+    missing = [iid for iid in item_ids if iid not in live]
+    if missing:
+        click.echo(
+            f"Error: no live (PENDING) snipe on the comics server for: "
+            f"{', '.join(missing)}",
+            err=True,
+        )
+        sys.exit(1)
+
+    failures: list[str] = []
+    for iid in item_ids:
+        # No max_bid in the payload — see group_cmd's docstring. `source`
+        # mirrors `edit`'s BUI-621 provenance tag so /api/decisions can tell a
+        # group write from a cap edit.
+        ok, data, error = _server_request_result(
+            "patch", f"/api/bids/{iid}",
+            json={"snipe_group": group_n, "source": "cli"},
+        )
+        if not ok:
+            failures.append(iid)
+            if isinstance(data, dict) and data.get("blocked"):
+                click.echo(
+                    f"  {iid}: blocked — "
+                    f"{data.get('message', 'blocked by policy.')}",
+                    err=True,
+                )
+                _print_advisories(data.get("advisories") or [])
+            elif isinstance(data, dict) and data.get("indeterminate"):
+                # BUI-697's lesson, applied here: a client timeout is not
+                # evidence the write failed. Say so, or the operator re-runs
+                # against a queue that already changed.
+                click.echo(
+                    f"  {iid}: INDETERMINATE — {error} The group change may "
+                    f"have landed; re-read `gixen list` before retrying.",
+                    err=True,
+                )
+            else:
+                click.echo(f"  {iid}: failed — {error}", err=True)
+            continue
+
+        row = data if isinstance(data, dict) else {}
+        cap = _format_cap(row.get("max_bid"))
+        # Print the cap the server actually holds after the write. The command
+        # promises not to move money; showing the number is what lets an
+        # operator verify that instead of trusting it.
+        suffix = f" (max bid unchanged at {cap})" if cap else ""
+        click.echo(f"  {iid}: group -> {group_n}{suffix}")
+        landed = row.get("snipe_group")
+        if isinstance(landed, int) and landed != group_n:
+            # Belt-and-braces on top of BUI-709's Gixen-side confirm (which
+            # already refuses to report success when the LISTED group differs
+            # from the sent one). Warn, don't fail: the read-back row is
+            # `get_bid_by_item_id`, which is not status-filtered, so a
+            # mismatch is likelier to be that quirk than a lost write.
+            click.echo(
+                f"  {iid}: warning — server reports group {landed}, not "
+                f"{group_n}; re-read `gixen list`.",
+                err=True,
+            )
+        _print_advisories(advisories_from_response(row))
+
+    ok_count = len(item_ids) - len(failures)
+    click.echo(f"Updated {ok_count} of {len(item_ids)} snipe(s).")
+    if failures:
+        sys.exit(1)
+
+
 @cli.command("group")
 @click.argument("group_n", type=click.IntRange(0, 10))
 @click.argument("item_ids", nargs=-1, required=True)
@@ -1160,7 +1299,25 @@ def group_cmd(group_n: int, item_ids: tuple[str, ...]):
     """Assign one or more existing snipes to a group (0=ungroup, 1-10).
 
     Preserves each snipe's existing max bid and offset.
+
+    BUI-710: server mode (COMICS_SERVER_URL set) routes each item through
+    `PATCH /api/bids/{item_id}` — the same retrying, dbidid-fast-path,
+    policy-checked write `edit` uses — instead of the direct-Gixen loop below,
+    which needs 1+3N `home_2.php` round trips with no retry and failed for
+    ~18h straight during the 2026-08-07 outage. The PATCH body carries NO
+    max_bid: BUI-710 made `EditBidRequest.max_bid` a None-passthrough, so the
+    server resolves the current cap from the live row inside the same
+    `_api_lock` acquisition that does the Gixen modify. That is the whole
+    safety argument for putting a group change on a money endpoint — this
+    command never states, computes, or transmits a bid amount, so it cannot
+    transmit a wrong one, and no concurrent edit can slip into a read->PATCH
+    window that doesn't exist. The direct-Gixen branch stays as the fallback
+    when no server URL is configured.
     """
+    if _server_url():
+        _group_via_server(group_n, item_ids)
+        return
+
     client = _make_client()
     try:
         snipes = client.list_snipes()

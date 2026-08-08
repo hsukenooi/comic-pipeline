@@ -97,26 +97,50 @@ caller can retry and reconcile**:
 
 | mechanism | `home_2.php` round trips for N items | retry / reconcile |
 |---|---|---|
-| `gixen group N id1..idN` (direct-Gixen only) | **1 + 3N** — one list up front, then per item a pre-POST list, the POST, and the confirm list | none: one shot, `sys.exit(1)` on failure |
+| `gixen group N id1..idN` — **direct-Gixen fallback** (no `COMICS_SERVER_URL`) | **1 + 3N** — one list up front, then per item a pre-POST list, the POST, and the confirm list | none: one shot, `sys.exit(1)` on failure |
+| `gixen group N id1..idN` — **server mode** (BUI-710, `PATCH /api/bids/{id}` per item) | **1 + 2N** when the row has a cached `dbidid` (1 + 3N on a cache miss) — one opening sync shared by every item, then per item the POST and the confirm list | server-side stale-`dbidid` retry, `modify_snipe`'s own one-shot POST retry, per-item BUI-697 `INDETERMINATE` labelling |
 | `gixen add-batch` row with `"group": N` (`POST /api/bids` upsert) | **3N** | BUI-697 `INDETERMINATE` + `reconcile_indeterminate_rows` |
 | `gixen edit <id> <cap> --group N` in server mode (`PATCH /api/bids/{id}`) | **2N** when the row has a cached `dbidid` (94/102 live PENDING rows did) — the fast path skips the pre-POST lookup | server-side stale-`dbidid` retry only |
 
-`gixen group` is the worst of the three *and* the only one with no retry machinery,
-which is exactly why it failed 100% while adds landed. Its per-item `modify_snipe` call
-does not reuse the `dbidid` it already resolved in its own opening `list_snipes()` — and
-should not start to: a stale `dbidid` addresses a *different* Gixen row, so reusing a
-several-round-trips-old one risks writing a cap onto the wrong snipe.
+The **direct-Gixen fallback** is the worst of these *and* the only one with no
+caller-level retry machinery, which is exactly why it failed 100% while adds landed. Its
+per-item `modify_snipe` call does not reuse the `dbidid` it already resolved in its own
+opening `list_snipes()` — and should not start to: a stale `dbidid` addresses a
+*different* Gixen row, so reusing a several-round-trips-old one risks writing a cap onto
+the wrong snipe.
 
-### 3. During an outage, prefer group-at-add; fall back to server-mode `edit --group`.
+**Server mode (BUI-710) is now the default for `gixen group`** whenever
+`COMICS_SERVER_URL` is set, and it is cheaper than the direct path for the same reason
+`edit --group` is: the server's cached `dbidid` skips the pre-POST list. The one opening
+round trip is a `GET /api/snipes`, deliberately *not* `GET /api/bids` — only `/api/snipes`
+runs `_ensure_fresh_sync`, which re-mirrors every live row's `max_bid` from Gixen's own
+list (`mirror_gixen_max_bid`) before the server resolves caps from those rows. It is the
+same single opening fetch the direct path already spends, spent on freshness instead of
+on `dbidid`s the server already caches. When Gixen is unreachable that sync fails soft
+and the last-known caps are used — deliberate, since grouping while `home_2.php` stalls
+is the whole point.
+
+### 3. During an outage, prefer group-at-add; `gixen group` itself now works in server mode.
 
 - **New snipes:** put `"group": N` on the `add-batch` row (or `gixen add --group N`).
   The group rides the add you were going to make anyway — zero extra round trips — and
   inherits add-batch's retry/reconcile semantics.
-- **Existing snipes:** `gixen edit <item_id> <current_max_bid> --group N` with
-  `COMICS_SERVER_URL` set. Read `<current_max_bid>` from `/api/comics/snipes` (local DB,
-  no Gixen call) — **`max_bid` is required on `PATCH` and is re-POSTed to Gixen, so
-  passing the wrong number silently changes a real bid.** Omit `--offset`; the server
-  passes the current value through from the DB.
+- **Existing snipes:** `gixen group N <item_id> ...` with `COMICS_SERVER_URL` set. Since
+  BUI-710 this is no longer the direct-Gixen one-shot the rest of this doc warns about —
+  it PATCHes each item through the server, sequentially, and **states no cap at all**:
+  `EditBidRequest.max_bid` became a `None`-passthrough, so the server resolves the
+  current cap from the live PENDING row inside the same `_api_lock` acquisition that
+  does the Gixen modify. A request that carries no bid amount cannot carry a wrong one,
+  and no concurrent edit can land in a read→PATCH window that does not exist. It prints
+  the resulting cap per item so you can see that nothing moved.
+- **The `edit --group` route is still the fallback for two cases:** an item with no live
+  PENDING row on the server (a never-ingested web-added snipe — `gixen group` 422s there
+  rather than guess a cap), and a group change that a `POLICY_BLOCK_*` flag is refusing
+  (`gixen group` has no `--ack-policy` of its own). Then: `gixen edit <item_id>
+  <current_max_bid> --group N`, reading `<current_max_bid>` from `/api/comics/snipes` —
+  **on that route `max_bid` is a number you supply and it IS re-POSTed to Gixen, so
+  passing the wrong one silently changes a real bid.** Omit `--offset`; the server passes
+  the current value through from the DB.
 - Either way, apply the outage rule that actually worked: **persistent bounded retry +
   reconcile** — write, wait 30–90s, re-read `/api/comics/snipes`, diff, retry the
   stragglers. A single-shot verdict during a mid-body stall is meaningless in both
@@ -154,6 +178,15 @@ carry `snipe_group` end to end and both of which need fewer round trips than
 `gixen group`, with retry/reconcile available. What is *not* available is a
 `home_2.php`-free write of any kind; the mitigation is fewer round trips plus persistent
 bounded retry, not a different endpoint.
+
+**Update (BUI-710):** `gixen group` is no longer the odd one out. It now has a server-mode
+branch that PATCHes each item through `/api/bids/{id}` — the same path, the same cached
+`dbidid` fast path, the same retries — and falls back to the direct-Gixen loop only when
+`COMICS_SERVER_URL` is unset. BUI-700 deferred this because a group PATCH had to re-state
+`max_bid`, which is re-POSTed to Gixen; BUI-710 dissolved that rather than guarding it, by
+making `EditBidRequest.max_bid` a `None`-passthrough resolved server-side from the live
+row. So the workaround in §3 is now the *fallback*, not the recommended route, and the
+"1 + 3N with no retry" row in §2's table describes only the no-server-URL fallback.
 
 ## References
 

@@ -487,6 +487,186 @@ def test_edit_bid_no_pending_row_falls_back_to_default_offset(api):
 
 
 # ---------------------------------------------------------------------------
+# BUI-710: max_bid joins the same None-passthrough family — a GROUP-ONLY PATCH
+# (`gixen group` in server mode) states no cap at all, so it cannot state a
+# wrong one. Unlike bid_offset/snipe_group, an unresolvable max_bid is a 422,
+# never a default: there is no safe default cap.
+# ---------------------------------------------------------------------------
+
+def test_edit_bid_group_only_preserves_cap_and_sends_a_concrete_one_to_gixen(api):
+    """The core BUI-710 contract. Omitting max_bid keeps the stored cap, and
+    Gixen — whose modify form REQUIRES newmaxbid — still receives a concrete
+    number (the resolved one), never None."""
+    from decimal import Decimal
+    api.post("/api/bids", json={"item_id": "710000001", "max_bid": 50.0,
+                                "bid_offset": 12, "snipe_group": 0})
+    r = api.patch("/api/bids/710000001", json={"snipe_group": 3})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["max_bid"] == 50.0     # unchanged — no money moved
+    assert data["snipe_group"] == 3    # the one thing this request asked for
+    assert data["bid_offset"] == 12    # BUI-401 passthrough still intact
+    args, kwargs = api.mock_gixen.modify_snipe.call_args
+    assert args[1] == Decimal("50.0")
+    assert kwargs.get("snipe_group") == 3
+    assert kwargs.get("bid_offset") == 12
+
+
+def test_edit_bid_group_only_resolves_the_live_row_not_a_stale_terminal_one(api):
+    """The money analogue of test_edit_bid_no_pending_row_falls_back_to_zero_
+    not_stale_terminal_group: with BOTH an old resolved row and a live PENDING
+    row on one item_id, the cap re-POSTed to Gixen must come from the LIVE row.
+    Leaking the terminal row's cap here would re-arm a real bid at a price from
+    a previous bidding cycle."""
+    from decimal import Decimal
+    _seed_bid_row("710000002", status="WON", max_bid=999.0)
+    api.post("/api/bids", json={"item_id": "710000002", "max_bid": 40.0})
+    r = api.patch("/api/bids/710000002", json={"snipe_group": 2})
+    assert r.status_code == 200
+    assert api.mock_gixen.modify_snipe.call_args.args[1] == Decimal("40.0")
+
+
+def test_edit_bid_group_only_with_no_live_row_is_422_and_never_calls_gixen(api):
+    """Fail closed. With only a terminal row (or nothing at all) there is no
+    cap to resolve, and any default would be a silent money change — so this
+    422s BEFORE any Gixen call, unlike the offset/group fallbacks above."""
+    _seed_bid_row("710000003", status="WON", max_bid=999.0)
+    r = api.patch("/api/bids/710000003", json={"snipe_group": 2})
+    assert r.status_code == 422
+    assert "max_bid" in r.json()["detail"]
+    api.mock_gixen.modify_snipe.assert_not_called()
+
+
+@pytest.mark.parametrize("stored", [0.0, -5.0, "not-a-number"])
+def test_edit_bid_group_only_rejects_a_degenerate_stored_cap(api, stored):
+    """The resolved cap is held to the same bar as an explicit one. sqlite is
+    dynamically typed, so a REAL column is a convention, not a guarantee, and
+    the request validator is bypassed on this path — a resolved 0 would POST
+    newmaxbid=0 to Gixen."""
+    api.post("/api/bids", json={"item_id": "710000010", "max_bid": 50.0})
+    conn = _dbconn()
+    conn.execute(
+        "UPDATE bids SET max_bid=? WHERE item_id='710000010'", (stored,),
+    )
+    conn.commit()
+    conn.close()
+    api.mock_gixen.modify_snipe.reset_mock()
+    r = api.patch("/api/bids/710000010", json={"snipe_group": 2})
+    assert r.status_code == 422
+    api.mock_gixen.modify_snipe.assert_not_called()
+
+
+def test_edit_bid_group_only_on_unknown_item_is_422_not_a_guessed_cap(api):
+    """No local row at all — the web-added-snipe case api_edit_bid otherwise
+    self-heals via sync. A group-only PATCH still refuses rather than guessing,
+    because the self-heal happens only AFTER the Gixen modify has fired."""
+    r = api.patch("/api/bids/710000004", json={"snipe_group": 2})
+    assert r.status_code == 422
+    api.mock_gixen.modify_snipe.assert_not_called()
+
+
+def test_edit_bid_group_only_resolves_the_cap_under_api_lock(api, monkeypatch):
+    """The resolve read and the Gixen modify share one _api_lock acquisition —
+    the property that makes server-side resolution strictly safer than a client
+    reading the cap and echoing it back (BUI-402's argument, now covering the
+    cap itself)."""
+    import server.main as sm
+    api.post("/api/bids", json={"item_id": "710000005", "max_bid": 50.0})
+
+    real = sm.get_pending_bid_by_item_id
+    observed = []
+
+    def spy(conn, item_id):
+        lock = sm._api_lock
+        observed.append(lock is not None and lock.locked())
+        return real(conn, item_id)
+
+    monkeypatch.setattr(sm, "get_pending_bid_by_item_id", spy)
+    r = api.patch("/api/bids/710000005", json={"snipe_group": 6})
+    assert r.status_code == 200
+    assert observed and observed[0] is True
+
+
+def test_edit_bid_group_only_stamps_max_bid_changed_at(api):
+    """Deliberate, not incidental: we just re-POSTed this exact cap to Gixen,
+    so the stamp is true — and it is what stops an in-flight scrape that
+    started earlier from mirroring a stale cap back over it."""
+    api.post("/api/bids", json={"item_id": "710000006", "max_bid": 50.0})
+    conn = _dbconn()
+    conn.execute("UPDATE bids SET max_bid_changed_at=NULL WHERE item_id='710000006'")
+    conn.commit()
+    conn.close()
+    r = api.patch("/api/bids/710000006", json={"snipe_group": 1})
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT max_bid_changed_at, max_bid FROM bids WHERE item_id='710000006'"
+    ).fetchone()
+    assert row["max_bid_changed_at"] is not None
+    assert row["max_bid"] == 50.0
+
+
+def test_edit_bid_group_only_records_the_resolved_cap_in_the_decision_ledger(
+    api, monkeypatch,
+):
+    """The BUI-618 ledger must show the number that actually went to Gixen —
+    a NULL here would make a group write untraceable in /api/decisions."""
+    monkeypatch.delenv("POLICY_EXPOSURE_CEILING", raising=False)
+    api.post("/api/bids", json={"item_id": "710000007", "max_bid": 50.0})
+    r = api.patch(
+        "/api/bids/710000007", json={"snipe_group": 4, "source": "cli"},
+    )
+    assert r.status_code == 200
+    edit_rows = [x for x in _decisions("710000007") if x["trigger"] == "edit"]
+    assert len(edit_rows) == 1
+    assert edit_rows[0]["outcome"] == "committed"
+    assert edit_rows[0]["requested_max_bid"] == 50.0
+    assert edit_rows[0]["source"] == "cli"
+
+
+def test_edit_bid_group_only_unconfirmed_group_writes_nothing_locally(api):
+    """The group-not-actually-landed case. BUI-709 made modify_snipe's confirm
+    compare the LISTED snipe_group against the sent one, so a group that
+    doesn't land raises GixenModifyNotConfirmedError — and that must leave the
+    local row entirely alone (old group, old cap), never a DB that claims a
+    group Gixen doesn't hold."""
+    from gixen_client import GixenModifyNotConfirmedError
+    api.post("/api/bids", json={"item_id": "710000011", "max_bid": 50.0,
+                                "snipe_group": 1})
+    api.mock_gixen.modify_snipe.side_effect = GixenModifyNotConfirmedError(
+        "710000011", 50.0,
+    )
+    r = api.patch("/api/bids/710000011", json={"snipe_group": 7})
+    assert r.status_code == 503
+    row = _dbconn().execute(
+        "SELECT snipe_group, max_bid FROM bids WHERE item_id='710000011'"
+    ).fetchone()
+    assert row["snipe_group"] == 1     # not 7 — the write never landed
+    assert row["max_bid"] == 50.0      # and the cap was not touched either
+
+
+def test_edit_bid_explicit_max_bid_still_writes_through(api):
+    """Regression guard: making the field optional must not weaken the normal
+    cap edit."""
+    api.post("/api/bids", json={"item_id": "710000008", "max_bid": 50.0})
+    r = api.patch("/api/bids/710000008", json={"max_bid": 75.0})
+    assert r.status_code == 200
+    assert r.json()["max_bid"] == 75.0
+
+
+@pytest.mark.parametrize("bad", [0, -1, -0.01])
+def test_edit_bid_non_positive_max_bid_still_rejected(api, bad):
+    """An explicit non-positive cap is still a 422 — `None` is the ONLY newly
+    accepted value. Guards the obvious way to break the validator while making
+    the field optional (`if v <= 0` on a None would have crashed; `is not None`
+    must not become a blanket skip)."""
+    api.post("/api/bids", json={"item_id": "710000009", "max_bid": 50.0})
+    api.mock_gixen.modify_snipe.reset_mock()
+    r = api.patch("/api/bids/710000009", json={"max_bid": bad})
+    assert r.status_code == 422
+    api.mock_gixen.modify_snipe.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # BUI-402: the bid_offset/snipe_group passthrough resolve read must run INSIDE
 # _api_lock (with the modify + update_bid), closing the TOCTOU where a
 # concurrent group/offset-changing PATCH landed between the read and the modify
