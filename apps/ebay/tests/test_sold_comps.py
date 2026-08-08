@@ -3618,6 +3618,311 @@ class TestFetchSoldComps:
         assert m.call_count == 0, "no live call past a tripped breaker"
 
 
+# ─── BUI-701: sold-comps.com request pacing ───────────────────────────────────
+
+class _FakeClock:
+    """A deterministic virtual clock for testing _RateLimiter/backoff without
+    real wall-clock sleeps (BUI-701). `sleep(x)` advances the virtual clock
+    forward by x and returns immediately in real time; `monotonic()` reads
+    the current virtual time. Both are thread-safe (one shared lock), so
+    concurrent callers see a single consistent timeline — the same contract
+    time.monotonic()/time.sleep() give the rate limiter in production, just
+    compressed to zero real elapsed time so a simulated 200-book paced batch
+    (which would take real minutes) runs in milliseconds."""
+
+    def __init__(self):
+        self._t = 0.0
+        self._lock = threading.Lock()
+
+    def monotonic(self):
+        with self._lock:
+            return self._t
+
+    def sleep(self, seconds):
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._t += seconds
+
+
+class TestRateLimiter:
+    """Unit tests for _RateLimiter (BUI-701)."""
+
+    def test_sequential_acquisitions_are_spaced_by_interval(self, monkeypatch):
+        """Each acquire() reserves a slot exactly `interval` seconds after
+        the previous one — the core leaky-bucket invariant that keeps the
+        dispatch rate at rate_per_min regardless of how fast the caller asks
+        for slots."""
+        clock = _FakeClock()
+        monkeypatch.setattr(sc.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(sc.time, "sleep", clock.sleep)
+
+        limiter = sc._RateLimiter(rate_per_min=60.0)  # interval = 1.0s
+        starts = []
+        for _ in range(5):
+            limiter.acquire()
+            starts.append(clock.monotonic())
+
+        assert starts[0] == pytest.approx(0.0), "first call never waits"
+        for i in range(1, 5):
+            assert starts[i] - starts[i - 1] == pytest.approx(1.0)
+
+    def test_idle_period_does_not_bank_burst_credit(self, monkeypatch):
+        """A long idle gap must not let a later burst of calls fire back-to-
+        back. A bursty token bucket would allow exactly that; BUI-701
+        deliberately chose zero burst allowance instead, because the
+        2026-08-07 incident's mechanism WAS a burst tipping a saturated
+        window over — closing that means no accumulated credit, ever."""
+        clock = _FakeClock()
+        monkeypatch.setattr(sc.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(sc.time, "sleep", clock.sleep)
+
+        limiter = sc._RateLimiter(rate_per_min=60.0)  # interval = 1.0s
+        limiter.acquire()
+        clock.sleep(100.0)  # plenty of idle time to "bank", if it could
+        t0 = clock.monotonic()
+        limiter.acquire()
+        limiter.acquire()
+        limiter.acquire()
+        # Three more calls still take a full 2 intervals — none fire early.
+        assert clock.monotonic() - t0 == pytest.approx(2.0)
+
+    def test_effective_rate_respects_target_over_many_calls(self, monkeypatch):
+        """N acquisitions must span at least (N-1) intervals — i.e. the
+        realized rate never exceeds rate_per_min, the property the 200-book
+        batch test below relies on."""
+        clock = _FakeClock()
+        monkeypatch.setattr(sc.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(sc.time, "sleep", clock.sleep)
+
+        limiter = sc._RateLimiter(rate_per_min=sc._SOLD_COMPS_RATE_LIMIT_PER_MIN)
+        n = 200
+        for _ in range(n):
+            limiter.acquire()
+        elapsed_min = clock.monotonic() / 60.0
+        realized_rate = (n - 1) / elapsed_min if elapsed_min else float("inf")
+        assert realized_rate <= sc._SOLD_COMPS_RATE_LIMIT_PER_MIN + 1e-6
+        # And comfortably under the 60 req/min ceiling with real headroom.
+        assert realized_rate < 60.0
+
+    def test_thread_safety_real_threads_never_dispatch_closer_than_interval(self):
+        """Real concurrent threads (not the fake clock) hammering acquire()
+        must never produce two dispatches closer together than one
+        interval — proves the lock correctly protects `_next_slot` under
+        contention rather than two threads both reading a stale slot and
+        racing each other into (nearly) the same instant."""
+        interval = 0.02  # kept small so N threads finish quickly in CI
+        limiter = sc._RateLimiter(rate_per_min=60.0 / interval)
+        n = 25
+        timestamps = []
+        lock = threading.Lock()
+
+        def worker():
+            limiter.acquire()
+            with lock:
+                timestamps.append(time.monotonic())
+
+        threads = [threading.Thread(target=worker) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        timestamps.sort()
+        assert len(timestamps) == n
+        gaps = [b - a for a, b in zip(timestamps, timestamps[1:])]
+        assert all(g >= interval - 0.01 for g in gaps), gaps
+        assert timestamps[-1] - timestamps[0] >= (n - 1) * interval - 0.01
+
+
+class TestSoldCompsBackoff:
+    """Unit tests for _sold_comps_backoff_seconds (BUI-701)."""
+
+    def test_429_gets_a_much_longer_wait_than_the_shared_default(self):
+        resp = MagicMock(status_code=429)
+        wait = sc._sold_comps_backoff_seconds(0, resp, None)
+        assert wait >= sc._SOLD_COMPS_429_BASE_BACKOFF_SEC
+        assert wait > 10 * (2 ** 0), "must dwarf the shared 2**attempt default"
+
+    def test_429_backoff_grows_and_jitters_across_attempts(self):
+        resp = MagicMock(status_code=429)
+        base = sc._SOLD_COMPS_429_BASE_BACKOFF_SEC
+        waits_attempt0 = [sc._sold_comps_backoff_seconds(0, resp, None) for _ in range(20)]
+        waits_attempt1 = [sc._sold_comps_backoff_seconds(1, resp, None) for _ in range(20)]
+        # Growth: attempt 1's minimum possible wait exceeds attempt 0's
+        # maximum possible wait (base * 2**attempt, plus up to 50% jitter).
+        assert max(waits_attempt0) <= base * 1.5 + 1e-9
+        assert min(waits_attempt1) >= base * 2
+        # Jitter: draws are not all identical (deflakes only if RNG produced
+        # a degenerate run — astronomically unlikely across 20 draws).
+        assert len(set(waits_attempt0)) > 1
+
+    def test_non_429_retryable_status_keeps_shared_default_schedule(self):
+        resp = MagicMock(status_code=503)
+        assert sc._sold_comps_backoff_seconds(2, resp, None) == 2 ** 2
+
+    def test_network_error_keeps_shared_default_schedule(self):
+        exc = requests.exceptions.ConnectionError("boom")
+        assert sc._sold_comps_backoff_seconds(1, None, exc) == 2 ** 1
+
+
+class TestSoldCompsPacingIntegration:
+    """BUI-701 acceptance test: a 200-book batch must complete without a
+    terminal 429 at default settings. Uses a mocked/patched clock (no real
+    sleeping — a real run would take real minutes) and a fake sold-comps.com
+    that 429s once its own sliding-window request rate exceeds the real
+    provider's documented 60 req/min ceiling. No live provider call anywhere
+    in this test."""
+
+    class _RateLimitedFakeProvider:
+        """Models sold-comps.com's own 60 req/min ceiling: any GET whose
+        virtual timestamp falls within a 60s trailing window that already
+        holds >= `ceiling` prior requests gets a 429; every other GET
+        succeeds. Timestamps are read from the (monkeypatched) fake clock
+        via sc.time.monotonic(), so this judges requests on the SAME
+        timeline the rate limiter and backoff use."""
+
+        def __init__(self, ceiling=60):
+            self.ceiling = ceiling
+            self._lock = threading.Lock()
+            self._timestamps = []
+            self.terminal_failures = 0
+
+        def get(self, url, **kwargs):
+            now = sc.time.monotonic()
+            with self._lock:
+                self._timestamps = [t for t in self._timestamps if now - t < 60.0]
+                if len(self._timestamps) >= self.ceiling:
+                    resp = MagicMock()
+                    resp.status_code = 429
+                    resp.raise_for_status = MagicMock(
+                        side_effect=requests.HTTPError(response=resp))
+                    return resp
+                self._timestamps.append(now)
+            return _sold_comps_good([_sc_item()])
+
+    def test_200_book_batch_completes_without_terminal_429s(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        clock = _FakeClock()
+        monkeypatch.setattr(sc.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(sc.time, "sleep", clock.sleep)
+        # Fresh limiter bound to the fake clock's timeline for test isolation
+        # (the module-level singleton is process-wide and could carry state
+        # from an earlier test in this run).
+        monkeypatch.setattr(sc, "_SOLD_COMPS_RATE_LIMITER",
+                            sc._RateLimiter(sc._SOLD_COMPS_RATE_LIMIT_PER_MIN))
+
+        provider = self._RateLimitedFakeProvider(ceiling=60)
+        breaker = sc._CircuitBreaker(sc.CIRCUIT_BREAKER_THRESHOLD,
+                                     total_books=200, provider_name="sold-comps.com")
+
+        with patch("sold_comps.requests.get", side_effect=provider.get):
+            with sc.ThreadPoolExecutor(max_workers=sc.DEFAULT_MAX_WORKERS) as pool:
+                futures = [
+                    pool.submit(sc.fetch_sold_comps, f"book-{i}", "key",
+                               breaker=breaker)
+                    for i in range(200)
+                ]
+                errors = []
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except Exception as e:  # noqa: BLE001 — collecting for the assertion below
+                        errors.append(e)
+
+        assert errors == [], (
+            f"{len(errors)}/200 books hit a terminal failure under pacing: "
+            f"{errors[:3]}"
+        )
+        assert breaker.tripped is False, (
+            "a terminal 429 would have counted against this breaker "
+            "(fetch_sold_comps' terminal-failures-only accounting) — "
+            "tripped means the pacing let requests through faster than "
+            "the fake ceiling allows"
+        )
+
+
+class TestSoldCompsSemaphoreBackoffInterplay:
+    """BUI-701 adversarial thread-safety test: a request backing off after a
+    429 must NOT hold one of the 4 concurrency slots for the whole backoff —
+    otherwise the other 3 workers are starved for however long the (now much
+    longer, 15-45s+) 429 backoff lasts. Runs with real threads and real
+    (tiny) sleeps — this is specifically proving the semaphore is released
+    at the right moment in real time, so it cannot use the fake clock."""
+
+    def test_semaphore_released_during_429_backoff_not_held(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        # A fresh rate limiter so this test isn't at the mercy of whatever
+        # real-time state the module-level singleton carries in from
+        # whichever test ran immediately before it (its first acquire()
+        # here must return instantly, so the only long sleep() call
+        # observed below is unambiguously the 429 backoff).
+        monkeypatch.setattr(sc, "_SOLD_COMPS_RATE_LIMITER",
+                            sc._RateLimiter(sc._SOLD_COMPS_RATE_LIMIT_PER_MIN))
+        # Small but real backoff — long enough to reliably observe, short
+        # enough to keep the test fast.
+        monkeypatch.setattr(sc, "_SOLD_COMPS_429_BASE_BACKOFF_SEC", 0.3)
+
+        calls = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                bad = MagicMock()
+                bad.status_code = 429
+                bad.raise_for_status = MagicMock(
+                    side_effect=requests.HTTPError(response=bad))
+                return bad
+            return _sold_comps_good([_sc_item()])
+
+        sleeping = threading.Event()
+        release_sleep = threading.Event()
+        real_sleep = time.sleep
+
+        def observing_sleep(seconds):
+            if seconds > 0.05:  # the 429 backoff, not incidental bookkeeping
+                sleeping.set()
+                release_sleep.wait(timeout=5)
+            real_sleep(min(seconds, 0.01))  # yield briefly, keep it fast
+
+        monkeypatch.setattr(sc.time, "sleep", observing_sleep)
+
+        result = {}
+
+        def worker():
+            with patch("sold_comps.requests.get", side_effect=fake_get):
+                result["data"], result["hit"], _ = sc.fetch_sold_comps("t", "k")
+
+        t = threading.Thread(target=worker)
+        t.start()
+        acquired = []
+        try:
+            assert sleeping.wait(timeout=5), "429 backoff sleep never started"
+            # The first call's HTTP attempt has returned (429) and the
+            # semaphore's `with` block has therefore already exited — while
+            # that call is now backing off, grab ALL 4 permits from THIS
+            # thread. This must succeed immediately: if the semaphore were
+            # still (wrongly) held across the backoff, this would block and
+            # the acquire(timeout=1) calls below would time out.
+            acquired = [sc._SOLD_COMPS_SEMAPHORE.acquire(timeout=1)
+                       for _ in range(sc._SOLD_COMPS_MAX_CONCURRENCY)]
+            assert all(acquired), (
+                "semaphore still held during 429 backoff — this would "
+                "starve the other 3 workers for the whole (much longer, "
+                "post-BUI-701) 429 backoff"
+            )
+        finally:
+            for permit in acquired:
+                if permit:
+                    sc._SOLD_COMPS_SEMAPHORE.release()
+            release_sleep.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive(), "worker thread did not finish"
+        assert result["hit"] is False
+        assert calls["n"] == 2, "expected exactly one retry after the 429"
+
+
 class TestProviderFallback:
     """End-to-end failover at the fetch_book_comps level, through
     _fetch_with_fallback, with requests.get routed per endpoint."""
