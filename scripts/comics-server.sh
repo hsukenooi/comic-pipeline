@@ -54,12 +54,18 @@ comics_resolve_server() {
 # Health-gate the server. /health is a static {"status":"ok"} — it proves the
 # process is up but NOT that the collection store is healthy, so callers must
 # still check the exit code of the actual data call (that is comics_curl's job).
+# BUI-681: like comics_curl (BUI-186), the gate must bound a hung/half-open
+# server — a *down* server refuses fast, but a *hung* one stalls the caller
+# forever (and a launchd StartInterval job that hangs here never restarts).
+# Tighter than COMICS_CURL_MAX_TIME: /health is static, so anything past a
+# few seconds already means trouble.
+COMICS_HEALTH_MAX_TIME="${COMICS_HEALTH_MAX_TIME:-5}"
 comics_health_gate() {
   if [ -z "${COMICS_SERVER_URL:-}" ]; then
     echo "comics_health_gate: COMICS_SERVER_URL is unset — call comics_resolve_server first." >&2
     return 1
   fi
-  if ! curl -sf "${COMICS_SERVER_URL}/health" >/dev/null 2>&1; then
+  if ! curl -sf --max-time "$COMICS_HEALTH_MAX_TIME" "${COMICS_SERVER_URL}/health" >/dev/null 2>&1; then
     echo "The comics server at '${COMICS_SERVER_URL}' is not responding. Confirm the server is running before continuing." >&2
     return 1
   fi
