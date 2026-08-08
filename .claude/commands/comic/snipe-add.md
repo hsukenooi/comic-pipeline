@@ -194,6 +194,30 @@ Retroactive grouping: `gixen group N <item_id>...` assigns existing snipes to
 a group (0 = ungroup; direct-Gixen only, but the next sync mirrors it back
 onto the DB row per BUI-381 as long as the row is still `PENDING`).
 
+**When Gixen is stalling, do not use `gixen group` (BUI-700).** It re-reads the
+whole `home_2.php` snipe table `1 + 3N` times for N items and has no retry — it
+failed 100% for ~18 hours in the 2026-08-07/08 outage while adds kept landing.
+Two lighter paths already carry the group end to end:
+
+- **Grouping at add time (preferred):** `--group N` / the row's `group` field.
+  Zero extra round trips, and add-batch's BUI-697 reconcile resolves a
+  "Server timed out." row for you.
+- **Regrouping an existing snipe:** `gixen edit <item_id> <current_max_bid> --group N`
+  in server mode (`PATCH`, 2N round trips — it skips the pre-POST table read
+  when the row has a cached `dbidid`). Read `<current_max_bid>` from
+  `/api/comics/snipes` first — **`max_bid` is required and is re-POSTed to
+  Gixen, so a wrong number silently changes a real bid.**
+
+Either way, retry persistently and reconcile against `/api/comics/snipes`
+afterwards; a "Server timed out." during a stall often committed anyway.
+
+⚠️ **Re-running an add-batch row that omits `group` UN-GROUPS an already-grouped
+snipe** — the payload always sends `snipe_group`, defaulting to 0, and 0 means
+"ungrouped", not "unchanged". Carry `group` on every re-run of a grouped row.
+Full detail (round-trip table, the ledger evidence, why the DB value is not
+proof a group formed):
+`docs/solutions/conventions/bid-group-formation-without-the-snipe-table-fetch.md`.
+
 After `/comic:fmv` (or `/comic:buy`) has produced a row with `comic_id` and a numeric `grade`:
 
 ```bash

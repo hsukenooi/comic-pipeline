@@ -5124,3 +5124,174 @@ def test_add_bid_extra_unknown_field_ignored(api):
         },
     )
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# BUI-700: forming a bid group without `gixen group`
+#
+# `gixen group` is direct-Gixen only and re-reads the whole home_2.php snipe
+# table (once up front, then again inside each per-item modify_snipe), so it
+# failed 100% during the 2026-08-07/08 mid-body stall while the add path kept
+# landing under retry. These tests pin the two server-mode paths that carry a
+# group end to end WITHOUT `gixen group`, and pin the failure shape that the
+# outage actually produced. See docs/solutions/conventions/
+# bid-group-formation-without-the-snipe-table-fetch.md.
+# ---------------------------------------------------------------------------
+
+def _group_state(item_id):
+    conn = _dbconn()
+    row = conn.execute(
+        "SELECT snipe_group, group_changed_at, max_bid FROM bids "
+        "WHERE item_id=? AND status='PENDING'",
+        (item_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def test_create_carries_group_to_gixen_and_the_db(api):
+    """group-at-add: POST /api/bids for a brand-new item threads snipe_group
+    into add_snipe (which POSTs newsnipegroup) and into the inserted row."""
+    r = api.post(
+        "/api/bids",
+        json={"item_id": "700100001", "max_bid": 50.0, "snipe_group": 5},
+    )
+    assert r.status_code == 200
+    assert r.json()["created"] is True
+    assert api.mock_gixen.add_snipe.call_args.kwargs["snipe_group"] == 5
+    assert _group_state("700100001")["snipe_group"] == 5
+
+
+def test_upsert_of_a_live_row_applies_group_end_to_end(api):
+    """The BUI-700 question, answered: re-POSTing an EXISTING live snipe with a
+    `group` really does apply it — snipe_group reaches modify_snipe (and so
+    Gixen's newsnipegroup form field) and is written to the row, with
+    group_changed_at stamped because the group actually changed."""
+    api.post("/api/bids", json={"item_id": "700100002", "max_bid": 40.0})
+    assert _group_state("700100002")["snipe_group"] == 0
+    api.mock_gixen.add_snipe.reset_mock()
+
+    r = api.post(
+        "/api/bids",
+        json={"item_id": "700100002", "max_bid": 40.0, "snipe_group": 5},
+    )
+    assert r.status_code == 200
+    assert r.json()["created"] is False
+    # Gixen modify, not a second add — and the group rode along on it.
+    api.mock_gixen.add_snipe.assert_not_called()
+    assert api.mock_gixen.modify_snipe.call_args.kwargs["snipe_group"] == 5
+
+    row = _group_state("700100002")
+    assert row["snipe_group"] == 5
+    assert row["group_changed_at"] is not None  # BUI-384 membership bound
+    assert row["max_bid"] == 40.0               # cap unchanged by the regroup
+
+
+def test_two_upserts_form_a_group_without_any_snipe_table_read(api):
+    """Two rows, one group, entirely through POST /api/bids — the `gixen group`
+    replacement. list_snipes() is the home_2.php table read that `gixen group`
+    depends on; the server never calls it on this path (the reads that DO
+    happen are inside GixenClient.modify_snipe, which is mocked here — see
+    TestNewSnipeGroupOnEveryWritePath in test_gixen_client.py for that half)."""
+    for item_id in ("700100003", "700100004"):
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": 30.0})
+    api.mock_gixen.list_snipes.reset_mock()
+    api.mock_gixen.modify_snipe.reset_mock()
+
+    for item_id in ("700100003", "700100004"):
+        r = api.post(
+            "/api/bids",
+            json={"item_id": item_id, "max_bid": 30.0, "snipe_group": 7},
+        )
+        assert r.status_code == 200
+
+    # Both halves matter: the DB row alone proves nothing, because _sync_gixen's
+    # refresh_snipe_group mirror overwrites it from Gixen's own listing on the
+    # next cycle. The group is only real if Gixen was told (BUI-381/BUI-383).
+    assert [c.kwargs["snipe_group"]
+            for c in api.mock_gixen.modify_snipe.call_args_list] == [7, 7]
+    assert _group_state("700100003")["snipe_group"] == 7
+    assert _group_state("700100004")["snipe_group"] == 7
+    api.mock_gixen.list_snipes.assert_not_called()
+
+
+def test_patch_carries_group_on_the_cached_dbidid_fast_path(api):
+    """`gixen edit <id> <cap> --group N` in server mode: the cheapest existing
+    regroup, because a warm dbidid lets modify_snipe skip its pre-POST snipe
+    table lookup. bid_offset is omitted and must still pass through (BUI-401)."""
+    api.post("/api/bids", json={"item_id": "700100005", "max_bid": 60.0, "bid_offset": 9})
+    _seed_dbidid("700100005", "cached-700")
+
+    r = api.patch(
+        "/api/bids/700100005",
+        json={"max_bid": 60.0, "snipe_group": 5, "source": "cli"},
+    )
+    assert r.status_code == 200
+    kwargs = api.mock_gixen.modify_snipe.call_args.kwargs
+    assert kwargs["snipe_group"] == 5
+    assert kwargs["dbidid"] == "cached-700"
+    assert kwargs["bid_offset"] == 9          # resolved from the DB, not reset to 6
+    assert _group_state("700100005")["snipe_group"] == 5
+
+
+def test_gixen_failure_on_a_group_upsert_writes_no_group(api):
+    """The 2026-08-08 outage reproduction (bid_decisions rows 278-281, all
+    `upsert`/`gixen_failed`): when the Gixen call raises, _modify_and_update_bid
+    never reaches update_bid, so the group stays unwritten and the ledger says
+    gixen_failed. The upsert path did not "ignore" group — it never ran."""
+    from gixen_client import GixenConnectionError
+
+    api.post("/api/bids", json={"item_id": "700100006", "max_bid": 40.0})
+    api.mock_gixen.modify_snipe.side_effect = GixenConnectionError("curl exit 28")
+
+    r = api.post(
+        "/api/bids",
+        json={"item_id": "700100006", "max_bid": 40.0, "snipe_group": 5,
+              "source": "batch"},
+    )
+    assert r.status_code == 503
+
+    row = _group_state("700100006")
+    assert row["snipe_group"] == 0            # no group landed
+    assert row["group_changed_at"] is None    # update_bid never ran
+
+    conn = _dbconn()
+    decision = conn.execute(
+        "SELECT trigger, outcome FROM bid_decisions WHERE item_id='700100006' "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    assert (decision["trigger"], decision["outcome"]) == ("upsert", "gixen_failed")
+
+
+def test_upsert_omitting_group_silently_ungroups_a_grouped_row(api):
+    """The retry trap. AddBidRequest.snipe_group defaults to 0 (no None
+    passthrough, unlike EditBidRequest since BUI-392) and
+    add_batch.build_bid_payload always sends the key — so re-running an
+    add-batch rows.json whose row has no `group` UN-GROUPS a snipe that was
+    already grouped. Characterized, not fixed: `gixen add` without --group
+    legitimately means group 0. Carry `group` on every re-run, or regroup with
+    PATCH (which does pass through)."""
+    api.post("/api/bids", json={"item_id": "700100007", "max_bid": 40.0, "snipe_group": 5})
+    assert _group_state("700100007")["snipe_group"] == 5
+
+    api.post("/api/bids", json={"item_id": "700100007", "max_bid": 45.0})
+    assert api.mock_gixen.modify_snipe.call_args.kwargs["snipe_group"] == 0
+    assert _group_state("700100007")["snipe_group"] == 0
+
+    # PATCH is the contrast: omitting snipe_group leaves the group alone.
+    api.post("/api/bids", json={"item_id": "700100007", "max_bid": 45.0, "snipe_group": 5})
+    api.patch("/api/bids/700100007", json={"max_bid": 50.0})
+    assert api.mock_gixen.modify_snipe.call_args.kwargs["snipe_group"] == 5
+    assert _group_state("700100007")["snipe_group"] == 5
+
+
+def test_add_batch_row_group_reaches_the_bid_payload():
+    """The rows.json `group` key is what a skill actually writes — pin that it
+    lands on the POST /api/bids field the tests above exercise, and that an
+    omitted `group` becomes an explicit 0 (the trap characterized above)."""
+    import add_batch
+
+    payload = add_batch.build_bid_payload("700100008", 40.0, 6, 5)
+    assert payload["snipe_group"] == 5
+    assert add_batch.build_bid_payload("700100008", 40.0, 6, 0)["snipe_group"] == 0
