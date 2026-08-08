@@ -304,6 +304,28 @@ GIXEN_RAW_TERMINAL_STATUSES: frozenset[str] = frozenset(GIXEN_TERMINAL_MAP)
 # Client
 # ---------------------------------------------------------------------------
 
+def _default_client_timeout() -> float:
+    """Resolve GixenClient's default timeout (BUI-699).
+
+    A *good-case* fetch of home_2.php (the snipe table GET/POST target used
+    by login/_get_home_page/_post_home below) measured 12.95s for 399,838
+    bytes / 91 snipe rows in a 2026-08-07 probe, and the page only grows as
+    more snipes are added — the old 15.0s default left ~2s of margin on a
+    real-money write path. 60s gives real headroom over that measured good
+    case. 322/328 all-time curl-28 (operation timeout) failures were on this
+    same endpoint, zero on login across 1,358 logins, so home_2.php is
+    specifically where the margin matters. This does not rescue a genuinely
+    stalled transfer (one probe still failed mid-body at 60s) — that class is
+    BUI-697's reconcile job, not a timeout value. Override with
+    GIXEN_CLIENT_TIMEOUT (seconds) for local tuning without a code change.
+    """
+    return float(os.getenv("GIXEN_CLIENT_TIMEOUT", "60.0"))
+
+
+# Read once at import time (module-level default args are bound at def-time,
+# same pattern as server/main.py's SYNC_INTERVAL) rather than per instance.
+_DEFAULT_TIMEOUT = _default_client_timeout()
+
 _LOGIN_COOLDOWN = 300  # seconds to wait after a failed login before retrying
 # BUI-118: a *transient* login failure (connectivity blip — ConnectionError /
 # Timeout / empty body, the BUI-77 classification) gets a short cooldown for the
@@ -341,7 +363,7 @@ class GixenClient:
         self,
         username: Optional[str] = None,
         password: Optional[str] = None,
-        timeout: float = 15.0,
+        timeout: float = _DEFAULT_TIMEOUT,
     ):
         self.username = username or os.getenv("GIXEN_USERNAME", "")
         self.password = password or os.getenv("GIXEN_PASSWORD", "")
