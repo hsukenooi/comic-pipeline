@@ -55,16 +55,26 @@ def create_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS fmv (
-            id          INTEGER PRIMARY KEY,
-            comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
-            grade       REAL NOT NULL,
-            low         REAL,
-            high        REAL,
-            comps       INTEGER,
-            confidence  TEXT CHECK(confidence IN ('high', 'medium', 'low') OR confidence IS NULL),
-            notes       TEXT,
-            flag_reason TEXT,
-            updated_at  TEXT,
+            id                 INTEGER PRIMARY KEY,
+            comic_id           INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+            grade              REAL NOT NULL,
+            low                REAL,
+            high               REAL,
+            comps              INTEGER,
+            confidence         TEXT CHECK(confidence IN ('high', 'medium', 'low') OR confidence IS NULL),
+            notes              TEXT,
+            flag_reason        TEXT,
+            -- BUI-712: the BUI-522 ungraded-market anchor (median price + raw
+            -- copy count off the grade-less comps build_pool drops) as REAL
+            -- COLUMNS, not notes parsing — the ticket's own contract, since the
+            -- `ungraded_anchor=$X (nN raw)` fmv_notes token was never meant to
+            -- be a machine-readable format. Display-only (BUI-522/BUI-713): the
+            -- anchor enters no pool, moves no guard, sets no bid cap — see
+            -- upsert_fmv's docstring for why the flag_reason CASE that NULLs
+            -- low/high must NOT NULL these two.
+            ungraded_anchor    REAL,
+            ungraded_anchor_n  INTEGER,
+            updated_at         TEXT,
             UNIQUE(comic_id, grade)
         )
     """)
@@ -211,6 +221,9 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # flag_reason column must be added AFTER the fmv-split / year-nullable rebuilds
     # above (those recreate `fmv` from the pre-BUI-132 schema), so it survives them.
     _migrate_add_fmv_flag_reason_column(conn)
+    # Same ordering requirement as flag_reason above: must run after the
+    # fmv-split / year-nullable rebuilds so it survives them on an existing DB.
+    _migrate_add_fmv_ungraded_anchor_columns(conn)
     _migrate_lowercase_title_indexes(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
@@ -353,6 +366,32 @@ def _migrate_add_fmv_flag_reason_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(fmv)")}
     if "flag_reason" not in cols:
         conn.execute("ALTER TABLE fmv ADD COLUMN flag_reason TEXT")
+
+
+def _migrate_add_fmv_ungraded_anchor_columns(conn: sqlite3.Connection) -> None:
+    """Add the nullable `ungraded_anchor`/`ungraded_anchor_n` columns to fmv (BUI-712).
+
+    Promotes the BUI-522 ungraded-market anchor — previously visible only as an
+    `ungraded_anchor=$X (nN raw)` token buried in `fmv_notes` — to real columns
+    so the /comics dashboard can render it for unpriced-but-linked rows without
+    parsing notes text (never a contract; see fmv_runner._build_notes).
+
+    Additive and idempotent, mirroring _migrate_add_fmv_flag_reason_column. Both
+    columns are nullable: a row priced before this migration simply has NULL
+    here (display degrades to the pre-existing `—`), and a row whose upstream
+    raw comps produced no anchor also stores NULL (not a sentinel like 0 —
+    `ungraded_anchor=0` would be indistinguishable from "unpriced at $0").
+    Checked and added independently of `ALTER TABLE ... ADD COLUMN` running
+    twice (SQLite errors on a duplicate column add), same PRAGMA table_info
+    guard as every other additive migration in this module — safe to run on
+    every startup, including against a live WAL-mode DB with concurrent
+    readers, since ADD COLUMN here never rewrites existing rows.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fmv)")}
+    if "ungraded_anchor" not in cols:
+        conn.execute("ALTER TABLE fmv ADD COLUMN ungraded_anchor REAL")
+    if "ungraded_anchor_n" not in cols:
+        conn.execute("ALTER TABLE fmv ADD COLUMN ungraded_anchor_n INTEGER")
 
 
 # ---------------------------------------------------------------------------
@@ -1614,6 +1653,8 @@ def upsert_fmv(
     confidence: str | None = None,
     notes: str | None = None,
     flag_reason: str | None = None,
+    ungraded_anchor: float | None = None,
+    ungraded_anchor_n: int | None = None,
 ) -> int:
     """Upsert a per-grade FMV row. Returns the fmv id.
 
@@ -1640,6 +1681,16 @@ def upsert_fmv(
       metadata beside it (comps/confidence/notes), which a stub used to
       overwrite because it carries them non-NULL (`fmv_comps: 0`, a confidence
       label, notes) — leaving the contradictory `low=15 high=20 comps=0`.
+
+    `ungraded_anchor`/`ungraded_anchor_n` (BUI-712) carry the BUI-522
+    ungraded-market anchor as structured columns. They follow the SAME
+    treatment as `comps`/`confidence`/`notes` above — NOT the flag-nulls-price
+    treatment `low`/`high` get. That's deliberate: a flagged (needs_manual) row
+    is exactly the row the dashboard wants the anchor visible on (it's the
+    context standing in for the missing price), so the flagged branch takes
+    `excluded.ungraded_anchor(_n)` outright rather than forcing NULL. The n=0
+    stub guard still applies (second WHEN): a bare stub must not blank out a
+    previously-stored anchor on a priced row.
     """
     if grade is None:
         raise ValueError("grade is required for upsert_fmv")
@@ -1650,8 +1701,9 @@ def upsert_fmv(
     now = datetime.now(timezone.utc).isoformat() if has_value else None
     conn.execute(
         """
-        INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, notes, flag_reason, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, notes,
+                          flag_reason, ungraded_anchor, ungraded_anchor_n, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(comic_id, grade) DO UPDATE SET
             -- A flagged incoming row clears the stale auto-priced number; an
             -- unflagged incoming row (a fresh price OR a bare n=0 stub)
@@ -1683,6 +1735,18 @@ def upsert_fmv(
             notes       = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.notes
                                WHEN excluded.low IS NULL AND low IS NOT NULL THEN notes
                                ELSE COALESCE(excluded.notes,      notes) END,
+            -- BUI-712: the anchor is precisely the context a flagged row wants
+            -- visible, so — unlike low/high above — a flagged incoming row does
+            -- NOT get its anchor forced to NULL; it takes whatever the caller
+            -- posted (mirrors the comps/confidence/notes treatment). The n=0
+            -- stub guard (second WHEN) still protects a priced row's anchor
+            -- from being blanked by a failed re-lookup.
+            ungraded_anchor   = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.ungraded_anchor
+                               WHEN excluded.low IS NULL AND low IS NOT NULL THEN ungraded_anchor
+                               ELSE COALESCE(excluded.ungraded_anchor, ungraded_anchor) END,
+            ungraded_anchor_n = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.ungraded_anchor_n
+                               WHEN excluded.low IS NULL AND low IS NOT NULL THEN ungraded_anchor_n
+                               ELSE COALESCE(excluded.ungraded_anchor_n, ungraded_anchor_n) END,
             -- A flagged row stores its flag; a freshly-priced row clears any
             -- prior flag (incoming low set ⇒ no longer needs_manual); a bare
             -- n=0 stub leaves the flag untouched.
@@ -1693,7 +1757,8 @@ def upsert_fmv(
                                THEN excluded.updated_at
                                ELSE updated_at END
         """,
-        (comic_id, grade, low, high, comps, confidence, notes, flag_reason, now),
+        (comic_id, grade, low, high, comps, confidence, notes, flag_reason,
+         ungraded_anchor, ungraded_anchor_n, now),
     )
     conn.commit()
     row = conn.execute(

@@ -24,6 +24,20 @@
     font-size: 11px;
   }
 
+  /* BUI-712: grayed BUI-522 ungraded-market anchor, shown in the FMV cell for
+     an unpriced-but-linked row (the fmv row exists but low/high are NULL
+     because the pool failed a quality gate). Dim + italic like .mute, so it
+     reads visibly different from a real priced $lo–$hi range — the anchor is
+     context for a human, never a price (BUI-522/BUI-713 contract). */
+  .fmv-anchor { color: var(--fg-mute); font-style: italic; }
+  .fmv-anchor .flag-marker {
+    display: inline-block;
+    color: var(--yellow);
+    margin-left: 4px;
+    font-size: 11px;
+    cursor: help;
+  }
+
   td.title {
     max-width: 380px;
     color: var(--fg);
@@ -337,7 +351,35 @@ function fmtSeller(r) {
 
 function fmtFmv(r) {
   const lo = r.fmv_low, hi = r.fmv_high;
-  if (lo == null && hi == null) return '<span class="seller">—</span>';
+  if (lo == null && hi == null) {
+    // BUI-712: an unpriced-but-linked row (fmv row exists, but low/high are
+    // NULL because the pool failed a quality gate) may still carry the
+    // BUI-522 ungraded anchor — show it grayed out instead of a bare "—" so
+    // the operator sees the pipeline's raw-market read instead of nothing.
+    // Gated on r.needs_linking (a row with no linked fmv at all has no anchor
+    // anyway — server aggregates over zero rows -> null — but this keeps the
+    // two cases explicit) AND lot_count === 1, mirroring maxDealClass's own
+    // single-comic scoping above: for a lot (N>=2), fmv_low/fmv_high null out
+    // whenever ANY member is unpriced (see _build_comics_row), even if the
+    // PRIMARY book itself priced fine and merely also happens to carry a
+    // stored anchor (anchors are computed independently of pricing success —
+    // see BUI-713's 212-row measurement of priced+anchored rows). Showing the
+    // primary's anchor there would misreport a lot as "no price, here's the
+    // raw read" when the true story is "one of the OTHER books is unpriced."
+    // At lot_count === 1 the aggregate IS the primary's own low/high, so
+    // "aggregate null" and "primary unpriced" are the same fact. Display
+    // only — never a price (BUI-522/BUI-713): renderActive/renderHistory
+    // must never read ungraded_anchor for value_pct, sorting, or bid math.
+    if (!r.needs_linking && r.lot_count === 1 && r.ungraded_anchor != null) {
+      const nSuffix = r.ungraded_anchor_n != null ? ` (n=${r.ungraded_anchor_n})` : '';
+      const flagMarker = r.flag_reason
+        ? ` <span class="flag-marker" title="flagged: ${escapeHtml(r.flag_reason)} — not an FMV, raw-market context only">⚑</span>`
+        : '';
+      return `<span class="fmv-anchor" title="BUI-522 ungraded-market anchor — informational only, not an FMV">`
+        + `~$${Math.round(r.ungraded_anchor).toLocaleString()} raw${nSuffix}</span>${flagMarker}`;
+    }
+    return '<span class="seller">—</span>';
+  }
   if (lo != null && hi != null) {
     if (Math.round(lo) === Math.round(hi)) return `$${Math.round(lo).toLocaleString()}`;
     return `$${Math.round(lo).toLocaleString()}–$${Math.round(hi).toLocaleString()}`;

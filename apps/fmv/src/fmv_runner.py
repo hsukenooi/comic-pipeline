@@ -2012,6 +2012,14 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
     ``_post_json``. The caller (``_compute_and_upsert_one``) does not catch
     it either; it is meant to bubble all the way to `run()`'s per-book loop,
     which turns it into a skip rather than a crash."""
+    # BUI-712: post the BUI-522 ungraded anchor as structured fields ALONGSIDE
+    # the existing `ungraded_anchor=$X (nN raw)` fmv_notes token (_build_notes
+    # above still writes it — nothing here replaces that, it's a separate,
+    # human-readable trace). None when this fetch produced no grade-less comps
+    # (or on a cache-reused row, where the raw comps aren't persisted so the
+    # anchor can't be reconstructed — see _fmv_from_db_row) → server stores
+    # NULL, and the dashboard degrades to `—`, same as today.
+    anchor = fmv.get("ungraded_anchor")
     body = {
         "title": inp["title"],
         "issue": str(inp["issue"]),
@@ -2028,6 +2036,8 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
         # None for an auto-priced book → server stores NULL (not flagged) and, on
         # a re-price, clears any prior flag.
         "fmv_flag_reason": fmv.get("flag_reason"),
+        "fmv_ungraded_anchor": anchor["median"] if anchor else None,
+        "fmv_ungraded_anchor_n": anchor["n"] if anchor else None,
     }
     if inp.get("locg_id"):
         body["locg_id"] = inp["locg_id"]
