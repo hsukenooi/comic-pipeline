@@ -448,3 +448,69 @@ def test_sweep_no_orphans_returns_zero():
 
     assert result["merged"] == 0
     assert result["details"] == []
+
+
+# ---------------------------------------------------------------------------
+# BUI-715: yeared-branch match also absorbs an orphan yearless sibling
+# (symmetric with the yearless-branch's PER-103 cleanup above)
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_yeared_found_absorbs_orphan_yearless_sibling():
+    """When the yeared branch finds its exact-year match, it must also clean
+    up any orphan yearless sibling for the same identity instead of leaving
+    it to coexist — the BUI-579/581 duplicate-identity hazard. Before
+    BUI-715 this branch returned immediately on an existing_yeared hit
+    without ever looking at a yearless sibling."""
+    conn = _fresh_db()
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', 1963)")
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+
+    result = upsert_comic(conn, title="X", issue="1", year=1963)
+
+    yeared_id = conn.execute(
+        "SELECT id FROM comics WHERE title='X' AND issue='1' AND year=1963"
+    ).fetchone()[0]
+    assert result == yeared_id
+    assert conn.execute(
+        "SELECT count(*) FROM comics WHERE title='X' AND issue='1'"
+    ).fetchone()[0] == 1
+
+
+def test_upsert_yeared_found_reparents_orphan_yearless_fmv_and_bid_fmvs():
+    """The orphan cleanup on the yeared-found path must reparent fmv/
+    bid_fmvs, not just delete the row — otherwise a bid linked to the
+    orphan's fmv loses its link."""
+    conn = _fresh_db()
+    conn.execute("INSERT INTO bids (id, item_id, max_bid) VALUES (1, 'eb1', 50.0)")
+    yeared_id = upsert_comic(conn, title="X", issue="1", year=1963)
+    conn.execute("INSERT INTO comics (title, issue, year) VALUES ('X', '1', NULL)")
+    yearless_id = conn.execute(
+        "SELECT id FROM comics WHERE year IS NULL AND title='X'"
+    ).fetchone()[0]
+    yearless_fmv_id = upsert_fmv(conn, comic_id=yearless_id, grade=9.2, low=800)
+    conn.execute(
+        "INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (1, ?, 1)",
+        (yearless_fmv_id,),
+    )
+
+    result = upsert_comic(conn, title="X", issue="1", year=1963)
+
+    assert result == yeared_id
+    fmv = conn.execute(
+        "SELECT * FROM fmv WHERE comic_id=? AND grade=9.2", (yeared_id,)
+    ).fetchone()
+    assert fmv is not None and fmv["low"] == 800
+    row = conn.execute("SELECT fmv_id FROM bid_fmvs WHERE bid_id=1").fetchone()
+    assert row["fmv_id"] == fmv["id"], "bid_fmvs must be reparented onto the surviving fmv"
+    assert conn.execute(
+        "SELECT count(*) FROM comics WHERE title='X' AND issue='1'"
+    ).fetchone()[0] == 1
+    # No grade conflict on the yeared row, so the fmv row is reassigned
+    # in-place (same id, new comic_id) — mirrors the yearless-branch's
+    # no-conflict case (test_yearless_insert_cleans_orphan_and_migrates_fmv_
+    # no_conflict above), not deleted-and-recreated.
+    assert fmv["id"] == yearless_fmv_id
+    assert conn.execute(
+        "SELECT comic_id FROM fmv WHERE id=?", (yearless_fmv_id,)
+    ).fetchone()[0] == yeared_id, "orphan fmv must be reparented onto the surviving comic"

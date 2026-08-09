@@ -608,6 +608,17 @@ async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
 
     Populates the bid_fmvs junction table and sets bids.fmv_id so the
     /api/comics/snipes dashboard can show cond_grade and fmv_low/fmv_high.
+
+    BUI-715: when the caller supplies `year` and the matched book's comics
+    row is still yearless, promote it in the same call — extends
+    `upsert_comic`'s existing yearless→yeared reconciliation (db.py) onto the
+    link path instead of leaving a caller-known year stranded on a book that
+    already has an fmv/bid link. Reuses `upsert_comic` rather than writing a
+    parallel merge, so the same PER-104 conflicting-sibling guard and
+    fmv/bid_fmvs reparenting apply here too. If promotion merges into a
+    pre-existing yeared sibling (a different comic id), the fmv row to link
+    is re-resolved by (new comic id, grade) — `upsert_comic`'s merge always
+    leaves exactly one fmv row at that grade on the survivor.
     """
     if not re.match(r"^\d+$", item_id):
         raise HTTPException(status_code=422, detail="item_id must be numeric")
@@ -624,8 +635,33 @@ async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
             detail=f"No FMV found (strategies attempted: {', '.join(strategy)})",
         )
 
-    link_fmv_to_bid(db, bid["id"], fmv_row["fmv_id"], is_primary=True)
-    return {"item_id": item_id, "fmv_id": fmv_row["fmv_id"], "linked": True}
+    fmv_id = fmv_row["fmv_id"]
+    if req.year is not None:
+        comic = db.execute(
+            "SELECT c.id, c.title, c.issue, c.year, c.variant, c.locg_id, c.locg_variant_id "
+            "FROM fmv f JOIN comics c ON c.id = f.comic_id WHERE f.id = ?",
+            (fmv_id,),
+        ).fetchone()
+        if comic is not None and comic["year"] is None:
+            promoted_comic_id = upsert_comic(
+                db,
+                title=comic["title"],
+                issue=comic["issue"],
+                year=req.year,
+                variant=comic["variant"],
+                locg_id=comic["locg_id"],
+                locg_variant_id=comic["locg_variant_id"],
+            )
+            if promoted_comic_id != comic["id"]:
+                merged_fmv = db.execute(
+                    "SELECT id FROM fmv WHERE comic_id=? AND grade=?",
+                    (promoted_comic_id, req.grade),
+                ).fetchone()
+                if merged_fmv is not None:
+                    fmv_id = merged_fmv["id"]
+
+    link_fmv_to_bid(db, bid["id"], fmv_id, is_primary=True)
+    return {"item_id": item_id, "fmv_id": fmv_id, "linked": True}
 
 
 def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[Any | None, list[str]]:
@@ -775,7 +811,13 @@ async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
                         wconn,
                         title=primary["title"],
                         issue=req.issue,
-                        year=primary["year"],
+                        # BUI-715: prefer a caller-supplied year for this issue
+                        # over the primary book's year — a lot's other issues
+                        # aren't necessarily the same cover year as the
+                        # primary, and the primary itself may still be
+                        # yearless. Falls back to the old behavior when the
+                        # caller omits it.
+                        year=req.year if req.year is not None else primary["year"],
                     )
                     # Create an fmv stub at the primary's grade for the lot issue
                     new_fmv_id = upsert_fmv(wconn, target_comic_id, primary["grade"])
@@ -1423,6 +1465,114 @@ async def api_sweep_orphans(request: Request, dry_run: bool = True):
     """
     db = request.app.state.db
     return sweep_orphan_yearless_comics(db, dry_run=dry_run)
+
+
+@router.post("/api/comics/backfill-year")
+async def api_backfill_year(
+    request: Request, dry_run: bool = True, active_only: bool = True, limit: int = 25
+):
+    """One-time backfill (BUI-715) for NULL-year comics rows.
+
+    Scans comics with `year IS NULL`, tries `resolve_year_and_locg` (the same
+    best-effort LOCG lookup `POST /api/extract-comics` already uses for the
+    same purpose) on each, and — when it resolves — writes the year through
+    `upsert_comic`, so the write goes through this process's single `db`
+    connection (the same one every other overlay write uses) rather than a
+    standalone script opening the DB file directly. That is what makes this
+    endpoint the sanctioned remediation path instead of a hand-rolled sqlite3
+    script: the comics-table remediation lore (docs/solutions) is exactly
+    that ad hoc direct-file writes on a running server race the live sync
+    loop, and `bids.fmv_id` has no FK so a dangling reference from a bad
+    direct write is invisible to `foreign_key_check`. Routing through
+    `upsert_comic` also means a NULL-year row with a pre-existing yeared
+    sibling merges (BUI-715's own core deliverable — see `upsert_comic`'s
+    docstring) instead of leaving a duplicate identity behind.
+
+    `active_only=True` (default) scopes the scan to comics with at least one
+    `bid_fmvs` link — i.e. books actually tied to a snipe — matching this
+    ticket's acceptance criterion ("existing NULL-year rows for actively-
+    linked comics are backfilled"). Pass `active_only=false` to widen the
+    scan to every yearless comics row, including ones with no bid history.
+
+    `dry_run=True` (default, mirrors `/api/sweep-orphans`) previews without
+    writing: each result carries `resolved` (bool) and, when true, the year
+    that WOULD be written. Pass `?dry_run=false` to commit. `limit` defaults
+    to a deliberately small 25 and bounds how many rows are scanned in one
+    call — each resolution shells out to the `locg` CLI **synchronously**
+    (subprocess, not awaited) with a 30s timeout apiece, so a large limit
+    blocks this single-process server's whole event loop — sync loop, other
+    requests, everything — for up to `limit * 30s`. Call repeatedly with a
+    small limit to page through a larger backlog instead of raising it.
+
+    Returns `{dry_run, scanned, resolved, unresolved, results}` — `results`
+    entries that fail to resolve carry `resolved: false` and no `year`, so a
+    caller can tell "nothing to do yet" apart from "this call did nothing"
+    (the same fetch-err-vs-genuine-zero distinction this project keeps
+    re-learning elsewhere).
+    """
+    db = request.app.state.db
+    scope_sql = (
+        "SELECT DISTINCT c.id, c.title, c.issue, c.variant, c.locg_id, c.locg_variant_id "
+        "FROM comics c "
+        "JOIN fmv f ON f.comic_id = c.id "
+        "JOIN bid_fmvs bf ON bf.fmv_id = f.id "
+        "WHERE c.year IS NULL ORDER BY c.id LIMIT ?"
+        if active_only
+        else "SELECT id, title, issue, variant, locg_id, locg_variant_id "
+        "FROM comics WHERE year IS NULL ORDER BY id LIMIT ?"
+    )
+    rows = db.execute(scope_sql, (limit,)).fetchall()
+
+    results: list[dict] = []
+    resolved_count = 0
+    for row in rows:
+        resolution = resolve_year_and_locg(row["title"], row["issue"])
+        if resolution is None:
+            results.append(
+                {
+                    "comic_id": row["id"],
+                    "title": row["title"],
+                    "issue": row["issue"],
+                    "resolved": False,
+                }
+            )
+            continue
+        resolved_count += 1
+        entry: dict[str, Any] = {
+            "comic_id": row["id"],
+            "title": row["title"],
+            "issue": row["issue"],
+            "resolved": True,
+            "year": resolution.year,
+        }
+        if not dry_run:
+            # locg_id/locg_variant_id: pass the resolution's values as-is (not
+            # `or row[...]`) — upsert_comic COALESCEs a None against the
+            # existing stored value internally, so this already preserves
+            # row["locg_id"] when the resolution didn't find one, without an
+            # `or` that would (incorrectly, if unlikely) treat a real 0 as
+            # missing.
+            new_comic_id = upsert_comic(
+                db,
+                title=row["title"],
+                issue=row["issue"],
+                year=resolution.year,
+                variant=row["variant"],
+                locg_id=resolution.locg_id,
+                locg_variant_id=resolution.locg_variant_id,
+            )
+            entry["comic_id_after"] = new_comic_id
+            entry["merged"] = new_comic_id != row["id"]
+        results.append(entry)
+
+    return {
+        "dry_run": dry_run,
+        "active_only": active_only,
+        "scanned": len(rows),
+        "resolved": resolved_count,
+        "unresolved": len(rows) - resolved_count,
+        "results": results,
+    }
 
 
 # ---------------------------------------------------------------------------

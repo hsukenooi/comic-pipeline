@@ -1331,7 +1331,11 @@ def upsert_comic(
     (title, issue, variant) logical comic:
 
     - Yeared insert finds an existing yeared row at the same year → updates
-      locg metadata, returns it.
+      locg metadata, returns it. BUI-715: also absorbs (merges fmv/bid_fmvs
+      from, then deletes) an orphan yearless sibling for the same identity if
+      one exists — mirrors the yearless-insert branch's PER-103 cleanup below
+      so an orphan can't survive no matter which insert direction discovers
+      the pairing first.
     - Yeared insert finds an existing yearless row for the same (title, issue)
       → promotes it (UPDATE comics SET year=?), returns it. Avoids creating a
       duplicate alongside the yearless placeholder. Exception: if a yeared row
@@ -1376,6 +1380,25 @@ def upsert_comic(
             (title, issue, year, *v_param),
         ).fetchone()
         if existing_yeared is not None:
+            # BUI-715: absorb any orphan yearless sibling for this identity
+            # right here, symmetric with the yearless-insert branch's PER-103
+            # cleanup below. Without this, a caller that now supplies the year
+            # for a book that already has a canonical yeared row (e.g. a
+            # second, later-informed write) would leave an older yearless
+            # placeholder — created back when the year wasn't known yet, such
+            # as an FMV run priced before identify resolved it — permanently
+            # coexisting beside it: the exact BUI-579/581 duplicate-identity
+            # hazard this ticket closes. Reuses the same
+            # _merge_yearless_into_yeared helper `sweep_orphan_yearless_comics`
+            # already uses for its periodic broom, just applied eagerly at
+            # write time instead of waiting for a manual sweep.
+            orphan = conn.execute(
+                f"SELECT id FROM comics WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NULL AND {v_sql}",
+                (title, issue, *v_param),
+            ).fetchone()
+            if orphan is not None:
+                _merge_yearless_into_yeared(conn, orphan["id"], existing_yeared["id"])
+                conn.execute("DELETE FROM comics WHERE id=?", (orphan["id"],))
             conn.execute(
                 "UPDATE comics SET locg_id=COALESCE(?, locg_id), "
                 "locg_variant_id=COALESCE(?, locg_variant_id) WHERE id=?",
