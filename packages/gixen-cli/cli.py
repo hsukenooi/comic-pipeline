@@ -1371,7 +1371,19 @@ def group_cmd(group_n: int, item_ids: tuple[str, ...]):
 def remove(item_id: str):
     """Remove a snipe."""
     if _server_url():
-        _server_request("delete", f"/api/bids/{item_id}")
+        result = _server_request("delete", f"/api/bids/{item_id}")
+        # BUI-716: 202 REMOVAL_PENDING — Gixen was unreachable, but the server
+        # persisted the removal intent, disarmed its local sniper, and its
+        # retry loop owns the Gixen cancel. Say exactly that instead of the
+        # unqualified "Removed" (which would be the inverse of the BUI-697
+        # honesty rule: claiming completion for an unconfirmed write).
+        if isinstance(result, dict) and result.get("status") == "REMOVAL_PENDING":
+            click.echo(
+                f"Removal accepted for {item_id} — Gixen is unreachable right "
+                "now. The server has disarmed the snipe and will keep "
+                "retrying the Gixen cancel; verify later with `gixen list`."
+            )
+            return
         click.echo(f"Removed snipe for {item_id}")
         return
 

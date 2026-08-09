@@ -883,11 +883,39 @@ def test_purge_gixen_error_returns_503(api):
     assert r.status_code == 503
 
 
-def test_remove_bid_gixen_error_returns_503(api):
+def test_remove_bid_gixen_error_persists_intent_returns_202(api):
+    """BUI-716: a Gixen failure during remove must no longer drop the user's
+    intent (the 2026-08-09 incident: a remove 503'd during a Gixen flap,
+    persisted nothing, and the snipe fired for real money a day later). The
+    endpoint stamps removal_requested_at BEFORE the Gixen call and answers
+    202 REMOVAL_PENDING — the row is disarmed locally and queued for
+    _retry_pending_removals, not forgotten."""
     from gixen_client import GixenError
     api.mock_gixen.remove_snipe.side_effect = GixenError("network error")
     api.post("/api/bids", json={"item_id": "700000001", "max_bid": 50.0})
     r = api.delete("/api/bids/700000001")
+    assert r.status_code == 202
+    assert r.json()["status"] == "REMOVAL_PENDING"
+
+    row = _dbconn().execute(
+        "SELECT status, removal_requested_at FROM bids WHERE item_id='700000001'"
+    ).fetchone()
+    assert row["status"] == "PENDING"  # not tombstoned — Gixen never confirmed
+    assert row["removal_requested_at"] is not None  # but the intent survives
+
+    # The dashboards must see the pending removal, not an ordinary live row.
+    snipes = api.get("/api/snipes").json()
+    mine = [s for s in snipes if s["item_id"] == "700000001"]
+    assert mine and mine[0]["removal_pending"] is True
+
+
+def test_remove_bid_gixen_error_without_pending_row_returns_503(api):
+    """BUI-716: with no PENDING row there is nothing armed locally and nothing
+    for the retry loop to scan — a 202 would promise a retry nobody performs,
+    so the legacy fail-loudly 503 contract is kept for this shape."""
+    from gixen_client import GixenError
+    api.mock_gixen.remove_snipe.side_effect = GixenError("network error")
+    r = api.delete("/api/bids/700000009")
     assert r.status_code == 503
 
 
@@ -5503,3 +5531,113 @@ def test_add_batch_row_group_reaches_the_bid_payload():
     payload = add_batch.build_bid_payload("700100008", 40.0, 6, 5)
     assert payload["snipe_group"] == 5
     assert add_batch.build_bid_payload("700100008", 40.0, 6, 0)["snipe_group"] == 0
+
+
+# ---------------------------------------------------------------------------
+# BUI-716: _retry_pending_removals — the durability half of the removal
+# contract (api_remove_bid's 202 path stamps intent; this pass finishes the
+# Gixen cancel). Driven directly on this test's own event loop, bypassing the
+# TestClient/lifespan portal, for the same loop-affinity reason documented on
+# test_sniper_loop_commits_under_write_lock above.
+# ---------------------------------------------------------------------------
+
+def _drive_removal_pass(tmp_path, monkeypatch, mock_gixen, rows):
+    """Seed an on-disk DB with (item_id, status, removal_requested_at) rows,
+    point server.main's globals at it, run ONE _retry_pending_removals pass,
+    and return the open connection for assertions."""
+    import asyncio
+    import server.main as m
+    from server.db import init_db
+
+    path = tmp_path / "removal.db"
+    db = init_db(path)
+    for item_id, status, removal_requested_at in rows:
+        db.execute(
+            "INSERT INTO bids (item_id, max_bid, status, auction_end_at, "
+            "bid_offset, removal_requested_at) "
+            "VALUES (?, 10.0, ?, '2030-01-01T00:00:00+00:00', 6, ?)",
+            (item_id, status, removal_requested_at),
+        )
+    db.commit()
+
+    monkeypatch.setattr(m, "_db", db)
+    monkeypatch.setattr(m, "_db_path", path)
+    monkeypatch.setattr(m, "_api_client", mock_gixen)
+
+    async def run():
+        # Locks created inside the running loop asyncio.run() drives this
+        # test on (a Lock built on a different loop raises on first use).
+        monkeypatch.setattr(m, "_api_lock", asyncio.Lock())
+        monkeypatch.setattr(m, "_write_lock", asyncio.Lock())
+        await m._retry_pending_removals()
+
+    asyncio.run(run())
+    return db
+
+
+def test_retry_pending_removals_confirms_and_tombstones(tmp_path, monkeypatch):
+    """Gixen cancel succeeds on retry → the queued row tombstones REMOVED."""
+    mock = MagicMock()
+    mock.remove_snipe.return_value = True
+    db = _drive_removal_pass(tmp_path, monkeypatch, mock, [
+        ("716000001", "PENDING", "2026-08-09T00:00:00+00:00"),
+    ])
+    row = db.execute(
+        "SELECT status FROM bids WHERE item_id='716000001'"
+    ).fetchone()
+    db.close()
+    assert row["status"] == "REMOVED"
+    mock.remove_snipe.assert_called_once()
+
+
+def test_retry_pending_removals_already_gone_tombstones(tmp_path, monkeypatch):
+    """Reconcile exit: the snipe is already absent from Gixen — the desired
+    end state is true, so the row tombstones exactly as a confirmed cancel
+    would (the BUI-164 semantics, carried into the retry pass)."""
+    from gixen_client import GixenSnipeNotFoundError
+
+    mock = MagicMock()
+    mock.remove_snipe.side_effect = GixenSnipeNotFoundError("gone from Gixen")
+    db = _drive_removal_pass(tmp_path, monkeypatch, mock, [
+        ("716000002", "PENDING", "2026-08-09T00:00:00+00:00"),
+    ])
+    row = db.execute(
+        "SELECT status FROM bids WHERE item_id='716000002'"
+    ).fetchone()
+    db.close()
+    assert row["status"] == "REMOVED"
+
+
+def test_retry_pending_removals_gixen_down_keeps_intent(tmp_path, monkeypatch):
+    """A still-failing Gixen leaves the row PENDING with its stamp intact —
+    queued for the next pass, never dropped and never tombstoned early (a
+    premature tombstone would hide a snipe Gixen may still fire)."""
+    from gixen_client import GixenError
+
+    mock = MagicMock()
+    mock.remove_snipe.side_effect = GixenError("still down")
+    db = _drive_removal_pass(tmp_path, monkeypatch, mock, [
+        ("716000003", "PENDING", "2026-08-09T00:00:00+00:00"),
+    ])
+    row = db.execute(
+        "SELECT status, removal_requested_at FROM bids WHERE item_id='716000003'"
+    ).fetchone()
+    db.close()
+    assert row["status"] == "PENDING"
+    assert row["removal_requested_at"] is not None
+
+
+def test_retry_pending_removals_ignores_unstamped_rows(tmp_path, monkeypatch):
+    """An ordinary live snipe (no removal intent) is not the retry loop's to
+    touch — remove_snipe must never be called for it."""
+    mock = MagicMock()
+    mock.remove_snipe.return_value = True
+    db = _drive_removal_pass(tmp_path, monkeypatch, mock, [
+        ("716000004", "PENDING", None),
+    ])
+    row = db.execute(
+        "SELECT status FROM bids WHERE item_id='716000004'"
+    ).fetchone()
+    db.close()
+    assert row["status"] == "PENDING"
+    mock.remove_snipe.assert_not_called()

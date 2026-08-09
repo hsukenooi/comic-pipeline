@@ -3062,3 +3062,25 @@ def test_readd_over_sync_seller_normalizes_key(api):
     adv = api.get("/api/seller-reliability", params={"seller": "beatlebluecat"})
     assert adv.json()["sample_size"] == 1
     assert adv.json()["avg_deviation"] == pytest.approx(2.0)
+
+
+def test_comics_snipes_exposes_removal_pending(api):
+    """BUI-716 parity: /api/comics/snipes must carry removal_pending exactly
+    as gixen-cli's /api/snipes does — the dashboard renders these rows as
+    "removal pending", so a drift here re-opens the endpoint-parity class
+    (BUI-50) for the new field."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "716000001", "max_bid": 50.0})
+    api.post("/api/bids", json={"item_id": "716000002", "max_bid": 50.0})
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "UPDATE bids SET removal_requested_at='2026-08-09T00:22:08+00:00' "
+        "WHERE item_id='716000001'"
+    )
+    raw.commit()
+    raw.close()
+
+    snipes = api.get("/api/comics/snipes").json()
+    by_id = {s["item_id"]: s for s in snipes}
+    assert by_id["716000001"]["removal_pending"] is True
+    assert by_id["716000002"]["removal_pending"] is False
