@@ -890,13 +890,29 @@ def _resolve_max_bid(brief_row: dict, row_overrides: dict) -> float | None:
     return value
 
 
-def _resolve_group(row: dict, row_overrides: dict) -> int:
+def _resolve_group(row: dict, row_overrides: dict) -> int | None:
     """The override's group always wins when present and non-null;
-    otherwise the working-list row's own default (from a Step 2 bid-group
-    candidate marking), defaulting to 0 (no group). Delegates the parse to
-    `_optional_int` and adds only the incremental 0-10 range check."""
+    otherwise the working-list row's own explicit `group` key, if it has
+    one (from a Step 2 bid-group candidate marking); otherwise `None` —
+    nothing was explicitly resolved, so the write site (BUI-711) omits the
+    output key entirely and `add_one_row`'s own None-passthrough (BUI-708)
+    preserves an existing group on upsert instead of un-grouping it.
+
+    Mirrors `add_one_row`'s `"group" in row` idiom (:484) so an explicit 0
+    — an override of 0, or a row's own `"group": 0` — is never collapsed
+    into 'unspecified': 0 is a positive 'ungroup' claim (BUI-383), and
+    Python's `0 if 0 is not None else ...` truthiness trap is exactly what
+    dropped it pre-fix (`if group:` at the old write site treated a
+    resolved 0 the same as never having resolved anything). Delegates the
+    parse to `_optional_int` and adds only the incremental 0-10 range
+    check."""
     override_value = row_overrides.get("group")
-    raw = override_value if override_value is not None else row.get("group", 0)
+    if override_value is not None:
+        raw = override_value
+    elif "group" in row:
+        raw = row.get("group")
+    else:
+        return None
     value = _optional_int({"group": raw}, "group", 0)
     if not (0 <= value <= 10):
         raise _RowValidationError(f"invalid group: {raw!r} (must be 0-10)")
@@ -1145,7 +1161,11 @@ def build_batch_rows(
         else:
             result.unlinked.append({"item_id": item_id, "reason": "comic_id_null"})
 
-        if group:
+        # BUI-711: `is not None`, not truthy — a resolved 0 (explicit
+        # un-group) must still be emitted. Nothing resolved (None) omits
+        # the key, so add_one_row's own None-passthrough (BUI-708) leaves
+        # an existing group unchanged on upsert.
+        if group is not None:
             out_row["group"] = group
 
         seller = row.get("seller")

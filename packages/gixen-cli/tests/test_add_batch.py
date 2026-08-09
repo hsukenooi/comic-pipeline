@@ -1125,6 +1125,76 @@ def test_build_batch_rows_zero_group_omitted_from_output():
     assert "group" not in result.rows[0]
 
 
+# ---------------------------------------------------------------------------
+# build_batch_rows — explicit group:0 un-group intent must survive (BUI-711)
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, `_resolve_group` returned a plain int (never None) and the write
+# site used `if group:` — falsy, so a *resolved* 0 was indistinguishable
+# from *nothing resolved* and the output row silently omitted "group".
+# Post-BUI-708, an omitted key means passthrough (preserve the existing
+# group on upsert), so this silently defeated an explicit un-group request.
+
+
+def test_build_batch_rows_override_zero_group_is_emitted():
+    """An override explicitly un-grouping an already-grouped item must
+    produce a concrete `"group": 0` in the output row, not an omitted key —
+    an omitted key would passthrough-preserve the working list's group=3
+    on upsert instead of un-grouping it."""
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", group=3)]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"group": 0}})
+    assert result.rows[0]["group"] == 0
+    assert "group" in result.rows[0]
+
+
+def test_build_batch_rows_working_list_explicit_zero_group_is_emitted():
+    """A working-list row's own explicit `"group": 0` (no override at all)
+    must also survive as a concrete 0, not be collapsed into 'unspecified'
+    the way an absent `group` key is."""
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1", group=0)]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows[0]["group"] == 0
+    assert "group" in result.rows[0]
+
+
+def test_build_batch_rows_override_zero_group_on_never_grouped_row_is_emitted():
+    """An override of 0 on a row that never had a group (no `group` key on
+    the working-list row at all) is still a positive, explicit claim and
+    must be emitted — not silently coalesced with the 'no group anywhere'
+    case just because the net effect is a no-op on the server side."""
+    brief = [_brief("1", max_bid=50)]
+    working_list = [_wl_row("1")]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"group": 0}})
+    assert result.rows[0]["group"] == 0
+    assert "group" in result.rows[0]
+
+
+def test_build_batch_rows_mixed_grouped_and_ungrouped_rows_in_one_batch():
+    """A batch mixing a still-grouped row and an explicitly un-grouped row
+    must resolve each independently — the un-group override on one item
+    must not leak onto its sibling's resolved group."""
+    brief = [_brief("1", max_bid=50), _brief("2", max_bid=60)]
+    working_list = [_wl_row("1", group=4), _wl_row("2", group=4)]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"group": 0}})
+    by_item = {r["item_id"]: r for r in result.rows}
+    assert by_item["1"]["group"] == 0
+    assert by_item["2"]["group"] == 4
+
+
+def test_build_batch_rows_nonzero_groups_unaffected_by_fix():
+    """Non-zero groups (override and working-list default) are unchanged by
+    the None-vs-0 fix — regression guard alongside the pre-existing
+    override/default tests above."""
+    brief = [_brief("1", max_bid=50), _brief("2", max_bid=60)]
+    working_list = [_wl_row("1", group=3), _wl_row("2", group=5)]
+    result = build_batch_rows(brief, working_list, overrides={"1": {"group": 7}})
+    by_item = {r["item_id"]: r for r in result.rows}
+    assert by_item["1"]["group"] == 7
+    assert by_item["2"]["group"] == 5
+
+
 def test_build_batch_rows_skips_bin_listing_type_field():
     brief = [_brief("1", max_bid=50)]
     working_list = [_wl_row("1", listing_type="BIN")]
