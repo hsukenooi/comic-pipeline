@@ -1028,6 +1028,52 @@ def test_locg_link_auto_create_commits_under_write_lock(api, monkeypatch):
     assert all(record)
 
 
+def test_locg_link_auto_create_uses_request_year_over_primary(api):
+    """BUI-715: the lot-issue auto-create branch prefers a request-supplied
+    `year` over the primary book's year — a lot's other issue isn't
+    necessarily the same cover year as the primary, and the primary itself
+    may still be yearless. Mirrors test_locg_link_auto_create_commits_under_
+    write_lock's setup (issue '2' has no existing match, so it forces the
+    auto-create branch)."""
+    api.post("/api/bids", json={"item_id": "555000020", "max_bid": 30.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Daredevil #1 1993 VF", "555000020"))
+    raw.commit()
+    raw.close()
+    api.post("/api/extract-comics")
+
+    r = api.post(
+        "/api/bids/555000020/comics/locg",
+        json={"locg_id": 1931250, "issue": "2", "year": 1994},
+    )
+    assert r.status_code == 200
+    assert r.json()["issue"] == "2"
+    assert r.json()["year"] == 1994
+
+
+def test_locg_link_auto_create_falls_back_to_primary_year_when_omitted(api):
+    """Omitting `year` on the request preserves the pre-BUI-715 behavior:
+    the auto-created issue inherits the primary book's year."""
+    api.post("/api/bids", json={"item_id": "555000021", "max_bid": 30.0})
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE bids SET ebay_title=? WHERE item_id=?",
+                ("Daredevil #1 1993 VF", "555000021"))
+    raw.commit()
+    raw.close()
+    api.post("/api/extract-comics")
+
+    r = api.post(
+        "/api/bids/555000021/comics/locg",
+        json={"locg_id": 1931251, "issue": "2"},
+    )
+    assert r.status_code == 200
+    assert r.json()["issue"] == "2"
+    assert r.json()["year"] == 1993  # inherited from the primary (Daredevil #1 1993)
+
+
 def test_locg_link_unknown_item_returns_404(api):
     r = api.post("/api/bids/000000000/comics/locg", json={"locg_id": 12345})
     assert r.status_code == 404
@@ -1222,6 +1268,234 @@ def test_link_fmv_404_lists_attempted_strategies(api):
     assert "comic_id=99999" in detail
     assert "locg_id=88888" in detail
     assert "series='Nope'" in detail
+
+
+def test_link_fmv_with_year_promotes_yearless_comic(api):
+    """BUI-715: a link-fmv call that supplies `year` promotes the matched
+    book's still-yearless comics row in the same request, via upsert_comic's
+    existing reconciliation — extending the yearless->yeared promotion
+    precedent onto the link path instead of leaving a caller-known year
+    stranded."""
+    api.post("/api/bids", json={"item_id": "600000020", "max_bid": 50.0})
+    r = api.post("/api/comics", json={
+        "title": "Invincible", "issue": "2",
+        "grade": 8.0, "fmv_low": 300.0, "fmv_high": 400.0,
+    })
+    comic_id = r.json()["id"]
+    assert r.json()["year"] is None
+
+    r1 = api.post("/api/bids/600000020/link-fmv",
+                   json={"comic_id": comic_id, "grade": 8.0})
+    assert r1.status_code == 200
+    fmv_id_before = r1.json()["fmv_id"]
+
+    # Year becomes known later; re-link supplies it.
+    r2 = api.post("/api/bids/600000020/link-fmv",
+                   json={"comic_id": comic_id, "grade": 8.0, "year": 2003})
+    assert r2.status_code == 200
+    assert r2.json()["fmv_id"] == fmv_id_before  # same fmv row, comic promoted in place
+
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    comics = raw.execute(
+        "SELECT id, year FROM comics WHERE title='Invincible' AND issue='2'"
+    ).fetchall()
+    raw.close()
+    assert [dict(c) for c in comics] == [{"id": comic_id, "year": 2003}]
+
+
+def test_link_fmv_year_merges_yearless_into_preexisting_yeared_sibling(api):
+    """BUI-715 data-integrity case: if a genuinely separate yeared sibling
+    already exists for the same (title, issue) when link-fmv learns the
+    year, promotion must MERGE into it (fmv/bid_fmvs reparented, yearless
+    row deleted) rather than leaving two comics rows / a duplicate fmv link
+    — the BUI-579/581 duplicate-identity hazard this ticket closes."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "600000021", "max_bid": 50.0})
+    r = api.post("/api/comics", json={
+        "title": "Invincible", "issue": "7",
+        "grade": 8.5, "fmv_low": 200.0, "fmv_high": 260.0,
+    })
+    yearless_comic_id = r.json()["id"]
+    api.post("/api/bids/600000021/link-fmv",
+              json={"comic_id": yearless_comic_id, "grade": 8.5})
+
+    # A genuinely separate yeared sibling for the same book, seeded directly
+    # (simulating pre-existing/legacy data — upsert_comic itself would never
+    # create this pair going forward).
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO comics (title, issue, year) VALUES ('Invincible', '7', 2004)"
+    )
+    raw.commit()
+    yeared_comic_id = raw.execute(
+        "SELECT id FROM comics WHERE title='Invincible' AND issue='7' AND year=2004"
+    ).fetchone()[0]
+    raw.close()
+
+    r2 = api.post("/api/bids/600000021/link-fmv",
+                   json={"comic_id": yearless_comic_id, "grade": 8.5, "year": 2004})
+    assert r2.status_code == 200
+    new_fmv_id = r2.json()["fmv_id"]
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    remaining = raw.execute(
+        "SELECT id, year FROM comics WHERE title='Invincible' AND issue='7'"
+    ).fetchall()
+    assert [dict(c) for c in remaining] == [{"id": yeared_comic_id, "year": 2004}]
+    fmv_row = raw.execute("SELECT comic_id FROM fmv WHERE id=?", (new_fmv_id,)).fetchone()
+    assert fmv_row["comic_id"] == yeared_comic_id
+    bf = raw.execute(
+        "SELECT bf.fmv_id FROM bid_fmvs bf JOIN bids b ON b.id=bf.bid_id "
+        "WHERE b.item_id='600000021'"
+    ).fetchone()
+    assert bf["fmv_id"] == new_fmv_id, "bid_fmvs must be reparented onto the surviving fmv row"
+    raw.close()
+
+
+def test_link_fmv_without_year_does_not_touch_yearless_comic(api):
+    """No `year` on the request must leave a yearless match yearless —
+    promotion is opt-in, triggered only when the caller actually supplies a
+    year."""
+    api.post("/api/bids", json={"item_id": "600000022", "max_bid": 50.0})
+    r = api.post("/api/comics", json={
+        "title": "Invincible", "issue": "10",
+        "grade": 8.0, "fmv_low": 250.0, "fmv_high": 320.0,
+    })
+    comic_id = r.json()["id"]
+
+    r2 = api.post("/api/bids/600000022/link-fmv",
+                   json={"comic_id": comic_id, "grade": 8.0})
+    assert r2.status_code == 200
+
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    row = raw.execute("SELECT year FROM comics WHERE id=?", (comic_id,)).fetchone()
+    raw.close()
+    assert row[0] is None
+
+
+# ---------------------------------------------------------------------------
+# POST /api/comics/backfill-year
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_year_dry_run_resolves_without_writing(api, monkeypatch):
+    """BUI-715: dry_run (default) reports what would be written without
+    mutating the DB — mirrors /api/sweep-orphans' dry_run convention."""
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    api.post("/api/bids", json={"item_id": "700000001", "max_bid": 50.0})
+    r = api.post("/api/comics", json={
+        "title": "Invincible", "issue": "13",
+        "grade": 8.0, "fmv_low": 200.0, "fmv_high": 260.0,
+    })
+    comic_id = r.json()["id"]
+    api.post("/api/bids/700000001/link-fmv", json={"comic_id": comic_id, "grade": 8.0})
+
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg",
+        lambda series, issue: LocgResolution(year=2005, locg_id=555, locg_variant_id=None),
+    )
+
+    r = api.post("/api/comics/backfill-year")  # dry_run defaults True
+    assert r.status_code == 200
+    body = r.json()
+    assert body["dry_run"] is True
+    entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
+    assert entry["resolved"] is True
+    assert entry["year"] == 2005
+
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    row = raw.execute("SELECT year FROM comics WHERE id=?", (comic_id,)).fetchone()
+    raw.close()
+    assert row[0] is None, "dry_run must not write"
+
+
+def test_backfill_year_commits_and_reports_resolved_count(api, monkeypatch):
+    """dry_run=false writes the resolved year through upsert_comic (the same
+    single `db` connection every overlay write uses)."""
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    api.post("/api/bids", json={"item_id": "700000002", "max_bid": 50.0})
+    r = api.post("/api/comics", json={
+        "title": "Invincible", "issue": "31",
+        "grade": 8.5, "fmv_low": 100.0, "fmv_high": 150.0,
+    })
+    comic_id = r.json()["id"]
+    api.post("/api/bids/700000002/link-fmv", json={"comic_id": comic_id, "grade": 8.5})
+
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg",
+        lambda series, issue: LocgResolution(year=2009, locg_id=None, locg_variant_id=None),
+    )
+
+    r = api.post("/api/comics/backfill-year", params={"dry_run": "false"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["dry_run"] is False
+    assert body["resolved"] >= 1
+
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    row = raw.execute("SELECT year FROM comics WHERE id=?", (comic_id,)).fetchone()
+    raw.close()
+    assert row[0] == 2009
+
+
+def test_backfill_year_unresolved_is_reported_not_silently_dropped(api, monkeypatch):
+    """A book the LOCG fallback can't resolve is reported as resolved=false,
+    not silently skipped from the response."""
+    from gixen_overlay import routes
+
+    api.post("/api/bids", json={"item_id": "700000003", "max_bid": 50.0})
+    r = api.post("/api/comics", json={
+        "title": "Some Obscure Book", "issue": "1",
+        "grade": 9.0, "fmv_low": 10.0, "fmv_high": 15.0,
+    })
+    comic_id = r.json()["id"]
+    api.post("/api/bids/700000003/link-fmv", json={"comic_id": comic_id, "grade": 9.0})
+
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+
+    r = api.post("/api/comics/backfill-year")
+    assert r.status_code == 200
+    body = r.json()
+    entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
+    assert entry["resolved"] is False
+    assert "year" not in entry
+
+
+def test_backfill_year_active_only_excludes_unlinked_comics(api, monkeypatch):
+    """active_only=True (the default) scopes to comics with at least one
+    bid_fmvs link — a NULL-year row with no bid history is out of scope."""
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    # Yearless comic created but never linked to any bid.
+    r = api.post("/api/comics", json={"title": "Unlinked Book", "issue": "1"})
+    unlinked_id = r.json()["id"]
+
+    calls = []
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg",
+        lambda series, issue: calls.append((series, issue))
+        or LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
+    )
+
+    r = api.post("/api/comics/backfill-year")
+    assert r.status_code == 200
+    body = r.json()
+    assert all(e["comic_id"] != unlinked_id for e in body["results"])
+
+    r2 = api.post("/api/comics/backfill-year", params={"active_only": "false"})
+    body2 = r2.json()
+    assert any(e["comic_id"] == unlinked_id for e in body2["results"])
 
 
 # ---------------------------------------------------------------------------

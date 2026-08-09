@@ -64,6 +64,11 @@ class LocgLinkRequest(BaseModel):
     locg_id: int
     locg_variant_id: int | None = None
     issue: str | None = None  # if set, target a specific issue within a lot
+    year: int | None = None  # BUI-715: cover year for the auto-created lot issue;
+    # falls back to the bid's primary comic's year when omitted (unchanged
+    # behavior for existing callers) — lets a caller that already knows the
+    # year for the *other* issue in a lot supply it even when the primary
+    # book on the bid is itself still yearless.
 
 
 class LinkFmvRequest(BaseModel):
