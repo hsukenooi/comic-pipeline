@@ -1531,12 +1531,32 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
 _CGC_PROXY_NOTE_TOKEN = "CGC proxy"
 
 # The 0.50–0.55 proxy factor is calibrated on VINTAGE keys (ASM #50, 1967),
-# where a slab carries a large certification premium over raw. For modern books
-# the raw/slab ratio is far lower (everyone slabs, raw grade-risk is severe), so
-# applying the vintage factor to a modern high-grade slab would over-price the
-# raw badly. Gate the tier to pre-cutoff books (mirrors sold_comps'
-# _VINTAGE_YEAR_CUTOFF); a book with no year, or a modern one, stays
-# needs_manual rather than getting a mis-calibrated proxy band.
+# where a slab carries a large certification premium over raw. Gate the tier to
+# pre-cutoff books (mirrors sold_comps' _VINTAGE_YEAR_CUTOFF); a book with no
+# year, or a modern one, stays needs_manual rather than getting a band priced
+# off a factor that was never measured for it.
+#
+# BUI-714 tried to lift this gate with a separately-measured modern factor, and
+# stopped on the measurement. Two corrections came out of it, both worth having
+# here so the next attempt starts from data instead of from this comment:
+#
+#   * The old rationale — "for modern books the raw/slab ratio is FAR LOWER
+#     (everyone slabs, raw grade-risk is severe)" — is not what the data says.
+#     The three measurable modern raw:slab cells came in at 0.77, 1.27 and 1.62,
+#     i.e. at or ABOVE the vintage factor, not below it. The ticket's own
+#     motivating datum (~0.67) was not reproduced either. The gate is right; the
+#     reason written on it was a guess.
+#   * The real blocker is not the factor at all. A modern key's certified
+#     population sits at 9.2+ (3 of 57 measured modern slab comps were at or
+#     below grade 8.5), while the five modern keys the ticket was filed for are
+#     graded 7.5–8.5. So `cgc_ladder_price`'s no-extrapolation refusal — a money
+#     guard that must not be relaxed — rejects the book before any factor is
+#     applied. Admitting moderns here without also gutting that guard is inert:
+#     it fired ZERO times across the 8 modern books measured, including the very
+#     book the ticket was filed for.
+#
+# See docs/solutions/best-practices/modern-cgc-proxy-factor-is-unmeasurable.md
+# and TestModernCgcProxyStaysRefused in tests/test_fmv_runner.py.
 _CGC_PROXY_VINTAGE_YEAR_CUTOFF = 2000
 
 # A genuine slab listing names its certifier (CGC/CBCS) in the title. The
