@@ -4090,3 +4090,102 @@ class TestRunInversionSweep:
         assert "$35-70" in out and "$5-45" in out
         # The advisory contract must be stated wherever findings are shown.
         assert "no price was changed" in out
+
+
+# ─── BUI-714: the CGC-proxy tier stays vintage-only (measured) ────────────────
+#
+# Both fixtures are real slab ladders, returned by ONE `include_graded` pass on
+# the named book, measured 2026-08-09. `_slab`'s hardcoded ASM-50 title is inert
+# here: `cgc_proxy_fmv` reads only (grade, price) — title filtering happens
+# upstream in `_slab_comps_only` — so only the grades and prices below carry
+# meaning.
+
+# Invincible #2 (2003), the book BUI-714 was filed for. Nine slab comps,
+# monotonic, well clear of the $400 value floor — and still refused, because a
+# modern key's certified copies sit at 9.2+ while the raw copy we are bidding on
+# is graded 8.0. Across all 8 modern books measured, 3 of 57 slab comps (5%)
+# were at or below grade 8.5.
+_INVINCIBLE_2_MODERN_LADDER = [
+    _slab(550.0, 9.2),
+    _slab(700.0, 9.6), _slab(761.0, 9.6), _slab(761.0, 9.6),
+    _slab(800.0, 9.6), _slab(900.0, 9.6),
+    _slab(1350.0, 9.8), _slab(1499.0, 9.8), _slab(2500.0, 9.8),
+]
+
+# Invincible #61 (2009). Monotonic and deep enough, and it DOES reach the target
+# grade — this one is refused by the value floor instead ($261 < $400). The
+# second-most-common refusal in the measurement, pinned so a future modern
+# attempt cannot quietly lower the floor to gain coverage.
+_INVINCIBLE_61_MODERN_LADDER = [
+    _slab(200.0, 7.0),
+    _slab(261.0, 9.2),
+    _slab(400.0, 9.8), _slab(450.0, 9.8), _slab(474.95, 9.8),
+    _slab(500.0, 9.8), _slab(550.0, 9.8),
+]
+
+
+class TestModernCgcProxyStaysRefused:
+    """BUI-714 was closed as a measured no-ship. Two independent things have to
+    stay true for that decision to hold, and each is pinned here because each
+    is a plausible future edit:
+
+    1. `_is_vintage` keeps refusing a modern year. Relaxing it is the literal
+       change BUI-714 proposed.
+    2. Even if someone DID relax it, the no-extrapolation guard still refuses
+       the motivating book — so a modern extension is inert unless that money
+       guard is ALSO relaxed. Do not relax it: the measurement found zero
+       usable modern raw:slab calibration cells at or below grade 8.5, so a
+       band published there would rest on an unmeasured factor.
+
+    See docs/solutions/best-practices/modern-cgc-proxy-factor-is-unmeasurable.md
+    """
+
+    def test_gate_still_refuses_a_modern_year(self):
+        assert fmv_runner._is_vintage({"input": {"year": 2003}}) is False
+        assert fmv_runner._is_vintage({"input": {"year": 1999}}) is True
+
+    def test_missing_year_still_fails_closed(self):
+        """Four of the five live modern candidates (Invincible #2/#7/#10/#13)
+        carry no `comics.year` at all — the gate must stay conservative."""
+        assert fmv_runner._is_vintage({"input": {}}) is False
+
+    def test_modern_ladder_refuses_the_grade_we_actually_bid(self):
+        """The real Invincible #2 ladder + the real target grade (8.0) → None.
+        This is the no-extrapolation guard, NOT the year gate and NOT the
+        factor: no recalibration of the factor can make this book price."""
+        assert fmv_math.cgc_proxy_fmv(
+            _INVINCIBLE_2_MODERN_LADDER, target_grade=8.0) is None
+
+    def test_the_same_ladder_does_price_inside_its_observed_range(self):
+        """Guards against the test above passing for a boring reason (a broken
+        fixture). The ladder is trustworthy and clears the value floor — it is
+        specifically the 8.0 target, below every observed slab, that is
+        refused."""
+        priced = fmv_math.cgc_proxy_fmv(
+            _INVINCIBLE_2_MODERN_LADDER, target_grade=9.6)
+        assert priced is not None
+        assert priced["cgc_proxy"] is True
+        assert priced["confidence"] == fmv_math.CGC_PROXY_CONFIDENCE
+
+    def test_every_live_modern_candidate_grade_is_refused(self):
+        """The five candidates BUI-714 names (Invincible #2/#7/#10/#11/#13) are
+        graded 7.5, 8.0, 8.0, 8.0 and 8.5. None is inside a modern slab ladder's
+        observed range. (The wider live modern needs_manual population runs
+        7.5-9.0; the 9.0 rows are cheap mid-run books the $400 floor refuses —
+        see test_modern_ladder_under_the_value_floor_is_refused.)"""
+        for grade in (7.5, 8.0, 8.5):
+            assert fmv_math.cgc_proxy_fmv(
+                _INVINCIBLE_2_MODERN_LADDER, target_grade=grade) is None, grade
+
+    def test_modern_ladder_under_the_value_floor_is_refused(self):
+        """A modern ladder that DOES reach the target grade is still refused
+        when the slab price is under CGC_PROXY_MIN_SLAB_PRICE. Pins the second
+        refusal reason so coverage can't be bought by lowering the floor."""
+        assert fmv_math.cgc_proxy_fmv(
+            _INVINCIBLE_61_MODERN_LADDER, target_grade=9.2) is None
+        # Not refused for lack of a reachable price — the ladder resolves here.
+        ladder = fmv_math.bucket_medians(_INVINCIBLE_61_MODERN_LADDER)
+        counts = fmv_math.bucket_counts(_INVINCIBLE_61_MODERN_LADDER)
+        slab, _ = fmv_math._cgc_ladder_price_and_clamp(ladder, 9.2, counts=counts)
+        assert slab == 261.0
+        assert slab < fmv_math.CGC_PROXY_MIN_SLAB_PRICE
