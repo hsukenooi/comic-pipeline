@@ -1530,7 +1530,8 @@ def _set_bid_fields(db_path, item_id, **fields):
 
 
 def _link_comic(db_path, item_id, *, title, issue, year, grade,
-                fmv_low=None, fmv_high=None, is_primary=True, flag_reason=None):
+                fmv_low=None, fmv_high=None, is_primary=True, flag_reason=None,
+                ungraded_anchor=None, ungraded_anchor_n=None):
     """Create a comic + fmv row and link it to a bid via bid_fmvs."""
     raw = sqlite3.connect(db_path)
     raw.row_factory = sqlite3.Row
@@ -1544,9 +1545,11 @@ def _link_comic(db_path, item_id, *, title, issue, year, grade,
             (title, issue, year),
         ).fetchone()["id"]
         raw.execute(
-            "INSERT OR REPLACE INTO fmv (comic_id, grade, low, high, flag_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (cid, grade, fmv_low, fmv_high, flag_reason),
+            "INSERT OR REPLACE INTO fmv "
+            "(comic_id, grade, low, high, flag_reason, ungraded_anchor, ungraded_anchor_n) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cid, grade, fmv_low, fmv_high, flag_reason,
+             ungraded_anchor, ungraded_anchor_n),
         )
         fid = raw.execute(
             "SELECT id FROM fmv WHERE comic_id=? AND grade=?", (cid, grade)
@@ -1747,6 +1750,47 @@ def test_comics_snipes_excludes_terminal_statuses(api):
         assert f"10000010{i}" not in returned
 
 
+def test_comics_snipes_exposes_flag_reason_and_ungraded_anchor(api):
+    """BUI-712: an unpriced-but-linked row (fmv exists, low/high NULL because
+    the pool failed a quality gate) carries the BUI-522 ungraded anchor as
+    real fields — not a notes-parsing job for the client."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "712000001", "max_bid": 234.50})
+    _set_bid_fields(db_path, "712000001",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+    _link_comic(db_path, "712000001",
+                title="Invincible", issue="2", year=2003, grade=9.8,
+                fmv_low=None, fmv_high=None, flag_reason="one_sided",
+                ungraded_anchor=335.0, ungraded_anchor_n=11)
+
+    row = api.get("/api/comics/snipes").json()[0]
+    assert row["item_id"] == "712000001"
+    assert row["fmv_low"] is None
+    assert row["fmv_high"] is None
+    assert row["needs_linking"] is False
+    assert row["flag_reason"] == "one_sided"
+    assert row["ungraded_anchor"] == 335.0
+    assert row["ungraded_anchor_n"] == 11
+    # BUI-522/BUI-713 contract: the anchor must never drive value_pct.
+    assert row["value_pct"] is None
+
+
+def test_comics_snipes_no_linked_fmv_has_null_anchor_fields(api):
+    """A row with no linked fmv at all (needs_linking) has nothing to
+    aggregate the anchor from — flag_reason/ungraded_anchor(_n) stay NULL,
+    same as fmv_low/fmv_high, so the frontend's plain `—` path is untouched."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "712000002", "max_bid": 50.0})
+    _set_bid_fields(db_path, "712000002",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+
+    row = api.get("/api/comics/snipes").json()[0]
+    assert row["needs_linking"] is True
+    assert row["flag_reason"] is None
+    assert row["ungraded_anchor"] is None
+    assert row["ungraded_anchor_n"] is None
+
+
 # --- /api/comics/history ---
 
 
@@ -1917,6 +1961,75 @@ def test_comics_history_removed_does_not_shadow_legit_loss(api):
     matching = [r for r in rows if r["item_id"] == "200000016"]
     assert len(matching) == 1
     assert matching[0]["status"] == "LOST"
+
+
+def test_comics_history_exposes_flag_reason_and_ungraded_anchor(api):
+    """BUI-712, history side of the parity requirement: an ended snipe whose
+    linked fmv never priced still carries the anchor + flag_reason."""
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at) "
+        "VALUES (?, ?, 'LOST', datetime('now', '-1 day'))",
+        ("712000003", 234.50),
+    )
+    raw.commit()
+    raw.close()
+    _link_comic(db_path, "712000003",
+                title="Invincible", issue="7", year=2004, grade=9.6,
+                fmv_low=None, fmv_high=None, flag_reason="too_sparse",
+                ungraded_anchor=25.0, ungraded_anchor_n=7)
+
+    rows = api.get("/api/comics/history").json()
+    matching = [r for r in rows if r["item_id"] == "712000003"]
+    assert len(matching) == 1
+    row = matching[0]
+    assert row["flag_reason"] == "too_sparse"
+    assert row["ungraded_anchor"] == 25.0
+    assert row["ungraded_anchor_n"] == 7
+    assert row["value_pct"] is None
+
+
+def test_comics_snipes_and_history_expose_the_same_fmv_field_set(api):
+    """BUI-712 endpoint-parity test: /api/comics/snipes and /api/comics/history
+    both go through _build_comics_row, so a field added to one must appear on
+    the other in the same commit — this is the BUI-50-class drift the ticket
+    calls out by name. Builds one active row and one ended row and asserts
+    both response shapes carry the identical key set, field-by-field, not just
+    a spot-check on one endpoint."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "712000004", "max_bid": 100.0})
+    _set_bid_fields(db_path, "712000004",
+                    auction_end_at="2099-01-01T00:00:00+00:00")
+    _link_comic(db_path, "712000004",
+                title="Invincible", issue="10", year=2004, grade=9.4,
+                fmv_low=None, fmv_high=None, flag_reason="one_sided",
+                ungraded_anchor=315.0, ungraded_anchor_n=9)
+
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at) "
+        "VALUES (?, ?, 'LOST', datetime('now', '-1 day'))",
+        ("712000005", 100.0),
+    )
+    raw.commit()
+    raw.close()
+    _link_comic(db_path, "712000005",
+                title="Invincible", issue="11", year=2004, grade=9.4,
+                fmv_low=None, fmv_high=None, flag_reason="one_sided",
+                ungraded_anchor=315.0, ungraded_anchor_n=9)
+
+    snipe_row = api.get("/api/comics/snipes").json()[0]
+    history_rows = api.get("/api/comics/history").json()
+    history_row = [r for r in history_rows if r["item_id"] == "712000005"][0]
+
+    assert set(snipe_row.keys()) == set(history_row.keys())
+    for field in ("flag_reason", "ungraded_anchor", "ungraded_anchor_n",
+                  "fmv_low", "fmv_high", "value_pct"):
+        assert field in snipe_row and field in history_row
+    assert snipe_row["ungraded_anchor"] == history_row["ungraded_anchor"] == 315.0
+    assert snipe_row["ungraded_anchor_n"] == history_row["ungraded_anchor_n"] == 9
+    assert snipe_row["flag_reason"] == history_row["flag_reason"] == "one_sided"
 
 
 # --- /api/comics/outcomes (BUI-286) ------------------------------------------

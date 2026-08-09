@@ -1623,6 +1623,61 @@ class TestUpsertFmv:
         assert body["fmv_confidence"] == "high"
         assert body["locg_id"] == 42
 
+    def test_posts_structured_ungraded_anchor_fields(self, server_url):
+        """BUI-712: the ungraded anchor is posted as structured fields
+        ALONGSIDE the existing fmv_notes token (_build_notes still writes
+        `ungraded_anchor=$X (nN raw)` — that token is untouched by this)."""
+        inp = {"title": "Invincible", "issue": "2", "year": 2003, "grade": 9.8}
+        fmv = {"fmv_low": None, "fmv_high": None, "n": 11, "confidence": "LOW",
+               "window": 1.0, "cv_pct": "n/a", "flag_reason": "one_sided",
+               "ungraded_anchor": {"median": 335.0, "n": 11}}
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"id": 1}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post:
+            fmv_runner._upsert_fmv(server_url, inp, fmv)
+            body = post.call_args.kwargs["json"]
+        assert body["fmv_ungraded_anchor"] == 335.0
+        assert body["fmv_ungraded_anchor_n"] == 11
+        # The notes token is a separate, untouched trace — not replaced.
+        assert "ungraded_anchor=$335 (n=11 raw)" in body["fmv_notes"]
+
+    def test_posts_null_ungraded_anchor_fields_when_absent(self, server_url):
+        """No grade-less comps (or a cache-reused row that can't reconstruct
+        the anchor) -> both structured fields post as None, same as today's
+        notes-token behavior (_build_notes omits the token entirely)."""
+        inp = {"title": "X", "issue": "1", "year": 1990, "grade": 9.0}
+        fmv = {"fmv_low": 100, "fmv_high": 150, "n": 8, "confidence": "HIGH",
+               "window": 0.5, "cv_pct": "20%", "ungraded_anchor": None}
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"id": 1}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post:
+            fmv_runner._upsert_fmv(server_url, inp, fmv)
+            body = post.call_args.kwargs["json"]
+        assert body["fmv_ungraded_anchor"] is None
+        assert body["fmv_ungraded_anchor_n"] is None
+
+    def test_posts_null_ungraded_anchor_fields_when_key_missing(self, server_url):
+        """A caller whose fmv dict doesn't even carry the `ungraded_anchor` key
+        (older/partial dicts, or the pre-BUI-712 test fixtures throughout this
+        file) must not crash — mirrors the .get() tolerance _build_notes
+        already relies on."""
+        inp = {"title": "X", "issue": "1", "year": 1990, "grade": 9.0}
+        fmv = {"fmv_low": 100, "fmv_high": 150, "n": 8, "confidence": "HIGH",
+               "window": 0.5, "cv_pct": "20%"}
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"id": 1}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post:
+            fmv_runner._upsert_fmv(server_url, inp, fmv)
+            body = post.call_args.kwargs["json"]
+        assert body["fmv_ungraded_anchor"] is None
+        assert body["fmv_ungraded_anchor_n"] is None
+
     def test_upsert_fmv_fails_loud_on_post_error(self, server_url):
         """BUI-186: a failed FMV upsert aborts the run (fail loud) instead of
         returning None and proceeding with a book that was priced but never

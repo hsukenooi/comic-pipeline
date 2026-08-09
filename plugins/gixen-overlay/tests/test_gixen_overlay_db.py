@@ -110,6 +110,41 @@ def test_create_tables_adds_flag_reason_to_legacy_fmv(db):
     create_tables(db)
 
 
+def test_create_tables_adds_ungraded_anchor_columns_to_legacy_fmv(db):
+    """BUI-712: a pre-BUI-712 fmv table (no ungraded_anchor/ungraded_anchor_n
+    columns) gets both added by re-running create_tables, preserving existing
+    rows. Version-skew tolerant and idempotent — mirrors
+    test_create_tables_adds_flag_reason_to_legacy_fmv above."""
+    cid = _insert_comic(db)
+    # Simulate a pre-BUI-712 fmv row written before the columns existed.
+    db.execute("ALTER TABLE fmv DROP COLUMN ungraded_anchor")
+    db.execute("ALTER TABLE fmv DROP COLUMN ungraded_anchor_n")
+    db.execute(
+        "INSERT INTO fmv (comic_id, grade, low, high) VALUES (?, 9.2, 100, 200)",
+        (cid,),
+    )
+    db.commit()
+    cols = {r[1] for r in db.execute("PRAGMA table_info(fmv)")}
+    assert "ungraded_anchor" not in cols
+    assert "ungraded_anchor_n" not in cols
+
+    create_tables(db)  # re-run: should add both columns
+    cols = {r[1] for r in db.execute("PRAGMA table_info(fmv)")}
+    assert "ungraded_anchor" in cols
+    assert "ungraded_anchor_n" in cols
+    row = db.execute(
+        "SELECT low, ungraded_anchor, ungraded_anchor_n FROM fmv WHERE grade=9.2"
+    ).fetchone()
+    assert row["low"] == 100  # existing row preserved
+    assert row["ungraded_anchor"] is None
+    assert row["ungraded_anchor_n"] is None
+
+    # Idempotent: running twice more (including via create_tables directly,
+    # which is what a live server does on every startup) must not error.
+    create_tables(db)
+    create_tables(db)
+
+
 # ---------------------------------------------------------------------------
 # upsert_comic (identity-only)
 # ---------------------------------------------------------------------------
@@ -1036,6 +1071,103 @@ def test_upsert_fmv_fresh_price_clears_prior_flag(db):
     assert row["low"] == 500.0
     assert row["high"] == 700.0
     assert row["flag_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# upsert_fmv ungraded_anchor / ungraded_anchor_n (BUI-712)
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_fmv_stores_anchor_fields(db):
+    cid = _insert_comic(db)
+    fid = upsert_fmv(
+        db, cid, 9.6, flag_reason="one_sided",
+        ungraded_anchor=335.0, ungraded_anchor_n=11,
+    )
+    row = db.execute(
+        "SELECT low, flag_reason, ungraded_anchor, ungraded_anchor_n "
+        "FROM fmv WHERE id=?", (fid,),
+    ).fetchone()
+    assert row["low"] is None
+    assert row["flag_reason"] == "one_sided"
+    assert row["ungraded_anchor"] == 335.0
+    assert row["ungraded_anchor_n"] == 11
+
+
+def test_upsert_fmv_without_anchor_fields_leaves_them_null(db):
+    """Callers that never pass ungraded_anchor (most upsert_fmv call sites)
+    must not accidentally get a non-NULL default."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(db, cid, 9.2, low=800.0, high=1000.0)
+    row = db.execute(
+        "SELECT ungraded_anchor, ungraded_anchor_n FROM fmv WHERE id=?", (fid,),
+    ).fetchone()
+    assert row["ungraded_anchor"] is None
+    assert row["ungraded_anchor_n"] is None
+
+
+def test_upsert_fmv_flag_reason_case_does_not_null_anchor_columns(db):
+    """BUI-712's core write-side contract: the CASE that nulls low/high on a
+    newly-flagged row must NOT null ungraded_anchor/ungraded_anchor_n — the
+    anchor is precisely the context the dashboard wants visible on a flagged
+    (unpriced) row, unlike low/high which genuinely become meaningless."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(
+        db, cid, 9.6, low=800.0, high=1000.0, comps=12, confidence="high",
+    )
+    # Re-upsert as a flagged row that ALSO carries a fresh anchor reading.
+    upsert_fmv(
+        db, cid, 9.6, flag_reason="too_wide",
+        ungraded_anchor=234.5, ungraded_anchor_n=7,
+    )
+    row = db.execute(
+        "SELECT low, high, flag_reason, ungraded_anchor, ungraded_anchor_n "
+        "FROM fmv WHERE id=?", (fid,),
+    ).fetchone()
+    assert row["low"] is None
+    assert row["high"] is None
+    assert row["flag_reason"] == "too_wide"
+    assert row["ungraded_anchor"] == 234.5
+    assert row["ungraded_anchor_n"] == 7
+
+
+def test_upsert_fmv_n0_stub_does_not_wipe_anchor_of_a_priced_row(db):
+    """Same n=0 stub guard as comps/confidence/notes: a bare stub re-upsert
+    must not blank a previously-stored anchor."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(
+        db, cid, 9.6, low=800.0, high=1000.0, comps=12,
+        ungraded_anchor=335.0, ungraded_anchor_n=11,
+    )
+    upsert_fmv(db, cid, 9.6)  # bare n=0 stub
+    row = db.execute(
+        "SELECT low, ungraded_anchor, ungraded_anchor_n FROM fmv WHERE id=?",
+        (fid,),
+    ).fetchone()
+    assert row["low"] == 800.0
+    assert row["ungraded_anchor"] == 335.0
+    assert row["ungraded_anchor_n"] == 11
+
+
+def test_upsert_fmv_fresh_price_updates_anchor_via_coalesce(db):
+    """A freshly-priced re-upsert (not flagged, not a stub) COALESCE-updates
+    the anchor like comps/confidence/notes."""
+    cid = _insert_comic(db)
+    fid = upsert_fmv(
+        db, cid, 8.0, low=15.0, high=20.0, comps=11,
+        ungraded_anchor=18.0, ungraded_anchor_n=5,
+    )
+    upsert_fmv(
+        db, cid, 8.0, low=30.0, high=40.0, comps=25,
+        ungraded_anchor=32.0, ungraded_anchor_n=9,
+    )
+    row = db.execute(
+        "SELECT low, ungraded_anchor, ungraded_anchor_n FROM fmv WHERE id=?",
+        (fid,),
+    ).fetchone()
+    assert row["low"] == 30.0
+    assert row["ungraded_anchor"] == 32.0
+    assert row["ungraded_anchor_n"] == 9
 
 
 # ---------------------------------------------------------------------------

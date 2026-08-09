@@ -414,6 +414,8 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
             confidence=req.fmv_confidence,
             notes=req.fmv_notes,
             flag_reason=req.fmv_flag_reason,
+            ungraded_anchor=req.fmv_ungraded_anchor,
+            ungraded_anchor_n=req.fmv_ungraded_anchor_n,
         )
         # BUI-659: append an immutable snapshot of the row upsert_fmv just
         # wrote to fmv_history. Runs AFTER upsert_fmv's own commit — the fmv
@@ -1187,6 +1189,19 @@ def _build_comics_row(row):
         "value_pct": value_pct,
         "lot_count": lot_count,
         "needs_linking": needs_linking,
+        # BUI-712: the primary fmv's flag_reason + BUI-522 ungraded anchor,
+        # exposed as real fields (not client-side notes parsing — the ticket's
+        # own contract). Present whenever a primary fmv is linked, priced or
+        # not; the frontend renders them only for the unpriced-but-linked case
+        # (fmv_low/fmv_high None, needs_linking False) — a priced row ignores
+        # them, and an unlinked row never has them (aggregate over zero rows).
+        # Deliberately NOT folded into value_pct/fmv_low/fmv_high math above:
+        # the anchor is context for a human, never a price (BUI-522/BUI-713
+        # contract) — it must never drive deal-coloring, sorting-as-price, or
+        # any bid math.
+        "flag_reason": item.get("primary_flag_reason"),
+        "ungraded_anchor": item.get("primary_ungraded_anchor"),
+        "ungraded_anchor_n": item.get("primary_ungraded_anchor_n"),
     }
 
 
@@ -1196,7 +1211,15 @@ _COMICS_AGGREGATES = """
     SUM(f.high) AS fmv_high_sum,
     COUNT(bf.fmv_id) AS lot_count,
     SUM(CASE WHEN bf.fmv_id IS NOT NULL AND f.low IS NULL THEN 1 ELSE 0 END) AS fmv_low_null_count,
-    SUM(CASE WHEN bf.fmv_id IS NOT NULL AND f.high IS NULL THEN 1 ELSE 0 END) AS fmv_high_null_count
+    SUM(CASE WHEN bf.fmv_id IS NOT NULL AND f.high IS NULL THEN 1 ELSE 0 END) AS fmv_high_null_count,
+    -- BUI-712: the primary book's flag_reason + BUI-522 ungraded anchor, so an
+    -- unpriced-but-linked row can render `~$335 raw (n=11)` instead of a bare
+    -- `—`. Same MAX(CASE WHEN bf.is_primary...) shape as primary_grade above —
+    -- one scalar per group, taken from the primary fmv row only (a lot's
+    -- non-primary issues don't drive the displayed anchor).
+    MAX(CASE WHEN bf.is_primary = 1 THEN f.flag_reason END) AS primary_flag_reason,
+    MAX(CASE WHEN bf.is_primary = 1 THEN f.ungraded_anchor END) AS primary_ungraded_anchor,
+    MAX(CASE WHEN bf.is_primary = 1 THEN f.ungraded_anchor_n END) AS primary_ungraded_anchor_n
 """
 
 

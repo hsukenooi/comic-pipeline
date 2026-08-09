@@ -36,6 +36,16 @@ class UpsertComicRequest(BaseModel):
     fmv_confidence: str | None = None
     fmv_notes: str | None = None
     fmv_flag_reason: str | None = None
+    # BUI-712: the BUI-522 ungraded-market anchor (median + raw-copy count off
+    # the grade-less comps build_pool drops) as structured fields, posted
+    # ALONGSIDE (not instead of) the `ungraded_anchor=$X (nN raw)` fmv_notes
+    # token fmv_runner._build_notes already writes — the notes token stays a
+    # human-readable trace, these are the machine-readable source of truth for
+    # the /comics dashboard. Same cross-package-contract shape as
+    # FMV_FLAG_REASONS above: fmv_runner is the sole producer, so a field added
+    # here must land in the same commit as its fmv_runner.py counterpart.
+    fmv_ungraded_anchor: float | None = None
+    fmv_ungraded_anchor_n: int | None = None
     locg_id: int | None = None
     locg_variant_id: int | None = None
 
