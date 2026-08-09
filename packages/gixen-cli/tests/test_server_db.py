@@ -2935,3 +2935,100 @@ def test_bid_decisions_has_no_update_path():
 
     source = inspect.getsource(db_module)
     assert "UPDATE bid_decisions" not in source
+
+
+# ---------------------------------------------------------------------------
+# BUI-716: removal intent — set_removal_requested / get_pending_removal_bids /
+# the get_bids_ready_to_snipe disarm
+# ---------------------------------------------------------------------------
+
+def _seed_ready_row(db, item_id, **overrides):
+    """A PENDING row whose fire time has already arrived."""
+    fields = {
+        "item_id": item_id, "max_bid": 10.0, "status": "PENDING",
+        "auction_end_at": "2020-01-01T00:00:00+00:00", "bid_offset": 6,
+        "removal_requested_at": None,
+    }
+    fields.update(overrides)
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, "
+        "bid_offset, removal_requested_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (fields["item_id"], fields["max_bid"], fields["status"],
+         fields["auction_end_at"], fields["bid_offset"],
+         fields["removal_requested_at"]),
+    )
+    db.commit()
+
+
+def test_ready_to_snipe_excludes_removal_requested(db):
+    """BUI-716: the moment removal intent is stamped, the local sniper must
+    stop arming the row — even while the Gixen-side cancel is unconfirmed.
+    This is the disarm that was missing in the 2026-08-09 incident."""
+    from server.db import get_bids_ready_to_snipe, set_removal_requested
+
+    _seed_ready_row(db, "716100001")
+    _seed_ready_row(db, "716100002")
+    now = "2030-01-01T00:00:00+00:00"
+    assert {r["item_id"] for r in get_bids_ready_to_snipe(db, now)} == {
+        "716100001", "716100002",
+    }
+
+    assert set_removal_requested(db, "716100001") is True
+    db.commit()
+    assert {r["item_id"] for r in get_bids_ready_to_snipe(db, now)} == {
+        "716100002",
+    }
+
+
+def test_set_removal_requested_no_pending_row_returns_false(db):
+    from server.db import set_removal_requested
+
+    assert set_removal_requested(db, "716100404") is False
+
+
+def test_set_removal_requested_is_id_scoped_to_the_pending_row(db):
+    """A resolved sibling sharing item_id must never pick up the stamp — the
+    scope-status-writes-to-row-id-not-item-id class (BUI-633)."""
+    from server.db import set_removal_requested
+
+    _seed_ready_row(db, "716100003", status="WON")
+    _seed_ready_row(db, "716100003")  # the live PENDING row
+    assert set_removal_requested(db, "716100003") is True
+    db.commit()
+
+    rows = db.execute(
+        "SELECT status, removal_requested_at FROM bids WHERE item_id='716100003'"
+    ).fetchall()
+    stamped = {r["status"]: r["removal_requested_at"] for r in rows}
+    assert stamped["PENDING"] is not None
+    assert stamped["WON"] is None
+
+
+def test_set_removal_requested_keeps_earliest_stamp(db):
+    """Idempotent on re-request: a retried click must not advance the stamp —
+    the earliest intent time is the forensic record."""
+    from server.db import set_removal_requested
+
+    _seed_ready_row(db, "716100005",
+                    removal_requested_at="2026-08-09T00:00:00+00:00")
+    assert set_removal_requested(db, "716100005") is True
+    db.commit()
+    row = db.execute(
+        "SELECT removal_requested_at FROM bids WHERE item_id='716100005'"
+    ).fetchone()
+    assert row["removal_requested_at"] == "2026-08-09T00:00:00+00:00"
+
+
+def test_get_pending_removal_bids_queue_predicate(db):
+    """Only PENDING + stamped rows are the retry loop's work queue; resolved
+    or tombstoned rows drop out by status without the stamp being cleared."""
+    from server.db import get_pending_removal_bids
+
+    _seed_ready_row(db, "716100006",
+                    removal_requested_at="2026-08-09T00:00:00+00:00")
+    _seed_ready_row(db, "716100007")  # no stamp
+    _seed_ready_row(db, "716100008", status="REMOVED",
+                    removal_requested_at="2026-08-09T00:00:00+00:00")
+
+    queue = {r["item_id"] for r in get_pending_removal_bids(db)}
+    assert queue == {"716100006"}

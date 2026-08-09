@@ -2795,6 +2795,32 @@ def test_cli_remove_deletes_server(monkeypatch):
         mock_req.delete.assert_called_once()
         call_url = mock_req.delete.call_args[0][0]
         assert "/api/bids/123456789" in call_url
+        assert "Removed snipe" in result.output
+
+
+def test_cli_remove_202_reports_pending_not_removed(monkeypatch):
+    """BUI-716: a 202 REMOVAL_PENDING (Gixen unreachable, intent persisted)
+    must not print the unqualified "Removed snipe" — the Gixen cancel is
+    unconfirmed, and claiming completion for an unconfirmed write is the
+    BUI-697 honesty failure in the other direction."""
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://localhost:8080")
+
+    runner = CliRunner()
+    with patch("cli.requests") as mock_req:
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.status_code = 202
+        mock_resp.json.return_value = {
+            "item_id": "123456789",
+            "status": "REMOVAL_PENDING",
+            "detail": "Gixen unreachable",
+        }
+        mock_req.delete.return_value = mock_resp
+
+        result = runner.invoke(cli_app, ["remove", "123456789"])
+        assert result.exit_code == 0
+        assert "Removal accepted" in result.output
+        assert "Removed snipe" not in result.output
 
 
 def test_cli_purge_posts_to_server(monkeypatch):

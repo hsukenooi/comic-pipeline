@@ -17,7 +17,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 
 from gixen_client import (
@@ -37,6 +37,7 @@ from server.db import (
     DB_PATH, init_db, insert_bid, update_bid_grades, get_bid_by_item_id,
     get_bid_by_id, get_pending_bid_by_item_id,
     update_bid, update_bid_status, delete_bid, get_all_bids,
+    set_removal_requested, get_pending_removal_bids,
     mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
     refresh_snipe_group, mirror_gixen_max_bid,
@@ -1406,6 +1407,63 @@ async def _sniper_loop() -> None:
         await asyncio.sleep(SNIPER_INTERVAL)
 
 
+# BUI-716: cadence for re-attempting Gixen cancels whose removal intent is
+# persisted but unconfirmed. 30s is BUI-562's measured recovery point for a
+# flapping (not rate-limited) Gixen — a retry within 30s of a failure
+# recovered 12/12, and sooner-is-safe held under the inverted dose-response.
+REMOVAL_RETRY_INTERVAL = 30
+
+
+async def _retry_pending_removals() -> None:
+    """One pass over PENDING rows carrying removal_requested_at (BUI-716).
+
+    The persistent-bounded-retry-and-reconcile half of the removal contract:
+    api_remove_bid stamps the intent and answers 202; this pass re-attempts
+    the Gixen cancel until one of three exits confirms the end state —
+    remove_snipe succeeds (cancel confirmed), GixenSnipeNotFoundError (the
+    snipe is already gone — reconcile says the desired state is true), or the
+    row leaves PENDING via sync (auction resolved first; the queue predicate
+    drops it without touching the stamp). A GixenError leaves the row queued
+    for the next pass — the intent is never dropped.
+    """
+    db = _get_db()
+    for row in get_pending_removal_bids(db):
+        item_id = row["item_id"]
+        try:
+            await _remove_with_cache_fallback(db, item_id)
+        except GixenSnipeNotFoundError:
+            logger.info(
+                "_retry_pending_removals: %s already absent from Gixen — "
+                "tombstoning REMOVED", item_id,
+            )
+        except GixenError as e:
+            logger.warning(
+                "_retry_pending_removals: Gixen cancel for %s still failing "
+                "(%s) — will retry in %ds", item_id, e, REMOVAL_RETRY_INTERVAL,
+            )
+            continue
+        else:
+            logger.info(
+                "_retry_pending_removals: Gixen cancel for %s confirmed — "
+                "tombstoning REMOVED", item_id,
+            )
+        # BUI-408 shape: await-free write after the Gixen await above — its
+        # own short-lived write_transaction() under _write_lock, one per row
+        # (a later row's failure must not roll back this row's tombstone).
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                delete_bid(wconn, item_id)
+
+
+async def _removal_retry_loop() -> None:
+    while True:
+        try:
+            await _retry_pending_removals()
+        except Exception:
+            logger.exception("_removal_retry_loop: unexpected error, continuing")
+        await asyncio.sleep(REMOVAL_RETRY_INTERVAL)
+
+
 # ---------------------------------------------------------------------------
 # Per-snipe outcome watchdog (BUI-604) — READ-ONLY
 # ---------------------------------------------------------------------------
@@ -1844,6 +1902,11 @@ async def lifespan(app: FastAPI):
         _bidder = ebay_bidder.EbayBidder()
         await _bidder.start()
         sniper_task = asyncio.create_task(_sniper_loop())
+    # BUI-716: finishes Gixen cancels whose removal intent is persisted but
+    # unconfirmed (api_remove_bid's 202 path). Unconditional — it is the
+    # durability half of the removal contract, and with no queued removals a
+    # pass is one indexed SELECT every 30s.
+    removal_retry_task = asyncio.create_task(_removal_retry_loop())
 
     yield
 
@@ -1865,6 +1928,7 @@ async def lifespan(app: FastAPI):
         await _bidder.stop()
     if sync_task:
         sync_task.cancel()
+    removal_retry_task.cancel()
 
     row = _db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     if row and row[0]:
@@ -2420,6 +2484,10 @@ def _serialize_snipe_row(item: dict) -> dict:
         "cached_at": item.get("cached_at"),
         "local_snipe_at": item.get("local_snipe_at"),
         "local_snipe_result": item.get("local_snipe_result"),
+        # BUI-716: True while a requested removal awaits Gixen confirmation —
+        # the dashboards render these rows as "removal pending", not as
+        # ordinary live snipes with a working remove button.
+        "removal_pending": item.get("removal_requested_at") is not None,
     }
 
 
@@ -3066,6 +3134,20 @@ async def api_remove_bid(item_id: str):
     if not re.match(r"^\d+$", item_id):
         raise HTTPException(status_code=422, detail="item_id must be numeric")
     db = _get_db()
+
+    # BUI-716: persist the removal intent BEFORE the first Gixen call. The
+    # 2026-08-09 incident: a remove during a Gixen flap 503'd, persisted
+    # nothing, and the un-removed snipe fired for real money a day later.
+    # With the stamp down first, a Gixen failure can no longer lose the
+    # user's click — get_bids_ready_to_snipe stops arming the row
+    # immediately, and _removal_retry_loop owns the Gixen cancel to
+    # completion. False (no PENDING row) keeps the legacy fail-loudly 503 on
+    # Gixen errors: nothing is armed locally and the retry loop scans
+    # PENDING rows only, so a 202 would promise a retry nobody performs.
+    async with _write_locked():
+        with write_transaction(_get_db_path()) as wconn:
+            intent_persisted = set_removal_requested(wconn, item_id)
+
     try:
         await _remove_with_cache_fallback(db, item_id)
     except GixenSnipeNotFoundError:
@@ -3078,7 +3160,24 @@ async def api_remove_bid(item_id: str):
             "remove: %s already absent from Gixen — tombstoning REMOVED", item_id,
         )
     except GixenError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
+        if not intent_persisted:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        logger.warning(
+            "remove: Gixen cancel for %s failed (%s) — removal intent "
+            "persisted, sniper disarmed, retry loop will finish the cancel",
+            item_id, e,
+        )
+        # 202, not 503: the request IS accepted — the row can no longer fire
+        # locally and the Gixen-side cancel is owned by _removal_retry_loop.
+        # str(e) is session-id-redacted at the exception layer (BUI-558).
+        return JSONResponse(
+            status_code=202,
+            content={
+                "item_id": item_id,
+                "status": "REMOVAL_PENDING",
+                "detail": str(e),
+            },
+        )
 
     delete_bid(db, item_id)
     # BUI-407: delete_bid no longer self-commits — commit here, at the same

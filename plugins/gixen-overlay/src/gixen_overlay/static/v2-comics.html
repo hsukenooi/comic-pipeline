@@ -127,6 +127,23 @@
     font-weight: 600;
   }
   tbody tr.removing { opacity: 0.4; transition: opacity 0.25s var(--ease-out); }
+  /* BUI-716: server-confirmed pending removal (202) — Gixen cancel still in
+     flight via the retry loop; the row is disarmed but not yet tombstoned. */
+  tbody tr.removal-pending { opacity: 0.45; }
+  .removal-pending-tag {
+    margin-left: 8px;
+    font-size: 11px;
+    color: var(--fg-dim);
+    font-style: italic;
+    white-space: nowrap;
+  }
+  /* BUI-716: persistent, visible failure state — never tooltip-only. */
+  .remove-error {
+    margin-left: 8px;
+    font-size: 11px;
+    color: var(--red);
+    white-space: nowrap;
+  }
 
   /* top-of-page refresh sweep — visible only while a fetch is in flight */
   .refresh-bar {
@@ -372,6 +389,12 @@ function outcome(r) {
 
 // ---- Tables -----------------------------------------------------------------
 
+// BUI-716: remove-flow state, keyed by item_id so it survives table rebuilds
+// (see the "Per-row remove" section below for the full contract).
+let _armedRemove = null;            // {itemId, armedAt, timer} — single slot
+const _removingIds = new Set();     // item_ids with a DELETE in flight
+const _removeErrors = new Map();    // item_id -> sticky visible error text
+
 function renderActive(snipes) {
   const active = snipes.filter(r => !isEnded(r)).sort((a,b) =>
     (a.end_date_iso ? new Date(a.end_date_iso) : Infinity) -
@@ -405,7 +428,27 @@ function renderActive(snipes) {
       + `data-current-max="${max != null ? max : ''}" `
       + `title="click to edit">${maxInner}</span>`;
     const fullTitle = displayTitle(r);
-    const rowClass = [overbid ? "overbid" : "", r.needs_linking ? "needs-linking" : ""]
+    // BUI-716: the remove cell is rendered FROM state keyed by item_id, so a
+    // rebuild re-applies an armed confirm / in-flight removal / sticky error
+    // instead of silently destroying it (the pre-fix intent-eater).
+    const removing = _removingIds.has(r.item_id);
+    const armed = _armedRemove && _armedRemove.itemId === r.item_id;
+    const removeErr = _removeErrors.get(r.item_id);
+    let removeCell;
+    if (r.removal_pending) {
+      removeCell = `<span class="removal-pending-tag" title="removal accepted — Gixen cancel retrying in the background">removing…</span>`;
+    } else if (removing) {
+      removeCell = `<span class="removal-pending-tag">removing…</span>`;
+    } else {
+      const errTag = removeErr
+        ? `<span class="remove-error" title="${escapeHtml(removeErr)}">⚠ remove failed</span>`
+        : "";
+      removeCell = `${errTag}<button class="remove-btn${armed ? " confirming" : ""}" `
+        + `data-item-id="${r.item_id}" aria-label="remove snipe">`
+        + `${armed ? "✕ remove?" : "✕"}</button>`;
+    }
+    const rowClass = [overbid ? "overbid" : "", r.needs_linking ? "needs-linking" : "",
+                      r.removal_pending ? "removal-pending" : "", removing ? "removing" : ""]
       .filter(Boolean).join(" ");
     return `<tr class="${rowClass}" data-item-id="${r.item_id}">
       <td><a class="item-id" href="${ebayUrl(r.item_id)}" target="_blank">${r.item_id}</a></td>
@@ -415,7 +458,7 @@ function renderActive(snipes) {
       <td class="right num">${maxCell}</td>
       <td class="right num">${fmtFmv(r)}</td>
       <td class="right num">${timeCell}</td>
-      <td class="seller">${fmtSeller(r)}<button class="remove-btn" data-item-id="${r.item_id}" aria-label="remove snipe">✕</button></td>
+      <td class="seller">${fmtSeller(r)}${removeCell}</td>
     </tr>`;
   }).join("");
   el.innerHTML = `<div class="panel">
@@ -486,6 +529,17 @@ function renderAll(snipes, history) {
   renderEnded(history || []);
 }
 
+// BUI-716: is the user mid-interaction with a row? While true, the poll loop
+// must not rebuild the table — innerHTML replacement destroys the armed
+// confirm button (and any in-progress max edit), which is exactly how the
+// 2026-08-09 removal clicks were silently eaten. The fresh snapshot still
+// lands in _lastSnipes; the next state change or poll tick renders it.
+function _uiInteractionLive() {
+  return Boolean(_armedRemove)
+      || _removingIds.size > 0
+      || Boolean(document.querySelector("#active-section .editing, #active-section .saving"));
+}
+
 async function load() {
   if (_inFlight) return;
   _inFlight = true;
@@ -496,7 +550,7 @@ async function load() {
       fetchJson(HISTORY_URL),
     ]);
     _lastSnipes = snipes;
-    renderAll(snipes, history);
+    if (!_uiInteractionLive()) renderAll(snipes, history);
   } catch (e) {
     console.error("comics dashboard refresh failed:", e);
   } finally {
@@ -714,41 +768,64 @@ async function saveMaxBid(cell, newMax) {
 }
 
 // ---- Per-row remove (two-click confirm) -------------------------------------
+//
+// BUI-716: all remove-flow state is keyed by item_id in the three module-level
+// slots declared above renderActive — NEVER on DOM nodes. The 2026-08-09
+// incident: armed state lived on the button element, the 30s poll's innerHTML
+// rebuild replaced it between click 1 and click 2, and four removals were
+// silently eaten (one un-removed snipe then fired and won for real money).
+// State transitions mutate the slots and re-render from _lastSnipes, so the
+// table is always a pure function of (snapshot, state).
 
-function resetConfirms(except) {
-  document.querySelectorAll(".remove-btn.confirming").forEach(b => {
-    if (b === except) return;
-    b.classList.remove("confirming");
-    b.textContent = "✕";
-    if (b._confirmTimer) clearTimeout(b._confirmTimer);
-  });
+function _rerenderActive() {
+  if (_lastSnipes) renderActive(_lastSnipes);
 }
 
-async function confirmRemove(btn) {
-  const itemId = btn.dataset.itemId;
-  const tr = btn.closest("tr");
-  if (!tr) return;
-  tr.classList.add("removing");
-  // Optimistically drop the row from the cached snapshot so it can't
-  // reappear before load() re-fetches.
-  if (_lastSnipes) {
-    _lastSnipes = _lastSnipes.filter(r => r.item_id !== itemId);
-  }
+function _clearArmed() {
+  if (_armedRemove && _armedRemove.timer) clearTimeout(_armedRemove.timer);
+  _armedRemove = null;
+}
+
+async function confirmRemove(itemId) {
+  _removingIds.add(itemId);
+  _removeErrors.delete(itemId);
+  _rerenderActive();
+  // Same 30s bound as the max-edit save: a hung request must resolve to a
+  // visible failure state, never a row stuck on "removing…".
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
   try {
-    const resp = await fetch(`/api/bids/${itemId}`, {method: "DELETE"});
+    const resp = await fetch(`/api/bids/${itemId}`, {method: "DELETE", signal: ctrl.signal});
+    clearTimeout(timer);
+    if (resp.status === 202) {
+      // Removal accepted, Gixen unreachable right now: the server persisted
+      // the intent, disarmed its sniper, and its retry loop owns the cancel.
+      // Reflect the pending state immediately; polls keep it until the
+      // tombstone lands and the row leaves the snapshot.
+      const row = _lastSnipes && _lastSnipes.find(r => r.item_id === itemId);
+      if (row) row.removal_pending = true;
+      _removingIds.delete(itemId);
+      _rerenderActive();
+      return;
+    }
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
       try { const j = await resp.json(); if (j.detail) detail = j.detail; } catch (_) {}
       throw new Error(detail);
     }
-    tr.style.opacity = "0";
+    // 200 — removed and tombstoned; drop the row from the snapshot so it
+    // can't reappear before load() re-fetches.
+    if (_lastSnipes) _lastSnipes = _lastSnipes.filter(r => r.item_id !== itemId);
+    _removingIds.delete(itemId);
+    _rerenderActive();
     setTimeout(() => { load(); }, 250);
   } catch (e) {
-    tr.classList.remove("removing");
-    btn.classList.remove("confirming");
-    btn.textContent = "✕";
-    btn.title = `remove failed: ${e.message}`;
-    setTimeout(() => { btn.title = "remove snipe"; }, 3500);
+    clearTimeout(timer);
+    _removingIds.delete(itemId);
+    const msg = e.name === "AbortError" ? "request timed out" : e.message;
+    // Sticky, visible, survives re-renders; cleared only by a retry click.
+    _removeErrors.set(itemId, `remove failed: ${msg}`);
+    _rerenderActive();
   }
 }
 
@@ -770,25 +847,31 @@ document.addEventListener("click", e => {
 
   const btn = e.target.closest(".remove-btn");
   if (btn) {
-    resetConfirms(btn);
-    if (btn.classList.contains("confirming")) {
-      const armedAt = btn._armedAt || 0;
-      if (Date.now() - armedAt < 400) return;
-      if (btn._confirmTimer) clearTimeout(btn._confirmTimer);
-      confirmRemove(btn);
+    const itemId = btn.dataset.itemId;
+    if (_armedRemove && _armedRemove.itemId === itemId) {
+      // Anti-accident guard: a double-click's second press must not confirm.
+      // Unlike the pre-BUI-716 shape this swallow is not silent — the armed
+      // state persists visibly ("✕ remove?") and the next click confirms.
+      if (Date.now() - _armedRemove.armedAt < 400) return;
+      _clearArmed();
+      confirmRemove(itemId);
     } else {
-      btn.classList.add("confirming");
-      btn.textContent = "✕ remove?";
-      btn._armedAt = Date.now();
-      btn._confirmTimer = setTimeout(() => {
-        btn.classList.remove("confirming");
-        btn.textContent = "✕";
-      }, 5000);
+      _clearArmed();               // arming this row un-arms any other
+      _removeErrors.delete(itemId); // a retry click clears the sticky error
+      _armedRemove = {
+        itemId,
+        armedAt: Date.now(),
+        timer: setTimeout(() => { _armedRemove = null; _rerenderActive(); }, 8000),
+      };
+      _rerenderActive();
     }
     return;
   }
 
-  resetConfirms(null);
+  if (_armedRemove) {
+    _clearArmed();
+    _rerenderActive();
+  }
 });
 
 // ---- Keyboard + refresh button ----------------------------------------------

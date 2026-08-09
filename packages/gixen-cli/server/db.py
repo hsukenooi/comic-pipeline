@@ -249,6 +249,17 @@ _COLUMN_MIGRATIONS = [
     # this to admit a purge-swept first-party comp: "resolved now, or
     # resolved before the tombstone."
     "ALTER TABLE bids ADD COLUMN prior_status TEXT",
+    # BUI-716: when a removal was REQUESTED for this row (the user's click),
+    # as distinct from when the removal was CONFIRMED on Gixen (the REMOVED
+    # tombstone). Persisted by api_remove_bid BEFORE the Gixen attempt, so a
+    # Gixen outage can no longer drop the intent: get_bids_ready_to_snipe
+    # excludes any row carrying this stamp (the local sniper is disarmed the
+    # moment the server hears the click), and _removal_retry_loop keeps
+    # re-attempting the Gixen cancel until it confirms, then tombstones.
+    # NULL means no removal was ever requested; the stamp is never cleared —
+    # a requested removal has no un-request path, the row either tombstones
+    # or resolves terminally via sync first.
+    "ALTER TABLE bids ADD COLUMN removal_requested_at TEXT",
     # BUI-385: provenance tag on the group_wins ledger (which writer recorded
     # a row) — a GROUP_WIN_SOURCES value, exposed over /api/group-wins for
     # forensics. Nullable on ADD; _apply_migrations stamps pre-column rows
@@ -289,7 +300,8 @@ _BIDS_TABLE_SQL = """
         ebay_no_price_at    TEXT,
         group_changed_at    TEXT,
         max_bid_changed_at  TEXT,
-        prior_status        TEXT
+        prior_status        TEXT,
+        removal_requested_at TEXT
     )
 """
 
@@ -1296,6 +1308,45 @@ def delete_bid(conn: sqlite3.Connection, item_id: str) -> None:
     )
 
 
+def set_removal_requested(conn: sqlite3.Connection, item_id: str) -> bool:
+    """BUI-716: stamp removal intent on this item_id's live PENDING row.
+
+    Returns True if a PENDING row was stamped (or already carried the stamp),
+    False if there is no PENDING row — in which case there is nothing the
+    local sniper could fire and nothing for _removal_retry_loop to scan, so
+    the caller keeps the legacy fail-loudly behavior on a Gixen error.
+
+    id-scoped like delete_bid (BUI-633): a resolved sibling sharing item_id
+    must never pick up a removal stamp — see
+    docs/solutions/design-patterns/scope-status-writes-to-row-id-not-item-id.md.
+    Idempotent on re-request: the original stamp is kept so the earliest
+    intent time survives retries.
+
+    Caller must conn.commit() (BUI-407) — see insert_bid's docstring.
+    """
+    row = get_pending_bid_by_item_id(conn, item_id)
+    if row is None:
+        return False
+    if row["removal_requested_at"] is not None:
+        return True
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE bids SET removal_requested_at=? WHERE id=?",
+        (now, row["id"]),
+    )
+    return True
+
+
+def get_pending_removal_bids(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """BUI-716: PENDING rows whose removal was requested but not yet confirmed
+    on Gixen — the work queue for _removal_retry_loop. Terminal rows drop out
+    by status alone: once sync resolves or the tombstone lands, the row stops
+    matching without the stamp ever being cleared."""
+    return conn.execute(
+        "SELECT * FROM bids WHERE status='PENDING' AND removal_requested_at IS NOT NULL"
+    ).fetchall()
+
+
 def get_all_bids(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM bids ORDER BY added_at DESC").fetchall()
 
@@ -1467,12 +1518,18 @@ def set_auction_end_time(conn: sqlite3.Connection, item_id: str, end_time_iso: s
 
 
 def get_bids_ready_to_snipe(conn: sqlite3.Connection, now_iso: str) -> list[sqlite3.Row]:
-    """Return PENDING bids whose fire time (auction_end_at - bid_offset) has arrived."""
+    """Return PENDING bids whose fire time (auction_end_at - bid_offset) has arrived.
+
+    BUI-716: rows with removal_requested_at set are excluded — a requested
+    removal disarms the local sniper immediately, even while the Gixen-side
+    cancel is still unconfirmed (see _removal_retry_loop in server.main).
+    """
     return conn.execute(
         """
         SELECT * FROM bids
         WHERE status = 'PENDING'
           AND local_snipe_at IS NULL
+          AND removal_requested_at IS NULL
           AND auction_end_at IS NOT NULL
           AND datetime(auction_end_at, '-' || bid_offset || ' seconds') <= datetime(?)
         """,

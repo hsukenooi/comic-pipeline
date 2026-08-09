@@ -1131,6 +1131,9 @@ def _build_comics_row(row):
         "cached_at": item.get("cached_at"),
         "local_snipe_at": item.get("local_snipe_at"),
         "local_snipe_result": item.get("local_snipe_result"),
+        # BUI-716: mirrors _serialize_snipe_row — True while a requested
+        # removal awaits Gixen confirmation; the dashboard grays these rows.
+        "removal_pending": item.get("removal_requested_at") is not None,
         # Raw numerics so JS doesn't need to re-parse for math.
         "max_bid_numeric": max_bid_numeric,
         "current_bid_numeric": current_bid_numeric,
