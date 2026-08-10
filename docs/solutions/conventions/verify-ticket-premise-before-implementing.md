@@ -23,6 +23,7 @@ applies_when:
   - "A ticket proposes a detector or signal, justified by two or three named examples rather than a measured population"
   - "A ticket's premise IS the parting recommendation of an earlier ticket that was closed on measurement"
   - "A ticket proposes tightening an existing threshold or constant rather than adding a new signal — tightening dilutes precision exactly like adding does"
+  - "A ticket asserts a stored field is read by a named consumer (feeds a guard, gates a check) — grep the consumer for reads of that field before designing around it"
   - "A ticket describes an ordering, precedence, or gating defect — measure how often it actually fires before designing the remedy"
   - "A ticket blames pollution or junk in a data pool — rank the junk by whether it can reach the output, not by how wrong it looks"
   - "A ticket asks to remediate rows produced by a writer that has not itself been fixed"
@@ -776,6 +777,7 @@ Before implementing any ticket that:
 | BUI-592 | Flag a high grade priced below its own raw anchor | Precision 0.21, recall 0.50; a **276-combination sweep found no setting** reaching precision ≥0.80 at recall ≥0.50. 11 of 14 firings sat under the $10 floor BUI-583 already derived | Canceled; its parting advice ("tighten an existing flag instead") became BUI-594 and died too |
 | BUI-594 | Nudge `ANCHOR_DIVERGES_PCT` 0.5→0.45 to catch X-Men #97 | **The arithmetic never supported it** — #97 needs `T<0.4284`; at `0.45` the band floor is $19.24 vs `high=$20`, still no fire. The "misses by $2.50" was a *dollar* gap of one `$5` `clean_round` step. 0/3 new firings true. And #97 is already reported by `--inversion-sweep` (BUI-583) | Canceled; no code. Precision-1.00 preserved |
 | BUI-597 | A yearless-broaden tier suppresses the better alt-masthead tier | Real, but **trigger rate 2/13**. On the one genuine case the probe returns 0 and loses — identical pool, +1 paid query — because the "bad" tier had *corrected* a wrong-year query, inverting the ticket's framing | Canceled; the actual defect found was a grade-tagged **lot listing** manufacturing a $3825 bid cap (BUI-598) |
+| BUI-717 | 21 `fmv` rows with `low=$0` weaken the `over_fmv`/`recomputed_cap` money guards | **No policy check reads `fmv.low`** — one grep of `policy.py`: every guard reads `high` (`_priceable` gates on it, `over_fmv` sums it, `recomputed_cap` multiplies it). The $0s are `clean_round`'s $5-step artifact on $2–7 books; oracle over all 21 rows: 1 of 19 moves, toward a *looser* cap | Canceled on measurement — first contradiction-class candidate to dissolve; N=1 residual reprice filed (BUI-720); see `grep-the-consumer-before-claiming-a-field-weakens-a-guard.md` |
 
 ## Practical checklist
 
