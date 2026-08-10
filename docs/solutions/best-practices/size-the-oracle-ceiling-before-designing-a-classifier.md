@@ -255,9 +255,21 @@ of the time the pool simply got more honest.
 
 ## Why This Matters
 
-Eight consecutive FMV signal tickets in this repo have now been Canceled on measurement
-(BUI-578, 582, 590, 592, 594, 597, 629, and 667). Every one of them spent its effort on classifier
-precision. Not one of them established first that a perfect classifier was worth having.
+Fourteen FMV signal/tier tickets in this repo have now been Canceled on measurement
+(BUI-578, 582, 590, 592, 594, 597, 629, 638, 663, 667, the publish-tier pair 713/714, 717, and 718).
+Every one of them spent its effort on classifier or tier design. Not one of them established
+first that a perfect classifier was worth having.
+
+BUI-717 (2026-08-10) extended the discipline's reach: it was the **first
+contradiction-in-the-data candidate to dissolve** — the exclusion family BUI-675
+established as the reliable one. Its cross-title class was a genuine identity
+contradiction (comp title vs key title) and still failed step 4b (the class sat
+*below* its pool medians, so excluding it raises caps) and the magnitude bound
+(1 of 19 rows moves). A contradiction earns the measurement; it does not skip it.
+The premise itself ("fmv.low feeds the policy checks") also died to a one-line
+grep of the consumer — see
+`docs/solutions/best-practices/grep-the-consumer-before-claiming-a-field-weakens-a-guard.md`,
+the step that belongs *before* this doc's recipe.
 
 An oracle bound is cheap, it is an upper bound rather than an estimate, and it either kills
 the ticket outright or tells you the ceiling you are optimizing toward. It is the highest-value

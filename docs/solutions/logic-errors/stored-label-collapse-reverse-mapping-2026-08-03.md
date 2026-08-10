@@ -89,3 +89,11 @@ on measurement.
 3. Pin the two at-risk cohorts with regression tests named after the workflow they
    protect (here: the standard 0.80 medium bid, and the 0.70 CGC-proxy bid) so the
    next remap cannot silently reintroduce the false positives.
+
+## Related
+
+- `docs/solutions/best-practices/grep-the-consumer-before-claiming-a-field-weakens-a-guard.md` —
+  the consumer-side mirror (BUI-717): this doc says read the WRITER before
+  reverse-mapping a stored value; that one says grep the READER before claiming a
+  field feeds it. Together: a column's meaning lives at its read/write sites, not
+  in its name.

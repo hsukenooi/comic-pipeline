@@ -161,6 +161,9 @@ class TestConfidence:
 
 class TestCleanRound:
     @pytest.mark.parametrize("v,expected", [
+        # A quartile below half the $5 step rounds to $0 — a stored low of $0 on a
+        # cheap book is this step ladder, not comp pollution (BUI-717).
+        (2.49, 0),
         (3.51, 5), (4.99, 5), (12.0, 10), (47.5, 50),
         (60, 60), (135, 140), (172, 170),
         (210, 200), (255, 250), (810, 800),

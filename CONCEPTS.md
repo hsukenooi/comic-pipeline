@@ -225,3 +225,13 @@ Pricing a book off graded-slab (CGC/CBCS) prices instead of raw sold comps, disc
 - **eBay-slab proxy tier** — the automated form: a second graded-only eBay-sold pass builds a slab grade→price ladder, and a raw price is read off it at a conservative discount, emitted at capped (low) confidence and only as a **rescue** for a sparse-pool book that would otherwise be [[needs_manual]]. Deterministic because its inputs are structured eBay sold prices, and bounded by a non-circular trigger, a minimum ladder depth, a monotonic-ladder requirement, an [[Envelope Clamp]] on thin grade buckets, and a hard bid-factor cap.
 
 The discount factor differs by price source — an eBay CGC *sold* basis is not an auction-house *realized* basis — so a factor calibrated to one source must not be applied to the other.
+
+### Oracle Bound
+The measured ceiling on what a proposed comp classifier or exclusion rule could ever be worth: assume a **perfect** detector for the class, apply it to the stored comps corpus, and measure how much the published prices would actually move — before designing any real detector. Read as a **magnitude** (dollars of correction), never a count of affected pools, and measured in **both directions**, because removing a comp can raise a price as easily as lower it. Since removals are non-monotonic, the bound sizes the prize rather than limiting what a specific rule will do.
+
+Its companion question is **which side of its pool's median the class sits on**: a class priced below the median is depressing the band, so excluding it *loosens* the [[Money Path]] rather than protecting it — correct-on-identity and profitable-to-exclude are independent properties. A class that keys on data already stored in the [[Comps Ledger]] gets its bound from a single query, which is why the bound is measured first, always.
+
+### Contradiction Class
+An exclusion candidate discovered because **two observations of the same fact disagree** — duplicate fetches of one listing at different prices, cross-provider disagreement, a comp's own title disputing the identity key it is filed under — as opposed to a hypothesis about a comp pool's *shape* (spread, depth, internal ladder). Shape hypotheses have repeatedly dissolved on measurement; the exclusion classes that shipped were found by contradictions.
+
+Membership earns a hearing, not an exemption: a contradiction class still must pass the [[Oracle Bound]] and its side-of-the-median question before it ships, and at least one genuine contradiction class has dissolved there.

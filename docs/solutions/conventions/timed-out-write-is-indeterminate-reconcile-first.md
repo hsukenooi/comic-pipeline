@@ -150,3 +150,6 @@ or a validation failure is an **answer**; a timeout is the absence of one.
   came from.
 - Tickets: BUI-697 (this fix), BUI-699 (the timeout value itself), BUI-562 (the same
   outage's retry-timing analysis).
+- `docs/solutions/conventions/an-endpoint-success-report-is-not-a-write.md` — the mirror
+  direction (BUI-715/721): a write reported RESOLVED that never happened (a guard declined
+  it and the report didn't know). Either direction, the rule is the same: read the store.

@@ -6,6 +6,8 @@ module: "apps/fmv/src/fmv_runner.py (_is_vintage, _apply_cgc_proxy_rescue), apps
 problem_type: best_practice
 component: fmv_pipeline
 severity: high
+status: corrected
+superseded_by: "BUI-717 (Canceled on measurement 2026-08-10): the out-of-scope aside below is wrong on both halves — no policy check reads fmv.low (all read high; verified by grep of policy.py), and the cross-title exclusion class dissolved on oracle measurement (1 of 19 rows moves, toward a LOOSER cap). See docs/solutions/best-practices/grep-the-consumer-before-claiming-a-field-weakens-a-guard.md. The doc's core claim (modern raw:slab factor unmeasurable, refusals stay) stands."
 mechanized_by: test
 enforced_by_test:
   - apps/fmv/tests/test_fmv_runner.py::TestModernCgcProxyStaysRefused
@@ -151,8 +153,12 @@ independently.)
 - **21 prod `fmv` rows carry `low = $0`**, the largest being X-Men #96 @8.5
   (`$0–$90`). Its stored raw comps include cross-title matches — "Ultimate X-Men
   #96", "Uncanny X-Men '96 Special", "X-Men '96 #1" — filed under the 1975 key.
-  A `$0` band is not a price, and `fmv.low` is read by the overlay's policy
-  checks.
+  ~~A `$0` band is not a price, and `fmv.low` is read by the overlay's policy
+  checks.~~ **CORRECTED (BUI-717, 2026-08-10): no policy check reads `fmv.low` —
+  every guard reads `high` — and the $0 lows are `clean_round`'s $5-step
+  artifact on $2–7 books, not pollution. The cross-title class dissolved on
+  oracle measurement; only fmv 917 (this X-Men #96 row) was genuinely mispriced
+  (BUI-720). See the `status:` stamp above.**
 - **Invincible #19's modern ladder is non-monotonic** (9.4 = $835 > 9.6 =
   $733.50) because the 9.4 bucket is a single comp — the BUI-349 lone-outlier
   shape, appearing on a modern book.
