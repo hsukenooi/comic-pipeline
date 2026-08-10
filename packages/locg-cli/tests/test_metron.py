@@ -1931,6 +1931,29 @@ def test_resolve_issue_by_membership_stops_after_breaker_trips_mid_candidate_loo
     assert client.degraded is True
 
 
+def test_resolve_issue_by_membership_partial_scan_after_hit_fails_soft():
+    """A breaker trip AFTER an earlier candidate already hit must still fail
+    soft: the failed candidate's membership is unknown, so it could have made
+    this a cross-volume tie — and a wrong year is worse than no year
+    (BUI-719). Uniqueness is never certified off a partial scan."""
+    vol1 = _mock_series(id=1, display_name="X-Men (1963)")
+    vol2 = _mock_series(id=2, display_name="X-Men (1991)")
+    client, session = _make_client_with_session(series_list=[vol1, vol2])
+    session.issues_list.side_effect = [
+        [_mock_issue(id=100, cover_date="1963-09-01")],
+        _server_error_api_error(500),
+        _server_error_api_error(500),
+    ]
+
+    with patch("locg.metron.time.sleep"):
+        result = client.resolve_issue_by_membership("X-Men", "6")
+
+    assert result is None
+    # vol1 hit (1 call); vol2's capped retry consumed the two 5xx entries.
+    assert session.issues_list.call_count == 3
+    assert client.degraded is True
+
+
 # ---------------------------------------------------------------------------
 # Credential error — raised, not swallowed
 # ---------------------------------------------------------------------------

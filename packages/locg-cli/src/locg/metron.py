@@ -652,6 +652,15 @@ class MetronClient:
             if detail is not None:
                 hits.append(detail)
 
+        if self.degraded:
+            # The scan is INCOMPLETE: the last-checked candidate's
+            # issue_in_series call failed (each decorated call resets the
+            # flag on entry, so a True here can only come from that final
+            # failure — earlier failures break the loop before the next
+            # call's reset). An unchecked candidate could have made this a
+            # cross-volume tie, and a wrong year is worse than no year —
+            # never certify uniqueness off a partial scan.
+            return None
         if len(hits) != 1:
             return None
         return hits[0]
