@@ -1190,6 +1190,105 @@ def cmd_creator_run_lookup(
     }
 
 
+def _year_from_metron_dates(
+    store_date: Optional[str], cover_date: Optional[str]
+) -> Optional[int]:
+    """Extract a 4-digit year from Metron's ISO ``YYYY-MM-DD`` date strings.
+
+    Prefers ``store_date`` (on-sale/publication date) over ``cover_date`` —
+    closer to what a seller would write in an eBay title parenthetical, the
+    same preference `gixen_overlay.locg_lookup`'s old LOCG-detail-page parser
+    used (BUI-719). Returns ``None`` when neither is present or well-formed,
+    rather than falling back to a series' publication-range year — that
+    would be a GUESS (a series can span decades), and a wrong year is worse
+    than no year at all (it corrupts the comics identity key downstream).
+    """
+    for value in (store_date, cover_date):
+        if isinstance(value, str) and len(value) >= 4 and value[:4].isdigit():
+            return int(value[:4])
+    return None
+
+
+def cmd_resolve_year_lookup(series: str, issue: str) -> dict[str, Any]:
+    """Resolve a ``(series, issue)`` pair's publication YEAR via Metron (BUI-719).
+
+    Read-only Metron-backed year resolver — the sanctioned subprocess target
+    for `gixen_overlay.locg_lookup.resolve_year_and_locg` (`extract-comics`'s
+    year fallback and `POST /api/comics/backfill-year`, both in
+    `plugins/gixen-overlay`). LOCG blocks ALL programmatic/agent access, a
+    permanent standing state (confirmed 2026-08-10) — the previous fallback
+    (`locg lookup <spec> --no-collection`, a live LOCG site search) is dead
+    on every cache miss and always was going to stay that way, so the
+    resolution SOURCE moved to Metron rather than attempting to route around
+    the block.
+
+    Unlike :meth:`MetronClient.lookup_issue` (which needs a caller-supplied
+    ``year`` to disambiguate multiple same-named series — useless here,
+    since resolving a year IS the point), this calls
+    :meth:`MetronClient.resolve_issue_by_membership`, which disambiguates by
+    which same-named series candidate actually CONTAINS ``issue`` — see that
+    method's docstring for why (BUI-719: the Metron-side mirror of LOCG's
+    "Vol. N" label-reuse trap). Zero or 2+ candidates containing the issue is
+    a genuine, unresolvable ambiguity and returns ``{"error": ...}`` rather
+    than guess — a wrong year corrupts the comics identity key and vintage
+    gates, so ambiguity always fails soft to no-year here, never a guess.
+
+    Also fails soft (an error, not a fabricated year) when Metron resolves
+    the issue but has neither a ``store_date`` nor a ``cover_date`` on it —
+    common on older/thin Metron records — rather than deriving a year from
+    the series' open-ended publication range (see
+    :func:`_year_from_metron_dates`).
+
+    Returns ``{"status": "ok", "series", "issue", "year", "metron_id",
+    "series_id", "series_name"}`` on success, or ``{"error": ...}`` on any
+    failure (ambiguous, no match, no usable date, missing Metron
+    credentials, or a Metron rate limit/connection/5xx failure exhausted
+    past :func:`_retry_once_on_rate_limit`'s single capped retry).
+    """
+    from locg.metron import MetronClient, MetronCredentialError
+
+    series = (series or "").strip()
+    issue = (issue or "").strip()
+    if not series:
+        return {"error": "resolve-year: series must be non-empty"}
+    if not issue:
+        return {"error": "resolve-year: issue must be non-empty"}
+
+    metron = MetronClient()
+    try:
+        detail = metron.resolve_issue_by_membership(series, issue)
+    except MetronCredentialError as e:
+        return {"error": str(e)}
+
+    if detail is None:
+        return {
+            "error": (
+                f"Could not unambiguously resolve {series!r} #{issue} on Metron "
+                "(no exact-name series contains that issue, or more than one does)."
+            )
+        }
+
+    year = _year_from_metron_dates(detail.get("store_date"), detail.get("cover_date"))
+    if year is None:
+        return {
+            "error": (
+                f"Metron resolved {series!r} #{issue} to "
+                f"metron_id={detail.get('metron_id')} but has no cover_date/store_date "
+                "to derive a year from."
+            )
+        }
+
+    return {
+        "status": "ok",
+        "series": series,
+        "issue": issue,
+        "year": year,
+        "metron_id": detail.get("metron_id"),
+        "series_id": detail.get("series_id"),
+        "series_name": detail.get("series_name"),
+    }
+
+
 def cmd_wish_list_remove(title: str, cache: Optional[CollectionCache] = None) -> dict[str, Any]:
     """Remove the first matching entry from the local wish-list cache.
 

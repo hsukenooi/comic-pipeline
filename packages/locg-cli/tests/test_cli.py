@@ -451,6 +451,77 @@ def test_cli_creator_run_requires_series_id(monkeypatch, capsys):
     assert exc.value.code == 2
 
 
+def test_cli_resolve_year_dispatches_without_client(monkeypatch, capsys):
+    """`locg resolve-year` (BUI-719) is wired to cmd_resolve_year_lookup and
+    never constructs LOCGClient (pure Metron lookup, no LOCG session needed —
+    LOCG blocks all programmatic access)."""
+    import locg.cli
+
+    client_constructed = []
+
+    class FakeClient:
+        def __init__(self):
+            client_constructed.append(True)
+        def close(self):
+            pass
+
+    calls = []
+
+    def fake_resolve(series, issue):
+        calls.append((series, issue))
+        return {"status": "ok", "series": series, "issue": issue, "year": 1986}
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "cmd_resolve_year_lookup", fake_resolve)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["locg", "resolve-year", "Uncanny X-Men", "211"],
+    )
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert not client_constructed, "resolve-year must not construct LOCGClient"
+    assert calls == [("Uncanny X-Men", "211")]
+
+    out = capsys.readouterr().out
+    assert json.loads(out)["year"] == 1986
+
+
+def test_cli_resolve_year_requires_both_positionals(monkeypatch, capsys):
+    """Omitting the issue positional is an argparse error (exit code 2)."""
+    monkeypatch.setattr(
+        sys, "argv",
+        ["locg", "resolve-year", "Uncanny X-Men"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+
+
+def test_cli_resolve_year_dash_prefixed_issue_needs_double_dash():
+    """A `--`-less dash-prefixed, non-numeric issue token (e.g. a "-1AU"-style
+    one-shot label) is misparsed by argparse as an unrecognized flag — this
+    is exactly why gixen_overlay.locg_lookup always sends `--` before the
+    positionals (BUI-719). Documents the failure mode this repo's one caller
+    avoids, so a future caller that drops the `--` regresses visibly here."""
+    parser = create_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["resolve-year", "X-Men", "-1AU"])
+
+
+def test_cli_resolve_year_double_dash_protects_dash_prefixed_values():
+    """With `--` (what the overlay actually sends), dash-prefixed series/issue
+    values of any shape parse cleanly as plain positionals."""
+    parser = create_parser()
+    for series, issue in [("X-Men", "-1AU"), ("X-Men", "-A"), ("-1 Flashback", "-1")]:
+        args = parser.parse_args(["resolve-year", "--", series, issue])
+        assert args.series == series
+        assert args.issue == issue
+
+
 def test_cli_wish_list_set_year_dispatches_without_client(monkeypatch, tmp_path, capsys):
     """BUI-387: `locg wish-list set-year <name> <year>` is a pure local-cache
     write — it dispatches to cmd_wish_list_set_year and never constructs a

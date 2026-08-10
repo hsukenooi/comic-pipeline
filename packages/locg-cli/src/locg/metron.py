@@ -559,6 +559,112 @@ class MetronClient:
             )
             return None
 
+    @_retry_once_on_rate_limit
+    def resolve_issue_by_membership(
+        self, series_query: str, issue_number: str | int
+    ) -> Optional[dict[str, Any]]:
+        """Resolve ``(series_query, issue_number)`` by VOLUME MEMBERSHIP, not year (BUI-719).
+
+        :meth:`resolve_series`/:meth:`lookup_issue` disambiguate multiple
+        same-named series candidates using a caller-supplied publication
+        ``year`` (BUI-32) — but ``_disambiguate_series`` fails closed to
+        ``None`` the instant ``series_list`` has more than one candidate AND
+        ``year`` is ``None`` (both its multi-candidate branch and its
+        singleton in-window acceptor require a real year to do anything).
+        That makes ``resolve_series``/``lookup_issue`` unusable for exactly
+        the population this method exists for: **resolving a year in the
+        first place**, for a series name that has more than one same-named
+        Metron volume. That collision is not rare — Metron's own
+        ``display_name`` disambiguates same-named volumes with a trailing
+        ``" (YYYY)"`` (e.g. ``"X-Men (1963)"`` vs ``"X-Men (1991)"``), but
+        :func:`_normalize_metron_display_name` strips exactly that suffix
+        for the exact-match comparison, so both collapse to the same
+        normalized name and both pass the exact-name filter — the Metron-side
+        mirror of the LOCG "Vol. N" label-reuse trap this project has already
+        hit once on the LOCG side.
+
+        Disambiguates the other way instead: of the series whose
+        ``display_name`` EXACT-matches ``series_query`` (BUI-485 rules, via
+        :func:`_normalize_metron_display_name`), which ones actually CONTAIN
+        ``issue_number`` (:meth:`issue_in_series`)? A volume that doesn't
+        have that issue number is not a candidate at all — the "issue number
+        constrains volume choice" rule BUI-719 specifies. Returns the
+        resolved issue's detail dict (:meth:`issue_in_series`'s shape) only
+        when EXACTLY ONE exact-name candidate contains the issue. Returns
+        ``None`` on zero series matches, zero exact-name survivors, zero
+        candidates containing the issue, or a genuine cross-volume TIE (2+
+        same-named volumes that both happen to contain that issue number) —
+        every one of those is an unresolvable ambiguity, never guessed.
+
+        ``series_query`` is passed through :func:`_map_annual_masthead`
+        first (BUI-487), same as :meth:`resolve_series`, so an
+        Annual/Giant-Size/Special filed under a masthead Metron doesn't use
+        still finds its real series before the membership check runs.
+
+        Returns ``None`` on any Metron failure (rate limit, network error,
+        5xx exhausted after the decorator's capped retry). MetronCredentialError
+        re-raises, same contract as every other public lookup here.
+        """
+        metron_query = _map_annual_masthead(series_query)
+        try:
+            session = self._get_session()
+            series_list = session.series_list({"name": metron_query})
+        except MetronCredentialError:
+            raise
+        except RateLimitError:
+            raise  # handled by @_retry_once_on_rate_limit, not the blanket handler below
+        except Exception as exc:  # noqa: BLE001  # Metron API failure — log and return None to skip resolution
+            # BUI-342: a genuine 5xx propagates to @_retry_once_on_rate_limit
+            # for one capped retry + a `degraded` trip; a data-shape/404
+            # ApiError does NOT (it stays a silent None, same as before).
+            if _is_server_error(exc):
+                raise
+            if _is_connection_error(exc):
+                self.degraded = True
+            logger.debug(
+                "Metron series search failed for %r (mapped from %r): %s",
+                metron_query, series_query, exc,
+            )
+            return None
+
+        if not series_list:
+            return None
+
+        query_norm = _normalize_metron_display_name(metron_query)
+        exact_matches = [
+            s for s in series_list
+            if _normalize_metron_display_name(getattr(s, "display_name", None)) == query_norm
+        ]
+        if not exact_matches:
+            return None
+
+        hits: list[dict[str, Any]] = []
+        for candidate in exact_matches:
+            if self.degraded:
+                # BUI-344-style guard (mirrors resolve_creator_run): the
+                # breaker already tripped on an earlier candidate's
+                # issue_in_series call (5xx / rate-limit-exhausted /
+                # connection error) — stop spending capped retries against a
+                # down Metron for every remaining candidate rather than
+                # limping through the rest of the list.
+                break
+            detail = self.issue_in_series(candidate, issue_number)
+            if detail is not None:
+                hits.append(detail)
+
+        if self.degraded:
+            # The scan is INCOMPLETE: the last-checked candidate's
+            # issue_in_series call failed (each decorated call resets the
+            # flag on entry, so a True here can only come from that final
+            # failure — earlier failures break the loop before the next
+            # call's reset). An unchecked candidate could have made this a
+            # cross-volume tie, and a wrong year is worse than no year —
+            # never certify uniqueness off a partial scan.
+            return None
+        if len(hits) != 1:
+            return None
+        return hits[0]
+
     def lookup_issue(
         self, series_query: str, issue_number: str | int, year: Any = None
     ) -> Optional[dict[str, Any]]:

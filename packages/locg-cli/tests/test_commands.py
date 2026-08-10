@@ -2752,6 +2752,131 @@ def test_creator_run_lookup_empty_role_falls_back_to_penciller(tmp_path, monkeyp
 
 
 # ---------------------------------------------------------------------------
+# cmd_resolve_year_lookup (BUI-719) — the Metron-backed replacement for the
+# now-permanently-dead LOCG live-search year fallback. Read-only, no
+# collection/wish-list touches; ambiguity always fails soft to an error, never
+# a guessed year (a wrong year corrupts the comics identity key downstream).
+# ---------------------------------------------------------------------------
+
+def _patch_metron_resolve_issue(monkeypatch, detail=None, side_effect=None):
+    """Patch MetronClient so resolve_issue_by_membership returns canned data
+    (or raises, via `side_effect`)."""
+    import locg.metron as metron_mod
+    from unittest.mock import MagicMock
+
+    inst = MagicMock()
+    if side_effect is not None:
+        inst.resolve_issue_by_membership.side_effect = side_effect
+    else:
+        inst.resolve_issue_by_membership.return_value = detail
+    monkeypatch.setattr(metron_mod, "MetronClient", lambda: inst)
+    return inst
+
+
+def test_resolve_year_lookup_resolves_via_metron_membership(monkeypatch):
+    from locg.commands import cmd_resolve_year_lookup
+
+    inst = _patch_metron_resolve_issue(monkeypatch, detail={
+        "metron_id": 42,
+        "cover_date": "1986-10-01",
+        "store_date": "1986-08-15",
+        "series_year_began": 1963,
+        "series_year_end": None,
+        "series_name": "Uncanny X-Men",
+        "series_id": 7,
+    })
+
+    result = cmd_resolve_year_lookup(series="Uncanny X-Men", issue="211")
+
+    assert result == {
+        "status": "ok",
+        "series": "Uncanny X-Men",
+        "issue": "211",
+        "year": 1986,
+        "metron_id": 42,
+        "series_id": 7,
+        "series_name": "Uncanny X-Men",
+    }
+    inst.resolve_issue_by_membership.assert_called_once_with("Uncanny X-Men", "211")
+
+
+def test_resolve_year_lookup_prefers_store_date_over_cover_date(monkeypatch):
+    """store_date (on-sale) wins over cover_date when both are present —
+    closer to what a seller writes in an eBay title parenthetical."""
+    from locg.commands import cmd_resolve_year_lookup
+
+    _patch_metron_resolve_issue(monkeypatch, detail={
+        "metron_id": 1, "cover_date": "1987-01-01", "store_date": "1986-11-01",
+        "series_id": 1, "series_name": "X",
+    })
+    result = cmd_resolve_year_lookup(series="X", issue="1")
+    assert result["year"] == 1986
+
+
+def test_resolve_year_lookup_falls_back_to_cover_date_when_store_date_missing(monkeypatch):
+    from locg.commands import cmd_resolve_year_lookup
+
+    _patch_metron_resolve_issue(monkeypatch, detail={
+        "metron_id": 1, "cover_date": "1963-03-01", "store_date": None,
+        "series_id": 1, "series_name": "X-Men",
+    })
+    result = cmd_resolve_year_lookup(series="X-Men", issue="1")
+    assert result["year"] == 1963
+
+
+def test_resolve_year_lookup_no_date_data_errors_instead_of_guessing(monkeypatch):
+    """Metron resolved the issue but has neither store_date nor cover_date —
+    common on thin older records. Must error, never derive a year from the
+    series' open-ended publication range."""
+    from locg.commands import cmd_resolve_year_lookup
+
+    _patch_metron_resolve_issue(monkeypatch, detail={
+        "metron_id": 1, "cover_date": None, "store_date": None,
+        "series_year_began": 1963, "series_year_end": None,
+        "series_id": 1, "series_name": "X-Men",
+    })
+    result = cmd_resolve_year_lookup(series="X-Men", issue="1")
+    assert "error" in result
+    assert "no cover_date/store_date" in result["error"]
+
+
+def test_resolve_year_lookup_ambiguous_membership_errors(monkeypatch):
+    """resolve_issue_by_membership returning None (zero or 2+ same-named
+    volumes containing the issue) is a hard error, not a silent guess."""
+    from locg.commands import cmd_resolve_year_lookup
+
+    _patch_metron_resolve_issue(monkeypatch, detail=None)
+    result = cmd_resolve_year_lookup(series="X-Men", issue="6")
+    assert "error" in result
+    assert "X-Men" in result["error"]
+
+
+def test_resolve_year_lookup_requires_series_and_issue(monkeypatch):
+    """Empty inputs are rejected before any Metron call is made."""
+    from locg.commands import cmd_resolve_year_lookup
+
+    inst = _patch_metron_resolve_issue(monkeypatch, detail=None)
+    assert "error" in cmd_resolve_year_lookup(series="  ", issue="1")
+    assert "error" in cmd_resolve_year_lookup(series="X-Men", issue="  ")
+    inst.resolve_issue_by_membership.assert_not_called()
+
+
+def test_resolve_year_lookup_credential_error_returns_error_dict(monkeypatch):
+    """A missing/misconfigured Metron credential surfaces as an error dict,
+    not an unhandled exception — this runs as a CLI subprocess call."""
+    from locg.commands import cmd_resolve_year_lookup
+    from locg.metron import MetronCredentialError
+
+    _patch_metron_resolve_issue(
+        monkeypatch,
+        side_effect=MetronCredentialError("METRON_USERNAME and METRON_PASSWORD must be set"),
+    )
+    result = cmd_resolve_year_lookup(series="X-Men", issue="1")
+    assert "error" in result
+    assert "METRON_USERNAME" in result["error"]
+
+
+# ---------------------------------------------------------------------------
 # cmd_wish_list_remove
 # ---------------------------------------------------------------------------
 
