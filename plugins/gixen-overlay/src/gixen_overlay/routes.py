@@ -1440,10 +1440,11 @@ async def api_extract_comics(request: Request):
             skipped.append({"item_id": item_id, "reason": "no issue extracted"})
             continue
         year = parsed.year
-        # PER-98: year is optional. Try LOCG only as a best-effort enrichment
-        # for the locg_id (and a real year if available). When it fails, fall
+        # PER-98: year is optional. Try a best-effort Metron-backed resolution
+        # (BUI-719 — LOCG blocks programmatic access, so `locg_id` is never
+        # populated by this path anymore; only `.year`). When it fails, fall
         # through with year=None — upsert_comic handles yearless rows and
-        # promotes them to yeared rows later if LOCG becomes reachable.
+        # promotes them to yeared rows later if this resolves on a later run.
         primary_resolution = None
         if year is None:
             primary_resolution = resolve_year_and_locg(parsed.series, issues[0])
@@ -1500,8 +1501,10 @@ async def api_backfill_year(
     """One-time backfill (BUI-715) for NULL-year comics rows.
 
     Scans comics with `year IS NULL`, tries `resolve_year_and_locg` (the same
-    best-effort LOCG lookup `POST /api/extract-comics` already uses for the
-    same purpose) on each, and — when it resolves — writes the year through
+    best-effort Metron-backed lookup `POST /api/extract-comics` already uses
+    for the same purpose — BUI-719: the resolution source moved from LOCG to
+    Metron, but the function name and call site here are unchanged) on each,
+    and — when it resolves — writes the year through
     `upsert_comic`, so the write goes through this process's single `db`
     connection (the same one every other overlay write uses) rather than a
     standalone script opening the DB file directly. That is what makes this

@@ -1771,6 +1771,167 @@ def test_resolve_creator_run_stops_after_breaker_trips_mid_loop():
 
 
 # ---------------------------------------------------------------------------
+# resolve_issue_by_membership (BUI-719)
+#
+# Unlike lookup_issue/resolve_series, this method has no `year` to
+# disambiguate multiple same-named series with — resolving a year IS the
+# point (it backs gixen-overlay's LOCG-blocked year fallback). It
+# disambiguates by which exact-name candidate actually CONTAINS the
+# requested issue number instead.
+# ---------------------------------------------------------------------------
+
+def test_resolve_issue_by_membership_single_candidate_contains_issue():
+    client, session = _make_client_with_session(
+        series_list=[_mock_series(id=1, display_name="Fantastic Four", year_began=1961, year_end=1996)],
+        issues_list=[_mock_issue(id=100, cover_date="1963-01-01", store_date=None)],
+    )
+    result = client.resolve_issue_by_membership("Fantastic Four", "1")
+
+    assert result is not None
+    assert result["metron_id"] == 100
+    assert result["series_id"] == 1
+    session.series_list.assert_called_once_with({"name": "Fantastic Four"})
+    session.issues_list.assert_called_once_with({"series_id": 1, "number": "1"})
+
+
+def test_resolve_issue_by_membership_single_candidate_missing_issue_returns_none():
+    """The one exact-name series exists but doesn't have this issue number —
+    not ambiguous, just no match. Must not guess."""
+    client, _ = _make_client_with_session(
+        series_list=[_mock_series(id=1, display_name="Fantastic Four")],
+        issues_list=[],  # issue not found in this series
+    )
+    assert client.resolve_issue_by_membership("Fantastic Four", "9999") is None
+
+
+def test_resolve_issue_by_membership_two_volumes_only_one_contains_issue():
+    """The core BUI-719 case: two Metron volumes share a display name once
+    _normalize_metron_display_name strips their trailing '(YYYY)' decoration
+    ("X-Men (1963)" and "X-Men (1991)" both normalize to "x-men") — the
+    Metron-side mirror of the LOCG "Vol. N" label-reuse trap. Only the 1963
+    volume actually reaches issue #6; membership, not year, must pick it."""
+    vol1 = _mock_series(id=1, display_name="X-Men (1963)", year_began=1963, year_end=1970)
+    vol2 = _mock_series(id=2, display_name="X-Men (1991)", year_began=1991, year_end=2001)
+    client, session = _make_client_with_session(series_list=[vol1, vol2])
+    session.issues_list.side_effect = [
+        [_mock_issue(id=6, cover_date="1964-03-01")],  # vol1 has #6
+        [],                                              # vol2 does not
+    ]
+
+    result = client.resolve_issue_by_membership("X-Men", "6")
+
+    assert result is not None
+    assert result["series_id"] == 1
+    assert result["metron_id"] == 6
+    assert session.issues_list.call_count == 2
+    session.issues_list.assert_any_call({"series_id": 1, "number": "6"})
+    session.issues_list.assert_any_call({"series_id": 2, "number": "6"})
+
+
+def test_resolve_issue_by_membership_two_volumes_both_contain_issue_is_ambiguous():
+    """Both same-named volumes happen to have an issue #6 — a genuine,
+    unresolvable cross-volume tie. Fail soft to None, never guess (BUI-719:
+    a wrong year is worse than no year)."""
+    vol1 = _mock_series(id=1, display_name="X-Men (1963)", year_began=1963, year_end=1970)
+    vol2 = _mock_series(id=2, display_name="X-Men (1991)", year_began=1991, year_end=2001)
+    client, session = _make_client_with_session(series_list=[vol1, vol2])
+    session.issues_list.side_effect = [
+        [_mock_issue(id=6, cover_date="1964-03-01")],
+        [_mock_issue(id=606, cover_date="1992-04-01")],
+    ]
+
+    assert client.resolve_issue_by_membership("X-Men", "6") is None
+
+
+def test_resolve_issue_by_membership_no_series_match_returns_none():
+    client, _ = _make_client_with_session(series_list=[])
+    assert client.resolve_issue_by_membership("Nonexistent Series", "1") is None
+
+
+def test_resolve_issue_by_membership_no_exact_name_match_returns_none():
+    """A substring-matching decoy ("Batman Beyond") never competes even
+    though Metron's search surfaced it for the "Batman" query."""
+    client, _ = _make_client_with_session(
+        series_list=[
+            _mock_series(id=1, display_name="Batman Beyond (1999)", year_began=1999, year_end=2001),
+        ],
+    )
+    assert client.resolve_issue_by_membership("Batman", "1") is None
+
+
+def test_resolve_issue_by_membership_applies_annual_masthead_mapping():
+    """An Annual filed under our masthead ("Uncanny X-Men Annual") that
+    Metron files under a different one ("X-Men Annual") must still resolve —
+    the BUI-487 translation applies here too, same as resolve_series."""
+    client, session = _make_client_with_session(
+        series_list=[_mock_series(id=42, display_name="X-Men Annual (1970)", year_began=1970, year_end=2007)],
+        issues_list=[_mock_issue(id=600, cover_date="1982-09-01")],
+    )
+    result = client.resolve_issue_by_membership("Uncanny X-Men Annual", "6")
+
+    assert result is not None
+    assert result["series_id"] == 42
+    session.series_list.assert_called_once_with({"name": "X-Men Annual"})
+
+
+def test_resolve_issue_by_membership_raises_credential_error_when_no_env(monkeypatch):
+    monkeypatch.delenv("METRON_USERNAME", raising=False)
+    monkeypatch.delenv("METRON_PASSWORD", raising=False)
+    client = MetronClient()
+    with pytest.raises(MetronCredentialError, match="METRON_USERNAME"):
+        client.resolve_issue_by_membership("Batman", "1")
+
+
+def test_resolve_issue_by_membership_swallows_generic_exception():
+    client = MetronClient()
+    session = MagicMock()
+    session.series_list.side_effect = ConnectionError("network down")
+    client._session = session
+    assert client.resolve_issue_by_membership("Batman", "1") is None
+
+
+def test_resolve_issue_by_membership_retries_once_after_rate_limit_and_succeeds():
+    from mokkari.exceptions import RateLimitError
+    client, session = _make_client_with_session(
+        issues_list=[_mock_issue(id=100)],
+    )
+    session.series_list.side_effect = [
+        RateLimitError("rate limited", retry_after=5),
+        [_mock_series(id=1, display_name="Fantastic Four")],
+    ]
+
+    with patch("locg.metron.time.sleep") as mock_sleep:
+        result = client.resolve_issue_by_membership("Fantastic Four", "1")
+
+    assert result is not None
+    assert result["metron_id"] == 100
+    assert session.series_list.call_count == 2
+    mock_sleep.assert_called_once()
+
+
+def test_resolve_issue_by_membership_stops_after_breaker_trips_mid_candidate_loop():
+    """Mirrors resolve_creator_run's BUI-344 guard: once a candidate's
+    issue_in_series call trips the breaker (5xx exhausted), the remaining
+    same-named candidates are never separately queried."""
+    vol1 = _mock_series(id=1, display_name="X-Men (1963)")
+    vol2 = _mock_series(id=2, display_name="X-Men (1991)")
+    client, session = _make_client_with_session(series_list=[vol1, vol2])
+    session.issues_list.side_effect = [
+        _server_error_api_error(500),
+        _server_error_api_error(500),
+    ]
+
+    with patch("locg.metron.time.sleep"):
+        result = client.resolve_issue_by_membership("X-Men", "6")
+
+    assert result is None
+    # vol1's own capped retry consumes both side_effect entries; vol2 is
+    # never queried once the breaker tripped.
+    assert session.issues_list.call_count == 2
+    assert client.degraded is True
+
+
+# ---------------------------------------------------------------------------
 # Credential error — raised, not swallowed
 # ---------------------------------------------------------------------------
 

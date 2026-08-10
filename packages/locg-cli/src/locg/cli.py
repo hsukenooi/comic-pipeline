@@ -48,6 +48,7 @@ from locg.commands import (
     cmd_read_list,
     cmd_releases,
     cmd_remove,
+    cmd_resolve_year_lookup,
     cmd_search,
     cmd_series,
     cmd_update,
@@ -624,6 +625,24 @@ def create_parser() -> argparse.ArgumentParser:
         help="Credit role to filter the run by (default: penciller).",
     )
 
+    # resolve-year (BUI-719): read-only lookup, no wish-list/collection writes.
+    p = sub.add_parser(
+        "resolve-year",
+        parents=[common],
+        help="Resolve a (series, issue) pair's publication year via Metron (read-only, no writes)",
+        epilog=(
+            "Metron-backed replacement for the old LOCG-search year fallback — "
+            "LOCG blocks all programmatic access now (standing state, not an "
+            "outage). Disambiguates same-named series by ISSUE MEMBERSHIP "
+            "(which volume actually contains this issue number), not by year, "
+            "since resolving a year is the point. Fails soft with "
+            "{\"error\": ...} on any ambiguity rather than guess — a wrong "
+            "year corrupts the comics identity key."
+        ),
+    )
+    p.add_argument("series", help="Series title, e.g. 'Uncanny X-Men'.")
+    p.add_argument("issue", help="Issue number, e.g. '211'.")
+
     # read-list
     p = sub.add_parser("read-list", parents=[common], help="View your read list (requires login)")
     p.add_argument("--title", help="Filter results by title (case-insensitive substring match)")
@@ -780,13 +799,15 @@ def main() -> None:
         and getattr(args, "wish_list_command", None)
         in ("add", "remove", "migrate-source", "set-year")
     )
-    # creator-run is a pure Metron lookup — never needs the Playwright/LOCG client.
+    # creator-run and resolve-year are pure Metron lookups — never need the
+    # Playwright/LOCG client.
     _needs_client = not (
         args.command == "cache"
         or (_collection_sub in _LOCAL_COLLECTION_SUBCMDS)
         or _wish_list_cached
         or _wish_list_add
         or args.command == "creator-run"
+        or args.command == "resolve-year"
     )
 
     client: Optional[LOCGClient] = None
@@ -1054,6 +1075,8 @@ def main() -> None:
                 series_id=args.series_id,
                 role=args.role or "penciller",
             )
+        elif args.command == "resolve-year":
+            result = cmd_resolve_year_lookup(series=args.series, issue=args.issue)
         elif args.command == "read-list":
             result = cmd_read_list(client, title=args.title)
         elif args.command == "add":
