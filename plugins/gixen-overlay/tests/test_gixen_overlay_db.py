@@ -824,6 +824,35 @@ def test_upsert_comic_allcaps_skips_yearless_promotion_on_yeared_sibling_conflic
     assert db.execute("SELECT COUNT(*) FROM comics").fetchone()[0] == 2
 
 
+def test_upsert_comic_skip_reason_signals_per104_guard(db):
+    """BUI-721: the guard path is otherwise indistinguishable from a genuine
+    in-place promotion — same returned id, same "unchanged" outcome. A caller
+    that passes an empty `skip_reason` dict gets it populated on the guard
+    path only, and left empty on every writing path."""
+    cur = db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("The Mighty Thor", "154"),
+    )
+    db.commit()
+    id_yearless = cur.lastrowid
+    db.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)",
+        ("The Mighty Thor", "154", 1968),
+    )
+    db.commit()
+
+    skip: dict[str, str] = {}
+    id_returned = upsert_comic(db, "The Mighty Thor", "154", 1999, skip_reason=skip)
+
+    assert id_returned == id_yearless
+    assert skip == {"code": "yeared_sibling_conflict"}
+
+    # A genuine write (no conflicting yeared sibling) leaves skip_reason empty.
+    skip_ok: dict[str, str] = {}
+    upsert_comic(db, "Some Other Book", "1", 2001, skip_reason=skip_ok)
+    assert skip_ok == {}
+
+
 def test_sweep_orphan_yearless_comics_merges_allcaps_stubs(db):
     yeared_id = upsert_comic(db, "The Mighty Thor", "154", 1968)
     # Manually insert an ALL-CAPS yearless stub (bypassing upsert_comic which
