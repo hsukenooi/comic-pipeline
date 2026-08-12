@@ -517,21 +517,64 @@ def _ping_fmv_heartbeat(server_url: str, *, persisted: int) -> None:
         )
 
 
-# ─── Hand-priced row protection (BUI-533) ─────────────────────────────────────
+# ─── Hand-priced row protection (BUI-533, widened BUI-759) ────────────────────
 
-# A hand-priced row's fmv_notes starts with one of these markers — the de-facto
+# A hand-priced row's fmv_notes OPENS with one of these words — the de-facto
 # provenance convention an operator already uses when overriding the CLI's own
 # comp-pool result (e.g. Batman #251, 2026-07-24: hand $250-300 anchored on the
 # lone real 4.0 sale, after the CLI's pooled $400-425 off 5.0-6.0 comps was
 # rejected as pricing the wrong market).
-_HAND_PRICE_MARKERS = ("hand §", "hand OVERRIDE")
+#
+# BUI-759: BUI-533 shipped the tuple ("hand §", "hand OVERRIDE") matched with a
+# case-SENSITIVE `str.startswith`, having sampled only half the convention.
+# Measured against the live rows on 2026-08-12 by calling this very predicate:
+# 7 of 12 operator-priced rows were unprotected, because operators also write
+# `manual: …` and `Manual: …` (capital M — hence case-insensitive, not just a
+# longer tuple). Among the 7 was the ASM #50 (1st Kraven) row hand-priced at
+# $600-680 — one default `comic-fmv` run away from being replaced by the pooled
+# answer the operator had already rejected.
+#
+# `manually` is listed because `manual\b` does NOT match it, and the whole
+# defect being fixed here is a marker set sampled too narrowly. The two error
+# directions are not symmetric: a MISS silently overwrites a human's priced
+# number (money lost, no signal), while a false POSITIVE only declines to
+# refresh a machine row — and says so, in the run summary's hand-priced skip
+# count and the row's `skipped_hand_priced` source. So when in doubt, match.
+_HAND_PRICE_MARKERS = ("hand", "manual", "manually")
+
+# Anchored at the START of the notes (`.match`, not `.search`) and terminated by
+# a word boundary. Two false-positive directions are closed by that shape:
+#   - a note that merely MENTIONS a hand override mid-string ("… see hand
+#     OVERRIDE policy doc") is not a provenance claim — the marker is a prefix;
+#   - an English word that merely BEGINS with a marker ("handled by …") is not
+#     one either, which a bare `startswith("hand")` could not tell apart. The
+#     same boundary is why `_build_notes`' own `manual_review=<flag>` token
+#     cannot claim a row even if it ever led the string: `_` is a word char.
+# Every machine-written note starts with `window=` or `LEDGER-ADVISORY` (see
+# `_build_notes`), so neither direction can fire on the pipeline's own output.
+#
+# The markers above must stay BARE WORDS: they are `re.escape`d (so a stray
+# metacharacter can never silently reshape this pattern), but a marker ending
+# in punctuation — "manual:" — would put `\b` after a non-word char and then
+# only match when a word char FOLLOWS, i.e. the opposite of what it looks like.
+# `test_markers_are_bare_words` fails loudly if one is ever added.
+_HAND_PRICE_PREFIX_RE = re.compile(
+    r"\s*(?:" + "|".join(re.escape(m) for m in _HAND_PRICE_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
 
 
 def _is_hand_priced(notes: str | None) -> bool:
-    """True when `notes` (a row's persisted fmv_notes) carries a hand-priced
-    provenance marker. A default batch run must never silently recompute over
-    a row this returns True for (see `_split_by_db_cache`)."""
-    return notes is not None and notes.startswith(_HAND_PRICE_MARKERS)
+    """True when `notes` (a row's persisted fmv_notes) OPENS with a hand-priced
+    provenance marker, in any capitalization. A default batch run must never
+    silently recompute over a row this returns True for (see
+    `_split_by_db_cache`).
+
+    Matches the operator conventions actually observed on live rows:
+    `hand § …`, `hand OVERRIDE …`, `hand §direct (BUI-720): …`, `manual: …`,
+    `Manual: …`, `manual (BUI-720): …`.
+    """
+    return notes is not None and _HAND_PRICE_PREFIX_RE.match(notes) is not None
 
 
 # ─── Step 1 — DB cache reuse ──────────────────────────────────────────────────
