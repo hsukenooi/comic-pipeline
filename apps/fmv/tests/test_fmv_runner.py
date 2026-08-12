@@ -57,6 +57,34 @@ def _no_ledger_advisory_by_default(monkeypatch):
     monkeypatch.setattr(fmv_runner, "_ledger_advisory", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_identity_rows_by_default(monkeypatch):
+    """BUI-775: the hand-priced provenance check now looks a book up by the
+    identity the WRITE itself keys on — `(title, issue, grade)` — which is a
+    real HTTP GET, and is now made for EVERY graded book rather than only for
+    the ones carrying a `locg_id`. Default it to "the server holds no such
+    row" (`[]`), which is exactly the verdict every pre-existing test in this
+    file already asserts by stubbing `_db_lookup` to None, so tests about
+    other features keep testing those. Tests that ARE about this path override
+    it locally (an inner `patch` wins over a monkeypatch). Same pattern as the
+    three fixtures above (BUI-286, BUI-658, BUI-663)."""
+    monkeypatch.setattr(fmv_runner, "_db_lookup_by_identity",
+                        lambda *a, **k: [])
+
+
+_REAL_DB_LOOKUP_BY_IDENTITY = fmv_runner._db_lookup_by_identity
+
+
+@pytest.fixture
+def real_identity_lookup(monkeypatch, _no_identity_rows_by_default):
+    """Opt out of `_no_identity_rows_by_default` above, for the tests that are
+    ABOUT the BUI-775 lookup and must exercise the real one with only the HTTP
+    layer faked. Depends on the autouse fixture explicitly so it is guaranteed
+    to run after it rather than relying on pytest's ordering."""
+    monkeypatch.setattr(fmv_runner, "_db_lookup_by_identity",
+                        _REAL_DB_LOOKUP_BY_IDENTITY)
+
+
 def _make_book(item_id, title, issue, year, grade, locg_id=None):
     book = {"item_id": item_id, "title": title, "issue": issue,
             "year": year, "grade": grade}
@@ -192,16 +220,25 @@ class TestSplitByDbCache:
         assert skipped_hand == {}
         assert force_notes == {}
 
-    def test_book_without_locg_id_goes_to_compute(self, server_url):
-        # BUI-153: the DB-FMV cache-skip requires a locg_id, so a title-derived
-        # book (grade set, no locg_id) always falls through to a fresh compute —
-        # which is why --max-age-days is inert in the orchestrated /comic:buy flow.
+    def test_book_without_locg_id_is_not_cache_reused(self, server_url):
+        # BUI-153: DB-FMV cache REUSE still requires a locg_id, so a
+        # title-derived book (grade set, no locg_id) never lands in `cached` —
+        # which is why --max-age-days is inert in the orchestrated /comic:buy
+        # flow. BUI-775 narrowed this to reuse only: the hand-priced
+        # provenance check is no longer gated on locg_id (see
+        # TestSplitByDbCacheHandPricedWithoutLocgId), so `_db_lookup` — the
+        # locg-keyed lookup — is still never called, but the book is now
+        # checked by the identity the WRITE uses before it reaches compute.
         books = [_make_book("1", "X", "1", 1990, 9.0)]
-        with patch("fmv_runner._db_lookup") as lookup:
+        with patch("fmv_runner._db_lookup") as lookup, \
+             patch("fmv_runner._db_lookup_by_identity",
+                   return_value=[]) as identity:
             (cached, needs, skipped_hand, force_notes,
              lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
             lookup.assert_not_called()
+            identity.assert_called_once_with(
+                server_url, title="X", issue="1", grade=9.0)
         assert cached == {}
         assert len(needs) == 1
         assert skipped_hand == {}
@@ -615,19 +652,429 @@ class TestSplitByDbCacheLookupFailsClosed:
         assert skipped_hand == {}
         assert list(lookup_err) == [0]
 
-    def test_ineligible_book_never_reaches_the_lookup(self, server_url):
-        """A book with no locg_id can't be looked up by key at all, so it can't
-        target an existing row either — it must keep going to compute rather
-        than get caught by the new skip."""
-        books = [_make_book("1", "X", "1", 1990, 9.0)]
+    def test_gradeless_book_never_reaches_the_lookup(self, server_url):
+        """`grade is None` is the ONE genuine ineligibility (BUI-775):
+        `POST /api/comics` upserts an `fmv` row only when a grade was
+        supplied, so a gradeless book overwrites nothing and must keep going
+        to compute rather than get caught by the fail-closed skip.
+
+        This test USED to assert the same thing about a book with no
+        `locg_id`, on the reasoning that such a book "can't be looked up by
+        key at all, so it can't target an existing row either". The second
+        half of that was false — `upsert_comic` keys on
+        `(title, issue, variant)` and never on `locg_id` — and it is what
+        left 11 of the 12 live hand-priced rows unprotected (BUI-775)."""
+        books = [_make_book("1", "X", "1", 1990, None)]
         with patch("fmv_runner._db_lookup",
-                   side_effect=_failing_provenance_lookup()) as lookup:
+                   side_effect=_failing_provenance_lookup()) as lookup, \
+             patch("fmv_runner._db_lookup_by_identity",
+                   side_effect=AssertionError("must not be looked up")
+                   ) as identity:
             (cached, needs, skipped_hand, force_notes,
              lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
         lookup.assert_not_called()
+        identity.assert_not_called()
         assert lookup_err == {}
         assert len(needs) == 1
+
+
+def _fake_get(rows, capture=None):
+    """A `requests.get` side_effect returning `rows` as JSON, recording the
+    params it was called with into `capture` when given. Seam-free: the real
+    `_db_lookup_by_identity`, the real `_get_json_or_warn` and the real call
+    site all participate."""
+    def _get(url, params=None, timeout=None):
+        if capture is not None:
+            capture.append((url, params))
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = rows
+        return resp
+    return _get
+
+
+# The real ASM #50 row (fmv 767) as `GET /api/comics` serves it, `locg_id`
+# genuinely null — the shape BUI-775 measured on the live Mini.
+_ASM50_ROW = {
+    "id": 685, "fmv_id": 767, "title": "Amazing Spider-Man", "issue": "50",
+    "year": 1967, "grade": 6.5, "fmv_low": 600.0, "fmv_high": 680.0,
+    "fmv_comps": 4, "fmv_confidence": "medium", "locg_id": None,
+    "locg_variant_id": None,
+    "fmv_notes": "Manual: CGC-proxy + genuine raw comps (ASM #50, 1st Kraven)",
+    "fmv_updated_at": "2026-07-24T00:00:00",
+}
+
+
+class TestSplitByDbCacheHandPricedWithoutLocgId:
+    """BUI-775: the hand-priced guard must fire for a book with NO `locg_id`.
+
+    The predicate (`_is_hand_priced`) was already correct after BUI-759 — it
+    was simply never consulted, because `_split_by_db_cache` gated its whole
+    lookup behind `bool(book["locg_id"])`. That left 11 of the 12 live
+    hand-priced rows, ASM #50 at $600-680 among them, one default
+    `comic-fmv` run from being overwritten. These tests pin the ELIGIBILITY
+    GATE by asserting the bucketing, not the predicate: a fixture-only
+    predicate test is exactly what let this hide behind BUI-759's green
+    suite.
+    """
+
+    def _asm50(self):
+        # No locg_id key at all — as `/comic:identify` emits it, and as the
+        # live `comics` row stores it.
+        return _make_book("1", "Amazing Spider-Man", "50", 1967, 6.5)
+
+    def test_hand_priced_row_is_skipped_although_the_book_has_no_locg_id(
+            self, server_url):
+        books = [self._asm50()]
+        with patch("fmv_runner._db_lookup_by_identity",
+                   return_value=[_ASM50_ROW]):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=0, force=False)
+        assert needs == []                      # never sent to recompute
+        assert skipped_hand == {0: _ASM50_ROW}  # counted as a hand-priced skip
+        assert cached == {}
+        assert lookup_err == {}
+
+    def test_seam_free_the_whole_chain_protects_the_row(self, server_url,
+                                                       real_identity_lookup):
+        """Patches only the HTTP layer, so `_write_identity`,
+        `_db_lookup_by_identity`, `_get_json_or_warn` and the call site all
+        run for real. The stubbed-helper test above would still pass if the
+        fallback were wired to a key the server cannot answer; this one
+        would not — and it also pins the QUERY, which must be the write's own
+        key."""
+        seen: list = []
+        books = [self._asm50()]
+        with patch("fmv_runner.requests.get",
+                   side_effect=_fake_get([_ASM50_ROW], seen)):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=0, force=False)
+        assert skipped_hand == {0: _ASM50_ROW}
+        assert needs == []
+        assert [p for _, p in seen] == [
+            {"title": "Amazing Spider-Man", "issue": "50", "grade": 6.5}]
+
+    def test_a_machine_priced_row_without_locg_id_still_recomputes(
+            self, server_url):
+        """The gate is removed, not inverted: an ordinary pipeline-written row
+        must still refresh, or the fix would freeze the whole table."""
+        row = dict(_ASM50_ROW,
+                   fmv_notes="window=±0.5 | cv=20% | label=HIGH")
+        with patch("fmv_runner._db_lookup_by_identity", return_value=[row]):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [self._asm50()], server_url=server_url, max_age_days=0,
+                force=False)
+        assert skipped_hand == {}
+        assert lookup_err == {}
+        assert [b["_idx"] for b in needs] == [0]
+
+    def test_no_stored_row_recomputes(self, server_url):
+        with patch("fmv_runner._db_lookup_by_identity", return_value=[]):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [self._asm50()], server_url=server_url, max_age_days=0,
+                force=False)
+        assert [b["_idx"] for b in needs] == [0]
+        assert skipped_hand == {} and lookup_err == {}
+
+    def test_force_still_echoes_the_old_notes_on_the_fallback_path(
+            self, server_url, capsys):
+        """BUI-533's overwrite-AND-echo contract must hold on the new key too,
+        or `--force` would destroy provenance unlogged for exactly the rows
+        BUI-775 just made reachable."""
+        books = [self._asm50()]
+        with patch("fmv_runner._db_lookup_by_identity",
+                   return_value=[_ASM50_ROW]):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=0, force=True)
+        assert skipped_hand == {}
+        assert [b["_idx"] for b in needs] == [0]   # proceeds to recompute
+        assert force_notes == {0: _ASM50_ROW["fmv_notes"]}
+        fmv_runner._echo_hand_override_notes(force_notes, books)
+        assert "1st Kraven" in capsys.readouterr().err
+
+    def test_lookup_failure_on_the_fallback_path_fails_closed(
+            self, server_url, real_identity_lookup):
+        """BUI-544's posture must extend to the new lookup: a dead server on
+        the fallback is "don't know", never "not hand-priced"."""
+        import requests
+        with patch("fmv_runner.requests.get",
+                   side_effect=requests.ConnectionError("server down")):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [self._asm50()], server_url=server_url, max_age_days=0,
+                force=False)
+        assert needs == []
+        assert skipped_hand == {}
+        assert list(lookup_err) == [0]
+
+    def test_locg_id_present_but_unmatched_still_falls_back_to_the_write_key(
+            self, server_url):
+        """A `locg_id` on the BOOK does not mean the stored comic row carries
+        one, and the write never keys on it either. So a locg lookup that
+        finds nothing must not end the search — the same overwrite is still
+        one recompute away."""
+        book = _make_book("1", "Amazing Spider-Man", "50", 1967, 6.5,
+                          locg_id=999)
+        with patch("fmv_runner._db_lookup", return_value=None), \
+             patch("fmv_runner._db_lookup_by_identity",
+                   return_value=[_ASM50_ROW]):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [book], server_url=server_url, max_age_days=0, force=False)
+        assert needs == []
+        assert skipped_hand == {0: _ASM50_ROW}
+
+    def test_locg_hit_that_is_not_hand_priced_does_not_end_the_search(
+            self, server_url):
+        """A clean row at the `locg_id` key is no evidence about the row
+        `(title, issue, variant)` actually resolves onto — the write goes to
+        the latter."""
+        clean = dict(_ASM50_ROW, fmv_notes="window=±0.5 | cv=20%")
+        book = _make_book("1", "Amazing Spider-Man", "50", 1967, 6.5,
+                          locg_id=999)
+        with patch("fmv_runner._db_lookup",
+                   side_effect=_stale_hand_lookup(clean)), \
+             patch("fmv_runner._db_lookup_by_identity",
+                   return_value=[_ASM50_ROW]):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [book], server_url=server_url, max_age_days=0, force=False)
+        assert needs == []
+        assert skipped_hand == {0: _ASM50_ROW}
+
+
+class TestSplitByDbCacheAmbiguousIdentityFailsClosed:
+    """BUI-775: `variant` is part of the write's key, but `GET /api/comics`
+    neither filters on it nor returns it — so the fallback lookup can answer
+    with several rows. When one of them is hand-priced, WHICH row a recompute
+    would overwrite is undecidable, and "don't know" is not "not
+    hand-priced"."""
+
+    def _book(self):
+        return _make_book("1", "X-Men", "96", 1975, 4.0)
+
+    def _two_candidates(self, second_notes):
+        return [dict(_ASM50_ROW, id=661, fmv_id=733, title="X-Men",
+                     issue="96", year=1975, grade=4.0,
+                     fmv_notes="hand §direct: VG 4.0 $35"),
+                dict(_ASM50_ROW, id=662, fmv_id=901, title="X-Men",
+                     issue="96", year=1975, grade=4.0,
+                     fmv_notes=second_notes)]
+
+    def test_ambiguous_with_a_hand_priced_candidate_is_skipped(self,
+                                                               server_url):
+        with patch("fmv_runner._db_lookup_by_identity",
+                   return_value=self._two_candidates("window=±0.5 | cv=20%")):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [self._book()], server_url=server_url, max_age_days=0,
+                force=False)
+        assert needs == []                 # never recomputed → never overwritten
+        assert list(lookup_err) == [0]
+        assert "undecidable" in lookup_err[0]
+
+    def test_the_ambiguous_skip_is_not_counted_as_a_hand_priced_skip(
+            self, server_url):
+        """Same binding rider BUI-544 established: a non-verdict must be its
+        OWN category, and must NOT reuse an arbitrary candidate's price — a
+        guess here is a wrong number, not a missing one."""
+        with patch("fmv_runner._db_lookup_by_identity",
+                   return_value=self._two_candidates("window=±0.5")):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [self._book()], server_url=server_url, max_age_days=0,
+                force=False)
+        assert skipped_hand == {}
+        assert cached == {}
+        assert force_notes == {}
+
+    def test_ambiguous_with_no_hand_priced_candidate_recomputes(self,
+                                                                server_url):
+        """Ambiguity alone is not a reason to refuse: if NO candidate is
+        hand-priced then whichever row the write lands on is not one this
+        guard protects. Failing closed here would freeze every duplicated
+        identity in the table (17 such groups live, none hand-priced)."""
+        rows = [dict(r, fmv_notes="window=±0.5 | cv=20%")
+                for r in self._two_candidates("window=±1.0")]
+        with patch("fmv_runner._db_lookup_by_identity", return_value=rows):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [self._book()], server_url=server_url, max_age_days=0,
+                force=False)
+        assert [b["_idx"] for b in needs] == [0]
+        assert lookup_err == {} and skipped_hand == {}
+
+    def test_force_echoes_every_hand_priced_candidate(self, server_url):
+        """`--force` is licensed to overwrite, and its contract is
+        echo-first. With several candidates we echo all the hand-priced ones —
+        a superset of what can be overwritten is honest; a silent overwrite
+        is not."""
+        with patch("fmv_runner._db_lookup_by_identity",
+                   return_value=self._two_candidates("hand §interp: $30-40")):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [self._book()], server_url=server_url, max_age_days=0,
+                force=True)
+        assert [b["_idx"] for b in needs] == [0]
+        assert force_notes[0] == "hand §direct: VG 4.0 $35 | hand §interp: $30-40"
+
+
+class TestWriteIdentity:
+    """BUI-775: the guard's key must be the key the WRITE uses. The comics
+    server re-normalizes `title` inside `upsert_comic` before it becomes row
+    identity, so the client cannot just query with what it holds."""
+
+    def test_returns_the_title_and_issue_the_server_will_store(self):
+        assert fmv_runner._write_identity(
+            {"title": "Amazing Spider-Man", "issue": "50"}
+        ) == ("Amazing Spider-Man", "50")
+
+    def test_issue_is_stringified_like_the_upsert_body(self):
+        """`_upsert_fmv` posts `str(inp["issue"])`, and `list_comics` matches
+        `c.issue = ?` exactly — an int here would query a value the write
+        never stores."""
+        assert fmv_runner._write_identity(
+            {"title": "Batman", "issue": 245}) == ("Batman", "245")
+
+    def test_a_trailing_bare_issue_token_is_stripped_as_the_server_does(self):
+        """Mirrors the server's `_strip_embedded_issue`, the one branch of its
+        `_normalize_comic_title` that a comic-fmv post can still reach."""
+        assert fmv_runner._write_identity(
+            {"title": "Amazing Spider-Man 300", "issue": "300"}
+        ) == ("Amazing Spider-Man", "300")
+
+    def test_declines_when_the_title_still_carries_its_issue_token(self):
+        """With `#<issue>` present the server's OTHER two rules (BUI-599's
+        listing-tail truncation, BUI-625's edition-designation extraction)
+        become reachable, and predicting the stored identity would mean
+        re-implementing them here. `run()` strips the token before this module
+        sees a book, so this is unreachable in production — asserting it beats
+        arguing it, and a wrong guess is the exact BUI-775 failure class."""
+        assert fmv_runner._write_identity(
+            {"title": "Iron Man #126 (Marvel Comics 1979) VF", "issue": "126"}
+        ) is None
+
+    def test_declines_on_a_missing_title_or_issue(self):
+        assert fmv_runner._write_identity({"issue": "1"}) is None
+        assert fmv_runner._write_identity({"title": "X"}) is None
+        assert fmv_runner._write_identity({"title": "X", "issue": "  "}) is None
+
+    def test_a_book_with_no_derivable_identity_fails_closed(self, server_url):
+        """A book whose write identity cannot be derived is unverifiable, so
+        it must be skipped — not recomputed on the assumption that no row
+        exists."""
+        books = [{"item_id": "1",
+                  "title": "Iron Man #126 (Marvel Comics 1979) VF",
+                  "issue": "126", "grade": 9.0}]
+        with patch("fmv_runner._db_lookup_by_identity",
+                   side_effect=AssertionError("must not be looked up")):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=0, force=False)
+        assert needs == []
+        assert list(lookup_err) == [0]
+        assert "unverifiable" in lookup_err[0]
+
+
+class TestDbLookupByIdentity:
+    def test_rows_for_another_book_are_discarded(self, server_url,
+                                                 real_identity_lookup):
+        """Defense in depth, same as `_db_lookup`'s: FastAPI silently ignores
+        query params an older server build doesn't know, so a lookup that
+        widened to "every comic at this grade" must not answer with another
+        book's hand-priced row (which would falsely FREEZE this book) — nor
+        with another book's clean row (which would falsely CLEAR it)."""
+        other = dict(_ASM50_ROW, id=1, fmv_id=2, title="Batman", issue="251")
+        with patch("fmv_runner.requests.get",
+                   side_effect=_fake_get([other, _ASM50_ROW])):
+            rows = fmv_runner._db_lookup_by_identity(
+                server_url, title="Amazing Spider-Man", issue="50", grade=6.5)
+        assert rows == [_ASM50_ROW]
+
+    def test_a_stub_row_is_still_examined_for_provenance(
+            self, server_url, real_identity_lookup):
+        """`_db_lookup` drops `fmv_low is null` rows because they are useless
+        as a PRICE to reuse. Here a row is being examined for PROVENANCE, and
+        a hand-priced row must be protected whether or not it currently
+        carries a number — the upsert would overwrite its notes either way."""
+        stub = dict(_ASM50_ROW, fmv_low=None, fmv_high=None)
+        with patch("fmv_runner.requests.get", side_effect=_fake_get([stub])):
+            rows = fmv_runner._db_lookup_by_identity(
+                server_url, title="Amazing Spider-Man", issue="50", grade=6.5)
+        assert rows == [stub]
+
+    def test_a_failed_get_raises_rather_than_reading_as_no_row(
+            self, server_url, real_identity_lookup):
+        """The BUI-544 trap, on the new lookup: `_get_json_or_warn` collapses
+        a failure into its default, which must NOT be the empty list a genuine
+        miss returns."""
+        import requests
+        with patch("fmv_runner.requests.get",
+                   side_effect=requests.ConnectionError("down")):
+            with pytest.raises(fmv_runner._DbLookupFailed):
+                fmv_runner._db_lookup_by_identity(
+                    server_url, title="X", issue="1", grade=9.0)
+
+    def test_an_empty_answer_is_a_genuine_miss(self, server_url,
+                                               real_identity_lookup):
+        with patch("fmv_runner.requests.get", side_effect=_fake_get([])):
+            assert fmv_runner._db_lookup_by_identity(
+                server_url, title="X", issue="1", grade=9.0) == []
+
+    def test_a_non_list_body_fails_closed(self, server_url,
+                                          real_identity_lookup):
+        """A well-formed JSON body of the wrong SHAPE (an error envelope)
+        parses fine and would read as "no rows" — the BUI-544 collapse wearing
+        a different hat."""
+        with patch("fmv_runner.requests.get",
+                   side_effect=_fake_get({"detail": "nope"})):
+            with pytest.raises(fmv_runner._DbLookupFailed):
+                fmv_runner._db_lookup_by_identity(
+                    server_url, title="X", issue="1", grade=9.0)
+
+    def test_a_string_grade_still_matches_the_stored_float(
+            self, server_url, real_identity_lookup):
+        """A batch carrying `"6.5"` rather than `6.5` must not silently match
+        nothing: the server coerces the query param, returns the row, and a
+        bare `==` on the verification would then discard it — leaving the row
+        unprotected while the guard reported a clean miss."""
+        book = {"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
+                "year": 1967, "grade": "6.5"}
+        with patch("fmv_runner.requests.get",
+                   side_effect=_fake_get([_ASM50_ROW])):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [book], server_url=server_url, max_age_days=0, force=False)
+        assert skipped_hand == {0: _ASM50_ROW}
+        assert needs == []
+
+
+class TestRunLeavesALocgIdLessHandPricedRowUntouched:
+    """BUI-775 acceptance criterion 2, end to end (mocked network): a default
+    `comic-fmv` run over a hand-priced book with no `locg_id` must fetch
+    nothing and write nothing."""
+
+    def test_no_fetch_and_no_upsert(self, server_url, capsys):
+        batch = [{"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        with patch("fmv_runner._read_batch", return_value=batch), \
+             patch("fmv_runner._db_lookup_by_identity",
+                   return_value=[_ASM50_ROW]), \
+             patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        fetch_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+        err = capsys.readouterr().err
+        assert "skipped 1 hand-priced row(s)" in err
 
 
 class TestEchoHandOverrideNotes:
@@ -763,8 +1210,12 @@ class TestRunFailsClosedOnLookupError:
         cap = capsys.readouterr()
         combined = cap.out + cap.err
         assert "skipped 1 book(s)" in combined
-        assert "comics-server FMV lookup FAILED" in combined
+        assert "hand-priced provenance could NOT be verified" in combined
         assert "NOT because they were hand-priced" in combined
+        # BUI-775: the headline now names the CATEGORY (no verdict was
+        # reached); the per-book line is what names THIS book's cause, and
+        # an outage must still be legible as an outage.
+        assert "comics-server FMV lookup failed" in combined
         # The BUI-533 hand-priced count line must NOT fire — no book here was
         # hand-priced; we simply couldn't tell. Matched on that line's exact
         # phrasing, since the BUI-544 message legitimately says "hand-priced".
@@ -780,7 +1231,7 @@ class TestRunFailsClosedOnLookupError:
                            server_url=server_url)
         fetch_mock.assert_not_called()
         cap = capsys.readouterr()
-        assert "comics-server FMV lookup FAILED" in cap.err
+        assert "hand-priced provenance could NOT be verified" in cap.err
         # --brief still emits the row, so a machine consumer sees the book
         # rather than it vanishing from the output entirely.
         assert '"item_id": "1"' in cap.out
@@ -804,7 +1255,7 @@ class TestRunFailsClosedOnLookupError:
                            max_age_days=7, force=False, quiet=False,
                            server_url=server_url)
         out = capsys.readouterr().out
-        assert "skip:db-err" in out
+        assert "skip:unverified" in out
         assert "skipped_lookup_error" in out
         assert "n/a" not in out
 
@@ -842,8 +1293,10 @@ class TestRunFailsClosedOnLookupError:
         # pure JSON Lines under --brief.
         assert cap.out == ""
         assert "skipped 1 hand-priced row(s)" in cap.err
-        assert "skipped 1 book(s) because the comics-server FMV lookup FAILED" \
-            in cap.err
+        assert ("skipped 1 book(s) because their hand-priced provenance "
+                "could NOT be verified") in cap.err
+        # ...and the per-book reason line names WHICH book and why.
+        assert "X-Men #39: comics-server lookup failed" in cap.err
 
 
 class TestRunSkipsPermanentWriteRejection:

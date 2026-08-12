@@ -230,10 +230,11 @@ def run(*, batch_path: str | None, out_path: str | None,
     # 1. DB cache reuse (skipped if --force). Also separates out hand-priced
     #    rows (BUI-533): a default run must skip them entirely (skipped_hand),
     #    while a --force run proceeds but reports what it's about to overwrite
-    #    (force_overwrite_notes). BUI-544: when the provenance lookup itself
-    #    FAILS we can't tell hand-priced from not, so the book is skipped too —
-    #    but into its own bucket (skipped_lookup_error), never folded into the
-    #    hand-priced count.
+    #    (force_overwrite_notes). BUI-544/BUI-775: when the provenance check
+    #    can't reach a verdict — the lookup FAILED, or it answered with several
+    #    rows one of which is hand-priced — we can't tell hand-priced from not,
+    #    so the book is skipped too, but into its own bucket
+    #    (skipped_lookup_error), never folded into the hand-priced count.
     (cached, needs_compute, skipped_hand, force_overwrite_notes,
      skipped_lookup_error) = _split_by_db_cache(
         books, server_url=server_url, max_age_days=max_age_days, force=force,
@@ -340,20 +341,29 @@ def run(*, batch_path: str | None, out_path: str | None,
     # be read as the hand-priced skip above. Fail-closed turns a comics-server
     # outage into skipped books; that has to be loud, or a transient failure
     # silently under-computes a batch while looking like normal protection.
+    # BUI-775 added a second cause with the same not-a-verdict meaning (an
+    # ambiguous identity), so the headline names the CATEGORY and each row
+    # carries its own reason rather than the headline asserting one cause.
     # Goes to stderr (unconditional, like the count above — both routed there
     # since BUI-549 closed the gap on the count above): it is a failure, and
     # stdout is the machine-read surface under --brief.
     if skipped_lookup_error:
         click.echo(
-            f"⚠️  skipped {len(skipped_lookup_error)} book(s) because the "
-            "comics-server FMV lookup FAILED — NOT because they were "
-            "hand-priced. Hand-priced provenance could not be verified, so "
-            "these rows were left completely untouched (not priced, not "
-            "recomputed, not overwritten) rather than risk overwriting a "
-            "hand-priced row. Check the comics server and re-run; --force "
-            "does NOT bypass this.",
+            f"⚠️  skipped {len(skipped_lookup_error)} book(s) because their "
+            "hand-priced provenance could NOT be verified — NOT because they "
+            "were hand-priced. These rows were left completely untouched (not "
+            "priced, not recomputed, not overwritten) rather than risk "
+            "overwriting a hand-priced row; --force does NOT bypass this. "
+            "Per-book reasons:",
             err=True,
         )
+        for idx, reason in skipped_lookup_error.items():
+            book = books[idx]
+            click.echo(
+                f"    - {book.get('title', '?')} #{book.get('issue', '?')}: "
+                f"{reason}",
+                err=True,
+            )
 
     # BUI-639: a THIRD skip class, reported separately from both above and
     # worded so it can never be read as either. Unlike skipped_lookup_error
@@ -598,8 +608,27 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
     - force_overwrite_notes_by_idx (BUI-533): original input index → the OLD
       fmv_notes of a hand-priced row that `--force` is about to overwrite, so
       the caller can echo them into the run log before they're lost.
-    - skipped_lookup_error_by_idx (BUI-544): original input index → why the
-      hand-priced provenance check could not be answered. See below.
+    - skipped_lookup_error_by_idx (BUI-544/BUI-775): original input index → why
+      the hand-priced provenance check could not be ANSWERED — a failed lookup
+      (BUI-544) or an undecidable one (BUI-775). See below.
+
+    BUI-775 — the provenance check is keyed on the WRITE's key, not on
+    `locg_id`. `upsert_comic` keys a comics row on `(title, issue, variant)`;
+    `locg_id` is optional metadata that is never identity. So a book carrying
+    no `locg_id` still resolves onto — and `upsert_fmv`'s
+    `ON CONFLICT(comic_id, grade)` still overwrites — an existing row. The
+    guard used to gate its whole lookup behind `bool(book["locg_id"])`, which
+    left 11 of the 12 live hand-priced rows (including ASM #50 at $600-680)
+    invisible to a guard that was otherwise working: the predicate was correct
+    and simply never consulted. The lookup is now keyed on `_write_identity` —
+    the same `(title, issue)` the server will store — so the guard sees exactly
+    the rows the write can land on. `locg_id`, when present, is still consulted
+    FIRST (it survives a title spelling the write itself would not match), but
+    it is no longer the gate.
+
+    `grade is None` remains a genuine ineligibility, and is the only one:
+    `POST /api/comics` calls `upsert_fmv` only when a grade was supplied, so a
+    gradeless book writes no `fmv` row at all and has nothing to overwrite.
 
     BUI-544 — the provenance check fails CLOSED. The age-unbounded lookup is
     the single chokepoint that decides whether a book is hand-priced, and
@@ -612,6 +641,18 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
     overwritten, and reported as its OWN category — a book skipped because the
     server was unreachable is not a book skipped because it was hand-priced,
     and an operator must never mistake an outage for normal protection.
+
+    BUI-775 extends the same posture to AMBIGUITY, the other way this check
+    can fail to reach a verdict. `variant` is part of the write's key but
+    `GET /api/comics` neither filters on it nor returns it, so a
+    `(title, issue, grade)` lookup can answer with SEVERAL rows — different
+    variants, or yeared/yearless siblings. When one of them is hand-priced we
+    cannot say which row a recompute would land on, so the book is skipped
+    into the same not-a-verdict bucket rather than recomputed. "Don't know" is
+    not "not hand-priced", whether the not-knowing came from an outage or from
+    an under-specified key. (When NO candidate is hand-priced the count is
+    irrelevant: whichever row the write hits, it is not one this guard
+    protects, so the book recomputes normally.)
 
     Fail-closed applies under `--force` too. `--force` is licensed to overwrite
     a hand-priced row, but BUI-533's contract is "overwrite AND echo the old
@@ -632,49 +673,215 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
     force_overwrite_notes: dict[int, str] = {}
     skipped_lookup_error: dict[int, str] = {}
     for i, book in enumerate(books):
-        eligible = bool(book.get("locg_id")) and book.get("grade") is not None
-        if not eligible:
+        grade = book.get("grade")
+        if grade is None:
+            # The ONLY genuine ineligibility (BUI-775): `POST /api/comics`
+            # calls `upsert_fmv` only when a grade was supplied, so a gradeless
+            # book writes no `fmv` row and can overwrite nothing.
             needs.append({"_idx": i, **book})
             continue
+        locg_id = book.get("locg_id")
 
-        if not force:
-            row = _db_lookup(server_url, locg_id=book["locg_id"],
-                             grade=book["grade"],
+        if locg_id and not force:
+            row = _db_lookup(server_url, locg_id=locg_id, grade=grade,
                              locg_variant_id=book.get("locg_variant_id"),
                              max_age_days=max_age_days)
             if row:
                 cached[i] = row
                 continue
 
-        # Either --force (cache reuse always bypassed) or the fresh lookup
-        # above missed (no row yet, or the existing one is stale enough that
-        # normal logic would recompute). Before sending to compute, check
-        # whether an EXISTING row — regardless of age — is hand-priced: the
-        # protection must hold even on a stale row (that's precisely the
-        # 2026-07-24 incident: a batch refresh silently overwrote 10
-        # hand-priced rows), and a --force run still needs the OLD notes to
-        # echo even though it proceeds to overwrite.
+        # Either --force (cache reuse always bypassed), or the fresh lookup
+        # above missed / never ran. Before sending to compute, check whether an
+        # EXISTING row — regardless of age — is hand-priced: the protection
+        # must hold even on a stale row (that's precisely the 2026-07-24
+        # incident: a batch refresh silently overwrote 10 hand-priced rows),
+        # and a --force run still needs the OLD notes to echo even though it
+        # proceeds to overwrite.
         try:
-            existing = _db_lookup(server_url, locg_id=book["locg_id"],
-                                  grade=book["grade"],
-                                  locg_variant_id=book.get("locg_variant_id"),
-                                  max_age_days=None, strict=True)
+            candidates = _hand_price_candidates(server_url, book, grade=grade)
         except _DbLookupFailed as exc:
             # BUI-544: "don't know" is not "not hand-priced" — fail closed.
             skipped_lookup_error[i] = str(exc)
             continue
-        if existing is not None:
-            existing_notes = existing.get("fmv_notes")
-            if existing_notes is not None and _is_hand_priced(existing_notes):
-                if force:
-                    force_overwrite_notes[i] = existing_notes
-                else:
-                    skipped_hand[i] = existing
-                    continue
+
+        hand_rows = [r for r in candidates
+                     if _is_hand_priced(r.get("fmv_notes"))]
+        if hand_rows:
+            if force:
+                # BUI-533's contract is overwrite-AND-echo. With several
+                # candidates we echo every hand-priced one — a superset of
+                # what the recompute can overwrite is honest; a silent
+                # overwrite is not.
+                force_overwrite_notes[i] = " | ".join(
+                    str(r.get("fmv_notes")) for r in hand_rows)
+            elif len(candidates) == 1:
+                skipped_hand[i] = candidates[0]
+                continue
+            else:
+                # BUI-775: hand-priced, but we cannot say WHICH row a write
+                # would land on (see the docstring: `variant` is part of the
+                # write key and `GET /api/comics` neither filters on nor
+                # returns it). Skip without reusing an arbitrary candidate's
+                # price — a guess here is a wrong number, not a missing one.
+                skipped_lookup_error[i] = (
+                    f"{len(candidates)} stored rows share this book's write "
+                    f"identity and {len(hand_rows)} of them is hand-priced, so "
+                    "which row a recompute would overwrite is undecidable "
+                    "(GET /api/comics does not expose `variant`, which IS part "
+                    "of the write key)"
+                )
+                continue
 
         needs.append({"_idx": i, **book})
     return (cached, needs, skipped_hand, force_overwrite_notes,
             skipped_lookup_error)
+
+
+def _hand_price_candidates(server_url: str, book: dict, *,
+                           grade: float) -> list[dict]:
+    """Every stored FMV row a write for `book` at `grade` could land on, for
+    the hand-priced provenance check in `_split_by_db_cache`.
+
+    Raises `_DbLookupFailed` when the question cannot be answered — either a
+    lookup FAILED (BUI-544) or the book carries no write identity to look up
+    (BUI-775). Both are "don't know", and the caller fails closed on both.
+
+    `locg_id` first, when the book has one: it is the pre-BUI-775 key, it costs
+    one already-warm round trip, and it can find a row whose stored title the
+    write's own key would not match. But it is only a SHORTCUT — a hit ends the
+    search only when the row it found is hand-priced (nothing further can
+    change the verdict). Anything else falls through to the write's real key,
+    because a clean `locg_id` row is no evidence at all about the row
+    `(title, issue, variant)` actually resolves onto.
+    """
+    if book.get("locg_id"):
+        row = _db_lookup(server_url, locg_id=book["locg_id"], grade=grade,
+                         locg_variant_id=book.get("locg_variant_id"),
+                         max_age_days=None, strict=True)
+        if row is not None and _is_hand_priced(row.get("fmv_notes")):
+            return [row]
+
+    identity = _write_identity(book)
+    if identity is None:
+        raise _DbLookupFailed(
+            "cannot derive the (title, issue) this book would be written "
+            f"under, so its hand-priced provenance is unverifiable: "
+            f"title={book.get('title')!r} issue={book.get('issue')!r}"
+        )
+    title, issue = identity
+    return _db_lookup_by_identity(server_url, title=title, issue=issue,
+                                  grade=grade)
+
+
+def _write_identity(book: dict) -> tuple[str, str] | None:
+    """The `(title, issue)` the comics server will STORE for *book* — i.e. the
+    identity `upsert_comic` keys the write on — or None when that cannot be
+    derived, which the caller must treat as fail-closed.
+
+    BUI-775's whole point is that the guard's key must be the SAME key the
+    write uses, so this mirrors the server's `_normalize_comic_title` rather
+    than trusting the raw input. Three rules run there, and only ONE of them
+    is reachable for a book `comic-fmv` posts:
+
+    - `_strip_listing_tail` (BUI-599) and `_extract_edition_designation`
+      (BUI-625) both require the title to still contain its own `#<issue>`
+      token. `run()` applies `_normalize_book_title` to every book BEFORE this
+      module does anything else, and that strips every such token — so neither
+      rule can fire on a title we post. Rather than argue that from call order,
+      it is ASSERTED: a title that still carries its `#<issue>` token returns
+      None (fail closed) instead of a guess, because predicting the stored
+      identity would then mean re-implementing two server-side rules here.
+    - `_strip_embedded_issue` is what remains, and `apps/fmv` already carries a
+      verbatim twin of it (the duplication is deliberate and documented on both
+      copies — apps/fmv is not a workspace member). Applying it here reproduces
+      the server's transform exactly, including the `or title` fail-open a
+      title that is nothing but its own issue token relies on.
+
+    `variant` is deliberately NOT part of what this returns: it IS part of the
+    server's key, but `GET /api/comics` can neither filter on it nor report
+    it, so the lookup is variant-blind by construction. That gap is handled
+    where it must be — as ambiguity, failing closed — not papered over here.
+    """
+    title = book.get("title")
+    issue = book.get("issue")
+    if not title or issue is None:
+        return None
+    issue_str = str(issue).strip()
+    if not issue_str:
+        return None
+    if re.search(rf'#\s*{re.escape(issue_str)}\b', title, flags=re.IGNORECASE):
+        return None
+    return (_strip_embedded_issue(title, issue_str) or title, issue_str)
+
+
+def _grade_key(value: object) -> object:
+    """Compare grades by NUMBER when both sides are numeric, by value
+    otherwise.
+
+    `9.0` (what the server serves) and `"9.0"` (what a hand-written batch file
+    can carry — `/comic:identify` emits year as a string too, which is what
+    BUI-565 had to coerce) are the same grade, but `==` says they are not. A
+    guard whose row-verification silently matches nothing is a guard that does
+    not run, which is the whole BUI-775 failure class; erring toward "these
+    are the same row" is the safe direction here, since the consequence is a
+    skip, never a write.
+    """
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return value
+
+
+def _db_lookup_by_identity(server_url: str, *, title: str, issue: str,
+                           grade: float) -> list[dict]:
+    """Every stored FMV row at `(title, issue, grade)` — ALL of them, not the
+    freshest one. Raises `_DbLookupFailed` if the GET fails.
+
+    Always strict, and never age-filtered: the only caller is the hand-priced
+    provenance check, for which a soft-failed lookup is the BUI-544 trap and a
+    stale row is the BUI-533 one.
+
+    Deliberately does NOT reuse `_db_lookup`'s `fmv_low is not None` filter.
+    That filter exists to stop a BUI-44 stub row being REUSED as a price; here
+    a row is being examined for provenance, and a hand-priced row must be
+    protected whether or not it currently carries a number.
+
+    Re-verifies title/issue/grade client-side for the same reason `_db_lookup`
+    does: FastAPI silently ignores query params an older server build doesn't
+    know, and a lookup that silently widened to "every comic at this grade"
+    would answer with other books' rows. Note which way that filter can only
+    err: it can DROP a row the server returned, never invent one — and since
+    the server matched `title` with SQL `LOWER()`, any row it returned is
+    already ASCII-case-equal here.
+    """
+    rows = _get_json_or_warn(
+        f"{server_url}/api/comics",
+        params={"title": title, "issue": issue, "grade": grade},
+        warn=(f"hand-priced provenance lookup failed "
+              f"(title={title!r} issue={issue!r})"),
+        default=_LOOKUP_FAILED,
+    )
+    if rows is _LOOKUP_FAILED:
+        raise _DbLookupFailed(
+            f"comics-server FMV lookup failed for title={title!r} "
+            f"issue={issue!r} grade={grade}"
+        )
+    if rows is None or rows == []:
+        return []
+    if not isinstance(rows, list):
+        # A well-formed JSON body of the wrong SHAPE (an error envelope, say)
+        # parses fine, so `_get_json_or_warn` hands it straight back. Reading
+        # that as "no rows" is the BUI-544 collapse wearing a different hat —
+        # it is another way of not knowing, so it fails closed too.
+        raise _DbLookupFailed(
+            f"comics-server returned a non-list body for title={title!r} "
+            f"issue={issue!r} grade={grade}"
+        )
+    return [r for r in rows
+            if isinstance(r, dict)
+            and str(r.get("title") or "").lower() == title.lower()
+            and str(r.get("issue")) == issue
+            and _grade_key(r.get("grade")) == _grade_key(grade)]
 
 
 def _echo_hand_override_notes(force_overwrite_notes: dict[int, str],
@@ -2434,11 +2641,14 @@ def _stitch(books: list[dict], cached: dict[int, dict],
     `source` so the table/summary/--brief can tell a protected hand-priced
     row apart from an ordinary cache hit.
 
-    `skipped_lookup_error` (BUI-544) is the opposite case: the lookup FAILED,
-    so there is no row to reuse and no price at all this run. It gets its own
-    `source` too — never `skipped_hand_priced` (that would let an outage be
-    read as protection) and never the bare `error` source (that reads as a
-    compute failure, when in fact nothing was even attempted).
+    `skipped_lookup_error` (BUI-544/BUI-775) is the opposite case: the
+    hand-priced question could not be ANSWERED — the lookup FAILED (BUI-544),
+    or it answered ambiguously with several candidate rows one of which is
+    hand-priced (BUI-775) — so there is no row that can honestly be reused and
+    no price at all this run. It gets its own `source` too — never
+    `skipped_hand_priced` (that would let a non-verdict be read as protection)
+    and never the bare `error` source (that reads as a compute failure, when in
+    fact nothing was even attempted).
 
     `skipped_rejected` (BUI-639) is a third distinct case: the book WAS
     computed (fmv_math ran) but the comics-server write that would have
@@ -2484,9 +2694,10 @@ def _stitch(books: list[dict], cached: dict[int, dict],
                 "source": "skipped_lookup_error",
                 "breaker_tripped": False,
                 "error": (
-                    "BUI-544: skipped, hand-priced provenance unverifiable — "
-                    f"{skipped_lookup_error[i]}. Row left untouched; this is a "
-                    "server failure, not a hand-priced skip and not zero comps."
+                    "BUI-544/BUI-775: skipped, hand-priced provenance "
+                    f"unverifiable — {skipped_lookup_error[i]}. Row left "
+                    "untouched; this is an unanswerable provenance check, not "
+                    "a hand-priced skip and not zero comps."
                 ),
             })
         elif i in skipped_rejected:
@@ -2728,8 +2939,8 @@ def _brief_row(r: dict) -> dict:
         `"cached"`, `"cgc-proxy"`, `"skipped_hand_priced"`,
         `"skipped_lookup_error"`, `"skipped_rejected"` (BUI-639),
         `"ledger-advisory"` (BUI-663), or `"error"`). Without this, a
-        `skipped_lookup_error` row (comics-server
-        lookup FAILED — hand-priced provenance unverifiable, row left
+        `skipped_lookup_error` row (hand-priced provenance unverifiable —
+        the lookup FAILED or answered ambiguously, row left
         completely untouched) projects identically to an ordinary
         unpriced/no-comps row: both have every pricing field null. A
         `--brief`-only consumer (no table, no summary) otherwise has no way
@@ -2840,13 +3051,14 @@ def _print_table(rows: list[dict]) -> None:
             med_str = f"${fmv.get('median') or '?'}"
             mb_str = f"${fmv.get('max_bid') or '?'}"
         elif r.get("source") == "skipped_lookup_error":
-            # BUI-544: never priced this run — the comics-server lookup behind
-            # the hand-price guard failed, so the book was skipped. It has no
-            # comps and no queries, so without this branch it would render as
-            # a bland 'n/a' and read as "illiquid" (the BUI-143 trap) or be
-            # mistaken for the hand-priced skip. Distinct token, distinct
-            # source column.
-            fmv_str = "skip:db-err"
+            # BUI-544/BUI-775: never priced this run — the hand-price guard
+            # could not reach a verdict (lookup failed, or answered
+            # ambiguously), so the book was skipped. It has no comps and no
+            # queries, so without this branch it would render as a bland 'n/a'
+            # and read as "illiquid" (the BUI-143 trap) or be mistaken for the
+            # hand-priced skip. Distinct token, distinct source column; the
+            # per-book reason is in the summary and the row's `error`.
+            fmv_str = "skip:unverified"
             med_str = "—"
             mb_str = "—"
         elif r.get("source") == "skipped_rejected":

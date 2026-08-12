@@ -42,6 +42,17 @@ def server_url():
     return "http://test-server:8080"
 
 
+@pytest.fixture(autouse=True)
+def _no_identity_rows_by_default(monkeypatch):
+    """BUI-775: the hand-priced provenance check now looks every graded book
+    up by the identity the WRITE keys on (`title`/`issue`/`grade`), a real
+    HTTP GET that the `run()`-level tests below never mocked because it did
+    not exist. Default it to "no such row" so those tests keep testing comps
+    posting. Mirrors the identically-named fixture in test_fmv_runner.py."""
+    monkeypatch.setattr(fmv_runner, "_db_lookup_by_identity",
+                        lambda *a, **k: [])
+
+
 # BUI-673: the real BUI-657 stamp. `sold_comps.fetch`/`fetch_sold_comps`
 # return `response_fetched_at` as a raw epoch FLOAT (`time.time()` live,
 # `st_mtime` on a cache hit) and `fetch_book_comps` assigns it verbatim. This
