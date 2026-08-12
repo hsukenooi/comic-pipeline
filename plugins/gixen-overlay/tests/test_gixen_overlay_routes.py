@@ -570,6 +570,46 @@ def test_list_comics_by_locg_id(api):
     assert rows[0]["title"] == "Amazing Spider-Man"
 
 
+def _post_variant_pair(api):
+    """A base cover and its Newsstand sibling, over the real HTTP surface."""
+    for variant in (None, "Newsstand"):
+        body = {"title": "X-Men", "issue": "96", "year": 1975, "grade": 4.0,
+                "fmv_low": 35, "fmv_high": 45, "fmv_comps": 8,
+                "fmv_confidence": "medium", "fmv_notes": "n"}
+        if variant:
+            body["variant"] = variant
+        assert api.post("/api/comics", json=body).status_code == 200
+
+
+def test_list_comics_serves_variant_over_http(api):
+    """BUI-777: `variant` must survive the ROUTE, not just `list_comics` — the
+    guard reads it off the JSON. Asserted at the HTTP surface because a field
+    selected in SQL but dropped on the way out is exactly the 'correct check
+    that never reaches the data' failure this ticket family exists for."""
+    _post_variant_pair(api)
+    rows = api.get("/api/comics", params={"title": "X-Men"}).json()
+    assert len(rows) == 2
+    assert all("variant" in r for r in rows)
+    assert {r["variant"] for r in rows} == {None, "Newsstand"}
+
+
+def test_list_comics_variant_filter_is_wired_through_the_route(api):
+    """The query param must actually reach `list_comics`. FastAPI silently
+    ignores params a handler does not declare, so an unwired param would
+    return EVERY row while looking like it filtered — the BUI-139/775 trap."""
+    _post_variant_pair(api)
+    rows = api.get("/api/comics",
+                   params={"title": "X-Men", "variant": "Newsstand"}).json()
+    assert [r["variant"] for r in rows] == ["Newsstand"]
+
+
+def test_list_comics_without_variant_param_is_unchanged(api):
+    """API-contract guarantee: an existing caller that omits the new param
+    sees exactly its previous behavior — every variant, unfiltered."""
+    _post_variant_pair(api)
+    assert len(api.get("/api/comics", params={"title": "X-Men"}).json()) == 2
+
+
 def test_list_comics_by_locg_variant_id_scopes_to_variant(api):
     """BUI-139: a base cover and a Newsstand variant of one issue share the same
     issue-level locg_id (only locg_variant_id differs). GET with locg_variant_id

@@ -2275,6 +2275,7 @@ def list_comics(
     grade: float | None = None,
     locg_id: int | None = None,
     locg_variant_id: int | None = None,
+    variant: str | None = None,
     max_age_days: float | None = None,
 ) -> list[sqlite3.Row]:
     """Return comics enriched with FMV data. One row per (comic, fmv) pair.
@@ -2287,6 +2288,20 @@ def list_comics(
         Newsstand variant (a different price tier). When set, scope to that
         exact variant. (Base/NULL-variant disambiguation is done caller-side in
         comic-fmv's _db_lookup, since an absent query param can't express NULL.)
+    variant: BUI-777 — `comics.variant` is the THIRD component of the identity
+        `upsert_comic` keys a row on, alongside (title, issue). Until now this
+        column was neither returned nor filterable, which made every consumer
+        of this endpoint variant-blind about the one field that decides which
+        row a write lands on. Matched case-SENSITIVELY and with no trimming,
+        deliberately: the identity indexes key on `COALESCE(variant,'')` with
+        no `LOWER` and no collation (see `_extract_edition_designation`), so
+        matching any less strictly here would claim rows the write itself
+        would not resolve onto. Like `locg_variant_id`, an absent query param
+        cannot express "variant IS NULL" (the base edition) — only "no
+        filter" — so a caller that must distinguish the base edition from its
+        variant siblings has to narrow on the returned `variant` field
+        client-side. `comic-fmv`'s hand-priced guard does exactly that and
+        never sends this param; it exists for ad hoc and dashboard queries.
     max_age_days: if set, only return rows where the joined fmv.updated_at
         is within the last N days. Stale rows are excluded so callers can't
         accidentally reuse outdated FMVs.
@@ -2311,6 +2326,9 @@ def list_comics(
     if locg_variant_id is not None:
         clauses.append("c.locg_variant_id = ?")
         params.append(locg_variant_id)
+    if variant is not None:
+        clauses.append("c.variant = ?")
+        params.append(variant)
     if max_age_days is not None:
         cutoff = (datetime.now(timezone.utc)
                   - timedelta(days=max_age_days)).isoformat()
@@ -2320,6 +2338,22 @@ def list_comics(
     return conn.execute(
         f"""
         SELECT c.id, c.title, c.issue, c.year, c.locg_id, c.locg_variant_id,
+               -- BUI-777: the third component of `upsert_comic`'s row identity
+               -- (title, issue, variant). Serving it is what lets a caller key
+               -- its lookup on exactly what the WRITE keys on; without it a
+               -- (title, issue, grade) query can answer with a base cover AND
+               -- its Newsstand sibling and no way to tell which row a write
+               -- would land on. Like `fmv_provenance` below, it must be on
+               -- EVERY row, not just the ones the dashboard renders.
+               --
+               -- The KEY's mere presence is load-bearing too: `comic-fmv`
+               -- distinguishes "this server serves variant, and this row's is
+               -- NULL" from "this server predates the column" by whether the
+               -- key exists at all, and falls back to the old variant-blind
+               -- fail-closed behavior for the latter. Removing it from this
+               -- SELECT would therefore not un-protect anything — it would
+               -- restore the older, lossier protection.
+               c.variant,
                f.id AS fmv_id, f.grade,
                f.low AS fmv_low, f.high AS fmv_high, f.comps AS fmv_comps,
                f.confidence AS fmv_confidence, f.notes AS fmv_notes,

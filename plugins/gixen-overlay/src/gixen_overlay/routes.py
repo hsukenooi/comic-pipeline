@@ -201,6 +201,7 @@ async def api_list_comics(
     grade: float | None = None,
     locg_id: int | None = None,
     locg_variant_id: int | None = None,
+    variant: str | None = None,
     max_age_days: float | None = None,
 ):
     """List comics enriched with FMV data.
@@ -211,6 +212,13 @@ async def api_list_comics(
     same issue (same `locg_id`) don't reuse each other's FMV. `max_age_days`
     excludes rows whose `fmv_updated_at` is older than the cutoff so callers
     can't reuse stale FMVs by accident.
+
+    `variant` (BUI-777) filters on `comics.variant`, the third component of the
+    identity `upsert_comic` keys a row on. Every row now also RETURNS `variant`
+    — that is the half `comic-fmv`'s hand-priced guard actually consumes, since
+    an absent query param cannot express "the base edition" (variant IS NULL),
+    only "no filter". Both halves are purely additive: a caller that omits the
+    param and ignores the extra field sees exactly the previous behavior.
     """
     db = request.app.state.db
     rows = list_comics(
@@ -221,6 +229,7 @@ async def api_list_comics(
         grade=grade,
         locg_id=locg_id,
         locg_variant_id=locg_variant_id,
+        variant=variant,
         max_age_days=max_age_days,
     )
     return [dict(r) for r in rows]
