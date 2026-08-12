@@ -1703,6 +1703,29 @@ _NUMERIC_GRADE_RE = re.compile(
 # ending in non-word characters like `+` or `-`, a trailing `\b` fails when
 # the next char is whitespace or end-of-string (both non-word). Use `(?!\w)`
 # for trailing boundaries on non-word tails.
+#
+# Word-form "near mint": the abbreviations NM / NM- were handled from the
+# start, but the spelled-out forms were not — even though "very good", "good",
+# "fair" and "poor" all were. Measured over the stored comps corpus (15,235
+# rows, 9,339 of them grade-less): 57 grade-less titles say "near mint", 27 of
+# those "near mint minus". Recovering them is the entire upside — the other
+# 98.6% of grade-less titles carry no condition signal of any kind, so this is
+# a parser-consistency fix, NOT an FMV-coverage improvement (per-book effect is
+# 0-1 comps and will not clear a `too_sparse` flag).
+#
+# These two patterns bound with `(?<![a-z0-9])`/`(?![a-z0-9])` instead of `\b`
+# because every one of those 57 titles comes from a seller format delimited by
+# UNDERSCORES ("UNCANNY X-MEN #190_FEBRUARY 1985_NEAR MINT MINUS_AMAZING..."),
+# and `_` is a word character — so `\b` never fires at either edge. The
+# lookarounds treat `_` as the separator it visually is, while still refusing
+# to match inside a longer alphanumeric run.
+#
+# Bare "mint" is deliberately NOT mapped. Of the 35 grade-less titles that
+# contain it without "near", the set includes a Hasbro action figure ("MINT IN
+# BOX MIB"), two graded trading cards ("BGS 9 Mint POP 1", a Panini football
+# card), a silver coin ("Mintage 250") and a hedged "NM/ (Mint?)". It is seller
+# vocabulary, not a grade, and mapping it to 9.9 would inject the scale's most
+# inflated value off its least reliable signal.
 _LETTER_PATTERNS = [
     # Tier 1 — slash combos (longest first)
     (re.compile(r'\bnm[/\\]m\b', re.I), 9.6),
@@ -1713,9 +1736,35 @@ _LETTER_PATTERNS = [
     (re.compile(r'\bgd[/\\]vg\b', re.I), 3.0),
     (re.compile(r'\bfr[/\\]gd\b', re.I), 1.5),
 
+    # Tier 1b — the same slash combos SPELLED OUT. These must sit in Tier 1
+    # for the identical reason the abbreviations do: a combo's second half is
+    # itself a valid grade word, so a Tier 3 bare-word pattern would match the
+    # component and short-circuit the loop. "VERY FINE/NEAR MINT" read as plain
+    # "near mint" yields 9.4 instead of VF/NM's 9.0 — a 0.4-grade overstatement
+    # on a book we might bid against.
+    #
+    # Two of these were already wrong before word-form near mint existed:
+    # "FINE/VERY FINE" fell through to `\bfine\b` -> 6.0 (FN/VF is 7.0) and
+    # "VERY GOOD/FINE" to `\bvery good\b` -> 4.0 (VG/FN is 5.0). Corpus counts
+    # at the time of writing: very fine/near mint 8, fine/very fine 9, near
+    # mint/mint 3, very good/fine 2.
+    #
+    # Separator class is `[/\\-]` with optional surrounding whitespace or
+    # underscores, covering every form observed: "VERY FINE/NEAR MINT",
+    # "VERY FINE-NEAR MINT", and "VERY FINE - NEAR MINT".
+    (re.compile(r'(?<![a-z0-9])near[\s_]*mint[\s_]*[/\\-][\s_]*mint(?![a-z0-9])', re.I), 9.6),
+    (re.compile(r'(?<![a-z0-9])very[\s_]*fine[\s_]*[/\\-][\s_]*near[\s_]*mint(?![a-z0-9])', re.I), 9.0),
+    (re.compile(r'(?<![a-z0-9])fine[\s_]*[/\\-][\s_]*very[\s_]*fine(?![a-z0-9])', re.I), 7.0),
+    (re.compile(r'(?<![a-z0-9])very[\s_]*good[\s_]*[/\\-][\s_]*fine(?![a-z0-9])', re.I), 5.0),
+    (re.compile(r'(?<![a-z0-9])good[\s_]*[/\\-][\s_]*very[\s_]*good(?![a-z0-9])', re.I), 3.0),
+    (re.compile(r'(?<![a-z0-9])fair[\s_]*[/\\-][\s_]*good(?![a-z0-9])', re.I), 1.5),
+
     # Tier 2 — letter + modifier (+ / -)
     (re.compile(r'\bnm\+(?!\w)', re.I), 9.6),
     (re.compile(r'\bnm-(?!\w)', re.I), 9.2),
+    # Must precede the bare "near mint" in Tier 3: that pattern also matches
+    # the "NEAR MINT MINUS" prefix, and the loop returns on first hit.
+    (re.compile(r'(?<![a-z0-9])near[\s_-]+mint[\s_-]+minus(?![a-z0-9])', re.I), 9.2),
     (re.compile(r'\bvf\+(?!\w)', re.I), 8.5),
     (re.compile(r'\bvf-(?!\w)', re.I), 7.5),
     (re.compile(r'\bfn\+(?!\w)|\bfine\+(?!\w)', re.I), 6.5),
@@ -1726,6 +1775,7 @@ _LETTER_PATTERNS = [
 
     # Tier 3 — bare letters (must come last; other patterns would match inside)
     (re.compile(r'\bnm\b(?![+\-/\\])', re.I), 9.4),
+    (re.compile(r'(?<![a-z0-9])near[\s_-]+mint(?![a-z0-9])', re.I), 9.4),
     (re.compile(r'\bvf\b(?![+\-/\\])', re.I), 8.0),
     (re.compile(r'\bfn\b(?![+\-/\\])|\bfine\b(?![+\-/\\])', re.I), 6.0),
     (re.compile(r'\bvg\b(?![+\-/\\])|\bvery good\b', re.I), 4.0),
