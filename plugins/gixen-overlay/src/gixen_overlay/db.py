@@ -1346,8 +1346,21 @@ def upsert_comic(
     locg_id: int | None = None,
     locg_variant_id: int | None = None,
     variant: str | None = None,
+    skip_reason: dict[str, str] | None = None,
 ) -> int:
     """Upsert a comic identity row. Returns the comic id.
+
+    `skip_reason` (optional, BUI-721): pass an empty dict and this function
+    sets `skip_reason["code"]` whenever a guard declines to perform the write
+    the caller asked for and returns a row unchanged instead — today that is
+    only the PER-104 yeared-sibling-conflict guard below, which sets
+    `"yeared_sibling_conflict"`. The return value alone cannot signal this: on
+    that path the id returned is identical to the id a genuine in-place
+    promotion would have returned, so a caller that needs to tell "wrote it"
+    from "guard refused" apart (e.g. a backfill endpoint reporting counts —
+    see docs/solutions/conventions/an-endpoint-success-report-is-not-a-write.md)
+    must pass this out-param rather than trust the return value. Left `None`
+    (the default), behavior is unchanged for every existing caller.
 
     BUI-591/BUI-599: `title` is normalized before it becomes row identity — the
     duplicated issue number and any listing junk trailing it are removed; see
@@ -1468,6 +1481,8 @@ def upsert_comic(
                     year,
                     variant,
                 )
+                if skip_reason is not None:
+                    skip_reason["code"] = "yeared_sibling_conflict"
                 return existing_yearless["id"]
             conn.execute(
                 "UPDATE comics SET year=?, "

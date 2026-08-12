@@ -1498,6 +1498,171 @@ def test_backfill_year_active_only_excludes_unlinked_comics(api, monkeypatch):
     assert any(e["comic_id"] == unlinked_id for e in body2["results"])
 
 
+def test_backfill_year_guard_skip_reports_unresolved_not_resolved(api, monkeypatch):
+    """BUI-721: when upsert_comic's PER-104 guard refuses a yearless
+    promotion (a yeared sibling exists at a *different* year), the endpoint
+    must not report `resolved: true` for a row whose `year` column stayed
+    NULL. This is the exact Hulk Annual #1 (comic 328) incident from BUI-715's
+    production run — docs/solutions/conventions/
+    an-endpoint-success-report-is-not-a-write.md.
+
+    Going through `POST /api/comics` for both rows would let `upsert_comic`
+    auto-reconcile them into one row (there'd be no split to guard) — the
+    guard only fires on a *pre-existing* split state, so this seeds it
+    directly via SQL, the same way the DB-layer PER-104 test does."""
+    conn = sqlite3.connect(os.environ["DB_PATH"])
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)",
+        ("Guarded Book", "1", 1968),
+    )
+    cur = conn.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)",
+        ("Guarded Book", "1"),
+    )
+    comic_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO fmv (comic_id, grade, low, high) VALUES (?, ?, ?, ?)",
+        (comic_id, 9.0, 50.0, 70.0),
+    )
+    conn.commit()
+    conn.close()
+
+    # Link the yearless row to a bid via the API (active_only scope requires
+    # a bid_fmvs link) — resolves onto the fmv row just inserted via comic_id.
+    api.post("/api/bids", json={"item_id": "700000004", "max_bid": 50.0})
+    api.post("/api/bids/700000004/link-fmv", json={"comic_id": comic_id, "grade": 9.0})
+
+    # Metron resolves to a DIFFERENT year (1999) than the existing yeared
+    # sibling (1968) — this is what fires the PER-104 guard.
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg",
+        lambda series, issue: LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
+    )
+
+    r = api.post("/api/comics/backfill-year", params={"dry_run": "false"})
+    assert r.status_code == 200
+    body = r.json()
+    entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
+
+    assert entry["resolved"] is False
+    assert entry["skipped"] == "yeared_sibling_conflict"
+    # The report still surfaces the year Metron returned, for diagnosis —
+    # just not as a claim that it was written.
+    assert entry["year"] == 1999
+
+    # The top-level resolved_count must not have counted this row (the
+    # over-counting half of the original defect).
+    assert body["resolved"] == 0
+    assert body["unresolved"] == 1
+
+    db_path = os.environ["DB_PATH"]
+    raw = sqlite3.connect(db_path)
+    row = raw.execute("SELECT year FROM comics WHERE id=?", (comic_id,)).fetchone()
+    raw.close()
+    assert row[0] is None, "PER-104 guard must leave the yearless row unwritten"
+
+
+def test_backfill_year_offset_pages_past_unresolvable_head(api, monkeypatch):
+    """BUI-721: the scan has no OFFSET, so unresolved rows re-occupy the head
+    of every subsequent scan — a repeated small-limit run over an
+    unresolvable head must still terminate with full coverage instead of
+    stalling. Threading each response's `next_offset` into the next call's
+    `offset` must visit every in-scope row exactly once."""
+    from gixen_overlay import routes
+
+    comic_ids = []
+    for i, item_id in enumerate(["700000005", "700000006", "700000007"]):
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": 20.0})
+        r = api.post("/api/comics", json={
+            "title": f"Unresolvable Book {i}", "issue": "1",
+            "grade": 8.0, "fmv_low": 10.0, "fmv_high": 15.0,
+        })
+        comic_id = r.json()["id"]
+        comic_ids.append(comic_id)
+        api.post(f"/api/bids/{item_id}/link-fmv", json={"comic_id": comic_id, "grade": 8.0})
+
+    # Every row is permanently unresolvable — models the BUI-715 stall case.
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+
+    seen: list[int] = []
+    offset = 0
+    for _ in range(10):  # generous bound; a real stall would exceed this
+        r = api.post(
+            "/api/comics/backfill-year", params={"limit": 2, "offset": offset}
+        )
+        assert r.status_code == 200
+        body = r.json()
+        if body["scanned"] == 0:
+            break
+        seen.extend(e["comic_id"] for e in body["results"])
+        offset = body["next_offset"]
+    else:
+        pytest.fail("backfill-year did not terminate within 10 rounds — offset paging is stuck")
+
+    # Every in-scope comic was visited exactly once — no duplicate re-scan of
+    # the stuck head, no row skipped over.
+    assert sorted(cid for cid in seen if cid in comic_ids) == sorted(comic_ids)
+    assert len(seen) == len(comic_ids)
+
+
+def test_backfill_year_dry_run_paging_terminates(api, monkeypatch):
+    """BUI-721: `next_offset` must advance by the whole page in a dry run.
+
+    The paging recurrence `next_offset = offset + unresolved` is only correct
+    when a resolved row LEAVES the `year IS NULL` population — i.e. when it was
+    written. A dry run writes nothing, so every scanned row stays. Advancing by
+    the unresolved count alone re-scans the resolvable ones, and when a whole
+    page resolves it advances by ZERO: the caller loops forever, spending a
+    Metron call per row per round. That is the same stall BUI-721 exists to
+    fix, and `dry_run=True` is this endpoint's default, so it sits on the
+    default path rather than in a corner.
+    """
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    comic_ids = []
+    for i, item_id in enumerate(["700000021", "700000022", "700000023", "700000024"]):
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": 20.0})
+        r = api.post("/api/comics", json={
+            "title": f"Resolvable Book {i}", "issue": "1",
+            "grade": 8.0, "fmv_low": 10.0, "fmv_high": 15.0,
+        })
+        comic_id = r.json()["id"]
+        comic_ids.append(comic_id)
+        api.post(f"/api/bids/{item_id}/link-fmv", json={"comic_id": comic_id, "grade": 8.0})
+
+    # Every row resolves — the case that pins next_offset at 0.
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg",
+        lambda series, issue: LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
+    )
+
+    seen: list[int] = []
+    offset = 0
+    for _ in range(10):
+        r = api.post("/api/comics/backfill-year",
+                     params={"limit": 2, "offset": offset, "dry_run": "true"})
+        assert r.status_code == 200
+        body = r.json()
+        if body["scanned"] == 0:
+            break
+        seen.extend(e["comic_id"] for e in body["results"])
+        offset = body["next_offset"]
+    else:
+        pytest.fail(
+            "dry-run backfill-year did not terminate within 10 rounds — "
+            "next_offset does not advance when a page fully resolves"
+        )
+
+    # Each in-scope row previewed exactly once: no re-scan, none skipped.
+    assert sorted(cid for cid in seen if cid in comic_ids) == sorted(comic_ids)
+    assert len(seen) == len(comic_ids)
+
+
 # ---------------------------------------------------------------------------
 # GET /api/dashboard-tabs
 # ---------------------------------------------------------------------------

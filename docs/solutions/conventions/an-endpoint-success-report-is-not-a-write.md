@@ -9,6 +9,9 @@ severity: high
 mechanized_by: test
 enforced_by_test:
   - plugins/gixen-overlay/tests/test_gixen_overlay_db.py::test_upsert_comic_allcaps_skips_yearless_promotion_on_yeared_sibling_conflict
+  - plugins/gixen-overlay/tests/test_gixen_overlay_db.py::test_upsert_comic_skip_reason_signals_per104_guard
+  - plugins/gixen-overlay/tests/test_gixen_overlay_routes.py::test_backfill_year_guard_skip_reports_unresolved_not_resolved
+  - plugins/gixen-overlay/tests/test_gixen_overlay_routes.py::test_backfill_year_offset_pages_past_unresolvable_head
 applies_when:
   - "Running a bulk backfill or repair through a write endpoint and reporting how many rows changed"
   - "An endpoint returns a per-row result that a caller treats as proof of persistence"
@@ -44,8 +47,9 @@ any non-`None` resolution as resolved. Hulk Annual #1 (comic 328) was reported
 `year: 2024` in rounds 2 and 4 while its `year` stayed `NULL` — and the guard
 was right to refuse: the 1968 twin (row 312) is the real book, filed on Metron
 as "Incredible Hulk Special", so Metron's 2024 answer was wrong for it. Correct
-guard, honest data, lying report. The report defect is BUI-721 (open); what
-generalizes is the verification practice that caught it.
+guard, honest data, lying report. The report defect was fixed in BUI-721 (see
+"After," below); what generalizes is the verification practice that caught
+it.
 
 ## Guidance
 
@@ -96,12 +100,19 @@ sqlite3 "file:$HOME/.comics-server/db.sqlite.backup-2026-08-10?immutable=1" \
 
 ### Operational notes from the same run
 
-Because the backfill scan has no offset, unresolved rows pile up at the head
-and a fixed-limit batch re-scans the same stalled prefix forever — escalating
+Because the backfill scan had no offset, unresolved rows piled up at the head
+and a fixed-limit batch re-scanned the same stalled prefix forever — escalating
 limits (40 → 65 → 110 → 162) cleared it at ~2.3× Metron spend. Per-round retry
 self-healed transient 429 failures (Captain America #110 failed three rounds,
-then resolved), so a round's failures are not terminal. Both are BUI-721
-fix-shape inputs.
+then resolved), so a round's failures are not terminal. BUI-721 fixed both:
+`upsert_comic` now takes an optional `skip_reason` out-param the PER-104 guard
+populates (so a caller can tell a guard-refused no-op from a real write
+without re-reading the row itself), and the endpoint takes an `offset` plus
+returns `next_offset`, so a repeated small-limit run pages past an
+unresolvable head instead of re-scanning it — see `POST
+/api/comics/backfill-year`'s docstring in `routes.py` for the exact paging
+protocol (a naive `round_number * limit` offset is wrong, because successful
+writes shrink the population but failures/skips do not).
 
 ## Why This Matters
 
@@ -136,7 +147,10 @@ Both read as successful in-place year writes.
 promotion — yeared sibling conflict (... incoming_year=2024 ...)`, and row 312
 holds the same title/issue at `year = 1968`. The guard was protecting the
 correct book from a wrong Metron answer while the endpoint reported the wrong
-year as written. Filed as BUI-721.
+year as written. Fixed in BUI-721: the same request now returns
+`{"comic_id": 328, "resolved": false, "skipped": "yeared_sibling_conflict",
+"year": 2024}` — `resolved: false` and no `comic_id_after`/`merged`, so the
+response itself no longer claims a write that never happened.
 
 ## Related
 
@@ -150,5 +164,5 @@ year as written. Filed as BUI-721.
   the narrow precedent: use GET to verify actual state after a POST.
 - `docs/solutions/best-practices/a-probe-of-a-write-endpoint-is-a-write.md` —
   deploy-probe adjacency.
-- Tickets: BUI-715 (the run), BUI-721 (the report defect, open), BUI-697 (the
+- Tickets: BUI-715 (the run), BUI-721 (the report defect, fixed), BUI-697 (the
   mirror), BUI-593 (fetch succeeded / write 422d — the family's first member).

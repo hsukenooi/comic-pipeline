@@ -1496,7 +1496,11 @@ async def api_sweep_orphans(request: Request, dry_run: bool = True):
 
 @router.post("/api/comics/backfill-year")
 async def api_backfill_year(
-    request: Request, dry_run: bool = True, active_only: bool = True, limit: int = 25
+    request: Request,
+    dry_run: bool = True,
+    active_only: bool = True,
+    limit: int = 25,
+    offset: int = 0,
 ):
     """One-time backfill (BUI-715) for NULL-year comics rows.
 
@@ -1533,11 +1537,48 @@ async def api_backfill_year(
     requests, everything — for up to `limit * 30s`. Call repeatedly with a
     small limit to page through a larger backlog instead of raising it.
 
-    Returns `{dry_run, scanned, resolved, unresolved, results}` — `results`
-    entries that fail to resolve carry `resolved: false` and no `year`, so a
-    caller can tell "nothing to do yet" apart from "this call did nothing"
-    (the same fetch-err-vs-genuine-zero distinction this project keeps
-    re-learning elsewhere).
+    **Paging protocol (BUI-721):** the scan is `WHERE year IS NULL ORDER BY
+    id LIMIT ? OFFSET ?` — a row that resolves and writes leaves the `year IS
+    NULL` population (so it never occupies a later page), but a row that
+    stays unresolved (Metron miss, or the PER-104 guard below) does NOT, so
+    it re-occupies the head of every subsequent scan unless explicitly paged
+    past. **Do not compute `offset` as `round_number * limit`** — the
+    population shrinks by however many rows each round *writes*, not by
+    `limit`, so a naive multiple skips over never-scanned rows. Instead pass
+    the previous response's `next_offset` verbatim as this call's `offset`;
+    it already accounts for exactly how many rows from prior calls remain
+    unresolved and stayed in the population. (In a `dry_run` pass `next_offset`
+    advances by the whole page instead: a preview writes nothing, so *no* row
+    leaves the population and every scanned row would otherwise be re-served
+    at the head.) Repeat with `offset=0` on the
+    first call and `offset=<previous next_offset>` on each subsequent call
+    until a response comes back with `scanned: 0` — at that point every row
+    in scope has been visited exactly once (full coverage), whether it wrote,
+    failed, or was guard-skipped. A row that failed for a transient reason
+    (e.g. a rate limit) is not retried automatically within one such pass —
+    start a fresh pass at `offset=0` later to retry; `results` entries
+    without a `skipped` code are worth retrying, entries with one (below)
+    are not, since the guard will refuse the same write again. Keep
+    `dry_run` and `active_only` fixed for the whole paging sequence — each
+    defines a different `year IS NULL` population (a dry_run preview never
+    calls `upsert_comic`, so it can't see PER-104 guard skips the way a real
+    run does; `active_only` changes the WHERE/JOIN entirely), and a
+    `next_offset` computed under one combination does not correspond to a
+    row's position under another.
+
+    Returns `{dry_run, active_only, offset, next_offset, scanned, resolved,
+    unresolved, results}` — `results` entries that fail to resolve carry
+    `resolved: false` and no `year`, so a caller can tell "nothing to do yet"
+    apart from "this call did nothing" (the same fetch-err-vs-genuine-zero
+    distinction this project keeps re-learning elsewhere). A row whose
+    resolution succeeded but whose write was declined by `upsert_comic`'s
+    PER-104 guard (a yeared sibling exists at a different year — see
+    `upsert_comic`'s docstring) also reports `resolved: false`, plus
+    `skipped: "yeared_sibling_conflict"` and the `year` Metron returned (for
+    diagnosis) — never `resolved: true` for a row whose `year` column is
+    still `NULL` after the call (docs/solutions/conventions/
+    an-endpoint-success-report-is-not-a-write.md: BUI-721 was exactly this —
+    the response claimed a write that never happened).
     """
     db = request.app.state.db
     scope_sql = (
@@ -1545,12 +1586,12 @@ async def api_backfill_year(
         "FROM comics c "
         "JOIN fmv f ON f.comic_id = c.id "
         "JOIN bid_fmvs bf ON bf.fmv_id = f.id "
-        "WHERE c.year IS NULL ORDER BY c.id LIMIT ?"
+        "WHERE c.year IS NULL ORDER BY c.id LIMIT ? OFFSET ?"
         if active_only
         else "SELECT id, title, issue, variant, locg_id, locg_variant_id "
-        "FROM comics WHERE year IS NULL ORDER BY id LIMIT ?"
+        "FROM comics WHERE year IS NULL ORDER BY id LIMIT ? OFFSET ?"
     )
-    rows = db.execute(scope_sql, (limit,)).fetchall()
+    rows = db.execute(scope_sql, (limit, offset)).fetchall()
 
     results: list[dict] = []
     resolved_count = 0
@@ -1566,13 +1607,10 @@ async def api_backfill_year(
                 }
             )
             continue
-        resolved_count += 1
         entry: dict[str, Any] = {
             "comic_id": row["id"],
             "title": row["title"],
             "issue": row["issue"],
-            "resolved": True,
-            "year": resolution.year,
         }
         if not dry_run:
             # locg_id/locg_variant_id: pass the resolution's values as-is (not
@@ -1581,6 +1619,7 @@ async def api_backfill_year(
             # row["locg_id"] when the resolution didn't find one, without an
             # `or` that would (incorrectly, if unlikely) treat a real 0 as
             # missing.
+            skip_reason: dict[str, str] = {}
             new_comic_id = upsert_comic(
                 db,
                 title=row["title"],
@@ -1589,17 +1628,49 @@ async def api_backfill_year(
                 variant=row["variant"],
                 locg_id=resolution.locg_id,
                 locg_variant_id=resolution.locg_variant_id,
+                skip_reason=skip_reason,
             )
-            entry["comic_id_after"] = new_comic_id
-            entry["merged"] = new_comic_id != row["id"]
+            if skip_reason:
+                # BUI-721: upsert_comic's PER-104 guard declined the write —
+                # the row's year is still NULL. Report it as unresolved, not
+                # as the successful write it never was.
+                entry["resolved"] = False
+                entry["skipped"] = skip_reason["code"]
+                entry["year"] = resolution.year
+            else:
+                resolved_count += 1
+                entry["resolved"] = True
+                entry["year"] = resolution.year
+                entry["comic_id_after"] = new_comic_id
+                entry["merged"] = new_comic_id != row["id"]
+        else:
+            # Preview only — upsert_comic (and its PER-104 guard) is never
+            # called, so there is nothing to disprove this optimistic read.
+            resolved_count += 1
+            entry["resolved"] = True
+            entry["year"] = resolution.year
         results.append(entry)
 
+    unresolved_count = len(rows) - resolved_count
+    # `next_offset` must advance by however many of THIS page's rows are still
+    # in the `year IS NULL` population on the next call — those are the ones a
+    # plain LIMIT would otherwise re-serve at the head. In a real run that is
+    # the unresolved ones (a written row leaves the population). In a DRY RUN
+    # nothing is written, so *every* scanned row stays — advancing by
+    # `unresolved_count` there re-scans the resolvable ones, and when a whole
+    # page resolves it advances by zero and the caller loops forever burning a
+    # Metron call per row per round. `dry_run=True` is this endpoint's default
+    # and the paging protocol above says to call until `scanned: 0`, so that
+    # loop is the reachable default path, not a corner case.
+    consumed = len(rows) if dry_run else unresolved_count
     return {
         "dry_run": dry_run,
         "active_only": active_only,
+        "offset": offset,
+        "next_offset": offset + consumed,
         "scanned": len(rows),
         "resolved": resolved_count,
-        "unresolved": len(rows) - resolved_count,
+        "unresolved": unresolved_count,
         "results": results,
     }
 
