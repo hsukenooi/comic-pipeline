@@ -262,6 +262,122 @@ class TestIsHandPriced:
             "window=±0.5 | cv=20% | see hand OVERRIDE policy doc") is False
 
 
+# BUI-759: the notes prefix of every operator-priced row that existed on the
+# live comics server when this gap was measured (2026-08-12) — the seven
+# `manual:` ones verbatim from the ticket's table, the five `hand §` ones with
+# representative tails (the table recorded only their shared prefix, which is
+# the load-bearing part). Seven of them — every `manual:`/`Manual:` one — was False
+# under BUI-533's case-sensitive `("hand §", "hand OVERRIDE")` startswith,
+# including fmv 767: the ASM #50 (1st Kraven) row hand-priced at $600-680.
+#
+# This is a CENSUS, not a sample. Its job is to make the next unprotected
+# prefix variant fail loudly here instead of silently losing a priced row on
+# the Mini: when a new operator convention appears, add its prefix to this list
+# — if the matcher does not cover it, this test says so before a batch run
+# discovers it the expensive way.
+_LIVE_OPERATOR_NOTES_PREFIXES = [
+    # fmv 767 — ASM #50, $600-680. The capital M is why matching must be
+    # case-insensitive and not merely a longer marker tuple.
+    "Manual: CGC-proxy + genuine raw comps (ASM #50",
+    "manual: narrowed to +/-1.0 grade window",      # fmv 732
+    "manual: narrowed to +/-1.0 grade window",      # fmv 739
+    "manual: cross-variant proxy from Newsstand",   # fmv 745
+    "manual: one-sided extrapolation below VG-",    # fmv 757
+    "manual: exact grade match at VG/FN 5.0",       # fmv 759
+    "manual: excluded $59.99 suspect outlier",      # fmv 763
+    # The five already protected by BUI-533 — they must STAY protected.
+    "hand § anchored on the lone 4.0 sale",         # fmv 733
+    "hand § direct comps at this grade",            # fmv 810
+    "hand § operator band, CLI pool rejected",      # fmv 862
+    "hand § cross-checked against slab ladder",     # fmv 913
+    "hand § re-priced after the 2026-08 sale",      # fmv 917
+]
+
+
+class TestIsHandPricedCoversLiveOperatorRows:
+    """BUI-759 regression: the guard must cover the prefixes operators
+    ACTUALLY write, not the half of the convention BUI-533 sampled."""
+
+    @pytest.mark.parametrize("notes", _LIVE_OPERATOR_NOTES_PREFIXES)
+    def test_every_live_operator_row_is_detected(self, notes):
+        assert fmv_runner._is_hand_priced(notes) is True
+
+    def test_all_twelve_live_rows_detected(self):
+        """The census as a whole — 12/12. A partial regression must name the
+        unprotected prefixes, because '7 of 12 protected' is precisely the
+        finding this ticket exists for and 'assert False' would not say it."""
+        missed = [n for n in _LIVE_OPERATOR_NOTES_PREFIXES
+                  if not fmv_runner._is_hand_priced(n)]
+        detected = len(_LIVE_OPERATOR_NOTES_PREFIXES) - len(missed)
+        assert not missed, (
+            f"{detected} of {len(_LIVE_OPERATOR_NOTES_PREFIXES)} live "
+            f"operator-priced rows protected; UNPROTECTED: {missed}")
+
+    def test_census_is_never_shrunk(self):
+        """Growing this list is fine (a new convention appears); shrinking it
+        is how the guard would silently narrow again, so pin the floor at the
+        12 rows measured on 2026-08-12."""
+        assert len(_LIVE_OPERATOR_NOTES_PREFIXES) >= 12
+
+    def test_markers_are_bare_words(self):
+        """`_HAND_PRICE_PREFIX_RE` terminates each marker with `\\b`, which only
+        behaves as 'end of the marker word' for a marker made of word chars. A
+        punctuated marker ("manual:") would invert the match instead of
+        widening it — fail here rather than in a batch run."""
+        for marker in fmv_runner._HAND_PRICE_MARKERS:
+            assert marker.isalpha(), (
+                f"marker {marker!r} is not a bare word — see the contract "
+                f"comment above _HAND_PRICE_PREFIX_RE")
+
+    @pytest.mark.parametrize("notes", [
+        "manual: narrowed to +/-1.0 grade window",
+        "Manual: CGC-proxy + genuine raw comps",
+        "MANUAL: shouting operator",
+        "manual (BUI-720): repaired from the ledger",   # the BUI-720 row
+        "manually re-priced off the lone VF sale",
+        "hand § anchored on the 4.0 sale",
+        "hand §direct (BUI-720): re-posted to be covered",
+        "hand OVERRIDE: rejecting CLI pool",
+        "Hand § capitalized by a different operator",
+        "  manual: leading whitespace from a paste",
+        "hand-priced: hyphenated variant",
+    ])
+    def test_case_and_punctuation_variants_detected(self, notes):
+        assert fmv_runner._is_hand_priced(notes) is True
+
+    @pytest.mark.parametrize("notes", [
+        "",
+        "window=±0.5 | cv=20% | label=HIGH",
+        "window=n/a | cv=12% | label=MEDIUM | manual_review=one_sided",
+        # `_build_notes` writes a literal `manual_review=<flag>` token. It is
+        # never first today, but if it ever became first it must still read as
+        # machine output — `_` is a word char, so the marker's word boundary
+        # rejects it. Pinned here so a widening can't quietly claim it.
+        "manual_review=one_sided | window=±0.5 | cv=31%",
+        "LEDGER-ADVISORY (stale comps, no bid cap) | window=±0.5",
+        # An English word that merely BEGINS with a marker is not a provenance
+        # claim — this is what a bare `startswith("hand")` would get wrong.
+        "handled by the CGC ladder, no raw comps",
+        "handoff from the calibration report",
+    ])
+    def test_machine_and_lookalike_notes_not_hand_priced(self, notes):
+        assert fmv_runner._is_hand_priced(notes) is False
+
+    def test_real_machine_written_notes_are_not_hand_priced(self):
+        """Tie the false-positive direction to the ACTUAL machine writer rather
+        than to a hand-copied fixture: whatever `_build_notes` emits must never
+        read as operator provenance, or a default run would refuse to refresh
+        its own rows. If someone ever makes `_build_notes` open with a word the
+        matcher claims, this fails here."""
+        machine = fmv_runner._build_notes(
+            {"window": 0.5, "cv_pct": 20, "confidence": "HIGH"})
+        assert fmv_runner._is_hand_priced(machine) is False
+        advisory = fmv_runner._build_notes(
+            {"window": None, "cv_pct": 31, "confidence": "LOW",
+             "ledger_advisory": True, "flag_reason": "one_sided"})
+        assert fmv_runner._is_hand_priced(advisory) is False
+
+
 class TestSplitByDbCacheHandPriced:
     def test_stale_hand_priced_row_is_skipped_not_recomputed(self, server_url):
         """The exact 2026-07-24 incident this ticket exists for: a hand-priced
@@ -288,6 +404,31 @@ class TestSplitByDbCacheHandPriced:
         assert cached == {}
         assert needs == []
         assert skipped_hand == {0: hand_row}
+        assert force_notes == {}
+
+    def test_stale_manual_prefixed_row_is_skipped_not_recomputed(self, server_url):
+        """BUI-759 at the CONSUMER, not just at the predicate: the real ASM #50
+        row (fmv 767, $600-680, `Manual:` with a capital M) went through this
+        exact path unprotected. A default run must now leave it untouched."""
+        books = [_make_book("1", "The Amazing Spider-Man", "50", 1967, 6.5,
+                            locg_id=100)]
+        manual_row = {"id": 767, "fmv_low": 600, "fmv_high": 680,
+                      "fmv_comps": 4, "fmv_confidence": "medium",
+                      "fmv_notes": "Manual: CGC-proxy + genuine raw comps "
+                                   "(ASM #50, 1st Kraven)",
+                      "fmv_updated_at": "2020-01-01T00:00:00"}  # very stale
+
+        def _lookup(server, *, locg_id, grade, locg_variant_id, max_age_days,
+                    strict=False):
+            return manual_row if max_age_days is None else None
+
+        with patch("fmv_runner._db_lookup", side_effect=_lookup):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                books, server_url=server_url, max_age_days=7, force=False)
+        assert needs == []                       # never sent to recompute
+        assert skipped_hand == {0: manual_row}   # reported as a hand-priced skip
+        assert cached == {}
         assert force_notes == {}
 
     def test_fresh_hand_priced_row_reused_via_normal_cache_path(self, server_url):
